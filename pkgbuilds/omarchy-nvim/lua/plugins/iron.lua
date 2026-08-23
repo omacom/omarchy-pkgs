@@ -16,7 +16,6 @@ return {
     { "<leader>rsn", "<cmd>lua require('iron.core').send_code_block(true)<cr>", desc = "Send Code Block & Move Next" },
     { "<leader>rsm", "<cmd>lua require('iron.core').run_motion('send_motion')<cr>", desc = "Send Motion" },
     { "<leader>rs", "<cmd>lua require('iron.core').visual_send()<cr>", mode = "v", desc = "Send Selection" },
-    { "<leader>rsv", "<cmd>lua require('iron.core').visual_send()<cr>", mode = "v", desc = "Send Selection" },
     { "<leader>rm", desc = "+marks" },
     { "<leader>rmm", "<cmd>lua require('iron.core').run_motion('mark_motion')<cr>", desc = "Mark Motion" },
     { "<leader>rmv", "<cmd>lua require('iron.core').mark_visual()<cr>", mode = "v", desc = "Mark Visual" },
@@ -24,6 +23,7 @@ return {
     { "<leader>rmr", "<cmd>lua require('iron.core').send_mark()<cr>", desc = "Send Mark" },
     { "<leader>rq", "<cmd>lua require('iron.core').send(nil, string.char(03))<cr>", desc = "Interrupt REPL" },
     { "<leader>rx", "<cmd>lua require('iron.core').close_repl()<cr>", desc = "Exit REPL" },
+    { "<leader>rc", desc = "+clear" },
     { "<leader>rcc", "<cmd>lua require('iron.core').send(nil, string.char(12))<cr>", desc = "Clear REPL" },
     { "<leader>rcl", "<cmd>lua require('iron.marks').clear_hl()<cr>", desc = "Clear Highlight" },
   },
@@ -41,17 +41,15 @@ return {
           },
           python = {
             command = python_cmd,
-            format = function(lines, extras)
-              local result = require("iron.fts.common").bracketed_paste_python(lines, extras)
-              return vim.tbl_filter(function(line)
-                return not string.match(line, "^%s*#")
-              end, result)
-            end,
+            -- Python 3.13+ defaults to the auto-indenting PyREPL, which
+            -- re-indents pasted blocks and breaks them; force the basic REPL.
+            env = { PYTHON_BASIC_REPL = "1" },
+            format = require("iron.fts.common").bracketed_paste_python,
             block_dividers = { "# %%", "#%%" },
           },
         },
         repl_filetype = function(bufnr, ft)
-          return ft
+          return "iron"
         end,
         repl_open_cmd = "vertical split",
       },
@@ -63,6 +61,13 @@ return {
   end,
   config = function(_, opts)
     require("iron.core").setup(opts)
-    vim.keymap.set("t", "<esc>", "<C-\\><C-n>", { desc = "Exit terminal mode" })
+    -- Buffer-local to iron's REPL buffers only: a global terminal-mode <esc>
+    -- mapping would swallow Escape in every :terminal (TUIs, nested vim).
+    vim.api.nvim_create_autocmd("FileType", {
+      pattern = "iron",
+      callback = function(ev)
+        vim.keymap.set("t", "<esc>", "<C-\\><C-n>", { buffer = ev.buf, desc = "Exit terminal mode" })
+      end,
+    })
   end,
 }
