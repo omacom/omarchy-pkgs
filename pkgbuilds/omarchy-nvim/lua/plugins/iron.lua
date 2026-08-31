@@ -49,7 +49,11 @@ return {
           },
         },
         repl_filetype = function(bufnr, ft)
-          return "iron"
+          -- Buffer-local to iron's REPL buffers only: a global terminal-mode
+          -- <esc> mapping would swallow Escape in every :terminal. Return the
+          -- source ft so iron's keybindings still resolve inside the REPL.
+          vim.keymap.set("t", "<esc>", "<C-\\><C-n>", { buffer = bufnr, desc = "Exit terminal mode" })
+          return ft
         end,
         repl_open_cmd = "vertical split",
       },
@@ -61,13 +65,5 @@ return {
   end,
   config = function(_, opts)
     require("iron.core").setup(opts)
-    -- Buffer-local to iron's REPL buffers only: a global terminal-mode <esc>
-    -- mapping would swallow Escape in every :terminal (TUIs, nested vim).
-    vim.api.nvim_create_autocmd("FileType", {
-      pattern = "iron",
-      callback = function(ev)
-        vim.keymap.set("t", "<esc>", "<C-\\><C-n>", { buffer = ev.buf, desc = "Exit terminal mode" })
-      end,
-    })
   end,
 }
