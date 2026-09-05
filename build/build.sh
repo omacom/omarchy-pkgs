@@ -567,15 +567,24 @@ if [[ -n "$PACKAGES" ]]; then
     fi
   done
 else
-  # Build all packages that need updates from the relevant directories
+  # Build all packages that need updates from the relevant directories.
+  # Enumerate first and stop on failure: the version check queued this run
+  # from its own reading of the metadata, and a shorter list here (an
+  # unreadable file for the container user, say) would build nothing and
+  # report success — the queue then refills on the next tick, forever.
+  if ! CANDIDATE_PACKAGES=$(collect_packages); then
+    echo "==> ERROR: could not enumerate packages for $MIRROR ($ARCH); refusing to build a partial list"
+    exit 1
+  fi
   while IFS= read -r pkg; do
+    [[ -n "$pkg" ]] || continue
     if check_needs_build "$pkg"; then
       PACKAGES_TO_BUILD+=("$pkg")
     else
       echo "  + $pkg - already up to date"
       SKIPPED_PACKAGES="$SKIPPED_PACKAGES $pkg"
     fi
-  done < <(collect_packages)
+  done <<<"$CANDIDATE_PACKAGES"
 fi
 
 if [[ ${#PACKAGES_TO_BUILD[@]} -eq 0 ]]; then
