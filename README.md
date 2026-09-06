@@ -748,6 +748,15 @@ Fields:
 
 ## Adding Packages
 
+### Intel T2 Macs
+
+The required kernel, matching headers, audio configuration and fan daemon are
+maintained directly here. See [T2 package builds](docs/t2/README.md) for pinned
+sources, local build and validation commands, updates, firmware provenance and
+the migration checklist. They remain `skip_build: true` pending migration and
+hardware testing. Apple firmware redistribution is unresolved; this does not
+yet replace the complete external T2 repository dependency.
+
 ### From AUR
 
 ```bash

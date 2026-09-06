@@ -170,12 +170,46 @@ get_local_version() {
   local pkg="$1"
 
   load_local_versions
+  # A pkgbase is current only when every split output has the same version.
+  # A surviving kernel must not hide missing or older headers.
+  local pkgdir output version="" candidate
+  pkgdir=$(find_package_dir "$pkg") || return 0
+  while IFS= read -r output; do
+    [[ -n "$output" ]] || return 0
+    candidate=${LOCAL_VERSION_BY_NAME[$output]:-}
+    [[ -n "$candidate" ]] || return 0
+    [[ -z "$version" || "$version" == "$candidate" ]] || return 0
+    version=$candidate
+  done < <(package_output_names "$pkgdir")
+  [[ -n "$version" ]] && echo "$version"
+}
 
-  if [[ -n "${LOCAL_VERSION_BY_NAME[$pkg]:-}" ]]; then
-    echo "${LOCAL_VERSION_BY_NAME[$pkg]}"
-  elif [[ -n "${LOCAL_VERSION_BY_BASE[$pkg]:-}" ]]; then
-    echo "${LOCAL_VERSION_BY_BASE[$pkg]}"
-  fi
+package_output_names() {
+  (cd "$1" && CARCH="$ARCH" bash -c 'source PKGBUILD >/dev/null; printf "%s\n" "${pkgname[@]}"')
+}
+
+# OMARCHY_KEEP_BUILD_WORKSPACE retains unsigned packages as well as the DB.
+# Check the actual archives, including every split output, before reusing them.
+# A recipe/source edit must bump pkgrel, just as it does for a published build.
+staged_package_is_current() {
+  local pkgdir="$1" version="$2" output file info found count=0
+  while IFS= read -r output; do
+    [[ -n "$output" ]] || return 1
+    found=false
+    for file in "$BUILD_OUTPUT_DIR/$output-${version#*:}-"{any,"$ARCH"}.pkg.tar.*; do
+      [[ -f "$file" && "$file" != *.sig ]] || continue
+      info=$(bsdtar -xOf "$file" .PKGINFO 2>/dev/null) || continue
+      if grep -qxF "pkgname = $output" <<<"$info" &&
+         grep -qxF "pkgver = $version" <<<"$info" &&
+         grep -qxE "arch = (any|$ARCH)" <<<"$info"; then
+        found=true
+        break
+      fi
+    done
+    [[ "$found" == true ]] || return 1
+    ((count += 1))
+  done < <(package_output_names "$pkgdir")
+  (( count > 0 ))
 }
 
 # Check if package should be built for current architecture
@@ -490,6 +524,14 @@ check_needs_build() {
   # Get PKGBUILD version (including epoch if present)
   local pkgbuild_version=$(cd "$pkgdir" && bash -c 'source PKGBUILD; if [[ -n "$epoch" ]]; then echo "${epoch}:${pkgver}-${pkgrel}"; else echo "${pkgver}-${pkgrel}"; fi' 2>/dev/null)
   [[ -z "$pkgbuild_version" ]] && return 1
+
+  # Moving VCS refs must still be checked against upstream. The T2 recipes
+  # have static versions and immutable sources, so their staged outputs can
+  # be reused without another download or compile.
+  if ! grep -qE '^pkgver[[:space:]]*\(\)' "$pkgbuild" &&
+     staged_package_is_current "$pkgdir" "$pkgbuild_version"; then
+    return 1
+  fi
 
   # Check if already built
   local local_version=$(get_local_version "$pkg")
