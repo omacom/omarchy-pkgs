@@ -1,11 +1,14 @@
 # Intel T2 Mac packages
 
-Omarchy owns three recipes producing four packages. The kernel and fan daemon
-compile from source; audio configuration and headers are packaged data/build
-files. Apple/Broadcom firmware is proprietary binary data and remains unresolved.
-No firmware blobs or externally built T2 packages enter these builds.
+Omarchy owns four recipes producing all five required packages. The kernel and
+fan daemon compile from source; audio configuration and headers are packaged
+data/build files. Apple/Broadcom firmware is packaged proprietary data from an
+[Omarchy-owned source fork](https://github.com/omacom/apple-bcm-firmware).
+All five install using Arch plus our local outputs, without externally built
+arch-mact2 packages. Firmware redistribution rights and hardware qualification
+remain unresolved; production installations have not migrated.
 
-All three `.omarchy/package.json` files use `source: local`, an
+All four `.omarchy/package.json` files use `source: local`, an
 `upstream_commit` recording the import, and `skip_build: true`. This keeps them
 out of scheduled builds while allowing explicit local builds. Normal edge → rc
 → stable promotion remains available after qualification; no fast ring is set.
@@ -25,7 +28,7 @@ set; the database is authoritative for this inventory.
 | `linux-t2-headers` | `7.2.3.arch1-1` | Same split PKGBUILD and compilation as kernel | Exact local `linux-t2=$pkgver-$pkgrel`; `binutils`, `glibc`, `libelf`, `libgcc`, `openssl`, `pahole`, `xxhash`, `zlib`, `zstd` |
 | `apple-t2-audio-config` | `0.4.r21.ga973d53-1` | `deqrocks/t2bce` UCM profiles | `alsa-ucm-conf`; PipeWire/PulseAudio and kernel are optional metadata dependencies |
 | `t2fanrd` | `r16.48baf96-1` | `GnomedDev/T2FanRD` Rust daemon | Build: Arch `cargo`, locked crates; runtime `glibc`, `libgcc`, `systemd` |
-| `apple-bcm-firmware` | `14.0-1` | Separate `NoaHimesaka1873/apple-bcm-firmware` recipe, not in the collection | Binary firmware archives from Funami plus an unpinned Asahi conversion tool; see [firmware](firmware.md) |
+| `apple-bcm-firmware` | `14.0-1` | `omacom/apple-bcm-firmware`, fork of AdityaGarg8/Apple-Firmware; checked-in Sonoma 14.4.1 Intel blobs | No extra build/runtime dependencies; SHA-256 verified archive and per-file manifest; see [firmware](firmware.md) |
 
 Local revisions use `.1` after the upstream release number, so they sort above
 the corresponding mirror builds without an epoch. The exact build results and
@@ -66,6 +69,13 @@ Pinned inputs:
   `cargo build --frozen` compiles offline after fetching. `LICENCE` is packaged;
   Cargo declares `GPL-3.0-or-later`.
 
+* Firmware tree at
+  [`dc061b535d53e293cdd5793c1255faaca197574b`](https://github.com/omacom/apple-bcm-firmware/tree/dc061b535d53e293cdd5793c1255faaca197574b),
+  from a documented macOS runner extraction. The archive and all 132 installed
+  Intel files have SHA-256 pins. This is binary/data packaging, not compilation.
+  The fork's Actions are disabled, with no package releases. See the firmware
+  report for provenance gaps, license findings and local extraction alternatives.
+
 The kernel packaging repository's GPL license and original maintainer and
 contributor attribution are retained. The kernel itself declares GPL-2.0-only.
 Omarchy's recipe changes are captured in
@@ -96,12 +106,12 @@ are publication commands and must not be used for local validation.
 ```bash
 # Docker or rootless Podman; image comes from the existing build/Dockerfile.
 CONTAINER_ENGINE=podman OMARCHY_BUILD_CPUS=8 \
-  bin/build --arch x86_64 --package linux-t2 apple-t2-audio-config t2fanrd
+  bin/build --arch x86_64 --package linux-t2 apple-t2-audio-config apple-bcm-firmware t2fanrd
 
 # Use a previously inspected/prepared image and retain local artifacts on retry.
 CONTAINER_ENGINE=podman OMARCHY_BUILD_CPUS=8 \
   OMARCHY_SKIP_BUILDER_IMAGE=1 OMARCHY_KEEP_BUILD_WORKSPACE=1 \
-  bin/build --arch x86_64 --package linux-t2 apple-t2-audio-config t2fanrd
+  bin/build --arch x86_64 --package linux-t2 apple-t2-audio-config apple-bcm-firmware t2fanrd
 
 CONTAINER_ENGINE=podman bin/validate-t2
 build/test-build-reuse.sh
@@ -121,8 +131,9 @@ keeping `pkgver`: retained artifacts are version-based caches, not a proof of
 bit-for-bit reproducibility or an integrity check of the entire archive payload.
 
 `bin/validate-t2` runs in a fresh container, rejects preinstalled T2 packages and
-unexpected repositories, and installs the four outputs through pacman and our
-local DB. It checks dependency consistency, package files, module metadata,
+unexpected repositories, and installs the five outputs through pacman and our
+local DB alongside Arch's Broadcom firmware. It checks exact firmware filenames
+and hashes, dependency consistency, package files, module metadata,
 kernel/header agreement, a test initramfs, an external module compiled against
 the installed headers, audio profile paths, and the disabled fan service. It
 does not load modules, start fan control, or touch the host's boot setup.
@@ -149,6 +160,12 @@ bin/sync-t2 apple-t2-audio-config FULL_40_CHARACTER_COMMIT
 git ls-remote https://github.com/GnomedDev/T2FanRD.git HEAD
 bin/sync-t2 t2fanrd FULL_40_CHARACTER_COMMIT --check
 bin/sync-t2 t2fanrd FULL_40_CHARACTER_COMMIT
+
+# Review/import the desired firmware tree into the Omarchy fork first.
+# The version must describe its checked-in files, not its Debian/RPM releases.
+bin/sync-t2 apple-bcm-firmware FULL_40_CHARACTER_COMMIT --firmware-version 14.4.1 --check
+bin/sync-t2 apple-bcm-firmware FULL_40_CHARACTER_COMMIT --firmware-version 14.4.1
+# Same macOS version, changed tree: supply an increasing --pkgrel, e.g. 1.2.
 ```
 
 Kernel imports preserve the upstream checksums, detached signatures, patch pin
@@ -157,7 +174,15 @@ no longer applies fails before editing. Review any key rotation explicitly;
 the importer does not fetch/accept new signing identities automatically.
 For audio/fan sources, it calculates the upstream commit count, verifies the
 GitHub tar archive's embedded full commit, and hashes the archive and local
-service/configuration files. No upstream PKGBUILD is executed during import.
+service/configuration files. Firmware imports use the explicit reviewed macOS
+version, verify the archive's commit and regenerate Intel hashes from Git blobs.
+Missing previously supported filenames, empty files and symlinks fail the import;
+new Intel filenames appear in the review diff. Removing a board/family requires
+an explicit manual coverage/manifest review. The same macOS version needs an
+increasing `--pkgrel` when content changes. Update the provenance report with the
+new macOS/runner or recovery inputs; the importer cannot prove a version label.
+Keep the firmware fork's Actions disabled when importing upstream changes, and
+review any inherited workflow changes. No upstream PKGBUILD is executed during import.
 Failed downloads, moving refs, wrong archives, downgrades and same-version
 content changes fail before edits. Upstream revision changes receive an Omarchy
 `.1` suffix. For a local-only change, edit/bump `pkgrel` and the affected hashes
@@ -166,8 +191,8 @@ manually, as with other local packages.
 After any import, review `git diff`, rebuild, run `bin/validate-t2`, test reuse,
 and repeat hardware qualification. The importer is tested with offline Git
 fixtures, including an update followed by a no-op, wrong archive, moving-ref and
-downgrade failures. The three real current pins were also reimported in preview
-mode without changes. Update success does not establish kernel compatibility.
+downgrade failures, plus firmware coverage and same-version release changes.
+All four real current pins were also reimported in preview mode without changes. Update success does not establish kernel compatibility.
 
 ## Omarchy settings and migration
 
@@ -195,11 +220,11 @@ source build service. These histories were inspected read-only.
 
 Retiring the external dependency needs a later coordinated change:
 
-1. Resolve the firmware path: an explicit redistribution grant for a pinned
-   firmware source, or installation-time/on-device extraction with suitable
-   licensing and offline-install support. Remove `apple-bcm-firmware` from the
-   automatic transaction only when its replacement is ready.
-2. Qualify the four local packages on representative T2 hardware, including the
+1. Resolve the firmware release requirement: establish rights for the pinned
+   Omarchy-owned blob tree, or implement installation-time/on-device extraction
+   with suitable licensing and offline-install support. Local dependency closure
+   now works; fork ownership does not itself grant redistribution rights.
+2. Qualify all five local packages on representative T2 hardware, including the
    kernel and audio pair. Keep a bootable fallback kernel and recovery method.
 3. Enable scheduled builds deliberately; build for each intended channel's
    Arch snapshot and sign/publish through the normal repository workflow.

@@ -1,26 +1,82 @@
-# Apple/Broadcom firmware: remaining dependency
+# Apple/Broadcom firmware
 
-The missing install-time dependency is **`apple-bcm-firmware 14.0-1`**. The four
-other outputs build without it. There is no firmware compilation step: `.bin`,
-Bluetooth `.bin`, calibration `.txt`, `.clm_blob` and `.txcap_blob` files are
-binary/data inputs extracted from macOS, then renamed and packaged for Linux.
+`apple-bcm-firmware 14.4.1-1.1` now builds locally from an **Omarchy-owned fork**
+of the actual firmware tree, with no Funami archive or finished arch-mact2
+package as an input. The isolated five-package pacman transaction succeeds.
+These are packaged Apple/Broadcom blobs and calibration data, not firmware
+compiled by Omarchy. Redistribution rights and hardware operation remain
+unresolved release requirements.
 
-The original recipe is
-[`NoaHimesaka1873/apple-bcm-firmware` at `805a1fff70c8d8b8136f24722cd240c529437a78`](https://github.com/NoaHimesaka1873/apple-bcm-firmware/blob/805a1fff70c8d8b8136f24722cd240c529437a78/PKGBUILD).
-It downloads `https://mirror.funami.tech/arch-mact2/firmware/bluetooth.tar.gz`
-and `wifi.tar.gz`, plus an unpinned fork of `asahi-installer`. All three checksums
-are `SKIP`; license is `unknown`, URL is empty, and the description still says
-Big Sur despite the 14.0 version and Sonoma-related history. Rebuilding that
-recipe would still depend on externally hosted firmware, with insufficient
-provenance and verification.
+## Controlled source and exact coverage
 
-The current finished package was downloaded **for inspection only**, outside
-the build worktree and container mounts. Its SHA-256 is
+[omacom/apple-bcm-firmware](https://github.com/omacom/apple-bcm-firmware) is a fork
+of [AdityaGarg8/Apple-Firmware](https://github.com/AdityaGarg8/Apple-Firmware).
+Git history and upstream attribution are retained. The fork was created for
+this work; its Actions permissions were explicitly set to `enabled: false`,
+and it has no releases. The inherited Debian publishing workflow is inactive.
+Do not enable it: it publishes packages and references the original author's
+repository and secrets. Maintenance here uses reviewed Git trees and
+`omarchy-pkgs/bin/sync-t2`, not upstream Debian/RPM release assets.
+
+The source pin is
+[`dc061b535d53e293cdd5793c1255faaca197574b`](https://github.com/omacom/apple-bcm-firmware/tree/dc061b535d53e293cdd5793c1255faaca197574b).
+The firmware files last changed in
+[`8dce96552f774a00e0009b3187563fedb6b0beed`](https://github.com/omacom/apple-bcm-firmware/commit/8dce96552f774a00e0009b3187563fedb6b0beed),
+“Update to Sonoma 14.4.1”. That is the package version even though newer
+upstream release assets exist: those assets do not describe the checked-in tree.
+The fork's full-commit archive SHA-256 is
+`c66b9c37a73fdd2fa7a11ea7b177edfca9b85fd33f87557c9fb5e3640398671d`.
+
+The upstream README identifies a **macOS GitHub Runner Image** as the extraction
+source. It does not record the exact runner image identifier or original Apple
+image hashes. This gives a documented extraction origin and immutable received
+files, but not a fully reproduced chain from an Apple recovery image. A future
+refresh should capture those inputs as well as the resulting filenames/hashes.
+The extraction/renaming work is attributed to Aditya Garg and the t2linux/Asahi
+contributors; their tool licenses do not grant rights to the firmware itself.
+
+The package contains exactly **132 nonempty Intel firmware files**, totaling
+**20,639,588 bytes**, selected from 168 files in the upstream tree:
+
+| Family | Files | Purpose |
+| --- | ---: | --- |
+| brcmfmac4355c1 | 7 | Wi-Fi firmware and board calibration |
+| brcmfmac4364b2 | 72 | Wi-Fi firmware and board calibration |
+| brcmfmac4364b3 | 36 | Wi-Fi firmware and board calibration |
+| brcmfmac4377b3 | 15 | Wi-Fi firmware and board calibration |
+| brcmbt4377b3 | 2 | Bluetooth firmware and PTB data |
+
+All 132 Intel filenames match the Intel subset of the existing `14.0-1` package.
+Apple Silicon families are deliberately excluded. This includes `.bin`, `.ptb`,
+`.txt`, `.clm_blob` and `.txcap_blob` data, retaining their Linux driver names.
+The checked-in [manifest](../../pkgbuilds/apple-bcm-firmware/intel-firmware.sha256)
+pins every installed file. `makepkg` verifies the archive and local sources;
+`check()` verifies all file hashes. Container validation compares the installed
+manifest with the checked-in one, verifies installed bytes and the exact file
+set, and installs alongside Arch's `linux-firmware-broadcom` without conflicts.
+No module reload hook, install script, service or boot configuration is added.
+Filename coverage alone does not prove device/model operation.
+
+## Earlier arch-mact2 provenance
+
+Forking the original
+[`NoaHimesaka1873/apple-bcm-firmware` recipe](https://github.com/NoaHimesaka1873/apple-bcm-firmware/blob/805a1fff70c8d8b8136f24722cd240c529437a78/PKGBUILD)
+would not remove Funami dependence: it contains no firmware and downloads
+`https://mirror.funami.tech/arch-mact2/firmware/{wifi,bluetooth}.tar.gz` plus an
+unpinned Asahi installer fork. All three checksums are `SKIP`; license is
+`unknown`. The raw archives contain no license/readme/notice files. Their
+SHA-256 hashes, inspected outside builders, are:
+
+* Wi-Fi: `91d5d734f27ea1812a6b3c23f469f69d38b1f39a605420fe89acc5df90b380f8`
+* Bluetooth: `0e4ac278d2e2dc38a700c23c233063007cb37887d59386ac78f073f28680ea3f`
+
+The finished `apple-bcm-firmware-14.0-1-any.pkg.tar.zst` was downloaded **only
+for inspection**, outside build mounts, and never installed or used as a build
+input. SHA-256:
 `f2cd47d9e3fb9658f16997b2d9ace3033b57925b8c6ddd86ccc3d07d0c3e9559`.
-Its `.PKGINFO` repeats `license = unknown`, `packager = Unknown Packager`, an
-empty URL, and build timestamp 1698047430. It has 242 archive entries, including
-metadata and directories, and installs firmware under `usr/lib/firmware/brcm`.
-It was neither installed nor used as a source/dependency of these builds.
+Its metadata declares `license = unknown`, `packager = Unknown Packager`, an
+empty URL and build timestamp 1698047430. Its 242 archive entries include 235
+firmware files plus metadata/directories; comparison uses the 132 Intel files.
 
 ## Extraction provenance
 
@@ -81,9 +137,12 @@ the extracted blobs. This review found no separate Apple/Broadcom grant covering
 the precise files in this package; this is an unresolved release requirement,
 not a conclusion that every possible local use is prohibited.
 
-Consequently this branch does not add a firmware PKGBUILD claiming a license,
-ship an empty replacement that falsely satisfies pacman, or fetch an external
-finished package as a build input. Complete install independence requires either
-a documented grant for the exact pinned blobs, or a separately reviewed local
-extraction and installer migration. Until then, existing automatic T2 installs
-still rely on the external firmware package.
+The Omarchy fork also has no separate license grant for these exact files.
+The new PKGBUILD records `LicenseRef-unknown` and packages a provenance note;
+it does not claim the extraction tool's MIT license for the firmware. Forking
+controls availability and history but does not resolve redistribution rights.
+All four package bases remain `skip_build: true`, and no built package was
+signed or published. Local technical dependency closure is complete; retiring
+the production external firmware dependency still requires the rights decision,
+or a reviewed on-device extraction path, followed by hardware qualification
+and installer/channel migration.

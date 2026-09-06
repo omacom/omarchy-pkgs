@@ -19,6 +19,7 @@ SOURCES = {
     "linux-t2": "NoaHimesaka1873/linux-t2-arch",
     "apple-t2-audio-config": "deqrocks/t2bce",
     "t2fanrd": "GnomedDev/t2fanrd",
+    "apple-bcm-firmware": "omacom/apple-bcm-firmware",
 }
 
 
@@ -38,14 +39,47 @@ def replace_scalar(recipe, name, value):
     return re.sub(rf"^{re.escape(name)}=.*$", f"{name}={value}", recipe, flags=re.M)
 
 
+def firmware_manifest(repo, commit, previous):
+    """Hash Git blobs, preserving existing Intel filename coverage on updates."""
+    pattern = r"(brcmfmac(?:4355c1|4364b2|4364b3|4377b3)-|brcmbt4377b3-)[A-Za-z0-9,._-]+"
+    entries = run("git", "-C", str(repo), "ls-tree", "-rz", commit,
+                  "lib/firmware/brcm").decode().split("\0")
+    hashes = {}
+    for entry in filter(None, entries):
+        attributes, path = entry.split("\t", 1)
+        name = path.removeprefix("lib/firmware/brcm/")
+        if not re.fullmatch(pattern, name):
+            continue
+        mode, kind, oid = attributes.split()
+        if mode != "100644" or kind != "blob":
+            raise ValueError(f"Firmware must be regular data: {path}")
+        content = run("git", "-C", str(repo), "cat-file", "blob", oid)
+        if not content:
+            raise ValueError(f"Empty firmware: {path}")
+        hashes[name] = hashlib.sha256(content).hexdigest()
+    old_names = {line.split()[1] for line in previous.splitlines()}
+    if not hashes or old_names - hashes.keys():
+        raise ValueError("Firmware import would remove existing Intel filenames; review coverage explicitly")
+    return "".join(f"{digest}  {name}\n" for name, digest in sorted(hashes.items())).encode()
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("package", choices=SOURCES)
     parser.add_argument("commit", help="reviewed full 40-character upstream commit")
     parser.add_argument("--check", action="store_true", help="show the diff without writing")
+    parser.add_argument("--firmware-version", help="reviewed macOS version of the firmware Git tree, not release assets")
+    parser.add_argument("--pkgrel", help="firmware-only local release, e.g. 1.2 for a same-macOS update (default 1.1)")
     args = parser.parse_args()
     if not re.fullmatch(r"[0-9a-f]{40}", args.commit):
         parser.error("commit must be a full lowercase Git SHA-1")
+    if args.package == "apple-bcm-firmware":
+        if not args.firmware_version or not re.fullmatch(r"[0-9]+(?:\.[0-9]+)+", args.firmware_version):
+            parser.error("firmware requires --firmware-version with the reviewed macOS version")
+        if args.pkgrel and not re.fullmatch(r"[1-9][0-9]*\.[1-9][0-9]*", args.pkgrel):
+            parser.error("--pkgrel must be a positive dotted local release")
+    elif args.firmware_version or args.pkgrel:
+        parser.error("--firmware-version and --pkgrel apply only to apple-bcm-firmware")
     if not shutil.which("vercmp"):
         parser.error("vercmp (pacman) is required for upgrade ordering")
     package = ROOT / "pkgbuilds" / args.package
@@ -75,10 +109,15 @@ def main():
             # build without taking over upstream's integer release numbering.
             candidate = replace_scalar(candidate, "pkgrel", scalar(candidate, "pkgrel") + ".1")
         else:
-            count = run("git", "-C", str(repo), "rev-list", "--count", args.commit, text=True).strip()
-            prefix = "0.4.r" if args.package == "apple-t2-audio-config" else "r"
-            separator = ".g" if args.package == "apple-t2-audio-config" else "."
-            version = f"{prefix}{count}{separator}{args.commit[:7]}"
+            if args.package == "apple-bcm-firmware":
+                version = args.firmware_version
+                files["intel-firmware.sha256"] = firmware_manifest(
+                    repo, args.commit, (package / "intel-firmware.sha256").read_text())
+            else:
+                count = run("git", "-C", str(repo), "rev-list", "--count", args.commit, text=True).strip()
+                prefix = "0.4.r" if args.package == "apple-t2-audio-config" else "r"
+                separator = ".g" if args.package == "apple-t2-audio-config" else "."
+                version = f"{prefix}{count}{separator}{args.commit[:7]}"
             archive = tmp / "source.tar.gz"
             run("curl", "--fail", "--silent", "--show-error", "--location", "--retry", "3",
                 f"https://github.com/{SOURCES[args.package]}/archive/{args.commit}.tar.gz", "-o", str(archive))
@@ -90,9 +129,12 @@ def main():
             if args.package == "t2fanrd":
                 sums += [hashlib.sha256((package / name).read_bytes()).hexdigest()
                          for name in ("t2fanrd.service", "t2fand.conf")]
+            elif args.package == "apple-bcm-firmware":
+                sums += [hashlib.sha256(files["intel-firmware.sha256"]).hexdigest(),
+                         hashlib.sha256((package / "PROVENANCE.md").read_bytes()).hexdigest()]
             candidate = replace_scalar(current, "_commit", args.commit)
             candidate = replace_scalar(candidate, "pkgver", version)
-            candidate = replace_scalar(candidate, "pkgrel", "1.1")
+            candidate = replace_scalar(candidate, "pkgrel", args.pkgrel or "1.1")
             candidate, replacements = re.subn(r"^sha256sums=\([^)]*\)",
                 "sha256sums=(" + "\n            ".join(f"'{s}'" for s in sums) + ")",
                 candidate, flags=re.M)

@@ -1,10 +1,12 @@
 # Local validation results — September 5, 2026
 
-Four unsigned packages were built locally and installed successfully in a fresh
-x86_64 container. **Firmware independence and actual T2 hardware readiness are
-not established.** The full five-package transaction fails specifically with
-`error: target not found: apple-bcm-firmware` when only Arch and our outputs are
-available. [Firmware provenance and the remaining decision](firmware.md).
+All five required unsigned packages were built locally and installed successfully
+in a fresh x86_64 container using **Arch plus our local staging repository**.
+The firmware input comes from an Omarchy-owned Git fork; no external arch-mact2
+package bootstraps the build or install. **Production independence and actual T2
+hardware readiness are not established.** Firmware redistribution rights,
+independent extraction provenance and production migration remain outstanding.
+[Firmware provenance and release requirements](firmware.md).
 
 | Output | Version | Compressed bytes | Result |
 | --- | --- | ---: | --- |
@@ -12,6 +14,7 @@ available. [Firmware provenance and the remaining decision](firmware.md).
 | linux-t2-headers | 7.2.3.arch1-1.1 | 91,112,464 | Same compilation; external module build passed |
 | apple-t2-audio-config | 0.4.r21.ga973d53-1.1 | 4,390 | UCM data packaged from pinned source |
 | t2fanrd | r16.48baf96-1.1 | 270,180 | Compiled with locked/frozen Cargo dependencies |
+| apple-bcm-firmware | 14.4.1-1.1 | 3,271,108 | 132 Intel firmware/data files packaged from the pinned Omarchy fork |
 
 Kernel release: **`7.2.3-arch1-Watanare-T2-1.1-t2`**. All SHA-256 hashes and
 parsed `.PKGINFO` records are in [built-packages.json](built-packages.json).
@@ -79,8 +82,13 @@ Measured kernel build resources:
 
 The audio data package took approximately one second of makepkg time. The fan
 daemon took approximately thirteen seconds with two CPUs, including source and
-crate fetching. Container startup/key import/upgrade overhead is additional;
-separate userspace CPU/memory peaks were not recorded. No bit-for-bit second
+crate fetching. Firmware makepkg ran from **02:54:21 to 02:54:23 UTC** September 6
+(22:54 locally September 5), with two CPUs; the entire `bin/build` invocation
+took **7.406 seconds**. Its source archive download was approximately 16.51 MiB;
+the firmware payload is 20,639,588 bytes, compressed package 3,271,108 bytes,
+and retained source/package workspace about 20 MiB. No firmware compilation was
+performed. Container startup/key import/upgrade overhead is additional to the
+makepkg timings; separate userspace CPU/memory peaks were not recorded. No bit-for-bit second
 kernel compilation was attempted; repeat validation tests artifact reuse.
 
 ## Commands and outcomes
@@ -104,10 +112,15 @@ CONTAINER_ENGINE=podman OMARCHY_KEEP_BUILD_WORKSPACE=1 \
   OMARCHY_SKIP_BUILDER_IMAGE=1 OMARCHY_BUILD_CPUS=2 \
   bin/build --arch x86_64 --package t2fanrd
 
-# Final stable-script rerun: succeeds, all three bases/four outputs reused.
+# Build firmware from the new source fork, preserving the existing outputs.
 CONTAINER_ENGINE=podman OMARCHY_KEEP_BUILD_WORKSPACE=1 \
-  OMARCHY_SKIP_BUILDER_IMAGE=1 OMARCHY_BUILD_CPUS=8 \
-  bin/build --arch x86_64 --package linux-t2 apple-t2-audio-config t2fanrd
+  OMARCHY_SKIP_BUILDER_IMAGE=1 OMARCHY_BUILD_CPUS=2 \
+  bin/build --arch x86_64 --package apple-bcm-firmware
+
+# Final stable-script rerun: succeeds, all four bases/five outputs reused.
+CONTAINER_ENGINE=podman OMARCHY_KEEP_BUILD_WORKSPACE=1 \
+  OMARCHY_SKIP_BUILDER_IMAGE=1 OMARCHY_BUILD_CPUS=2 \
+  bin/build --arch x86_64 --package linux-t2 apple-t2-audio-config apple-bcm-firmware t2fanrd
 
 CONTAINER_ENGINE=podman bin/validate-t2
 ```
@@ -130,21 +143,26 @@ Final pacman validation exited **0** and reported:
 linux-t2 7.2.3.arch1-1.1
 linux-t2-headers 7.2.3.arch1-1.1
 apple-t2-audio-config 0.4.r21.ga973d53-1.1
+apple-bcm-firmware 14.4.1-1.1
 t2fanrd r16.48baf96-1.1
 No database errors have been found!
 linux-t2: 7716 total files, 0 altered files
 linux-t2-headers: 21843 total files, 0 altered files
 apple-t2-audio-config: 18 total files, 0 altered files
+apple-bcm-firmware: 142 total files, 0 altered files
 t2fanrd: 16 total files, 0 altered files
-PASS: local pacman transaction, dependencies, modules, initramfs, headers, UCM files and fan service (7.2.3-arch1-Watanare-T2-1.1-t2)
+linux-firmware-broadcom: 176 total files, 0 altered files
+PASS: five-package local pacman transaction, firmware hashes/Arch coexistence, dependencies, modules, initramfs, headers, UCM files and fan service (7.2.3-arch1-Watanare-T2-1.1-t2)
 ```
 
-The transaction installed the four packages from **`file:///packages/`** and
+The transaction installed all five packages from **`file:///packages/`** and
 their missing standard dependencies from Arch: `mkinitcpio 41.1-1`,
 `mkinitcpio-busybox 1.36.1-1`, `pahole 1:1.31-2` and
-`alsa-ucm-conf 1.2.16.1-1`. Other dependencies were already in the inspected Arch
+`alsa-ucm-conf 1.2.16.1-1`. Coexistence testing also installed Arch's
+`linux-firmware-broadcom 20260810-2` and `linux-firmware-whence 20260810-2`.
+Other dependencies were already in the inspected Arch
 base image. No `--nodeps`, `--assume-installed`, external binary bootstrap or
-firmware substitute was used. The staging database contains all four outputs.
+firmware substitute was used. The staging database contains all five outputs.
 
 Checks included:
 
@@ -163,6 +181,11 @@ Checks included:
 * `systemd-analyze verify` passes for `t2fanrd.service`; the service remains
   disabled. `ldd` resolves libc, libm and libgcc. The config includes Fan1/Fan2
   and is marked for pacman backup handling.
+* All 132 installed Intel firmware files match the independent checked-in
+  SHA-256 manifest, with the exact filename set and no empty files/symlinks.
+  This preserves 132/132 Intel filenames from the inspected mirror package.
+  The package has no install script, and Arch Broadcom firmware coexists without
+  conflicts. Kernel firmware loading still requires actual T2 hardware.
 * All three UCM speaker profiles and their card entry files exist. ALSA
   activation and audio playback require actual T2 hardware and were not tested.
 
@@ -192,18 +215,24 @@ bin/omarchy-release self-test
 All passed locally. Both new fixture tests also passed in the Arch builder
 container. The reuse suite covers missing/stale/corrupt split outputs, local
 release bumps, and incomplete/mixed published DBs. The actual final container
-rerun reports **0 built, 3 bases skipped, 0 failed**; artifact SHA-256 hashes are
-unchanged. An invalid `OMARCHY_BUILD_CPUS` value is rejected before running a
+rerun reports **0 built, 4 bases skipped, 0 failed**, taking 4.749 seconds;
+all five artifact SHA-256 hashes are unchanged. An invalid `OMARCHY_BUILD_CPUS` value is rejected before running a
 container.
 
 `bin/sync-t2 <package> <current-full-commit> --check` reports zero changed files
-for each real source pin. An isolated kernel recipe copy with an older version
+for each real source pin (firmware also needs `--firmware-version 14.4.1`). An isolated kernel recipe copy with an older version
 marker was previewed and imported from `786d47549c81cefadab58e8a6a7d8ec4065a9467`;
 the result exactly matched the checked-in recipe/configuration and a second
 import was a no-op. This tests import behavior, not compatibility with an
 unreviewed future release. Offline fixtures exercise archive commit checking,
 successful update, no-op reuse, downgrade and moving-ref rejection. A kernel
 patch application failure likewise stops before writing package files.
+Firmware fixtures additionally require an explicit version, exclude ARM files,
+verify the manifest, reject changed content at the same version, accept a
+higher local release, and reject missing Intel filenames, empty blobs and
+symlinks without changing package files. The updated suite passed both locally
+and in a fresh Arch builder container. A real fork import preview reported
+`apple-bcm-firmware: 0 file(s) would change`.
 
 ## Evidence and outstanding work
 
@@ -211,10 +240,22 @@ Full local logs are retained under `logs/`: `t2-kernel-build.log`,
 `t2-userspace-build.log`, `t2-fan-build.log`, `t2-all-reuse.log`,
 `t2-validation-final.log`, `t2-container-tests.log`, `t2-existing-*-tests.log`,
 `t2-update-*.log`, `t2-kernel-update-*.log`, image/inventory/audit files,
-per-package `.PKGINFO`/`.BUILDINFO`, and resource JSONL files. Logs and unsigned
+per-package `.PKGINFO`/`.BUILDINFO`, and resource JSONL files. Firmware follow-up
+logs are `t2-firmware-build.log`, `t2-validation-firmware.log`,
+`t2-five-package-reuse.log`, `t2-firmware-update-tests.log`,
+`t2-firmware-update-check.log` and `t2-firmware-container-tests.log`. Logs and unsigned
 archives are gitignored; this report and the JSON records are committed.
 
-Firmware rights/provenance and an actual extraction result remain unresolved.
+The firmware fork is `omacom/apple-bcm-firmware`, parent
+`AdityaGarg8/Apple-Firmware`, pinned to `dc061b535d53e293cdd5793c1255faaca197574b`.
+GitHub API checks confirmed Actions disabled and zero releases. Creating and
+pushing Git repositories did not publish built packages. The initial four-output
+validation correctly identified missing firmware; the final five-output test
+above supersedes that install-time blocker.
+
+Firmware redistribution rights and independently reproduced Apple extraction
+remain unresolved. The received files have pinned hashes and upstream's macOS
+runner provenance; the exact original runner/image identifiers are missing.
 No physical T2 boot, input, Wi-Fi, Bluetooth, audio, fan or suspend test was run.
 The [migration and hardware checklist](README.md#omarchy-settings-and-migration)
 must be completed before removing the external repository or enabling routine

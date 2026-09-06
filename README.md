@@ -750,12 +750,14 @@ Fields:
 
 ### Intel T2 Macs
 
-The required kernel, matching headers, audio configuration and fan daemon are
-maintained directly here. See [T2 package builds](docs/t2/README.md) for pinned
-sources, local build and validation commands, updates, firmware provenance and
-the migration checklist. They remain `skip_build: true` pending migration and
-hardware testing. Apple firmware redistribution is unresolved; this does not
-yet replace the complete external T2 repository dependency.
+The required kernel, matching headers, audio configuration, fan daemon and
+Apple/Broadcom firmware are maintained directly here. Firmware blobs come from
+the [Omarchy-owned source fork](https://github.com/omacom/apple-bcm-firmware).
+All five outputs install using Arch plus our local staging repository. See
+[T2 package builds](docs/t2/README.md) for sources, build/validation commands,
+updates, provenance and migration. They remain `skip_build: true` pending
+hardware qualification and migration; firmware redistribution rights are still
+unresolved. Production installations continue using the external T2 repository.
 
 ### From AUR
 

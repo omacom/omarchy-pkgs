@@ -13,18 +13,26 @@ sudo pacman -Syu --noconfirm
 sudo sed -i '/^\[core\]$/i [omarchy-build]\nSigLevel = Never\nServer = file:///packages\n' /etc/pacman.conf
 sudo pacman -Sy --noconfirm
 pacman-conf
-# Prove the remaining blocker explicitly; never substitute an empty provider.
-if pacman -Sp linux-t2 linux-t2-headers apple-t2-audio-config apple-bcm-firmware t2fanrd > /tmp/t2-full-transaction 2>&1; then
-  echo 'Unexpected apple-bcm-firmware provider in the isolated repositories' >&2
-  exit 1
-fi
-grep -F 'target not found: apple-bcm-firmware' /tmp/t2-full-transaction
-pacman -Sp --print-format '%r %n %v %l' mkinitcpio linux-t2 linux-t2-headers apple-t2-audio-config t2fanrd
-sudo pacman -S --noconfirm mkinitcpio linux-t2 linux-t2-headers apple-t2-audio-config t2fanrd
-pacman -Q linux-t2 linux-t2-headers apple-t2-audio-config t2fanrd
+packages=(linux-t2 linux-t2-headers apple-t2-audio-config apple-bcm-firmware t2fanrd)
+# Also test coexistence with Arch's normal Broadcom firmware on real installs.
+pacman -Sp --print-format '%r %n %v %l' mkinitcpio linux-firmware-broadcom "${packages[@]}" | tee /tmp/t2-full-transaction
+for package in "${packages[@]}"; do
+  grep -E "^omarchy-build $package [^ ]+ file:///packages/" /tmp/t2-full-transaction
+done
+sudo pacman -S --noconfirm mkinitcpio linux-firmware-broadcom "${packages[@]}"
+pacman -Q "${packages[@]}"
 [[ $(pacman -Q linux-t2 | cut -d' ' -f2) == "$(pacman -Q linux-t2-headers | cut -d' ' -f2)" ]]
 pacman -Dk
-pacman -Qkk linux-t2 linux-t2-headers apple-t2-audio-config t2fanrd
+pacman -Qkk "${packages[@]}" linux-firmware-broadcom
+
+# Compare installed files against the independent, checked-in source manifest.
+manifest=/t2-firmware-manifest
+cmp "$manifest" /usr/share/doc/apple-bcm-firmware/intel-firmware.sha256
+(cd /usr/lib/firmware/brcm && sha256sum --strict --check "$manifest")
+awk '{print "usr/lib/firmware/brcm/" $2}' "$manifest" | sort > /tmp/t2-firmware-expected
+pacman -Qlq apple-bcm-firmware | sed 's|^/||' | grep '^usr/lib/firmware/brcm/.' | sort > /tmp/t2-firmware-installed
+diff -u /tmp/t2-firmware-expected /tmp/t2-firmware-installed
+[[ $(pacman -Qi apple-bcm-firmware | sed -n 's/^Install Script *: //p') == No ]]
 
 mapfile -t releases < <(find /usr/lib/modules -name pkgbase -exec grep -lFx linux-t2 {} +)
 [[ ${#releases[@]} == 1 ]]
@@ -82,5 +90,5 @@ done
 ldd /usr/bin/t2fanrd
 if ldd /usr/bin/t2fanrd | grep -q 'not found'; then exit 1; fi
 grep -qx '\[Fan2\]' /etc/t2fand.conf
-echo "PASS: local pacman transaction, dependencies, modules, initramfs, headers, UCM files and fan service ($kver)"
-echo 'Not tested: booting or operating actual T2 hardware; Apple firmware is absent.'
+echo "PASS: five-package local pacman transaction, firmware hashes/Arch coexistence, dependencies, modules, initramfs, headers, UCM files and fan service ($kver)"
+echo 'Not tested: booting or operating actual T2 hardware, firmware loading or independent Apple extraction.'
