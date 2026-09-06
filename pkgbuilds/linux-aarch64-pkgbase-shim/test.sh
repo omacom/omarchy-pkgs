@@ -6,6 +6,7 @@ scratch=$(mktemp -d)
 trap 'rm -rf "$scratch"' EXIT
 export OMARCHY_KERNEL_SHIM_ROOT=$scratch
 export SHIM_NATIVE=0 SHIM_KERNEL_PRESENT=1
+export SHIM_IMAGE_OWNER=linux-aarch64
 
 pacman() {
   if [[ $1 == -Qlq ]]; then
@@ -13,12 +14,15 @@ pacman() {
     return 0
   fi
   case $2 in
-    /boot/Image | /usr/lib/modules/test)
+    /boot/Image)
+      printf '%s\n' "$SHIM_IMAGE_OWNER"
+      ;;
+    /usr/lib/modules/test)
       ((SHIM_KERNEL_PRESENT)) || return 1
       printf 'linux-aarch64\n'
       ;;
     /usr/lib/modules/test/pkgbase | /usr/lib/modules/test/vmlinuz)
-      ((SHIM_NATIVE)) || return 1
+      [[ $SHIM_NATIVE == 1 || $2 == /usr/lib/modules/test/"$SHIM_NATIVE" ]] || return 1
       printf 'linux-aarch64\n'
       ;;
     *) return 1 ;;
@@ -66,14 +70,38 @@ cmp "$scratch/boot/Image" "$modules/vmlinuz"
 [[ $(wc -l <"$scratch/rebuilds") == 1 ]]
 echo 'ok - the installer can defer boot-image regeneration'
 
-SHIM_NATIVE=1
-printf 'package-owned' >"$modules/vmlinuz"
-run_shim usr/lib/modules/test/
-[[ $(<"$modules/vmlinuz") == package-owned ]]
-echo 'ok - native package-owned kernel files are preserved'
+for SHIM_NATIVE in pkgbase vmlinuz; do
+  printf 'package-owned' >"$modules/vmlinuz"
+  run_shim usr/lib/modules/test/
+  [[ $(<"$modules/vmlinuz") == package-owned ]]
+done
+echo 'ok - either package-owned metadata file prevents replacement'
 
 SHIM_NATIVE=0
+SHIM_IMAGE_OWNER=another-kernel
+run_shim usr/lib/modules/test/
+[[ $(<"$modules/vmlinuz") == package-owned ]]
+SHIM_IMAGE_OWNER=linux-aarch64
+echo 'ok - a different kernel image owner prevents replacement'
+
+(
+  # shellcheck disable=SC2329 # Invoked by the shim in a child shell.
+  cp() { return 1; }
+  export -f cp
+  if run_shim usr/lib/modules/test/; then
+    echo 'not ok - a failed image copy was accepted' >&2
+    exit 1
+  fi
+  [[ $(<"$modules/vmlinuz") == package-owned ]]
+)
+echo 'ok - failed copies preserve the previous kernel image'
+
 SHIM_KERNEL_PRESENT=0
+mkdir -p "$modules/updates/dkms"
+run_shim usr/lib/modules/test/
+[[ -d $modules/updates/dkms && -f $modules/vmlinuz ]]
+rmdir "$modules/updates/dkms" "$modules/updates"
+echo 'ok - kernel removal preserves DKMS leftovers'
 run_shim usr/lib/modules/test/
 [[ ! -d $modules ]]
 echo 'ok - kernel removal cleans up leftover shim metadata'
