@@ -13,7 +13,7 @@ import yaml
 WORKFLOW = yaml.safe_load(
     (Path(__file__).resolve().parents[1] / ".github/workflows/build-aarch64.yml").read_text()
 )
-STEPS = {step["name"]: step for step in WORKFLOW["jobs"]["build"]["steps"]}
+STEPS = {step["id"]: step for step in WORKFLOW["jobs"]["build"]["steps"] if "id" in step}
 
 
 class BuildAarch64Test(unittest.TestCase):
@@ -43,18 +43,18 @@ class BuildAarch64Test(unittest.TestCase):
         )
 
     def test_empty_package_set_is_valid(self):
-        result = self.run_step("Resolve inputs")
+        result = self.run_step("meta")
         self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_known_package_and_rc_mirror(self):
-        result = self.run_step("Resolve inputs", INPUT_PACKAGES=" example ", INPUT_MIRROR="rc")
+        result = self.run_step("meta", INPUT_PACKAGES=" example ", INPUT_MIRROR="rc")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("PACKAGES=example\n", (self.root / "env").read_text())
 
     def test_options_paths_unknown_packages_and_newlines_are_rejected(self):
         for value in ("--dry-run", "..", "../example", "missing", "example\ninjected=value"):
             with self.subTest(value=value):
-                result = self.run_step("Resolve inputs", INPUT_PACKAGES=value)
+                result = self.run_step("meta", INPUT_PACKAGES=value)
                 self.assertNotEqual(result.returncode, 0)
 
     def test_split_package_is_verified_by_pkgbase(self):
@@ -66,13 +66,13 @@ class BuildAarch64Test(unittest.TestCase):
             ["tar", "--zstd", "-cf", "omarchy.db.tar.zst", desc.parent.name],
             cwd=repo, check=True,
         )
-        result = self.run_step("Verify repository", REPO_DIR=str(repo), PACKAGES="example")
+        result = self.run_step("verify", REPO_DIR=str(repo), PACKAGES="example")
         self.assertEqual(result.returncode, 0, result.stderr)
-        result = self.run_step("Verify repository", REPO_DIR=str(repo), PACKAGES="exampl.")
+        result = self.run_step("verify", REPO_DIR=str(repo), PACKAGES="exampl.")
         self.assertNotEqual(result.returncode, 0)
 
     def test_cache_includes_sources_and_package_selection(self):
-        cache = STEPS["Restore repository tree"]["with"]
+        cache = STEPS["cache"]["with"]
         self.assertNotIn("restore-keys", cache)
         self.assertIn("packages_key", cache["key"])
         for path in ("pkgbuilds/**", "build/**", "helpers/**", "bin/**"):
@@ -97,7 +97,7 @@ package() {
         self.assertEqual(len(packages), 1)
         subprocess.run(["repo-add", "omarchy.db.tar.zst", packages[0].name], cwd=recipe,
                        check=True, stdout=subprocess.DEVNULL)
-        result = self.run_step("Verify repository", REPO_DIR=str(recipe), PACKAGES="example")
+        result = self.run_step("verify", REPO_DIR=str(recipe), PACKAGES="example")
         self.assertEqual(result.returncode, 0, result.stderr)
 
 
