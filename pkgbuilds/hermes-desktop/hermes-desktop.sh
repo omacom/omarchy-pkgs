@@ -228,7 +228,6 @@ if ! ready; then
 fi
 
 export HERMES_DESKTOP_HERMES_ROOT="$root"
-export PATH="$HOME/.local/bin:$PATH"
 export HERMES_DESKTOP_PASSWORD_STORE="${HERMES_DESKTOP_PASSWORD_STORE:-gnome-libsecret}"
 unset ELECTRON_RUN_AS_NODE PYTHONPATH PYTHONHOME
 

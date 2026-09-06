@@ -71,11 +71,10 @@ class LauncherTests(unittest.TestCase):
         self.write(self.base / 'installer', INSTALLER)
         self.write(self.base / 'python', '#!/bin/bash\n[[ ${FAIL_READY:-} != 1 ]]\n')
         self.write(self.base / 'gui', '''#!/usr/bin/env python3
-import json,os,sys,time,shutil
-json.dump({'selected_cli':shutil.which('hermes'),'pid':os.getpid(),'args':sys.argv[1:],'root':os.environ['HERMES_DESKTOP_HERMES_ROOT'],'node':os.environ.get('ELECTRON_RUN_AS_NODE'),'password':os.environ['HERMES_DESKTOP_PASSWORD_STORE']},open(os.environ['TEST_OUTPUT'],'w'))
+import json,os,sys,time
+json.dump({'pid':os.getpid(),'args':sys.argv[1:],'root':os.environ['HERMES_DESKTOP_HERMES_ROOT'],'node':os.environ.get('ELECTRON_RUN_AS_NODE'),'password':os.environ['HERMES_DESKTOP_PASSWORD_STORE']},open(os.environ['TEST_OUTPUT'],'w'))
 if os.environ.get('TEST_GUI_WAIT'): time.sleep(30)
 ''')
-        self.write(self.bin / 'hermes', '#!/bin/bash\nexit 99\n')
         self.write(self.bin / 'unshare', '#!/bin/bash\nexit 0\n')
         self.write(self.bin / 'xdg-terminal-exec', '#!/bin/bash\nprintf "%s\\n" "$@" > "$TEST_OUTPUT"\n')
         source = SOURCE.read_text().replace('/usr/share/hermes-desktop/install.sh', str(self.base / 'installer'))
@@ -112,7 +111,6 @@ if os.environ.get('TEST_GUI_WAIT'): time.sleep(30)
         observed = json.loads(self.output.read_text())
         self.assertEqual(observed['args'], ['--ozone-platform=wayland','--disable-setuid-sandbox','hermes://test?a=b','two words'])
         self.assertEqual(observed['root'],str(self.root))
-        self.assertEqual(observed['selected_cli'],str(self.home/'.local/bin/hermes'))
         self.assertIsNone(observed['node'])
         self.assertEqual(observed['password'],'gnome-libsecret')
         self.assertEqual(before,self.log.read_bytes())
