@@ -93,10 +93,41 @@ echo "ok - differing variants require a unique match"
 printf '%s\0' "$firmware_path/qccdsp8380.mbn" >"$node/firmware-name"
 mkdir -p "$dt_root/gpu@0/zap-shader"
 printf '%s\0' "$firmware_path/qcdxkmsuc8380.mbn" >"$dt_root/gpu@0/zap-shader/firmware-name"
-printf 'zap' | gzip >"$firmware_root/$firmware_path/qcdxkmsuc8380.mbn.gz"
+zap="$firmware_path/qcdxkmsuc8380.mbn"
+config="$scratch/root/etc/mkinitcpio.conf.d/qcom-firmware.conf"
+for compression in zstd xz; do
+  if [[ $compression == zstd ]]; then suffix=zst; else suffix=xz; fi
+  printf 'zap' | "$compression" -c >"$firmware_root/$zap.$suffix"
+  run_extractor --install --no-rebuild -d "$driver_store"
+  [[ -z $(run_extractor --list-missing) ]]
+  grep -Fq "$zap.$suffix" "$config"
+  rm "$firmware_root/$zap.$suffix"
+done
+echo "ok - zstd and xz firmware are loadable and included in the initramfs"
+
+printf 'zap' | gzip >"$firmware_root/$zap.gz"
+[[ $(run_extractor --list-missing) == "$zap" ]]
 run_extractor --install --no-rebuild -d "$driver_store"
-grep -Fq 'qcdxkmsuc8380.mbn.gz' "$scratch/root/etc/mkinitcpio.conf.d/qcom-firmware.conf"
-echo "ok - already installed GPU firmware is included in the initramfs"
+[[ ! -e $config ]]
+printf 'zap' >"$driver_store/matching/qcdxkmsuc8380.mbn"
+run_extractor --install --no-rebuild -d "$driver_store"
+cmp "$driver_store/matching/qcdxkmsuc8380.mbn" "$firmware_root/updates/$zap"
+grep -Fq "updates/$zap" "$config"
+echo "ok - gzip does not hide missing firmware or prevent extraction"
+
+# Compressed updates must not take precedence over a plain packaged file.
+mv "$firmware_root/updates/$zap" "$firmware_root/$zap"
+printf 'update' | zstd -c >"$firmware_root/updates/$zap.zst"
+run_extractor --install --no-rebuild -d "$driver_store"
+grep -Fq "$firmware_root/$zap" "$config"
+if grep -Fq "updates/$zap" "$config"; then
+  echo "not ok - firmware selection differs from the kernel search order" >&2
+  exit 1
+fi
+printf 'update' >"$firmware_root/updates/$zap"
+run_extractor --install --no-rebuild -d "$driver_store"
+grep -Fq "updates/$zap" "$config"
+echo "ok - plain firmware is preferred before compressed directory overrides"
 
 limine-update() { printf 'rebuild\n' >>"$QCOM_FW_ROOT/rebuilds"; }
 export -f limine-update
