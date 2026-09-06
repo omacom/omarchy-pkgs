@@ -192,12 +192,15 @@ PY
   fi
   # The native builder also handles updates and supports the namespace
   # sandbox. The shell installer's desktop stage still requires a sudo chown.
-  env -u PYTHONPATH -u PYTHONHOME "${cli[@]}" desktop --build-only
+  # The build registers a desktop entry, too. Keep it private until the new
+  # CLI is published so a different hermes on PATH cannot become its target.
+  env -u PYTHONPATH -u PYTHONHOME XDG_DATA_HOME="$install_backup/desktop" "${cli[@]}" desktop --build-only
 
   # Build first: a failed download leaves the old terminal CLI usable.
   stage complete
   stage path
   runtime_ready || die "The CLI or desktop is not ready. See the installer output above."
+  env -u PYTHONPATH -u PYTHONHOME PATH="$HOME/.local/bin:$PATH" "${cli[@]}" desktop --skip-build --build-only
   if ! grep -qxF '/.omarchy-hermes-desktop' "$root/.git/info/exclude"; then
     printf '/.omarchy-hermes-desktop\n' >>"$root/.git/info/exclude"
   fi
@@ -238,6 +241,8 @@ fi
 
 export HERMES_DESKTOP_HERMES_ROOT="$root"
 export HERMES_DESKTOP_PASSWORD_STORE="${HERMES_DESKTOP_PASSWORD_STORE:-gnome-libsecret}"
+# Upstream desktop registration resolves its launcher through PATH.
+export PATH="$HOME/.local/bin:$PATH"
 unset ELECTRON_RUN_AS_NODE PYTHONPATH PYTHONHOME
 
 flags=()

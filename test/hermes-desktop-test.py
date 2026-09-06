@@ -62,6 +62,8 @@ class LauncherTests(unittest.TestCase):
         self.log = self.base / 'stages'
         self.output = self.base / 'launch.json'
         self.env = dict(os.environ, HOME=str(self.home), HERMES_HOME=str(self.home / '.hermes'),
+                        XDG_DATA_HOME=str(self.home / '.local/share'),
+                        XDG_CONFIG_HOME=str(self.home / '.config'), XDG_CACHE_HOME=str(self.home / '.cache'),
                         PATH=f'{self.bin}:/usr/bin:/bin', TEST_LOG=str(self.log),
                         TEST_GUI=str(self.base / 'gui'), TEST_PYTHON=str(self.base / 'python'),
                         TEST_OUTPUT=str(self.output), GIT_CONFIG_NOSYSTEM='1',
@@ -72,13 +74,21 @@ class LauncherTests(unittest.TestCase):
         self.write(self.base / 'python', '''#!/bin/bash
 set -eu
 if [[ ${2:-} == desktop ]]; then
-  [[ ${3:-} == --build-only ]]
-  printf 'desktop\\n' >> "$TEST_LOG"
-  [[ ${FAIL_STAGE:-} != desktop ]] || exit 42
   root=$(dirname "$1")
-  mkdir -p "$root/apps/desktop/release/linux-unpacked"
-  cp "$TEST_GUI" "$root/apps/desktop/release/linux-unpacked/Hermes"
-  printf '/apps/\\n/.hermes-bootstrap-complete\\n' >> "$root/.git/info/exclude"
+  if [[ ${3:-} == --skip-build ]]; then
+    [[ ${4:-} == --build-only && -x $root/apps/desktop/release/linux-unpacked/Hermes ]]
+    [[ ${FAIL_FINAL_REGISTER:-} != 1 ]] || exit 45
+  else
+    [[ ${3:-} == --build-only ]]
+    printf 'desktop\\n' >> "$TEST_LOG"
+    [[ ${FAIL_STAGE:-} != desktop ]] || exit 42
+    mkdir -p "$root/apps/desktop/release/linux-unpacked"
+    cp "$TEST_GUI" "$root/apps/desktop/release/linux-unpacked/Hermes"
+    printf '/apps/\\n/.hermes-bootstrap-complete\\n' >> "$root/.git/info/exclude"
+  fi
+  entry_dir="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
+  mkdir -p "$entry_dir"
+  printf 'Exec=%s desktop\\n' "$(command -v hermes || printf '%s/venv/bin/python -m hermes_cli.main' "$root")" > "$entry_dir/hermes.desktop"
 else
   [[ ${FAIL_READY:-} != 1 ]]
 fi
@@ -129,6 +139,24 @@ if os.environ.get('TEST_GUI_WAIT'): time.sleep(30)
         self.assertEqual((self.root/'keep').read_text(),'foreign checkout\n')
         self.assertFalse((self.root/'.omarchy-hermes-desktop').exists())
         self.assertFalse((self.home/'.local/bin/hermes').exists())
+
+    def test_desktop_registration_uses_published_cli(self):
+        self.write(self.bin/'hermes', '#!/bin/bash\necho foreign\n')
+        self.install()
+        entry=self.home/'.local/share/applications/hermes.desktop'
+        self.assertEqual(entry.read_text(),f'Exec={self.home}/.local/bin/hermes desktop\n')
+
+    def test_failed_registration_preserves_previous_launcher(self):
+        wrapper=self.home/'.local/bin/hermes'
+        self.write(wrapper,'#!/bin/bash\n# Written by omarchy-install-hermes-cli.\necho old\n')
+        entry=self.home/'.local/share/applications/hermes.desktop'
+        self.write(entry,'previous desktop entry\n')
+        before=wrapper.read_bytes()
+        self.run_launcher('--install',ok=False,FAIL_FINAL_REGISTER='1')
+        self.assertEqual(wrapper.read_bytes(),before)
+        self.assertEqual(entry.read_text(),'previous desktop entry\n')
+        self.run_launcher('--check',ok=False)
+        self.install()
 
     def test_warm_launch_and_package_reinstall_leave_runtime_untouched(self):
         self.install()
