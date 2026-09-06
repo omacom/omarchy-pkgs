@@ -2,6 +2,7 @@
 """Exercise the packaged entry point with a disposable HOME and installer."""
 import json
 import os
+import pty
 import signal
 import time
 from pathlib import Path
@@ -199,6 +200,23 @@ if os.environ.get('TEST_GUI_WAIT'): time.sleep(30)
         self.addCleanup(lambda: os.kill(observed['pid'],signal.SIGTERM))
         self.assertIn('hermes://open',observed['args'])
         self.run_launcher('--install')
+        lock=self.home/'.hermes/.omarchy-hermes-desktop.lock'
+        self.assertEqual(subprocess.run(['flock','--nonblock',str(lock),'true']).returncode,0)
+
+    def test_cold_terminal_launch_releases_lock_before_exec(self):
+        master,slave=pty.openpty()
+        process=subprocess.Popen(['bash',str(self.base/'launcher')],stdin=slave,stdout=slave,stderr=slave,env=self.env | {'TEST_GUI_WAIT':'1'})
+        os.close(slave)
+        def cleanup():
+            if process.poll() is None: process.terminate()
+            process.wait(timeout=5)
+            os.close(master)
+        self.addCleanup(cleanup)
+        for _ in range(100):
+            if self.output.exists(): break
+            time.sleep(.02)
+        self.assertTrue(self.output.exists())
+        self.assertIsNone(process.poll())
         lock=self.home/'.hermes/.omarchy-hermes-desktop.lock'
         self.assertEqual(subprocess.run(['flock','--nonblock',str(lock),'true']).returncode,0)
 
