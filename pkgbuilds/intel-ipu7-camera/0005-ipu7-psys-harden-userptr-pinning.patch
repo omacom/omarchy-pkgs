@@ -1,0 +1,142 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Afonso Oliveira <afonso.oliveira707@gmail.com>
+Date: Tue, 1 Sep 2026 21:50:00 +0100
+Subject: [PATCH] media: intel/ipu7: harden PSYS userptr pinning
+
+Reject invalid and oversized userptr ranges before allocating their page
+arrays. Keep the page count in size_t, use overflow-checked allocation,
+remove FOLL_FORCE, and require the entire range to be pinned before
+publishing attachment state. Clear the attachment state after releasing it.
+
+Upstream-Status: Not submitted
+---
+ drivers/media/pci/intel/ipu7/psys/ipu-psys.c | 68 ++++++++++++++++------------
+ 1 file changed, 38 insertions(+), 30 deletions(-)
+
+diff --git a/drivers/media/pci/intel/ipu7/psys/ipu-psys.c b/drivers/media/pci/intel/ipu7/psys/ipu-psys.c
+index fee9ee8..c6c4b52 100644
+--- a/drivers/media/pci/intel/ipu7/psys/ipu-psys.c
++++ b/drivers/media/pci/intel/ipu7/psys/ipu-psys.c
+@@ -13,6 +13,7 @@
+ #include <linux/kthread.h>
+ #include <linux/mm.h>
+ #include <linux/module.h>
++#include <linux/overflow.h>
+ #include <linux/pm_runtime.h>
+ #include <linux/poll.h>
+ #include <uapi/linux/sched/types.h>
+@@ -49,63 +50,63 @@ static DEFINE_MUTEX(ipu7_psys_mutex);
+ 
+ static int ipu7_psys_get_userpages(struct ipu7_dma_buf_attach *attach)
+ {
+-	struct vm_area_struct *vma;
+-	unsigned long start, end;
+-	int npages, array_size;
++	unsigned long start, last;
++	size_t npages;
+ 	struct page **pages;
+ 	struct sg_table *sgt;
+ 	int ret = -ENOMEM;
+-	int nr = 0;
++	long nr;
+ 	u32 flags;
+ 
++	if (WARN_ON_ONCE(attach->pages || attach->npages || attach->sgt))
++		return -EINVAL;
++
++	if (!attach->userptr || !attach->len || attach->len > MAX_RW_COUNT)
++		return -EINVAL;
++
+ 	start = (unsigned long)attach->userptr;
+-	end = PAGE_ALIGN(start + attach->len);
+-	npages = PHYS_PFN(end - (start & PAGE_MASK));
+-	array_size = npages * sizeof(struct page *);
++	if (check_add_overflow(start, (unsigned long)attach->len - 1, &last))
++		return -EOVERFLOW;
++
++	npages = (((last & PAGE_MASK) - (start & PAGE_MASK)) >> PAGE_SHIFT) + 1;
++	if (!npages || npages > INT_MAX)
++		return -E2BIG;
+ 
+ 	sgt = kzalloc(sizeof(*sgt), GFP_KERNEL);
+ 	if (!sgt)
+ 		return -ENOMEM;
+ 
+-	WARN_ON_ONCE(attach->npages);
+-
+-	pages = kvzalloc(array_size, GFP_KERNEL);
++	pages = kvmalloc_array(npages, sizeof(*pages), GFP_KERNEL);
+ 	if (!pages)
+ 		goto free_sgt;
+ 
+-	mmap_read_lock(current->mm);
+-	vma = vma_lookup(current->mm, start);
+-	if (unlikely(!vma)) {
+-		ret = -EFAULT;
+-		goto error_up_read;
+-	}
+-	mmap_read_unlock(current->mm);
+-
+-	flags = FOLL_WRITE | FOLL_FORCE | FOLL_LONGTERM;
++	flags = FOLL_WRITE | FOLL_LONGTERM;
+ 	nr = pin_user_pages_fast(start & PAGE_MASK, npages,
+ 				 flags, pages);
+-	if (nr < npages)
+-		goto error;
+-
+-	attach->pages = pages;
+-	attach->npages = npages;
++	if (nr < 0) {
++		ret = nr;
++		goto unpin_pages;
++	}
++	if ((size_t)nr != npages) {
++		ret = -EFAULT;
++		goto unpin_pages;
++	}
+ 
+ 	ret = sg_alloc_table_from_pages(sgt, pages, npages,
+ 					start & ~PAGE_MASK, attach->len,
+ 					GFP_KERNEL);
+ 	if (ret < 0)
+-		goto error;
++		goto unpin_pages;
+ 
++	attach->pages = pages;
++	attach->npages = npages;
+ 	attach->sgt = sgt;
+ 
+ 	return 0;
+ 
+-error_up_read:
+-	mmap_read_unlock(current->mm);
+-error:
+-	if (nr)
++unpin_pages:
++	if (nr > 0)
+ 		unpin_user_pages(pages, nr);
+-
+ 	kvfree(pages);
+ free_sgt:
+ 	kfree(sgt);
+@@ -126,6 +127,8 @@ static void ipu7_psys_put_userpages(struct ipu7_dma_buf_attach *attach)
+ 
+ 	sg_free_table(attach->sgt);
+ 	kfree(attach->sgt);
++	attach->pages = NULL;
++	attach->npages = 0;
+ 	attach->sgt = NULL;
+ }
+ 
+@@ -580,6 +583,11 @@ static int ipu7_psys_getbuf(struct ipu_psys_buffer *buf,
+ 		return -EINVAL;
+ 	}
+ 
++	if (!buf->len || buf->len > MAX_RW_COUNT) {
++		dev_err(dev, "Invalid userptr buffer length\n");
++		return -EINVAL;
++	}
++
+ 	kbuf = kzalloc(sizeof(*kbuf), GFP_KERNEL);
+ 	if (!kbuf)
+ 		return -ENOMEM;
