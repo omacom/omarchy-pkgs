@@ -1,0 +1,354 @@
+#!/bin/bash
+set -euo pipefail
+
+repo_root=$(realpath "${BASH_SOURCE[0]%/*}/..")
+
+fail() {
+  echo "FAIL: $*" >&2
+  exit 1
+}
+
+srcinfo_for() {
+  local package=$1
+  local package_dir="$repo_root/pkgbuilds/$package"
+
+  [[ -f "$package_dir/PKGBUILD" ]] || fail "$package is missing its PKGBUILD"
+  (cd "$package_dir" && makepkg --printsrcinfo)
+}
+
+assert_field() {
+  local srcinfo=$1 field=$2 expected=$3
+  grep -Eq "^[[:space:]]+$field = $expected$" <<< "$srcinfo" ||
+    fail "expected $field = $expected"
+}
+
+assert_pinned_sources() {
+  local srcinfo=$1 package=$2
+  local sources sums
+
+  sources=$(awk -F' = ' '$1 ~ /^[[:space:]]*source($|_)/ { print $2 }' <<< "$srcinfo")
+  sums=$(awk -F' = ' '$1 ~ /^[[:space:]]*sha256sums($|_)/ { print $2 }' <<< "$srcinfo")
+
+  [[ -n "$sources" ]] || fail "$package declares no sources"
+  [[ -n "$sums" ]] || fail "$package declares no sha256sums"
+  ! grep -Eq '(^|[+:])(git|hg|svn|bzr)\+' <<< "$sources" ||
+    fail "$package uses a moving VCS source"
+  ! grep -Fxq 'SKIP' <<< "$sums" || fail "$package skips source verification"
+  awk 'length != 64 || /[^0-9a-f]/ { exit 1 }' <<< "$sums" ||
+    fail "$package has a non-SHA-256 source checksum"
+}
+
+prepare_verifier_fixture() {
+  local modules=$1 installed_module=$2
+
+  mkdir -p "$modules/7.1.8-arch1-3/updates/dkms" \
+    "$modules/7.1.8-arch1-4" \
+    "$modules/7.1.8-zen1-1-zen"
+  printf 'linux\n' > "$modules/7.1.8-arch1-3/pkgbase"
+  printf 'linux\n' > "$modules/7.1.8-arch1-4/pkgbase"
+  printf 'linux-zen\n' > "$modules/7.1.8-zen1-1-zen/pkgbase"
+  printf 'module fixture\n' > \
+    "$modules/7.1.8-arch1-3/updates/dkms/$installed_module"
+}
+
+assert_stock_kernel_verifier() {
+  local verifier=$1 modules=$2 module_name=$3 capability=$4
+  local output
+
+  printf 'usr/lib/modules/7.1.8-arch1-3/modules.order\n' | \
+    "$verifier" --modules-root "$modules" ||
+    fail "$capability verifier rejected a present stock-kernel DKMS module"
+
+  if output=$(printf 'usr/lib/modules/7.1.8-arch1-4/modules.order\n' | \
+    "$verifier" --modules-root "$modules" 2>&1); then
+    fail "$capability verifier accepted a missing stock-kernel DKMS module"
+  fi
+  grep -Fq "Missing $module_name for stock kernel 7.1.8-arch1-4" <<< "$output" ||
+    fail "$capability verifier did not identify the missing stock-kernel module"
+
+  printf 'usr/lib/modules/7.1.8-zen1-1-zen/modules.order\n' | \
+    "$verifier" --modules-root "$modules" ||
+    fail "$capability verifier treated an alternative kernel as stock"
+}
+
+test_camera_packages_are_versioned_and_pinned() {
+  local driver firmware
+
+  driver=$(srcinfo_for facetimehd-dkms)
+  assert_field "$driver" pkgver 0.7.0.2
+  assert_field "$driver" pkgrel 1.1
+  assert_field "$driver" depends dkms
+  assert_field "$driver" depends facetimehd-firmware
+  assert_pinned_sources "$driver" facetimehd-dkms
+
+  firmware=$(srcinfo_for facetimehd-firmware)
+  assert_field "$firmware" epoch 1
+  assert_field "$firmware" pkgver 1.43_5
+  assert_field "$firmware" pkgrel 2.1
+  assert_pinned_sources "$firmware" facetimehd-firmware
+}
+
+test_camera_firmware_builds_before_driver() {
+  local plan order
+
+  plan=$("$repo_root/bin/repo" build --dry-run --package \
+    facetimehd-dkms facetimehd-firmware snd-hda-macbookpro-dkms)
+  order=$(sed -n 's/^==> Build order: //p' <<< "$plan")
+  [[ "$order" == *facetimehd-firmware*facetimehd-dkms* ]] ||
+    fail "package builder does not order FaceTime HD firmware before its driver"
+}
+
+test_camera_package_installs_post_dkms_verifier() {
+  local package_dir="$repo_root/pkgbuilds/facetimehd-dkms"
+  local work
+
+  work=$(mktemp -d)
+  trap 'rm -rf "$work"' RETURN
+  mkdir -p "$work/src/facetimehd-0.7.0.2"
+  printf 'GPL fixture\n' > "$work/src/facetimehd-0.7.0.2/LICENSE"
+  printf 'PACKAGE_NAME="facetimehd"\nPACKAGE_VERSION="0.7.0.2"\n' > \
+    "$work/src/facetimehd-0.7.0.2/dkms.conf"
+  printf 'fixture\n' > "$work/src/facetimehd-0.7.0.2/Makefile"
+  printf 'fixture\n' > "$work/src/facetimehd-0.7.0.2/fthd_fixture.c"
+  for package_file in verify-kernel-modules 75-facetimehd-verify.hook; do
+    [[ -f "$package_dir/$package_file" ]] && cp "$package_dir/$package_file" "$work/src/"
+  done
+
+  fakeroot bash -c '
+    set -euo pipefail
+    source "$1"
+    srcdir=$2
+    pkgdir=$3
+    cd "$srcdir"
+    package
+  ' _ "$package_dir/PKGBUILD" "$work/src" "$work/pkg"
+
+  [[ -x "$work/pkg/usr/lib/omarchy/verify-facetimehd" ]] ||
+    fail "camera package omitted its post-DKMS verifier"
+  [[ -f "$work/pkg/usr/share/libalpm/hooks/75-facetimehd-verify.hook" ]] ||
+    fail "camera package omitted its post-DKMS pacman hook"
+  grep -Fxq 'NeedsTargets' \
+    "$work/pkg/usr/share/libalpm/hooks/75-facetimehd-verify.hook" ||
+    fail "camera post-DKMS hook does not pass transaction targets to the verifier"
+}
+
+test_camera_verifier_fails_when_stock_kernel_module_is_missing() {
+  local verifier="$repo_root/pkgbuilds/facetimehd-dkms/verify-kernel-modules"
+  local work modules output
+
+  [[ -x "$verifier" ]] || fail "camera post-DKMS verifier is missing"
+
+  work=$(mktemp -d)
+  trap 'rm -rf "$work"' RETURN
+  modules="$work/modules"
+  prepare_verifier_fixture "$modules" facetimehd.ko.xz
+  assert_stock_kernel_verifier "$verifier" "$modules" facetimehd camera
+
+  if output=$(printf 'usr/src/facetimehd-0.7.0.2/dkms.conf\n' | \
+    "$verifier" --modules-root "$modules" 2>&1); then
+    fail "camera package upgrade ignored a stock kernel without its module"
+  fi
+  grep -Fq 'Missing facetimehd for stock kernel 7.1.8-arch1-4' <<< "$output" ||
+    fail "camera package upgrade did not identify an unbuilt stock kernel"
+}
+
+test_audio_source_preparation_is_reproducible() {
+  local prepare="$repo_root/pkgbuilds/snd-hda-macbookpro-dkms/prepare-source"
+  local work driver kernel archive first second header
+
+  [[ -x "$prepare" ]] || fail "audio source preparation command is missing"
+
+  work=$(mktemp -d)
+  trap 'rm -rf "$work"' RETURN
+  driver="$work/driver"
+  kernel="$work/kernel/linux-7.1.8/sound/hda"
+  archive="$work/linux-7.1.8.tar.xz"
+  first="$work/first"
+  second="$work/second"
+
+  mkdir -p "$driver/makefiles" "$driver/patch_cirrus" \
+    "$kernel/common" "$kernel/codecs/cirrus"
+  printf 'upstream hda makefile\n' > "$kernel/Makefile"
+  printf 'upstream common makefile\n' > "$kernel/common/Makefile"
+  printf 'upstream codecs makefile\n' > "$kernel/codecs/Makefile"
+  printf 'upstream cirrus makefile\n' > "$kernel/codecs/cirrus/Makefile"
+  printf 'upstream source\n' > "$kernel/codecs/cirrus/patch_cs8409.c"
+  printf 'upstream header\n' > "$kernel/codecs/cirrus/patch_cs8409.h"
+
+  printf 'fixture hda makefile\n' > "$driver/makefiles/Makefile"
+  printf 'fixture common makefile\n' > "$driver/makefiles/Makefile_common"
+  printf 'fixture codecs makefile\n' > "$driver/makefiles/Makefile_codecs"
+  printf 'fixture cirrus makefile\n' > "$driver/makefiles/Makefile_cirrus"
+  for header in cirrus_apple.h patch_cirrus_boot84.h patch_cirrus_new84.h \
+    patch_cirrus_real84.h patch_cirrus_hda_generic_copy.h patch_cirrus_real84_i2c.h; do
+    printf 'fixture %s\n' "$header" > "$driver/patch_cirrus/$header"
+  done
+  printf '%s\n' \
+    '--- a/codecs/cirrus/patch_cs8409.c' \
+    '+++ b/codecs/cirrus/patch_cs8409.c' \
+    '@@ -1 +1 @@' \
+    '-upstream source' \
+    '+patched fixture source' > "$driver/patch_cs8409.c.diff"
+  printf '%s\n' \
+    '--- a/codecs/cirrus/patch_cs8409.h' \
+    '+++ b/codecs/cirrus/patch_cs8409.h' \
+    '@@ -1 +1 @@' \
+    '-upstream header' \
+    '+patched fixture header' > "$driver/patch_cs8409.h.diff"
+
+  tar -cJf "$archive" -C "$work/kernel" linux-7.1.8
+  env -u HOME "$prepare" --driver-root "$driver" --linux-archive "$archive" --output "$first"
+  env HOME=/nonexistent "$prepare" --driver-root "$driver" --linux-archive "$archive" --output "$second"
+
+  diff -ruN "$first" "$second" >/dev/null || fail "prepared audio source is not reproducible"
+  grep -Fxq 'upstream hda makefile' "$first/hda/Makefile.orig" ||
+    fail "prepared audio source did not preserve the upstream makefile"
+  grep -Fxq 'fixture hda makefile' "$first/hda/Makefile" ||
+    fail "prepared audio source did not install the driver makefile"
+  grep -Fxq 'patched fixture source' "$first/hda/codecs/cirrus/patch_cs8409.c" ||
+    fail "prepared audio source did not apply the driver patch"
+}
+
+test_audio_package_pins_active_kernel_series() {
+  local srcinfo
+
+  srcinfo=$(srcinfo_for snd-hda-macbookpro-dkms)
+  assert_field "$srcinfo" pkgver 0.1
+  assert_field "$srcinfo" pkgrel 1
+  assert_field "$srcinfo" arch any
+  assert_field "$srcinfo" depends dkms
+  assert_field "$srcinfo" \
+    source \
+    'snd_hda_macbookpro-cb27cc483f4fe98be03a4f4bef466c00aa7d244b.tar.gz::https://github.com/davidjo/snd_hda_macbookpro/archive/cb27cc483f4fe98be03a4f4bef466c00aa7d244b.tar.gz'
+  assert_field "$srcinfo" \
+    source \
+    'linux-7.1.8.tar.xz::https://cdn.kernel.org/pub/linux/kernel/v7.x/linux-7.1.8.tar.xz'
+  assert_field "$srcinfo" noextract linux-7.1.8.tar.xz
+  assert_field "$srcinfo" sha256sums 74320a51c1675d94533f75f97ace9a27c08ae8d7e0d67dd352a5f6b07293de81
+  assert_field "$srcinfo" sha256sums ff01dcb449279d5b4cfccdb01fee639cf5ff1803f1749a77844dd33915422c49
+  assert_pinned_sources "$srcinfo" snd-hda-macbookpro-dkms
+}
+
+test_audio_dkms_contract_is_offline_and_series_aware() {
+  local package_dir="$repo_root/pkgbuilds/snd-hda-macbookpro-dkms"
+  local selector="$package_dir/prepare-dkms-build"
+  local work fakebin output
+
+  [[ -x "$selector" ]] || fail "DKMS kernel-series selector is missing"
+  [[ -f "$package_dir/dkms.conf" ]] || fail "audio dkms.conf is missing"
+
+  work=$(mktemp -d)
+  trap 'rm -rf "$work"' RETURN
+  fakebin="$work/fakebin"
+  mkdir -p "$work/source/series/7.1/hda" "$fakebin"
+  printf 'prepared 7.1 source\n' > "$work/source/series/7.1/hda/series-marker"
+  cp "$selector" "$work/source/prepare-dkms-build"
+
+  for command in uname curl wget git; do
+    printf '#!/bin/sh\nexit 99\n' > "$fakebin/$command"
+    chmod +x "$fakebin/$command"
+  done
+
+  (
+    cd "$work/source"
+    env -u HOME PATH="$fakebin:/usr/bin" ./prepare-dkms-build 7.1.8-arch1-3
+  )
+  grep -Fxq 'prepared 7.1 source' "$work/source/build/hda/series-marker" ||
+    fail "DKMS did not select the prepared 7.1 source"
+
+  if output=$(cd "$work/source" && HOME=/nonexistent PATH="$fakebin:/usr/bin" \
+    ./prepare-dkms-build 7.2.0-arch1-1 2>&1); then
+    fail "DKMS accepted an unprepared kernel series"
+  fi
+  grep -Fq 'No prepared audio source for kernel series 7.2' <<< "$output" ||
+    fail "DKMS did not explain the unsupported kernel series"
+
+  (
+    kernelver=7.1.8-arch1-3
+    kernel_source_dir=/fixtures/7.1.8/build
+    source "$package_dir/dkms.conf"
+    [[ ${PRE_BUILD:-} == './prepare-dkms-build 7.1.8-arch1-3' ]] || exit 1
+    [[ ${MAKE[0]:-} == 'make KERNELBUILD=/fixtures/7.1.8/build' ]] || exit 1
+    [[ ${BUILT_MODULE_NAME[0]:-} == 'snd-hda-codec-cs8409' ]] || exit 1
+    [[ ${BUILT_MODULE_LOCATION[0]:-} == 'build/hda/codecs/cirrus' ]] || exit 1
+  ) || fail "dkms.conf does not target the explicit kernel and modern module location"
+}
+
+test_audio_package_installs_self_contained_dkms_source() {
+  local package_dir="$repo_root/pkgbuilds/snd-hda-macbookpro-dkms"
+  local work dkms_root
+
+  work=$(mktemp -d)
+  trap 'rm -rf "$work"' RETURN
+  mkdir -p "$work/src/prepared/7.1/hda" \
+    "$work/src/snd_hda_macbookpro-cb27cc483f4fe98be03a4f4bef466c00aa7d244b"
+  printf 'prepared source\n' > "$work/src/prepared/7.1/hda/series-marker"
+  printf 'GPL fixture\n' > \
+    "$work/src/snd_hda_macbookpro-cb27cc483f4fe98be03a4f4bef466c00aa7d244b/LICENSE"
+  cp "$package_dir/Makefile" "$package_dir/dkms.conf" \
+    "$package_dir/prepare-dkms-build" "$work/src/"
+  for package_file in verify-kernel-modules 75-snd-hda-macbookpro-verify.hook; do
+    [[ -f "$package_dir/$package_file" ]] && cp "$package_dir/$package_file" "$work/src/"
+  done
+
+  fakeroot bash -c '
+    set -euo pipefail
+    source "$1"
+    srcdir=$2
+    pkgdir=$3
+    package
+  ' _ "$package_dir/PKGBUILD" "$work/src" "$work/pkg"
+
+  dkms_root="$work/pkg/usr/src/snd_hda_macbookpro-0.1"
+  [[ -f "$dkms_root/series/7.1/hda/series-marker" ]] ||
+    fail "audio package omitted its prepared 7.1 source"
+  [[ -x "$dkms_root/prepare-dkms-build" ]] ||
+    fail "audio package omitted its DKMS series selector"
+  [[ -f "$dkms_root/Makefile" ]] || fail "audio package omitted its build interface"
+  grep -Fxq 'PACKAGE_VERSION="0.1"' "$dkms_root/dkms.conf" ||
+    fail "audio package did not set its DKMS version"
+  ! grep -Eq '(https?://|\b(curl|wget|git|uname)[[:space:]]|\$HOME)' \
+    "$dkms_root/prepare-dkms-build" "$dkms_root/Makefile" "$dkms_root/dkms.conf" ||
+    fail "installed DKMS build interface has a network, HOME, or uname dependency"
+  [[ -x "$work/pkg/usr/lib/omarchy/verify-snd-hda-macbookpro" ]] ||
+    fail "audio package omitted its post-DKMS verifier"
+  [[ -f "$work/pkg/usr/share/libalpm/hooks/75-snd-hda-macbookpro-verify.hook" ]] ||
+    fail "audio package omitted its post-DKMS pacman hook"
+  grep -Fxq 'NeedsTargets' \
+    "$work/pkg/usr/share/libalpm/hooks/75-snd-hda-macbookpro-verify.hook" ||
+    fail "post-DKMS hook does not pass transaction targets to the verifier"
+}
+
+test_audio_verifier_fails_when_stock_kernel_module_is_missing() {
+  local verifier="$repo_root/pkgbuilds/snd-hda-macbookpro-dkms/verify-kernel-modules"
+  local work modules output
+
+  [[ -x "$verifier" ]] || fail "post-DKMS verifier is missing"
+
+  work=$(mktemp -d)
+  trap 'rm -rf "$work"' RETURN
+  modules="$work/modules"
+  prepare_verifier_fixture "$modules" snd-hda-codec-cs8409.ko.zst
+  assert_stock_kernel_verifier \
+    "$verifier" "$modules" snd-hda-codec-cs8409 audio
+
+  mkdir -p "$modules/7.1.9-arch1-1"
+  printf 'linux\n' > "$modules/7.1.9-arch1-1/pkgbase"
+  if output=$(printf 'usr/src/snd_hda_macbookpro-0.1/dkms.conf\n' | \
+    "$verifier" --modules-root "$modules" 2>&1); then
+    fail "package upgrade ignored a stock kernel without headers or a DKMS module"
+  fi
+  grep -Fq 'Missing snd-hda-codec-cs8409 for stock kernel 7.1.9-arch1-1' <<< "$output" ||
+    fail "package upgrade did not identify an unbuilt stock kernel"
+}
+
+test_camera_packages_are_versioned_and_pinned
+test_camera_firmware_builds_before_driver
+test_camera_package_installs_post_dkms_verifier
+test_camera_verifier_fails_when_stock_kernel_module_is_missing
+test_audio_source_preparation_is_reproducible
+test_audio_package_pins_active_kernel_series
+test_audio_dkms_contract_is_offline_and_series_aware
+test_audio_package_installs_self_contained_dkms_source
+test_audio_verifier_fails_when_stock_kernel_module_is_missing
+echo "PASS: MacBookPro13,1 package checks"
