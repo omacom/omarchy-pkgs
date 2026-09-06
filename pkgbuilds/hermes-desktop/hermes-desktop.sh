@@ -66,7 +66,7 @@ restore_launchers() {
 }
 
 stage() {
-  bash "$installer" --dir "$root" --branch main --non-interactive --stage "$1"
+  bash "$installer" --dir "${2:-$root}" --branch main --non-interactive --stage "$1"
 }
 
 install_desktop() {
@@ -170,20 +170,29 @@ PY
     env -u PYTHONPATH -u PYTHONHOME "${cli[@]}" update --yes --branch main
   elif [[ ! -e $root ]]; then
     stage prerequisites
-    stage repository
-    printf '/.omarchy-hermes-desktop\n' >>"$root/.git/info/exclude"
-    printf 'pending\n' >"$marker"
+    # Publish only a complete clone with its ownership marker. An interrupted
+    # clone stays aside for inspection and cannot block the next installation.
+    local repository_dir
+    repository_dir=$(mktemp -d "$HERMES_HOME/.omarchy-hermes-repository.XXXXXX")
+    echo "Preparing the Hermes checkout in $repository_dir"
+    stage repository "$repository_dir/hermes-agent"
+    printf '/.omarchy-hermes-desktop\n' >>"$repository_dir/hermes-agent/.git/info/exclude"
+    printf 'pending\n' >"$repository_dir/hermes-agent/.omarchy-hermes-desktop"
+    mv -T --no-clobber "$repository_dir/hermes-agent" "$root"
+    [[ ! -e $repository_dir/hermes-agent ]] || die "Keeping the checkout that appeared at $root during installation."
+    rmdir "$repository_dir"
   fi
 
   if [[ $mise_predecessor == true ]]; then
     printf '%s\n' 'pipx:hermes-agent[extras=all]' >"$root/.git/omarchy-mise-predecessor"
   fi
 
-  if [[ $legacy == true ]]; then
-    env -u PYTHONPATH -u PYTHONHOME "${cli[@]}" desktop --build-only
-  else
-    for command in venv python-deps node-deps config desktop; do stage "$command"; done
+  if [[ $legacy == false ]]; then
+    for command in venv python-deps node-deps config; do stage "$command"; done
   fi
+  # The native builder also handles updates and supports the namespace
+  # sandbox. The shell installer's desktop stage still requires a sudo chown.
+  env -u PYTHONPATH -u PYTHONHOME "${cli[@]}" desktop --build-only
 
   # Build first: a failed download leaves the old terminal CLI usable.
   stage complete

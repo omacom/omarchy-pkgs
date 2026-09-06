@@ -23,16 +23,16 @@ case $stage in
 repository)
   mkdir -p "$root/venv/bin"
   git init -q "$root"
+  [[ ${FAIL_PARTIAL_CLONE:-} != 1 ]] || exit 44
   git -C "$root" remote add origin https://github.com/NousResearch/hermes-agent.git
   touch "$root/hermes"
   cp "$TEST_PYTHON" "$root/venv/bin/python"
   git -C "$root" add hermes venv
   git -C "$root" -c user.email=test@example.com -c user.name=Test commit -qm initial
-  ;;
-desktop)
-  mkdir -p "$root/apps/desktop/release/linux-unpacked"
-  cp "$TEST_GUI" "$root/apps/desktop/release/linux-unpacked/Hermes"
-  printf '/apps/\n/.hermes-bootstrap-complete\n' >> "$root/.git/info/exclude"
+  if [[ ${RACE_CLONE:-} == 1 ]]; then
+    mkdir -p "$HOME/.hermes/hermes-agent"
+    printf 'foreign checkout\n' > "$HOME/.hermes/hermes-agent/keep"
+  fi
   ;;
 complete) touch "$root/.hermes-bootstrap-complete";;
 path)
@@ -69,7 +69,20 @@ class LauncherTests(unittest.TestCase):
         for k in ['FAIL_STAGE', 'FAIL_AFTER_PATH', 'PYTHONHOME', 'PYTHONPATH']:
             self.env.pop(k, None)
         self.write(self.base / 'installer', INSTALLER)
-        self.write(self.base / 'python', '#!/bin/bash\n[[ ${FAIL_READY:-} != 1 ]]\n')
+        self.write(self.base / 'python', '''#!/bin/bash
+set -eu
+if [[ ${2:-} == desktop ]]; then
+  [[ ${3:-} == --build-only ]]
+  printf 'desktop\\n' >> "$TEST_LOG"
+  [[ ${FAIL_STAGE:-} != desktop ]] || exit 42
+  root=$(dirname "$1")
+  mkdir -p "$root/apps/desktop/release/linux-unpacked"
+  cp "$TEST_GUI" "$root/apps/desktop/release/linux-unpacked/Hermes"
+  printf '/apps/\\n/.hermes-bootstrap-complete\\n' >> "$root/.git/info/exclude"
+else
+  [[ ${FAIL_READY:-} != 1 ]]
+fi
+''')
         self.write(self.base / 'gui', '''#!/usr/bin/env python3
 import json,os,sys,time
 json.dump({'pid':os.getpid(),'args':sys.argv[1:],'root':os.environ['HERMES_DESKTOP_HERMES_ROOT'],'node':os.environ.get('ELECTRON_RUN_AS_NODE'),'password':os.environ['HERMES_DESKTOP_PASSWORD_STORE']},open(os.environ['TEST_OUTPUT'],'w'))
@@ -102,6 +115,20 @@ if os.environ.get('TEST_GUI_WAIT'): time.sleep(30)
         self.assertLess(stages.index('desktop'), stages.index('path'))
         self.assertEqual((self.root / '.omarchy-hermes-desktop').read_text(), 'ready\n')
         self.assertEqual(subprocess.check_output(['git','-C',str(self.root),'status','--porcelain'],env=self.env),b'')
+
+    def test_interrupted_clone_stays_aside_and_retry_succeeds(self):
+        self.run_launcher('--install', ok=False, FAIL_PARTIAL_CLONE='1')
+        self.assertFalse(self.root.exists())
+        partials=list((self.home/'.hermes').glob('.omarchy-hermes-repository.*/hermes-agent/.git'))
+        self.assertEqual(len(partials),1)
+        self.install()
+        self.assertTrue(partials[0].is_dir())
+
+    def test_clone_publication_preserves_concurrent_checkout(self):
+        self.run_launcher('--install', ok=False, RACE_CLONE='1')
+        self.assertEqual((self.root/'keep').read_text(),'foreign checkout\n')
+        self.assertFalse((self.root/'.omarchy-hermes-desktop').exists())
+        self.assertFalse((self.home/'.local/bin/hermes').exists())
 
     def test_warm_launch_and_package_reinstall_leave_runtime_untouched(self):
         self.install()
