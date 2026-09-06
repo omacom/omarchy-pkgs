@@ -1,0 +1,167 @@
+From e26bb459d0f3dad83c6a31d5e4480e60760c262b Mon Sep 17 00:00:00 2001
+From: Bartosz Juraszewski <bjuraszewski@gmail.com>
+Date: Mon, 22 Jun 2026 20:27:33 +0200
+Subject: [PATCH] ASoC: tas2783: Update loaded firmware names to linux-firmware
+ 20260519
+
+In linux-firmware commit from 2026-05-19 `2f90f4fe5c67f51a8410907a...`
+`ASoC: tas2783: Add Firmware files for tas2783A projects` by Baojun Xu
+138 new firmware files for tas2783 were added, none of which are loaded
+by the kernel. Kernel expects files to be named with the following
+convention: "%04X-%1X-%1X.bin". However the added firmware files follow
+"-0x%1X.bin" naming instead with `0x` hex prefix, which fails to load
+resulting in following dmesg log:
+
+  slave-tas2783 sdw:0:1:0102:0000:01:8: Direct firmware load for 1714-1-8.bin failed with error -2
+  slave-tas2783 sdw:0:1:0102:0000:01:8: Failed to read fw binary 1714-1-8.bin
+  slave-tas2783 sdw:0:1:0102:0000:01:b: Direct firmware load for 1714-1-B.bin failed with error -2
+  slave-tas2783 sdw:0:1:0102:0000:01:b: Failed to read fw binary 1714-1-B.bin
+  slave-tas2783 sdw:0:1:0102:0000:01:8: error playback without fw download
+  slave-tas2783 sdw:0:1:0102:0000:01:8: ASoC error (-22): at snd_soc_dai_hw_params() on tas2783-codec
+
+This same commit removes all 22 symlinks from WHENCE, that used naming
+without the '0x' prefix to only 6 prevoiusly existing .bin files.
+
+This patch adds `0x` prefix explicitly to the generated firmware name
+allowing file to successfully load. In case prefixed firmware is missing
+due to out of date linux-firmware, we set the fallback flag and attempt
+to load firmware again based on the old file names.
+
+This prefix change results in functioning firmware loading on ASUS
+ProArt PX13 HN7306EAC, which uses 1714-1-0x8.bin and 1714-1-0xB.bin
+firmware files.
+
+Tested on top of 7.1 and next-20260619 with SND_SOC_AMD_ACP7X set to no.
+
+Signed-off-by: Bartosz Juraszewski <bjuraszewski@gmail.com>
+Link: https://patch.msgid.link/20260622182733.23947-1-bjuraszewski@gmail.com
+Signed-off-by: Mark Brown <broonie@kernel.org>
+---
+ sound/soc/codecs/tas2783-sdw.c | 73 +++++++++++++++++++++++-----------
+ 1 file changed, 50 insertions(+), 23 deletions(-)
+
+diff --git a/sound/soc/codecs/tas2783-sdw.c b/sound/soc/codecs/tas2783-sdw.c
+index 1127ea59b5e4ce..3d0b116544cc48 100644
+--- a/sound/soc/codecs/tas2783-sdw.c
++++ b/sound/soc/codecs/tas2783-sdw.c
+@@ -100,6 +100,8 @@ struct tas2783_prv {
+ 	wait_queue_head_t fw_wait;
+ 	bool fw_dl_task_done;
+ 	bool fw_dl_success;
++	/* use fallback fw name */
++	bool fw_use_fallback;
+ };
+ 
+ static const struct reg_default tas2783_reg_default[] = {
+@@ -740,11 +742,19 @@ static void tas2783_fw_ready(const struct firmware *fmw, void *context)
+ 		goto out;
+ 	}
+ 
++	/* firmware binary not found*/
+ 	if (!fmw || !fmw->data) {
+-		/* firmware binary not found*/
+-		dev_err(tas_dev->dev,
+-			"Failed to read fw binary %s\n",
+-			tas_dev->rca_binaryname);
++		if (!tas_dev->fw_use_fallback) {
++			tas_dev->fw_use_fallback = true;
++			dev_info(tas_dev->dev,
++				"Failed to read preferred fw binary: %s, attempting fallback binary load\n",
++				tas_dev->rca_binaryname);
++		} else {
++			dev_err(tas_dev->dev,
++				"Failed to read fallback fw binary %s\n",
++				tas_dev->rca_binaryname);
++		}
++
+ 		ret = -EINVAL;
+ 		goto out;
+ 	}
+@@ -1105,13 +1115,16 @@ static void tas_generate_fw_name(struct sdw_slave *slave, char *name, size_t siz
+ 	bool pci_found = false;
+ #if IS_ENABLED(CONFIG_PCI)
+ 	struct device *dev = &slave->dev;
++	struct tas2783_prv *tas_dev = dev_get_drvdata(&slave->dev);
+ 	struct pci_dev *pci = NULL;
++	const char *fw_uid_prefix = tas_dev->fw_use_fallback ? "" : "0x";
+ 
+ 	for (; dev; dev = dev->parent) {
+ 		if (dev->bus == &pci_bus_type) {
+ 			pci = to_pci_dev(dev);
+-			scnprintf(name, size, "%04X-%1X-%1X.bin",
+-				  pci->subsystem_device, bus->link_id, unique_id);
++			scnprintf(name, size, "%04X-%1X-%s%1X.bin",
++				  pci->subsystem_device, bus->link_id,
++				  fw_uid_prefix, unique_id);
+ 			pci_found = true;
+ 			break;
+ 		}
+@@ -1123,28 +1136,15 @@ static void tas_generate_fw_name(struct sdw_slave *slave, char *name, size_t siz
+ 			  bus->link_id, unique_id);
+ }
+ 
+-static s32 tas_io_init(struct device *dev, struct sdw_slave *slave)
++static s32 tas_fw_load(struct tas2783_prv *tas_dev, struct sdw_slave *slave)
+ {
+-	struct tas2783_prv *tas_dev = dev_get_drvdata(dev);
+ 	s32 ret;
+ 	u8 unique_id = tas_dev->sdw_peripheral->id.unique_id;
+ 
+-	if (tas_dev->hw_init)
+-		return 0;
+-
+-	tas_dev->fw_dl_task_done = false;
+-	tas_dev->fw_dl_success = false;
+-
+-	ret = regmap_write(tas_dev->regmap, TAS2783_SW_RESET, 0x1);
+-	if (ret) {
+-		dev_err(dev, "sw reset failed, err=%d", ret);
+-		return ret;
+-	}
+-	usleep_range(2000, 2200);
+-
+ 	tas_generate_fw_name(slave, tas_dev->rca_binaryname,
+ 			     sizeof(tas_dev->rca_binaryname));
+ 
++	tas_dev->fw_dl_task_done = false;
+ 	ret = request_firmware_nowait(THIS_MODULE, FW_ACTION_UEVENT,
+ 				      tas_dev->rca_binaryname, tas_dev->dev,
+ 				      GFP_KERNEL, tas_dev, tas2783_fw_ready);
+@@ -1159,8 +1159,35 @@ static s32 tas_io_init(struct device *dev, struct sdw_slave *slave)
+ 				 msecs_to_jiffies(TIMEOUT_FW_DL_MS));
+ 	if (!ret) {
+ 		dev_err(tas_dev->dev, "fw request, wait_event timeout\n");
+-		ret = -EAGAIN;
+-	} else {
++		return -EAGAIN;
++	}
++
++	return 0;
++}
++
++static s32 tas_io_init(struct device *dev, struct sdw_slave *slave)
++{
++	struct tas2783_prv *tas_dev = dev_get_drvdata(dev);
++	s32 ret;
++
++	if (tas_dev->hw_init)
++		return 0;
++
++	tas_dev->fw_dl_success = false;
++
++	ret = regmap_write(tas_dev->regmap, TAS2783_SW_RESET, 0x1);
++	if (ret) {
++		dev_err(dev, "sw reset failed, err=%d", ret);
++		return ret;
++	}
++	usleep_range(2000, 2200);
++
++	tas_dev->fw_use_fallback = false;
++	ret = tas_fw_load(tas_dev, slave);
++	if (!ret && tas_dev->fw_use_fallback)
++		ret = tas_fw_load(tas_dev, slave);
++
++	if (!ret) {
+ 		if (tas_dev->sa_func_data)
+ 			ret = sdca_regmap_write_init(dev, tas_dev->regmap,
+ 						     tas_dev->sa_func_data);

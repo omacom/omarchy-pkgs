@@ -1,0 +1,221 @@
+#!/bin/bash
+# HP EliteBook X G2i: audio boot-race self-heal, the second layer.
+#
+# Layer one is the WirePlumber ExecStartPre wait. It narrows the window but
+# does not close it, and two distinct faults get through. They live at
+# different layers and the ALSA-level check is blind to the PipeWire-level one,
+# so both are checked:
+#
+#   A. ALSA/UCM. The card is on any profile other than HiFi. "off" is the
+#      signature of losing the TAS2783 enumeration race; recovery is a
+#      WirePlumber restart, up to three attempts. Anything else -- pro-audio,
+#      in practice -- means UCM never ran: the speaker routes stay off and no
+#      mic device exists, while nothing logs an error. WirePlumber restores a
+#      pinned profile from its state file on every boot, so a restart cannot
+#      clear it; only an explicit profile switch rewrites the pin. This
+#      machine lost twelve days to a pro-audio pin that the old "not off"
+#      check reported as healthy.
+#
+#   B. PipeWire graph. The profile is a healthy "HiFi", nothing logs an error,
+#      and there is still no sound or the wrong sound, because the graph does
+#      not route through the tuning chain: the default sink names a node that
+#      does not exist, the raw Speaker sink is default while the tuning chain
+#      exists (every stream bypasses the EQ), or the tuning output is not
+#      linked to the Speaker sink (silence the moment the speakers are
+#      selected). Recovery: the cheap targeted fix first, then restart the
+#      tuning filter-chain, escalating to the whole audio stack.
+#
+# Fault B is the reason this script logs a graph snapshot on every run,
+# including the healthy ones. A profile-only check reports "healthy" while the
+# machine is silent, which is worse than no check at all.
+
+SPK_RE='Speaker__sink'
+TUNING_SINK='omarchy_speaker_tuning'
+TUNING_OUT='omarchy_speaker_tuning_output'
+
+repaired=0
+
+card_index() {
+  awk '/^ *[0-9]+ \[/ { idx = $1; gsub(/[^0-9]/, "", idx) }
+       /sof-soundwire/ { print idx; exit }' /proc/asound/cards
+}
+
+card_profile() {
+  pactl list cards 2>/dev/null |
+    grep -A40 "platform-sof_sdw" | grep "Active Profile" | awk '{print $3}'
+}
+
+card_pactl_name() {
+  pactl list short cards 2>/dev/null |
+    awk '/platform-sof_sdw/ { print $2; exit }'
+}
+
+sink_exists() {
+  pactl list short sinks 2>/dev/null | awk '{print $2}' | grep -qx "$1"
+}
+
+# Channels of the tuning output actually linked through to the speaker sink.
+tuning_links() {
+  pw-link -l 2>/dev/null |
+    grep -A1 "^${TUNING_OUT}:output_" | grep -c -- "-> .*${SPK_RE}"
+}
+
+# Prints the reason on stdout and returns 0 when the graph cannot make sound.
+graph_fault() {
+  local default_sink links
+
+  default_sink=$(pactl get-default-sink 2>/dev/null)
+
+  if [ -z "$default_sink" ] || [ "$default_sink" = "@DEFAULT_SINK@" ]; then
+    echo "no default sink"
+    return 0
+  fi
+
+  if ! sink_exists "$default_sink"; then
+    echo "default sink '$default_sink' does not exist"
+    return 0
+  fi
+
+  # The remaining checks only apply while the tuning chain is present. If the
+  # user has selected headphones, HDMI or Bluetooth, that choice is respected;
+  # the tuning plumbing behind it still has to be intact.
+  sink_exists "$TUNING_SINK" || return 1
+
+  case "$default_sink" in
+    *${SPK_RE})
+      echo "raw speaker sink is default while the tuning chain exists"
+      return 0
+      ;;
+  esac
+
+  links=$(tuning_links)
+  if [ "${links:-0}" -lt 2 ]; then
+    echo "only ${links:-0}/2 tuning channels reach the speakers"
+    return 0
+  fi
+
+  return 1
+}
+
+snapshot() {
+  echo "graph: profile=$(card_profile) default-sink=$(pactl get-default-sink 2>/dev/null) tuning-links=$(tuning_links)/2 tuning-svc=$(systemctl --user is-active omarchy-speaker-tuning 2>/dev/null)"
+}
+
+repair_graph() {
+  local reason="$1"
+
+  repaired=1
+
+  # The bypass fault has a one-line fix. Restarting services for it would
+  # churn the graph for nothing.
+  if [ "$reason" = "raw speaker sink is default while the tuning chain exists" ]; then
+    echo "graph fault: $reason - making the tuning chain the default sink"
+    pactl set-default-sink "$TUNING_SINK" 2>/dev/null
+    sleep 2
+    if ! reason=$(graph_fault); then
+      echo "graph recovered after default-sink switch"
+      return 0
+    fi
+  fi
+
+  echo "graph fault: $reason - restarting the speaker tuning filter-chain"
+  systemctl --user restart omarchy-speaker-tuning 2>/dev/null
+  sleep 4
+
+  if ! reason=$(graph_fault); then
+    echo "graph recovered after tuning restart"
+    return 0
+  fi
+
+  echo "still broken ($reason) - restarting the full audio stack"
+  systemctl --user restart wireplumber.service pipewire.service pipewire-pulse.service 2>/dev/null
+  sleep 6
+
+  if ! reason=$(graph_fault); then
+    echo "graph recovered after full audio restart"
+    return 0
+  fi
+
+  echo "graph still broken after full audio restart: $reason"
+  return 1
+}
+
+finish_up() {
+  local card
+  card=$(card_index)
+
+  # The rt712 FU0F/FU1E hardware capture switches default to muted, and the UCM
+  # auto-unmute loses its race on some boots, which records pure silence while
+  # every level looks correct. Idempotent, so enforce it every time.
+  if [ -n "$card" ]; then
+    amixer -c "$card" cset name='rt712 FU0F Capture Switch' on,on >/dev/null 2>&1
+    amixer -c "$card" cset name='rt712 FU1E Capture Switch' on,on,on,on >/dev/null 2>&1
+  fi
+
+  # The shell latches audio state at start and its PipeWire subscription can be
+  # dead after a restart down here, so the bar shows a stale mute or volume.
+  # Restarting it is the only reliable resync, and it costs a visible flicker --
+  # so only do it when something was actually repaired, never on a clean boot.
+  [ "$repaired" -eq 1 ] || return 0
+  sleep 2
+  if [ -n "$HYPRLAND_INSTANCE_SIGNATURE" ] || [ -n "$WAYLAND_DISPLAY" ]; then
+    omarchy restart shell >/dev/null 2>&1 && echo "shell restarted for audio-state sync"
+  else
+    echo "no wayland env in service context - skipping shell restart"
+  fi
+}
+
+# --- Fault A: card profile is not HiFi ----------------------------------------
+profile_ok=0
+for attempt in 1 2 3; do
+  sleep 8
+  prof=$(card_profile)
+  if [ "$prof" = "HiFi" ]; then
+    echo "audio profile healthy: $prof"
+    profile_ok=1
+    break
+  fi
+  repaired=1
+  if [ -n "$prof" ] && [ "$prof" != "off" ]; then
+    # A pinned wrong profile survives any restart; only an explicit switch
+    # rewrites WirePlumber's persisted pin.
+    echo "attempt $attempt: sof_sdw profile is '$prof' - switching it back to HiFi"
+    pactl set-card-profile "$(card_pactl_name)" HiFi 2>/dev/null
+    sleep 4
+  else
+    echo "attempt $attempt: sof_sdw profile is '$prof' - restarting wireplumber to recover"
+    systemctl --user restart wireplumber
+    sleep 4
+    systemctl --user restart omarchy-speaker-tuning 2>/dev/null
+  fi
+  if [ "$(card_profile)" = "HiFi" ]; then
+    profile_ok=1
+    break
+  fi
+done
+
+if [ "$profile_ok" -ne 1 ]; then
+  echo "gave up on the card profile after 3 attempts"
+  snapshot
+  # Still run finish_up. The rt712 capture switches are independent of the
+  # card profile, and leaving them muted here is what turns a speaker fault
+  # into a total audio loss: the user loses the microphone as well, on the
+  # one boot where recovery already failed.
+  finish_up
+  exit 0
+fi
+
+# --- Fault B: profile is fine but the graph does not reach the speakers -------
+# Give WirePlumber a moment to finish linking the tuning output after any
+# restart above before judging the graph.
+sleep 3
+
+if reason=$(graph_fault); then
+  repair_graph "$reason"
+else
+  echo "audio graph healthy: default sink $(pactl get-default-sink 2>/dev/null), $(tuning_links)/2 tuning channels linked"
+fi
+
+snapshot
+finish_up
+exit 0

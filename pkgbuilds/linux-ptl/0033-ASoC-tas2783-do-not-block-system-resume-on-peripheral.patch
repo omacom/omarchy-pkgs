@@ -1,0 +1,125 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Meir Dick <mdick85@gmail.com>
+Date: Wed, 12 Aug 2026 14:35:38 -0400
+Subject: [PATCH] ASoC: tas2783: do not block system resume on peripheral
+ re-attach
+
+tas2783_sdca_dev_resume() is installed for both RUNTIME_PM_OPS and
+SYSTEM_SLEEP_PM_OPS. When the peripheral was detached it waits up to
+TAS2783_PROBE_TIMEOUT (5s) for initialization_complete before restoring
+the register cache.
+
+The Master clears peripheral status over system suspend, so
+slave->unattach_request is always set on system resume and the wait is
+always taken. What it waits for is re-enumeration followed by
+tas_io_init(), which issues a software reset and then a
+request_firmware_nowait() whose completion it waits for. That work runs
+in bus context and is serialized across the peripherals on the link, so
+on a machine with four amplifiers it takes several seconds in total.
+
+dpm_resume() runs with userspace frozen, so the whole system waits.
+Measured on an HP EliteBook X G2i (four TAS2783 on link 2) with
+/sys/power/pm_print_times enabled:
+
+  slave-tas2783 sdw:0:2:0102:0000:01:9: acpi_subsys_resume returned -110 after 6805123 usecs
+  slave-tas2783 sdw:0:2:0102:0000:01:a: acpi_subsys_resume returned 0 after 2358742 usecs
+  slave-tas2783 sdw:0:2:0102:0000:01:c: acpi_subsys_resume returned 0 after 64217 usecs
+  slave-tas2783 sdw:0:2:0102:0000:01:d: acpi_subsys_resume returned 0 after 48221 usecs
+
+That is 9.2s of a 9.7s resume phase. Every other device on the machine,
+including the GPU, resumes in under 400ms, and the display cannot come
+back until the last of these returns.
+
+The amplifier that reports the timeout is not faulty. Resume order is
+the reverse of enumeration order, so the peripheral that attaches last
+(device_number 4) is the first one waited on, and it absorbs the head of
+a job that only finishes once all four have been re-initialized. All
+four completions land within ~112ms of each other at the end. Reordering
+the list would only move the timeout to whichever peripheral went first.
+
+Blocking is reasonable for runtime resume, where only the audio path
+waits. It is not reasonable for system resume. Give system sleep its own
+callback that returns without waiting, leaving the regmap in cache-only
+mode. tas_update_status() already restores the cache and calls
+tas_io_init() when the peripheral re-attaches, so nothing is lost;
+playback cannot start before the card has resumed in any case.
+
+Clear slave->unattach_request there as well, since the system resume
+path no longer does it. The runtime path still clears it after its own
+wait.
+---
+ sound/soc/codecs/tas2783-sdw.c | 48 ++++++++++++++++++++++++++++++++--
+ 1 file changed, 46 insertions(+), 2 deletions(-)
+
+--- a/sound/soc/codecs/tas2783-sdw.c
++++ b/sound/soc/codecs/tas2783-sdw.c
+@@ -1103,8 +1103,40 @@
+ 	return 0;
+ }
+ 
++static s32 tas2783_sdca_dev_system_resume(struct device *dev)
++{
++	struct sdw_slave *slave = dev_to_sdw_dev(dev);
++	struct tas2783_prv *tas_dev = dev_get_drvdata(dev);
++
++	/*
++	 * If the peripheral stayed attached there is nothing to wait for, so
++	 * restore the cache here as the runtime resume path does.
++	 */
++	if (!slave->unattach_request) {
++		regcache_cache_only(tas_dev->regmap, false);
++		regcache_sync(tas_dev->regmap);
++		return 0;
++	}
++
++	/*
++	 * The peripheral was detached by the Master. Re-enumeration and the
++	 * firmware download that follows it run asynchronously in bus context,
++	 * and tas_update_status() restores the cache once the peripheral is
++	 * back. Blocking here would hold the system resume path - and with it
++	 * every frozen task - for as long as that takes.
++	 *
++	 * On a four amplifier machine the downloads are serialized on the bus
++	 * and take several seconds in total, which is long enough to be
++	 * visible to the user as a delay before the display comes back. Leave
++	 * the regmap in cache-only mode and return; playback cannot start
++	 * before the card resumes anyway.
++	 */
++	return 0;
++}
++
+ static const struct dev_pm_ops tas2783_sdca_pm = {
+-	SYSTEM_SLEEP_PM_OPS(tas2783_sdca_dev_system_suspend, tas2783_sdca_dev_resume)
++	SYSTEM_SLEEP_PM_OPS(tas2783_sdca_dev_system_suspend,
++			    tas2783_sdca_dev_system_resume)
+ 	RUNTIME_PM_OPS(tas2783_sdca_dev_suspend, tas2783_sdca_dev_resume, NULL)
+ };
+ 
+@@ -1193,6 +1225,7 @@
+ {
+ 	struct tas2783_prv *tas_dev = dev_get_drvdata(&slave->dev);
+ 	struct device *dev = &slave->dev;
++	s32 ret;
+ 
+ 	dev_dbg(dev, "Peripheral status = %s",
+ 		status == SDW_SLAVE_UNATTACHED ? "unattached" :
+@@ -1213,7 +1246,18 @@
+ 	regcache_sync(tas_dev->regmap);
+ 
+ 	/* perform I/O transfers required for Slave initialization */
+-	return tas_io_init(&slave->dev, slave);
++	ret = tas_io_init(&slave->dev, slave);
++
++	/*
++	 * The system resume path returns without waiting for
++	 * initialization_complete, so clear the re-attach request here, once
++	 * the peripheral really has been re-initialized. The runtime resume
++	 * path still clears it after its own wait.
++	 */
++	if (!ret)
++		slave->unattach_request = 0;
++
++	return ret;
+ }
+ 
+ /*

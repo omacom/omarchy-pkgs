@@ -1,0 +1,78 @@
+From 119046319e773ff86b98e3ab67623443f8481d7b Mon Sep 17 00:00:00 2001
+From: Andrey Golovko <andrey.golovko@gmail.com>
+Date: Thu, 13 Aug 2026 19:40:00 +0300
+Subject: [PATCH] ASoC: tas2783-sdw: power the Function up before preparing the
+ port
+
+A Data Port cannot complete channel preparation while the SDCA Function
+is powered down: the peripheral raises the channel's bit in
+DPn_PrepareStatus and never clears it.
+
+tas_sdw_hw_params() takes care of that for a stream that is being set
+up, and the retry loop there says so - "ensure power on so that port
+prepare succeeds".  Port preparation, however, also happens on a stream
+that is merely re-prepared, without hw_params() running again.  That is
+what userspace does after a suspend in which the peripheral lost power:
+snd_pcm_prepare() reaches .prepare and sdw_prepare_stream(), the port is
+prepared afresh, but PDE23 is still at the PS3 reset default because
+nothing wrote it since the device came back.
+
+The result is silence with no error anywhere.  The codec sets
+simple_ch_prep_sm, so sdw_prep_deprep_slave_port() skips the
+NOT_PREPARED poll, and a port that never prepares is indistinguishable
+from a healthy one.
+
+Power the Function up in the PRE_PREP callback, immediately before the
+PrepareCtrl write it already performs, so that preparation has what it
+needs on every path that prepares a port.
+
+Measured on an ASUS ProArt PX13 (AMD ACP7.0, two TAS2783): after s2idle
+with ~100 s of S0i3 residency, DPn_PrepareStatus stays at the channel
+mask and there is no audio; writing PDE23 PS0 and re-issuing the prepare
+clears it within 1 ms and audio returns.
+
+Signed-off-by: Andrey Golovko <andrey.golovko@gmail.com>
+Link: https://patch.msgid.link/20260813194000.10412-3-andrey.golovko@gmail.com
+Signed-off-by: Mark Brown <broonie@kernel.org>
+---
+ sound/soc/codecs/tas2783-sdw.c | 20 ++++++++++++++++++++
+ 1 file changed, 20 insertions(+)
+
+diff --git a/sound/soc/codecs/tas2783-sdw.c b/sound/soc/codecs/tas2783-sdw.c
+index c217da5fccdf61..d32d8f441651ca 100644
+--- a/sound/soc/codecs/tas2783-sdw.c
++++ b/sound/soc/codecs/tas2783-sdw.c
+@@ -1259,6 +1259,7 @@ static int tas_port_prep(struct sdw_slave *slave, struct sdw_prepare_ch *prep_ch
+ 			 enum sdw_port_prep_ops pre_ops)
+ {
+ 	struct device *dev = &slave->dev;
++	struct tas2783_prv *tas_dev = dev_get_drvdata(dev);
+ 	struct sdw_dpn_prop *dpn_prop;
+ 	u32 addr;
+ 	int ret;
+@@ -1270,6 +1271,25 @@ static int tas_port_prep(struct sdw_slave *slave, struct sdw_prepare_ch *prep_ch
+ 	addr = SDW_DPN_PREPARECTRL(prep_ch->num);
+ 	switch (pre_ops) {
+ 	case SDW_OPS_PORT_PRE_PREP:
++		/*
++		 * The Function has to be powered before the port can complete
++		 * channel preparation.  hw_params() does that when a stream is
++		 * set up, but a stream that is only re-prepared - as it is
++		 * after the peripheral lost power in S0i3 - does not go
++		 * through hw_params() again, and the peripheral is back at its
++		 * PS3 reset default.  Power it up here, where it is needed.
++		 */
++		scoped_guard(mutex, &tas_dev->pde_lock)
++			ret = regmap_write(tas_dev->regmap,
++					   SDW_SDCA_CTL(1, TAS2783_SDCA_ENT_PDE23,
++							TAS2783_SDCA_CTL_REQ_POW_STATE, 0),
++					   TAS2783_SDCA_POW_STATE_ON);
++		if (ret) {
++			dev_err(dev, "power up failed for port %d, err=%d\n",
++				prep_ch->num, ret);
++			return ret;
++		}
++
+ 		ret = sdw_write_no_pm(slave, addr, prep_ch->ch_mask);
+ 		if (ret)
+ 			dev_err(dev, "prep failed for port %d, err=%d\n",
