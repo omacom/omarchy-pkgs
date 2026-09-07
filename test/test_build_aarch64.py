@@ -49,6 +49,11 @@ class BuildAarch64Test(unittest.TestCase):
         result = self.run_step("meta")
         self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_checkout_does_not_persist_credentials(self):
+        checkout = next(step for step in WORKFLOW["jobs"]["build"]["steps"]
+                        if step.get("uses", "").startswith("actions/checkout@"))
+        self.assertIs(checkout["with"].get("persist-credentials"), False)
+
     def test_known_package_and_rc_mirror(self):
         result = self.run_step("meta", INPUT_PACKAGES=" example ", INPUT_MIRROR="rc")
         self.assertEqual(result.returncode, 0, result.stderr)
