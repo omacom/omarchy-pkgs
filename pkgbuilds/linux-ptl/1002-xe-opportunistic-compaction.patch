@@ -1,0 +1,98 @@
+Subject: [PATCH v6 2/2] drm/xe: Make use of
+ shrink_control::opportunistic_compaction hint
+From: Matthew Brost <matthew.brost@intel.com>
+Date: Tue, 16 Jun 2026 20:22:18 -0700
+Message-Id: <20260617032218.1165929-3-matthew.brost@intel.com>
+MIME-Version: 1.0
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: 8bit
+
+Xe/TTM backup reclaim can be extremely expensive under fragmentation
+pressure as reclaim may migrate or destroy actively used GPU working
+sets despite the system still having substantial free memory available.
+
+Under high-order opportunistic reclaim, repeatedly backing up GPU
+memory can lead to reclaim/rebind ping-pong behavior where active GPU
+working sets are continuously torn down and reconstructed without
+materially improving allocation success.
+
+Use the new shrink_control::opportunistic_compaction hint to avoid Xe
+backup reclaim during fragmentation-driven high-order reclaim attempts.
+In this mode the shrinker skips advertising backup-backed reclaimable
+memory and avoids initiating backup operations entirely.
+
+Order-0 and non-opportunistic reclaim behavior remain unchanged, so
+Xe backup reclaim still participates normally during genuine memory
+pressure.
+
+Cc: Andrew Morton <akpm@linux-foundation.org>
+Cc: Dave Chinner <david@fromorbit.com>
+Cc: Qi Zheng <zhengqi.arch@bytedance.com>
+Cc: Roman Gushchin <roman.gushchin@linux.dev>
+Cc: Muchun Song <muchun.song@linux.dev>
+Cc: David Hildenbrand <david@kernel.org>
+Cc: Lorenzo Stoakes <ljs@kernel.org>
+Cc: "Liam R. Howlett" <Liam.Howlett@oracle.com>
+Cc: Vlastimil Babka <vbabka@kernel.org>
+Cc: Mike Rapoport <rppt@kernel.org>
+Cc: Suren Baghdasaryan <surenb@google.com>
+Cc: Michal Hocko <mhocko@suse.com>
+Cc: Johannes Weiner <hannes@cmpxchg.org>
+Cc: Shakeel Butt <shakeel.butt@linux.dev>
+Cc: Kairui Song <kasong@tencent.com>
+Cc: Barry Song <baohua@kernel.org>
+Cc: Axel Rasmussen <axelrasmussen@google.com>
+Cc: Yuanchu Xie <yuanchu@google.com>
+Cc: Wei Xu <weixugc@google.com>
+Cc: linux-mm@kvack.org
+Cc: linux-kernel@vger.kernel.org
+Assisted-by: Claude:claude-opus-4.6
+Signed-off-by: Matthew Brost <matthew.brost@intel.com>
+Reviewed-by: Thomas Hellström <thomas.hellstrom@linux.intel.com>
+---
+ drivers/gpu/drm/xe/xe_shrinker.c | 20 +++++++++++++++++---
+ 1 file changed, 17 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/gpu/drm/xe/xe_shrinker.c b/drivers/gpu/drm/xe/xe_shrinker.c
+index 83374cd57660..198149f266c6 100644
+--- a/drivers/gpu/drm/xe/xe_shrinker.c
++++ b/drivers/gpu/drm/xe/xe_shrinker.c
+@@ -139,10 +139,17 @@ static unsigned long
+ xe_shrinker_count(struct shrinker *shrink, struct shrink_control *sc)
+ {
+ 	struct xe_shrinker *shrinker = to_xe_shrinker(shrink);
+-	unsigned long num_pages;
++	unsigned long num_pages = 0;
+ 	bool can_backup = !!(sc->gfp_mask & __GFP_FS);
+ 
+-	num_pages = ttm_backup_bytes_avail() >> PAGE_SHIFT;
++	/*
++	 * Skip accounting backup-able pages when this is an opportunistic
++	 * high-order pass: TTM backup work shrinks at native page granularity
++	 * and is unlikely to produce the contiguous block the caller wants,
++	 * so don't advertise it as reclaimable for this hint.
++	 */
++	if (!sc->opportunistic_compaction)
++		num_pages = ttm_backup_bytes_avail() >> PAGE_SHIFT;
+ 	read_lock(&shrinker->lock);
+ 
+ 	if (can_backup)
+@@ -233,7 +240,14 @@ static unsigned long xe_shrinker_scan(struct shrinker *shrink, struct shrink_con
+ 	}
+ 
+ 	sc->nr_scanned = nr_scanned;
+-	if (nr_scanned >= nr_to_scan || !can_backup)
++	/*
++	 * Stop after the purge pass for opportunistic high-order reclaim:
++	 * the subsequent backup/writeback pass works at native page order
++	 * and is unlikely to free a contiguous high-order block, so doing
++	 * it here would just churn working sets for no compaction benefit.
++	 */
++	if (nr_scanned >= nr_to_scan || !can_backup ||
++	    sc->opportunistic_compaction)
+ 		goto out;
+ 
+ 	/* If we didn't wake before, try to do it now if needed. */
+-- 
+2.34.1
+
