@@ -842,7 +842,8 @@ bin/repo release --package my-package
 - Packages whose `arch=()` lacks `aarch64` are skipped, not failed
 - For a manual native CI build, trigger **Build aarch64 Packages** from the Actions
   tab. Choose `edge`, `rc`, or `stable` and optionally name the packages to build,
-  including any required recipes from this repository. The workflow uploads an
+  including any required recipes from this repository. Package channel policy
+  still applies. The workflow uploads an
   unsigned artifact; signing and publishing happen on the repository host.
 
 ### Building for Both Architectures
