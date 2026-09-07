@@ -76,6 +76,7 @@ mediaprobe_rs=$(tar -xOzf "$tarball" "$expected_root/src/backend/mediaprobe.rs")
 metareq_rs=$(tar -xOzf "$tarball" "$expected_root/src/backend/metareq.rs")
 sharelink_qml=$(tar -xOzf "$tarball" "$expected_root/ui/ShareLink.qml")
 copyfile_rs=$(tar -xOzf "$tarball" "$expected_root/src/backend/copyfile.rs")
+regfile_rs=$(tar -xOzf "$tarball" "$expected_root/src/backend/regfile.rs" 2>/dev/null || true)
 
 if ! grep -Fq 'a.push("--".to_string());' <<<"$archive_rs" ||
   ! grep -Fq 'let input = std::fs::canonicalize(input)' <<<"$archiveops_rs" ||
@@ -84,7 +85,9 @@ if ! grep -Fq 'a.push("--".to_string());' <<<"$archive_rs" ||
   ! grep -Fq 'if !sandbox::available()' <<<"$mediaprobe_rs" ||
   ! grep -Fq 'if !sandbox::available()' <<<"$metareq_rs" ||
   ! grep -Fq 'copyToClipboard.command = ["wl-copy", url]' <<<"$sharelink_qml" ||
-  ! grep -Fq '.custom_flags(O_NOFOLLOW)' <<<"$copyfile_rs"; then
+  ! { grep -Fq '.custom_flags(O_NOFOLLOW)' <<<"$copyfile_rs" ||
+      { grep -Fq 'open_if_regular(src, O_NOFOLLOW)' <<<"$copyfile_rs" &&
+        grep -Fq 'custom_flags(O_NONBLOCK | extra_flags)' <<<"$regfile_rs"; }; }; then
   printf 'Release %s does not contain every required upstream security fix\n' "$best_tag" >&2
   exit 1
 fi
