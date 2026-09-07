@@ -5,6 +5,10 @@
 
 # Setup directories
 ARCH=${ARCH:-x86_64}
+# ARCH selects the repository target for this script, but make and Kbuild also
+# interpret an exported ARCH themselves (Linux calls this target "arm64").
+# Keep the shell variable local to the orchestrator so PKGBUILDs see CARCH only.
+export -n ARCH
 MIRROR=${MIRROR:-edge}
 DRY_RUN=${DRY_RUN:-false}
 PKGBUILDS_DIR=${PKGBUILDS_DIR:-/pkgbuilds}
@@ -12,8 +16,36 @@ BUILD_OUTPUT_DIR=${BUILD_OUTPUT_DIR:-/build-output/$MIRROR/$ARCH}
 FINAL_OUTPUT_DIR=${FINAL_OUTPUT_DIR:-/pkgs.omarchy.org/$MIRROR/$ARCH}
 HELPERS_DIR=${HELPERS_DIR:-/helpers}
 SRC_DIR=${SRC_DIR:-/src}
+# Set by bin/build from OMARCHY_DEFER_RUNTIME_DEPS after it has checked the
+# request; re-checked here so the container never trusts a stray value.
+DEFER_RUNTIME_DEPS=${DEFER_RUNTIME_DEPS:-false}
 
 source "$HELPERS_DIR/package-metadata.sh"
+
+if [[ $DEFER_RUNTIME_DEPS != "false" && $DEFER_RUNTIME_DEPS != "true" ]]; then
+  echo "DEFER_RUNTIME_DEPS must be true or false" >&2
+  exit 1
+fi
+if [[ $DEFER_RUNTIME_DEPS == "true" ]]; then
+  deferred_runtime=0
+  deferred_settings=0
+  deferred_count=0
+  for package in $PACKAGES; do
+    ((deferred_count += 1))
+    case $package in
+      omarchy|omarchy-dev) deferred_runtime=1 ;;
+      omarchy-settings|omarchy-settings-dev) deferred_settings=1 ;;
+      *)
+        echo "Runtime dependency deferral only applies to the omarchy pair, not $package" >&2
+        exit 1
+        ;;
+    esac
+  done
+  if (( deferred_runtime != 1 || deferred_settings != 1 || deferred_count != 2 )); then
+    echo "Runtime dependency deferral requires exactly the omarchy pair" >&2
+    exit 1
+  fi
+fi
 
 if [[ "$DRY_RUN" != true ]]; then
   # Import GPG keys
@@ -32,14 +64,11 @@ if [[ "$DRY_RUN" != true ]]; then
   # Configure Omarchy repositories for dependency resolution
   echo "==> Configuring Omarchy repositories for dependency resolution..."
 
-  # Always add omarchy-build repo (for incremental builds)
-  # Packages in build-output are unsigned, so use SigLevel = Never
-  sudo tee -a /etc/pacman.conf > /dev/null <<EOF
-
-[omarchy-build]
-SigLevel = Never
-Server = file://$BUILD_OUTPUT_DIR
-EOF
+  # Always add omarchy-build repo first (for incremental builds). Repository
+  # order is pacman's priority order, so this must precede the official repos;
+  # otherwise pacman can select an older official package with the same name.
+  # Packages in build-output are unsigned, so use SigLevel = Never.
+  sudo sed -i "/^\[core\]$/i [omarchy-build]\nSigLevel = Never\nServer = file://$BUILD_OUTPUT_DIR\n" /etc/pacman.conf
   echo "  -> omarchy-build (priority 1): $BUILD_OUTPUT_DIR"
 
   # Initialize empty build database if it doesn't exist
@@ -48,23 +77,21 @@ EOF
     # Create an empty database
     repo-add omarchy-build.db.tar.zst >/dev/null 2>&1
     ln -sf omarchy-build.db.tar.zst omarchy-build.db
-  else
-    # Database exists, check if we need to rebuild it from packages
-    if ls *.pkg.tar.* 2>/dev/null | grep -v '\.sig$' | grep -v 'omarchy-build\.db' | grep -q .; then
-      echo "==> Rebuilding build database from existing packages..."
-      ls *.pkg.tar.* | grep -v '\.sig$' | grep -v 'omarchy-build\.db' | xargs -r repo-add omarchy-build.db.tar.zst >/dev/null 2>&1
-      ln -sf omarchy-build.db.tar.zst omarchy-build.db
-    fi
+  fi
+  # Fold any packages already in the workspace into the database, whether
+  # they came with an existing database or were dropped in by an earlier
+  # workflow job (OMARCHY_KEEP_BUILD_WORKSPACE). Without this a seeded
+  # workspace with no database would leave those packages invisible to
+  # dependency resolution.
+  if ls *.pkg.tar.* 2>/dev/null | grep -v '\.sig$' | grep -v 'omarchy-build\.db' | grep -q .; then
+    echo "==> Rebuilding build database from existing packages..."
+    ls *.pkg.tar.* | grep -v '\.sig$' | grep -v 'omarchy-build\.db' | xargs -r repo-add omarchy-build.db.tar.zst >/dev/null 2>&1
+    ln -sf omarchy-build.db.tar.zst omarchy-build.db
   fi
 
   # Add omarchy repo if it has a database (stable packages)
   if [[ -f "$FINAL_OUTPUT_DIR/omarchy.db.tar.zst" ]] || [[ -f "$FINAL_OUTPUT_DIR/omarchy.db" ]]; then
-    sudo tee -a /etc/pacman.conf > /dev/null <<EOF
-
-[omarchy]
-SigLevel = Optional TrustAll
-Server = file://$FINAL_OUTPUT_DIR
-EOF
+    sudo sed -i "/^\[core\]$/i [omarchy]\nSigLevel = Optional TrustAll\nServer = file://$FINAL_OUTPUT_DIR\n" /etc/pacman.conf
     echo "  -> omarchy (priority 2): $FINAL_OUTPUT_DIR"
   fi
 
@@ -155,26 +182,9 @@ get_local_version() {
 # Returns 0 (success) if should build, 1 if should skip
 should_build_for_arch() {
   local pkg="$1"
-  local current_arch="$ARCH"
-  local pkgdir=$(find_package_dir "$pkg")
-  local pkgbuild="$pkgdir/PKGBUILD"
-
-  [[ ! -f "$pkgbuild" ]] && return 1
-
-  # Check PKGBUILD arch=() array
-  local pkgbuild_archs=$(cd "$pkgdir" && bash -c 'source PKGBUILD 2>/dev/null; echo "${arch[@]}"')
-
-  # If arch=('any'), build for all architectures
-  if [[ "$pkgbuild_archs" == "any" ]]; then
-    return 0
-  fi
-
-  # Check if current arch is in PKGBUILD arch=()
-  if echo "$pkgbuild_archs" | grep -qw "$current_arch"; then
-    return 0  # Build
-  else
-    return 1  # Skip
-  fi
+  local pkgdir
+  pkgdir=$(find_package_dir "$pkg")
+  [[ -n "$pkgdir" ]] && package_supports_arch "$pkgdir" "$ARCH"
 }
 
 # For VCS packages, makepkg recalculates pkgver() before the build. If the
@@ -221,6 +231,31 @@ refresh_vcs_pkgver_preserving_local_pkgrel() {
 
   if [[ -n "$refreshed_pkgver" && "$refreshed_pkgver" != "$original_pkgver" ]]; then
     echo "    Refreshed VCS version: $original_pkgver -> $refreshed_pkgver"
+  fi
+}
+
+# With runtime dependency checks deferred, makepkg runs --nodeps, so the
+# build-time dependencies it would normally install with -s have to be
+# installed explicitly: makedepends and checkdepends, including the
+# architecture-suffixed variants for the current CARCH.
+install_deferred_build_dependencies() {
+  local pkg="$1"
+  local -a build_deps=()
+
+  mapfile -t build_deps < <(
+    CARCH="$ARCH" bash -c '
+      source PKGBUILD
+      arch_makedepends="makedepends_${CARCH}[@]"
+      arch_checkdepends="checkdepends_${CARCH}[@]"
+      printf "%s\n" \
+        "${makedepends[@]}" "${!arch_makedepends}" \
+        "${checkdepends[@]}" "${!arch_checkdepends}"
+    ' | awk 'NF && !seen[$0]++'
+  )
+
+  if (( ${#build_deps[@]} )); then
+    echo "    Installing build-only dependencies for $pkg..."
+    sudo pacman -S --needed --noconfirm -- "${build_deps[@]}"
   fi
 }
 
@@ -280,21 +315,64 @@ build_package() {
   # Build package without signing (signing is done separately)
   # PACMAN override uses a wrapper that adds --ask 4 to auto-resolve conflicts
   # (e.g. rustup replacing rust) since --noconfirm defaults to 'N' on those prompts
-  MAKEPKG_FLAGS="-scf --noconfirm"
+  local -a makepkg_flags=(-scf --noconfirm)
+  if [[ $DEFER_RUNTIME_DEPS == "true" ]]; then
+    # The pair's runtime dependencies (each other, and packages other jobs
+    # of the same pipeline build) are not resolvable here; the assembled set
+    # is installed in one verified transaction downstream. Only the
+    # build-time dependencies are installed, then makepkg skips the check.
+    install_deferred_build_dependencies "$pkg" || {
+      FAILED_PACKAGES="$FAILED_PACKAGES $pkg"
+      return 1
+    }
+    makepkg_flags=(-cf --noconfirm --nodeps)
+  fi
 
-  if PACMAN=/usr/local/bin/pacman-for-makepkg makepkg $MAKEPKG_FLAGS; then
+  if PACMAN=/usr/local/bin/pacman-for-makepkg makepkg "${makepkg_flags[@]}"; then
     # Ensure output directory exists
     mkdir -p "$BUILD_OUTPUT_DIR"
-    
-    for pkg_file in *.pkg.tar.*; do
-      [[ -f "$pkg_file" ]] && cp "$pkg_file" "$BUILD_OUTPUT_DIR/"
+
+    # Copy only the artifacts makepkg declares as outputs. A PKGBUILD may use
+    # another pacman package as a source (schist-bin does); a *.pkg.tar.* glob
+    # would mistake that source archive for one of our freshly built packages.
+    local -a package_files=()
+    mapfile -t package_files < <(makepkg --packagelist)
+
+    if [[ ${#package_files[@]} -eq 0 ]]; then
+      echo "    Makepkg produced no package files for $pkg"
+      FAILED_PACKAGES="$FAILED_PACKAGES $pkg"
+      return 1
+    fi
+
+    local dependency_pkg_file=""
+    local -a new_pkgs=()
+    local pkg_path pkg_file
+    for pkg_path in "${package_files[@]}"; do
+      pkg_file=${pkg_path##*/}
+      if [[ ! -f "$pkg_file" ]]; then
+        # makepkg predicts an automatic -debug output whenever debug is
+        # enabled, but data-only packages may contain no symbols and therefore
+        # legitimately produce no debug archive.
+        if [[ "$pkg_file" == *-debug-*.pkg.tar.* ]]; then
+          continue
+        fi
+
+        echo "    Expected package file was not produced: $pkg_file"
+        FAILED_PACKAGES="$FAILED_PACKAGES $pkg"
+        return 1
+      fi
+
+      cp "$pkg_file" "$BUILD_OUTPUT_DIR/"
+      new_pkgs+=("$pkg_file")
+
+      if [[ "$(bsdtar -xOf "$pkg_file" .PKGINFO 2>/dev/null | sed -n 's/^pkgname = //p')" == "$pkg" ]]; then
+        dependency_pkg_file="$BUILD_OUTPUT_DIR/$pkg_file"
+      fi
     done
 
     cd "$BUILD_OUTPUT_DIR"
 
-    # Find ALL package files (handles split packages)
-    local new_pkgs=($(ls -t ${pkg}-*.pkg.tar.* 2>/dev/null | grep -v '\.sig$' | grep -v 'omarchy-build\.db'))
-
+    # Add every output from this build, including split packages.
     if [[ ${#new_pkgs[@]} -gt 0 ]]; then
       repo-add omarchy-build.db.tar.zst "${new_pkgs[@]}" >/dev/null 2>&1
       ln -sf omarchy-build.db.tar.zst omarchy-build.db
@@ -302,6 +380,24 @@ build_package() {
     fi
 
     cd /src/$pkg
+
+    # A lower-priority official repository may contain an older package with
+    # the same name. Install the exact artifact we just built before building
+    # its consumers, so pacman cannot select that older provider instead.
+    if [[ "${INSTALL_PACKAGES[$pkg]:-}" == "1" ]]; then
+      if [[ -z "$dependency_pkg_file" ]]; then
+        echo "    Could not find the built $pkg package to install as a dependency"
+        FAILED_PACKAGES="$FAILED_PACKAGES $pkg"
+        return 1
+      fi
+
+      echo "    Installing freshly built $pkg for dependent packages..."
+      if ! sudo /usr/local/bin/pacman-for-makepkg -U --needed --noconfirm "$dependency_pkg_file"; then
+        echo "    Failed to install freshly built dependency $pkg"
+        FAILED_PACKAGES="$FAILED_PACKAGES $pkg"
+        return 1
+      fi
+    fi
 
     echo "    Successfully built $pkg"
     SUCCESSFUL_PACKAGES="$SUCCESSFUL_PACKAGES $pkg"
@@ -421,7 +517,7 @@ check_needs_build() {
 
 # Collect packages that should be built for the selected mirror
 collect_packages() {
-  packages_for_unscoped_build "$MIRROR"
+  packages_for_unscoped_build "$MIRROR" "$ARCH"
 }
 
 # Main execution
@@ -473,13 +569,6 @@ if [[ -n "$PACKAGES" ]]; then
 else
   # Build all packages that need updates from the relevant directories
   while IFS= read -r pkg; do
-    # Check if package should be built for this architecture
-    if ! should_build_for_arch "$pkg"; then
-      echo "  - $pkg - not built for $ARCH"
-      SKIPPED_PACKAGES="$SKIPPED_PACKAGES $pkg"
-      continue
-    fi
-
     if check_needs_build "$pkg"; then
       PACKAGES_TO_BUILD+=("$pkg")
     else

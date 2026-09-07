@@ -13,6 +13,27 @@ print_header "Omarchy Package Builder"
 
 DRY_RUN=false
 
+# Knobs for builds driven from CI or resumed by hand. Each defaults to the
+# historical behaviour, so an unadorned `bin/build` is unchanged.
+#
+#   OMARCHY_KEEP_BUILD_WORKSPACE=1  keep build-output/$MIRROR/$ARCH instead of
+#                                   wiping it, so packages built by an earlier
+#                                   job (or a previous, interrupted run) seed
+#                                   the build database and resolve as
+#                                   dependencies of what builds now.
+#   OMARCHY_SKIP_BUILDER_IMAGE=1    use the omarchy-pkg-builder image already
+#                                   present instead of building it; a workflow
+#                                   that builds the image once with an external
+#                                   BuildKit cache can then fan out over many
+#                                   package jobs without each one rebuilding it.
+#   OMARCHY_DEFER_RUNTIME_DEPS=true build the omarchy/omarchy-settings pair
+#                                   with --nodeps (see build/build.sh); only
+#                                   for a pipeline that verifies the install
+#                                   transaction afterwards.
+KEEP_BUILD_WORKSPACE=${OMARCHY_KEEP_BUILD_WORKSPACE:-0}
+SKIP_BUILDER_IMAGE=${OMARCHY_SKIP_BUILDER_IMAGE:-0}
+DEFER_RUNTIME_DEPS=${OMARCHY_DEFER_RUNTIME_DEPS:-false}
+
 # Parse command line arguments
 while [[ $# -gt 0 ]]; do
   case $1 in
@@ -23,8 +44,8 @@ while [[ $# -gt 0 ]]; do
     ;;
   --mirror)
     MIRROR="$2"
-    if [[ "$MIRROR" != "edge" && "$MIRROR" != "stable" ]]; then
-      print_error "Invalid mirror: $MIRROR (must be 'edge' or 'stable')"
+    if ! validate_mirror "$MIRROR"; then
+      print_error "Invalid mirror: $MIRROR (must be one of: $VALID_MIRRORS)"
       exit 1
     fi
     update_arch_paths
@@ -48,7 +69,7 @@ while [[ $# -gt 0 ]]; do
     echo ""
     echo "Options:"
     echo "  --arch <arch>        Target architecture (x86_64 or aarch64, default: x86_64)"
-    echo "  --mirror <mirror>    Mirror to use (edge or stable, default: edge)"
+    echo "  --mirror <mirror>    Mirror to use (edge, rc, or stable, default: edge)"
     echo "  --package <names>    Build only the specified package(s) (space-separated)"
     echo "  --dry-run           Show what would build without running makepkg"
     echo "  -h, --help           Show this help message"
@@ -67,6 +88,11 @@ while [[ $# -gt 0 ]]; do
     echo "  $0 --package yay"
     echo "  $0 --package yay elephant cursor-bin"
     echo ""
+    echo "Environment (for CI and resumed builds; defaults keep today's behaviour):"
+    echo "  OMARCHY_KEEP_BUILD_WORKSPACE=1   keep build-output and reuse packages already there"
+    echo "  OMARCHY_SKIP_BUILDER_IMAGE=1     use the existing builder image instead of building it"
+    echo "  OMARCHY_DEFER_RUNTIME_DEPS=true  build the omarchy pair with --nodeps (transaction verified later)"
+    echo ""
     exit 0
     ;;
   *)
@@ -76,18 +102,55 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+require_valid_arch "$ARCH"
+
+if [[ $DEFER_RUNTIME_DEPS != "false" && $DEFER_RUNTIME_DEPS != "true" ]]; then
+  print_error "OMARCHY_DEFER_RUNTIME_DEPS must be true or false"
+  exit 1
+fi
+
+# Deferring runtime dependencies is only sound for the omarchy pair, and only
+# when both halves are built together: the pair depends on each other and on
+# packages that a sharded pipeline builds in other jobs, and the consumer of
+# this mode installs the assembled set in one verified transaction. Check the
+# request here so a misuse fails before Docker starts.
+if [[ $DEFER_RUNTIME_DEPS == "true" ]]; then
+  deferred_runtime=0
+  deferred_settings=0
+  deferred_count=0
+  for package in $PACKAGES; do
+    ((deferred_count += 1))
+    case $package in
+      omarchy|omarchy-dev) deferred_runtime=1 ;;
+      omarchy-settings|omarchy-settings-dev) deferred_settings=1 ;;
+      *)
+        print_error "OMARCHY_DEFER_RUNTIME_DEPS only applies to the omarchy/omarchy-settings pair, not $package"
+        exit 1
+        ;;
+    esac
+  done
+  if (( deferred_runtime != 1 || deferred_settings != 1 || deferred_count != 2 )); then
+    print_error "OMARCHY_DEFER_RUNTIME_DEPS requires --package with exactly the omarchy pair"
+    exit 1
+  fi
+fi
+
 # Show target architecture and mirror after parsing args
 print_info "Target architecture: $ARCH"
 print_info "Mirror: $MIRROR"
 print_info "Build workspace: $BUILD_OUTPUT_DIR"
 print_info "Final output: $REPO_DIR"
+if [[ $DEFER_RUNTIME_DEPS == "true" ]]; then
+  print_info "Runtime dependency checks: deferred to the install transaction"
+fi
 
 if [[ "$DRY_RUN" == true ]]; then
-  print_warning "DRY RUN MODE - build plan only; no Docker or makepkg will run"
+  print_warning "DRY RUN MODE - build plan only; no container or makepkg will run"
   ARCH="$ARCH" \
     MIRROR="$MIRROR" \
     PACKAGES="$PACKAGES" \
     DRY_RUN=true \
+    DEFER_RUNTIME_DEPS="$DEFER_RUNTIME_DEPS" \
     PKGBUILDS_DIR="$PKGBUILDS_DIR" \
     BUILD_OUTPUT_DIR="$BUILD_OUTPUT_DIR" \
     FINAL_OUTPUT_DIR="$REPO_DIR" \
@@ -100,21 +163,45 @@ fi
 # Create directories if they don't exist
 mkdir -p "$BUILD_OUTPUT_DIR" "$REPO_DIR" "$SRC_DIR"
 
-# Check Docker is available
-check_docker
+# Check the selected container engine is available
+check_engine
 
-# Setup QEMU for aarch64 builds on x86_64 hosts
-if [[ "$(uname -m)" == "x86_64" && "$ARCH" == "aarch64" ]]; then
-  # Check if QEMU is already working
-  if ! docker run --rm --platform linux/arm64 alpine:3.21 /bin/true >/dev/null 2>&1; then
-    print_info "Setting up QEMU for ARM64 emulation..."
-    setup_qemu
+# A foreign target architecture runs under QEMU user emulation. Probe by
+# actually running a container for the target platform: that is the only
+# test that covers both "binfmt not registered" and "registered but broken".
+HOST_ARCH=$(uname -m)
+[[ "$HOST_ARCH" == "arm64" ]] && HOST_ARCH=aarch64
+if [[ "$HOST_ARCH" != "$ARCH" ]]; then
+  PROBE_IMAGE="alpine:3.21"
+  [[ "$CONTAINER_ENGINE" == "podman" ]] && PROBE_IMAGE="docker.io/library/alpine:3.21"
+
+  # Rootless Podman cannot repair host binfmt state itself. Validate the flags
+  # before the basic probe, because an F-only registration can start an ARM
+  # container but silently breaks sudo inside it.
+  if [[ "$CONTAINER_ENGINE" == "podman" ]]; then
+    setup_qemu "$ARCH"
+  fi
+
+  if ! "$CONTAINER_ENGINE" run "${CONTAINER_RUN_ARGS[@]}" --rm "$(get_platform_arg "$ARCH")" "$PROBE_IMAGE" /bin/true >/dev/null 2>&1; then
+    if [[ "$CONTAINER_ENGINE" == "podman" ]]; then
+      print_error "QEMU $ARCH is registered, but the container probe failed"
+      print_info "Refresh the registration with: sudo systemctl restart systemd-binfmt"
+      exit 1
+    else
+      print_info "Setting up QEMU for $ARCH emulation on this $HOST_ARCH host..."
+      setup_qemu "$ARCH"
+    fi
   fi
 fi
 
-# Clean build-output directory to start fresh
-print_info "Cleaning build workspace..."
-rm -rf "$BUILD_OUTPUT_DIR"/*
+# Clean build-output directory to start fresh, unless the caller seeded it
+# with packages from an earlier job or is resuming an interrupted run.
+if [[ $KEEP_BUILD_WORKSPACE == "1" ]]; then
+  print_info "Keeping existing build workspace..."
+else
+  print_info "Cleaning build workspace..."
+  rm -rf "${BUILD_OUTPUT_DIR:?}"/*
+fi
 mkdir -p "$BUILD_OUTPUT_DIR"
 
 # Show package info
@@ -124,8 +211,20 @@ else
   print_info "Building unscoped packages for $MIRROR mirror"
 fi
 
-# Build/update the Docker image
-build_docker_image "$BUILD_DIR" "$ARCH" "$MIRROR"
+# Build/update the Docker image, unless the caller prepared the exact image
+# already (a workflow building it once with an external BuildKit cache). A
+# missing image is an error rather than a silent rebuild: the point of the
+# flag is that every job runs the same bytes.
+IMAGE_TAG="omarchy-pkg-builder:latest-$ARCH-$MIRROR"
+if [[ $SKIP_BUILDER_IMAGE == "1" ]]; then
+  if ! "$CONTAINER_ENGINE" image inspect "$IMAGE_TAG" >/dev/null 2>&1; then
+    print_error "Prepared builder image is unavailable: $IMAGE_TAG"
+    exit 1
+  fi
+  print_info "Using prepared builder image: $IMAGE_TAG"
+else
+  build_docker_image "$BUILD_DIR" "$ARCH" "$MIRROR"
+fi
 
 print_info "Running package build..."
 
@@ -133,9 +232,12 @@ print_info "Running package build..."
 mkdir -p "$BUILD_OUTPUT_DIR"
 mkdir -p "$REPO_DIR"
 
-# Ensure output directories are writable by container user
-make_dir_writable "$BUILD_OUTPUT_DIR"
-make_dir_writable "$REPO_DIR"
+# Rootful Docker writes as the image uid, so retain its existing permission
+# workaround. Rootless Podman uses keep-id and must leave ownership/modes alone.
+if [[ "$CONTAINER_ENGINE" == "docker" ]]; then
+  make_dir_writable "$BUILD_OUTPUT_DIR"
+  make_dir_writable "$REPO_DIR"
+fi
 
 # Build Docker arguments
 DOCKER_ARGS=(
@@ -143,18 +245,25 @@ DOCKER_ARGS=(
   -e ARCH="$ARCH"
   -e MIRROR="$MIRROR"
   -e PACKAGES="$PACKAGES"
+  -e OMARCHY_RC_PINS="${OMARCHY_RC_PINS:-}"
+  -e DEFER_RUNTIME_DEPS="$DEFER_RUNTIME_DEPS"
   -v "$BUILD_ROOT/build-output:/build-output"
-  -v "$BUILD_ROOT/pkgs.omarchy.org:/pkgs.omarchy.org"
+  -v "$REPO_ROOT:/pkgs.omarchy.org"
   -v "$BUILD_DIR:/build:ro"
   -v "$BUILD_ROOT/helpers:/helpers:ro"
   -v "$BUILD_ROOT/pkgbuilds:/pkgbuilds:ro"
 )
 
+# Podman-created images can leave WORKDIR owned by a remapped uid. Mount the
+# existing host-user-owned workspace so the builder can write there.
+if [[ "$CONTAINER_ENGINE" == "podman" ]]; then
+  DOCKER_ARGS+=(-v "$SRC_DIR:/src")
+fi
+
 # Run the builder with assembled args
-IMAGE_TAG="omarchy-pkg-builder:latest-$ARCH-$MIRROR"
 PLATFORM_ARG=$(get_platform_arg "$ARCH")
 
-docker run $PLATFORM_ARG "${DOCKER_ARGS[@]}" "$IMAGE_TAG" /build/build.sh
+"$CONTAINER_ENGINE" run "${CONTAINER_RUN_ARGS[@]}" "$PLATFORM_ARG" "${DOCKER_ARGS[@]}" "$IMAGE_TAG" /build/build.sh
 
 BUILD_RESULT=$?
 

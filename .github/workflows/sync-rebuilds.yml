@@ -1,0 +1,102 @@
+name: Sync Rebuild Triggers
+
+on:
+  schedule:
+    # Every 6 hours, off the hour to dodge the scheduling backlog at :00
+    - cron: '40 */6 * * *'
+  workflow_dispatch:
+    inputs:
+      packages:
+        description: 'Specific packages to update (space-separated, leave empty for all)'
+        required: false
+        default: ''
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      # Runs in an Arch container against the mirror the x86_64 builder itself
+      # uses, because the question being asked is what that builder will link
+      # against and a different mirror can be hours ahead of it. Recording a
+      # version the build never saw is the one failure this command must not
+      # have: nothing re-fires once the record matches.
+      - name: Bump pkgrel for packages whose dependencies moved
+        run: |
+          docker run --rm \
+            -e PACKAGES="$PACKAGES" \
+            -e HOST_UID="$(id -u)" \
+            -e HOST_GID="$(id -g)" \
+            -v "$PWD/bin:/workspace/bin:ro" \
+            -v "$PWD/helpers:/workspace/helpers:ro" \
+            -v "$PWD/pkgbuilds:/workspace/pkgbuilds" \
+            -w /workspace \
+            archlinux:base-devel bash -lc '
+              set -euo pipefail
+
+              printf "Server = https://mirror.omarchy.org/\$repo/os/\$arch\n" > /etc/pacman.d/mirrorlist
+              pacman -Syu --noconfirm jq
+
+              groupadd -g "$HOST_GID" runner
+              useradd -m -u "$HOST_UID" -g "$HOST_GID" runner
+              chown -R runner:runner /workspace/pkgbuilds
+
+              if [[ -n "${PACKAGES:-}" ]]; then
+                read -r -a package_args <<< "$PACKAGES"
+                runuser -u runner -- ./bin/sync-rebuilds "${package_args[@]}"
+              else
+                runuser -u runner -- ./bin/sync-rebuilds
+              fi
+            '
+        env:
+          PACKAGES: ${{ github.event.inputs.packages }}
+
+      - name: Check for changes
+        id: changes
+        run: |
+          if [ -z "$(git status --porcelain)" ]; then
+            echo "has_changes=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_changes=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create Pull Request
+        if: steps.changes.outputs.has_changes == 'true'
+        uses: peter-evans/create-pull-request@v7
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          commit-message: 'chore: rebuild against updated dependencies'
+          title: 'chore: rebuild against updated dependencies'
+          body: |
+            Automated pkgrel bump for packages that link against a dependency
+            which has moved in the official repositories.
+
+            Each package names those dependencies in `rebuild_on` and carries the
+            versions its current pkgrel was bumped for in `rebuilt_against`. The
+            bump is what makes the rebuilt package an upgrade pacman will offer;
+            without it the build produces the version already published and no
+            one receives it.
+          branch: auto/sync-rebuilds
+          delete-branch: true
+          labels: automated
+          reviewers: ryanrhughes
+
+      - name: Notify Basecamp on failure
+        if: failure() && env.BASECAMP_CHATBOT_URL != ''
+        env:
+          BASECAMP_CHATBOT_URL: ${{ secrets.BASECAMP_CHATBOT_URL }}
+        run: |
+          curl -s -o /dev/null \
+            -H "Content-Type: application/json" \
+            -d "$(jq -n --arg content \
+              "🔴 <strong>Rebuild trigger sync failed</strong><br><a href=\"${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\">View run</a>" \
+              '{content: $content}')" \
+            "$BASECAMP_CHATBOT_URL"

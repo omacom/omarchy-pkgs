@@ -1,6 +1,10 @@
 #!/bin/bash
 # Check PKGBUILD versions against published repo versions
-# Creates state files for edge and/or stable if any packages need building
+# Creates a state file per channel and architecture when packages need building
+#
+# Usage: check-versions [--pull] [--arch <arch>]
+#   --pull         pull the repository first (the scheduled run does this)
+#   --arch <arch>  check one architecture; default: every published one
 
 set -e
 
@@ -8,18 +12,53 @@ BUILD_ROOT=$(realpath "${BASH_SOURCE[0]%/*}/..")
 source "$BUILD_ROOT/helpers/message-helpers.sh"
 source "$BUILD_ROOT/helpers/paths.sh"
 source "$BUILD_ROOT/helpers/package-metadata.sh"
+source "$BUILD_ROOT/helpers/lock-helpers.sh"
 
-STATE_DIR="${OMARCHY_STATE_DIR:-/root/.state}"
-ARCH="${ARCH:-x86_64}"
+PULL=false
+ARCHES=""
+
+while [[ $# -gt 0 ]]; do
+  case $1 in
+  --pull)
+    PULL=true
+    shift
+    ;;
+  --arch)
+    require_valid_arch "$2"
+    ARCHES="$2"
+    shift 2
+    ;;
+  *)
+    print_error "Unknown option: $1"
+    exit 1
+    ;;
+  esac
+done
+[[ -n "$ARCHES" ]] || ARCHES=$(published_arches)
 
 mkdir -p "$STATE_DIR"
 
+# Runs on a tight schedule, so it must never disturb a build in progress:
+# comparing versions reads the PKGBUILDs a running build is reading, and
+# --pull would swap them underneath it. Take the lock non-blocking and skip
+# the tick when a release owns it — the queue is unchanged, so the next tick
+# picks up exactly where this one left off.
+if ! try_release_lock; then
+  exit 0
+fi
+
 print_header "Package Version Check"
+
+# The scheduled run pulls; a manual run leaves the operator's tree alone.
+if [[ "$PULL" == true ]]; then
+  print_info "Updating repository..."
+  git -C "$BUILD_ROOT" pull --ff-only || print_warning "git pull failed — checking the current tree"
+fi
 
 get_repo_version() {
   local pkg="$1"
   local mirror="$2"
-  local repo_db="$BUILD_ROOT/pkgs.omarchy.org/$mirror/$ARCH/omarchy.db.tar.zst"
+  local repo_db="$REPO_ROOT/$mirror/$ARCH/omarchy.db.tar.zst"
 
   [[ -f "$repo_db" ]] || return 0
 
@@ -40,10 +79,26 @@ get_repo_version() {
   '
 }
 
+# The PKGBUILD's full version (epoch:pkgver-pkgrel) for the architecture being
+# checked. Prints nothing when pkgver or pkgrel cannot be read: a partial
+# version like "-" would compare unequal to everything published and queue a
+# rebuild on every tick, so an unreadable PKGBUILD must not queue at all.
 get_pkgbuild_version() {
   local pkgdir="$1"
-  if [[ -f "$pkgdir/PKGBUILD" ]]; then
-    (cd "$pkgdir" && bash -c 'source PKGBUILD 2>/dev/null; if [[ -n "$epoch" ]]; then echo "${epoch}:${pkgver}-${pkgrel}"; else echo "${pkgver}-${pkgrel}"; fi')
+  local epoch pkgver pkgrel
+
+  [[ -f "$pkgdir/PKGBUILD" ]] || return 1
+
+  epoch=$(package_pkgbuild_var "$pkgdir" epoch "$ARCH")
+  pkgver=$(package_pkgbuild_var "$pkgdir" pkgver "$ARCH")
+  pkgrel=$(package_pkgbuild_var "$pkgdir" pkgrel "$ARCH")
+
+  [[ -n "$pkgver" && -n "$pkgrel" ]] || return 1
+
+  if [[ -n "$epoch" ]]; then
+    echo "${epoch}:${pkgver}-${pkgrel}"
+  else
+    echo "${pkgver}-${pkgrel}"
   fi
 }
 
@@ -58,8 +113,8 @@ check_vcs_unchanged() {
 
   # If epoch or pkgrel changed in PKGBUILD, release even if upstream is unchanged.
   local pkgbuild_epoch pkgbuild_pkgrel
-  pkgbuild_epoch=$(cd "$pkgdir" && bash -c 'source PKGBUILD 2>/dev/null; echo "${epoch:-}"')
-  pkgbuild_pkgrel=$(cd "$pkgdir" && bash -c 'source PKGBUILD 2>/dev/null; echo "${pkgrel}"')
+  pkgbuild_epoch=$(package_pkgbuild_var "$pkgdir" epoch "$ARCH")
+  pkgbuild_pkgrel=$(package_pkgbuild_var "$pkgdir" pkgrel "$ARCH")
 
   local repo_pkgrel="${repo_version##*-}"
   local repo_no_pkgrel="${repo_version%-*}"
@@ -87,12 +142,11 @@ check_package() {
   local mirror="$3"
 
   local pkgbuild_version repo_version
-  pkgbuild_version=$(get_pkgbuild_version "$pkgdir")
-  repo_version=$(get_repo_version "$pkg" "$mirror")
-
-  if [[ -z "$pkgbuild_version" ]]; then
+  if ! pkgbuild_version=$(get_pkgbuild_version "$pkgdir") || [[ -z "$pkgbuild_version" ]]; then
+    print_warning "$pkg: could not read pkgver/pkgrel from its PKGBUILD for $ARCH — not queueing"
     return 1
   fi
+  repo_version=$(get_repo_version "$pkg" "$mirror")
 
   if grep -qE '^pkgver[[:space:]]*\(\)' "$pkgdir/PKGBUILD"; then
     if [[ -n "$repo_version" && -n "$(package_extract_vcs_hash_from_version "$repo_version")" ]]; then
@@ -112,16 +166,28 @@ check_package() {
     return 1
   fi
 
+  # Different is not the same as newer. A checkout behind the published state
+  # — a stale branch, an un-pulled host — otherwise queues a REBUILD OF AN
+  # OLDER VERSION every cycle: the builder produces it, and promotion refuses
+  # it because that exact filename is already published with different bytes.
+  # If the artifact for this version already exists in the channel, there is
+  # nothing to build regardless of which direction the versions differ.
+  if compgen -G "$REPO_ROOT/$mirror/$ARCH/${pkg}-${pkgbuild_version}-*.pkg.tar."[!s]* >/dev/null 2>&1; then
+    print_warning "$pkg $pkgbuild_version is already published — this checkout is behind the channel; not queueing"
+    return 1
+  fi
+
   return 0
 }
 
 check_mirror() {
   local mirror="$1"
-  local state_file="$STATE_DIR/.sync-needed-$mirror"
+  local state_file
+  state_file=$(sync_queue_file "$mirror" "$ARCH")
   local needs_build=false
   local packages=()
 
-  print_info "Checking $mirror packages..."
+  print_info "Checking $mirror packages for $ARCH..."
 
   while IFS= read -r pkg; do
     local pkgdir="$PKGBUILDS_DIR/$pkg"
@@ -129,23 +195,32 @@ check_mirror() {
       needs_build=true
       packages+=("$pkg")
     fi
-  done < <(packages_for_unscoped_build "$mirror")
+  done < <(packages_for_unscoped_build "$mirror" "$ARCH")
 
   echo ""
 
   if [[ "$needs_build" == true ]]; then
-    touch "$state_file"
-    print_success "${mirror^} needs building (${#packages[@]} packages)"
+    # Record WHAT is queued, not just THAT something is: the release run reads
+    # this to name the packages in its start report, which is the difference
+    # between "a build is running" and "your package is in this build".
+    printf '%s\n' "${packages[@]}" >"$state_file"
+    print_success "${mirror^} ($ARCH) needs building (${#packages[@]} packages)"
     print_info "Packages: ${packages[*]}"
     print_info "State file created: $state_file"
   else
-    print_info "${mirror^} is up to date"
+    print_info "${mirror^} ($ARCH) is up to date"
   fi
 
   echo ""
 }
 
-check_mirror edge
-check_mirror stable
+# One pass per published architecture: the version comparison reads that
+# architecture's channel databases, and each queue is its own file.
+for ARCH in $ARCHES; do
+  update_arch_paths
+  check_mirror edge
+  check_mirror rc
+  check_mirror stable
+done
 
 print_success "Version check complete!"

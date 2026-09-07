@@ -39,13 +39,13 @@ RUN mkdir -p /etc/pacman.d && \
 RUN if [ "${TARGETARCH}" = "amd64" ]; then \
         if [ "${MIRROR}" = "stable" ]; then \
             printf 'Server = https://stable-mirror.omarchy.org/$repo/os/$arch\n' > /etc/pacman.d/mirrorlist; \
+        elif [ "${MIRROR}" = "rc" ]; then \
+            printf 'Server = https://rc-mirror.omarchy.org/$repo/os/$arch\n' > /etc/pacman.d/mirrorlist; \
         else \
             printf 'Server = https://mirror.omarchy.org/$repo/os/$arch\n' > /etc/pacman.d/mirrorlist; \
         fi; \
     else \
-        curl -L "https://raw.githubusercontent.com/archlinuxarm/PKGBUILDs/master/core/pacman-mirrorlist/mirrorlist" 2>/dev/null | \
-            sed -E 's/^\s*#\s*Server\s*=/Server =/g' > /etc/pacman.d/mirrorlist && \
-        sed -i 's/\$arch/aarch64/g' /etc/pacman.d/mirrorlist; \
+        printf 'Server = https://fl.us.mirror.archlinuxarm.org/aarch64/$repo\n' > /etc/pacman.d/mirrorlist; \
     fi
 
 # Bootstrap keyrings (required before pacstrap can verify packages)
@@ -104,10 +104,18 @@ RUN ln -sf /usr/lib/os-release /etc/os-release && \
     fi
 
 # Setup Omarchy keyring manually before adding repo (avoids keyserver trust issues)
-# Note: Repository is removed at the end since build scripts add it dynamically
+# Note: Repository is removed at the end since build scripts add it dynamically.
+# The keyring comes from this image's own channel (the bare /$arch path is a
+# stale legacy layout). It is always taken from the x86_64 tree, whatever the
+# image's own architecture: omarchy-keyring is an arch=any package, and the
+# x86_64 tree is the one that exists before a new architecture has published
+# anything. Bootstrapping from the target's own tree would make the first
+# aarch64 build depend on an aarch64 repository that only that build can
+# create.
+ARG MIRROR=edge
 RUN pacman-key --recv-keys 40DFB630FF42BCFFB047046CF0134EE680CAC571 --keyserver keys.openpgp.org && \
     pacman-key --lsign-key 40DFB630FF42BCFFB047046CF0134EE680CAC571 && \
-    printf '\n[omarchy]\nSigLevel = Optional\nServer = https://pkgs.omarchy.org/$arch\n' >> /etc/pacman.conf && \
+    printf '\n[omarchy]\nSigLevel = Optional\nServer = https://pkgs.omarchy.org/%s/x86_64\n' "${MIRROR}" >> /etc/pacman.conf && \
     pacman -Sy --noconfirm && \
     pacman -S --noconfirm omarchy-keyring && \
     pacman-key --populate omarchy && \
@@ -132,8 +140,13 @@ RUN useradd -m -G wheel -s /bin/bash builder && \
     chmod 700 /home/builder/.gnupg && \
     chown -R builder:builder /home/builder
 
+# Arch Linux ARM's makepkg.conf still defaults PKGEXT to .pkg.tar.xz; every
+# tool downstream of the build (sign.sh, push-build, sync-rebuilds, the
+# notifier) expects .pkg.tar.zst, so an aarch64 package would build and then
+# be skipped at signing. Pin the extension so both architectures match.
 RUN sed -i 's/^#MAKEFLAGS=.*/MAKEFLAGS="-j$(nproc)"/' /etc/makepkg.conf && \
-    sed -i 's/^COMPRESSZST=.*/COMPRESSZST=(zstd -c -z -q --threads=0 -)/' /etc/makepkg.conf
+    sed -i 's/^COMPRESSZST=.*/COMPRESSZST=(zstd -c -z -q --threads=0 -)/' /etc/makepkg.conf && \
+    sed -i "s|^PKGEXT=.*|PKGEXT='.pkg.tar.zst'|" /etc/makepkg.conf
 
 # Pacman wrapper that auto-resolves package conflicts (e.g. rustup vs rust).
 # makepkg only passes --noconfirm to pacman, which defaults to 'N' on conflict

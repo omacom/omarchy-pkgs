@@ -1,0 +1,404 @@
+#!/bin/bash
+# Move packages forward through the channel pipeline: edge -> rc -> stable.
+#
+# Copies package artifacts AND their detached signatures from one channel to
+# the next, driven by the source channel's database (not the raw directory, so
+# historical files never leak forward), then cleans, rebuilds, and syncs the
+# destination. Published filenames are never overwritten: a same-name file
+# that already exists at the destination is skipped (and reported when its
+# bytes differ), because the R2 cache cannot recover from a rewrite.
+
+set -e
+
+BUILD_ROOT=$(realpath "${BASH_SOURCE[0]%/*}/..")
+source "$BUILD_ROOT/helpers/message-helpers.sh"
+source "$BUILD_ROOT/helpers/paths.sh"
+source "$BUILD_ROOT/helpers/lock-helpers.sh"
+source "$BUILD_ROOT/helpers/package-metadata.sh"
+source "$BUILD_ROOT/helpers/basecamp-notifier.sh"
+
+FROM=""
+TO=""
+DRY_RUN=false
+SYNC_REMOTE=""
+SKIP_PROD_CHECK=false
+FAST_RING_ONLY=false
+BOOTSTRAP=false
+PACKAGES=""
+ALL_ARCHES=false
+
+# Kept for --arch all, which re-invokes this script per architecture with the
+# other arguments unchanged (minus the --arch all pair itself).
+ORIGINAL_ARGS=()
+arch_option=false
+for arg in "$@"; do
+  if [[ "$arch_option" == true ]]; then
+    [[ "$arg" != "all" ]] && ORIGINAL_ARGS+=("--arch" "$arg")
+    arch_option=false
+  elif [[ "$arg" == "--arch" ]]; then
+    arch_option=true
+  else
+    ORIGINAL_ARGS+=("$arg")
+  fi
+done
+
+usage() {
+  echo "Usage: $0 --from <channel> --to <channel> [OPTIONS]"
+  echo ""
+  echo "Directions:"
+  echo "  --from edge   --to rc       Open a release train: carry edge forward into rc"
+  echo "  --from rc     --to stable   Ship: promote the tested rc channel to stable"
+  echo "  --from stable --to rc       Only with --fast-ring (parity replication)"
+  echo "                              or --bootstrap (one-time initial seed)"
+  echo ""
+  echo "Options:"
+  echo "  --arch <arch>|all     Target architecture (x86_64 or aarch64, default: x86_64);"
+  echo "                        all = every published architecture, one after another"
+  echo "  --package <names...>  Advance only the named package(s)"
+  echo "  --fast-ring           Restrict to fast-ring packages (stable -> rc parity copy)"
+  echo "  --bootstrap           One-time stable -> rc seed before forward-only enforcement"
+  echo "  --dry-run             Preview without changing files"
+  echo "  --sync-remote <path>  Rclone remote for sync (default: pkgs.omarchy.org:omarchy-pkgs)"
+  echo "  --skip-prod-check     Skip production confirmation during sync"
+  echo "  -h, --help            Show this help message"
+  echo ""
+  echo "What it does:"
+  echo "  1) Read the source channel database for the current package set"
+  echo "  2) Copy eligible packages + .sig files not yet at the destination"
+  echo "  3) Clean the destination (keep 2 versions)"
+  echo "  4) Rebuild the destination database"
+  echo "  5) Sync the destination to the remote (packages first, database last)"
+  exit "${1:-0}"
+}
+
+while [[ $# -gt 0 ]]; do
+  case $1 in
+  --from)
+    FROM="$2"
+    shift 2
+    ;;
+  --to)
+    TO="$2"
+    shift 2
+    ;;
+  --arch)
+    if [[ "$2" == "all" ]]; then
+      ALL_ARCHES=true
+      ARCH=all
+    else
+      require_valid_arch "$2"
+      ARCH="$2"
+      update_arch_paths
+    fi
+    shift 2
+    ;;
+  --package)
+    shift
+    while [[ $# -gt 0 && ! "$1" =~ ^-- ]]; do
+      PACKAGES="$PACKAGES $1"
+      shift
+    done
+    PACKAGES="${PACKAGES# }"
+    if [[ -z "$PACKAGES" ]]; then
+      print_error "--package requires at least one package name"
+      exit 1
+    fi
+    ;;
+  --fast-ring)
+    FAST_RING_ONLY=true
+    shift
+    ;;
+  --bootstrap)
+    BOOTSTRAP=true
+    shift
+    ;;
+  --dry-run)
+    DRY_RUN=true
+    shift
+    ;;
+  --sync-remote)
+    SYNC_REMOTE="$2"
+    shift 2
+    ;;
+  --skip-prod-check)
+    SKIP_PROD_CHECK=true
+    shift
+    ;;
+  -h | --help)
+    usage 0
+    ;;
+  *)
+    print_error "Unknown option: $1"
+    usage 1
+    ;;
+  esac
+done
+
+require_valid_mirror "$FROM"
+require_valid_mirror "$TO"
+
+# The pipeline only moves forward. stable -> rc is allowed for exactly two
+# labeled purposes: fast-ring parity replication and the one-time bootstrap.
+# edge -> stable is the legacy migrate path, kept for the transition cycle.
+case "$FROM->$TO" in
+"edge->rc" | "rc->stable") ;;
+"edge->stable")
+  print_warning "edge -> stable is the legacy migrate path; new releases flow edge -> rc -> stable"
+  ;;
+"stable->rc")
+  if [[ "$FAST_RING_ONLY" != true && "$BOOTSTRAP" != true ]]; then
+    print_error "stable -> rc requires --fast-ring (parity replication) or --bootstrap (initial seed)"
+    exit 1
+  fi
+  ;;
+*)
+  print_error "Refusing $FROM -> $TO: packages only move forward (edge -> rc -> stable)"
+  exit 1
+  ;;
+esac
+
+if [[ "$ALL_ARCHES" == true ]]; then
+  # Hold one lock across the whole operation so a timer cannot mutate a
+  # channel between architectures. Check every source database before moving
+  # the first one; a failed sync can still require an idempotent retry, but a
+  # missing architecture never creates a knowingly partial advance.
+  if [[ "$DRY_RUN" != true ]]; then
+    acquire_release_lock || exit 1
+  fi
+
+  ARCHES=$(published_arches)
+  for arch in $ARCHES; do
+    source_db="$REPO_ROOT/$FROM/$arch/omarchy.db.tar.zst"
+    if [[ ! -f "$source_db" ]]; then
+      print_error "Source database not found: $source_db"
+      echo "Nothing has been published to the $FROM channel for $arch."
+      exit 1
+    fi
+  done
+
+  for arch in $ARCHES; do
+    "$0" --arch "$arch" "${ORIGINAL_ARGS[@]}" || exit $?
+  done
+  exit 0
+fi
+
+SOURCE_DIR="$REPO_ROOT/$FROM/$ARCH"
+TARGET_DIR="$REPO_ROOT/$TO/$ARCH"
+SOURCE_DB="$SOURCE_DIR/omarchy.db.tar.zst"
+
+print_header "Advance Channel: $FROM -> $TO"
+print_info "Architecture: $ARCH"
+print_info "Source: $SOURCE_DIR"
+print_info "Target: $TARGET_DIR"
+[[ "$FAST_RING_ONLY" == true ]] && print_info "Scope: fast-ring packages only"
+[[ "$BOOTSTRAP" == true ]] && print_info "Mode: bootstrap (initial rc seed)"
+[[ -n "$PACKAGES" ]] && print_info "Packages: $PACKAGES"
+
+if [[ ! -f "$SOURCE_DB" ]]; then
+  print_error "Source database not found: $SOURCE_DB"
+  echo "Nothing has been published to the $FROM channel on this host."
+  exit 1
+fi
+
+if [[ "$DRY_RUN" == true ]]; then
+  print_warning "DRY RUN MODE - No changes will be made"
+else
+  acquire_release_lock || exit 1
+fi
+
+# Manifest: "name<TAB>base<TAB>filename" per current package in the source db.
+# Each desc record begins with %FILENAME%, so that marker both closes the
+# previous record and opens the next.
+read_manifest() {
+  tar -xOf "$SOURCE_DB" --wildcards '*/desc' 2>/dev/null | awk '
+    function emit() {
+      if (name != "" && filename != "") printf "%s\t%s\t%s\n", name, base, filename
+      name = ""; base = ""; filename = ""
+    }
+    $0 == "%FILENAME%" { emit(); getline; filename = $0; next }
+    $0 == "%NAME%" { getline; name = $0; next }
+    $0 == "%BASE%" { getline; base = $0; next }
+    END { emit() }
+  '
+}
+
+package_wanted() {
+  local name="$1" base="$2"
+  [[ -z "$PACKAGES" ]] && return 0
+  local want
+  for want in $PACKAGES; do
+    [[ "$want" == "$name" || "$want" == "$base" ]] && return 0
+  done
+  return 1
+}
+
+# Split packages publish under their pkgname; eligibility metadata lives in
+# the pkgbase directory. Packages whose PKGBUILD has since been removed from
+# this repo default to moving: they are part of the source channel's set and
+# leaving them behind would hole the destination.
+package_eligible() {
+  local name="$1" base="$2"
+  local pkgdir
+
+  pkgdir=$(package_dir_for_name "$name" 2>/dev/null) ||
+    pkgdir=$(package_dir_for_name "$base" 2>/dev/null) || pkgdir=""
+
+  if [[ -z "$pkgdir" ]]; then
+    [[ "$FAST_RING_ONLY" == true ]] && return 1
+    return 0
+  fi
+
+  if [[ "$FAST_RING_ONLY" == true ]]; then
+    package_is_fast_ring "$pkgdir" || return 1
+  fi
+
+  # The bootstrap seeds an empty rc from stable, so parity is the whole point:
+  # membership in the destination is enough. Nothing is built in rc yet, so
+  # there is no native artifact to race — and the release pair MUST come along
+  # or rc cannot serve omarchy/omarchy-settings until the first RC is cut.
+  if [[ "$BOOTSTRAP" == true ]]; then
+    package_in_channel "$pkgdir" "$TO"
+    return
+  fi
+
+  package_moves_to_channel "$pkgdir" "$TO"
+}
+
+mkdir -p "$TARGET_DIR"
+
+COPIED=0
+COPIED_FILES=""
+PRESENT=0
+SKIPPED=0
+MISSING_FILES=()
+MISSING_SIGS=()
+DIFFERING=()
+
+while IFS=$'\t' read -r name base filename; do
+  package_wanted "$name" "$base" || continue
+  if ! package_eligible "$name" "$base"; then
+    SKIPPED=$((SKIPPED + 1))
+    continue
+  fi
+
+  src="$SOURCE_DIR/$filename"
+  sig="$src.sig"
+  dest="$TARGET_DIR/$filename"
+
+  if [[ ! -f "$src" ]]; then
+    MISSING_FILES+=("$filename")
+    continue
+  fi
+  if [[ ! -f "$sig" ]]; then
+    MISSING_SIGS+=("$filename")
+    continue
+  fi
+
+  if [[ -f "$dest" ]]; then
+    if cmp -s "$src" "$dest"; then
+      # A crash between the package and signature copies leaves an unsigned
+      # package behind; the bytes are identical, so the source signature is
+      # valid for it. Package + signature resume as one unit.
+      if [[ ! -f "$dest.sig" ]]; then
+        if [[ "$DRY_RUN" == true ]]; then
+          echo "  would restore missing signature: $filename.sig"
+        else
+          cp -p "$sig" "$dest.sig"
+          echo "  restored missing signature: $filename.sig"
+        fi
+      fi
+      PRESENT=$((PRESENT + 1))
+    else
+      DIFFERING+=("$filename")
+    fi
+    continue
+  fi
+
+  if [[ "$DRY_RUN" == true ]]; then
+    echo "  would copy: $filename (+ .sig)"
+  else
+    cp -p "$src" "$dest"
+    cp -p "$sig" "$dest.sig"
+    echo "  copied: $filename (+ .sig)"
+  fi
+  COPIED=$((COPIED + 1))
+  COPIED_FILES+="$filename"$'\n'
+done < <(read_manifest)
+
+echo ""
+print_info "Copied: $COPIED | Already present: $PRESENT | Not eligible: $SKIPPED"
+
+if [[ ${#MISSING_FILES[@]} -gt 0 ]]; then
+  print_error "${#MISSING_FILES[@]} package(s) named in the $FROM database are missing on disk:"
+  printf '  %s\n' "${MISSING_FILES[@]}"
+  echo "The $FROM channel is inconsistent; rebuild its database before advancing."
+  exit 1
+fi
+
+if [[ ${#MISSING_SIGS[@]} -gt 0 ]]; then
+  print_error "${#MISSING_SIGS[@]} package(s) have no detached signature in $FROM:"
+  printf '  %s\n' "${MISSING_SIGS[@]}"
+  echo "Signatures must travel with their packages. Backfill them by copying the"
+  echo "files into build-output/$FROM/$ARCH, running bin/repo sign --mirror $FROM,"
+  echo "and moving the .sig files back beside the packages — then re-run."
+  exit 1
+fi
+
+if [[ ${#DIFFERING[@]} -gt 0 ]]; then
+  print_error "${#DIFFERING[@]} file(s) already published in $TO with DIFFERENT bytes:"
+  printf '  %s\n' "${DIFFERING[@]}"
+  echo "Published filenames are never rewritten, and two artifacts fighting over"
+  echo "one name means something built twice from different inputs. Resolve it"
+  echo "deliberately: bump pkgrel and rebuild so the new artifact gets a new"
+  echo "filename, or remove the source copy if the destination is correct."
+  exit 1
+fi
+
+if [[ "$DRY_RUN" == true ]]; then
+  print_info "Dry run: skipping clean, database update, and sync"
+  exit 0
+fi
+
+print_info "Cleaning $TO repository..."
+"$BUILD_ROOT/bin/clean-repo" --mirror "$TO" --arch "$ARCH"
+
+print_info "Updating $TO repository database..."
+"$BUILD_ROOT/bin/update-repo" --mirror "$TO" --arch "$ARCH"
+
+echo ""
+print_info "Syncing $TO repository to remote..."
+SYNC_ARGS=("--mirror" "$TO" "--arch" "$ARCH")
+[[ -n "$SYNC_REMOTE" ]] && SYNC_ARGS+=("--remote" "$SYNC_REMOTE")
+[[ "$SKIP_PROD_CHECK" == true ]] && SYNC_ARGS+=("--skip-prod-check")
+"$BUILD_ROOT/bin/sync-repo" "${SYNC_ARGS[@]}" || {
+  print_error "Sync failed"
+  exit 1
+}
+
+print_success "Advance complete: $FROM -> $TO"
+
+# A promotion is how something reaches users, so say what moved and where.
+if ((COPIED > 0)); then
+  moved=""
+  shown=0
+  while IFS= read -r moved_file; do
+    [[ -z "$moved_file" ]] && continue
+    ((shown >= 25)) && break
+    moved+="<br>• $(package_file_label "$moved_file" | basecamp_html_escape)"
+    shown=$((shown + 1))
+  done <<<"$COPIED_FILES"
+  ((COPIED > shown)) && moved+="<br>• …and $((COPIED - shown)) more"
+
+  if [[ "$FAST_RING_ONLY" == true ]]; then
+    # Parity replication rides along with a stable release, which has already
+    # reported these exact packages. Repeating the list would double every
+    # fast-ring release in chat, so this is a one-liner.
+    notify_info "Kept $TO in parity: $COPIED fast-ring package(s) from $FROM" \
+      "Arch: $ARCH · the same artifacts just published to $FROM"
+  else
+    label="Promoted $FROM → $TO"
+    [[ "$BOOTSTRAP" == true ]] && label="Bootstrapped the $TO channel from $FROM"
+    notify_info "$label" \
+      "Arch: $ARCH · $(hostname -s 2>/dev/null || echo host)<br><strong>$COPIED package(s) moved:</strong>$moved<br><br>Live at https://pkgs.omarchy.org/$TO/$ARCH/"
+  fi
+fi
