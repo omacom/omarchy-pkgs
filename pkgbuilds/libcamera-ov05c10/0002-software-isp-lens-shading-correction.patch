@@ -1,0 +1,1112 @@
+diff --git c/include/libcamera/internal/software_isp/debayer_params.h i/include/libcamera/internal/software_isp/debayer_params.h
+index 6772b43..c3a334c 100644
+--- c/include/libcamera/internal/software_isp/debayer_params.h
++++ i/include/libcamera/internal/software_isp/debayer_params.h
+@@ -10,13 +10,55 @@
+ 
+ #pragma once
+ 
++#include <memory>
+ #include <stdint.h>
++#include <vector>
+ 
+ #include "libcamera/internal/matrix.h"
+ #include "libcamera/internal/vector.h"
+ 
+ namespace libcamera {
+ 
++/**
++ * \struct LensShadingTable
++ * \brief Per-channel lens shading correction gains over the output frame
++ *
++ * The three planes each hold \a width x \a height gains in row-major order,
++ * spanning the debayer INPUT frame: grid node (0, 0) sits on input pixel
++ * (0, 0) and node (width - 1, height - 1) on the last input pixel. Consumers
++ * interpolate bilinearly between nodes and map their own window into the
++ * input frame themselves.
++ *
++ * Spanning the input frame rather than the rendered window matters because the
++ * software ISP crops rather than scales: the rendered window is a centred crop
++ * of the input whose size is only known to the debayer. Anchoring the table to
++ * the input frame keeps it correct for every output size without the IPA
++ * having to know which one was negotiated.
++ *
++ * A gain of 1.0 leaves a channel unchanged. Gains multiply the black-level
++ * corrected signal, so they must be applied after black level subtraction and
++ * before the white balance gains.
++ *
++ * The table is produced by the IPA and shared with the debayer and the
++ * statistics engine through a shared_ptr, so that passing DebayerParams by
++ * value stays cheap and the table can be compared for identity to avoid
++ * redundant GPU uploads.
++ */
++struct LensShadingTable {
++	unsigned int width = 0;
++	unsigned int height = 0;
++	std::vector<float> r;
++	std::vector<float> g;
++	std::vector<float> b;
++
++	bool isValid() const
++	{
++		const size_t n = static_cast<size_t>(width) * height;
++		return width >= 2 && height >= 2 &&
++		       r.size() == n && g.size() == n && b.size() == n;
++	}
++};
++
+ struct DebayerParams {
+ 	Matrix<float, 3, 3> combinedMatrix = { { 1.0, 0.0, 0.0,
+ 						 0.0, 1.0, 0.0,
+@@ -25,6 +67,7 @@ struct DebayerParams {
+ 	float gamma = 1.0;
+ 	float contrastExp = 1.0;
+ 	RGB<float> gains = RGB<float>({ 1.0, 1.0, 1.0 });
++	std::shared_ptr<const LensShadingTable> lsc;
+ };
+ 
+ } /* namespace libcamera */
+diff --git c/src/ipa/simple/algorithms/lsc.cpp i/src/ipa/simple/algorithms/lsc.cpp
+new file mode 100644
+index 0000000..d5750f2
+--- /dev/null
++++ i/src/ipa/simple/algorithms/lsc.cpp
+@@ -0,0 +1,300 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++/*
++ * Copyright (C) 2026, Omarchy
++ *
++ * Lens shading correction
++ *
++ * Reads per-illuminant lens shading tables from the tuning file, interpolates
++ * them on the same correlated colour temperature that Ccm uses, maps them onto
++ * the frame currently being produced and publishes the result through
++ * DebayerParams::lsc.
++ *
++ * The gains multiply the black-level corrected signal and are applied before
++ * the white balance gains, which is where a shading correction belongs: the
++ * per-channel falloff is a property of the lens and colour filter array, not
++ * of the illuminant's white point.
++ *
++ * Tuning file format:
++ *
++ *   - Lsc:
++ *       luminanceStrength: 0.0
++ *       gridWidth: 33
++ *       gridHeight: 25
++ *       tables:
++ *         - ct: 2835
++ *           r: [ ... gridWidth * gridHeight floats ... ]
++ *           g: [ ... ]
++ *           b: [ ... ]
++ *
++ * The r, g and b planes hold the absolute correction gains measured by the
++ * sensor vendor, over the full sensor active area, in row-major order. A gain
++ * of 1.0 leaves a channel unchanged; the smallest gain is normally 1.0 at the
++ * optical centre.
++ *
++ * luminanceStrength selects how much of the luminance falloff to undo:
++ *
++ *   0.0  correct colour shading only. Green is left at unity everywhere and
++ *        red and blue are corrected relative to it. This removes the colour
++ *        cast towards the edges of the frame without amplifying corner noise
++ *        and without pushing the corners into clipping. It is the default
++ *        because this pipeline has no denoise stage.
++ *   1.0  apply the vendor tables as measured, undoing the vignetting as well.
++ *
++ * Values in between raise the luminance part of the correction to that power.
++ */
++
++#include "lsc.h"
++
++#include <algorithm>
++#include <cmath>
++
++#include <libcamera/base/log.h>
++
++#include "libcamera/internal/value_node.h"
++
++#include "simple/ipa_context.h"
++
++namespace {
++
++/* Rebuild the table only when the estimated CT moves by at least this much. */
++constexpr unsigned int kTemperatureThreshold = 100;
++
++} /* namespace */
++
++namespace libcamera {
++
++LOG_DEFINE_CATEGORY(IPASoftLsc)
++
++namespace ipa::soft::algorithms {
++
++int Lsc::init(IPAContext &context, const ValueNode &tuningData)
++{
++	luminanceStrength_ =
++		tuningData["luminanceStrength"].get<float>(0.0f);
++	luminanceStrength_ = std::clamp(luminanceStrength_, 0.0f, 1.0f);
++
++	width_ = tuningData["gridWidth"].get<uint32_t>(0);
++	height_ = tuningData["gridHeight"].get<uint32_t>(0);
++	if (width_ < 2 || height_ < 2) {
++		LOG(IPASoftLsc, Error)
++			<< "gridWidth and gridHeight must both be >= 2";
++		return -EINVAL;
++	}
++
++	const ValueNode &tables = tuningData["tables"];
++	if (tables.isEmpty() || !tables.isList()) {
++		LOG(IPASoftLsc, Error) << "'tables' must be a non-empty list";
++		return -EINVAL;
++	}
++
++	const size_t expected = static_cast<size_t>(width_) * height_;
++
++	for (const auto &entry : tables.asList()) {
++		unsigned int ct = entry["ct"].get<uint32_t>(0);
++		if (!ct) {
++			LOG(IPASoftLsc, Error) << "table without a 'ct' key";
++			return -EINVAL;
++		}
++
++		Table table;
++		table.r = entry["r"].get<std::vector<float>>().value_or(std::vector<float>{});
++		table.g = entry["g"].get<std::vector<float>>().value_or(std::vector<float>{});
++		table.b = entry["b"].get<std::vector<float>>().value_or(std::vector<float>{});
++
++		if (table.r.size() != expected || table.g.size() != expected ||
++		    table.b.size() != expected) {
++			LOG(IPASoftLsc, Error)
++				<< "table for ct " << ct << " has "
++				<< table.r.size() << "/" << table.g.size() << "/"
++				<< table.b.size() << " entries, expected "
++				<< expected << " each";
++			return -EINVAL;
++		}
++
++		/*
++		 * A zero or negative gain would divide the image by zero once
++		 * inverted by a downstream consumer, and cannot come from a
++		 * real measurement. Reject the file rather than clamp it,
++		 * because a table that fails this is not the table it claims.
++		 */
++		for (const auto *plane : { &table.r, &table.g, &table.b }) {
++			for (float v : *plane) {
++				if (!(v > 0.0f) || v > 64.0f) {
++					LOG(IPASoftLsc, Error)
++						<< "table for ct " << ct
++						<< " has an out of range gain " << v;
++					return -EINVAL;
++				}
++			}
++		}
++
++		tables_[ct] = std::move(table);
++	}
++
++	context.lscEnabled = true;
++
++	LOG(IPASoftLsc, Info)
++		<< "loaded " << tables_.size() << " lens shading table(s), "
++		<< width_ << "x" << height_
++		<< ", luminanceStrength " << luminanceStrength_;
++
++	return 0;
++}
++
++int Lsc::configure(IPAContext &context,
++		   [[maybe_unused]] const IPAConfigInfo &configInfo)
++{
++	const IPACameraSensorInfo &info = context.sensorInfo;
++
++	/*
++	 * The tables cover the sensor active area. The frame covers the
++	 * analogue crop of it, so map one onto the other.
++	 *
++	 * The debayer additionally trims a two pixel border off the frame
++	 * before it renders. That is not accounted for here: on this class of
++	 * sensor it shifts the sampling point of a table node by well under
++	 * a thousandth of the frame width, which is far below the accuracy of
++	 * the tables themselves.
++	 */
++	if (info.activeAreaSize.width && info.activeAreaSize.height &&
++	    info.analogCrop.width && info.analogCrop.height) {
++		cropX_ = static_cast<float>(info.analogCrop.x) / info.activeAreaSize.width;
++		cropY_ = static_cast<float>(info.analogCrop.y) / info.activeAreaSize.height;
++		cropW_ = static_cast<float>(info.analogCrop.width) / info.activeAreaSize.width;
++		cropH_ = static_cast<float>(info.analogCrop.height) / info.activeAreaSize.height;
++	} else {
++		cropX_ = cropY_ = 0.0f;
++		cropW_ = cropH_ = 1.0f;
++	}
++
++	/* Force a rebuild on the next prepare(). */
++	current_.reset();
++	lastCt_ = 0;
++
++	LOG(IPASoftLsc, Debug)
++		<< "crop within active area: " << cropX_ << "," << cropY_
++		<< " " << cropW_ << "x" << cropH_;
++
++	return 0;
++}
++
++bool Lsc::interpolate(unsigned int ct, Table &out) const
++{
++	if (tables_.empty())
++		return false;
++
++	auto hi = tables_.lower_bound(ct);
++
++	if (hi == tables_.begin()) {
++		out = hi->second;
++		return true;
++	}
++
++	if (hi == tables_.end()) {
++		out = std::prev(hi)->second;
++		return true;
++	}
++
++	auto lo = std::prev(hi);
++	const float span = static_cast<float>(hi->first - lo->first);
++	const float f = span > 0.0f ? (ct - lo->first) / span : 0.0f;
++
++	const size_t n = lo->second.r.size();
++	out.r.resize(n);
++	out.g.resize(n);
++	out.b.resize(n);
++	for (size_t i = 0; i < n; i++) {
++		out.r[i] = lo->second.r[i] + f * (hi->second.r[i] - lo->second.r[i]);
++		out.g[i] = lo->second.g[i] + f * (hi->second.g[i] - lo->second.g[i]);
++		out.b[i] = lo->second.b[i] + f * (hi->second.b[i] - lo->second.b[i]);
++	}
++
++	return true;
++}
++
++void Lsc::build(unsigned int ct)
++{
++	Table src;
++	if (!interpolate(ct, src))
++		return;
++
++	/*
++	 * Sample the active-area table over the crop that the frame covers.
++	 * The output keeps the same node count, so when the crop is the whole
++	 * active area every output node lands exactly on an input node and
++	 * this reduces to a copy.
++	 */
++	auto sample = [&](const std::vector<float> &plane, float u, float v) {
++		const float x = std::clamp(u, 0.0f, 1.0f) * (width_ - 1);
++		const float y = std::clamp(v, 0.0f, 1.0f) * (height_ - 1);
++		const unsigned int x0 = std::min<unsigned int>(x, width_ - 2);
++		const unsigned int y0 = std::min<unsigned int>(y, height_ - 2);
++		const float fx = x - x0;
++		const float fy = y - y0;
++		const float a = plane[y0 * width_ + x0];
++		const float b = plane[y0 * width_ + x0 + 1];
++		const float c = plane[(y0 + 1) * width_ + x0];
++		const float d = plane[(y0 + 1) * width_ + x0 + 1];
++		return (a * (1.0f - fx) + b * fx) * (1.0f - fy) +
++		       (c * (1.0f - fx) + d * fx) * fy;
++	};
++
++	auto table = std::make_shared<LensShadingTable>();
++	table->width = width_;
++	table->height = height_;
++	table->r.resize(static_cast<size_t>(width_) * height_);
++	table->g.resize(table->r.size());
++	table->b.resize(table->r.size());
++
++	const bool luminance = luminanceStrength_ > 0.0f;
++
++	for (unsigned int j = 0; j < height_; j++) {
++		const float v = cropY_ + cropH_ * j / (height_ - 1);
++		for (unsigned int i = 0; i < width_; i++) {
++			const float u = cropX_ + cropW_ * i / (width_ - 1);
++			const size_t o = j * width_ + i;
++
++			const float r = sample(src.r, u, v);
++			const float g = sample(src.g, u, v);
++			const float b = sample(src.b, u, v);
++
++			/*
++			 * Split the vendor gain into a luminance part, common
++			 * to all three channels, and a colour part relative to
++			 * green. Apply all of the colour part and as much of
++			 * the luminance part as luminanceStrength_ asks for.
++			 */
++			const float lum = luminance
++						  ? std::pow(g, luminanceStrength_)
++						  : 1.0f;
++
++			table->r[o] = (r / g) * lum;
++			table->g[o] = lum;
++			table->b[o] = (b / g) * lum;
++		}
++	}
++
++	current_ = std::move(table);
++}
++
++void Lsc::prepare(IPAContext &context,
++		  [[maybe_unused]] const uint32_t frame,
++		  [[maybe_unused]] IPAFrameContext &frameContext,
++		  DebayerParams *params)
++{
++	const unsigned int ct = context.activeState.awb.temperatureK;
++
++	if (!current_ ||
++	    (ct > lastCt_ ? ct - lastCt_ : lastCt_ - ct) >= kTemperatureThreshold) {
++		build(ct);
++		lastCt_ = ct;
++	}
++
++	params->lsc = current_;
++}
++
++REGISTER_IPA_ALGORITHM(Lsc, "Lsc")
++
++} /* namespace ipa::soft::algorithms */
++
++} /* namespace libcamera */
+diff --git c/src/ipa/simple/algorithms/lsc.h i/src/ipa/simple/algorithms/lsc.h
+new file mode 100644
+index 0000000..9595037
+--- /dev/null
++++ i/src/ipa/simple/algorithms/lsc.h
+@@ -0,0 +1,64 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++/*
++ * Copyright (C) 2026, Omarchy
++ *
++ * Lens shading correction
++ */
++
++#pragma once
++
++#include <map>
++#include <memory>
++#include <stdint.h>
++#include <vector>
++
++#include "libcamera/internal/software_isp/debayer_params.h"
++
++#include "algorithm.h"
++
++namespace libcamera {
++
++namespace ipa::soft::algorithms {
++
++class Lsc : public Algorithm
++{
++public:
++	Lsc() = default;
++	~Lsc() = default;
++
++	int init(IPAContext &context, const ValueNode &tuningData) override;
++	int configure(IPAContext &context, const IPAConfigInfo &configInfo) override;
++	void prepare(IPAContext &context,
++		     const uint32_t frame,
++		     IPAFrameContext &frameContext,
++		     DebayerParams *params) override;
++
++private:
++	/* One calibration table, as stored in the tuning file. */
++	struct Table {
++		std::vector<float> r;
++		std::vector<float> g;
++		std::vector<float> b;
++	};
++
++	bool interpolate(unsigned int ct, Table &out) const;
++	void build(unsigned int ct);
++
++	std::map<unsigned int, Table> tables_;
++	unsigned int width_ = 0;
++	unsigned int height_ = 0;
++	float luminanceStrength_ = 0.0f;
++
++	/* Crop of the sensor active area covered by the frame, normalised. */
++	float cropX_ = 0.0f;
++	float cropY_ = 0.0f;
++	float cropW_ = 1.0f;
++	float cropH_ = 1.0f;
++
++	std::shared_ptr<const LensShadingTable> current_;
++	unsigned int lastCt_ = 0;
++};
++
++} /* namespace ipa::soft::algorithms */
++
++} /* namespace libcamera */
+diff --git c/src/ipa/simple/algorithms/meson.build i/src/ipa/simple/algorithms/meson.build
+index 73c6372..c9f6e55 100644
+--- c/src/ipa/simple/algorithms/meson.build
++++ i/src/ipa/simple/algorithms/meson.build
+@@ -6,4 +6,5 @@ soft_simple_ipa_algorithms = files([
+     'agc.cpp',
+     'blc.cpp',
+     'ccm.cpp',
++    'lsc.cpp',
+ ])
+diff --git c/src/ipa/simple/ipa_context.h i/src/ipa/simple/ipa_context.h
+index 8ccfacb..eaed874 100644
+--- c/src/ipa/simple/ipa_context.h
++++ i/src/ipa/simple/ipa_context.h
+@@ -90,6 +90,7 @@ struct IPAContext {
+ 	FCQueue<IPAFrameContext> frameContexts;
+ 	ControlInfoMap::Map ctrlMap;
+ 	bool ccmEnabled = false;
++	bool lscEnabled = false;
+ };
+ 
+ } /* namespace ipa::soft */
+diff --git c/src/libcamera/shaders/bayer_unpacked.frag i/src/libcamera/shaders/bayer_unpacked.frag
+index 10c5e94..23502af 100644
+--- c/src/libcamera/shaders/bayer_unpacked.frag
++++ i/src/libcamera/shaders/bayer_unpacked.frag
+@@ -30,6 +30,28 @@ uniform vec3            blacklevel;
+ uniform float           gamma;
+ uniform float           contrastExp;
+ 
++/*
++ * Lens shading correction. The gains live in an 8 bit RGB texture, encoded
++ * per channel as a LOGARITHM of the gain relative to that channel's minimum:
++ *
++ *     texel = log2(gain / lsc_min) / lsc_log2ratio
++ *     gain  = lsc_min * exp2(texel * lsc_log2ratio)
++ *
++ * A linear encoding would spread the 256 steps evenly in absolute gain, which
++ * is wrong when the table spans 1.0 to 8.7: a step is then 0.03 of gain, worth
++ * 3% where the gain is near unity, and it shows as banding across the middle
++ * of the frame. In log space the step is a constant fraction of the gain, so
++ * the worst case relative error is half a step everywhere: 0.05% for a colour
++ * only table and 0.42% for a full strength one, both comfortably under the
++ * 2.6% the table's own resampling costs.
++ *
++ * lsc_min = 1 and lsc_log2ratio = 0 makes this a no-op.
++ */
++uniform sampler2D       tex_lsc;
++uniform vec3            lsc_min;
++uniform vec3            lsc_log2ratio;
++varying vec2            lscCoord;
++
+ float apply_contrast(float value)
+ {
+     // Apply simple S-curve
+@@ -135,6 +157,19 @@ void main(void) {
+      */
+     rgb = (rgb - blacklevel) / (1.0 - blacklevel);
+ 
++    /*
++     * Lens shading correction, on the black level corrected signal and before
++     * the white balance gains.
++     *
++     * Applying it to the demosaiced RGB rather than to each Bayer tap is
++     * exact, not an approximation: the demosaic is a fixed linear filter, so
++     * scaling every tap of a channel by one gain is identical to scaling that
++     * channel's output. The only error is that all taps share the gain
++     * sampled at the centre pixel rather than at their own position, which
++     * over the two pixel filter radius is far below the table's own accuracy.
++     */
++    rgb = rgb * (lsc_min * exp2(texture2D(tex_lsc, lscCoord).rgb * lsc_log2ratio));
++
+     /* Apply AWB gains, and saturate each channel at sensor range */
+     rgb = clamp(rgb * awb, vec3(0.0), vec3(1.0));
+ 
+diff --git c/src/libcamera/shaders/bayer_unpacked.vert i/src/libcamera/shaders/bayer_unpacked.vert
+index 423dde0..81b12a2 100644
+--- c/src/libcamera/shaders/bayer_unpacked.vert
++++ i/src/libcamera/shaders/bayer_unpacked.vert
+@@ -42,7 +42,14 @@ varying vec4            yCoord;
+ 
+ uniform float stride_factor;
+ 
++/*
++ * Texture coordinate for the lens shading table. Unlike center.xy this is not
++ * scaled by stride_factor: the table spans the image, not the padded stride.
++ */
++varying vec2 lscCoord;
++
+ void main(void) {
++    lscCoord = textureIn;
+     center.xy = vec2(textureIn.x * stride_factor, textureIn.y);
+     center.zw = textureIn * tex_size + tex_bayer_first_red;
+ 
+diff --git c/src/libcamera/software_isp/debayer_cpu.cpp i/src/libcamera/software_isp/debayer_cpu.cpp
+index 49382b4..be444a5 100644
+--- c/src/libcamera/software_isp/debayer_cpu.cpp
++++ i/src/libcamera/software_isp/debayer_cpu.cpp
+@@ -12,6 +12,8 @@
+ #include "debayer_cpu.h"
+ 
+ #include <algorithm>
++#include <array>
++#include <cmath>
+ #include <stdlib.h>
+ #include <sys/ioctl.h>
+ #include <utility>
+@@ -45,9 +47,10 @@ public:
+ 	void process(uint32_t frame, const uint8_t *src, uint8_t *dst);
+ 
+ private:
+-	void setupInputMemcpy(const uint8_t *linePointers[]);
++	void setupInputMemcpy(const uint8_t *linePointers[], unsigned int inputY);
+ 	void shiftLinePointers(const uint8_t *linePointers[], const uint8_t *src);
+-	void memcpyNextLine(const uint8_t *linePointers[]);
++	void memcpyNextLine(const uint8_t *linePointers[], unsigned int inputY);
++	void scaleLine(uint8_t *line, unsigned int inputY);
+ 	void process2(uint32_t frame, const uint8_t *src, uint8_t *dst);
+ 	void process4(uint32_t frame, const uint8_t *src, uint8_t *dst);
+ 
+@@ -109,6 +112,7 @@ DebayerCpu::DebayerCpu(std::unique_ptr<SwStatsCpu> stats, const CameraManager &c
+ 	const GlobalConfiguration &configuration = cm._d()->configuration();
+ 	bool enableInputMemcpy =
+ 		configuration.option<bool>({ "software_isp", "copy_input_buffer" }).value_or(true);
++	inputMemcpyEnabled_ = enableInputMemcpy;
+ 
+ 	unsigned int threadCount =
+ 		configuration.option<unsigned int>({ "software_isp", "threads" }).value_or(kDefaultThreads);
+@@ -592,6 +596,7 @@ int DebayerCpu::setDebayerFunctions(PixelFormat inputFormat,
+ 			SET_DEBAYER_METHODS(debayer12_BGBG_BGR888, debayer12_GRGR_BGR888)
+ 			break;
+ 		}
++		bayerOrder_ = bayerFormat.order;
+ 		setupStandardBayerOrder(bayerFormat.order);
+ 		return 0;
+ 	}
+@@ -703,6 +708,15 @@ int DebayerCpu::configure(const StreamConfiguration &inputCfg,
+ 	window_.width = outputCfg.size.width;
+ 	window_.height = outputCfg.size.height;
+ 
++	/*
++	 * The lens shading table spans the input frame, not the window, because
++	 * the window is a centred crop whose size the IPA does not know.
++	 */
++	lscInputWidth_ = inputCfg.size.width;
++	lscInputHeight_ = inputCfg.size.height;
++	lscTable_.reset();
++	lscValid_ = false;
++
+ 	/*
+ 	 * Set the stats window to the whole processed window. Its coordinates are
+ 	 * relative to the debayered area since debayering passes only the part of
+@@ -787,7 +801,91 @@ DebayerCpu::strideAndFrameSize(const PixelFormat &outputFormat, const Size &size
+ 	return std::make_tuple(stride, stride * size.height);
+ }
+ 
+-void DebayerCpuThread::setupInputMemcpy(const uint8_t *linePointers[])
++/**
++ * \brief Apply the lens shading gains to one copied input line
++ * \param[inout] line The copied line, including its left padding
++ * \param[in] inputY Row of this line within the debayer input frame
++ *
++ * The gains are bilinear over the table. The vertical interpolation is done
++ * once per line into a small scratch row, so the per pixel cost is one
++ * horizontal lerp plus the scale itself.
++ *
++ * The gains multiply the black level corrected signal, hence the subtract and
++ * add around the multiply. Working in Q12 fixed point keeps the whole line in
++ * integer arithmetic, which is what lets the compiler vectorise it.
++ *
++ * This runs on the same buffers the statistics engine reads, so correcting
++ * here corrects the statistics as well. That is deliberate: it is what stops
++ * the shading from biasing the grey world white balance estimate.
++ */
++void DebayerCpuThread::scaleLine(uint8_t *line, unsigned int inputY)
++{
++	if (!debayer_->lscValid_)
++		return;
++
++	const LensShadingTable &t = *debayer_->lscTable_;
++	const unsigned int shift = DebayerCpu::kLscFractionalBits;
++	const unsigned int one = 1U << shift;
++	const int black = debayer_->lscBlack_;
++	const unsigned int width = debayer_->window_.width;
++	const unsigned int xOffset = debayer_->window_.x;
++
++	/* Vertical position within the table. */
++	const unsigned int hIn = debayer_->lscInputHeight_;
++	float fy = hIn > 1
++			   ? static_cast<float>(inputY) * (t.height - 1) / (hIn - 1)
++			   : 0.0f;
++	fy = std::clamp(fy, 0.0f, static_cast<float>(t.height - 1));
++	unsigned int gy = std::min<unsigned int>(fy, t.height - 2);
++	const float wy = fy - gy;
++
++	/*
++	 * Blend the two bracketing table rows into a scratch row, once per
++	 * line, for each of the two Bayer channels present on this input row.
++	 */
++	const unsigned int rowParity = inputY & 1;
++	std::array<float, 2 * DebayerCpu::kMaxLscWidth> row;
++	const std::vector<float> *planes[2] = {
++		debayer_->lscPlane_[rowParity][0],
++		debayer_->lscPlane_[rowParity][1],
++	};
++
++	for (unsigned int q = 0; q < 2; q++) {
++		const std::vector<float> &pl = *planes[q];
++		for (unsigned int i = 0; i < t.width; i++) {
++			const float a = pl[gy * t.width + i];
++			const float b = pl[(gy + 1) * t.width + i];
++			row[q * DebayerCpu::kMaxLscWidth + i] = a + wy * (b - a);
++		}
++	}
++
++	uint8_t *p8 = line + lineBufferPadding_;
++	uint16_t *p16 = reinterpret_cast<uint16_t *>(p8);
++	const float xScale = (t.width - 1) / static_cast<float>(debayer_->lscInputWidth_ - 1);
++	const unsigned int maxValue = (1U << debayer_->inputConfig_.bpp) - 1;
++
++	for (unsigned int x = 0; x < width; x++) {
++		const float fx = std::clamp((xOffset + x) * xScale, 0.0f,
++					    static_cast<float>(t.width - 1));
++		const unsigned int gx = std::min<unsigned int>(fx, t.width - 2);
++		const float wx = fx - gx;
++		const float *r = &row[(x & 1) * DebayerCpu::kMaxLscWidth];
++		const float g = r[gx] + wx * (r[gx + 1] - r[gx]);
++		const int gain = static_cast<int>(g * one + 0.5f);
++		if (static_cast<unsigned int>(gain) == one)
++			continue;
++
++		int v = debayer_->inputConfig_.bpp == 8 ? p8[x] : p16[x];
++		v = black + (((v - black) * gain) >> shift);
++		v = std::clamp<int>(v, 0, maxValue);
++		if (debayer_->inputConfig_.bpp == 8)
++			p8[x] = static_cast<uint8_t>(v);
++		else
++			p16[x] = static_cast<uint16_t>(v);
++	}
++}
++
++void DebayerCpuThread::setupInputMemcpy(const uint8_t *linePointers[], unsigned int inputY)
+ {
+ 	const unsigned int patternHeight = debayer_->inputConfig_.patternSize.height;
+ 
+@@ -798,6 +896,14 @@ void DebayerCpuThread::setupInputMemcpy(const uint8_t *linePointers[])
+ 		memcpy(lineBuffers_[i].data(),
+ 		       linePointers[i + 1] - lineBufferPadding_,
+ 		       lineBufferLength_);
++		/*
++		 * linePointers[1] is the line above linePointers[2], which is
++		 * the first line this thread renders. Clamped at the top of
++		 * the frame, where linePointers[1] is a copy of the line
++		 * below; using inputY for it is then exactly right anyway.
++		 */
++		scaleLine(lineBuffers_[i].data(),
++			  inputY + i + 1 - patternHeight);
+ 		linePointers[i + 1] = lineBuffers_[i].data() + lineBufferPadding_;
+ 	}
+ 
+@@ -816,7 +922,7 @@ void DebayerCpuThread::shiftLinePointers(const uint8_t *linePointers[], const ui
+ 		src + (patternHeight / 2) * (int)debayer_->inputConfig_.stride;
+ }
+ 
+-void DebayerCpuThread::memcpyNextLine(const uint8_t *linePointers[])
++void DebayerCpuThread::memcpyNextLine(const uint8_t *linePointers[], unsigned int inputY)
+ {
+ 	const unsigned int patternHeight = debayer_->inputConfig_.patternSize.height;
+ 
+@@ -826,6 +932,7 @@ void DebayerCpuThread::memcpyNextLine(const uint8_t *linePointers[])
+ 	memcpy(lineBuffers_[lineBufferIndex_].data(),
+ 	       linePointers[patternHeight] - lineBufferPadding_,
+ 	       lineBufferLength_);
++	scaleLine(lineBuffers_[lineBufferIndex_].data(), inputY);
+ 	linePointers[patternHeight] = lineBuffers_[lineBufferIndex_].data() + lineBufferPadding_;
+ 
+ 	lineBufferIndex_ = (lineBufferIndex_ + 1) % (patternHeight + 1);
+@@ -885,7 +992,7 @@ void DebayerCpuThread::process2(uint32_t frame, const uint8_t *src, uint8_t *dst
+ 		yEnd -= 2;
+ 	}
+ 
+-	setupInputMemcpy(linePointers);
++	setupInputMemcpy(linePointers, window.y + yStart_);
+ 
+ 	/*
+ 	 * Note y is the line-number *inside* the window, since stats_' window
+@@ -894,14 +1001,14 @@ void DebayerCpuThread::process2(uint32_t frame, const uint8_t *src, uint8_t *dst
+ 	 */
+ 	for (unsigned int y = yStart_; y < yEnd; y += 2) {
+ 		shiftLinePointers(linePointers, src);
+-		memcpyNextLine(linePointers);
++		memcpyNextLine(linePointers, window.y + y + 1);
+ 		debayer_->stats_->processLine0(frame, y, linePointers, threadIndex_);
+ 		debayer_->debayer0(dst, linePointers);
+ 		src += inputStride;
+ 		dst += outputStride;
+ 
+ 		shiftLinePointers(linePointers, src);
+-		memcpyNextLine(linePointers);
++		memcpyNextLine(linePointers, window.y + y + 2);
+ 		debayer_->debayer1(dst, linePointers);
+ 		src += inputStride;
+ 		dst += outputStride;
+@@ -909,7 +1016,7 @@ void DebayerCpuThread::process2(uint32_t frame, const uint8_t *src, uint8_t *dst
+ 
+ 	if (window.y == 0 && yEnd_ == window.height) {
+ 		shiftLinePointers(linePointers, src);
+-		memcpyNextLine(linePointers);
++		memcpyNextLine(linePointers, window.y + yEnd + 1);
+ 		debayer_->stats_->processLine0(frame, yEnd, linePointers, threadIndex_);
+ 		debayer_->debayer0(dst, linePointers);
+ 		src += inputStride;
+@@ -941,7 +1048,7 @@ void DebayerCpuThread::process4(uint32_t frame, const uint8_t *src, uint8_t *dst
+ 	linePointers[3] = src;
+ 	linePointers[4] = src + inputStride;
+ 
+-	setupInputMemcpy(linePointers);
++	setupInputMemcpy(linePointers, debayer_->window_.y + yStart_);
+ 
+ 	/*
+ 	 * Note y is the line-number *inside* the window, since stats_' window
+@@ -950,27 +1057,27 @@ void DebayerCpuThread::process4(uint32_t frame, const uint8_t *src, uint8_t *dst
+ 	 */
+ 	for (unsigned int y = yStart_; y < yEnd_; y += 4) {
+ 		shiftLinePointers(linePointers, src);
+-		memcpyNextLine(linePointers);
++		memcpyNextLine(linePointers, debayer_->window_.y + y);
+ 		debayer_->stats_->processLine0(frame, y, linePointers, threadIndex_);
+ 		debayer_->debayer0(dst, linePointers);
+ 		src += inputStride;
+ 		dst += outputStride;
+ 
+ 		shiftLinePointers(linePointers, src);
+-		memcpyNextLine(linePointers);
++		memcpyNextLine(linePointers, debayer_->window_.y + y);
+ 		debayer_->debayer1(dst, linePointers);
+ 		src += inputStride;
+ 		dst += outputStride;
+ 
+ 		shiftLinePointers(linePointers, src);
+-		memcpyNextLine(linePointers);
++		memcpyNextLine(linePointers, debayer_->window_.y + y);
+ 		debayer_->stats_->processLine2(frame, y, linePointers, threadIndex_);
+ 		debayer_->debayer2(dst, linePointers);
+ 		src += inputStride;
+ 		dst += outputStride;
+ 
+ 		shiftLinePointers(linePointers, src);
+-		memcpyNextLine(linePointers);
++		memcpyNextLine(linePointers, debayer_->window_.y + y);
+ 		debayer_->debayer3(dst, linePointers);
+ 		src += inputStride;
+ 		dst += outputStride;
+@@ -995,6 +1102,98 @@ void DebayerCpu::updateGammaTable(const DebayerParams &params)
+ 	}
+ }
+ 
++/**
++ * \brief Prepare the lens shading state for the frame about to be rendered
++ * \param[in] params The debayer parameters published by the IPA
++ *
++ * Resolves which table plane each of the four Bayer sites reads from, and
++ * latches the black level in raw units. Everything else is done per line in
++ * DebayerCpuThread::scaleLine().
++ *
++ * The correction is skipped, with one warning, for CSI-2 packed inputs and for
++ * 4x4 Bayer patterns. Packed data cannot be scaled in place without unpacking
++ * it first, and a 4x4 pattern needs a sixteen way site mapping that no sensor
++ * this correction targets uses.
++ */
++void DebayerCpu::updateLsc(const DebayerParams &params)
++{
++	const int black = std::lround(params.blackLevel.g() *
++				      ((1 << inputConfig_.bpp) - 1));
++
++	if (params.lsc == lscTable_ && black == lscBlack_)
++		return;
++
++	lscTable_ = params.lsc;
++	lscBlack_ = black;
++	lscValid_ = false;
++
++	if (!lscTable_ || !lscTable_->isValid())
++		return;
++
++	/*
++	 * The correction is applied while each input line is copied into the
++	 * thread's line buffer, so that the statistics engine, which reads the
++	 * same buffers, sees corrected data too. With the copy turned off there
++	 * is nowhere to apply it that would not write to the caller's buffer.
++	 */
++	if (!inputMemcpyEnabled_) {
++		LOG(Debayer, Warning)
++			<< "lens shading not applied: software_isp.copy_input_buffer "
++			<< "is disabled";
++		return;
++	}
++
++	if (lscTable_->width > kMaxLscWidth) {
++		LOG(Debayer, Warning)
++			<< "lens shading table too wide (" << lscTable_->width
++			<< " > " << kMaxLscWidth << "), not applied";
++		return;
++	}
++
++	if (inputConfig_.patternSize.width != 2 ||
++	    inputConfig_.patternSize.height != 2 ||
++	    (inputConfig_.bpp != 8 && inputConfig_.bpp != 16)) {
++		LOG(Debayer, Warning)
++			<< "lens shading not applied: input format is packed or "
++			<< "does not use a 2x2 Bayer pattern";
++		return;
++	}
++
++	/*
++	 * Map each of the four Bayer sites of the 2x2 pattern onto the table
++	 * plane it must use. window_.x and window_.y are aligned to the
++	 * pattern size by configure(), so the parity of a window coordinate is
++	 * the parity of the matching input frame coordinate.
++	 */
++	const std::vector<float> *r = &lscTable_->r;
++	const std::vector<float> *g = &lscTable_->g;
++	const std::vector<float> *b = &lscTable_->b;
++
++	switch (bayerOrder_) {
++	case BayerFormat::BGGR:
++		lscPlane_[0][0] = b; lscPlane_[0][1] = g;
++		lscPlane_[1][0] = g; lscPlane_[1][1] = r;
++		break;
++	case BayerFormat::GBRG:
++		lscPlane_[0][0] = g; lscPlane_[0][1] = b;
++		lscPlane_[1][0] = r; lscPlane_[1][1] = g;
++		break;
++	case BayerFormat::GRBG:
++		lscPlane_[0][0] = g; lscPlane_[0][1] = r;
++		lscPlane_[1][0] = b; lscPlane_[1][1] = g;
++		break;
++	case BayerFormat::RGGB:
++		lscPlane_[0][0] = r; lscPlane_[0][1] = g;
++		lscPlane_[1][0] = g; lscPlane_[1][1] = b;
++		break;
++	default:
++		LOG(Debayer, Warning) << "lens shading not applied: unknown Bayer order";
++		return;
++	}
++
++	lscValid_ = true;
++}
++
+ void DebayerCpu::updateLookupTables(const DebayerParams &params)
+ {
+ 	const bool gammaUpdateNeeded =
+@@ -1074,6 +1273,7 @@ void DebayerCpu::process(uint32_t frame, FrameBuffer *input, FrameBuffer *output
+ 	dmaSyncBegin(dmaSyncers, input, output);
+ 
+ 	updateLookupTables(params);
++	updateLsc(params);
+ 
+ 	/* Copy metadata from the input buffer */
+ 	FrameMetadata &metadata = output->_d()->metadata();
+diff --git c/src/libcamera/software_isp/debayer_cpu.h i/src/libcamera/software_isp/debayer_cpu.h
+index 5281c65..5546618 100644
+--- c/src/libcamera/software_isp/debayer_cpu.h
++++ i/src/libcamera/software_isp/debayer_cpu.h
+@@ -128,6 +128,7 @@ private:
+ 				bool ccmEnabled);
+ 	void updateGammaTable(const DebayerParams &params);
+ 	void updateLookupTables(const DebayerParams &params);
++	void updateLsc(const DebayerParams &params);
+ 
+ 	static constexpr unsigned int kRGBLookupSize = 256;
+ 	static constexpr unsigned int kGammaLookupSize = 1024;
+@@ -149,11 +150,29 @@ private:
+ 	bool ccmEnabled_;
+ 	DebayerParams params_;
+ 
++	/*
++	 * Lens shading gains, resampled to one entry per input pixel column for
++	 * each of the two Bayer channels found on an even and an odd input row.
++	 * Q12 fixed point, 4096 == unity. Rebuilt whenever the IPA publishes a
++	 * new table; see updateLsc().
++	 */
++	static constexpr unsigned int kLscFractionalBits = 12;
++	static constexpr unsigned int kMaxLscWidth = 256;
++	std::shared_ptr<const LensShadingTable> lscTable_;
++	/* [row parity][column parity] -> the table plane that Bayer site uses */
++	const std::vector<float> *lscPlane_[2][2] = {};
++	unsigned int lscInputWidth_ = 0;
++	unsigned int lscInputHeight_ = 0;
++	int lscBlack_ = 0;
++	bool lscValid_ = false;
++	bool inputMemcpyEnabled_ = true;
++
+ 	debayerFn debayer0_;
+ 	debayerFn debayer1_;
+ 	debayerFn debayer2_;
+ 	debayerFn debayer3_;
+ 	Rectangle window_;
++	BayerFormat::Order bayerOrder_ = BayerFormat::BGGR;
+ 	std::unique_ptr<SwStatsCpu> stats_;
+ 	unsigned int xShift_; /* Offset of 0/1 applied to window_.x */
+ 
+diff --git c/src/libcamera/software_isp/debayer_egl.cpp i/src/libcamera/software_isp/debayer_egl.cpp
+index 02651fe..960098e 100644
+--- c/src/libcamera/software_isp/debayer_egl.cpp
++++ i/src/libcamera/software_isp/debayer_egl.cpp
+@@ -10,6 +10,7 @@
+ #include "debayer_egl.h"
+ 
+ #include <algorithm>
++#include <cmath>
+ #include <assert.h>
+ #include <memory>
+ #include <stdlib.h>
+@@ -121,6 +122,9 @@ int DebayerEGL::getShaderVariableLocations(void)
+ 	blackLevelUniformDataIn_ = glGetUniformLocation(programId_, "blacklevel");
+ 	gammaUniformDataIn_ = glGetUniformLocation(programId_, "gamma");
+ 	contrastExpUniformDataIn_ = glGetUniformLocation(programId_, "contrastExp");
++	lscUniformSampler_ = glGetUniformLocation(programId_, "tex_lsc");
++	lscUniformMin_ = glGetUniformLocation(programId_, "lsc_min");
++	lscUniformLog2Ratio_ = glGetUniformLocation(programId_, "lsc_log2ratio");
+ 
+ 	textureUniformStep_ = glGetUniformLocation(programId_, "tex_step");
+ 	textureUniformSize_ = glGetUniformLocation(programId_, "tex_size");
+@@ -391,6 +395,98 @@ uint32_t DebayerEGL::preferredInputStride(const PixelFormat &inputFormat, const
+ 	return info.stride(size.width, 0, 256);
+ }
+ 
++/**
++ * \brief Upload the lens shading table as a texture, when it changes
++ * \param[in] params The debayer parameters published by the IPA
++ *
++ * Each channel is encoded as log2(gain / min) / log2(max / min) in an 8 bit
++ * RGB texture, with min and log2(max / min) carried in the lsc_min and
++ * lsc_log2ratio uniforms. See bayer_unpacked.frag for why the encoding is
++ * logarithmic rather than linear: a linear encoding of a table spanning 1.0
++ * to 8.7 quantises to 3% of the gain near the centre of the frame and bands
++ * visibly. Log encoding makes the error a constant fraction of the gain,
++ * 0.05% for a colour only table and 0.42% for a full strength one.
++ *
++ * The table is compared by shared_ptr identity, so a table that has not
++ * changed costs nothing. The IPA only rebuilds it when the estimated colour
++ * temperature moves, so in practice this uploads a handful of times per
++ * session.
++ *
++ * GL_LINEAR filtering does the bilinear interpolation between table nodes in
++ * hardware, which is why the correction is essentially free on this path.
++ */
++void DebayerEGL::updateLscTexture(const DebayerParams &params)
++{
++	if (params.lsc == lscUploaded_)
++		return;
++
++	lscUploaded_ = params.lsc;
++
++	/*
++	 * Only the unpacked Bayer shader carries the correction. The CSI-2
++	 * packed shader unpacks two pixels out of a texel and has no spare
++	 * varying to address the table with, and DebayerCpu skips packed input
++	 * for the matching reason, so both back ends decline the same formats.
++	 * Say so once rather than silently doing nothing.
++	 */
++	if (lscUploaded_ && lscUniformSampler_ < 0) {
++		static bool warned = false;
++		if (!warned) {
++			LOG(Debayer, Warning)
++				<< "lens shading table ignored: the packed Bayer "
++				<< "shader does not implement the correction";
++			warned = true;
++		}
++		return;
++	}
++
++	if (!lscUploaded_ || !lscUploaded_->isValid()) {
++		/* Identity: gain = 1 * exp2(texel * 0) = 1. */
++		for (unsigned int c = 0; c < 3; c++) {
++			lscMin_[c] = 1.0f;
++			lscLog2Ratio_[c] = 0.0f;
++		}
++		return;
++	}
++
++	const LensShadingTable &t = *lscUploaded_;
++	const std::vector<float> *planes[3] = { &t.r, &t.g, &t.b };
++	const size_t n = static_cast<size_t>(t.width) * t.height;
++
++	std::vector<uint8_t> texels(n * 3);
++	for (unsigned int c = 0; c < 3; c++) {
++		const auto [lo, hi] = std::minmax_element(planes[c]->begin(),
++							  planes[c]->end());
++		lscMin_[c] = *lo;
++		lscLog2Ratio_[c] = std::log2(*hi / *lo);
++		const float scale = lscLog2Ratio_[c] > 0.0f
++					    ? 255.0f / lscLog2Ratio_[c]
++					    : 0.0f;
++		for (size_t i = 0; i < n; i++) {
++			const float v =
++				std::log2((*planes[c])[i] / lscMin_[c]) * scale;
++			texels[i * 3 + c] =
++				static_cast<uint8_t>(std::clamp(v + 0.5f, 0.0f, 255.0f));
++		}
++	}
++
++	if (!lscTexture_)
++		glGenTextures(1, &lscTexture_);
++
++	glActiveTexture(GL_TEXTURE0 + kLscTextureUnitId);
++	glBindTexture(GL_TEXTURE_2D, lscTexture_);
++	glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, t.width, t.height, 0, GL_RGB,
++		     GL_UNSIGNED_BYTE, texels.data());
++	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
++	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
++	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
++	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
++
++	LOG(Debayer, Debug)
++		<< "uploaded " << t.width << "x" << t.height
++		<< " lens shading table";
++}
++
+ void DebayerEGL::setShaderVariableValues(eGLImage &eglImageIn, const DebayerParams &params)
+ {
+ 	/*
+@@ -449,6 +545,15 @@ void DebayerEGL::setShaderVariableValues(eGLImage &eglImageIn, const DebayerPara
+ 	 */
+ 	glUniform1i(textureUniformBayerDataIn_, eglImageIn.texture_unit_uniform_id_);
+ 
++	updateLscTexture(params);
++	if (lscTexture_) {
++		glActiveTexture(GL_TEXTURE0 + kLscTextureUnitId);
++		glBindTexture(GL_TEXTURE_2D, lscTexture_);
++	}
++	glUniform1i(lscUniformSampler_, kLscTextureUnitId);
++	glUniform3fv(lscUniformMin_, 1, lscMin_);
++	glUniform3fv(lscUniformLog2Ratio_, 1, lscLog2Ratio_);
++
+ 	/*
+ 	 * These values are:
+ 	 * firstRed = tex_bayer_first_red - bayer_8.vert
+diff --git c/src/libcamera/software_isp/debayer_egl.h i/src/libcamera/software_isp/debayer_egl.h
+index d6223f3..5958298 100644
+--- c/src/libcamera/software_isp/debayer_egl.h
++++ i/src/libcamera/software_isp/debayer_egl.h
+@@ -66,6 +66,7 @@ private:
+ 	static int getOutputConfig(PixelFormat outputFormat, DebayerOutputConfig &config);
+ 	int initBayerShaders(PixelFormat inputFormat, PixelFormat outputFormat);
+ 	int getShaderVariableLocations();
++	void updateLscTexture(const DebayerParams &params);
+ 	void setShaderVariableValues(eGLImage &eGLImageIn, const DebayerParams &params);
+ 	int debayerGPU(FrameBuffer *input, FrameBuffer *output, const DebayerParams &params, std::optional<MappedFrameBuffer> *mappedInputBuffer, std::optional<DmaSyncer> *inputBufferDmaSyncer);
+ 
+@@ -111,6 +112,16 @@ private:
+ 	/* Contrast */
+ 	GLint contrastExpUniformDataIn_;
+ 
++	/* Lens shading correction */
++	GLint lscUniformSampler_ = -1;
++	GLint lscUniformMin_ = -1;
++	GLint lscUniformLog2Ratio_ = -1;
++	GLuint lscTexture_ = 0;
++	std::shared_ptr<const LensShadingTable> lscUploaded_;
++	GLfloat lscMin_[3] = { 1.0f, 1.0f, 1.0f };
++	GLfloat lscLog2Ratio_[3] = { 0.0f, 0.0f, 0.0f };
++	static constexpr uint32_t kLscTextureUnitId = 7;
++
+ 	Size nativeOutputSize_;
+ 	Rectangle window_;
+ 	std::unique_ptr<SwStatsCpu> stats_;

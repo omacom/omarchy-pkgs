@@ -1,0 +1,411 @@
+diff --git c/include/libcamera/internal/software_isp/swstats_cpu.h w/include/libcamera/internal/software_isp/swstats_cpu.h
+index 5518709..4a630f1 100644
+--- c/include/libcamera/internal/software_isp/swstats_cpu.h
++++ w/include/libcamera/internal/software_isp/swstats_cpu.h
+@@ -11,6 +11,7 @@
+ 
+ #pragma once
+ 
++#include <memory>
+ #include <stdint.h>
+ #include <vector>
+ 
+@@ -21,6 +22,7 @@
+ 
+ #include "libcamera/internal/bayer_format.h"
+ #include "libcamera/internal/shared_mem_object.h"
++#include "libcamera/internal/software_isp/debayer_params.h"
+ #include "libcamera/internal/software_isp/swisp_stats.h"
+ 
+ #include "benchmark.h"
+@@ -54,6 +56,8 @@ public:
+ 
+ 	int configure(const StreamConfiguration &inputCfg, unsigned int statsBufferCount = 1);
+ 	void setWindow(const Rectangle &window);
++	void setLsc(std::shared_ptr<const LensShadingTable> table,
++		    const Size &inputSize, float blackLevel);
+ 	void startFrame(uint32_t frame);
+ 	void finishFrame(uint32_t frame, uint32_t bufferId);
+ 	void processFrame(uint32_t frame, uint32_t bufferId, MappedFrameBuffer &input);
+@@ -67,7 +71,7 @@ public:
+ 		    y >= (window_.y + window_.height))
+ 			return;
+ 
+-		(this->*stats0_)(src, stats_[statsBufferIndex]);
++		(this->*stats0_)(y, src, stats_[statsBufferIndex]);
+ 	}
+ 
+ 	void processLine2(uint32_t frame, unsigned int y, const uint8_t *src[], unsigned int statsBufferIndex = 0)
+@@ -79,28 +83,28 @@ public:
+ 		    y >= (window_.y + window_.height))
+ 			return;
+ 
+-		(this->*stats2_)(src, stats_[statsBufferIndex]);
++		(this->*stats2_)(y, src, stats_[statsBufferIndex]);
+ 	}
+ 
+ 	Signal<uint32_t, uint32_t> statsReady;
+ 
+ private:
+-	using statsProcessFn = void (SwStatsCpu::*)(const uint8_t *src[], SwIspStats &stats);
++	using statsProcessFn = void (SwStatsCpu::*)(unsigned int y, const uint8_t *src[], SwIspStats &stats);
+ 	using processFrameFn = void (SwStatsCpu::*)(MappedFrameBuffer &in);
+ 
+ 	int setupStandardBayerOrder(BayerFormat::Order order);
+ 	/* Bayer 8 bpp unpacked */
+-	void statsBGGR8Line0(const uint8_t *src[], SwIspStats &stats);
++	void statsBGGR8Line0(unsigned int y, const uint8_t *src[], SwIspStats &stats);
+ 	/* Bayer 10 bpp unpacked */
+-	void statsBGGR10Line0(const uint8_t *src[], SwIspStats &stats);
++	void statsBGGR10Line0(unsigned int y, const uint8_t *src[], SwIspStats &stats);
+ 	/* Bayer 12 bpp unpacked */
+-	void statsBGGR12Line0(const uint8_t *src[], SwIspStats &stats);
++	void statsBGGR12Line0(unsigned int y, const uint8_t *src[], SwIspStats &stats);
+ 	/* Bayer 10 bpp packed */
+-	void statsBGGR10PLine0(const uint8_t *src[], SwIspStats &stats);
+-	void statsGBRG10PLine0(const uint8_t *src[], SwIspStats &stats);
++	void statsBGGR10PLine0(unsigned int y, const uint8_t *src[], SwIspStats &stats);
++	void statsGBRG10PLine0(unsigned int y, const uint8_t *src[], SwIspStats &stats);
+ 	/* Bayer 12 bpp packed */
+-	void statsBGGR12PLine0(const uint8_t *src[], SwIspStats &stats);
+-	void statsGBRG12PLine0(const uint8_t *src[], SwIspStats &stats);
++	void statsBGGR12PLine0(unsigned int y, const uint8_t *src[], SwIspStats &stats);
++	void statsGBRG12PLine0(unsigned int y, const uint8_t *src[], SwIspStats &stats);
+ 
+ 	void processBayerFrame2(MappedFrameBuffer &in);
+ 
+@@ -121,6 +125,27 @@ private:
+ 	unsigned int stride_;
+ 	unsigned int sumShift_;
+ 
++	/*
++	 * Lens shading gains, sampled at exactly the columns the stats loops
++	 * visit. Rebuilt once per line; see lscRowFor().
++	 */
++	struct LscRow {
++		std::vector<float> r;
++		std::vector<float> g;
++		std::vector<float> b;
++		unsigned int y = ~0u;
++	};
++	const LscRow *lscRowFor(unsigned int y);
++
++	std::shared_ptr<const LensShadingTable> lscTable_;
++	LscRow lscRow_;
++	Size lscInputSize_;
++	float lscBlack_ = 0.0f;
++	unsigned int bitDepth_ = 8;
++	bool packed_ = false;
++	unsigned int lscMaxValue_ = 0;
++	bool lscValid_ = false;
++
+ 	std::vector<SwIspStats> stats_;
+ 	SharedMemObject<SwIspStats> sharedStats_;
+ 	Benchmark bench_;
+diff --git c/src/libcamera/software_isp/debayer_egl.cpp w/src/libcamera/software_isp/debayer_egl.cpp
+index 960098e..6ee38d5 100644
+--- c/src/libcamera/software_isp/debayer_egl.cpp
++++ w/src/libcamera/software_isp/debayer_egl.cpp
+@@ -546,6 +546,16 @@ void DebayerEGL::setShaderVariableValues(eGLImage &eglImageIn, const DebayerPara
+ 	glUniform1i(textureUniformBayerDataIn_, eglImageIn.texture_unit_uniform_id_);
+ 
+ 	updateLscTexture(params);
++
++	/*
++	 * This back end renders on the GPU but computes its statistics with a
++	 * separate CPU pass over the raw input, which the shader's correction
++	 * never touches. Hand the table to the statistics engine so that the
++	 * white balance estimate is made on corrected data. DebayerCpu does
++	 * the opposite, on purpose: it corrects the line buffers the
++	 * statistics already read, so it must not publish the table here.
++	 */
++	stats_->setLsc(params.lsc, Size(width_, height_), params.blackLevel.g());
+ 	if (lscTexture_) {
+ 		glActiveTexture(GL_TEXTURE0 + kLscTextureUnitId);
+ 		glBindTexture(GL_TEXTURE_2D, lscTexture_);
+diff --git c/src/libcamera/software_isp/swstats_cpu.cpp w/src/libcamera/software_isp/swstats_cpu.cpp
+index 7fb77ce..1ebc30c 100644
+--- c/src/libcamera/software_isp/swstats_cpu.cpp
++++ w/src/libcamera/software_isp/swstats_cpu.cpp
+@@ -11,6 +11,8 @@
+ 
+ #include "libcamera/internal/software_isp/swstats_cpu.h"
+ 
++#include <algorithm>
++
+ #include <libcamera/base/log.h>
+ 
+ #include <libcamera/stream.h>
+@@ -171,22 +173,43 @@ static constexpr unsigned int kRedYMul = 77; /* 0.299 * 256 */
+ static constexpr unsigned int kGreenYMul = 150; /* 0.587 * 256 */
+ static constexpr unsigned int kBlueYMul = 29; /* 0.114 * 256 */
+ 
+-#define SWSTATS_START_LINE_STATS(pixel_t) \
+-	pixel_t r, g, g2, b;              \
+-	uint64_t yVal;                    \
+-                                          \
+-	uint64_t sumR = 0;                \
+-	uint64_t sumG = 0;                \
+-	uint64_t sumB = 0;
++#define SWSTATS_START_LINE_STATS(pixel_t)     \
++	pixel_t r, g, g2, b;                  \
++	uint64_t yVal;                        \
++                                              \
++	uint64_t sumR = 0;                    \
++	uint64_t sumG = 0;                    \
++	uint64_t sumB = 0;                    \
++	const LscRow *lsc = lscRowFor(y);     \
++	unsigned int lscIndex = 0;
+ 
+-#define SWSTATS_ACCUMULATE_LINE_STATS(div) \
+-	sumR += r;                         \
+-	sumG += g;                         \
+-	sumB += b;                         \
+-                                           \
+-	yVal = r * kRedYMul;               \
+-	yVal += g * kGreenYMul;            \
+-	yVal += b * kBlueYMul;             \
++/*
++ * Apply the lens shading gains, if the debayer back end has published a table
++ * and has not already corrected the data in place.
++ *
++ * The gains multiply the black level corrected signal, so the pedestal is
++ * taken out and put back around the multiply. Skipping that would scale the
++ * pedestal too, worth up to 1.1% of the range in red at the extreme corner,
++ * which is the same order as the shading error being corrected.
++ *
++ * lscIndex counts samples, not pixels: every stats loop visits one 2x2 block
++ * per iteration, and lscRowFor() builds the row at exactly those positions.
++ */
++#define SWSTATS_ACCUMULATE_LINE_STATS(div)                            \
++	if (lsc) {                                                    \
++		r = lscApply(r, lsc->r[lscIndex], lscBlack_, lscMaxValue_); \
++		g = lscApply(g, lsc->g[lscIndex], lscBlack_, lscMaxValue_); \
++		b = lscApply(b, lsc->b[lscIndex], lscBlack_, lscMaxValue_); \
++		lscIndex++;                                           \
++	}                                                             \
++                                                                      \
++	sumR += r;                                                    \
++	sumG += g;                                                    \
++	sumB += b;                                                    \
++                                                                      \
++	yVal = r * kRedYMul;                                          \
++	yVal += g * kGreenYMul;                                       \
++	yVal += b * kBlueYMul;                                        \
+ 	stats.yHistogram[yVal * SwIspStats::kYHistogramSize / (256 * 256 * (div))]++;
+ 
+ #define SWSTATS_FINISH_LINE_STATS() \
+@@ -194,7 +217,137 @@ static constexpr unsigned int kBlueYMul = 29; /* 0.114 * 256 */
+ 	stats.sum_.g() += sumG;     \
+ 	stats.sum_.b() += sumB;
+ 
+-void SwStatsCpu::statsBGGR8Line0(const uint8_t *src[], SwIspStats &stats)
++namespace {
++
++/* Apply one gain to one black level corrected sample, saturating. */
++template<typename T>
++T lscApply(T value, float gain, float black, unsigned int maxValue)
++{
++	const float v = black + (static_cast<float>(value) - black) * gain;
++	const float c = std::clamp(v, 0.0f, static_cast<float>(maxValue));
++	return static_cast<T>(c + 0.5f);
++}
++
++} /* namespace */
++
++/**
++ * \brief Publish the lens shading table the statistics should correct with
++ * \param[in] table The table, or nullptr to disable the correction
++ * \param[in] inputSize Size of the frame the statistics walk
++ * \param[in] blackLevel Black level as a fraction of the full range
++ *
++ * Only a back end whose statistics read UNCORRECTED data may call this.
++ * DebayerEGL must, because it renders on the GPU and computes statistics from
++ * a separate CPU pass over the raw input. DebayerCpu must NOT, because it
++ * applies the correction while copying each input line and hands the
++ * statistics those same buffers; calling this there would correct twice.
++ *
++ * The correction is declined for CSI-2 packed input, so that the statistics
++ * and the rendered frame always agree about whether shading has been taken
++ * out: neither debayer back end corrects packed data either.
++ */
++void SwStatsCpu::setLsc(std::shared_ptr<const LensShadingTable> table,
++			const Size &inputSize, float blackLevel)
++{
++	lscBlack_ = blackLevel * ((1 << bitDepth_) - 1);
++
++	if (table == lscTable_ && inputSize == lscInputSize_)
++		return;
++
++	lscTable_ = table;
++	lscInputSize_ = inputSize;
++	lscRow_.y = ~0u;
++	lscValid_ = false;
++
++	if (!table || !table->isValid())
++		return;
++
++	if (packed_) {
++		LOG(SwStatsCpu, Warning)
++			<< "lens shading not applied to statistics: packed input";
++		return;
++	}
++
++	if (!inputSize.width || !inputSize.height) {
++		LOG(SwStatsCpu, Warning)
++			<< "lens shading not applied to statistics: no input size";
++		return;
++	}
++
++	lscMaxValue_ = (1 << bitDepth_) - 1;
++	lscValid_ = true;
++}
++
++/**
++ * \brief Build the lens shading gains for one statistics line
++ * \param[in] y Line number, relative to the statistics window
++ * \return The gains at each sampled column, or nullptr if disabled
++ *
++ * The vertical interpolation is done once per line and the horizontal one is
++ * evaluated only at the columns the stats loops actually visit, which is one
++ * column in four. That keeps this to roughly a third of the cost of the line
++ * it serves.
++ *
++ * Both source lines of a 2x2 block share the gains of the block's top line.
++ * Over one row the field moves by well under half a percent of the correction,
++ * which is far below the accuracy of the table.
++ */
++const SwStatsCpu::LscRow *SwStatsCpu::lscRowFor(unsigned int y)
++{
++	if (!lscValid_)
++		return nullptr;
++
++	if (lscRow_.y == y)
++		return &lscRow_;
++
++	const LensShadingTable &t = *lscTable_;
++	const unsigned int samples = window_.width / 4 + 1;
++
++	if (lscRow_.r.size() < samples) {
++		lscRow_.r.resize(samples);
++		lscRow_.g.resize(samples);
++		lscRow_.b.resize(samples);
++	}
++
++	/*
++	 * SwStatsCpu walks the buffer it is given from its own window origin,
++	 * so these are the absolute coordinates of the samples in the input
++	 * frame.
++	 */
++	const float fy = std::clamp(static_cast<float>(window_.y + y) *
++					    (t.height - 1) / (lscInputSize_.height - 1),
++				    0.0f, static_cast<float>(t.height - 1));
++	const unsigned int gy = std::min<unsigned int>(fy, t.height - 2);
++	const float wy = fy - gy;
++
++	const float xScale = static_cast<float>(t.width - 1) /
++			     (lscInputSize_.width - 1);
++
++	for (unsigned int i = 0; i < samples; i++) {
++		const float fx = std::clamp((window_.x + i * 4) * xScale, 0.0f,
++					    static_cast<float>(t.width - 1));
++		const unsigned int gx = std::min<unsigned int>(fx, t.width - 2);
++		const float wx = fx - gx;
++
++		auto sample = [&](const std::vector<float> &pl) {
++			const float a = pl[gy * t.width + gx];
++			const float b = pl[gy * t.width + gx + 1];
++			const float c = pl[(gy + 1) * t.width + gx];
++			const float d = pl[(gy + 1) * t.width + gx + 1];
++			return (a * (1.0f - wx) + b * wx) * (1.0f - wy) +
++			       (c * (1.0f - wx) + d * wx) * wy;
++		};
++
++		lscRow_.r[i] = sample(t.r);
++		lscRow_.g[i] = sample(t.g);
++		lscRow_.b[i] = sample(t.b);
++	}
++
++	lscRow_.y = y;
++	return &lscRow_;
++}
++
++void SwStatsCpu::statsBGGR8Line0(unsigned int y, const uint8_t *src[], SwIspStats &stats)
+ {
+ 	const uint8_t *src0 = src[1] + window_.x;
+ 	const uint8_t *src1 = src[2] + window_.x;
+@@ -219,7 +372,7 @@ void SwStatsCpu::statsBGGR8Line0(const uint8_t *src[], SwIspStats &stats)
+ 	SWSTATS_FINISH_LINE_STATS()
+ }
+ 
+-void SwStatsCpu::statsBGGR10Line0(const uint8_t *src[], SwIspStats &stats)
++void SwStatsCpu::statsBGGR10Line0(unsigned int y, const uint8_t *src[], SwIspStats &stats)
+ {
+ 	const uint16_t *src0 = (const uint16_t *)src[1] + window_.x;
+ 	const uint16_t *src1 = (const uint16_t *)src[2] + window_.x;
+@@ -245,7 +398,7 @@ void SwStatsCpu::statsBGGR10Line0(const uint8_t *src[], SwIspStats &stats)
+ 	SWSTATS_FINISH_LINE_STATS()
+ }
+ 
+-void SwStatsCpu::statsBGGR12Line0(const uint8_t *src[], SwIspStats &stats)
++void SwStatsCpu::statsBGGR12Line0(unsigned int y, const uint8_t *src[], SwIspStats &stats)
+ {
+ 	const uint16_t *src0 = (const uint16_t *)src[1] + window_.x;
+ 	const uint16_t *src1 = (const uint16_t *)src[2] + window_.x;
+@@ -271,7 +424,7 @@ void SwStatsCpu::statsBGGR12Line0(const uint8_t *src[], SwIspStats &stats)
+ 	SWSTATS_FINISH_LINE_STATS()
+ }
+ 
+-void SwStatsCpu::statsBGGR10PLine0(const uint8_t *src[], SwIspStats &stats)
++void SwStatsCpu::statsBGGR10PLine0(unsigned int y, const uint8_t *src[], SwIspStats &stats)
+ {
+ 	const uint8_t *src0 = src[1] + window_.x * 5 / 4;
+ 	const uint8_t *src1 = src[2] + window_.x * 5 / 4;
+@@ -297,7 +450,7 @@ void SwStatsCpu::statsBGGR10PLine0(const uint8_t *src[], SwIspStats &stats)
+ 	SWSTATS_FINISH_LINE_STATS()
+ }
+ 
+-void SwStatsCpu::statsGBRG10PLine0(const uint8_t *src[], SwIspStats &stats)
++void SwStatsCpu::statsGBRG10PLine0(unsigned int y, const uint8_t *src[], SwIspStats &stats)
+ {
+ 	const uint8_t *src0 = src[1] + window_.x * 5 / 4;
+ 	const uint8_t *src1 = src[2] + window_.x * 5 / 4;
+@@ -323,7 +476,7 @@ void SwStatsCpu::statsGBRG10PLine0(const uint8_t *src[], SwIspStats &stats)
+ 	SWSTATS_FINISH_LINE_STATS()
+ }
+ 
+-void SwStatsCpu::statsBGGR12PLine0(const uint8_t *src[], SwIspStats &stats)
++void SwStatsCpu::statsBGGR12PLine0(unsigned int y, const uint8_t *src[], SwIspStats &stats)
+ {
+ 	const uint8_t *src0 = src[1] + window_.x * 3 / 2;
+ 	const uint8_t *src1 = src[2] + window_.x * 3 / 2;
+@@ -349,7 +502,7 @@ void SwStatsCpu::statsBGGR12PLine0(const uint8_t *src[], SwIspStats &stats)
+ 	SWSTATS_FINISH_LINE_STATS()
+ }
+ 
+-void SwStatsCpu::statsGBRG12PLine0(const uint8_t *src[], SwIspStats &stats)
++void SwStatsCpu::statsGBRG12PLine0(unsigned int y, const uint8_t *src[], SwIspStats &stats)
+ {
+ 	const uint8_t *src0 = src[1] + window_.x * 3 / 2;
+ 	const uint8_t *src1 = src[2] + window_.x * 3 / 2;
+@@ -473,6 +626,11 @@ int SwStatsCpu::configure(const StreamConfiguration &inputCfg, unsigned int stat
+ 	BayerFormat bayerFormat =
+ 		BayerFormat::fromPixelFormat(inputCfg.pixelFormat);
+ 
++	bitDepth_ = bayerFormat.bitDepth;
++	packed_ = bayerFormat.packing != BayerFormat::Packing::None;
++	lscValid_ = false;
++	lscTable_.reset();
++
+ 	if (bayerFormat.packing == BayerFormat::Packing::None &&
+ 	    setupStandardBayerOrder(bayerFormat.order) == 0) {
+ 		processFrame_ = &SwStatsCpu::processBayerFrame2;
+@@ -589,7 +747,7 @@ void SwStatsCpu::processBayerFrame2(MappedFrameBuffer &in)
+ 		/* linePointers[0] is not used by any stats0_ functions */
+ 		linePointers[1] = src;
+ 		linePointers[2] = src + stride_;
+-		(this->*stats0_)(linePointers, stats_[0]);
++		(this->*stats0_)(y, linePointers, stats_[0]);
+ 		src += stride_ * 2;
+ 	}
+ }
