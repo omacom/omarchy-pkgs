@@ -77,7 +77,7 @@ return {
 		priority = 1000,
 	},
 	{
-		"gthelding/monokai-pro.nvim",
+		"loctvl842/monokai-pro.nvim",
 		lazy = true,
 		priority = 1000,
 	},
