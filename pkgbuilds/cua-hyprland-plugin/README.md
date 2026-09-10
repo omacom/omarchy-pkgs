@@ -124,24 +124,98 @@ hyprctl plugin load /usr/lib/cua/hyprland/cua-hyprland-plugin.so
 hyprctl -j cua:status
 ```
 
-Loading alone does not enable input. To enable the trusted local transport,
-add this setting to Omarchy's Lua configuration:
+Loading alone does not enable input. Before opting in, save open work and save
+the exact current personal input configuration. The backup command refuses a
+symlinked input file and refuses to replace an earlier backup:
 
-```lua
-hl.config({plugin = {cua = {enabled = true}}})
+```sh
+test -f "$HOME/.config/hypr/input.lua" && \
+  test ! -L "$HOME/.config/hypr/input.lua" && \
+  test ! -e "$HOME/.config/hypr/input.lua.cua-before" && \
+  cp --archive -- "$HOME/.config/hypr/input.lua" \
+    "$HOME/.config/hypr/input.lua.cua-before"
 ```
 
-Run `hyprctl reload`, then inspect `hyprctl -j cua:status` again. A runtime
-keyword or Lua evaluation without a configuration reload does not reconcile
-the input sockets. Verify input protocol v3, input capability, socket paths, and
-compositor identity before starting Driver with
-`CUA_DRIVER_RS_ENABLE_WAYLAND=1`. Verify a supported background action through
-fresh Driver snapshots and the saved application result. Do not automatically
+If `input.lua` is a symlink, stop here: back up and later restore its resolved
+target explicitly instead of using the commands below.
+
+The background-input admission guard requires the exact XKB keymap
+`rules=evdev`, `model=pc105`, `layout=us`, empty variant and options, and no
+custom keymap file. Stock Omarchy 4.0.3 English (US) is not that literal
+configuration: it leaves rules and model empty and sets
+`compose:caps,shift:both_capslock_cancel`. Those options make Caps Lock the
+Compose key and both Shift keys the Caps Lock/cancel chord. The required empty
+options restore ordinary Caps Lock behavior and remove both stock shortcuts
+while Cua input is enabled. Any other effective value is intentionally refused
+as `unsupported_layout`; do not weaken or bypass that admission guard.
+
+Append this override to `~/.config/hypr/input.lua` so it follows any existing
+input settings. It both selects the exact admitted keymap and enables the
+trusted local transport:
+
+```lua
+hl.config({
+  input = {
+    kb_rules = "evdev",
+    kb_model = "pc105",
+    kb_layout = "us",
+    kb_variant = "",
+    kb_options = "",
+    kb_file = "",
+  },
+  plugin = { cua = { enabled = true } },
+})
+```
+
+Reload, then read back every keymap value rather than relying on the source
+file alone:
+
+```sh
+hyprctl reload
+for name in kb_rules kb_model kb_layout kb_variant kb_options kb_file; do
+  value=$(hyprctl -j getoption "input:$name" | jq -r '.str')
+  printf '%s=%s\n' "$name" "$value"
+done
+hyprctl -j cua:status
+```
+
+The keymap readback must be exactly:
+
+```text
+kb_rules=evdev
+kb_model=pc105
+kb_layout=us
+kb_variant=
+kb_options=
+kb_file=
+```
+
+A runtime keyword or Lua evaluation without `hyprctl reload` does not reconcile
+the input sockets. Continue only when status also reports input protocol v3,
+input capability, socket paths, and the expected compositor identity. Do not
+disable NumLock; that was required only by a strict qualification observer, not
+by the demonstrated background-input contract.
+
+Start Driver with `CUA_DRIVER_RS_ENABLE_WAYLAND=1`. For the activation check,
+use background input in a new disposable Inkscape document to create a text
+object containing `CUA activation check`. Save it under a new temporary
+filename, then verify the text in both a fresh Driver snapshot and the reopened
+saved SVG. Never test against an existing document, and do not automatically
 replay an action with a partial or unknown outcome.
 
-To disable input, set the enabling value to false (or remove it) and run
-`hyprctl reload`. Retained inert agent pointers can remain until the compositor
-exits; disabling input does not unload the mapped module.
+After the check, restore the exact saved configuration and reload it:
+
+```sh
+command mv --force -- "$HOME/.config/hypr/input.lua.cua-before" \
+  "$HOME/.config/hypr/input.lua"
+hyprctl reload
+hyprctl -j cua:status
+```
+
+Confirm that the prior keymap values are back and status reports input disabled.
+Retained inert agent pointers can remain until the compositor exits; disabling
+input does not unload the mapped module. If you intentionally keep activation,
+retain the backup until you are ready to perform this exact restoration.
 
 Before an incompatible desktop update, remove operator-added plugin activation
 settings, save work, and exit the graphical session. From a text console, run
