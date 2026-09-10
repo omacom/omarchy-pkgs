@@ -240,8 +240,9 @@ The [agreed ownership split](https://github.com/omacom/omarchy-pkgs/pull/346#iss
 assigns profiles, build kits, plugin fixes, and native input evidence to Cua.
 Francesco (@f-trycua) is the Cua contact through this PR. Omarchy owns package
 integration, dependency-change detection, Omabot validation, and signing and
-publication decisions. Omarchy must name its package/release owner before
-rollout. Maintenance is best effort, with no turnaround commitment.
+publication decisions. Spencer (@spencerbull) and Emir (@emirb) jointly own
+that Omarchy package and release path. Maintenance is best effort, with no
+turnaround commitment.
 
 Edge detects upcoming incompatibilities; RC validates the intended stable
 environment. Mirror/channel changes and changes to ABI dependencies, Driver,
