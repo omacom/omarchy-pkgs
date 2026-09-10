@@ -65,6 +65,10 @@ if [[ "$DRY_RUN" != true ]]; then
 
   mkdir -p "$BUILD_OUTPUT_DIR" "$FINAL_OUTPUT_DIR"
 
+  # The image drops pacman's private signing key. Keyring upgrades need a
+  # container-local key to sign newly trusted keys.
+  sudo pacman-key --init || exit 1
+
   # Bring the container up to date before any makedepends are installed. The
   # image is layer-cached, so its glibc drifts behind the mirror while makepkg
   # -s pulls makedepends from the freshly synced database -- a partial upgrade
