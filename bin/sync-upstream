@@ -32,8 +32,15 @@ pkgbuilds/<package>/.omarchy/upstream.sh, a hook that reports JSON on stdout:
 Architecture keys become sha256sums_<arch> in the PKGBUILD; the key "any" means
 the unsuffixed sha256sums array. An empty object ({}) reports no update.
 
-When the reported version is newer than the checked-in one, pkgver and the
-listed checksum arrays are rewritten and pkgrel is reset to 1.
+A vendor whose download URLs carry more than the version -- a build hash, a
+release id -- keeps that in an underscore-prefixed PKGBUILD variable and has
+the hook report it under "vars":
+
+  { "pkgver": "1.2.3", "vars": { "_commit": "<hash>" }, "sha256sums": { ... } }
+
+When the reported version is newer than the checked-in one, pkgver, the
+listed checksum arrays and any reported vars are rewritten and pkgrel is
+reset to 1.
 
 A package may declare "min_release_age" in .omarchy/package.json ("24h", "2d",
 or bare seconds) to quarantine fresh releases until maintainers have had time
@@ -209,7 +216,21 @@ validate_release() {
       .value | type == "array" and length > 0 and all(test("\\A[0-9a-f]{64}\\z"))
     ))
     and (if has("published_at") then (.published_at | type == "string" and length > 0) else true end)
+    and (if has("vars") then (
+      # Underscore-prefixed names only, so a hook can never reach pkgver,
+      # pkgrel, source or anything else makepkg owns; values are written
+      # unquoted into shell, so they are held to a plain token alphabet.
+      (.vars | type == "object")
+      and (.vars | to_entries | all(
+        (.key | test("\\A_[A-Za-z0-9_]+\\z"))
+        and (.value | type == "string" and test("\\A[A-Za-z0-9._+-]+\\z"))
+      ))
+    ) else true end)
   ' <<<"$release" >/dev/null
+}
+
+release_var_names() {
+  jq -r '.vars // {} | keys[]' <<<"$1"
 }
 
 # Confirm the rewritten PKGBUILD parses and actually holds what we meant to put
@@ -228,6 +249,9 @@ verify_pkgbuild() {
     return 1
   fi
 
+  local vars=()
+  mapfile -t vars < <(release_var_names "$release")
+
   local dump
   if ! dump=$(CARCH=x86_64 bash -c '
     source "$1" >/dev/null 2>&1 || exit 1
@@ -237,7 +261,7 @@ verify_pkgbuild() {
       declare -n array="$name"
       printf "%s\t%s\n" "$name" "${array[*]}"
     done
-  ' _ "$pkgbuild" "${arrays[@]}" 2>/dev/null); then
+  ' _ "$pkgbuild" "${arrays[@]}" "${vars[@]}" 2>/dev/null); then
     print_error "Rewritten PKGBUILD could not be read back"
     return 1
   fi
@@ -246,13 +270,16 @@ verify_pkgbuild() {
   expected=$(
     printf 'pkgver\t%s\n' "$pkgver"
     printf 'pkgrel\t1\n'
-    local array arch
+    local array arch name
     for array in "${arrays[@]}"; do
       arch="${array#sha256sums}"
       arch="${arch#_}"
       [[ -n "$arch" ]] || arch="any"
       printf '%s\t%s\n' "$array" \
         "$(jq -r --arg arch "$arch" '.sha256sums[$arch] | join(" ")' <<<"$release")"
+    done
+    for name in "${vars[@]}"; do
+      printf '%s\t%s\n' "$name" "$(jq -r --arg name "$name" '.vars[$name]' <<<"$release")"
     done
   )
 
@@ -310,6 +337,12 @@ apply_release() {
 
     set_pkgbuild_scalar "$scratch" pkgver "$pkgver" || exit 1
     set_pkgbuild_scalar "$scratch" pkgrel 1 || exit 1
+
+    local name
+    while IFS= read -r name; do
+      set_pkgbuild_scalar "$scratch" "$name" \
+        "$(jq -r --arg name "$name" '.vars[$name]' <<<"$release")" || exit 1
+    done < <(release_var_names "$release")
 
     verify_pkgbuild "$scratch" "$release" "$pkgver" "${arrays[@]}" || exit 1
   ); then
@@ -958,6 +991,35 @@ EOF
     "$(grep -m1 '^sha256sums_x86_64=' "$e2e_root/mise-bin/PKGBUILD")"
   check "aarch64 checksum lands in the PKGBUILD" "sha256sums_aarch64=('$mise_a64')" \
     "$(grep -m1 '^sha256sums_aarch64=' "$e2e_root/mise-bin/PKGBUILD")"
+
+  # A hook whose download URL needs more than the version reports the extra
+  # piece under "vars"; it must land next to pkgver, and only underscore
+  # variables with token-shaped values may get through.
+  echo "Hook-reported vars:"
+  local varpkg="$e2e_root/selftest-vars"
+  mkdir -p "$varpkg/.omarchy"
+  local var_sum
+  var_sum=$(printf '1%.0s' {1..64})
+  printf 'pkgver=1.0.0\npkgrel=3\n_commit=0000000000000000000000000000000000000000\nsha256sums=(%s)\n' "'SKIP'" > "$varpkg/PKGBUILD"
+  cat > "$varpkg/.omarchy/upstream.sh" <<EOF
+#!/bin/bash
+echo '{"pkgver": "1.1.0", "vars": {"_commit": "abc123def456"}, "sha256sums": {"any": ["$var_sum"]}}'
+EOF
+  prev_updated=$UPDATED; prev_failed=$FAILED
+  PKGBUILDS_DIR="$e2e_root" sync_package selftest-vars >/dev/null 2>&1 || true
+  check "hook with vars updates without failures" "updated=1 failed=0" \
+    "updated=$((UPDATED - prev_updated)) failed=$((FAILED - prev_failed))"
+  check "reported var lands in the PKGBUILD" "_commit=abc123def456" \
+    "$(grep -m1 '^_commit=' "$varpkg/PKGBUILD")"
+  check "pkgver and pkgrel follow the var update" "pkgver=1.1.0 pkgrel=1" \
+    "$(grep -m1 '^pkgver=' "$varpkg/PKGBUILD") $(grep -m1 '^pkgrel=' "$varpkg/PKGBUILD")"
+
+  vst=0; validate_release '{"pkgver": "1.0.0", "vars": {"pkgrel": "9"}, "sha256sums": {"any": ["'"$var_sum"'"]}}' || vst=$?
+  check "vars cannot name a makepkg variable" "1" "$vst"
+  vst=0; validate_release '{"pkgver": "1.0.0", "vars": {"_commit": "a b; rm -rf /"}, "sha256sums": {"any": ["'"$var_sum"'"]}}' || vst=$?
+  check "vars values are held to a token alphabet" "1" "$vst"
+  vst=0; validate_release '{"pkgver": "1.0.0", "sha256sums": {"any": ["'"$var_sum"'"]}}' || vst=$?
+  check "a release without vars still validates" "0" "$vst"
 
   # A malformed declaration must fail the run loudly, and still be discovered.
   local badpkg="$e2e_root/selftest-broken"

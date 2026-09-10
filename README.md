@@ -479,8 +479,16 @@ the unsuffixed `sha256sums` array, and only the arrays a hook names are touched.
 An empty object (`{}`) reports no update, which is how a hook waits out a release
 that has landed for one architecture but not yet the other.
 
+A vendor whose download URLs carry more than the version — a build hash, a
+release id — keeps that in an underscore-prefixed PKGBUILD variable and has the
+hook report it under `vars`, for example `"vars": { "_commit": "<hash>" }`
+(see `pkgbuilds/grok-bot/.omarchy/upstream.sh`). Only `_`-prefixed names with
+plain token values are accepted, so a hook can never reach `pkgver`, `source`
+or anything else makepkg owns.
+
 When the reported version is newer than the checked-in one, `bin/sync-upstream`
-rewrites `pkgver` and those checksum arrays and resets `pkgrel` to 1. A version
+rewrites `pkgver`, those checksum arrays and any reported vars, and resets
+`pkgrel` to 1. A version
 that is equal or older leaves the package alone, so a vendor rolling a release
 back cannot walk the repository backwards.
 
