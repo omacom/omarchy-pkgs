@@ -50,11 +50,16 @@ Cua's retained evidence covers background application effects, two-lane overlap,
 third-owner refusal, primary-input preservation, conflicts, stale targets and
 geometry, cancellation, desktop faults, recovery, and cold package transitions.
 Production-package app checks and independent primary observers are separate
-from trace-enabled diagnostics. The complete native Linux runner passed all
-128 required cells: 87 deliveries and 41 expected refusals, with no failures
-or skips. That runner used source-built released Driver 0.24.0; the real-app
-checks separately used the actual Omarchy `cua-driver-bin 0.24.0-1` executable.
-See the linked qualification record for exact artifacts and observation limits.
+from trace-enabled diagnostics. Cua's retained canonical run
+`433ce968ee164d5e8e3226e800db93a6` recorded all 128 required cells: 87
+deliveries and 41 expected refusals, with no failures or skips; its completion
+report has SHA-256
+`1eda4cc008ea6b27d96c21d58f8041834398a43409642376bafe84ad38f0e112`.
+That run used source-built released Driver 0.24.0; the real-app checks
+separately used the actual Omarchy `cua-driver-bin 0.24.0-1` executable. A
+separate later Omabot replay reported 124 passes and four failures, plus seven
+incomplete native cases, so Omarchy replay remains an explicit merge gate. See
+the linked qualification record for exact artifacts and observation limits.
 
 Duplicate motion notifications are retained and counted. They are acceptable
 only when pointer identity, coordinates, focus, held input, and foreground
