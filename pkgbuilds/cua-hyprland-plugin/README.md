@@ -1,103 +1,182 @@
 # Optional Cua Hyprland plugin
 
-This package builds the optional Cua input plugin separately from Cua Driver.
-It does not add the plugin to the Omarchy installation or change the Driver
-package. The recipe is copied unchanged from the published Cua Driver 0.24.0
-build kit, including its source checks, mandatory tests, and ABI checks.
+This package targets **Omarchy stable x86_64**, with Inkscape `1.4.4-6` and
+two independent background-input lanes. Cua's native qualification is recorded
+in [the kit's qualification record](https://github.com/trycua/cua/releases/download/cua-hyprland-kit-v1.1.0-omarchy-stable-20260910/QUALIFICATION.md)
+and [Cua #3698](https://github.com/trycua/cua/pull/3698). Omabot replay and
+Omarchy's explicit merge, signing, and publication decisions remain required.
+Keep `skip_build: true` until those gates pass.
 
-The package is in the fast release ring with `skip_build: true`. This keeps it
-out of unscoped builds while maintainers qualify the pinned environment.
-An explicit package build remains available. Fast-ring membership does not
-establish compatibility: edge, rc, and stable use separate build environments,
-and each must satisfy the exact contract before publication there.
+The plugin is optional. Cua Driver works independently, and installation does
+not load the plugin or enable input. Metadata restricts the initial destination
+to `channels: ["stable"]`; `release_ring: fast` permits a native package build.
+Edge, RC, and ARM publication are outside this initial scope.
 
-## Source and ABI contract
+## Source and build profile
 
-The authoritative release is
-[cua-driver-rs-v0.24.0](https://github.com/trycua/cua/releases/tag/cua-driver-rs-v0.24.0),
-at source revision `4b3396d9fe4bd3cf723b0eb8db83c18a8764b520`.
-Both archives use the stem
-`cua-hyprland-plugin-0.24.0-4b3396d9fe4bd3cf723b0eb8db83c18a8764b520`.
-The release's `checksums.txt` records these SHA-256 values:
+The package uses the [Driver 0.26.1 plugin source](https://github.com/trycua/cua/releases/tag/cua-driver-rs-v0.26.1),
+including the [desktop-fault cleanup repair](https://github.com/trycua/cua/pull/3702).
+It is not a repackaging of the unmodified 0.24.0 plugin. The Driver client
+pairing qualified for this package remains `cua-driver-bin 0.24.0-1`, with
+input protocol v3. Discovery protocol v2 is separate.
 
-| Artifact | SHA-256 |
-| --- | --- |
-| Source (`.tar.gz`) | `73b65823b3281c027a31cd8f7d9ca9586fe7386ed1eec74174f2e72cea0af643` |
-| Build kit (`-build-kit.tar.gz`) | `f91a7b61a39f0efdcee9558eb6725fe864340e8eacf940346499222afe7f7869` |
+Profile `omarchy-stable-20260910`, kit `1.1.0`, and package release `2` pin:
 
-The supported environment is Linux x86_64, `hyprland=0.56.2-1`, headers
-`0.56.2`, GCC `16.1.1 20260728`, and shared `libstdc++.so.6.0.36`.
-The compiler probe and compositor must carry the exact GCC ELF comment; the
-compiler, compositor, and module must resolve identical runtime bytes. The
-recipe rejects mismatches. `gcc-libs` alone is not proof of runtime compatibility.
-There is no qualified ARM build.
+- Hyprland `0.56.2-2`, headers `0.56.2`, and measured executable/header hashes.
+- GCC `16.2.1 20260810`, including compiler bytes and emitted ELF identity.
+- Shared runtime `libstdc++.so.6.0.36`, its bytes, and exact ABI package versions.
 
-Production input is enabled at build time. Experimental signed input and
-tracing are disabled. Source and build provenance are installed with the module.
-The build requires CMake 3.30 or later and Python 3.11 or later. The default
-compiler is `/usr/bin/g++`; an absolute `CUA_RELEASE_CXX` path can select an
-already provisioned matching compiler without bypassing runtime checks.
-The package does not provision a compiler or change runtime search paths.
+The generated `PKGBUILD` identifies the immutable kit download, outer checksum,
+and member checksums. The kit records the full source and tooling revisions,
+profile digest, and source archive/manifest digests. Do not infer compatibility
+from a matching version label or substitute an unreviewed profile.
 
-## Review and qualify
+The download wrapper verifies its complete inventory before executing downloaded
+tooling. It preserves the source archive and its historical embedded verifier,
+but explicitly uses the new kit's `profile_verify.py`. Source integrity,
+package-owned headers, pkg-config selection, compiler probes, runtime equality,
+and production flags remain mandatory. Packaging runs all bundled CTests even
+with `--nocheck` or `--repackage`; `--skipinteg` does not bypass recipe checks.
+Production input is built in; experimental signed input and tracing are off.
 
-Download both archives and `checksums.txt` from the exact release. Verify the
-archive hashes before extracting the kit, then verify its `SHA256SUMS` with the
-source archive alongside it. Compare this package's `PKGBUILD` byte for byte
-with the kit's recipe. Follow the kit's operator README and
-[release packaging instructions](https://github.com/trycua/cua/blob/4b3396d9fe4bd3cf723b0eb8db83c18a8764b520/libs/cua-driver/hyprland-plugin/packaging/release/README.md).
+## What is qualified
 
-Before enabling scheduled builds or publishing a package, maintainers need:
+The initial app scope is native Wayland Inkscape `1.4.4-6` with the canonical
+US keymap. Two lanes require independent Driver processes and distinct native
+application clients, not merely two windows. This is concurrency inside one
+desktop account, not multi-user or mutually untrusted-agent isolation.
 
-1. A native build in each intended channel's pinned x86_64 environment, with
-   all bundled tests passing and the packaged ELF dependencies and provenance
-   inspected. An unsigned, explicitly scoped repository build is
-   `bin/repo build --package cua-hyprland-plugin --arch x86_64 --mirror edge`.
-   Repeat with the intended channel only when its environment matches.
-2. The kit's `lifecycle.py` gate in a disposable pinned Arch environment,
-   including installation, removal, reinstallation, and refusal with a different
-   Hyprland package. That gate uses isolated ALPM roots and metadata dependency
-   fixtures; it does not prove live activation.
-3. Fresh-session activation and representative supported input, then upgrade,
-   rollback, and removal across compositor restarts. Retain evidence for the
-   exact package, source revision, compositor, compiler, and runtime.
+Cua's retained evidence covers background application effects, two-lane overlap,
+third-owner refusal, primary-input preservation, conflicts, stale targets and
+geometry, cancellation, desktop faults, recovery, and cold package transitions.
+Production-package app checks and independent primary observers are separate
+from trace-enabled diagnostics. The complete native Linux runner passed all
+128 required cells: 87 deliveries and 41 expected refusals, with no failures
+or skips. That runner used source-built released Driver 0.24.0; the real-app
+checks separately used the actual Omarchy `cua-driver-bin 0.24.0-1` executable.
+See the linked qualification record for exact artifacts and observation limits.
 
-Static review and download verification do not establish these native results.
-The source manifest's `native_certified: false` describes the generator's
-scope; separate native evidence must establish runtime qualification.
+Duplicate motion notifications are retained and counted. They are acceptable
+only when pointer identity, coordinates, focus, held input, and foreground
+interaction remain unchanged. Actual motion—including moving away and back—
+fails isolation. After cancellation, an inert agent pointer may remain parked
+if held input is released and authority is revoked.
 
-## Update policy
+Current LibreOffice Calc `26.8`, Chromium/Electron raw background input,
+XWayland, Unicode/IME, non-US layouts, and modified pointer gestures are outside
+this profile. The plugin does not widen Driver's application admission.
+Foreground input, capture, and accessibility have separate contracts; a
+background refusal never authorizes a hidden foreground fallback or unlock.
 
-Updates are explicit maintainer changes. There is no upstream polling hook,
-AUR synchronization, or automatic `rebuild_on` bump. Do not use Omarchy's
-`pinned` metadata flag here: it controls the Omarchy release pair's rc branch
-workflow, not native ABI compatibility.
+## Omabot replay before merge
 
-For an update, select an exact Cua Driver component tag, download its matching
-source and build kit, verify published checksums, and review the recipe and
-manifest together. Replace the recipe and update this record only after reviewing
-the new ABI contract. A Driver release alone does not qualify its plugin for
-a changed compositor. Keep `skip_build` enabled until the required channel
-evidence is available; removing it is a separate publication decision.
+Use the unsigned, explicitly scoped build command:
 
-Do not widen the Hyprland dependency or remove compiler/runtime checks to
-accommodate channel drift. If a channel cannot provide the pins, keep the
-plugin unavailable there and use Driver without this plugin. An installed
-plugin's exact dependency can block a compositor upgrade; remove the plugin
-using the restart procedure before moving to an incompatible environment.
+```sh
+bin/repo build --package cua-hyprland-plugin --arch x86_64 --mirror stable
+```
 
-## Activation and removal
+In a fresh worker matching the reviewed profile:
 
-The package installs only the module, license, and provenance. It has no install
-hooks, autoloading, configuration edits, or hot replacement. Follow the
-[pinned operator guide](https://github.com/trycua/cua/blob/4b3396d9fe4bd3cf723b0eb8db83c18a8764b520/libs/cua-driver/hyprland-plugin/packaging/release/USAGE.md)
-for deliberate loading, input enablement, status checks, and supported apps.
-Loading the module alone does not enable its input transport.
+1. Verify the downloaded kit and source identities against the reviewed recipe.
+   Record the actual channel snapshot, Driver, compiler, compositor, runtime,
+   applications, keymap, and resulting package/module hashes.
+2. Require all bundled tests and native compatibility checks. Do not weaken
+   exact dependencies or replace the compositor to make the build pass.
+3. Install through pacman and activate in a fresh session. Replay the declared
+   app, two-lane, refusal, primary-input, cancellation, and fault/recovery checks
+   against the actual packaged Driver and module. A Cua Fleet result is not an
+   Omabot result; matching source alone does not certify different binaries.
+4. Verify restart-based upgrade, rollback, removal, and reinstallation. Retain
+   evidence that binds each result to the package and mapped module bytes.
 
-Before installing or upgrading, save your work and exit Hyprland. Install from
-a text console, start a fresh session, and deliberately activate and verify the
-module. Keep the prior package and its matching environment for rollback.
-Before removal, remove any operator-added load and enable settings, exit
-Hyprland, and remove the package from a text console. Start a fresh session
-afterward. Upgrade, rollback, and removal require compositor restart; do not
-hot-unload/reload the module or force installation past its dependency pin.
+Portable tests, screenshots, health reports, and a successful build do not
+replace native qualification. Recheck the published Driver package before
+rollout and qualify any changed pairing explicitly.
+
+## Activation, updates, and removal
+
+The package installs the module at
+`/usr/lib/cua/hyprland/cua-hyprland-plugin.so` and provenance plus the consumer
+verifier under `/usr/share/cua-hyprland-plugin/`. There are no hooks, autoloading,
+configuration edits, or hot replacement.
+
+Save your work and exit Hyprland before installing, replacing, or removing the
+package. Install the exact reviewed package from a text console, then start a
+fresh session. Before loading, run the consumer check with the independently
+reviewed kit-provenance digest from the qualification record:
+
+```sh
+python3 /usr/share/cua-hyprland-plugin/profile_verify.py \
+  --kit /usr/share/cua-hyprland-plugin \
+  --kit-sha256 7beb736adfd334eed52e84070177634269e3a09f8bb25971b38606933ff4c997 \
+  --consumer /usr/lib/cua/hyprland/cua-hyprland-plugin.so
+```
+
+This check requires Python 3.11+, binutils `readelf`, and system `ldd`/`pacman`,
+not a compiler or headers. If it fails, leave the plugin unloaded. It verifies
+installed compatibility, not runtime mapping or input effects.
+
+After that check passes in the fresh session, load the module explicitly:
+
+```sh
+hyprctl plugin load /usr/lib/cua/hyprland/cua-hyprland-plugin.so
+hyprctl -j cua:status
+```
+
+Loading alone does not enable input. To enable the trusted local transport,
+add this setting to Omarchy's Lua configuration:
+
+```lua
+hl.config({plugin = {cua = {enabled = true}}})
+```
+
+Run `hyprctl reload`, then inspect `hyprctl -j cua:status` again. A runtime
+keyword or Lua evaluation without a configuration reload does not reconcile
+the input sockets. Verify input protocol v3, input capability, socket paths, and
+compositor identity before starting Driver with
+`CUA_DRIVER_RS_ENABLE_WAYLAND=1`. Verify a supported background action through
+fresh Driver snapshots and the saved application result. Do not automatically
+replay an action with a partial or unknown outcome.
+
+To disable input, set the enabling value to false (or remove it) and run
+`hyprctl reload`. Retained inert agent pointers can remain until the compositor
+exits; disabling input does not unload the mapped module.
+
+Before an incompatible desktop update, remove operator-added plugin activation
+settings, save work, and exit the graphical session. From a text console, run
+`sudo pacman -R cua-hyprland-plugin`, then apply the normal desktop update and
+verify a fresh session without the plugin. Declining removal preserves the
+dependency refusal. Disabling input alone leaves exact dependencies installed;
+do not force an upgrade past them.
+
+Retain the previous package with its matching compositor, runtime, Driver, and
+provenance as a rollback set. Restore a consistent set outside the graphical
+session, then repeat the fresh-session consumer and app checks. Do not hot
+unload/reload or replace a mapped module.
+
+## Ownership and publication
+
+The [agreed ownership split](https://github.com/omacom/omarchy-pkgs/pull/346#issuecomment-5612834061)
+assigns profiles, build kits, plugin fixes, and native input evidence to Cua.
+Francesco (@f-trycua) is the Cua contact through this PR. Omarchy owns package
+integration, dependency-change detection, Omabot validation, and signing and
+publication decisions. Omarchy must name its package/release owner before
+rollout. Maintenance is best effort, with no turnaround commitment.
+
+Edge detects upcoming incompatibilities; RC validates the intended stable
+environment. Mirror/channel changes and changes to ABI dependencies, Driver,
+or admitted apps request a new candidate and affected qualification. They do
+not establish compatibility or authorize additional publication channels.
+
+`skip_build` controls selection, not publication authority. This package has no
+upstream polling, AUR synchronization, or automatic rebuild bump. After replay
+and explicit merge approval, the named Omarchy owner must deliberately sign
+and publish the validated bytes. `bin/repo release` rebuilds before publication;
+`push` and `upload-prebuilt` also publish. None supplies native qualification.
+Do not silently substitute newly rebuilt bytes during signing/publication.
+
+Finally, install the signed published package on a fresh consumer, verify its
+signature and package/module digests, and perform a short activation,
+background-action, and cleanup smoke. Broader channels or unattended publishing
+require an enforced artifact-to-evidence gate, including prebuilt uploads.
