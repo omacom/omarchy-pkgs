@@ -1,0 +1,251 @@
+From 1e2a75fb7d0f925eab94fd32e62fe6147d954ea1 Mon Sep 17 00:00:00 2001
+From: Housong Zhang <housong.zhang@mediatek.com>
+Date: Mon, 27 Jul 2026 11:33:03 +0530
+Subject: [PATCH] NVIDIA: SAUCE: i2c: mediatek: Add ACPI/MT8901 support and
+ firmware-managed clocks
+
+BugLink: https://bugs.launchpad.net/bugs/2163407
+
+On MT8901-based platforms the I2C controllers are described through
+ACPI (HID NVDA0200) rather than device tree. The upstream i2c-mt65xx
+driver is DT-only: no acpi_match_table, no propagation of the ACPI
+fwnode to the i2c_adapter device, and clock/timing properties read
+through of_property_read_*() helpers that don't operate on ACPI nodes.
+Compounding that, on these platforms firmware keeps the controller's
+"main" and "dma" clocks running and does not expose them via the
+Linux clk framework, so devm_clk_get() returns -ENOENT for both.
+
+Consequently the driver does not bind on ACPI systems: no i2c_adapter
+is created, HID-over-I2C never enumerates child devices, and the
+internal I2C keyboard stays silent.
+
+Wire up ACPI and accept firmware-managed clocks:
+
+* Add mt8901_compat (v3 register layout, default_parent_rate=124.8 MHz
+  as a stand-in for clk_get_rate() when no clock provider is exposed)
+  and an acpi_match_table entry NVDA0200 -> mt8901_compat.
+
+* Replace of_device_get_match_data() with device_get_match_data() in
+  probe (with a NULL-match check), and switch mtk_i2c_parse_dt() to
+  the fwnode-aware device_property_read_*() helpers so DT and ACPI
+  share the same probe path.
+
+* Call device_set_node(&adap->dev, dev_fwnode(&pdev->dev)) so the
+  ACPI fwnode reaches the i2c_adapter device; without it,
+  has_acpi_companion() on the adapter returns 0 and
+  i2c_acpi_register_devices() exits early, leaving HID children
+  unenumerated.
+
+* Gate devm_clk_get() for "main"/"dma" on has_acpi_companion() - use
+  devm_clk_get_optional() in the ACPI branch so absent clocks are
+  accepted, and substitute i2c->dev_comp->default_parent_rate when
+  mtk_i2c_set_speed() has no clock handle to query.
+
+Signed-off-by: Housong Zhang <housong.zhang@mediatek.com>
+Signed-off-by: Kiran Maddaraki <kmaddaraki@nvidia.com>
+Acked-by: Jamie Nguyen <jamien@nvidia.com>
+Acked-by: Matthew R. Ochs <mochs@nvidia.com>
+Acked-by: Carol L Soto <csoto@nvidia.com>
+Signed-off-by: Brad Figg <bfigg@nvidia.com>
+---
+ drivers/i2c/busses/i2c-mt65xx.c | 100 +++++++++++++++++++++++++++-----
+ 1 file changed, 85 insertions(+), 15 deletions(-)
+
+diff --git a/drivers/i2c/busses/i2c-mt65xx.c b/drivers/i2c/busses/i2c-mt65xx.c
+index cb4d3aa709d01..ddac913483258 100644
+--- a/drivers/i2c/busses/i2c-mt65xx.c
++++ b/drivers/i2c/busses/i2c-mt65xx.c
+@@ -4,6 +4,7 @@
+  * Author: Xudong Chen <xudong.chen@mediatek.com>
+  */
+ 
++#include <linux/acpi.h>
+ #include <linux/clk.h>
+ #include <linux/completion.h>
+ #include <linux/delay.h>
+@@ -269,6 +270,14 @@ struct mtk_i2c_compatible {
+ 	unsigned char ltiming_adjust: 1;
+ 	unsigned char apdma_sync: 1;
+ 	unsigned char max_dma_support;
++	/*
++	 * Parent clock rate to use when the platform does not expose a
++	 * Linux clock provider for the I2C source clock (e.g. firmware-
++	 * managed clocks under ACPI). Left zero on SoCs whose firmware
++	 * exposes clocks through the clk framework; in that case the
++	 * driver continues to call clk_get_rate() on a mandatory clock.
++	 */
++	unsigned int default_parent_rate;
+ };
+ 
+ struct mtk_i2c_ac_timing {
+@@ -522,6 +531,26 @@ static const struct mtk_i2c_compatible mt8192_compat = {
+ 	.max_dma_support = 36,
+ };
+ 
++static const struct mtk_i2c_compatible mt8901_compat = {
++	.regs = mt_i2c_regs_v3,
++	.pmic_i2c = 0,
++	.dcm = 0,
++	.auto_restart = 1,
++	.aux_len_reg = 1,
++	.timing_adjust = 1,
++	.dma_sync = 0,
++	.ltiming_adjust = 1,
++	.apdma_sync = 1,
++	.max_dma_support = 40,
++	/*
++	 * MT8901 I2C on firmware-managed platforms: the IP is clocked off
++	 * a 124.8 MHz parent that is not exposed via clk_get_rate(). This
++	 * value mirrors the rate the SoC input clock is programmed to by
++	 * the boot loader.
++	 */
++	.default_parent_rate = 124800000,
++};
++
+ static const struct of_device_id mtk_i2c_of_match[] = {
+ 	{ .compatible = "mediatek,mt2712-i2c", .data = &mt2712_compat },
+ 	{ .compatible = "mediatek,mt6577-i2c", .data = &mt6577_compat },
+@@ -539,6 +568,14 @@ static const struct of_device_id mtk_i2c_of_match[] = {
+ };
+ MODULE_DEVICE_TABLE(of, mtk_i2c_of_match);
+ 
++#ifdef CONFIG_ACPI
++static const struct acpi_device_id mtk_i2c_acpi_match[] = {
++	{ "NVDA0200", (kernel_ulong_t)&mt8901_compat },
++	{ }
++};
++MODULE_DEVICE_TABLE(acpi, mtk_i2c_acpi_match);
++#endif
++
+ static u16 mtk_i2c_readw(struct mtk_i2c *i2c, enum I2C_REGS_OFFSET reg)
+ {
+ 	return readw(i2c->base + i2c->dev_comp->regs[reg]);
+@@ -1347,24 +1384,31 @@ static const struct i2c_algorithm mtk_i2c_algorithm = {
+ 	.functionality = mtk_i2c_functionality,
+ };
+ 
+-static int mtk_i2c_parse_dt(struct device_node *np, struct mtk_i2c *i2c)
++static int mtk_i2c_parse_fw(struct mtk_i2c *i2c)
+ {
+ 	int ret;
+ 
+-	ret = of_property_read_u32(np, "clock-frequency", &i2c->speed_hz);
++	ret = device_property_read_u32(i2c->dev, "clock-frequency",
++				       &i2c->speed_hz);
+ 	if (ret < 0)
+ 		i2c->speed_hz = I2C_MAX_STANDARD_MODE_FREQ;
+ 
+-	ret = of_property_read_u32(np, "clock-div", &i2c->clk_src_div);
+-	if (ret < 0)
+-		return ret;
++	ret = device_property_read_u32(i2c->dev, "clock-div",
++				       &i2c->clk_src_div);
++	if (ret < 0) {
++		if (has_acpi_companion(i2c->dev))
++			i2c->clk_src_div = 1;
++		else
++			return ret;
++	}
+ 
+ 	if (i2c->clk_src_div == 0)
+ 		return -EINVAL;
+ 
+-	i2c->have_pmic = of_property_read_bool(np, "mediatek,have-pmic");
+-	i2c->use_push_pull =
+-		of_property_read_bool(np, "mediatek,use-push-pull");
++	i2c->have_pmic = device_property_read_bool(i2c->dev,
++						   "mediatek,have-pmic");
++	i2c->use_push_pull = device_property_read_bool(i2c->dev,
++						       "mediatek,use-push-pull");
+ 
+ 	i2c_parse_fw_timings(i2c->dev, &i2c->timing_info, true);
+ 
+@@ -1376,6 +1420,7 @@ static int mtk_i2c_probe(struct platform_device *pdev)
+ 	int ret = 0;
+ 	struct mtk_i2c *i2c;
+ 	int i, irq, speed_clk;
++	unsigned int parent_rate;
+ 
+ 	i2c = devm_kzalloc(&pdev->dev, sizeof(*i2c), GFP_KERNEL);
+ 	if (!i2c)
+@@ -1395,10 +1440,12 @@ static int mtk_i2c_probe(struct platform_device *pdev)
+ 
+ 	init_completion(&i2c->msg_complete);
+ 
+-	i2c->dev_comp = of_device_get_match_data(&pdev->dev);
+-	i2c->adap.dev.of_node = pdev->dev.of_node;
++	i2c->dev_comp = device_get_match_data(&pdev->dev);
++	if (!i2c->dev_comp)
++		return -ENODEV;
+ 	i2c->dev = &pdev->dev;
+ 	i2c->adap.dev.parent = &pdev->dev;
++	device_set_node(&i2c->adap.dev, dev_fwnode(&pdev->dev));
+ 	i2c->adap.owner = THIS_MODULE;
+ 	i2c->adap.algo = &mtk_i2c_algorithm;
+ 	i2c->adap.quirks = i2c->dev_comp->quirks;
+@@ -1412,7 +1459,7 @@ static int mtk_i2c_probe(struct platform_device *pdev)
+ 			return PTR_ERR(i2c->adap.bus_regulator);
+ 	}
+ 
+-	ret = mtk_i2c_parse_dt(pdev->dev.of_node, i2c);
++	ret = mtk_i2c_parse_fw(i2c);
+ 	if (ret)
+ 		return -EINVAL;
+ 
+@@ -1423,14 +1470,33 @@ static int mtk_i2c_probe(struct platform_device *pdev)
+ 	for (i = 0; i < I2C_MT65XX_CLK_MAX; i++)
+ 		i2c->clocks[i].id = i2c_mt65xx_clk_ids[i];
+ 
+-	/* Get clocks one by one, some may be optional */
+-	i2c->clocks[I2C_MT65XX_CLK_MAIN].clk = devm_clk_get(&pdev->dev, "main");
++	/*
++	 * On DT-described platforms the "main" and "dma" clocks are
++	 * mandatory and probe must fail loudly if they are missing or
++	 * misconfigured. On platforms where firmware manages the I2C
++	 * clocks and does not expose them via the clk framework (the
++	 * ACPI case), there is no Linux clock provider to query; in
++	 * that case fall through to devm_clk_get_optional() and rely
++	 * on the per-compat default_parent_rate below to drive
++	 * mtk_i2c_set_speed().
++	 */
++	if (has_acpi_companion(&pdev->dev)) {
++		i2c->clocks[I2C_MT65XX_CLK_MAIN].clk =
++			devm_clk_get_optional(&pdev->dev, "main");
++		i2c->clocks[I2C_MT65XX_CLK_DMA].clk =
++			devm_clk_get_optional(&pdev->dev, "dma");
++	} else {
++		i2c->clocks[I2C_MT65XX_CLK_MAIN].clk =
++			devm_clk_get(&pdev->dev, "main");
++		i2c->clocks[I2C_MT65XX_CLK_DMA].clk =
++			devm_clk_get(&pdev->dev, "dma");
++	}
++
+ 	if (IS_ERR(i2c->clocks[I2C_MT65XX_CLK_MAIN].clk)) {
+ 		dev_err(&pdev->dev, "cannot get main clock\n");
+ 		return PTR_ERR(i2c->clocks[I2C_MT65XX_CLK_MAIN].clk);
+ 	}
+ 
+-	i2c->clocks[I2C_MT65XX_CLK_DMA].clk = devm_clk_get(&pdev->dev, "dma");
+ 	if (IS_ERR(i2c->clocks[I2C_MT65XX_CLK_DMA].clk)) {
+ 		dev_err(&pdev->dev, "cannot get dma clock\n");
+ 		return PTR_ERR(i2c->clocks[I2C_MT65XX_CLK_DMA].clk);
+@@ -1458,7 +1524,10 @@ static int mtk_i2c_probe(struct platform_device *pdev)
+ 
+ 	strscpy(i2c->adap.name, I2C_DRV_NAME, sizeof(i2c->adap.name));
+ 
+-	mtk_i2c_set_speed(i2c, clk_get_rate(i2c->clocks[speed_clk].clk));
++	parent_rate = i2c->clocks[speed_clk].clk
++		    ? clk_get_rate(i2c->clocks[speed_clk].clk)
++		    : i2c->dev_comp->default_parent_rate;
++	mtk_i2c_set_speed(i2c, parent_rate);
+ 
+ 	if (i2c->dev_comp->max_dma_support > 32) {
+ 		ret = dma_set_mask(&pdev->dev,
+@@ -1552,6 +1621,7 @@ static struct platform_driver mtk_i2c_driver = {
+ 		.name = I2C_DRV_NAME,
+ 		.pm = pm_sleep_ptr(&mtk_i2c_pm),
+ 		.of_match_table = mtk_i2c_of_match,
++		.acpi_match_table = ACPI_PTR(mtk_i2c_acpi_match),
+ 	},
+ };
+ 
