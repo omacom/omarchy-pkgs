@@ -3,7 +3,7 @@
 set -euo pipefail
 [[ -e /run/.containerenv || -e /.dockerenv ]] || { echo 'Requires a disposable container' >&2; exit 1; }
 (( EUID == 0 )) || exit 1
-for package in docker podman-docker omarchy-settings omarchy-settings-dev; do
+for package in docker docker-git podman-docker omarchy-settings omarchy-settings-dev; do
   if pacman -Q "$package" >/dev/null 2>&1; then
     echo "Fixture requires an empty package baseline: $package" >&2
     exit 1
@@ -28,7 +28,7 @@ pkgdesc = Disposable settings retirement fixture
 arch = any
 EOF
   case "$name" in
-    podman-docker)
+    podman-docker|docker-git)
       printf 'provides = docker\nconflict = docker\n' >>"$stage/.PKGINFO" ;;
     omarchy-settings|omarchy-settings-dev)
       printf 'depend = diffutils\n' >>"$stage/.PKGINFO"
@@ -78,6 +78,7 @@ assert_retired() {
 
 package_fixture docker 1
 package_fixture podman-docker 1
+package_fixture docker-git 1
 for variant in omarchy-settings omarchy-settings-dev; do
   package_fixture "$variant" 1 false
   package_fixture "$variant" 2 true
@@ -105,5 +106,33 @@ for variant in omarchy-settings omarchy-settings-dev; do
   install_fixture "$variant" 4
   for path in "${paths[@]}"; do [[ $(cat "/$path") == "stock $path" ]]; done
   printf 'ok - %s older source without the Podman generator retains its Docker defaults\n' "$variant"
+  pacman -R --noconfirm "$variant"
+  install_fixture docker-git 1
+  [[ $(pacman -Qq docker) == docker-git ]]
+  install_fixture "$variant" 1
+  printf 'custom Docker settings\n' >/etc/docker/daemon.json
+  chmod 600 /etc/docker/daemon.json
+  install_fixture "$variant" 2
+  assert_pending
+  install_fixture "$variant" 2
+  assert_pending
+  printf 'ok - %s upgrade/reinstall preserves alternate Docker provider configuration\n' "$variant"
+  # Exercise the actual function with an unreadable package database.
+  (
+    source "$ROOT/pkgbuilds/$variant/$variant.install"
+    pacman() { return 2; }
+    _docker_defaults_retire
+  )
+  assert_pending
+  printf 'ok - %s retains configuration when package queries fail\n' "$variant"
+  install_fixture podman-docker 1
+  install_fixture "$variant" 3
+  assert_retired
+  pacman -R --noconfirm "$variant"
+  rm -f /etc/docker/daemon.json.before-podman
+  pacman -R --noconfirm podman-docker
+  install_fixture "$variant" 3
+  for path in "${paths[@]}"; do [[ ! -e /$path && ! -e /$path.before-podman ]]; done
+  printf 'ok - fresh %s retires Docker defaults when no provider is installed\n' "$variant"
   pacman -R --noconfirm "$variant"
 done
