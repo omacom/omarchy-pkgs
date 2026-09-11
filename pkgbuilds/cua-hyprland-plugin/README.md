@@ -17,8 +17,11 @@ Edge, RC, and ARM publication are outside this initial scope.
 The package uses the [Driver 0.26.1 plugin source](https://github.com/trycua/cua/releases/tag/cua-driver-rs-v0.26.1),
 including the [desktop-fault cleanup repair](https://github.com/trycua/cua/pull/3702).
 It is not a repackaging of the unmodified 0.24.0 plugin. The Driver client
-pairing qualified for this package remains `cua-driver-bin 0.24.0-1`, with
-input protocol v3. Discovery protocol v2 is separate.
+intended for Omarchy publication is `cua-driver-bin 0.27.0-1`, with input
+protocol v3. Driver 0.27.0 contains the bounded stale-geometry retry validated
+with this pinned module; its production plugin source is unchanged from the
+source used here. Discovery protocol v2 is separate. Omarchy must still build,
+replay, sign, and publish that exact package pairing before rollout.
 
 Profile `omarchy-stable-20260910`, kit `1.1.0`, and package release `2` pin:
 
@@ -55,11 +58,20 @@ from trace-enabled diagnostics. Cua's retained canonical run
 deliveries and 41 expected refusals, with no failures or skips; its completion
 report has SHA-256
 `1eda4cc008ea6b27d96c21d58f8041834398a43409642376bafe84ad38f0e112`.
-That run used source-built released Driver 0.24.0; the real-app checks
-separately used the actual Omarchy `cua-driver-bin 0.24.0-1` executable. A
-separate later Omabot replay reported 124 passes and four failures, plus seven
-incomplete native cases, so Omarchy replay remains an explicit merge gate. See
-the linked qualification record for exact artifacts and observation limits.
+That historical run used source-built released Driver 0.24.0; earlier real-app
+checks separately used the then-published Omarchy `cua-driver-bin 0.24.0-1`
+executable. A separate later Omabot replay reported 124 passes and four
+failures, plus seven incomplete native cases. Cua subsequently passed those
+four cells with the repair candidate shipped in Driver 0.27.0 and passed all
+seven lifecycle cases. A final exact-release Fleet replay then passed all four
+cells with Driver and harness source `082de4344b731ae4738ddc6a6f13f21bb3c49a85`,
+released Driver binary SHA-256
+`bb1b65394e912246220f9f758c9efbbf6260cec16e3562e62a361fa95329377f`,
+and evidence SHA-256
+`b6c47278a3db398ecbb4d7aed2bce44a467e2af37e6d4ccfc236d1e07aa70af7`.
+Omarchy replay of the intended 0.27.0 package pairing remains an explicit
+merge gate. See the linked qualification record and PR description for exact
+artifacts and observation limits.
 
 Duplicate motion notifications are retained and counted. They are acceptable
 only when pointer identity, coordinates, focus, held input, and foreground
