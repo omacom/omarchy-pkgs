@@ -1,17 +1,16 @@
 #!/usr/bin/env bash
 # Resolve current Grok Bot stable from Cursor's update feed and pin PKGBUILD.
-# Linux has no latest alias (linux-x64 feed returns 204). The darwin-arm64
-# sand feed publishes version + commit; the Linux .deb lives at the same commit.
-# Darwin can ship first — HEAD-check the Linux URL and fail loudly if 404.
+# The linux-x64 sand feed publishes version + commit via its AppImage zsync URL;
+# the Linux .deb lives at the same commit with a predictable filename.
 set -euo pipefail
 
 PKGBUILD_PATH="${1:-PKGBUILD}"
 [[ -f "${PKGBUILD_PATH}" ]] || { echo "Error: PKGBUILD not found at '${PKGBUILD_PATH}'" >&2; exit 1; }
 
-FEED='https://api2.cursor.sh/updates/api/update/darwin-arm64/sand/0.0.0/00000000-0000-0000-0000-000000000000/stable'
+FEED='https://api2.cursor.sh/updates/api/update/linux-x64/sand/0.0.0/00000000-0000-0000-0000-000000000000/stable'
 json="$(curl -fsSL -H 'cache-control: no-cache' "${FEED}")"
 
-ver="$(jq -er '.name // .version' <<<"${json}")"
+ver="$(jq -er '.version // .name' <<<"${json}")"
 feed_url="$(jq -er '.url' <<<"${json}")"
 commit="$(sed -nE 's@.*/(grokbot|sand)/stable/([0-9a-f]{40})/.*@\2@p' <<<"${feed_url}")"
 
@@ -20,7 +19,7 @@ commit="$(sed -nE 's@.*/(grokbot|sand)/stable/([0-9a-f]{40})/.*@\2@p' <<<"${feed
   exit 1
 }
 
-deb_url="https://downloads.cursor.com/grokbot/stable/${commit}/linux/x64/Grok_Bot_${ver}.deb"
+deb_url="https://downloads.cursor.com/grokbot/stable/${commit}/linux/x64/grok-bot_${ver}_amd64.deb"
 code="$(curl -fsSIL -o /dev/null -w '%{http_code}' "${deb_url}")"
 [[ "${code}" == "200" ]] || {
   echo "Error: Linux deb not fetchable (${code}): ${deb_url}" >&2
@@ -37,7 +36,7 @@ current_ver="$(sed -nE 's/^pkgver=([^[:space:]#]+).*/\1/p' "${PKGBUILD_PATH}" | 
 sed -i -E \
   -e "s/^_commit=.*/_commit=${commit}/" \
   -e "s/^pkgver=.*/pkgver=${ver}/" \
-  -e "0,/^[[:space:]]*'[0-9a-f]{64}'/s//    '${sum}'/" \
+  -e "s/^sha256sums=\\('[0-9a-f]{64}'/sha256sums=('${sum}'/" \
   "${PKGBUILD_PATH}"
 
 if [[ "${ver}" != "${current_ver}" ]]; then
