@@ -1,0 +1,367 @@
+#!/bin/bash
+#
+# Copy missing vendor-signed Qualcomm firmware from a Windows driver store.
+# Required filenames come from the running device tree.
+#
+# Modes
+#   --stage DIR       Live ISO, before the disk is touched: scan the Windows
+#                     partitions and save the missing files under DIR (the
+#                     installer copies DIR into the target). Missing firmware
+#                     is reported without aborting staging.
+#   --install         Installed system or the installer's chroot: take the
+#                     files from the stage (--stage-dir, default
+#                     /var/lib/omarchy/firmware-stage), else from a Windows
+#                     partition still on disk, write them under
+#                     /usr/lib/firmware/updates, record a manifest, add the
+#                     zap shader to the initramfs, and rebuild the boot image
+#                     (unless --no-rebuild). This is the default mode.
+#   --list-missing    Print the device-tree firmware names not present under
+#                     /usr/lib/firmware, one per line. Needs no root.
+#   -d DIR            Use DIR as the driver store (a Windows/System32/
+#                     DriverStore/FileRepository directory, or any directory
+#                     tree holding the files) instead of scanning partitions.
+#
+# Files land in /usr/lib/firmware/updates to avoid package ownership conflicts.
+#
+# Derived from Canonical's qcom-firmware-extract (Tobias Heider, GPL-2+):
+# https://salsa.debian.org/debian/qcom-firmware-extract
+# SPDX-License-Identifier: GPL-2.0-or-later
+
+set -euo pipefail
+
+DT_ROOT=${QCOM_FW_DT_ROOT:-/sys/firmware/devicetree/base}
+FW_ROOT=${QCOM_FW_FIRMWARE_ROOT:-/usr/lib/firmware}
+# Destination prefix for the installed-system paths (tests only).
+ROOT=${QCOM_FW_ROOT:-}
+STATE_DIR="$ROOT/var/lib/omarchy/qcom-firmware"
+MANIFEST="$STATE_DIR/manifest"
+INITCPIO_CONF="$ROOT/etc/mkinitcpio.conf.d/qcom-firmware.conf"
+DEFAULT_STAGE_DIR="$ROOT/var/lib/omarchy/firmware-stage"
+DRIVERSTORE_PATH="Windows/System32/DriverStore/FileRepository"
+
+mode=install
+stage_dir=""
+driverstore=""
+rebuild=yes
+
+usage() {
+  sed -n '2,/^# SPDX/{/^# SPDX/d;s/^# \{0,1\}//p}' "$0"
+}
+
+while (($#)); do
+  case $1 in
+    --stage) mode=stage; stage_dir=${2:?--stage needs a directory}; shift ;;
+    --stage-dir) stage_dir=${2:?--stage-dir needs a directory}; shift ;;
+    --install) mode=install ;;
+    --list-missing) mode=list ;;
+    --no-rebuild) rebuild=no ;;
+    -d) driverstore=${2:?-d needs a directory}; shift ;;
+    -h | --help) usage; exit 0 ;;
+    *) echo "qcom-firmware-extract: unknown option: $1" >&2; usage >&2; exit 2 ;;
+  esac
+  shift
+done
+
+log() { printf 'qcom-firmware-extract: %s\n' "$*"; }
+warn() { printf 'qcom-firmware-extract: %s\n' "$*" >&2; }
+
+# ---------------------------------------------------------------------------
+# 1. What does this machine ask for, and what is already there?
+# ---------------------------------------------------------------------------
+
+# Prints "<node-name> <firmware path>" for every firmware-name entry in the
+# device tree. A property can hold several NUL-separated strings.
+dt_firmware_names() {
+  local prop node name
+  [[ -d $DT_ROOT ]] || return 0
+  find "$DT_ROOT" -name firmware-name -type f -print0 2>/dev/null | sort -z |
+    while IFS= read -r -d '' prop; do
+      node=${prop%/firmware-name}
+      node=${node#"$DT_ROOT"/}
+      tr '\0' '\n' <"$prop" | while IFS= read -r name; do
+        [[ -n $name ]] && printf '%s %s\n' "$node" "$name"
+      done
+    done
+}
+
+# The kernel searches every directory for plain firmware before trying zstd
+# and xz. gzip is not an automatic firmware-loader fallback.
+firmware_file() {
+  local name=$1 dir ext
+  for ext in '' .zst .xz; do
+    for dir in "$FW_ROOT/updates" "$FW_ROOT"; do
+      if [[ -f "$dir/$name$ext" ]]; then
+        printf '%s\n' "$dir/$name$ext"
+        return 0
+      fi
+    done
+  done
+  return 1
+}
+
+declare -a missing_nodes=() missing_names=()
+while read -r node name; do
+  firmware_file "$name" >/dev/null && continue
+  missing_nodes+=("$node")
+  missing_names+=("$name")
+done < <(dt_firmware_names)
+
+if [[ $mode == list ]]; then
+  ((${#missing_names[@]})) && printf '%s\n' "${missing_names[@]}"
+  exit 0
+fi
+
+if [[ ! -d $DT_ROOT ]]; then
+  log "no device tree on this machine, nothing to do"
+  exit 0
+fi
+if [[ $mode != install ]] && ((${#missing_names[@]} == 0)); then
+  log "every firmware file the device tree names is already installed"
+  exit 0
+fi
+
+# Root is needed to write under /usr/lib/firmware (and, below, to mount
+# partitions); staging a -d driver store into a user directory needs neither.
+if ((EUID != 0)) && [[ $mode == install && -z $ROOT ]]; then
+  warn "must run as root"
+  exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# 2. Where can they come from?
+# ---------------------------------------------------------------------------
+
+declare -a sources=()   # directories to search, best first
+declare -a mounts=()    # temporary mounts to undo
+cleanup() {
+  local m
+  for m in "${mounts[@]-}"; do
+    [[ -n $m ]] || continue
+    umount "$m" 2>/dev/null || true
+    rmdir "$m" 2>/dev/null || true
+  done
+}
+trap cleanup EXIT
+
+# Mount Windows driver stores read-only, preferring internal disks.
+scan_windows_partitions() {
+  local dev fstype tran mp bitlocker=""
+  if ((EUID != 0)); then
+    warn "must run as root to read the Windows partitions"
+    exit 1
+  fi
+  local -a internal=() external=()
+  while read -r dev fstype tran; do
+    case $fstype in
+      ntfs) ;;
+      BitLocker) bitlocker+=" $dev"; continue ;;
+      *) continue ;;
+    esac
+    if [[ $tran == usb ]]; then external+=("$dev"); else internal+=("$dev"); fi
+  done < <(lsblk -rpno PATH,FSTYPE,TRAN 2>/dev/null | awk 'NF>=2')
+
+  for dev in "${internal[@]}" "${external[@]}"; do
+    mp=$(mktemp -d /run/qcom-firmware-extract.XXXXXX)
+    if mount -t ntfs3 -o ro,nosuid,nodev,noexec "$dev" "$mp" 2>/dev/null; then
+      mounts+=("$mp")
+      if [[ -d "$mp/$DRIVERSTORE_PATH" ]]; then
+        log "Windows driver store found on $dev"
+        sources+=("$mp/$DRIVERSTORE_PATH")
+      fi
+    else
+      warn "could not mount $dev read-only (ntfs3); skipping it"
+      rmdir "$mp" 2>/dev/null || true
+    fi
+  done
+  [[ -n $bitlocker ]] && warn "BitLocker volume(s) skipped:$bitlocker; turn BitLocker off in Windows to let the firmware be read"
+  return 0
+}
+
+firmware_sha256() {
+  local file=$1
+  case "$file" in
+    *.zst) zstd -qdc -- "$file" ;;
+    *.xz) xz -dc -- "$file" ;;
+    *) cat -- "$file" ;;
+  esac | sha256sum | cut -d' ' -f1
+}
+
+# Match ambiguous DTBs to an installed sibling firmware blob from the same node.
+matching_companion_candidate() {
+  local node=$1
+  shift
+  local -a candidates=("$@")
+  local dt_node dt_name installed installed_hash candidate sibling matched compatible
+  local -a matches=()
+
+  for candidate in "${candidates[@]}"; do
+    matched=0
+    compatible=1
+    while read -r dt_node dt_name; do
+      [[ $dt_node == "$node" ]] || continue
+      installed=$(firmware_file "$dt_name") || continue
+      installed_hash=$(firmware_sha256 "$installed") || return 1
+      sibling=$(find "${candidate%/*}" -maxdepth 1 -type f \
+        -iname "$(basename "$dt_name")" -print -quit 2>/dev/null)
+      [[ -n $sibling ]] || continue
+      if [[ $(sha256sum "$sibling" | cut -d' ' -f1) == "$installed_hash" ]]; then
+        matched=1
+      else
+        compatible=0
+        break
+      fi
+    done < <(dt_firmware_names)
+    if ((matched && compatible)); then
+      matches+=("$candidate")
+    fi
+  done
+
+  unique_candidate "${matches[@]}"
+}
+
+# Duplicate copies are safe only when their contents agree.
+unique_candidate() {
+  (($#)) || return 1
+  local first=$1 candidate
+  shift
+  for candidate in "$@"; do
+    cmp -s "$first" "$candidate" || return 1
+  done
+  printf '%s\n' "$first"
+}
+
+# Require a companion match when several firmware variants exist.
+find_in_sources() {
+  local base=$1 node=$2 candidate
+  local -a candidates=()
+  while IFS= read -r -d '' candidate; do
+    candidates+=("$candidate")
+  done < <(find "${sources[@]}" -type f -iname "$base" -print0 2>/dev/null)
+
+  ((${#candidates[@]})) || return 1
+  if unique_candidate "${candidates[@]}"; then
+    return 0
+  fi
+
+  if matching_companion_candidate "$node" "${candidates[@]}"; then
+    return 0
+  fi
+
+  warn "refusing ambiguous $base: no unique variant matches its installed companion firmware"
+  return 1
+}
+
+# ---------------------------------------------------------------------------
+# 3. Stage: live session, before the disk is written
+# ---------------------------------------------------------------------------
+
+if [[ $mode == stage ]]; then
+  if [[ -f "$stage_dir/manifest" ]]; then
+    log "already staged in $stage_dir"
+    exit 0
+  fi
+  if [[ -n $driverstore ]]; then sources=("$driverstore"); else scan_windows_partitions; fi
+  mkdir -p "$stage_dir"
+  staged=0
+  : >"$stage_dir/manifest.partial"
+  for i in "${!missing_names[@]}"; do
+    node=${missing_nodes[$i]}
+    name=${missing_names[$i]}
+    src=""
+    if ((${#sources[@]})); then
+      src=$(find_in_sources "$(basename "$name")" "$node") || true
+    fi
+    if [[ -z $src ]]; then
+      warn "not found in the driver store: $name"
+      continue
+    fi
+    install -Dm644 "$src" "$stage_dir/$name"
+    printf '%s %s %s\n' "$name" "$(sha256sum "$src" | cut -d' ' -f1)" "$src" >>"$stage_dir/manifest.partial"
+    staged=$((staged + 1))
+  done
+  mv "$stage_dir/manifest.partial" "$stage_dir/manifest"
+  log "staged $staged of ${#missing_names[@]} firmware files in $stage_dir"
+  exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# 4. Install: from the stage, else from a Windows partition still on disk
+# ---------------------------------------------------------------------------
+
+[[ -n $stage_dir ]] || stage_dir=$DEFAULT_STAGE_DIR
+if [[ -n $driverstore ]]; then
+  sources=("$driverstore")
+elif [[ -f "$stage_dir/manifest" ]]; then
+  log "using the firmware staged by the installer in $stage_dir"
+  sources=("$stage_dir")
+elif ((${#missing_names[@]})); then
+  scan_windows_partitions
+fi
+
+mkdir -p "$STATE_DIR"
+touch "$MANIFEST"
+installed=0
+for i in "${!missing_names[@]}"; do
+  node=${missing_nodes[$i]}
+  name=${missing_names[$i]}
+  src=""
+  if ((${#sources[@]})); then
+    src=$(find_in_sources "$(basename "$name")" "$node") || true
+  fi
+  if [[ -z $src ]]; then
+    warn "not found: $name"
+    continue
+  fi
+  install -Dm644 "$src" "$FW_ROOT/updates/$name"
+  sum=$(sha256sum "$src" | cut -d' ' -f1)
+  # Keep one line per firmware name.
+  grep -v "^$name " "$MANIFEST" >"$MANIFEST.new" || true
+  printf '%s %s %s %s\n' "$name" "$sum" "$src" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >>"$MANIFEST.new"
+  mv "$MANIFEST.new" "$MANIFEST"
+  log "installed $name"
+  installed=$((installed + 1))
+done
+
+# Include existing GPU zap shaders in the initramfs for the early DRM driver.
+declare -a initramfs_files=()
+while read -r node name; do
+  [[ ${node##*/} == zap-shader || ${node##*/} == zap-shader@* ]] || continue
+  if file=$(firmware_file "$name"); then
+    initramfs_files+=("${file#"$ROOT"}")
+  fi
+done < <(dt_firmware_names)
+initramfs_changed=0
+if ((${#initramfs_files[@]})); then
+  initramfs_config=$(
+    echo "# Generated by qcom-firmware-extract for early DRM firmware loading."
+    printf 'FILES+=(%s)\n' "$(printf '%q ' "${initramfs_files[@]}" | sed 's/ $//')"
+  )
+  if [[ ! -f $INITCPIO_CONF || $(<"$INITCPIO_CONF") != "$initramfs_config" ]]; then
+    mkdir -p "$(dirname "$INITCPIO_CONF")"
+    printf '%s\n' "$initramfs_config" >"$INITCPIO_CONF"
+    initramfs_changed=1
+  fi
+elif [[ -f $INITCPIO_CONF ]]; then
+  rm -f "$INITCPIO_CONF"
+  initramfs_changed=1
+fi
+
+still_missing=$(( ${#missing_names[@]} - installed ))
+if ((installed == 0)); then
+  if ((still_missing > 0 && ${#sources[@]} == 0)); then
+    warn "no Windows installation found to copy from; run again with -d <driver store> when one is available"
+  fi
+  log "nothing installed; $still_missing firmware file(s) still missing"
+  ((initramfs_changed)) || exit 0
+else
+  log "installed $installed firmware file(s), $still_missing still missing"
+fi
+
+if [[ $rebuild == yes ]]; then
+  if command -v limine-update >/dev/null 2>&1; then
+    limine-update
+  else
+    mkinitcpio -P
+  fi
+  log "reboot to load the added firmware"
+fi
