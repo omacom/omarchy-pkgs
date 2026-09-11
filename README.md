@@ -839,6 +839,7 @@ bin/repo release --package my-package
 - Same workflow, just add `--arch aarch64`; the scheduled pipeline runs it
   automatically once `aarch64` is in `PUBLISHED_ARCHES`
 - Packages whose `arch=()` lacks `aarch64` are skipped, not failed
+- For native CI builds, run the **aarch64 package repo** workflow.
 
 ### Building for Both Architectures
 
