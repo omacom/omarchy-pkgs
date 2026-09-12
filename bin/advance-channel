@@ -364,6 +364,45 @@ print_info "Cleaning $TO repository..."
 print_info "Updating $TO repository database..."
 "$BUILD_ROOT/bin/update-repo" --mirror "$TO" --arch "$ARCH"
 
+# OPR advisory sidecar (#378): carry the CVE metadata for moved packages
+# forward with the artifacts they describe. The destination database stays
+# authoritative on which versions exist; entries are merged by package name
+# and never rewrite a package file. A merged sidecar is new bytes, so its
+# detached signature is dropped with a warning — visible + fail-open until
+# the next signed ingest refresh.
+if [[ -f "$SOURCE_DIR/omarchy.advisories.json" ]]; then
+  if [[ ! -f "$TARGET_DIR/omarchy.advisories.json" ]]; then
+    cp -p "$SOURCE_DIR/omarchy.advisories.json" "$TARGET_DIR/omarchy.advisories.json"
+    [[ -f "$SOURCE_DIR/omarchy.advisories.json.sig" ]] &&
+      cp -p "$SOURCE_DIR/omarchy.advisories.json.sig" "$TARGET_DIR/omarchy.advisories.json.sig" || true
+    echo "  carried advisory sidecar from $FROM (new destination file)"
+  else
+    dest_names=$(tar -xOf "$TARGET_DIR/omarchy.db.tar.zst" --wildcards '*/desc' 2>/dev/null |
+      awk '$0 == "%NAME%" { getline; print }' | sort -u | jq -R . | jq -s .)
+    merged=$(mktemp)
+    if jq -s --argjson dest_names "$dest_names" '
+        (.[1].advisories // {}) as $src |
+        (.[0].advisories // {}) as $dst |
+        ($dest_names | map({(.): true}) | add // {}) as $wanted |
+        {schema: 1, channel: .[0].channel, arch: .[0].arch,
+         generated_at: (.[0].generated_at // .[1].generated_at // ""),
+         advisories: ($dst + ($src | with_entries(select(.key as $k | $wanted[$k]))))}
+      ' "$TARGET_DIR/omarchy.advisories.json" \
+      "$SOURCE_DIR/omarchy.advisories.json" >"$merged" 2>/dev/null &&
+      jq -e '.schema == 1 and (.advisories | type == "object")' \
+        "$merged" >/dev/null 2>&1; then
+      if ! cmp -s "$merged" "$TARGET_DIR/omarchy.advisories.json"; then
+        cp "$merged" "$TARGET_DIR/omarchy.advisories.json"
+        rm -f "$TARGET_DIR/omarchy.advisories.json.sig"
+        echo "  merged advisory sidecar from $FROM (signature dropped; re-sign via bin/sync-advisories)"
+      fi
+    else
+      print_warning "Could not merge advisory sidecar from $FROM; leaving destination sidecar unchanged"
+    fi
+    rm -f "$merged"
+  fi
+fi
+
 echo ""
 print_info "Syncing $TO repository to remote..."
 SYNC_ARGS=("--mirror" "$TO" "--arch" "$ARCH")
