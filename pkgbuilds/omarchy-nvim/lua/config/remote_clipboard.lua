@@ -88,6 +88,9 @@ function M.setup()
     end
   end
 
+  -- LazyVim disables clipboard syncing over SSH; our provider supports it.
+  vim.opt.clipboard = "unnamedplus"
+
   vim.g.clipboard = {
     name = "OmarchyRemoteClipboard",
     copy = { ["+"] = copy("+"), ["*"] = copy("*") },
