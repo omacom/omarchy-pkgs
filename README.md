@@ -43,7 +43,8 @@ podman run --rm --platform linux/arm64 docker.io/library/alpine:latest uname -m
 # Should output: aarch64
 ```
 
-**Note**: emulated builds are much slower than native ones.
+**Note**: emulated builds are much slower than native ones. The **Build aarch64
+Packages** workflow builds on native ARM64 runners without emulation.
 
 ### Published architectures
 
@@ -839,6 +840,11 @@ bin/repo release --package my-package
 - Same workflow, just add `--arch aarch64`; the scheduled pipeline runs it
   automatically once `aarch64` is in `PUBLISHED_ARCHES`
 - Packages whose `arch=()` lacks `aarch64` are skipped, not failed
+- For a manual native CI build, trigger **Build aarch64 Packages** from the Actions
+  tab. Choose `edge`, `rc`, or `stable` and optionally name the packages to build,
+  including any required recipes from this repository. Package channel policy
+  still applies. The workflow uploads an
+  unsigned artifact; signing and publishing happen on the repository host.
 
 ### Building for Both Architectures
 
