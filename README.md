@@ -547,6 +547,7 @@ bin/package-worktree <package>       # Create upstream/patched/current scratch w
 bin/repo remove <package>            # Remove package
 bin/sync-upstream                    # Update packages that track a vendor release feed
 bin/sync-rebuilds                    # Bump pkgrel for packages whose dependencies moved
+bin/sync-advisories                  # Refresh the OPR advisory sidecar (CVE metadata, no rebuild; see docs/opr-advisory-sidecar.md)
 bin/clean-docker                     # Clear Docker images/cache (forces fresh rebuild)
 ```
 

@@ -1,0 +1,355 @@
+#!/bin/bash
+# Refresh the OPR advisory sidecar without rebuilding any package.
+# (omacom/omarchy-pkgs#378, first milestone)
+#
+# Reads the channel's pacman database for the published package set, merges
+# per-package CVE reports from a feed directory, and writes
+#   <repo>/<channel>/<arch>/omarchy.advisories.json (+ .sig)
+# Package archives are never touched: a new CVE updates the sidecar while
+# every .pkg.tar.zst keeps its bytes.
+#
+# Feed directory layout (OPR-operated ingest input, not checked-in CVE data):
+#   <feed>/<pkgname>.json  e.g. feed/mise-bin.json:
+#   {
+#     "cve_ids": ["CVE-2026-12345"],
+#     "cve_max_severity": "HIGH", "severity_scale": "CVSSv3",
+#     "advisory_as_of": "2026-09-10T00:00:00Z",
+#     "scan_source": "osv.dev", "note": "optional context"
+#   }
+# A missing file means "not yet scanned" (scan_status=missing, fail-open).
+# An unreadable file or a severity without a scale means scan_status=error.
+# Preferred live source is OSV (https://osv.dev); NVD/vendor feeds map onto
+# the same fields. Only the fields above are read; unknown keys are ignored.
+#
+# Usage:
+#   bin/sync-advisories [--mirror edge] [--arch x86_64] [--package mise-bin...]
+#                       [--feed ./advisories-feed] [--stale-after 72h]
+#                       [--dry-run] [--no-sign]
+
+set -euo pipefail
+
+BUILD_ROOT=$(realpath "${BASH_SOURCE[0]%/*}/..")
+# shellcheck source=../helpers/paths.sh
+source "$BUILD_ROOT/helpers/paths.sh"
+# shellcheck source=../helpers/message-helpers.sh
+source "$BUILD_ROOT/helpers/message-helpers.sh"
+# shellcheck source=../helpers/advisory-helpers.sh
+source "$BUILD_ROOT/helpers/advisory-helpers.sh"
+
+FEED_DIR=""
+STALE_AFTER="72h"
+DRY_RUN=false
+NO_SIGN=false
+PACKAGES=()
+
+usage() {
+  cat <<EOF
+Usage: $0 [OPTIONS]
+
+Refresh the OPR advisory sidecar for one channel/arch without rebuilding.
+
+Options:
+  --mirror <edge|rc|stable>   Channel (default: edge; --channel is accepted too)
+  --channel <name>            Alias for --mirror
+  --arch <x86_64|aarch64>     Architecture (default: x86_64)
+  --package <names...>        Refresh only the named package(s)
+  --feed <dir>                Per-package JSON feed dir (default: ./advisories-feed)
+  --stale-after <duration>    Mark scans older than this stale (default: 72h;
+                              bare seconds or s/m/h/d suffix)
+  --dry-run                   Show the plan; write nothing
+  --no-sign                   Write the sidecar without a detached .sig
+  -h, --help                  Show this help message
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+  --mirror | --channel)
+    [[ $# -ge 2 ]] || {
+      print_error "$1 requires a value"
+      exit 1
+    }
+    MIRROR="$2"
+    require_valid_mirror "$MIRROR"
+    update_arch_paths
+    shift 2
+    ;;
+  --arch)
+    [[ $# -ge 2 ]] || {
+      print_error "--arch requires a value"
+      exit 1
+    }
+    require_valid_arch "$2"
+    ARCH="$2"
+    update_arch_paths
+    shift 2
+    ;;
+  --package)
+    shift
+    while [[ $# -gt 0 && ! "$1" =~ ^-- ]]; do
+      PACKAGES+=("$1")
+      shift
+    done
+    [[ ${#PACKAGES[@]} -gt 0 ]] || {
+      print_error "--package requires at least one package name"
+      exit 1
+    }
+    ;;
+  --feed)
+    [[ $# -ge 2 ]] || {
+      print_error "--feed requires a value"
+      exit 1
+    }
+    FEED_DIR="$2"
+    shift 2
+    ;;
+  --stale-after)
+    [[ $# -ge 2 ]] || {
+      print_error "--stale-after requires a value"
+      exit 1
+    }
+    STALE_AFTER="$2"
+    shift 2
+    ;;
+  --dry-run)
+    DRY_RUN=true
+    shift
+    ;;
+  --no-sign)
+    NO_SIGN=true
+    shift
+    ;;
+  -h | --help)
+    usage
+    exit 0
+    ;;
+  *)
+    print_error "Unknown option: $1"
+    usage >&2
+    exit 1
+    ;;
+  esac
+done
+
+[[ -z "$FEED_DIR" ]] && FEED_DIR="$BUILD_ROOT/advisories-feed"
+STALE_SECONDS=$(advisory_duration_seconds "$STALE_AFTER") || {
+  print_error "Invalid --stale-after value: $STALE_AFTER (use e.g. 72h, 2d, 3600)"
+  exit 1
+}
+
+DB_FILE="$REPO_DIR/omarchy.db.tar.zst"
+[[ -f "$DB_FILE" ]] || {
+  print_error "Repository database not found: $DB_FILE"
+  exit 1
+}
+SIDECAR=$(advisory_sidecar_path "$REPO_DIR")
+NOW_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+NOW_EPOCH=$(date -u +%s)
+
+print_header "Sync Advisories ($MIRROR/$ARCH)"
+print_info "Database: $DB_FILE"
+print_info "Sidecar:  $SIDECAR"
+print_info "Feed:     $FEED_DIR"
+print_info "Stale after: $STALE_AFTER"
+[[ ${#PACKAGES[@]} -gt 0 ]] && print_info "Packages: ${PACKAGES[*]}"
+
+# Manifest: NAME<TAB>VERSION(pkgver-pkgrel)<TAB>ARCH<TAB>FILENAME per db entry.
+read_db_manifest() {
+  tar -xOf "$DB_FILE" --wildcards '*/desc' 2>/dev/null | awk '
+    function emit() {
+      if (name != "" && version != "" && filename != "")
+        printf "%s\t%s\t%s\t%s\n", name, version, arch, filename
+      name=""; version=""; arch=""; filename=""
+    }
+    $0 == "%FILENAME%" { emit(); getline; filename=$0; next }
+    $0 == "%NAME%" { getline; name=$0; next }
+    $0 == "%VERSION%" { getline; version=$0; next }
+    $0 == "%ARCH%" { getline; arch=$0; next }
+    END { emit() }
+  '
+}
+
+package_wanted() {
+  [[ ${#PACKAGES[@]} -eq 0 ]] && return 0
+  local name="$1"
+  local want
+  for want in "${PACKAGES[@]}"; do
+    [[ "$want" == "$name" ]] && return 0
+  done
+  return 1
+}
+
+split_pkgver_pkgrel() {
+  # VERSION is pkgver-pkgrel where pacman splits on the LAST hyphen.
+  local version="$1"
+  local pkgrel="${version##*-}"
+  local pkgver="${version%-*}"
+  printf '%s\t%s\n' "$pkgver" "$pkgrel"
+}
+
+iso_of_file_mtime() {
+  date -u -d "@$(stat -c %Y "$1")" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null ||
+    date -u -r "$1" +%Y-%m-%dT%H:%M:%SZ
+}
+
+WORK=$(mktemp -d)
+trap 'rm -rf "$WORK"' EXIT
+ENTRIES="$WORK/entries.jsonl"
+: >"$ENTRIES"
+
+OK_COUNT=0
+STALE_COUNT=0
+MISSING_COUNT=0
+ERROR_COUNT=0
+
+while IFS=$'\t' read -r name version db_arch filename; do
+  package_wanted "$name" || continue
+  IFS=$'\t' read -r pkgver pkgrel < <(split_pkgver_pkgrel "$version")
+  feed="$FEED_DIR/$name.json"
+
+  if [[ ! -f "$feed" ]]; then
+    MISSING_COUNT=$((MISSING_COUNT + 1))
+    jq -c -n --arg name "$name" --arg pkgver "$pkgver" --arg pkgrel "$pkgrel" \
+      --arg arch "$ARCH" --arg artifact "$filename" \
+      '{key: $name, value: {pkgver: $pkgver, pkgrel: $pkgrel, arch: $arch,
+        artifact: $artifact, cve_ids: [], cve_max_severity: "NONE",
+        severity_scale: "CVSSv3", advisory_as_of: null, scanned_at: null,
+        scan_source: null, scan_status: "missing",
+        note: "Not yet scanned by OPR ingest; visible, fail-open."}}' \
+      >>"$ENTRIES"
+    continue
+  fi
+
+  if ! feed_json=$(jq -c '.' "$feed" 2>/dev/null); then
+    ERROR_COUNT=$((ERROR_COUNT + 1))
+    jq -c -n --arg name "$name" --arg pkgver "$pkgver" --arg pkgrel "$pkgrel" \
+      --arg arch "$ARCH" --arg artifact "$filename" --arg now "$NOW_UTC" \
+      --arg source "feed-parse" \
+      '{key: $name, value: {pkgver: $pkgver, pkgrel: $pkgrel, arch: $arch,
+        artifact: $artifact, cve_ids: [], cve_max_severity: "UNKNOWN",
+        severity_scale: "CVSSv3", advisory_as_of: null, scanned_at: $now,
+        scan_source: $source, scan_status: "error",
+        note: "OPR ingest could not parse the feed report; visible, fail-open."}}' \
+      >>"$ENTRIES"
+    continue
+  fi
+
+  cve_ids=$(jq -c '.cve_ids // []' <<<"$feed_json")
+  severity=$(jq -r '.cve_max_severity // "NONE"' <<<"$feed_json")
+  scale=$(jq -r '.severity_scale // "CVSSv3"' <<<"$feed_json")
+  advisory_as_of=$(jq -r '.advisory_as_of // ""' <<<"$feed_json")
+  scan_source=$(jq -r '.scan_source // "osv.dev"' <<<"$feed_json")
+  note=$(jq -r '.note // ""' <<<"$feed_json")
+  [[ -z "$advisory_as_of" ]] && advisory_as_of=$(iso_of_file_mtime "$feed")
+
+  # A claimed severity without a stated scale is a feed bug: fail closed on
+  # the entry (status=error), fail open on policy (never block).
+  if [[ "$severity" != "NONE" && "$severity" != "UNKNOWN" && -z "$scale" ]]; then
+    ERROR_COUNT=$((ERROR_COUNT + 1))
+    jq -c -n --arg name "$name" --arg pkgver "$pkgver" --arg pkgrel "$pkgrel" \
+      --arg arch "$ARCH" --arg artifact "$filename" --arg now "$NOW_UTC" \
+      --argjson cve_ids "$cve_ids" --arg severity "$severity" \
+      --arg as_of "$advisory_as_of" --arg source "$scan_source" \
+      '{key: $name, value: {pkgver: $pkgver, pkgrel: $pkgrel, arch: $arch,
+        artifact: $artifact, cve_ids: $cve_ids, cve_max_severity: $severity,
+        severity_scale: "", advisory_as_of: $as_of, scanned_at: $now,
+        scan_source: $source, scan_status: "error",
+        note: "Feed claimed a severity without stating its scale; needs OPR triage."}}' \
+      >>"$ENTRIES"
+    continue
+  fi
+
+  as_of_epoch=$(date -u -d "$advisory_as_of" +%s 2>/dev/null || echo 0)
+  if [[ "$as_of_epoch" -le 0 ]]; then
+    ERROR_COUNT=$((ERROR_COUNT + 1))
+    jq -c -n --arg name "$name" --arg pkgver "$pkgver" --arg pkgrel "$pkgrel" \
+      --arg arch "$ARCH" --arg artifact "$filename" --arg now "$NOW_UTC" \
+      --argjson cve_ids "$cve_ids" --arg severity "$severity" \
+      --arg scale "$scale" --arg as_of "$advisory_as_of" --arg source "$scan_source" \
+      --arg note "$note" \
+      '{key: $name, value: {pkgver: $pkgver, pkgrel: $pkgrel, arch: $arch,
+        artifact: $artifact, cve_ids: $cve_ids, cve_max_severity: $severity,
+        severity_scale: $scale, advisory_as_of: $as_of, scanned_at: $now,
+        scan_source: $source, scan_status: "error",
+        note: (if $note == "" then "Feed advisory timestamp is unreadable; needs OPR triage." else $note end)}}' \
+      >>"$ENTRIES"
+    continue
+  fi
+
+  age=$((NOW_EPOCH - as_of_epoch))
+  if [[ "$age" -gt "$STALE_SECONDS" ]]; then
+    status="stale"
+    STALE_COUNT=$((STALE_COUNT + 1))
+    status_note="Scan is older than $STALE_AFTER; visible, fail-open."
+    [[ -n "$note" ]] && status_note="$note"
+  else
+    status="ok"
+    OK_COUNT=$((OK_COUNT + 1))
+    status_note="$note"
+  fi
+
+  jq -c -n --arg name "$name" --arg pkgver "$pkgver" --arg pkgrel "$pkgrel" \
+    --arg arch "$ARCH" --arg artifact "$filename" --arg now "$NOW_UTC" \
+    --argjson cve_ids "$cve_ids" --arg severity "$severity" \
+    --arg scale "$scale" --arg as_of "$advisory_as_of" --arg source "$scan_source" \
+    --arg status "$status" --arg note "$status_note" \
+    '{key: $name, value: {pkgver: $pkgver, pkgrel: $pkgrel, arch: $arch,
+      artifact: $artifact, cve_ids: $cve_ids, cve_max_severity: $severity,
+      severity_scale: $scale, advisory_as_of: $as_of, scanned_at: $now,
+      scan_source: $source, scan_status: $status, note: $note}}' \
+    >>"$ENTRIES"
+done < <(read_db_manifest)
+
+# Preserve entries for packages not refreshed in a filtered (--package) run.
+if [[ ${#PACKAGES[@]} -gt 0 && -f "$SIDECAR" ]]; then
+  jq -c '
+    .advisories // {} | to_entries[] |
+    select(.key as $k | $ARGS.positional | index($k) | not) |
+    {key, value}
+  ' "$SIDECAR" --args "${PACKAGES[@]}" >>"$ENTRIES" 2>/dev/null || true
+fi
+
+NEW_SIDECAR="$WORK/omarchy.advisories.json"
+jq -c -s --arg channel "$MIRROR" --arg arch "$ARCH" --arg generated_at "$NOW_UTC" \
+  --argjson schema "$ADVISORY_SCHEMA_VERSION" \
+  '{schema: $schema, channel: $channel, arch: $arch,
+    generated_at: $generated_at,
+    advisories: (map({(.key): .value}) | add // {})}' \
+  "$ENTRIES" >"$NEW_SIDECAR"
+advisory_validate_sidecar "$NEW_SIDECAR"
+
+print_info "ok=$OK_COUNT stale=$STALE_COUNT missing=$MISSING_COUNT error=$ERROR_COUNT"
+
+if [[ "$DRY_RUN" == true ]]; then
+  print_warning "Dry run: sidecar unchanged"
+  jq '.' "$NEW_SIDECAR"
+  exit 0
+fi
+
+mkdir -p "$REPO_DIR"
+cp "$NEW_SIDECAR" "$SIDECAR"
+print_success "Wrote $SIDECAR (package archives unchanged)"
+
+if [[ "$NO_SIGN" == true ]]; then
+  print_warning "Skipping detached signature (--no-sign); clients should warn until it is signed"
+  exit 0
+fi
+
+# Independently signed with the OPR repo key, like the pacman database.
+if [[ -n "${GPG_PRIVATE_KEY:-}" && -n "${GPG_PASSPHRASE:-}" ]]; then
+  key_home=$(mktemp -d)
+  chmod 700 "$key_home"
+  echo "$GPG_PRIVATE_KEY" | GNUPGHOME="$key_home" gpg --batch --import 2>/dev/null
+  key_id=$(GNUPGHOME="$key_home" gpg --list-secret-keys --keyid-format LONG 2>/dev/null |
+    grep "^sec" | head -1 | awk '{print $2}' | cut -d/ -f2)
+  GNUPGHOME="$key_home" gpg --batch --yes --pinentry-mode loopback \
+    --passphrase "$GPG_PASSPHRASE" --detach-sign --no-armor \
+    --local-user "$key_id" -o "$SIDECAR.sig" "$SIDECAR"
+  rm -rf "$key_home"
+  print_success "Signed $SIDECAR.sig"
+elif command -v gpg >/dev/null 2>&1 && gpg --list-secret-keys >/dev/null 2>&1; then
+  gpg --batch --yes --detach-sign --no-armor -o "$SIDECAR.sig" "$SIDECAR"
+  print_success "Signed $SIDECAR.sig"
+else
+  print_warning "No GPG key available; leaving $SIDECAR unsigned (clients treat unsigned as warn, fail-open)"
+fi
