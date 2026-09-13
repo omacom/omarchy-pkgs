@@ -55,6 +55,13 @@ sync_fail_file() { # sync_fail_file <mirror> <arch>
   echo "$STATE_DIR/.build-failed-$1-$2"
 }
 
+# Packages the last build could not produce, one name per line. A release that
+# publishes the survivors reads this to name what it left behind: the build and
+# the release are separate processes, so the list has to outlive the builder.
+build_failures_file() { # build_failures_file <mirror> <arch>
+  echo "$STATE_DIR/.build-failures-$1-$2"
+}
+
 # The pre-architecture names, .sync-needed-<mirror> and .build-failed-<mirror>,
 # meant x86_64. A host upgraded mid-cycle may still hold one; readers treat
 # it as the x86_64 file until it is consumed.
