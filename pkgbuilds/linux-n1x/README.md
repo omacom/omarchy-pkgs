@@ -39,8 +39,7 @@ bin/repo build --arch aarch64 --package linux-n1x
 
 The package installs the raw arm64 `Image` for Limine's aarch64 Linux protocol
 and does not ship device trees because the observed N1x systems boot through
-ACPI. Parallel compilation remains capped at 12 jobs so it can also complete
-under x86_64 QEMU emulation.
+ACPI. Compilation uses every core of the (native aarch64) build host.
 
 This is a bring-up artifact, not a supported N1x release. Required physical
 validation includes the target PCI identity, console and SSH boot without the
