@@ -92,7 +92,7 @@ if ! grep -Fq 'a.push("--".to_string());' <<<"$archive_rs" ||
   ! grep -Fq 'if !sandbox::available()' <<<"$mediaprobe_rs" ||
   ! grep -Fq 'if !sandbox::available()' <<<"$metareq_rs" ||
   ! grep -Fq 'copyToClipboard.command = ["wl-copy", url]' <<<"$sharelink_qml" ||
-  ! grep -Fq 'regfile::open_if_regular(src, O_NOFOLLOW)' <<<"$copyfile_rs" ||
+  ! grep -Fq 'regfile::open_if_regular(src.at, O_NOFOLLOW)' <<<"$copyfile_rs" ||
   ! grep -Fq '.custom_flags(O_NONBLOCK | extra_flags)' <<<"$regfile_rs"; then
   printf 'Release %s does not contain every required upstream security fix\n' "$best_tag" >&2
   exit 1
