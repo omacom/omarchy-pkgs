@@ -1,0 +1,147 @@
+From 20328b2d85af852e8b142290bb437a8bff1c5d25 Mon Sep 17 00:00:00 2001
+From: Vitor Pacheco <vpacheco.costa@gmail.com>
+Date: Wed, 16 Sep 2026 14:11:20 -0300
+Subject: [PATCH] media: ov02c10: support a 26 MHz external clock
+
+Some Samsung Galaxy Book3/Book4 boards clock the OV02C10 at 26 MHz. The
+driver only accepts 19.2 MHz, so the sensor fails to probe with
+"external clock 26000000 is not supported".
+
+OmniVision's PLL settings for 26 MHz are not available. With a 26 MHz
+clock the existing register lists still produce a valid stream, but
+every internal clock runs 26 / 19.2 times faster: the MIPI link is 541.7
+MHz instead of 400 MHz and the default frame rate is 40.6 fps instead of
+30 fps. Merely accepting the clock, as done by out-of-tree packages,
+leaves the reported link frequency and pixel rate wrong, which breaks
+exposure time calculation in libcamera and shortens the maximum
+exposure.
+
+Accept the 26 MHz clock and scale the link frequency, the pixel rate and
+the default frame length by the clock ratio, so the sensor runs at 30
+fps with the full exposure range and userspace sees the real timings.
+Boards with a 19.2 MHz clock are unchanged.
+
+Tested on a Samsung Galaxy Book3 Ultra (960XFH, Raptor Lake IPU6): 30.07
+fps measured with libcamera, auto exposure converges indoors.
+
+Signed-off-by: Vitor Pacheco <vpacheco.costa@gmail.com>
+---
+ drivers/media/i2c/ov02c10.c | 53 ++++++++++++++++++++++++++++---------
+ 1 file changed, 40 insertions(+), 13 deletions(-)
+
+diff --git a/drivers/media/i2c/ov02c10.c b/drivers/media/i2c/ov02c10.c
+index cf93d36..ba3f4ad 100644
+--- a/drivers/media/i2c/ov02c10.c
++++ b/drivers/media/i2c/ov02c10.c
+@@ -16,6 +16,7 @@
+ 
+ #define OV02C10_LINK_FREQ_400MHZ	400000000ULL
+ #define OV02C10_MCLK			19200000
++#define OV02C10_MCLK_26MHZ		26000000
+ #define OV02C10_RGB_DEPTH		10
+ 
+ #define OV02C10_REG_CHIP_ID		CCI_REG16(0x300a)
+@@ -376,7 +377,7 @@ struct ov02c10 {
+ 	struct regmap *regmap;
+ 
+ 	/* V4L2 Controls */
+-	struct v4l2_ctrl *link_freq;
++	struct v4l2_ctrl *link_freq_ctrl;
+ 	struct v4l2_ctrl *pixel_rate;
+ 	struct v4l2_ctrl *vblank;
+ 	struct v4l2_ctrl *hblank;
+@@ -389,8 +390,31 @@ struct ov02c10 {
+ 	/* MIPI lane info */
+ 	u32 link_freq_index;
+ 	u8 mipi_lanes;
++
++	/* External clock rate */
++	unsigned long mclk;
++	/* Link frequency reported through V4L2_CID_LINK_FREQ */
++	s64 link_freq;
+ };
+ 
++/*
++ * The register lists are written for a 19.2 MHz external clock. With a
++ * 26 MHz clock the same PLL settings make every internal clock, the MIPI link
++ * included, run 26 / 19.2 times faster. Scale the values reported to userspace
++ * accordingly.
++ */
++static u64 ov02c10_clk_scale(struct ov02c10 *ov02c10, u64 val)
++{
++	return div_u64(val * ov02c10->mclk + OV02C10_MCLK / 2, OV02C10_MCLK);
++}
++
++/* Default frame length, 30 fps independent of lane count and clock */
++static u32 ov02c10_vts_def(struct ov02c10 *ov02c10,
++			   const struct ov02c10_mode *mode)
++{
++	return ov02c10_clk_scale(ov02c10, mode->vts_min * ov02c10->mipi_lanes);
++}
++
+ static inline struct ov02c10 *to_ov02c10(struct v4l2_subdev *subdev)
+ {
+ 	return container_of(subdev, struct ov02c10, sd);
+@@ -497,17 +521,19 @@ static int ov02c10_init_controls(struct ov02c10 *ov02c10)
+ 
+ 	v4l2_ctrl_handler_init(ctrl_hdlr, 12);
+ 
+-	ov02c10->link_freq = v4l2_ctrl_new_int_menu(ctrl_hdlr,
+-						    &ov02c10_ctrl_ops,
+-						    V4L2_CID_LINK_FREQ,
+-						    ov02c10->link_freq_index, 0,
+-						    link_freq_menu_items);
+-	if (ov02c10->link_freq)
+-		ov02c10->link_freq->flags |= V4L2_CTRL_FLAG_READ_ONLY;
++	ov02c10->link_freq = ov02c10_clk_scale(ov02c10,
++			link_freq_menu_items[ov02c10->link_freq_index]);
++	ov02c10->link_freq_ctrl = v4l2_ctrl_new_int_menu(ctrl_hdlr,
++							 &ov02c10_ctrl_ops,
++							 V4L2_CID_LINK_FREQ,
++							 0, 0,
++							 &ov02c10->link_freq);
++	if (ov02c10->link_freq_ctrl)
++		ov02c10->link_freq_ctrl->flags |= V4L2_CTRL_FLAG_READ_ONLY;
+ 
+ 	/* MIPI lanes are DDR -> use link-freq * 2 */
+-	pixel_rate = div_u64(link_freq_menu_items[ov02c10->link_freq_index] *
+-			     2 * ov02c10->mipi_lanes, OV02C10_RGB_DEPTH);
++	pixel_rate = div_u64(ov02c10->link_freq * 2 * ov02c10->mipi_lanes,
++			     OV02C10_RGB_DEPTH);
+ 
+ 	ov02c10->pixel_rate = v4l2_ctrl_new_std(ctrl_hdlr, &ov02c10_ctrl_ops,
+ 						V4L2_CID_PIXEL_RATE, 0,
+@@ -517,7 +543,7 @@ static int ov02c10_init_controls(struct ov02c10 *ov02c10)
+ 	 * For default multiple min by number of lanes to keep the default
+ 	 * FPS the same indepenedent of the lane count.
+ 	 */
+-	vts_def = mode->vts_min * ov02c10->mipi_lanes;
++	vts_def = ov02c10_vts_def(ov02c10, mode);
+ 
+ 	vblank_min = mode->vts_min - mode->height;
+ 	vblank_max = OV02C10_VTS_MAX - mode->height;
+@@ -715,7 +741,7 @@ static int ov02c10_set_format(struct v4l2_subdev *sd,
+ 		return 0;
+ 
+ 	/* Update limits and set FPS to default */
+-	vblank_def = mode->vts_min * ov02c10->mipi_lanes - mode->height;
++	vblank_def = ov02c10_vts_def(ov02c10, mode) - mode->height;
+ 	__v4l2_ctrl_modify_range(ov02c10->vblank, mode->vts_min - mode->height,
+ 				 OV02C10_VTS_MAX - mode->height, 1, vblank_def);
+ 	__v4l2_ctrl_s_ctrl(ov02c10->vblank, vblank_def);
+@@ -892,10 +918,11 @@ static int ov02c10_probe(struct i2c_client *client)
+ 				     "failed to get imaging clock\n");
+ 
+ 	freq = clk_get_rate(ov02c10->img_clk);
+-	if (freq != OV02C10_MCLK)
++	if (freq != OV02C10_MCLK && freq != OV02C10_MCLK_26MHZ)
+ 		return dev_err_probe(ov02c10->dev, -EINVAL,
+ 				     "external clock %lu is not supported",
+ 				     freq);
++	ov02c10->mclk = freq;
+ 
+ 	v4l2_i2c_subdev_init(&ov02c10->sd, client, &ov02c10_subdev_ops);
+ 
+-- 
+2.55.0
+
