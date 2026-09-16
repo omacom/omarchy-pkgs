@@ -10,16 +10,20 @@ profile `off` with no usable sink.
 ## Where the fix actually lives
 
 Most of the fix is kernel-side, and every piece is an edit to a file that
-already exists in the kernel. They ship as patches in `linux-ptl`, which this
-machine installs anyway for its other Panther Lake backports:
+already exists in the kernel. They ship as patches in `linux-omarchy`, the
+Omarchy default kernel:
 
 | Patch | What it does |
 |---|---|
-| `0050-ASoC-Intel-soc-acpi-intel-ptl-add-HP-EliteBook-X-G2i` | Adds the match-table entry for the board's RT712 (link 3) + quad TAS2783A (link 2). Without it SOF falls back to a barebones machine driver and never instantiates the amps. The array lists the amps L,R,L,R by physical side, which is load-bearing for stereo. |
-| `0051-ASoC-sdw_utils-set-a-component-name-for-the-TAS2783A` | Makes the card report `spk:tas2783` in `card->components`. Every other amp in `codec_info_list` already declares this; the TAS2783A did not, so UCM could not resolve a speaker configuration. Merged upstream as `79bec4638`; drop at the 7.2 rebase. |
-| `0061-soundwire-stream-append-ports-when-a-second-DAI-joins` | Stops a second DAI joining a stream from overwriting the first DAI's port config. Not board-specific. |
-| `0062-ASoC-Intel-sof_sdw-split-a-four-amp-TAS2783A-link` | Gives the amp dai_link two CPU pins, which selects the `sdca-2amp` topology. |
-| `0063-ASoC-tas2783-take-one-stream-channel-per-mono-amplifier` | `.set_tdm_slot` on tas2783, driven from the `tas2783-N` prefix by `asoc_sdw_ti_spk_rtd_init()`. |
+| `0520-asoc-ptl-match-hp-elitebook-x-g2i` | Adds the match-table entry for the board's RT712 (link 3) + quad TAS2783A (link 2). Without it SOF falls back to a barebones machine driver and never instantiates the amps. The array lists the amps L,R,L,R by physical side, which is load-bearing for stereo. |
+| `0523-soundwire-stream-second-dai-ports` | Stops a second DAI joining a stream from overwriting the first DAI's port config. Not board-specific. |
+| `0524-sof-sdw-four-amp-two-pdis` | Gives the amp dai_link two CPU pins, which selects the `sdca-2amp` topology. |
+| `0525-tas2783-one-channel-per-amp` | `.set_tdm_slot` on tas2783, driven from the `tas2783-N` prefix by `asoc_sdw_ti_spk_rtd_init()`. |
+
+The card reports `spk:tas2783` (the TAS2783A component name) from 7.2 on; no
+patch is needed for that any more. The remaining tas2783 patches in
+`linux-omarchy` (`0521`, `0522`, `0526`-`0528`) cover resume and the factory
+calibration and are described in their own headers.
 
 The last three are what make the machine stereo. Without them all four
 amplifiers receive the same channel and the speakers play mono-left — a state

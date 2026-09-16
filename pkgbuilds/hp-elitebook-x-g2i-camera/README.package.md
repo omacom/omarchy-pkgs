@@ -174,7 +174,7 @@ only one of them is genuinely out of tree:
 |---|---|---|
 | `intel_ipu7`, `intel_ipu7_isys`, `ipu_acpi*`, `intel_cvs` | `intel-ipu7-drivers` | The IPU7 has no mainline driver at all. Shared with `intel-ipu7-camera`. |
 | `ov05c10` sensor driver | this package, as DKMS | Intel's driver from `intel/ipu6-drivers`, taken unmodified at a pinned commit. It exists in neither mainline nor `intel-ipu7-camera`, so it overrides nothing. |
-| `OVTI05C1` link frequencies, 480 MHz to 480 + 900 MHz | `linux-ptl`, patch `0032` | `ipu-bridge` is an in-tree file. A DKMS module rebuilding it would fork it and freeze every other sensor's entry in the table. The patch is Intel's own, carried verbatim. Without it, probing fails with `no link frequency 900000000 supported`. |
+| `OVTI05C1` link frequencies, 480 MHz to 480 + 900 MHz | `linux-omarchy`, patch `0543` | `ipu-bridge` is an in-tree file. A DKMS module rebuilding it would fork it and freeze every other sensor's entry in the table. The patch is Intel's own, carried verbatim. Without it, probing fails with `no link frequency 900000000 supported`. |
 
 The daemon discovers the media device, sensor subdev, CSI-2 receiver and
 capture node from the live graph rather than assuming `/dev/media0`,
