@@ -1,0 +1,170 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jml <jml@carbonforge.ai>
+Date: Sun, 23 Aug 2026 20:41:53 -0700
+Subject: [PATCH] ASoC: tas2783: re-initialise amplifiers from .startup after
+ system sleep
+
+After system sleep the amplifiers come back silent. The firmware is in
+fact re-downloaded correctly when the peripheral re-enumerates - the
+download reports success and both fw_dl_success and hw_init are set -
+but the part still produces no output. Only a firmware download
+performed shortly before playback restores sound.
+
+Doing that from .hw_params is not safe when the parts are used as an
+aggregated pair on a single SoundWire stream, as they are on the HP
+OmniBook X Flip 14-kc0xxx: by then the first amplifier's port
+configuration is already in place, and resetting the second one knocks
+the first out. Exactly one of the two speakers then works, and which one
+varies from resume to resume.
+
+Do the re-initialisation from .startup instead. ASoC calls .startup for
+every codec DAI of a link before any of them reaches .hw_params, so both
+amplifiers can be re-initialised while the stream is still unconfigured.
+
+Gate it on a flag set from a PM notifier rather than on fw_dl_success:
+whether a given peripheral re-enumerates before or after the notifier
+runs is a race, so fw_dl_success is not a reliable indication that the
+DSP still holds its program.
+
+Signed-off-by: jml <jml@carbonforge.ai>
+Link: https://lore.kernel.org/r/20260824034153.50193-4-jml@carbonforge.ai
+Link: https://patchwork.kernel.org/project/alsa-devel/patch/20260824034153.50193-4-jml@carbonforge.ai/
+[mdick85: patch 3/3 of the v2 series, unchanged. Stalled: Mark Brown's
+ review of 2026-08-31 (Link below) calls the approach a bodge and asks
+ for the resume path to bring the part back on its own. Carried until
+ something does; Baojun Xu's "add firmware download status check" (v4,
+ patchwork 14815978), which reactivates the amplifier after resume from
+ tas_io_init(), is the likely replacement. Not prepared for sending.]
+Link: https://lore.kernel.org/r/0c55f950-fc93-4826-9178-193dcf64658f@sirena.org.uk
+Signed-off-by: Meir Dick <mdick85@gmail.com>
+---
+ sound/soc/codecs/tas2783-sdw.c | 78 ++++++++++++++++++++++++++++++++++
+ 1 file changed, 78 insertions(+)
+
+diff --git a/sound/soc/codecs/tas2783-sdw.c b/sound/soc/codecs/tas2783-sdw.c
+index 8e63924..48e1d3a 100644
+--- a/sound/soc/codecs/tas2783-sdw.c
++++ b/sound/soc/codecs/tas2783-sdw.c
+@@ -24,6 +24,7 @@
+ #include <linux/pm.h>
+ #include <linux/pm_runtime.h>
+ #include <linux/regmap.h>
++#include <linux/suspend.h>
+ #include <linux/wait.h>
+ #include <linux/soundwire/sdw.h>
+ #include <linux/soundwire/sdw_registers.h>
+@@ -103,8 +104,13 @@ struct tas2783_prv {
+ 	bool fw_dl_success;
+ 	/* use fallback fw name */
+ 	bool fw_use_fallback;
++	/* set across system sleep, cleared once the part has been re-inited */
++	bool force_reinit;
++	struct notifier_block pm_nb;
+ };
+ 
++static s32 tas_io_init(struct device *dev, struct sdw_slave *slave);
++
+ static const struct reg_default tas2783_reg_default[] = {
+ 	{TAS2783_AMP_LEVEL, 0x28},
+ 	{TASDEV_REG_SDW(0, 0, 0x04), 0x21},
+@@ -1033,7 +1039,47 @@ static s32 tas_sdw_pcm_hw_free(struct snd_pcm_substream *substream,
+ 			    TAS2783_SDCA_POW_STATE_OFF);
+ }
+ 
++/*
++ * The amplifier loses its DSP program across system sleep and only a
++ * firmware download performed shortly before playback makes it produce
++ * sound again. Doing that from .hw_params is not safe when the parts are
++ * used as an aggregated pair on one SoundWire stream: by then the first
++ * amplifier's port configuration is already in place, and resetting the
++ * second one knocks the first out, so exactly one of the two speakers
++ * works and which one varies from resume to resume.
++ *
++ * .startup runs for every codec DAI of the link before any of them
++ * reaches .hw_params, so both amplifiers can be re-initialised while the
++ * stream is still unconfigured.
++ */
++static int tas_sdw_startup(struct snd_pcm_substream *substream,
++			   struct snd_soc_dai *dai)
++{
++	struct snd_soc_component *component = dai->component;
++	struct tas2783_prv *tas_dev =
++		snd_soc_component_get_drvdata(component);
++	s32 ret;
++
++	if (!tas_dev->force_reinit && tas_dev->fw_dl_success)
++		return 0;
++
++	tas_dev->hw_init = false;
++	regcache_cache_only(tas_dev->regmap, false);
++
++	ret = tas_io_init(tas_dev->dev, tas_dev->sdw_peripheral);
++	if (ret || !tas_dev->fw_dl_success) {
++		dev_err(tas_dev->dev, "re-init before playback failed, err=%d\n",
++			ret);
++		return -EIO;
++	}
++
++	tas_dev->force_reinit = false;
++
++	return 0;
++}
++
+ static const struct snd_soc_dai_ops tas_dai_ops = {
++	.startup	= tas_sdw_startup,
+ 	.hw_params	= tas_sdw_hw_params,
+ 	.hw_free	= tas_sdw_pcm_hw_free,
+ 	.set_stream	= tas_set_sdw_stream,
+@@ -1417,6 +1463,32 @@ static void tas_remove(struct tas2783_prv *tas_dev)
+ 	snd_soc_unregister_component(tas_dev->dev);
+ }
+ 
++/*
++ * fw_dl_success on its own is not a reliable indication that the DSP still
++ * holds its program: whether a given peripheral re-enumerates before or
++ * after this notifier runs is a race, and a download performed while the
++ * bus is still settling does not stick.
++ */
++static int tas2783_pm_notify(struct notifier_block *nb,
++			     unsigned long action, void *data)
++{
++	struct tas2783_prv *tas_dev =
++		container_of(nb, struct tas2783_prv, pm_nb);
++
++	switch (action) {
++	case PM_SUSPEND_PREPARE:
++	case PM_HIBERNATION_PREPARE:
++	case PM_POST_SUSPEND:
++	case PM_POST_HIBERNATION:
++		tas_dev->force_reinit = true;
++		break;
++	default:
++		break;
++	}
++
++	return NOTIFY_DONE;
++}
++
+ static s32 tas_sdw_probe(struct sdw_slave *peripheral,
+ 			 const struct sdw_device_id *id)
+ {
+@@ -1488,6 +1560,11 @@ static s32 tas_sdw_probe(struct sdw_slave *peripheral,
+ 	/* keep in cache until the device is fully initialized */
+ 	regcache_cache_only(regmap, true);
+ 	tas_dev->regmap = regmap;
++
++	tas_dev->pm_nb.notifier_call = tas2783_pm_notify;
++	if (register_pm_notifier(&tas_dev->pm_nb))
++		dev_warn(dev, "pm notifier registration failed");
++
+ 	return tas_init(tas_dev);
+ }
+ 
+@@ -1495,6 +1572,7 @@ static void tas_sdw_remove(struct sdw_slave *peripheral)
+ {
+ 	struct tas2783_prv *tas_dev = dev_get_drvdata(&peripheral->dev);
+ 
++	unregister_pm_notifier(&tas_dev->pm_nb);
+ 	pm_runtime_disable(tas_dev->dev);
+ 	tas_remove(tas_dev);
+ 	mutex_destroy(&tas_dev->calib_lock);
