@@ -22,4 +22,10 @@ for dep in "${depends[@]}"; do
 done
 [[ $found -eq 1 ]] || fail "depends does not include npm (got: ${depends[*]-})"
 
+for dep in "${makedepends[@]-}"; do
+  case "$dep" in
+    npm|npm=*) fail "npm is already in depends; do not duplicate it in makedepends" ;;
+  esac
+done
+
 printf 'PASS: openclaw runtime depends include npm\n'
