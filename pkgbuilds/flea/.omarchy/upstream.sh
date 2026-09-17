@@ -85,6 +85,14 @@ sharelink_qml=$(tar -xOzf "$tarball" "$expected_root/ui/ShareLink.qml")
 copyfile_rs=$(tar -xOzf "$tarball" "$expected_root/src/backend/copyfile.rs")
 regfile_rs=$(tar -xOzf "$tarball" "$expected_root/src/backend/regfile.rs")
 
+# Every check below pins a literal line except the O_NOFOLLOW one. That check
+# guards a property -- the copy opens its source with O_NOFOLLOW, so a symlink
+# swapped in cannot redirect the read -- and pinning the exact call expression
+# made it assert the spelling instead. v0.3.0 moved the first argument from
+# `src` to `src.at` when directory-relative opens landed, kept O_NOFOLLOW, and
+# hardened symlink handling further; the literal still refused it. Match the
+# call and the flag together so a rename cannot read as a removed fix, while
+# dropping O_NOFOLLOW still fails.
 if ! grep -Fq 'a.push("--".to_string());' <<<"$archive_rs" ||
   ! grep -Fq 'let input = std::fs::canonicalize(input)' <<<"$archiveops_rs" ||
   ! grep -Fq 'if op != "compress" && op != "extract"' <<<"$run_rs$archivereq_rs" ||
@@ -92,7 +100,7 @@ if ! grep -Fq 'a.push("--".to_string());' <<<"$archive_rs" ||
   ! grep -Fq 'if !sandbox::available()' <<<"$mediaprobe_rs" ||
   ! grep -Fq 'if !sandbox::available()' <<<"$metareq_rs" ||
   ! grep -Fq 'copyToClipboard.command = ["wl-copy", url]' <<<"$sharelink_qml" ||
-  ! grep -Fq 'regfile::open_if_regular(src, O_NOFOLLOW)' <<<"$copyfile_rs" ||
+  ! grep -Eq 'open_if_regular\(.*O_NOFOLLOW' <<<"$copyfile_rs" ||
   ! grep -Fq '.custom_flags(O_NONBLOCK | extra_flags)' <<<"$regfile_rs"; then
   printf 'Release %s does not contain every required upstream security fix\n' "$best_tag" >&2
   exit 1
