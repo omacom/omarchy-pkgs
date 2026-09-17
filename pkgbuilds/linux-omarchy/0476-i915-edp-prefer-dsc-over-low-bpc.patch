@@ -1,0 +1,200 @@
+From: Ruslan Shevchenko <rshevchenko@neoflex.ru>
+Subject: [PATCH] drm/i915/dp: prefer DSC over eDP color depths below 8 bpc
+
+The uncompressed link search may select 6 bpc to fit an eDP mode even
+when the panel supports a higher input depth with DSC. Since that
+configuration is valid, the existing fallback never tries DSC.
+
+Try DSC when a valid uncompressed eDP configuration falls below 8 bpc
+and below the permitted input depth. Restore the original pipe_bpp
+before computing DSC limits so the uncompressed search does not limit
+the DSC input depth.
+
+If DSC configuration or the final dotclock check fails, restore the
+uncompressed configuration. Save the complete DSC state, including
+compression_enabled_on_link, which intel_dp_dsc_reset_config() does
+not clear. Required DSC configurations retain their existing errors.
+
+On a HONOR MagicBook Pro 14, this changes 3120x2080 at 120 Hz from
+18 bpp with dithering to 24 bpp with DSC and no dithering.
+
+Based on Ruslan Shevchenko's original eDP DSC preference patch. The
+preference policy and restoration of the requested input depth are
+retained from that work.
+
+Subsequent changes by NeroSong (2026-09-16):
+- Restore the complete DSC state and fec_enable on optional DSC failure,
+  including compression_enabled_on_link after a late dotclock rejection.
+- Rebase onto the Omarchy 7.2.5 display code and shorten inline comments
+  without changing the tested control flow.
+- Integrate the patch into the base and BORE kernel package recipes.
+
+Validation:
+- Hardware-tested on a HONOR MagicBook Pro 14 with linux-omarchy 7.2.5-3
+  using a rebuilt xe module: normal boot, 3120x2080 at 120 Hz, 24 bpp,
+  DSC enabled and dithering disabled. Initial external-display hotplug
+  also worked. This revision preserves that tested executable logic.
+- Ten extracted-function tests cover policy and failure recovery using
+  stubbed hardware helpers. The late-dotclock rollback regression fails
+  with the original reset-only implementation and passes with this fix.
+- The patch applies without fuzz to the 7.2.5-4 sources for both kernel
+  variants. Recipe checksums and checkpatch validation pass.
+
+The original sign-off below is retained for provenance. It does not
+indicate review or approval of these subsequent changes by the author.
+
+Link: https://github.com/rs0x29a/Linux-on-HONOR-MagicBook-14-Pro-2026-AI_ZQC-P_M1010/commit/1f5be693c6dd9c0c1b8406fb85cbdbbe893b8b23
+
+Signed-off-by: Ruslan Shevchenko <rshevchenko@neoflex.ru>
+---
+Original contribution license
+=============================
+The notice below is retained from the source repository's LICENSE for
+its original contributions. Existing Linux source retains its existing
+license and copyright notices.
+
+MIT License
+
+Copyright (c) 2026 the contributors of HONOR_ZQC-P_M1010
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+
+diff --git a/drivers/gpu/drm/i915/display/intel_dp.c b/drivers/gpu/drm/i915/display/intel_dp.c
+--- a/drivers/gpu/drm/i915/display/intel_dp.c
++++ b/drivers/gpu/drm/i915/display/intel_dp.c
+@@ -2936,7 +2936,11 @@
+ 		&pipe_config->hw.adjusted_mode;
+ 	struct intel_dp *intel_dp = enc_to_intel_dp(encoder);
+ 	struct link_config_limits limits;
+-	bool dsc_needed, joiner_needs_dsc;
++	bool dsc_needed, joiner_needs_dsc, dsc_preferred = false;
++	int uncompressed_bpp = 0, uncompressed_clock = 0, uncompressed_lanes = 0;
++	typeof(pipe_config->dsc) uncompressed_dsc = {};
++	bool uncompressed_fec_enable = false;
++	int entry_bpp = pipe_config->pipe_bpp;
+ 	int ret = 0;
+ 
+ 	intel_dp_dsc_reset_config(pipe_config);
+@@ -2971,6 +2975,18 @@
+ 					   0,
+ 					   num_joined_pipes))
+ 			dsc_needed = true;
++		else if (intel_dp_is_edp(intel_dp) &&
++			 pipe_config->pipe_bpp < 8 * 3 &&
++			 pipe_config->pipe_bpp < limits.pipe.max_bpp &&
++			 intel_dp_supports_dsc(intel_dp, connector, pipe_config)) {
++			/* Prefer DSC to reducing eDP color depth below 8 bpc. */
++			uncompressed_dsc = pipe_config->dsc;
++			uncompressed_fec_enable = pipe_config->fec_enable;
++			uncompressed_bpp = pipe_config->pipe_bpp;
++			uncompressed_clock = pipe_config->port_clock;
++			uncompressed_lanes = pipe_config->lane_count;
++			dsc_preferred = true;
++		}
+ 	}
+ 
+ 	if (dsc_needed && !intel_dp_supports_dsc(intel_dp, connector, pipe_config)) {
+@@ -2978,33 +2994,64 @@
+ 		return -EINVAL;
+ 	}
+ 
+-	if (dsc_needed) {
++	if (dsc_needed || dsc_preferred) {
+ 		int dsc_slice_count;
+ 
+ 		drm_dbg_kms(display->drm,
+-			    "Try DSC (fallback=%s, joiner=%s, force=%s)\n",
++			    "Try DSC (fallback=%s, joiner=%s, force=%s, preferred=%s)\n",
+ 			    str_yes_no(ret), str_yes_no(joiner_needs_dsc),
+-			    str_yes_no(intel_dp->force_dsc_en));
+-
+-		if (!intel_dp_compute_config_limits(intel_dp, conn_state, pipe_config,
+-						    respect_downstream_limits,
+-						    true,
+-						    &limits))
+-			return -EINVAL;
+-
+-		ret = intel_dp_dsc_compute_config(intel_dp, pipe_config,
+-						  conn_state, &limits, 64);
+-		if (ret < 0)
+-			return ret;
+-
+-		dsc_slice_count = intel_dsc_line_slice_count(&pipe_config->dsc.slice_config);
+-
+-		if (!intel_dp_dotclk_valid(display,
+-					   adjusted_mode->crtc_clock,
+-					   adjusted_mode->crtc_htotal,
+-					   dsc_slice_count,
+-					   num_joined_pipes))
+-			return -EINVAL;
++			    str_yes_no(intel_dp->force_dsc_en),
++			    str_yes_no(dsc_preferred));
++
++		ret = -EINVAL;
++
++		/*
++		 * Restore the requested depth before computing DSC limits. The
++		 * uncompressed search may have reduced pipe_bpp to fit the link.
++		 */
++		if (dsc_preferred)
++			pipe_config->pipe_bpp = entry_bpp;
++
++		if (intel_dp_compute_config_limits(intel_dp, conn_state, pipe_config,
++						   respect_downstream_limits,
++						   true,
++						   &limits)) {
++			ret = intel_dp_dsc_compute_config(intel_dp, pipe_config,
++							  conn_state, &limits, 64);
++
++			if (ret >= 0) {
++				dsc_slice_count =
++					intel_dsc_line_slice_count(&pipe_config->dsc.slice_config);
++
++				if (!intel_dp_dotclk_valid(display,
++							   adjusted_mode->crtc_clock,
++							   adjusted_mode->crtc_htotal,
++							   dsc_slice_count,
++							   num_joined_pipes))
++					ret = -EINVAL;
++			}
++		}
++
++		if (ret < 0) {
++			/* Required DSC has no uncompressed fallback. */
++			if (dsc_needed)
++				return ret;
++
++			/* Keep the valid uncompressed configuration if DSC fails. */
++			drm_dbg_kms(display->drm,
++				    "DSC preferred but not usable, keeping %d bpp uncompressed\n",
++				    uncompressed_bpp);
++
++			/*
++			 * Restore all DSC state, including compression_enabled_on_link
++			 * set before the final dotclock check.
++			 */
++			pipe_config->dsc = uncompressed_dsc;
++			pipe_config->fec_enable = uncompressed_fec_enable;
++			pipe_config->pipe_bpp = uncompressed_bpp;
++			pipe_config->port_clock = uncompressed_clock;
++			pipe_config->lane_count = uncompressed_lanes;
++		}
+ 	}
+ 
+ 	drm_dbg_kms(display->drm,
