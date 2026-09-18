@@ -62,6 +62,17 @@ run_build() {
   "$TEST_ROOT/bin/build" --arch "$TEST_ARCH" --package "$@"
 }
 
+# Exercise keyring population even if the image's keyring package is current.
+fixture keyring ''
+cat >> "$TEST_ROOT/pkgbuilds/keyring/PKGBUILD" <<'EOF'
+check() { sudo pacman-key --populate archlinux; }
+EOF
+run_build keyring > "$TEST_ROOT/keyring.log" 2>&1 || {
+  cat "$TEST_ROOT/keyring.log"
+  exit 1
+}
+printf 'PASS: keyring population works without a private key in the image\n'
+
 fixture omarchy-settings ''
 fixture omarchy "depends=('omarchy-settings=1')"
 fixture omarchy-settings-dev "provides=('omarchy-settings'); conflicts=('omarchy-settings')"
