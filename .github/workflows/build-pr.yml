@@ -1,0 +1,191 @@
+name: Build changed packages
+
+# Build every package directory a PR touches, one job per package per arch, on
+# the self-hosted droplet pool. Artifacts are unsigned; publish.yml signs and
+# publishes them on merge.
+#
+# Tooling runs from the base branch; a PR supplies only pkgbuilds/. The
+# vouch gate limits who may spend compute; this limits what their PR can run.
+
+# No paths filter: `result` is the required status check, so it has to be
+# reported on every PR. A PR that touches no package directory gets an empty
+# matrix and a passing result in seconds.
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled]
+  workflow_dispatch:
+    inputs:
+      packages:
+        description: "Space-separated package directories to build"
+        required: true
+
+concurrency:
+  group: build-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  # Builds cost real machines, so they run only for trusted authors:
+  # collaborators, anyone in .github/VOUCHED.td (read from the default
+  # branch, so a PR cannot vouch for itself), or a PR a maintainer has
+  # labelled "build-approved". Everyone else gets this job's plan output
+  # and a passing `result`, which is enough for a maintainer to review
+  # before deciding to spend the compute.
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.list.outputs.matrix }}
+      count: ${{ steps.gate.outputs.count }}
+      trusted: ${{ steps.gate.outputs.trusted }}
+      empty: ${{ steps.list.outputs.empty }}
+    steps:
+      # Same rule as the build job: bin/build-matrix comes from base, the
+      # package directories from the PR head.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - if: github.event_name == 'pull_request'
+        run: |
+          git fetch --no-tags --depth=1 origin "${{ github.event.pull_request.head.sha }}"
+          git checkout "${{ github.event.pull_request.head.sha }}" -- pkgbuilds/
+          # Bootstrap: the PR that introduces this tooling has a base without
+          # it. Take the plan helper from the PR head in that one case; it
+          # runs on a hosted runner and only prints a plan.
+          if [[ ! -x bin/build-matrix ]]; then
+            git checkout "${{ github.event.pull_request.head.sha }}" -- bin/build-matrix helpers/
+            echo "::notice::base branch has no bin/build-matrix; using the PR's copy for planning"
+          fi
+      - id: vouch
+        if: github.event_name == 'pull_request'
+        uses: mitchellh/vouch/action/check-user@f23dbb5e745334f97414ec70463ce7301071a661 # v1
+        with:
+          user: ${{ github.event.pull_request.user.login }}
+          allow-fail: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # One matrix entry per package per architecture. Every package builds
+      # once, against edge; the channels it ships to on merge are carried
+      # along for information. A filename means one set of bytes.
+      - id: list
+        run: |
+          if [[ -n "${{ github.event.inputs.packages }}" ]]; then
+            names="${{ github.event.inputs.packages }}"
+          else
+            names=$(git diff --name-only "${{ github.event.pull_request.base.sha }}" "${{ github.event.pull_request.head.sha }}" -- pkgbuilds \
+              | awk -F/ '$1=="pkgbuilds" && NF>2 {print $2}' | sort -u)
+          fi
+          matrix=$(printf '%s\n' $names | bin/build-matrix)
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+          echo "planned=$(jq '.include | length' <<<"$matrix")" >> "$GITHUB_OUTPUT"
+          jq -r '.include[] | "\(.package) \(.arch) -> \(.channels)"' <<<"$matrix"
+          # A PR whose diff against its base is empty changes nothing: its
+          # content already landed some other way (a sync PR beat it, or a
+          # merge from master swallowed it). Merging it would record a change
+          # that isn't one. Flag it so `result` fails rather than passes.
+          if [[ "${{ github.event_name }}" == pull_request ]]; then
+            total=$(git diff --name-only "${{ github.event.pull_request.base.sha }}" "${{ github.event.pull_request.head.sha }}" | wc -l)
+            echo "empty=$([[ $total -eq 0 ]] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+            echo "files changed vs base: $total"
+          else
+            echo "empty=false" >> "$GITHUB_OUTPUT"
+          fi
+      - id: gate
+        env:
+          STATUS: ${{ steps.vouch.outputs.status || 'dispatch' }}
+          AUTHOR: ${{ github.event.pull_request.user.login }}
+          APPROVED: ${{ contains(github.event.pull_request.labels.*.name, 'build-approved') }}
+          PLANNED: ${{ steps.list.outputs.planned }}
+        run: |
+          case "$STATUS" in
+            bot|collaborator|vouched|dispatch) trusted=true ;;
+            # A denouncement is absolute: the label cannot override it.
+            denounced) trusted=false ;;
+            *) trusted=$APPROVED ;;
+          esac
+          echo "trusted=$trusted" >> "$GITHUB_OUTPUT"
+          if [[ $trusted == true ]]; then
+            echo "count=$PLANNED" >> "$GITHUB_OUTPUT"
+            echo "Author $AUTHOR is trusted ($STATUS); building $PLANNED package(s)."
+          else
+            echo "count=0" >> "$GITHUB_OUTPUT"
+            echo "::warning::Author $AUTHOR is not trusted ($STATUS). $PLANNED package build(s) planned but not run."
+            if [[ $STATUS == denounced ]]; then
+              echo "::warning::The author is denounced in .github/VOUCHED.td; the build-approved label does not apply."
+            else
+              echo "::warning::A maintainer can add the author to .github/VOUCHED.td, or apply the 'build-approved' label to build this PR."
+            fi
+          fi
+
+  build:
+    needs: changes
+    if: needs.changes.outputs.count != '0'
+    runs-on: [self-hosted, omarchy-builder]
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.changes.outputs.matrix) }}
+    steps:
+      # Tooling from base: everything that executes on this droplet's host
+      # (bin/, helpers/, build/) comes from the base branch. Only the PR's
+      # package directories are overlaid. A PR can therefore change what
+      # gets built, never how the runner builds it. A PR that changes both
+      # tooling and a package builds the package with the OLD tooling; land
+      # the tooling first. workflow_dispatch has no PR and runs as checked out.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha || github.sha }}
+          persist-credentials: false
+      - name: Overlay the PR's package directories onto base tooling
+        if: github.event_name == 'pull_request'
+        run: |
+          set -euo pipefail
+          git fetch --no-tags --depth=1 origin "${{ github.event.pull_request.head.sha }}"
+          git checkout "${{ github.event.pull_request.head.sha }}" -- pkgbuilds/
+          echo "tooling: $(git rev-parse --short HEAD) (base)  packages: ${{ github.event.pull_request.head.sha }} (PR head)"
+          git status --short | head
+      - name: Build ${{ matrix.package }} (${{ matrix.arch }}, ships to ${{ matrix.channels }})
+        env:
+          CONTAINER_ENGINE: docker
+        run: bin/build --mirror edge --arch ${{ matrix.arch }} --package ${{ matrix.package }}
+      # The artifact label carries the package directory's git tree hash so
+      # the publish step can find the build for exactly the tree that merged.
+      # The package file inside keeps makepkg's standard name untouched.
+      # The artifact label uses the PR head's tree for this package: that is
+      # the tree that merges, and what publish looks up.
+      - name: Tree hash
+        id: tree
+        run: echo "hash=$(git rev-parse "${{ github.event.pull_request.head.sha || github.sha }}:pkgbuilds/${{ matrix.package }}")" >> "$GITHUB_OUTPUT"
+      - name: Upload artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.package }}-${{ matrix.arch }}-${{ steps.tree.outputs.hash }}
+          path: build-output/edge/${{ matrix.arch }}/*.pkg.tar.zst
+          if-no-files-found: error
+          retention-days: 7
+
+  # The one required status check. Matrix job names carry the package name, so
+  # they cannot be listed in branch protection; this job's name is stable and
+  # it fails if any package failed. It also runs (and passes) when no package
+  # changed, so tooling-only PRs are not stuck waiting for a status.
+  result:
+    needs: [changes, build]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          echo "trusted=${{ needs.changes.outputs.trusted }} build=${{ needs.build.result }}"
+          # An untrusted author's PR is held, not failed: the required check
+          # stays pending until a maintainer vouches or labels it.
+          if [[ "${{ needs.changes.outputs.trusted }}" != "true" ]]; then
+            echo "::error::Builds were not run: author is not vouched. Add to .github/VOUCHED.td or apply the 'build-approved' label."
+            exit 1
+          fi
+          # Nothing to merge: the PR's diff against its base is empty. Its
+          # change already landed elsewhere. Close it rather than merge it.
+          if [[ "${{ needs.changes.outputs.empty }}" == "true" ]]; then
+            echo "::error::This PR changes no files relative to its base. Its content is already on the target branch; close it instead of merging."
+            exit 1
+          fi
+          [[ "${{ needs.build.result }}" == "success" || "${{ needs.build.result }}" == "skipped" ]]

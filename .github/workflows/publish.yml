@@ -1,0 +1,315 @@
+name: Publish merged packages
+
+# On every push to master: for each package directory the push touched and
+# each architecture it supports, find the PR build artifact for exactly that
+# tree (label = <pkg>-<arch>-<treehash>), or build it now when there is
+# none, then publish that one artifact into every channel the package ships
+# to. One build, one file, several databases: a filename means one set of
+# bytes everywhere, and channels are views over a shared pool.
+#
+# Secrets live in the "publish" environment, restricted to master:
+#   GPG_PRIVATE_KEY, GPG_PASSPHRASE   the channel signing key
+#   R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_ENDPOINT
+# OMARCHY_PUBLISH_PREFIX (environment variable, not secret) points a proof
+# run at a scratch prefix inside the live bucket; empty means the real
+# channel paths.
+
+on:
+  push:
+    branches: [master]
+    paths: ["pkgbuilds/**"]
+  workflow_dispatch:
+    inputs:
+      packages:
+        description: "Space-separated package directories to publish from master"
+        required: true
+
+# Merges serialize. Two publishes into one channel at once would race on
+# the database; queued is fine, cancelled is not.
+concurrency:
+  group: publish
+  cancel-in-progress: false
+
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.list.outputs.matrix }}
+      count: ${{ steps.list.outputs.count }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - id: list
+        run: |
+          if [[ -n "${{ github.event.inputs.packages }}" ]]; then
+            names="${{ github.event.inputs.packages }}"
+          else
+            names=$(git diff --name-only "${{ github.event.before }}..${{ github.sha }}" -- pkgbuilds \
+              | awk -F/ '$1=="pkgbuilds" && NF>2 {print $2}' | sort -u)
+          fi
+          matrix=$(printf '%s\n' $names | bin/build-matrix)
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+          echo "count=$(jq '.include | length' <<<"$matrix")" >> "$GITHUB_OUTPUT"
+          jq -r '.include[] | "\(.package) \(.arch) -> \(.channels)"' <<<"$matrix"
+
+  # One job for the whole merge. It collects every PR artifact for the
+  # merged tree (building only what has none), then walks each channel and
+  # architecture slot exactly once: pull that database, add every package
+  # that belongs in it, upload. Six slots, six round trips, however many
+  # packages the merge carried. One process is the only writer, so there
+  # is no race between packages; the run-level concurrency group above
+  # keeps one merge from overlapping the next.
+  publish:
+    needs: changes
+    if: needs.changes.outputs.count != '0'
+    runs-on: [self-hosted, omarchy-builder]
+    environment: publish
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      # Every matrix entry, as a file the shell steps can loop over:
+      # package arch channels publish_arches
+      - name: Plan
+        run: |
+          jq -r '.include[] | "\(.package) \(.arch) \(.channels|gsub(" ";",")) \(.publish_arches|gsub(" ";","))"' \
+            <<'EOF_MATRIX' > plan.txt
+          ${{ needs.changes.outputs.matrix }}
+          EOF_MATRIX
+          cat plan.txt
+
+      # Fetch each package's PR artifact into build-output/edge/<arch>/, or
+      # build it when no artifact exists for exactly this tree.
+      - name: Collect artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CONTAINER_ENGINE: docker
+        run: |
+          set -uo pipefail
+          # sources.jsonl: where each package's files came from, or that the
+          # build failed. A failed build ends the run before any publish, and
+          # the record says so instead of the report job finding nothing.
+          : > sources.jsonl
+          failed=0
+          while read -r package arch channels publish_arches; do
+            hash=$(git rev-parse "HEAD:pkgbuilds/$package")
+            label="$package-$arch-$hash"
+            found=$(curl -fsS -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${{ github.repository }}/actions/artifacts?name=$label&per_page=5" \
+              | jq -r '[.artifacts[] | select(.expired|not)] | sort_by(.created_at) | last | .archive_download_url // empty')
+            mkdir -p "build-output/edge/$arch"
+            if [[ -n "$found" ]]; then
+              echo "==> $label: PR artifact"
+              if curl -fsSL -H "Authorization: Bearer $GH_TOKEN" -o /tmp/artifact.zip "$found" && unzip -oq /tmp/artifact.zip -d "build-output/edge/$arch"; then
+                jq -nc --arg p "$package" --arg a "$arch" '{package:$p, arch:$a, source:"pr-artifact"}' >> sources.jsonl
+              else
+                jq -nc --arg p "$package" --arg a "$arch" '{package:$p, arch:$a, source:"artifact-download-failed"}' >> sources.jsonl; failed=1; break
+              fi
+            else
+              # bin/build plans against the public channel first. If the
+              # channel already holds master's version there is nothing to
+              # build and nothing to publish: a re-run for a package that
+              # turned out to be fine. Record it and move on.
+              plan=$(CONTAINER_ENGINE=docker bin/build --dry-run --mirror edge --arch "$arch" --package "$package" 2>&1 | grep -E '^==> Plan complete' || true)
+              # "Packages that would build:" followed by nothing means none.
+              if [[ -n "$plan" && -z "$(sed -E 's/.*would build: *//' <<<"$plan" | tr -d '[:space:]')" ]]; then
+                echo "==> $label: already published at master's version, nothing to do"
+                jq -nc --arg p "$package" --arg a "$arch" '{package:$p, arch:$a, source:"already-published"}' >> sources.jsonl
+                continue
+              fi
+              echo "==> $label: no artifact for this tree, building"
+              if OMARCHY_KEEP_BUILD_WORKSPACE=1 bin/build --mirror edge --arch "$arch" --package "$package"; then
+                jq -nc --arg p "$package" --arg a "$arch" '{package:$p, arch:$a, source:"built"}' >> sources.jsonl
+              else
+                jq -nc --arg p "$package" --arg a "$arch" '{package:$p, arch:$a, source:"build-failed"}' >> sources.jsonl; failed=1; break
+              fi
+            fi
+          done < plan.txt
+          ls -1 build-output/edge/*/*.pkg.tar.zst 2>/dev/null || true
+          if (( failed )); then
+            # Write the record now; the publish step will not run.
+            jq -n --arg sha "${{ github.sha }}" --arg run "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+              --arg prefix "${OMARCHY_PUBLISH_PREFIX:-}" --arg event "${{ github.event_name }}" \
+              --slurpfile sources sources.jsonl --slurpfile plan <(jq -c '.include[]' <<<'${{ needs.changes.outputs.matrix }}' | jq -sc .) \
+              '{time: (now|todate), commit:$sha, run:$run, event:$event, target: (if $prefix=="" then "live" else $prefix end), plan:$plan[0], sources:$sources, slots:[]}' \
+              > publish-record.json
+            cat publish-record.json
+            exit 1
+          fi
+
+      - name: Publish
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+          RCLONE_CONFIG_R2_TYPE: s3
+          RCLONE_CONFIG_R2_PROVIDER: Cloudflare
+          # The token is scoped to the bucket; it may not CreateBucket, and
+          # rclone's existence check is a CreateBucket in disguise.
+          RCLONE_CONFIG_R2_NO_CHECK_BUCKET: "true"
+          RCLONE_CONFIG_R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          RCLONE_CONFIG_R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          RCLONE_CONFIG_R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          OMARCHY_PUBLISH_PREFIX: ${{ vars.OMARCHY_PUBLISH_PREFIX }}
+        # repo-add, gpg and bsdtar are Arch tools; run the publish inside the
+        # builder image (host-native, edge) with the workspace mounted.
+        run: |
+          set -euo pipefail
+          if ! compgen -G "build-output/edge/*/*.pkg.tar.zst" >/dev/null; then
+            echo "Nothing to publish: every requested package is already published at master's version."
+            jq -n --arg sha "${{ github.sha }}" --arg run "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+              --arg prefix "${OMARCHY_PUBLISH_PREFIX:-}" --arg event "${{ github.event_name }}" \
+              --slurpfile sources sources.jsonl --slurpfile plan <(jq -c '.include[]' <<<'${{ needs.changes.outputs.matrix }}' | jq -sc .) \
+              '{time: (now|todate), commit:$sha, run:$run, event:$event, target: (if $prefix=="" then "live" else $prefix end), plan:$plan[0], sources:$sources, slots:[]}' \
+              > publish-record.json
+            cat publish-record.json
+            exit 0
+          fi
+          docker image inspect omarchy-pkg-builder:latest-x86_64-edge >/dev/null 2>&1 \
+            || docker buildx build --load -t omarchy-pkg-builder:latest-x86_64-edge --build-arg MIRROR=edge build
+
+          # Group the merge's files by the (channel, architecture) slot each
+          # belongs to. A package's files live under build-output/edge/<built
+          # arch>/ and are named <pkgname>-<ver>-<arch|any>.pkg.tar.zst; a
+          # split package's outputs share the pkgbase's directory, so match
+          # on the artifact list rather than the name.
+          # pkgbase is read inside the builder image: the Ubuntu host has no
+          # bsdtar. One container call maps every file to its pkgbase.
+          docker run --rm -v "$PWD:/w:ro" -w /w omarchy-pkg-builder:latest-x86_64-edge bash -c '
+            for f in build-output/edge/*/*.pkg.tar.zst; do
+              printf "%s %s\n" "$f" "$(bsdtar -xOf "$f" .PKGINFO | awk -F" = " "\$1==\"pkgbase\"{print \$2}")"
+            done' > pkgbase.txt
+          declare -A slot_files=()
+          while read -r package arch channels publish_arches; do
+            for f in build-output/edge/"$arch"/*.pkg.tar.zst; do
+              # Only files this package produced (its PKGINFO pkgbase).
+              [[ $(awk -v f="$f" '$1==f{print $2}' pkgbase.txt) == "$package" ]] || continue
+              for mirror in ${channels//,/ }; do
+                for parch in ${publish_arches//,/ }; do
+                  slot_files["$mirror/$parch"]+="$f "
+                done
+              done
+            done
+          done < plan.txt
+
+          # Deterministic slot order: edge before rc before stable, x86_64
+          # before aarch64, so a failure leaves the earlier rings consistent.
+          # Every slot's outcome goes into publish-record.json for the report
+          # job: what was published, where, from which artifact, and whether
+          # the slot succeeded. A failing slot stops the loop (set -e) but the
+          # record still shows everything before it landed.
+          : > slots.jsonl
+          record_slot() { jq -nc --arg m "$1" --arg a "$2" --arg st "$3" --arg files "$4" \
+            '{mirror:$m, arch:$a, status:$st, packages:[$files | split(" ") | .[] | select(length>0) | sub(".*/";"") | sub("\\.pkg\\.tar\\.zst$";"")]}' >> slots.jsonl; }
+          status=0
+          for mirror in edge rc stable; do
+            for parch in x86_64 aarch64; do
+              files=${slot_files["$mirror/$parch"]:-}
+              [[ -n "$files" ]] || continue
+              echo "==> $mirror/$parch: $files"
+              if docker run --rm \
+                -e GPG_PRIVATE_KEY -e GPG_PASSPHRASE -e OMARCHY_PUBLISH_PREFIX \
+                -e RCLONE_CONFIG_R2_TYPE -e RCLONE_CONFIG_R2_PROVIDER -e RCLONE_CONFIG_R2_ENDPOINT -e RCLONE_CONFIG_R2_NO_CHECK_BUCKET \
+                -e RCLONE_CONFIG_R2_ACCESS_KEY_ID -e RCLONE_CONFIG_R2_SECRET_ACCESS_KEY \
+                -v "$PWD:/w:ro" -w /w \
+                omarchy-pkg-builder:latest-x86_64-edge \
+                bin/publish-artifact --remote R2:omarchy-pkgs --mirror "$mirror" --arch "$parch" $files; then
+                record_slot "$mirror" "$parch" published "$files"
+              else
+                record_slot "$mirror" "$parch" failed "$files"
+                status=1
+                break 2
+              fi
+            done
+          done
+          jq -n --arg sha "${{ github.sha }}" --arg run "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            --arg prefix "${OMARCHY_PUBLISH_PREFIX:-}" --arg event "${{ github.event_name }}" \
+            --slurpfile slots slots.jsonl --slurpfile sources sources.jsonl --slurpfile plan <(jq -c '.include[]' <<<'${{ needs.changes.outputs.matrix }}' | jq -sc .) \
+            '{time: (now|todate), commit:$sha, run:$run, event:$event, target: (if $prefix=="" then "live" else $prefix end), plan:$plan[0], sources:$sources, slots:$slots}' \
+            > publish-record.json
+          cat publish-record.json
+          exit $status
+
+      - name: Keep the publish record
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: publish-record-${{ github.run_id }}
+          path: publish-record.json
+          retention-days: 90
+
+  # Tell people what happened. A comment on the merged PR (found by the
+  # merge commit, so squash and rebase merges work too) and a line appended
+  # to a running JSON log in the bucket, next to the packages it describes,
+  # so the history is public and can be rendered later.
+  report:
+    needs: [changes, publish]
+    if: always() && needs.publish.result != 'skipped'
+    runs-on: ubuntu-latest
+    environment: publish
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: publish-record-${{ github.run_id }}
+      - name: Render
+        id: render
+        run: |
+          jq -r --arg outcome "${{ needs.publish.result }}" '
+            def pkgs: [.packages[] | select(test("-debug-")|not)] | join(", ");
+            def src: if .source=="pr-artifact" then "PR artifact" elif .source=="built" then "built here" elif .source=="already-published" then "already published, skipped" else "**" + .source + "**" end;
+            "### Publish " + (if $outcome=="success" then "succeeded" else "FAILED" end) +
+            " → **" + .target + "**" + (if .target!="live" then " (proof prefix, not live)" else "" end),
+            "",
+            "Packages: " + ([.sources[] | .package + " (" + .arch + ", " + src + ")"] | join("; ")),
+            "",
+            (if (.slots|length) > 0 then (.slots[] | "- `" + .mirror + "/" + .arch + "`: " + (if .status=="published" then "" else "**" + .status + "** " end) + pkgs)
+             elif ([.sources[] | select(.source=="already-published")] | length) == (.sources|length) then "_Nothing to publish: already at master'"'"'s version everywhere._"
+             else "_Nothing was published._" end),
+            "",
+            (if ([.sources[] | select(.source|test("failed"))] | length) > 0 then "_A build failed, so no channel was touched._\n"
+             elif (.plan|length) > (.slots|length) then "_Some planned slots did not run because an earlier slot failed._\n" else "" end),
+            "Commit " + .commit[0:7] + " · [run](" + .run + ")"
+          ' publish-record.json > comment.md
+          cat comment.md
+      - name: Comment on the merged PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          pr=$(gh api "repos/${{ github.repository }}/commits/${{ github.sha }}/pulls" --jq '.[0].number // empty')
+          if [[ -n "$pr" ]]; then
+            gh pr comment "$pr" -R "${{ github.repository }}" --body-file comment.md
+            echo "commented on #$pr"
+          else
+            echo "no PR for ${{ github.sha }} (manual dispatch?); skipping PR comment"
+          fi
+      - name: Append to the publish log in the bucket
+        env:
+          RCLONE_CONFIG_R2_TYPE: s3
+          RCLONE_CONFIG_R2_PROVIDER: Cloudflare
+          RCLONE_CONFIG_R2_NO_CHECK_BUCKET: "true"
+          RCLONE_CONFIG_R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          RCLONE_CONFIG_R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          RCLONE_CONFIG_R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+        run: |
+          curl -fsSL https://downloads.rclone.org/rclone-current-linux-amd64.zip -o rclone.zip && unzip -jq rclone.zip '*/rclone' && chmod +x rclone
+          # One JSON object per line, newest last. Served at
+          # https://pkgs.omarchy.org/publish-log.jsonl
+          ./rclone copy R2:omarchy-pkgs/publish-log.jsonl . --s3-no-head 2>/dev/null || : > publish-log.jsonl
+          jq -c . publish-record.json >> publish-log.jsonl
+          ./rclone copyto publish-log.jsonl R2:omarchy-pkgs/publish-log.jsonl --s3-no-head
+          echo "log now has $(wc -l < publish-log.jsonl) entries"
+
+  result:
+    needs: [changes, publish]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          echo "publish result: ${{ needs.publish.result }}"
+          [[ "${{ needs.publish.result }}" == "success" || "${{ needs.publish.result }}" == "skipped" ]]

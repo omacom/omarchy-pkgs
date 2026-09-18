@@ -330,5 +330,71 @@ os.execv(os.environ['REAL_GIT'], ['git', *args])
         self.assertEqual(metadata_file.read_bytes(), original)
 
 
+class T3CodeHookTest(unittest.TestCase):
+    """Keep both desktop architectures on the same complete upstream release."""
+
+    def setUp(self):
+        work = tempfile.TemporaryDirectory()
+        self.addCleanup(work.cleanup)
+        self.root = Path(work.name)
+        self.recipe = self.root / "PKGBUILD"
+        self.recipe.write_text("pkgver=0.0.41\n")
+        self.feed = self.root / "latest-linux.yml"
+        self.feed.write_text("version: 0.0.42\npath: T3-Code-0.0.42-x86_64.AppImage\n")
+        self.arm_feed = self.root / "latest-linux-arm64.yml"
+        self.arm_feed.write_text("version: 0.0.42\npath: T3-Code-0.0.42-arm64.AppImage\n")
+        for arch in ("x86_64", "arm64"):
+            (self.root / f"T3-Code-0.0.42-{arch}.AppImage").write_text(arch)
+        # Serve only fixture assets, and record the requested release URLs.
+        curl = self.root / "curl"
+        curl.write_text('#!/bin/bash\nurl="${@: -1}"\nprintf "%s\\n" "$url" >> requests\ncat "${url##*/}"\n')
+        curl.chmod(0o755)
+        self.env = dict(os.environ, PATH=f"{self.root}:{os.environ['PATH']}")
+
+    def run_hook(self):
+        return subprocess.run(
+            ['bash', str(ROOT / 'pkgbuilds/t3code-bin/.omarchy/upstream.sh')],
+            cwd=self.root, env=self.env, text=True, capture_output=True,
+        )
+
+    def test_hashes_both_architectures_from_one_release(self):
+        result = self.run_hook()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout), {
+            'pkgver': '0.0.42',
+            'sha256sums': {
+                arch: [w.hash_file(self.root / f'T3-Code-0.0.42-{asset_arch}.AppImage', 'sha256')]
+                for arch, asset_arch in [('x86_64', 'x86_64'), ('aarch64', 'arm64')]
+            },
+        })
+        self.assertIn('/download/v0.0.42/latest-linux-arm64.yml', (self.root / 'requests').read_text())
+
+    def test_current_version_does_not_download_assets(self):
+        self.recipe.write_text('pkgver=0.0.42\n')
+        result = self.run_hook()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout), {})
+        self.assertEqual(len((self.root / 'requests').read_text().splitlines()), 1)
+
+    def test_incomplete_or_mismatched_arm_release_reports_no_update(self):
+        for bad_feed in ('', 'version: 0.0.43\npath: T3-Code-0.0.42-arm64.AppImage\n',
+                         'version: 0.0.42\npath: renamed.AppImage\n'):
+            with self.subTest(feed=bad_feed):
+                self.arm_feed.write_text(bad_feed)
+                result = self.run_hook()
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(result.stdout, '')
+        self.arm_feed.unlink()
+        result = self.run_hook()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, '')
+
+    def test_missing_arm_asset_reports_no_update(self):
+        (self.root / 'T3-Code-0.0.42-arm64.AppImage').unlink()
+        result = self.run_hook()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, '')
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

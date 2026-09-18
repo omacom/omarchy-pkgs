@@ -168,6 +168,8 @@ in `origin` and has no effect on release selection.
 
 These packages were already excluded from automatic AUR updates. The migration preserves that policy.
 
+`linux-firmware-cirrus` is a deliberate hold: a self-retiring shim that ships Arch's linux-firmware-cirrus 20260910-2 payload to stable while stable's Arch snapshot is on 20260810-2 (Dell XPS 13 DX13260 / 1028:0e54 speaker firmware). It is versioned 20260810-3 so the genuine Arch package supersedes it as soon as the snapshot advances; bumping it to the Arch version would defeat that. Delete the recipe once stable's snapshot carries linux-firmware >= 20260910.
+
 ## Package-specific boundaries
 
 - NVIDIA watches remain on the 580 driver branch.
