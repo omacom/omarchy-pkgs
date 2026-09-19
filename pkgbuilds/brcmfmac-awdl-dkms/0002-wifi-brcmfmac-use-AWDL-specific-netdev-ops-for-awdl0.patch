@@ -1,0 +1,129 @@
+From 0d585d4b964c672633e7fcb18070cdeeb3986160 Mon Sep 17 00:00:00 2001
+From: Brent Kearney <1550934+brentkearney@users.noreply.github.com>
+Date: Wed, 26 Aug 2026 19:02:47 -0600
+Subject: [PATCH 02/11] wifi: brcmfmac: use AWDL-specific netdev ops for awdl0
+
+Bringing an AWDL interface up through brcmf_netdev_open() stops the firmware
+answering dcmds. Every subsequent command times out with -EIO, the
+infrastructure STA link drops with it, and only a brcmfmac reload recovers
+the device.
+
+The standard open path runs station bring-up against the interface: a toe_ol
+iovar query, brcmf_cfg80211_up(), and then the multicast and promisc
+configuration that ndo_set_rx_mode schedules via _brcmf_set_multicast_list().
+An AWDL bsscfg is not a station, and issuing that sequence against one wedges
+the firmware control path.
+
+Give AWDL interfaces their own net_device_ops. brcmf_netdev_open_awdl()
+checks the bus is up, clears the 802.1x pending count, and leaves the carrier
+off, touching no firmware state. ndo_set_rx_mode is omitted entirely so the
+multicast worker never runs for these interfaces, and ndo_stop skips
+brcmf_cfg80211_down() for the same reason the open path skips
+brcmf_cfg80211_up().
+
+awdl0 now comes up with the firmware still responsive and the STA link
+undisturbed.
+---
+ .../broadcom/brcm80211/brcmfmac/cfg80211.c    |  2 +
+ .../broadcom/brcm80211/brcmfmac/core.c        | 52 ++++++++++++++++++-
+ .../broadcom/brcm80211/brcmfmac/core.h        |  1 +
+ 3 files changed, 54 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/cfg80211.c b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/cfg80211.c
+index a93e410..5326a3a 100644
+--- a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/cfg80211.c
++++ b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/cfg80211.c
+@@ -698,6 +698,8 @@ void brcmf_cfg80211_awdl_attach_pending(struct brcmf_if *ifp)
+ 		goto done;
+ 	}
+ 
++	/* Must be set before brcmf_net_attach(), which picks netdev_ops. */
++	ifp->is_awdl = true;
+ 	strscpy(ifp->ndev->name, cfg->awdl_ifname, sizeof(ifp->ndev->name));
+ 	err = brcmf_net_attach(ifp, false);
+ 	if (err) {
+diff --git a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/core.c b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/core.c
+index 3c4125c..8b01fcb 100644
+--- a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/core.c
++++ b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/core.c
+@@ -632,6 +632,55 @@ static int brcmf_netdev_open(struct net_device *ndev)
+ 	return 0;
+ }
+ 
++/* AWDL interfaces are not STAs. brcmf_netdev_open() runs the standard station
++ * bring-up -- a toe_ol query, brcmf_cfg80211_up(), then the multicast and
++ * promisc configuration driven by ndo_set_rx_mode -- and issuing those against
++ * an AWDL bsscfg stops the firmware answering dcmds at all: every subsequent
++ * command times out and only a brcmfmac reload recovers it. Bring the netdev
++ * up without touching firmware, and deliberately omit ndo_set_rx_mode so the
++ * multicast worker never runs for these interfaces.
++ */
++static int brcmf_netdev_open_awdl(struct net_device *ndev)
++{
++	struct brcmf_if *ifp = netdev_priv(ndev);
++	struct brcmf_pub *drvr = ifp->drvr;
++	struct brcmf_bus *bus_if = drvr->bus_if;
++
++	brcmf_dbg(TRACE, "Enter, bsscfgidx=%d (AWDL)\n", ifp->bsscfgidx);
++
++	if (bus_if->state != BRCMF_BUS_UP) {
++		bphy_err(drvr, "failed bus is not ready\n");
++		return -EAGAIN;
++	}
++
++	atomic_set(&ifp->pend_8021x_cnt, 0);
++
++	/* Carrier stays off until AWDL is actually running. */
++	netif_carrier_off(ndev);
++	return 0;
++}
++
++static int brcmf_netdev_stop_awdl(struct net_device *ndev)
++{
++	struct brcmf_if *ifp = netdev_priv(ndev);
++
++	brcmf_dbg(TRACE, "Enter, bsscfgidx=%d (AWDL)\n", ifp->bsscfgidx);
++
++	/* No brcmf_cfg80211_down(): this vif was never brought up through
++	 * cfg80211, and tearing down the STA state would hit the same
++	 * unresponsive-firmware path as the bring-up.
++	 */
++	brcmf_net_setcarrier(ifp, false);
++	return 0;
++}
++
++static const struct net_device_ops brcmf_netdev_ops_awdl = {
++	.ndo_open = brcmf_netdev_open_awdl,
++	.ndo_stop = brcmf_netdev_stop_awdl,
++	.ndo_start_xmit = brcmf_netdev_start_xmit,
++	.ndo_set_mac_address = brcmf_netdev_set_mac_address,
++};
++
+ static const struct net_device_ops brcmf_netdev_ops_pri = {
+ 	.ndo_open = brcmf_netdev_open,
+ 	.ndo_stop = brcmf_netdev_stop,
+@@ -651,7 +700,8 @@ int brcmf_net_attach(struct brcmf_if *ifp, bool locked)
+ 	ndev = ifp->ndev;
+ 
+ 	/* set appropriate operations */
+-	ndev->netdev_ops = &brcmf_netdev_ops_pri;
++	ndev->netdev_ops = ifp->is_awdl ? &brcmf_netdev_ops_awdl
++					: &brcmf_netdev_ops_pri;
+ 
+ 	ndev->needed_headroom += drvr->hdrlen;
+ 	ndev->ethtool_ops = &brcmf_ethtool_ops;
+diff --git a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/core.h b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/core.h
+index 4b52a3a..451bcf8 100644
+--- a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/core.h
++++ b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/core.h
+@@ -268,6 +268,7 @@ struct brcmf_if {
+ 	struct in6_addr ipv6_addr_tbl[NDOL_MAX_ENTRIES];
+ 	u8 ipv6addr_idx;
+ 	bool fwil_fwerr;
++	bool is_awdl;
+ };
+ 
+ int brcmf_netdev_wait_pend8021x(struct brcmf_if *ifp);
+-- 
+2.55.0
+
