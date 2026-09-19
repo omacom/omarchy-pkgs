@@ -2,13 +2,14 @@
 
 pkgname=intel-ipu7-camera
 pkgver=1.0.6
-pkgrel=2
+pkgrel=3
 pkgdesc="Intel IPU7 MIPI camera stack for Hurrican/Performance (OV08X40 + hardware ISP)"
 arch=('x86_64')
 url="https://github.com/TsaiGaggery/hurrican_omarchy_enabling"
 license=('GPL-2.0-or-later')
 depends=(
   'dkms'
+  'linux-headers'
   'v4l2loopback-dkms'
   'v4l2-relayd'
   'gstreamer'
@@ -64,6 +65,8 @@ source=(
   "intel-cvs-v4l2.c::${_intel_cvs_url}/v4l2.c?h=${_intel_cvs_kernel_tag}"
   "intel-cvs-icvs.h::${_intel_cvs_url}/icvs.h?h=${_intel_cvs_kernel_tag}"
   "0004-ipu7-psys-register-device-bus.patch"
+  "0005-ipu7-psys-harden-userptr-pinning.patch"
+  "check-userptr-range.c"
   "0003-icvs-set-rgbcamera_pwrup_host-0-for-Panther-Lake.patch"
   "0005-camhal-MediaControl-route-through-Intel-CVS-bridge.patch"
   "0006-camhal-ipu75xa-ov08x40-Intel-CVS-formats.patch"
@@ -79,7 +82,7 @@ source=(
   "hide-ipu7-v4l2.conf"
   "disable-libcamera.conf"
   "71-ipu7-hide-isys.rules"
-  "90-ipu7-psys.rules"
+  "70-ipu7-psys.rules"
   "camera-tmpfiles.conf"
   "ov08x40.yaml"
   "camera-sleep-hook"
@@ -94,12 +97,15 @@ sha256sums=(
   'SKIP' 'SKIP' 'SKIP' 'SKIP' 'SKIP' 'SKIP' 'SKIP'
   'SKIP' 'SKIP' 'SKIP' 'SKIP' 'SKIP' 'SKIP' 'SKIP'
   'SKIP' 'SKIP' 'SKIP' 'SKIP' 'SKIP' 'SKIP' 'SKIP'
-  'SKIP'
+  'SKIP' 'SKIP' 'SKIP'
 )
 
 prepare() {
   cd "${srcdir}/ipu7-drivers"
-  patch -Np1 -i "${srcdir}/0004-ipu7-psys-register-device-bus.patch"
+  # --fuzz=0: a security patch that lands somewhere other than its anchor still
+  # compiles, and the build is the only place that can refuse it.
+  patch -Np1 --fuzz=0 -i "${srcdir}/0004-ipu7-psys-register-device-bus.patch"
+  patch -Np1 --fuzz=0 -i "${srcdir}/0005-ipu7-psys-harden-userptr-pinning.patch"
 
   cd "${srcdir}/vision-drivers"
   git config user.email "build@localhost"
@@ -177,6 +183,54 @@ build() {
   [[ ! -f configure ]] && ./autogen.sh
   ./configure --prefix=/usr
   make -j"$(nproc)"
+}
+
+check() {
+  local driver_tree="${srcdir}/ipu7-drivers"
+  local psys_source="${srcdir}/ipu7-drivers/drivers/media/pci/intel/ipu7/psys/ipu-psys.c"
+  local check_tree="${srcdir}/ipu7-drivers-check"
+  local kernel_build kernel_files grep_result result=0 attach_failure
+
+  [[ -f $psys_source && -r $psys_source ]] || return 1
+  grep -q 'kvmalloc_array(npages, sizeof(\*pages)' "${psys_source}" || return 1
+  grep -q 'attach->len > MAX_RW_COUNT' "${psys_source}" || return 1
+  if grep 'FOLL_FORCE' "${psys_source}" >/dev/null; then
+    return 1
+  else
+    grep_result=$?
+    (( grep_result == 1 )) || return 1
+  fi
+  attach_failure=$(sed -n '/^attach_fail:$/,+1p' "$psys_source") || return 1
+  [[ $attach_failure == $'attach_fail:\n\tkbuf->db_attach = NULL;' ]] || return 1
+
+  cc -std=c11 -O2 -Wall -Wextra -Werror \
+    "${srcdir}/check-userptr-range.c" -o "${srcdir}/check-userptr-range" || return 1
+  "${srcdir}/check-userptr-range" || return 1
+
+  kernel_files=$(pacman -Qql linux-headers) || return 1
+  kernel_build="$(sed -n \
+    '\#/build/Makefile$# { s#/Makefile$##; s#^#/#; p; q; }' <<<"$kernel_files")" || return 1
+  if [[ ! -f "${kernel_build}/Makefile" ]]; then
+    printf 'Unable to locate the linux-headers build tree\n' >&2
+    return 1
+  fi
+
+  (
+    cd "${srcdir}"
+    "${kernel_build}/scripts/checkpatch.pl" --no-tree --strict --no-signoff \
+      0005-ipu7-psys-harden-userptr-pinning.patch
+  ) || return 1
+
+  rm -rf "${check_tree}" || return 1
+  cp -a "${driver_tree}" "${check_tree}" || return 1
+  if ! make -C "${check_tree}" BUILD_INTEL_IPU_ACPI=1 \
+    KERNEL_SRC="${kernel_build}"; then
+    rm -rf "${check_tree}"
+    return 1
+  fi
+  [[ -s ${check_tree}/drivers/media/pci/intel/ipu7/psys/intel-ipu7-psys.ko ]] || result=1
+  rm -rf "${check_tree}" || return 1
+  return "$result"
 }
 
 package() {
@@ -267,8 +321,9 @@ package() {
   # udev rules
   install -Dm644 "${srcdir}/71-ipu7-hide-isys.rules" \
     "${pkgdir}/usr/lib/udev/rules.d/71-ipu7-hide-isys.rules"
-  install -Dm644 "${srcdir}/90-ipu7-psys.rules" \
-    "${pkgdir}/usr/lib/udev/rules.d/90-ipu7-psys.rules"
+  # uaccess must be tagged before systemd's 73-seat-late.rules applies ACLs.
+  install -Dm644 "${srcdir}/70-ipu7-psys.rules" \
+    "${pkgdir}/usr/lib/udev/rules.d/70-ipu7-psys.rules"
 
   # v4l2-relayd config for IPU7 camera
   install -Dm644 "${srcdir}/v4l2-relayd-ipu7.conf" \
