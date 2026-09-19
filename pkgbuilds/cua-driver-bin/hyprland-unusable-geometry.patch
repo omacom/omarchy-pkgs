@@ -1,0 +1,191 @@
+--- a/libs/cua-driver/rust/crates/platform-linux/src/atspi/native.rs
++++ b/libs/cua-driver/rust/crates/platform-linux/src/atspi/native.rs
+@@ -649,7 +649,10 @@
+     clients: &[(&str, u32, u32)],
+     target: usize,
+ ) -> Option<usize> {
+-    let &(title, _, _) = clients.get(target)?;
++    let &(title, width, height) = clients.get(target)?;
++    if width == 0 || height == 0 {
++        return None;
++    }
+     // Retain the existing refusal for duplicate compositor titles, regardless
+     // of geometry. A missing AX sibling must not make that join look unique.
+     if title.is_empty() || clients.iter().filter(|c| c.0 == title).count() != 1 {
+@@ -658,12 +661,14 @@
+     let matches = |frame: &HyprlandFrame, client: &(&str, u32, u32)| {
+         frame.title == client.0
+             || (frame.browser_root
+-                && frame.size.is_some_and(|(w, h)| {
++                // Unknown competitor geometry cannot disprove a decorated
++                // title match. The requested target was checked above.
++                && (client.1 == 0 || client.2 == 0 || frame.size.is_some_and(|(w, h)| {
+                     w > 0
+                         && h > 0
+                         && i64::from(w) == i64::from(client.1)
+                         && i64::from(h) == i64::from(client.2)
+-                })
++                }))
+                 && chromium_title_matches(&frame.title, client.0))
+     };
+     let mut candidates = frames.iter().filter(|f| matches(f, &clients[target]));
+@@ -704,6 +709,36 @@
+                 Some(7)
+             );
+         }
++    }
++    #[test]
++    fn unusable_target_geometry_refuses_without_losing_identity_competitors() {
++        assert_eq!(
++            correlate_hyprland_frame(&[frame("Page")], &[("Page", 0, 0)], 0),
++            None
++        );
++        assert_eq!(
++            correlate_hyprland_frame(&[frame("Page")], &[("Page", 800, 600), ("Page", 0, 0)], 0),
++            None
++        );
++    }
++    #[test]
++    fn unknown_geometry_decorated_competitor_still_refuses() {
++        assert_eq!(
++            correlate_hyprland_frame(
++                &[frame("Page - Work")],
++                &[("Page - Work", 800, 600), ("Page", 0, 0)],
++                0
++            ),
++            None
++        );
++        assert_eq!(
++            correlate_hyprland_frame(
++                &[frame("Page - Work")],
++                &[("Page - Work", 800, 600), ("Other", 0, 0)],
++                0
++            ),
++            Some(7)
++        );
+     }
+     #[test]
+     fn generic_prefixes_unknown_apps_and_wrong_sizes_refuse() {
+diff --git i/libs/cua-driver/rust/crates/platform-linux/src/wayland/hyprland.rs w/libs/cua-driver/rust/crates/platform-linux/src/wayland/hyprland.rs
+index e1bbb6ae7..6a174cccf 100644
+--- i/libs/cua-driver/rust/crates/platform-linux/src/wayland/hyprland.rs
++++ w/libs/cua-driver/rust/crates/platform-linux/src/wayland/hyprland.rs
+@@ -284,11 +284,16 @@ fn windows_from_clients(clients: Vec<Client>, active: &HashSet<i64>) -> Result<V
+     for c in clients.into_iter().filter(|c| c.mapped) {
+         let address = u64::from_str_radix(c.address.strip_prefix("0x").unwrap_or(&c.address), 16)?;
+         let pid = u32::try_from(c.pid)?;
+-        let width = u32::try_from(c.size[0])?;
+-        let height = u32::try_from(c.size[1])?;
+-        if address == 0 || pid == 0 || !valid_dimensions(width, height) || !seen.insert(address) {
+-            bail!("invalid or duplicate Hyprland window identity/geometry");
++        if address == 0 || pid == 0 || !seen.insert(address) {
++            bail!("invalid or duplicate Hyprland window identity");
+         }
++        // Tiling transitions can report non-positive geometry for a mapped
++        // client. Preserve its identity as an ambiguity competitor without
++        // letting unusable bounds suppress every other window's discovery.
++        let width = u32::try_from(c.size[0]).unwrap_or(0);
++        let height = u32::try_from(c.size[1]).unwrap_or(0);
++        let usable = valid_dimensions(width, height);
++        let (width, height) = if usable { (width, height) } else { (0, 0) };
+         windows.push(Window {
+             address,
+             pid,
+@@ -299,7 +304,7 @@ fn windows_from_clients(clients: Vec<Client>, active: &HashSet<i64>) -> Result<V
+             width,
+             height,
+             workspace: c.workspace.id,
+-            visible: !c.hidden && active.contains(&c.workspace.id),
++            visible: usable && !c.hidden && active.contains(&c.workspace.id),
+             hidden: c.hidden,
+         });
+     }
+@@ -344,7 +349,7 @@ pub fn window_for_address(address: u64) -> Option<Window> {
+     list_windows()
+         .ok()?
+         .into_iter()
+-        .find(|w| w.address == address)
++        .find(|w| w.address == address && valid_dimensions(w.width, w.height))
+ }
+ 
+ /// AT-SPI has no native Hyprland handle. Correlate only when the title is
+@@ -357,7 +362,8 @@ fn accessibility_target(windows: &[Window], address: u64, pid: u32) -> Option<Wi
+     let target = windows
+         .iter()
+         .find(|w| w.address == address && w.pid == pid)?;
+-    (!target.title.is_empty()
++    (valid_dimensions(target.width, target.height)
++        && !target.title.is_empty()
+         && windows
+             .iter()
+             .filter(|w| w.pid == pid && w.title == target.title)
+@@ -371,7 +377,11 @@ fn accessibility_target(windows: &[Window], address: u64, pid: u32) -> Option<Wi
+ pub fn window_for_pid(pid: u32) -> Option<Window> {
+     let mut owned = list_windows().ok()?.into_iter().filter(|w| w.pid == pid);
+     let first = owned.next()?;
+-    owned.next().is_none().then_some(first)
++    owned
++        .next()
++        .is_none()
++        .then_some(first)
++        .filter(|window| valid_dimensions(window.width, window.height))
+ }
+ 
+ pub fn target_is_active(address: u64, pid: Option<u32>) -> Result<bool> {
+@@ -391,7 +401,10 @@ fn capture_target(windows: &[Window], address: u64, pid: Option<u32>) -> Result<
+         .iter()
+         .find(|w| w.address == address)
+         .context("requested Hyprland window no longer exists; refresh list_windows")?;
+-    if pid.is_some_and(|pid| target.pid != pid) || target.hidden {
++    if pid.is_some_and(|pid| target.pid != pid)
++        || target.hidden
++        || !valid_dimensions(target.width, target.height)
++    {
+         bail!("requested Hyprland target ownership/visibility is unproven");
+     }
+     // The v1 wire request takes only the low word. Refuse collisions across
+@@ -451,6 +464,44 @@ mod tests {
+         }
+     }
+ 
++    #[test]
++    fn unusable_sibling_geometry_preserves_discovery_and_identity_competitors() {
++        let client = |address: &str, size| Client {
++            address: address.into(),
++            mapped: true,
++            hidden: false,
++            pid: 42,
++            title: "Same title".into(),
++            class: "fixture".into(),
++            at: [0, 0],
++            size,
++            workspace: Workspace { id: 1 },
++        };
++        for size in [[-378, 247], [0, 247], [i32::MAX, i32::MAX]] {
++            let windows = windows_from_clients(
++                vec![client("0x10", size), client("0x20", [800, 600])],
++                &HashSet::from([1]),
++            )
++            .unwrap();
++            assert_eq!(windows.len(), 2);
++            assert_eq!((windows[0].width, windows[0].height), (0, 0));
++            assert!(!windows[0].visible);
++            assert!(capture_target(&windows, 0x10, Some(42)).is_err());
++            assert!(capture_target(&windows, 0x20, Some(42)).is_ok());
++            assert!(accessibility_target(&windows, 0x10, 42).is_none());
++            assert!(
++                accessibility_target(&windows, 0x20, 42).is_none(),
++                "invalid geometry must not remove duplicate title competitors"
++            );
++            let mut collision = windows.clone();
++            collision[0].address = 0x100000020;
++            assert!(
++                capture_target(&collision, 0x20, Some(42)).is_err(),
++                "invalid geometry must not remove export-handle collisions"
++            );
++        }
++    }
++
+     #[test]
+     fn exact_identity_never_falls_back_to_sibling_or_other_pid() {
+         let windows = [window(0x10, 42), window(0x20, 42)];

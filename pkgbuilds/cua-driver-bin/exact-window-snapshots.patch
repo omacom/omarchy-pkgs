@@ -1,0 +1,3519 @@
+--- a/libs/cua-driver/rust/crates/platform-linux/src/atspi/native.rs
++++ b/libs/cua-driver/rust/crates/platform-linux/src/atspi/native.rs
+@@ -6,13 +6,10 @@
+ //! small shared Tokio runtime via `block_on` (callers already invoke these
+ //! from `tokio::task::spawn_blocking`, so blocking here is safe).
+ //!
+-//! Element indices match the markdown produced by [`walk_tree`]: a depth-first,
+-//! pre-order traversal of the target application's windows, numbering the
+-//! nodes accepted by the shared [`is_indexable`] capability predicate.
+-//! `perform_action`, `set_value`, and `get_element_bounds` index into that same
+-//! ordered set.
+-
+-use std::sync::OnceLock;
++//! Exact-window snapshots traverse one proven native root. Actions resolve
++//! snapshot-owned native objects; numeric indexes never trigger a new walk.
++
++use std::sync::{Arc, OnceLock};
+ use std::time::Duration;
+ 
+ use anyhow::{anyhow, Context, Result};
+@@ -35,10 +32,18 @@
+ /// listener.
+ const LISTENER_STARTUP_TIMEOUT: Duration = Duration::from_secs(3);
+ 
+-/// Run `fut` with [`CALL_TIMEOUT`]; `None` on timeout so the caller can skip
+-/// the node and keep walking rather than blocking forever.
++// Shared deadline bounds every capture read without discarding accumulated nodes.
++tokio::task_local! {
++    static SNAPSHOT_DEADLINE: tokio::time::Instant;
++}
++
+ async fn call<T>(fut: impl std::future::Future<Output = T>) -> Option<T> {
+-    tokio::time::timeout(CALL_TIMEOUT, fut).await.ok()
++    let deadline = SNAPSHOT_DEADLINE
++        .try_with(|deadline| *deadline)
++        .ok()
++        .unwrap_or_else(|| tokio::time::Instant::now() + CALL_TIMEOUT)
++        .min(tokio::time::Instant::now() + CALL_TIMEOUT);
++    tokio::time::timeout_at(deadline, fut).await.ok()
+ }
+ 
+ async fn before_snapshot_deadline<T>(
+@@ -227,7 +232,9 @@
+ 
+ /// A node discovered during the pre-order walk, with its proxy retained so the
+ /// per-index operations can act on it without re-walking the tree.
++#[derive(Clone)]
+ struct Visited<'a> {
++    object: RawObjectRef,
+     depth: usize,
+     role: String,
+     /// Display text: the accessible `name`, or — for editable/text widgets that
+@@ -329,7 +336,7 @@
+ /// WebKitGTK uses its well-known WebProcess name for the embedded web tree.
+ /// Keep the wire values as strings while walking so zbus does not reject that
+ /// validly addressable well-known name before we can call it.
+-#[derive(Clone, Debug)]
++#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+ struct RawObjectRef {
+     name: String,
+     path: String,
+@@ -531,7 +538,7 @@
+ ) -> Result<Option<Vec<Visited<'a>>>> {
+     collect_visited_bounded(conn, pid, 0, None, None)
+         .await
+-        .map(|walked| walked.map(|(visited, _)| visited))
++        .map(|walked| walked.map(|(visited, _, _)| visited))
+ }
+ 
+ /// Screen-space distance between an AT-SPI frame's extents and a native
+@@ -840,12 +847,6 @@
+             .collect();
+         return correlate_hyprland_frame(&frames, &clients, target);
+     }
+-    if seeds.len() == 1 {
+-        // One top-level: the caller's window is the only thing this
+-        // application could be showing, and no geometry round-trip can make
+-        // that more certain.
+-        return Some(0);
+-    }
+     let window = crate::x11::list_windows(Some(pid))
+         .into_iter()
+         .find(|candidate| candidate.xid == xid)?;
+@@ -899,7 +900,7 @@
+     xid: u64,
+     max_elements: Option<usize>,
+     max_depth: Option<usize>,
+-) -> Result<Option<(Vec<Visited<'a>>, Option<usize>)>> {
++) -> Result<Option<(Vec<Visited<'a>>, Option<usize>, super::TraversalStatus)>> {
+     let app = match app_for_pid(conn, pid).await? {
+         Some(a) => a,
+         None => return Ok(None),
+@@ -918,8 +919,16 @@
+             .into_iter()
+             .filter_map(|child| RawObjectRef::from_atspi(&child))
+             .collect(),
+-        _ => Vec::new(),
++        Some(Err(error)) => {
++            return Err(anyhow!(
++                "read_failure: application children unavailable: {error}"
++            ))
++        }
++        None => return Err(anyhow!("deadline: application children lookup timed out")),
+     };
++    if seeds.is_empty() {
++        return Ok(None);
++    }
+ 
+     // Resolve which seed is the caller's window before walking, from the same
+     // child list the walk is about to seed from. Re-reading `get_children()`
+@@ -931,12 +940,24 @@
+         resolve_window_frame(conn, pid, xid, &seeds).await
+     };
+ 
+-    let mut stack: Vec<(RawObjectRef, usize, bool, usize)> = seeds
+-        .into_iter()
+-        .enumerate()
+-        .map(|(ordinal, r)| (r, 0usize, false, ordinal))
+-        .rev()
+-        .collect();
++    if xid != 0 && scoped_frame.is_none() {
++        if snapshot_deadline_reached() {
++            return Err(anyhow!("deadline: native window identity lookup timed out"));
++        }
++        return Err(anyhow!(
++            "accessibility_window_identity_unproven: exact AT-SPI root is ambiguous or unavailable"
++        ));
++    }
++    let mut stack = traversal_seeds(seeds, scoped_frame);
++    let mut traversal = super::TraversalStatus {
++        scope: if scoped_frame.is_some() {
++            "exact_window"
++        } else {
++            "application"
++        }
++        .into(),
++        ..Default::default()
++    };
+ 
+     let mut visited: Vec<Visited<'a>> = Vec::new();
+     // Guard against pathological/looping trees. Defaults to 5 000 (the
+@@ -960,14 +981,17 @@
+ 
+     while let Some((oref, depth, inherited_web_doc, frame_ordinal)) = stack.pop() {
+         if budget == 0 {
+-            dlog!("node budget exhausted; truncating walk");
++            traversal.reasons.push("node_limit".into());
++            traversal.pending_nodes += stack.len() + 1;
+             break;
+         }
+-        if std::time::Instant::now() >= deadline {
+-            dlog!("collect_visited time budget exhausted; returning partial walk");
++        if std::time::Instant::now() >= deadline || snapshot_deadline_reached() {
++            traversal.reasons.push("deadline".into());
++            traversal.pending_nodes += stack.len() + 1;
+             break;
+         }
+         budget -= 1;
++        traversal.visited_nodes += 1;
+         // WebKitGTK publishes its embedded page on a distinct WebProcess
+         // D-Bus peer and can expose blank role names for the entire subtree.
+         // The peer identity is therefore the reliable document boundary when
+@@ -984,11 +1008,21 @@
+             Some(Ok(a)) => a,
+             Some(Err(error)) => {
+                 dlog!("  accessible_for failed: {error:#}");
++                traversal.reasons.push("read_failure".into());
+                 continue;
+             }
+             None => {
++                traversal.reasons.push(
++                    if snapshot_deadline_reached() {
++                        "deadline"
++                    } else {
++                        "read_timeout"
++                    }
++                    .into(),
++                );
+                 consecutive_timeouts += 1;
+                 if consecutive_timeouts >= 3 {
++                    traversal.pending_nodes += stack.len();
+                     dlog!(
+                         "{} consecutive AT-SPI timeouts (accessible_for); app unresponsive, bailing walk",
+                         consecutive_timeouts
+@@ -1009,13 +1043,23 @@
+             // A completed-but-errored call is node-specific; keep walking.
+             Some(Err(error)) => {
+                 dlog!("  get_interfaces failed: {error:#}");
++                traversal.reasons.push("read_failure".into());
+                 continue;
+             }
+             // A timeout means the app didn't answer in CALL_TIMEOUT. A run of
+             // these means the whole app is wedged — bail so callers fall back.
+             None => {
++                traversal.reasons.push(
++                    if snapshot_deadline_reached() {
++                        "deadline"
++                    } else {
++                        "read_timeout"
++                    }
++                    .into(),
++                );
+                 consecutive_timeouts += 1;
+                 if consecutive_timeouts >= 3 {
++                    traversal.pending_nodes += stack.len();
+                     dlog!(
+                         "{} consecutive AT-SPI timeouts; app unresponsive, bailing walk",
+                         consecutive_timeouts
+@@ -1040,6 +1084,24 @@
+             call(acc.get_state()),
+             call(raw_children(zconn, &oref)),
+         );
++        if !matches!(&role_r, Some(Ok(_)))
++            || !matches!(&name_r, Some(Ok(_)))
++            || !matches!(&state_r, Some(Ok(_)))
++            || !matches!(&children_r, Some(Ok(_)))
++        {
++            traversal.reasons.push(
++                if snapshot_deadline_reached() {
++                    "deadline"
++                } else {
++                    "read_failure"
++                }
++                .into(),
++            );
++        }
++        if matches!(&state_r, Some(Ok(state)) if state.contains(State::Defunct)) {
++            traversal.reasons.push("defunct_object".into());
++            continue;
++        }
+         let role = match role_r {
+             Some(Ok(r)) => r,
+             _ => String::new(),
+@@ -1088,46 +1150,39 @@
+         let mut value: Option<String> = None;
+         let mut text_content = String::new();
+         if has_action || has_value || has_text {
+-            if let Some(Ok(proxies)) = call(acc.proxies()).await {
++            if let Some(proxies) = observed_read(call(acc.proxies()).await, &mut traversal) {
+                 if has_action {
+-                    if let Some(Ok(ap)) = call(proxies.action()).await {
+-                        let n = call(ap.n_actions()).await.and_then(|r| r.ok()).unwrap_or(0);
++                    if let Some(ap) = observed_read(call(proxies.action()).await, &mut traversal) {
++                        let n =
++                            observed_read(call(ap.n_actions()).await, &mut traversal).unwrap_or(0);
+                         for i in 0..n {
+-                            // Preserve the AT-SPI action index even when an
+-                            // individual name lookup fails. `do_action` takes
+-                            // this original index, so compacting the vector
+-                            // could otherwise actuate a different action than
+-                            // the name we selected.
++                            if snapshot_deadline_reached() {
++                                traversal.reasons.push("deadline".into());
++                                break;
++                            }
+                             actions.push(
+-                                call(ap.get_name(i))
+-                                    .await
+-                                    .and_then(|result| result.ok())
++                                observed_read(call(ap.get_name(i)).await, &mut traversal)
+                                     .unwrap_or_default(),
+                             );
+                         }
+                     }
+                 }
+                 if has_value {
+-                    if let Some(Ok(vp)) = call(proxies.value()).await {
+-                        value = call(vp.current_value())
+-                            .await
+-                            .and_then(|r| r.ok())
++                    if let Some(vp) = observed_read(call(proxies.value()).await, &mut traversal) {
++                        value = observed_read(call(vp.current_value()).await, &mut traversal)
+                             .map(format_value);
+                     }
+                 }
+-                // Text content is where editable/entry text (the typed string)
+-                // lives; `name` is usually empty for such widgets.
+                 if has_text {
+-                    if let Some(Ok(tp)) = call(proxies.text()).await {
+-                        let count = call(tp.character_count())
+-                            .await
+-                            .and_then(|r| r.ok())
++                    if let Some(tp) = observed_read(call(proxies.text()).await, &mut traversal) {
++                        let count = observed_read(call(tp.character_count()).await, &mut traversal)
+                             .unwrap_or(0);
+                         if count > 0 {
+-                            let end = count.min(4096);
+-                            if let Some(Ok(t)) = call(tp.get_text(0, end)).await {
+-                                text_content = t;
+-                            }
++                            text_content = observed_read(
++                                call(tp.get_text(0, count.min(4096))).await,
++                                &mut traversal,
++                            )
++                            .unwrap_or_default();
+                         }
+                     }
+                 }
+@@ -1146,6 +1201,14 @@
+         // Honor max_depth (#22865): skip enqueueing descendants whose depth
+         // would exceed the cap.
+         let descend = max_depth.map(|d| depth + 1 <= d).unwrap_or(true);
++        if !descend {
++            if let Some(Ok(children)) = &children_r {
++                if !children.is_empty() {
++                    traversal.reasons.push("depth_limit".into());
++                    traversal.pending_nodes += children.len();
++                }
++            }
++        }
+         if descend {
+             match children_r {
+                 Some(Ok(children)) => {
+@@ -1159,6 +1222,7 @@
+         }
+ 
+         visited.push(Visited {
++            object: oref.clone(),
+             depth,
+             role,
+             name,
+@@ -1180,7 +1244,295 @@
+     }
+ 
+     dlog!("walked pid {pid}: {} node(s)", visited.len());
+-    Ok(Some((visited, scoped_frame)))
++    traversal.reasons.sort();
++    traversal.reasons.dedup();
++    Ok(Some((visited, scoped_frame, traversal)))
++}
++
++fn observed_read<T, E>(
++    result: Option<std::result::Result<T, E>>,
++    traversal: &mut super::TraversalStatus,
++) -> Option<T> {
++    match result {
++        Some(Ok(value)) => Some(value),
++        _ => {
++            traversal.reasons.push(
++                if snapshot_deadline_reached() {
++                    "deadline"
++                } else {
++                    "read_failure"
++                }
++                .into(),
++            );
++            None
++        }
++    }
++}
++
++fn snapshot_deadline_reached() -> bool {
++    SNAPSHOT_DEADLINE
++        .try_with(|deadline| tokio::time::Instant::now() >= *deadline)
++        .unwrap_or(false)
++}
++
++fn traversal_seeds(
++    seeds: Vec<RawObjectRef>,
++    frame: Option<usize>,
++) -> Vec<(RawObjectRef, usize, bool, usize)> {
++    seeds
++        .into_iter()
++        .enumerate()
++        .filter(|(ordinal, _)| frame.is_none_or(|frame| *ordinal == frame))
++        .map(|(ordinal, object)| (object, 0, false, ordinal))
++        .rev()
++        .collect()
++}
++
++/// A native object retained by one immutable snapshot. Display indexes are
++/// local to this snapshot and are never resolved through a fresh traversal.
++#[derive(Clone)]
++pub struct NativeElement {
++    snapshot: Arc<NativeSnapshot>,
++    index: usize,
++    visited_index: usize,
++    #[cfg(test)]
++    test_identity: String,
++}
++
++struct NativeSnapshot {
++    pid: u32,
++    process_start: String,
++    window_id: u64,
++    connection_name: String,
++    root: RawObjectRef,
++    owners: std::collections::HashMap<String, String>,
++    visited: Vec<Visited<'static>>,
++}
++
++impl std::fmt::Debug for NativeElement {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        f.debug_struct("NativeElement")
++            .field("pid", &self.snapshot.pid)
++            .field("window_id", &self.snapshot.window_id)
++            .field("index", &self.index)
++            .finish()
++    }
++}
++impl std::fmt::Display for NativeElement {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        self.index.fmt(f)
++    }
++}
++impl NativeElement {
++    pub fn index(&self) -> usize {
++        self.index
++    }
++    pub fn window_id(&self) -> u64 {
++        self.snapshot.window_id
++    }
++    #[cfg(test)]
++    pub(crate) fn for_test(identity: &str) -> Self {
++        Self {
++            snapshot: Arc::new(NativeSnapshot {
++                pid: 0,
++                process_start: String::new(),
++                window_id: 0,
++                connection_name: String::new(),
++                root: RawObjectRef {
++                    name: String::new(),
++                    path: String::new(),
++                },
++                owners: Default::default(),
++                visited: Vec::new(),
++            }),
++            index: 0,
++            visited_index: 0,
++            test_identity: identity.into(),
++        }
++    }
++    #[cfg(test)]
++    pub(crate) fn identity(&self) -> &str {
++        &self.test_identity
++    }
++}
++
++fn process_start(pid: u32) -> Result<String> {
++    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))
++        .context("stale_native_element: target process vanished")?;
++    stat.rsplit_once(')')
++        .and_then(|(_, fields)| fields.split_whitespace().nth(19))
++        .map(str::to_owned)
++        .context("stale_native_element: process identity unavailable")
++}
++
++async fn bus_owner(conn: &AccessibilityConnection, name: &str) -> Result<String> {
++    let proxy = atspi::zbus::fdo::DBusProxy::new(conn.connection()).await?;
++    let name = atspi::zbus::names::BusName::try_from(name)?;
++    Ok(call(proxy.get_name_owner(name))
++        .await
++        .context("native bus owner timed out")??
++        .to_string())
++}
++
++/// Validate a resolved snapshot target before choosing any input route.
++pub fn validate_element(pid: u32, element: NativeElement) -> Result<()> {
++    bounded(
++        async { validated_target(pid, &element).await.map(|_| ()) },
++        || Err(anyhow!("stale_native_element: target validation timed out")),
++    )
++}
++
++fn same_native_object(
++    a: &RawObjectRef,
++    b: &RawObjectRef,
++    owners: &std::collections::HashMap<String, String>,
++) -> bool {
++    let owner = |object: &RawObjectRef| {
++        owners
++            .get(&object.name)
++            .cloned()
++            .unwrap_or_else(|| object.name.clone())
++    };
++    a.path == b.path && owner(a) == owner(b)
++}
++
++async fn validated_target<'a>(
++    pid: u32,
++    element: &'a NativeElement,
++) -> Result<&'a Visited<'static>> {
++    let snapshot = &element.snapshot;
++    if pid != snapshot.pid || process_start(pid)? != snapshot.process_start {
++        return Err(anyhow!("stale_native_element: process identity changed"));
++    }
++    let conn = shared_connection().await?;
++    if conn.connection().unique_name().map(|name| name.as_str())
++        != Some(snapshot.connection_name.as_str())
++    {
++        return Err(anyhow!(
++            "stale_native_element: accessibility connection changed"
++        ));
++    }
++    for (name, expected) in &snapshot.owners {
++        if bus_owner(conn, name).await? != *expected {
++            return Err(anyhow!("stale_native_element: accessibility peer changed"));
++        }
++    }
++    let app = app_for_pid(conn, pid)
++        .await?
++        .context("stale_native_element: application unavailable")?;
++    let seeds: Vec<_> = call(app.get_children())
++        .await
++        .context("native root lookup timed out")??
++        .iter()
++        .filter_map(RawObjectRef::from_atspi)
++        .collect();
++    let ordinal = resolve_window_frame(conn, pid, snapshot.window_id, &seeds)
++        .await
++        .context("accessibility_window_identity_unproven: native window binding lost")?;
++    if !seeds
++        .get(ordinal)
++        .is_some_and(|root| same_native_object(root, &snapshot.root, &snapshot.owners))
++    {
++        return Err(anyhow!("stale_native_element: exact window root changed"));
++    }
++    let target = snapshot
++        .visited
++        .get(element.visited_index)
++        .context("stale_native_element: missing object")?;
++    let mut object = target.object.clone();
++    let mut seen = std::collections::HashSet::new();
++    for _ in 0..512 {
++        if !seen.insert(object.clone()) {
++            break;
++        }
++        let acc = call(accessible_for(conn, &object))
++            .await
++            .context("native object lookup timed out")??;
++        let state = call(acc.get_state())
++            .await
++            .context("native object state timed out")??;
++        if state.contains(State::Defunct) {
++            return Err(anyhow!("stale_native_element: defunct object"));
++        }
++        if same_native_object(&object, &snapshot.root, &snapshot.owners) {
++            return Ok(target);
++        }
++        // Reuse the explicitly non-caching Accessible proxy. A default zbus
++        // proxy could issue Properties.GetAll and crash Qt5's AT-SPI bridge.
++        let (name, path): (String, atspi::zbus::zvariant::OwnedObjectPath) =
++            call(acc.inner().get_property("Parent"))
++                .await
++                .context("native ancestry lookup timed out")??;
++        object = RawObjectRef {
++            name,
++            path: path.to_string(),
++        };
++    }
++    Err(anyhow!(
++        "stale_native_element: object no longer belongs to the exact window"
++    ))
++}
++
++async fn retain_snapshot(
++    pid: u32,
++    xid: u64,
++    visited: Vec<Visited<'static>>,
++    scope: Option<usize>,
++) -> Result<Vec<(usize, NativeElement)>> {
++    if scope.is_none() || xid == 0 {
++        return Ok(Vec::new());
++    }
++    let root = visited
++        .first()
++        .filter(|node| node.depth == 0)
++        .context("native snapshot has no retained root")?
++        .object
++        .clone();
++    let conn = shared_connection().await?;
++    let mut owners = std::collections::HashMap::new();
++    for node in &visited {
++        if !owners.contains_key(&node.object.name) {
++            owners.insert(
++                node.object.name.clone(),
++                bus_owner(conn, &node.object.name).await?,
++            );
++        }
++    }
++    let indices: Vec<_> = visited
++        .iter()
++        .enumerate()
++        .filter(|(_, node)| is_indexable(node))
++        .map(|(index, _)| index)
++        .collect();
++    let snapshot = Arc::new(NativeSnapshot {
++        pid,
++        process_start: process_start(pid)?,
++        window_id: xid,
++        connection_name: conn
++            .connection()
++            .unique_name()
++            .context("native connection has no bus identity")?
++            .to_string(),
++        root,
++        owners,
++        visited,
++    });
++    Ok(indices
++        .into_iter()
++        .enumerate()
++        .map(|(index, visited_index)| {
++            (
++                index,
++                NativeElement {
++                    snapshot: snapshot.clone(),
++                    index,
++                    visited_index,
++                    #[cfg(test)]
++                    test_identity: String::new(),
++                },
++            )
++        })
++        .collect())
+ }
+ 
+ /// Render visited nodes into the markdown + node list `walk_tree` returns.
+@@ -1191,12 +1543,9 @@
+ /// each depth, so descendants can look up their parent_element_index without
+ /// a second pass.
+ ///
+-/// `only_frame` restricts what is *emitted* to one application top-level while
+-/// leaving the index space application-wide. Element indices are the contract
+-/// between a snapshot and every actuator that later takes one
+-/// (`perform_action`, `focus_element`, `set_value`, …), and those resolve an
+-/// index against the whole application. Renumbering per window would make a
+-/// window-scoped snapshot's indices name different elements at actuation time.
++/// `only_frame` restricts application discovery output when needed. Exact-window
++/// captures already traverse just that frame; their local indexes are bound to
++/// retained native objects in the snapshot, never to a later application walk.
+ fn render(visited: &[Visited<'_>], only_frame: Option<usize>) -> (String, Vec<AtspiNode>) {
+     let mut md = String::new();
+     let mut nodes = Vec::new();
+@@ -1362,6 +1711,8 @@
+ /// One accessibility snapshot, plus whether it was provably narrowed to the
+ /// caller's window.
+ pub struct WalkedTree {
++    pub elements: Vec<(usize, NativeElement)>,
++    pub traversal: super::TraversalStatus,
+     pub markdown: String,
+     pub nodes: Vec<AtspiNode>,
+     pub bounds: Vec<(usize, i32, i32, u32, u32)>,
+@@ -1391,63 +1742,81 @@
+     timeout: Duration,
+ ) -> Result<Option<WalkedTree>> {
+     runtime().block_on(async {
+-        // Tree traversal and bounds collection form one snapshot. Keep one
+-        // deadline for both phases so a dead AT-SPI peer cannot outlive the
+-        // operation timeout while resolving geometry.
+         let deadline = tokio::time::Instant::now() + timeout;
+-        let walk_started = std::time::Instant::now();
+-        let walk = async {
+-            let conn = shared_connection().await?;
+-            collect_visited_bounded(conn, pid, xid, max_elements, max_depth).await
+-        };
+-        let walked = match before_snapshot_deadline(deadline, walk).await {
+-            Ok(result) => result?,
+-            Err(_) => {
+-                dlog!("walk_tree timed out for pid {pid}");
+-                return Ok(None);
+-            }
+-        };
+-        let Some((visited, scoped_frame)) = walked else {
++        let conn = before_snapshot_deadline(deadline, shared_connection())
++            .await
++            .map_err(|_| anyhow!("deadline: accessibility connection timed out"))??;
++        let initial_process = process_start(pid)?;
++        // Per-call waits use this same deadline. The collector returns its
++        // accumulated nodes instead of losing them to outer future cancellation.
++        let walked = SNAPSHOT_DEADLINE
++            .scope(
++                deadline,
++                collect_visited_bounded(conn, pid, xid, max_elements, max_depth),
++            )
++            .await?;
++        let Some((visited, scoped_frame, mut traversal)) = walked else {
++            if tokio::time::Instant::now() >= deadline {
++                return Err(anyhow!(
++                    "deadline: native accessibility discovery timed out"
++                ));
++            }
+             return Ok(None);
+         };
+-        let walk_elapsed = walk_started.elapsed();
+         let (markdown, nodes) = render(&visited, scoped_frame);
+-        let bounds_started = std::time::Instant::now();
+         let bounds = match before_snapshot_deadline(
+             deadline,
+             element_bounds_for_visited(&visited, pid, xid, scoped_frame),
+         )
+         .await
+         {
+-            Ok(bounds) => bounds,
++            Ok(bounds) => {
++                traversal.bounds_complete = bounds.len()
++                    == visited
++                        .iter()
++                        .filter(|node| is_indexable(node) && node.has_component)
++                        .count();
++                if !traversal.bounds_complete {
++                    traversal.reasons.push("bounds_partial".into());
++                }
++                bounds
++            }
+             Err(_) => {
+-                dlog!("element bounds timed out for pid {pid}");
++                traversal.reasons.push("bounds_deadline".into());
+                 Vec::new()
+             }
+         };
+-        dlog!(
+-            "snapshot phases pid {pid}: walk_ms={} bounds_ms={} visited={} bounds={}",
+-            walk_elapsed.as_millis(),
+-            bounds_started.elapsed().as_millis(),
+-            visited.len(),
+-            bounds.len()
+-        );
+-        // Bounds are keyed by the application-wide element index, so drop the
+-        // entries for windows this snapshot no longer shows.
+-        let bounds = if scoped_frame.is_some() {
+-            let emitted: std::collections::HashSet<usize> =
+-                nodes.iter().filter_map(|node| node.element_index).collect();
+-            bounds
+-                .into_iter()
+-                .filter(|(index, ..)| emitted.contains(index))
+-                .collect()
++        // Retain references without any tree re-walk. A small incomplete walk
++        // can still expose usable native objects while reporting its limit.
++        let elements = if visited.is_empty() {
++            Vec::new()
+         } else {
+-            bounds
++            match before_snapshot_deadline(
++                deadline,
++                retain_snapshot(pid, xid, visited, scoped_frame),
++            )
++            .await
++            {
++                Ok(result) => result?,
++                Err(_) => {
++                    traversal.reasons.push("identity_deadline".into());
++                    Vec::new()
++                }
++            }
+         };
++        if process_start(pid)? != initial_process {
++            return Err(anyhow!(
++                "stale_native_element: process changed during snapshot"
++            ));
++        }
++        traversal.reasons.sort();
++        traversal.reasons.dedup();
+         Ok(Some(WalkedTree {
+             markdown,
+             nodes,
+             bounds,
++            elements,
++            traversal,
+             window_scoped: scoped_frame.is_some(),
+         }))
+     })
+@@ -1733,48 +2102,35 @@
+ }
+ 
+ /// Write into the exact indexed editable exposed by the caller's snapshot.
+-pub fn type_into_editable_at(pid: u32, idx: usize, text: &str) -> Result<()> {
++pub fn type_into_editable_at(pid: u32, element: NativeElement, text: &str) -> Result<()> {
+     bounded(
+         async {
+-            let conn = shared_connection().await?;
+-            let visited = collect_visited(conn, pid)
+-                .await?
+-                .ok_or_else(|| anyhow!("no AT-SPI application for pid {pid}"))?;
+-            let target = visited
+-                .iter()
+-                .filter(|node| is_indexable(node))
+-                .nth(idx)
+-                .ok_or_else(|| anyhow!("element {idx} not found (total: {})", visited.len()))?;
+-            if write_into_editable_target(target, text).await? {
++            let target = validated_target(pid, &element).await?;
++            let proxies = target.acc.proxies().await?;
++            if write_through_editable_proxies(&proxies, text).await? {
++                return Ok(());
++            }
++            if target.has_component {
++                let component = proxies.component().await?;
++                let accepted = call(component.grab_focus())
++                    .await
++                    .context("native focus timed out")??;
++                if !accepted {
++                    return Err(anyhow!("native object refused focus"));
++                }
++            }
++            // Focus may destroy/recreate a toolkit object. Never substitute the
++            // control now occupying its old ordinal or carrying its old label.
++            let target = validated_target(pid, &element).await?;
++            if write_through_editable_proxies(&target.acc.proxies().await?, text).await? {
+                 Ok(())
+             } else {
+-                // GrabFocus can rebuild WebKitGTK's accessibility object. Walk
+-                // the same index space again and retry only that exact element;
+-                // never fall through to a different focused/first editable.
+-                let refreshed = collect_visited(conn, pid)
+-                    .await?
+-                    .ok_or_else(|| anyhow!("no AT-SPI application for pid {pid}"))?;
+-                let refreshed_target = refreshed
+-                    .iter()
+-                    .filter(|node| is_indexable(node))
+-                    .nth(idx)
+-                    .ok_or_else(|| {
+-                        anyhow!("element {idx} disappeared after AT-SPI focus refresh")
+-                    })?;
+-                if write_into_editable_target(refreshed_target, text).await? {
+-                    Ok(())
+-                } else {
+-                    Err(anyhow!(
+-                        "element {idx} is not writable through AT-SPI EditableText"
+-                    ))
+-                }
++                Err(anyhow!(
++                    "native object is not writable through EditableText"
++                ))
+             }
+         },
+-        || {
+-            Err(anyhow!(
+-                "AT-SPI editable write timed out for element {idx} in pid {pid}"
+-            ))
+-        },
++        || Err(anyhow!("AT-SPI editable write timed out for pid {pid}")),
+     )
+ }
+ 
+@@ -2101,62 +2457,45 @@
+     )
+ }
+ 
+-pub fn perform_action(pid: u32, idx: usize) -> Result<(String, bool)> {
+-    bounded(
+-        async {
+-            let conn = shared_connection().await?;
+-            let visited = collect_visited(conn, pid)
+-                .await?
+-                .ok_or_else(|| anyhow!("no AT-SPI application for pid {pid}"))?;
+-            let action_nodes: Vec<&Visited> = visited.iter().filter(|v| is_indexable(v)).collect();
+-            let target = action_nodes.get(idx).ok_or_else(|| {
+-                anyhow!("element {idx} not found (total: {})", action_nodes.len())
+-            })?;
+-
+-            // Suspected no-op: actuating `do_action(0)` on a passive display role
+-            // (a `label`/`static`/`image` indexed only for its Value interface) or a
+-            // node that advertises no action at all is the AT-SPI analogue of macOS'
+-            // "element does not advertise this action" — the call returns success but
+-            // likely changes nothing. Reuses the same passive-role detector
+-            // `select_click_target` leans on for the coordinate paths. The caller
+-            // turns this into `effect: "suspected_noop"` + an escalation hint.
+-            let suspected_noop = target.actions.is_empty() || is_passive_role(&target.role);
+-
+-            // Which action to actuate is decided by NAME, not by position. A
+-            // GTK4 text view advertises `buffer.delete-line` first, so firing
+-            // "action 0" there deletes a line of the user's document while
+-            // reporting an ordinary click. An element that advertises no
+-            // activation at all is a no-op the caller must escalate past —
+-            // not an invitation to fire whatever happens to be first.
+-            let chosen = activation_index(&target.role, &target.actions).ok_or_else(|| {
+-                anyhow!("element {idx} does not advertise a safe activation action")
+-            })?;
+-
+-            let ap = target
+-                .acc
+-                .proxies()
++async fn activate_retained(pid: u32, element: &NativeElement) -> Result<(String, bool)> {
++    let target = validated_target(pid, element).await?;
++    let role = call(target.acc.get_role_name())
++        .await
++        .context("native role lookup timed out")??;
++    let ap = target.acc.proxies().await?.action().await?;
++    let count = call(ap.n_actions())
++        .await
++        .context("native action count timed out")??;
++    let mut actions = Vec::new();
++    for index in 0..count {
++        actions.push(
++            call(ap.get_name(index))
+                 .await
+-                .map_err(|e| anyhow!("interface proxies unavailable: {e}"))?
+-                .action()
+-                .await
+-                .map_err(|e| anyhow!("Action unavailable: {e}"))?;
+-            let action = target.actions.get(chosen).cloned().unwrap_or_default();
+-            ap.do_action(chosen as i32)
+-                .await
+-                .map_err(|e| anyhow!("doAction failed: {e}"))?;
+-            // AT-SPI's doAction acknowledgement can precede the renderer's
+-            // queued DOM mutation. Give WebKit/Chromium one short event-loop
+-            // turn before returning success so a caller's immediate external
+-            // state read observes the action it was told was delivered.
+-            tokio::time::sleep(Duration::from_millis(50)).await;
+-            Ok((action, suspected_noop))
+-        },
+-        || {
+-            Err(anyhow!(
+-                "perform_action timed out for pid {pid} (app unresponsive to AT-SPI)"
+-            ))
+-        },
+-    )
++                .context("native action name timed out")??,
++        );
++    }
++    let suspected_noop = actions.is_empty() || is_passive_role(&role);
++    let chosen = activation_index(&role, &actions)
++        .context("native object does not advertise a safe activation action")?;
++    validated_target(pid, element).await?;
++    let action = actions[chosen].clone();
++    let accepted = ap
++        .do_action(chosen as i32)
++        .await
++        .context("native action failed")?;
++    if !accepted {
++        return Err(anyhow!("native action was not accepted"));
++    }
++    tokio::time::sleep(Duration::from_millis(50)).await;
++    Ok((action, suspected_noop))
++}
++
++pub fn perform_action(pid: u32, element: NativeElement) -> Result<(String, bool)> {
++    bounded(activate_retained(pid, &element), || {
++        Err(anyhow!(
++            "perform_action timed out for pid {pid} (app unresponsive to AT-SPI)"
++        ))
++    })
+ }
+ 
+ /// A mutation was attempted; callers must not replay through another route.
+@@ -2498,7 +2837,7 @@
+ /// `ScrollProgress` preserves uncertainty after an attempted mutation.
+ pub fn scroll_element(
+     pid: u32,
+-    idx: usize,
++    element: NativeElement,
+     direction: &str,
+     amount: usize,
+     by: cua_driver_contract::ScrollBy,
+@@ -2507,15 +2846,9 @@
+     let acknowledged = std::cell::Cell::new(0);
+     let result = bounded(
+         async {
+-            let conn = shared_connection().await?;
+-            let visited = collect_visited(conn, pid)
+-                .await?
+-                .ok_or_else(|| anyhow!("no AT-SPI application for pid {pid}"))?;
+-            let target = visited
+-                .iter()
+-                .filter(|v| is_indexable(v))
+-                .nth(idx)
+-                .ok_or_else(|| anyhow!("element {idx} not found (total: {})", visited.len()))?;
++            let idx = element.index;
++            let target = validated_target(pid, &element).await?;
++            let visited = &element.snapshot.visited;
+             let proxies = target
+                 .acc
+                 .proxies()
+@@ -2600,7 +2933,7 @@
+                     observation.as_ref().map(|o| o.3.clone()),
+                     &attempted,
+                     &acknowledged,
+-                    || async { action.do_action(action_index).await.map_err(Into::into) },
++                    || async { validated_target(pid, &element).await?; action.do_action(action_index).await.map_err(Into::into) },
+                     |baseline| async {
+                         let (component, probes, coord, _) = observation
+                             .as_ref()
+@@ -2680,18 +3013,11 @@
+ /// after the acknowledgement can therefore split one string between the old
+ /// and new controls. Wait for the target's Focused state to become observable;
+ /// an acknowledgement without read-back is not sufficient for global input.
+-pub fn focus_element(pid: u32, idx: usize) -> Result<bool> {
++pub fn focus_element(pid: u32, element: NativeElement) -> Result<bool> {
+     bounded(
+         async {
+-            let conn = shared_connection().await?;
+-            let visited = collect_visited(conn, pid)
+-                .await?
+-                .ok_or_else(|| anyhow!("no AT-SPI application for pid {pid}"))?;
+-            let target = visited
+-                .iter()
+-                .filter(|v| is_indexable(v))
+-                .nth(idx)
+-                .ok_or_else(|| anyhow!("element {idx} not found (total: {})", visited.len()))?;
++            let idx = element.index;
++            let target = validated_target(pid, &element).await?;
+             let proxies = target
+                 .acc
+                 .proxies()
+@@ -2721,7 +3047,13 @@
+                 )
+                 .await
+                 {
+-                    Ok(Ok(state)) if state.contains(State::Focused) => return Ok(true),
++                    Ok(Ok(state)) if state.contains(State::Defunct) => {
++                        return Err(anyhow!("stale_native_element: focus object became defunct"))
++                    }
++                    Ok(Ok(state)) if state.contains(State::Focused) => {
++                        validated_target(pid, &element).await?;
++                        return Ok(true);
++                    }
+                     _ => {
+                         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                     }
+@@ -2750,15 +3082,24 @@
+ /// a click lands on the button, not its enclosing panel. Returns `Ok(Some(action))`
+ /// when an element was actuated, `Ok(None)` when no actionable element covers the
+ /// point (the caller then falls back to the synthetic X11 path).
+-pub fn perform_action_at_point(pid: u32, win_x: i32, win_y: i32) -> Result<Option<String>> {
++pub fn perform_action_at_point(
++    pid: u32,
++    xid: u64,
++    win_x: i32,
++    win_y: i32,
++) -> Result<Option<String>> {
+     bounded(
+         async {
+             let conn = shared_connection().await?;
+-            let visited = match collect_visited(conn, pid).await? {
+-                Some(v) => v,
+-                None => return Ok(None),
+-            };
+-            let web_document_origin = web_document_origin_for_visited(&visited, pid, 0, None)
++            if xid == 0 {
++                return Err(anyhow!("exact window required for native hit testing"));
++            }
++            let (visited, scope, _) =
++                match collect_visited_bounded(conn, pid, xid, None, None).await? {
++                    Some(v) => v,
++                    None => return Ok(None),
++                };
++            let web_document_origin = web_document_origin_for_visited(&visited, pid, xid, scope)
+                 .await
+                 .unwrap_or((0, 0));
+ 
+@@ -2803,22 +3144,16 @@
+             let Some(idx) = select_click_target(&frames, win_x, win_y) else {
+                 return Ok(None);
+             };
+-            let target = &visited[idx];
+-            let Some(chosen) = activation_index(&target.role, &target.actions) else {
+-                return Ok(None);
+-            };
+-            let ap = target
+-                .acc
+-                .proxies()
++            let object = visited[idx].object.clone();
++            let retained = retain_snapshot(pid, xid, visited, scope).await?;
++            let element = retained
++                .into_iter()
++                .map(|(_, element)| element)
++                .find(|element| element.snapshot.visited[element.visited_index].object == object)
++                .context("native hit target is not retained")?;
++            activate_retained(pid, &element)
+                 .await
+-                .map_err(|e| anyhow!("interface proxies unavailable: {e}"))?
+-                .action()
+-                .await
+-                .map_err(|e| anyhow!("Action unavailable: {e}"))?;
+-            ap.do_action(chosen as i32)
+-                .await
+-                .map_err(|e| anyhow!("doAction failed: {e}"))?;
+-            Ok(target.actions.get(chosen).cloned())
++                .map(|(action, _)| Some(action))
+         },
+         || Ok(None),
+     )
+@@ -2854,8 +3189,11 @@
+ ) -> Result<Option<String>> {
+     bounded(
+         async {
++            if xid == 0 {
++                return Err(anyhow!("exact window required for native hit testing"));
++            }
+             let conn = shared_connection().await?;
+-            let (visited, scoped_frame) =
++            let (visited, scoped_frame, _) =
+                 match collect_visited_bounded(conn, pid, xid, None, None).await? {
+                     Some(walked) => walked,
+                     None => return Ok(None),
+@@ -2876,22 +3214,15 @@
+             let Some(idx) = select_click_target(&frames, screen_x, screen_y) else {
+                 return Ok(None);
+             };
+-            let target = action_nodes[idx];
+-            let Some(chosen) = activation_index(&target.role, &target.actions) else {
+-                return Ok(None);
+-            };
+-            let ap = target
+-                .acc
+-                .proxies()
++            let retained = retain_snapshot(pid, xid, visited, scoped_frame).await?;
++            let element = retained
++                .into_iter()
++                .find(|(index, _)| *index == idx)
++                .context("native hit target is not retained")?
++                .1;
++            activate_retained(pid, &element)
+                 .await
+-                .map_err(|e| anyhow!("interface proxies unavailable: {e}"))?
+-                .action()
+-                .await
+-                .map_err(|e| anyhow!("Action unavailable: {e}"))?;
+-            ap.do_action(chosen as i32)
+-                .await
+-                .map_err(|e| anyhow!("doAction failed: {e}"))?;
+-            Ok(target.actions.get(chosen).cloned())
++                .map(|(action, _)| Some(action))
+         },
+         || Ok(None),
+     )
+@@ -2939,18 +3270,11 @@
+     best_active.or(best_passive).map(|(_, idx)| idx)
+ }
+ 
+-pub fn set_value(pid: u32, idx: usize, value: &str) -> Result<()> {
++pub fn set_value(pid: u32, element: NativeElement, value: &str) -> Result<()> {
+     bounded(
+         async {
+-            let conn = shared_connection().await?;
+-            let visited = collect_visited(conn, pid)
+-                .await?
+-                .ok_or_else(|| anyhow!("no AT-SPI application for pid {pid}"))?;
+-            let action_nodes: Vec<&Visited> = visited.iter().filter(|v| is_indexable(v)).collect();
+-            let target = action_nodes.get(idx).ok_or_else(|| {
+-                anyhow!("element {idx} not found (total: {})", action_nodes.len())
+-            })?;
+-
++            let idx = element.index;
++            let target = validated_target(pid, &element).await?;
+             let proxies = target
+                 .acc
+                 .proxies()
+@@ -3004,106 +3328,35 @@
+     )
+ }
+ 
+-pub fn get_element_bounds(pid: u32, idx: usize) -> Result<(i32, i32, u32, u32)> {
+-    if crate::wayland::is_wayland() && crate::wayland::hyprland::is_session() {
+-        let window = crate::wayland::hyprland::window_for_pid(pid)
+-            .context("Hyprland bounds require an exact window for multi-window apps")?;
+-        return get_element_bounds_for_window(pid, window.address, idx);
+-    }
+-    bounded(
+-        async {
+-            let conn = shared_connection().await?;
+-            let visited = collect_visited(conn, pid)
+-                .await?
+-                .ok_or_else(|| anyhow!("no AT-SPI application for pid {pid}"))?;
+-            let web_document_origin = web_document_origin_for_visited(&visited, pid, 0, None)
+-                .await
+-                .unwrap_or((0, 0));
+-            let action_nodes: Vec<&Visited> = visited.iter().filter(|v| is_indexable(v)).collect();
+-            let target = action_nodes
+-                .get(idx)
+-                .ok_or_else(|| anyhow!("element {idx} not found"))?;
+-            if !target.has_component {
+-                return Err(anyhow!("element {idx} exposes no Component interface"));
+-            }
+-            let comp = target
+-                .acc
+-                .proxies()
+-                .await
+-                .map_err(|e| anyhow!("interface proxies unavailable: {e}"))?
+-                .component()
+-                .await
+-                .map_err(|e| anyhow!("Component unavailable: {e}"))?;
+-            // Prefer WINDOW coords + a deterministic screen offset — fixes GTK4,
+-            // whose CoordType::Screen collapses every element to (0,0). Fall back to
+-            // Screen on Wayland / when no X11 window resolves (offset is None).
+-            match window_to_screen_offset(pid, 0, None) {
+-                Some((ox, oy)) => {
+-                    let (x, y, w, h) = comp
+-                        .get_extents(CoordType::Window)
+-                        .await
+-                        .map_err(|e| anyhow!("getExtents failed: {e}"))?;
+-                    let (document_x, document_y) = if target.in_web_doc {
+-                        web_document_origin
+-                    } else {
+-                        (0, 0)
+-                    };
+-                    Ok((
+-                        x + ox + document_x,
+-                        y + oy + document_y,
+-                        w.max(0) as u32,
+-                        h.max(0) as u32,
+-                    ))
+-                }
+-                None => {
+-                    let (x, y, w, h) = comp
+-                        .get_extents(CoordType::Screen)
+-                        .await
+-                        .map_err(|e| anyhow!("getExtents failed: {e}"))?;
+-                    Ok((x, y, w.max(0) as u32, h.max(0) as u32))
+-                }
+-            }
+-        },
+-        || {
+-            Err(anyhow!(
+-                "get_element_bounds timed out for pid {pid} (app unresponsive to AT-SPI)"
+-            ))
+-        },
+-    )
++pub fn get_element_bounds(pid: u32, element: NativeElement) -> Result<(i32, i32, u32, u32)> {
++    get_element_bounds_for_window(pid, element.window_id(), element)
+ }
+ 
+ pub fn get_element_bounds_for_window(
+     pid: u32,
+     xid: u64,
+-    idx: usize,
++    element: NativeElement,
+ ) -> Result<(i32, i32, u32, u32)> {
+-    if !crate::wayland::is_wayland() || !crate::wayland::hyprland::is_session() {
+-        return get_element_bounds(pid, idx);
+-    }
+     bounded(
+         async {
+-            let conn = shared_connection().await?;
+-            let (visited, scoped_frame) = collect_visited_bounded(conn, pid, xid, None, None)
+-                .await?
+-                .context("no AT-SPI application")?;
+-            let scope =
+-                scoped_frame.context("Hyprland accessibility window identity is unproven")?;
+-            let target = visited
+-                .iter()
+-                .filter(|v| is_indexable(v))
+-                .nth(idx)
+-                .context("element no longer exists")?;
+-            if target.frame_ordinal != scope {
+-                return Err(anyhow!("element does not belong to the requested window"));
+-            }
+-            element_bounds_for_visited(&visited, pid, xid, Some(scope))
+-                .await
++            if xid != element.window_id() {
++                return Err(anyhow!("native object belongs to another window"));
++            }
++            let target = validated_target(pid, &element).await?;
++            let bounds = element_bounds_for_visited(
++                &element.snapshot.visited,
++                pid,
++                xid,
++                Some(target.frame_ordinal),
++            )
++            .await;
++            bounds
+                 .into_iter()
+-                .find(|(index, ..)| *index == idx)
+-                .map(|(_, x, y, w, h)| (x, y, w, h))
+-                .context("element has no compositor-attested screen bounds")
++                .find(|(index, ..)| *index == element.index)
++                .map(|(_, x, y, width, height)| (x, y, width, height))
++                .context("native object has no exact-window bounds")
+         },
+-        || Err(anyhow!("Hyprland element bounds timed out")),
++        || Err(anyhow!("native element bounds timed out")),
+     )
+ }
+ 
+@@ -3738,9 +3991,7 @@
+         );
+     }
+ 
+-    /// Being the only candidate is not evidence of correspondence. (The walk
+-    /// does short-circuit a genuinely single-top-level application before it
+-    /// reaches this function — see `resolve_window_frame`.)
++    /// Being the only candidate is not evidence of correspondence.
+     #[test]
+     fn a_sole_candidate_still_has_to_be_close_enough() {
+         let far_away = i32::try_from(FRAME_MATCH_TOLERANCE_PX).unwrap() + 500;
+@@ -4320,3 +4571,89 @@
+         assert_eq!(activation_index("button", &sparse), Some(2));
+     }
+ }
++
++#[cfg(test)]
++mod retained_window_tests {
++    use super::*;
++    use std::collections::HashMap;
++
++    fn object(path: &str) -> RawObjectRef {
++        RawObjectRef {
++            name: ":1.23".into(),
++            path: path.into(),
++        }
++    }
++
++    fn synthetic_walk(sibling_size: usize, limit: usize, scoped: bool) -> Vec<RawObjectRef> {
++        let sibling = object("/earlier");
++        let target = object("/target");
++        let search = object("/target/search");
++        let mut children = HashMap::from([(target.clone(), vec![search])]);
++        children.insert(
++            sibling.clone(),
++            (0..sibling_size)
++                .map(|i| object(&format!("/earlier/{i}")))
++                .collect(),
++        );
++        let mut stack = traversal_seeds(vec![sibling, target], scoped.then_some(1));
++        let mut visited = Vec::new();
++        while let Some((node, depth, _, frame)) = stack.pop() {
++            if visited.len() == limit {
++                break;
++            }
++            for child in children.get(&node).into_iter().flatten().rev() {
++                stack.push((child.clone(), depth + 1, false, frame));
++            }
++            visited.push(node);
++        }
++        visited
++    }
++
++    #[test]
++    fn large_earlier_window_cannot_spend_target_node_budget() {
++        assert!(!synthetic_walk(8000, 5000, false).contains(&object("/target/search")));
++        for size in [0, 8000, 16000] {
++            assert_eq!(
++                synthetic_walk(size, 3, true),
++                vec![object("/target"), object("/target/search")]
++            );
++        }
++    }
++
++    #[test]
++    fn retained_object_identity_survives_sibling_insertion_and_reordering() {
++        let retained = Arc::new(synthetic_walk(8000, 3, true));
++        let target = retained[1].clone();
++        let new_seeds = vec![object("/new"), object("/target"), object("/earlier")];
++        assert_eq!(traversal_seeds(new_seeds, Some(1))[0].0, object("/target"));
++        let mut actions = Vec::new();
++        actions.push(target);
++        assert_eq!(actions, vec![object("/target/search")]);
++        assert_ne!(actions[0], object("/new/search"));
++    }
++
++    #[test]
++    fn native_identity_requires_path_and_bus_owner_not_label_or_ordinal() {
++        let reference = object("/target/search");
++        let owners = HashMap::from([("org.example.Renderer".into(), ":1.23".into())]);
++        let alias = RawObjectRef {
++            name: "org.example.Renderer".into(),
++            path: reference.path.clone(),
++        };
++        assert!(same_native_object(&reference, &alias, &owners));
++        assert!(!same_native_object(
++            &reference,
++            &object("/replacement/search"),
++            &owners
++        ));
++        let changed = HashMap::from([("org.example.Renderer".into(), ":1.24".into())]);
++        assert!(!same_native_object(&reference, &alias, &changed));
++    }
++
++    #[test]
++    fn failed_metadata_reads_make_traversal_partial() {
++        let mut status = super::super::TraversalStatus::default();
++        assert_eq!(observed_read::<u32, ()>(Some(Err(())), &mut status), None);
++        assert_eq!(status.reasons, ["read_failure"]);
++    }
++}
+diff --git i/libs/cua-driver/rust/crates/platform-linux/src/atspi/cache.rs w/libs/cua-driver/rust/crates/platform-linux/src/atspi/cache.rs
+index 269574735..60a6f3556 100644
+--- i/libs/cua-driver/rust/crates/platform-linux/src/atspi/cache.rs
++++ w/libs/cua-driver/rust/crates/platform-linux/src/atspi/cache.rs
+@@ -1,26 +1,27 @@
+-use super::AtspiNode;
++use super::native::NativeElement;
+ use cua_driver_core::element_cache::{ElementCacheCore, SnapshotPayload};
+ 
++/// Numeric indices are only keys within this capture. The payload retains the
++/// native object selected at capture time, regardless of later tree reordering.
+ pub struct CachedSnapshot {
+-    elements: Vec<usize>,
++    elements: std::collections::BTreeMap<usize, NativeElement>,
+ }
+ 
+ impl CachedSnapshot {
+-    pub fn from_nodes(nodes: &[AtspiNode]) -> Self {
+-        let mut elements: Vec<_> = nodes.iter().filter_map(|node| node.element_index).collect();
+-        elements.sort_unstable();
+-        elements.dedup();
+-        Self { elements }
++    pub fn from_elements(elements: &[(usize, NativeElement)]) -> Self {
++        Self {
++            elements: elements.iter().cloned().collect(),
++        }
+     }
+ }
+ 
+ impl SnapshotPayload for CachedSnapshot {
+-    type Element = usize;
++    type Element = NativeElement;
+     fn len(&self) -> usize {
+         self.elements.len()
+     }
+-    fn retain(&self, index: usize) -> Option<usize> {
+-        self.elements.binary_search(&index).ok().map(|_| index)
++    fn retain(&self, index: usize) -> Option<NativeElement> {
++        self.elements.get(&index).cloned()
+     }
+ }
+ 
+@@ -31,36 +32,54 @@ mod tests {
+     use super::*;
+     use cua_driver_core::element_token::{token_for, ResolvedElement};
+ 
+-    fn node(index: usize) -> AtspiNode {
+-        AtspiNode {
+-            element_index: Some(index),
+-            role: "button".into(),
+-            name: None,
+-            value: None,
+-            checked: None,
+-            enabled: None,
+-            selected: None,
+-            description: None,
+-            actions: Vec::new(),
+-            element_key: 999,
+-            depth: 0,
+-            parent_element_index: None,
+-            in_web_content: false,
++    fn payload(entries: &[(usize, &str)]) -> CachedSnapshot {
++        CachedSnapshot::from_elements(
++            &entries
++                .iter()
++                .map(|(index, identity)| (*index, NativeElement::for_test(identity)))
++                .collect::<Vec<_>>(),
++        )
++    }
++
++    fn identity(resolved: ResolvedElement<NativeElement>) -> String {
++        match resolved {
++            ResolvedElement::Element { element, .. } => element.identity().into(),
++            _ => panic!("expected retained native object"),
+         }
+     }
+ 
+     #[test]
+-    fn sparse_application_indices_are_members_not_dense_offsets_or_native_keys() {
++    fn sparse_snapshot_indices_retain_native_objects_not_ordinals() {
+         let cache = ElementCache::new();
+-        let id = cache.publish(42, 7, CachedSnapshot::from_nodes(&[node(11), node(7)]));
+-        for index in [7, 11] {
+-            let resolved = cache
+-                .resolve_element_args(42, None, Some(&token_for(id, index)), None, None, "click")
+-                .unwrap();
+-            assert!(
+-                matches!(resolved, ResolvedElement::Element { element, .. } if element == index)
+-            );
+-        }
++        let id = cache.publish(
++            42,
++            7,
++            payload(&[(11, "target-button"), (7, "other-button")]),
++        );
++        let token = token_for(id, 11);
++        let target = || {
++            cache
++                .resolve_element_args(42, None, Some(&token), None, None, "click")
++                .unwrap()
++        };
++        assert_eq!(identity(target()), "target-button");
++        // An unrelated window can insert/reorder controls without changing this
++        // snapshot's native target, even if it uses the same numeric indices.
++        cache.publish(
++            42,
++            8,
++            payload(&[(11, "inserted-sibling"), (7, "reordered-sibling")]),
++        );
++        assert_eq!(identity(target()), "target-button");
++        let handle = token.trim_end_matches(":11");
++        assert_eq!(
++            identity(
++                cache
++                    .resolve_element_args(42, Some(11), None, Some(handle), Some(7), "set_value")
++                    .unwrap()
++            ),
++            "target-button"
++        );
+         for index in [0, 1, 8, 999] {
+             assert!(cache
+                 .resolve_element_args(42, None, Some(&token_for(id, index)), None, None, "click")
+@@ -68,23 +87,11 @@ mod tests {
+         }
+     }
+ 
+-    #[test]
+-    fn duplicate_and_unindexed_nodes_do_not_create_members() {
+-        let mut unindexed = node(8);
+-        unindexed.element_index = None;
+-        let payload = CachedSnapshot::from_nodes(&[node(11), unindexed, node(7), node(11)]);
+-        assert_eq!(payload.len(), 2);
+-        assert_eq!(payload.retain(7), Some(7));
+-        assert_eq!(payload.retain(11), Some(11));
+-        assert_eq!(payload.retain(8), None);
+-        assert_eq!(payload.retain(0), None);
+-    }
+-
+     #[test]
+     fn replacement_retires_old_linux_membership() {
+         let cache = ElementCache::new();
+-        let old = cache.publish(42, 7, CachedSnapshot::from_nodes(&[node(7), node(11)]));
+-        let fresh = cache.publish(42, 7, CachedSnapshot::from_nodes(&[node(3)]));
++        let old = cache.publish(42, 7, payload(&[(7, "old-button"), (11, "old-entry")]));
++        let fresh = cache.publish(42, 7, payload(&[(3, "new-button")]));
+         for index in [7, 11] {
+             let refusal = cache
+                 .resolve_element_args(42, None, Some(&token_for(old, index)), None, None, "click")
+@@ -104,42 +111,58 @@ mod tests {
+                 )
+                 .is_err());
+         }
+-        let target = cache
+-            .resolve_element_args(42, None, Some(&token_for(fresh, 3)), None, None, "click")
+-            .unwrap();
+-        assert!(matches!(
+-            target,
+-            ResolvedElement::Element {
+-                window_id: Some(7),
+-                element: 3,
+-                ..
+-            }
+-        ));
++        assert_eq!(
++            identity(
++                cache
++                    .resolve_element_args(
++                        42,
++                        None,
++                        Some(&token_for(fresh, 3)),
++                        None,
++                        Some(7),
++                        "click"
++                    )
++                    .unwrap()
++            ),
++            "new-button"
++        );
+     }
+ 
+     #[test]
+     fn compositor_window_ids_do_not_alias_their_low_bits() {
+         let cache = ElementCache::new();
+         let window = (1_u64 << 40) | 7;
+-        let low = cache.publish(42, 7, CachedSnapshot::from_nodes(&[node(7)]));
+-        let high = cache.publish(42, window, CachedSnapshot::from_nodes(&[node(11)]));
+-        let target = cache
++        let low = cache.publish(42, 7, payload(&[(7, "low-button")]));
++        let high = cache.publish(42, window, payload(&[(11, "high-button")]));
++        assert_eq!(
++            identity(
++                cache
++                    .resolve_element_args(
++                        42,
++                        None,
++                        Some(&token_for(high, 11)),
++                        None,
++                        Some(window),
++                        "click"
++                    )
++                    .unwrap()
++            ),
++            "high-button"
++        );
++        assert!(cache
++            .resolve_element_args(42, None, Some(&token_for(high, 11)), None, Some(7), "click")
++            .is_err());
++        cache.remove(42, window);
++        assert!(cache
+             .resolve_element_args(
+                 42,
+                 None,
+                 Some(&token_for(high, 11)),
+                 None,
+                 Some(window),
+-                "click",
++                "click"
+             )
+-            .unwrap();
+-        assert!(
+-            matches!(target, ResolvedElement::Element { window_id: Some(id), element: 11, .. } if id == window)
+-        );
+-        assert!(cache
+-            .resolve_element_args(42, None, Some(&token_for(high, 11)), None, Some(7), "click")
+             .is_err());
+-        cache.remove(42, window);
+         assert!(cache
+             .resolve_element_args(42, None, Some(&token_for(low, 7)), None, Some(7), "click")
+             .is_ok());
+@@ -148,7 +171,7 @@ mod tests {
+     #[test]
+     fn empty_linux_snapshot_has_no_element_zero() {
+         let cache = ElementCache::new();
+-        let id = cache.publish(42, 7, CachedSnapshot::from_nodes(&[]));
++        let id = cache.publish(42, 7, payload(&[]));
+         assert!(cache
+             .resolve_element_args(42, None, Some(&token_for(id, 0)), None, None, "click")
+             .is_err());
+diff --git i/libs/cua-driver/rust/crates/platform-linux/src/atspi/mod.rs w/libs/cua-driver/rust/crates/platform-linux/src/atspi/mod.rs
+index 2d534d102..a479afab0 100644
+--- i/libs/cua-driver/rust/crates/platform-linux/src/atspi/mod.rs
++++ w/libs/cua-driver/rust/crates/platform-linux/src/atspi/mod.rs
+@@ -14,7 +14,7 @@ use anyhow::Result;
+ pub mod cache;
+ pub mod native;
+ pub use cache::ElementCache;
+-pub use native::ensure_listener_active;
++pub use native::{ensure_listener_active, NativeElement};
+ 
+ #[derive(Clone, Debug)]
+ pub struct AtspiNode {
+@@ -44,7 +44,19 @@ pub struct AtspiNode {
+     pub in_web_content: bool,
+ }
+ 
++/// Capture coverage is independent from native object identity and provenance.
++#[derive(Clone, Debug, Default, serde::Serialize)]
++pub struct TraversalStatus {
++    pub scope: String,
++    pub visited_nodes: usize,
++    pub pending_nodes: usize,
++    pub reasons: Vec<String>,
++    pub bounds_complete: bool,
++}
++
+ pub struct AtspiTreeResult {
++    pub elements: Vec<(usize, NativeElement)>,
++    pub traversal: TraversalStatus,
+     pub tree_markdown: String,
+     pub nodes: Vec<AtspiNode>,
+     pub bounds: Vec<(usize, i32, i32, u32, u32)>,
+@@ -79,26 +91,15 @@ pub(crate) fn walk_tree_for_recording(
+     xid: u64,
+     timeout: std::time::Duration,
+ ) -> AtspiTreeResult {
+-    if let Ok(Some(walked)) = native::walk_tree_bounded_with_timeout(pid, xid, None, None, timeout)
+-    {
+-        if !walked.markdown.is_empty() {
+-            return AtspiTreeResult {
+-                tree_markdown: walked.markdown,
+-                nodes: walked.nodes,
+-                bounds: walked.bounds,
+-                trusted: true,
+-                degraded_reason: None,
+-                window_scoped: walked.window_scoped,
+-            };
+-        }
++    match native::walk_tree_bounded_with_timeout(pid, xid, None, None, timeout) {
++        Ok(Some(walked)) => from_native(walked, None),
++        Ok(None) => walk_via_x11_properties(xid, None),
++        Err(error) => failed_capture(xid, None, error.to_string()),
+     }
+-    walk_via_x11_properties(xid, None)
+ }
+ 
+-/// Walk the AT-SPI tree with caller-supplied caps. `None` for either cap
+-/// means "use the walker's built-in default" (5 000 nodes; unlimited depth).
+-/// Issue #22865: caps protect against Electron / large web apps that
+-/// produce 10k+ element trees and blow context windows.
++/// Walk the target subtree with one deadline shared by readiness retries,
++/// traversal, and geometry. Only registration/readiness absence is retried.
+ pub fn walk_tree_bounded(
+     pid: u32,
+     xid: u64,
+@@ -106,65 +107,112 @@ pub fn walk_tree_bounded(
+     max_elements: Option<usize>,
+     max_depth: Option<usize>,
+ ) -> AtspiTreeResult {
+-    // Native AT-SPI (most complete). On a COLD launch the Qt6 (and some GTK)
+-    // AT-SPI bridge registers lazily — the first walk against a freshly
+-    // launched app can come back with just the root window (element_count=1,
+-    // no children) because `org.a11y.atspi.Registry` hasn't finished
+-    // enumerating the app's tree yet. Retry a few times with a short backoff
+-    // while the tree is suspiciously root-only, so the first get_window_state
+-    // after launch returns the real tree instead of an empty one. See #1927.
+-    const MAX_ATTEMPTS: usize = 4;
+-    let mut native_failure = None;
+-    for attempt in 0..MAX_ATTEMPTS {
+-        match native::walk_tree_bounded(pid, xid, max_elements, max_depth) {
+-            Ok(Some(walked)) => {
+-                // `nodes.len() <= 1` == only the root window resolved: the
+-                // cold-registry symptom. Accept any real tree immediately; only
+-                // keep waiting on the degenerate case, and accept it anyway on the
+-                // final attempt rather than discarding a (minimal) valid result.
+-                if !walked.markdown.is_empty()
+-                    && (walked.nodes.len() > 1 || attempt == MAX_ATTEMPTS - 1)
+-                {
+-                    let md = if let Some(q) = query {
+-                        filter_tree(&walked.markdown, q)
+-                    } else {
+-                        walked.markdown
+-                    };
+-                    return AtspiTreeResult {
+-                        tree_markdown: md,
+-                        nodes: walked.nodes,
+-                        bounds: walked.bounds,
+-                        trusted: true,
+-                        degraded_reason: None,
+-                        window_scoped: walked.window_scoped,
+-                    };
+-                }
+-            }
+-            Ok(None) => {}
+-            Err(error) => native_failure = Some(error.to_string()),
+-        }
+-        if attempt < MAX_ATTEMPTS - 1 {
+-            std::thread::sleep(std::time::Duration::from_millis(150));
+-        }
++    match capture_with_retry(
++        std::time::Duration::from_secs(25),
++        std::time::Duration::from_millis(150),
++        |remaining| {
++            native::walk_tree_bounded_with_timeout(pid, xid, max_elements, max_depth, remaining)
++        },
++    ) {
++        Ok(Some(walked)) => from_native(walked, query),
++        Ok(None) => walk_via_x11_properties(xid, query),
++        Err(error) => failed_capture(xid, query, error.to_string()),
+     }
++}
+ 
+-    // Fallback: X11 window properties as minimal tree.
++fn capture_with_retry(
++    timeout: std::time::Duration,
++    backoff: std::time::Duration,
++    mut capture: impl FnMut(std::time::Duration) -> Result<Option<native::WalkedTree>>,
++) -> Result<Option<native::WalkedTree>> {
++    let deadline = std::time::Instant::now() + timeout;
++    for attempt in 0..4 {
++        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
++        if remaining.is_zero() {
++            anyhow::bail!("atspi_deadline: capture readiness deadline exhausted");
++        }
++        let result = capture(remaining)?;
++        let retry = result.as_ref().is_none_or(|tree| {
++            tree.traversal.reasons.is_empty() && tree.traversal.visited_nodes <= 1
++        });
++        if !retry || attempt == 3 {
++            return Ok(result);
++        }
++        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
++        if remaining <= backoff {
++            return match result {
++                Some(mut tree) => {
++                    tree.traversal.reasons.push("deadline".into());
++                    Ok(Some(tree))
++                }
++                None => Err(anyhow::anyhow!(
++                    "atspi_deadline: capture readiness deadline exhausted"
++                )),
++            };
++        }
++        std::thread::sleep(backoff);
++    }
++    unreachable!("bounded readiness loop returns on final attempt")
++}
++
++fn from_native(walked: native::WalkedTree, query: Option<&str>) -> AtspiTreeResult {
++    let degraded_reason = (!walked.traversal.reasons.is_empty())
++        .then(|| format!("atspi_partial: {}", walked.traversal.reasons.join(",")));
++    AtspiTreeResult {
++        tree_markdown: query
++            .map(|q| filter_tree(&walked.markdown, q))
++            .unwrap_or(walked.markdown),
++        nodes: walked.nodes,
++        bounds: walked.bounds,
++        elements: walked.elements,
++        traversal: walked.traversal,
++        trusted: true,
++        degraded_reason,
++        window_scoped: walked.window_scoped,
++    }
++}
++
++fn failed_capture(xid: u64, query: Option<&str>, error: String) -> AtspiTreeResult {
+     let mut fallback = walk_via_x11_properties(xid, query);
+-    fallback.degraded_reason = native_failure.map(|error| format!("atspi_walk_failed: {error}"));
++    let reason = if error.contains("window_identity_unproven") || error.contains("ambiguous") {
++        fallback.window_scoped = false;
++        "window_identity_unproven"
++    } else if error.contains("deadline") || error.contains("timed out") {
++        "deadline"
++    } else {
++        "read_failure"
++    };
++    fallback.traversal.reasons = vec![reason.into()];
++    fallback.degraded_reason = Some(format!("atspi_walk_failed: {error}"));
+     fallback
+ }
+ 
++impl AtspiTreeResult {
++    /// Internal consumers must use this capture's retained target, never re-walk
++    /// a process-wide ordinal after deciding which control should be actuated.
++    pub fn element(&self, index: usize) -> Result<NativeElement> {
++        if !self.trusted || !self.window_scoped {
++            anyhow::bail!("accessibility_window_identity_unproven");
++        }
++        self.elements
++            .iter()
++            .find(|(candidate, _)| *candidate == index)
++            .map(|(_, element)| element.clone())
++            .ok_or_else(|| anyhow::anyhow!("snapshot native target is unavailable"))
++    }
++}
++
+ /// Perform the first advertised action on element `idx` within pid's app tree.
+ /// Returns `Ok((action_name, suspected_noop))` on success — `suspected_noop`
+ /// is true when the actuated node looked like a silent no-op (a passive
+ /// display role, or no advertised action), so the caller can surface
+ /// `effect: "suspected_noop"`.
+-pub fn perform_action(pid: u32, idx: usize) -> Result<(String, bool)> {
++pub fn perform_action(pid: u32, idx: NativeElement) -> Result<(String, bool)> {
+     native::perform_action(pid, idx)
+ }
+ 
+ /// Give an indexed AT-SPI element keyboard focus without activating its window.
+-pub fn focus_element(pid: u32, idx: usize) -> Result<bool> {
++pub fn focus_element(pid: u32, idx: NativeElement) -> Result<bool> {
+     native::focus_element(pid, idx)
+ }
+ 
+@@ -172,7 +220,7 @@ pub use native::ScrollProgress;
+ 
+ pub fn scroll_element(
+     pid: u32,
+-    idx: usize,
++    idx: NativeElement,
+     direction: &str,
+     amount: usize,
+     by: cua_driver_contract::ScrollBy,
+@@ -194,8 +242,13 @@ pub fn list_windows(filter_pid: Option<u32>) -> Vec<crate::x11::WindowInfo> {
+ /// click on toolkits (GTK) that drop synthetic X11 pointer events. Returns
+ /// `Ok(Some(action))` when an element was actuated, `Ok(None)` when no
+ /// actionable element covers the point (caller falls back to the X11 path).
+-pub fn perform_action_at_point(pid: u32, win_x: i32, win_y: i32) -> Result<Option<String>> {
+-    native::perform_action_at_point(pid, win_x, win_y)
++pub fn perform_action_at_point(
++    pid: u32,
++    xid: u64,
++    win_x: i32,
++    win_y: i32,
++) -> Result<Option<String>> {
++    native::perform_action_at_point(pid, xid, win_x, win_y)
+ }
+ 
+ /// Resolve a *screen* pixel to the indexable element whose reconstructed screen
+@@ -221,14 +274,14 @@ pub fn type_into_editable(pid: u32, text: &str) -> Result<()> {
+ }
+ 
+ /// Type into the exact indexed editable from the caller's accessibility snapshot.
+-pub fn type_into_editable_at(pid: u32, idx: usize, text: &str) -> Result<()> {
++pub fn type_into_editable_at(pid: u32, idx: NativeElement, text: &str) -> Result<()> {
+     native::type_into_editable_at(pid, idx, text)
+ }
+ 
+ /// Set the text value of element `idx` within pid's app tree via AT-SPI.
+ /// Tries `EditableText.set_text_contents(value)` first, then
+ /// `Value.set_current_value(float)`.
+-pub fn set_value(pid: u32, idx: usize, value: &str) -> Result<()> {
++pub fn set_value(pid: u32, idx: NativeElement, value: &str) -> Result<()> {
+     native::set_value(pid, idx, value)
+ }
+ 
+@@ -250,18 +303,26 @@ pub fn focused_is_editable(pid: u32) -> Result<Option<bool>> {
+     native::focused_is_editable(pid)
+ }
+ 
+-pub fn get_element_bounds(pid: u32, idx: usize) -> Result<(i32, i32, u32, u32)> {
++pub fn get_element_bounds(pid: u32, idx: NativeElement) -> Result<(i32, i32, u32, u32)> {
+     native::get_element_bounds(pid, idx)
+ }
+ 
+ pub fn get_element_bounds_for_window(
+     pid: u32,
+     xid: u64,
+-    idx: usize,
++    idx: NativeElement,
+ ) -> Result<(i32, i32, u32, u32)> {
+     native::get_element_bounds_for_window(pid, xid, idx)
+ }
+ 
++fn unavailable_status() -> TraversalStatus {
++    TraversalStatus {
++        scope: "unproven".into(),
++        reasons: vec!["unavailable".into()],
++        ..Default::default()
++    }
++}
++
+ // ── Internal helpers ─────────────────────────────────────────────────────────
+ 
+ /// Minimal X11 property-based tree (fallback when AT-SPI is unavailable).
+@@ -275,6 +336,8 @@ fn walk_via_x11_properties(xid: u64, query: Option<&str>) -> AtspiTreeResult {
+                 tree_markdown: String::new(),
+                 nodes: vec![],
+                 bounds: vec![],
++                elements: vec![],
++                traversal: unavailable_status(),
+                 trusted: false,
+                 degraded_reason: None,
+                 window_scoped: false,
+@@ -333,6 +396,8 @@ fn walk_via_x11_properties(xid: u64, query: Option<&str>) -> AtspiTreeResult {
+         tree_markdown,
+         nodes,
+         bounds: vec![],
++        elements: vec![],
++        traversal: unavailable_status(),
+         trusted: false,
+         // Built by reading this exact window's X11 properties, so it describes
+         // one window by construction — but `trusted: false` still bars it from
+@@ -425,3 +490,88 @@ fn filter_tree(markdown: &str, query: &str) -> String {
+     r.push('\n');
+     r
+ }
++
++#[cfg(test)]
++mod capture_status_tests {
++    use super::*;
++    use std::time::Duration;
++
++    fn tree(reasons: &[&str], visited_nodes: usize) -> native::WalkedTree {
++        native::WalkedTree {
++            markdown: String::new(),
++            nodes: Vec::new(),
++            bounds: Vec::new(),
++            elements: Vec::new(),
++            window_scoped: true,
++            traversal: TraversalStatus {
++                scope: "exact_window".into(),
++                visited_nodes,
++                pending_nodes: 0,
++                reasons: reasons.iter().map(|reason| (*reason).into()).collect(),
++                bounds_complete: true,
++            },
++        }
++    }
++
++    #[test]
++    fn deterministic_limits_and_partial_reads_are_not_retried() {
++        for reason in [
++            "node_limit",
++            "depth_limit",
++            "deadline",
++            "read_failure",
++            "window_identity_unproven",
++        ] {
++            let mut attempts = 0;
++            let result = capture_with_retry(Duration::from_secs(1), Duration::ZERO, |_| {
++                attempts += 1;
++                Ok(Some(tree(&[reason], 1)))
++            })
++            .unwrap()
++            .unwrap();
++            assert_eq!(attempts, 1, "{reason}");
++            assert_eq!(result.traversal.reasons, [reason]);
++        }
++    }
++
++    #[test]
++    fn registration_retry_accepts_ready_target_and_preserves_remaining_deadline() {
++        let mut remaining = Vec::new();
++        let result = capture_with_retry(Duration::from_secs(1), Duration::ZERO, |budget| {
++            remaining.push(budget);
++            match remaining.len() {
++                1 => Ok(None),
++                2 => Ok(Some(tree(&[], 1))),
++                _ => Ok(Some(tree(&[], 3))),
++            }
++        })
++        .unwrap()
++        .unwrap();
++        assert_eq!(remaining.len(), 3);
++        assert!(remaining.windows(2).all(|pair| pair[1] <= pair[0]));
++        assert_eq!(result.traversal.visited_nodes, 3);
++    }
++
++    #[test]
++    fn readiness_backoff_cannot_start_a_new_full_deadline() {
++        let mut attempts = 0;
++        let result =
++            capture_with_retry(Duration::from_millis(1), Duration::from_millis(150), |_| {
++                attempts += 1;
++                Ok(None)
++            });
++        assert_eq!(attempts, 1);
++        assert!(result.err().unwrap().to_string().contains("deadline"));
++    }
++
++    #[test]
++    fn native_errors_do_not_repeat_full_walks() {
++        let mut attempts = 0;
++        let result = capture_with_retry(Duration::from_secs(1), Duration::ZERO, |_| {
++            attempts += 1;
++            Err(anyhow::anyhow!("accessibility_window_identity_unproven"))
++        });
++        assert_eq!(attempts, 1);
++        assert!(result.is_err());
++    }
++}
+diff --git i/libs/cua-driver/rust/crates/platform-linux/src/browser_consent_ui.rs w/libs/cua-driver/rust/crates/platform-linux/src/browser_consent_ui.rs
+index 64ec8ab15..53355c782 100644
+--- i/libs/cua-driver/rust/crates/platform-linux/src/browser_consent_ui.rs
++++ w/libs/cua-driver/rust/crates/platform-linux/src/browser_consent_ui.rs
+@@ -211,7 +211,9 @@ fn trusted_allow_click(pid: u32, window_id: u64) -> anyhow::Result<()> {
+             .ok_or_else(|| {
+                 anyhow::anyhow!("the exact Chromium remote-debugging consent action became stale")
+             })?;
+-        let (center_x, center_y) = exact_button_center(&tree.bounds, index)?;
++        let (x, y, width, height) =
++            crate::atspi::get_element_bounds_for_window(pid, window_id, tree.element(index)?)?;
++        let (center_x, center_y) = exact_button_center(&[(index, x, y, width, height)], index)?;
+         if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+             crate::wayland::click_focused(center_x, center_y, 1, 1)
+         } else {
+@@ -237,12 +239,14 @@ pub fn dismiss(pid: u32, window_id: u64) -> Result<bool, BrowserRefusal> {
+                 "the exact remote-debugging consent prompt exposed no semantic cancel action",
+             )
+         })?;
+-        crate::atspi::perform_action(pid, index).map_err(|error| {
+-            refusal(
+-                BrowserRefusalCode::BrowserWrongTargetRefused,
+-                format!("the exact browser consent cancel action failed: {error}"),
+-            )
+-        })?;
++        tree.element(index)
++            .and_then(|element| crate::atspi::perform_action(pid, element))
++            .map_err(|error| {
++                refusal(
++                    BrowserRefusalCode::BrowserWrongTargetRefused,
++                    format!("the exact browser consent cancel action failed: {error}"),
++                )
++            })?;
+         dismissed = true;
+         if Instant::now() >= deadline {
+             return Err(refusal(
+@@ -284,7 +288,13 @@ pub async fn handle(
+         saw_prompt |= prompt_present;
+         match exact_allow_button(&tree.nodes, &tree.bounds)? {
+             Some(index) if accessibility_action_at.is_none() => {
+-                tokio::task::spawn_blocking(move || crate::atspi::perform_action(pid, index))
++                let element = tree.element(index).map_err(|error| {
++                    refusal(
++                        BrowserRefusalCode::BrowserWrongTargetRefused,
++                        format!("the browser consent snapshot target is unavailable: {error}"),
++                    )
++                })?;
++                tokio::task::spawn_blocking(move || crate::atspi::perform_action(pid, element))
+                     .await
+                     .map_err(|error| {
+                         refusal(
+diff --git i/libs/cua-driver/rust/crates/platform-linux/src/browser_setup_ui.rs w/libs/cua-driver/rust/crates/platform-linux/src/browser_setup_ui.rs
+index 7f1d815a1..1f3ca5579 100644
+--- i/libs/cua-driver/rust/crates/platform-linux/src/browser_setup_ui.rs
++++ w/libs/cua-driver/rust/crates/platform-linux/src/browser_setup_ui.rs
+@@ -378,7 +378,8 @@ impl SetupUiHandle {
+                 .flatten()
+                 .filter(|node| node.checked == Some(true))
+                 .and_then(|node| node.element_index)
+-                .is_some_and(|index| crate::atspi::perform_action(self.pid, index).is_ok());
++                .and_then(|index| tree.element(index).ok())
++                .is_some_and(|element| crate::atspi::perform_action(self.pid, element).is_ok());
+         if restored {
+             self.enabled_remote_debugging = false;
+         }
+@@ -557,7 +558,10 @@ fn set_remote_debugging(
+                 }
+                 Some(_) if !handle.enable_attempted => {
+                     let index = node.element_index.expect("actionable checkbox index");
+-                    if let Err(error) = crate::atspi::perform_action(pid, index) {
++                    if let Err(error) = tree
++                        .element(index)
++                        .and_then(|element| crate::atspi::perform_action(pid, element))
++                    {
+                         return Err(handle.abort(refusal(
+                             BrowserRefusalCode::BrowserWrongTargetRefused,
+                             format!("the exact checkbox action failed: {error}"),
+@@ -595,7 +599,11 @@ fn set_remote_debugging(
+                             );
+                         }
+                         let index = checkbox.element_index.expect("actionable checkbox index");
+-                        let (x, y, width, height) = crate::atspi::get_element_bounds(pid, index)?;
++                        let (x, y, width, height) = crate::atspi::get_element_bounds_for_window(
++                            pid,
++                            window_id,
++                            tree.element(index)?,
++                        )?;
+                         if width <= 1 || height <= 1 {
+                             anyhow::bail!(
+                                 "the exact Microsoft Edge remote-debugging checkbox had empty screen bounds"
+diff --git i/libs/cua-driver/rust/crates/platform-linux/src/recording_hooks.rs w/libs/cua-driver/rust/crates/platform-linux/src/recording_hooks.rs
+index 5e327a79d..74143d7fe 100644
+--- i/libs/cua-driver/rust/crates/platform-linux/src/recording_hooks.rs
++++ w/libs/cua-driver/rust/crates/platform-linux/src/recording_hooks.rs
+@@ -91,18 +91,18 @@ pub fn element_window_local_xy(
+             "recording",
+         )
+         .ok()?;
+-    let (index, window, _) = resolved.into_parts(None);
++    let (_, window, element) = resolved.into_parts(None);
+     let window_id = window?;
+-    let element_index = u32::try_from(index?).ok()?;
++    let element = element?;
+     let point = if !capture_point {
+         None
+     } else if tokio::runtime::Handle::try_current().is_ok() {
+-        std::thread::spawn(move || element_window_local_xy_blocking(window_id, pid, element_index))
++        std::thread::spawn(move || element_window_local_xy_blocking(window_id, pid, element))
+             .join()
+             .ok()
+             .flatten()
+     } else {
+-        element_window_local_xy_blocking(window_id, pid, element_index)
++        element_window_local_xy_blocking(window_id, pid, element)
+     };
+     Some((window_id, point))
+ }
+@@ -111,11 +111,11 @@ pub fn element_window_local_xy(
+ fn element_window_local_xy_blocking(
+     window_id: u64,
+     pid: i64,
+-    element_index: u32,
++    element: crate::atspi::NativeElement,
+ ) -> Option<(f64, f64)> {
+     let pid = u32::try_from(pid).ok()?;
+     let (screen_x, screen_y, width, height) =
+-        crate::atspi::get_element_bounds_for_window(pid, window_id, element_index as usize).ok()?;
++        crate::atspi::get_element_bounds_for_window(pid, window_id, element).ok()?;
+     let window = resolve_window_for_recording(pid, Some(window_id))?;
+     if crate::wayland::is_wayland() && crate::wayland::hyprland::is_session() {
+         let (display_width, display_height, _) = crate::wayland::hyprland::screen_size().ok()?;
+diff --git i/libs/cua-driver/rust/crates/platform-linux/src/tools/impl_.rs w/libs/cua-driver/rust/crates/platform-linux/src/tools/impl_.rs
+index d835bf1fc..3a51c9036 100644
+--- i/libs/cua-driver/rust/crates/platform-linux/src/tools/impl_.rs
++++ w/libs/cua-driver/rust/crates/platform-linux/src/tools/impl_.rs
+@@ -16,6 +16,7 @@ use std::fs;
+ use std::path::PathBuf;
+ use std::sync::{Arc, RwLock};
+ 
++use crate::atspi::native::NativeElement;
+ use crate::atspi::ElementCache;
+ use cursor_overlay::CursorRegistry;
+ 
+@@ -662,7 +663,7 @@ impl Tool for GetWindowStateTool {
+                 callers — but new fields will only be added to the structured \
+                 side. Set `query` to project BOTH representations to matching \
+                 rows plus their ancestor chain while preserving original indices. \
+-                `total_element_count` reports the complete snapshot and \
++                `total_element_count` reports the captured target subtree and \
+                 `returned_element_count` reports the projection.\n\n\
+                 Always returns BOTH the element tree AND a screenshot — ground on \
+                 both and cross-check (the tree lies on some surfaces). Choose the \
+@@ -698,7 +699,7 @@ impl Tool for GetWindowStateTool {
+                 "screenshot_out_file":{"type":"string",
+                     "description":"When set, write the PNG to this file path (~ expanded) instead of embedding base64 in the response. The structured output carries screenshot_file_path instead."},
+                 "query":{"type":"string","description":"Optional case-insensitive substring. Projects both tree_markdown and structured elements to matches plus ancestors while preserving original indices. Compare total_element_count with returned_element_count."},
+-                "max_elements":{"type":"integer","minimum":1,"description":"Cap on total AT-SPI nodes walked. Omit for the default (5 000). Lower for huge web/Electron trees."},
++                "max_elements":{"type":"integer","minimum":1,"description":"Cap on AT-SPI nodes walked in the proven target window. Omit for the default (5 000)."},
+                 "max_depth":{"type":"integer","minimum":1,"description":"Cap on the AT-SPI tree walk depth. Omit for the default (uncapped). Lower for deeply nested apps."},
+                 "max_dimension":{"type":"integer","minimum":1,"description":"Optional cap on the returned screenshot's long edge, in pixels (aspect ratio preserved) — the cheap path for a small preview. Applied on top of the configured max_image_dimension ceiling; the tighter wins. Omit for the configured default."}
+             },"additionalProperties":false}),
+@@ -893,17 +894,17 @@ impl Tool for GetWindowStateTool {
+                     structured["elements_complete"] = json!(false);
+                     structured["tree_markdown"] = json!(tr.tree_markdown);
+ 
+-                    let target_scoped = !(crate::wayland::is_wayland()
+-                        && crate::wayland::hyprland::is_session())
+-                        || tr.window_scoped;
+-                    if !observation_only && !target_scoped {
++                    let target_scoped = tr.window_scoped;
++                    let actionable = target_scoped && tr.trusted && !tr.elements.is_empty();
++                    structured["traversal"] = json!(tr.traversal);
++                    if !observation_only && !actionable {
+                         state.element_cache.remove(pid as i32, xid);
+                     }
+-                    let snapshot_id = (!observation_only && target_scoped).then(|| {
++                    let snapshot_id = (!observation_only && actionable).then(|| {
+                         state.element_cache.publish(
+                             pid as i32,
+                             xid,
+-                            crate::atspi::cache::CachedSnapshot::from_nodes(&tr.nodes),
++                            crate::atspi::cache::CachedSnapshot::from_elements(&tr.elements),
+                         )
+                     });
+ 
+@@ -960,7 +961,7 @@ impl Tool for GetWindowStateTool {
+                     // degraded so callers don't read `elements: []` as authoritative.
+                     if !target_scoped {
+                         structured["degraded"] = json!(true);
+-                        structured["degraded_reason"] = json!("accessibility_window_identity_unproven: tree is application-scoped; exact-window element tokens and bounds are unavailable");
++                        structured["degraded_reason"] = json!("accessibility_window_identity_unproven: exact AT-SPI window identity could not be proven; element tokens and bounds are unavailable");
+                     } else if !source_trusted {
+                         structured["degraded"] = json!(true);
+                         structured["degraded_reason"] = json!(source_degraded_reason
+@@ -970,6 +971,12 @@ impl Tool for GetWindowStateTool {
+                                  discovery evidence; it cannot prove checked state."
+                                     .to_owned()
+                             }));
++                    } else if !tr.traversal.reasons.is_empty() {
++                        structured["degraded"] = json!(true);
++                        structured["degraded_reason"] = json!(format!(
++                            "atspi_partial: {}",
++                            tr.traversal.reasons.join(", ")
++                        ));
+                     } else if count == 0 {
+                         structured["degraded"] = json!(true);
+                         structured["degraded_reason"] = json!(
+@@ -1591,39 +1598,20 @@ fn chromium_family_program(program: &str) -> bool {
+ /// Resolve an AT-SPI element's center in window-local coordinates.
+ ///
+ /// Returns `(xid, window_local_x, window_local_y)`.
+-/// Looks up element bounds via native AT-SPI, finds the owning window
+-/// (via `xid_hint` or the first window for `pid`), then converts screen-absolute
++/// Looks up retained native bounds in the exact owning window,
++/// then converts screen-absolute
+ /// → window-local coords via compositor metadata on Wayland or
+ /// XTranslateCoordinates on X11.
+ fn resolve_element_local_coords(
+     pid: u32,
+-    idx: usize,
++    idx: NativeElement,
+     xid_hint: Option<u64>,
+ ) -> anyhow::Result<(u64, f64, f64)> {
+-    let (bx, by, bw, bh) = if let Some(xid) = xid_hint {
+-        crate::atspi::get_element_bounds_for_window(pid, xid, idx)?
+-    } else {
+-        crate::atspi::get_element_bounds(pid, idx)?
+-    };
++    let xid = xid_hint.unwrap_or_else(|| idx.window_id());
++    let (bx, by, bw, bh) = crate::atspi::get_element_bounds_for_window(pid, xid, idx)?;
+     let screen_cx = bx as f64 + bw as f64 / 2.0;
+     let screen_cy = by as f64 + bh as f64 / 2.0;
+ 
+-    let xid = if let Some(x) = xid_hint {
+-        x
+-    } else if crate::wayland::wayland_input_enabled() {
+-        crate::wayland::list_windows_dispatch(Some(pid))
+-            .into_iter()
+-            .next()
+-            .map(|window| window.xid)
+-            .ok_or_else(|| anyhow::anyhow!("No Wayland windows for pid {pid}"))?
+-    } else {
+-        crate::x11::list_windows(Some(pid))
+-            .into_iter()
+-            .next()
+-            .map(|w| w.xid)
+-            .ok_or_else(|| anyhow::anyhow!("No windows for pid {pid}"))?
+-    };
+-
+     if crate::wayland::wayland_input_enabled() {
+         let (window_x, window_y, window_width, window_height) =
+             crate::wayland::window_geometry(xid)
+@@ -1651,7 +1639,11 @@ fn resolve_element_local_coords(
+     Ok((xid, local_x, local_y))
+ }
+ 
+-fn element_screen_center(pid: u32, idx: usize, xid: Option<u64>) -> anyhow::Result<(f64, f64)> {
++fn element_screen_center(
++    pid: u32,
++    idx: NativeElement,
++    xid: Option<u64>,
++) -> anyhow::Result<(f64, f64)> {
+     let (bx, by, bw, bh) = match xid {
+         Some(xid) => crate::atspi::get_element_bounds_for_window(pid, xid, idx)?,
+         None => crate::atspi::get_element_bounds(pid, idx)?,
+@@ -2434,7 +2426,7 @@ async fn focus_hyprland_foreground(
+     args: &Value,
+     pid: u32,
+     xid: u64,
+-    element: Option<usize>,
++    element: Option<NativeElement>,
+     pixel: Option<(f64, f64)>,
+ ) -> Result<(), ToolResult> {
+     if !crate::wayland::hyprland_input::enabled() {
+@@ -2466,7 +2458,12 @@ async fn focus_hyprland_foreground(
+         if activation.is_error == Some(true) {
+             return Err(activation);
+         }
+-        match tokio::task::spawn_blocking(move || crate::atspi::focus_element(pid, index)).await {
++        match tokio::task::spawn_blocking({
++            let index = index.clone();
++            move || crate::atspi::focus_element(pid, index.clone())
++        })
++        .await
++        {
+             Ok(Ok(true)) => {}
+             _ => return Err(foreground_hyprland_refusal("AT-SPI child focus failed")),
+         }
+@@ -2974,7 +2971,7 @@ fn current_pointer_position() -> Option<(f64, f64)> {
+ fn explicit_keyboard_cursor_target(
+     pid: u32,
+     xid: u64,
+-    element_index: Option<usize>,
++    element_index: Option<NativeElement>,
+     pixel_target: Option<(f64, f64)>,
+ ) -> Option<(f64, f64)> {
+     if let Some(element_index) = element_index {
+@@ -3000,7 +2997,7 @@ async fn position_named_session_keyboard_cursor(
+     args: &Value,
+     pid: u32,
+     xid: u64,
+-    element_index: Option<usize>,
++    element_index: Option<NativeElement>,
+     pixel_target: Option<(f64, f64)>,
+     preserve_legacy_element_visual: bool,
+ ) {
+@@ -3019,8 +3016,9 @@ async fn position_named_session_keyboard_cursor(
+             .get(&cursor_id)
+             .and_then(|cursor| cursor.x.zip(cursor.y))
+     });
+-    let explicit = tokio::task::spawn_blocking(move || {
+-        explicit_keyboard_cursor_target(pid, xid, element_index, pixel_target)
++    let explicit = tokio::task::spawn_blocking({
++        let element_index = element_index.clone();
++        move || explicit_keyboard_cursor_target(pid, xid, element_index, pixel_target)
+     })
+     .await
+     .ok()
+@@ -3437,9 +3435,28 @@ impl Tool for ClickTool {
+             Ok(r) => r,
+             Err(e) => return e,
+         };
+-        let elem_idx_resolved: Option<usize> = match &resolved {
+-            cua_driver_core::element_token::ResolvedElement::Element { element_index, .. } => {
+-                Some(*element_index)
++        if let cua_driver_core::element_token::ResolvedElement::Element { element, .. } = &resolved
++        {
++            let target = element.clone();
++            match tokio::task::spawn_blocking(move || {
++                crate::atspi::native::validate_element(pid, target)
++            })
++            .await
++            {
++                Ok(Ok(())) => {}
++                Ok(Err(error)) => {
++                    return ToolResult::error(format!(
++                        "Snapshot target is no longer valid: {error}"
++                    ))
++                }
++                Err(error) => {
++                    return ToolResult::error(format!("Target validation failed: {error}"))
++                }
++            }
++        }
++        let elem_idx_resolved: Option<NativeElement> = match &resolved {
++            cua_driver_core::element_token::ResolvedElement::Element { element, .. } => {
++                Some(element.clone())
+             }
+             cua_driver_core::element_token::ResolvedElement::None => None,
+         };
+@@ -3457,8 +3474,9 @@ impl Tool for ClickTool {
+             // matching the coordinate path below and the macOS/Windows backends.
+             // Previously perform_action ran inside this spawn_blocking, so the
+             // app updated before the cursor visibly arrived.
+-            let placement =
+-                tokio::task::spawn_blocking(move || -> anyhow::Result<(u64, f64, f64)> {
++            let placement = tokio::task::spawn_blocking({
++                let idx = idx.clone();
++                move || -> anyhow::Result<(u64, f64, f64)> {
+                     let (cx, cy) = element_screen_center(pid, idx, xid_hint)?;
+                     let xid = xid_hint
+                         .or_else(|| {
+@@ -3469,10 +3487,11 @@ impl Tool for ClickTool {
+                         })
+                         .unwrap_or(0);
+                     Ok((xid, cx, cy))
+-                })
+-                .await
+-                .ok()
+-                .and_then(Result::ok);
++                }
++            })
++            .await
++            .ok()
++            .and_then(Result::ok);
+             if let Some((xid, sx, sy)) = placement {
+                 if xid != 0 {
+                     crate::overlay::send_command_for(
+@@ -3494,9 +3513,11 @@ impl Tool for ClickTool {
+                 );
+             }
+             if element_click_prefers_ax(foreground_hyprland, button, count, !modifiers.is_empty()) {
+-                let ax_result =
+-                    tokio::task::spawn_blocking(move || crate::atspi::perform_action(pid, idx))
+-                        .await;
++                let ax_result = tokio::task::spawn_blocking({
++                    let idx = idx.clone();
++                    move || crate::atspi::perform_action(pid, idx.clone())
++                })
++                .await;
+                 if let Ok(Ok((_action, suspected_noop))) = ax_result {
+                     let mut structured = json!({
+                         "path": "ax",
+@@ -3512,7 +3533,7 @@ impl Tool for ClickTool {
+                 // AT-SPI errors can arrive after dispatch. Do not introduce a
+                 // primary-seat replay when its semantic outcome is uncertain.
+                 if foreground_hyprland {
+-                    return foreground_ax_click_unknown(pid, idx);
++                    return foreground_ax_click_unknown(pid, idx.index());
+                 }
+             }
+             if foreground_hyprland {
+@@ -3524,8 +3545,9 @@ impl Tool for ClickTool {
+                         "an exact window_id or window-bound element token is required",
+                     );
+                 };
+-                let point = tokio::task::spawn_blocking(move || {
+-                    resolve_element_local_coords(pid, idx, Some(xid))
++                let point = tokio::task::spawn_blocking({
++                    let idx = idx.clone();
++                    move || resolve_element_local_coords(pid, idx, Some(xid))
+                 })
+                 .await;
+                 let (x, y) = match point {
+@@ -3592,41 +3614,44 @@ impl Tool for ClickTool {
+ 
+             // The AX route was unavailable. Fall back to a target-addressed
+             // X11 event for toolkits that accept it.
+-            let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+-                let (xid2, lx, ly) = resolve_element_local_coords(pid, idx, xid_hint)?;
+-                let modifier_refs: Vec<&str> = modifiers.iter().map(String::as_str).collect();
+-                if crate::wayland::wayland_input_enabled() && !modifier_refs.is_empty() {
+-                    anyhow::bail!(
+-                        "modified element clicks are unavailable on native Wayland: \
++            let result = tokio::task::spawn_blocking({
++                let idx = idx.clone();
++                move || -> anyhow::Result<()> {
++                    let (xid2, lx, ly) = resolve_element_local_coords(pid, idx, xid_hint)?;
++                    let modifier_refs: Vec<&str> = modifiers.iter().map(String::as_str).collect();
++                    if crate::wayland::wayland_input_enabled() && !modifier_refs.is_empty() {
++                        anyhow::bail!(
++                            "modified element clicks are unavailable on native Wayland: \
+                          the pointer route cannot carry keyboard modifier state"
+-                    );
+-                }
+-                // An explicit X11 foreground request needs the real XTest path
+-                // even for a plain click. Some native widgets (notably GTK
+-                // selectable rows) expose bounds but no AT-SPI Action and
+-                // ignore a targeted XSendEvent; limiting XTest to modified
+-                // clicks made those rows addressable but not selectable.
+-                if delivery.is_foreground() && !crate::wayland::wayland_input_enabled() {
+-                    let (_, sx, sy) = placement
+-                        .ok_or_else(|| anyhow::anyhow!("element screen bounds unavailable"))?;
+-                    crate::input::with_x11_foreground(xid2, 80, || {
+-                        crate::input::send_click_xtest_desktop_with_modifiers(
+-                            sx.round() as i32,
+-                            sy.round() as i32,
+-                            button,
++                        );
++                    }
++                    // An explicit X11 foreground request needs the real XTest path
++                    // even for a plain click. Some native widgets (notably GTK
++                    // selectable rows) expose bounds but no AT-SPI Action and
++                    // ignore a targeted XSendEvent; limiting XTest to modified
++                    // clicks made those rows addressable but not selectable.
++                    if delivery.is_foreground() && !crate::wayland::wayland_input_enabled() {
++                        let (_, sx, sy) = placement
++                            .ok_or_else(|| anyhow::anyhow!("element screen bounds unavailable"))?;
++                        crate::input::with_x11_foreground(xid2, 80, || {
++                            crate::input::send_click_xtest_desktop_with_modifiers(
++                                sx.round() as i32,
++                                sy.round() as i32,
++                                button,
++                                count,
++                                &modifier_refs,
++                            )
++                        })
++                    } else {
++                        crate::input::send_click_with_modifiers(
++                            xid2,
++                            lx as i32,
++                            ly as i32,
+                             count,
++                            button,
+                             &modifier_refs,
+                         )
+-                    })
+-                } else {
+-                    crate::input::send_click_with_modifiers(
+-                        xid2,
+-                        lx as i32,
+-                        ly as i32,
+-                        count,
+-                        button,
+-                        &modifier_refs,
+-                    )
++                    }
+                 }
+             })
+             .await;
+@@ -3767,104 +3792,107 @@ impl Tool for ClickTool {
+         // delivery_mode: background (default) = no-focus-steal injection;
+         // foreground = activate the target window (EWMH) first, then inject,
+         // then restore prior active. Mirrors macOS/Windows.
+-        let result = tokio::task::spawn_blocking(move || -> anyhow::Result<&'static str> {
+-            if crate::wayland::wayland_input_enabled() {
+-                if !modifiers_for_task.is_empty() {
+-                    anyhow::bail!(
+-                        "modified coordinate clicks are unavailable on native Wayland: \
++        let result = tokio::task::spawn_blocking({
++            move || -> anyhow::Result<&'static str> {
++                if crate::wayland::wayland_input_enabled() {
++                    if !modifiers_for_task.is_empty() {
++                        anyhow::bail!(
++                            "modified coordinate clicks are unavailable on native Wayland: \
+                          the pointer route cannot carry keyboard modifier state"
+-                    );
+-                }
+-                // Vision/pixel click on native Wayland. Mutter drops synthetic
+-                // virtual-pointer events (the `wayland::click` warp doesn't land),
+-                // so for a plain left single click resolve the screen pixel to the
+-                // covering accessible element and fire its action by
+-                // `element_index` — the coordinate-free path already verified
+-                // working. (x,y) are screen coords here, matching the frames in
+-                // `get_window_state`. Miss → fall through to the injection paths.
+-                if !delivery.is_foreground() && button == 1 && count == 1 {
+-                    if let Ok(Some(_)) =
+-                        crate::atspi::perform_action_at_screen_point(pid, xid, output_x, output_y)
+-                    {
+-                        return Ok("wayland_atspi");
++                        );
+                     }
+-                }
+-                if crate::wayland::is_inject_mode() {
+-                    crate::wayland::inject_click(pid, xid, x, y, count as u32, button)?;
+-                    return Ok("wayland_cua_compositor");
+-                }
+-                if !delivery.is_foreground() {
+-                    return Ok("background_unavailable");
+-                }
+-                // Native Wayland: focus+raise the target toplevel
+-                // (foreign-toplevel `activate`), then drive `count` virtual-pointer
+-                // button events. Wayland injection routes to the compositor focus.
+-                crate::wayland::with_target_foreground(pid, xid, || {
+-                    crate::wayland::click_focused(output_x, output_y, count as u32, button)
+-                })?;
+-                return Ok("wayland_activate");
+-            }
+-            // X11 injection. Tiered no-focus-steal delivery (background):
+-            //   1. Plain left single-click → AT-SPI doAction at that point.
+-            //   2. Right / middle / double click → real MPX uinput pointer + XI2
+-            //      shield grab (real Xorg only; skipped on Xvfb/Wayland).
+-            //   3. Fallback → synthetic XSendEvent.
+-            // Foreground skips the AT-SPI shortcut and does a real activated pixel
+-            // click (the agent's escalation when background didn't land).
+-            let inject = |fg: bool| -> anyhow::Result<&'static str> {
+-                if !fg && button == 1 && count == 1 && modifiers_for_task.is_empty() {
+-                    if let Ok(Some(_)) = crate::atspi::perform_action_at_point(pid, xi, yi) {
+-                        return Ok("x11_atspi");
++                    // Vision/pixel click on native Wayland. Mutter drops synthetic
++                    // virtual-pointer events (the `wayland::click` warp doesn't land),
++                    // so for a plain left single click resolve the screen pixel to the
++                    // covering accessible element and fire its action by
++                    // `element_index` — the coordinate-free path already verified
++                    // working. (x,y) are screen coords here, matching the frames in
++                    // `get_window_state`. Miss → fall through to the injection paths.
++                    if !delivery.is_foreground() && button == 1 && count == 1 {
++                        if let Ok(Some(_)) = crate::atspi::perform_action_at_screen_point(
++                            pid, xid, output_x, output_y,
++                        ) {
++                            return Ok("wayland_atspi");
++                        }
+                     }
++                    if crate::wayland::is_inject_mode() {
++                        crate::wayland::inject_click(pid, xid, x, y, count as u32, button)?;
++                        return Ok("wayland_cua_compositor");
++                    }
++                    if !delivery.is_foreground() {
++                        return Ok("background_unavailable");
++                    }
++                    // Native Wayland: focus+raise the target toplevel
++                    // (foreign-toplevel `activate`), then drive `count` virtual-pointer
++                    // button events. Wayland injection routes to the compositor focus.
++                    crate::wayland::with_target_foreground(pid, xid, || {
++                        crate::wayland::click_focused(output_x, output_y, count as u32, button)
++                    })?;
++                    return Ok("wayland_activate");
+                 }
+-                if fg {
+-                    // Foreground: the window is already activated. Deliver a REAL
+-                    // XTest warp+button click. Synthetic XSendEvent button events
+-                    // are dropped by GTK/Qt/Chromium/Firefox, and the MPX uinput
+-                    // path needs /dev/uinput, which headless X servers
+-                    // (Xvfb/Xtigervnc) lack — so neither focuses the clicked
+-                    // widget. XTest is accepted as real input and gives the
+-                    // widget keyboard focus, so a following type lands.
+-                    if let Ok((sx, sy)) = window_local_to_screen(xid, xi as f64, yi as f64) {
++                // X11 injection. Tiered no-focus-steal delivery (background):
++                //   1. Plain left single-click → AT-SPI doAction at that point.
++                //   2. Right / middle / double click → real MPX uinput pointer + XI2
++                //      shield grab (real Xorg only; skipped on Xvfb/Wayland).
++                //   3. Fallback → synthetic XSendEvent.
++                // Foreground skips the AT-SPI shortcut and does a real activated pixel
++                // click (the agent's escalation when background didn't land).
++                let inject = |fg: bool| -> anyhow::Result<&'static str> {
++                    if !fg && button == 1 && count == 1 && modifiers_for_task.is_empty() {
++                        if let Ok(Some(_)) = crate::atspi::perform_action_at_point(pid, xid, xi, yi)
++                        {
++                            return Ok("x11_atspi");
++                        }
++                    }
++                    if fg {
++                        // Foreground: the window is already activated. Deliver a REAL
++                        // XTest warp+button click. Synthetic XSendEvent button events
++                        // are dropped by GTK/Qt/Chromium/Firefox, and the MPX uinput
++                        // path needs /dev/uinput, which headless X servers
++                        // (Xvfb/Xtigervnc) lack — so neither focuses the clicked
++                        // widget. XTest is accepted as real input and gives the
++                        // widget keyboard focus, so a following type lands.
++                        if let Ok((sx, sy)) = window_local_to_screen(xid, xi as f64, yi as f64) {
++                            let modifier_refs: Vec<&str> =
++                                modifiers_for_task.iter().map(String::as_str).collect();
++                            crate::input::send_click_xtest_desktop_with_modifiers(
++                                sx.round() as i32,
++                                sy.round() as i32,
++                                button,
++                                count,
++                                &modifier_refs,
++                            )?;
++                            return Ok("x11_xtest_fg");
++                        }
++                    }
++                    if modifiers_for_task.is_empty() {
++                        x11_pixel_click_no_focus_steal(
++                            &cursor_id_for_task,
++                            xid,
++                            xi,
++                            yi,
++                            button,
++                            count,
++                        )?;
++                    } else {
+                         let modifier_refs: Vec<&str> =
+                             modifiers_for_task.iter().map(String::as_str).collect();
+-                        crate::input::send_click_xtest_desktop_with_modifiers(
+-                            sx.round() as i32,
+-                            sy.round() as i32,
++                        x11_pixel_click_no_focus_steal_modifiers(
++                            xid,
++                            xi,
++                            yi,
+                             button,
+                             count,
+                             &modifier_refs,
+                         )?;
+-                        return Ok("x11_xtest_fg");
+                     }
+-                }
+-                if modifiers_for_task.is_empty() {
+-                    x11_pixel_click_no_focus_steal(
+-                        &cursor_id_for_task,
+-                        xid,
+-                        xi,
+-                        yi,
+-                        button,
+-                        count,
+-                    )?;
++                    Ok(if fg { "x11_pixel_fg" } else { "x11_pixel" })
++                };
++                if delivery.is_foreground() {
++                    crate::input::with_x11_foreground(xid, 80, || inject(true))
+                 } else {
+-                    let modifier_refs: Vec<&str> =
+-                        modifiers_for_task.iter().map(String::as_str).collect();
+-                    x11_pixel_click_no_focus_steal_modifiers(
+-                        xid,
+-                        xi,
+-                        yi,
+-                        button,
+-                        count,
+-                        &modifier_refs,
+-                    )?;
++                    inject(false)
+                 }
+-                Ok(if fg { "x11_pixel_fg" } else { "x11_pixel" })
+-            };
+-            if delivery.is_foreground() {
+-                crate::input::with_x11_foreground(xid, 80, || inject(true))
+-            } else {
+-                inject(false)
+             }
+         })
+         .await;
+@@ -3950,12 +3978,15 @@ async fn focus_by_pixel(
+ async fn focus_nested_inject_target(
+     pid: u32,
+     window_id: u64,
+-    element_index: Option<usize>,
++    element_index: Option<NativeElement>,
+     pixel: Option<(f64, f64)>,
+ ) -> Result<(), ToolResult> {
+     if let Some(index) = element_index {
+-        return match tokio::task::spawn_blocking(move || crate::atspi::focus_element(pid, index))
+-            .await
++        return match tokio::task::spawn_blocking({
++            let index = index.clone();
++            move || crate::atspi::focus_element(pid, index.clone())
++        })
++        .await
+         {
+             Ok(Ok(true)) => Ok(()),
+             Ok(Ok(false)) => Err(ToolResult::error(format!(
+@@ -4065,12 +4096,29 @@ impl Tool for TypeTextTool {
+             Ok(r) => r,
+             Err(e) => return e,
+         };
++        if let cua_driver_core::element_token::ResolvedElement::Element { element, .. } = &resolved
++        {
++            let target = element.clone();
++            match tokio::task::spawn_blocking(move || {
++                crate::atspi::native::validate_element(pid, target)
++            })
++            .await
++            {
++                Ok(Ok(())) => {}
++                Ok(Err(error)) => {
++                    return ToolResult::error(format!(
++                        "Snapshot target is no longer valid: {error}"
++                    ))
++                }
++                Err(error) => {
++                    return ToolResult::error(format!("Target validation failed: {error}"))
++                }
++            }
++        }
+         let (resolved_elem_idx, resolved_window_id) = match &resolved {
+             cua_driver_core::element_token::ResolvedElement::Element {
+-                element_index,
+-                window_id,
+-                ..
+-            } => (Some(*element_index), window_id.map(|v| v as u64)),
++                element, window_id, ..
++            } => (Some(element.clone()), window_id.map(|v| v as u64)),
+             cua_driver_core::element_token::ResolvedElement::None => (None, None),
+         };
+         let xid_opt = args.opt_u64("window_id").or(resolved_window_id);
+@@ -4154,12 +4202,13 @@ impl Tool for TypeTextTool {
+             }
+             // Native editables retain their verifiable, addressed AT-SPI route.
+             if !is_chromium_embedder(pid) && !is_webkitgtk_embedder(pid) {
+-                if let Some(index) = resolved_elem_idx {
++                if let Some(index) = resolved_elem_idx.clone() {
+                     let text_ax = text.clone();
+                     if matches!(
+-                        tokio::task::spawn_blocking(move || crate::atspi::type_into_editable_at(
+-                            pid, index, &text_ax
+-                        ))
++                        tokio::task::spawn_blocking({
++                            let index = index.clone();
++                            move || crate::atspi::type_into_editable_at(pid, index, &text_ax)
++                        })
+                         .await,
+                         Ok(Ok(()))
+                     ) {
+@@ -4181,7 +4230,7 @@ impl Tool for TypeTextTool {
+                 &args,
+                 pid,
+                 xid,
+-                resolved_elem_idx,
++                resolved_elem_idx.clone(),
+                 px.zip(py),
+             )
+             .await
+@@ -4223,7 +4272,7 @@ impl Tool for TypeTextTool {
+             &args,
+             pid,
+             xid,
+-            resolved_elem_idx,
++            resolved_elem_idx.clone(),
+             px.zip(py),
+             true,
+         )
+@@ -4239,10 +4288,11 @@ impl Tool for TypeTextTool {
+             && !is_chromium_embedder(pid)
+             && !is_webkitgtk_embedder(pid)
+         {
+-            let idx = resolved_elem_idx.expect("checked above");
++            let idx = resolved_elem_idx.clone().expect("checked above");
+             let text_at = text.clone();
+-            let targeted = tokio::task::spawn_blocking(move || {
+-                crate::atspi::type_into_editable_at(pid, idx, &text_at)
++            let targeted = tokio::task::spawn_blocking({
++                let idx = idx.clone();
++                move || crate::atspi::type_into_editable_at(pid, idx.clone(), &text_at)
+             })
+             .await;
+             if let Ok(Ok(())) = targeted {
+@@ -4254,7 +4304,7 @@ impl Tool for TypeTextTool {
+         // compositor's focused toplevel, so keys reach the addressed control.
+         if crate::wayland::is_inject_mode() {
+             if let Err(error) =
+-                focus_nested_inject_target(pid, xid, resolved_elem_idx, px.zip(py)).await
++                focus_nested_inject_target(pid, xid, resolved_elem_idx.clone(), px.zip(py)).await
+             {
+                 return error;
+             }
+@@ -4320,17 +4370,20 @@ impl Tool for TypeTextTool {
+             && crate::wayland::wayland_input_enabled()
+             && (is_chromium_embedder(pid) || is_webkitgtk_embedder(pid))
+         {
+-            if let Some(idx) = resolved_elem_idx {
++            if let Some(idx) = resolved_elem_idx.clone() {
+                 let text_w = text.clone();
+-                let result = tokio::task::spawn_blocking(move || {
+-                    crate::wayland::with_target_foreground(pid, xid, || {
+-                        if !crate::atspi::focus_element(pid, idx)? {
+-                            anyhow::bail!(
+-                                "AT-SPI Component.GrabFocus returned false for element {idx}"
+-                            );
+-                        }
+-                        crate::wayland::type_text_focused(&text_w)
+-                    })
++                let result = tokio::task::spawn_blocking({
++                    let idx = idx.clone();
++                    move || {
++                        crate::wayland::with_target_foreground(pid, xid, || {
++                            if !crate::atspi::focus_element(pid, idx.clone())? {
++                                anyhow::bail!(
++                                    "AT-SPI Component.GrabFocus returned false for element {idx}"
++                                );
++                            }
++                            crate::wayland::type_text_focused(&text_w)
++                        })
++                    }
+                 })
+                 .await;
+                 return match result {
+@@ -4348,27 +4401,59 @@ impl Tool for TypeTextTool {
+             }
+         }
+ 
++        // Foreground means the caller explicitly permits activation. Chromium
++        // and WebKitGTK can acknowledge an accessibility write without
++        // producing the renderer input event, so web embedders use real XTest
++        // key events. Native toolkits keep their verifiable AT-SPI path below.
++        if delivery.is_foreground()
++            && !crate::wayland::wayland_input_enabled()
++            && (is_chromium_embedder(pid) || is_webkitgtk_embedder(pid))
++        {
++            let text_f = text.clone();
++            let idx = resolved_elem_idx.clone();
++            let result = tokio::task::spawn_blocking(move || {
++                crate::input::with_x11_foreground(xid, 80, || {
++                    if let Some(idx) = idx {
++                        if !crate::atspi::focus_element(pid, idx.clone())? {
++                            anyhow::bail!(
++                                "AT-SPI Component.GrabFocus returned false for element {idx}"
++                            );
++                        }
++                    }
++                    crate::input::send_type_text_xtest(&text_f)
++                })
++            })
++            .await;
++            return match result {
++                Ok(Ok(())) => ToolResult::text(format!(
++                    "Typed {text_len} character(s) (via X11, delivery_mode=foreground)."
++                ))
++                .with_structured(type_text_structured(
++                    "key_events_fg",
++                    text_len,
++                    false,
++                )),
++                Ok(Err(e)) => ToolResult::error(e.to_string()),
++                Err(e) => ToolResult::error(format!("Task error: {e}")),
++            };
++        }
++
+         // AX addressing names one exact editable. Try this focus-free route
+         // before native Wayland keyboard injection, which can only target the
+         // compositor's globally focused surface.
+-        if let Some(idx) = resolved_elem_idx {
++        if let Some(idx) = resolved_elem_idx.clone() {
+             let text_at = text.clone();
+-            let targeted = tokio::task::spawn_blocking(move || {
+-                crate::atspi::type_into_editable_at(pid, idx, &text_at)
++            let targeted = tokio::task::spawn_blocking({
++                let idx = idx.clone();
++                move || crate::atspi::type_into_editable_at(pid, idx.clone(), &text_at)
+             })
+             .await;
+             match targeted {
+                 Ok(Ok(())) => {
+                     return type_text_ax_result(pid, text_len, "via targeted AT-SPI");
+                 }
+-                Ok(Err(_)) | Err(_)
+-                    if !delivery.is_foreground() && crate::wayland::wayland_input_enabled() =>
+-                {
+-                    return crate::input::delivery::background_unavailable_error(
+-                        crate::input::delivery::BackgroundUnavailable::FocusedInputOnly,
+-                    );
+-                }
+-                _ => {}
++                Ok(Err(error)) => return ToolResult::error(error.to_string()),
++                Err(error) => return ToolResult::error(format!("Task error: {error}")),
+             }
+         }
+ 
+@@ -4382,11 +4467,11 @@ impl Tool for TypeTextTool {
+                 );
+             }
+             let text_w = text.clone();
+-            let idx = resolved_elem_idx;
++            let idx = resolved_elem_idx.clone();
+             let result = tokio::task::spawn_blocking(move || {
+                 crate::wayland::with_target_foreground(pid, xid, || {
+                     if let Some(idx) = idx {
+-                        if !crate::atspi::focus_element(pid, idx)? {
++                        if !crate::atspi::focus_element(pid, idx.clone())? {
+                             anyhow::bail!(
+                                 "AT-SPI Component.GrabFocus returned false for element {idx}"
+                             );
+@@ -4458,40 +4543,6 @@ impl Tool for TypeTextTool {
+                 Err(e) => ToolResult::error(format!("Task error: {e}")),
+             };
+         }
+-        // Foreground means the caller explicitly permits activation. Chromium
+-        // and WebKitGTK can acknowledge an accessibility write without
+-        // producing the renderer input event, so web embedders use real XTest
+-        // key events. Native toolkits keep their verifiable AT-SPI path below.
+-        if delivery.is_foreground() && (is_chromium_embedder(pid) || is_webkitgtk_embedder(pid)) {
+-            let text_f = text.clone();
+-            let idx = resolved_elem_idx;
+-            let result = tokio::task::spawn_blocking(move || {
+-                crate::input::with_x11_foreground(xid, 80, || {
+-                    if let Some(idx) = idx {
+-                        if !crate::atspi::focus_element(pid, idx)? {
+-                            anyhow::bail!(
+-                                "AT-SPI Component.GrabFocus returned false for element {idx}"
+-                            );
+-                        }
+-                    }
+-                    crate::input::send_type_text_xtest(&text_f)
+-                })
+-            })
+-            .await;
+-            return match result {
+-                Ok(Ok(())) => ToolResult::text(format!(
+-                    "Typed {text_len} character(s) (via X11, delivery_mode=foreground)."
+-                ))
+-                .with_structured(type_text_structured(
+-                    "key_events_fg",
+-                    text_len,
+-                    false,
+-                )),
+-                Ok(Err(e)) => ToolResult::error(e.to_string()),
+-                Err(e) => ToolResult::error(format!("Task error: {e}")),
+-            };
+-        }
+-
+         // Prefer the focused widget — the element the user just clicked. If a
+         // NON-editable input holds keyboard focus (a spreadsheet cell, a
+         // terminal, a canvas), the focus-free AT-SPI editable search below would
+@@ -4790,9 +4841,28 @@ impl Tool for PressKeyTool {
+             Ok(r) => r,
+             Err(e) => return e,
+         };
++        if let cua_driver_core::element_token::ResolvedElement::Element { element, .. } = &resolved
++        {
++            let target = element.clone();
++            match tokio::task::spawn_blocking(move || {
++                crate::atspi::native::validate_element(pid, target)
++            })
++            .await
++            {
++                Ok(Ok(())) => {}
++                Ok(Err(error)) => {
++                    return ToolResult::error(format!(
++                        "Snapshot target is no longer valid: {error}"
++                    ))
++                }
++                Err(error) => {
++                    return ToolResult::error(format!("Target validation failed: {error}"))
++                }
++            }
++        }
+         let resolved_element_index = match &resolved {
+-            cua_driver_core::element_token::ResolvedElement::Element { element_index, .. } => {
+-                Some(*element_index)
++            cua_driver_core::element_token::ResolvedElement::Element { element, .. } => {
++                Some(element.clone())
+             }
+             cua_driver_core::element_token::ResolvedElement::None => None,
+         };
+@@ -4888,7 +4958,7 @@ impl Tool for PressKeyTool {
+                 &args,
+                 pid,
+                 xid,
+-                resolved_element_index,
++                resolved_element_index.clone(),
+                 px.zip(py),
+             )
+             .await
+@@ -4903,7 +4973,7 @@ impl Tool for PressKeyTool {
+             &args,
+             pid,
+             xid,
+-            resolved_element_index,
++            resolved_element_index.clone(),
+             px.zip(py),
+             false,
+         )
+@@ -4913,7 +4983,8 @@ impl Tool for PressKeyTool {
+         // Preserve legacy modifiers by promoting the request to a chord.
+         if crate::wayland::is_inject_mode() {
+             if let Err(error) =
+-                focus_nested_inject_target(pid, xid, resolved_element_index, px.zip(py)).await
++                focus_nested_inject_target(pid, xid, resolved_element_index.clone(), px.zip(py))
++                    .await
+             {
+                 return error;
+             }
+@@ -4971,11 +5042,11 @@ impl Tool for PressKeyTool {
+         if crate::wayland::wayland_input_enabled() {
+             let key_w = key.clone();
+             let chord = press_key_chord(&mods, &key);
+-            let idx = resolved_element_index;
++            let idx = resolved_element_index.clone();
+             let result = tokio::task::spawn_blocking(move || {
+                 crate::wayland::with_target_foreground(pid, xid, || {
+                     if let Some(idx) = idx {
+-                        if !crate::atspi::focus_element(pid, idx)? {
++                        if !crate::atspi::focus_element(pid, idx.clone())? {
+                             anyhow::bail!(
+                                 "AT-SPI Component.GrabFocus returned false for element {idx}"
+                             );
+@@ -5002,7 +5073,7 @@ impl Tool for PressKeyTool {
+         // A preceding PX click establishes internal widget focus, but that
+         // click restores the prior top-level before returning.
+         let deliver_fg = delivery.is_foreground();
+-        let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
++        let result = tokio::task::spawn_blocking({ let resolved_element_index = resolved_element_index.clone(); move || -> anyhow::Result<()> {
+             if resolved_element_index.is_none()
+                 && mods.is_empty()
+                 && key_for_task.eq_ignore_ascii_case("enter")
+@@ -5019,8 +5090,8 @@ impl Tool for PressKeyTool {
+             // XSendEvent (no focus steal) for apps that accept it.
+             if deliver_fg {
+                 return crate::input::with_x11_foreground(xid, 80, || {
+-                    if let Some(element_index) = resolved_element_index {
+-                        if !crate::atspi::focus_element(pid, element_index)? {
++                    if let Some(element_index) = resolved_element_index.clone() {
++                        if !crate::atspi::focus_element(pid, element_index.clone())? {
+                             anyhow::bail!(
+                                 "AT-SPI Component.GrabFocus returned false for element {element_index}"
+                             );
+@@ -5029,8 +5100,8 @@ impl Tool for PressKeyTool {
+                     crate::input::send_key_xtest(&key_for_task, &m)
+                 });
+             }
+-            if let Some(element_index) = resolved_element_index {
+-                if !crate::atspi::focus_element(pid, element_index)? {
++            if let Some(element_index) = resolved_element_index.clone() {
++                if !crate::atspi::focus_element(pid, element_index.clone())? {
+                     anyhow::bail!(
+                         "AT-SPI Component.GrabFocus returned false for element {element_index}"
+                     );
+@@ -5041,7 +5112,7 @@ impl Tool for PressKeyTool {
+             } else {
+                 crate::input::send_key(xid, &key_for_task, &m)
+             }
+-        })
++        } })
+         .await;
+         let mode_label = if deliver_fg {
+             "foreground"
+@@ -5166,9 +5237,28 @@ impl Tool for HotkeyTool {
+             Ok(resolved) => resolved,
+             Err(error) => return error,
+         };
++        if let cua_driver_core::element_token::ResolvedElement::Element { element, .. } = &resolved
++        {
++            let target = element.clone();
++            match tokio::task::spawn_blocking(move || {
++                crate::atspi::native::validate_element(pid, target)
++            })
++            .await
++            {
++                Ok(Ok(())) => {}
++                Ok(Err(error)) => {
++                    return ToolResult::error(format!(
++                        "Snapshot target is no longer valid: {error}"
++                    ))
++                }
++                Err(error) => {
++                    return ToolResult::error(format!("Target validation failed: {error}"))
++                }
++            }
++        }
+         let resolved_element_index = match &resolved {
+-            cua_driver_core::element_token::ResolvedElement::Element { element_index, .. } => {
+-                Some(*element_index)
++            cua_driver_core::element_token::ResolvedElement::Element { element, .. } => {
++                Some(element.clone())
+             }
+             cua_driver_core::element_token::ResolvedElement::None => None,
+         };
+@@ -5310,7 +5400,7 @@ impl Tool for HotkeyTool {
+                 &args,
+                 pid,
+                 xid,
+-                resolved_element_index,
++                resolved_element_index.clone(),
+                 px.zip(py),
+             )
+             .await
+@@ -5325,7 +5415,7 @@ impl Tool for HotkeyTool {
+             &args,
+             pid,
+             xid,
+-            resolved_element_index,
++            resolved_element_index.clone(),
+             px.zip(py),
+             false,
+         )
+@@ -5333,7 +5423,8 @@ impl Tool for HotkeyTool {
+ 
+         if crate::wayland::is_inject_mode() {
+             if let Err(error) =
+-                focus_nested_inject_target(pid, xid, resolved_element_index, px.zip(py)).await
++                focus_nested_inject_target(pid, xid, resolved_element_index.clone(), px.zip(py))
++                    .await
+             {
+                 return error;
+             }
+@@ -5359,9 +5450,10 @@ impl Tool for HotkeyTool {
+             && crate::wayland::wayland_input_enabled()
+             && is_chromium_embedder(pid)
+         {
+-            if let Some(element_index) = resolved_element_index {
+-                let coordinates = tokio::task::spawn_blocking(move || {
+-                    resolve_element_local_coords(pid, element_index, Some(xid))
++            if let Some(element_index) = resolved_element_index.clone() {
++                let coordinates = tokio::task::spawn_blocking({
++                    let element_index = element_index.clone();
++                    move || resolve_element_local_coords(pid, element_index, Some(xid))
+                 })
+                 .await;
+                 let (_, x, y) = match coordinates {
+@@ -5377,9 +5469,10 @@ impl Tool for HotkeyTool {
+             }
+         }
+ 
+-        if let Some(element_index) = resolved_element_index {
+-            let focused = tokio::task::spawn_blocking(move || {
+-                crate::atspi::focus_element(pid, element_index)
++        if let Some(element_index) = resolved_element_index.clone() {
++            let focused = tokio::task::spawn_blocking({
++                let element_index = element_index.clone();
++                move || crate::atspi::focus_element(pid, element_index.clone())
+             })
+             .await;
+             match focused {
+@@ -5514,12 +5607,29 @@ impl Tool for SetValueTool {
+             Ok(r) => r,
+             Err(e) => return e,
+         };
++        if let cua_driver_core::element_token::ResolvedElement::Element { element, .. } = &resolved
++        {
++            let target = element.clone();
++            match tokio::task::spawn_blocking(move || {
++                crate::atspi::native::validate_element(pid, target)
++            })
++            .await
++            {
++                Ok(Ok(())) => {}
++                Ok(Err(error)) => {
++                    return ToolResult::error(format!(
++                        "Snapshot target is no longer valid: {error}"
++                    ))
++                }
++                Err(error) => {
++                    return ToolResult::error(format!("Target validation failed: {error}"))
++                }
++            }
++        }
+         let (idx, resolved_window_id) = match &resolved {
+             cua_driver_core::element_token::ResolvedElement::Element {
+-                element_index,
+-                window_id,
+-                ..
+-            } => (*element_index, window_id.map(u64::from)),
++                element, window_id, ..
++            } => (element.clone(), window_id.map(u64::from)),
+             cua_driver_core::element_token::ResolvedElement::None => return ToolResult::error(
+                 "set_value requires element_index or element_token to address the target element.",
+             ),
+@@ -5529,11 +5639,21 @@ impl Tool for SetValueTool {
+             .opt_u64("window_id")
+             .or(resolved_window_id)
+             .unwrap_or(0);
+-        position_named_session_keyboard_cursor(&self.state, &args, pid, xid, Some(idx), None, true)
+-            .await;
+-        let result =
+-            tokio::task::spawn_blocking(move || crate::atspi::set_value(pid, idx, &value_for_task))
+-                .await;
++        position_named_session_keyboard_cursor(
++            &self.state,
++            &args,
++            pid,
++            xid,
++            Some(idx.clone()),
++            None,
++            true,
++        )
++        .await;
++        let result = tokio::task::spawn_blocking({
++            let idx = idx.clone();
++            move || crate::atspi::set_value(pid, idx.clone(), &value_for_task)
++        })
++        .await;
+         match result {
+             Ok(Ok(())) => ToolResult::text(format!("Set value of element [{idx}] to '{value}'.")),
+             Ok(Err(e)) => ToolResult::error(e.to_string()),
+@@ -5739,6 +5859,25 @@ impl Tool for ScrollTool {
+             Ok(r) => r,
+             Err(e) => return e,
+         };
++        if let cua_driver_core::element_token::ResolvedElement::Element { element, .. } = &resolved
++        {
++            let target = element.clone();
++            match tokio::task::spawn_blocking(move || {
++                crate::atspi::native::validate_element(pid, target)
++            })
++            .await
++            {
++                Ok(Ok(())) => {}
++                Ok(Err(error)) => {
++                    return ToolResult::error(format!(
++                        "Snapshot target is no longer valid: {error}"
++                    ))
++                }
++                Err(error) => {
++                    return ToolResult::error(format!("Target validation failed: {error}"))
++                }
++            }
++        }
+         let xid_opt: Option<u64> = match &resolved {
+             cua_driver_core::element_token::ResolvedElement::Element { window_id, .. } => window_id
+                 .map(|v| v as u64)
+@@ -5780,8 +5919,8 @@ impl Tool for ScrollTool {
+             _ => return ToolResult::error("Pass both x and y to pixel-target scroll."),
+         };
+         let resolved_element_index = match &resolved {
+-            cua_driver_core::element_token::ResolvedElement::Element { element_index, .. } => {
+-                Some(*element_index)
++            cua_driver_core::element_token::ResolvedElement::Element { element, .. } => {
++                Some(element.clone())
+             }
+             cua_driver_core::element_token::ResolvedElement::None => None,
+         };
+@@ -5792,9 +5931,17 @@ impl Tool for ScrollTool {
+         }
+ 
+         if named_session_cursor_key(&args).is_some() {
+-            let visual_target = tokio::task::spawn_blocking(move || {
+-                explicit_keyboard_cursor_target(pid, xid, resolved_element_index, pixel_target)
++            let visual_target = tokio::task::spawn_blocking({
++                let resolved_element_index = resolved_element_index.clone();
++                move || {
++                    explicit_keyboard_cursor_target(
++                        pid,
++                        xid,
++                        resolved_element_index.clone(),
++                        pixel_target,
++                    )
+                     .or_else(|| keyboard_window_center(xid))
++                }
+             })
+             .await
+             .ok()
+@@ -5815,10 +5962,9 @@ impl Tool for ScrollTool {
+                 return refusal;
+             }
+         }
+-        if let cua_driver_core::element_token::ResolvedElement::Element { element_index, .. } =
+-            &resolved
++        if let cua_driver_core::element_token::ResolvedElement::Element { element, .. } = &resolved
+         {
+-            let idx = *element_index;
++            let idx = element.clone();
+             // WebKitGTK acknowledges the AT-SPI scroll action without moving
+             // the DOM scroller. On native Wayland, use a real compositor wheel
+             // event at the resolved element instead of reporting a silent
+@@ -5826,8 +5972,17 @@ impl Tool for ScrollTool {
+             // coordinate-based compositor fallback.
+             if !(crate::wayland::wayland_input_enabled() && is_webkitgtk_embedder(pid)) {
+                 let direction_for_ax = direction.clone();
+-                let ax_result = tokio::task::spawn_blocking(move || {
+-                    crate::atspi::scroll_element(pid, idx, &direction_for_ax, amount, by)
++                let ax_result = tokio::task::spawn_blocking({
++                    let idx = idx.clone();
++                    move || {
++                        crate::atspi::scroll_element(
++                            pid,
++                            idx.clone(),
++                            &direction_for_ax,
++                            amount,
++                            by,
++                        )
++                    }
+                 })
+                 .await;
+                 match ax_result {
+@@ -5854,9 +6009,10 @@ impl Tool for ScrollTool {
+                     "an exact window_id or window-bound element token is required",
+                 );
+             }
+-            let point = if let Some(index) = resolved_element_index {
+-                match tokio::task::spawn_blocking(move || {
+-                    resolve_element_local_coords(pid, index, Some(xid))
++            let point = if let Some(index) = resolved_element_index.clone() {
++                match tokio::task::spawn_blocking({
++                    let index = index.clone();
++                    move || resolve_element_local_coords(pid, index, Some(xid))
+                 })
+                 .await
+                 {
+@@ -5891,7 +6047,7 @@ impl Tool for ScrollTool {
+             let owner = named_session_cursor_key(&args);
+             let (_cancellation, dispatch) =
+                 match spawn_isolated_hyprland(&args, move |cancellation| {
+-                    let point = if let Some(idx) = resolved_element_index {
++                    let point = if let Some(idx) = resolved_element_index.clone() {
+                         let (_, x, y) = resolve_element_local_coords(pid, idx, Some(xid))?;
+                         Some((x, y))
+                     } else {
+@@ -5952,13 +6108,12 @@ impl Tool for ScrollTool {
+                 (Some(point), _) => Some(point),
+                 (
+                     None,
+-                    cua_driver_core::element_token::ResolvedElement::Element {
+-                        element_index, ..
+-                    },
++                    cua_driver_core::element_token::ResolvedElement::Element { element, .. },
+                 ) => {
+-                    let idx = *element_index;
+-                    match tokio::task::spawn_blocking(move || {
+-                        resolve_element_local_coords(pid, idx, Some(xid))
++                    let idx = element.clone();
++                    match tokio::task::spawn_blocking({
++                        let idx = idx.clone();
++                        move || resolve_element_local_coords(pid, idx, Some(xid))
+                     })
+                     .await
+                     {
+@@ -6006,10 +6161,11 @@ impl Tool for ScrollTool {
+         // Chromium/GTK routes the wheel to the toplevel instead of the
+         // requested scroll region.
+         let element_point = match &resolved {
+-            cua_driver_core::element_token::ResolvedElement::Element { element_index, .. } => {
+-                let idx = *element_index;
+-                match tokio::task::spawn_blocking(move || {
+-                    resolve_element_local_coords(pid, idx, Some(xid))
++            cua_driver_core::element_token::ResolvedElement::Element { element, .. } => {
++                let idx = element.clone();
++                match tokio::task::spawn_blocking({
++                    let idx = idx.clone();
++                    move || resolve_element_local_coords(pid, idx, Some(xid))
+                 })
+                 .await
+                 {
+@@ -6210,9 +6366,28 @@ impl Tool for DoubleClickTool {
+             Ok(r) => r,
+             Err(e) => return e,
+         };
++        if let cua_driver_core::element_token::ResolvedElement::Element { element, .. } = &resolved
++        {
++            let target = element.clone();
++            match tokio::task::spawn_blocking(move || {
++                crate::atspi::native::validate_element(pid, target)
++            })
++            .await
++            {
++                Ok(Ok(())) => {}
++                Ok(Err(error)) => {
++                    return ToolResult::error(format!(
++                        "Snapshot target is no longer valid: {error}"
++                    ))
++                }
++                Err(error) => {
++                    return ToolResult::error(format!("Target validation failed: {error}"))
++                }
++            }
++        }
+         let elem_idx_resolved = match &resolved {
+-            cua_driver_core::element_token::ResolvedElement::Element { element_index, .. } => {
+-                Some(*element_index)
++            cua_driver_core::element_token::ResolvedElement::Element { element, .. } => {
++                Some(element.clone())
+             }
+             cua_driver_core::element_token::ResolvedElement::None => None,
+         };
+@@ -6224,14 +6399,18 @@ impl Tool for DoubleClickTool {
+         };
+         if let Some(idx) = elem_idx_resolved {
+             let xid_hint = window_id_resolved;
+-            let result = tokio::task::spawn_blocking(move || -> anyhow::Result<(u64, f64, f64)> {
+-                resolve_element_local_coords(pid, idx, xid_hint)
++            let result = tokio::task::spawn_blocking({
++                let idx = idx.clone();
++                move || -> anyhow::Result<(u64, f64, f64)> {
++                    resolve_element_local_coords(pid, idx, xid_hint)
++                }
+             })
+             .await;
+             return match result {
+                 Ok(Ok((xid, lx, ly))) => {
+-                    if let Ok(Ok((sx, sy))) = tokio::task::spawn_blocking(move || {
+-                        element_screen_center(pid, idx, Some(xid))
++                    if let Ok(Ok((sx, sy))) = tokio::task::spawn_blocking({
++                        let idx = idx.clone();
++                        move || element_screen_center(pid, idx, Some(xid))
+                     })
+                     .await
+                     {
+@@ -6449,9 +6628,28 @@ impl Tool for RightClickTool {
+             Ok(r) => r,
+             Err(e) => return e,
+         };
++        if let cua_driver_core::element_token::ResolvedElement::Element { element, .. } = &resolved
++        {
++            let target = element.clone();
++            match tokio::task::spawn_blocking(move || {
++                crate::atspi::native::validate_element(pid, target)
++            })
++            .await
++            {
++                Ok(Ok(())) => {}
++                Ok(Err(error)) => {
++                    return ToolResult::error(format!(
++                        "Snapshot target is no longer valid: {error}"
++                    ))
++                }
++                Err(error) => {
++                    return ToolResult::error(format!("Target validation failed: {error}"))
++                }
++            }
++        }
+         let elem_idx_resolved = match &resolved {
+-            cua_driver_core::element_token::ResolvedElement::Element { element_index, .. } => {
+-                Some(*element_index)
++            cua_driver_core::element_token::ResolvedElement::Element { element, .. } => {
++                Some(element.clone())
+             }
+             cua_driver_core::element_token::ResolvedElement::None => None,
+         };
+@@ -6463,14 +6661,18 @@ impl Tool for RightClickTool {
+         };
+         if let Some(idx) = elem_idx_resolved {
+             let xid_hint = window_id_resolved;
+-            let result = tokio::task::spawn_blocking(move || -> anyhow::Result<(u64, f64, f64)> {
+-                resolve_element_local_coords(pid, idx, xid_hint)
++            let result = tokio::task::spawn_blocking({
++                let idx = idx.clone();
++                move || -> anyhow::Result<(u64, f64, f64)> {
++                    resolve_element_local_coords(pid, idx, xid_hint)
++                }
+             })
+             .await;
+             return match result {
+                 Ok(Ok((xid, lx, ly))) => {
+-                    if let Ok(Ok((sx, sy))) = tokio::task::spawn_blocking(move || {
+-                        element_screen_center(pid, idx, Some(xid))
++                    if let Ok(Ok((sx, sy))) = tokio::task::spawn_blocking({
++                        let idx = idx.clone();
++                        move || element_screen_center(pid, idx, Some(xid))
+                     })
+                     .await
+                     {
+@@ -9073,14 +9275,13 @@ impl Tool for TypeTextCharsTool {
+             name: "type_text_chars".into(),
+             description: "Type text character-by-character with a configurable inter-character \
+                 delay (default 30 ms). Useful for apps that miss keystrokes. \
+-                Otherwise identical to type_text (XSendEvent, no focus steal).".into(),
++                Uses window-directed keyboard input. Element targets require type_text.".into(),
+             input_schema: json!({
+                 "type":"object","required":["pid","text"],"properties":{
+                     "pid":{"type":"integer"},
+                     "window_id":{"type":"integer"},
+                     "text":{"type":"string"},
+                     "delay_ms":{"type":"integer","description":"Milliseconds between chars (default 30)."},
+-                    "element_index": cua_driver_core::tool_schema::element_index_schema(),
+                     "type_chars_only":{"type":"boolean","description":"Skip element focus, type directly. Default false."}
+                 },"additionalProperties":false
+             }),
+@@ -9090,6 +9291,12 @@ impl Tool for TypeTextCharsTool {
+ 
+     async fn invoke(&self, args: Value) -> ToolResult {
+         use cua_driver_core::tool_args::ArgsExt;
++        if ["element_index", "element_token", "snapshot_id"]
++            .iter()
++            .any(|key| args.get(*key).is_some())
++        {
++            return ToolResult::error("type_text_chars does not support element targets; use type_text with an element_token or snapshot_id and element_index");
++        }
+         let pid = args.u64_or("pid", 0) as u32;
+         let text_raw = match args.require_str("text") {
+             Ok(v) => v,
+@@ -10128,3 +10335,15 @@ mod desktop_capture_frame_tests {
+         assert!(error.to_string().contains("cannot be mapped uniformly"));
+     }
+ }
++
++#[cfg(test)]
++#[tokio::test]
++async fn character_typing_never_ignores_an_element_target() {
++    for args in [
++        json!({"pid": 1, "text": "unused", "element_index": 0}),
++        json!({"pid": 1, "text": "unused", "element_token": "s00000001:0"}),
++        json!({"pid": 1, "text": "unused", "snapshot_id": "s00000001"}),
++    ] {
++        assert_eq!(TypeTextCharsTool.invoke(args).await.is_error, Some(true));
++    }
++}

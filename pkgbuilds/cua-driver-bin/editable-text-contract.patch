@@ -1,0 +1,1529 @@
+--- a/libs/cua-driver/rust/crates/cua-driver-core/src/expectation.rs
++++ b/libs/cua-driver/rust/crates/cua-driver-core/src/expectation.rs
+@@ -623,6 +623,19 @@
+         let Some(expected) = expected else {
+             continue;
+         };
++        // A partial native text read cannot prove either equality or inequality.
++        // Older platform providers omit this additive field and retain their
++        // existing contract; an explicit incomplete/protected value fails closed.
++        if field == "value"
++            && (element.get("value_complete").and_then(Value::as_bool) == Some(false)
++                || element.get("protected").and_then(Value::as_bool) == Some(true))
++        {
++            return (
++                VerificationStatus::Unknown,
++                Some(UnknownReason::ObservationUnavailable),
++                Some(project_element(element)),
++            );
++        }
+         let Some(actual) = element.get(field) else {
+             return (
+                 VerificationStatus::Unknown,
+@@ -730,10 +743,17 @@
+         "role",
+         "label",
+         "value",
++        "value_complete",
++        "value_status",
++        "value_source",
++        "protected",
+         "enabled",
+         "selected",
+         "frame",
+     ] {
++        if key == "value" && element.get("protected").and_then(Value::as_bool) == Some(true) {
++            continue;
++        }
+         if let Some(value) = element.get(key) {
+             projection.insert(key.to_owned(), value.clone());
+         }
+@@ -823,6 +843,57 @@
+                 elements: None,
+                 element_source_trusted: false,
+                 elements_complete: false,
++            },
++        );
++        assert_eq!(outcomes[0].status, VerificationStatus::Satisfied);
++    }
++
++    #[test]
++    fn incomplete_or_protected_values_cannot_prove_a_predicate() {
++        for (actual, complete, protected) in [
++            ("1", false, false),
++            ("partial", false, false),
++            ("1", true, true),
++        ] {
++            let outcomes = evaluate_predicates(
++                &[element_predicate("updates")],
++                &ObservationSnapshot {
++                    window: Some(window()),
++                    elements: Some(vec![json!({
++                        "role": "checkbox", "label": "Updates", "value": actual,
++                        "value_complete": complete, "protected": protected
++                    })]),
++                    element_source_trusted: true,
++                    elements_complete: true,
++                },
++            );
++            assert_eq!(outcomes[0].status, VerificationStatus::Unknown);
++            assert_eq!(
++                outcomes[0].unknown_reason,
++                Some(UnknownReason::ObservationUnavailable)
++            );
++        }
++        assert!(
++            project_element(&json!({"value": "secret", "protected": true}))
++                .get("value")
++                .is_none()
++        );
++    }
++
++    #[test]
++    fn complete_empty_value_can_prove_a_predicate() {
++        let mut predicate = element_predicate("updates");
++        predicate.element.as_mut().unwrap().value_equals = Some(String::new());
++        let outcomes = evaluate_predicates(
++            &[predicate],
++            &ObservationSnapshot {
++                window: Some(window()),
++                elements: Some(vec![json!({
++                    "role": "checkbox", "label": "Updates", "value": "",
++                    "value_complete": true, "value_status": "complete"
++                })]),
++                element_source_trusted: true,
++                elements_complete: true,
+             },
+         );
+         assert_eq!(outcomes[0].status, VerificationStatus::Satisfied);
+--- a/libs/cua-driver/rust/crates/platform-linux/src/atspi/mod.rs
++++ b/libs/cua-driver/rust/crates/platform-linux/src/atspi/mod.rs
+@@ -18,6 +18,7 @@
+ 
+ #[derive(Clone, Debug)]
+ pub struct AtspiNode {
++    pub text: NativeTextObservation,
+     pub element_index: Option<usize>,
+     pub role: String,
+     pub name: Option<String>,
+@@ -44,6 +45,62 @@
+     pub in_web_content: bool,
+ }
+ 
++/// Native field evidence. Unknown and failed reads must not look like an empty field.
++#[derive(Clone, Debug, serde::Serialize)]
++pub struct NativeTextObservation {
++    #[serde(skip_serializing_if = "Option::is_none")]
++    pub editable: Option<bool>,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    pub editable_source: Option<String>,
++    pub value_complete: bool,
++    pub value_status: String,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    pub value_source: Option<String>,
++    pub protected: bool,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    pub input_type: Option<String>,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    pub input_type_source: Option<String>,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    pub placeholder: Option<String>,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    pub placeholder_source: Option<String>,
++    pub name_source: String,
++    pub name_complete: bool,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    pub description_source: Option<String>,
++    pub description_complete: bool,
++    pub attributes_complete: bool,
++}
++
++impl Default for NativeTextObservation {
++    fn default() -> Self {
++        Self {
++            editable: None,
++            editable_source: None,
++            value_complete: false,
++            value_status: "not_applicable".into(),
++            value_source: None,
++            protected: false,
++            input_type: None,
++            input_type_source: None,
++            placeholder: None,
++            placeholder_source: None,
++            name_source: "unavailable".into(),
++            name_complete: false,
++            description_source: None,
++            description_complete: false,
++            attributes_complete: false,
++        }
++    }
++}
++
++#[derive(Clone, Debug, serde::Serialize)]
++pub struct SetValueOutcome {
++    pub method: &'static str,
++    pub effect: &'static str,
++}
++
+ /// Capture coverage is independent from native object identity and provenance.
+ #[derive(Clone, Debug, Default, serde::Serialize)]
+ pub struct TraversalStatus {
+@@ -279,9 +336,9 @@
+ }
+ 
+ /// Set the text value of element `idx` within pid's app tree via AT-SPI.
+-/// Tries `EditableText.set_text_contents(value)` first, then
+-/// `Value.set_current_value(float)`.
+-pub fn set_value(pid: u32, idx: NativeElement, value: &str) -> Result<()> {
++/// Replaces text with `EditableText.set_text_contents`, or sets a native numeric
++/// Value. Success requires fresh native readback; insertion is never a fallback.
++pub fn set_value(pid: u32, idx: NativeElement, value: &str) -> Result<SetValueOutcome> {
+     native::set_value(pid, idx, value)
+ }
+ 
+@@ -365,6 +422,7 @@
+             Some(title.clone())
+         },
+         value: None,
++        text: NativeTextObservation::default(),
+         checked: None,
+         enabled: None,
+         selected: None,
+--- a/libs/cua-driver/rust/crates/platform-linux/src/atspi/native.rs
++++ b/libs/cua-driver/rust/crates/platform-linux/src/atspi/native.rs
+@@ -18,7 +18,8 @@
+ use atspi::proxy::proxy_ext::ProxyExt;
+ use atspi::{CoordType, Interface, State, StateSet};
+ 
+-use super::AtspiNode;
++use super::{AtspiNode, NativeTextObservation, SetValueOutcome};
++use std::sync::atomic::{AtomicBool, Ordering};
+ 
+ /// Per-call D-Bus timeout: a single unresponsive accessible (common in large,
+ /// lazily-built trees like Chromium's) must not stall the whole walk.
+@@ -237,10 +238,11 @@
+     object: RawObjectRef,
+     depth: usize,
+     role: String,
+-    /// Display text: the accessible `name`, or — for editable/text widgets that
+-    /// expose no name — the Text-interface content (where typed text lives).
++    /// Native accessible name. Editable values never substitute for this name.
+     name: String,
+     value: Option<String>,
++    text: NativeTextObservation,
++    description: Option<String>,
+     checked: Option<bool>,
+     enabled: Option<bool>,
+     selected: Option<bool>,
+@@ -1141,6 +1143,7 @@
+             Some(Ok(r)) => r,
+             _ => String::new(),
+         };
++        let name_complete = matches!(&name_r, Some(Ok(_)));
+         let mut name = match name_r {
+             Some(Ok(n)) => n,
+             _ => String::new(),
+@@ -1178,13 +1181,20 @@
+             None
+         };
+ 
+-        // Collect action names, numeric value, and (crucially) Text-interface
+-        // content. Only touch `proxies` when an interface is actually present,
+-        // and drop the borrow before `acc` moves into `visited`.
++        let state = state_r.as_ref().and_then(|state| state.as_ref().ok());
++        let field = is_text_field(&role, state, has_editable);
++        let (mut text, mut value, description) = observe_field(
++            &acc,
++            &role,
++            state,
++            has_editable,
++            has_text,
++            field,
++            name_complete,
++        )
++        .await;
+         let mut actions: Vec<String> = Vec::new();
+-        let mut value: Option<String> = None;
+-        let mut text_content = String::new();
+-        if has_action || has_value || has_text {
++        if has_action || has_value || (has_text && !field && !text.protected) {
+             if let Some(proxies) = observed_read(call(acc.proxies()).await, &mut traversal) {
+                 if has_action {
+                     if let Some(ap) = observed_read(call(proxies.action()).await, &mut traversal) {
+@@ -1202,31 +1212,50 @@
+                         }
+                     }
+                 }
+-                if has_value {
++                if has_value && !field && !text.protected {
++                    text.value_status = "read_failure".into();
++                    text.value_source = Some("atspi.Value.CurrentValue".into());
+                     if let Some(vp) = observed_read(call(proxies.value()).await, &mut traversal) {
+                         value = observed_read(call(vp.current_value()).await, &mut traversal)
+                             .map(format_value);
++                        text.value_complete = value.is_some();
++                        text.value_status = if value.is_some() {
++                            "complete"
++                        } else {
++                            "read_failure"
++                        }
++                        .into();
++                        text.value_source = Some("atspi.Value.CurrentValue".into());
+                     }
+                 }
+-                if has_text {
++                // Passive document text can remain display text. Editable fields
++                // always preserve Name, Text value and Description separately.
++                if has_text
++                    && !field
++                    && !text.protected
++                    && state.is_some()
++                    && !role.is_empty()
++                    && name.trim().is_empty()
++                {
+                     if let Some(tp) = observed_read(call(proxies.text()).await, &mut traversal) {
+-                        let count = observed_read(call(tp.character_count()).await, &mut traversal)
+-                            .unwrap_or(0);
+-                        if count > 0 {
+-                            text_content = observed_read(
+-                                call(tp.get_text(0, count.min(4096))).await,
+-                                &mut traversal,
+-                            )
+-                            .unwrap_or_default();
++                        if let Some(count) =
++                            observed_read(call(tp.character_count()).await, &mut traversal)
++                        {
++                            if count > 0 {
++                                if let Some(content) = observed_read(
++                                    call(tp.get_text(0, count.min(4096))).await,
++                                    &mut traversal,
++                                ) {
++                                    name = content;
++                                    text.name_source = "atspi.Text".into();
++                                    text.name_complete =
++                                        count <= 4096 && name.chars().count() == count as usize;
++                                }
++                            }
+                         }
+                     }
+                 }
+             }
+-        }
+-
+-        // Surface Text content as the display name when the widget has no name.
+-        if name.trim().is_empty() && !text_content.trim().is_empty() {
+-            name = text_content;
+         }
+ 
+         // Children inherit web-document context, plus this node's own role.
+@@ -1262,6 +1291,8 @@
+             role,
+             name,
+             value,
++            text,
++            description,
+             checked,
+             enabled,
+             selected,
+@@ -1282,6 +1313,225 @@
+     traversal.reasons.sort();
+     traversal.reasons.dedup();
+     Ok(Some((visited, scoped_frame, traversal)))
++}
++
++// Bounds apply to each field value, independently of the traversal node budget.
++const MAX_FIELD_CHARACTERS: i32 = 65_536;
++
++type NativeAttributes = std::collections::HashMap<String, String>;
++
++fn is_text_field(role: &str, state: Option<&StateSet>, has_editable: bool) -> bool {
++    has_editable
++        || state.is_some_and(|s| s.contains(State::Editable))
++        || matches!(
++            role.to_ascii_lowercase().as_str(),
++            "entry" | "text" | "password text" | "password" | "combo box" | "combobox"
++        )
++}
++
++fn is_protected_field(role: &str, attrs: Option<&NativeAttributes>) -> bool {
++    role.to_ascii_lowercase().contains("password")
++        || attrs.is_some_and(|attrs| {
++            ["text-input-type", "input-type", "type"].iter().any(|key| {
++                attrs
++                    .get(*key)
++                    .is_some_and(|v| v.eq_ignore_ascii_case("password"))
++            }) || ["protected", "password", "secret"].iter().any(|key| {
++                attrs
++                    .get(*key)
++                    .is_some_and(|v| matches!(v.as_str(), "true" | "1"))
++            })
++        })
++}
++
++fn field_metadata(
++    role: &str,
++    state: Option<&StateSet>,
++    has_editable: bool,
++    attrs: Option<&NativeAttributes>,
++    name_complete: bool,
++) -> NativeTextObservation {
++    let mut text = NativeTextObservation {
++        editable: state.map(|s| s.contains(State::Editable) && !s.contains(State::ReadOnly)),
++        editable_source: state.map(|_| "atspi.State.Editable/ReadOnly".into()),
++        protected: is_protected_field(role, attrs),
++        value_status: "not_applicable".into(),
++        name_source: "atspi.Accessible.Name".into(),
++        name_complete,
++        attributes_complete: attrs.is_some(),
++        ..Default::default()
++    };
++    if text.editable.is_none() && has_editable {
++        text.editable = Some(true);
++        text.editable_source = Some("atspi.EditableText".into());
++    }
++    if let Some(attrs) = attrs {
++        if let Some(source) = attrs.get("name-from") {
++            text.name_source = format!("atspi.name-from:{source}");
++        }
++        for key in ["text-input-type", "input-type"] {
++            if let Some(value) = attrs.get(key).filter(|v| !v.is_empty()) {
++                text.input_type = Some(value.clone());
++                text.input_type_source = Some(format!("atspi.attribute:{key}"));
++                break;
++            }
++        }
++        for key in ["placeholder-text", "placeholder"] {
++            if let Some(value) = attrs.get(key) {
++                text.placeholder = Some(value.clone());
++                text.placeholder_source = Some(format!("atspi.attribute:{key}"));
++                break;
++            }
++        }
++    }
++    text
++}
++
++/// Count uses Unicode scalar values, as AT-SPI character offsets do, not bytes.
++/// A second equal read detects same-length edits during capture. This is a
++/// consistent observation, not a promise that the application cannot edit later.
++fn classify_text_read(before: i32, after: i32, first: &str, second: &str) -> &'static str {
++    if before < 0 || after < 0 {
++        "read_failure"
++    } else if before != after || first != second {
++        "changed_during_read"
++    } else if before > MAX_FIELD_CHARACTERS {
++        "truncated"
++    } else if first.chars().count() != before as usize {
++        "incomplete"
++    } else {
++        "complete"
++    }
++}
++
++fn text_read_guard(
++    role: Option<&str>,
++    state: Option<&StateSet>,
++    attrs: Option<&NativeAttributes>,
++) -> Option<&'static str> {
++    let (Some(role), Some(state), Some(attrs)) = (role, state, attrs) else {
++        return Some("protection_unknown");
++    };
++    if role.is_empty() {
++        return Some("protection_unknown");
++    }
++    if is_protected_field(role, Some(attrs)) {
++        return Some("protected");
++    }
++    if state.contains(State::Defunct) || state.contains(State::Stale) {
++        return Some("stale");
++    }
++    if state.contains(State::Truncated) {
++        return Some("platform_truncated");
++    }
++    None
++}
++
++async fn read_field_value(acc: &AccessibleProxy<'_>) -> (Option<String>, &'static str) {
++    let result = async {
++        let proxies = call(acc.proxies()).await?.ok()?;
++        let tp = call(proxies.text()).await?.ok()?;
++        let before = call(tp.character_count()).await?.ok()?;
++        if before < 0 {
++            return None;
++        }
++        let first = call(tp.get_text(0, before.min(MAX_FIELD_CHARACTERS)))
++            .await?
++            .ok()?;
++        let after = call(tp.character_count()).await?.ok()?;
++        if after < 0 {
++            return None;
++        }
++        let second = call(tp.get_text(0, after.min(MAX_FIELD_CHARACTERS)))
++            .await?
++            .ok()?;
++        Some((first, second, before, after))
++    }
++    .await;
++    // Protection can change while the application services GetText. Do not
++    // publish even a consistent value unless fresh native metadata still
++    // establishes a readable object. This guard also covers action readback.
++    let (role, state, attrs) = tokio::join!(
++        call(acc.get_role_name()),
++        call(acc.get_state()),
++        call(acc.get_attributes()),
++    );
++    let role = role.and_then(Result::ok);
++    let state = state.and_then(Result::ok);
++    let attrs = attrs.and_then(Result::ok);
++    if let Some(status) = text_read_guard(role.as_deref(), state.as_ref(), attrs.as_ref()) {
++        return (None, status);
++    }
++    match result {
++        Some((first, second, before, after)) => {
++            let status = classify_text_read(before, after, &first, &second);
++            // Partial text is usable only when explicitly labelled partial;
++            // changing reads are omitted, since neither is a reliable value.
++            let value = if status == "changed_during_read" {
++                None
++            } else {
++                Some(first)
++            };
++            (value, status)
++        }
++        None => (
++            None,
++            if snapshot_deadline_reached() {
++                "deadline"
++            } else {
++                "read_failure"
++            },
++        ),
++    }
++}
++
++async fn observe_field(
++    acc: &AccessibleProxy<'_>,
++    role: &str,
++    state: Option<&StateSet>,
++    has_editable: bool,
++    has_text: bool,
++    field: bool,
++    name_complete: bool,
++) -> (NativeTextObservation, Option<String>, Option<String>) {
++    // GetAttributes is a method and the Accessible proxy disables property
++    // caching. Never warm a GetAll cache (older Qt bridges crash on GetAll).
++    let (attrs, description) = if field {
++        let (attrs, description) =
++            tokio::join!(call(acc.get_attributes()), call(acc.description()));
++        (attrs.and_then(Result::ok), description.and_then(Result::ok))
++    } else {
++        (None, None)
++    };
++    let mut text = field_metadata(role, state, has_editable, attrs.as_ref(), name_complete);
++    text.description_complete = description.is_some();
++    text.description_source = description.as_ref().map(|_| {
++        attrs
++            .as_ref()
++            .and_then(|attrs| attrs.get("description-from"))
++            .map(|source| format!("atspi.description-from:{source}"))
++            .unwrap_or_else(|| "atspi.Accessible.Description".into())
++    });
++    let mut value = None;
++    if text.protected {
++        text.value_status = "protected".into();
++    } else if field {
++        text.value_source = has_text.then(|| "atspi.Text.GetText".into());
++        text.value_status = if attrs.is_none() || state.is_none() || role.is_empty() {
++            // A failed protection/classification read cannot authorize exposing
++            // potentially secret text, even if Text itself answers.
++            "protection_unknown".into()
++        } else if !has_text {
++            "unavailable".into()
++        } else {
++            let (observed, status) = read_field_value(acc).await;
++            text.protected |= status == "protected";
++            value = observed;
++            status.into()
++        };
++        text.value_complete = text.value_status == "complete";
++    }
++    (text, value, description)
+ }
+ 
+ fn observed_read<T, E>(
+@@ -1486,8 +1736,8 @@
+         let state = call(acc.get_state())
+             .await
+             .context("native object state timed out")??;
+-        if state.contains(State::Defunct) {
+-            return Err(anyhow!("stale_native_element: defunct object"));
++        if state.contains(State::Defunct) || state.contains(State::Stale) {
++            return Err(anyhow!("stale_native_element: defunct or stale object"));
+         }
+         if same_native_object(&object, &snapshot.root, &snapshot.owners) {
+             return Ok(target);
+@@ -1571,8 +1821,8 @@
+ }
+ 
+ /// Render visited nodes into the markdown + node list `walk_tree` returns.
+-/// Format matches the historical pyatspi output exactly so downstream parsing
+-/// (`extract_text_from_markdown`, `query_dom`) is unaffected.
++/// Field rows distinguish native names from values and publish completeness;
++/// non-field rows retain the historical markdown shape.
+ ///
+ /// `parent_at_depth` tracks the most recently emitted actionable index at
+ /// each depth, so descendants can look up their parent_element_index without
+@@ -1620,14 +1870,21 @@
+                 continue;
+             }
+             let act_str = v.actions.join(",");
+-            let val_part = match &v.value {
+-                Some(val) if !val.is_empty() => format!(" value=\"{val}\""),
+-                _ => String::new(),
+-            };
++            let val_part = value_markdown(v.value.as_deref(), &v.text);
++            let name_part =
++                if is_text_field(&v.role, None, v.has_editable) || v.text.editable == Some(true) {
++                    format!(
++                        "accessible_name={} [name_source={} name_complete={}]",
++                        serde_json::to_string(&v.name).unwrap(),
++                        serde_json::to_string(&v.text.name_source).unwrap(),
++                        v.text.name_complete
++                    )
++                } else {
++                    serde_json::to_string(&v.name).unwrap()
++                };
+             md.push_str(&format!(
+-                "{indent}- [{idx}] {role} \"{name}\"{val_part} [actions=[{act_str}]]\n",
++                "{indent}- [{idx}] {role} {name_part}{val_part} [actions=[{act_str}]]\n",
+                 role = v.role,
+-                name = v.name,
+             ));
+             nodes.push(AtspiNode {
+                 element_index: Some(idx),
+@@ -1637,11 +1894,12 @@
+                 } else {
+                     Some(v.name.clone())
+                 },
+-                value: v.value.clone().filter(|s| !s.is_empty()),
++                value: v.value.clone(),
++                text: v.text.clone(),
+                 checked: v.checked,
+                 enabled: v.enabled,
+                 selected: v.selected,
+-                description: None,
++                description: v.description.clone(),
+                 actions: v.actions.clone(),
+                 element_key: idx as u64,
+                 depth: v.depth,
+@@ -1668,6 +1926,20 @@
+     }
+ 
+     (md, nodes)
++}
++
++/// Markdown readers get the same completeness distinction as structured rows.
++fn value_markdown(value: Option<&str>, text: &NativeTextObservation) -> String {
++    let mut rendered = value
++        .map(|value| format!(" value={}", serde_json::to_string(value).unwrap()))
++        .unwrap_or_default();
++    if text.value_status != "not_applicable" {
++        rendered.push_str(&format!(
++            " [value_complete={} value_status={}]",
++            text.value_complete, text.value_status
++        ));
++    }
++    rendered
+ }
+ 
+ /// Format an AT-SPI numeric value like the historical `str(currentValue)`
+@@ -1706,7 +1978,9 @@
+     is_indexable_capabilities(
+         &v.role,
+         !v.actions.is_empty(),
+-        v.has_editable,
++        v.has_editable
++            || v.text.editable == Some(true)
++            || v.text.value_source.as_deref() == Some("atspi.Text.GetText"),
+         v.has_value,
+         v.selectable,
+         v.has_component,
+@@ -3305,60 +3579,157 @@
+     best_active.or(best_passive).map(|(_, idx)| idx)
+ }
+ 
+-pub fn set_value(pid: u32, element: NativeElement, value: &str) -> Result<()> {
++pub fn set_value(pid: u32, element: NativeElement, value: &str) -> Result<SetValueOutcome> {
++    set_value_with_cancel(pid, element, value, Arc::new(AtomicBool::new(false)))
++}
++
++pub fn set_value_with_cancel(
++    pid: u32,
++    element: NativeElement,
++    value: &str,
++    cancelled: Arc<AtomicBool>,
++) -> Result<SetValueOutcome> {
++    let attempted = Arc::new(AtomicBool::new(false));
++    let timeout_attempted = attempted.clone();
+     bounded(
+         async {
+-            let idx = element.index;
+-            let target = validated_target(pid, &element).await?;
+-            let proxies = target
+-                .acc
+-                .proxies()
+-                .await
+-                .map_err(|e| anyhow!("interface proxies unavailable: {e}"))?;
+-
+-            // SetValue is a focus-free accessibility operation. Do not call
+-            // Component.GrabFocus here: GTK may activate and raise the entire
+-            // toplevel in response, violating the background contract. Toolkits
+-            // that expose EditableText only while focused must return an honest
+-            // unsupported error rather than changing desktop focus implicitly.
+-            if let Ok(et) = proxies.editable_text().await {
+-                // Replace whole contents (parity with the Windows/macOS set_value,
+-                // which overwrite rather than insert at the caret).
+-                if et.set_text_contents(value).await.unwrap_or(false) {
+-                    return Ok(());
++            let operation = async {
++                if cancelled.load(Ordering::Acquire) {
++                    return Err(anyhow!("cancelled_before_delivery"));
+                 }
+-                // Some toolkits reject SetTextContents but accept an insert at the
+-                // caret offset; clear-then-insert as a fallback.
+-                let off = match proxies.text().await {
+-                    Ok(tp) => tp.caret_offset().await.unwrap_or(0),
+-                    Err(_) => 0,
+-                };
+-                let len = value.chars().count() as i32;
+-                if et.insert_text(off, value, len).await.unwrap_or(false) {
+-                    return Ok(());
++                let target = validated_target(pid, &element).await?;
++                let (state, role, attrs, interfaces) = tokio::join!(
++                    call(target.acc.get_state()),
++                    call(target.acc.get_role_name()),
++                    call(target.acc.get_attributes()),
++                    call(target.acc.get_interfaces()),
++                );
++                let state = state.context("unsupported: field state unavailable")??;
++                let role = role.context("unsupported: field role unavailable")??;
++                let attrs = attrs.context("unsupported: field attributes unavailable")??;
++                let interfaces = interfaces.context("unsupported: interfaces unavailable")??;
++                if is_protected_field(&role, Some(&attrs)) {
++                    return Err(anyhow!(
++                        "unsupported: protected field replacement is not exposed"
++                    ));
+                 }
+-            }
+-            if target.has_value {
+-                let v: f64 = value
+-                    .parse()
+-                    .map_err(|_| anyhow!("value '{value}' is not numeric for a Value element"))?;
+-                proxies
+-                    .value()
++                let has_editable = interfaces.contains(Interface::EditableText);
++                let field = is_text_field(&role, Some(&state), has_editable);
++                let proxies = call(target.acc.proxies())
+                     .await
+-                    .map_err(|e| anyhow!("Value unavailable: {e}"))?
+-                    .set_current_value(v)
+-                    .await
+-                    .map_err(|e| anyhow!("setCurrentValue failed: {e}"))?;
+-                return Ok(());
+-            }
+-            Err(anyhow!(
+-                "element {idx} exposes neither EditableText nor Value"
+-            ))
++                    .context("unsupported: interface lookup timed out")??;
++                let method;
++                let numeric;
++                if field {
++                    if !state.contains(State::Editable) || state.contains(State::ReadOnly) {
++                        return Err(anyhow!("unsupported: field is not natively editable"));
++                    }
++                    if !has_editable || !interfaces.contains(Interface::Text) {
++                        return Err(anyhow!(
++                            "unsupported: native text replacement/readback unavailable"
++                        ));
++                    }
++                    let et = call(proxies.editable_text())
++                        .await
++                        .context("unsupported: EditableText lookup timed out")??;
++                    // Do not focus, clear-and-insert, or retry a rejected write.
++                    // Each is a separate operation and can append or target a
++                    // changed control. This method has replacement semantics.
++                    validated_target(pid, &element).await?;
++                    if cancelled.load(Ordering::Acquire) {
++                        return Err(anyhow!("cancelled_before_delivery"));
++                    }
++                    attempted.store(true, Ordering::Release);
++                    let accepted = call(et.set_text_contents(value))
++                        .await
++                        .context("replacement acknowledgement timed out")??;
++                    if !accepted {
++                        return Err(anyhow!("native replacement was not acknowledged"));
++                    }
++                    method = "atspi.EditableText.SetTextContents";
++                    numeric = None;
++                } else if interfaces.contains(Interface::Value) {
++                    let requested: f64 = value.parse().map_err(|_| {
++                        anyhow!("unsupported: native Value requires a numeric value")
++                    })?;
++                    if !requested.is_finite() {
++                        return Err(anyhow!("unsupported: native Value requires a finite value"));
++                    }
++                    let vp = call(proxies.value())
++                        .await
++                        .context("unsupported: Value lookup timed out")??;
++                    validated_target(pid, &element).await?;
++                    if cancelled.load(Ordering::Acquire) {
++                        return Err(anyhow!("cancelled_before_delivery"));
++                    }
++                    attempted.store(true, Ordering::Release);
++                    call(vp.set_current_value(requested))
++                        .await
++                        .context("numeric replacement acknowledgement timed out")??;
++                    method = "atspi.Value.SetCurrentValue";
++                    numeric = Some(requested);
++                } else {
++                    return Err(anyhow!(
++                        "unsupported: object has no native replacement interface"
++                    ));
++                }
++                if cancelled.load(Ordering::Acquire) {
++                    return Err(anyhow!("cancelled after delivery"));
++                }
++                let fresh = validated_target(pid, &element).await?;
++                if let Some(expected) = numeric {
++                    let proxies = call(fresh.acc.proxies())
++                        .await
++                        .context("readback lookup timed out")??;
++                    let vp = call(proxies.value())
++                        .await
++                        .context("Value readback unavailable")??;
++                    let actual = call(vp.current_value())
++                        .await
++                        .context("numeric readback timed out")??;
++                    if actual != expected {
++                        return Err(anyhow!("numeric replacement readback differs"));
++                    }
++                } else {
++                    let (state, role, attrs) = tokio::join!(
++                        call(fresh.acc.get_state()),
++                        call(fresh.acc.get_role_name()),
++                        call(fresh.acc.get_attributes()),
++                    );
++                    let state = state.context("readback state unavailable")??;
++                    let role = role.context("readback role unavailable")??;
++                    let attrs = attrs.context("readback attributes unavailable")??;
++                    if is_protected_field(&role, Some(&attrs)) || state.contains(State::ReadOnly) {
++                        return Err(anyhow!("field protection changed during replacement"));
++                    }
++                    let (actual, status) = read_field_value(&fresh.acc).await;
++                    if status != "complete" || actual.as_deref() != Some(value) {
++                        return Err(anyhow!("replacement readback was incomplete or differed"));
++                    }
++                }
++                validated_target(pid, &element).await?;
++                if cancelled.load(Ordering::Acquire) {
++                    return Err(anyhow!("cancelled after delivery"));
++                }
++                Ok(SetValueOutcome {
++                    method,
++                    effect: "verified",
++                })
++            }
++            .await;
++            operation.map_err(|error| {
++                if attempted.load(Ordering::Acquire) {
++                    // Avoid embedding D-Bus errors: providers can echo secrets.
++                    anyhow!("outcome_uncertain: native replacement was attempted but its effect could not be verified")
++                } else { error }
++            })
+         },
+         || {
+-            Err(anyhow!(
+-                "set_value timed out for pid {pid} (app unresponsive to AT-SPI)"
+-            ))
++            Err(anyhow!(if timeout_attempted.load(Ordering::Acquire) {
++                "outcome_uncertain: native replacement timed out after delivery began"
++            } else {
++                "unsupported: native replacement timed out before delivery"
++            }))
+         },
+     )
+ }
+@@ -4692,3 +5063,210 @@
+         assert_eq!(status.reasons, ["read_failure"]);
+     }
+ }
++
++#[cfg(test)]
++mod editable_contract_tests {
++    use super::*;
++
++    #[test]
++    fn markdown_distinguishes_empty_partial_and_unreadable_values() {
++        let text = NativeTextObservation {
++            value_complete: true,
++            value_status: "complete".into(),
++            ..Default::default()
++        };
++        assert_eq!(
++            value_markdown(Some(""), &text),
++            " value=\"\" [value_complete=true value_status=complete]"
++        );
++        let partial = NativeTextObservation {
++            value_status: "truncated".into(),
++            ..Default::default()
++        };
++        assert!(value_markdown(Some("x\"\n"), &partial)
++            .contains("value_complete=false value_status=truncated"));
++        assert!(!value_markdown(Some("x\"\n"), &partial).contains('\n'));
++        let protected = NativeTextObservation {
++            value_status: "protected".into(),
++            protected: true,
++            ..Default::default()
++        };
++        assert_eq!(
++            value_markdown(None, &protected),
++            " [value_complete=false value_status=protected]"
++        );
++    }
++
++    #[test]
++    fn replacement_cancelled_before_delivery_never_resolves_or_writes_target() {
++        let error = set_value_with_cancel(
++            0,
++            NativeElement::for_test("invalid-target"),
++            "private requested value",
++            Arc::new(AtomicBool::new(true)),
++        )
++        .unwrap_err();
++        assert_eq!(error.to_string(), "cancelled_before_delivery");
++    }
++
++    #[test]
++    fn postread_protection_changes_and_incomplete_metadata_discard_text() {
++        let attrs = NativeAttributes::new();
++        let state = StateSet::new(State::Editable);
++        assert_eq!(
++            text_read_guard(Some("entry"), Some(&state), Some(&attrs)),
++            None
++        );
++        assert_eq!(
++            text_read_guard(Some("password text"), Some(&state), Some(&attrs)),
++            Some("protected")
++        );
++        assert_eq!(
++            text_read_guard(Some("entry"), Some(&state), None),
++            Some("protection_unknown")
++        );
++        assert_eq!(
++            text_read_guard(None, Some(&state), Some(&attrs)),
++            Some("protection_unknown")
++        );
++        assert_eq!(
++            text_read_guard(
++                Some("entry"),
++                Some(&StateSet::new(State::Stale)),
++                Some(&attrs)
++            ),
++            Some("stale")
++        );
++        assert_eq!(
++            text_read_guard(
++                Some("entry"),
++                Some(&StateSet::new(State::Truncated)),
++                Some(&attrs)
++            ),
++            Some("platform_truncated")
++        );
++    }
++
++    #[test]
++    fn empty_text_is_a_complete_value() {
++        assert_eq!(classify_text_read(0, 0, "", ""), "complete");
++    }
++
++    #[test]
++    fn unicode_counts_are_characters_not_bytes() {
++        assert_eq!(classify_text_read(3, 3, "音🎵é", "音🎵é"), "complete");
++        assert_eq!(classify_text_read(9, 9, "音🎵é", "音🎵é"), "incomplete");
++    }
++
++    #[test]
++    fn incomplete_and_truncated_text_never_claim_complete() {
++        assert_eq!(classify_text_read(10, 10, "short", "short"), "incomplete");
++        let full_prefix = "x".repeat(MAX_FIELD_CHARACTERS as usize);
++        assert_eq!(
++            classify_text_read(
++                MAX_FIELD_CHARACTERS + 1,
++                MAX_FIELD_CHARACTERS + 1,
++                &full_prefix,
++                &full_prefix
++            ),
++            "truncated"
++        );
++        assert_eq!(classify_text_read(-1, -1, "", ""), "read_failure");
++    }
++
++    #[test]
++    fn concurrent_edits_of_equal_or_different_lengths_are_unknown() {
++        assert_eq!(
++            classify_text_read(4, 4, "Suno", "Song"),
++            "changed_during_read"
++        );
++        assert_eq!(
++            classify_text_read(4, 5, "Suno", "Songs"),
++            "changed_during_read"
++        );
++    }
++
++    #[test]
++    fn editable_is_native_state_not_role_or_label() {
++        let state = StateSet::new(State::Editable);
++        let text = field_metadata(
++            "combo box",
++            Some(&state),
++            false,
++            Some(&NativeAttributes::new()),
++            true,
++        );
++        assert_eq!(text.editable, Some(true));
++        assert!(text.input_type.is_none());
++        assert_eq!(
++            field_metadata("entry", Some(&StateSet::empty()), false, None, true).editable,
++            Some(false)
++        );
++        assert_eq!(
++            field_metadata("entry", None, false, None, false).editable,
++            None
++        );
++        assert_eq!(
++            field_metadata(
++                "entry",
++                Some(&StateSet::new(State::Editable | State::ReadOnly)),
++                true,
++                None,
++                true
++            )
++            .editable,
++            Some(false)
++        );
++    }
++
++    #[test]
++    fn native_name_placeholder_and_input_type_are_independent() {
++        let attrs = NativeAttributes::from([
++            ("name-from".into(), "contents".into()),
++            ("placeholder".into(), "Find music".into()),
++            ("text-input-type".into(), "text".into()),
++        ]);
++        let text = field_metadata(
++            "combo box",
++            Some(&StateSet::new(State::Editable)),
++            false,
++            Some(&attrs),
++            true,
++        );
++        assert_eq!(text.name_source, "atspi.name-from:contents");
++        assert_eq!(text.placeholder.as_deref(), Some("Find music"));
++        assert_eq!(text.input_type.as_deref(), Some("text"));
++        assert_eq!(
++            text.input_type_source.as_deref(),
++            Some("atspi.attribute:text-input-type")
++        );
++        assert!(!text.value_complete);
++    }
++
++    #[test]
++    fn protected_role_and_native_password_attributes_are_blocked() {
++        assert!(is_protected_field("password text", None));
++        for key in ["text-input-type", "input-type", "type"] {
++            assert!(is_protected_field(
++                "entry",
++                Some(&NativeAttributes::from([(key.into(), "password".into())]))
++            ));
++        }
++        assert!(is_protected_field(
++            "entry",
++            Some(&NativeAttributes::from([(
++                "protected".into(),
++                "true".into()
++            )]))
++        ));
++    }
++
++    #[test]
++    fn missing_evidence_is_not_complete_and_role_never_invents_search() {
++        let text = field_metadata("search box", None, false, None, false);
++        assert!(!text.value_complete);
++        assert!(!text.name_complete);
++        assert!(!text.attributes_complete);
++        assert!(text.input_type.is_none());
++    }
++}
+--- a/libs/cua-driver/rust/crates/platform-linux/src/browser_consent_ui.rs
++++ b/libs/cua-driver/rust/crates/platform-linux/src/browser_consent_ui.rs
+@@ -15,7 +15,9 @@
+ fn normalized_text(node: &AtspiNode) -> String {
+     [
+         node.name.as_deref(),
+-        node.value.as_deref(),
++        node.value
++            .as_deref()
++            .filter(|_| node.text.value_complete && !node.text.protected),
+         node.description.as_deref(),
+     ]
+     .into_iter()
+@@ -373,6 +375,7 @@
+             enabled: None,
+             selected: None,
+             description: None,
++            text: Default::default(),
+             actions: actions.iter().map(|value| (*value).to_owned()).collect(),
+             element_key: 0,
+             depth: 0,
+--- a/libs/cua-driver/rust/crates/platform-linux/src/browser_setup_ui.rs
++++ b/libs/cua-driver/rust/crates/platform-linux/src/browser_setup_ui.rs
+@@ -20,7 +20,9 @@
+ fn field_equals(node: &AtspiNode, expected: &str) -> bool {
+     [
+         node.name.as_deref(),
+-        node.value.as_deref(),
++        node.value
++            .as_deref()
++            .filter(|_| node.text.value_complete && !node.text.protected),
+         node.description.as_deref(),
+     ]
+     .into_iter()
+@@ -51,6 +53,7 @@
+             && node
+                 .value
+                 .as_deref()
++                .filter(|_| node.text.value_complete && !node.text.protected)
+                 .or(node.name.as_deref())
+                 .is_some_and(|value| value.trim().eq_ignore_ascii_case(descriptor.setup_url))
+     });
+@@ -165,6 +168,7 @@
+ fn omnibox_holds_setup_url(node: &AtspiNode, descriptor: &BrowserSetupDescriptor) -> bool {
+     node.value
+         .as_deref()
++        .filter(|_| node.text.value_complete && !node.text.protected)
+         .or(node.name.as_deref())
+         .is_some_and(|value| value.trim().eq_ignore_ascii_case(descriptor.setup_url))
+ }
+@@ -691,6 +695,10 @@
+             enabled: None,
+             selected: None,
+             description: None,
++            text: crate::atspi::NativeTextObservation {
++                value_complete: value.is_some(),
++                ..Default::default()
++            },
+             actions: actions.iter().map(|value| (*value).to_owned()).collect(),
+             element_key: 0,
+             depth: 0,
+@@ -764,6 +772,14 @@
+     }
+ 
+     #[test]
++    fn incomplete_omnibox_value_cannot_prove_the_setup_url() {
++        let mut candidate = node("entry", "Address and search bar", Some(descriptor().setup_url), &[]);
++        assert!(omnibox_holds_setup_url(&candidate, descriptor()));
++        candidate.text.value_complete = false;
++        assert!(!omnibox_holds_setup_url(&candidate, descriptor()));
++    }
++
++    #[test]
+     fn setup_timeout_explains_linux_renderer_accessibility_precondition() {
+         let message = setup_not_ready_message(descriptor());
+         assert!(message.contains("complete AT-SPI tree"));
+--- a/libs/cua-driver/rust/crates/platform-linux/src/tools/impl_.rs
++++ b/libs/cua-driver/rust/crates/platform-linux/src/tools/impl_.rs
+@@ -578,19 +578,12 @@
+ 
+ /// Build a single structured element entry for `get_window_state`.
+ /// Returns `None` when the node has no `element_index` (non-actionable rows).
+-fn build_element_entry(
++pub(super) fn build_element_entry(
+     n: &crate::atspi::AtspiNode,
+     snapshot_id: Option<u32>,
+     bounds: Option<(i32, i32, u32, u32)>,
+ ) -> Option<serde_json::Value> {
+     let idx = n.element_index?;
+-    // `label` mirrors what a human reading the markdown row would call this
+-    // element: name first, then value, then description.
+-    let label = n
+-        .name
+-        .clone()
+-        .or_else(|| n.value.clone())
+-        .or_else(|| n.description.clone());
+     let mut entry = json!({
+         "element_index": idx,
+         "role": n.role,
+@@ -602,17 +595,43 @@
+     if n.in_web_content {
+         entry["in_web_content"] = json!(true);
+     }
+-    if let Some(label) = label {
+-        entry["label"] = json!(label);
+-    }
+-    // Surface the element's value separately from `label` (which collapses
+-    // name→value→description): a field with both a name AND typed text would
+-    // otherwise hide the text from a caller reading the structured side,
+-    // leaving it only in tree_markdown. See the macOS get_window_state builder
+-    // for the rationale.
+-    if let Some(value) = n.value.clone().filter(|v| !v.is_empty()) {
++    // Accessible names are platform-computed and may come from descendants.
++    // Preserve that observation, but never turn current text or a description
++    // into the editable field's label. Native provenance is published below.
++    if let Some(name) = &n.name {
++        if n.text.name_source != "atspi.Text" {
++            entry["accessible_name"] = json!(name);
++        }
++        let field = n.text.editable == Some(true)
++            || n.text.protected
++            || n.text.value_source.as_deref() == Some("atspi.Text.GetText")
++            || matches!(
++                n.role.as_str(),
++                "entry" | "text" | "password text" | "combo box" | "combobox"
++            );
++        if !field || editable_name_is_label(&n.text.name_source) {
++            entry["label"] = json!(name);
++            entry["label_source"] = json!(n.text.name_source);
++        }
++    }
++    if let Some(description) = &n.description {
++        entry["description"] = json!(description);
++    }
++    if let Some(value) = n.value.as_ref().filter(|_| !n.text.protected) {
+         entry["value"] = json!(value);
+     }
++    if let Value::Object(metadata) = serde_json::to_value(&n.text).expect("native text metadata") {
++        entry.as_object_mut().unwrap().extend(metadata);
++    }
++    entry["input_type_status"] = json!(if n.text.input_type.is_some() {
++        "known"
++    } else if n.text.attributes_complete {
++        "unavailable"
++    } else if n.text.value_status == "not_applicable" {
++        "not_applicable"
++    } else {
++        "read_failure"
++    });
+     if let Some(enabled) = n.enabled {
+         entry["enabled"] = json!(enabled);
+     }
+@@ -635,6 +654,17 @@
+         entry["frame"] = json!({ "x": x, "y": y, "w": w, "h": h });
+     }
+     Some(entry)
++}
++
++fn editable_name_is_label(source: &str) -> bool {
++    // A conservative allowlist of native name provenance. "contents" can be
++    // the adjacent Clear button, while unknown provenance proves no field label.
++    matches!(
++        source,
++        "atspi.name-from:attribute"
++            | "atspi.name-from:relatedElement"
++            | "atspi.name-from:related-element"
++    )
+ }
+ 
+ pub struct GetWindowStateTool {
+@@ -655,11 +685,16 @@
+                 the structured array.\n\n\
+                 PREFERRED CONSUMERS read `structuredContent.elements` (one entry \
+                 per indexed row with `element_index`, `role`, `label`, `value`, \
++                `accessible_name`, native `editable` when known, `value_complete`, \
++                `value_status`, `protected`, and text/label provenance. Empty readable \
++                values are preserved as empty strings. `placeholder` and `description` \
++                are separate; `input_type` is included only from native attributes, \
++                with `input_type_status` explaining missing evidence. \
+                 `enabled`, `selected`, `actions` (names of AT-SPI actions exposed \
+                 by the element, omitted when empty), \
+                 `frame: {x,y,w,h}` when AT-SPI reports usable bounds, \
+                 `parent_index`, `depth`). The markdown `tree_markdown` stays \
+-                available and unchanged in shape for existing text-parsing \
++                available with explicit field provenance and completeness for text-parsing \
+                 callers — but new fields will only be added to the structured \
+                 side. Set `query` to project BOTH representations to matching \
+                 rows plus their ancestor chain while preserving original indices. \
+@@ -1125,6 +1160,7 @@
+             enabled: Some(true),
+             selected: None,
+             description: None,
++            text: Default::default(),
+             actions,
+             element_key: 1,
+             depth: 0,
+@@ -1157,6 +1193,71 @@
+         ]);
+         let entry = build_element_entry(&n, None, None).unwrap();
+         assert_eq!(entry["actions"], json!(["Press", "Open"]));
++    }
++
++    #[test]
++    fn editable_rows_preserve_empty_values_separately_from_names() {
++        let mut n = node(Vec::new());
++        n.role = "entry".into();
++        n.name = Some("Search catalog".into());
++        n.value = Some(String::new());
++        n.description = Some("Choose a query".into());
++        n.text.editable = Some(true);
++        n.text.name_source = "atspi.name-from:attribute".into();
++        n.text.value_complete = true;
++        n.text.value_status = "complete".into();
++        n.text.placeholder = Some("Type here".into());
++        n.text.attributes_complete = true;
++        let entry = build_element_entry(&n, Some(10), None).unwrap();
++        assert_eq!(entry["value"], "");
++        assert_eq!(entry["value_complete"], true);
++        assert_eq!(entry["editable"], true);
++        assert_eq!(entry["accessible_name"], "Search catalog");
++        assert_eq!(entry["label"], "Search catalog");
++        assert_eq!(entry["placeholder"], "Type here");
++        assert_eq!(entry["description"], "Choose a query");
++        assert!(entry.get("input_type").is_none());
++        assert_eq!(entry["input_type_status"], "unavailable");
++    }
++
++    #[test]
++    fn editable_current_value_and_clear_contents_never_become_field_labels() {
++        let mut n = node(Vec::new());
++        n.role = "combo box".into();
++        n.text.editable = Some(true);
++        n.value = Some("Deep House".into());
++        n.description = Some("Query description".into());
++        for (name, source) in [
++            (None, "atspi.name"),
++            (Some("Clear"), "atspi.name-from:contents"),
++            (Some("Clear"), "atspi.name"),
++        ] {
++            n.name = name.map(str::to_owned);
++            n.text.name_source = source.into();
++            let entry = build_element_entry(&n, None, None).unwrap();
++            assert!(entry.get("label").is_none());
++            assert_eq!(entry["value"], "Deep House");
++            assert_eq!(entry.get("accessible_name").and_then(Value::as_str), name);
++        }
++    }
++
++    #[test]
++    fn protected_and_failed_values_do_not_look_like_complete_empty_fields() {
++        let mut n = node(Vec::new());
++        n.value = Some("should never escape".into());
++        n.text.protected = true;
++        n.text.value_complete = false;
++        n.text.value_status = "protected".into();
++        let entry = build_element_entry(&n, None, None).unwrap();
++        assert!(entry.get("value").is_none());
++        assert_eq!(entry["value_complete"], false);
++        assert_eq!(entry["value_status"], "protected");
++        n.value = None;
++        n.text.protected = false;
++        n.text.value_status = "read_failure".into();
++        let entry = build_element_entry(&n, None, None).unwrap();
++        assert!(entry.get("value").is_none());
++        assert_eq!(entry["value_complete"], false);
+     }
+ }
+ 
+@@ -5564,12 +5665,132 @@
+ }
+ static SV_DEF: std::sync::OnceLock<ToolDef> = std::sync::OnceLock::new();
+ 
++/// A blocking native write must see cancellation when its async caller drops.
++struct CancelNativeValueOnDrop(Arc<std::sync::atomic::AtomicBool>);
++
++impl Drop for CancelNativeValueOnDrop {
++    fn drop(&mut self) {
++        self.0.store(true, std::sync::atomic::Ordering::Release);
++    }
++}
++
++fn retain_native_value_lifecycle(
++    args: &Value,
++) -> Result<Option<cua_driver_core::session::SessionDispatchGuard>, String> {
++    use cua_driver_core::session;
++    let Some(owner) = named_session_cursor_key(args) else {
++        return Ok(None);
++    };
++    let transport_owner = args
++        .get("_transport_session_id")
++        .and_then(Value::as_str)
++        .unwrap_or(&owner);
++    let snapshot = session::session_snapshot(&owner, transport_owner, std::time::Duration::ZERO)
++        .ok_or_else(|| "unsupported: admitted session is no longer available".to_owned())?;
++    session::begin_session_dispatch(
++        &owner,
++        snapshot.public_label.as_deref(),
++        transport_owner,
++        snapshot.implicit,
++        snapshot.transport,
++        snapshot.client_kind,
++    )
++    .map(Some)
++    .map_err(str::to_owned)
++}
++
++fn native_set_value_result(result: anyhow::Result<crate::atspi::SetValueOutcome>) -> ToolResult {
++    use cua_driver_core::action_record::{
++        ActionEffect, ActionEvidence, ActionExecutionRecord, ActionTransport, ActualDelivery,
++        EvidenceKind, RequestedDelivery,
++    };
++    let (effect, detail) = match result {
++        Ok(outcome) => (
++            ActionEffect::Confirmed,
++            format!("{}: the retained native target's complete value matched the replacement on fresh readback.", outcome.method),
++        ),
++        Err(error) => {
++            let detail = error.to_string();
++            let uncertain = detail.starts_with("outcome_uncertain:");
++            (if uncertain { ActionEffect::Unverifiable } else { ActionEffect::Refused }, detail)
++        }
++    };
++    let mut record = ActionExecutionRecord::builder(
++        effect,
++        ActionTransport::LinuxAtSpiValue,
++        RequestedDelivery::Background,
++    )
++    .detail(detail.clone());
++    if effect == ActionEffect::Confirmed {
++        record = record
++            .actual_delivery(ActualDelivery::Background)
++            .evidence(ActionEvidence {
++                kind: EvidenceKind::ValueReadback,
++                detail:
++                    "Complete native value readback matched; protected values are never returned."
++                        .into(),
++            });
++    } else if effect == ActionEffect::Unverifiable {
++        record = record.actual_delivery(ActualDelivery::Unknown);
++    }
++    let record = record.build().expect("native replacement action record");
++    let structured =
++        serde_json::to_value(record.public_result().expect("native action projection"))
++            .expect("native action JSON");
++    let result = if effect == ActionEffect::Confirmed {
++        ToolResult::text(detail)
++    } else {
++        ToolResult::error(detail)
++    };
++    result
++        .with_structured(structured)
++        .with_action_record(record)
++}
++
++#[cfg(test)]
++mod native_value_result_tests {
++    use super::*;
++
++    #[test]
++    fn replacement_outcomes_distinguish_proof_refusal_and_uncertainty() {
++        let confirmed = native_set_value_result(Ok(crate::atspi::SetValueOutcome {
++            method: "atspi.EditableText.SetTextContents",
++            effect: "verified",
++        }));
++        assert_ne!(confirmed.is_error, Some(true));
++        assert_eq!(confirmed.structured_content.unwrap()["effect"], "confirmed");
++        let refused = native_set_value_result(Err(anyhow::anyhow!(
++            "unsupported: no replacement interface"
++        )));
++        assert_eq!(refused.is_error, Some(true));
++        let refused = refused.structured_content.unwrap();
++        assert_eq!(refused["effect"], "refused");
++        assert!(refused.get("delivery").is_none_or(Value::is_null));
++        let uncertain = native_set_value_result(Err(anyhow::anyhow!(
++            "outcome_uncertain: acknowledgement timed out"
++        )));
++        assert_eq!(uncertain.is_error, Some(true));
++        let uncertain = uncertain.structured_content.unwrap();
++        assert_eq!(uncertain["effect"], "unverifiable");
++        assert_eq!(uncertain["delivery"]["mode"], "unknown");
++    }
++
++    #[test]
++    fn dropped_native_value_invocation_cancels_the_worker() {
++        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
++        let guard = CancelNativeValueOnDrop(flag.clone());
++        assert!(!flag.load(std::sync::atomic::Ordering::Acquire));
++        drop(guard);
++        assert!(flag.load(std::sync::atomic::Ordering::Acquire));
++    }
++}
++
+ #[async_trait]
+ impl Tool for SetValueTool {
+     fn def(&self) -> &ToolDef {
+         SV_DEF.get_or_init(|| ToolDef {
+             name: "set_value".into(),
+-            description: "Set value of an AT-SPI element via SetValue action.".into(),
++            description: "Replace an exact snapshot-bound element's complete text through native AT-SPI EditableText, or set its numeric Value. Never appends. Unsupported replacement is refused; uncertain delivery is reported without retry. Success requires fresh complete native readback.".into(),
+             input_schema: json!({
+                 "type":"object","required":["pid","value"],"properties":{
+                     "session": cua_driver_core::tool_schema::session_schema(),
+@@ -5649,15 +5870,27 @@
+             true,
+         )
+         .await;
++        let cancellation = Arc::new(std::sync::atomic::AtomicBool::new(false));
++        let _cancel_on_drop = CancelNativeValueOnDrop(cancellation.clone());
++        let lifecycle = match retain_native_value_lifecycle(&args) {
++            Ok(guard) => guard,
++            Err(error) => return native_set_value_result(Err(anyhow::anyhow!(error))),
++        };
+         let result = tokio::task::spawn_blocking({
+             let idx = idx.clone();
+-            move || crate::atspi::set_value(pid, idx.clone(), &value_for_task)
++            move || {
++                // Cancellation drops the async caller first; session cleanup
++                // must still wait until this bounded native worker has exited.
++                let _lifecycle = lifecycle;
++                crate::atspi::native::set_value_with_cancel(pid, idx, &value_for_task, cancellation)
++            }
+         })
+         .await;
+         match result {
+-            Ok(Ok(())) => ToolResult::text(format!("Set value of element [{idx}] to '{value}'.")),
+-            Ok(Err(e)) => ToolResult::error(e.to_string()),
+-            Err(e) => ToolResult::error(format!("Task error: {e}")),
++            Ok(result) => native_set_value_result(result),
++            Err(_) => native_set_value_result(Err(anyhow::anyhow!(
++                "outcome_uncertain: native replacement worker did not return; refresh state before another action"
++            ))),
+         }
+     }
+ }
+--- a/libs/cua-driver/rust/crates/platform-linux/src/tools/page.rs
++++ b/libs/cua-driver/rust/crates/platform-linux/src/tools/page.rs
+@@ -81,16 +81,16 @@
+                 None => true, // safe now — only reached when selector is wildcard
+             })
+             .map(|n| {
+-                let name = n.name.as_deref().unwrap_or("");
+-                let value = n.value.as_deref().unwrap_or("");
+-                let index = n
+-                    .element_index
+-                    .map(|i| format!("[{i}] "))
+-                    .unwrap_or_default();
+-                if value.is_empty() {
+-                    format!("- {index}{} \"{}\"", n.role, name)
++                // Reuse the native observation contract instead of flattening
++                // incomplete text into an apparently complete name/value pair.
++                if let Some(entry) = super::impl_::build_element_entry(n, None, None) {
++                    format!("- {entry}")
+                 } else {
+-                    format!("- {index}{} \"{}\" = \"{}\"", n.role, name, value)
++                    format!(
++                        "- {} accessible_name={}",
++                        n.role,
++                        serde_json::to_string(&n.name).unwrap()
++                    )
+                 }
+             })
+             .collect();
