@@ -56,8 +56,7 @@ installer/updater still assumes Ubuntu; update this port through pacman.
 
 ## Privileges and service model
 
-The package grants no privileges and installs no sudo policy. The service and
-helpers rely on exactly the following:
+The package grants no privileges at installation. On first launch, an interactive terminal explains Docker access and asks for confirmation and administrator authentication. The root-owned authorization helper adds only the invoking account to the docker group and installs a sudo rule for enabling, starting and stopping that account's Workbench service. It refuses root accounts, unexpected arguments, invalid usernames and nonstandard home paths. The service and helpers rely on exactly the following:
 
 - `nvwb-spark@<username>.service` runs as that user (`User=%i`) with `HOME` and
   its working directory under `/home/<username>`; the template requires a home
@@ -88,15 +87,13 @@ under `/etc/sudoers.d/` with mode 0440:
     /usr/bin/systemctl stop nvwb-spark@<username>.service
 ```
 
-The bring-up machine used temporary passwordless sudo instead. Replace that
-with a rule of this shape before treating an installation as more than bring-up.
+Release 15 installs this scoped rule through `/usr/lib/nvwb-spark/authorize` after the first-launch confirmation. It never enables unrestricted passwordless sudo. To revoke it, stop/disable the service as an administrator, remove `/etc/sudoers.d/nvwb-spark-<username>`, and remove the account from the docker group. Restart the session to discard its existing group membership.
 
 ## Configure
 
 Required native components include Docker, NVIDIA Container Toolkit, git,
 git-lfs, pciutils, sudo, Python and PyYAML. The service template currently requires
-a home at `/home/<username>`. Configure Docker GPU access and add the account to
-the docker group before running:
+a home at `/home/<username>`. The Spark ISO registers the NVIDIA Docker runtime. Launch AI Workbench from the application menu to complete account setup. The new process picks up Docker membership without rebooting the desktop. To repeat the user configuration after account authorization, run:
 
 ```sh
 nvwb-spark-setup
