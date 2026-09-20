@@ -178,3 +178,5 @@ The native installation is reported complete only when the measured Git/LFS,
 Docker, GPU/runtime/toolkit and driver capabilities are ready and the native
 service is active. Missing prerequisites keep reconciliation pending; this package
 does not claim that the Debian installer itself ran.
+
+Release 16 initializes an empty project inventory on new accounts. Existing inventory is validated and preserved, and included in setup backups. A clean-account hardware test exposed that the vendor backend reads this file without creating it.

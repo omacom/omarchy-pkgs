@@ -132,6 +132,7 @@ class SetupOrdering(unittest.TestCase):
         self.before = self.snapshot()
         with contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(self.module.main(['--no-start']), 0)
+        self.assertEqual(json.loads((self.base / 'inventory.json').read_text()), [])
         config = yaml.safe_load((self.base / 'config.yaml').read_text())
         self.assertEqual(config['extra'], 'keep')
         self.assertEqual(config['container'], {'runtime': 'docker', 'buildtime': 'docker'})
@@ -151,6 +152,20 @@ class SetupOrdering(unittest.TestCase):
         privileged = [argv for argv in self.calls if argv[0] == '/usr/bin/sudo']
         self.assertEqual(privileged, [['/usr/bin/sudo', '-n', '/usr/bin/systemctl', 'enable', 'nvwb-spark@tester.service']])
         self.assertFalse(any('daemon-reload' in argv for argv in self.calls))
+
+    def test_existing_inventory_is_preserved_and_invalid_inventory_refused(self):
+        inventory = self.base / 'inventory.json'
+        original = '[{"name": "existing-project", "path": "/home/tester/project"}]\n'
+        inventory.write_text(original)
+        self.before = self.snapshot()
+        self.module.main(['--no-start'])
+        self.assertEqual(inventory.read_text(), original)
+        for invalid in ('{}', '{broken', '[1]'):
+            inventory.write_text(invalid)
+            self.before = self.snapshot()
+            with self.assertRaises(SystemExit):
+                self.module.main([])
+            self.assertEqual(self.snapshot(), self.before)
 
     def test_existing_local_context_is_reused_and_service_started(self):
         self.contexts = [{'name': 'local', 'hostname': 'localhost', 'workbenchDir': str(self.base)}]
