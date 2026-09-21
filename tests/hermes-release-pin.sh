@@ -21,4 +21,13 @@ for var in pkgver _commit; do
   fi
 done
 
+# The dependency is what makes pacman install them as a pair, read from the
+# sourced array rather than the text so a comment cannot stand in for it.
+pkgver=$(pkgbuild_var hermes-agent pkgver)
+depends_list=$(cd "$root/pkgbuilds/hermes-desktop" && bash -c 'source PKGBUILD >/dev/null 2>&1; printf "%s\n" "${depends[@]}"')
+if ! grep -qxF "hermes-agent=$pkgver" <<<"$depends_list"; then
+  echo "hermes-desktop must depend on hermes-agent=$pkgver" >&2
+  exit 1
+fi
+
 echo "ok - hermes-agent and hermes-desktop pin the same release"

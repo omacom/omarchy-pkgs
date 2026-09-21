@@ -8,15 +8,12 @@ import subprocess
 import sys
 import tempfile
 
-source, patch_file, launcher = map(Path, sys.argv[1:])
+source, launcher = map(Path, sys.argv[1:])
 with tempfile.TemporaryDirectory(prefix="hermes-runtime-check-") as temporary:
     root = Path(temporary)
     destination = root / "scripts/desktop-update/posix.sh"
     destination.parent.mkdir(parents=True)
     shutil.copyfile(source / "scripts/desktop-update/posix.sh", destination)
-    # Omarchy's installer requires the patch and accepts an upstreamed fix
-    # through its reverse check. Verify that path without changing the release.
-    subprocess.run(["git", "apply", "--reverse", "--check", str(patch_file.resolve())], cwd=root, check=True)
 
     home = root / "home with spaces"
     runtime = home / ".hermes/hermes-agent"
