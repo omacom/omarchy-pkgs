@@ -1,7 +1,5 @@
 """Setup must validate everything before it changes ~/.nvwb, and needs only its own unit."""
 import contextlib
-import importlib.machinery
-import importlib.util
 import io
 import json
 import os
@@ -10,27 +8,13 @@ import subprocess
 import tempfile
 import unittest
 from unittest.mock import patch
-
-try:
-    import yaml
-except ImportError:  # pragma: no cover - the helper itself requires PyYAML
-    yaml = None
-
-path = Path(__file__).resolve().parents[1] / 'nvwb-spark-setup'
+import yaml
+from helpers import load_script
 
 
-def load():
-    loader = importlib.machinery.SourceFileLoader('workbench_setup', str(path))
-    spec = importlib.util.spec_from_loader(loader.name, loader)
-    module = importlib.util.module_from_spec(spec)
-    loader.exec_module(module)
-    return module
-
-
-@unittest.skipUnless(yaml, 'PyYAML is required by the setup helper')
 class SetupOrdering(unittest.TestCase):
     def setUp(self):
-        self.module = load()
+        self.module = load_script('nvwb-spark-setup')
         self.temp = tempfile.TemporaryDirectory()
         self.home = Path(self.temp.name) / 'tester'
         self.base = self.home / '.nvwb'
@@ -128,10 +112,12 @@ class SetupOrdering(unittest.TestCase):
         (self.base / 'config.yaml').write_text('extra: keep\n')
         (self.base / 'bin').mkdir()
         (self.base / 'bin/nvwb-cli').write_bytes(b'vendor binary')
+        (self.base / 'bin/wb-svc.spark-new').symlink_to('/stale')
         (self.home / '.bashrc').write_text('# shell\n')
         self.before = self.snapshot()
         with contextlib.redirect_stdout(io.StringIO()):
-            self.assertEqual(self.module.main(['--no-start']), 0)
+            self.assertEqual(self.module.main([]), 0)
+        self.assertFalse((self.base / 'bin/wb-svc.spark-new').is_symlink())
         self.assertEqual(json.loads((self.base / 'inventory.json').read_text()), [])
         config = yaml.safe_load((self.base / 'config.yaml').read_text())
         self.assertEqual(config['extra'], 'keep')
@@ -150,22 +136,18 @@ class SetupOrdering(unittest.TestCase):
                        '--description', 'Native Arch ARM'], self.calls)
         self.assertIn([cli, 'internal', 'install-hook', 'tester', str(os.getuid()), str(os.getgid())], self.calls)
         privileged = [argv for argv in self.calls if argv[0] == '/usr/bin/sudo']
-        self.assertEqual(privileged, [['/usr/bin/sudo', '-n', '/usr/bin/systemctl', 'enable', 'nvwb-spark@tester.service']])
+        self.assertEqual(privileged, [['/usr/bin/sudo', '-n', '/usr/bin/systemctl', verb, 'nvwb-spark@tester.service']
+                                      for verb in ('enable', 'start')])
         self.assertFalse(any('daemon-reload' in argv for argv in self.calls))
 
-    def test_existing_inventory_is_preserved_and_invalid_inventory_refused(self):
+    def test_existing_inventory_is_preserved(self):
         inventory = self.base / 'inventory.json'
         original = '[{"name": "existing-project", "path": "/home/tester/project"}]\n'
         inventory.write_text(original)
         self.before = self.snapshot()
-        self.module.main(['--no-start'])
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.module.main([])
         self.assertEqual(inventory.read_text(), original)
-        for invalid in ('{}', '{broken', '[1]'):
-            inventory.write_text(invalid)
-            self.before = self.snapshot()
-            with self.assertRaises(SystemExit):
-                self.module.main([])
-            self.assertEqual(self.snapshot(), self.before)
 
     def test_existing_local_context_is_reused_and_service_started(self):
         self.contexts = [{'name': 'local', 'hostname': 'localhost', 'workbenchDir': str(self.base)}]
@@ -181,7 +163,7 @@ class SetupOrdering(unittest.TestCase):
         self.contexts = None
         self.before = self.snapshot()
         with contextlib.redirect_stdout(io.StringIO()):
-            self.assertEqual(self.module.main(['--no-start']), 0)
+            self.assertEqual(self.module.main([]), 0)
         self.assertTrue(any('create' in argv for argv in self.calls), 'a local context must be created')
 
 

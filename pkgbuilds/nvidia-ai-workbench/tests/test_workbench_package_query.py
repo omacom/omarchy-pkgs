@@ -1,21 +1,18 @@
 """The Workbench compatibility query must reflect installed Arch packages only."""
 import contextlib
 import io
-from pathlib import Path
-import runpy
 import subprocess
 import sys
 import unittest
 from unittest.mock import patch
-
-SCRIPT = Path(__file__).resolve().parents[1] / 'dpkg-query'
+from helpers import load_script
 
 
 class PackageQuery(unittest.TestCase):
     def invoke(self, args, result):
         out = io.StringIO()
-        with patch.object(sys, 'argv', [str(SCRIPT), *args]), patch('subprocess.run', return_value=result) as run, contextlib.redirect_stdout(out):
-            runpy.run_path(str(SCRIPT), run_name='__main__')
+        with patch.object(sys, 'argv', ['dpkg-query', *args]), patch('subprocess.run', return_value=result) as run, contextlib.redirect_stdout(out):
+            load_script('dpkg-query')
         return out.getvalue(), run
 
     def test_installed_status_comes_from_pacman(self):

@@ -1,18 +1,12 @@
 """Keep genuine driver/CUDA values while accommodating the vendor's old parser."""
-import importlib.machinery
-import importlib.util
-from pathlib import Path
+import contextlib
+import io
 import subprocess
 import unittest
 from unittest.mock import patch
-import contextlib
-import io
+from helpers import load_script
 
-path = Path(__file__).resolve().parents[1] / 'nvidia-smi'
-loader = importlib.machinery.SourceFileLoader('smi_adapter', str(path))
-spec = importlib.util.spec_from_loader(loader.name, loader)
-module = importlib.util.module_from_spec(spec)
-loader.exec_module(module)
+module = load_script('nvidia-smi')
 
 
 class VersionCompatibility(unittest.TestCase):

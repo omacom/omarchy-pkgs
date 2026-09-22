@@ -1,16 +1,10 @@
 """Authorization cannot select another account or grant arbitrary service control."""
-import importlib.machinery
-import importlib.util
-from pathlib import Path
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
+from helpers import load_script
 
-path = Path(__file__).resolve().parents[1] / 'nvwb-spark-authorize'
-loader = importlib.machinery.SourceFileLoader('authorize', str(path))
-spec = importlib.util.spec_from_loader(loader.name, loader)
-module = importlib.util.module_from_spec(spec)
-loader.exec_module(module)
+module = load_script('nvwb-spark-authorize')
 
 
 class Authorization(unittest.TestCase):
