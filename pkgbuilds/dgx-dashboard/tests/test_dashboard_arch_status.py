@@ -1,23 +1,28 @@
-import importlib.machinery
-import importlib.util
 from pathlib import Path
 import subprocess
 import tempfile
 import unittest
 from unittest.mock import patch
-
-path = Path(__file__).resolve().parents[1] / 'arch-package-status'
-loader = importlib.machinery.SourceFileLoader('dashboard_arch', str(path))
-spec = importlib.util.spec_from_loader(loader.name, loader)
-m = importlib.util.module_from_spec(spec)
-loader.exec_module(m)
+from helpers import load_script
+m = load_script('arch-package-status')
 
 class DashboardStatus(unittest.TestCase):
-    def test_no_update_candidates_do_not_scan_repository_metadata(self):
-        with patch.object(m, 'run') as command, patch.object(m.tarfile, 'open') as archive:
-            m.metadata(Path('/unused'), [])
+    def test_no_update_candidates_do_not_query_repository_metadata(self):
+        with patch.object(m, 'run') as command:
+            m.metadata([], [], Path('/unused'))
         command.assert_not_called()
-        archive.assert_not_called()
+
+    def test_repository_metadata_matches_candidates(self):
+        rows = m.parse_updates(subprocess.CompletedProcess([], 0, 'example 1:2.0-1 -> 1:2.1-2\n', ''))
+        output = 'example 1:2.1-2 extra aarch64 4096 An example with spaces\n'
+        with patch.object(m, 'run', return_value=subprocess.CompletedProcess([], 0, output, '')):
+            m.metadata(rows, [], Path('/unused'))
+        self.assertEqual((rows[0]['repository'], rows[0]['size'], rows[0]['description']),
+                         ('extra', 4096, 'An example with spaces'))
+        for output in ('', 'example 1:2.0-1 extra aarch64 4096 Stale\n', 'example 1:2.1-2 extra aarch64 unknown\n'):
+            with patch.object(m, 'run', return_value=subprocess.CompletedProcess([], 0, output, '')):
+                with self.assertRaises(RuntimeError):
+                    m.metadata([dict(r) for r in rows], [], Path('/unused'))
 
     def test_empty_query_and_failure_are_distinct(self):
         self.assertEqual(m.parse_updates(subprocess.CompletedProcess([], 1, '', '')), [])
