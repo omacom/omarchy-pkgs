@@ -1,0 +1,131 @@
+#!/bin/bash
+
+_dtb="/boot/dtbs/qcom/x1e80100-dell-inspiron-14-plus-7441.dtb"
+_dtbo="/usr/lib/dell-inspiron-7441-backlight/dell-inspiron-7441-backlight.dtbo"
+_state_dir="/var/lib/dell-inspiron-7441-backlight"
+_panel="/soc@0/display-subsystem@ae00000/displayport-controller@aea0000/aux-bus/panel"
+
+_sha256() {
+  local hash_output
+
+  hash_output=$(sha256sum "$1") || return
+  printf '%s\n' "${hash_output%% *}"
+}
+
+# True when the DTB on disk is exactly the one this package last wrote.
+_is_our_patch() {
+  local recorded actual
+
+  [[ -f $_state_dir/stock.dtb && -f $_state_dir/patched.sha256 ]] || return 1
+  recorded=$(<"$_state_dir/patched.sha256")
+  actual=$(_sha256 "$_dtb") || return 1
+  [[ $actual == "$recorded" ]]
+}
+
+_has_backlight() {
+  fdtget "$1" "$_panel" backlight >/dev/null 2>&1
+}
+
+_forget_state() {
+  rm -f -- "$_state_dir/stock.dtb" "$_state_dir/patched.sha256"
+}
+
+_rebuild_boot_images() {
+  local output status
+
+  if command -v limine-mkinitcpio >/dev/null 2>&1; then
+    output=$(limine-mkinitcpio 2>&1)
+    status=$?
+    [[ -z $output ]] || printf '%s\n' "$output"
+
+    (( status == 0 )) || return "$status"
+    [[ $output != *"ERROR:"* ]] || return 1
+  elif command -v mkinitcpio >/dev/null 2>&1; then
+    mkinitcpio -P
+  else
+    printf ':: Unable to rebuild boot images: install mkinitcpio and rebuild before rebooting.\n' >&2
+    return 1
+  fi
+}
+
+apply_backlight_overlay() {
+  local source_dtb tmp
+
+  if [[ ! -f $_dtb ]]; then
+    printf ':: %s is not installed; nothing to patch.\n' "$_dtb"
+    return 0
+  fi
+
+  if _is_our_patch; then
+    # Re-derive from the saved stock DTB so a newer overlay replaces the old one.
+    source_dtb="$_state_dir/stock.dtb"
+  elif _has_backlight "$_dtb"; then
+    printf ':: The installed device tree already wires a panel backlight; leaving it unchanged.\n'
+    _forget_state
+    return 0
+  else
+    source_dtb="$_dtb"
+  fi
+
+  tmp=$(mktemp "$_dtb.XXXXXX") || return
+  if ! fdtoverlay -i "$source_dtb" -o "$tmp" "$_dtbo" || ! _has_backlight "$tmp"; then
+    rm -f -- "$tmp"
+    printf ':: Unable to apply the PWM backlight overlay to %s.\n' "$_dtb" >&2
+    return 1
+  fi
+  chmod 644 "$tmp"
+
+  if [[ $source_dtb == "$_dtb" ]]; then
+    if ! install -Dm644 "$_dtb" "$_state_dir/stock.dtb"; then
+      rm -f -- "$tmp"
+      return 1
+    fi
+  fi
+
+  if ! mv -f -- "$tmp" "$_dtb"; then
+    rm -f -- "$tmp"
+    return 1
+  fi
+  _sha256 "$_dtb" >"$_state_dir/patched.sha256" || return
+  printf ':: Enabled the PWM backlight in %s.\n' "$_dtb"
+}
+
+restore_stock_dtb() {
+  local tmp
+
+  if [[ -f $_dtb ]] && _is_our_patch; then
+    tmp=$(mktemp "$_dtb.XXXXXX") || return
+    if ! cp -- "$_state_dir/stock.dtb" "$tmp" || ! chmod 644 "$tmp" || ! mv -f -- "$tmp" "$_dtb"; then
+      rm -f -- "$tmp"
+      printf ':: Unable to restore the stock device tree to %s.\n' "$_dtb" >&2
+      return 1
+    fi
+    printf ':: Restored the stock device tree in %s.\n' "$_dtb"
+  fi
+
+  _forget_state
+  rmdir -- "$_state_dir" 2>/dev/null || true
+}
+
+if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
+  if (( EUID != 0 )); then
+    printf ':: Run dell-inspiron-7441-backlight-apply as root.\n' >&2
+    exit 1
+  fi
+
+  case ${1:-} in
+    '')
+      apply_backlight_overlay && _rebuild_boot_images
+      ;;
+    --no-rebuild)
+      apply_backlight_overlay
+      ;;
+    --restore)
+      restore_stock_dtb && _rebuild_boot_images
+      ;;
+    *)
+      printf 'Usage: dell-inspiron-7441-backlight-apply [--no-rebuild|--restore]\n' >&2
+      exit 2
+      ;;
+  esac
+fi
