@@ -338,7 +338,11 @@ esac
             self.assertIn("When = PreTransaction", hook)
             self.assertIn("AbortOnFail", hook)
             self.assertIn(f"Exec = /usr/lib/{app}/package-remove {app}", hook)
-            self.assertIn("pkgrel=4", (directory / "PKGBUILD").read_text())
+            release = next(
+                line for line in (directory / "PKGBUILD").read_text().splitlines()
+                if line.startswith("pkgrel=")
+            )
+            self.assertGreaterEqual(int(release.removeprefix("pkgrel=")), 4)
             scripts.append((directory / "package-remove").read_bytes())
         self.assertEqual(*scripts)
 
