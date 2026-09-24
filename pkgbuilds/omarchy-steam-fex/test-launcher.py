@@ -199,11 +199,11 @@ class SteamLauncherTests(unittest.TestCase):
         self.assert_fex(self.run_launcher(), ['-cef-force-occlusion'], [])
         self.assertEqual(path.read_text(), ORIGINAL)
 
-    def test_ready_launch_patches_and_keeps_updates_enabled(self):
+    def test_ready_launch_patches_and_keeps_update_checks_enabled(self):
         path = self.chunk()
         self.client_ready()
         args = ['steam://open/main']
-        self.assert_fex(self.run_launcher(*args), ['-cef-force-occlusion'], args)
+        self.assert_fex(self.run_launcher(*args), ['-cef-force-occlusion', '-noverifyfiles'], args)
         self.assertIn('m_bIsConnectedToANetwork=!0', path.read_text())
         self.assert_desktop()
 
