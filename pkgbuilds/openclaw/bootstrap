@@ -1,0 +1,324 @@
+#!/bin/bash
+set -euo pipefail
+
+# OpenClaw's updater owns the npm package here. Pacman supplies the system
+# Node/npm runtime and this integration, independently of application releases.
+prefix="${HOME:?HOME must be set}/.local/share/openclaw/runtime"
+runtime="$prefix/lib/node_modules/openclaw/openclaw.mjs"
+marker="$prefix/.omarchy-managed"
+node_bin=/usr/bin
+# Match upstream OpenClaw's native user-unit location.
+unit_dir="$HOME/.config/systemd/user"
+dropin_name=50-omarchy-runtime.conf
+dropin_marker='# Managed by Omarchy OpenClaw runtime integration.'
+
+fail() { printf 'OpenClaw: %s\n' "$*" >&2; exit 1; }
+
+owned() {
+    [[ ! -L "$prefix" && -f "$marker" && ! -L "$marker" ]] &&
+        [[ $(cat "$marker") == omarchy-openclaw-runtime-v1 ]]
+}
+
+ready() {
+    owned && [[ ! -e "$prefix/.bootstrap-incomplete" && -f "$runtime" && -f "${runtime%/*}/package.json" ]]
+}
+
+user_only() {
+    (( EUID != 0 )) || fail 'Run this command as your desktop user, without sudo.'
+}
+
+lock() {
+    mkdir -p "${prefix%/*}"
+    exec 9>"${prefix%/*}/.runtime.lock"
+    flock 9
+}
+
+check() {
+    ready || return 1
+    node_environment || return 1
+    "$node_bin/node" "$runtime" --version
+}
+
+node_environment() {
+    [[ -x "$node_bin/node" && -x "$node_bin/npm" ]] || return 1
+    # npm uses env node; both it and child processes must select system Node
+    # even when the calling shell has a version manager ahead of /usr/bin.
+    export PATH="$node_bin:$PATH"
+}
+
+managed_dropin() {
+    [[ -f "$1" && ! -L "$1" ]] && [[ $(head -n 1 "$1") == "$dropin_marker" ]]
+}
+
+check_dropins() {
+    local service file dropin
+    for service in openclaw-gateway openclaw-node; do
+        file="$unit_dir/$service.service"
+        if [[ -e "$file" || -L "$file" ]]; then
+            native_unit "$file" || fail "Existing $service service is custom or belongs to another installation; migrate it explicitly before installing."
+        fi
+        [[ ! -L "$unit_dir/$service.service.d" ]] || fail "Refusing symlinked $service service settings."
+        for dropin in "$unit_dir/$service.service.d/"*.conf; do
+            [[ -e "$dropin" || -L "$dropin" ]] || continue
+            [[ ! -L "$dropin" ]] || fail "Refusing symlinked service settings at $dropin."
+            if grep -Eq '^[[:space:]]*ExecStart[[:space:]]*=' "$dropin"; then
+                fail "Custom ExecStart override at $dropin must be migrated explicitly."
+            fi
+        done
+        file="$unit_dir/$service.service.d/$dropin_name"
+        if [[ -e "$file" || -L "$file" ]]; then
+            managed_dropin "$file" || fail "Refusing to overwrite unmanaged service settings at $file."
+        fi
+    done
+}
+
+native_unit() {
+    local file=$1 line start='' count=0 package entry token rest
+    local command_pattern='^ExecStart=("([^"\\]|\\.)*"|[^[:space:]"\\]+)[[:space:]]+(.*)$'
+    local heap_pattern='^--(max-old-space-size|max-old-space-size-percentage|max-heap-size)=[0-9]+([.][0-9]+)?[[:space:]]+(.*)$'
+    [[ -f "$file" && ! -L "$file" ]] || return 1
+    grep -Eq '^Environment="?OPENCLAW_SERVICE_MARKER=openclaw"?$' "$file" || return 1
+    while IFS= read -r line; do
+        if [[ "$line" == ExecStart=* ]]; then
+            start=$line
+            ((count += 1))
+        fi
+    done <"$file"
+    (( count == 1 )) && [[ "$start" =~ $command_pattern ]] || return 1
+    token=${BASH_REMATCH[1]}
+    rest=${BASH_REMATCH[3]}
+    [[ "$token" == */node || "$token" == */node\" ]] || return 1
+    # Upstream canonicalizes retained heap controls before the entrypoint.
+    # Refuse arbitrary flags such as --eval or --require.
+    while [[ "$rest" =~ $heap_pattern ]]; do
+        rest=${BASH_REMATCH[3]}
+    done
+    for package in /usr/lib/node_modules/openclaw "$prefix/lib/node_modules/openclaw"; do
+        if [[ "$package" == "$prefix/"* ]] && ! owned; then
+            continue
+        fi
+        for entry in "$package/dist/index.js" "$package/dist/entry.js" "$package/openclaw.mjs"; do
+            # The native renderer doubles systemd specifiers, then quotes
+            # whitespace, double quotes and backslashes. Match without evaluation.
+            entry=${entry//%/%%}
+            if [[ "$entry" == *[[:space:]\"\\]* ]]; then
+                entry=${entry//\\/\\\\}
+                entry=${entry//\"/\\\"}
+                entry="\"$entry\""
+            fi
+            [[ "$rest" == "$entry" || "$rest" == "$entry "* ]] && return 0
+        done
+    done
+    return 1
+}
+
+systemd_escape() {
+    local value=$1
+    value=${value//\\/\\\\}
+    value=${value//\"/\\\"}
+    value=${value//%/%%}
+    [[ "$value" != *$'\n'* && "$value" != *$'\r'* ]] || fail 'Service paths cannot contain newlines.'
+    printf '%s' "$value"
+}
+
+service_environment() {
+    local service dir file temporary path_value prefix_value
+    local restart_changed=${1:-false}
+    local -a changed=()
+    path_value=$(systemd_escape "$node_bin:$HOME/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/sbin:/bin")
+    prefix_value=$(systemd_escape "$prefix")
+    for service in openclaw-gateway openclaw-node; do
+        # Upstream fingerprints native unit artifacts during publication. A
+        # drop-in created before the first main unit makes that install fail.
+        [[ -f "$unit_dir/$service.service" ]] || continue
+        dir="$unit_dir/$service.service.d"
+        file="$dir/$dropin_name"
+        mkdir -p "$dir"
+        temporary=$(mktemp "$dir/.omarchy-runtime.XXXXXX")
+        printf '%s\n' "$dropin_marker" '[Service]' \
+            "Environment=\"PATH=$path_value\"" \
+            "Environment=\"npm_config_prefix=$prefix_value\"" \
+            'UnsetEnvironment=NPM_CONFIG_PREFIX OPENCLAW_WRAPPER' >"$temporary"
+        if [[ -f "$file" ]] && cmp -s -- "$temporary" "$file"; then
+            rm -- "$temporary"
+            continue
+        fi
+        chmod 644 "$temporary"
+        mv -f -- "$temporary" "$file"
+        changed+=("$service.service")
+    done
+    (( ${#changed[@]} )) || return 0
+    # A cold installation may not have a user manager yet. The files are read
+    # when that manager starts, and the installer reloads before binding units.
+    systemctl --user daemon-reload >/dev/null 2>&1 || true
+    if [[ "$restart_changed" == true ]]; then
+        for service in "${changed[@]}"; do
+            # A newly installed running service must inherit npm's prefix.
+            # Do not activate services the user stopped or disabled.
+            if systemctl --user is-enabled --quiet "$service" &&
+                systemctl --user is-active --quiet "$service"; then
+                systemctl --user try-restart "$service"
+            fi
+        done
+    fi
+}
+
+run_lifecycle() {
+    local child status=0 signal_status=0 cleanup_status
+    # Keep stdin attached for interactive onboarding. Signals sent to the
+    # launcher must reach the actual CLI before we inspect its completed unit.
+    # Bash otherwise starts asynchronous commands with SIGINT ignored.
+    env --default-signal=INT,QUIT "$node_bin/node" "$runtime" "$@" <&0 &
+    child=$!
+    trap 'signal_status=143; kill -TERM "$child" 2>/dev/null || true' TERM
+    trap 'signal_status=130; kill -INT "$child" 2>/dev/null || true' INT
+    trap 'signal_status=129; kill -HUP "$child" 2>/dev/null || true' HUP
+    while true; do
+        if wait "$child"; then status=0; else status=$?; fi
+        # A trapped signal interrupts wait while the CLI may still be writing
+        # its service. Reap it fully before touching any service artifact.
+        kill -0 "$child" 2>/dev/null || break
+    done
+    trap - TERM INT HUP
+    (( signal_status == 0 )) || status=$signal_status
+    set +e
+    (
+        set -e
+        lock
+        check_dropins
+        service_environment true
+    )
+    cleanup_status=$?
+    set -e
+    if (( cleanup_status != 0 )); then
+        printf 'OpenClaw: service environment setup failed; rerun /usr/lib/openclaw/bootstrap --install.\n' >&2
+        (( status != 0 )) || status=$cleanup_status
+    fi
+    return "$status"
+}
+
+lifecycle_command() {
+    local argument
+    local -a command_args=()
+    # Classify the command without removing root options from the real argv.
+    # Named profiles/dev use different native unit names and remain separate
+    # from Omarchy's default gateway/node service integration.
+    while (( $# )); do
+        case "$1" in
+            --no-color) shift ;;
+            --log-level) (( $# >= 2 )) || return 1; shift 2 ;;
+            --log-level=*) shift ;;
+            --profile)
+                [[ ${2:-} == default ]] || return 1
+                shift 2
+                ;;
+            --profile=default) shift ;;
+            --profile=*|--dev|--container|--container=*|--help|-h|--version|-V) return 1 ;;
+            --) shift; command_args+=("$@"); break ;;
+            *) command_args+=("$1"); shift ;;
+        esac
+    done
+    set -- "${command_args[@]}"
+    if [[ ${1:-} == dashboard ]]; then
+        # JSON probes never install a gateway; interactive/--yes dashboard can.
+        for argument in "$@"; do
+            [[ "$argument" == --json ]] && return 1
+        done
+        return 0
+    fi
+    case "${1:-} ${2:-}" in
+        'update status'|'update --help') return 1 ;;
+        'onboard '*|'configure '*|'setup '*|'doctor '*|'update '*|\
+        'gateway install'|'node install'|'daemon install') return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+install_runtime() {
+    local version=${1-latest}
+    # Allow release tags and exact versions, never arbitrary npm specs.
+    [[ "$version" =~ ^[A-Za-z0-9][A-Za-z0-9.+-]*$ ]] || fail 'Invalid OpenClaw version or release tag.'
+    check_dropins
+    lock
+    check_dropins
+    if [[ -e "$prefix" || -L "$prefix" ]]; then
+        owned || fail "Refusing to modify an unmanaged installation at $prefix."
+    else
+        mkdir -p "$prefix"
+        printf '%s\n' omarchy-openclaw-runtime-v1 >"$marker"
+    fi
+    # Reinstalling the integration must never downgrade a self-updated app.
+    node_environment || fail 'System Node or npm is missing. Reinstall the nodejs and npm packages.'
+    if ready; then
+        check
+    else
+        touch "$prefix/.bootstrap-incomplete"
+        "$node_bin/npm" install --global --prefix "$prefix" \
+            --allow-scripts=openclaw "openclaw@$version"
+        "$node_bin/node" "$runtime" --version ||
+            fail 'The runtime did not pass its version check; rerun installation to repair it.'
+        rm -- "$prefix/.bootstrap-incomplete"
+    fi
+    service_environment
+    flock -u 9
+    exec 9>&-
+}
+
+export SHARP_IGNORE_GLOBAL_LIBVIPS=1
+# Upstream must see its real npm package path to detect update ownership.
+unset OPENCLAW_WRAPPER
+# Keep npm discovery and the global update target aligned with the runtime.
+export npm_config_prefix="$prefix"
+unset NPM_CONFIG_PREFIX
+
+case "${1:-}" in
+    --prefix)
+        (( $# == 1 )) || fail 'Unexpected arguments.'
+        printf '%s\n' "$prefix"
+        ;;
+    --check)
+        (( $# == 1 )) || fail 'Unexpected arguments.'
+        user_only
+        check
+        ;;
+    --install)
+        (( $# <= 2 )) || fail 'Usage: bootstrap --install [version]'
+        user_only
+        install_runtime "${2-latest}"
+        ;;
+    --remove)
+        (( $# == 1 )) || fail 'Unexpected arguments.'
+        user_only
+        lock
+        if [[ -e "$prefix" || -L "$prefix" ]]; then
+            owned || fail "Refusing to remove an unmanaged installation at $prefix."
+            rm -rf -- "$prefix"
+        fi
+        for service in openclaw-gateway openclaw-node; do
+            file="$unit_dir/$service.service.d/$dropin_name"
+            if managed_dropin "$file"; then
+                rm -- "$file"
+                rmdir -- "${file%/*}" 2>/dev/null || true
+            fi
+        done
+        systemctl --user daemon-reload >/dev/null 2>&1 || true
+        ;;
+    --run)
+        shift
+        user_only
+        if ! ready; then
+            install_runtime >&2
+        fi
+        node_environment ||
+            fail 'System Node or npm is missing. Reinstall the nodejs and npm packages.'
+        # Only service-changing commands perform postflight. Status/dashboard
+        # polling during onboarding must not race upstream unit publication.
+        if lifecycle_command "$@"; then
+            check_dropins
+            run_lifecycle "$@"
+        else
+            exec "$node_bin/node" "$runtime" "$@"
+        fi
+        ;;
+    *) fail 'Usage: bootstrap --check | --install [version] | --remove | --prefix' ;;
+esac
