@@ -75,10 +75,9 @@ def with_hermes_node_path(env=None):
     cli.write_text(forbidden)
     cli.chmod(0o755)
     (cli.parent / "python").symlink_to(sys.executable)
-    for command in ("sudo", "omarchy-install-hermes-cli"):
-        target = mock_bin / command
-        target.write_text(forbidden if command == "sudo" else '#!/bin/bash\nexit 0\n')
-        target.chmod(0o755)
+    sudo = mock_bin / "sudo"
+    sudo.write_text(forbidden)
+    sudo.chmod(0o755)
 
     output = root / "launch.json"
     forbidden_output = root / "forbidden"

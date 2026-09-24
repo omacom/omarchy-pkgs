@@ -4,11 +4,6 @@ set -euo pipefail
 unset ELECTRON_RUN_AS_NODE PYTHONPATH PYTHONHOME
 export HERMES_DESKTOP_IGNORE_EXISTING=1
 
-# Reconcile direct package installs and interrupted Omarchy setup as well.
-if command -v omarchy-install-hermes-cli >/dev/null 2>&1; then
-  omarchy-install-hermes-cli >/dev/null 2>&1 || true
-fi
-
 hermes_home=$(realpath -ms -- "${HERMES_HOME:-$HOME/.hermes}")
 parent=${hermes_home%/*}
 if [[ ${parent##*/} == [Pp][Rr][Oo][Ff][Ii][Ll][Ee][Ss] ]]; then
