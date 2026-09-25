@@ -48,8 +48,63 @@ pkgrel to 1, but the complete epoch:pkgver-pkgrel must still increase.
 
 GitHub releases exclude drafts and prereleases unless `allow_prerelease` is true.
 Existing `min_release_age` policies apply: a feed without a verifiable publication
-time cannot bypass a configured hold. Git branch watches derive a commit count
-and date from the actual branch history and write an immutable source pin.
+time cannot bypass a configured hold.
+
+## Branch watches
+
+A `git_branch` watch treats every commit on a branch as a release and writes an
+immutable pin (`"_commit": "{commit}"`) so the recipe never carries a moving
+`#branch=` source; `tests/pinned-sources.sh` enforces that. The clone is bare,
+blobless and single-branch, read only with git, and shared by every package
+that watches the same branch in one run, so two recipes pinned from it always
+see the same commit. Values available to `version`:
+
+- `{date}` (default), `{count}` (commits on the branch), `{commit}`
+  (`{commit:.7}` for the short form)
+- with `tag_pattern` (a regular expression with a named `version` group,
+  matched against whole tags): `{tag}`, `{version}` from that tag, and
+  `{distance}`, the number of commits past it. Only tags in the pinned
+  commit's own history count, so a release cut on another branch is ignored.
+
+`{version}.r{distance}.g{commit:.7}` gives `1.21.0.r15.gabc1234`, which pacman
+orders above the `1.21.0` release it follows and below `1.21.1`; `omasnap-git`
+uses it. The Omarchy dev pair uses `{version}.r{count}.g{commit:.7}` instead
+because its published history counted every commit and the number must never
+go down.
+
+`min_release_age` holds a branch tip until its commit timestamp is old enough.
+A fresh tip leaves the existing pin alone; the watch never walks backward to
+an older commit. This uses Git's committer date, not the time a commit was
+pushed. `BYPASS_MIN_RELEASE_AGE=1` bypasses the hold.
+
+Packages marked `"auto_merge": true` ride the unattended lane
+(`track-branches.yml`) instead of the reviewed sync PR: their bump PR is opened
+and auto-merged as soon as the build checks pass. `bin/sync-upstream --lane
+reviewed|auto-merge|all` selects a lane; the scheduled workflows each pass their
+own. Packages that pin the same branch move in lockstep: if one of them fails
+to update, the run restores the others and reports the group as failed. A
+targeted sync includes the other packages watching that branch, so requesting
+only `omarchy-dev` also updates `omarchy-settings-dev`.
+
+### Enable unattended branch updates
+
+The schedule already runs in GitHub Actions; no server cron job is needed.
+It uses a personal access token so its PRs trigger builds and its merges trigger
+publishing without manual approval. No GitHub App is required.
+
+1. Use a fine-grained PAT with access to **omacom/omarchy-pkgs** and repository
+   **Contents: Read and write** and **Pull requests: Read and write** permissions.
+   Its owner must be trusted by the build workflow (for example, a collaborator).
+   The existing controller PAT can be reused when it has these permissions.
+2. In the repository's
+   [Actions secrets](https://github.com/omacom/omarchy-pkgs/settings/secrets/actions),
+   save the PAT as `PKGS_BOT_TOKEN`. Update this secret when the token is rotated
+   or expires. The built-in Actions `GITHUB_TOKEN` cannot run this unattended chain.
+3. Keep **Allow auto-merge** enabled and require `result`, `self-tests`, and
+   `build-isolation` on `master`; the tracker does not request a protection bypass.
+4. After merging the tracker, run **Track upstream branches** once from Actions
+   to verify that its PR builds, auto-merges, and starts **Publish merged packages**.
+   Subsequent runs happen every two hours.
 
 Checksums retain their algorithms (SHA256, SHA512, BLAKE2, etc.) and source order.
 Changed git sources are hashed with makepkg's git-archive convention. Unchanged
@@ -131,6 +186,8 @@ in `origin` and has no effect on release selection.
 | `localsend` | github | [localsend/localsend](https://github.com/localsend/localsend) |
 | `localsend-bin` | github | [localsend/localsend](https://github.com/localsend/localsend) |
 | `macbook12-spi-driver-dkms` | git_branch | [https://github.com/marc-git/macbook12-spi-driver.git](https://github.com/marc-git/macbook12-spi-driver.git) |
+| `omarchy-dev`, `omarchy-settings-dev` | git_branch (auto-merge) | [https://github.com/basecamp/omarchy.git](https://github.com/basecamp/omarchy.git) `quattro` |
+| `omasnap-git` | git_branch (auto-merge) | [https://github.com/omacom/omasnap.git](https://github.com/omacom/omasnap.git) `main` |
 | `makima-bin` | github | [cyber-sushi/makima](https://github.com/cyber-sushi/makima) |
 | `minecraft-launcher` | archive | [https://launcher.mojang.com/download/Minecraft.deb](https://launcher.mojang.com/download/Minecraft.deb) |
 | `nautilus-dropbox` | github | [dropbox/nautilus-dropbox](https://github.com/dropbox/nautilus-dropbox) |

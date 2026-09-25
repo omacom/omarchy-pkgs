@@ -23,6 +23,14 @@ The filesystem no longer encodes release policy. Instead:
   (`OMARCHY_RC_PINS=1`, which `omarchy-release rc` sets) may build it for rc — master's
   shipped pins can never overwrite an in-flight RC. The dev pair
   (`omarchy-dev`, `omarchy-settings-dev`) is pinned to `edge`
+- packages that follow a moving upstream branch (the dev pair on `quattro`,
+  `omasnap-git` on `main`) still pin an exact commit in their PKGBUILD. A
+  `git_branch` upstream watch moves that pin, and `"auto_merge": true` puts the
+  package on the unattended lane: `track-branches.yml` opens the bump PR every
+  two hours and auto-merges it once the build checks pass, so a branch tip
+  reaches the edge channel without anyone clicking. No PKGBUILD may carry an
+  unpinned git source (`tests/pinned-sources.sh`); a branch that has to be
+  followed gets a watch, not a `#branch=` fragment
 - Omarchy owns every checked-in recipe; upstream watches update release metadata without replacing packaging or architecture support
 - packages can opt out of unscoped builds with `skip_build`; explicit `--package` builds remain available
 - packages follow direct upstream watches/providers in `.omarchy/package.json`, or a custom `.omarchy/upstream.sh` hook
@@ -719,6 +727,7 @@ Fields:
 - `upstream`: optional direct release watch (see [Upstream watches](docs/upstream-sources.md)), or an existing GitHub, git-tag, npm, or Debian provider. GitHub architecture assets may be a string or an ordered array, and can be combined with disjoint versioned `sources` — see [Sync Upstream Releases](#sync-upstream-releases). Mutually exclusive with `.omarchy/upstream.sh`.
 - `min_release_age`: optional quarantine for upstream releases (`"24h"`, `"2d"`, or bare seconds). The newest release older than the window ships; anything younger waits, and a release whose age cannot be proven fails the sync. Bypass deliberately with `BYPASS_MIN_RELEASE_AGE=1 bin/sync-upstream <package>`.
 - `sync`: `false` records an existing manual maintenance hold. Held packages have no upstream watch/provider/hook and are excluded from automatic updates.
+- `auto_merge`: optional boolean; defaults to `false`. `true` moves the package's upstream updates from the reviewed 6-hourly sync PR to the unattended lane: `track-branches.yml` opens its bump PR and auto-merges it when CI is green. Meant for packages that follow a moving branch through a `git_branch` watch, where every tip is a release and there is nothing for a reviewer to read. Requires an upstream watch, provider, or hook.
 - `origin`: optional historical import provenance, with `aur` (package name) and `commit`. It does not control updates.
 - `release_ring`: optional. `fast` means the package is built directly for stable as well as edge, with the artifacts replicated into rc for parity. Packages without a ring build in edge and reach stable through the pipeline (`bin/repo advance`).
 - `channels`: optional array bounding where the package may be built (`edge`, `rc`, `stable`). Without the key a package is a member of every channel and follows the default build rules above; `bin/repo advance` refuses to carry a package anywhere it isn't a member.
@@ -880,8 +889,17 @@ The repository includes GitHub workflows and systemd services for automated rele
 
 #### GitHub Workflows
 
-1. **sync-upstream.yml** (Every 6 hours): Watches direct upstream feeds and updates owned recipes. Successful package updates reach a PR even if another feed fails; failed recipes stay untouched and the workflow remains red.
+1. **sync-upstream.yml** (Every 6 hours): Watches direct upstream feeds and updates owned recipes on the reviewed lane. Successful package updates reach a PR even if another feed fails; failed recipes stay untouched and the workflow remains red.
 2. **sync-rebuilds.yml** (Every 6 hours): Bumps pkgrel for packages whose `rebuild_on` dependencies have moved in the official repositories and opens a PR.
+3. **track-branches.yml** (Every 2 hours): The unattended lane. Pins every `"auto_merge": true` package to the tip of its watched branch once its commit timestamp clears `min_release_age`, opens one PR for all of them, and enables auto-merge. Packages pinned from the same branch move together or not at all, including targeted syncs. The PR builds like any other; a tip that fails to build stays an open red PR until the next tick supersedes it.
+
+The tracking PR and auto-merge use the PAT stored in `PKGS_BOT_TOKEN`, with
+Contents and Pull requests write access to this repository and an owner trusted
+to trigger builds. The existing controller PAT can be reused. No GitHub App is
+required. The built-in Actions `GITHUB_TOKEN` cannot drive the unattended
+build-and-publish chain, so the tracker requires this secret before it runs.
+The reviewed sync workflows continue to use `GITHUB_TOKEN` and require
+maintainer approval as before. See [setup instructions](docs/upstream-sources.md#enable-unattended-branch-updates).
 
 To approve builds for an unvouched contributor's PR, apply **`build-approved`**.
 Until approval, the PR shows **Awaiting build approval** and its required

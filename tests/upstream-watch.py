@@ -178,6 +178,160 @@ b2sums=('old' 'local-b2')
         expected = subprocess.check_output(['git', '-c', 'core.abbrev=no', '-C', str(repo), 'archive', '--format', 'tar', 'v1.0'])
         self.assertEqual(archive.read_bytes(), expected)
 
+    def branch_fixture(self, fresh_tip=False):
+        """An upstream with two release tags and commits past the newest one,
+        all committed years ago; with fresh_tip, one more commit dated now."""
+        repo = self.root / 'branch-upstream'
+        repo.mkdir()
+        git = ['git', '-C', str(repo), '-c', 'user.name=Test', '-c', 'user.email=test@example.test']
+        old = {**os.environ, 'GIT_COMMITTER_DATE': '2020-01-01T00:00:00+00:00', 'GIT_AUTHOR_DATE': '2020-01-01T00:00:00+00:00'}
+        subprocess.run(['git', 'init', '-q', '-b', 'main', str(repo)], check=True)
+        shas = []
+        def commit(index, env):
+            (repo / 'source').write_text(f'revision {index}')
+            subprocess.run([*git, 'add', '.'], check=True)
+            subprocess.run([*git, 'commit', '-qm', f'commit {index}'], env=env, check=True)
+            shas.append(subprocess.check_output([*git, 'rev-parse', 'HEAD'], text=True).strip())
+        for index, tag in enumerate([None, 'v1.0.0', 'v1.1.0', None, None]):
+            commit(index, old)
+            if tag:
+                subprocess.run([*git, 'tag', tag], check=True)
+        # A newer release tagged on another branch is not something main is "past".
+        subprocess.run([*git, 'checkout', '-q', '-b', 'hotfix', shas[1]], check=True)
+        (repo / 'hotfix').write_text('x')
+        subprocess.run([*git, 'add', '.'], check=True)
+        subprocess.run([*git, 'commit', '-qm', 'hotfix'], env=old, check=True)
+        subprocess.run([*git, 'tag', 'v9.9.9'], check=True)
+        subprocess.run([*git, 'checkout', '-q', 'main'], check=True)
+        if fresh_tip:
+            commit(len(shas), os.environ)
+        return repo, shas
+
+    def redirect_clone(self, repo):
+        command = w.subprocess.run
+        def redirect(args, **kwargs):
+            if 'clone' in args:
+                args = [f'file://{repo}' if arg == 'https://example.test/tool.git' else arg for arg in args]
+            return command(args, **kwargs)
+        return patch.object(w.subprocess, 'run', side_effect=redirect)
+
+    def test_git_branch_versions_from_reachable_tag_and_shares_one_clone(self):
+        repo, shas = self.branch_fixture()
+        with self.redirect_clone(repo):
+            tip = w.git_branch_tip('https://example.test/tool.git', 'main', r'v(?P<version>[0-9.]+)', self.fetch.cache)
+            again = w.git_branch_tip('https://example.test/tool.git', 'main', None, self.fetch.cache)
+        self.assertEqual((tip['commit'], tip['tag'], tip['version'], tip['distance'], tip['count']), (shas[-1], 'v1.1.0', '1.1.0', '2', '5'))
+        self.assertEqual(again['commit'], shas[-1])
+        self.assertEqual(len(list(self.fetch.cache.glob('*.branch.git'))), 1, 'one clone per branch per run')
+        watch = {'git_branch': 'https://example.test/tool.git', 'branch': 'main', 'tag_pattern': r'v(?P<version>[0-9.]+)',
+                 'version': '{version}.r{distance}.g{commit:.7}', 'variables': {'_commit': '{commit}'}}
+        pkgver = w.candidate(watch, tip)['pkgver']
+        self.assertEqual(pkgver, f'1.1.0.r2.g{shas[-1][:7]}')
+        self.assertEqual(w.vercmp(pkgver, '1.1.0'), 1)
+        self.assertEqual(w.vercmp(pkgver, '1.1.1'), -1)
+        with self.redirect_clone(repo), self.assertRaisesRegex(ValueError, 'no tag'):
+            w.git_branch_tip('https://example.test/tool.git', 'main', r'release-(?P<version>[0-9.]+)', self.root / 'other-cache')
+
+    def test_git_branch_min_age_holds_the_tip_instead_of_selecting_history(self):
+        repo, shas = self.branch_fixture(fresh_tip=True)
+        watch = {'git_branch': 'https://example.test/tool.git', 'branch': 'main'}
+        with self.redirect_clone(repo):
+            releases = w.discover(watch, self.fetch)
+        self.assertEqual(w.select_release(releases)['values']['commit'], shas[-1])
+        self.assertIsNone(w.select_release(releases, min_age=3600))
+        self.assertEqual(w.select_release(releases, min_age=3600, bypass=True)['values']['commit'], shas[-1])
+
+    def branch_sync_fixture(self):
+        repo, shas = self.branch_fixture()
+        for directory in ['bin', 'helpers']:
+            shutil.copytree(ROOT / directory, self.root / directory)
+        for name in ['dev', 'settings-dev']:
+            package = self.root / 'pkgbuilds' / name
+            (package / '.omarchy').mkdir(parents=True)
+            (package / '.omarchy/package.json').write_text(json.dumps({
+                'source': 'local', 'auto_merge': True, 'upstream': {'watch': {
+                    'git_branch': 'https://example.test/tool.git', 'branch': 'main',
+                    'tag_pattern': r'v(?P<version>[0-9.]+)',
+                    'version': '{version}.r{count}.g{commit:.7}',
+                    'variables': {'_commit': '{commit}'}}}}))
+            (package / 'PKGBUILD').write_text(f'''pkgname={name}
+pkgver=1.0.0
+pkgrel=1
+_commit={shas[1]}
+arch=('any')
+source=("tool::git+https://example.test/tool.git#commit=${{_commit}}")
+sha256sums=('old')
+''')
+        stub = self.root / 'stub'
+        stub.mkdir()
+        git = stub / 'git'
+        git.write_text('''#!/usr/bin/env python3
+import os, sys
+args = [os.environ['BRANCH_FIXTURE'] if arg == 'https://example.test/tool.git' else arg for arg in sys.argv[1:]]
+os.execv(os.environ['REAL_GIT'], ['git', *args])
+''')
+        git.chmod(0o755)
+        env = {**os.environ, 'PATH': str(stub) + os.pathsep + os.environ['PATH'],
+               'BRANCH_FIXTURE': f'file://{repo}', 'REAL_GIT': shutil.which('git')}
+        def sync(*args):
+            return subprocess.run([str(self.root / 'bin/sync-upstream'), *args],
+                                  env=env, text=True, capture_output=True)
+        return self.root / 'pkgbuilds', shas[-1], sync
+
+    def test_targeted_branch_sync_updates_siblings_and_then_noops(self):
+        packages, tip, sync = self.branch_sync_fixture()
+        result = sync('--lane', 'auto-merge', 'dev')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        for package in packages.iterdir():
+            recipe = w.read_recipe(package / 'PKGBUILD')
+            self.assertEqual(w.scalar(recipe, '_commit'), tip)
+            self.assertEqual(w.scalar(recipe, 'pkgver'), f'1.1.0.r5.g{tip[:7]}')
+            self.assertRegex(recipe['sha256sums'][0], r'^[0-9a-f]{64}$')
+        self.assertIn('Updated: 2', result.stdout)
+        result = sync('--lane', 'auto-merge', 'dev')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('Updated: 0', result.stdout)
+
+    def test_branch_sync_rolls_back_when_a_sibling_fails(self):
+        packages, tip, sync = self.branch_sync_fixture()
+        broken = packages / 'settings-dev/PKGBUILD'
+        broken.write_text(broken.read_text().replace("sha256sums=('old')", 'sha256sums=()'))
+        before = {p: p.read_bytes() for p in packages.glob('*/PKGBUILD')}
+        result = sync('--lane', 'auto-merge', 'dev')
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn('Lockstep violation', result.stdout + result.stderr)
+        self.assertIn('Updated: 0', result.stdout)
+        self.assertEqual(before, {p: p.read_bytes() for p in before})
+
+    def test_reviewed_lane_leaves_auto_merge_packages_untouched(self):
+        packages, tip, sync = self.branch_sync_fixture()
+        before = {p: p.read_bytes() for p in packages.glob('*/PKGBUILD')}
+        result = sync('--lane', 'reviewed')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('Updated: 0', result.stdout)
+        self.assertEqual(before, {p: p.read_bytes() for p in before})
+
+    def test_different_lanes_cannot_split_a_branch_pair(self):
+        packages, tip, sync = self.branch_sync_fixture()
+        metadata = packages / 'settings-dev/.omarchy/package.json'
+        metadata.write_text(metadata.read_text().replace('"auto_merge": true', '"auto_merge": false'))
+        before = {p: p.read_bytes() for p in packages.glob('*/PKGBUILD')}
+        result = sync('--lane', 'auto-merge', 'dev')
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn('Lockstep violation', result.stdout + result.stderr)
+        self.assertEqual(before, {p: p.read_bytes() for p in before})
+
+    def test_git_branch_tag_template_requires_tag_pattern(self):
+        base = {'git_branch': 'https://example.test/tool.git', 'branch': 'main'}
+        w.validate({**base, 'version': '{date}.r{count}'})
+        w.validate({**base, 'tag_pattern': r'v(?P<version>[0-9.]+)', 'version': '{version}.r{distance}.g{commit:.7}'})
+        for extra in [{'version': '{version}.r{distance}'}, {'version': '{tag}'}, {'tag_pattern': 'v[0-9.]+'},
+                      {'tag_pattern': 7}, {'tag_pattern': ''}]:
+            with self.subTest(extra=extra), self.assertRaises(ValueError):
+                w.validate({**base, **extra})
+        with self.assertRaisesRegex(ValueError, 'only applies'):
+            w.validate({'github': 'owner/tool', 'pattern': r'v(?P<version>[0-9.]+)', 'tag_pattern': r'v(?P<version>[0-9.]+)'})
+
     def test_invalid_optional_metadata_fails_validation(self):
         valid = {'github': 'owner/tool', 'pattern': r'v(?P<version>[0-9.]+)'}
         for extra in [{'variables': []}, {'fields': {'commit': 3}}, {'submodules': {'pkgver': 'libs/common'}},

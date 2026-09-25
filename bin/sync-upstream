@@ -12,6 +12,7 @@ trap 'rm -rf "$TEMP_DIR"' EXIT
 export UPSTREAM_CACHE_DIR="$TEMP_DIR/watch-cache"
 
 SPECIFIC_PACKAGES=()
+LANE=all
 
 usage() {
   cat <<EOF
@@ -49,6 +50,14 @@ the bypass, so the resulting change still goes through a reviewed PR.
 Arguments:
   PACKAGE    One or more package names to update (optional)
 
+Options:
+  --lane <reviewed|auto-merge|all>
+             Which delivery lane to sync (default: all). Packages marked
+             "auto_merge": true ride the unattended lane (the branch tracker
+             opens and auto-merges their PR); everything else is reviewed.
+             The scheduled workflows each pass their own lane so a moving
+             branch tip never waits on a vendor release, or the reverse.
+
 Commands:
   self-test  Run the offline fixture tests for release selection, the
              quarantine backstop, and metadata parsing
@@ -64,6 +73,14 @@ while [[ $# -gt 0 ]]; do
     -h|--help)
       usage
       exit 0
+      ;;
+    --lane)
+      LANE="${2:-}"
+      case "$LANE" in
+        reviewed|auto-merge|all) ;;
+        *) print_error "Invalid --lane '$LANE' (expected reviewed, auto-merge, or all)"; exit 1 ;;
+      esac
+      shift 2
       ;;
     --*)
       print_error "Unknown option: $1"
@@ -1014,16 +1031,100 @@ if [[ ${#SPECIFIC_PACKAGES[@]} -gt 0 && "${SPECIFIC_PACKAGES[0]}" == "self-test"
   exit 0
 fi
 
+# Packages that pin the same upstream branch move together or not at all.
+# The watch reads one shared clone per run, so they only disagree when one
+# package's update failed after the tip was chosen (a checksum fetch, say).
+# Leaving the other one advanced would ship omarchy-dev and
+# omarchy-settings-dev from different commits, which is exactly the skew the
+# release pair's lockstep guard exists to prevent. Restore the packages that
+# moved and count the group as failed; the next run tries again.
+declare -A BEFORE_SYNC=()
+
+snapshot_package() {
+  local package="$1" pkgbuild="$PKGBUILDS_DIR/$1/PKGBUILD"
+  [[ -f "$pkgbuild" ]] || return 0
+  mkdir -p "$TEMP_DIR/before"
+  cp "$pkgbuild" "$TEMP_DIR/before/$package"
+  BEFORE_SYNC["$package"]=1
+}
+
+branch_watch_key() {
+  local package_dir="$1"
+  jq -r '
+    (.upstream.watch? | objects | select(has("git_branch")))
+    | "\(.git_branch)#\(.branch)"
+  ' "$package_dir/.omarchy/package.json" 2>/dev/null
+}
+
+enforce_branch_lockstep() {
+  local package key
+  declare -A groups=()
+  for package in "${!BEFORE_SYNC[@]}"; do
+    key=$(branch_watch_key "$PKGBUILDS_DIR/$package")
+    [[ -n "$key" ]] || continue
+    groups["$key"]+="$package "
+  done
+  for key in "${!groups[@]}"; do
+    local members commits pin
+    read -r -a members <<<"${groups[$key]}"
+    (( ${#members[@]} > 1 )) || continue
+    commits=$(for package in "${members[@]}"; do
+      pin=$(grep -m1 -E '^_commit=' "$PKGBUILDS_DIR/$package/PKGBUILD" | cut -d= -f2- | tr -d "\"'" || true)
+      printf '%s\n' "${pin:-missing:$package}"
+    done | sort -u | grep -c .)
+    (( commits > 1 )) || continue
+    print_error "Lockstep violation on $key: ${members[*]} pin different commits; restoring all of them"
+    for package in "${members[@]}"; do
+      if ! cmp -s "$TEMP_DIR/before/$package" "$PKGBUILDS_DIR/$package/PKGBUILD"; then
+        cp "$TEMP_DIR/before/$package" "$PKGBUILDS_DIR/$package/PKGBUILD"
+        # Not ((--UPDATED)): an arithmetic command that evaluates to zero
+        # returns 1, and under errexit that would end the run right here.
+        UPDATED=$((UPDATED > 0 ? UPDATED - 1 : 0))
+      fi
+    done
+    ((++FAILED))
+  done
+}
+
+sync_in_lane() {
+  local package="$1" package_dir="$PKGBUILDS_DIR/$1"
+  snapshot_package "$package"
+  if [[ -d "$package_dir" ]] && ! package_in_lane "$package_dir" "$LANE"; then
+    print_info "Skipping $package: not in the $LANE lane"
+    ((++SKIPPED))
+    return 0
+  fi
+  sync_package "$package"
+}
+
 if [[ ${#SPECIFIC_PACKAGES[@]} -gt 0 ]]; then
   SPECIFIC_MODE=true
+  # A targeted run is still a branch update: include every sibling watching
+  # the same branch, otherwise the lockstep check never sees the omitted one.
+  declare -A selected=() selected_branches=()
   for package in "${SPECIFIC_PACKAGES[@]}"; do
-    sync_package "$package"
+    selected["$package"]=1
+    key=$(branch_watch_key "$PKGBUILDS_DIR/$package" || true)
+    [[ -z "$key" ]] || selected_branches["$key"]=1
+  done
+  for package_dir in "$PKGBUILDS_DIR"/*; do
+    [[ -f "$package_dir/PKGBUILD" ]] || continue
+    package=${package_dir##*/}
+    [[ -z "${selected[$package]:-}" ]] || continue
+    key=$(branch_watch_key "$package_dir" || true)
+    if [[ -n "$key" && -n "${selected_branches[$key]:-}" ]]; then
+      SPECIFIC_PACKAGES+=("$package")
+    fi
+  done
+  for package in "${SPECIFIC_PACKAGES[@]}"; do
+    sync_in_lane "$package"
   done
 else
   while IFS= read -r package; do
-    sync_package "$package"
+    sync_in_lane "$package"
   done < <(packages_for_upstream_sync)
 fi
+enforce_branch_lockstep
 
 echo ""
 if [[ $FAILED -gt 0 ]]; then
