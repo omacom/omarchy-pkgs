@@ -1,5 +1,5 @@
 #!/bin/bash
-# Run the omarchy-settings recipes' package() against synthetic source trees:
+# Run the omarchy-settings recipe's package() against synthetic source trees:
 # an older source keeps today's per-architecture package, and a source that
 # selects its platform profile at runtime ships the same files, backup and
 # optdepends on aarch64 as on x86_64.
@@ -138,9 +138,9 @@ in_list() {
 }
 
 make_source "$scratch/legacy"
-make_source "$scratch/profile" default/settings-runtime-profile "$keyboard_unit"
+make_source "$scratch/profile" default/settings-runtime-profile "$keyboard_unit" etc/mkinitcpio.conf.d/00-omarchy-hooks.conf
 
-for recipe in omarchy-settings omarchy-settings-dev; do
+for recipe in omarchy-settings; do
   rm -rf "${scratch:?}"/legacy-* "${scratch:?}"/profile-*
   # An older source keeps the per-architecture package it has always had.
   package_as "$recipe" "$scratch/legacy" x86_64 legacy-x86_64 pinned
@@ -183,10 +183,12 @@ for recipe in omarchy-settings omarchy-settings-dev; do
     fail 'runtime-profile source backs up the same files on both architectures'
   cmp -s "$scratch/profile-x86_64.optdepends" "$scratch/profile-aarch64.optdepends" ||
     fail 'runtime-profile source has the same optdepends on both architectures'
+  in_list etc/mkinitcpio.conf.d/00-omarchy-hooks.conf "$scratch/profile-x86_64.backup" ||
+    fail 'the HOOKS baseline drop-in is backed up where the source has it'
   in_list usr/lib/systemd/user/omarchy-brightness-keyboard-auto.service "$scratch/profile-aarch64.files" ||
     fail 'the keyboard unit first-run enables ships when the source has it'
   comm -13 "$scratch/legacy-x86_64.files" "$scratch/profile-x86_64.files" >"$scratch/added"
-  [[ $(cat "$scratch/added") == "$(printf '%s\n' usr/lib/systemd/user/omarchy-brightness-keyboard-auto.service usr/share/omarchy/default/settings-runtime-profile "usr/share/omarchy/$keyboard_unit" | sort)" ]] ||
-    fail 'x86_64 gains only the keyboard unit and the marker from a runtime-profile source' "$(cat "$scratch/added")"
+  [[ $(cat "$scratch/added") == "$(printf '%s\n' usr/lib/systemd/user/omarchy-brightness-keyboard-auto.service usr/share/omarchy/default/settings-runtime-profile "usr/share/omarchy/$keyboard_unit" etc/mkinitcpio.conf.d/00-omarchy-hooks.conf | sort)" ]] ||
+    fail 'x86_64 gains only the new source files from a runtime-profile source' "$(cat "$scratch/added")"
   echo "PASS: $recipe: a runtime-profile source ships the full set on aarch64"
 done
