@@ -3,14 +3,16 @@ _pkgname="limine-entry-tool"
 pkgname="limine-mkinitcpio-hook"
 _gradle_version=9.7.1
 pkgver=1.39.0
-pkgrel=1
+pkgrel=2
 pkgdesc="Install kernels for the Limine bootloader."
 arch=('x86_64' 'aarch64')
 url="https://gitlab.com/Zesko/limine-entry-tool"
 source=("${_pkgname}::git+${url}.git#tag=${pkgver}")
 source_x86_64=("https://github.com/graalvm/graalvm-ce-builds/releases/download/graal-25.2.4/graalvm-community-jdk-25i2-25.0.4_linux-x64_bin.tar.gz")
 source_aarch64=("https://github.com/graalvm/graalvm-ce-builds/releases/download/graal-25.2.4/graalvm-community-jdk-25i2-25.0.4_linux-aarch64_bin.tar.gz"
-	"https://services.gradle.org/distributions/gradle-${_gradle_version}-bin.zip")
+	"https://services.gradle.org/distributions/gradle-${_gradle_version}-bin.zip"
+	"limine-apple-gate"
+	"mkinitcpio-install.hook")
 license=("GPL3")
 provides=('limine-entry-tool')
 options=(!debug !strip)
@@ -34,7 +36,9 @@ conflicts=('limine-entry-tool')
 sha256sums=('6c4affb6fb6367a1222f7d0c54957a3142781d7894bbf61b1a274bd153e5d869')
 sha256sums_x86_64=('3f4a89de8eaa96f2ed677f09957c7e872cd8467aad3537f8b5394c1b8c4b942e')
 sha256sums_aarch64=('22286f7ecd21b9aedb3226b9bf797469e1bd3eefc491e12ef3dd49b452d230b7'
-	'acd53f1edaf02f1a8ff99879f8a34b302661a057d9b063ae9e35b552f804d20a')
+	'acd53f1edaf02f1a8ff99879f8a34b302661a057d9b063ae9e35b552f804d20a'
+	'199fa2122e4a20ed80e6cf5df235b4e50739593803522bfa65700b1ef242b9ce'
+	'9fc607e81d2f09aa0dfd313805277af92977535bd222f1e86caf5fbb28138cb4')
 
 prepare() {
 	[[ -d "${_graalvm_version}" ]] && rm -rf "${_graalvm_version}"
@@ -77,4 +81,58 @@ package() {
 	# limine hook symlinks
 	ln -sf /usr/bin/limine-reset-enroll "$pkgdir/etc/boot/hooks/pre.d/10-limine-reset-enroll"
 	ln -sf /usr/bin/limine-enroll-config "$pkgdir/etc/boot/hooks/post.d/90-limine-enroll-config"
+
+	if [[ $CARCH == aarch64 ]]; then
+		_apple_silicon_hooks
+	fi
+}
+
+# An Apple Silicon Mac boots GRUB until Omarchy activates Limine, and keeps
+# the kernel and initramfs that mkinitcpio's presets install under /boot
+# after that too (GRUB, the boot check and the snapshot tools read them).
+# The aarch64 hooks and mkinitcpio wrapper run through limine-apple-gate,
+# which leaves every other machine as upstream ships it. On a Mac:
+# - Limine's kernel and removal hooks wait until Limine is active;
+# - mkinitcpio's own kernel hook, which Limine's takes over by name, runs from
+#   a copy of mkinitcpio 42's (mkinitcpio-install.hook: keep its triggers in
+#   step with mkinitcpio's), just before Limine's;
+# - Limine's EFI deploy hook stays out: omarchy-mac-boot puts Limine in
+#   U-Boot's EFI/BOOT/BOOTAA64.EFI slot;
+# - the wrapper is plain mkinitcpio: it would run limine-mkinitcpio after
+#   every preset build, mkinitcpio's kernel hook included.
+_apple_silicon_hooks() {
+	local scripts=/usr/share/libalpm/scripts
+	local gate=$scripts/limine-apple-gate
+	local hooks="$pkgdir/usr/share/libalpm/hooks"
+	local kernel_hook="$pkgdir/etc/pacman.d/hooks/90-mkinitcpio-install.hook"
+	local mac_hook="$hooks/90-mkinitcpio-apple-install.hook"
+	local wrapper="$pkgdir/usr/local/bin/mkinitcpio"
+
+	install -Dm755 "$srcdir/limine-apple-gate" "$pkgdir$gate"
+	install -Dm644 "$srcdir/mkinitcpio-install.hook" "$mac_hook"
+	sed -i -e 's|^Description = .*|Description = Updating linux initcpios under /boot (Apple Silicon)...|' \
+		-e "s|^Exec = $scripts/mkinitcpio install\$|Exec = $gate --mac $scripts/mkinitcpio install|" "$mac_hook"
+	sed -i "s|^Exec = $scripts/limine-mkinitcpio-|Exec = $gate $scripts/limine-mkinitcpio-|" \
+		"$kernel_hook" "$hooks/60-limine-mkinitcpio-remove-pre.hook" "$hooks/90-limine-mkinitcpio-remove-post.hook"
+	sed -i "s|^Exec = /usr/bin/limine-install\$|Exec = $gate --not-mac /usr/bin/limine-install|" "$hooks/80-limine-efi-deploy.hook"
+	sed -i "1a $gate --mac \\&\\& exec /usr/bin/mkinitcpio \"\$@\"" "$wrapper"
+
+	local expected=(
+		"$mac_hook|Exec = $gate --mac $scripts/mkinitcpio install"
+		"$kernel_hook|Exec = $gate $scripts/limine-mkinitcpio-install"
+		"$hooks/60-limine-mkinitcpio-remove-pre.hook|Exec = $gate $scripts/limine-mkinitcpio-remove pre"
+		"$hooks/90-limine-mkinitcpio-remove-post.hook|Exec = $gate $scripts/limine-mkinitcpio-remove post"
+		"$hooks/80-limine-efi-deploy.hook|Exec = $gate --not-mac /usr/bin/limine-install"
+	)
+	local entry
+	for entry in "${expected[@]}"; do
+		[[ $(grep '^Exec = ' "${entry%%|*}") == "${entry#*|}" ]] || {
+			echo "${entry%%|*}: expected '${entry#*|}'" >&2
+			return 1
+		}
+	done
+	[[ $(sed -n 1,2p "$wrapper") == $'#!/usr/bin/env bash\n'"$gate --mac && exec /usr/bin/mkinitcpio \"\$@\"" ]] || {
+		echo "the mkinitcpio wrapper does not start with the Apple Silicon gate" >&2
+		return 1
+	}
 }
