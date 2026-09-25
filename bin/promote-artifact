@@ -1,0 +1,349 @@
+#!/bin/bash
+# Promote published packages from one channel to the next inside the remote
+# repository, for one architecture, and undo such a promotion.
+#
+#   promote-artifact --from <edge|rc> --to <rc|stable> --arch <arch> --package <names...>
+#                    [--expect-sha256 <digest>] [--dry-run] [--remote <remote>]
+#   promote-artifact --withdraw --to <channel> --arch <arch> --package <names...> [--dry-run]
+#   promote-artifact --reinstate --to <channel> --arch <arch> --file <filenames...> [--dry-run]
+#
+# bin/advance-channel promotes from the repository host's own tree, but
+# publish.yml publishes merged packages straight to the remote from a CI
+# builder, so those files never reach the host. This works on the remote,
+# the way a merge does.
+#
+# Promote
+#   1. read the source channel's database from the remote
+#   2. take each named package's entry there (a split package by its pkgbase)
+#      and refuse one whose recipe may not move into the target channel
+#      (package_moves_to_channel, the rule advance-channel applies)
+#   3. with --expect-sha256, refuse unless those entries are the qualified
+#      set: the sha256 of their sorted "name version filename sha256" lines
+#   4. refuse to move a package backwards or over other bytes of its version
+#   5. download the files, check each against the source database, publish
+#      them with bin/publish-artifact --mirror <to>, and check the target now
+#      holds exactly its earlier entries with those replaced or added
+#
+# Withdraw drops entries from a channel's database (repo-remove); reinstate
+# publishes a file the channel still holds back into its database, over a
+# newer entry. Together they undo a promotion, which prints the exact
+# commands. Files are never deleted: published filenames are immutable.
+#
+# Nothing is rebuilt, and only <to>/<arch> changes. --dry-run stops before any
+# upload and also accepts a public URL (https://pkgs.omarchy.org) as the remote.
+set -euo pipefail
+BUILD_ROOT=$(realpath "${BASH_SOURCE[0]%/*}/..")
+source "$BUILD_ROOT/helpers/message-helpers.sh"
+source "$BUILD_ROOT/helpers/paths.sh"
+source "$BUILD_ROOT/helpers/package-metadata.sh"
+
+REMOTE=${REMOTE:-pkgs.omarchy.org:omarchy-pkgs}
+PREFIX=${OMARCHY_PUBLISH_PREFIX:-}
+MODE=promote
+FROM=""
+TO=""
+TARGET_ARCH=""
+EXPECT=""
+DRY_RUN=false
+PACKAGES=()
+FILES=()
+while [[ $# -gt 0 ]]; do
+  case $1 in
+  --from) FROM=$2; shift 2 ;;
+  --to) TO=$2; require_valid_mirror "$TO"; shift 2 ;;
+  --arch) TARGET_ARCH=$2; require_valid_arch "$TARGET_ARCH"; shift 2 ;;
+  --remote) REMOTE=$2; shift 2 ;;
+  --expect-sha256) EXPECT=$2; shift 2 ;;
+  --withdraw) MODE=withdraw; shift ;;
+  --reinstate) MODE=reinstate; shift ;;
+  --dry-run) DRY_RUN=true; shift ;;
+  --package)
+    shift
+    while [[ $# -gt 0 && $1 != --* ]]; do PACKAGES+=("$1"); shift; done
+    ;;
+  --file)
+    shift
+    while [[ $# -gt 0 && $1 != --* ]]; do FILES+=("$1"); shift; done
+    ;;
+  -h | --help) sed -n '2,34p' "$0"; exit 0 ;;
+  *) print_error "Unknown option: $1"; exit 1 ;;
+  esac
+done
+
+case $MODE in
+promote)
+  case "$FROM->$TO" in
+  "edge->rc" | "rc->stable") ;;
+  *) print_error "Refusing $FROM -> $TO: promotion moves edge -> rc or rc -> stable"; exit 1 ;;
+  esac
+  (( ${#PACKAGES[@]} && ! ${#FILES[@]} )) || { print_error "Promotion takes --package names"; exit 1; }
+  ;;
+withdraw)
+  [[ -z $FROM && -z $EXPECT ]] && (( ${#PACKAGES[@]} && ! ${#FILES[@]} )) ||
+    { print_error "--withdraw takes --to, --arch and --package"; exit 1; }
+  ;;
+reinstate)
+  [[ -z $FROM && -z $EXPECT ]] && (( ${#FILES[@]} && ! ${#PACKAGES[@]} )) ||
+    { print_error "--reinstate takes --to, --arch and --file"; exit 1; }
+  ;;
+esac
+[[ -n $TO ]] || { print_error "--to is required"; exit 1; }
+[[ -n $TARGET_ARCH ]] || { print_error "--arch is required: one architecture at a time"; exit 1; }
+ARCH=$TARGET_ARCH
+for name in "${PACKAGES[@]}"; do
+  [[ $name =~ ^[a-z0-9@_+][a-z0-9@._+-]*$ ]] || { print_error "Not a package name: $name"; exit 1; }
+done
+for file in "${FILES[@]}"; do
+  [[ $file =~ ^[A-Za-z0-9@_+][A-Za-z0-9@._+:-]*\.pkg\.tar\.[a-z0-9]+$ ]] || { print_error "Not a package filename: $file"; exit 1; }
+done
+[[ -z $EXPECT || $EXPECT =~ ^[0-9a-f]{64}$ ]] || { print_error "--expect-sha256 must be a sha256"; exit 1; }
+URL_REMOTE=false
+[[ $REMOTE == http://* || $REMOTE == https://* ]] && URL_REMOTE=true
+if [[ $URL_REMOTE == true && $DRY_RUN != true ]]; then
+  print_error "A URL is read-only; changing a channel needs an rclone remote"
+  exit 1
+fi
+command -v vercmp >/dev/null || { print_error "vercmp (pacman) is required"; exit 1; }
+
+slot() { echo "$REMOTE/${PREFIX:+$PREFIX/}$1/$ARCH"; }
+WORK=$(mktemp -d)
+trap 'rm -rf "$WORK"' EXIT
+
+# fetch_db <mirror> <dir>: the channel's omarchy.db.tar.zst (and, from an
+# rclone remote, its listing and omarchy.files.tar.zst) into <dir>. Returns 1
+# when the channel has no database yet. Every other failure exits: an
+# unreadable channel is never an empty one.
+fetch_db() {
+  local mirror=$1 dir=$2 code listing
+  mkdir -p "$dir"
+  if [[ $URL_REMOTE == true ]]; then
+    code=$(curl -sS -L -H 'Cache-Control: no-cache' -o "$dir/omarchy.db.tar.zst" -w '%{http_code}' \
+      "$(slot "$mirror")/omarchy.db.tar.zst?$(date +%s)$RANDOM") || { print_error "Cannot read $(slot "$mirror")"; exit 1; }
+    case $code in
+    200) return 0 ;;
+    404) rm -f "$dir/omarchy.db.tar.zst"; return 1 ;;
+    *) print_error "Cannot read $(slot "$mirror")/omarchy.db.tar.zst (HTTP $code)"; exit 1 ;;
+    esac
+  fi
+  if ! listing=$(rclone lsf "$(slot "$mirror")/" --s3-no-head 2>&1); then
+    grep -q 'directory not found' <<<"$listing" && return 1
+    print_error "Cannot read $(slot "$mirror"): $listing"
+    exit 1
+  fi
+  printf '%s\n' "$listing" >"$dir/listing"
+  grep -qx 'omarchy.db.tar.zst' <<<"$listing" || return 1
+  rclone copyto "$(slot "$mirror")/omarchy.db.tar.zst" "$dir/omarchy.db.tar.zst" --s3-no-head ||
+    { print_error "Cannot download $(slot "$mirror")/omarchy.db.tar.zst"; exit 1; }
+  if grep -qx 'omarchy.files.tar.zst' <<<"$listing"; then
+    rclone copyto "$(slot "$mirror")/omarchy.files.tar.zst" "$dir/omarchy.files.tar.zst" --s3-no-head ||
+      { print_error "Cannot download $(slot "$mirror")/omarchy.files.tar.zst"; exit 1; }
+  fi
+}
+
+# db_entries <db>: name, base, version, filename, sha256 per entry (tabs).
+db_entries() {
+  local dir
+  [[ -s $1 ]] || return 0
+  dir=$(mktemp -d "$WORK/db.XXXXXX")
+  bsdtar -xf "$1" -C "$dir" || { print_error "Cannot read $1"; exit 1; }
+  find "$dir" -name desc -type f -exec awk '
+    function emit() { if (name != "") printf "%s\t%s\t%s\t%s\t%s\n", name, (base == "" ? name : base), version, filename, sha; name = base = version = filename = sha = "" }
+    FNR == 1 { emit() }
+    /^%NAME%$/ { getline; name = $0; next }
+    /^%BASE%$/ { getline; base = $0; next }
+    /^%VERSION%$/ { getline; version = $0; next }
+    /^%FILENAME%$/ { getline; filename = $0; next }
+    /^%SHA256SUM%$/ { getline; sha = $0; next }
+    END { emit() }' {} + | LC_ALL=C sort
+}
+
+# select_named <entries> <out> <channel>: the entries whose name or base was
+# named; every named package must have one.
+select_named() {
+  local package missing=()
+  awk -F'\t' -v want=" ${PACKAGES[*]} " 'index(want, " " $1 " ") || index(want, " " $2 " ")' "$1" >"$2"
+  for package in "${PACKAGES[@]}"; do
+    awk -F'\t' -v p="$package" '$1 == p || $2 == p { found = 1 } END { exit !found }' "$2" || missing+=("$package")
+  done
+  (( ${#missing[@]} == 0 )) || { print_error "Not in $3/$ARCH: ${missing[*]}"; exit 1; }
+}
+
+set_lines() { awk -F'\t' '{ print $1, $3, $4, $5 }' "$1" | LC_ALL=C sort; }
+sha256() { if command -v sha256sum >/dev/null; then sha256sum | cut -d' ' -f1; else shasum -a 256 | cut -d' ' -f1; fi; }
+
+# check_target <before> <changed> <after-dir>: the target's database now holds
+# exactly the entries of <before> whose names are not in <changed>, plus the
+# entries of <changed>. Anything else (a lost entry, an unexpected one) stops.
+check_target() {
+  local expected actual
+  rm -rf "$3"
+  fetch_db "$TO" "$3" || true
+  expected=$( { awk -F'\t' 'NR == FNR { drop[$1] = 1; next } !($1 in drop)' "$2" "$1"; cat "$2"; } | LC_ALL=C sort)
+  actual=$(db_entries "$3/omarchy.db.tar.zst")
+  if [[ $expected != "$actual" ]]; then
+    print_error "$TO/$ARCH does not hold what it should after the change:"
+    diff <(echo "$expected") <(echo "$actual") | sed 's/^/  /' || true
+    exit 1
+  fi
+}
+
+# The database pair in <dir> back to the channel, database last. Every file it
+# names is already there.
+upload_db() {
+  ln -sf omarchy.db.tar.zst "$1/omarchy.db"
+  ln -sf omarchy.files.tar.zst "$1/omarchy.files"
+  rclone copy "$1" "$(slot "$TO")" --s3-no-head --checksum --copy-links --filter '+ omarchy.files*' --filter '- *'
+  rclone copy "$1" "$(slot "$TO")" --s3-no-head --checksum --copy-links --filter '+ omarchy.db*' --filter '- *'
+}
+
+# --- withdraw ---------------------------------------------------------------
+if [[ $MODE == withdraw ]]; then
+  print_header "Withdraw from $TO ($ARCH)"
+  fetch_db "$TO" "$WORK/repo" || { print_error "$(slot "$TO") has no database"; exit 1; }
+  db_entries "$WORK/repo/omarchy.db.tar.zst" >"$WORK/before"
+  select_named "$WORK/before" "$WORK/gone" "$TO"
+  set_lines "$WORK/gone" | sed 's/^/  withdraw: /'
+  if [[ $DRY_RUN == true ]]; then
+    print_info "Dry run: nothing uploaded; the files stay on the remote either way"
+    exit 0
+  fi
+  mapfile -t names < <(cut -f1 "$WORK/gone")
+  ( cd "$WORK/repo" && repo-remove --quiet omarchy.db.tar.zst "${names[@]}" )
+  upload_db "$WORK/repo"
+  expected=$(awk -F'\t' 'NR == FNR { drop[$1] = 1; next } !($1 in drop)' "$WORK/gone" "$WORK/before")
+  rm -rf "$WORK/after"; fetch_db "$TO" "$WORK/after" || true
+  [[ $(db_entries "$WORK/after/omarchy.db.tar.zst") == "$expected" ]] ||
+    { print_error "$TO/$ARCH does not hold exactly its other entries after withdrawing"; exit 1; }
+  print_success "Withdrew ${#names[@]} entr$( (( ${#names[@]} == 1 )) && echo y || echo ies) from $TO/$ARCH"
+  exit 0
+fi
+
+# --- reinstate --------------------------------------------------------------
+if [[ $MODE == reinstate ]]; then
+  print_header "Reinstate in $TO ($ARCH)"
+  fetch_db "$TO" "$WORK/to" || { print_error "$(slot "$TO") has no database"; exit 1; }
+  db_entries "$WORK/to/omarchy.db.tar.zst" >"$WORK/before"
+  for file in "${FILES[@]}"; do
+    grep -qxF "$file" "$WORK/to/listing" && grep -qxF "$file.sig" "$WORK/to/listing" ||
+      { print_error "$TO/$ARCH does not hold $file and its signature"; exit 1; }
+  done
+  if [[ $DRY_RUN == true ]]; then
+    printf '  would reinstate: %s\n' "${FILES[@]}"
+    exit 0
+  fi
+  mkdir -p "$WORK/files"
+  : >"$WORK/changed"
+  for file in "${FILES[@]}"; do
+    rclone copyto "$(slot "$TO")/$file" "$WORK/files/$file" --s3-no-head || { print_error "Cannot download $file"; exit 1; }
+    info=$(bsdtar -xOf "$WORK/files/$file" .PKGINFO)
+    name=$(awk -F' = ' '$1 == "pkgname" { print $2 }' <<<"$info")
+    base=$(awk -F' = ' '$1 == "pkgbase" { print $2 }' <<<"$info")
+    version=$(awk -F' = ' '$1 == "pkgver" { print $2 }' <<<"$info")
+    printf '%s\t%s\t%s\t%s\t%s\n' "$name" "${base:-$name}" "$version" "$file" "$(sha256 <"$WORK/files/$file")" >>"$WORK/changed"
+    echo "  reinstate: $name $version"
+  done
+  "$BUILD_ROOT/bin/publish-artifact" --remote "$REMOTE" --mirror "$TO" --arch "$ARCH" "${FILES[@]/#/$WORK/files/}"
+  check_target "$WORK/before" "$WORK/changed" "$WORK/after"
+  print_success "Reinstated ${#FILES[@]} file(s) in $TO/$ARCH"
+  exit 0
+fi
+
+# --- promote: the named packages in the source channel ---------------------
+print_header "Promote: $FROM -> $TO ($ARCH)"
+print_info "Remote: $(slot "$FROM") -> $(slot "$TO")"
+print_info "Packages: ${PACKAGES[*]}"
+[[ $DRY_RUN == true ]] && print_warning "DRY RUN - nothing will be uploaded"
+
+fetch_db "$FROM" "$WORK/from" || { print_error "$(slot "$FROM") has no database"; exit 1; }
+db_entries "$WORK/from/omarchy.db.tar.zst" >"$WORK/from.entries"
+select_named "$WORK/from.entries" "$WORK/set" "$FROM"
+
+refused=()
+while IFS=$'\t' read -r name base _ _ _; do
+  pkgdir=$(package_dir_for_name "$name" 2>/dev/null) || pkgdir=$(package_dir_for_name "$base" 2>/dev/null) || pkgdir=""
+  if [[ -z $pkgdir ]]; then
+    print_warning "$name: no recipe here; moving it as advance-channel would"
+    continue
+  fi
+  if ! package_moves_to_channel "$pkgdir" "$TO"; then
+    if package_in_channel "$pkgdir" "$TO"; then
+      refused+=("$name (built natively for $TO)")
+    else
+      refused+=("$name (not a member of $TO; widen its channels first)")
+    fi
+  fi
+done <"$WORK/set"
+(( ${#refused[@]} == 0 )) || { print_error "May not move into $TO:"; printf '  %s\n' "${refused[@]}"; exit 1; }
+
+digest=$(set_lines "$WORK/set" | sha256)
+print_info "Set sha256: $digest ($(wc -l <"$WORK/set" | tr -d ' ') entries)"
+set_lines "$WORK/set" | sed 's/^/  /'
+if [[ -n $EXPECT && $digest != "$EXPECT" ]]; then
+  print_error "$FROM/$ARCH does not hold the expected set ($EXPECT)"
+  exit 1
+fi
+
+fetch_db "$TO" "$WORK/to" || print_warning "$(slot "$TO") has no database yet"
+db_entries "$WORK/to/omarchy.db.tar.zst" >"$WORK/to.entries"
+moves=()
+added=()
+replaced=()
+problems=()
+while IFS=$'\t' read -r name _ version filename sha; do
+  current=$(awk -F'\t' -v n="$name" '$1 == n { print $3 "\t" $4 "\t" $5; exit }' "$WORK/to.entries")
+  if [[ -z $current ]]; then
+    echo "  new:     $name $version"
+    moves+=("$filename")
+    added+=("$name")
+    continue
+  fi
+  IFS=$'\t' read -r tversion tfilename tsha <<<"$current"
+  if [[ $tfilename == "$filename" && $tsha == "$sha" ]]; then
+    echo "  served:  $name $version (already in $TO)"
+  elif [[ $tversion == "$version" ]]; then
+    problems+=("$name $version: $TO holds other bytes under this version")
+  elif (( $(vercmp "$version" "$tversion") < 0 )); then
+    problems+=("$name: $TO has $tversion, newer than $FROM's $version")
+  else
+    echo "  move:    $name $tversion -> $version"
+    moves+=("$filename")
+    replaced+=("$tfilename")
+  fi
+done <"$WORK/set"
+(( ${#problems[@]} == 0 )) || { print_error "Refusing:"; printf '  %s\n' "${problems[@]}"; exit 1; }
+
+if (( ${#moves[@]} == 0 )); then
+  print_success "$TO/$ARCH already serves the set"
+  exit 0
+fi
+rollback() {
+  print_info "To undo it:"
+  (( ${#added[@]} == 0 )) ||
+    echo "  bin/promote-artifact --withdraw --to $TO --arch $ARCH --package ${added[*]}"
+  (( ${#replaced[@]} == 0 )) ||
+    echo "  bin/promote-artifact --reinstate --to $TO --arch $ARCH --file ${replaced[*]}"
+}
+if [[ $DRY_RUN == true ]]; then
+  printf '  would publish: %s\n' "${moves[@]}"
+  rollback
+  print_info "Dry run: nothing uploaded; only $TO/$ARCH would change"
+  exit 0
+fi
+
+# --- promote: publish the source's bytes -----------------------------------
+mkdir -p "$WORK/files"
+files=()
+for filename in "${moves[@]}"; do
+  rclone copyto "$(slot "$FROM")/$filename" "$WORK/files/$filename" --s3-no-head ||
+    { print_error "Cannot download $filename from $FROM"; exit 1; }
+  want_sha=$(awk -F'\t' -v f="$filename" '$4 == f { print $5 }' "$WORK/set")
+  [[ $(sha256 <"$WORK/files/$filename") == "$want_sha" ]] ||
+    { print_error "$filename does not match $FROM's database"; exit 1; }
+  files+=("$WORK/files/$filename")
+done
+
+"$BUILD_ROOT/bin/publish-artifact" --remote "$REMOTE" --mirror "$TO" --arch "$ARCH" "${files[@]}"
+
+check_target "$WORK/to.entries" "$WORK/set" "$WORK/after"
+print_success "Promoted ${#moves[@]} file(s) to $TO/$ARCH (set $digest)"
+rollback
