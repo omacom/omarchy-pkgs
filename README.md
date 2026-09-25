@@ -520,7 +520,8 @@ A package names those dependencies in `.omarchy/package.json`:
 ```
 
 `bin/sync-rebuilds` reads each named package's version from the official
-repositories for every published architecture the package supports and compares
+repositories for every architecture a merge builds (`CI_ARCHES` in
+`helpers/paths.sh`, both by default) that the package supports and compares
 it to `rebuilt_against`. Records are kept per architecture because Arch and
 Arch Linux ARM can carry different dependency versions. pkgrel is bumped once
 when any recorded version moves; that one source revision is then rebuilt by
@@ -538,6 +539,8 @@ x86_64 builder. aarch64 versions are read directly from the live Arch Linux ARM
 repository database, which is also what the ARM builder uses. Testing and
 staging repositories do not count. A legacy flat `rebuilt_against` record is
 read as x86_64 and is migrated naturally the next time a rebuild is needed.
+
+A dependency this repository carries for an architecture (a recipe here that builds for edge on it, such as aquamarine on aarch64) shadows the distribution's, because the builder lists `[omarchy]` first. Its version is the recipe's, and it counts only once edge publishes that version: until then the builder still links against the previous one, so dependents are left alone for that run.
 
 ### Other
 
@@ -726,7 +729,7 @@ Fields:
 - `skip_build`: optional boolean; defaults to `false`. Set `true` to exclude a package from scheduled version checks and unscoped builds. The package can still be built explicitly with `bin/repo release --package <name>`.
 - `pkgrel`: legacy import customization metadata. Maintained recipes keep their complete package release directly in PKGBUILD; rebuilds increment it there.
 - `rebuild_on`: optional array of package names this package links against closely enough that it must be rebuilt when they change, independent of its own source. Read by `bin/sync-rebuilds`.
-- `rebuilt_against`: written by `bin/sync-rebuilds`. Maps each published architecture to the versions of its `rebuild_on` packages that the current pkgrel was bumped for.
+- `rebuilt_against`: written by `bin/sync-rebuilds`. Maps each built architecture to the versions of its `rebuild_on` packages that the current pkgrel was bumped for.
 - `upstream_commit`: legacy AUR metadata, superseded by `origin.commit`. `bin/package-worktree` can use historical provenance to inspect the original recipe.
 
 ### Build Matrix

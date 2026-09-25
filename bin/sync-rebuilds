@@ -67,8 +67,10 @@ Examples:
   $0 quickshell-git    # Update specific packages
 
 x86_64 trigger versions come from the local pacman database; aarch64 versions
-come from the live Arch Linux ARM repository database. Only architectures in
-PUBLISHED_ARCHES that the package supports are considered.
+come from the live Arch Linux ARM repository database. A trigger this
+repository carries for an architecture shadows both, so its version is the
+checked-in recipe's once edge publishes it. Every architecture in CI_ARCHES
+(what a merge builds) that the package supports is considered.
 EOF
 }
 
@@ -167,6 +169,8 @@ repo_version() { # repo_version <arch> <package>
 }
 
 declare -A PUBLISHED_VERSION=()
+declare -A EDGE_VERSION=()
+declare -A EDGE_READ=()
 PUBLISHED_LOADED=false
 
 remember_published() {
@@ -190,7 +194,7 @@ load_published_versions() {
 
   local arch mirror db name base version
 
-  for arch in $(published_arches); do
+  for arch in $(ci_arches); do
     for mirror in "${PUBLISHED_MIRRORS[@]}"; do
       db="$TEMP_DIR/published-$mirror-$arch.db.tar.zst"
 
@@ -199,10 +203,19 @@ load_published_versions() {
         print_warning "Could not read the published $mirror/$arch database; bumps are not checked against it this run"
         continue
       fi
+      if ! tar -tf "$db" >/dev/null 2>&1; then
+        print_warning "Unreadable published $mirror/$arch database; bumps are not checked against it this run"
+        continue
+      fi
+      [[ "$mirror" == edge ]] && EDGE_READ["$arch"]=1
 
       while IFS=$'\t' read -r name base version; do
         [[ -n "$name" && -n "$version" ]] && remember_published "$name" "$version"
         [[ -n "$base" && -n "$version" ]] && remember_published "$base" "$version"
+        if [[ "$mirror" == edge && -n "$version" ]]; then
+          [[ -z "$name" ]] || EDGE_VERSION["$arch/$name"]="$version"
+          [[ -z "$base" ]] || EDGE_VERSION["$arch/$base"]="$version"
+        fi
       done < <(
         tar -xOf "$db" --wildcards '*/desc' 2>/dev/null | awk '
           function emit() {
@@ -225,6 +238,27 @@ published_version() {
 
   load_published_versions
   echo "${PUBLISHED_VERSION[$package]:-}"
+}
+
+# A trigger this repository builds for the architecture. The builder lists
+# [omarchy] ahead of the distribution repositories, so this recipe, not Arch or
+# Arch Linux ARM, decides what a dependent links against.
+carried_trigger_dir() { # carried_trigger_dir <arch> <trigger>
+  local pkgdir
+  pkgdir=$(package_dir_for_name "$2") || return 1
+  package_has_metadata "$pkgdir" || return 1
+  package_builds_for_mirror "$pkgdir" edge || return 1
+  package_supports_arch "$pkgdir" "$1" || return 1
+  echo "$pkgdir"
+}
+
+carried_version() { # carried_version <arch> <pkgdir>
+  local epoch pkgver pkgrel
+  epoch=$(package_pkgbuild_var "$2" epoch "$1") || return 1
+  pkgver=$(package_pkgbuild_var "$2" pkgver "$1") || return 1
+  pkgrel=$(package_pkgbuild_var "$2" pkgrel "$1") || return 1
+  [[ -n "$pkgver" && -n "$pkgrel" ]] || return 1
+  echo "${epoch:+$epoch:}$pkgver-$pkgrel"
 }
 
 # The pkgver of a full version string, with any epoch and pkgrel removed.
@@ -368,13 +402,33 @@ sync_package() {
 
   print_info "Checking $package against ${triggers[*]}..."
 
-  local current="{}" arch arch_current trigger version considered=0
-  for arch in $(published_arches); do
+  local current="{}" arch arch_current trigger version carried considered=0
+  for arch in $(ci_arches); do
     package_supports_arch "$package_dir" "$arch" || continue
     considered=$((considered + 1))
     arch_current="{}"
     for trigger in "${triggers[@]}"; do
-      if ! version=$(repo_version "$arch" "$trigger"); then
+      if carried=$(carried_trigger_dir "$arch" "$trigger"); then
+        if ! version=$(carried_version "$arch" "$carried"); then
+          print_error "  Could not read the $arch version of $trigger from its recipe; leaving $package alone"
+          ((++FAILED))
+          return 0
+        fi
+        load_published_versions
+        if [[ -z "${EDGE_READ[$arch]:-}" ]]; then
+          print_error "  Could not read the published edge/$arch database for $trigger; leaving $package alone"
+          ((++FAILED))
+          return 0
+        fi
+        # Until edge publishes the recipe's version the builder still links
+        # against the previous one, and recording the new version now would
+        # certify a build that never saw it.
+        if [[ "${EDGE_VERSION[$arch/$trigger]:-}" != "$version" ]]; then
+          print_warning "  $trigger $version is not published on edge/$arch yet; leaving $package alone until it is"
+          ((++SKIPPED))
+          return 0
+        fi
+      elif ! version=$(repo_version "$arch" "$trigger"); then
         print_error "  Could not read $arch repository versions; leaving $package alone"
         ((++FAILED))
         return 0
@@ -479,6 +533,7 @@ sync_package() {
   # checkout that has fallen behind the repository can otherwise be bumped to
   # something pacman orders below what it would replace.
   local floor
+  load_published_versions
   floor=$(published_version "$package")
   if [[ -n "$floor" && "$(version_pkgver "$floor")" == "$pkgver" ]]; then
     if [[ "$(vercmp "$new_version" "$floor")" -le 0 ]]; then
@@ -584,26 +639,33 @@ STUB
   chmod +x "$root/stub/pacman"
 }
 
-# Serves a repository database assembled by hand from name=version pairs. With
-# none given the stub fails, which is how the unreachable-repository path is
+# A repository database assembled by hand from name=version pairs.
+selftest_db() {
+  local out="$1"
+  shift
+  local staging="$out.d" entry name version
+
+  rm -rf "$staging"
+  mkdir -p "$staging"
+  for entry in "$@"; do
+    name="${entry%=*}"
+    version="${entry#*=}"
+    mkdir -p "$staging/$name-$version"
+    printf '%%FILENAME%%\n%s-%s-x86_64.pkg.tar.zst\n\n%%NAME%%\n%s\n\n%%BASE%%\n%s\n\n%%VERSION%%\n%s\n' \
+      "$name" "$version" "$name" "$name" "$version" > "$staging/$name-$version/desc"
+  done
+  tar --zstd -cf "$out" -C "$staging" .
+}
+
+# Serves one published database for every channel and architecture. With no
+# pairs given the stub fails, which is how the unreachable-repository path is
 # exercised.
 selftest_published() {
   local root="$1"
   shift
-  local staging="$root/stub/db"
-  local entry name version
 
   if [[ $# -gt 0 ]]; then
-    rm -rf "$staging"
-    mkdir -p "$staging"
-    for entry in "$@"; do
-      name="${entry%=*}"
-      version="${entry#*=}"
-      mkdir -p "$staging/$name-$version"
-      printf '%%FILENAME%%\n%s-%s-x86_64.pkg.tar.zst\n\n%%NAME%%\n%s\n\n%%BASE%%\n%s\n\n%%VERSION%%\n%s\n' \
-        "$name" "$version" "$name" "$name" "$version" > "$staging/$name-$version/desc"
-    done
-    tar --zstd -cf "$root/stub/omarchy.db.tar.zst" -C "$staging" .
+    selftest_db "$root/stub/omarchy.db.tar.zst" "$@"
   fi
 
   cat > "$root/stub/curl" <<'STUB'
@@ -616,17 +678,31 @@ while [[ $# -gt 0 ]]; do
     *) url="$1"; shift ;;
   esac
 done
-if [[ "$url" == */aarch64/* ]]; then
-  repo="${url%/*}"
-  repo="${repo##*/}"
-  db="$(dirname "$0")/alarm-$repo.db"
-else
-  db="$(dirname "$0")/omarchy.db.tar.zst"
-fi
+case "$url" in
+  */omarchy.db.tar.zst)
+    channel="${url%/omarchy.db.tar.zst}"
+    arch="${channel##*/}"
+    channel="${channel%/*}"
+    db="$(dirname "$0")/omarchy-${channel##*/}-$arch.db.tar.zst"
+    [[ -f "$db" ]] || db="$(dirname "$0")/omarchy.db.tar.zst"
+    ;;
+  */aarch64/*)
+    repo="${url%/*}"
+    db="$(dirname "$0")/alarm-${repo##*/}.db"
+    ;;
+  *) db="" ;;
+esac
 [[ -f "$db" && -n "$out" ]] || exit 22
 cp "$db" "$out"
 STUB
   chmod +x "$root/stub/curl"
+}
+
+# Serves one channel and architecture its own published database.
+selftest_channel() { # selftest_channel <root> <channel> <arch> [name=version...]
+  local root="$1" channel="$2" arch="$3"
+  shift 3
+  selftest_db "$root/stub/omarchy-$channel-$arch.db.tar.zst" "$@"
 }
 
 selftest_alarm() {
@@ -668,12 +744,15 @@ cmd_self_test() {
     fi
   }
 
+  # SELFTEST_ARCHES stands in for CI_ARCHES; "default" leaves it unset, as the
+  # scheduled workflow does.
   run_case() {
     local root="$1"
     shift
-    local status=0
-    OMARCHY_ARCHES="${SELFTEST_ARCHES:-x86_64}" \
-      PATH="$root/stub:$PATH" "$root/bin/sync-rebuilds" "$@" > "$root/output" 2>&1 || status=$?
+    local status=0 arches=(CI_ARCHES="${SELFTEST_ARCHES:-x86_64}")
+    [[ "${SELFTEST_ARCHES:-}" != default ]] || arches=(-u CI_ARCHES)
+    env "${arches[@]}" PATH="$root/stub:$PATH" \
+      "$root/bin/sync-rebuilds" "$@" > "$root/output" 2>&1 || status=$?
     echo "$status"
   }
 
@@ -780,6 +859,68 @@ cmd_self_test() {
   check "run succeeds" 0 "$(run_case "$root")"
   unset SELFTEST_ARCHES
   check "pkgrel untouched" 1 "$(pkgrel_of "$root/pkgbuilds/t-x86")"
+
+  echo "An ARM-only package is checked when no architecture list is given:"
+  root=$(selftest_root arm-default)
+  selftest_package "$root" t-arm-default 1 '{"source":"local","rebuild_on":["dep-a"],"rebuilt_against":{"aarch64":{"dep-a":"1-1"}}}' 1.0 aarch64
+  selftest_pacman "$root"
+  selftest_published "$root"
+  selftest_alarm "$root" dep-a=2-1
+  SELFTEST_ARCHES=default
+  check "run succeeds" 0 "$(run_case "$root")"
+  unset SELFTEST_ARCHES
+  check "pkgrel bumped" 2 "$(pkgrel_of "$root/pkgbuilds/t-arm-default")"
+  check "ARM trigger recorded" "2-1" \
+    "$(jq -r '.rebuilt_against.aarch64["dep-a"]' "$root/pkgbuilds/t-arm-default/.omarchy/package.json")"
+
+  echo "A dependency carried here for ARM is read from its recipe once edge publishes it:"
+  root=$(selftest_root carried)
+  selftest_package "$root" t-carried 1.1 '{"source":"local","channels":["edge"]}' 0.15.1 aarch64
+  selftest_package "$root" t-linked 3 '{"source":"local","rebuild_on":["t-carried"],"rebuilt_against":{"x86_64":{"t-carried":"0.15.1-1"},"aarch64":{"t-carried":"0.15.0-2"}}}' 1.0 'x86_64 aarch64'
+  selftest_pacman "$root" t-carried=0.15.1-1
+  selftest_published "$root"
+  selftest_alarm "$root" t-carried=0.15.1-1
+  selftest_channel "$root" edge aarch64 t-carried=0.15.1-1.1
+  SELFTEST_ARCHES=default
+  check "run succeeds" 0 "$(run_case "$root")"
+  check "pkgrel bumped" 4 "$(pkgrel_of "$root/pkgbuilds/t-linked")"
+  check "the carried version is recorded, not Arch Linux ARM's" "0.15.1-1.1" \
+    "$(jq -r '.rebuilt_against.aarch64["t-carried"]' "$root/pkgbuilds/t-linked/.omarchy/package.json")"
+  check "x86_64, where nothing is carried, still reads the distribution" "0.15.1-1" \
+    "$(jq -r '.rebuilt_against.x86_64["t-carried"]' "$root/pkgbuilds/t-linked/.omarchy/package.json")"
+  check "a second run succeeds" 0 "$(run_case "$root")"
+  unset SELFTEST_ARCHES
+  check "a second run leaves it alone" 4 "$(pkgrel_of "$root/pkgbuilds/t-linked")"
+
+  echo "A carried dependency that edge does not publish yet leaves its dependents alone:"
+  root=$(selftest_root carried-in-flight)
+  selftest_package "$root" t-carried 1.2 '{"source":"local","channels":["edge"]}' 0.15.1 aarch64
+  selftest_package "$root" t-linked 4 '{"source":"local","rebuild_on":["t-carried"],"rebuilt_against":{"aarch64":{"t-carried":"0.15.1-1.1"}}}' 1.0 aarch64
+  selftest_pacman "$root"
+  selftest_published "$root"
+  selftest_alarm "$root" t-carried=0.15.1-1
+  selftest_channel "$root" edge aarch64 t-carried=0.15.1-1.1
+  SELFTEST_ARCHES=aarch64
+  check "run succeeds" 0 "$(run_case "$root")"
+  unset SELFTEST_ARCHES
+  check "pkgrel untouched" 4 "$(pkgrel_of "$root/pkgbuilds/t-linked")"
+  check "record untouched" "0.15.1-1.1" \
+    "$(jq -r '.rebuilt_against.aarch64["t-carried"]' "$root/pkgbuilds/t-linked/.omarchy/package.json")"
+
+  echo "A carried dependency whose edge database cannot be read fails the run:"
+  root=$(selftest_root carried-unreadable)
+  selftest_package "$root" t-carried 1.1 '{"source":"local","channels":["edge"]}' 0.15.1 aarch64
+  selftest_package "$root" t-linked 3 '{"source":"local","rebuild_on":["t-carried"],"rebuilt_against":{"aarch64":{"t-carried":"0.15.0-2"}}}' 1.0 aarch64
+  selftest_pacman "$root"
+  selftest_published "$root"
+  selftest_alarm "$root" t-carried=0.15.1-1
+  SELFTEST_ARCHES=aarch64
+  check "run fails" 1 "$(run_case "$root")"
+  check "pkgrel untouched" 3 "$(pkgrel_of "$root/pkgbuilds/t-linked")"
+  printf 'not a database\n' > "$root/stub/omarchy-edge-aarch64.db.tar.zst"
+  check "a corrupt download fails the run too" 1 "$(run_case "$root")"
+  unset SELFTEST_ARCHES
+  check "pkgrel still untouched" 3 "$(pkgrel_of "$root/pkgbuilds/t-linked")"
 
   echo "A PKGBUILD that branches on CARCH at file scope still reads its version:"
   root=$(selftest_root carch-branch)
