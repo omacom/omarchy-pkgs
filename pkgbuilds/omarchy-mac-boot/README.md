@@ -10,6 +10,10 @@ The package is aarch64-only and published to edge only. It widens to rc and stab
 
 It requires `limine-mkinitcpio-hook` 1.39.0-2 or newer: that is the first build whose hooks leave a Mac's `/boot` to mkinitcpio until Limine is activated. With an older hook, Limine's kernel hook replaces mkinitcpio's by name, and this package's `limine-ready` gate stops it on a Mac that still boots GRUB, so a kernel update would never reach `/boot`.
 
+## HOOKS baseline
+
+From the source that drops the boot package's own Plymouth fragment (omacom/omarchy-mac#544), the Apple drop-ins build on omarchy-settings' HOOKS baseline, `/etc/mkinitcpio.conf.d/00-omarchy-hooks.conf` (omacom/omarchy-mac#536). With an older settings package the Mac initramfs loses Plymouth at the passphrase prompt. A settings version cannot express this: quattro candidate builds sort below stock releases, and `omarchy` pins its settings version exactly. So when the staged payload has no `93-omarchy-mac-plymouth.conf`, `package()` adds a dependency on the name `omarchy-mkinitcpio-hooks-baseline`. Every settings package that ships the baseline on aarch64 (`omarchy-settings`, `omarchy-settings-dev`, candidate builds) must `provide` that name. Until one does, such a build of this package cannot be installed: it fails outright rather than silently booting without Plymouth.
+
 ## Transition
 
 - It provides, conflicts with and replaces `omarchy-apple-boot` and `omarchy-first-boot`. The scriptlet moves a pending `omarchy-first-boot` marker to `omarchy-mac-first-boot`, drops the replaced unit's dangling enable link and points at a customised `90-omarchy-asahi.conf.pacsave`.
