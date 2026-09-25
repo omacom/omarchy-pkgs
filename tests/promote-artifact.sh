@@ -74,7 +74,7 @@ fail() { echo "FAIL: $1"; cat "$T/out"; exit 1; }
 initial=$(db_hashes); rc_initial=$(entries rc/aarch64)
 promote --from edge --to rc --arch aarch64 --package kernel shared --dry-run && grep -q 'would publish: kernel-1.0-2-aarch64' "$T/out" \
   && grep -q -- '--reinstate --to rc --arch aarch64 --file kernel-1.0-1-aarch64.pkg.tar.zst kernel-headers-1.0-1-aarch64.pkg.tar.zst' "$T/out" \
-  && grep -q -- '--withdraw --to rc --arch aarch64 --package shared' "$T/out" \
+  && grep -q -- '--withdraw --to rc --arch aarch64 --package shared --expect shared=1.0-1' "$T/out" \
   && [[ "$(db_hashes)" == "$initial" ]] && pass "dry run plans the moves and their undo, and changes nothing" || fail "dry run"
 digest=$(sed -n 's/.*Set sha256: \([0-9a-f]\{64\}\).*/\1/p' "$T/out")
 [[ $digest =~ ^[0-9a-f]{64}$ ]] || fail "the dry run printed no set digest"
@@ -111,13 +111,19 @@ promote --from edge --to rc --arch aarch64 --package kernel shared && grep -q 'a
 if promote --from rc --to stable --arch aarch64 --package shared; then fail "a backwards move should refuse"; fi
 grep -q 'newer than rc' "$T/out" && pass "never moves a package backwards" || fail "backwards reason"
 
-promote --withdraw --to rc --arch aarch64 --package shared \
+if promote --withdraw --to rc --arch aarch64 --package shared; then fail "withdraw without --expect should refuse"; fi
+grep -q 'needs --expect' "$T/out" && pass "withdraw needs --expect" || fail "withdraw --expect reason"
+before_withdraw=$(db_hashes)
+if promote --withdraw --to rc --arch aarch64 --package shared --expect shared=1.0-2; then fail "withdraw of another version should refuse"; fi
+grep -q 'does not hold exactly the expected entries' "$T/out" && [[ "$(db_hashes)" == "$before_withdraw" ]] \
+  && pass "withdraw refuses when the channel holds other versions than expected" || fail "withdraw version reason"
+promote --withdraw --to rc --arch aarch64 --package shared --expect shared=1.0-1 \
   && promote --reinstate --to rc --arch aarch64 --file "$(basename "${K1[0]}")" "$(basename "${K1[1]}")" \
   && [[ "$(entries rc/aarch64)" == "$rc_initial" ]] && [[ "$(others "$(db_hashes)")" == "$(others "$initial")" ]] \
   && [[ -f "$REMOTE/rc/aarch64/$(basename "${K2[0]}")" ]] \
   && pass "rollback (withdraw the new, reinstate the replaced) restores rc/aarch64's entries; files stay" || fail "rollback"
 
-promote --withdraw --to rc --arch aarch64 --package kernel && [[ "$(entries rc/aarch64)" == "dup-1.0-1/ fast-1.0-1/ " ]] \
+promote --withdraw --to rc --arch aarch64 --package kernel --expect kernel=1.0-1 kernel-headers=1.0-1 && [[ "$(entries rc/aarch64)" == "dup-1.0-1/ fast-1.0-1/ " ]] \
   && pass "withdraw by pkgbase drops the split packages" || fail "withdraw by pkgbase"
 if promote --reinstate --to rc --arch aarch64 --file never-1.0-1-aarch64.pkg.tar.zst; then fail "reinstating an absent file should refuse"; fi
 grep -q 'does not hold never-1.0-1' "$T/out" && pass "reinstate needs the file in the channel" || fail "reinstate reason"

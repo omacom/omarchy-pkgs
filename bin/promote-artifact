@@ -4,7 +4,8 @@
 #
 #   promote-artifact --from <edge|rc> --to <rc|stable> --arch <arch> --package <names...>
 #                    [--expect-sha256 <digest>] [--dry-run] [--remote <remote>]
-#   promote-artifact --withdraw --to <channel> --arch <arch> --package <names...> [--dry-run]
+#   promote-artifact --withdraw --to <channel> --arch <arch> --package <names...>
+#                    --expect <name=version...> [--dry-run]
 #   promote-artifact --reinstate --to <channel> --arch <arch> --file <filenames...> [--dry-run]
 #
 # bin/advance-channel promotes from the repository host's own tree, but
@@ -24,10 +25,12 @@
 #      them with bin/publish-artifact --mirror <to>, and check the target now
 #      holds exactly its earlier entries with those replaced or added
 #
-# Withdraw drops entries from a channel's database (repo-remove); reinstate
-# publishes a file the channel still holds back into its database, over a
-# newer entry. Together they undo a promotion, which prints the exact
-# commands. Files are never deleted: published filenames are immutable.
+# Withdraw drops entries from a channel's database (repo-remove), only when
+# --expect names exactly the name=version of every entry it would drop (a dry
+# run prints that list). Reinstate publishes a file the channel still holds
+# back into its database, over a newer entry. Together they undo a promotion,
+# which prints the exact commands. Files are never deleted: published
+# filenames are immutable.
 #
 # Nothing is rebuilt, and only <to>/<arch> changes. --dry-run stops before any
 # upload and also accepts a public URL (https://pkgs.omarchy.org) as the remote.
@@ -44,6 +47,7 @@ FROM=""
 TO=""
 TARGET_ARCH=""
 EXPECT=""
+EXPECT_ENTRIES=()
 DRY_RUN=false
 PACKAGES=()
 FILES=()
@@ -54,6 +58,10 @@ while [[ $# -gt 0 ]]; do
   --arch) TARGET_ARCH=$2; require_valid_arch "$TARGET_ARCH"; shift 2 ;;
   --remote) REMOTE=$2; shift 2 ;;
   --expect-sha256) EXPECT=$2; shift 2 ;;
+  --expect)
+    shift
+    while [[ $# -gt 0 && $1 != --* ]]; do EXPECT_ENTRIES+=("$1"); shift; done
+    ;;
   --withdraw) MODE=withdraw; shift ;;
   --reinstate) MODE=reinstate; shift ;;
   --dry-run) DRY_RUN=true; shift ;;
@@ -65,7 +73,7 @@ while [[ $# -gt 0 ]]; do
     shift
     while [[ $# -gt 0 && $1 != --* ]]; do FILES+=("$1"); shift; done
     ;;
-  -h | --help) sed -n '2,34p' "$0"; exit 0 ;;
+  -h | --help) sed -n '2,36p' "$0"; exit 0 ;;
   *) print_error "Unknown option: $1"; exit 1 ;;
   esac
 done
@@ -76,14 +84,14 @@ promote)
   "edge->rc" | "rc->stable") ;;
   *) print_error "Refusing $FROM -> $TO: promotion moves edge -> rc or rc -> stable"; exit 1 ;;
   esac
-  (( ${#PACKAGES[@]} && ! ${#FILES[@]} )) || { print_error "Promotion takes --package names"; exit 1; }
+  (( ${#PACKAGES[@]} && ! ${#FILES[@]} && ! ${#EXPECT_ENTRIES[@]} )) || { print_error "Promotion takes --package names (and --expect-sha256)"; exit 1; }
   ;;
 withdraw)
   [[ -z $FROM && -z $EXPECT ]] && (( ${#PACKAGES[@]} && ! ${#FILES[@]} )) ||
-    { print_error "--withdraw takes --to, --arch and --package"; exit 1; }
+    { print_error "--withdraw takes --to, --arch, --package and --expect"; exit 1; }
   ;;
 reinstate)
-  [[ -z $FROM && -z $EXPECT ]] && (( ${#FILES[@]} && ! ${#PACKAGES[@]} )) ||
+  [[ -z $FROM && -z $EXPECT ]] && (( ${#FILES[@]} && ! ${#PACKAGES[@]} && ! ${#EXPECT_ENTRIES[@]} )) ||
     { print_error "--reinstate takes --to, --arch and --file"; exit 1; }
   ;;
 esac
@@ -95,6 +103,9 @@ for name in "${PACKAGES[@]}"; do
 done
 for file in "${FILES[@]}"; do
   [[ $file =~ ^[A-Za-z0-9@_+][A-Za-z0-9@._+:-]*\.pkg\.tar\.[a-z0-9]+$ ]] || { print_error "Not a package filename: $file"; exit 1; }
+done
+for entry in "${EXPECT_ENTRIES[@]}"; do
+  [[ $entry =~ ^[a-z0-9@_+][a-z0-9@._+-]*=[A-Za-z0-9._+:~-]+$ ]] || { print_error "--expect takes name=version: $entry"; exit 1; }
 done
 [[ -z $EXPECT || $EXPECT =~ ^[0-9a-f]{64}$ ]] || { print_error "--expect-sha256 must be a sha256"; exit 1; }
 URL_REMOTE=false
@@ -203,6 +214,19 @@ if [[ $MODE == withdraw ]]; then
   db_entries "$WORK/repo/omarchy.db.tar.zst" >"$WORK/before"
   select_named "$WORK/before" "$WORK/gone" "$TO"
   set_lines "$WORK/gone" | sed 's/^/  withdraw: /'
+  # What is dropped must be exactly what the operator named, versions
+  # included: a channel that moved since the plan is not withdrawn from.
+  found=$(awk -F'\t' '{ print $1 "=" $3 }' "$WORK/gone" | LC_ALL=C sort)
+  expected=$(printf '%s\n' "${EXPECT_ENTRIES[@]}" | sed '/^$/d' | LC_ALL=C sort)
+  print_info "Expect: --expect $(tr '\n' ' ' <<<"$found")"
+  if [[ -n $expected && $expected != "$found" ]]; then
+    print_error "$TO/$ARCH does not hold exactly the expected entries (--expect $(tr '\n' ' ' <<<"$expected"))"
+    exit 1
+  fi
+  if [[ -z $expected && $DRY_RUN != true ]]; then
+    print_error "--withdraw needs --expect naming every entry it drops; run it with --dry-run for the list"
+    exit 1
+  fi
   if [[ $DRY_RUN == true ]]; then
     print_info "Dry run: nothing uploaded; the files stay on the remote either way"
     exit 0
@@ -288,6 +312,7 @@ fetch_db "$TO" "$WORK/to" || print_warning "$(slot "$TO") has no database yet"
 db_entries "$WORK/to/omarchy.db.tar.zst" >"$WORK/to.entries"
 moves=()
 added=()
+added_expect=()
 replaced=()
 problems=()
 while IFS=$'\t' read -r name _ version filename sha; do
@@ -296,6 +321,7 @@ while IFS=$'\t' read -r name _ version filename sha; do
     echo "  new:     $name $version"
     moves+=("$filename")
     added+=("$name")
+    added_expect+=("$name=$version")
     continue
   fi
   IFS=$'\t' read -r tversion tfilename tsha <<<"$current"
@@ -320,7 +346,7 @@ fi
 rollback() {
   print_info "To undo it:"
   (( ${#added[@]} == 0 )) ||
-    echo "  bin/promote-artifact --withdraw --to $TO --arch $ARCH --package ${added[*]}"
+    echo "  bin/promote-artifact --withdraw --to $TO --arch $ARCH --package ${added[*]} --expect ${added_expect[*]}"
   (( ${#replaced[@]} == 0 )) ||
     echo "  bin/promote-artifact --reinstate --to $TO --arch $ARCH --file ${replaced[*]}"
 }
