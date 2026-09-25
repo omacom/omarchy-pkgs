@@ -124,9 +124,10 @@ package_as() {
     backup=()
     # shellcheck disable=SC1090 # Exercise the recipe's own package function.
     source "$BUILD_ROOT/pkgbuilds/$recipe/PKGBUILD"
-    eval "optdepends+=(\"\${optdepends_$carch[@]}\")"
+    eval "optdepends+=(\"\${optdepends_${carch}[@]}\")"
     package
     printf '%s\n' "${backup[@]}" | sort >"$scratch/$name.backup"
+    # shellcheck disable=SC2154 # Set by the recipe.
     printf '%s\n' "${optdepends[@]}" >"$scratch/$name.optdepends"
     (cd "$pkgdir" && find . \( -type f -o -type l \) | sed 's|^\./||' | sort) >"$scratch/$name.files"
   )
