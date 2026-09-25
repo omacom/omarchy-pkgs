@@ -1,0 +1,118 @@
+#!/bin/bash
+# Publish built packages into one channel of the remote repository,
+# incrementally and immutably.
+#
+#   publish-artifact --mirror <edge|rc|stable> --arch <arch> <pkg files...>
+#
+# What it does, in order:
+#   1. pull the channel's current database from the remote
+#   2. refuse if any package filename already exists on the remote
+#   3. sign each package (GPG_PRIVATE_KEY / GPG_PASSPHRASE)
+#   4. repo-add the packages into the pulled database (replaces the entry
+#      for that name; nothing else in the channel is touched)
+#   5. upload packages, then signatures, then the database last
+#
+# Never overwrites: uploads use --ignore-existing for packages and the
+# pre-check in step 2 makes a same-name collision a hard failure rather than
+# a silent skip. The database is the only object rewritten, and it is
+# uploaded only after every file it references is present.
+#
+# The remote is an rclone remote (REMOTE, default the production one);
+# OMARCHY_PUBLISH_PREFIX can point a proof run at a scratch prefix.
+set -euo pipefail
+BUILD_ROOT=$(realpath "${BASH_SOURCE[0]%/*}/..")
+source "$BUILD_ROOT/helpers/message-helpers.sh"
+source "$BUILD_ROOT/helpers/paths.sh"
+
+REMOTE=${REMOTE:-pkgs.omarchy.org:omarchy-pkgs}
+PREFIX=${OMARCHY_PUBLISH_PREFIX:-}
+FILES=()
+while [[ $# -gt 0 ]]; do
+  case $1 in
+  --mirror) MIRROR=$2; require_valid_mirror "$MIRROR"; shift 2 ;;
+  --arch) ARCH=$2; require_valid_arch "$ARCH"; shift 2 ;;
+  --remote) REMOTE=$2; shift 2 ;;
+  -h|--help) sed -n '2,22p' "$0"; exit 0 ;;
+  -*) print_error "Unknown option: $1"; exit 1 ;;
+  *) FILES+=("$1"); shift ;;
+  esac
+done
+(( ${#FILES[@]} )) || { print_error "No package files given"; exit 1; }
+: "${GPG_PRIVATE_KEY:?}"; GPG_PASSPHRASE=${GPG_PASSPHRASE-}
+
+DEST="$REMOTE/${PREFIX:+$PREFIX/}$MIRROR/$ARCH"
+WORK=$(mktemp -d)
+trap 'rm -rf "$WORK"' EXIT
+print_header "Publish to $DEST"
+
+# --- 0. sanity: every file is a package, named as makepkg names it ---------
+for f in "${FILES[@]}"; do
+  [[ -f "$f" && "$f" == *.pkg.tar.* && "$f" != *.sig ]] || { print_error "Not a package file: $f"; exit 1; }
+  name=$(bsdtar -xOf "$f" .PKGINFO | awk -F' = ' '$1=="pkgname"{print $2}')
+  ver=$(bsdtar -xOf "$f" .PKGINFO | awk -F' = ' '$1=="pkgver"{print $2}')
+  pkgarch=$(bsdtar -xOf "$f" .PKGINFO | awk -F' = ' '$1=="arch"{print $2}')
+  [[ "$(basename "$f")" == "$name-$ver-$pkgarch.pkg.tar."* ]] || {
+    print_error "Filename does not match PKGINFO ($name-$ver-$pkgarch): $(basename "$f")"; exit 1; }
+  [[ "$pkgarch" == any || "$pkgarch" == "$ARCH" ]] || { print_error "$f is $pkgarch, publishing to $ARCH"; exit 1; }
+done
+
+# --- 1. pull the current database -----------------------------------------
+mkdir -p "$WORK/repo"
+listing=$(rclone lsf "$DEST/" --s3-no-head 2>/dev/null || true)
+if grep -q '^omarchy.db.tar.zst$' <<<"$listing"; then
+  rclone copy "$DEST/omarchy.db.tar.zst" "$WORK/repo" --s3-no-head
+  rclone copy "$DEST/omarchy.files.tar.zst" "$WORK/repo" --s3-no-head 2>/dev/null || true
+  print_info "Pulled current database ($(tar -tf "$WORK/repo/omarchy.db.tar.zst" | grep -c '/$') entries)"
+else
+  print_warning "No database at $DEST — creating a new one"
+fi
+
+# --- 2. same-name collisions ----------------------------------------------
+# A filename must mean one set of bytes across every channel. The same file
+# reaching a channel that already holds it (a fast-ring publish after edge,
+# a re-run, a later promotion) is fine: it is skipped on upload and only the
+# database entry is added. Different bytes under a name the channel already
+# has is the one thing this must never do.
+for f in "${FILES[@]}"; do
+  b=$(basename "$f")
+  grep -qxF "$b" <<<"$listing" || continue
+  remote_sum=$(rclone hashsum md5 "$DEST/$b" --s3-no-head 2>/dev/null | awk '{print $1}')
+  local_sum=$(md5sum "$f" | awk '{print $1}')
+  if [[ -n "$remote_sum" && "$remote_sum" == "$local_sum" ]]; then
+    print_info "Already published with identical bytes, adding to the database only: $b"
+  else
+    print_error "Already published with DIFFERENT bytes, refusing to overwrite: $b"
+    echo "  Bump pkgrel; published filenames are immutable."
+    exit 1
+  fi
+done
+
+# --- 3. sign ---------------------------------------------------------------
+export GNUPGHOME="$WORK/gnupg"; mkdir -m 700 "$GNUPGHOME"
+echo "$GPG_PRIVATE_KEY" | gpg --batch --quiet --import
+KEY_ID=$(gpg --list-secret-keys --with-colons | awk -F: '$1=="sec"{print $5; exit}')
+[[ -n "$KEY_ID" ]] || { print_error "No secret key imported"; exit 1; }
+for f in "${FILES[@]}"; do
+  cp "$f" "$WORK/repo/"
+  gpg --batch --yes --pinentry-mode loopback --passphrase "$GPG_PASSPHRASE" \
+    --detach-sign --no-armor --local-user "$KEY_ID" "$WORK/repo/$(basename "$f")"
+  print_step "signed $(basename "$f")"
+done
+
+# --- 4. repo-add (replaces the entry for each pkgname) ---------------------
+( cd "$WORK/repo" && repo-add --quiet omarchy.db.tar.zst "${FILES[@]/#*\//}" )
+ln -sf omarchy.db.tar.zst "$WORK/repo/omarchy.db"
+ln -sf omarchy.files.tar.zst "$WORK/repo/omarchy.files"
+print_info "Database now has $(tar -tf "$WORK/repo/omarchy.db.tar.zst" | grep -c '/$') entries"
+
+# --- 5. upload: packages, signatures, database last -----------------------
+rclone copy "$WORK/repo" "$DEST" --s3-no-head --ignore-existing --filter '- *.sig' --filter '+ *.pkg.tar.*' --filter '- *'
+rclone copy "$WORK/repo" "$DEST" --s3-no-head --ignore-existing --filter '+ *.pkg.tar.*.sig' --filter '- *'
+# Re-verify every referenced file is really there before the db goes up.
+listing=$(rclone lsf "$DEST/" --s3-no-head)
+for f in "${FILES[@]}"; do
+  b=$(basename "$f")
+  grep -qxF "$b" <<<"$listing" && grep -qxF "$b.sig" <<<"$listing" || { print_error "Upload incomplete: $b"; exit 1; }
+done
+rclone copy "$WORK/repo" "$DEST" --s3-no-head --checksum --copy-links --filter '+ omarchy.db*' --filter '+ omarchy.files*' --filter '- *'
+print_success "Published ${#FILES[@]} package(s) to $DEST"

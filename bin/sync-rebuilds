@@ -17,11 +17,14 @@ SELF_TEST=false
 # rebuilding for it would ship a package built against the wrong ABI.
 OFFICIAL_REPOS=" core extra multilib core-debug extra-debug "
 
-# The published repository, used as the floor a bumped pkgrel has to clear.
-# Only x86_64 is published today; aarch64 has no repository to compare against.
+# The published repositories are the floor a bumped pkgrel has to clear.
 PUBLISHED_BASE_URL="${OMARCHY_PUBLISHED_BASE_URL:-https://pkgs.omarchy.org}"
 PUBLISHED_MIRRORS=(edge stable)
-PUBLISHED_ARCH=x86_64
+
+# Arch Linux ARM has no dated snapshots. This is the same live repository the
+# aarch64 builder resolves; override it only when the builder mirror changes.
+ALARM_BASE_URL="${OMARCHY_ALARM_BASE_URL:-https://fl.us.mirror.archlinuxarm.org/aarch64}"
+ALARM_REPOS=(core extra alarm aur)
 
 usage() {
   cat <<EOF
@@ -34,10 +37,13 @@ A package opts in by naming those dependencies in .omarchy/package.json:
 
   { "source": "aur", "sync": false, "rebuild_on": ["qt6-base"] }
 
-The versions the current pkgrel was bumped for are recorded alongside, in
-rebuilt_against, and written by this command:
+The versions the current pkgrel was bumped for are recorded per published
+architecture in rebuilt_against, and written by this command:
 
-  { "rebuild_on": ["qt6-base"], "rebuilt_against": { "qt6-base": "6.11.2-2" } }
+  { "rebuild_on": ["qt6-base"], "rebuilt_against": {
+      "x86_64": { "qt6-base": "6.11.2-3" },
+      "aarch64": { "qt6-base": "6.11.2-2" }
+  } }
 
 pkgrel is bumped unless every package named in rebuild_on is recorded and still
 matches. A name that is missing from the record counts as changed, so opting a
@@ -60,8 +66,9 @@ Examples:
   $0                   # Update every package that declares rebuild_on
   $0 quickshell-git    # Update specific packages
 
-Trigger versions are read from the local pacman database, so sync it first
-(pacman -Sy) or this reports whatever that database last saw.
+x86_64 trigger versions come from the local pacman database; aarch64 versions
+come from the live Arch Linux ARM repository database. Only architectures in
+PUBLISHED_ARCHES that the package supports are considered.
 EOF
 }
 
@@ -94,7 +101,7 @@ SPECIFIC_MODE=false
 # The version of a trigger package as the build container would resolve it.
 # A name pacman does not know reports nothing rather than failing, so the caller
 # gets to say which package was left alone instead of the run dying here.
-repo_version() {
+native_repo_version() {
   local package="$1"
   local info
 
@@ -108,9 +115,59 @@ repo_version() {
   ' <<<"$info"
 }
 
+load_alarm_repo() {
+  local repo="$1" db index
+  index="$TEMP_DIR/alarm-$repo.index"
+  [[ -f "$index" ]] && return 0
+
+  db="$TEMP_DIR/alarm-$repo.db"
+  if ! curl -fsSL --max-time 120 -o "$db" "$ALARM_BASE_URL/$repo/$repo.db" 2>/dev/null; then
+    print_error "Could not read the aarch64 $repo repository database"
+    return 1
+  fi
+  if ! tar -tf "$db" >/dev/null 2>&1; then
+    print_error "Unreadable aarch64 $repo repository database"
+    return 1
+  fi
+
+  tar -xOf "$db" --wildcards '*/desc' 2>/dev/null | awk '
+    function emit() {
+      if (name != "" && version != "") {
+        print name "\t" version
+        if (base != "" && base != name) print base "\t" version
+      }
+      name=""; base=""; version=""
+    }
+    $0 == "%FILENAME%" { emit(); next }
+    $0 == "%NAME%" { if (name != "" && version != "") emit(); getline; name=$0; next }
+    $0 == "%BASE%" { getline; base=$0; next }
+    $0 == "%VERSION%" { getline; version=$0; next }
+    END { emit() }
+  ' >"$index"
+}
+
+alarm_repo_version() {
+  local package="$1" repo version
+  for repo in "${ALARM_REPOS[@]}"; do
+    load_alarm_repo "$repo" || return 1
+    version=$(awk -F '\t' -v package="$package" '$1 == package { print $2; exit }' "$TEMP_DIR/alarm-$repo.index")
+    if [[ -n "$version" ]]; then
+      echo "$version"
+      return 0
+    fi
+  done
+}
+
+repo_version() { # repo_version <arch> <package>
+  case "$1" in
+    x86_64) native_repo_version "$2" ;;
+    aarch64) alarm_repo_version "$2" ;;
+    *) return 1 ;;
+  esac
+}
+
 declare -A PUBLISHED_VERSION=()
 PUBLISHED_LOADED=false
-PUBLISHED_AVAILABLE=true
 
 remember_published() {
   local name="$1"
@@ -131,34 +188,35 @@ load_published_versions() {
   [[ "$PUBLISHED_LOADED" == true ]] && return 0
   PUBLISHED_LOADED=true
 
-  local mirror db name base version
+  local arch mirror db name base version
 
-  for mirror in "${PUBLISHED_MIRRORS[@]}"; do
-    db="$TEMP_DIR/published-$mirror.db.tar.zst"
+  for arch in $(published_arches); do
+    for mirror in "${PUBLISHED_MIRRORS[@]}"; do
+      db="$TEMP_DIR/published-$mirror-$arch.db.tar.zst"
 
-    if ! curl -fsSL --max-time 120 -o "$db" \
-      "$PUBLISHED_BASE_URL/$mirror/$PUBLISHED_ARCH/omarchy.db.tar.zst" 2>/dev/null; then
-      print_warning "Could not read the published $mirror database; bumps are not checked against it this run"
-      PUBLISHED_AVAILABLE=false
-      continue
-    fi
+      if ! curl -fsSL --max-time 120 -o "$db" \
+        "$PUBLISHED_BASE_URL/$mirror/$arch/omarchy.db.tar.zst" 2>/dev/null; then
+        print_warning "Could not read the published $mirror/$arch database; bumps are not checked against it this run"
+        continue
+      fi
 
-    while IFS=$'\t' read -r name base version; do
-      [[ -n "$name" && -n "$version" ]] && remember_published "$name" "$version"
-      [[ -n "$base" && -n "$version" ]] && remember_published "$base" "$version"
-    done < <(
-      tar -xOf "$db" --wildcards '*/desc' 2>/dev/null | awk '
-        function emit() {
-          if (name != "" && version != "") print name "\t" base "\t" version
-          name=""; base=""; version=""
-        }
-        $0 == "%FILENAME%" { emit(); next }
-        $0 == "%NAME%" { if (name != "" && version != "") emit(); getline; name=$0; next }
-        $0 == "%BASE%" { getline; base=$0; next }
-        $0 == "%VERSION%" { getline; version=$0; next }
-        END { emit() }
-      '
-    )
+      while IFS=$'\t' read -r name base version; do
+        [[ -n "$name" && -n "$version" ]] && remember_published "$name" "$version"
+        [[ -n "$base" && -n "$version" ]] && remember_published "$base" "$version"
+      done < <(
+        tar -xOf "$db" --wildcards '*/desc' 2>/dev/null | awk '
+          function emit() {
+            if (name != "" && version != "") print name "\t" base "\t" version
+            name=""; base=""; version=""
+          }
+          $0 == "%FILENAME%" { emit(); next }
+          $0 == "%NAME%" { if (name != "" && version != "") emit(); getline; name=$0; next }
+          $0 == "%BASE%" { getline; base=$0; next }
+          $0 == "%VERSION%" { getline; version=$0; next }
+          END { emit() }
+        '
+      )
+    done
   done
 }
 
@@ -179,7 +237,7 @@ pkgbuild_field() {
   local package_dir="$1"
   local field="$2"
 
-  (cd "$package_dir" && env -u OMARCHY_SRC bash -c "source PKGBUILD 2>/dev/null; echo \"\${$field:-}\"")
+  package_pkgbuild_var "$package_dir" "$field"
 }
 
 # 2 -> 3, and 1.1 -> 1.2. Anything else is a pkgrel this command has no business
@@ -252,7 +310,17 @@ record_triggers() {
   local package_dir="$1"
   local current="$2"
 
-  write_metadata "$package_dir" '.rebuilt_against = $current' --argjson current "$current"
+  # A flat record is the legacy x86_64 shape. Preserve records for
+  # architectures outside this run, then replace the ones just rebuilt.
+  write_metadata "$package_dir" '
+    (.rebuilt_against // {}) as $old |
+    (if ($old | length) == 0 then {}
+     elif ($old | to_entries | all(.value | type == "string"))
+     then {x86_64: $old}
+     else $old
+     end) as $by_arch |
+    .rebuilt_against = ($by_arch * $current)
+  ' --argjson current "$current"
 }
 
 # Metadata that does not parse would otherwise drop its package out of the run
@@ -300,20 +368,40 @@ sync_package() {
 
   print_info "Checking $package against ${triggers[*]}..."
 
-  local current="{}" trigger version
-  for trigger in "${triggers[@]}"; do
-    version=$(repo_version "$trigger")
-    if [[ -z "$version" ]]; then
-      print_error "  $trigger is in no official repository; leaving $package alone"
-      ((++FAILED))
-      return 0
-    fi
-    if ! current=$(jq -c --arg name "$trigger" --arg version "$version" '.[$name] = $version' <<<"$current"); then
-      print_error "  Could not record $trigger $version for $package"
+  local current="{}" arch arch_current trigger version considered=0
+  for arch in $(published_arches); do
+    package_supports_arch "$package_dir" "$arch" || continue
+    considered=$((considered + 1))
+    arch_current="{}"
+    for trigger in "${triggers[@]}"; do
+      if ! version=$(repo_version "$arch" "$trigger"); then
+        print_error "  Could not read $arch repository versions; leaving $package alone"
+        ((++FAILED))
+        return 0
+      fi
+      if [[ -z "$version" ]]; then
+        print_error "  $trigger is in no $arch repository; leaving $package alone"
+        ((++FAILED))
+        return 0
+      fi
+      if ! arch_current=$(jq -c --arg name "$trigger" --arg version "$version" '.[$name] = $version' <<<"$arch_current"); then
+        print_error "  Could not record $arch/$trigger $version for $package"
+        ((++FAILED))
+        return 0
+      fi
+    done
+    if ! current=$(jq -c --arg arch "$arch" --argjson versions "$arch_current" '.[$arch] = $versions' <<<"$current"); then
+      print_error "  Could not record $arch trigger versions for $package"
       ((++FAILED))
       return 0
     fi
   done
+
+  if ((considered == 0)); then
+    print_info "  Skipping: not built for any published architecture"
+    ((++SKIPPED))
+    return 0
+  fi
 
   local recorded
   if ! recorded=$(package_metadata_value "$package_dir" '.rebuilt_against' ""); then
@@ -323,13 +411,20 @@ sync_package() {
   fi
   [[ -n "$recorded" && "$recorded" != "null" ]] || recorded="{}"
 
+  # Before architecture-specific records existed, rebuilt_against described
+  # x86_64. Read it that way without forcing a metadata-only migration.
+  if jq -e 'to_entries | all(.value | type == "string")' >/dev/null <<<"$recorded"; then
+    recorded=$(jq -c '{x86_64: .}' <<<"$recorded")
+  fi
+
   # Walk the declared triggers rather than the record, so a name the record does
   # not carry reads as changed instead of going unexamined forever.
   local moved
   if ! moved=$(jq -r --argjson recorded "$recorded" '
-    to_entries
-    | map(select($recorded[.key] != .value)
-          | "\(.key) \($recorded[.key] // "unrecorded") -> \(.value)")
+    [to_entries[] as $arch
+     | $arch.value | to_entries[] as $trigger
+     | select($recorded[$arch.key][$trigger.key] != $trigger.value)
+     | "\($arch.key)/\($trigger.key) \($recorded[$arch.key][$trigger.key] // "unrecorded") -> \($trigger.value)"]
     | join(", ")
   ' <<<"$current"); then
     print_error "  Could not compare recorded trigger versions for $package"
@@ -338,7 +433,7 @@ sync_package() {
   fi
 
   if [[ -z "$moved" ]]; then
-    print_info "  Already rebuilt against $(jq -r 'to_entries | map("\(.key) \(.value)") | join(", ")' <<<"$current")"
+    print_info "  Already rebuilt against every published architecture"
     ((++SKIPPED))
     return 0
   fi
@@ -466,11 +561,11 @@ selftest_root() {
 }
 
 selftest_package() {
-  local root="$1" name="$2" pkgrel="$3" metadata="$4" pkgver="${5:-1.0}"
+  local root="$1" name="$2" pkgrel="$3" metadata="$4" pkgver="${5:-1.0}" arches="${6:-x86_64}"
   local dir="$root/pkgbuilds/$name"
 
   mkdir -p "$dir/.omarchy"
-  printf 'pkgname=%s\npkgver=%s\npkgrel=%s\narch=(x86_64)\n' "$name" "$pkgver" "$pkgrel" > "$dir/PKGBUILD"
+  printf 'pkgname=%s\npkgver=%s\npkgrel=%s\narch=(%s)\n' "$name" "$pkgver" "$pkgrel" "$arches" > "$dir/PKGBUILD"
   printf '%s\n' "$metadata" > "$dir/.omarchy/package.json"
 }
 
@@ -514,17 +609,49 @@ selftest_published() {
   cat > "$root/stub/curl" <<'STUB'
 #!/bin/bash
 out=""
+url=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -o) out="$2"; shift 2 ;;
-    *) shift ;;
+    *) url="$1"; shift ;;
   esac
 done
-db="$(dirname "$0")/omarchy.db.tar.zst"
+if [[ "$url" == */aarch64/* ]]; then
+  repo="${url%/*}"
+  repo="${repo##*/}"
+  db="$(dirname "$0")/alarm-$repo.db"
+else
+  db="$(dirname "$0")/omarchy.db.tar.zst"
+fi
 [[ -f "$db" && -n "$out" ]] || exit 22
 cp "$db" "$out"
 STUB
   chmod +x "$root/stub/curl"
+}
+
+selftest_alarm() {
+  local root="$1"
+  shift
+  local repo staging="$root/stub/alarm-db" entry name version
+
+  for repo in core extra; do
+    rm -rf "$staging"
+    mkdir -p "$staging"
+    if [[ "$repo" == "core" ]]; then
+      mkdir -p "$staging/unrelated-1-1"
+      printf '%%FILENAME%%\nunrelated-1-1-aarch64.pkg.tar.zst\n\n%%NAME%%\nunrelated\n\n%%BASE%%\nunrelated\n\n%%VERSION%%\n1-1\n' \
+        > "$staging/unrelated-1-1/desc"
+    else
+      for entry in "$@"; do
+        name="${entry%=*}"
+        version="${entry#*=}"
+        mkdir -p "$staging/$name-$version"
+        printf '%%FILENAME%%\n%s-%s-aarch64.pkg.tar.zst\n\n%%NAME%%\n%s\n\n%%BASE%%\n%s\n\n%%VERSION%%\n%s\n' \
+          "$name" "$version" "$name" "$name" "$version" > "$staging/$name-$version/desc"
+      done
+    fi
+    tar -czf "$root/stub/alarm-$repo.db" -C "$staging" .
+  done
 }
 
 cmd_self_test() {
@@ -545,7 +672,8 @@ cmd_self_test() {
     local root="$1"
     shift
     local status=0
-    PATH="$root/stub:$PATH" "$root/bin/sync-rebuilds" "$@" > "$root/output" 2>&1 || status=$?
+    OMARCHY_ARCHES="${SELFTEST_ARCHES:-x86_64}" \
+      PATH="$root/stub:$PATH" "$root/bin/sync-rebuilds" "$@" > "$root/output" 2>&1 || status=$?
     echo "$status"
   }
 
@@ -563,7 +691,7 @@ cmd_self_test() {
   check "run succeeds" 0 "$(run_case "$root")"
   check "pkgrel bumped" 2 "$(pkgrel_of "$root/pkgbuilds/t-partial")"
   check "unrecorded trigger now recorded" "2-2" \
-    "$(jq -r '.rebuilt_against["dep-b"]' "$root/pkgbuilds/t-partial/.omarchy/package.json")"
+    "$(jq -r '.rebuilt_against.x86_64["dep-b"]' "$root/pkgbuilds/t-partial/.omarchy/package.json")"
 
   echo "Opting a package in buys a rebuild rather than a bare record:"
   root=$(selftest_root fresh)
@@ -573,7 +701,7 @@ cmd_self_test() {
   check "run succeeds" 0 "$(run_case "$root")"
   check "pkgrel bumped" 2 "$(pkgrel_of "$root/pkgbuilds/t-fresh")"
   check "trigger recorded" "1-1" \
-    "$(jq -r '.rebuilt_against["dep-a"]' "$root/pkgbuilds/t-fresh/.omarchy/package.json")"
+    "$(jq -r '.rebuilt_against.x86_64["dep-a"]' "$root/pkgbuilds/t-fresh/.omarchy/package.json")"
 
   echo "An unchanged package is left alone:"
   root=$(selftest_root current)
@@ -612,6 +740,67 @@ cmd_self_test() {
   check "suffix recorded for the next AUR sync" 1 \
     "$(jq -r '.pkgrel.suffix' "$root/pkgbuilds/t-aur/.omarchy/package.json")"
 
+  echo "A dependency is tracked independently for both published architectures:"
+  root=$(selftest_root multiarch)
+  selftest_package "$root" t-multi 1 '{"source":"local","rebuild_on":["dep-a"],"rebuilt_against":{"dep-a":"1-1"}}' 1.0 'x86_64 aarch64'
+  selftest_pacman "$root" dep-a=1-1
+  selftest_published "$root"
+  selftest_alarm "$root" dep-a=2-1
+  SELFTEST_ARCHES="x86_64 aarch64"
+  check "run succeeds" 0 "$(run_case "$root")"
+  unset SELFTEST_ARCHES
+  check "pkgrel bumped once" 2 "$(pkgrel_of "$root/pkgbuilds/t-multi")"
+  check "x86_64 trigger recorded" "1-1" \
+    "$(jq -r '.rebuilt_against.x86_64["dep-a"]' "$root/pkgbuilds/t-multi/.omarchy/package.json")"
+  check "aarch64 trigger recorded" "2-1" \
+    "$(jq -r '.rebuilt_against.aarch64["dep-a"]' "$root/pkgbuilds/t-multi/.omarchy/package.json")"
+
+  echo "An ARM-only run records only the ARM dependency state:"
+  root=$(selftest_root arm-only)
+  selftest_package "$root" t-arm 1 '{"source":"local","rebuild_on":["dep-a"]}' 1.0 'x86_64 aarch64'
+  selftest_pacman "$root"
+  selftest_published "$root"
+  selftest_alarm "$root" dep-a=2-1
+  SELFTEST_ARCHES=aarch64
+  check "run succeeds" 0 "$(run_case "$root")"
+  unset SELFTEST_ARCHES
+  check "pkgrel bumped" 2 "$(pkgrel_of "$root/pkgbuilds/t-arm")"
+  check "ARM trigger recorded" "2-1" \
+    "$(jq -r '.rebuilt_against.aarch64["dep-a"]' "$root/pkgbuilds/t-arm/.omarchy/package.json")"
+  check "x86_64 was not consulted" "false" \
+    "$(jq -r '.rebuilt_against | has("x86_64")' "$root/pkgbuilds/t-arm/.omarchy/package.json")"
+
+  echo "An x86-only package ignores ARM during a dual-architecture run:"
+  root=$(selftest_root x86-package)
+  selftest_package "$root" t-x86 1 '{"source":"local","rebuild_on":["dep-a"],"rebuilt_against":{"dep-a":"1-1"}}'
+  selftest_pacman "$root" dep-a=1-1
+  selftest_published "$root"
+  selftest_alarm "$root" dep-a=2-1
+  SELFTEST_ARCHES="x86_64 aarch64"
+  check "run succeeds" 0 "$(run_case "$root")"
+  unset SELFTEST_ARCHES
+  check "pkgrel untouched" 1 "$(pkgrel_of "$root/pkgbuilds/t-x86")"
+
+  echo "A PKGBUILD that branches on CARCH at file scope still reads its version:"
+  root=$(selftest_root carch-branch)
+  mkdir -p "$root/pkgbuilds/t-carch/.omarchy"
+  cat > "$root/pkgbuilds/t-carch/PKGBUILD" <<'PKG'
+pkgname=t-carch
+case "$CARCH" in
+    x86_64) _suffix=x64 ;;
+    aarch64) _suffix=arm64 ;;
+    *) return 1 ;;
+esac
+pkgver=1.0
+pkgrel=3
+arch=(x86_64 aarch64)
+PKG
+  echo '{"source":"local"}' > "$root/pkgbuilds/t-carch/.omarchy/package.json"
+  check "pkgver read for x86_64" "1.0" "$(package_pkgbuild_var "$root/pkgbuilds/t-carch" pkgver x86_64)"
+  check "pkgrel read for x86_64" "3" "$(package_pkgbuild_var "$root/pkgbuilds/t-carch" pkgrel x86_64)"
+  check "arch-specific value follows CARCH" "arm64" "$(package_pkgbuild_var "$root/pkgbuilds/t-carch" _suffix aarch64)"
+  check "unsupported arch reports failure" 1 "$(package_pkgbuild_var "$root/pkgbuilds/t-carch" pkgver armv7h >/dev/null; echo $?)"
+
   echo ""
   if [[ "$failures" -eq 0 ]]; then
     print_success "Self-test passed"
@@ -626,9 +815,9 @@ if [[ "$SELF_TEST" == true ]]; then
   exit $?
 fi
 
-for tool in pacman vercmp jq curl; do
+for tool in pacman vercmp jq curl tar; do
   if ! command -v "$tool" >/dev/null 2>&1; then
-    print_error "$tool not found: reading trigger versions and ordering pkgrels both need pacman"
+    print_error "$tool not found: rebuild trigger sync cannot run"
     exit 1
   fi
 done

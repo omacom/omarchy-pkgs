@@ -1,0 +1,1127 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 8a80de2..2d48237 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -39,8 +39,28 @@ target_compile_options(cua_hyprland_protocol PRIVATE -Wall -Wextra -Wpedantic -W
+ cua_hyprland_harden(cua_hyprland_protocol)
+ set_target_properties(cua_hyprland_protocol PROPERTIES POSITION_INDEPENDENT_CODE ON)
+ 
++if(BUILD_TESTING OR CUA_HYPRLAND_INPUT OR CUA_HYPRLAND_TEST_INPUT)
++    find_package(PkgConfig REQUIRED)
++    pkg_check_modules(XKBCOMMON REQUIRED IMPORTED_TARGET xkbcommon)
++endif()
++
+ if(BUILD_TESTING)
++    add_executable(cua_hyprland_keyboard_layout_test tests/keyboard_layout_test.cpp)
++    target_compile_features(cua_hyprland_keyboard_layout_test PRIVATE cxx_std_26)
++    target_include_directories(cua_hyprland_keyboard_layout_test PRIVATE src)
++    target_link_libraries(cua_hyprland_keyboard_layout_test PRIVATE PkgConfig::XKBCOMMON)
++    target_compile_options(cua_hyprland_keyboard_layout_test PRIVATE -Wall -Wextra -Wpedantic -Werror)
++    add_test(NAME cua_hyprland_keyboard_layout_test COMMAND cua_hyprland_keyboard_layout_test)
++
+     find_package(Python3 REQUIRED COMPONENTS Interpreter)
++    add_test(NAME cua_hyprland_agent_keymap_test
++        COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/tests/agent_keymap_test.py)
++    set_tests_properties(cua_hyprland_agent_keymap_test PROPERTIES
++        ENVIRONMENT "CXX=${CMAKE_CXX_COMPILER}")
++    add_test(NAME cua_hyprland_foreground_modifiers_test
++        COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/tests/foreground_modifiers_test.py)
++    set_tests_properties(cua_hyprland_foreground_modifiers_test PROPERTIES
++        ENVIRONMENT "CXX=${CMAKE_CXX_COMPILER}")
+     add_test(NAME cua_hyprland_desktop_fault_policy_test
+         COMMAND ${Python3_EXECUTABLE} -B
+             ${CMAKE_CURRENT_SOURCE_DIR}/tests/desktop_fault_policy_test.py)
+@@ -218,6 +238,7 @@ if(CUA_HYPRLAND_BUILD_PLUGIN)
+             message(FATAL_ERROR "Input is pinned to Hyprland 0.56.2")
+         endif()
+         target_sources(cua_hyprland_plugin PRIVATE src/input_experiment.cpp)
++        target_link_libraries(cua_hyprland_plugin PRIVATE PkgConfig::XKBCOMMON)
+     endif()
+     if(CUA_HYPRLAND_INPUT)
+         target_compile_definitions(cua_hyprland_plugin PRIVATE CUA_HYPRLAND_INPUT=1)
+diff --git a/src/foreground_route.hpp b/src/foreground_route.hpp
+index 0b675d3..c3af461 100644
+--- a/src/foreground_route.hpp
++++ b/src/foreground_route.hpp
+@@ -68,11 +68,13 @@ struct ForegroundSeatBindings {
+     bool unique() const { return primary_candidates == 1; }
+ };
+ 
+-inline ForegroundFailureReason foreground_key_modifier_failure(const std::array<std::uint32_t, 4>& modifiers) {
+-    // The KEY mapping assumes a neutral US state, including layout group zero.
++inline ForegroundFailureReason foreground_key_modifier_failure(const std::array<std::uint32_t, 4>& modifiers,
++                                                                 std::uint32_t allowed_locked = 0) {
++    // The caller may admit a keymap-resolved ambient Num Lock mask. All other
++    // human modifiers and nonzero layout groups remain unsupported.
+     if (modifiers[0]) return ForegroundFailureReason::keyboard_depressed;
+     if (modifiers[1]) return ForegroundFailureReason::keyboard_latched;
+-    if (modifiers[2]) return ForegroundFailureReason::keyboard_locked;
++    if (modifiers[2] & ~allowed_locked) return ForegroundFailureReason::keyboard_locked;
+     if (modifiers[3]) return ForegroundFailureReason::keyboard_group;
+     return ForegroundFailureReason::none;
+ }
+diff --git a/src/input_experiment.cpp b/src/input_experiment.cpp
+index fc7e740..5d80d3e 100644
+--- a/src/input_experiment.cpp
++++ b/src/input_experiment.cpp
+@@ -9,6 +9,8 @@
+ #include "seat_lifetime.hpp"
+ #include "owned_socket_path.hpp"
+ #include "foreground_route.hpp"
++#include "keyboard_layout.hpp"
++#include <sys/mman.h>
+ 
+ #include <src/Compositor.hpp>
+ #include <src/devices/IKeyboard.hpp>
+@@ -214,7 +216,11 @@ struct InputExperiment::Impl {
+     xkb_keymap* keymap = nullptr;
+     xkb_state* keyboard_state = nullptr;
+     int keymap_fd = -1;
+-    bool retired = false, suspended = true, us_keymap = false, physical_keymap_present = false;
++    // Foreground state uses the actual primary map; never share it with agent seats.
++    xkb_keymap* physical_keymap = nullptr;
++    xkb_state* physical_state = nullptr;
++    std::string physical_keymap_text;
++    bool retired = false, suspended = true, physical_keymap_present = false;
+     WP<IKeyboard> physical_keyboard;
+     CHyprSignalListener keymap_listener;
+     unsigned lane;
+@@ -243,23 +249,37 @@ struct InputExperiment::Impl {
+         // No private key or input-enabled default exists in this component.
+     }
+ 
+-    static bool canonical_us_keymap(xkb_context* context, xkb_keymap* map) {
+-        // Compare canonical compiled content, not a layout display name. This
+-        // deliberately excludes variants, options, remaps, and multiple groups.
+-        const xkb_rule_names names{"evdev", "pc105", "us", "", ""};
+-        auto* reference = xkb_keymap_new_from_names(context, &names, XKB_KEYMAP_COMPILE_NO_FLAGS);
+-        if (!reference) return false;
+-        char* actual = xkb_keymap_get_as_string(map, XKB_KEYMAP_FORMAT_TEXT_V1);
+-        char* expected = xkb_keymap_get_as_string(reference, XKB_KEYMAP_FORMAT_TEXT_V1);
+-        const bool matches = actual && expected && std::strcmp(actual, expected) == 0;
+-        std::free(actual); std::free(expected); xkb_keymap_unref(reference);
+-        return matches;
+-    }
+-    bool layout_qualified() const {
+-        if (!kProduction) return true;
++    bool physical_layout_ready() const {
+         const auto keyboard = g_pSeatManager->m_keyboard.lock();
+-        return physical_keymap_present && us_keymap && keyboard_state && keyboard &&
+-            keyboard->m_xkbKeymapV1FD.get() >= 0 && keyboard->m_xkbKeymapV1String == keymap_text;
++        return physical_keymap_present && physical_state && keyboard &&
++            keyboard->m_xkbKeymapV1FD.get() >= 0 && keyboard->m_xkbKeymapV1String == physical_keymap_text;
++    }
++    bool layout_qualified(InputRoute route, std::uint64_t capability) const {
++        return keyboard_layout_ready(route, capability, keyboard_state && keymap_fd >= 0, physical_layout_ready());
++    }
++    void initialize_agent_keymap() {
++        if (keymap) return;
++        xkb_context_ = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
++        keymap = xkb_context_ ? agent_keymap(xkb_context_) : nullptr;
++        keyboard_state = keymap ? xkb_state_new(keymap) : nullptr;
++        char* text = keymap ? xkb_keymap_get_as_string(keymap, XKB_KEYMAP_FORMAT_TEXT_V1) : nullptr;
++        if (!keyboard_state || !text) {
++            std::free(text);
++            throw std::runtime_error("agent XKB keymap unavailable");
++        }
++        keymap_text = text;
++        std::free(text);
++        keymap_fd = memfd_create("cua-agent-keymap", MFD_CLOEXEC | MFD_ALLOW_SEALING);
++        if (keymap_fd < 0) throw std::runtime_error("agent keymap fd unavailable");
++        std::size_t offset = 0;
++        while (offset < keymap_text.size() + 1) {
++            const auto count = write(keymap_fd, keymap_text.c_str() + offset, keymap_text.size() + 1 - offset);
++            if (count < 0 && errno == EINTR) continue;
++            if (count <= 0) throw std::runtime_error("agent keymap write failed");
++            offset += static_cast<std::size_t>(count);
++        }
++        if (fcntl(keymap_fd, F_ADD_SEALS, F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_WRITE | F_SEAL_SEAL) < 0)
++            throw std::runtime_error("agent keymap sealing failed");
+     }
+     void sync_keymap() {
+         const auto keyboard = g_pSeatManager->m_keyboard.lock();
+@@ -278,38 +298,20 @@ struct InputExperiment::Impl {
+             return;
+         }
+         physical_keymap_present = true;
+-        if (keyboard_state && keymap_text == keyboard->m_xkbKeymapV1String) return;
+-        // Prepare a complete replacement before retiring the old independent
+-        // state. Keep our own fd: primary keyboard replacement must not leave
+-        // later seat bindings referring to a closed compositor fd.
+-        auto* context = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
+-        auto* map = context ? xkb_keymap_new_from_string(context, keyboard->m_xkbKeymapV1String.c_str(),
+-            XKB_KEYMAP_FORMAT_TEXT_V1, XKB_KEYMAP_COMPILE_NO_FLAGS) : nullptr;
+-        auto* state = map ? xkb_state_new(map) : nullptr;
+-        const auto fd = fcntl(keyboard->m_xkbKeymapV1FD.get(), F_DUPFD_CLOEXEC, 0);
+-        if (!state || fd < 0) {
+-            if (fd >= 0) close(fd);
+-            if (state) xkb_state_unref(state);
+-            if (map) xkb_keymap_unref(map);
+-            if (context) xkb_context_unref(context);
+-            throw std::runtime_error("independent XKB state unavailable");
+-        }
++        if (physical_keymap_text == keyboard->m_xkbKeymapV1String) return;
++        // Physical changes still revoke authority, but never replace the map
++        // advertised by either background keyboard.
+         desktop_transition();
+-        if (keyboard_state) xkb_state_unref(keyboard_state);
+-        if (keymap) xkb_keymap_unref(keymap);
+-        if (xkb_context_) xkb_context_unref(xkb_context_);
+-        if (keymap_fd >= 0) close(keymap_fd);
+-        keyboard_state = state; keymap = map; xkb_context_ = context; keymap_fd = fd;
+-        us_keymap = !kProduction || canonical_us_keymap(context, map);
+-        keymap_text = keyboard->m_xkbKeymapV1String;
+-        for (auto& k : keyboards)
+-            if (!k->dead && k->wl->resource())
+-                k->wl->sendKeymap(WL_KEYBOARD_KEYMAP_FORMAT_XKB_V1, keymap_fd, keymap_text.size() + 1);
+-        for (auto& seat : seats)
+-            if (!seat->dead && seat->wl->resource())
+-                seat->wl->sendCapabilities(static_cast<wl_seat_capability>(WL_SEAT_CAPABILITY_POINTER | WL_SEAT_CAPABILITY_KEYBOARD));
++        auto* map = xkb_keymap_new_from_string(xkb_context_, keyboard->m_xkbKeymapV1String.c_str(),
++            XKB_KEYMAP_FORMAT_TEXT_V1, XKB_KEYMAP_COMPILE_NO_FLAGS);
++        auto* state = map ? xkb_state_new(map) : nullptr;
++        if (physical_state) xkb_state_unref(physical_state);
++        if (physical_keymap) xkb_keymap_unref(physical_keymap);
++        physical_state = state; physical_keymap = map;
++        physical_keymap_text = keyboard->m_xkbKeymapV1String;
+     }
+     void start() {
++        initialize_agent_keymap();
+         sync_keymap();
+         timer = wl_event_loop_add_timer(g_pCompositor->m_wlEventLoop, tick, this);
+         if (!timer) throw std::runtime_error("input timer registration failed");
+@@ -389,6 +391,8 @@ struct InputExperiment::Impl {
+         cleanup_socket();
+         if (keyboard_state) xkb_state_unref(keyboard_state);
+         if (keymap) xkb_keymap_unref(keymap);
++        if (physical_state) xkb_state_unref(physical_state);
++        if (physical_keymap) xkb_keymap_unref(physical_keymap);
+         if (xkb_context_) xkb_context_unref(xkb_context_);
+         if (keymap_fd >= 0) close(keymap_fd);
+     }
+@@ -782,12 +786,40 @@ struct InputExperiment::Impl {
+             .exact_pointer_focus = root && g_pSeatManager->m_state.pointerFocus == root,
+         };
+     }
++    std::array<std::uint32_t, 4> capture_foreground_modifiers(bool needs_keyboard) const {
++        const auto physical = g_pSeatManager->m_keyboard.lock();
++        if (!physical) throw ForegroundFailure{ForegroundFailureReason::physical_keyboard};
++        std::array<std::uint32_t, 4> result{};
++        const auto observe = [&](const auto& kb, bool primary) {
++            const std::array<std::uint32_t, 4> state{kb->m_modifiersState.depressed, kb->m_modifiersState.latched,
++                kb->m_modifiersState.locked, kb->m_modifiersState.group};
++            if (needs_keyboard) {
++                const auto failure = foreground_key_modifier_failure(state, foreground_numlock_mask(kb->m_xkbKeymap));
++                if (failure != ForegroundFailureReason::none) throw ForegroundFailure{failure};
++                // Hyprland combines shared raw masks. A lock from a different
++                // encoding must not be reinterpreted as the primary Num Lock.
++                if (state[2] && state[2] != foreground_numlock_mask(physical_keymap))
++                    throw ForegroundFailure{ForegroundFailureReason::keyboard_locked};
++            }
++            for (unsigned i = 0; i < 3; ++i) result[i] |= state[i];
++            if (primary) result[3] = state[3];
++        };
++        observe(physical, true);
++        for (const auto& kb : g_pInputManager->m_keyboards) {
++            if (kb == physical || !kb->m_enabled || !kb->shareStates() ||
++                (kb->isVirtual() && g_pInputManager->shouldIgnoreVirtualKeyboard(kb))) continue;
++            observe(kb, false);
++        }
++        return result;
++    }
+     void require_foreground(Client& c) {
+         if (lease != &c) throw ForegroundFailure{ForegroundFailureReason::lease};
+         if (c.dead) throw ForegroundFailure{ForegroundFailureReason::client_dead};
+         if (!available()) throw ForegroundFailure{ForegroundFailureReason::session_unavailable};
+-        if (!layout_qualified()) throw ForegroundFailure{ForegroundFailureReason::unsupported_layout};
++        if (foreground_keyboard_used && !physical_layout_ready()) throw ForegroundFailure{ForegroundFailureReason::unsupported_layout};
+         if (Clock::now() >= expires) throw ForegroundFailure{ForegroundFailureReason::lease_expired};
++        if (foreground_keyboard_used && capture_foreground_modifiers(true) != foreground_modifiers)
++            throw ForegroundFailure{ForegroundFailureReason::keyboard_state};
+         const auto failure = foreground_guard(c).dispatch_failure(foreground_needs_pointer);
+         if (failure != ForegroundFailureReason::none) throw ForegroundFailure{failure};
+     }
+@@ -803,24 +835,31 @@ struct InputExperiment::Impl {
+                     p->sendButton(event_ms(), held_button, WL_POINTER_BUTTON_STATE_RELEASED);
+                     p->sendFrame();
+                 }
++        // Synthetic events only change our private state. If human input
++        // cancelled the action, restore the current real state, not stale locks.
++        const auto restore_modifiers = g_pSeatManager->m_keyboard.lock() ?
++            capture_foreground_modifiers(false) : foreground_modifiers;
+         if (foreground_keyboard_used && root && root->good() && g_pSeatManager->m_state.keyboardFocus == root)
+             for (const auto& weak : foreground_keyboards)
+                 if (const auto k = weak.lock(); k && k->good()) {
+                     for (auto code : held_keys) k->sendKey(event_ms(), code, WL_KEYBOARD_KEY_STATE_RELEASED);
+-                    k->sendMods(foreground_modifiers[0], foreground_modifiers[1], foreground_modifiers[2], foreground_modifiers[3]);
++                    k->sendMods(restore_modifiers[0], restore_modifiers[1], restore_modifiers[2], restore_modifiers[3]);
+                 }
+         held_button = 0; held_keys.clear();
+         foreground_pointers.clear(); foreground_keyboards.clear(); foreground_surface.reset(); foreground_seat.reset();
+         foreground_started = false;
+         foreground_keyboard_used = false;
++        if (physical_state) xkb_state_unref(physical_state);
++        physical_state = physical_keymap ? xkb_state_new(physical_keymap) : nullptr;
+     }
+-    void start_foreground(Client& c, double x, double y, bool needs_pointer, bool needs_keyboard) {
++    void start_foreground(Client& c, double x, double y, bool needs_pointer, bool needs_keyboard,
++                          const std::array<std::uint32_t, 4>& modifiers) {
+         const auto root = c.surface.lock();
+         const auto physical = g_pSeatManager->m_keyboard.lock();
+         const auto failure = foreground_guard(c).activation_failure();
+         if (failure != ForegroundFailureReason::none) throw ForegroundFailure{failure};
+         if (!physical) throw ForegroundFailure{ForegroundFailureReason::physical_keyboard};
+-        if (!keyboard_state) throw ForegroundFailure{ForegroundFailureReason::keyboard_state};
++        if (needs_keyboard && !physical_layout_ready()) throw ForegroundFailure{ForegroundFailureReason::keyboard_state};
+         if (needs_pointer && !g_pSeatManager->m_mouse) throw ForegroundFailure{ForegroundFailureReason::physical_pointer};
+         const Vector2D local{x + c.geometry[0] - c.geometry[4], y + c.geometry[1] - c.geometry[5]};
+         if (needs_pointer && (!point(c, x, y) || root->at(local, true).first != root)) throw ForegroundFailure{ForegroundFailureReason::pointer_target};
+@@ -831,24 +870,16 @@ struct InputExperiment::Impl {
+         for (const auto& k : seat->m_keyboards) if (k && k->good()) foreground_keyboards.push_back(k);
+         if (needs_pointer && foreground_pointers.empty()) throw ForegroundFailure{ForegroundFailureReason::pointer_resources};
+         if (foreground_keyboards.empty()) throw ForegroundFailure{ForegroundFailureReason::keyboard_resources};
+-        foreground_modifiers = {physical->m_modifiersState.depressed, physical->m_modifiersState.latched,
+-            physical->m_modifiersState.locked, physical->m_modifiersState.group};
+-        for (const auto& kb : g_pInputManager->m_keyboards) {
+-            if (!kb->m_enabled || !kb->shareStates() || (kb->isVirtual() && g_pInputManager->shouldIgnoreVirtualKeyboard(kb))) continue;
+-            foreground_modifiers[0] |= kb->m_modifiersState.depressed;
+-            foreground_modifiers[1] |= kb->m_modifiersState.latched;
+-            foreground_modifiers[2] |= kb->m_modifiersState.locked;
+-        }
+-        if (needs_keyboard) {
+-            const auto modifier_failure = foreground_key_modifier_failure(foreground_modifiers);
+-            if (modifier_failure != ForegroundFailureReason::none) throw ForegroundFailure{modifier_failure};
+-        }
+-        xkb_state_update_mask(keyboard_state, foreground_modifiers[0], foreground_modifiers[1], foreground_modifiers[2], 0, 0, foreground_modifiers[3]);
++        foreground_modifiers = modifiers;
++        if (needs_keyboard && capture_foreground_modifiers(true) != foreground_modifiers)
++            throw ForegroundFailure{ForegroundFailureReason::keyboard_state};
++        if (needs_keyboard) xkb_state_update_mask(physical_state, foreground_modifiers[0], foreground_modifiers[1], foreground_modifiers[2], 0, 0, foreground_modifiers[3]);
+         foreground_surface = root;
+         foreground_seat = seat;
+         foreground_needs_pointer = needs_pointer;
+         c.foreground_attempted = true;
+         foreground_started = true;
++        foreground_keyboard_used = needs_keyboard;
+         foreground_activating = true;
+         // Activation intentionally persists. Never save, borrow, or restore focus.
+         if (g_pSeatManager->m_state.keyboardFocus != root || Desktop::focusState()->window() != c.window.lock() ||
+@@ -858,7 +889,16 @@ struct InputExperiment::Impl {
+         if (lease != &c) throw ForegroundFailure{ForegroundFailureReason::lease};
+         const auto focus_failure = foreground_guard(c).dispatch_failure(false);
+         if (focus_failure != ForegroundFailureReason::none) throw ForegroundFailure{focus_failure};
+-        if (!needs_pointer) { require_foreground(c); return; }
++        if (!needs_pointer) {
++            require_foreground(c);
++            if (needs_keyboard)
++                for (const auto& weak : foreground_keyboards) {
++                    const auto k = weak.lock();
++                    if (!k || !k->good()) throw ForegroundFailure{ForegroundFailureReason::keyboard_resources};
++                    k->sendMods(foreground_modifiers[0], foreground_modifiers[1], foreground_modifiers[2], foreground_modifiers[3]);
++                }
++            return;
++        }
+         foreground_activating = true;
+         ::Pointer::mgr()->warpTo({x + c.geometry[0], y + c.geometry[1]});
+         if (lease != &c) throw ForegroundFailure{ForegroundFailureReason::lease};
+@@ -893,16 +933,17 @@ struct InputExperiment::Impl {
+     }
+     void foreground_key(Client& c, std::uint32_t code, bool pressed) {
+         require_foreground(c);
++        if (!physical_layout_ready()) throw ForegroundFailure{ForegroundFailureReason::unsupported_layout};
+         foreground_keyboard_used = true;
+-        xkb_state_update_key(keyboard_state, code + 8, pressed ? XKB_KEY_DOWN : XKB_KEY_UP);
++        xkb_state_update_key(physical_state, code + 8, pressed ? XKB_KEY_DOWN : XKB_KEY_UP);
+         if (pressed) held_keys.push_back(code); else std::erase(held_keys, code);
+         for (const auto& weak : foreground_keyboards) {
+             const auto k = weak.lock(); if (!k || !k->good()) throw ForegroundFailure{ForegroundFailureReason::keyboard_resources};
+             k->sendKey(event_ms(), code, pressed ? WL_KEYBOARD_KEY_STATE_PRESSED : WL_KEYBOARD_KEY_STATE_RELEASED);
+-            k->sendMods(xkb_state_serialize_mods(keyboard_state, XKB_STATE_MODS_DEPRESSED),
+-                xkb_state_serialize_mods(keyboard_state, XKB_STATE_MODS_LATCHED),
+-                xkb_state_serialize_mods(keyboard_state, XKB_STATE_MODS_LOCKED),
+-                xkb_state_serialize_layout(keyboard_state, XKB_STATE_LAYOUT_EFFECTIVE));
++            k->sendMods(xkb_state_serialize_mods(physical_state, XKB_STATE_MODS_DEPRESSED),
++                xkb_state_serialize_mods(physical_state, XKB_STATE_MODS_LATCHED),
++                xkb_state_serialize_mods(physical_state, XKB_STATE_MODS_LOCKED),
++                xkb_state_serialize_layout(physical_state, XKB_STATE_LAYOUT_EFFECTIVE));
+         }
+     }
+     bool pointer_enter(Client& c, double x, double y) {
+@@ -942,8 +983,8 @@ struct InputExperiment::Impl {
+         held_button = pressed ? value : 0;
+     }
+     bool keyboard_enter(Client& c) {
+-        const auto root = c.surface.lock(); const auto physical = g_pSeatManager->m_keyboard.lock();
+-        if (!root || !physical || physical->m_xkbKeymapV1String != keymap_text || !keyboard_state) return false;
++        const auto root = c.surface.lock();
++        if (!root || !keyboard_state || keymap_fd < 0) return false;
+         unsigned count = 0;
+         for (auto& k : keyboards) {
+             if (k->dead || !k->wl->resource() || k->wl->client() != root->client()) continue;
+@@ -1030,7 +1071,7 @@ struct InputExperiment::Impl {
+             if (kProduction && (!InputGrant::single_operation(requested_cap) ||
+                 (requested_cap == 16 && route != InputRoute::primary_foreground))) { invalidate(c); send(c, refusal("unsupported")); return; }
+             if (kProduction && !available()) { invalidate(c, false); send(c, refusal("session_unavailable")); return; }
+-            if (!layout_qualified()) { invalidate(c, false); send(c, refusal("unsupported_layout")); return; }
++            if (!layout_qualified(route, requested_cap)) { invalidate(c, false); send(c, refusal("unsupported_layout")); return; }
+             const auto pid = number(f[1]); const auto address = number(f[2], 16);
+             PHLWINDOW window;
+             for (const auto& w : Desktop::windowState()->windows())
+@@ -1090,7 +1131,7 @@ struct InputExperiment::Impl {
+         if (c.token.empty() || f[2] != c.token || !refresh(c)) { send(c, refusal("stale_target")); return; }
+         if (number(f[3]) != c.revision) { if (kProduction) revoke("stale_geometry"); send(c, refusal("stale_geometry")); return; }
+         if (!available()) { revoke("session_unavailable", true); send(c, refusal("session_unavailable")); return; }
+-        if (!layout_qualified()) { revoke("unsupported_layout", true); send(c, refusal("unsupported_layout")); return; }
++        if (!layout_qualified(c.route, cap)) { revoke("unsupported_layout", true); send(c, refusal("unsupported_layout")); return; }
+         if (lease && Clock::now() >= expires) revoke("lease_expired");
+         if (drag) { send(c, refusal("lease_busy")); return; }
+         if (lease != &c || !(capabilities & cap) || (kProduction && !grant.permits(cap, Clock::now()))) {
+@@ -1184,8 +1225,13 @@ struct InputExperiment::Impl {
+                 if (Clock::now() + std::chrono::milliseconds(duration + 50) >= expires) { send(c, refusal("lease_expired")); return; }
+             }
+         }
++        const auto modifiers = capture_foreground_modifiers(command == "KEY");
++        if (command == "KEY" && !foreground_chord_compatible(physical_keymap, keymap, code, mods, modifiers)) {
++            revoke("unsupported_layout", true);
++            send(c, refusal("unsupported_layout")); return;
++        }
+         if (!consume_grant(c, cap)) return;
+-        start_foreground(c, x, y, command != "KEY" && command != "ACTIVATE", command == "KEY");
++        start_foreground(c, x, y, command != "KEY" && command != "ACTIVATE", command == "KEY", modifiers);
+         if (command == "KEY") {
+             const std::array<std::uint32_t, 4> keys{42, 29, 56, 125};
+             for (unsigned i = 0; i < 4; ++i) if ((mods & (1u << i)) && keys[i] != code) foreground_key(c, keys[i], true);
+@@ -1227,7 +1273,7 @@ struct InputExperiment::Impl {
+         if (lease) {
+             if (lease->dead) revoke("disconnected", true);
+             else if (Clock::now() >= expires) revoke("lease_expired");
+-            else if (!available() || !layout_qualified()) revoke("cancelled", true);
++            else if (!available() || !layout_qualified(lease->route, capabilities)) revoke("cancelled", true);
+             else if (!refresh(*lease) || primary_conflict(*lease) || agent_conflict(*lease) ||
+                 (drag && !drag->geometry.matches(lease->revision))) revoke("cancelled");
+         }
+diff --git a/src/keyboard_layout.hpp b/src/keyboard_layout.hpp
+new file mode 100644
+index 0000000..f5f51c8
+--- /dev/null
++++ b/src/keyboard_layout.hpp
+@@ -0,0 +1,127 @@
++#pragma once
++
++#include "foreground_route.hpp"
++#include <xkbcommon/xkbcommon.h>
++#include <xkbcommon/xkbcommon-names.h>
++#include <array>
++#include <cstdint>
++#include <memory>
++
++namespace cua::hyprland {
++// Wire v3 carries evdev key positions plus fixed Shift/Ctrl/Alt/Super bits.
++// Background seats advertise this map, independently of the human keyboard.
++inline xkb_keymap* agent_keymap(xkb_context* context) {
++    const xkb_rule_names names{"evdev", "pc105", "us", "", ""};
++    return xkb_keymap_new_from_names(context, &names, XKB_KEYMAP_COMPILE_NO_FLAGS);
++}
++
++inline bool keyboard_layout_ready(InputRoute route, std::uint64_t capability,
++                                  bool agent_ready, bool physical_ready) {
++    if (!(capability & 2)) return true; // Pointer/activation needs no key mapping.
++    return route == InputRoute::primary_foreground ? physical_ready : agent_ready;
++}
++
++inline bool same_key_symbols(xkb_state* actual, xkb_state* expected, xkb_keycode_t key) {
++    const xkb_keysym_t *a = nullptr, *b = nullptr;
++    const int na = xkb_state_key_get_syms(actual, key, &a);
++    const int nb = xkb_state_key_get_syms(expected, key, &b);
++    if (na != nb) return false;
++    for (int i = 0; i < na; ++i) if (a[i] != b[i]) return false;
++    return true;
++}
++
++inline bool same_consumed_modifiers(xkb_state* actual, xkb_state* expected, xkb_keycode_t key) {
++    // Toolkits subtract consumed modifiers when matching shortcuts. Matching
++    // symbols and effective state alone does not preserve shortcut meaning.
++    for (auto* state : {actual, expected}) {
++        auto* map = xkb_state_get_keymap(state);
++        for (xkb_mod_index_t i = 0; i < xkb_keymap_num_mods(map); ++i) {
++            const char* name = xkb_keymap_mod_get_name(map, i);
++            if (xkb_state_mod_name_is_active(state, name, XKB_STATE_MODS_EFFECTIVE) <= 0) continue;
++            const auto ai = xkb_keymap_mod_get_index(xkb_state_get_keymap(actual), name);
++            const auto bi = xkb_keymap_mod_get_index(xkb_state_get_keymap(expected), name);
++            for (auto mode : {XKB_CONSUMED_MODE_XKB, XKB_CONSUMED_MODE_GTK})
++                if ((xkb_state_mod_index_is_consumed2(actual, key, ai, mode) > 0) !=
++                    (xkb_state_mod_index_is_consumed2(expected, key, bi, mode) > 0)) return false;
++        }
++    }
++    return true;
++}
++
++inline bool same_modifier_state(xkb_state* actual, xkb_state* expected) {
++    // Modifier indices can differ between maps. Compare names, in both directions,
++    // including nonstandard modifiers and lock/latch changes on key release.
++    for (auto* state : {actual, expected}) {
++        auto* map = xkb_state_get_keymap(state);
++        for (xkb_mod_index_t i = 0; i < xkb_keymap_num_mods(map); ++i) {
++            const char* name = xkb_keymap_mod_get_name(map, i);
++            for (auto component : {XKB_STATE_MODS_DEPRESSED, XKB_STATE_MODS_LATCHED,
++                                   XKB_STATE_MODS_LOCKED, XKB_STATE_MODS_EFFECTIVE}) {
++                const bool a = xkb_state_mod_name_is_active(actual, name, component) > 0;
++                const bool b = xkb_state_mod_name_is_active(expected, name, component) > 0;
++                if (a != b) return false;
++            }
++        }
++    }
++    for (auto component : {XKB_STATE_LAYOUT_DEPRESSED, XKB_STATE_LAYOUT_LATCHED,
++                           XKB_STATE_LAYOUT_LOCKED, XKB_STATE_LAYOUT_EFFECTIVE})
++        if (xkb_state_serialize_layout(actual, component) != xkb_state_serialize_layout(expected, component))
++            return false;
++    return true;
++}
++
++// Resolve the virtual modifier through this map; Num Lock is not necessarily
++// encoded as Mod2. Ambiguous encodings are deliberately not admitted.
++inline xkb_mod_mask_t foreground_numlock_mask(xkb_keymap* map) {
++    const auto mask = map ? xkb_keymap_mod_get_mask(map, XKB_VMOD_NAME_NUM) : 0;
++    return mask && !(mask & (mask - 1)) &&
++        !(mask & xkb_keymap_mod_get_mask(map, XKB_MOD_NAME_CAPS)) ? mask : 0;
++}
++
++// Simulate the complete chord before delivering any events or changing focus.
++// This is compatibility checking, not layout translation: physical key positions
++// remain unchanged. Unrelated remaps are harmless, requested remaps fail closed.
++inline bool foreground_chord_compatible(xkb_keymap* physical, xkb_keymap* canonical,
++                                        std::uint32_t code, std::uint32_t mods,
++                                        const std::array<std::uint32_t, 4>& modifiers) {
++    if (!physical || !canonical) return false;
++    if (foreground_key_modifier_failure(modifiers, foreground_numlock_mask(physical)) !=
++        ForegroundFailureReason::none) return false;
++    using State = std::unique_ptr<xkb_state, decltype(&xkb_state_unref)>;
++    State actual{xkb_state_new(physical), xkb_state_unref};
++    State expected{xkb_state_new(canonical), xkb_state_unref};
++    // The client retains Num Lock, but wire keys still mean the neutral US
++    // chord. A third state rejects keypad/navigation changes caused by the lock.
++    State intended{xkb_state_new(canonical), xkb_state_unref};
++    if (!actual || !expected || !intended) return false;
++    if (modifiers[2]) {
++        const auto canonical_lock = foreground_numlock_mask(canonical);
++        if (!canonical_lock) return false;
++        xkb_state_update_mask(actual.get(), 0, 0, modifiers[2], 0, 0, 0);
++        xkb_state_update_mask(expected.get(), 0, 0, canonical_lock, 0, 0, 0);
++        if (!same_modifier_state(actual.get(), expected.get())) return false;
++    }
++    const auto event = [&](std::uint32_t key, xkb_key_direction direction) {
++        // A client interprets the press using the preceding modifiers event.
++        // Stock both_capslock_cancel gives Shift a Caps_Lock symbol at its
++        // shifted level; that level is not another press. Releases pair by
++        // keycode, but their lock/latch/group effects still must agree.
++        if (direction == XKB_KEY_DOWN &&
++            (!same_key_symbols(actual.get(), expected.get(), key + 8) ||
++             !same_consumed_modifiers(actual.get(), expected.get(), key + 8) ||
++             !same_key_symbols(expected.get(), intended.get(), key + 8) ||
++             !same_consumed_modifiers(expected.get(), intended.get(), key + 8))) return false;
++        xkb_state_update_key(actual.get(), key + 8, direction);
++        xkb_state_update_key(expected.get(), key + 8, direction);
++        xkb_state_update_key(intended.get(), key + 8, direction);
++        return same_modifier_state(actual.get(), expected.get());
++    };
++    constexpr std::array<std::uint32_t, 4> keys{42, 29, 56, 125};
++    for (unsigned i = 0; i < keys.size(); ++i)
++        if ((mods & (1u << i)) && keys[i] != code && !event(keys[i], XKB_KEY_DOWN)) return false;
++    if (!event(code, XKB_KEY_DOWN) || !event(code, XKB_KEY_UP)) return false;
++    for (int i = 3; i >= 0; --i)
++        if ((mods & (1u << i)) && keys[i] != code && !event(keys[i], XKB_KEY_UP)) return false;
++    return true;
++}
++} // namespace cua::hyprland
+diff --git a/src/plugin.cpp b/src/plugin.cpp
+index 88b9900..ae7fc7c 100644
+--- a/src/plugin.cpp
++++ b/src/plugin.cpp
+@@ -218,6 +218,11 @@ std::string status_output(bool json) {
+ 
+     if (json) {
+         auto result = cua::hyprland::render_status_json(report);
++#ifdef CUA_HYPRLAND_INPUT
++        // Installation checks compiled support before enabling input seats.
++        result.pop_back();
++        result += ",\"keyboard_layout_independent\":true,\"foreground_numlock_compatible\":true}";
++#endif
+ #if defined(CUA_HYPRLAND_TEST_INPUT) || defined(CUA_HYPRLAND_INPUT)
+         if (g_experiment) {
+ #ifdef CUA_HYPRLAND_INPUT
+diff --git a/tests/agent_keymap_test.py b/tests/agent_keymap_test.py
+new file mode 100644
+index 0000000..78a3603
+--- /dev/null
++++ b/tests/agent_keymap_test.py
+@@ -0,0 +1,86 @@
++"""Exercise the production map initializer without a compositor or desktop changes."""
++import os
++from pathlib import Path
++import re
++import shlex
++import subprocess
++import tempfile
++import unittest
++
++ROOT = Path(__file__).resolve().parents[1]
++
++
++class AgentKeymapTest(unittest.TestCase):
++    def test_production_keymap_and_fd(self):
++        source = (ROOT / 'src/input_experiment.cpp').read_text()
++        body = re.search(r'^    void initialize_agent_keymap\(\).*?^    }', source, re.M | re.S)
++        self.assertIsNotNone(body)
++        fixture = r'''
++#include "keyboard_layout.hpp"
++#include <sys/mman.h>
++#include <sys/stat.h>
++#include <fcntl.h>
++#include <unistd.h>
++#include <cerrno>
++#include <cstdlib>
++#include <stdexcept>
++#include <string>
++#include <iostream>
++using namespace cua::hyprland;
++void check(bool v, const char* m) { if (!v) { std::cerr << m; std::exit(1); } }
++struct Lane {
++    xkb_context* xkb_context_ = nullptr;
++    xkb_keymap* keymap = nullptr;
++    xkb_state* keyboard_state = nullptr;
++    int keymap_fd = -1;
++    std::string keymap_text;
++    // INITIALIZER
++    ~Lane() {
++        if (keyboard_state) xkb_state_unref(keyboard_state);
++        if (keymap) xkb_keymap_unref(keymap);
++        if (xkb_context_) xkb_context_unref(xkb_context_);
++        if (keymap_fd >= 0) close(keymap_fd);
++    }
++};
++int main() {
++    Lane a, b;
++    a.initialize_agent_keymap(); b.initialize_agent_keymap();
++    check(a.keymap_fd != b.keymap_fd && a.keymap != b.keymap && a.keyboard_state != b.keyboard_state,
++          "lanes share owned map resources");
++    check(a.keymap_text == b.keymap_text, "lanes advertise different layouts");
++    for (Lane* lane : {&a, &b}) {
++        struct stat status{};
++        check(fstat(lane->keymap_fd, &status) == 0 && status.st_size == (off_t)lane->keymap_text.size() + 1,
++              "keymap fd is not terminated serialized map");
++        std::string text(status.st_size, '\0');
++        check(pread(lane->keymap_fd, text.data(), text.size(), 0) == status.st_size, "keymap fd cannot be read");
++        check(text == lane->keymap_text + '\0', "keymap fd differs from advertised map");
++        check(fcntl(lane->keymap_fd, F_GETFD) & FD_CLOEXEC, "keymap fd inherited by exec");
++        const int seals = F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_WRITE | F_SEAL_SEAL;
++        check((fcntl(lane->keymap_fd, F_GET_SEALS) & seals) == seals, "keymap fd not immutable");
++        const int fd = lane->keymap_fd;
++        lane->initialize_agent_keymap();
++        check(lane->keymap_fd == fd, "initialization replaced advertised map");
++        check(xkb_state_key_get_one_sym(lane->keyboard_state, 21 + 8) == XKB_KEY_y,
++              "background lane did not initialize US map");
++    }
++    xkb_state_update_key(a.keyboard_state, 42 + 8, XKB_KEY_DOWN);
++    check(xkb_state_key_get_one_sym(a.keyboard_state, 30 + 8) == XKB_KEY_A, "lane modifier not applied");
++    check(xkb_state_key_get_one_sym(b.keyboard_state, 30 + 8) == XKB_KEY_a, "lane modifier leaked");
++}
++'''.replace('// INITIALIZER', body.group())
++        compiler = shlex.split(os.environ.get('CXX', 'c++'))
++        flags = shlex.split(subprocess.check_output(['pkg-config', '--cflags', '--libs', 'xkbcommon'], text=True))
++        with tempfile.TemporaryDirectory(prefix='cua-agent-keymap-') as directory:
++            cpp, binary = Path(directory) / 'fixture.cpp', Path(directory) / 'fixture'
++            cpp.write_text(fixture)
++            build = subprocess.run([*compiler, '-std=c++20', '-Wall', '-Wextra', '-Wpedantic', '-Werror',
++                                    '-I', str(ROOT / 'src'), str(cpp), '-o', str(binary), *flags],
++                                   capture_output=True, text=True, timeout=60)
++            self.assertEqual(build.returncode, 0, build.stdout + build.stderr)
++            result = subprocess.run([str(binary)], capture_output=True, text=True, timeout=10)
++            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
++
++
++if __name__ == '__main__':
++    unittest.main()
+diff --git a/tests/desktop_fault_policy_fixture.cpp b/tests/desktop_fault_policy_fixture.cpp
+index 45c48ef..36be139 100644
+--- a/tests/desktop_fault_policy_fixture.cpp
++++ b/tests/desktop_fault_policy_fixture.cpp
+@@ -1,6 +1,7 @@
+ // Used by desktop_fault_policy_test.py, which inserts actual production bodies.
+ // Transport effects are counted here; native protocol/app behavior is separate.
+ #include "drag_geometry.hpp"
++#include "keyboard_layout.hpp"
+ #include "input_grant.hpp"
+ #include "passive_pointer_target.hpp"
+ 
+@@ -18,6 +19,7 @@ struct Window {};
+ struct Surface { int client() const { return 1; } };
+ using Target = PassivePointerTarget<std::weak_ptr<Window>, std::weak_ptr<Surface>>;
+ struct Client {
++    InputRoute route = InputRoute::independent;
+     bool dead = false;
+     void* source = nullptr;
+     int fd = -1;
+@@ -34,8 +36,6 @@ struct Pointer {
+ };
+ struct Drag { Client* client; DragGeometry geometry{1}; };
+ struct Trace { void mark(const char*, unsigned) {} };
+-enum class ForegroundFailureReason { none };
+-struct ForegroundFailure { ForegroundFailureReason reason; };
+ void wl_event_source_remove(void*) {}
+ int close(int) { return 0; }
+ std::string refusal(std::string_view reason) { return std::string(reason); }
+@@ -79,7 +79,7 @@ struct Lane {
+         drag.emplace(lease);
+     }
+     bool available() const { return !suspended && session; }
+-    bool layout_qualified() const { return layout; }
++    bool layout_qualified(InputRoute route, uint64_t cap) const { return keyboard_layout_ready(route, cap, layout, layout); }
+     bool refresh(Client&) const { return refresh_ok; }
+     template<typename T> bool primary_conflict(const T&) const { return primary_busy; }
+     template<typename T> bool agent_conflict(const T&) const { return peer_busy; }
+@@ -122,7 +122,7 @@ int main() {
+     for (bool session_fault : {true, false}) {
+         for (int path = 0; path < 3; ++path) {
+             Lane l;
+-            if (session_fault) l.session = false; else l.layout = false;
++            if (session_fault) l.session = false; else { l.layout = false; l.capabilities = 2; }
+             if (path == 0) l.guard_targets();
+             if (path == 1) l.target_refusal(*l.lease);
+             if (path == 2) l.action_refusal(*l.lease);
+@@ -133,6 +133,19 @@ int main() {
+             l.session = true; l.layout = true; l.guard_targets(); l.check_inert();
+         }
+     }
++    // Pointer admission, dispatch and ongoing drag ignore keyboard layout readiness.
++    for (auto route : {InputRoute::independent, InputRoute::primary_foreground}) {
++        for (uint64_t cap : {1, 4, 8, 16}) {
++            Lane l; l.layout = false; l.lease->route = route; l.capabilities = cap;
++            l.target_refusal(*l.lease, route, cap);
++            check(l.lease && l.responses.empty(), "pointer admission gated on layout");
++            l.action_refusal(*l.lease, cap);
++            check(l.lease && l.responses.empty(), "pointer dispatch gated on layout");
++            l.guard_targets();
++            check(l.lease && l.drag && l.held_button && l.responses.empty(),
++                  "pointer operation was gated by keyboard layout");
++        }
++    }
+     // Every passive safety guard still applies during either desktop fault.
+     for (bool session_fault : {true, false}) {
+         for (int bad = 0; bad < 8; ++bad) {
+diff --git a/tests/desktop_fault_policy_test.py b/tests/desktop_fault_policy_test.py
+index 68ca6c8..7a4d1b4 100644
+--- a/tests/desktop_fault_policy_test.py
++++ b/tests/desktop_fault_policy_test.py
+@@ -35,10 +35,11 @@ def fixture(source):
+     ):
+         block = source.split(start, 1)[1].split(end, 1)[0]
+         refusals = [line.strip() for line in block.splitlines()
+-                    if 'if (' in line and ('!available()' in line or '!layout_qualified()' in line)]
++                    if 'if (' in line and ('!available()' in line or '!layout_qualified(' in line)]
+         if len(refusals) != 2:
+             raise AssertionError(f'production refusal branches not found: {label}')
+-        methods += '\nvoid ' + label + '(Client& c) {\n' + '\n'.join(refusals) + '\n}'
++        params = ', InputRoute route = InputRoute::independent, uint64_t requested_cap = 2' if label == 'target_refusal' else ', uint64_t cap = 2'
++        methods += '\nvoid ' + label + '(Client& c' + params + ') {\n' + '\n'.join(refusals) + '\n}'
+     return (ROOT / 'tests/desktop_fault_policy_fixture.cpp').read_text().replace(
+         '// PRODUCTION_METHODS', methods)
+ 
+diff --git a/tests/foreground_modifiers_test.py b/tests/foreground_modifiers_test.py
+new file mode 100644
+index 0000000..013c9bf
+--- /dev/null
++++ b/tests/foreground_modifiers_test.py
+@@ -0,0 +1,225 @@
++"""Exercise production foreground state admission, dispatch and unwind with XKB."""
++import os
++from pathlib import Path
++import re
++import shlex
++import subprocess
++import tempfile
++import unittest
++
++ROOT = Path(__file__).resolve().parents[1]
++
++
++class ForegroundModifiersTest(unittest.TestCase):
++    def test_production_modifiers(self):
++        source = (ROOT / 'src/input_experiment.cpp').read_text()
++        methods = []
++        for name in ('capture_foreground_modifiers', 'require_foreground', 'finish_foreground',
++                     'start_foreground', 'foreground_key'):
++            body = re.search(r'^    \S[^\n]*\b' + name + r'\(.*?^    }', source, re.M | re.S)
++            self.assertIsNotNone(body, name)
++            methods.append(body.group())
++        preflight = re.search(r'        const auto modifiers = capture_foreground_modifiers\(command == "KEY"\);.*?'
++                              r'        start_foreground\([^\n]*;', source, re.S)
++        self.assertIsNotNone(preflight)
++        fixture = r'''
++#include "keyboard_layout.hpp"
++#include <algorithm>
++#include <chrono>
++#include <cstdlib>
++#include <iostream>
++#include <memory>
++#include <string>
++#include <vector>
++using namespace cua::hyprland;
++using Clock = std::chrono::steady_clock;
++void check(bool ok, const char* why) { if (!ok) { std::cerr << why; std::exit(1); } }
++struct Vector2D { double x, y; };
++constexpr int WL_KEYBOARD_KEY_STATE_PRESSED=1, WL_KEYBOARD_KEY_STATE_RELEASED=0;
++constexpr int WL_POINTER_BUTTON_STATE_RELEASED=0;
++struct Root : std::enable_shared_from_this<Root> {
++    bool good() const { return true; }
++    int client() const { return 0; }
++    auto at(Vector2D, bool) { return std::pair{shared_from_this(), 0}; }
++};
++struct Resource {
++    xkb_state* client = nullptr;
++    std::vector<xkb_keysym_t> symbols;
++    std::array<unsigned, 4> last{};
++    std::vector<std::array<unsigned, 4>> history;
++    bool good() const { return true; }
++    void sendKey(unsigned, unsigned code, unsigned down) {
++        if (down) symbols.push_back(xkb_state_key_get_one_sym(client, code + 8));
++    }
++    void sendMods(unsigned d, unsigned l, unsigned k, unsigned g) {
++        last={d,l,k,g}; history.push_back(last); xkb_state_update_mask(client,d,l,k,0,0,g);
++    }
++    void sendButton(unsigned, unsigned, unsigned) {}
++    void sendFrame() {}
++};
++struct Keyboard {
++    struct { unsigned depressed=0,latched=0,locked=0,group=0; } m_modifiersState;
++    xkb_keymap* m_xkbKeymap = nullptr;
++    bool m_enabled=true, shared=true, virt=false;
++    bool shareStates() const { return shared; }
++    bool isVirtual() const { return virt; }
++};
++struct Seat {
++    std::vector<std::shared_ptr<Resource>> m_keyboards, m_pointers;
++    bool good() const { return true; }
++};
++struct SeatManager {
++    std::weak_ptr<Keyboard> m_keyboard;
++    bool m_mouse=true;
++    struct { std::shared_ptr<Root> keyboardFocus, pointerFocus; } m_state;
++    std::shared_ptr<Seat> seat;
++    auto seatResourceForClient(int) { return seat; }
++    void setPointerFocus(std::shared_ptr<Root> root, Vector2D) { m_state.pointerFocus=root; }
++} manager, *g_pSeatManager=&manager;
++struct InputManager {
++    std::vector<std::shared_ptr<Keyboard>> m_keyboards;
++    bool shouldIgnoreVirtualKeyboard(const std::shared_ptr<Keyboard>&) { return false; }
++} input, *g_pInputManager=&input;
++namespace Desktop {
++constexpr int FOCUS_REASON_OTHER=0;
++struct Focus {
++    std::shared_ptr<Root> root;
++    std::shared_ptr<Keyboard> change_on_focus;
++    auto window() { return root; }
++    auto surface() { return root; }
++    void fullWindowFocus(std::shared_ptr<Root>, int, std::shared_ptr<Root> r) {
++        root=r; manager.m_state.keyboardFocus=r;
++        if (change_on_focus) change_on_focus->m_modifiersState.locked=0;
++    }
++} focus;
++auto focusState() { return &focus; }
++}
++namespace Pointer { struct Manager { void warpTo(Vector2D) {} } pointer; auto mgr(){ return &pointer; } }
++struct Client {
++    bool dead=false, foreground_attempted=false;
++    std::weak_ptr<Root> surface, window;
++    std::array<double, 6> geometry{};
++};
++struct Lane {
++    xkb_keymap* physical_keymap=nullptr;
++    xkb_keymap* keymap=nullptr;
++    xkb_state* physical_state=nullptr;
++    std::array<unsigned,4> foreground_modifiers{};
++    std::vector<std::weak_ptr<Resource>> foreground_keyboards, foreground_pointers;
++    std::weak_ptr<Root> foreground_surface;
++    std::weak_ptr<Seat> foreground_seat;
++    std::vector<unsigned> held_keys;
++    unsigned held_button=0;
++    bool foreground_started=false,foreground_activating=false,foreground_keyboard_used=false;
++    bool foreground_needs_pointer=false, layout_ready=true, physical_held=false;
++    Client* lease=nullptr;
++    Clock::time_point expires=Clock::now()+std::chrono::hours(1);
++    unsigned consumed=0, refused=0;
++    bool available() { return true; }
++    bool physical_layout_ready() { return layout_ready; }
++    bool point(Client&, double,double) { return true; }
++    unsigned event_ms() { return 0; }
++    void foreground_motion(Client&,double,double) {}
++    ForegroundGuard foreground_guard(Client&) {
++        return {.exact_root=true,.physical_keys=physical_held,.exact_keyboard_focus=true,.exact_pointer_focus=true};
++    }
++    void revoke(const char*, bool) {}
++    auto refusal(const char*) { return std::string{}; }
++    void send(Client&, const std::string&) { ++refused; }
++    bool consume_grant(Client&, unsigned) { ++consumed; return true; }
++    // METHODS
++    void preflight(Client& c, unsigned code, unsigned mods) {
++        const std::string command="KEY";
++        const unsigned cap=2;
++        const double x=0,y=0;
++        // PREFLIGHT
++    }
++    ~Lane() { if (physical_state) xkb_state_unref(physical_state); }
++};
++int main() {
++    auto context=xkb_context_new(XKB_CONTEXT_NO_FLAGS);
++    const xkb_rule_names names{"evdev","pc105","us","","ctrl:nocaps"};
++    auto physical=xkb_keymap_new_from_names(context,&names,XKB_KEYMAP_COMPILE_NO_FLAGS);
++    auto canonical=agent_keymap(context);
++    auto keyboard=std::make_shared<Keyboard>(); keyboard->m_xkbKeymap=physical;
++    manager.m_keyboard=keyboard; input.m_keyboards={keyboard};
++    auto root=std::make_shared<Root>();
++    manager.m_state.keyboardFocus=root; manager.m_state.pointerFocus=root; Desktop::focus.root=root;
++    manager.seat=std::make_shared<Seat>(); auto resource=std::make_shared<Resource>();
++    resource->client=xkb_state_new(physical); manager.seat->m_keyboards={resource};
++    Client client; client.surface=root; client.window=root;
++    Lane lane; lane.physical_keymap=physical; lane.keymap=canonical;
++    lane.physical_state=xkb_state_new(physical); lane.lease=&client;
++    const auto num=foreground_numlock_mask(physical);
++    keyboard->m_modifiersState.locked=num;
++    lane.preflight(client,30,1);
++    check(lane.foreground_started && lane.foreground_modifiers[2]==num && resource->last[2]==num,
++          "actual Num Lock state was not captured and published before input");
++    lane.foreground_key(client,42,true); lane.foreground_key(client,30,true);
++    lane.foreground_key(client,30,false); lane.foreground_key(client,42,false);
++    check(resource->symbols.back()==XKB_KEY_A,"client did not receive intended shifted text");
++    for (const auto& state : resource->history)
++        check(state[2]==num,"dispatch transiently cleared Num Lock");
++    lane.finish_foreground();
++    check(resource->last==std::array<unsigned,4>{0,0,num,0} && keyboard->m_modifiersState.locked==num,
++          "completion changed real or client Num Lock state");
++    const auto consumed=lane.consumed;
++    lane.preflight(client,79,0);
++    check(lane.refused==1 && lane.consumed==consumed && !lane.foreground_started,
++          "caller checked neutral state and admitted Num Lock keypad semantics");
++    keyboard->m_modifiersState.locked=0;
++    lane.preflight(client,79,0); lane.foreground_key(client,79,true); lane.foreground_key(client,79,false);
++    check(resource->symbols.back()==XKB_KEY_KP_End,"neutral keypad contract changed"); lane.finish_foreground();
++    keyboard->m_modifiersState.locked=num; lane.preflight(client,30,1); lane.foreground_key(client,42,true);
++    keyboard->m_modifiersState.locked=0;
++    try { lane.foreground_key(client,30,true); check(false,"ambient state change accepted"); }
++    catch (ForegroundFailure f) { check(f.reason==ForegroundFailureReason::keyboard_state,"wrong state change refusal"); }
++    lane.finish_foreground(); check(resource->last==std::array<unsigned,4>{},"cancellation restored stale Num Lock");
++    keyboard->m_modifiersState.locked=num; lane.preflight(client,30,1); lane.foreground_key(client,42,true);
++    keyboard->m_modifiersState.locked=xkb_keymap_mod_get_mask(physical,XKB_MOD_NAME_CAPS);
++    keyboard->m_modifiersState.depressed=xkb_keymap_mod_get_mask(physical,XKB_MOD_NAME_CTRL);
++    lane.finish_foreground();
++    check(resource->last[0]==keyboard->m_modifiersState.depressed && resource->last[2]==keyboard->m_modifiersState.locked,
++          "cancellation failed to restore current human Caps and held Control");
++    keyboard->m_modifiersState.depressed=0; keyboard->m_modifiersState.locked=num;
++    lane.physical_held=true;
++    try { lane.preflight(client,30,0); check(false,"held physical key admitted"); }
++    catch (ForegroundFailure f) { check(f.reason==ForegroundFailureReason::physical_keys,"wrong held-key refusal"); }
++    lane.physical_held=false;
++    auto shared=std::make_shared<Keyboard>(); shared->m_xkbKeymap=physical;
++    shared->m_modifiersState.locked=num;
++    keyboard->m_modifiersState.locked=0;
++    input.m_keyboards.push_back(shared);
++    lane.preflight(client,30,0);
++    check(lane.foreground_modifiers[2]==num && resource->last[2]==num,"shared Num Lock was ignored");
++    lane.foreground_key(client,30,true); lane.foreground_key(client,30,false); lane.finish_foreground();
++    check(resource->last[2]==num,"shared Num Lock not restored");
++    shared->m_modifiersState.locked=xkb_keymap_mod_get_mask(physical,XKB_MOD_NAME_CAPS);
++    try { lane.preflight(client,30,0); check(false,"shared Caps state admitted"); }
++    catch (ForegroundFailure f) { check(f.reason==ForegroundFailureReason::keyboard_locked,"wrong shared lock refusal"); }
++    shared->shared=false; lane.preflight(client,30,0); lane.finish_foreground();
++    // Focus callbacks can change real state between preflight and first event.
++    keyboard->m_modifiersState.locked=num;
++    Desktop::focus.root.reset(); Desktop::focus.change_on_focus=keyboard;
++    try { lane.preflight(client,30,0); check(false,"focus-time state change accepted"); }
++    catch (ForegroundFailure f) { check(f.reason==ForegroundFailureReason::keyboard_state,"wrong focus change refusal"); }
++    lane.finish_foreground();
++    check(resource->last[2]==0,"focus-time cancellation restored stale lock");
++    xkb_state_unref(resource->client); xkb_keymap_unref(physical); xkb_keymap_unref(canonical); xkb_context_unref(context);
++}
++'''.replace('// METHODS', '\n'.join(methods)).replace('// PREFLIGHT', preflight.group())
++        compiler = shlex.split(os.environ.get('CXX', 'c++'))
++        flags = shlex.split(subprocess.check_output(['pkg-config', '--cflags', '--libs', 'xkbcommon'], text=True))
++        with tempfile.TemporaryDirectory(prefix='cua-foreground-modifiers-') as directory:
++            cpp, binary = Path(directory) / 'fixture.cpp', Path(directory) / 'fixture'
++            cpp.write_text(fixture)
++            build = subprocess.run([*compiler, '-std=c++20', '-Wall', '-Wextra', '-Wpedantic', '-Werror',
++                                    '-I', str(ROOT / 'src'), str(cpp), '-o', str(binary), *flags],
++                                   capture_output=True, text=True, timeout=60)
++            self.assertEqual(build.returncode, 0, build.stdout + build.stderr)
++            result = subprocess.run([str(binary)], capture_output=True, text=True, timeout=10)
++            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
++
++
++if __name__ == '__main__':
++    unittest.main()
+diff --git a/tests/keyboard_layout_test.cpp b/tests/keyboard_layout_test.cpp
+new file mode 100644
+index 0000000..6d57616
+--- /dev/null
++++ b/tests/keyboard_layout_test.cpp
+@@ -0,0 +1,130 @@
++#include "keyboard_layout.hpp"
++#include <cstdlib>
++#include <iostream>
++#include <memory>
++
++using namespace cua::hyprland;
++void check(bool condition, const char* message) {
++    if (!condition) { std::cerr << message << '\n'; std::exit(1); }
++}
++int main() {
++    using Context = std::unique_ptr<xkb_context, decltype(&xkb_context_unref)>;
++    using Map = std::unique_ptr<xkb_keymap, decltype(&xkb_keymap_unref)>;
++    using State = std::unique_ptr<xkb_state, decltype(&xkb_state_unref)>;
++    Context context{xkb_context_new(XKB_CONTEXT_NO_FLAGS), xkb_context_unref};
++    Map agent{agent_keymap(context.get()), xkb_keymap_unref};
++    Map second{agent_keymap(context.get()), xkb_keymap_unref};
++    check(bool(agent) && bool(second), "canonical maps unavailable");
++    const auto map = [&](const char* layout, const char* options) {
++        const xkb_rule_names names{"evdev", "pc105", layout, "", options};
++        return Map{xkb_keymap_new_from_names(context.get(), &names, XKB_KEYMAP_COMPILE_NO_FLAGS), xkb_keymap_unref};
++    };
++    auto stock = map("us", "compose:caps,shift:both_capslock_cancel");
++    auto nocaps = map("us", "ctrl:nocaps");
++    auto swapctrl = map("us", "ctrl:swapcaps");
++    auto swapalt = map("us", "altwin:swap_alt_win");
++    auto german = map("de", "");
++    check(stock && nocaps && swapctrl && swapalt && german, "test keymaps unavailable");
++    for (auto* physical : {stock.get(), nocaps.get(), swapctrl.get(), swapalt.get(), german.get()}) {
++        check(foreground_chord_compatible(physical, agent.get(), 30, 0, {}), "unrelated remap blocked A");
++        check(foreground_chord_compatible(physical, agent.get(), 30, 1, {}), "unrelated remap blocked Shift+A");
++        check(foreground_chord_compatible(physical, agent.get(), 28, 0, {}), "unrelated remap blocked Return");
++    }
++    check(foreground_chord_compatible(stock.get(), agent.get(), 30, 2, {}), "stock Omarchy blocked Ctrl+A");
++    check(foreground_chord_compatible(nocaps.get(), agent.get(), 30, 2, {}), "Caps to Ctrl blocked Ctrl+A");
++    check(!foreground_chord_compatible(swapctrl.get(), agent.get(), 30, 2, {}), "Ctrl/Caps swap sent wrong Ctrl+A");
++    check(!foreground_chord_compatible(swapctrl.get(), agent.get(), 29, 0, {}), "remapped modifier key accepted");
++    check(!foreground_chord_compatible(swapalt.get(), agent.get(), 30, 4, {}), "Alt/Super swap sent wrong Alt+A");
++    check(!foreground_chord_compatible(swapalt.get(), agent.get(), 30, 8, {}), "Alt/Super swap sent wrong Super+A");
++    check(!foreground_chord_compatible(german.get(), agent.get(), 21, 0, {}), "German Z accepted as US Y");
++    check(!foreground_chord_compatible(german.get(), agent.get(), 3, 1, {}), "German shifted punctuation accepted");
++    check(!foreground_chord_compatible(nullptr, agent.get(), 30, 0, {}), "missing physical map accepted");
++    for (auto* physical : {agent.get(), stock.get(), nocaps.get()}) {
++        const auto numlock = foreground_numlock_mask(physical);
++        check(numlock != 0, "Num Lock encoding missing");
++        for (const auto locked : {0u, numlock}) {
++            const std::array<std::uint32_t, 4> ambient{0, 0, locked, 0};
++            for (const auto key : {30u, 48u, 44u, 2u, 11u, 28u, 57u})
++                for (const auto mods : {0u, 1u, 2u, 3u})
++                    check(foreground_chord_compatible(physical, agent.get(), key, mods, ambient),
++                          "Num Lock blocked ordinary text or shortcut");
++            for (const auto key : {71u, 72u, 75u, 79u, 82u, 83u})
++                check(foreground_chord_compatible(physical, agent.get(), key, 0, ambient) == !locked,
++                      "Num Lock keypad semantic change was ignored");
++        }
++        const auto caps = xkb_keymap_mod_get_mask(physical, XKB_MOD_NAME_CAPS);
++        for (const auto locked : {caps, caps | numlock, 0x80000000u})
++            check(!foreground_chord_compatible(physical, agent.get(), 30, 0, {0, 0, locked, 0}),
++                  "unsupported lock accepted");
++        check(!foreground_chord_compatible(physical, agent.get(), 30, 0, {numlock, 0, numlock, 0}),
++              "held modifier accepted with Num Lock");
++        check(!foreground_chord_compatible(physical, agent.get(), 30, 0, {0, numlock, numlock, 0}),
++              "latched modifier accepted with Num Lock");
++        check(!foreground_chord_compatible(physical, agent.get(), 30, 0, {0, 0, numlock, 1}),
++              "nonzero group accepted with Num Lock");
++    }
++    const auto numlock = foreground_numlock_mask(agent.get());
++    check(!foreground_chord_compatible(swapctrl.get(), agent.get(), 30, 2, {0, 0, numlock, 0}),
++          "Num Lock hid Ctrl remap");
++    check(!foreground_chord_compatible(german.get(), agent.get(), 21, 0, {0, 0, numlock, 0}),
++          "Num Lock hid layout mismatch");
++    // All supported wire chords remain compatible on the independent map.
++    for (unsigned code = 1; code <= 247; ++code)
++        if (code != 58 && code != 69 && code != 70)
++            for (unsigned mods = 0; mods < 16; ++mods)
++                check(foreground_chord_compatible(agent.get(), agent.get(), code, mods, {}), "canonical chord rejected");
++    // Two lanes never share modifier state and never mutate the human state.
++    State first{xkb_state_new(agent.get()), xkb_state_unref};
++    State other{xkb_state_new(second.get()), xkb_state_unref};
++    State human{xkb_state_new(german.get()), xkb_state_unref};
++    xkb_state_update_key(first.get(), 42 + 8, XKB_KEY_DOWN);
++    check(xkb_state_key_get_one_sym(first.get(), 30 + 8) == XKB_KEY_A, "agent shift not active");
++    check(xkb_state_key_get_one_sym(other.get(), 30 + 8) == XKB_KEY_a, "agent shift leaked across lanes");
++    check(xkb_state_key_get_one_sym(human.get(), 21 + 8) == XKB_KEY_z, "human layout changed");
++    // Same symbols can hide a changed XKB action. Simulate an A that sets Mod3.
++    char* serialized = xkb_keymap_get_as_string(agent.get(), XKB_KEYMAP_FORMAT_TEXT_V1);
++    std::string changed = serialized;
++    std::free(serialized);
++    const auto at = changed.find("key <AC01>");
++    const auto end = changed.find(';', at);
++    check(at != std::string::npos && end != std::string::npos, "test action fixture unavailable");
++    changed.replace(at, end - at + 1,
++        "key <AC01> { type=\"ALPHABETIC\", symbols[Group1]=[a,A], actions[Group1]=[LockMods(modifiers=Mod3),LockMods(modifiers=Mod3)] };");
++    Map lock{xkb_keymap_new_from_string(context.get(), changed.c_str(), XKB_KEYMAP_FORMAT_TEXT_V1, XKB_KEYMAP_COMPILE_NO_FLAGS), xkb_keymap_unref};
++    check(bool(lock), "action fixture failed to compile");
++    check(!foreground_chord_compatible(lock.get(), agent.get(), 30, 0, {}), "hidden lock action accepted");
++    check(!foreground_chord_compatible(lock.get(), agent.get(), 30, 0, {0, 0, numlock, 0}),
++          "Num Lock hid an unexpected lock action");
++    // Equal symbols and modifier state can still alter toolkit shortcut matching.
++    serialized = xkb_keymap_get_as_string(agent.get(), XKB_KEYMAP_FORMAT_TEXT_V1);
++    changed = serialized;
++    std::free(serialized);
++    const auto type_at = changed.find("type \"ALPHABETIC\"");
++    const auto type_end = changed.find("};", type_at);
++    check(type_at != std::string::npos && type_end != std::string::npos, "key type fixture unavailable");
++    changed.insert(type_end, "preserve[Shift] = Shift;\n");
++    Map preserved{xkb_keymap_new_from_string(context.get(), changed.c_str(), XKB_KEYMAP_FORMAT_TEXT_V1, XKB_KEYMAP_COMPILE_NO_FLAGS), xkb_keymap_unref};
++    check(bool(preserved), "preserved modifier fixture failed to compile");
++    check(!foreground_chord_compatible(preserved.get(), agent.get(), 30, 1, {}), "consumed modifier mismatch accepted");
++    check(!foreground_chord_compatible(preserved.get(), agent.get(), 30, 1, {0, 0, numlock, 0}),
++          "Num Lock hid changed shortcut consumption");
++    // A modifier that preserves Shift state but emits another symbol must fail.
++    serialized = xkb_keymap_get_as_string(agent.get(), XKB_KEYMAP_FORMAT_TEXT_V1);
++    changed = serialized;
++    std::free(serialized);
++    const auto shift_at = changed.find("key <LFSH>");
++    const auto shift_end = changed.find(';', shift_at);
++    check(shift_at != std::string::npos && shift_end != std::string::npos, "shift fixture unavailable");
++    changed.replace(shift_at, shift_end - shift_at + 1,
++        "key <LFSH> { symbols[Group1]=[Delete], actions[Group1]=[SetMods(modifiers=Shift)] };");
++    Map badshift{xkb_keymap_new_from_string(context.get(), changed.c_str(), XKB_KEYMAP_FORMAT_TEXT_V1, XKB_KEYMAP_COMPILE_NO_FLAGS), xkb_keymap_unref};
++    check(bool(badshift), "shift fixture failed to compile");
++    check(!foreground_chord_compatible(badshift.get(), agent.get(), 30, 1, {}), "modifier press symbols not checked");
++    for (auto route : {InputRoute::independent, InputRoute::primary_foreground}) {
++        for (uint64_t cap : {1, 4, 8, 16}) check(keyboard_layout_ready(route, cap, false, false), "pointer gated on layout");
++        check(!keyboard_layout_ready(route, 2, false, false), "key accepted without map");
++    }
++    check(keyboard_layout_ready(InputRoute::independent, 2, true, false), "background depends on human map");
++    check(!keyboard_layout_ready(InputRoute::primary_foreground, 2, true, false), "foreground uses agent readiness");
++    std::cout << "keyboard layout tests passed\n";
++}
+diff --git a/tests/plugin_input_lifetime_test.cpp b/tests/plugin_input_lifetime_test.cpp
+index ff09451..456da44 100644
+--- a/tests/plugin_input_lifetime_test.cpp
++++ b/tests/plugin_input_lifetime_test.cpp
+@@ -51,12 +51,17 @@ int main() {
+     check(setenv("XDG_RUNTIME_DIR", directory, 1) == 0 &&
+               setenv("HYPRLAND_INSTANCE_SIGNATURE", "mock", 1) == 0,
+           "select runtime");
+-    Config::Values::configured_bool_override = true;
++    Config::Values::configured_bool_override = false;
+     static_cast<void>(pluginInit(nullptr));
+     const auto toggle = [](bool enabled) {
+         HyprlandAPI::registered_bool->set_mock_value(enabled);
+         Event::bus()->m_events.config.reloaded.emit();
+     };
++#ifdef CUA_HYPRLAND_INPUT
++    const auto initial_status = HyprlandAPI::registered_legacy_command->fn(FORMAT_JSON, {});
++    check(created == 0 && initial_status.find("\"configured\":false") != std::string::npos && initial_status.find("\"keyboard_layout_independent\":true") != std::string::npos && initial_status.find("\"foreground_numlock_compatible\":true") != std::string::npos,
++          "disabled production module advertises compiled keyboard support before enable");
++#endif
+     for (unsigned i = 0; i < 20; ++i) {
+         toggle(true);
+ #ifdef CUA_HYPRLAND_INPUT
+@@ -64,6 +69,8 @@ int main() {
+         check(status.find("\"state\":\"input_v3_candidate\"") != std::string::npos &&
+                   status.find("trusted_local_per_action") != std::string::npos &&
+                   status.find("\"input\":{}") != std::string::npos &&
++                  status.find("\"keyboard_layout_independent\":true") != std::string::npos &&
++                  status.find("\"foreground_numlock_compatible\":true") != std::string::npos &&
+                   status.find("operator") == std::string::npos,
+               "v3 status advertises its actual admission mode");
+ #endif

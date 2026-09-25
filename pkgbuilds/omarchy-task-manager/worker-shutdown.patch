@@ -1,0 +1,90 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index c940e5e..d1cd40f 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -29,7 +29,8 @@ if(BUILD_TESTING)
+     target_include_directories(bridge-test PRIVATE ui)
+     target_link_libraries(bridge-test PRIVATE Qt6::Core Qt6::Gui Qt6::Test)
+     add_dependencies(bridge-test core)
+-    add_test(NAME bridge COMMAND bridge-test)
++    add_test(NAME bridge COMMAND bridge-test -nocrashhandler)
++    set_tests_properties(bridge PROPERTIES TIMEOUT 60)
+ endif()
+ if(BUILD_TESTING)
+     qt_add_executable(ui-test tests/ui_test.cpp ui/bridge.cpp ui/bridge.h)
+@@ -37,5 +38,6 @@ if(BUILD_TESTING)
+     qt_add_resources(ui-test test_qml PREFIX "/" FILES ${TASK_MANAGER_QML})
+     target_link_libraries(ui-test PRIVATE Qt6::Core Qt6::Gui Qt6::Quick Qt6::Qml Qt6::QuickControls2 Qt6::Test)
+     add_dependencies(ui-test core)
+-    add_test(NAME ui COMMAND ui-test)
++    add_test(NAME ui COMMAND ui-test -nocrashhandler)
++    set_tests_properties(ui PROPERTIES TIMEOUT 60)
+ endif()
+diff --git a/tests/bridge_test.cpp b/tests/bridge_test.cpp
+index 9bed7be..d6737a4 100644
+--- a/tests/bridge_test.cpp
++++ b/tests/bridge_test.cpp
+@@ -3,9 +3,46 @@
+ #include <QSignalSpy>
+ #include <QTemporaryDir>
+ #include <QTest>
++#include <memory>
++#include <signal.h>
+ class BridgeTest : public QObject {
+   Q_OBJECT
+ private slots:
++  void shutdownDoesNotPublish_data() {
++    QTest::addColumn<bool>("inFlight");
++    QTest::addColumn<bool>("stopped");
++    QTest::newRow("idle") << false << false;
++    QTest::newRow("sample-in-flight") << true << false;
++    QTest::newRow("stopped-worker") << true << true;
++  }
++  void shutdownDoesNotPublish() {
++    QFETCH(bool, inFlight);
++    QFETCH(bool, stopped);
++    auto bridge = std::make_unique<Bridge>();
++    QTRY_VERIFY_WITH_TIMEOUT(!bridge->snapshot().isEmpty(), 8000);
++    bridge->m_timer.stop();
++    QTRY_VERIFY_WITH_TIMEOUT(!bridge->busy(), 8000);
++    // Stop only the disposable worker owned by this bridge, forcing shutdown
++    // through terminate/kill rather than the normal stdin-EOF exit.
++    if (stopped) {
++      const auto workerPid = bridge->m_worker.processId();
++      QVERIFY(workerPid > 0);
++      QCOMPARE(::kill(workerPid, SIGSTOP), 0);
++    }
++    if (inFlight) {
++      bridge->refresh();
++      QVERIFY(bridge->busy());
++    }
++    QSignalSpy snapshots(bridge.get(), &Bridge::snapshotChanged);
++    QSignalSpy statuses(bridge.get(), &Bridge::statusChanged);
++    QSignalSpy busy(bridge.get(), &Bridge::busyChanged);
++    // Closing the app must not publish late samples or worker-exit errors while
++    // its bridge and UI are being destroyed. Spies outlive the bridge on purpose.
++    bridge.reset();
++    QCOMPARE(snapshots.count(), 0);
++    QCOMPARE(statuses.count(), 0);
++    QCOMPARE(busy.count(), 0);
++  }
+   void inspectionErrorsAndDismissal() {
+     Bridge bridge;
+     QTRY_VERIFY_WITH_TIMEOUT(!bridge.snapshot().isEmpty(), 8000);
+diff --git a/ui/bridge.cpp b/ui/bridge.cpp
+index 86b5b47..b1fb303 100644
+--- a/ui/bridge.cpp
++++ b/ui/bridge.cpp
+@@ -82,7 +82,12 @@ Bridge::Bridge(QObject *p) : QObject(p), m_rows(this) {
+   m_clock.start();
+ }
+ Bridge::~Bridge() {
++  // waitForFinished() can emit readyRead/error/finished synchronously. Quiesce
++  // callbacks before waiting, including if QProcess outlives our final wait and
++  // emits from its destructor after the other Bridge members are gone.
+   m_timer.stop();
++  m_timeout.stop();
++  m_worker.disconnect(this);
+   m_worker.closeWriteChannel();
+   if (!m_worker.waitForFinished(600)) {
+     m_worker.terminate();

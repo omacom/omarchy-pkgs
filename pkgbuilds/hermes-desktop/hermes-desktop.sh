@@ -1,41 +1,74 @@
 #!/bin/bash
 set -euo pipefail
 
-# Hermes Desktop is a shell around a Hermes runtime, and it only works against
-# one built from its own commit. A CLI from PyPI is always a different release
-# -- PyPI trails the tags -- and the mismatch fails the app's readiness probe
-# with 401 Unauthorized. So keep it away from whatever `hermes` is on PATH,
-# which on Omarchy is the mise CLI installed for the terminal agent, and let
-# the app provision and manage its own runtime under ~/.hermes. That is the
-# arrangement upstream ships, and the only one that starts.
+unset ELECTRON_RUN_AS_NODE PYTHONPATH PYTHONHOME
 export HERMES_DESKTOP_IGNORE_EXISTING=1
 
-# Chromium cannot reliably infer the Secret Service password-store backend
-# from a Hyprland session, even when GNOME Keyring is already providing it.
-# Keep an explicit user choice (such as KWallet), otherwise select the
-# libsecret backend that this package depends on.
-export HERMES_DESKTOP_PASSWORD_STORE="${HERMES_DESKTOP_PASSWORD_STORE:-gnome-libsecret}"
-
-# Reconcile every launch rather than trusting whatever installed us. A plain
-# `pacman -S hermes-desktop`, or an install interrupted partway, leaves any
-# Hermes the terminal agent had built still sitting there, and by then the
-# menu entry that would have tidied it up is disabled because we are present.
+# Reconcile direct package installs and interrupted Omarchy setup as well.
 if command -v omarchy-install-hermes-cli >/dev/null 2>&1; then
   omarchy-install-hermes-cli >/dev/null 2>&1 || true
 fi
 
-# Chromium's own Ozone detection falls back to XWayland often enough to matter,
-# and the result is a blurry window on every scaled display. Ask for Wayland
-# directly, unless the user has already picked a platform themselves.
-platform_flags=()
-if [[ -n "${WAYLAND_DISPLAY:-}" || ${XDG_SESSION_TYPE:-} == wayland ]]; then
-  platform_flags=(--ozone-platform=wayland)
-
-  for flag in "$@"; do
-    case "$flag" in
-    --ozone-platform=* | --ozone-platform-hint=*) platform_flags=() ;;
-    esac
-  done
+hermes_home=$(realpath -ms -- "${HERMES_HOME:-$HOME/.hermes}")
+parent=${hermes_home%/*}
+if [[ ${parent##*/} == [Pp][Rr][Oo][Ff][Ii][Ll][Ee][Ss] ]]; then
+  hermes_home=${parent%/*}
+  hermes_home=${hermes_home:-/}
+fi
+export HERMES_HOME="$hermes_home"
+runtime="$hermes_home/hermes-agent"
+native="$runtime/apps/desktop/release/linux-unpacked/Hermes"
+if [[ ! -x $native || ! -x $runtime/venv/bin/hermes ]]; then
+  native=/opt/hermes-desktop/Hermes
 fi
 
-exec /opt/hermes-desktop/Hermes "${platform_flags[@]}" "$@"
+# Both app locations use namespaces, never a user-writable setuid helper.
+if ! timeout 5 unshare --user --map-root-user true 2>/dev/null; then
+  echo "Hermes Desktop requires working unprivileged user namespaces for its sandbox." >&2
+  exit 1
+fi
+
+python=/usr/bin/python
+if [[ -x $runtime/venv/bin/python && -f $runtime/hermes_cli/main.py ]]; then
+  python="$runtime/venv/bin/python"
+else
+  runtime=""
+fi
+exec "$python" - "$native" "$runtime" "$@" <<'PY'
+import os
+from pathlib import Path
+import sys
+
+native, runtime, *args = sys.argv[1:]
+env = os.environ.copy()
+flags, gpu, store, ozone = [], "auto", "auto", "auto"
+if runtime:
+    sys.path.insert(0, runtime)
+    try:
+        # Upstream moved the helper out of main after the packaged release.
+        if Path(runtime, "hermes_cli/main_desktop.py").is_file():
+            from hermes_cli.main_desktop import _desktop_launch_options
+        else:
+            from hermes_cli.main import _desktop_launch_options
+        from hermes_constants import with_hermes_node_path
+
+        flags, gpu, store, ozone = _desktop_launch_options()
+        env = with_hermes_node_path(env)
+    except ImportError:
+        print("Could not load Hermes desktop settings; using launch defaults.", file=sys.stderr)
+
+env["HERMES_DESKTOP_CWD"] = os.getcwd()
+if gpu != "auto":
+    env.setdefault("HERMES_DESKTOP_DISABLE_GPU", gpu)
+if ozone != "auto":
+    env.setdefault("ELECTRON_OZONE_PLATFORM_HINT", ozone)
+env.setdefault("HERMES_DESKTOP_PASSWORD_STORE", store if store != "auto" else "gnome-libsecret")
+
+# Explicit config, environment and command-line choices override the Wayland default.
+if (env.get("WAYLAND_DISPLAY") or env.get("XDG_SESSION_TYPE") == "wayland") and (
+    "ELECTRON_OZONE_PLATFORM_HINT" not in env
+    and not any(arg.startswith(("--ozone-platform=", "--ozone-platform-hint=")) for arg in flags + args)
+):
+    flags.insert(0, "--ozone-platform=wayland")
+os.execve(native, [native, "--disable-setuid-sandbox", *flags, *args], env)
+PY

@@ -9,6 +9,7 @@ source "$BUILD_ROOT/helpers/upstream-github.sh"
 
 TEMP_DIR=$(mktemp -d)
 trap 'rm -rf "$TEMP_DIR"' EXIT
+export UPSTREAM_CACHE_DIR="$TEMP_DIR/watch-cache"
 
 SPECIFIC_PACKAGES=()
 
@@ -18,11 +19,11 @@ Usage: $0 [PACKAGE...]
 
 Update packages that track an upstream vendor release feed instead of the AUR.
 
-A package whose upstream ships tagged GitHub releases with a checksum manifest
-opts in declaratively, via "upstream" in .omarchy/package.json (see
-helpers/upstream-github.sh for the schema); no code needed. Anything with a
-bespoke feed provides pkgbuilds/<package>/.omarchy/upstream.sh instead, a hook
-that reports the newest upstream release as JSON on stdout:
+Packages opt in declaratively through "upstream" in .omarchy/package.json.
+Providers cover GitHub Releases with checksum manifests or API asset digests,
+semver-shaped git tags, npm dist-tags, and plain Debian Packages indexes. See
+README.md for the schemas. Anything outside those conventions may provide
+pkgbuilds/<package>/.omarchy/upstream.sh, a hook that reports JSON on stdout:
 
   {
     "pkgver": "1.2.3",
@@ -332,27 +333,33 @@ sync_package() {
     return 0
   fi
 
-  local github_repo has_upstream=false
-  github_repo=$(package_upstream_github_repo "$package_dir")
+  if jq -e '.sync == false' "$package_dir/.omarchy/package.json" >/dev/null 2>&1; then
+    print_info "Skipping $package: upstream updates held by sync=false"
+    ((++SKIPPED))
+    return 0
+  fi
+
+  local provider has_upstream=false
+  provider=$(package_upstream_provider "$package_dir")
   if package_has_upstream_provider "$package_dir"; then
     has_upstream=true
   fi
 
   # A present-but-unusable declaration fails loudly; treating it like "no
   # upstream source" would silently drop the package from scheduled runs.
-  if [[ "$has_upstream" == true && -z "$github_repo" ]]; then
-    print_error "Package $package has an unusable upstream declaration (needs a github owner/repo)"
+  if [[ "$has_upstream" == true && -z "$provider" ]]; then
+    print_error "Package $package has an unusable or ambiguous upstream declaration"
     ((++FAILED))
     return 0
   fi
 
-  if [[ -n "$github_repo" && -f "$hook" ]]; then
-    print_error "Package $package declares both upstream.github and an upstream.sh hook; keep exactly one"
+  if [[ -n "$provider" && -f "$hook" ]]; then
+    print_error "Package $package declares both an upstream provider and an upstream.sh hook; keep exactly one"
     ((++FAILED))
     return 0
   fi
 
-  if [[ -z "$github_repo" && ! -f "$hook" ]]; then
+  if [[ -z "$provider" && ! -f "$hook" ]]; then
     if [[ "$SPECIFIC_MODE" == true ]]; then
       print_error "Package $package has neither an upstream declaration nor .omarchy/upstream.sh"
       ((++FAILED))
@@ -372,10 +379,31 @@ sync_package() {
 
   print_info "Checking $package for upstream releases..."
 
-  local release
-  if [[ -n "$github_repo" ]]; then
-    if ! release=$(github_upstream_release "$package_dir" "$min_age"); then
-      print_error "GitHub release provider failed for $package"
+  if [[ "$provider" == watch ]]; then
+    local result
+    if ! result=$(python3 "$BUILD_ROOT/helpers/upstream-watch.py" sync "$package_dir" --min-age "$min_age"); then
+      print_error "Upstream watch failed for $package"
+      ((++FAILED))
+    elif [[ $(jq -r .status <<<"$result") == updated ]]; then
+      print_success "  $(jq -r '.before + " -> " + .after' <<<"$result")"
+      ((++UPDATED))
+    else
+      print_info "  $(jq -r '.reason' <<<"$result")"
+      ((++SKIPPED))
+    fi
+    return 0
+  fi
+
+  local release release_status=0
+  if [[ -n "$provider" ]]; then
+    case "$provider" in
+    github) release=$(github_upstream_release "$package_dir" "$min_age") || release_status=$? ;;
+    git_tags) release=$(git_tags_upstream_release "$package_dir") || release_status=$? ;;
+    npm) release=$(npm_upstream_release "$package_dir") || release_status=$? ;;
+    debian) release=$(debian_upstream_release "$package_dir") || release_status=$? ;;
+    esac
+    if [[ ${release_status:-0} -ne 0 ]]; then
+      print_error "$provider upstream provider failed for $package"
       ((++FAILED))
       return 0
     fi
@@ -461,8 +489,8 @@ sync_package() {
 # paths. Covers release selection (fallback past quarantined releases,
 # draft/prerelease filtering, bypass, unchanged version), failure paths
 # (unusable tags/timestamps, missing checksums), checksum template mapping
-# for both architectures, the min_release_age backstop, the duration parser,
-# and manifest validation.
+# for both architectures, release API digests, the min_release_age backstop,
+# the duration parser, and manifest validation.
 cmd_self_test() {
   local failures=0
 
@@ -539,6 +567,31 @@ EOF
   check "bypass lifts the quarantine" "2.0.0" "$(jq -r '.pkgver // "<none>"' <<<"$out")"
   check "x86_64 checksum via * binary-mode prefix" "$sum_x20" "$(jq -r '.sha256sums.x86_64[0] // "<none>"' <<<"$out")"
 
+  cp "$pkg/.omarchy/package.json" "$pkg/normal.json"
+  jq '.upstream.latest_only = true' "$pkg/normal.json" > "$pkg/.omarchy/package.json"
+  FIXTURE_RELEASES=$(jq -n --arg old "$old2d" '[
+    {tag_name: "v1.9.0", published_at: $old, draft: false, prerelease: false},
+    {tag_name: "v0.4.1-8", published_at: $old, draft: false, prerelease: false}
+  ]')
+  FIXTURE_CHECKSUMS=$(printf '%s\n' \
+    "$sum_x19  ./tool-v1.9.0-x64.tar.xz" \
+    "$sum_a19  ./tool-v1.9.0-arm64.tar.xz")
+  out=$(github_upstream_release "$pkg" 0 2>/dev/null) || out="<error>"
+  check "latest_only ignores incompatible historical tags" "1.9.0" "$(jq -r '.pkgver // "<none>"' <<<"$out")"
+  cp "$pkg/normal.json" "$pkg/.omarchy/package.json"
+  FIXTURE_RELEASES=$(jq -n --arg young "$young" --arg old2 "$old2d" --arg old3 "$old3d" '[
+    {tag_name: "v2.0.0", published_at: $young, draft: false, prerelease: false},
+    {tag_name: "v1.9.9", published_at: $old2,  draft: false, prerelease: true},
+    {tag_name: "v1.9.8", published_at: $old2,  draft: true,  prerelease: false},
+    {tag_name: "v1.9.0", published_at: $old2,  draft: false, prerelease: false},
+    {tag_name: "v1.8.0", published_at: $old3,  draft: false, prerelease: false}
+  ]')
+  FIXTURE_CHECKSUMS=$(printf '%s\n' \
+    "$sum_x19  ./tool-v1.9.0-x64.tar.xz" \
+    "$sum_a19  tool-v1.9.0-arm64.tar.xz" \
+    "$sum_x20  *tool-v2.0.0-x64.tar.xz" \
+    "$sum_a20  tool-v2.0.0-arm64.tar.xz")
+
   out=$(github_upstream_release "$pkg" 8640000 2>/dev/null) || out="<error>"
   check "everything quarantined reports no update" "{}" "$(jq -c . <<<"$out")"
 
@@ -561,6 +614,190 @@ EOF
   FIXTURE_CHECKSUMS="$sum_x19  ./tool-v1.9.0-x64.tar.xz"
   rc=0; github_upstream_release "$pkg" 86400 >/dev/null 2>&1 || rc=$?
   check "missing aarch64 checksum fails the sync" "1" "$rc"
+
+  # A vendor publishing no manifest: checksums come from the digests the
+  # release API reports per asset, with nothing fetched beyond the feed.
+  echo "Release API digests:"
+  local digpkg="$TEMP_DIR/selftest-digests"
+  mkdir -p "$digpkg/.omarchy"
+  printf 'pkgver=1.0.0\npkgrel=1\n' > "$digpkg/PKGBUILD"
+  cat > "$digpkg/.omarchy/package.json" <<'EOF'
+{
+  "source": "local",
+  "upstream": {
+    "github": "example/tool",
+    "digests": true,
+    "assets": {
+      "x86_64": "tool-{pkgver}-1-x86_64.pkg.tar.zst",
+      "aarch64": "tool-{pkgver}-1-aarch64.pkg.tar.zst"
+    }
+  }
+}
+EOF
+  FIXTURE_RELEASES=$(jq -n --arg old "$old2d" --arg x "$sum_x19" --arg a "$sum_a19" '[
+    {tag_name: "v1.9.0", published_at: $old, draft: false, prerelease: false, assets: [
+      {name: "tool-1.9.0-1-x86_64.pkg.tar.zst", digest: ("sha256:" + $x)},
+      {name: "tool-1.9.0-1-aarch64.pkg.tar.zst", digest: ("sha256:" + $a)},
+      {name: "tool-1.9.0-1-x86_64.rpm", digest: "sha256:0000000000000000000000000000000000000000000000000000000000000000"}
+    ]}
+  ]')
+  FIXTURE_CHECKSUMS="manifest must not be consulted"
+  out=$(github_upstream_release "$digpkg" 0 2>/dev/null) || out="<error>"
+  check "x86_64 checksum via the asset digest" "$sum_x19" "$(jq -r '.sha256sums.x86_64[0] // "<none>"' <<<"$out")"
+  check "aarch64 checksum via the asset digest" "$sum_a19" "$(jq -r '.sha256sums.aarch64[0] // "<none>"' <<<"$out")"
+
+  FIXTURE_RELEASES=$(jq -n --arg old "$old2d" --arg x "$sum_x19" '[
+    {tag_name: "v1.9.0", published_at: $old, draft: false, prerelease: false, assets: [
+      {name: "tool-1.9.0-1-x86_64.pkg.tar.zst", digest: ("sha256:" + $x)},
+      {name: "tool-1.9.0-1-aarch64.pkg.tar.zst"}
+    ]}
+  ]')
+  rc=0; github_upstream_release "$digpkg" 0 >/dev/null 2>&1 || rc=$?
+  check "asset without a digest fails the sync" "1" "$rc"
+
+  FIXTURE_RELEASES=$(jq -n --arg old "$old2d" --arg x "$sum_x19" '[
+    {tag_name: "v1.9.0", published_at: $old, draft: false, prerelease: false, assets: [
+      {name: "tool-1.9.0-1-x86_64.pkg.tar.zst", digest: ("sha256:" + $x)},
+      {name: "tool-1.9.0-2-aarch64.pkg.tar.zst", digest: ("sha256:" + $x)}
+    ]}
+  ]')
+  rc=0; github_upstream_release "$digpkg" 0 >/dev/null 2>&1 || rc=$?
+  check "asset re-cut under another release number fails the sync" "1" "$rc"
+
+  FIXTURE_RELEASES=$(jq -n --arg old "$old2d" --arg x "$sum_x19" --arg a "$sum_a19" '[
+    {tag_name: "v1.9.0", published_at: $old, draft: false, prerelease: false, assets: [
+      {name: "tool-1.9.0-1-x86_64.pkg.tar.zst", digest: $x},
+      {name: "tool-1.9.0-1-aarch64.pkg.tar.zst", digest: ("sha256:" + $a)}
+    ]}
+  ]')
+  rc=0; github_upstream_release "$digpkg" 0 >/dev/null 2>&1 || rc=$?
+  check "digest without the sha256: prefix fails the sync" "1" "$rc"
+
+  # The provider enforces the declaration shape itself: scheduled runs reach
+  # it without validate_package_metadata.
+  jq '.upstream.checksums = "SHASUMS256.txt"' "$digpkg/.omarchy/package.json" > "$digpkg/both.json"
+  cp "$digpkg/.omarchy/package.json" "$digpkg/good.json"
+  cp "$digpkg/both.json" "$digpkg/.omarchy/package.json"
+  rc=0; github_upstream_release "$digpkg" 0 >/dev/null 2>&1 || rc=$?
+  check "provider rejects checksums and digests together" "1" "$rc"
+  jq '.upstream.digests = "true"' "$digpkg/good.json" > "$digpkg/.omarchy/package.json"
+  rc=0; github_upstream_release "$digpkg" 0 >/dev/null 2>&1 || rc=$?
+  check "provider rejects a non-boolean digests" "1" "$rc"
+  cp "$digpkg/good.json" "$digpkg/.omarchy/package.json"
+
+  echo "Ordered GitHub assets with supplemental sources:"
+  local multipkg="$TEMP_DIR/selftest-multi-assets" multi_sum support_sum multi_vst
+  mkdir -p "$multipkg/.omarchy"
+  printf 'pkgver=1.0.0\npkgrel=1\n' > "$multipkg/PKGBUILD"
+  cat > "$multipkg/.omarchy/package.json" <<'EOF'
+{
+  "source": "local",
+  "upstream": {
+    "github": "example/tool",
+    "digests": true,
+    "assets": {
+      "x86_64": ["tool-{pkgver}-x86_64", "tool-{pkgver}-x86_64.asc"],
+      "aarch64": ["tool-{pkgver}-aarch64", "tool-{pkgver}-aarch64.asc"]
+    },
+    "sources": {
+      "any": ["https://example.test/tool/{tag}/support.txt"]
+    }
+  }
+}
+EOF
+  local sum_x19_sig sum_a19_sig
+  sum_x19_sig=$(printf '1%.0s' {1..64})
+  sum_a19_sig=$(printf '2%.0s' {1..64})
+  FIXTURE_RELEASES=$(jq -n --arg old "$old2d" --arg x "$sum_x19" --arg xs "$sum_x19_sig" \
+    --arg a "$sum_a19" --arg as "$sum_a19_sig" '[
+    {tag_name: "v1.9.0", published_at: $old, draft: false, prerelease: false, assets: [
+      {name: "tool-1.9.0-x86_64", digest: ("sha256:" + $x)},
+      {name: "tool-1.9.0-x86_64.asc", digest: ("sha256:" + $xs)},
+      {name: "tool-1.9.0-aarch64", digest: ("sha256:" + $a)},
+      {name: "tool-1.9.0-aarch64.asc", digest: ("sha256:" + $as)}
+    ]}
+  ]')
+  upstream_fetch_source() { printf 'remote fixture for %s\n' "$1" > "$2"; }
+  multi_sum=$(github_upstream_release "$multipkg" 0 2>/dev/null) || multi_sum="<error>"
+  support_sum=$(printf 'remote fixture for %s\n' 'https://example.test/tool/v1.9.0/support.txt' | sha256sum | cut -d' ' -f1)
+  check "ordered GitHub assets produce an ordered checksum array" "$sum_x19 $sum_x19_sig" \
+    "$(jq -r '.sha256sums.x86_64 | join(" ")' <<<"$multi_sum")"
+  check "GitHub supplemental source is downloaded and hashed" "$support_sum" \
+    "$(jq -r '.sha256sums.any[0]' <<<"$multi_sum")"
+  multi_vst=0; validate_package_metadata "$multipkg" >/dev/null || multi_vst=$?
+  check "GitHub asset lists and disjoint sources validate" "0" "$multi_vst"
+  jq '.upstream.sources.x86_64 = ["https://example.test/duplicate"]' \
+    "$multipkg/.omarchy/package.json" > "$multipkg/overlap.json"
+  cp "$multipkg/.omarchy/package.json" "$multipkg/good.json"
+  cp "$multipkg/overlap.json" "$multipkg/.omarchy/package.json"
+  multi_vst=0; validate_package_metadata "$multipkg" >/dev/null || multi_vst=$?
+  check "GitHub assets and sources cannot target the same checksum array" "1" "$multi_vst"
+  cp "$multipkg/good.json" "$multipkg/.omarchy/package.json"
+
+  echo "Debian Packages provider:"
+  local debpkg="$TEMP_DIR/selftest-debian" deb_sum deb_x_sum deb_a_sum deb_vst
+  mkdir -p "$debpkg/.omarchy"
+  printf 'pkgver=1.0.0\npkgrel=1\nsha256sums_x86_64=("old")\nsha256sums_aarch64=("old")\n' > "$debpkg/PKGBUILD"
+  cat > "$debpkg/.omarchy/package.json" <<'EOF'
+{
+  "source": "local",
+  "upstream": {
+    "debian": "https://packages.example.test/dists/stable/main/binary-amd64/Packages",
+    "package": "example-app",
+    "sources": {
+      "x86_64": ["https://downloads.example.test/app-{pkgver}-x64.tar.gz"],
+      "aarch64": ["https://downloads.example.test/app-{pkgver}-arm64.tar.gz"]
+    }
+  }
+}
+EOF
+  debian_fetch_packages() {
+    cat <<'EOF'
+Package: unrelated
+Version: 99.0.0
+
+Package: example-app
+Version: 1.9.0
+
+Package: example-app
+Version: 1.10.0
+EOF
+  }
+  deb_sum=$(debian_upstream_release "$debpkg")
+  deb_x_sum=$(printf 'remote fixture for %s\n' 'https://downloads.example.test/app-1.10.0-x64.tar.gz' | sha256sum | cut -d' ' -f1)
+  deb_a_sum=$(printf 'remote fixture for %s\n' 'https://downloads.example.test/app-1.10.0-arm64.tar.gz' | sha256sum | cut -d' ' -f1)
+  check "Debian provider selects the newest exact package stanza" "1.10.0" "$(jq -r '.pkgver' <<<"$deb_sum")"
+  check "Debian x86_64 source is hashed" "$deb_x_sum" "$(jq -r '.sha256sums.x86_64[0]' <<<"$deb_sum")"
+  check "Debian aarch64 source is hashed" "$deb_a_sum" "$(jq -r '.sha256sums.aarch64[0]' <<<"$deb_sum")"
+  deb_vst=0; validate_package_metadata "$debpkg" >/dev/null || deb_vst=$?
+  check "Debian declaration validates" "0" "$deb_vst"
+  printf 'pkgver=1.10.0\npkgrel=1\nsha256sums_x86_64=("old")\nsha256sums_aarch64=("old")\n' > "$debpkg/PKGBUILD"
+  check "checked-in Debian version avoids source downloads" "{}" "$(debian_upstream_release "$debpkg" | jq -c .)"
+
+  echo "End-to-end Debian sync with the checked-in 1password recipe:"
+  local one_root="$TEMP_DIR/e2e-1password" one_dir one_version=8.12.35
+  mkdir -p "$one_root"
+  cp -a "$BUILD_ROOT/pkgbuilds/1password" "$one_root/1password"
+  one_dir="$one_root/1password"
+  # Keep the real recipe shape, but make the fixture's starting version stable.
+  # Otherwise a routine package update can outrun the mocked release below.
+  sed -i -e 's/^pkgver=.*/pkgver=8.12.34/' -e 's/^pkgrel=.*/pkgrel=2/' "$one_dir/PKGBUILD"
+  debian_fetch_packages() {
+    printf 'Package: 1password\nVersion: %s\n' "$one_version"
+  }
+  upstream_fetch_source() { printf 'remote fixture for %s\n' "$1" > "$2"; }
+  local one_prev_updated=$UPDATED one_prev_failed=$FAILED
+  PKGBUILDS_DIR="$one_root" sync_package 1password >/dev/null 2>&1 || true
+  check "1password sync updates without failures" "updated=1 failed=0" \
+    "updated=$((UPDATED - one_prev_updated)) failed=$((FAILED - one_prev_failed))"
+  check "1password pkgver is the single download version source" "$one_version" \
+    "$(grep -m1 '^pkgver=' "$one_dir/PKGBUILD" | cut -d= -f2-)"
+  check "1password pkgrel resets to 1" "1" \
+    "$(grep -m1 '^pkgrel=' "$one_dir/PKGBUILD" | cut -d= -f2-)"
+  check "1password x86 URL follows the rewritten pkgver" "1password-${one_version}.x64.tar.gz" \
+    "$(CARCH=x86_64 bash -c 'source "$1"; basename "${source_x86_64[0]}"' _ "$one_dir/PKGBUILD")"
+  check "1password ARM URL follows the rewritten pkgver" "1password-${one_version}.arm64.tar.gz" \
+    "$(CARCH=aarch64 bash -c 'source "$1"; basename "${source_aarch64[0]}"' _ "$one_dir/PKGBUILD")"
 
   echo "Quarantine backstop:"
   local rel st
@@ -614,9 +851,99 @@ EOF
   echo '{"source": "local", "upstream": {"github": "example/tool"}}' > "$agepkg/.omarchy/package.json"
   vst=0; validate_package_metadata "$agepkg" >/dev/null || vst=$?
   check "upstream without checksums/assets is rejected" "1" "$vst"
+  echo '{"source": "local", "upstream": {"github": "example/tool", "checksums": "SHASUMS256.txt", "digests": true, "assets": {"x86_64": "a"}}}' > "$agepkg/.omarchy/package.json"
+  vst=0; validate_package_metadata "$agepkg" >/dev/null || vst=$?
+  check "upstream with both checksums and digests is rejected" "1" "$vst"
+  echo '{"source": "local", "upstream": {"github": "example/tool", "digests": "yes", "assets": {"x86_64": "a"}}}' > "$agepkg/.omarchy/package.json"
+  vst=0; validate_package_metadata "$agepkg" >/dev/null || vst=$?
+  check "non-boolean digests is rejected" "1" "$vst"
+  echo '{"source": "local", "upstream": {"github": "example/tool", "checksums": false, "digests": true, "assets": {"x86_64": "a"}}}' > "$agepkg/.omarchy/package.json"
+  vst=0; validate_package_metadata "$agepkg" >/dev/null || vst=$?
+  check "checksums: false alongside digests is rejected" "1" "$vst"
+  echo '{"source": "local", "upstream": {"github": "example/tool", "checksums": "SUMS", "digests": null, "assets": {"x86_64": "a"}}}' > "$agepkg/.omarchy/package.json"
+  vst=0; validate_package_metadata "$agepkg" >/dev/null || vst=$?
+  check "digests: null is rejected" "1" "$vst"
+  echo '{"source": "local", "upstream": {"github": "example/tool", "checksums": "SUMS", "digests": false, "assets": {"x86_64": "a"}}}' > "$agepkg/.omarchy/package.json"
+  vst=0; validate_package_metadata "$agepkg" >/dev/null || vst=$?
+  check "digests: false beside a checksums manifest is accepted" "0" "$vst"
+  echo '{"source": "local", "upstream": {"github": "example/tool", "digests": false, "assets": {"x86_64": "a"}}}' > "$agepkg/.omarchy/package.json"
+  vst=0; validate_package_metadata "$agepkg" >/dev/null || vst=$?
+  check "digests: false alone is rejected" "1" "$vst"
+  cp "$digpkg/.omarchy/package.json" "$agepkg/.omarchy/package.json"
+  vst=0; validate_package_metadata "$agepkg" >/dev/null || vst=$?
+  check "the digests declaration shape is accepted" "0" "$vst"
+  echo '{"source":"local","upstream":{"github":"example/tool","git_tags":"https://example/tool.git","checksums":"sums","assets":{"any":"tool"}}}' > "$agepkg/.omarchy/package.json"
+  vst=0; validate_package_metadata "$agepkg" >/dev/null || vst=$?
+  check "multiple provider types are rejected" "1" "$vst"
   cp "$pkg/.omarchy/package.json" "$agepkg/.omarchy/package.json"
   vst=0; validate_package_metadata "$agepkg" >/dev/null || vst=$?
   check "the real declaration shape is accepted" "0" "$vst"
+
+  echo "Git-tag provider:"
+  local tagpkg="$TEMP_DIR/selftest-tags" tag_sum remote_sum local_sum
+  mkdir -p "$tagpkg/.omarchy"
+  printf 'pkgver=1.0.0\npkgrel=4\nsha256sums=("old" "old")\n' > "$tagpkg/PKGBUILD"
+  printf 'local fixture\n' > "$tagpkg/local.patch"
+  cat > "$tagpkg/.omarchy/package.json" <<'EOF'
+{
+  "source": "local",
+  "upstream": {
+    "git_tags": "https://example.test/tool.git",
+    "tag_pattern": "release/{pkgver}",
+    "sources": {
+      "any": ["https://downloads.example.test/tool-{pkgver}.tar.gz", "file:local.patch"]
+    }
+  }
+}
+EOF
+  git_tags_fetch_refs() {
+    printf '%s\n' \
+      'aaaa refs/tags/release/1.9.0' \
+      'bbbb refs/tags/release/1.10.0' \
+      'cccc refs/tags/not-a-release'
+  }
+  upstream_fetch_source() { printf 'remote fixture for %s\n' "$1" > "$2"; }
+  tag_sum=$(git_tags_upstream_release "$tagpkg")
+  remote_sum=$(printf 'remote fixture for %s\n' 'https://downloads.example.test/tool-1.10.0.tar.gz' | sha256sum | cut -d' ' -f1)
+  local_sum=$(sha256sum "$tagpkg/local.patch" | cut -d' ' -f1)
+  check "pacman ordering selects 1.10.0 over 1.9.0" "1.10.0" "$(jq -r '.pkgver' <<<"$tag_sum")"
+  check "remote source template is downloaded and hashed" "$remote_sum" "$(jq -r '.sha256sums.any[0]' <<<"$tag_sum")"
+  check "local source entry is hashed" "$local_sum" "$(jq -r '.sha256sums.any[1]' <<<"$tag_sum")"
+  vst=0; validate_package_metadata "$tagpkg" >/dev/null || vst=$?
+  check "git-tags declaration validates" "0" "$vst"
+
+  echo "npm provider:"
+  local npmpkg="$TEMP_DIR/selftest-npm" npm_sum npm_tar_sum npm_notes_sum
+  mkdir -p "$npmpkg/.omarchy"
+  printf 'pkgver=1.0.0\npkgrel=1\nsha256sums=("old" "old")\n' > "$npmpkg/PKGBUILD"
+  cat > "$npmpkg/.omarchy/package.json" <<'EOF'
+{
+  "source": "local",
+  "upstream": {
+    "npm": "@example/tool",
+    "dist_tag": "latest",
+    "sources": {
+      "any": ["{npm_tarball}", "https://example.test/tool/{pkgver}/notes"]
+    }
+  }
+}
+EOF
+  npm_fetch_metadata() {
+    jq -n '{
+      "dist-tags": {latest: "2.0.0"},
+      versions: {"2.0.0": {dist: {tarball: "https://registry.npmjs.org/@example/tool/-/tool-2.0.0.tgz"}}},
+      time: {"2.0.0": "2024-01-02T03:04:05.000Z"}
+    }'
+  }
+  npm_sum=$(npm_upstream_release "$npmpkg")
+  npm_tar_sum=$(printf 'remote fixture for %s\n' 'https://registry.npmjs.org/@example/tool/-/tool-2.0.0.tgz' | sha256sum | cut -d' ' -f1)
+  npm_notes_sum=$(printf 'remote fixture for %s\n' 'https://example.test/tool/2.0.0/notes' | sha256sum | cut -d' ' -f1)
+  check "npm dist-tag selects its version" "2.0.0" "$(jq -r '.pkgver' <<<"$npm_sum")"
+  check "npm tarball placeholder is hashed" "$npm_tar_sum" "$(jq -r '.sha256sums.any[0]' <<<"$npm_sum")"
+  check "npm pkgver template is hashed" "$npm_notes_sum" "$(jq -r '.sha256sums.any[1]' <<<"$npm_sum")"
+  check "npm publication time is preserved" "2024-01-02T03:04:05.000Z" "$(jq -r '.published_at' <<<"$npm_sum")"
+  vst=0; validate_package_metadata "$npmpkg" >/dev/null || vst=$?
+  check "npm declaration validates" "0" "$vst"
 
   # End to end over the real mise-bin package: its checked-in metadata and
   # PKGBUILD, the full sync_package path (selection, validation, backstop,
@@ -668,6 +995,10 @@ EOF
   PKGBUILDS_DIR="$e2e_root" sync_package selftest-broken >/dev/null 2>&1 || true
   check "malformed upstream fails the sync instead of skipping" "1" "$((FAILED - prev_failed))"
   FAILED=0
+
+  if ! bash "$BUILD_ROOT/pkgbuilds/cua-driver-bin/.omarchy/upstream-test.sh"; then
+    failures=$((failures + 1))
+  fi
 
   echo ""
   if [[ "$failures" -eq 0 ]]; then

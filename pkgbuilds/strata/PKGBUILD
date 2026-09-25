@@ -1,10 +1,10 @@
 pkgname=strata
-pkgver=0.8.0
-pkgrel=1
+pkgver=0.19.0
+pkgrel=2
 pkgdesc='Fast, keyboard-first file manager for modern Linux desktops'
 arch=('x86_64' 'aarch64')
 url='https://github.com/lgse/strata'
-license=('GPL-3.0-or-later')
+license=('MIT')
 
 depends=(
   'bash'
@@ -20,6 +20,7 @@ depends=(
   'graphene'
   'gst-libav'
   'gst-plugins-good'
+  'gvfs'
   'gtk4'
   'gtksourceview5'
   'hicolor-icon-theme'
@@ -28,7 +29,7 @@ depends=(
   'util-linux'
   'xdg-terminal-exec'
 )
-makedepends=('cargo' 'glib2-devel' 'pkgconf')
+makedepends=('cargo' 'git' 'glib2-devel' 'pkgconf')
 optdepends=(
   'gvfs-smb: browse SMB network shares'
   'imagemagick: additional camera RAW preview support'
@@ -37,12 +38,19 @@ optdepends=(
 conflicts=('strata-git')
 options=('!debug' '!lto')
 
-_commit='61b4b0bc74a5b8ca262c7c080e9fea57bba65ff5'
 source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
-sha256sums=('8a6179ad5673afd8036ff6640c1740f6fa676516a05346c180d67ef98c4a56f7')
+sha256sums=('51701930728625ce1d6394949a4b6b2705f0999fd08be87f1a26d900209d62e0')
 
 prepare() {
   cd "$pkgname-$pkgver"
+
+  local commit
+  if ! commit=$(git get-tar-commit-id < <(gzip -dc "$srcdir/$pkgname-$pkgver.tar.gz")) ||
+    [[ ! $commit =~ ^[0-9a-f]{40}$ ]]; then
+    printf 'Could not recover the release commit from the source archive\n' >&2
+    return 1
+  fi
+  printf '%s\n' "$commit" >.build-commit
 
   cargo fetch --locked --target "$CARCH-unknown-linux-gnu"
 }
@@ -51,7 +59,8 @@ build() {
   cd "$pkgname-$pkgver"
 
   export CARGO_TARGET_DIR=target
-  export STRATA_BUILD_COMMIT="$_commit"
+  export STRATA_BUILD_COMMIT
+  STRATA_BUILD_COMMIT=$(<.build-commit)
   export STRATA_RELEASE_TAG="v$pkgver"
   export STRATA_BUILD_KIND=stable
   cargo build --frozen --release
@@ -60,11 +69,46 @@ build() {
 check() {
   cd "$pkgname-$pkgver"
 
-  export CARGO_TARGET_DIR=target
-  export STRATA_BUILD_COMMIT="$_commit"
+  # Upstream's release profile is fat LTO with one codegen unit, which
+  # compiles the final crate on a single thread. That is the right trade
+  # for the binary users run, and build() keeps it. The test harness is a
+  # second compile of the same crate under the same profile, thrown away
+  # afterwards; build it in parallel, in its own target directory so the
+  # shipped binary is untouched. Measured on the x86_64 builder: 708 s
+  # serial, 223 s with thin LTO and 16 units.
+  export CARGO_TARGET_DIR=target-check
+  export CARGO_PROFILE_RELEASE_LTO=thin
+  export CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16
+  export STRATA_BUILD_COMMIT
+  STRATA_BUILD_COMMIT=$(<.build-commit)
   export STRATA_RELEASE_TAG="v$pkgver"
   export STRATA_BUILD_KIND=stable
-  cargo test --frozen --release --all-targets --all-features
+  # Search fixtures depend on directory enumeration order and fail on overlayfs.
+  # Run them on tmpfs; other suites execute fixtures, so cannot use noexec /dev/shm.
+  local search_tmp
+  search_tmp=$(mktemp -d /dev/shm/strata-tests.XXXXXXXX) || return 1
+  local test_status=0
+  TMPDIR="$search_tmp" cargo test --frozen --release --all-targets --all-features \
+    services::search::tests:: -- --test-threads=1 || test_status=$?
+  rm -rf -- "$search_tmp"
+  (( test_status == 0 )) || return "$test_status"
+
+  # restart_waiter_* run `sh -c 'while kill -0 "$1"; do sleep; done'` with
+  # the pid u32::MAX. Arch's sh is bash, and bash's kill builtin in POSIX
+  # mode prints "not a pid or valid job spec" for that number but exits 0,
+  # so the loop never ends and the job hits its 180-minute timeout.
+  # Upstream CI runs on Ubuntu, where sh is dash and rejects the number.
+  # Skip until upstream waits on a real pid.
+  local skip=(--skip services::search::tests:: --skip ui::settings::tests::restart_waiter_)
+  # ownership_probe_errors_disable_in_place_updates points the pacman path
+  # at a directory and expects Command::output() to fail. aarch64 builds
+  # run under QEMU user-mode emulation, where glibc's posix_spawn cannot
+  # observe the child's failed execve (natively it returns EACCES); the
+  # spawn "succeeds" with exit 127, the probe reads that as "not owned",
+  # and the assertion fails. Passes natively.
+  [[ $CARCH == aarch64 ]] && skip+=(--skip services::update_install::tests::ownership_probe_errors_disable_in_place_updates)
+  cargo test --frozen --release --all-targets --all-features \
+    -- --test-threads=1 "${skip[@]}"
 }
 
 package() {
@@ -75,6 +119,10 @@ package() {
     "$pkgdir/usr/share/applications/io.github.lgse.Strata.desktop"
   install -Dm644 data/icons/scalable/apps/io.github.lgse.Strata.svg \
     "$pkgdir/usr/share/icons/hicolor/scalable/apps/io.github.lgse.Strata.svg"
+  # Payload for the app's per-user FileManager1 opt-in; upstream's own
+  # packaging stages it here, not in /usr/share/dbus-1.
+  install -Dm644 data/io.github.lgse.Strata.FileManager1.service \
+    "$pkgdir/usr/share/strata/io.github.lgse.Strata.FileManager1.service"
   install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
   install -Dm644 THIRD_PARTY_LICENSES.md \
     "$pkgdir/usr/share/licenses/$pkgname/THIRD_PARTY_LICENSES.md"

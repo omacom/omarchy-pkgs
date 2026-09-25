@@ -1,0 +1,763 @@
+diff --git a/arch/x86/include/asm/pgtable.h b/arch/x86/include/asm/pgtable.h
+--- a/arch/x86/include/asm/pgtable.h
++++ b/arch/x86/include/asm/pgtable.h
+@@ -50,7 +50,7 @@ void ptdump_walk_user_pgd_level_checkwx(void);
+ extern spinlock_t pgd_lock;
+ extern struct list_head pgd_list;
+ 
+-extern struct mm_struct *pgd_page_get_mm(struct page *page);
++struct mm_struct *pgd_page_get_mm(struct ptdesc *pt);
+ 
+ extern pmdval_t early_pmd_flags;
+ 
+diff --git a/arch/x86/include/asm/pgtable_types.h b/arch/x86/include/asm/pgtable_types.h
+--- a/arch/x86/include/asm/pgtable_types.h
++++ b/arch/x86/include/asm/pgtable_types.h
+@@ -512,7 +512,7 @@ static inline pgprot_t pgprot_large_2_4k(pgprot_t pgprot)
+ 	return __pgprot(protval_large_2_4k(pgprot_val(pgprot)));
+ }
+ 
+-
++struct ptdesc;
+ typedef struct page *pgtable_t;
+ 
+ extern pteval_t __supported_pte_mask;
+diff --git a/arch/x86/include/asm/pkeys.h b/arch/x86/include/asm/pkeys.h
+--- a/arch/x86/include/asm/pkeys.h
++++ b/arch/x86/include/asm/pkeys.h
+@@ -88,6 +88,9 @@ int mm_pkey_alloc(struct mm_struct *mm)
+ 	u16 all_pkeys_mask = ((1U << arch_max_pkey()) - 1);
+ 	int ret;
+ 
++	if (!arch_pkeys_enabled())
++		return -1;
++
+ 	/*
+ 	 * Are we out of pkeys?  We must handle this specially
+ 	 * because ffz() behavior is undefined if there are no
+diff --git a/arch/x86/include/asm/tlbflush.h b/arch/x86/include/asm/tlbflush.h
+--- a/arch/x86/include/asm/tlbflush.h
++++ b/arch/x86/include/asm/tlbflush.h
+@@ -4,6 +4,7 @@
+ 
+ #include <linux/mm_types.h>
+ #include <linux/mmu_notifier.h>
++#include <linux/minmax.h>
+ #include <linux/sched.h>
+ 
+ #include <asm/barrier.h>
+@@ -211,6 +212,12 @@ extern u16 invlpgb_count_max;
+ 
+ extern void initialize_tlbstate_and_flush(void);
+ 
++/*
++ * Keep stack-allocated flush_tlb_info cacheline aligned, but cap the
++ * alignment to avoid excessive stack usage on large-cacheline systems.
++ */
++#define FLUSH_TLB_INFO_ALIGN MIN(SMP_CACHE_BYTES, 64)
++
+ /*
+  * TLB flushing:
+  *
+@@ -249,7 +256,7 @@ struct flush_tlb_info {
+ 	u8			stride_shift;
+ 	u8			freed_tables;
+ 	u8			trim_cpumask;
+-};
++} __aligned(FLUSH_TLB_INFO_ALIGN);
+ 
+ void flush_tlb_local(void);
+ void flush_tlb_one_user(unsigned long addr);
+diff --git a/arch/x86/kernel/kvm.c b/arch/x86/kernel/kvm.c
+--- a/arch/x86/kernel/kvm.c
++++ b/arch/x86/kernel/kvm.c
+@@ -663,8 +663,10 @@ static void kvm_flush_tlb_multi(const struct cpumask *cpumask,
+ 	u8 state;
+ 	int cpu;
+ 	struct kvm_steal_time *src;
+-	struct cpumask *flushmask = this_cpu_cpumask_var_ptr(__pv_cpu_mask);
++	struct cpumask *flushmask;
+ 
++	guard(preempt)();
++	flushmask = this_cpu_cpumask_var_ptr(__pv_cpu_mask);
+ 	cpumask_copy(flushmask, cpumask);
+ 	/*
+ 	 * We have to call flush only on online vCPUs. And
+diff --git a/arch/x86/mm/fault.c b/arch/x86/mm/fault.c
+--- a/arch/x86/mm/fault.c
++++ b/arch/x86/mm/fault.c
+@@ -275,17 +275,17 @@ void arch_sync_kernel_mappings(unsigned long start, unsigned long end)
+ 	for (addr = start & PMD_MASK;
+ 	     addr >= TASK_SIZE_MAX && addr < VMALLOC_END;
+ 	     addr += PMD_SIZE) {
+-		struct page *page;
++		struct ptdesc *ptdesc;
+ 
+ 		spin_lock(&pgd_lock);
+-		list_for_each_entry(page, &pgd_list, lru) {
++		list_for_each_entry(ptdesc, &pgd_list, pt_list) {
+ 			spinlock_t *pgt_lock;
+ 
+ 			/* the pgt_lock only for Xen */
+-			pgt_lock = &pgd_page_get_mm(page)->page_table_lock;
++			pgt_lock = &pgd_page_get_mm(ptdesc)->page_table_lock;
+ 
+ 			spin_lock(pgt_lock);
+-			vmalloc_sync_one(page_address(page), addr);
++			vmalloc_sync_one(ptdesc_address(ptdesc), addr);
+ 			spin_unlock(pgt_lock);
+ 		}
+ 		spin_unlock(&pgd_lock);
+diff --git a/arch/x86/mm/init_64.c b/arch/x86/mm/init_64.c
+--- a/arch/x86/mm/init_64.c
++++ b/arch/x86/mm/init_64.c
+@@ -136,7 +136,7 @@ static void sync_global_pgds_l5(unsigned long start, unsigned long end)
+ 
+ 	for (addr = start; addr <= end; addr = ALIGN(addr + 1, PGDIR_SIZE)) {
+ 		const pgd_t *pgd_ref = pgd_offset_k(addr);
+-		struct page *page;
++		struct ptdesc *ptdesc;
+ 
+ 		/* Check for overflow */
+ 		if (addr < start)
+@@ -146,13 +146,13 @@ static void sync_global_pgds_l5(unsigned long start, unsigned long end)
+ 			continue;
+ 
+ 		spin_lock(&pgd_lock);
+-		list_for_each_entry(page, &pgd_list, lru) {
++		list_for_each_entry(ptdesc, &pgd_list, pt_list) {
+ 			pgd_t *pgd;
+ 			spinlock_t *pgt_lock;
+ 
+-			pgd = (pgd_t *)page_address(page) + pgd_index(addr);
++			pgd = (pgd_t *)ptdesc_address(ptdesc) + pgd_index(addr);
+ 			/* the pgt_lock only for Xen */
+-			pgt_lock = &pgd_page_get_mm(page)->page_table_lock;
++			pgt_lock = &pgd_page_get_mm(ptdesc)->page_table_lock;
+ 			spin_lock(pgt_lock);
+ 
+ 			if (!pgd_none(*pgd_ref) && !pgd_none(*pgd))
+@@ -174,7 +174,7 @@ static void sync_global_pgds_l4(unsigned long start, unsigned long end)
+ 	for (addr = start; addr <= end; addr = ALIGN(addr + 1, PGDIR_SIZE)) {
+ 		pgd_t *pgd_ref = pgd_offset_k(addr);
+ 		const p4d_t *p4d_ref;
+-		struct page *page;
++		struct ptdesc *ptdesc;
+ 
+ 		/*
+ 		 * With folded p4d, pgd_none() is always false, we need to
+@@ -187,15 +187,15 @@ static void sync_global_pgds_l4(unsigned long start, unsigned long end)
+ 			continue;
+ 
+ 		spin_lock(&pgd_lock);
+-		list_for_each_entry(page, &pgd_list, lru) {
++		list_for_each_entry(ptdesc, &pgd_list, pt_list) {
+ 			pgd_t *pgd;
+ 			p4d_t *p4d;
+ 			spinlock_t *pgt_lock;
+ 
+-			pgd = (pgd_t *)page_address(page) + pgd_index(addr);
++			pgd = (pgd_t *)ptdesc_address(ptdesc) + pgd_index(addr);
+ 			p4d = p4d_offset(pgd, addr);
+ 			/* the pgt_lock only for Xen */
+-			pgt_lock = &pgd_page_get_mm(page)->page_table_lock;
++			pgt_lock = &pgd_page_get_mm(ptdesc)->page_table_lock;
+ 			spin_lock(pgt_lock);
+ 
+ 			if (!p4d_none(*p4d_ref) && !p4d_none(*p4d))
+diff --git a/arch/x86/mm/pat/set_memory.c b/arch/x86/mm/pat/set_memory.c
+--- a/arch/x86/mm/pat/set_memory.c
++++ b/arch/x86/mm/pat/set_memory.c
+@@ -62,18 +62,18 @@ enum cpa_warn {
+ static const int cpa_warn_level = CPA_PROTECT;
+ 
+ /*
+- * Serialize cpa() (for !DEBUG_PAGEALLOC which uses large identity mappings)
+- * using cpa_lock. So that we don't allow any other cpu, with stale large tlb
+- * entries change the page attribute in parallel to some other cpu
+- * splitting a large page entry along with changing the attribute.
++ * Serialize cpa() using cpa_lock so that we don't allow any other cpu, with
++ * stale large tlb entries, to change the page attribute in parallel to some
++ * other cpu splitting a large page entry along with changing the attribute.
+  */
+ static DEFINE_SPINLOCK(cpa_lock);
+ 
+-#define CPA_FLUSHTLB 1
+-#define CPA_ARRAY 2
+-#define CPA_PAGES_ARRAY 4
+-#define CPA_NO_CHECK_ALIAS 8 /* Do not search for aliases */
+-#define CPA_COLLAPSE 16 /* try to collapse large pages */
++#define CPA_FLUSHTLB		0x01
++#define CPA_ARRAY		0x02
++#define CPA_PAGES_ARRAY		0x04
++#define CPA_NO_CHECK_ALIAS	0x08 /* Do not search for aliases */
++#define CPA_COLLAPSE		0x10 /* try to collapse large pages */
++#define CPA_DEBUG_PAGEALLOC	0x20
+ 
+ static inline pgprot_t cachemode2pgprot(enum page_cache_mode pcm)
+ {
+@@ -86,9 +86,8 @@ static unsigned long direct_pages_count[PG_LEVEL_NUM];
+ void update_page_count(int level, unsigned long pages)
+ {
+ 	/* Protect against CPA */
+-	spin_lock(&pgd_lock);
++	guard(spinlock)(&pgd_lock);
+ 	direct_pages_count[level] += pages;
+-	spin_unlock(&pgd_lock);
+ }
+ 
+ static void split_page_count(int level)
+@@ -418,6 +417,8 @@ static void cpa_collapse_large_pages(struct cpa_data *cpa)
+ 	int collapsed = 0;
+ 	int i;
+ 
++	guard(spinlock)(&cpa_lock);
++
+ 	if (cpa->flags & (CPA_PAGES_ARRAY | CPA_ARRAY)) {
+ 		for (i = 0; i < cpa->numpages; i++)
+ 			collapsed += collapse_large_pages(__cpa_addr(cpa, i),
+@@ -888,24 +889,23 @@ static void __set_pmd_pte(pte_t *kpte, unsigned long address, pte_t pte)
+ {
+ 	/* change init_mm */
+ 	set_pte_atomic(kpte, pte);
+-#ifdef CONFIG_X86_32
+-	{
+-		struct page *page;
+ 
+-		list_for_each_entry(page, &pgd_list, lru) {
++	if (IS_ENABLED(CONFIG_X86_32)) {
++		struct ptdesc *ptdesc;
++
++		list_for_each_entry(ptdesc, &pgd_list, pt_list) {
+ 			pgd_t *pgd;
+ 			p4d_t *p4d;
+ 			pud_t *pud;
+ 			pmd_t *pmd;
+ 
+-			pgd = (pgd_t *)page_address(page) + pgd_index(address);
++			pgd = (pgd_t *)ptdesc_address(ptdesc) + pgd_index(address);
+ 			p4d = p4d_offset(pgd, address);
+ 			pud = pud_offset(p4d, address);
+ 			pmd = pmd_offset(pud, address);
+ 			set_pte_atomic((pte_t *)pmd, pte);
+ 		}
+ 	}
+-#endif
+ }
+ 
+ static pgprot_t pgprot_clear_protnone_bits(pgprot_t prot)
+@@ -1075,16 +1075,11 @@ static int __should_split_large_page(pte_t *kpte, unsigned long address,
+ static int should_split_large_page(pte_t *kpte, unsigned long address,
+ 				   struct cpa_data *cpa)
+ {
+-	int do_split;
+-
+ 	if (cpa->force_split)
+ 		return 1;
+ 
+-	spin_lock(&pgd_lock);
+-	do_split = __should_split_large_page(kpte, address, cpa);
+-	spin_unlock(&pgd_lock);
+-
+-	return do_split;
++	guard(spinlock)(&pgd_lock);
++	return __should_split_large_page(kpte, address, cpa);
+ }
+ 
+ static void split_set_pte(struct cpa_data *cpa, pte_t *pte, unsigned long pfn,
+@@ -1135,16 +1130,14 @@ __split_large_page(struct cpa_data *cpa, pte_t *kpte, unsigned long address,
+ 	bool nx, rw;
+ 	pte_t *tmp;
+ 
+-	spin_lock(&pgd_lock);
++	guard(spinlock)(&pgd_lock);
+ 	/*
+ 	 * Check for races, another CPU might have split this page
+ 	 * up for us already:
+ 	 */
+ 	tmp = _lookup_address_cpa(cpa, address, &level, &nx, &rw);
+-	if (tmp != kpte) {
+-		spin_unlock(&pgd_lock);
++	if (tmp != kpte)
+ 		return 1;
+-	}
+ 
+ 	paravirt_alloc_pte(&init_mm, page_to_pfn(base));
+ 
+@@ -1177,7 +1170,6 @@ __split_large_page(struct cpa_data *cpa, pte_t *kpte, unsigned long address,
+ 		break;
+ 
+ 	default:
+-		spin_unlock(&pgd_lock);
+ 		return 1;
+ 	}
+ 
+@@ -1225,7 +1217,6 @@ __split_large_page(struct cpa_data *cpa, pte_t *kpte, unsigned long address,
+ 	 * just split large page entry.
+ 	 */
+ 	flush_tlb_all();
+-	spin_unlock(&pgd_lock);
+ 
+ 	return 0;
+ }
+@@ -1235,11 +1226,9 @@ static int split_large_page(struct cpa_data *cpa, pte_t *kpte,
+ {
+ 	struct ptdesc *ptdesc;
+ 
+-	if (!debug_pagealloc_enabled())
+-		spin_unlock(&cpa_lock);
++	spin_unlock(&cpa_lock);
+ 	ptdesc = pagetable_alloc(GFP_KERNEL, 0);
+-	if (!debug_pagealloc_enabled())
+-		spin_lock(&cpa_lock);
++	spin_lock(&cpa_lock);
+ 	if (!ptdesc)
+ 		return -ENOMEM;
+ 
+@@ -1298,11 +1287,11 @@ static int collapse_pmd_page(pmd_t *pmd, unsigned long addr,
+ 	list_add(&page_ptdesc(pmd_page(old_pmd))->pt_list, pgtables);
+ 
+ 	if (IS_ENABLED(CONFIG_X86_32)) {
+-		struct page *page;
++		struct ptdesc *ptdesc;
+ 
+ 		/* Update all PGD tables to use the same large page */
+-		list_for_each_entry(page, &pgd_list, lru) {
+-			pgd_t *pgd = (pgd_t *)page_address(page) + pgd_index(addr);
++		list_for_each_entry(ptdesc, &pgd_list, pt_list) {
++			pgd_t *pgd = (pgd_t *)ptdesc_address(ptdesc) + pgd_index(addr);
+ 			p4d_t *p4d = p4d_offset(pgd, addr);
+ 			pud_t *pud = pud_offset(p4d, addr);
+ 			pmd_t *pmd = pmd_offset(pud, addr);
+@@ -1376,7 +1365,7 @@ static int collapse_pud_page(pud_t *pud, unsigned long addr,
+  */
+ static int collapse_large_pages(unsigned long addr, struct list_head *pgtables)
+ {
+-	int collapsed = 0;
++	int collapsed;
+ 	pgd_t *pgd;
+ 	p4d_t *p4d;
+ 	pud_t *pud;
+@@ -1384,26 +1373,24 @@ static int collapse_large_pages(unsigned long addr, struct list_head *pgtables)
+ 
+ 	addr &= PMD_MASK;
+ 
+-	spin_lock(&pgd_lock);
++	guard(spinlock)(&pgd_lock);
+ 	pgd = pgd_offset_k(addr);
+ 	if (pgd_none(*pgd))
+-		goto out;
++		return 0;
+ 	p4d = p4d_offset(pgd, addr);
+ 	if (p4d_none(*p4d))
+-		goto out;
++		return 0;
+ 	pud = pud_offset(p4d, addr);
+ 	if (!pud_present(*pud) || pud_leaf(*pud))
+-		goto out;
++		return 0;
+ 	pmd = pmd_offset(pud, addr);
+ 	if (!pmd_present(*pmd) || pmd_leaf(*pmd))
+-		goto out;
++		return 0;
+ 
+ 	collapsed = collapse_pmd_page(pmd, addr, pgtables);
+ 	if (collapsed)
+ 		collapsed += collapse_pud_page(pud, addr, pgtables);
+ 
+-out:
+-	spin_unlock(&pgd_lock);
+ 	return collapsed;
+ }
+ 
+@@ -2004,6 +1991,7 @@ static int __change_page_attr_set_clr(struct cpa_data *cpa, int primary)
+ {
+ 	unsigned long numpages = cpa->numpages;
+ 	unsigned long rempages = numpages;
++	bool lock = true;
+ 	int ret = 0;
+ 
+ 	/*
+@@ -2013,6 +2001,29 @@ static int __change_page_attr_set_clr(struct cpa_data *cpa, int primary)
+ 	    !cpa->force_split)
+ 		return ret;
+ 
++	/*
++	 * DEBUG_PAGEALLOC is special; it is called from any context the
++	 * page-allocator is, which violates the normal cpa_lock locking
++	 * rules.
++	 *
++	 * However, since it is part of the page-allocator, things are still
++	 * properly serialized by the page-allocator locking and the fact that
++	 * when a page is owned by the page-allocator, it isn't owned by
++	 * anybody else. That is, you *SHOULD NOT* be calling cpa() on memory
++	 * that isn't allocated.
++	 *
++	 * Additionally, DEBUG_PAGEALLOC ensures (per probe_page_size_mask())
++	 * that the kernel mapping is 4k pages, therefore there are no large
++	 * pages to split/collapse.
++	 *
++	 * Furthermore, the page-allocator strictly manages pages that
++	 * *exist*, avoiding pgd_lock.
++	 *
++	 * Therefore, it is safe to not take cpa_lock.
++	 */
++	if (debug_pagealloc_enabled() && (cpa->flags & CPA_DEBUG_PAGEALLOC))
++		lock = false;
++
+ 	while (rempages) {
+ 		/*
+ 		 * Store the remaining nr of pages for the large page
+@@ -2023,11 +2034,12 @@ static int __change_page_attr_set_clr(struct cpa_data *cpa, int primary)
+ 		if (cpa->flags & (CPA_ARRAY | CPA_PAGES_ARRAY))
+ 			cpa->numpages = 1;
+ 
+-		if (!debug_pagealloc_enabled())
+-			spin_lock(&cpa_lock);
+-		ret = __change_page_attr(cpa, primary);
+-		if (!debug_pagealloc_enabled())
+-			spin_unlock(&cpa_lock);
++		if (lock) {
++			guard(spinlock)(&cpa_lock);
++			ret = __change_page_attr(cpa, primary);
++		} else {
++			ret = __change_page_attr(cpa, primary);
++		}
+ 		if (ret)
+ 			goto out;
+ 
+@@ -2606,7 +2618,7 @@ int set_pages_rw(struct page *page, int numpages)
+ 	return set_memory_rw(addr, numpages);
+ }
+ 
+-static int __set_pages_p(struct page *page, int numpages)
++static int __set_pages_p(struct page *page, int numpages, unsigned int cpa_flags)
+ {
+ 	unsigned long tempaddr = (unsigned long) page_address(page);
+ 	struct cpa_data cpa = { .vaddr = &tempaddr,
+@@ -2614,7 +2626,7 @@ static int __set_pages_p(struct page *page, int numpages)
+ 				.numpages = numpages,
+ 				.mask_set = __pgprot(_PAGE_PRESENT | _PAGE_RW),
+ 				.mask_clr = __pgprot(0),
+-				.flags = CPA_NO_CHECK_ALIAS };
++				.flags = CPA_NO_CHECK_ALIAS | cpa_flags };
+ 
+ 	/*
+ 	 * No alias checking needed for setting present flag. otherwise,
+@@ -2625,7 +2637,7 @@ static int __set_pages_p(struct page *page, int numpages)
+ 	return __change_page_attr_set_clr(&cpa, 1);
+ }
+ 
+-static int __set_pages_np(struct page *page, int numpages)
++static int __set_pages_np(struct page *page, int numpages, unsigned int cpa_flags)
+ {
+ 	unsigned long tempaddr = (unsigned long) page_address(page);
+ 	struct cpa_data cpa = { .vaddr = &tempaddr,
+@@ -2633,7 +2645,7 @@ static int __set_pages_np(struct page *page, int numpages)
+ 				.numpages = numpages,
+ 				.mask_set = __pgprot(0),
+ 				.mask_clr = __pgprot(_PAGE_PRESENT | _PAGE_RW | _PAGE_DIRTY),
+-				.flags = CPA_NO_CHECK_ALIAS };
++				.flags = CPA_NO_CHECK_ALIAS | cpa_flags };
+ 
+ 	/*
+ 	 * No alias checking needed for setting not present flag. otherwise,
+@@ -2646,20 +2658,20 @@ static int __set_pages_np(struct page *page, int numpages)
+ 
+ int set_direct_map_invalid_noflush(struct page *page)
+ {
+-	return __set_pages_np(page, 1);
++	return __set_pages_np(page, 1, 0);
+ }
+ 
+ int set_direct_map_default_noflush(struct page *page)
+ {
+-	return __set_pages_p(page, 1);
++	return __set_pages_p(page, 1, 0);
+ }
+ 
+ int set_direct_map_valid_noflush(struct page *page, unsigned nr, bool valid)
+ {
+ 	if (valid)
+-		return __set_pages_p(page, nr);
++		return __set_pages_p(page, nr, 0);
+ 
+-	return __set_pages_np(page, nr);
++	return __set_pages_np(page, nr, 0);
+ }
+ 
+ #ifdef CONFIG_DEBUG_PAGEALLOC
+@@ -2678,15 +2690,23 @@ void __kernel_map_pages(struct page *page, int numpages, int enable)
+ 	 * and hence no memory allocations during large page split.
+ 	 */
+ 	if (enable)
+-		__set_pages_p(page, numpages);
++		__set_pages_p(page, numpages, CPA_DEBUG_PAGEALLOC);
+ 	else
+-		__set_pages_np(page, numpages);
++		__set_pages_np(page, numpages, CPA_DEBUG_PAGEALLOC);
+ 
+ 	/*
+-	 * We should perform an IPI and flush all tlbs,
+-	 * but that can deadlock->flush only current cpu.
+-	 * Preemption needs to be disabled around __flush_tlb_all() due to
+-	 * CR3 reload in __native_flush_tlb().
++	 * We should perform an IPI and flush all tlbs, but that can
++	 * deadlock, settle for a local flush.
++	 *
++	 * Not doing a global TLB flush means that remote CPUs will retain
++	 * stale TLB entries. In case of P->NP (on free) this means the remote
++	 * CPUs will not take the faults, making the debug scheme less
++	 * reliable. On the NP->P (on alloc) this means the remote CPUs can
++	 * take a spurious fault. However spurious_kernel_fault() will observe
++	 * *_present() and fix it up.
++	 *
++	 * Preemption needs to be disabled around __flush_tlb_all() due to CR3
++	 * reload in __native_flush_tlb().
+ 	 */
+ 	preempt_disable();
+ 	__flush_tlb_all();
+diff --git a/arch/x86/mm/pgtable.c b/arch/x86/mm/pgtable.c
+--- a/arch/x86/mm/pgtable.c
++++ b/arch/x86/mm/pgtable.c
+@@ -74,9 +74,9 @@ static void pgd_set_mm(pgd_t *pgd, struct mm_struct *mm)
+ 	virt_to_ptdesc(pgd)->pt_mm = mm;
+ }
+ 
+-struct mm_struct *pgd_page_get_mm(struct page *page)
++struct mm_struct *pgd_page_get_mm(struct ptdesc *pt)
+ {
+-	return page_ptdesc(page)->pt_mm;
++	return pt->pt_mm;
+ }
+ 
+ static void pgd_ctor(struct mm_struct *mm, pgd_t *pgd)
+diff --git a/arch/x86/mm/tlb.c b/arch/x86/mm/tlb.c
+--- a/arch/x86/mm/tlb.c
++++ b/arch/x86/mm/tlb.c
+@@ -1373,35 +1373,19 @@ void flush_tlb_multi(const struct cpumask *cpumask,
+  */
+ unsigned long tlb_single_page_flush_ceiling __read_mostly = 33;
+ 
+-static DEFINE_PER_CPU_SHARED_ALIGNED(struct flush_tlb_info, flush_tlb_info);
+-
+-#ifdef CONFIG_DEBUG_VM
+-static DEFINE_PER_CPU(unsigned int, flush_tlb_info_idx);
+-#endif
+-
+-static struct flush_tlb_info *get_flush_tlb_info(struct mm_struct *mm,
+-			unsigned long start, unsigned long end,
+-			unsigned int stride_shift, bool freed_tables,
+-			u64 new_tlb_gen)
++static void init_flush_tlb_info(struct flush_tlb_info *info,
++				struct mm_struct *mm,
++				unsigned long start, unsigned long end,
++				unsigned int stride_shift, bool freed_tables,
++				u64 new_tlb_gen)
+ {
+-	struct flush_tlb_info *info = this_cpu_ptr(&flush_tlb_info);
+-
+-#ifdef CONFIG_DEBUG_VM
+-	/*
+-	 * Ensure that the following code is non-reentrant and flush_tlb_info
+-	 * is not overwritten. This means no TLB flushing is initiated by
+-	 * interrupt handlers and machine-check exception handlers.
+-	 */
+-	BUG_ON(this_cpu_inc_return(flush_tlb_info_idx) != 1);
+-#endif
+-
+ 	/*
+ 	 * If the number of flushes is so large that a full flush
+ 	 * would be faster, do a full flush.
+ 	 */
+ 	if ((end - start) >> stride_shift > tlb_single_page_flush_ceiling) {
+-		start = 0;
+-		end = TLB_FLUSH_ALL;
++		start	= 0;
++		end	= TLB_FLUSH_ALL;
+ 	}
+ 
+ 	info->start		= start;
+@@ -1412,32 +1396,21 @@ static struct flush_tlb_info *get_flush_tlb_info(struct mm_struct *mm,
+ 	info->new_tlb_gen	= new_tlb_gen;
+ 	info->initiating_cpu	= smp_processor_id();
+ 	info->trim_cpumask	= 0;
+-
+-	return info;
+-}
+-
+-static void put_flush_tlb_info(void)
+-{
+-#ifdef CONFIG_DEBUG_VM
+-	/* Complete reentrancy prevention checks */
+-	barrier();
+-	this_cpu_dec(flush_tlb_info_idx);
+-#endif
+ }
+ 
+ void flush_tlb_mm_range(struct mm_struct *mm, unsigned long start,
+ 				unsigned long end, unsigned int stride_shift,
+ 				bool freed_tables)
+ {
+-	struct flush_tlb_info *info;
++	struct flush_tlb_info info;
++	bool remote_flush = false;
+ 	int cpu = get_cpu();
+ 	u64 new_tlb_gen;
+ 
+ 	/* This is also a barrier that synchronizes with switch_mm(). */
+ 	new_tlb_gen = inc_mm_tlb_gen(mm);
+ 
+-	info = get_flush_tlb_info(mm, start, end, stride_shift, freed_tables,
+-				  new_tlb_gen);
++	init_flush_tlb_info(&info, mm, start, end, stride_shift, freed_tables, new_tlb_gen);
+ 
+ 	/*
+ 	 * flush_tlb_multi() is not optimized for the common case in which only
+@@ -1445,20 +1418,24 @@ void flush_tlb_mm_range(struct mm_struct *mm, unsigned long start,
+ 	 * flush_tlb_func_local() directly in this case.
+ 	 */
+ 	if (mm_global_asid(mm)) {
+-		broadcast_tlb_flush(info);
++		broadcast_tlb_flush(&info);
+ 	} else if (cpumask_any_but(mm_cpumask(mm), cpu) < nr_cpu_ids) {
+-		info->trim_cpumask = should_trim_cpumask(mm);
+-		flush_tlb_multi(mm_cpumask(mm), info);
+-		consider_global_asid(mm);
++		remote_flush = true;
+ 	} else if (mm == this_cpu_read(cpu_tlbstate.loaded_mm)) {
+ 		lockdep_assert_irqs_enabled();
+ 		local_irq_disable();
+-		flush_tlb_func(info);
++		flush_tlb_func(&info);
+ 		local_irq_enable();
+ 	}
+ 
+-	put_flush_tlb_info();
+ 	put_cpu();
++
++	if (remote_flush) {
++		info.trim_cpumask = should_trim_cpumask(mm);
++		flush_tlb_multi(mm_cpumask(mm), &info);
++		consider_global_asid(mm);
++	}
++
+ 	mmu_notifier_arch_invalidate_secondary_tlbs(mm, start, end);
+ }
+ 
+@@ -1527,19 +1504,16 @@ static void kernel_tlb_flush_range(struct flush_tlb_info *info)
+ 
+ void flush_tlb_kernel_range(unsigned long start, unsigned long end)
+ {
+-	struct flush_tlb_info *info;
++	struct flush_tlb_info info;
+ 
+ 	guard(preempt)();
++	init_flush_tlb_info(&info, NULL, start, end, PAGE_SHIFT, false,
++			    TLB_GENERATION_INVALID);
+ 
+-	info = get_flush_tlb_info(NULL, start, end, PAGE_SHIFT, false,
+-				  TLB_GENERATION_INVALID);
+-
+-	if (info->end == TLB_FLUSH_ALL)
+-		kernel_tlb_flush_all(info);
++	if (info.end == TLB_FLUSH_ALL)
++		kernel_tlb_flush_all(&info);
+ 	else
+-		kernel_tlb_flush_range(info);
+-
+-	put_flush_tlb_info();
++		kernel_tlb_flush_range(&info);
+ }
+ 
+ /*
+@@ -1707,12 +1681,12 @@ EXPORT_SYMBOL_FOR_KVM(__flush_tlb_all);
+ 
+ void arch_tlbbatch_flush(struct arch_tlbflush_unmap_batch *batch)
+ {
+-	struct flush_tlb_info *info;
+-
++	struct flush_tlb_info info;
++	bool remote_flush = false;
+ 	int cpu = get_cpu();
+ 
+-	info = get_flush_tlb_info(NULL, 0, TLB_FLUSH_ALL, 0, false,
+-				  TLB_GENERATION_INVALID);
++	init_flush_tlb_info(&info, NULL, 0, TLB_FLUSH_ALL, 0, false,
++			    TLB_GENERATION_INVALID);
+ 	/*
+ 	 * flush_tlb_multi() is not optimized for the common case in which only
+ 	 * a local TLB flush is needed. Optimize this use-case by calling
+@@ -1722,18 +1696,20 @@ void arch_tlbbatch_flush(struct arch_tlbflush_unmap_batch *batch)
+ 		invlpgb_flush_all_nonglobals();
+ 		batch->unmapped_pages = false;
+ 	} else if (cpumask_any_but(&batch->cpumask, cpu) < nr_cpu_ids) {
+-		flush_tlb_multi(&batch->cpumask, info);
++		remote_flush = true;
+ 	} else if (cpumask_test_cpu(cpu, &batch->cpumask)) {
+ 		lockdep_assert_irqs_enabled();
+ 		local_irq_disable();
+-		flush_tlb_func(info);
++		flush_tlb_func(&info);
+ 		local_irq_enable();
+ 	}
+ 
+-	cpumask_clear(&batch->cpumask);
+-
+-	put_flush_tlb_info();
+ 	put_cpu();
++
++	if (remote_flush)
++		flush_tlb_multi(&batch->cpumask, &info);
++
++	cpumask_clear(&batch->cpumask);
+ }
+ 
+ /*
+diff --git a/arch/x86/xen/mmu_pv.c b/arch/x86/xen/mmu_pv.c
+--- a/arch/x86/xen/mmu_pv.c
++++ b/arch/x86/xen/mmu_pv.c
+@@ -836,15 +836,15 @@ static void xen_pgd_pin(struct mm_struct *mm)
+  */
+ void xen_mm_pin_all(void)
+ {
+-	struct page *page;
++	struct ptdesc *ptdesc;
+ 
+ 	spin_lock(&init_mm.page_table_lock);
+ 	spin_lock(&pgd_lock);
+ 
+-	list_for_each_entry(page, &pgd_list, lru) {
+-		if (!PagePinned(page)) {
+-			__xen_pgd_pin(&init_mm, (pgd_t *)page_address(page));
+-			SetPageSavePinned(page);
++	list_for_each_entry(ptdesc, &pgd_list, pt_list) {
++		if (!PagePinned(ptdesc_page(ptdesc))) {
++			__xen_pgd_pin(&init_mm, (pgd_t *)ptdesc_address(ptdesc));
++			SetPageSavePinned(ptdesc_page(ptdesc));
+ 		}
+ 	}
+ 
+@@ -947,16 +947,16 @@ static void xen_pgd_unpin(struct mm_struct *mm)
+  */
+ void xen_mm_unpin_all(void)
+ {
+-	struct page *page;
++	struct ptdesc *ptdesc;
+ 
+ 	spin_lock(&init_mm.page_table_lock);
+ 	spin_lock(&pgd_lock);
+ 
+-	list_for_each_entry(page, &pgd_list, lru) {
+-		if (PageSavePinned(page)) {
+-			BUG_ON(!PagePinned(page));
+-			__xen_pgd_unpin(&init_mm, (pgd_t *)page_address(page));
+-			ClearPageSavePinned(page);
++	list_for_each_entry(ptdesc, &pgd_list, pt_list) {
++		if (PageSavePinned(ptdesc_page(ptdesc))) {
++			BUG_ON(!PagePinned(ptdesc_page(ptdesc)));
++			__xen_pgd_unpin(&init_mm, (pgd_t *)ptdesc_address(ptdesc));
++			ClearPageSavePinned(ptdesc_page(ptdesc));
+ 		}
+ 	}
+ 
