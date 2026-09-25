@@ -1,0 +1,240 @@
+#!/bin/bash
+# Ingest CVE records from OSV for published OPR versions; write a versioned
+# feed. (omacom/omarchy-pkgs#378) This is not a package scanner. If OSV has
+# no report yet, write nothing and let ingest mark the row missing.
+# Does not rebuild packages. Does not write the sidecar; pipe the feed
+# into bin/sync-advisories.
+#
+# Usage:
+#   bin/fetch-advisories [--mirror edge] [--arch x86_64] [--package mise-bin...]
+#                        [--feed ./advisories-feed] [--purl-map ./purls]
+#
+# Purl map lines: <pkgname> <purl-with-{version}>
+#   mise-bin pkg:github/jdx/mise@{version}
+
+set -euo pipefail
+
+BUILD_ROOT=$(realpath "${BASH_SOURCE[0]%/*}/..")
+# shellcheck source=../helpers/paths.sh
+source "$BUILD_ROOT/helpers/paths.sh"
+# shellcheck source=../helpers/message-helpers.sh
+source "$BUILD_ROOT/helpers/message-helpers.sh"
+# shellcheck source=../helpers/advisory-helpers.sh
+source "$BUILD_ROOT/helpers/advisory-helpers.sh"
+
+FEED_DIR=""
+PURL_MAP=""
+PACKAGES=()
+OSV_API="${OSV_API:-https://api.osv.dev/v1/query}"
+
+usage() {
+  cat <<EOF
+Usage: $0 [OPTIONS]
+
+Write versioned advisory feed JSON from OSV for packages in one channel/arch.
+
+Options:
+  --mirror <edge|rc|stable>   Channel (default: edge; --channel is accepted too)
+  --channel <name>            Alias for --mirror
+  --arch <x86_64|aarch64>     Architecture (default: x86_64)
+  --package <names...>        Fetch only the named package(s)
+  --feed <dir>                Feed output dir (default: ./advisories-feed)
+  --purl-map <file>           Lines: pkgname purl-with-{version}
+  -h, --help                  Show this help message
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+  --mirror | --channel)
+    [[ $# -ge 2 ]] || {
+      print_error "$1 requires a value"
+      exit 1
+    }
+    MIRROR="$2"
+    require_valid_mirror "$MIRROR"
+    update_arch_paths
+    shift 2
+    ;;
+  --arch)
+    [[ $# -ge 2 ]] || {
+      print_error "--arch requires a value"
+      exit 1
+    }
+    require_valid_arch "$2"
+    ARCH="$2"
+    update_arch_paths
+    shift 2
+    ;;
+  --package)
+    shift
+    while [[ $# -gt 0 && ! "$1" =~ ^-- ]]; do
+      PACKAGES+=("$1")
+      shift
+    done
+    [[ ${#PACKAGES[@]} -gt 0 ]] || {
+      print_error "--package requires at least one package name"
+      exit 1
+    }
+    ;;
+  --feed)
+    [[ $# -ge 2 ]] || {
+      print_error "--feed requires a value"
+      exit 1
+    }
+    FEED_DIR="$2"
+    shift 2
+    ;;
+  --purl-map)
+    [[ $# -ge 2 ]] || {
+      print_error "--purl-map requires a value"
+      exit 1
+    }
+    PURL_MAP="$2"
+    shift 2
+    ;;
+  -h | --help)
+    usage
+    exit 0
+    ;;
+  *)
+    print_error "Unknown option: $1"
+    usage >&2
+    exit 1
+    ;;
+  esac
+done
+
+[[ -z "$FEED_DIR" ]] && FEED_DIR="$BUILD_ROOT/advisories-feed"
+
+DB_FILE="$REPO_DIR/omarchy.db.tar.zst"
+[[ -f "$DB_FILE" ]] || {
+  print_error "Repository database not found: $DB_FILE"
+  exit 1
+}
+
+purl_for() {
+  local name="$1" pkgver="$2"
+  local line mapped
+  if [[ -n ${PURL_MAP:-} && -f "$PURL_MAP" ]]; then
+    while read -r line; do
+      [[ -z $line || $line == \#* ]] && continue
+      if [[ ${line%% *} == "$name" ]]; then
+        mapped=${line#* }
+        mapped=${mapped//\{version\}/$pkgver}
+        echo "$mapped"
+        return 0
+      fi
+    done <"$PURL_MAP"
+  fi
+  case "$name" in
+  mise-bin)
+    echo "pkg:github/jdx/mise@${pkgver}"
+    return 0
+    ;;
+  esac
+  return 1
+}
+
+package_wanted() {
+  [[ ${#PACKAGES[@]} -eq 0 ]] && return 0
+  local name="$1" want
+  for want in "${PACKAGES[@]}"; do
+    [[ $want == "$name" ]] && return 0
+  done
+  return 1
+}
+
+split_pkgver_pkgrel() {
+  local version="$1"
+  local pkgrel="${version##*-}"
+  local pkgver="${version%-*}"
+  printf '%s\t%s\n' "$pkgver" "$pkgrel"
+}
+
+read_db_manifest() {
+  tar -xOf "$DB_FILE" --wildcards '*/desc' 2>/dev/null | awk '
+    function emit() {
+      if (name != "" && version != "" && filename != "")
+        printf "%s\t%s\t%s\t%s\n", name, version, arch, filename
+      name=""; version=""; arch=""; filename=""
+    }
+    $0 == "%FILENAME%" { emit(); getline; filename=$0; next }
+    $0 == "%NAME%" { getline; name=$0; next }
+    $0 == "%VERSION%" { getline; version=$0; next }
+    $0 == "%ARCH%" { getline; arch=$0; next }
+    END { emit() }
+  '
+}
+
+cvss_band() {
+  local json="$1"
+  local vector
+  vector=$(jq -r '[.vulns[]?.severity[]? | select(.type == "CVSS_V3") | .score] | first // empty' <<<"$json")
+  if [[ $vector == *C:H* && $vector == *I:H* && $vector == *A:H* ]]; then
+    echo HIGH
+  elif [[ $vector == *:H* ]]; then
+    echo MEDIUM
+  elif jq -e '.vulns | length > 0' <<<"$json" >/dev/null 2>&1; then
+    echo LOW
+  else
+    echo NONE
+  fi
+}
+
+NOW_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+print_header "Fetch Advisories ($MIRROR/$ARCH)"
+print_info "Database: $DB_FILE"
+print_info "Feed:     $FEED_DIR"
+print_info "OSV:      $OSV_API"
+
+wrote=0
+skipped=0
+
+while IFS=$'\t' read -r name version db_arch filename; do
+  package_wanted "$name" || continue
+  IFS=$'\t' read -r pkgver pkgrel < <(split_pkgver_pkgrel "$version")
+  if ! purl=$(purl_for "$name" "$pkgver"); then
+    print_warning "No purl mapping for $name; leaving feed missing"
+    skipped=$((skipped + 1))
+    continue
+  fi
+
+  body=$(jq -n --arg purl "$purl" '{package:{purl:$purl}}')
+  if ! response=$(curl -fsS -X POST "$OSV_API" -H 'Content-Type: application/json' -d "$body"); then
+    print_warning "OSV query failed for $name $pkgver; leaving feed missing"
+    skipped=$((skipped + 1))
+    continue
+  fi
+  if ! jq -e '.' <<<"$response" >/dev/null 2>&1; then
+    print_warning "OSV returned non-JSON for $name $pkgver; leaving feed missing"
+    skipped=$((skipped + 1))
+    continue
+  fi
+
+  # Empty vulns: the source has no report for this version yet (OPR often
+  # ships first). Do not write a clean feed; ingest will mark the row missing.
+  if ! jq -e '(.vulns | type == "array") and (.vulns | length > 0)' <<<"$response" >/dev/null; then
+    print_info "OSV has no report for $name $pkgver; leaving feed missing"
+    skipped=$((skipped + 1))
+    continue
+  fi
+
+  cve_ids=$(jq -c '[.vulns[]? | (.id, (.aliases[]? // empty)) | select(startswith("CVE-"))] | unique' <<<"$response")
+  severity=$(cvss_band "$response")
+  dest=$(advisory_feed_path "$FEED_DIR" "$name" "$pkgver" "$pkgrel" "$ARCH")
+  mkdir -p "$(dirname "$dest")"
+  jq -n --arg name "$name" --arg pkgver "$pkgver" --arg pkgrel "$pkgrel" --arg arch "$ARCH" \
+    --argjson cve_ids "$cve_ids" --arg severity "$severity" --arg now "$NOW_UTC" \
+    '{
+      pkgname: $name, pkgver: $pkgver, pkgrel: $pkgrel, arch: $arch,
+      cve_ids: $cve_ids,
+      cve_max_severity: $severity, severity_scale: "CVSSv3",
+      advisory_as_of: $now, scanned_at: $now,
+      scan_source: "osv.dev", note: ""
+    }' >"$dest"
+  print_success "Wrote $dest"
+  wrote=$((wrote + 1))
+done < <(read_db_manifest)
+
+print_info "wrote=$wrote skipped=$skipped"
