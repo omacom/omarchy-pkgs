@@ -5,12 +5,9 @@
 # version has actually moved, so the six-hourly check normally costs one tiny
 # request.
 #
-# The download path carries no version, which makes it worth proving that what
-# arrived is what was announced: the tarball's top-level directory is named for
-# the release, and a mismatch means the object served is not the one
-# /version.txt describes. Reporting no update leaves the checked-in package
-# alone and lets the next run try again, which is the right answer whether the
-# cause is a half-published release or a stale CDN object.
+# Since 1.0.0 upstream serves versioned tarballs under /rtm/downloads/. The hook
+# still checks the tarball's top-level directory against /version.txt so a
+# half-published release cannot slip through.
 set -euo pipefail
 
 BASE_URL="https://tmog.org"
@@ -32,7 +29,7 @@ tarball=$(mktemp)
 trap 'rm -f "$tarball"' EXIT
 
 curl -fsSL -o "$tarball" \
-  "$BASE_URL/downloads/TMOG-Task-Manager-Linux-x86_64.tar.gz?v=${version}-free"
+  "$BASE_URL/rtm/downloads/TaskManagerOG-${version}-linux-x86_64.tar.gz"
 
 # Every entry is listed rather than just the first: `head -1` would close the
 # pipe under `tar` and take the whole hook down with SIGPIPE, and reading them
