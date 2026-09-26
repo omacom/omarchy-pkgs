@@ -1,0 +1,376 @@
+From 31828ef787702fa87b9077c268cc47c8589c0c83 Mon Sep 17 00:00:00 2001
+From: Brent Kearney <1550934+brentkearney@users.noreply.github.com>
+Date: Wed, 26 Aug 2026 18:29:18 -0600
+Subject: [PATCH 01/11] wifi: brcmfmac: add AWDL interface creation for BCM4387
+
+BCM4387 firmware implements AWDL (Apple Wireless Direct Link) and accepts
+BRCMF_INTERFACE_TYPE_AWDL through interface_create, but nl80211 has no AWDL
+iftype, so the interface cannot be created via add_virtual_intf(). Drive it
+from a vendor command instead.
+
+Creation is asynchronous, and has to be. nl80211 dispatches vendor commands
+holding the wiphy mutex: NL80211_CMD_VENDOR sets NL80211_FLAG_NEED_WIPHY
+without NL80211_FLAG_NO_WIPHY_MTX, unlike NL80211_CMD_NEW_INTERFACE which
+sets NEED_RTNL | NO_WIPHY_MTX and takes the wiphy mutex itself, in that
+order. Registering a netdev from the vendor command therefore deadlocks:
+
+  nl80211_vendor_cmd                    <- holds wiphy mutex
+   brcmf_awdl_add_vif
+    brcmf_net_attach
+     register_netdev                    <- takes RTNL
+      register_netdevice
+       call_netdevice_notifiers_info
+        cfg80211_netdev_notifier_call
+         mutex_lock                     <- wiphy mutex, already held
+
+The task blocks in uninterruptible sleep while holding the RTNL, which takes
+down every netdev operation on the system; recovery needs a reboot. Using
+cfg80211_register_netdevice() instead is not a fix either: it requires both
+the RTNL and the wiphy mutex, and the vendor command holds only the latter,
+so it trips ASSERT_RTNL and registers into an inconsistent state. Taking the
+RTNL explicitly would invert cfg80211's RTNL-then-wiphy order.
+
+So brcmf_awdl_add_vif() only asks firmware for the interface and returns.
+The netdev is registered later by brcmf_cfg80211_awdl_attach_pending(),
+called from the fweh event worker, which runs on the system workqueue
+holding neither lock. The vif event stays armed across the request because
+brcmf_notify_vif_event() is what links the brcmf_if to the vif; without it
+ndev->ieee80211_ptr is never set and cfg80211 ignores the netdev.
+
+Userspace must wait for awdl0 to appear rather than assume the vendor
+command created it.
+---
+ .../broadcom/brcm80211/brcmfmac/cfg80211.c    | 141 ++++++++++++++++++
+ .../broadcom/brcm80211/brcmfmac/cfg80211.h    |   5 +
+ .../broadcom/brcm80211/brcmfmac/fweh.c        |   7 +
+ .../brcm80211/brcmfmac/interface_create.c     |   8 +-
+ .../brcm80211/brcmfmac/interface_create.h     |   1 +
+ .../broadcom/brcm80211/brcmfmac/vendor.c      |  50 +++++++
+ .../broadcom/brcm80211/brcmfmac/vendor.h      |  12 ++
+ 7 files changed, 223 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/cfg80211.c b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/cfg80211.c
+index 7768676..a93e410 100644
+--- a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/cfg80211.c
++++ b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/cfg80211.c
+@@ -605,6 +605,147 @@ brcmf_cfg80211_update_proto_addr_mode(struct wireless_dev *wdev)
+  *
+  * Return: pointer to new vif on success, ERR_PTR(-errno) if not
+  */
++/**
++ * brcmf_awdl_add_vif() - create an AWDL interface and give it a netdev.
++ *
++ * @wiphy: wiphy device of the new interface.
++ * @name: name of the new interface.
++ *
++ * AWDL is Apple Wireless Direct Link, the link layer AirDrop and AirPlay run
++ * over. BCM4387 firmware implements it and accepts BRCMF_INTERFACE_TYPE_AWDL
++ * through interface_create, but there is no nl80211 interface type for it, so
++ * this cannot go through add_virtual_intf(). It is driven from the vendor
++ * command instead.
++ *
++ * The vif is allocated as NL80211_IFTYPE_STATION because cfg80211 needs some
++ * valid type for its bookkeeping; the firmware side is what actually decides
++ * the interface behaviour, from the iftype passed to interface_create.
++ *
++ * Return: pointer to the new vif on success, ERR_PTR(-errno) on failure.
++ */
++int brcmf_awdl_add_vif(struct wiphy *wiphy, const char *name)
++{
++	struct brcmf_cfg80211_info *cfg = wiphy_to_cfg(wiphy);
++	struct brcmf_if *ifp = netdev_priv(cfg_to_ndev(cfg));
++	struct brcmf_cfg80211_vif *vif;
++	int err;
++
++	if (brcmf_cfg80211_vif_event_armed(cfg) || cfg->awdl_pending)
++		return -EBUSY;
++
++	vif = brcmf_alloc_vif(cfg, NL80211_IFTYPE_STATION);
++	if (IS_ERR(vif))
++		return PTR_ERR(vif);
++
++	/* Arm before asking firmware: the BRCMF_E_IF event is what links the
++	 * brcmf_if to this vif (brcmf_notify_vif_event() bails with -EBADF if
++	 * nothing is armed, leaving ndev->ieee80211_ptr unset).
++	 */
++	brcmf_cfg80211_arm_vif_event(cfg, vif);
++
++	/* Pass NULL rather than a derived address. Supplying a MAC address
++	 * at interface_create time kills the firmware control channel about
++	 * two seconds after create, so the address is set afterwards via
++	 * cur_etheraddr instead.
++	 *
++	 */
++	strscpy(cfg->awdl_ifname, name, sizeof(cfg->awdl_ifname));
++	cfg->awdl_pending = true;
++
++	err = brcmf_cfg80211_request_awdl_if(ifp, NULL);
++	if (err) {
++		cfg->awdl_pending = false;
++		brcmf_cfg80211_arm_vif_event(cfg, NULL);
++		brcmf_free_vif(vif);
++		return err;
++	}
++
++	/* Deliberately do NOT wait for the interface here, and do NOT attach
++	 * the netdev. nl80211 calls vendor commands holding the wiphy mutex
++	 * (NL80211_CMD_VENDOR sets NEED_WIPHY without NO_WIPHY_MTX), and
++	 * register_netdev() re-enters that mutex via the netdev notifier
++	 * chain -> cfg80211_netdev_notifier_call(). Doing it here self-
++	 * deadlocks and wedges the RTNL for the whole system. The attach is
++	 * done from brcmf_cfg80211_awdl_attach_pending(), which the fweh
++	 * event worker calls while holding no locks at all.
++	 */
++	return 0;
++}
++
++/**
++ * brcmf_cfg80211_awdl_attach_pending() - finish AWDL interface creation.
++ *
++ * @ifp: interface the firmware just reported via BRCMF_E_IF_ADD.
++ *
++ * Called from the fweh event worker (brcmf_fweh_handle_if_event()), which
++ * runs on the system workqueue holding neither the RTNL nor the wiphy mutex.
++ * That is the only context in which register_netdev() is safe for an
++ * interface created outside cfg80211's own add_virtual_intf() path.
++ */
++void brcmf_cfg80211_awdl_attach_pending(struct brcmf_if *ifp)
++{
++	struct brcmf_cfg80211_info *cfg = ifp->drvr->config;
++	struct brcmf_cfg80211_vif *vif;
++	int err;
++
++	if (!cfg || !cfg->awdl_pending)
++		return;
++	cfg->awdl_pending = false;
++	vif = ifp->vif;
++
++	if (!ifp->ndev || !vif) {
++		bphy_err(ifp->drvr, "AWDL if event without netdev/vif\n");
++		goto done;
++	}
++
++	strscpy(ifp->ndev->name, cfg->awdl_ifname, sizeof(ifp->ndev->name));
++	err = brcmf_net_attach(ifp, false);
++	if (err) {
++		bphy_err(ifp->drvr, "registering AWDL netdevice failed\n");
++		free_netdev(ifp->ndev);
++		brcmf_free_vif(vif);
++		goto done;
++	}
++
++	brcmf_info("AWDL interface %s created (bsscfgidx %d)\n",
++		   ifp->ndev->name, ifp->bsscfgidx);
++done:
++	brcmf_cfg80211_arm_vif_event(cfg, NULL);
++}
++
++/**
++ * brcmf_awdl_del_vif() - tear down an interface made by brcmf_awdl_add_vif().
++ *
++ * @wiphy: wiphy device of the interface.
++ * @wdev: wireless device to remove.
++ *
++ * Return: 0 on success, negative errno on failure.
++ */
++int brcmf_awdl_del_vif(struct wiphy *wiphy, struct wireless_dev *wdev)
++{
++	struct brcmf_cfg80211_info *cfg = wiphy_to_cfg(wiphy);
++	struct brcmf_cfg80211_vif *vif = container_of(wdev,
++						      struct brcmf_cfg80211_vif,
++						      wdev);
++	struct brcmf_if *ifp = vif->ifp;
++	int err;
++
++	brcmf_cfg80211_arm_vif_event(cfg, vif);
++	err = brcmf_fil_bsscfg_data_set(ifp, "interface_remove", NULL, 0);
++	if (err) {
++		brcmf_cfg80211_arm_vif_event(cfg, NULL);
++		return err;
++	}
++
++	err = brcmf_cfg80211_wait_vif_event(cfg, BRCMF_E_IF_DEL,
++					    BRCMF_VIF_EVENT_TIMEOUT);
++	brcmf_cfg80211_arm_vif_event(cfg, NULL);
++	if (!err)
++		return -EIO;
++
++	return 0;
++}
++
+ static
+ struct wireless_dev *brcmf_apsta_add_vif(struct wiphy *wiphy, const char *name,
+ 					 struct vif_params *params,
+diff --git a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/cfg80211.h b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/cfg80211.h
+index dec5ff1..fdc9f7e 100644
+--- a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/cfg80211.h
++++ b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/cfg80211.h
+@@ -397,6 +397,8 @@ struct brcmf_cfg80211_info {
+ 	struct work_struct escan_timeout_work;
+ 	struct list_head vif_list;
+ 	struct brcmf_cfg80211_vif_event vif_event;
++	bool awdl_pending;
++	char awdl_ifname[IFNAMSIZ];
+ 	struct completion vif_disabled;
+ 	struct brcmu_d11inf d11inf;
+ 	struct brcmf_assoclist_le assoclist;
+@@ -508,6 +510,9 @@ bool brcmf_get_vif_state_any(struct brcmf_cfg80211_info *cfg,
+ void brcmf_cfg80211_arm_vif_event(struct brcmf_cfg80211_info *cfg,
+ 				  struct brcmf_cfg80211_vif *vif);
+ bool brcmf_cfg80211_vif_event_armed(struct brcmf_cfg80211_info *cfg);
++int brcmf_awdl_add_vif(struct wiphy *wiphy, const char *name);
++void brcmf_cfg80211_awdl_attach_pending(struct brcmf_if *ifp);
++int brcmf_awdl_del_vif(struct wiphy *wiphy, struct wireless_dev *wdev);
+ int brcmf_cfg80211_wait_vif_event(struct brcmf_cfg80211_info *cfg,
+ 				  u8 action, ulong timeout);
+ s32 brcmf_notify_escan_complete(struct brcmf_cfg80211_info *cfg,
+diff --git a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/fweh.c b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/fweh.c
+index eec4b10..3e06c23 100644
+--- a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/fweh.c
++++ b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/fweh.c
+@@ -183,6 +183,13 @@ static void brcmf_fweh_handle_if_event(struct brcmf_pub *drvr,
+ 	brcmf_fweh_call_event_handler(drvr, ifp, emsg->event_code, emsg,
+ 				      data);
+ 
++	/* The handler above establishes the vif <-> ifp linkage. Only then can
++	 * the AWDL netdev be registered, and only from here: this worker holds
++	 * no locks, unlike the vendor command that requested the interface.
++	 */
++	if (ifp && ifevent->action == BRCMF_E_IF_ADD)
++		brcmf_cfg80211_awdl_attach_pending(ifp);
++
+ 	if (ifp && ifevent->action == BRCMF_E_IF_DEL) {
+ 		bool armed = brcmf_cfg80211_vif_event_armed(drvr->config);
+ 
+diff --git a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/interface_create.c b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/interface_create.c
+index 1f40ff8..e9ebb90 100644
+--- a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/interface_create.c
++++ b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/interface_create.c
+@@ -52,7 +52,7 @@
+ enum brcmf_interface_type {
+ 	BRCMF_INTERFACE_TYPE_STA = 0,
+ 	BRCMF_INTERFACE_TYPE_AP = 1,
+-	/* The missing number here is deliberate */
++	BRCMF_INTERFACE_TYPE_AWDL = 2,
+ 	BRCMF_INTERFACE_TYPE_NAN = 3,
+ 	BRCMF_INTERFACE_TYPE_P2P_GO = 4,
+ 	BRCMF_INTERFACE_TYPE_P2P_GC = 5,
+@@ -240,6 +240,12 @@ int brcmf_cfg80211_request_sta_if(struct brcmf_if *ifp, u8 *macaddr)
+ 					 macaddr);
+ }
+ 
++int brcmf_cfg80211_request_awdl_if(struct brcmf_if *ifp, u8 *macaddr)
++{
++	return brcmf_cfg80211_request_if(ifp, BRCMF_INTERFACE_TYPE_AWDL,
++					 macaddr);
++}
++
+ int brcmf_cfg80211_request_ap_if(struct brcmf_if *ifp)
+ {
+ 	int err;
+diff --git a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/interface_create.h b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/interface_create.h
+index 669fa15..7fadbea 100644
+--- a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/interface_create.h
++++ b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/interface_create.h
+@@ -9,5 +9,6 @@
+ 
+ int brcmf_cfg80211_request_sta_if(struct brcmf_if *ifp, u8 *macaddr);
+ int brcmf_cfg80211_request_ap_if(struct brcmf_if *ifp);
++int brcmf_cfg80211_request_awdl_if(struct brcmf_if *ifp, u8 *macaddr);
+ 
+ #endif /* _BRCMF_INTERFACE_CREATE_H_ */
+diff --git a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/vendor.c b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/vendor.c
+index d07e7c7..6dd6a3d 100644
+--- a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/vendor.c
++++ b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/vendor.c
+@@ -104,6 +104,46 @@ static int brcmf_cfg80211_vndr_cmds_dcmd_handler(struct wiphy *wiphy,
+ 	return ret;
+ }
+ 
++#define BRCMF_AWDL_IFNAME	"awdl0"
++
++static int brcmf_cfg80211_vndr_cmds_awdl_handler(struct wiphy *wiphy,
++						 struct wireless_dev *wdev,
++						 const void *data, int len)
++{
++	struct net_device *ndev;
++	struct wireless_dev *awdl_wdev;
++	u32 op;
++
++	if (len < sizeof(op))
++		return -EINVAL;
++	op = *(const u32 *)data;
++
++	switch (op) {
++	case BRCMF_VNDR_AWDL_OP_CREATE:
++		ndev = dev_get_by_name(wiphy_net(wiphy), BRCMF_AWDL_IFNAME);
++		if (ndev) {
++			dev_put(ndev);
++			return -EEXIST;
++		}
++		/* Asynchronous: returns as soon as firmware has been asked.
++		 * The netdev appears once the fweh worker registers it, so
++		 * userspace must wait for awdl0 rather than assume it exists.
++		 */
++		return brcmf_awdl_add_vif(wiphy, BRCMF_AWDL_IFNAME);
++	case BRCMF_VNDR_AWDL_OP_DESTROY:
++		ndev = dev_get_by_name(wiphy_net(wiphy), BRCMF_AWDL_IFNAME);
++		if (!ndev)
++			return -ENODEV;
++		awdl_wdev = ndev->ieee80211_ptr;
++		dev_put(ndev);
++		if (!awdl_wdev)
++			return -ENODEV;
++		return brcmf_awdl_del_vif(wiphy, awdl_wdev);
++	default:
++		return -EINVAL;
++	}
++}
++
+ const struct wiphy_vendor_command brcmf_vendor_cmds[] = {
+ 	{
+ 		{
+@@ -115,4 +155,14 @@ const struct wiphy_vendor_command brcmf_vendor_cmds[] = {
+ 		.policy = VENDOR_CMD_RAW_DATA,
+ 		.doit = brcmf_cfg80211_vndr_cmds_dcmd_handler
+ 	},
++	{
++		{
++			.vendor_id = BROADCOM_OUI,
++			.subcmd = BRCMF_VNDR_CMDS_AWDL
++		},
++		.flags = WIPHY_VENDOR_CMD_NEED_WDEV |
++			 WIPHY_VENDOR_CMD_NEED_NETDEV,
++		.policy = VENDOR_CMD_RAW_DATA,
++		.doit = brcmf_cfg80211_vndr_cmds_awdl_handler
++	},
+ };
+diff --git a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/vendor.h b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/vendor.h
+index 418f33e..74886de 100644
+--- a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/vendor.h
++++ b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/vendor.h
+@@ -11,9 +11,21 @@
+ enum brcmf_vndr_cmds {
+ 	BRCMF_VNDR_CMDS_UNSPEC,
+ 	BRCMF_VNDR_CMDS_DCMD,
++	BRCMF_VNDR_CMDS_AWDL,
+ 	BRCMF_VNDR_CMDS_LAST
+ };
+ 
++/**
++ * enum brcmf_vndr_awdl_op - operations for BRCMF_VNDR_CMDS_AWDL
++ *
++ * @BRCMF_VNDR_AWDL_OP_CREATE: create the AWDL interface
++ * @BRCMF_VNDR_AWDL_OP_DESTROY: remove the AWDL interface
++ */
++enum brcmf_vndr_awdl_op {
++	BRCMF_VNDR_AWDL_OP_CREATE,
++	BRCMF_VNDR_AWDL_OP_DESTROY,
++};
++
+ /**
+  * enum brcmf_nlattrs - nl80211 message attributes
+  *
+-- 
+2.55.0
+

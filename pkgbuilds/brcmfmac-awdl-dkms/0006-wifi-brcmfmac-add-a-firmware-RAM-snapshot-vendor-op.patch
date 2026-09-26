@@ -1,0 +1,140 @@
+From e9420239cd155529a30d443b2741d9ec19ec0e76 Mon Sep 17 00:00:00 2001
+From: Brent Kearney <1550934+brentkearney@users.noreply.github.com>
+Date: Thu, 27 Aug 2026 00:37:26 -0600
+Subject: [PATCH 06/11] wifi: brcmfmac: add a firmware RAM snapshot vendor op
+
+The firmware image on disk keeps most of itself in a compressed region:
+cur_etheraddr, join_pref and the whole iovar name table are absent from its
+strings, so static analysis of the blob cannot reach the code that services
+AWDL iovars. Reading the RAM back after the firmware has unpacked itself can.
+
+Add BRCMF_VNDR_AWDL_OP_FWDUMP, which calls brcmf_debug_create_memdump() and
+leaves the result in /sys/class/devcoredump/devcdN/data, plus dump_addr and
+dump_len module parameters so a chosen slice can be read instead of all of RAM.
+
+dump_addr is clamped to [rambase, rambase + ramsize). BAR1 is 16 MB and
+ioremap() maps all of it, but only the TCM aperture is decoded; a read of an
+undecoded offset raises an SError on Apple Silicon and resets the machine
+instantly with nothing written to the journal. Reading the chip ROM this way
+is not possible, and the clamp is what keeps that from being rediscovered.
+---
+ .../broadcom/brcm80211/brcmfmac/pcie.c        | 42 ++++++++++++++++++-
+ .../broadcom/brcm80211/brcmfmac/vendor.c      | 10 +++++
+ .../broadcom/brcm80211/brcmfmac/vendor.h      |  2 +
+ 3 files changed, 52 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/pcie.c b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/pcie.c
+index 4421df0..e4441e9 100644
+--- a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/pcie.c
++++ b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/pcie.c
+@@ -1658,12 +1658,36 @@ static void brcmf_pcie_wowl_config(struct device *dev, bool enabled)
+ }
+ 
+ 
++/* Instrumentation aid, not for upstream. Lets the memdump start somewhere
++ * other than rambase, so a chosen slice of firmware RAM can be read back.
++ *
++ * DO NOT point this outside [rambase, rambase + ramsize). BAR1 is 16 MB and
++ * ioremap() happily maps all of it, but only the TCM aperture is actually
++ * decoded by the chip. A read of an undecoded offset does not return ~0 or
++ * raise a PCIe error that Linux can handle -- on Apple Silicon it raises an
++ * SError and the machine resets instantly, with nothing written to the
++ * journal. Reading the chip ROM at backplane 0x200000 does exactly that:
++ * the ROM is not reachable this way, even though the wlc_module registry's
++ * awdl callbacks (0x304a1c, 0x304748) live there.
++ * The clamp below enforces this; keep it.
++ */
++static uint brcmf_dump_addr;
++module_param_named(dump_addr, brcmf_dump_addr, uint, 0644);
++MODULE_PARM_DESC(dump_addr, "memdump start, must be within firmware RAM (0 = rambase)");
++
++static uint brcmf_dump_len;
++module_param_named(dump_len, brcmf_dump_len, uint, 0644);
++MODULE_PARM_DESC(dump_len, "memdump length in bytes (0 = ramsize - srsize)");
++
+ static size_t brcmf_pcie_get_ramsize(struct device *dev)
+ {
+ 	struct brcmf_bus *bus_if = dev_get_drvdata(dev);
+ 	struct brcmf_pciedev *buspub = bus_if->bus_priv.pcie;
+ 	struct brcmf_pciedev_info *devinfo = buspub->devinfo;
+ 
++	if (brcmf_dump_len)
++		return brcmf_dump_len;
++
+ 	return devinfo->ci->ramsize - devinfo->ci->srsize;
+ }
+ 
+@@ -1673,9 +1697,23 @@ static int brcmf_pcie_get_memdump(struct device *dev, void *data, size_t len)
+ 	struct brcmf_bus *bus_if = dev_get_drvdata(dev);
+ 	struct brcmf_pciedev *buspub = bus_if->bus_priv.pcie;
+ 	struct brcmf_pciedev_info *devinfo = buspub->devinfo;
++	u32 rambase = devinfo->ci->rambase;
++	u32 ramsize = devinfo->ci->ramsize;
++	u32 addr = brcmf_dump_addr ? brcmf_dump_addr : rambase;
+ 
+-	brcmf_dbg(PCIE, "dump at 0x%08X: len=%zu\n", devinfo->ci->rambase, len);
+-	brcmf_pcie_copy_dev_tomem(devinfo, devinfo->ci->rambase, data, len);
++	/* Refuse anything outside the TCM aperture: see the comment on
++	 * brcmf_dump_addr. Getting this wrong resets the machine, so fail the
++	 * dump rather than trust the caller.
++	 */
++	if (addr < rambase || addr >= rambase + ramsize ||
++	    len > rambase + ramsize - addr) {
++		brcmf_err(bus_if, "memdump 0x%08X+0x%zx outside RAM [0x%08X,0x%08X)\n",
++			  addr, len, rambase, rambase + ramsize);
++		return -ERANGE;
++	}
++
++	brcmf_dbg(PCIE, "dump at 0x%08X: len=%zu\n", addr, len);
++	brcmf_pcie_copy_dev_tomem(devinfo, addr, data, len);
+ 	return 0;
+ }
+ 
+diff --git a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/vendor.c b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/vendor.c
+index d3211d0..8cbe204 100644
+--- a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/vendor.c
++++ b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/vendor.c
+@@ -121,6 +121,7 @@ static int brcmf_cfg80211_vndr_cmds_awdl_handler(struct wiphy *wiphy,
+ 						 struct wireless_dev *wdev,
+ 						 const void *data, int len)
+ {
++	struct brcmf_cfg80211_info *cfg = wiphy_to_cfg(wiphy);
+ 	struct net_device *ndev;
+ 	struct wireless_dev *awdl_wdev;
+ 	u32 op;
+@@ -150,6 +151,15 @@ static int brcmf_cfg80211_vndr_cmds_awdl_handler(struct wiphy *wiphy,
+ 		if (!awdl_wdev)
+ 			return -ENODEV;
+ 		return brcmf_awdl_del_vif(wiphy, awdl_wdev);
++	case BRCMF_VNDR_AWDL_OP_FWDUMP:
++		/* Snapshot the firmware's own RAM, which is where the iovar
++		 * table and the AWDL handler actually live: the image on disk
++		 * keeps them in a compressed region, so the only way to read
++		 * the code that refuses "awdl" is to read it back after the
++		 * firmware has unpacked itself. Lands in
++		 * /sys/class/devcoredump/devcdN/data.
++		 */
++		return brcmf_debug_create_memdump(cfg->pub->bus_if, NULL, 0);
+ 	default:
+ 		return -EINVAL;
+ 	}
+diff --git a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/vendor.h b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/vendor.h
+index 74886de..a064e0e 100644
+--- a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/vendor.h
++++ b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/vendor.h
+@@ -20,10 +20,12 @@ enum brcmf_vndr_cmds {
+  *
+  * @BRCMF_VNDR_AWDL_OP_CREATE: create the AWDL interface
+  * @BRCMF_VNDR_AWDL_OP_DESTROY: remove the AWDL interface
++ * @BRCMF_VNDR_AWDL_OP_FWDUMP: snapshot firmware RAM to a devcoredump
+  */
+ enum brcmf_vndr_awdl_op {
+ 	BRCMF_VNDR_AWDL_OP_CREATE,
+ 	BRCMF_VNDR_AWDL_OP_DESTROY,
++	BRCMF_VNDR_AWDL_OP_FWDUMP,
+ };
+ 
+ /**
+-- 
+2.55.0
+
