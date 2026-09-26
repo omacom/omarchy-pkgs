@@ -38,17 +38,20 @@ jobs:
       vouch_status: ${{ steps.vouch.outputs.status }}
       empty: ${{ steps.list.outputs.empty }}
     steps:
-      # Same rule as the build job: bin/build-matrix comes from the base
-      # branch tip, the package directories from the PR head.
+      # Same rule as the build job: tooling comes from the current base,
+      # package contents from the virtual merge with the PR head.
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.event.pull_request.base.ref || github.sha }}
           fetch-depth: 0
           persist-credentials: false
-      - if: github.event_name == 'pull_request'
+      - id: merged
+        if: github.event_name == 'pull_request'
         run: |
-          git fetch --no-tags --depth=1 origin "${{ github.event.pull_request.head.sha }}"
-          git checkout "${{ github.event.pull_request.head.sha }}" -- pkgbuilds/
+          git fetch --no-tags origin "${{ github.event.pull_request.head.sha }}"
+          tree=$(git merge-tree --write-tree HEAD "${{ github.event.pull_request.head.sha }}")
+          echo "tree=$tree" >> "$GITHUB_OUTPUT"
+          git restore --source="$tree" --staged --worktree -- pkgbuilds/
           # Bootstrap: the PR that introduces this tooling has a base without
           # it. Take the plan helper from the PR head in that one case; it
           # runs on a hosted runner and only prints a plan.
@@ -87,22 +90,26 @@ jobs:
           if [[ -n "${{ github.event.inputs.packages }}" ]]; then
             names="${{ github.event.inputs.packages }}"
           else
-            names=$(git diff --name-only "${{ github.event.pull_request.base.sha }}" "${{ github.event.pull_request.head.sha }}" -- pkgbuilds \
+            names=$(git diff --name-only HEAD "${{ steps.merged.outputs.tree }}" -- pkgbuilds \
               | awk -F/ '$1=="pkgbuilds" && NF>2 {print $2}' | sort -u)
           fi
           matrix=$(printf '%s\n' $names | bin/build-matrix)
-          # A package directory whose exact tree already has a build artifact
-          # (label <pkg>-<arch>-<tree hash>, uploaded only after a successful
-          # build) is not built again. Pushing a fix for one package to a PR
-          # that touches fifty rebuilds one, not fifty; publish.yml finds the
-          # same artifacts on merge. workflow_dispatch is an explicit request
-          # and always builds.
+          # Reuse only an artifact for both this package tree and the current
+          # base-branch build contract. A tooling change invalidates older
+          # artifacts without rebuilding after unrelated changes.
+          # workflow_dispatch is an explicit request and always builds.
           if [[ "${{ github.event_name }}" == pull_request ]]; then
-            head="${{ github.event.pull_request.head.sha }}"
+            tree="${{ steps.merged.outputs.tree }}"
+            # A tooling-only PR has an empty matrix and checks out the old
+            # helper from base; it has no artifact to look up or key to make.
+            if [[ $(jq '.include | length' <<<"$matrix") -gt 0 ]]; then
+              source helpers/artifact-helpers.sh
+              tool_key=$(build_contract_key)
+            fi
             kept=(); reused=()
             while read -r entry; do
               package=$(jq -r .package <<<"$entry"); arch=$(jq -r .arch <<<"$entry")
-              label="$package-$arch-$(git rev-parse "$head:pkgbuilds/$package")"
+              label="$package-$arch-$(git rev-parse "$tree:pkgbuilds/$package")-$tool_key"
               found=$(curl -fsS -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
                 "https://api.github.com/repos/${{ github.repository }}/actions/artifacts?name=$label&per_page=5" \
                 | jq -r '[.artifacts[] | select(.expired|not)] | length' || echo 0)
@@ -117,12 +124,10 @@ jobs:
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
           echo "planned=$(jq '.include | length' <<<"$matrix")" >> "$GITHUB_OUTPUT"
           jq -r '.include[] | "\(.package) \(.arch) -> \(.channels)"' <<<"$matrix"
-          # A PR whose diff against its base is empty changes nothing: its
-          # content already landed some other way (a sync PR beat it, or a
-          # merge from master swallowed it). Merging it would record a change
-          # that isn't one. Flag it so `result` fails rather than passes.
+          # The virtual merge tree is what this PR would actually change on
+          # current base. A no-op merge should fail the required result.
           if [[ "${{ github.event_name }}" == pull_request ]]; then
-            total=$(git diff --name-only "${{ github.event.pull_request.base.sha }}" "${{ github.event.pull_request.head.sha }}" | wc -l)
+            total=$(git diff --name-only HEAD "${{ steps.merged.outputs.tree }}" | wc -l)
             echo "empty=$([[ $total -eq 0 ]] && echo true || echo false)" >> "$GITHUB_OUTPUT"
             echo "files changed vs base: $total"
           else
@@ -166,9 +171,9 @@ jobs:
       matrix: ${{ fromJson(needs.changes.outputs.matrix) }}
     steps:
       # Tooling from base: everything that executes on this droplet's host
-      # (bin/, helpers/, build/) comes from the base branch. Only the PR's
-      # package directories are overlaid. A PR can therefore change what
-      # gets built, never how the runner builds it. A PR that changes both
+      # (bin/, helpers/, build/) comes from the base branch. Package contents
+      # come from a virtual merge with the PR head. A PR can therefore change
+      # what gets built, never how the runner builds it. A PR that changes both
       # tooling and a package builds the package with the OLD tooling; land
       # the tooling first. workflow_dispatch has no PR and runs as checked out.
       # The base branch tip, not the event's base.sha: that sha is a snapshot
@@ -178,28 +183,38 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.event.pull_request.base.ref || github.sha }}
+          fetch-depth: 0
           persist-credentials: false
-      - name: Overlay the PR's package directories onto base tooling
+      - name: Overlay merged package contents onto base tooling
+        id: merged
         if: github.event_name == 'pull_request'
         run: |
           set -euo pipefail
-          git fetch --no-tags --depth=1 origin "${{ github.event.pull_request.head.sha }}"
-          git checkout "${{ github.event.pull_request.head.sha }}" -- pkgbuilds/
-          echo "tooling: $(git rev-parse --short HEAD) (base)  packages: ${{ github.event.pull_request.head.sha }} (PR head)"
-          git status --short | head
+          git fetch --no-tags origin "${{ github.event.pull_request.head.sha }}"
+          tree=$(git merge-tree --write-tree HEAD "${{ github.event.pull_request.head.sha }}")
+          echo "tree=$tree" >> "$GITHUB_OUTPUT"
+          git restore --source="$tree" --staged --worktree -- pkgbuilds/
+          echo "tooling: $(git rev-parse --short HEAD) (base)  packages: $tree (virtual merge)"
+          git status --short | sed -n '1,10p'
       - name: Build ${{ matrix.package }} (${{ matrix.arch }}, ships to ${{ matrix.channels }})
         id: build
         env:
           CONTAINER_ENGINE: docker
         run: bin/build --mirror edge --arch ${{ matrix.arch }} --package ${{ matrix.package }}
-      # The artifact label carries the package directory's git tree hash so
-      # the publish step can find the build for exactly the tree that merged.
+      # The artifact label carries both the package tree and the base tooling
+      # contract so publish can reject an artifact built with older tools.
       # The package file inside keeps makepkg's standard name untouched.
-      # The artifact label uses the PR head's tree for this package: that is
-      # the tree that merges, and what publish looks up.
+      # The artifact label uses the merged package tree, which is what the
+      # publisher will see if base has not changed again.
       - name: Tree hash
         id: tree
-        run: echo "hash=$(git rev-parse "${{ github.event.pull_request.head.sha || github.sha }}:pkgbuilds/${{ matrix.package }}")" >> "$GITHUB_OUTPUT"
+        run: |
+          source helpers/artifact-helpers.sh
+          tree="${{ steps.merged.outputs.tree || github.sha }}"
+          hash=$(git rev-parse "$tree:pkgbuilds/${{ matrix.package }}")
+          tool_key=$(build_contract_key)
+          echo "hash=$hash" >> "$GITHUB_OUTPUT"
+          echo "tool_key=$tool_key" >> "$GITHUB_OUTPUT"
       # The upload action rejects a path containing ':', which is how makepkg
       # names a package with an epoch. The files ride inside packages.tar
       # (helpers/artifact-helpers.sh); publish.yml unpacks it. Only a
@@ -214,7 +229,7 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.package }}-${{ matrix.arch }}-${{ steps.tree.outputs.hash }}
+          name: ${{ matrix.package }}-${{ matrix.arch }}-${{ steps.tree.outputs.hash }}-${{ steps.tree.outputs.tool_key }}
           path: packages.tar
           if-no-files-found: error
           retention-days: 7
