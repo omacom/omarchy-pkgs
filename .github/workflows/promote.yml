@@ -1,0 +1,156 @@
+name: Promote packages
+
+# Moves published packages between channels on the remote, for one
+# architecture, or undoes such a move: bin/promote-artifact reads the source
+# channel there and publishes its exact files into the target with
+# bin/publish-artifact, withdraws entries, or reinstates an earlier file. It
+# is the promotion path for what publish.yml publishes, which never reaches
+# the repository host's tree that bin/repo advance copies from.
+#
+# Scope: aarch64 into rc or stable. x86_64, or withdrawing from edge, needs
+# the override input. A real run needs `expect`: the set digest a promote dry
+# run prints, or the name=version list a withdraw dry run prints.
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "promote; withdraw (drop entries); reinstate (put an earlier file back)"
+        type: choice
+        options: [promote, withdraw, reinstate]
+        default: promote
+      from:
+        description: "Source channel (promote only)"
+        type: choice
+        options: [edge, rc]
+        default: edge
+      to:
+        description: "Target channel"
+        type: choice
+        options: [rc, stable, edge]
+        default: rc
+      arch:
+        description: "Architecture"
+        type: choice
+        options: [aarch64, x86_64]
+        default: aarch64
+      packages:
+        description: "Space-separated package names (a pkgbase selects its split packages); filenames for reinstate"
+        required: true
+      expect:
+        description: "promote: the set sha256; withdraw: name=version of every entry dropped (both printed by a dry run)"
+        required: false
+      dry_run:
+        description: "Plan only"
+        type: boolean
+        default: true
+      override_scope:
+        description: "Allow x86_64 or the edge channel (normally aarch64 into rc or stable only)"
+        type: boolean
+        default: false
+
+permissions: {}
+
+jobs:
+  # GitHub keeps one pending run per concurrency group and cancels the older
+  # one. Queuing a promotion behind a running publish would cancel a publish
+  # already waiting there, so refuse while any publish is unfinished. This
+  # narrows the window, it does not close it: a merge can still queue a
+  # publish between this check and the promote job taking the group.
+  preflight:
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          busy=$(gh run list -R "$GITHUB_REPOSITORY" --workflow publish.yml --limit 20 --json status \
+            --jq '[.[] | select(.status != "completed")] | length')
+          if (( busy > 0 )); then
+            echo "::error::A publish is running or queued; dispatch this again once it has finished."
+            exit 1
+          fi
+
+  promote:
+    needs: preflight
+    runs-on: [self-hosted, omarchy-builder]
+    environment: publish
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    # One writer per channel database: the same group as publish.yml.
+    concurrency:
+      group: publish
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: ${{ inputs.action }} (${{ inputs.to }}/${{ inputs.arch }})
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+          RCLONE_CONFIG_R2_TYPE: s3
+          RCLONE_CONFIG_R2_PROVIDER: Cloudflare
+          RCLONE_CONFIG_R2_NO_CHECK_BUCKET: "true"
+          RCLONE_CONFIG_R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          RCLONE_CONFIG_R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          RCLONE_CONFIG_R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          OMARCHY_PUBLISH_PREFIX: ${{ vars.OMARCHY_PUBLISH_PREFIX }}
+          ACTION: ${{ inputs.action }}
+          FROM: ${{ inputs.from }}
+          TO: ${{ inputs.to }}
+          ARCH: ${{ inputs.arch }}
+          PACKAGES: ${{ inputs.packages }}
+          EXPECT: ${{ inputs.expect }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          OVERRIDE: ${{ inputs.override_scope }}
+        run: |
+          set -euo pipefail
+          if [[ ($ARCH != aarch64 || $TO == edge) && $OVERRIDE != true ]]; then
+            echo "::error::This workflow moves aarch64 packages into rc or stable; set override_scope for $TO/$ARCH."
+            exit 1
+          fi
+          if [[ $DRY_RUN != true && $ACTION != reinstate && -z $EXPECT ]]; then
+            echo "::error::A real $ACTION needs expect: run it as a dry run first and copy what it prints."
+            exit 1
+          fi
+          read -r -a names <<<"$PACKAGES"
+          read -r -a expects <<<"$EXPECT"
+          for word in "${names[@]}" "${expects[@]}"; do
+            [[ $word =~ ^[A-Za-z0-9@_+][A-Za-z0-9@._+:=~-]*$ ]] || { echo "::error::Not a package name, filename or name=version: $word"; exit 1; }
+          done
+          args=(--remote R2:omarchy-pkgs --to "$TO" --arch "$ARCH")
+          case $ACTION in
+            promote)
+              args+=(--from "$FROM")
+              (( ${#expects[@]} == 0 )) || args+=(--expect-sha256 "${expects[0]}")
+              ;;
+            withdraw)
+              args+=(--withdraw)
+              (( ${#expects[@]} == 0 )) || args+=(--expect "${expects[@]}")
+              ;;
+            reinstate) args+=(--reinstate) ;;
+          esac
+          [[ $DRY_RUN != true ]] || args+=(--dry-run)
+          if [[ $ACTION == reinstate ]]; then args+=(--file "${names[@]}"); else args+=(--package "${names[@]}"); fi
+          docker image inspect omarchy-pkg-builder:latest-x86_64-edge >/dev/null 2>&1 \
+            || docker buildx build --load -t omarchy-pkg-builder:latest-x86_64-edge --build-arg MIRROR=edge build
+          docker run --rm \
+            -e GPG_PRIVATE_KEY -e GPG_PASSPHRASE -e OMARCHY_PUBLISH_PREFIX \
+            -e RCLONE_CONFIG_R2_TYPE -e RCLONE_CONFIG_R2_PROVIDER -e RCLONE_CONFIG_R2_ENDPOINT -e RCLONE_CONFIG_R2_NO_CHECK_BUCKET \
+            -e RCLONE_CONFIG_R2_ACCESS_KEY_ID -e RCLONE_CONFIG_R2_SECRET_ACCESS_KEY \
+            -v "$PWD:/w:ro" -w /w \
+            omarchy-pkg-builder:latest-x86_64-edge \
+            bin/promote-artifact "${args[@]}" | tee promote.log
+
+      - name: Keep the log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: promote-${{ github.run_id }}
+          path: promote.log
+          if-no-files-found: ignore
+          retention-days: 90

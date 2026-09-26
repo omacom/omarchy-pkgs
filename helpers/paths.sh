@@ -17,6 +17,27 @@ VALID_ARCHES="x86_64 aarch64"
 # one-off run.
 PUBLISHED_ARCHES="${OMARCHY_ARCHES:-x86_64}"
 
+# Architectures whose channels CI publishes straight to the remote
+# (publish.yml, promote.yml). This host's tree never receives those files,
+# and sync-repo compares package names only, so a database rebuilt here and
+# synced would drop CI's packages or silently put older versions back over
+# them. Listing one in PUBLISHED_ARCHES does not make this host a safe
+# publisher for it: sync and advance refuse it until the tree is proven
+# complete and OMARCHY_ALLOW_HOST_PUBLISH=1 is set. Promote those packages
+# with bin/promote-artifact instead.
+CI_ONLY_ARCHES="${OMARCHY_CI_ONLY_ARCHES-aarch64}"
+
+refuse_host_publish_for_ci_arch() { # refuse_host_publish_for_ci_arch <arch> <action>
+  case " $CI_ONLY_ARCHES " in
+  *" $1 "*) ;;
+  *) return 0 ;;
+  esac
+  [[ -n "${OMARCHY_ALLOW_HOST_PUBLISH:-}" ]] && return 0
+  echo "Refusing to $2 $1 from this host: CI publishes $1 channels straight to the remote, so this tree does not hold them" >&2
+  echo "and a database built here could drop or downgrade what CI published. Use bin/promote-artifact (promote.yml)." >&2
+  exit 1
+}
+
 validate_arch() {
   case " $VALID_ARCHES " in
   *" $1 "*) return 0 ;;
