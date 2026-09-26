@@ -75,9 +75,11 @@ def with_hermes_node_path(env=None):
     cli.write_text(forbidden)
     cli.chmod(0o755)
     (cli.parent / "python").symlink_to(sys.executable)
+    # The launcher used to call Omarchy's installer on every start; a launcher
+    # that reaches for it, or for sudo, fails here.
     for command in ("sudo", "omarchy-install-hermes-cli"):
         target = mock_bin / command
-        target.write_text(forbidden if command == "sudo" else '#!/bin/bash\nexit 0\n')
+        target.write_text(forbidden)
         target.chmod(0o755)
 
     output = root / "launch.json"
@@ -92,7 +94,7 @@ def with_hermes_node_path(env=None):
         assert result == {"args": ["--disable-setuid-sandbox", *expected_args],
                           "home": str(home / ".hermes"), "store": store, "gpu": gpu,
                           "ozone": ozone, "cwd": str(home), "inherited": []}, result
-        assert not forbidden_output.exists(), "launcher invoked CLI or sudo"
+        assert not forbidden_output.exists(), "launcher invoked the Omarchy installer or sudo"
         output.unlink()
 
     wayland = {"WAYLAND_DISPLAY": "wayland-1"}
