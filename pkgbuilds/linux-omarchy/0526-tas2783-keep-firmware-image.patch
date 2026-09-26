@@ -1,0 +1,213 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Meir Dick <mdick85@gmail.com>
+Date: Thu, 3 Sep 2026 22:50:00 -0400
+Subject: [PATCH] ASoC: tas2783: keep the firmware image for re-initialisation
+
+Every re-initialisation of the part goes back through
+request_firmware_nowait() and then waits up to TIMEOUT_FW_DL_MS for
+userspace to hand the file back. That happens after a bus reset, after
+a system resume, and on every .startup re-init as well. It is the
+slowest step in bringing the amplifiers back, and during a resume it is
+also the least reliable one, because the request races the rest of the
+system coming up and can time out, leaving a part that is enumerated
+but has no firmware. That reads as silence with no error.
+
+Split the programming loop out of tas2783_fw_ready() into
+tas2783_fw_program(), keep the image in RAM after the first successful
+load, and reprogram from it in tas_fw_load(). If reprogramming from the
+cache ever fails, fall back to requesting the file again rather than
+leaving the part unprogrammed.
+
+Baojun Xu's "ASoC: tas2783-sdw: add firmware download status check"
+(v4, 2026-09-15, patchwork 14815978) avoids the download in a different
+way, by not re-initialising a part that was never reset. The two do not
+conflict in code; if his is merged, this one should be re-evaluated
+against it rather than carried by habit. Not submitted upstream.
+
+Signed-off-by: Meir Dick <mdick85@gmail.com>
+---
+ sound/soc/codecs/tas2783-sdw.c | 123 +++++++++++++++++++++++----------
+ 1 file changed, 88 insertions(+), 35 deletions(-)
+
+diff --git a/sound/soc/codecs/tas2783-sdw.c b/sound/soc/codecs/tas2783-sdw.c
+index 783e02e..7a03f97 100644
+--- a/sound/soc/codecs/tas2783-sdw.c
++++ b/sound/soc/codecs/tas2783-sdw.c
+@@ -24,6 +24,8 @@
+ #include <linux/pm.h>
+ #include <linux/pm_runtime.h>
+ #include <linux/regmap.h>
++#include <linux/slab.h>
++#include <linux/string.h>
+ #include <linux/suspend.h>
+ #include <linux/wait.h>
+ #include <linux/soundwire/sdw.h>
+@@ -106,6 +108,15 @@ struct tas2783_prv {
+ 	bool fw_use_fallback;
+ 	/* set across system sleep, cleared once the part has been re-inited */
+ 	bool force_reinit;
++	/*
++	 * The firmware image, kept in RAM after the first successful load.
++	 * Re-initialisation - after a bus reset, a system resume, or the
++	 * .startup re-init - reprograms the part straight from here instead
++	 * of asking userspace for the file again, which is slow and can
++	 * time out while the rest of the system is still coming back.
++	 */
++	u8 *fw_cache;
++	size_t fw_cache_size;
+ 	/*
+ 	 * Playback channel mask for this mono amplifier, from
+ 	 * .set_tdm_slot. Zero means "take whatever the stream offers",
+@@ -791,51 +802,31 @@ static s32 tas_fw_get_next_file(const u8 *data, struct tas_fw_file *file)
+ 	return file->length + sizeof(u32) * 5;
+ }
+ 
+-static void tas2783_fw_ready(const struct firmware *fmw, void *context)
++/*
++ * Program one parsed firmware image into the part over SoundWire. Split
++ * out of tas2783_fw_ready() so that a cached image can be reprogrammed
++ * without going back through request_firmware(). @buf must stay valid
++ * for the whole call; file->fw_data points into it.
++ */
++static s32 tas2783_fw_program(struct tas2783_prv *tas_dev, const u8 *buf,
++			      s32 img_sz)
+ {
+-	struct tas2783_prv *tas_dev =
+-		(struct tas2783_prv *)context;
+-	const u8 *buf = NULL;
+-	s32  img_sz, ret = 0, cur_file = 0;
+-	s32 offset = 0;
+-
+ 	struct tas_fw_hdr *hdr __free(kfree) = kzalloc_obj(*hdr);
+ 	struct tas_fw_file *file __free(kfree) = kzalloc_obj(*file);
+-	if (!file || !hdr) {
+-		ret = -ENOMEM;
+-		goto out;
+-	}
++	s32 ret = 0, cur_file = 0, offset = 0;
+ 
+-	/* firmware binary not found*/
+-	if (!fmw || !fmw->data) {
+-		if (!tas_dev->fw_use_fallback) {
+-			tas_dev->fw_use_fallback = true;
+-			dev_info(tas_dev->dev,
+-				"Failed to read preferred fw binary: %s, attempting fallback binary load\n",
+-				tas_dev->rca_binaryname);
+-		} else {
+-			dev_err(tas_dev->dev,
+-				"Failed to read fallback fw binary %s\n",
+-				tas_dev->rca_binaryname);
+-		}
++	if (!file || !hdr)
++		return -ENOMEM;
+ 
+-		ret = -EINVAL;
+-		goto out;
+-	}
+-
+-	img_sz = fmw->size;
+-	buf = fmw->data;
+ 	offset += tas_fw_read_hdr(buf, hdr);
+ 	if (hdr->size != img_sz) {
+-		ret = -EINVAL;
+ 		dev_err(tas_dev->dev, "firmware size mismatch with header");
+-		goto out;
++		return -EINVAL;
+ 	}
+ 
+ 	if (img_sz < FW_DL_OFFSET) {
+-		ret = -EINVAL;
+ 		dev_err(tas_dev->dev, "unexpected size, size is too small");
+-		goto out;
++		return -EINVAL;
+ 	}
+ 
+ 	mutex_lock(&tas_dev->pde_lock);
+@@ -862,9 +853,51 @@ static void tas2783_fw_ready(const struct firmware *fmw, void *context)
+ 
+ 	if (cur_file == 0) {
+ 		dev_err(tas_dev->dev, "fw with no files");
++		return -EINVAL;
++	}
++	if (ret < 0)
++		return ret;
++
++	tas2783_update_calibdata(tas_dev);
++
++	return 0;
++}
++
++static void tas2783_fw_ready(const struct firmware *fmw, void *context)
++{
++	struct tas2783_prv *tas_dev =
++		(struct tas2783_prv *)context;
++	s32 ret = 0;
++
++	/* firmware binary not found*/
++	if (!fmw || !fmw->data) {
++		if (!tas_dev->fw_use_fallback) {
++			tas_dev->fw_use_fallback = true;
++			dev_info(tas_dev->dev,
++				"Failed to read preferred fw binary: %s, attempting fallback binary load\n",
++				tas_dev->rca_binaryname);
++		} else {
++			dev_err(tas_dev->dev,
++				"Failed to read fallback fw binary %s\n",
++				tas_dev->rca_binaryname);
++		}
++
+ 		ret = -EINVAL;
+-	} else {
+-		tas2783_update_calibdata(tas_dev);
++		goto out;
++	}
++
++	ret = tas2783_fw_program(tas_dev, fmw->data, fmw->size);
++	if (ret)
++		goto out;
++
++	/* Keep the image so later re-initialisations can skip userspace. */
++	if (!tas_dev->fw_cache) {
++		tas_dev->fw_cache = kvmemdup(fmw->data, fmw->size, GFP_KERNEL);
++		if (tas_dev->fw_cache)
++			tas_dev->fw_cache_size = fmw->size;
++		else
++			dev_warn(tas_dev->dev,
++				 "no memory to cache firmware; re-init will re-request it\n");
+ 	}
+ 
+ out:
+@@ -1316,6 +1349,25 @@ static s32 tas_fw_load(struct tas2783_prv *tas_dev, struct sdw_slave *slave)
+ 	s32 ret;
+ 	u8 unique_id = tas_dev->sdw_peripheral->id.unique_id;
+ 
++	if (tas_dev->fw_cache) {
++		ret = tas2783_fw_program(tas_dev, tas_dev->fw_cache,
++					 tas_dev->fw_cache_size);
++		if (!ret) {
++			tas_dev->fw_dl_success = true;
++			tas_dev->fw_dl_task_done = true;
++			wake_up(&tas_dev->fw_wait);
++			return 0;
++		}
++		/*
++		 * The cached image should not stop working, but if it does,
++		 * ask userspace for the file again rather than leaving the
++		 * part unprogrammed.
++		 */
++		dev_warn(tas_dev->dev,
++			 "cached firmware failed for uid=%d, err=%d; re-requesting\n",
++			 unique_id, ret);
++	}
++
+ 	tas_generate_fw_name(slave, tas_dev->rca_binaryname,
+ 			     sizeof(tas_dev->rca_binaryname));
+ 
+@@ -1618,6 +1670,7 @@ static void tas_sdw_remove(struct sdw_slave *peripheral)
+ 	unregister_pm_notifier(&tas_dev->pm_nb);
+ 	pm_runtime_disable(tas_dev->dev);
+ 	tas_remove(tas_dev);
++	kvfree(tas_dev->fw_cache);
+ 	mutex_destroy(&tas_dev->calib_lock);
+ 	mutex_destroy(&tas_dev->pde_lock);
+ 	dev_set_drvdata(&peripheral->dev, NULL);

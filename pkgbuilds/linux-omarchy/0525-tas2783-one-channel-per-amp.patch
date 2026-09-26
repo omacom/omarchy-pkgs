@@ -1,0 +1,168 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Meir Dick <mdick85@gmail.com>
+Date: Thu, 3 Sep 2026 22:47:00 -0400
+Subject: [PATCH] ASoC: tas2783: take one stream channel per mono amplifier
+
+A TAS2783 is a mono amplifier, but tas_sdw_hw_params() passes on the
+broadcast channel mask that snd_sdw_params_to_config() produces. Every
+part on a link therefore receives every channel, and a board with
+several amplifiers on one link plays the same channel out of all of
+them.
+
+Implement .set_tdm_slot so a machine driver can tell each part which
+channel of the stream it plays, and use that mask in hw_params when one
+has been set. DP1 ChannelEn implements two bits, so the mask is BIT(0)
+or BIT(1); anything wider is rejected. Parts on boards whose machine
+driver assigns no side keep the broadcast mask and behave as before.
+
+Assign the sides in asoc_sdw_ti_spk_rtd_init(), which already decodes
+them from the name_prefix to build the speaker widget routes:
+"tas2783-1" and "tas2783-3" are left, "tas2783-2" and "tas2783-4" are
+right. Which physical amplifier carries which prefix stays a property
+of the machine's match table.
+
+Mainline solves this differently in commit 173cb3147ba2 ("ASoC:
+tas2783-sdw: split a stereo stream across the two mono amps", v7.3-rc1):
+tas_sdw_hw_params() derives the one-channel mask from the name_prefix
+index itself, for any number of amplifiers, and needs nothing from the
+machine driver. The hw_params half of this patch duplicates that, and
+the .set_tdm_slot plumbing then has no caller that adds information the
+codec does not already have, so on a 7.3 base the whole patch is
+redundant and should be dropped, not rebased. It is not submitted
+upstream. On 7.2.y it is still needed. The four-amplifier case still
+needs the two-PDI split either way.
+
+Signed-off-by: Meir Dick <mdick85@gmail.com>
+---
+ sound/soc/codecs/tas2783-sdw.c       | 47 ++++++++++++++++++++++++++--
+ sound/soc/sdw_utils/soc_sdw_ti_amp.c | 21 +++++++++++++
+ 2 files changed, 66 insertions(+), 2 deletions(-)
+
+diff --git a/sound/soc/codecs/tas2783-sdw.c b/sound/soc/codecs/tas2783-sdw.c
+index 48e1d3a..783e02e 100644
+--- a/sound/soc/codecs/tas2783-sdw.c
++++ b/sound/soc/codecs/tas2783-sdw.c
+@@ -106,6 +106,13 @@ struct tas2783_prv {
+ 	bool fw_use_fallback;
+ 	/* set across system sleep, cleared once the part has been re-inited */
+ 	bool force_reinit;
++	/*
++	 * Playback channel mask for this mono amplifier, from
++	 * .set_tdm_slot. Zero means "take whatever the stream offers",
++	 * which is the right answer on a board whose machine driver does
++	 * not assign sides.
++	 */
++	unsigned int rx_mask;
+ 	struct notifier_block pm_nb;
+ };
+ 
+@@ -1008,10 +1015,23 @@ static s32 tas_sdw_hw_params(struct snd_pcm_substream *substream,
+ 	snd_sdw_params_to_config(substream, params,
+ 				 &stream_config, &port_config);
+ 	/* port 1 for playback */
+-	if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK)
++	if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK) {
+ 		port_config.num = 1;
+-	else
++		/*
++		 * Each TAS2783 is a mono amplifier. When the machine driver
++		 * has told us which side of the stream this part plays, take
++		 * that one channel instead of the whole broadcast mask, so
++		 * that several parts on one link can carry different
++		 * channels. DP1 ChannelEn implements two bits, so the mask
++		 * is BIT(0) or BIT(1).
++		 */
++		if (tas_dev->rx_mask) {
++			port_config.ch_mask = tas_dev->rx_mask;
++			stream_config.ch_count = hweight32(tas_dev->rx_mask);
++		}
++	} else {
+ 		port_config.num = 2;
++	}
+ 
+ 	ret = sdw_stream_add_slave(sdw_peripheral,
+ 				   &stream_config, &port_config, 1, sdw_stream);
+@@ -1078,9 +1098,32 @@ static int tas_sdw_startup(struct snd_pcm_substream *substream,
+ 	return 0;
+ }
+ 
++static int tas_sdw_set_tdm_slot(struct snd_soc_dai *dai, unsigned int tx_mask,
++				unsigned int rx_mask, int slots, int slot_width)
++{
++	struct tas2783_prv *tas_dev =
++		snd_soc_component_get_drvdata(dai->component);
++
++	/*
++	 * tx/rx are named from the CPU's point of view, so playback into
++	 * this amplifier arrives as tx_mask.
++	 */
++	if (hweight32(tx_mask) > 1) {
++		dev_err(tas_dev->dev,
++			"a mono amplifier takes one channel, mask=%#x\n",
++			tx_mask);
++		return -EINVAL;
++	}
++
++	tas_dev->rx_mask = tx_mask;
++
++	return 0;
++}
++
+ static const struct snd_soc_dai_ops tas_dai_ops = {
+ 	.startup	= tas_sdw_startup,
+ 	.hw_params	= tas_sdw_hw_params,
++	.set_tdm_slot	= tas_sdw_set_tdm_slot,
+ 	.hw_free	= tas_sdw_pcm_hw_free,
+ 	.set_stream	= tas_set_sdw_stream,
+ 	.shutdown	= tas_sdw_shutdown,
+diff --git a/sound/soc/sdw_utils/soc_sdw_ti_amp.c b/sound/soc/sdw_utils/soc_sdw_ti_amp.c
+index d0ae5d7..a9a945d 100644
+--- a/sound/soc/sdw_utils/soc_sdw_ti_amp.c
++++ b/sound/soc/sdw_utils/soc_sdw_ti_amp.c
+@@ -50,6 +50,7 @@ int asoc_sdw_ti_spk_rtd_init(struct snd_soc_pcm_runtime *rtd,
+ 	struct snd_soc_dapm_route route = {speaker, NULL, widget_name};
+ 	struct snd_soc_dai *codec_dai;
+ 	const char *prefix;
++	unsigned int ch_mask;
+ 	int i, ret = 0;
+ 
+ 	for_each_rtd_codec_dais(rtd, i, codec_dai) {
+@@ -59,18 +60,38 @@ int asoc_sdw_ti_spk_rtd_init(struct snd_soc_pcm_runtime *rtd,
+ 		prefix = codec_dai->component->name_prefix;
+ 		if (!strncmp(prefix, "tas2783-1", strlen("tas2783-1"))) {
+ 			strscpy(speaker, "Left Spk", sizeof(speaker));
++			ch_mask = BIT(0);
+ 		} else if (!strncmp(prefix, "tas2783-2", strlen("tas2783-2"))) {
+ 			strscpy(speaker, "Right Spk", sizeof(speaker));
++			ch_mask = BIT(1);
+ 		} else if (!strncmp(prefix, "tas2783-3", strlen("tas2783-3"))) {
+ 			strscpy(speaker, "Left Spk2", sizeof(speaker));
++			ch_mask = BIT(0);
+ 		} else if (!strncmp(prefix, "tas2783-4", strlen("tas2783-4"))) {
+ 			strscpy(speaker, "Right Spk2", sizeof(speaker));
++			ch_mask = BIT(1);
+ 		} else {
+ 			ret = -EINVAL;
+ 			dev_err(card->dev, "unhandled prefix %s", prefix);
+ 			break;
+ 		}
+ 
++		/*
++		 * Each part is a mono amplifier, so tell it which channel of
++		 * the stereo stream it plays. The prefix already names the
++		 * side; the match table decides which physical amplifier
++		 * carries which prefix. Parts whose driver does not implement
++		 * .set_tdm_slot keep the broadcast mask and the previous
++		 * behaviour.
++		 */
++		ret = snd_soc_dai_set_tdm_slot(codec_dai, ch_mask, 0, 2, 0);
++		if (ret && ret != -ENOTSUPP) {
++			dev_err(card->dev, "%s set_tdm_slot failed %d\n",
++				prefix, ret);
++			return ret;
++		}
++		ret = 0;
++
+ 		snprintf(widget_name, sizeof(widget_name), "%s SPK", prefix);
+ 		ret = asoc_sdw_ti_amp_initial_settings(card, prefix);
+ 		if (ret)
