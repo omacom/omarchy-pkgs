@@ -259,12 +259,20 @@ refresh_vcs_pkgver_preserving_local_pkgrel() {
   original_pkgver=$(bash -c 'source PKGBUILD 2>/dev/null; echo "${pkgver:-}"')
   original_pkgrel=$(bash -c 'source PKGBUILD 2>/dev/null; echo "${pkgrel:-}"')
 
-  # Omarchy local rebuilds use dotted pkgrels (AUR pkgrel + .suffix). Plain
-  # integer pkgrels can keep makepkg's normal reset-to-1 behavior on new VCS
-  # revisions.
-  [[ "$original_pkgrel" == *.* ]] || return 0
-
-  echo "    Refreshing VCS pkgver before build (preserving local pkgrel=$original_pkgrel)..."
+  # The refresh must happen before the real build for every VCS package:
+  # makepkg resolves dependencies against the static pkgver before it runs
+  # pkgver(), so an exact same-version dependency such as the omarchy pair's
+  # would otherwise request a stale release. Omarchy local rebuilds use dotted
+  # pkgrels (AUR pkgrel + .suffix), which makepkg resets to 1 on a new VCS
+  # revision; those are restored below. Plain integer pkgrels keep that
+  # normal reset-to-1 behavior.
+  local preserve_pkgrel=0
+  if [[ "$original_pkgrel" == *.* ]]; then
+    preserve_pkgrel=1
+    echo "    Refreshing VCS pkgver before build (preserving local pkgrel=$original_pkgrel)..."
+  else
+    echo "    Refreshing VCS pkgver before build..."
+  fi
   if [[ -x /usr/local/bin/pacman-for-makepkg ]]; then
     PACMAN=/usr/local/bin/pacman-for-makepkg makepkg --nobuild --nodeps --skipinteg --skippgpcheck --noprepare --noconfirm
   else
@@ -279,7 +287,7 @@ refresh_vcs_pkgver_preserving_local_pkgrel() {
   refreshed_pkgver=$(bash -c 'source PKGBUILD 2>/dev/null; echo "${pkgver:-}"')
   refreshed_pkgrel=$(bash -c 'source PKGBUILD 2>/dev/null; echo "${pkgrel:-}"')
 
-  if [[ "$refreshed_pkgrel" != "$original_pkgrel" ]]; then
+  if [[ "$preserve_pkgrel" == 1 && "$refreshed_pkgrel" != "$original_pkgrel" ]]; then
     sed -i "s/^pkgrel=.*/pkgrel=$original_pkgrel/" PKGBUILD
     echo "    Restored local pkgrel suffix: $refreshed_pkgrel -> $original_pkgrel"
   fi
@@ -394,6 +402,13 @@ build_package() {
       return 1
     }
     makepkg_flags=(-cf --noconfirm --nodeps)
+  fi
+  # The preliminary refresh already fetched the VCS sources and computed the
+  # version the dependency check sees. Hold that revision: without --holdver
+  # makepkg fetches the branch again after resolving dependencies and could
+  # package a newer commit than the one it validated.
+  if grep -qE '^pkgver[[:space:]]*\(\)' PKGBUILD; then
+    makepkg_flags+=(--holdver)
   fi
 
   if PACMAN=/usr/local/bin/pacman-for-makepkg makepkg "${makepkg_flags[@]}"; then
