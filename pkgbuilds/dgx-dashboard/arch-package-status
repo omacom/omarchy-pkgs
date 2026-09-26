@@ -1,0 +1,154 @@
+#!/usr/bin/python3
+"""Read-only Arch package inventory and Dashboard's narrow query protocol.
+
+Never installs packages or refreshes the live sync database. No generic apt
+emulation: only the observed read-only Dashboard calls are accepted.
+"""
+import fcntl
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+import tempfile
+import time
+
+CACHE = Path('/var/cache/dgx-dashboard-arch')
+MAX_AGE = 900
+TOKEN = re.compile(r'^[A-Za-z0-9@._+~:=-]+$')
+
+
+def run(args, allowed=(0,)):
+    result = subprocess.run(args, text=True, capture_output=True, timeout=180,
+                            env={**os.environ, 'LC_ALL': 'C', 'PATH': '/usr/bin'})
+    if result.returncode not in allowed:
+        raise RuntimeError(f'{args[0]} failed ({result.returncode}): {result.stderr.strip()}')
+    return result
+
+
+def parse_updates(result):
+    if result.returncode == 1:
+        if result.stdout.strip() or result.stderr.strip():
+            raise RuntimeError('Package query failed: ' + result.stderr.strip())
+        return []  # pacman -Qu returns 1 when no packages match.
+    rows = []
+    for line in result.stdout.splitlines():
+        parts = line.split()
+        if len(parts) < 4 or parts[2] != '->' or not all(TOKEN.fullmatch(p) for p in (parts[0], parts[1], parts[3])):
+            raise RuntimeError('Unexpected pacman update record')
+        suffix = ' '.join(parts[4:])
+        if suffix and suffix != '[ignored]':
+            raise RuntimeError('Unexpected pacman update annotation')
+        rows.append(dict(name=parts[0], currentVersion=parts[1], availableVersion=parts[3], ignored=bool(suffix)))
+    return rows
+
+
+def metadata(rows, common, cache):
+    wanted = {(r['name'], r['availableVersion']): r for r in rows}
+    if not wanted:
+        return
+    # With an empty cache directory, %s is the full compressed package size.
+    result = run(['/usr/bin/pacman', '-Sddp', '--noconfirm', '--cachedir', str(cache),
+                  '--print-format', '%n %v %r %a %s %d', *common, '--', *(r['name'] for r in rows)])
+    for line in result.stdout.splitlines():
+        parts = line.split(maxsplit=5)
+        if len(parts) < 5 or not all(TOKEN.fullmatch(p) for p in parts[:5]) or not parts[4].isdigit():
+            raise RuntimeError('Unexpected pacman package metadata')
+        row = wanted.pop((parts[0], parts[1]), None)
+        if row is None:
+            raise RuntimeError('Unexpected pacman package metadata')
+        row.update(repository=parts[2], architecture=parts[3], size=int(parts[4]),
+                   description=parts[5] if len(parts) == 6 else '')
+    if wanted:
+        raise RuntimeError('Repository metadata missing for update candidates')
+
+
+def refresh():
+    live = Path(run(['/usr/bin/pacman-conf', 'DBPath']).stdout.strip())
+    if not live.is_absolute() or not (live / 'local').is_dir():
+        raise RuntimeError('Invalid installed package database')
+    if (live / 'db.lck').exists():
+        raise RuntimeError('A package transaction is running; retry afterward')
+    with tempfile.TemporaryDirectory(prefix='query-', dir=CACHE) as directory:
+        db = Path(directory)
+        db.chmod(0o755)
+        (db / 'local').symlink_to(live / 'local', target_is_directory=True)
+        common = ['--dbpath', str(db), '--logfile', '/dev/null', '--color', 'never']
+        run(['/usr/bin/pacman', '-Sy', *common])
+        rows = parse_updates(run(['/usr/bin/pacman', '-Qu', *common], (0, 1)))
+        (db / 'cache').mkdir()
+        metadata(rows, common, db / 'cache')
+        # Resolve a complete transaction, including replacements/dependencies,
+        # without downloading packages or committing it.
+        result = run(['/usr/bin/pacman', '-Sup', '--noconfirm', '--print-format', '%n %v %a %s', *common])
+        planned = []
+        for line in result.stdout.splitlines():
+            parts = line.split()
+            if len(parts) != 4 or not all(TOKEN.fullmatch(p) for p in parts) or not parts[3].isdigit():
+                raise RuntimeError('Unexpected pacman transaction preview')
+            planned.append(dict(name=parts[0], version=parts[1], architecture=parts[2], size=int(parts[3])))
+        foreign = run(['/usr/bin/pacman', '-Qm', *common], (0, 1))
+        if foreign.returncode and (foreign.stdout.strip() or foreign.stderr.strip()):
+            raise RuntimeError('Could not inventory packages outside repositories')
+        if (live / 'db.lck').exists():
+            raise RuntimeError('A package transaction started during the check; retry afterward')
+        return dict(checkedAt=int(time.time()), backend='arch-pacman',
+                    updates=rows, transactionPreview=planned,
+                    unmanagedPackages=foreign.stdout.splitlines(),
+                    warnings=result.stderr.strip(), installSupported=False)
+
+
+def snapshot(force=False):
+    CACHE.mkdir(mode=0o755, parents=True, exist_ok=True)
+    path = CACHE / 'status.json'
+    with (CACHE / 'query.lock').open('a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            data = json.loads(path.read_text())
+            if not force and 0 <= time.time() - data['checkedAt'] <= MAX_AGE:
+                return data
+        except (OSError, ValueError, KeyError):
+            pass
+        # Never leave a previous successful snapshot authoritative after failure.
+        path.unlink(missing_ok=True)
+        data = refresh()
+        temporary = CACHE / 'status.json.new'
+        temporary.write_text(json.dumps(data, indent=2) + '\n')
+        temporary.replace(path)
+        return data
+
+
+def dispatch(program, args):
+    if program == 'apt' and args == ['update']:
+        snapshot(force=True)
+        return
+    if program == 'apt' and args == ['list', '--upgradable']:
+        data = snapshot()
+        print('Listing...')
+        for row in data['updates']:
+            if not row['ignored']:
+                print(f"{row['name']}/{row['repository']} {row['availableVersion']} {row['architecture']} [upgradable from: {row['currentVersion']}]")
+        return
+    if program == 'apt' and args == ['dist-upgrade', '-s']:
+        for row in snapshot()['transactionPreview']:
+            print(f"Inst {row['name']} ({row['version']} arch [{row['architecture']}])")
+        return
+    if program == 'apt-cache' and len(args) == 2 and args[0] == 'show' and TOKEN.fullmatch(args[1]) and not args[1].startswith('-'):
+        for row in snapshot()['updates']:
+            if row['name'] == args[1]:
+                print(f"Package: {row['name']}\nVersion: {row['availableVersion']}\nSize: {row['size']}\nDescription: {row['description']}")
+                return
+        raise RuntimeError('Package is not in the current update inventory')
+    if program == 'dgx-arch-package-status' and args in ([], ['--refresh']):
+        print(json.dumps(snapshot(force=bool(args)), indent=2))
+        return
+    raise RuntimeError('Unsupported operation: this Dashboard adapter only reads Arch package status; Ubuntu install/update/reboot is unavailable')
+
+
+if __name__ == '__main__':
+    try:
+        dispatch(Path(sys.argv[0]).name, sys.argv[1:])
+    except (OSError, RuntimeError, ValueError, KeyError, subprocess.TimeoutExpired) as error:
+        print(f'DGX Arch package status: {error}', file=sys.stderr)
+        sys.exit(1)
