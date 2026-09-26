@@ -139,12 +139,16 @@ elif [[ $RCLONE_STATUS -ne 0 ]]; then
   exit 1
 fi
 
+REMOTE_DB_FILE=""
 if grep -qx 'omarchy\.db' <<<"$REMOTE_LISTING"; then
   # bsdtar, not tar: the database is compressed and GNU tar will not detect that
   # on a pipe. repo-add has used both gzip and zstd, so let libarchive decide.
   REMOTE_DB_FILE=$(mktemp)
   trap 'rm -f "$REMOTE_DB_FILE"' EXIT
-  rclone cat "$REMOTE/$DESTINATION_DIRECTORY/omarchy.db" --s3-no-head >"$REMOTE_DB_FILE" 2>/dev/null
+  if ! rclone cat "$REMOTE/$DESTINATION_DIRECTORY/omarchy.db" --s3-no-head >"$REMOTE_DB_FILE" 2>/dev/null; then
+    print_error "Cannot download the remote repository database"
+    exit 1
+  fi
 
   if ! command -v bsdtar >/dev/null 2>&1; then
     print_error "bsdtar is not installed"
@@ -190,6 +194,54 @@ if grep -qx 'omarchy\.db' <<<"$REMOTE_LISTING"; then
   fi
 fi
 
+# A package filename is immutable. Comparing the current and outgoing database
+# digests catches a same-version rebuild before --ignore-existing silently
+# keeps the old object while the new database advertises different bytes.
+db_manifest() {
+  bsdtar -xOf "$1" 2>/dev/null | awk '
+    function emit() {
+      if (filename != "" && size != "" && digest != "")
+        printf "%s\t%s\t%s\n", filename, size, digest
+      filename = size = digest = ""
+    }
+    $0 == "%FILENAME%" { emit(); getline; filename = $0 }
+    $0 == "%CSIZE%" { getline; size = $0 }
+    $0 == "%SHA256SUM%" { getline; digest = $0 }
+    END { emit() }
+  '
+}
+
+LOCAL_DB="$REPO_DIR/omarchy.db"
+if [[ ! -f "$LOCAL_DB" ]]; then
+  print_error "Local repository database not found: $LOCAL_DB"
+  exit 1
+fi
+LOCAL_MANIFEST=$(db_manifest "$LOCAL_DB")
+if [[ -z "$LOCAL_MANIFEST" ]]; then
+  print_error "Local repository database has no readable package checksums"
+  exit 1
+fi
+
+declare -A REMOTE_DIGEST
+if [[ -n "$REMOTE_DB_FILE" ]]; then
+  REMOTE_MANIFEST=$(db_manifest "$REMOTE_DB_FILE")
+  if [[ -z "$REMOTE_MANIFEST" ]]; then
+    print_error "Remote repository database has no readable package checksums"
+    exit 1
+  fi
+  while IFS=$'\t' read -r filename size digest; do
+    REMOTE_DIGEST["$filename"]="$digest"
+  done <<<"$REMOTE_MANIFEST"
+fi
+
+while IFS=$'\t' read -r filename size digest; do
+  if [[ -n "${REMOTE_DIGEST[$filename]+x}" && "${REMOTE_DIGEST[$filename]}" != "$digest" ]]; then
+    print_error "Published filename has a different checksum in the outgoing database: $filename"
+    echo "Bump pkgrel and rebuild instead of replacing bytes under an existing filename."
+    exit 1
+  fi
+done <<<"$LOCAL_MANIFEST"
+
 # Upload packages first, database last, so the remote never advertises a package
 # it does not yet have.
 #
@@ -233,6 +285,31 @@ else
     exit 1
   fi
 fi
+
+# Check the objects actually served after upload, before publishing the new
+# database. One remote listing gives the sizes of all current package files;
+# this also catches an existing mirror drift such as #618 on a re-run.
+REMOTE_SIZES=$(rclone lsf "$REMOTE/$DESTINATION_DIRECTORY/" \
+  --s3-no-head --files-only --format sp --separator $'\t' 2>&1)
+RCLONE_STATUS=$?
+if [[ $RCLONE_STATUS -ne 0 ]]; then
+  print_error "Cannot list remote package sizes (rclone exit $RCLONE_STATUS)"
+  echo "$REMOTE_SIZES"
+  exit 1
+fi
+declare -A SERVED_SIZE
+while IFS=$'\t' read -r size filename; do
+  [[ -n "$filename" ]] && SERVED_SIZE["$filename"]="$size"
+done <<<"$REMOTE_SIZES"
+
+while IFS=$'\t' read -r filename size digest; do
+  if [[ -z "${SERVED_SIZE[$filename]+x}" || "${SERVED_SIZE[$filename]}" != "$size" ]]; then
+    print_error "Remote package size does not match the outgoing database: $filename"
+    echo "  Database: $size bytes; remote: ${SERVED_SIZE[$filename]:-missing}"
+    echo "Resolve the object/database mismatch before publishing the database."
+    exit 1
+  fi
+done <<<"$LOCAL_MANIFEST"
 
 # Then sync database files last to ensure repository integrity
 print_info "Updating repository database..."
