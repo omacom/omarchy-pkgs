@@ -43,6 +43,20 @@ reference_arch() {
   published_arches | head -1
 }
 
+# Architectures a merge to master builds and publishes: bin/build-matrix plans
+# a PR build for each one a package supports, and publish.yml ships them. This
+# is independent of PUBLISHED_ARCHES, so anything deciding what a merge has to
+# rebuild (bin/sync-rebuilds) follows this list. CI_ARCHES overrides it.
+CI_ARCHES="${CI_ARCHES:-x86_64 aarch64}"
+
+ci_arches() {
+  local arch
+  for arch in $CI_ARCHES; do
+    require_valid_arch "$arch"
+    echo "$arch"
+  done
+}
+
 # Scheduled-pipeline state, one file per channel and architecture, so one
 # architecture's queue or backoff never gates another's.
 STATE_DIR="${OMARCHY_STATE_DIR:-/root/.state}"
