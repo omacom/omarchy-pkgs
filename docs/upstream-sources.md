@@ -231,6 +231,8 @@ These packages were already excluded from automatic AUR updates. The migration p
 
 `cua-driver-bin` is a deliberate hold: Omarchy bumps it by hand, so a Cua release ships only when a maintainer has verified it. It keeps its `.omarchy/upstream.sh` hook and `min_release_age`, so lifting the hold means removing `"sync": false`. `cua-hyprland-plugin` declares no upstream source, so no automation updates it either.
 
+`linux-sp11` is a deliberate hold: the Microsoft Surface Pro 11 kernel, pinned by hand like `linux-aurora` to a turbineBMW/linux commit (branch `sp11/v7.3`: mainline plus the Surface Pro 11 series), and bumped only after booting on a Surface Pro 11.
+
 ## Package-specific boundaries
 
 - NVIDIA watches remain on the 580 driver branch.
