@@ -68,6 +68,7 @@ Watch it with `journalctl -u omarchy-controller -f` on the box.
   different bytes under an existing name, accept identical bytes, upload
   packages then signatures then the db.
 - aarch64 under QEMU with credential-preserving binfmt.
+- The binfmt image is pinned by reviewed digest in both the Docker helper and cloud-init; update both references together. Run privileged registration on disposable builders without reusable credentials.
 - Vouch gate: collaborators, `.github/VOUCHED.td`, or the `build-approved`
   label; denounced authors cannot be overridden by the label.
 - Tests run on PRs only; `result`, `self-tests`, `build-isolation` are the
