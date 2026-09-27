@@ -121,4 +121,32 @@ thresholds 60 90
 ! grep -l 'charge' "$package_dir"/*.service >/dev/null 2>&1 ||
   fail "no boot-time service imposes a charge window"
 
+# CPU power: each profile caps every policy at the nearest supported frequency.
+cpufreq="$scratch/cpufreq"
+for policy in policy0 policy4; do
+  mkdir -p "$cpufreq/$policy"
+  printf '710400\n' >"$cpufreq/$policy/cpuinfo_min_freq"
+  printf '3417600\n' >"$cpufreq/$policy/cpuinfo_max_freq"
+  printf '710400 1920000 2515200 3417600\n' >"$cpufreq/$policy/scaling_available_frequencies"
+  printf '710400\n' >"$cpufreq/$policy/scaling_min_freq"
+  printf '3417600\n' >"$cpufreq/$policy/scaling_max_freq"
+done
+cpu_profile() {
+  printf '%s\n' "$1" >"$scratch/profile"
+  SP11_CPUFREQ_ROOT="$cpufreq" SP11_PLATFORM_PROFILE_PATH="$scratch/profile" \
+    python "$package_dir/surface-pro-11-power-profile-cpufreq" --apply-once >/dev/null
+  cat "$cpufreq/policy0/scaling_max_freq" "$cpufreq/policy4/scaling_max_freq" | sort -u
+}
+[[ $(cpu_profile low-power) == 1920000 ]] || fail "power-saver caps the CPUs at 1.92 GHz"
+[[ $(cpu_profile balanced) == 2515200 ]] || fail "balanced caps the CPUs at 2.52 GHz"
+[[ $(cpu_profile performance) == 3417600 ]] || fail "performance restores the full range"
+printf 'quiet\n' >"$scratch/profile"
+if SP11_CPUFREQ_ROOT="$cpufreq" SP11_PLATFORM_PROFILE_PATH="$scratch/profile" \
+  python "$package_dir/surface-pro-11-power-profile-cpufreq" --apply-once >/dev/null 2>&1; then
+  fail "an unknown profile is rejected rather than guessed"
+fi
+
+grep -qx 'ConditionFirmware=device-tree-compatible(microsoft,denali-oled)' "$package_dir/surface-pro-11-power-profile-cpufreq.service" ||
+  fail "the CPU limit service runs only on the Surface Pro 11 OLED"
+
 echo "ok - surface-pro-11-support verifies its hardware setup"
