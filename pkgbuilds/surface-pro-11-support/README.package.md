@@ -14,6 +14,7 @@ The package contains no Microsoft or Qualcomm DSP firmware; `qcom-firmware-extra
 - **Battery**: after resume, a sleep hook writes the currently set charge thresholds back to the battery manager, which can lose them across suspend. It never chooses a limit: UPower or Omarchy's power settings do. With no limit set, it does nothing. The kernel driver restores the thresholds itself when the battery-manager service restarts.
 - **Bluetooth**: the WCN7850 stays an unconfigured controller until given a public address. A udev rule starts `surface-pro-11-bluetooth-address@<hci>.service` for each Qualcomm UART controller. The service sets the firmware's Wi-Fi address (`MacAddressEmulationAddress`) minus one, which is the identity Windows uses and the Flex Keyboard bonds to. Override it with `SP11_BLUETOOTH_PUBLIC_ADDRESS` in `/etc/surface-pro-11-bluetooth-address.conf`.
 - **CPU power**: `surface-pro-11-power-profile-cpufreq.service` caps the CPU clusters per power profile (1.92 GHz power-saver, 2.52 GHz balanced, full range for performance), because the firmware profile alone does not limit short loads. It follows power-profiles-daemon, which needs `power-profiles-daemon-surface-pro-11` to see the Surface's platform profile.
+- **Pen and touch**: the touch controller resets its firmware on resume, and a running iptsd never recovers. A sleep hook stops iptsd before suspend and starts it again after.
 
 Every service and sleep hook checks for the `microsoft,denali-oled` device tree and does nothing elsewhere.
 
