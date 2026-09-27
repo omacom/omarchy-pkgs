@@ -93,4 +93,32 @@ grep -q 'DRIVERS=="hci_uart_qca".*SYSTEMD_WANTS}+="surface-pro-11-bluetooth-addr
   <(tr -d '\\\n' <"$package_dir/60-surface-pro-11-bluetooth-address.rules") ||
   fail "each Qualcomm UART Bluetooth controller gets its own address service"
 
+# Every hook acts only on the Surface Pro 11 OLED.
+printf 'microsoft,denali-oled\0microsoft,denali\0qcom,x1e80100\0' >"$scratch/denali"
+printf 'lenovo,yoga-slim7x\0qcom,x1e80100\0' >"$scratch/other"
+
+# Battery: after resume the thresholds already set are written back unchanged.
+battery="$scratch/qcom-battmgr-bat"
+mkdir -p "$battery"
+charge_sleep() {
+  SP11_CHARGE_LIMIT_SYSFS="$battery" SP11_CHARGE_LIMIT_COMPATIBLE="$scratch/$1" \
+    bash "$package_dir/surface-pro-11-charge-limit-sleep" "${@:2}"
+}
+thresholds() {
+  printf '%s\n' "$1" >"$battery/charge_control_start_threshold"
+  printf '%s\n' "$2" >"$battery/charge_control_end_threshold"
+}
+thresholds 60 90
+[[ $(charge_sleep denali post suspend) == *"restored start=60 end=90" ]] ||
+  fail "a user-chosen charge window is written back as set after resume"
+[[ $(<"$battery/charge_control_start_threshold") == 60 && $(<"$battery/charge_control_end_threshold") == 90 ]] ||
+  fail "the charge window is never replaced"
+thresholds 0 100
+[[ -z $(charge_sleep denali post suspend) ]] || fail "with no charge limit set, nothing is written"
+thresholds 60 90
+[[ -z $(charge_sleep other post suspend) ]] || fail "the charge hook does nothing on other hardware"
+[[ -z $(charge_sleep denali pre suspend) ]] || fail "the charge hook acts only after resume"
+! grep -l 'charge' "$package_dir"/*.service >/dev/null 2>&1 ||
+  fail "no boot-time service imposes a charge window"
+
 echo "ok - surface-pro-11-support verifies its hardware setup"
