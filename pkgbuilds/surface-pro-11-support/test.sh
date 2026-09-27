@@ -61,4 +61,36 @@ grep -Fq 'api.libcamera.path = "/base/soc@0/cci@ac15000/i2c-bus@0/camera@60"' "$
 ! grep -q 'monitor.v4l2.rules' "$package_dir/50-surface-pro-11-cameras.conf" ||
   fail "V4L2 devices are not disabled; in WirePlumber 0.5 that stalls camera discovery"
 
+# Bluetooth: the controller gets the firmware Wi-Fi address minus one.
+efivars="$scratch/efivars"
+bin="$scratch/bin"
+mkdir -p "$efivars" "$bin"
+cat >"$bin/btmgmt" <<'STUB'
+#!/bin/bash
+state="$BTMGMT_STATE"
+case "$*" in
+  info) [[ -f $state ]] && printf 'hci0:\tPrimary controller\n\taddr %s version 13\n' "$(<"$state")" ;;
+  config) printf 'hci0:\tUnconfigured controller\n' ;;
+  "--index hci0 public-addr "*) printf '%s\n' "${*: -1}" >"$state" ;;
+esac
+STUB
+chmod +x "$bin/btmgmt"
+bluetooth_address() {
+  printf '\x07\x00\x00\x00'"$1" >"$efivars/MacAddressEmulationAddress-test"
+  rm -f "$scratch/btmgmt.state"
+  PATH="$bin:$PATH" BTMGMT_STATE="$scratch/btmgmt.state" SP11_BLUETOOTH_EFIVARS="$efivars" \
+    bash "$package_dir/surface-pro-11-bluetooth-address" hci0 >/dev/null
+  cat "$scratch/btmgmt.state"
+}
+[[ $(bluetooth_address '\xc4\xcb\x76\xa1\xab\x85') == "C4:CB:76:A1:AB:84" ]] ||
+  fail "the Bluetooth address is the firmware Wi-Fi address minus one"
+[[ $(bluetooth_address '\xc4\xcb\x76\xa1\xac\x00') == "C4:CB:76:A1:AB:FF" ]] ||
+  fail "the Bluetooth address borrows across octets"
+
+grep -qx 'ConditionFirmware=device-tree-compatible(microsoft,denali-oled)' "$package_dir/surface-pro-11-bluetooth-address@.service" ||
+  fail "the Bluetooth address service runs only on the Surface Pro 11 OLED"
+grep -q 'DRIVERS=="hci_uart_qca".*SYSTEMD_WANTS}+="surface-pro-11-bluetooth-address@%k.service"' \
+  <(tr -d '\\\n' <"$package_dir/60-surface-pro-11-bluetooth-address.rules") ||
+  fail "each Qualcomm UART Bluetooth controller gets its own address service"
+
 echo "ok - surface-pro-11-support verifies its hardware setup"

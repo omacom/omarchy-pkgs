@@ -11,11 +11,15 @@ The package contains no Microsoft or Qualcomm DSP firmware; `qcom-firmware-extra
   - The AudioReach topology (`qcom/x1e80100/X1E80100-Microsoft-Surface-Pro-11-tplg.bin`), built from `X1E80100-Microsoft-Surface-Pro-11.m4` against pinned `linux-msm/audioreach-topology` source and checked against the SHA-256 of the binary validated on the device.
   - ALSA UCM routing for speakers and microphones, derived from alsa-ucm-conf's Surface Pro 12in profile and linked from `conf.d/x1e80100/` by card name and by DMI identity. It sets a fixed hardware ceiling and leaves volume to software attenuation.
 - **Cameras**: a WirePlumber rule that hides the monochrome infrared sensor from camera pickers, so apps see only the front and back cameras (provided by libcamera through `pipewire-libcamera`).
+- **Bluetooth**: the WCN7850 stays an unconfigured controller until given a public address. A udev rule starts `surface-pro-11-bluetooth-address@<hci>.service` for each Qualcomm UART controller. The service sets the firmware's Wi-Fi address (`MacAddressEmulationAddress`) minus one, which is the identity Windows uses and the Flex Keyboard bonds to. Override it with `SP11_BLUETOOTH_PUBLIC_ADDRESS` in `/etc/surface-pro-11-bluetooth-address.conf`.
+
+Every service and sleep hook checks for the `microsoft,denali-oled` device tree and does nothing elsewhere.
 
 ## Retirement
 
 - Board data: drop once linux-firmware carries a Surface Pro 11 entry, selected by a `qcom,calibration-variant` in the Denali device tree.
 - Topology and UCM: drop once audioreach-topology and alsa-ucm-conf ship Surface Pro 11 profiles. alsa-ucm-conf shipping `MICROSOFT-Surface-Pro-11.conf` would conflict with this package's file, so drop the UCM here first.
+- Bluetooth: drop once the Denali device tree provides `local-bd-address` or the firmware supplies a public address.
 
 ## Licences
 

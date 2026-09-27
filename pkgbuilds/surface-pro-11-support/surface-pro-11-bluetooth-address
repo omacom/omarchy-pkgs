@@ -1,0 +1,123 @@
+#!/bin/bash
+
+# Configure the Surface Pro 11 Bluetooth controller from a validated public
+# address. WCN7850 appears as an unconfigured HCI controller until its public
+# address is supplied through the BlueZ management interface.
+
+set -euo pipefail
+
+hci_name=${1:?usage: surface-pro-11-bluetooth-address hciN}
+
+if [[ ! "$hci_name" =~ ^hci[0-9]+$ ]]; then
+  printf 'Invalid Bluetooth controller name: %s\n' "$hci_name" >&2
+  exit 2
+fi
+
+for command_name in btmgmt grep sleep; do
+  if ! command -v "$command_name" >/dev/null 2>&1; then
+    printf 'Required command is unavailable: %s\n' "$command_name" >&2
+    exit 1
+  fi
+done
+
+is_valid_unicast_hex() {
+  local address_hex="$1"
+  local first_octet
+
+  [[ "$address_hex" =~ ^[0-9A-F]{12}$ ]] || return 1
+  [[ "$address_hex" != 000000000000 && "$address_hex" != FFFFFFFFFFFF ]] || return 1
+
+  first_octet="${address_hex:0:2}"
+  (( (16#$first_octet & 1) == 0 ))
+}
+
+public_address="${SP11_BLUETOOTH_PUBLIC_ADDRESS:-}"
+if [[ -n "$public_address" ]]; then
+  public_address="${public_address^^}"
+  public_address_hex="${public_address//:/}"
+
+  if [[ ! "$public_address" =~ ^([0-9A-F]{2}:){5}[0-9A-F]{2}$ ]] || \
+    ! is_valid_unicast_hex "$public_address_hex"; then
+    echo 'SP11_BLUETOOTH_PUBLIC_ADDRESS is not a valid unicast MAC address' >&2
+    exit 2
+  fi
+
+  address_source='configured override'
+else
+  for command_name in find od tr; do
+    if ! command -v "$command_name" >/dev/null 2>&1; then
+      printf 'Required command is unavailable: %s\n' "$command_name" >&2
+      exit 1
+    fi
+  done
+
+  efi_path="$(find "${SP11_BLUETOOTH_EFIVARS:-/sys/firmware/efi/efivars}" -maxdepth 1 \
+    -name 'MacAddressEmulationAddress-*' -print -quit)"
+  if [[ -z "$efi_path" ]]; then
+    echo 'MacAddressEmulationAddress EFI variable is unavailable' >&2
+    exit 1
+  fi
+
+  # efivarfs prepends a four-byte attributes field to the address bytes.
+  efi_hex="$(od -An -tx1 -j4 -N6 "$efi_path" | tr -d ' \n' | \
+    tr '[:lower:]' '[:upper:]')"
+  if ! is_valid_unicast_hex "$efi_hex"; then
+    echo 'Firmware EFI variable does not contain a valid unicast address' >&2
+    exit 1
+  fi
+  # The EFI value is the Wi-Fi MAC. The Bluetooth identity, which Windows
+  # uses and the Flex Keyboard bonds to, is one lower.
+  printf -v bt_hex '%012X' $(( 16#$efi_hex - 1 ))
+  if ! is_valid_unicast_hex "$bt_hex"; then
+    echo 'Derived Bluetooth address is not a valid unicast address' >&2
+    exit 1
+  fi
+  printf -v public_address '%s:%s:%s:%s:%s:%s' \
+    "${bt_hex:0:2}" "${bt_hex:2:2}" "${bt_hex:4:2}" \
+    "${bt_hex:6:2}" "${bt_hex:8:2}" "${bt_hex:10:2}"
+  address_source='firmware Wi-Fi address minus one'
+fi
+
+# The standard Bluetooth udev rule starts bluetooth.target only after hci0 is
+# present.  Leave a short bounded poll for the management event to arrive.
+for ((attempt = 0; attempt < 50; attempt++)); do
+  controller_info="$(btmgmt info 2>/dev/null || :)"
+  if grep -q "^${hci_name}:" <<<"$controller_info"; then
+    if ! grep -Fq "addr $public_address" <<<"$controller_info"; then
+      printf '%s is already configured with a different public address; reboot required\n' \
+        "$hci_name" >&2
+      exit 1
+    fi
+
+    printf '%s is already configured\n' "$hci_name"
+    exit 0
+  fi
+
+  if btmgmt config 2>/dev/null | \
+    grep -q "^${hci_name}:.*Unconfigured controller"; then
+    btmgmt --index "$hci_name" public-addr "$public_address"
+
+    # Set Public Address completes before the controller's asynchronous
+    # reset, firmware reload, and configured-index event have finished.
+    # WCN7850 takes about two seconds on this machine, so wait for the
+    # resulting primary index instead of treating that interval as failure.
+    for ((ready_attempt = 0; ready_attempt < 100; ready_attempt++)); do
+      if btmgmt info 2>/dev/null | grep -q "^${hci_name}:"; then
+        printf 'Configured %s public address from the %s\n' \
+          "$hci_name" "$address_source"
+        exit 0
+      fi
+
+      sleep 0.1
+    done
+
+    echo 'Controller remained unconfigured after setting its address' >&2
+    exit 1
+  fi
+
+  sleep 0.1
+done
+
+printf '%s did not appear in the Bluetooth management interface\n' \
+  "$hci_name" >&2
+exit 1
