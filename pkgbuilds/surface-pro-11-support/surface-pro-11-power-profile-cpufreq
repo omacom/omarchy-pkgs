@@ -1,0 +1,299 @@
+#!/usr/bin/python3
+"""Apply three-tier SP11 CPU-frequency ceilings for power profiles.
+
+The SP11 Surface platform-profile driver exposes the real SAM/EC profile at
+/sys/class/platform-profile/platform-profile-0/profile.  The firmware profile
+does not currently impose an observable short-load CPU-frequency limit, so this
+small companion applies explicit power-saver and balanced ceilings to every
+SCMI cpufreq policy.  Performance restores each policy's hardware maximum.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+from pathlib import Path
+import signal
+import sys
+import time
+
+
+PROFILE_PATH = Path(
+    os.environ.get(
+        "SP11_PLATFORM_PROFILE_PATH",
+        "/sys/class/platform-profile/platform-profile-0/profile",
+    )
+)
+CPUFREQ_ROOT = Path(
+    os.environ.get("SP11_CPUFREQ_ROOT", "/sys/devices/system/cpu/cpufreq")
+)
+POWER_SAVER_TARGET_KHZ = int(
+    os.environ.get("SP11_POWER_SAVER_MAX_KHZ", "1920000")
+)
+BALANCED_TARGET_KHZ = int(
+    os.environ.get("SP11_BALANCED_MAX_KHZ", "2515200")
+)
+POWER_SAVER_PROFILES = frozenset(("low-power", "power-saver"))
+BALANCED_PROFILES = frozenset(
+    ("balanced", "balanced-performance", "balanced_performance")
+)
+PERFORMANCE_PROFILES = frozenset(("performance",))
+PPD_BUS_NAME = "org.freedesktop.UPower.PowerProfiles"
+PPD_OBJECT_PATH = "/org/freedesktop/UPower/PowerProfiles"
+PPD_INTERFACE = "org.freedesktop.UPower.PowerProfiles"
+DBUS_PROPERTIES_INTERFACE = "org.freedesktop.DBus.Properties"
+stop_requested = False
+
+
+def read_text(path: Path) -> str:
+    return path.read_text(encoding="ascii").strip()
+
+
+def write_and_verify(path: Path, value: int) -> None:
+    """Submit our request, then check the aggregate ceiling, not equality.
+
+    A thermal/boost QoS request may keep the effective maximum below ours.
+    Always write: even an equal readback can hide a different user request.
+    """
+    with path.open("w", encoding="ascii") as output:
+        output.write(f"{value}\n")
+    actual = -1
+    for _attempt in range(10):
+        actual = int(read_text(path))
+        if 0 < actual <= value:
+            return
+        time.sleep(0.05)
+    raise RuntimeError(
+        f"{path.parent.name}: requested {value} kHz but read back {actual} kHz"
+    )
+
+
+def policies() -> list[Path]:
+    result = sorted(
+        CPUFREQ_ROOT.glob("policy[0-9]*"),
+        key=lambda path: int(path.name.removeprefix("policy")),
+    )
+    if not result:
+        raise RuntimeError(f"no cpufreq policies found under {CPUFREQ_ROOT}")
+    return result
+
+
+def profile_target(profile: str) -> int | None:
+    if profile in POWER_SAVER_PROFILES:
+        return POWER_SAVER_TARGET_KHZ
+    if profile in BALANCED_PROFILES:
+        return BALANCED_TARGET_KHZ
+    if profile in PERFORMANCE_PROFILES:
+        return None
+    raise RuntimeError(f"unsupported power profile: {profile!r}")
+
+
+def policy_limit(policy: Path, target_khz: int | None) -> int:
+    hardware_max = int(read_text(policy / "cpuinfo_max_freq"))
+    if target_khz is None:
+        return hardware_max
+
+    available_path = policy / "scaling_available_frequencies"
+    if available_path.exists():
+        available = sorted(int(value) for value in read_text(available_path).split())
+        candidates = [
+            value for value in available if value <= target_khz and value <= hardware_max
+        ]
+        if not candidates:
+            raise RuntimeError(
+                f"{policy.name}: no supported frequency at or below "
+                f"{target_khz} kHz"
+            )
+        return candidates[-1]
+
+    hardware_min = int(read_text(policy / "cpuinfo_min_freq"))
+    return max(hardware_min, min(hardware_max, target_khz))
+
+
+def apply_limits(planned: list[tuple[Path, int]]) -> list[str]:
+    """Apply a preflighted plan, restoring prior effective ceilings on error.
+
+    Sysfs exposes aggregate limits, not the underlying user QoS requests.
+    Rollback is therefore conservative: it may retain an observed lower cap.
+    """
+    previous = {
+        policy: int(read_text(policy / "scaling_max_freq"))
+        for policy, _limit in planned
+    }
+    if any(value <= 0 for value in previous.values()):
+        raise RuntimeError("cannot snapshot a non-positive CPU frequency limit")
+    attempted: list[Path] = []
+    applied: list[str] = []
+    try:
+        for policy, limit in planned:
+            # Include a failing write: the kernel may have accepted the request
+            # before its readback failed.
+            attempted.append(policy)
+            write_and_verify(policy / "scaling_max_freq", limit)
+            actual = int(read_text(policy / "scaling_max_freq"))
+            applied.append(f"{policy.name}={actual}")
+    except (OSError, RuntimeError, ValueError) as error:
+        rollback_errors = []
+        for policy in reversed(attempted):
+            try:
+                write_and_verify(policy / "scaling_max_freq", previous[policy])
+            except (OSError, RuntimeError, ValueError) as rollback_error:
+                rollback_errors.append(f"{policy.name}: {rollback_error}")
+        if rollback_errors:
+            raise RuntimeError(
+                f"apply failed: {error}; rollback incomplete: "
+                + "; ".join(rollback_errors)
+            ) from error
+        raise
+    return applied
+
+
+def apply(profile: str | None = None) -> None:
+    if profile is None:
+        profile = read_text(PROFILE_PATH)
+    target_khz = profile_target(profile)
+    planned: list[tuple[Path, int]] = []
+
+    for policy in policies():
+        limit = policy_limit(policy, target_khz)
+        minimum = int(read_text(policy / "scaling_min_freq"))
+        if minimum > limit:
+            raise RuntimeError(
+                f"{policy.name}: scaling_min_freq {minimum} exceeds requested "
+                f"maximum {limit} kHz"
+            )
+        planned.append((policy, limit))
+
+    applied = apply_limits(planned)
+
+    mode = "full-range" if target_khz is None else f"capped-at-{target_khz}"
+    print(f"profile={profile} mode={mode} " + " ".join(applied), flush=True)
+
+
+def restore() -> None:
+    applied: list[str] = []
+    errors: list[str] = []
+    for policy in policies():
+        try:
+            maximum = int(read_text(policy / "cpuinfo_max_freq"))
+            write_and_verify(policy / "scaling_max_freq", maximum)
+            actual = int(read_text(policy / "scaling_max_freq"))
+            applied.append(f"{policy.name}={actual}")
+        except (OSError, RuntimeError, ValueError) as error:
+            errors.append(f"{policy.name}: {error}")
+    if errors:
+        raise RuntimeError("restore incomplete: " + "; ".join(errors))
+    print("restored " + " ".join(applied), flush=True)
+
+
+def request_stop(_signum: int, _frame: object) -> None:
+    global stop_requested
+    stop_requested = True
+
+
+def watch() -> None:
+    global stop_requested
+    stop_requested = False
+    import dbus
+    from dbus.mainloop.glib import DBusGMainLoop
+    from gi.repository import GLib
+
+    DBusGMainLoop(set_as_default=True)
+    bus = dbus.SystemBus()
+    loop = GLib.MainLoop()
+
+    def active_profile() -> str:
+        remote = bus.get_object(PPD_BUS_NAME, PPD_OBJECT_PATH)
+        properties = dbus.Interface(remote, DBUS_PROPERTIES_INTERFACE)
+        return str(properties.Get(PPD_INTERFACE, "ActiveProfile"))
+
+    def properties_changed(
+        _interface: object, changed: object, _invalidated: object
+    ) -> None:
+        if "ActiveProfile" in changed:
+            try:
+                apply(str(changed["ActiveProfile"]))
+            except (OSError, RuntimeError, ValueError) as error:
+                print(f"surface-pro-11-power-profile-cpufreq: {error}", file=sys.stderr, flush=True)
+
+    def apply_after_restart() -> bool:
+        try:
+            apply(active_profile())
+        except (dbus.DBusException, OSError, RuntimeError, ValueError) as error:
+            print(
+                f"surface-pro-11-power-profile-cpufreq: restart apply: {error}",
+                file=sys.stderr,
+                flush=True,
+            )
+        return GLib.SOURCE_REMOVE
+
+    def name_owner_changed(_name: object, _old_owner: object, new_owner: object) -> None:
+        if str(new_owner):
+            GLib.timeout_add(100, apply_after_restart)
+
+    def stop_loop(signum: int, frame: object) -> None:
+        request_stop(signum, frame)
+        loop.quit()
+
+    signal.signal(signal.SIGTERM, stop_loop)
+    signal.signal(signal.SIGINT, stop_loop)
+    bus.add_signal_receiver(
+        properties_changed,
+        signal_name="PropertiesChanged",
+        dbus_interface=DBUS_PROPERTIES_INTERFACE,
+        path=PPD_OBJECT_PATH,
+        arg0=PPD_INTERFACE,
+    )
+    bus.add_signal_receiver(
+        name_owner_changed,
+        signal_name="NameOwnerChanged",
+        dbus_interface="org.freedesktop.DBus",
+        path="/org/freedesktop/DBus",
+        arg0=PPD_BUS_NAME,
+    )
+    try:
+        apply(active_profile())
+        loop.run()
+    finally:
+        # Keep rollback limits on an application/startup failure. Only an
+        # intentional stop should remove our profile ceilings.
+        if stop_requested:
+            restore()
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    actions = parser.add_mutually_exclusive_group()
+    actions.add_argument("--watch", action="store_const", const="watch", dest="action")
+    actions.add_argument(
+        "--apply-once", action="store_const", const="apply-once", dest="action"
+    )
+    actions.add_argument(
+        "--restore", action="store_const", const="restore", dest="action"
+    )
+    actions.add_argument(
+        "--restore-after-stop", action="store_const", const="restore-after-stop",
+        dest="action",
+    )
+    args = parser.parse_args()
+
+    action = args.action or "watch"
+
+    try:
+        if action == "watch":
+            watch()
+        elif action == "restore":
+            restore()
+        elif action == "restore-after-stop":
+            if os.environ.get("SERVICE_RESULT") == "success":
+                restore()
+        else:
+            apply()
+    except (OSError, RuntimeError, ValueError) as error:
+        print(f"surface-pro-11-power-profile-cpufreq: {error}", file=sys.stderr, flush=True)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
