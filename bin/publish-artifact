@@ -2,7 +2,7 @@
 # Publish built packages into one channel of the remote repository,
 # incrementally and immutably.
 #
-#   publish-artifact --mirror <edge|rc|stable> --arch <arch> <pkg files...>
+#   publish-artifact --mirror <edge|rc|stable> --arch <arch> --manifest <file> <pkg files...>
 #
 # What it does, in order:
 #   1. pull the channel's current database from the remote
@@ -27,17 +27,20 @@ source "$BUILD_ROOT/helpers/paths.sh"
 REMOTE=${REMOTE:-pkgs.omarchy.org:omarchy-pkgs}
 PREFIX=${OMARCHY_PUBLISH_PREFIX:-}
 FILES=()
+MANIFEST=""
 while [[ $# -gt 0 ]]; do
   case $1 in
   --mirror) MIRROR=$2; require_valid_mirror "$MIRROR"; shift 2 ;;
   --arch) ARCH=$2; require_valid_arch "$ARCH"; shift 2 ;;
   --remote) REMOTE=$2; shift 2 ;;
+  --manifest) MANIFEST=$2; shift 2 ;;
   -h|--help) sed -n '2,22p' "$0"; exit 0 ;;
   -*) print_error "Unknown option: $1"; exit 1 ;;
   *) FILES+=("$1"); shift ;;
   esac
 done
 (( ${#FILES[@]} )) || { print_error "No package files given"; exit 1; }
+[[ -n $MANIFEST && -f $MANIFEST && ! -L $MANIFEST ]] || { print_error "A host-approved package manifest is required"; exit 1; }
 : "${GPG_PRIVATE_KEY:?}"; GPG_PASSPHRASE=${GPG_PASSPHRASE-}
 
 DEST="$REMOTE/${PREFIX:+$PREFIX/}$MIRROR/$ARCH"
@@ -45,19 +48,24 @@ WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
 print_header "Publish to $DEST"
 
-# --- 0. sanity: every file is a package, named as makepkg names it ---------
+# Snapshot only the explicit inputs, then validate the entire approved job set
+# before loading the signing key or contacting the remote. Builders cannot
+# choose the policy or enroll unrelated archives by dropping them in staging.
+mkdir -p "$WORK/repo"
+cp -P -- "$MANIFEST" "$WORK/manifest.json"
 for f in "${FILES[@]}"; do
-  [[ -f "$f" && "$f" == *.pkg.tar.* && "$f" != *.sig ]] || { print_error "Not a package file: $f"; exit 1; }
-  name=$(bsdtar -xOf "$f" .PKGINFO | awk -F' = ' '$1=="pkgname"{print $2}')
-  ver=$(bsdtar -xOf "$f" .PKGINFO | awk -F' = ' '$1=="pkgver"{print $2}')
-  pkgarch=$(bsdtar -xOf "$f" .PKGINFO | awk -F' = ' '$1=="arch"{print $2}')
-  [[ "$(basename "$f")" == "$name-$ver-$pkgarch.pkg.tar."* ]] || {
-    print_error "Filename does not match PKGINFO ($name-$ver-$pkgarch): $(basename "$f")"; exit 1; }
-  [[ "$pkgarch" == any || "$pkgarch" == "$ARCH" ]] || { print_error "$f is $pkgarch, publishing to $ARCH"; exit 1; }
+  b=$(basename "$f")
+  [[ -f $f && ! -L $f && $b == *.pkg.tar.zst && ! -e $WORK/repo/$b ]] || {
+    print_error "Not a unique regular package file: $f"; exit 1;
+  }
+  cp -P -- "$f" "$WORK/repo/$b"
 done
+approved=$(python3 "$BUILD_ROOT/helpers/package-scope.py" verify --policy-root "$PKGBUILDS_DIR" \
+  --arch "$ARCH" --directory "$WORK/repo" --manifest "$WORK/manifest.json")
+mapfile -t FILES <<< "$approved"
+FILES=("${FILES[@]/#/$WORK/repo/}")
 
 # --- 1. pull the current database -----------------------------------------
-mkdir -p "$WORK/repo"
 listing=$(rclone lsf "$DEST/" --s3-no-head 2>/dev/null || true)
 if grep -q '^omarchy.db.tar.zst$' <<<"$listing"; then
   rclone copy "$DEST/omarchy.db.tar.zst" "$WORK/repo" --s3-no-head
@@ -93,7 +101,6 @@ echo "$GPG_PRIVATE_KEY" | gpg --batch --quiet --import
 KEY_ID=$(gpg --list-secret-keys --with-colons | awk -F: '$1=="sec"{print $5; exit}')
 [[ -n "$KEY_ID" ]] || { print_error "No secret key imported"; exit 1; }
 for f in "${FILES[@]}"; do
-  cp "$f" "$WORK/repo/"
   gpg --batch --yes --pinentry-mode loopback --passphrase "$GPG_PASSPHRASE" \
     --detach-sign --no-armor --local-user "$KEY_ID" "$WORK/repo/$(basename "$f")"
   print_step "signed $(basename "$f")"

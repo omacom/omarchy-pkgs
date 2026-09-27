@@ -1,7 +1,7 @@
-# Only the build runner is under test; source-free fixtures need no Omarchy
-# bootstrap, signing key, mirror, or production repository.
+# Source-free build and publication fixtures need no Omarchy bootstrap,
+# production signing key, mirror, or production repository.
 FROM archlinux:base-devel
-RUN pacman -Syu --noconfirm git jq sudo && \
+RUN pacman -Syu --noconfirm git jq sudo python gnupg libarchive zstd rclone && \
     useradd -m -u 1000 builder && \
     echo 'builder ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/builder && \
     printf '#!/bin/bash\nexec /usr/bin/pacman --ask 4 "$@"\n' > /usr/local/bin/pacman-for-makepkg && \

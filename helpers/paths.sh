@@ -94,6 +94,8 @@ REPO_ROOT="${OMARCHY_REPO_ROOT:-$BUILD_ROOT/pkgs.omarchy.org}"
 update_arch_paths() {
   BUILD_OUTPUT_DIR="$BUILD_ROOT/build-output/$MIRROR/$ARCH" # Unsigned packages
   REPO_DIR="$REPO_ROOT/$MIRROR/$ARCH"                       # Repository (signed packages)
+  PUBLICATION_DIR="$BUILD_ROOT/.publication/$MIRROR/$ARCH"  # Host-owned approval, never writable by builds
+  PUBLICATION_MANIFEST="$PUBLICATION_DIR/manifest.json"
 }
 
 # Initialize architecture-specific directories with default ARCH and MIRROR

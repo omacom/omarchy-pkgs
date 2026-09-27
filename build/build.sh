@@ -15,6 +15,7 @@ DRY_RUN=${DRY_RUN:-false}
 # a fresh container. PACKAGES retains the original request for validation.
 BUILD_PACKAGE=${BUILD_PACKAGE:-}
 BUILD_PLAN_DIR=${BUILD_PLAN_DIR:-}
+JOB_OUTPUT_DIR=${JOB_OUTPUT_DIR:-}
 PKGBUILDS_DIR=${PKGBUILDS_DIR:-/pkgbuilds}
 BUILD_OUTPUT_DIR=${BUILD_OUTPUT_DIR:-/build-output/$MIRROR/$ARCH}
 FINAL_OUTPUT_DIR=${FINAL_OUTPUT_DIR:-/pkgs.omarchy.org/$MIRROR/$ARCH}
@@ -82,6 +83,16 @@ if [[ "$DRY_RUN" != true ]]; then
   if ! grep -Fxq -- "$BUILD_PACKAGE" "$BUILD_PLAN_DIR/packages"; then
     echo "Package is not in the build plan: $BUILD_PACKAGE" >&2
     exit 1
+  fi
+  # A job may consume prior artifacts, but may write only its private output.
+  # Keep the repository and plan scratch state inside this fresh container.
+  if [[ -n "$JOB_OUTPUT_DIR" ]]; then
+    staged_output="$BUILD_OUTPUT_DIR"
+    BUILD_OUTPUT_DIR=$(mktemp -d) || exit 1
+    cp -a "$staged_output/." "$BUILD_OUTPUT_DIR/" || exit 1
+    private_plan=$(mktemp -d) || exit 1
+    cp -a "$BUILD_PLAN_DIR/." "$private_plan/" || exit 1
+    BUILD_PLAN_DIR="$private_plan"
   fi
   # Import GPG keys
   /build/import-gpg-keys.sh || exit 1
@@ -443,6 +454,13 @@ build_package() {
     # outputs only after this package's entire split build has completed.
     mkdir -p "$BUILD_PLAN_DIR/artifacts" || return 1
     printf '%s\n' "${new_pkgs[@]}" > "$BUILD_PLAN_DIR/artifacts/$pkg" || return 1
+
+    if [[ -n "$JOB_OUTPUT_DIR" ]]; then
+      for pkg_file in "${new_pkgs[@]}"; do
+        cp -- "$pkg_file" "$JOB_OUTPUT_DIR/" || return 1
+      done
+      printf '%s\n' "${new_pkgs[@]}" > "$JOB_OUTPUT_DIR/.artifacts" || return 1
+    fi
 
     echo "    Successfully built $pkg"
     return 0

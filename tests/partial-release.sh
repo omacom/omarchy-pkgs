@@ -29,6 +29,8 @@ mkdir -p "$OMARCHY_BUILD_RESULT_DIR"
 : > "$OMARCHY_BUILD_RESULT_DIR/blocked"
 if [[ "$MODE" != all_failed ]]; then
   echo good-1-1-x86_64.pkg.tar.zst > "$OMARCHY_BUILD_RESULT_DIR/artifacts"
+  mkdir -p "$TEST_ROOT/.publication/edge/x86_64"
+  printf '{"jobs":[{"artifacts":[{"filename":"good-1-1-x86_64.pkg.tar.zst"}]}]}\n' > "$TEST_ROOT/.publication/edge/x86_64/manifest.json"
 fi
 touch "$OMARCHY_BUILD_RESULT_DIR/complete"
 [[ "$MODE" == success ]] && exit 0
@@ -84,7 +86,7 @@ done
 echo "depends=('bad')" >> "$TEST_ROOT/pkgbuilds/blocked/PKGBUILD"
 
 reset_case() {
-  rm -rf "$TEST_ROOT/build-output" "$TEST_ROOT/pkgs.omarchy.org" "$TEST_ROOT/state" "$TEST_ROOT/db"
+  rm -rf "$TEST_ROOT/build-output" "$TEST_ROOT/pkgs.omarchy.org" "$TEST_ROOT/state" "$TEST_ROOT/db" "$TEST_ROOT/.publication"
   mkdir -p "$TEST_ROOT/state"
   : > "$TEST_ROOT/stages"
   : > "$TEST_ROOT/signed"

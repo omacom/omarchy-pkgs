@@ -129,6 +129,7 @@ RUN pacman -Syu --noconfirm && \
         wget \
         curl \
         jq \
+        python \
         rclone \
         gnupg && \
     pacman -Scc --noconfirm && \
@@ -137,9 +138,9 @@ RUN pacman -Syu --noconfirm && \
 # makepkg cannot run as root
 RUN useradd -m -G wheel -s /bin/bash builder && \
     echo "builder ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers && \
-    mkdir -p /home/builder/.gnupg && \
+    mkdir -p /home/builder/.gnupg /src && \
     chmod 700 /home/builder/.gnupg && \
-    chown -R builder:builder /home/builder
+    chown -R builder:builder /home/builder /src
 
 # Arch Linux ARM's makepkg.conf still defaults PKGEXT to .pkg.tar.xz; every
 # tool downstream of the build (sign.sh, push-build, sync-rebuilds, the

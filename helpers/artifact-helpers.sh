@@ -27,18 +27,10 @@ pack_packages() {
   tar -cf "$out" -C "$dir" -- "${files[@]##*/}"
 }
 
-# unpack_packages <artifact dir> <dest>: the packages an unzipped artifact
-# carried, into <dest>. Packed artifacts hold packages.tar; artifacts from
-# builds before packing hold the bare files. The bare form can go once
-# those artifacts have expired (7-day retention).
+# unpack_packages <artifact dir or zip> <empty dest>: accept packed or legacy
+# bare artifacts, copying only regular package files through the checked helper.
 unpack_packages() {
-  local src=$1 dest=$2 files=()
-  mkdir -p "$dest"
-  if [[ -f "$src/packages.tar" ]]; then
-    tar -xf "$src/packages.tar" -C "$dest"
-    return 0
-  fi
-  mapfile -t files < <(package_files "$src")
-  (( ${#files[@]} )) || { echo "unpack_packages: nothing to unpack in $src" >&2; return 1; }
-  cp -- "${files[@]}" "$dest/"
+  local helper="$(realpath "${BASH_SOURCE[0]%/*}")/unpack-package-artifact.py"
+  mkdir -p "$2"
+  python3 "$helper" "$1" "$2"
 }

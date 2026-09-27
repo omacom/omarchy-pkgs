@@ -8,6 +8,7 @@ BUILD_ROOT=$(realpath "${BASH_SOURCE[0]%/*}/..")
 source "$BUILD_ROOT/helpers/message-helpers.sh"
 source "$BUILD_ROOT/helpers/docker-helpers.sh"
 source "$BUILD_ROOT/helpers/paths.sh"
+source "$BUILD_ROOT/helpers/lock-helpers.sh"
 
 print_header "Omarchy Package Builder"
 
@@ -163,6 +164,7 @@ if [[ "$DRY_RUN" == true ]]; then
 fi
 
 # Create directories if they don't exist
+acquire_release_lock || exit 1
 mkdir -p "$BUILD_OUTPUT_DIR" "$REPO_DIR" "$SRC_DIR"
 
 # Check the selected container engine is available
@@ -203,6 +205,7 @@ if [[ $KEEP_BUILD_WORKSPACE == "1" ]]; then
 else
   print_info "Cleaning build workspace..."
   rm -rf "${BUILD_OUTPUT_DIR:?}"/*
+  rm -f "$PUBLICATION_MANIFEST" "$PUBLICATION_DIR/manifest.json.sig" "$PUBLICATION_DIR/signing-key.gpg"
 fi
 mkdir -p "$BUILD_OUTPUT_DIR"
 
@@ -239,16 +242,18 @@ mkdir -p "$REPO_DIR"
 PACKAGE_CACHE_DIR="$BUILD_ROOT/cache/pacman/$MIRROR/$ARCH"
 mkdir -p "$PACKAGE_CACHE_DIR"
 PLAN_DIR=$(mktemp -d "$SRC_DIR/build-plan.XXXXXX")
-trap 'rm -rf "$PLAN_DIR"' EXIT
+install -d -m700 "$PUBLICATION_DIR"
+COLLECTED_DIR=$(mktemp -d "$PUBLICATION_DIR/build.XXXXXX")
+trap 'rm -rf -- "${PLAN_DIR:?}" "${COLLECTED_DIR:?}"' EXIT
 # Keep manifest directories host-owned so cleanup also works when Docker's
 # builder uid differs from the caller (as on GitHub runners).
-mkdir -p "$PLAN_DIR/artifacts"
+mkdir -p "$PLAN_DIR/artifacts" "$PUBLICATION_DIR"
+mkdir "$COLLECTED_DIR/artifacts"
 
 # Rootful Docker writes as the image uid, so retain its existing permission
 # workaround. Rootless Podman uses keep-id and must leave ownership/modes alone.
 if [[ "$CONTAINER_ENGINE" == "docker" ]]; then
-  make_dir_writable "$BUILD_OUTPUT_DIR"
-  make_dir_writable "$PLAN_DIR"
+  chmod 777 "$PLAN_DIR" "$PLAN_DIR/artifacts"
 fi
 
 # Build Docker arguments
@@ -261,20 +266,13 @@ DOCKER_ARGS=(
   -e OMARCHY_PUBLISHED_REPO_URL="${OMARCHY_PUBLISHED_REPO_URL-https://pkgs.omarchy.org}"
   -e DEFER_RUNTIME_DEPS="$DEFER_RUNTIME_DEPS"
   -e BUILD_PLAN_DIR=/build-plan
-  -v "$PLAN_DIR:/build-plan"
   -v "$PACKAGE_CACHE_DIR:/var/cache/pacman/pkg"
-  -v "$BUILD_ROOT/build-output:/build-output"
+  -v "$BUILD_ROOT/build-output:/build-output:ro"
   -v "$REPO_ROOT:/pkgs.omarchy.org:ro"
   -v "$BUILD_DIR:/build:ro"
   -v "$BUILD_ROOT/helpers:/helpers:ro"
   -v "$BUILD_ROOT/pkgbuilds:/pkgbuilds:ro"
 )
-
-# Podman-created images can leave WORKDIR owned by a remapped uid. Mount the
-# existing host-user-owned workspace so the builder can write there.
-if [[ "$CONTAINER_ENGINE" == "podman" ]]; then
-  DOCKER_ARGS+=(-v "$SRC_DIR:/src")
-fi
 
 # Plan once against the published database, then keep that order throughout
 # the run. Each package sees the staged artifacts but starts with a fresh
@@ -282,8 +280,15 @@ fi
 PLATFORM_ARG=$(get_platform_arg "$ARCH")
 
 "$CONTAINER_ENGINE" run "${CONTAINER_RUN_ARGS[@]}" "$PLATFORM_ARG" "${DOCKER_ARGS[@]}" \
+  -v "$PLAN_DIR:/build-plan" \
   -e DRY_RUN=true "$IMAGE_TAG" /build/build.sh
 
+for plan_file in packages skipped dependencies; do
+  [[ -f "$PLAN_DIR/$plan_file" && ! -L "$PLAN_DIR/$plan_file" ]] || {
+    print_error "Invalid build plan file: $plan_file"
+    exit 1
+  }
+done
 mapfile -t ORDERED_PACKAGES < "$PLAN_DIR/packages"
 mapfile -t SKIPPED_PACKAGES < "$PLAN_DIR/skipped"
 SUCCESSFUL_PACKAGES=()
@@ -291,7 +296,55 @@ FAILED_PACKAGES=()
 BLOCKED_PACKAGES=()
 declare -A BUILD_STATUS=()
 
+# Only this host-side collector can authorize outputs. Its manifest directory
+# is never mounted into a package build, and validation runs after that build
+# exits, using the reviewed policy and read-only candidate files.
+collect_job() {
+  local package=$1 job=$2 filename previous
+  "$CONTAINER_ENGINE" run "${CONTAINER_RUN_ARGS[@]}" --rm "$PLATFORM_ARG" \
+    -v "$job/output:/job:ro" -v "$BUILD_ROOT/helpers:/helpers:ro" \
+    -v "$PKGBUILDS_DIR:/pkgbuilds:ro" "$IMAGE_TAG" \
+    python3 /helpers/package-scope.py create --policy-root /pkgbuilds \
+    --package "$package" --arch "$ARCH" --directory /job --files /job/.artifacts \
+    > "$job/manifest.json"
+
+  if [[ -f "$PUBLICATION_MANIFEST" ]]; then
+    jq --arg package "$package" '.jobs |= map(select(.package != $package))' \
+      "$PUBLICATION_MANIFEST" > "$job/previous.json"
+    if [[ $(jq '.jobs | length' "$job/previous.json") != 0 ]]; then
+      python3 "$BUILD_ROOT/helpers/package-scope.py" merge \
+        --manifest "$job/previous.json" --manifest "$job/manifest.json" > "$job/combined.json"
+    else
+      cp "$job/manifest.json" "$job/combined.json"
+    fi
+    # A kept workspace may rebuild this job at a different version.
+    previous=$(jq -r --arg package "$package" '.jobs[] | select(.package == $package) | .artifacts[].filename' "$PUBLICATION_MANIFEST")
+    while IFS= read -r filename; do
+      [[ -z "$filename" ]] || rm -f -- "$BUILD_OUTPUT_DIR/$filename" "$BUILD_OUTPUT_DIR/$filename.sig"
+    done <<< "$previous"
+  else
+    cp "$job/manifest.json" "$job/combined.json"
+  fi
+
+  jq -r '.jobs[0].artifacts[].filename' "$job/manifest.json" > "$COLLECTED_DIR/artifacts/$package"
+  while IFS= read -r filename; do
+    install -m644 -- "$job/output/$filename" "$job/staged"
+    mv -T -- "$job/staged" "$BUILD_OUTPUT_DIR/$filename"
+  done < "$COLLECTED_DIR/artifacts/$package"
+  install -m644 "$job/combined.json" "$PUBLICATION_DIR/manifest.next"
+  mv -T "$PUBLICATION_DIR/manifest.next" "$PUBLICATION_MANIFEST"
+  rm -f "$PUBLICATION_DIR/manifest.json.sig"
+}
+
 for package in "${ORDERED_PACKAGES[@]}"; do
+  [[ $package =~ ^[a-zA-Z0-9][a-zA-Z0-9@._+-]*$ && -f "$PKGBUILDS_DIR/$package/PKGBUILD" ]] || {
+    print_error "Invalid package in build plan: $package"
+    exit 1
+  }
+  if [[ -n "$PACKAGES" && " $PACKAGES " != *" $package "* ]]; then
+    print_error "Build plan includes an unrequested package: $package"
+    exit 1
+  fi
   blocked_by=""
   while read -r consumer dependency; do
     if [[ "$consumer" == "$package" && "${BUILD_STATUS[$dependency]:-}" != success ]]; then
@@ -308,8 +361,16 @@ for package in "${ORDERED_PACKAGES[@]}"; do
   fi
 
   print_info "Building $package in a fresh container..."
+  job=$(mktemp -d "$COLLECTED_DIR/job.XXXXXX")
+  mkdir "$job/output"
+  if [[ "$CONTAINER_ENGINE" == docker ]]; then
+    chmod 777 "$job/output"
+  fi
   if "$CONTAINER_ENGINE" run "${CONTAINER_RUN_ARGS[@]}" "$PLATFORM_ARG" "${DOCKER_ARGS[@]}" \
+    -v "$PLAN_DIR:/build-plan:ro" -v "$job/output:/job-output" \
+    -e JOB_OUTPUT_DIR=/job-output \
     -e BUILD_PACKAGE="$package" "$IMAGE_TAG" /build/build.sh; then
+    collect_job "$package" "$job"
     BUILD_STATUS[$package]=success
     SUCCESSFUL_PACKAGES+=("$package")
   else
@@ -333,7 +394,7 @@ if [[ -n "${OMARCHY_BUILD_RESULT_DIR:-}" ]]; then
   mkdir -p "$OMARCHY_BUILD_RESULT_DIR"
   : > "$OMARCHY_BUILD_RESULT_DIR/artifacts"
   for package in "${SUCCESSFUL_PACKAGES[@]}"; do
-    cat "$PLAN_DIR/artifacts/$package" >> "$OMARCHY_BUILD_RESULT_DIR/artifacts"
+    cat "$COLLECTED_DIR/artifacts/$package" >> "$OMARCHY_BUILD_RESULT_DIR/artifacts"
   done
   printf '%s\n' "${FAILED_PACKAGES[@]}" | sed '/^$/d' > "$OMARCHY_BUILD_RESULT_DIR/failed"
   printf '%s\n' "${BLOCKED_PACKAGES[@]}" | sed '/^$/d' > "$OMARCHY_BUILD_RESULT_DIR/blocked"

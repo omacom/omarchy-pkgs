@@ -12,7 +12,7 @@ TEST_BUILDER_IMAGE=${TEST_BUILDER_IMAGE:-omarchy-pkg-builder:latest-$TEST_ARCH-e
 TEST_ROOT=$(mktemp -d)
 trap 'rm -rf "$TEST_ROOT"' EXIT
 mkdir -p "$TEST_ROOT/bin" "$TEST_ROOT/pkgbuilds" "$TEST_ROOT/build-output/edge/$TEST_ARCH"
-cp "$BUILD_ROOT/bin/build" "$TEST_ROOT/bin/"
+cp "$BUILD_ROOT/bin/"{build,sign,promote-build} "$TEST_ROOT/bin/"
 cp -r "$BUILD_ROOT/build" "$BUILD_ROOT/helpers" "$TEST_ROOT/"
 # No external verification keys are needed for source-free fixtures.
 : > "$TEST_ROOT/build/gpg-keys.txt"
@@ -24,6 +24,8 @@ mkdir "$TEST_ROOT/engine"
 cat > "$TEST_ROOT/engine/$CONTAINER_ENGINE" <<'ENGINE'
 #!/bin/bash
 args=("$@")
+# Sign/promote reuse the prepared utility image too.
+[[ ${args[0]} != buildx && ${args[0]} != build ]] || exit 0
 for index in "${!args[@]}"; do
   if [[ "${args[$index]}" == omarchy-pkg-builder:latest-* ]]; then
     args[$index]="$TEST_BUILDER_IMAGE"
@@ -156,3 +158,41 @@ if grep -q 'in a fresh container' "$TEST_ROOT/empty.log"; then
   exit 1
 fi
 printf 'PASS: empty plans finish without starting a package build\n'
+
+# The normal build -> sign -> promote handoff runs in real utility containers,
+# with a disposable key and no remote or package installation on the host.
+run_build independent consumer > "$TEST_ROOT/handoff.log" 2>&1 || { cat "$TEST_ROOT/handoff.log"; exit 1; }
+export GNUPGHOME="$TEST_ROOT/keyhome"
+mkdir -m700 "$GNUPGHOME"
+gpg --batch --quiet --passphrase '' --quick-gen-key 'Fixture <fixture@test.invalid>' ed25519 sign 0
+export GPG_PRIVATE_KEY
+GPG_PRIVATE_KEY=$(gpg --batch --armor --export-secret-keys)
+unset GNUPGHOME
+"$TEST_ROOT/bin/sign" --arch "$TEST_ARCH" > "$TEST_ROOT/sign.log" 2>&1 || { cat "$TEST_ROOT/sign.log"; exit 1; }
+[[ -f $TEST_ROOT/.publication/edge/$TEST_ARCH/manifest.json.sig ]]
+
+# An interrupted promotion keeps the sealed batch intact so a retry verifies
+# the entire set again, including packages already copied to production.
+REAL_MV=$(command -v mv); export REAL_MV TEST_ROOT
+cat > "$TEST_ROOT/engine/mv" <<'MOVE'
+#!/bin/bash
+if [[ ${*: -1} == */independent-*.pkg.tar.zst.sig && -e $TEST_ROOT/fail-move ]]; then
+  rm "$TEST_ROOT/fail-move"
+  exit 1
+fi
+exec "$REAL_MV" "$@"
+MOVE
+chmod +x "$TEST_ROOT/engine/mv"
+touch "$TEST_ROOT/fail-move"
+if "$TEST_ROOT/bin/promote-build" --arch "$TEST_ARCH" > "$TEST_ROOT/promote-failed.log" 2>&1; then
+  echo 'FAIL: interrupted promotion reported success' >&2; exit 1
+fi
+[[ -f $TEST_ROOT/.publication/edge/$TEST_ARCH/manifest.json.sig ]]
+"$TEST_ROOT/bin/promote-build" --arch "$TEST_ARCH" > "$TEST_ROOT/promote.log" 2>&1 || { cat "$TEST_ROOT/promote.log"; exit 1; }
+for package in independent consumer; do
+  [[ -f $TEST_ROOT/pkgs.omarchy.org/edge/$TEST_ARCH/$package-1-1-$TEST_ARCH.pkg.tar.zst.sig ]]
+  [[ ! -e $TEST_ROOT/build-output/edge/$TEST_ARCH/$package-1-1-$TEST_ARCH.pkg.tar.zst ]]
+done
+[[ ! -e $TEST_ROOT/.publication/edge/$TEST_ARCH/manifest.json ]]
+"$TEST_ROOT/bin/promote-build" --arch "$TEST_ARCH" > /dev/null
+printf 'PASS: signed manifest promotion recovers from interruption and completes idempotently\n'

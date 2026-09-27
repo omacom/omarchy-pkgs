@@ -82,47 +82,96 @@ jobs:
           EOF_MATRIX
           cat plan.txt
 
-      # Fetch each package's PR artifact into build-output/edge/<arch>/, or
-      # build it when no artifact exists for exactly this tree. An artifact
-      # carries its package files inside packages.tar (see build-pr.yml and
-      # helpers/artifact-helpers.sh: the upload action rejects the colon in
-      # an epoch filename).
+      # The host-native utility image supplies bsdtar and python for the
+      # reviewed package-scope gate. It receives no signing credentials.
+      - name: Prepare validation image
+        run: docker buildx build --load -t omarchy-pkg-builder:latest-x86_64-edge --build-arg MIRROR=edge build
+
       - name: Collect artifacts
         env:
           GH_TOKEN: ${{ github.token }}
           CONTAINER_ENGINE: docker
         run: |
-          set -uo pipefail
+          set -euo pipefail
           source helpers/artifact-helpers.sh
-          # sources.jsonl: where each package's files came from, or that the
-          # build failed. A failed build ends the run before any publish, and
-          # the record says so instead of the report job finding nothing.
           : > sources.jsonl
           failed=0
+          scratch=$(mktemp -d)
+          trap 'rm -rf "$scratch"' EXIT
           while read -r package arch channels publish_arches; do
             hash=$(git rev-parse "HEAD:pkgbuilds/$package")
             label="$package-$arch-$hash"
             found=$(curl -fsS -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
               "https://api.github.com/repos/${{ github.repository }}/actions/artifacts?name=$label&per_page=5" \
               | jq -r '[.artifacts[] | select(.expired|not)] | sort_by(.created_at) | last | .archive_download_url // empty')
-            mkdir -p "build-output/edge/$arch"
             if [[ -n "$found" ]]; then
               echo "==> $label: PR artifact"
-              rm -rf /tmp/artifact; mkdir -p /tmp/artifact
-              if curl -fsSL -H "Authorization: Bearer $GH_TOKEN" -o /tmp/artifact.zip "$found" \
-                && unzip -oq /tmp/artifact.zip -d /tmp/artifact \
-                && unpack_packages /tmp/artifact "build-output/edge/$arch"; then
-                jq -nc --arg p "$package" --arg a "$arch" '{package:$p, arch:$a, source:"pr-artifact"}' >> sources.jsonl
-              else
-                jq -nc --arg p "$package" --arg a "$arch" '{package:$p, arch:$a, source:"artifact-download-failed"}' >> sources.jsonl; failed=1; break
+              job=$(mktemp -d "$scratch/job.XXXXXXXX")
+              mkdir "$job/output"
+              if ! curl -fsSL -H "Authorization: Bearer $GH_TOKEN" -o "$job/artifact.zip" "$found" \
+                || ! unpack_packages "$job/artifact.zip" "$job/output"; then
+                jq -nc --arg p "$package" --arg a "$arch" '{package:$p, arch:$a, source:"artifact-download-failed"}' >> sources.jsonl
+                failed=1; break
               fi
+              shopt -s nullglob
+              job_files=("$job/output"/*.pkg.tar.zst)
+              if (( ${#job_files[@]} == 0 )); then
+                jq -nc --arg p "$package" --arg a "$arch" '{package:$p, arch:$a, source:"artifact-validation-failed"}' >> sources.jsonl
+                failed=1; break
+              fi
+              printf '%s\n' "${job_files[@]##*/}" > "$job/output/.files"
+              if ! docker run --rm --user "$(id -u):$(id -g)" \
+                -v "$job/output:/job:ro" -v "$PWD/pkgbuilds:/pkgbuilds:ro" -v "$PWD/helpers:/helpers:ro" \
+                omarchy-pkg-builder:latest-x86_64-edge \
+                python3 /helpers/package-scope.py create --policy-root /pkgbuilds \
+                --package "$package" --arch "$arch" --directory /job --files /job/.files \
+                > "$job/manifest.json"; then
+                jq -nc --arg p "$package" --arg a "$arch" '{package:$p, arch:$a, source:"artifact-validation-failed"}' >> sources.jsonl
+                failed=1; break
+              fi
+              global="$PWD/build-output/edge/$arch"
+              publication="$PWD/.publication/edge/$arch"
+              mkdir -p "$global"
+              install -d -m700 "$publication"
+              mapfile -t approved < <(jq -r '.jobs[].artifacts[].filename' "$job/manifest.json")
+              collision=0
+              for filename in "${approved[@]}"; do
+                if [[ -e "$global/$filename" || -L "$global/$filename" ]]; then collision=1; fi
+              done
+              if (( collision )); then
+                jq -nc --arg p "$package" --arg a "$arch" '{package:$p, arch:$a, source:"artifact-validation-failed"}' >> sources.jsonl
+                failed=1; break
+              fi
+              for filename in "${approved[@]}"; do
+                cp -P -- "$job/output/$filename" "$global/$filename" || { failed=1; break; }
+              done
+              if (( failed )); then
+                jq -nc --arg p "$package" --arg a "$arch" '{package:$p, arch:$a, source:"artifact-validation-failed"}' >> sources.jsonl
+                break
+              fi
+              if [[ -f "$publication/manifest.json" ]]; then
+                if ! python3 helpers/package-scope.py merge \
+                  --manifest "$publication/manifest.json" --manifest "$job/manifest.json" > "$job/combined.json"; then
+                  jq -nc --arg p "$package" --arg a "$arch" '{package:$p, arch:$a, source:"artifact-validation-failed"}' >> sources.jsonl
+                  failed=1; break
+                fi
+              else
+                cp "$job/manifest.json" "$job/combined.json" || { failed=1; break; }
+              fi
+              if ! docker run --rm --user "$(id -u):$(id -g)" \
+                -v "$global:/output:ro" -v "$job/combined.json:/manifest.json:ro" \
+                -v "$PWD/pkgbuilds:/pkgbuilds:ro" -v "$PWD/helpers:/helpers:ro" \
+                omarchy-pkg-builder:latest-x86_64-edge \
+                python3 /helpers/package-scope.py verify --policy-root /pkgbuilds \
+                --arch "$arch" --directory /output --manifest /manifest.json > /dev/null; then
+                jq -nc --arg p "$package" --arg a "$arch" '{package:$p, arch:$a, source:"artifact-validation-failed"}' >> sources.jsonl
+                failed=1; break
+              fi
+              mv -T "$job/combined.json" "$publication/manifest.json"
+              rm -f "$publication/manifest.json.sig"
+              jq -nc --arg p "$package" --arg a "$arch" '{package:$p, arch:$a, source:"pr-artifact"}' >> sources.jsonl
             else
-              # bin/build plans against the public channel first. If the
-              # channel already holds master's version there is nothing to
-              # build and nothing to publish: a re-run for a package that
-              # turned out to be fine. Record it and move on.
               plan=$(CONTAINER_ENGINE=docker bin/build --dry-run --mirror edge --arch "$arch" --package "$package" 2>&1 | grep -E '^==> Plan complete' || true)
-              # "Packages that would build:" followed by nothing means none.
               if [[ -n "$plan" && -z "$(sed -E 's/.*would build: *//' <<<"$plan" | tr -d '[:space:]')" ]]; then
                 echo "==> $label: already published at master's version, nothing to do"
                 jq -nc --arg p "$package" --arg a "$arch" '{package:$p, arch:$a, source:"already-published"}' >> sources.jsonl
@@ -132,13 +181,12 @@ jobs:
               if OMARCHY_KEEP_BUILD_WORKSPACE=1 bin/build --mirror edge --arch "$arch" --package "$package"; then
                 jq -nc --arg p "$package" --arg a "$arch" '{package:$p, arch:$a, source:"built"}' >> sources.jsonl
               else
-                jq -nc --arg p "$package" --arg a "$arch" '{package:$p, arch:$a, source:"build-failed"}' >> sources.jsonl; failed=1; break
+                jq -nc --arg p "$package" --arg a "$arch" '{package:$p, arch:$a, source:"build-failed"}' >> sources.jsonl
+                failed=1; break
               fi
             fi
           done < plan.txt
-          ls -1 build-output/edge/*/*.pkg.tar.zst 2>/dev/null || true
           if (( failed )); then
-            # Write the record now; the publish step will not run.
             jq -n --arg sha "${{ github.sha }}" --arg run "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
               --arg prefix "${OMARCHY_PUBLISH_PREFIX:-}" --arg event "${{ github.event_name }}" \
               --slurpfile sources sources.jsonl --slurpfile plan <(jq -c '.include[]' <<<'${{ needs.changes.outputs.matrix }}' | jq -sc .) \
@@ -165,7 +213,7 @@ jobs:
         # builder image (host-native, edge) with the workspace mounted.
         run: |
           set -euo pipefail
-          if ! compgen -G "build-output/edge/*/*.pkg.tar.zst" >/dev/null; then
+          if ! jq -se 'any(.[]; .source == "built" or .source == "pr-artifact")' sources.jsonl > /dev/null; then
             echo "Nothing to publish: every requested package is already published at master's version."
             jq -n --arg sha "${{ github.sha }}" --arg run "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
               --arg prefix "${OMARCHY_PUBLISH_PREFIX:-}" --arg event "${{ github.event_name }}" \
@@ -175,55 +223,74 @@ jobs:
             cat publish-record.json
             exit 0
           fi
-          docker image inspect omarchy-pkg-builder:latest-x86_64-edge >/dev/null 2>&1 \
-            || docker buildx build --load -t omarchy-pkg-builder:latest-x86_64-edge --build-arg MIRROR=edge build
 
-          # Group the merge's files by the (channel, architecture) slot each
-          # belongs to. A package's files live under build-output/edge/<built
-          # arch>/ and are named <pkgname>-<ver>-<arch|any>.pkg.tar.zst; a
-          # split package's outputs share the pkgbase's directory, so match
-          # on the artifact list rather than the name.
-          # pkgbase is read inside the builder image: the Ubuntu host has no
-          # bsdtar. One container call maps every file to its pkgbase.
-          docker run --rm -v "$PWD:/w:ro" -w /w omarchy-pkg-builder:latest-x86_64-edge bash -c '
-            for f in build-output/edge/*/*.pkg.tar.zst; do
-              printf "%s %s\n" "$f" "$(bsdtar -xOf "$f" .PKGINFO | awk -F" = " "\$1==\"pkgbase\"{print \$2}")"
-            done' > pkgbase.txt
-          declare -A slot_files=()
-          while read -r package arch channels publish_arches; do
-            for f in build-output/edge/"$arch"/*.pkg.tar.zst; do
-              # Only files this package produced (its PKGINFO pkgbase).
-              [[ $(awk -v f="$f" '$1==f{print $2}' pkgbase.txt) == "$package" ]] || continue
-              for mirror in ${channels//,/ }; do
-                for parch in ${publish_arches//,/ }; do
-                  slot_files["$mirror/$parch"]+="$f "
-                done
-              done
-            done
-          done < plan.txt
-
-          # Deterministic slot order: edge before rc before stable, x86_64
-          # before aarch64, so a failure leaves the earlier rings consistent.
-          # Every slot's outcome goes into publish-record.json for the report
-          # job: what was published, where, from which artifact, and whether
-          # the slot succeeded. A failing slot stops the loop (set -e) but the
-          # record still shows everything before it landed.
+          # Select jobs by the trusted matrix package and build architecture.
+          # A source manifest authorizes the exact filenames; no archive field
+          # is used to decide which job or channel receives them.
           : > slots.jsonl
           record_slot() { jq -nc --arg m "$1" --arg a "$2" --arg st "$3" --arg files "$4" \
             '{mirror:$m, arch:$a, status:$st, packages:[$files | split(" ") | .[] | select(length>0) | sub(".*/";"") | sub("\\.pkg\\.tar\\.zst$";"")]}' >> slots.jsonl; }
           status=0
           for mirror in edge rc stable; do
             for parch in x86_64 aarch64; do
-              files=${slot_files["$mirror/$parch"]:-}
-              [[ -n "$files" ]] || continue
+              slotdir=$(mktemp -d "$PWD/.publication/slot.XXXXXXXX")
+              mkdir -m 700 "$slotdir/packages"
+              manifest_args=()
+              selected=0
+              while read -r package arch channels publish_arches; do
+                [[ " ${channels//,/ } " == *" $mirror "* ]] || continue
+                [[ " ${publish_arches//,/ } " == *" $parch "* ]] || continue
+                source_kind=$(jq -r --arg p "$package" --arg a "$arch" \
+                  'select(.package == $p and .arch == $a) | .source' sources.jsonl)
+                if [[ "$source_kind" == already-published ]]; then
+                  continue
+                fi
+                [[ "$source_kind" == built || "$source_kind" == pr-artifact ]] || {
+                  echo "Missing collected source for $package/$arch" >&2; exit 1;
+                }
+                source_manifest="$PWD/.publication/edge/$arch/manifest.json"
+                job_manifest="$slotdir/job-$selected.json"
+                jq -e --arg p "$package" --arg a "$parch" \
+                  '. as $m | [$m.jobs[] | select(.package == $p)] as $jobs |
+                   if ($jobs|length) == 1 then {version:1,target_arch:$a,jobs:$jobs}
+                   else error("selected job missing or duplicate") end' \
+                  "$source_manifest" > "$job_manifest"
+                manifest_args+=(--manifest "$job_manifest")
+                mapfile -t authorized < <(jq -r '.jobs[].artifacts[].filename' "$job_manifest")
+                for filename in "${authorized[@]}"; do
+                  [[ ! -e "$slotdir/packages/$filename" && ! -L "$slotdir/packages/$filename" ]] || {
+                    echo "Duplicate slot filename: $filename" >&2; exit 1;
+                  }
+                  cp -P -- "build-output/edge/$arch/$filename" "$slotdir/packages/$filename"
+                done
+                selected=$((selected + 1))
+              done < plan.txt
+              (( selected > 0 )) || { rmdir "$slotdir/packages"; rmdir "$slotdir"; continue; }
+              python3 helpers/package-scope.py merge "${manifest_args[@]}" > "$slotdir/manifest.json"
+              # Retargeting to another architecture succeeds only for arch=any
+              # outputs. Verify the complete slot before any key is passed.
+              docker run --rm --user "$(id -u):$(id -g)" \
+                -v "$slotdir/packages:/packages:ro" -v "$slotdir/manifest.json:/manifest.json:ro" \
+                -v "$PWD/pkgbuilds:/pkgbuilds:ro" -v "$PWD/helpers:/helpers:ro" \
+                omarchy-pkg-builder:latest-x86_64-edge \
+                python3 /helpers/package-scope.py verify --policy-root /pkgbuilds \
+                --arch "$parch" --directory /packages --manifest /manifest.json > /dev/null
+              slot_rel=${slotdir#"$PWD/"}
+              file_args=()
+              mapfile -t authorized < <(jq -r '.jobs[].artifacts[].filename' "$slotdir/manifest.json")
+              for filename in "${authorized[@]}"; do
+                file_args+=("/w/$slot_rel/packages/$filename")
+              done
+              printf -v files '%s ' "${file_args[@]}"
               echo "==> $mirror/$parch: $files"
-              if docker run --rm \
+              if docker run --rm --user "$(id -u):$(id -g)" \
                 -e GPG_PRIVATE_KEY -e GPG_PASSPHRASE -e OMARCHY_PUBLISH_PREFIX \
                 -e RCLONE_CONFIG_R2_TYPE -e RCLONE_CONFIG_R2_PROVIDER -e RCLONE_CONFIG_R2_ENDPOINT -e RCLONE_CONFIG_R2_NO_CHECK_BUCKET \
                 -e RCLONE_CONFIG_R2_ACCESS_KEY_ID -e RCLONE_CONFIG_R2_SECRET_ACCESS_KEY \
                 -v "$PWD:/w:ro" -w /w \
                 omarchy-pkg-builder:latest-x86_64-edge \
-                bin/publish-artifact --remote R2:omarchy-pkgs --mirror "$mirror" --arch "$parch" $files; then
+                bin/publish-artifact --remote R2:omarchy-pkgs --mirror "$mirror" --arch "$parch" \
+                  --manifest "/w/$slot_rel/manifest.json" "${file_args[@]}"; then
                 record_slot "$mirror" "$parch" published "$files"
               else
                 record_slot "$mirror" "$parch" failed "$files"

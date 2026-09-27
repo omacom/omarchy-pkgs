@@ -13,11 +13,12 @@ BUILD_ROOT=$(realpath "${BASH_SOURCE[0]%/*}/..")
 source "$BUILD_ROOT/helpers/message-helpers.sh"
 source "$BUILD_ROOT/helpers/paths.sh"
 source "$BUILD_ROOT/helpers/host-helpers.sh"
+source "$BUILD_ROOT/helpers/docker-helpers.sh"
 
 HOST=""
 REMOTE_ROOT="/root/omarchy-pkgs"
 CREDENTIALS="/root/.omarchy/build-credentials"
-PACKAGES=""
+JOBS=()
 PACKAGE_FLAG_GIVEN=false
 DRY_RUN=false
 ASSUME_YES=false
@@ -28,11 +29,13 @@ print_header "Push Build to Host"
 while [[ $# -gt 0 ]]; do
   case $1 in
   --arch)
+    [[ $# -ge 2 ]] || { print_error "Missing --arch value"; exit 1; }
     ARCH="$2"
     update_arch_paths
     shift 2
     ;;
   --mirror)
+    [[ $# -ge 2 ]] || { print_error "Missing --mirror value"; exit 1; }
     MIRROR="$2"
     if ! validate_mirror "$MIRROR"; then
       print_error "Invalid mirror: $MIRROR (must be one of: $VALID_MIRRORS)"
@@ -45,16 +48,17 @@ while [[ $# -gt 0 ]]; do
     shift
     PACKAGE_FLAG_GIVEN=true
     while [[ $# -gt 0 && ! "$1" =~ ^-- ]]; do
-      [[ -n "$1" ]] && PACKAGES="$PACKAGES $1"
+      JOBS+=("$1")
       shift
     done
-    PACKAGES="${PACKAGES# }"
     ;;
   --host)
+    [[ $# -ge 2 ]] || { print_error "Missing --host value"; exit 1; }
     HOST="$2"
     shift 2
     ;;
   --remote-root)
+    [[ $# -ge 2 ]] || { print_error "Missing --remote-root value"; exit 1; }
     REMOTE_ROOT="$2"
     shift 2
     ;;
@@ -79,7 +83,7 @@ while [[ $# -gt 0 ]]; do
     echo "Options:"
     echo "  --arch <arch>          Target architecture (default: x86_64)"
     echo "  --mirror <mirror>      Mirror to publish to (edge, rc, or stable, default: edge)"
-    echo "  --package <names>      Only push these packages (space-separated)"
+    echo "  --package <names>      Only push these reviewed pkgbuild jobs (space-separated)"
     echo "  --host <host>          ssh destination (default: \$OMARCHY_REPO_HOST or .repo-host)"
     echo "  --remote-root <path>   Repository path on the host (default: $REMOTE_ROOT)"
     echo "  --dry-run              Show what would be pushed, transfer nothing"
@@ -100,6 +104,9 @@ while [[ $# -gt 0 ]]; do
 done
 
 # --- host resolution ---------------------------------------------------------
+require_valid_arch "$ARCH"
+require_valid_mirror "$MIRROR"
+update_arch_paths
 
 if ! HOST=$(resolve_repo_host "$HOST"); then
   print_no_repo_host
@@ -114,88 +121,68 @@ if [[ ! -d "$BUILD_OUTPUT_DIR" ]]; then
   exit 1
 fi
 
-# Package files only. Signatures are produced on the host, and the repo database
-# is rebuilt there, so neither should ride along.
-mapfile -t ALL_FILES < <(cd "$BUILD_OUTPUT_DIR" && ls -1 *.pkg.tar.* 2>/dev/null | grep -v '\.sig$' || true)
-
-# "--package" with nothing after it, or with an empty variable, must not quietly
-# widen to every artifact — that is the difference between shipping one package
-# and shipping whatever else happens to be lying around.
-if [[ "$PACKAGE_FLAG_GIVEN" == true && -z "$PACKAGES" ]]; then
-  print_error "--package requires at least one package name"
+# The build host's manifest is the only source of authorized archive names.
+if [[ ! -f "$PUBLICATION_MANIFEST" ]]; then
+  print_error "No local approved build manifest: $PUBLICATION_MANIFEST"
   exit 1
 fi
-
-# On a build machine an unscoped build leaves the whole repository in
-# build-output, because there is no local database to tell it what already
-# exists. Interactively that is survivable — the confirmation below lists every
-# package first — but with --yes nobody sees the list, so require an explicit
-# selection instead.
-if [[ -z "$PACKAGES" && "$ASSUME_YES" == true ]] && ! on_repo_host; then
+if [[ "$PACKAGE_FLAG_GIVEN" == true && ${#JOBS[@]} -eq 0 ]]; then
+  print_error "--package requires at least one reviewed job"
+  exit 1
+fi
+if [[ ${#JOBS[@]} -eq 0 && "$ASSUME_YES" == true ]] && ! on_repo_host; then
   print_error "--package is required to publish unattended from a build machine"
-  echo ""
-  echo "There is no repository database in $REPO_DIR, so a preceding unscoped"
-  echo "build would have rebuilt everything rather than only what changed, and"
-  echo "--yes would publish all ${#ALL_FILES[@]} of them without showing the list."
-  echo ""
-  echo "Name the packages to publish:"
-  echo "  bin/repo push --package <name>"
   exit 1
 fi
 
-# --package means the same thing here as it does to bin/build: a pkgbase, whose
-# every output ships together. Selecting only the artifact whose filename matched
-# would publish one third of a split package like nvidia-580xx-utils and silently
-# leave nvidia-580xx-dkms and opencl-nvidia-580xx behind. An output's own name
-# still matches, for pushing just one of them on purpose.
-#
-# Package identity comes from .PKGINFO rather than the filename or PKGBUILD: it
-# is what makepkg actually recorded, and it handles epochs and split packages.
-package_identity_of() {
-  bsdtar -xOf "$1" .PKGINFO 2>/dev/null |
-    awk -F ' = ' '
-      $1 == "pkgname" { name = $2 }
-      $1 == "pkgbase" { base = $2 }
-      $1 == "pkgver" { version = $2 }
-      END { print name "\t" base "\t" version }
-    '
-}
+EXPLICIT_JOBS=$PACKAGE_FLAG_GIVEN
+if [[ $EXPLICIT_JOBS == false ]]; then
+  mapfile -t JOBS < <(jq -r '.jobs[].package' "$PUBLICATION_MANIFEST")
+fi
+for job in "${JOBS[@]}"; do
+  if [[ ! $job =~ ^[A-Za-z0-9][A-Za-z0-9@._+-]*$ || ! -f "$PKGBUILDS_DIR/$job/.omarchy/package.json" ]]; then
+    print_error "Unknown reviewed job: $job (use a pkgbuild directory, not an output alias)"
+    exit 1
+  fi
+done
 
-FILES=()
-if [[ -z "$PACKAGES" ]]; then
-  FILES=("${ALL_FILES[@]}")
+selected_dir=$(mktemp -d)
+trap 'rm -rf "$selected_dir"' EXIT
+if [[ $EXPLICIT_JOBS == true ]]; then
+  printf '%s\n' "${JOBS[@]}" | jq -R . | jq -s . > "$selected_dir/jobs.json"
+  if ! jq -e --slurpfile selected "$selected_dir/jobs.json" \
+    '(.jobs | map(.package)) as $known | ($selected[0] | length > 0 and length == (unique | length) and all(.[]; . as $job | $known | index($job) != null))' \
+    "$PUBLICATION_MANIFEST" >/dev/null; then
+    print_error "Selected job is absent from the local approved manifest (output aliases are unsupported)"
+    exit 1
+  fi
+  jq --slurpfile selected "$selected_dir/jobs.json" \
+    '.jobs |= map(select(.package as $job | $selected[0] | index($job) != null))' \
+    "$PUBLICATION_MANIFEST" > "$selected_dir/manifest.json"
 else
-  declare -A MATCHED=()
-  declare -A LATEST_FILE=()
-  declare -A LATEST_VERSION=()
-  for file in "${ALL_FILES[@]}"; do
-    IFS=$'\t' read -r pkgname pkgbase pkgver < <(package_identity_of "$BUILD_OUTPUT_DIR/$file")
-    for wanted in $PACKAGES; do
-      if [[ "$pkgname" == "$wanted" || "$pkgbase" == "$wanted" ]]; then
-        MATCHED["$wanted"]=1
-        if [[ -z "${LATEST_FILE[$pkgname]:-}" ]] ||
-          [[ $(vercmp "$pkgver" "${LATEST_VERSION[$pkgname]}") -gt 0 ]]; then
-          LATEST_FILE["$pkgname"]="$file"
-          LATEST_VERSION["$pkgname"]="$pkgver"
-        fi
-        break
-      fi
-    done
-  done
-
-  for wanted in $PACKAGES; do
-    if [[ -z "${MATCHED[$wanted]:-}" ]]; then
-      print_error "No built artifact for '$wanted' in $BUILD_OUTPUT_DIR"
-      print_warning "Name a package or the pkgbase it was built from"
-      exit 1
-    fi
-  done
-
-  mapfile -t FILES < <(printf '%s\n' "${LATEST_FILE[@]}" | sort)
+  cp "$PUBLICATION_MANIFEST" "$selected_dir/manifest.json"
 fi
 
+# Verify the selected jobs against their reviewed policies and current bytes.
+check_engine
+TOOL_ARCH=$(docker_native_arch) || { print_error 'Unsupported host architecture'; exit 1; }
+build_docker_image "$BUILD_DIR" "$TOOL_ARCH" "$MIRROR"
+verify_extra=()
+[[ $EXPLICIT_JOBS != true ]] || verify_extra=(--allow-extra)
+verify_user=()
+if [[ $CONTAINER_ENGINE == docker ]]; then
+  verify_user=(--user "$(id -u):$(id -g)")
+fi
+"$CONTAINER_ENGINE" run "${CONTAINER_RUN_ARGS[@]}" --rm "${verify_user[@]}" \
+  "$(get_platform_arg "$TOOL_ARCH")" \
+  -v "$BUILD_OUTPUT_DIR:/output:ro" -v "$PKGBUILDS_DIR:/pkgbuilds:ro" \
+  -v "$BUILD_ROOT/helpers:/helpers:ro" -v "$selected_dir:/selection:ro" \
+  "omarchy-pkg-builder:latest-$TOOL_ARCH-$MIRROR" \
+  python3 /helpers/package-scope.py verify --policy-root /pkgbuilds --arch "$ARCH" \
+    --directory /output --manifest /selection/manifest.json "${verify_extra[@]}" > "$selected_dir/files"
+mapfile -t FILES < "$selected_dir/files"
 if [[ ${#FILES[@]} -eq 0 ]]; then
-  print_error "No packages found in $BUILD_OUTPUT_DIR"
+  print_error "No approved archives selected"
   exit 1
 fi
 
@@ -223,7 +210,8 @@ if [[ "$DRY_RUN" == true ]]; then
   print_warning "DRY RUN - nothing transferred"
   echo ""
   print_info "Would run on $HOST:"
-  echo "  source $CREDENTIALS && cd $REMOTE_ROOT && bin/upload-prebuilt --mirror $MIRROR --arch $ARCH"
+  echo "  bin/upload-prebuilt --mirror $MIRROR --arch $ARCH --package ${JOBS[*]}"
+  if [[ $INCLUDE_STAGED == true ]]; then echo "    --include-staged"; fi
   exit 0
 fi
 
@@ -256,32 +244,8 @@ if ! ssh "$HOST" "test -d $q_remote_root"; then
 fi
 ssh "$HOST" "mkdir -p $q_remote_output"
 
-# upload-prebuilt signs and promotes everything in the host's build-output, not
-# just what we are about to send. Anything already sitting there — typically the
-# leftovers of an earlier failed push — would ride along unnoticed.
-staged=$(ssh "$HOST" "cd $q_remote_output && ls -1 *.pkg.tar.* 2>/dev/null | grep -v '\.sig\$' || true")
-unexpected=""
-if [[ -n "$staged" ]]; then
-  while IFS= read -r remote_file; do
-    [[ -z "$remote_file" ]] && continue
-    for file in "${FILES[@]}"; do
-      [[ "$remote_file" == "$file" ]] && continue 2
-    done
-    unexpected+="$remote_file"$'\n'
-  done <<<"$staged"
-fi
-
-if [[ -n "$unexpected" && "$INCLUDE_STAGED" != true ]]; then
-  print_error "The host already has staged packages this push did not build:"
-  echo ""
-  echo "$unexpected" | grep -v '^$' | sed 's/^/  /'
-  echo ""
-  echo "Publishing signs and promotes everything in $REMOTE_BUILD_OUTPUT, so these"
-  echo "would be published too. They are usually left over from a failed push."
-  echo ""
-  echo "Remove them on the host, or pass --include-staged to publish them as well."
-  exit 1
-fi
+# The remote adapter checks every staged archive against the selected jobs
+# and any previously approved jobs explicitly retained with --include-staged.
 print_success "Host ready"
 echo ""
 
@@ -296,6 +260,11 @@ echo ""
 
 print_info "Verifying checksums..."
 local_sums=$(cd "$BUILD_OUTPUT_DIR" && sha256sum "${FILES[@]}" | sort)
+expected_sums=$(jq -r '.jobs[].artifacts[] | "\(.sha256)  \(.filename)"' "$selected_dir/manifest.json" | sort)
+if [[ "$local_sums" != "$expected_sums" ]]; then
+  print_error "Local archives changed since manifest verification"
+  exit 1
+fi
 remote_sums=$(ssh "$HOST" "cd $q_remote_output && sha256sum $(printf '%q ' "${FILES[@]}")" | sort)
 if [[ "$local_sums" != "$remote_sums" ]]; then
   print_error "Checksum mismatch after upload"
@@ -309,7 +278,12 @@ echo ""
 
 print_info "Publishing on $HOST (sign -> promote -> update -> sync)..."
 echo ""
-if ! ssh "$HOST" "source $q_credentials && cd $q_remote_root && bin/upload-prebuilt --mirror $(printf '%q' "$MIRROR") --arch $(printf '%q' "$ARCH") --skip-prod-check"; then
+remote_args=(--mirror "$MIRROR" --arch "$ARCH" --skip-prod-check)
+if (( ${#JOBS[@]} )); then remote_args+=(--package "${JOBS[@]}"); fi
+if [[ $INCLUDE_STAGED == true ]]; then remote_args+=(--include-staged); fi
+remote_command="source $q_credentials && cd $q_remote_root && bin/upload-prebuilt"
+for arg in "${remote_args[@]}"; do remote_command+=" $(printf '%q' "$arg")"; done
+if ! ssh "$HOST" "$remote_command"; then
   print_error "Remote publish failed"
   print_warning "The uploaded packages are still in $REMOTE_BUILD_OUTPUT on $HOST"
   exit 1

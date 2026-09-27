@@ -1,200 +1,105 @@
 #!/bin/bash
-# Promote packages from build-output to pkgs.omarchy.org
-
-set -e
+# Promote only the sealed, signed artifacts in the host-owned build manifest.
+set -euo pipefail
 
 BUILD_ROOT=$(realpath "${BASH_SOURCE[0]%/*}/..")
 source "$BUILD_ROOT/helpers/message-helpers.sh"
 source "$BUILD_ROOT/helpers/paths.sh"
 source "$BUILD_ROOT/helpers/lock-helpers.sh"
+source "$BUILD_ROOT/helpers/docker-helpers.sh"
 
-print_header "Promote Build to Production"
-
-# Parse arguments
 DRY_RUN=false
 while [[ $# -gt 0 ]]; do
   case $1 in
-  --arch)
-    ARCH="$2"
-    update_arch_paths
-    shift 2
-    ;;
-  --mirror)
-    MIRROR="$2"
-    require_valid_mirror "$MIRROR"
-    update_arch_paths
-    shift 2
-    ;;
-  --dry-run)
-    DRY_RUN=true
-    shift
-    ;;
-  -h | --help)
-    echo "Usage: $0 [OPTIONS]"
-    echo ""
-    echo "Options:"
-    echo "  --arch <arch>      Target architecture (x86_64 or aarch64, default: x86_64)"
-    echo "  --mirror <mirror>  Mirror to use (edge, rc, or stable, default: edge)"
-    echo "  --dry-run          Show what would be copied without copying"
-    echo "  -h, --help         Show this help message"
-    echo ""
-    echo "This script promotes packages from build-output/ to pkgs.omarchy.org/"
-    exit 0
-    ;;
-  *)
-    print_error "Unknown option: $1"
-    exit 1
-    ;;
+    --arch) ARCH=$2; require_valid_arch "$ARCH"; update_arch_paths; shift 2 ;;
+    --mirror) MIRROR=$2; require_valid_mirror "$MIRROR"; update_arch_paths; shift 2 ;;
+    --dry-run) DRY_RUN=true; shift ;;
+    -h|--help)
+      echo "Usage: $0 [--arch <arch>] [--mirror <channel>] [--dry-run]"
+      echo "Promote the verified build manifest; --dry-run previews unsigned approved outputs."
+      exit 0
+      ;;
+    *) print_error "Unknown option: $1"; exit 1 ;;
   esac
 done
+require_valid_arch "$ARCH"
+require_valid_mirror "$MIRROR"
+acquire_release_lock || exit 1
 
-if [[ "$DRY_RUN" != true ]]; then
-  acquire_release_lock || exit 1
-fi
-
-print_info "Mirror: $MIRROR"
-print_info "Build output: $BUILD_OUTPUT_DIR"
-print_info "Final output: $REPO_DIR"
-
-# Check if build output exists
-if [[ ! -d "$BUILD_OUTPUT_DIR" ]]; then
-  print_error "Build output directory not found: $BUILD_OUTPUT_DIR"
-  print_warning "Run bin/repo build first"
-  exit 1
-fi
-
-# Count packages in build output
-cd "$BUILD_OUTPUT_DIR"
-PACKAGE_COUNT=$(ls -1 *.pkg.tar.* 2>/dev/null | grep -v '\.sig$' | grep -v 'omarchy-build\.db' | wc -l)
-
-if [[ $PACKAGE_COUNT -eq 0 ]]; then
-  print_warning "No packages found in build output"
+print_header "Promote Build to Production"
+if [[ ! -f "$PUBLICATION_MANIFEST" ]]; then
+  shopt -s nullglob
+  pending=("$BUILD_OUTPUT_DIR"/*.pkg.tar.zst)
+  if (( ${#pending[@]} )); then
+    print_error "No approved build manifest. Rebuild or explicitly approve the selected prebuilt jobs."
+    exit 1
+  fi
+  print_info "No approved packages to promote"
   exit 0
 fi
 
-print_info "Found $PACKAGE_COUNT package(s) to promote"
+check_engine
+TOOL_ARCH=$(docker_native_arch)
+build_docker_image "$BUILD_DIR" "$TOOL_ARCH" "$MIRROR"
+user_args=()
+[[ "$CONTAINER_ENGINE" != docker ]] || user_args=(--user "$(id -u):$(id -g)")
+verify_args=()
+[[ $DRY_RUN != true ]] || verify_args=(--unsigned)
+listing=$("$CONTAINER_ENGINE" run "${CONTAINER_RUN_ARGS[@]}" --rm "${user_args[@]}" \
+  "$(get_platform_arg "$TOOL_ARCH")" -e ARCH="$ARCH" -e MIRROR="$MIRROR" \
+  -v "$BUILD_ROOT/build-output:/build-output:ro" -v "$PUBLICATION_DIR:/publication:ro" \
+  -v "$BUILD_DIR:/build:ro" -v "$BUILD_ROOT/helpers:/helpers:ro" -v "$PKGBUILDS_DIR:/pkgbuilds:ro" \
+  "omarchy-pkg-builder:latest-$TOOL_ARCH-$MIRROR" /build/verify-publication.sh "${verify_args[@]}")
+mapfile -t packages <<< "$listing"
 
-if [[ "$DRY_RUN" == true ]]; then
-  print_warning "DRY RUN MODE - No files will be copied"
-  echo ""
-  print_info "Packages that would be promoted:"
-  ls -1 *.pkg.tar.* 2>/dev/null | grep -v 'omarchy-build\.db' | grep -v 'omarchy-build\.files' | while read -r pkg; do
-    echo "  - $pkg"
-  done
-else
-  echo ""
-  mkdir -p "$REPO_DIR"
+if [[ $DRY_RUN == true ]]; then
+  printf '  - %s\n' "${packages[@]}"
+  exit 0
+fi
 
-  echo "==> Verifying all packages have signatures..."
-  MISSING_SIGS=()
-  for pkg_file in *.pkg.tar.*; do
-    # Skip build database files
-    [[ "$pkg_file" == omarchy-build.db* ]] && continue
-    [[ "$pkg_file" == omarchy-build.files* ]] && continue
-    # Skip signature files themselves
-    [[ "$pkg_file" == *.sig ]] && continue
-    [[ ! -f "$pkg_file" ]] && continue
-
-    # Check if signature exists
-    if [[ ! -f "$pkg_file.sig" ]]; then
-      MISSING_SIGS+=("$pkg_file")
-    fi
-  done
-
-  if [[ ${#MISSING_SIGS[@]} -gt 0 ]]; then
-    echo ""
-    print_error "ERROR: The following packages are missing signatures:"
-    for pkg in "${MISSING_SIGS[@]}"; do
-      echo "  - $pkg (missing $pkg.sig)"
-    done
-    echo ""
-    print_error "All packages must be signed before promotion!"
-    echo ""
-    echo "To fix this, run:"
-    echo "  bin/repo sign --mirror $MIRROR --arch $ARCH"
-    exit 1
-  fi
-
-  # VCS packages (omarchy-dev and friends) are versioned off the upstream commit,
-  # so rebuilding the same commit produces the same filename. That is harmless
-  # when the artifact is identical — a run that promoted but died before the
-  # database was updated leaves exactly this state, and failing here would wedge
-  # every later run. Re-promoting *different* content under a published filename
-  # is the real hazard, so only that aborts.
-  echo "==> Checking for existing files in production..."
-  CONFLICTS=()
-  declare -A ALREADY_PROMOTED=()
-  for pkg_file in *.pkg.tar.*; do
-    # Skip build database files
-    [[ "$pkg_file" == omarchy-build.db* ]] && continue
-    [[ "$pkg_file" == omarchy-build.files* ]] && continue
-    [[ "$pkg_file" == *.sig ]] && continue
-    [[ ! -f "$pkg_file" ]] && continue
-
-    if [[ -f "$REPO_DIR/$pkg_file" ]]; then
-      if cmp -s "$pkg_file" "$REPO_DIR/$pkg_file"; then
-        ALREADY_PROMOTED["$pkg_file"]=1
-      else
-        CONFLICTS+=("$pkg_file")
-      fi
-    fi
-  done
-
-  # Signatures carry a timestamp, so a re-signed package never matches byte for
-  # byte. Judge them by the package they sign and keep the published signature.
-  for pkg_file in *.pkg.tar.*.sig; do
-    [[ ! -f "$pkg_file" ]] && continue
-    [[ -f "$REPO_DIR/$pkg_file" ]] || continue
-
-    if [[ -n "${ALREADY_PROMOTED[${pkg_file%.sig}]:-}" ]]; then
-      ALREADY_PROMOTED["$pkg_file"]=1
+mkdir -p "$REPO_DIR"
+declare -A present=()
+for filename in "${packages[@]}"; do
+  if [[ -e "$REPO_DIR/$filename" || -L "$REPO_DIR/$filename" ]]; then
+    if [[ ! -L "$REPO_DIR/$filename" && -f "$REPO_DIR/$filename" ]] &&
+      cmp -s "$PUBLICATION_DIR/packages/$filename" "$REPO_DIR/$filename"; then
+      present["$filename"]=1
     else
-      CONFLICTS+=("$pkg_file")
-    fi
-  done
-
-  if [[ ${#CONFLICTS[@]} -gt 0 ]]; then
-    echo ""
-    print_error "ERROR: The following packages already exist in production with different contents:"
-    for conflict in "${CONFLICTS[@]}"; do
-      echo "  - $conflict"
-    done
-    echo ""
-    print_error "Refusing to replace published packages in pkgs.omarchy.org!"
-    exit 1
-  fi
-
-  if [[ ${#ALREADY_PROMOTED[@]} -gt 0 ]]; then
-    print_info "Already in production (identical, skipping): ${#ALREADY_PROMOTED[@]} file(s)"
-    for promoted in "${!ALREADY_PROMOTED[@]}"; do
-      echo "  - $promoted"
-    done
-  fi
-
-  print_info "Moving packages to production..."
-
-  MOVED=0
-  for pkg_file in *.pkg.tar.*; do
-    # Skip build database files
-    [[ "$pkg_file" == omarchy-build.db* ]] && continue
-    [[ "$pkg_file" == omarchy-build.files* ]] && continue
-    [[ ! -f "$pkg_file" ]] && continue
-    [[ -n "${ALREADY_PROMOTED[$pkg_file]:-}" ]] && continue
-
-    # Use mv to prevent race condition caused by cp
-    if mv -v "$pkg_file" "$REPO_DIR/"; then
-      MOVED=$((MOVED + 1))
-    else
-      print_error "Failed to move $pkg_file"
+      print_error "Refusing to replace published package with different contents: $filename"
       exit 1
     fi
-  done
+  fi
+done
 
-  echo ""
-  print_success "Promoted $MOVED file(s) to pkgs.omarchy.org"
+staged=""
+trap '[[ -z ${staged:-} ]] || rm -f -- "$staged"' EXIT
+publish_file() {
+  staged=$(mktemp "$REPO_DIR/.publish.XXXXXX")
+  install -m644 -- "$1" "$staged"
+  mv -T -- "$staged" "$2"
+  staged=""
+}
 
-  print_info "Cleaning up build directory..."
-  cd "$BUILD_OUTPUT_DIR"
-  rm -f *.pkg.tar.* omarchy-build.db* omarchy-build.files*
-  print_success "Build directory cleaned"
-fi
+for filename in "${packages[@]}"; do
+  if [[ -z ${present[$filename]:-} ]]; then
+    publish_file "$PUBLICATION_DIR/packages/$filename" "$REPO_DIR/$filename"
+  fi
+  # Keep a prior signature for byte-identical packages, preserving idempotence.
+  if [[ -z ${present[$filename]:-} || ! -f "$REPO_DIR/$filename.sig" ]]; then
+    publish_file "$PUBLICATION_DIR/signatures/$filename.sig" "$REPO_DIR/$filename.sig"
+  fi
+done
+
+# Only the manifest's files are ours to remove; other staged files stay unsigned.
+for filename in "${packages[@]}"; do
+  rm -f -- "$BUILD_OUTPUT_DIR/$filename" "$BUILD_OUTPUT_DIR/$filename.sig"
+done
+rm -f "$BUILD_OUTPUT_DIR"/omarchy-build.db* "$BUILD_OUTPUT_DIR"/omarchy-build.files*
+# Keep the complete sealed input until promotion and staging cleanup finish, so
+# an interrupted run can repeat verification. Retire approval before its files.
+rm -f "$PUBLICATION_MANIFEST"
+for filename in "${packages[@]}"; do
+  rm -f -- "$PUBLICATION_DIR/packages/$filename" "$PUBLICATION_DIR/signatures/$filename.sig"
+done
+rm -f "$PUBLICATION_DIR/manifest.json.sig" "$PUBLICATION_DIR/signing-key.gpg"
+print_success "Promoted ${#packages[@]} verified package(s)"

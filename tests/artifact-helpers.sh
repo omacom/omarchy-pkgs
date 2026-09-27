@@ -43,3 +43,86 @@ bash -e -c "source '$ROOT/helpers/artifact-helpers.sh'; pack_packages '$T/built'
 mkdir -p "$T/empty"
 if pack_packages "$T/empty" "$T/x.tar" 2>/dev/null; then fail "packing an empty build dir should fail"; else pass "empty build dir refused"; fi
 if unpack_packages "$T/empty" "$T/out3" 2>/dev/null; then fail "an empty artifact should fail"; else pass "empty artifact refused"; fi
+
+# Fixed malformed data entries exercise the checked unpacker without running
+# package hooks or extracting anything through tar/unzip executables.
+python3 - "$T" "$PLAIN" <<'PY'
+from pathlib import Path
+import io
+import stat
+import sys
+import tarfile
+import warnings
+import zipfile
+
+root, plain = Path(sys.argv[1]), sys.argv[2]
+
+def inner(name, kind=tarfile.REGTYPE, entries=None):
+    data = io.BytesIO()
+    with tarfile.open(fileobj=data, mode='w') as tar:
+        for item in entries or [(name, kind)]:
+            entry = tarfile.TarInfo(item[0])
+            entry.type = item[1]
+            if item[1] == tarfile.REGTYPE:
+                entry.size = 4
+                tar.addfile(entry, io.BytesIO(b'data'))
+            else:
+                entry.linkname = plain
+                tar.addfile(entry)
+    return data.getvalue()
+
+for label, content in {
+    'traversal': inner('../outside.pkg.tar.zst'),
+    'symlink': inner(plain, tarfile.SYMTYPE),
+    'hardlink': inner(plain, tarfile.LNKTYPE),
+    'duplicate': inner(plain, entries=[(plain, tarfile.REGTYPE)] * 2),
+}.items():
+    with zipfile.ZipFile(root / f'{label}.zip', 'w') as outer:
+        outer.writestr('packages.tar', content)
+
+with zipfile.ZipFile(root / 'good.zip', 'w') as outer:
+    outer.writestr('packages.tar', inner(plain))
+with zipfile.ZipFile(root / 'zip-traversal.zip', 'w') as outer:
+    outer.writestr('../packages.tar', inner(plain))
+with zipfile.ZipFile(root / 'zip-symlink.zip', 'w') as outer:
+    entry = zipfile.ZipInfo('packages.tar')
+    entry.create_system = 3
+    entry.external_attr = (stat.S_IFLNK | 0o777) << 16
+    outer.writestr(entry, b'elsewhere')
+with zipfile.ZipFile(root / 'zip-duplicate.zip', 'w') as outer:
+    outer.writestr('packages.tar', inner(plain))
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', UserWarning)
+        outer.writestr('packages.tar', inner(plain))
+PY
+
+mkdir "$T/zip-out"
+unpack_packages "$T/good.zip" "$T/zip-out" || fail "GitHub zip unpack"
+[[ $(cat "$T/zip-out/$PLAIN") == data ]] || fail "GitHub zip bytes"
+pass "GitHub zip and inner packages.tar unpack safely"
+
+for case in traversal symlink hardlink duplicate zip-traversal zip-symlink zip-duplicate; do
+  mkdir "$T/reject-$case"
+  if unpack_packages "$T/$case.zip" "$T/reject-$case" >/dev/null 2>&1; then
+    fail "accepted malformed $case entry"
+  fi
+done
+[[ ! -e "$T/outside.pkg.tar.zst" ]] || fail "traversal created a file"
+pass "malformed tar and zip entries refused"
+
+mkdir "$T/legacy-link" "$T/legacy-hardlink" "$T/legacy-dest"
+ln -s "$T/built/$PLAIN" "$T/legacy-link/$PLAIN"
+ln "$T/built/$PLAIN" "$T/legacy-hardlink/$PLAIN"
+for case in legacy-link legacy-hardlink; do
+  if unpack_packages "$T/$case" "$T/legacy-dest" >/dev/null 2>&1; then
+    fail "accepted $case"
+  fi
+done
+if unpack_packages "$T/old" "$T/out2" >/dev/null 2>&1; then
+  fail "overwrote existing destination"
+fi
+pass "legacy links and destination overwrites refused"
+
+# The CI self-test job already runs this script inside its Arch utility image.
+# Exercise the workflow's real collection and slot shell blocks there too.
+python3 "$ROOT/tests/publish-workflow.py"

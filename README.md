@@ -161,6 +161,8 @@ bin/repo update                         # Update database
 bin/repo sync                           # Sync to remote
 ```
 
+Signing accepts only the host-approved manifest in `.publication/<channel>/<arch>/`. Each completed build is checked against its reviewed package identities, and the manifest records the exact filenames and SHA-256 digests. The signer checks private copies and signs the manifest as well as the packages; promotion verifies this sealed batch. Stray files in `build-output/` never become approved merely by being present. Existing unsigned workspaces without a manifest must be rebuilt or admitted explicitly with `bin/upload-prebuilt --package <job>`.
+
 ### Building Heavy Packages Locally
 
 Large packages build faster on a local machine than on the server. Build them
@@ -182,6 +184,8 @@ bin/repo push --package nvidia-580xx-utils     # Upload + publish on the host
 `push` uploads to the host's `build-output/`, verifies checksums, and runs
 `bin/upload-prebuilt` there. Do not publish from a local checkout instead: only
 the repository host holds the complete repository and the signing key.
+
+`--package` selects a pkgbuild directory and all of its declared split outputs. It does not select an individual output alias. Manual admission refuses multiple staged versions of a job and unrelated archives. `--include-staged` can retain previously approved jobs; it cannot approve arbitrary leftovers on the host.
 
 **Name the package.** `build` asks the local repository database which packages
 are already built, and a build machine has no such database, so an unscoped run
@@ -724,6 +728,7 @@ Fields:
 - `channels`: optional array bounding where the package may be built (`edge`, `rc`, `stable`). Without the key a package is a member of every channel and follows the default build rules above; `bin/repo advance` refuses to carry a package anywhere it isn't a member.
 - `pinned`: optional boolean. A pinned package's version is set per release by `omarchy-release` on the `rc` branch, so it is never built for stable (promotion only) and is built for rc only from that branch's worktree (`OMARCHY_RC_PINS=1`). Used by `omarchy` and `omarchy-settings`.
 - `skip_build`: optional boolean; defaults to `false`. Set `true` to exclude a package from scheduled version checks and unscoped builds. The package can still be built explicitly with `bin/repo release --package <name>`.
+- `artifacts`: optional reviewed output identity policy, such as `{"pkgbase":"asusctl","packages":["asusctl","rog-control-center"]}`. By default, both the base and sole primary package name equal the directory name. Declare split outputs or a different base explicitly; all primary outputs must be present at one version. The usual optional `<pkgbase>-debug` output is also allowed. This binds identities and bytes, not the safety of the contents of an allowed package.
 - `pkgrel`: legacy import customization metadata. Maintained recipes keep their complete package release directly in PKGBUILD; rebuilds increment it there.
 - `rebuild_on`: optional array of package names this package links against closely enough that it must be rebuilt when they change, independent of its own source. Read by `bin/sync-rebuilds`.
 - `rebuilt_against`: written by `bin/sync-rebuilds`. Maps each published architecture to the versions of its `rebuild_on` packages that the current pkgrel was bumped for.
@@ -801,7 +806,7 @@ The build system automatically handles inter-package dependencies:
    `checkdepends`, and their architecture-specific arrays.
 2. Builds each package in a fresh container. Installed packages and changes
    to the container's system files cannot carry over to the next build.
-3. Shares successful artifacts through the temporary `[omarchy-build]` repo,
+3. Gives each job its own writable output and shares verified successful artifacts read-only through the temporary `[omarchy-build]` repo,
    installing newly built prerequisites in each consumer's container.
 4. Blocks consumers of a failed prerequisite while continuing independent
    builds. Any failure still prevents the release from publishing.

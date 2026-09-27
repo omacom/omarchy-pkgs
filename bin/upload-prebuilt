@@ -1,37 +1,66 @@
 #!/bin/bash
-# Upload prebuilt packages: sign → promote → update → sync
-
-set -e
-
+# Admit explicitly selected prebuilt jobs, then sign and publish approved artifacts.
+set -euo pipefail
 SCRIPT_DIR=$(realpath "${BASH_SOURCE[0]%/*}")
 BUILD_ROOT=$(realpath "$SCRIPT_DIR/..")
+source "$BUILD_ROOT/helpers/message-helpers.sh"
 source "$BUILD_ROOT/helpers/paths.sh"
+source "$BUILD_ROOT/helpers/docker-helpers.sh"
 source "$BUILD_ROOT/helpers/lock-helpers.sh"
 
-acquire_release_lock || exit 1
-
-# Only sync understands the publishing flags; sign, promote and update reject
-# unknown options outright, so they cannot be forwarded blindly.
-COMMON_ARGS=()
+JOBS=()
 SYNC_ARGS=()
-while [[ $# -gt 0 ]]; do
+INCLUDE_STAGED=false
+while (( $# )); do
   case $1 in
-  --skip-prod-check | --prune)
-    SYNC_ARGS+=("$1")
-    shift
-    ;;
-  --remote)
-    SYNC_ARGS+=("$1" "$2")
-    shift 2
-    ;;
-  *)
-    COMMON_ARGS+=("$1")
-    shift
-    ;;
+    --arch|--mirror|--remote)
+      (( $# >= 2 )) || { print_error "Missing value for $1"; exit 1; }
+      case $1 in
+        --arch) ARCH=$2 ;;
+        --mirror) MIRROR=$2 ;;
+        --remote) SYNC_ARGS+=(--remote "$2") ;;
+      esac
+      shift 2 ;;
+    --package)
+      shift
+      (( $# )) && [[ $1 != --* ]] || { print_error '--package requires a job name'; exit 1; }
+      while (( $# )) && [[ $1 != --* ]]; do JOBS+=("$1"); shift; done ;;
+    --include-staged) INCLUDE_STAGED=true; shift ;;
+    --skip-prod-check|--prune) SYNC_ARGS+=("$1"); shift ;;
+    -h|--help)
+      echo "Usage: $0 [--arch ARCH] [--mirror MIRROR] [--package JOB ...] [--include-staged] [sync options]"
+      echo 'JOB is a reviewed pkgbuild directory. Select all split outputs by job, not output alias.'
+      echo 'Without --package, consume only an existing host-owned manifest.'
+      exit 0 ;;
+    *) print_error "Unknown option: $1"; exit 1 ;;
   esac
 done
+require_valid_arch "$ARCH"
+require_valid_mirror "$MIRROR"
+update_arch_paths
+acquire_release_lock
 
-"$SCRIPT_DIR/repo" sign "${COMMON_ARGS[@]}"
-"$SCRIPT_DIR/repo" promote "${COMMON_ARGS[@]}"
-"$SCRIPT_DIR/repo" update "${COMMON_ARGS[@]}"
-"$SCRIPT_DIR/repo" sync "${COMMON_ARGS[@]}" "${SYNC_ARGS[@]}"
+check_engine
+TOOL_ARCH=$(docker_native_arch) || { print_error 'Unsupported host architecture'; exit 1; }
+build_docker_image "$BUILD_DIR" "$TOOL_ARCH" "$MIRROR"
+install -d -m700 "$PUBLICATION_DIR"
+candidate=$(mktemp "$PUBLICATION_DIR/.manifest.XXXXXX")
+trap 'rm -f "$candidate"' EXIT
+user_args=()
+[[ $CONTAINER_ENGINE != docker ]] || user_args=(--user "$(id -u):$(id -g)")
+"$CONTAINER_ENGINE" run "${CONTAINER_RUN_ARGS[@]}" --rm "${user_args[@]}" \
+  "$(get_platform_arg "$TOOL_ARCH")" -e MIRROR="$MIRROR" \
+  -v "$BUILD_ROOT/build-output:/build-output:ro" \
+  -v "$PKGBUILDS_DIR:/pkgbuilds:ro" -v "$BUILD_ROOT/helpers:/helpers:ro" \
+  -v "$PUBLICATION_DIR:/publication:ro" \
+  "omarchy-pkg-builder:latest-$TOOL_ARCH-$MIRROR" \
+  /helpers/admit-prebuilt.sh "$ARCH" "$INCLUDE_STAGED" "${JOBS[@]}" > "$candidate"
+if (( ${#JOBS[@]} )); then
+  chmod 644 "$candidate"
+  mv -T "$candidate" "$PUBLICATION_MANIFEST"
+  rm -f "$PUBLICATION_DIR/manifest.json.sig"
+fi
+"$SCRIPT_DIR/repo" sign --arch "$ARCH" --mirror "$MIRROR"
+"$SCRIPT_DIR/repo" promote --arch "$ARCH" --mirror "$MIRROR"
+"$SCRIPT_DIR/repo" update --arch "$ARCH" --mirror "$MIRROR"
+"$SCRIPT_DIR/repo" sync --arch "$ARCH" --mirror "$MIRROR" "${SYNC_ARGS[@]}"
