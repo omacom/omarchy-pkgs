@@ -61,6 +61,9 @@ grep -Fq 'api.libcamera.path = "/base/soc@0/cci@ac15000/i2c-bus@0/camera@60"' "$
 ! grep -q 'monitor.v4l2.rules' "$package_dir/50-surface-pro-11-cameras.conf" ||
   fail "V4L2 devices are not disabled; in WirePlumber 0.5 that stalls camera discovery"
 
+bin="$scratch/bin"
+mkdir -p "$bin"
+
 # Every hook acts only on the Surface Pro 11 OLED.
 printf 'microsoft,denali-oled\0microsoft,denali\0qcom,x1e80100\0' >"$scratch/denali"
 printf 'lenovo,yoga-slim7x\0qcom,x1e80100\0' >"$scratch/other"
@@ -88,6 +91,29 @@ thresholds 60 90
 [[ -z $(charge_sleep denali pre suspend) ]] || fail "the charge hook acts only after resume"
 ! grep -l 'charge' "$package_dir"/*.service >/dev/null 2>&1 ||
   fail "no boot-time service imposes a charge window"
+
+# Pen: iptsd is stopped before sleep and a fresh process started after resume.
+cat >"$bin/systemctl" <<'STUB'
+#!/bin/bash
+case $1 in
+  list-units) printf 'iptsd@dev-hidraw5.service loaded active running Intel Precise Touch & Stylus Daemon\n' ;;
+  *) printf '%s\n' "$*" >>"$SYSTEMCTL_LOG" ;;
+esac
+STUB
+chmod +x "$bin/systemctl"
+iptsd_sleep() {
+  PATH="$bin:$PATH" SYSTEMCTL_LOG="$scratch/systemctl.log" SP11_IPTSD_STATE="$scratch/iptsd.units" \
+    SP11_IPTSD_COMPATIBLE="$scratch/$1" SP11_IPTSD_SETTLE=0 bash "$package_dir/surface-pro-11-iptsd-sleep" "${@:2}"
+}
+iptsd_sleep other pre suspend
+[[ ! -e $scratch/systemctl.log ]] || fail "iptsd is left alone on other hardware"
+iptsd_sleep denali pre suspend
+iptsd_sleep denali post suspend
+[[ $(<"$scratch/systemctl.log") == $'stop iptsd@dev-hidraw5.service\nstart iptsd@dev-hidraw5.service' ]] ||
+  fail "iptsd restarts across suspend, since the touch controller resets on resume"
+iptsd_sleep denali post suspend
+[[ $(wc -l <"$scratch/systemctl.log") == 2 ]] ||
+  fail "a resume without a matching stop starts nothing"
 
 # CPU power: each profile caps every policy at the nearest supported frequency.
 cpufreq="$scratch/cpufreq"
