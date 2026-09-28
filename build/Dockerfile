@@ -129,6 +129,7 @@ RUN pacman -Syu --noconfirm && \
         wget \
         curl \
         jq \
+        rclone \
         gnupg && \
     pacman -Scc --noconfirm && \
     rm -rf /var/cache/pacman/pkg/*
@@ -146,7 +147,8 @@ RUN useradd -m -G wheel -s /bin/bash builder && \
 # be skipped at signing. Pin the extension so both architectures match.
 RUN sed -i 's/^#MAKEFLAGS=.*/MAKEFLAGS="-j$(nproc)"/' /etc/makepkg.conf && \
     sed -i 's/^COMPRESSZST=.*/COMPRESSZST=(zstd -c -z -q --threads=0 -)/' /etc/makepkg.conf && \
-    sed -i "s|^PKGEXT=.*|PKGEXT='.pkg.tar.zst'|" /etc/makepkg.conf
+    sed -i "s|^PKGEXT=.*|PKGEXT='.pkg.tar.zst'|" /etc/makepkg.conf && \
+    sed -i 's|^#\?PACKAGER=.*|PACKAGER="Omarchy <pkgs@omarchy.org>"|' /etc/makepkg.conf
 
 # Pacman wrapper that auto-resolves package conflicts (e.g. rustup vs rust).
 # makepkg only passes --noconfirm to pacman, which defaults to 'N' on conflict
