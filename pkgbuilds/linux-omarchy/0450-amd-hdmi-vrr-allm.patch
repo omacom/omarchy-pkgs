@@ -1,0 +1,456 @@
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+@@ -104,6 +104,7 @@
+ #include "ivsrcid/dcn/irqsrcs_dcn_1_0.h"
+ 
+ #include "modules/inc/mod_freesync.h"
++#include "modules/inc/mod_info_packet.h"
+ #include "modules/inc/mod_power.h"
+ #include "modules/power/power_helpers.h"
+ 
+@@ -10068,6 +10069,9 @@ static void update_freesync_state_on_stream(
+ 		&vrr_infopacket,
+ 		pack_sdp_v1_3);
+ 
++	if (new_stream->sink->sink_signal == SIGNAL_TYPE_HDMI_FRL)
++		mod_build_infopacket_vtem(new_stream, &vrr_params, 0, &vrr_infopacket);
++
+ 	new_crtc_state->freesync_vrr_info_changed |=
+ 		(memcmp(&new_crtc_state->vrr_infopacket,
+ 			&vrr_infopacket,
+@@ -10079,6 +10083,36 @@ static void update_freesync_state_on_stream(
+ 	new_stream->vrr_infopacket = vrr_infopacket;
+ 	new_stream->allow_freesync = mod_freesync_get_freesync_enabled(&vrr_params);
+ 
++	/*
++	 * HDMI ALLM: when Gaming-VRR is active (VRR_EN=1) and the sink
++	 * advertises ALLM in the SCDS, the Source shall transmit the HF-VSIF
++	 * with ALLM_Mode=1 (HDMI 2.1 Section 7.6.6).
++	 */
++	if (new_stream->signal == SIGNAL_TYPE_HDMI_TYPE_A ||
++	    new_stream->signal == SIGNAL_TYPE_HDMI_FRL) {
++		struct dc_info_packet hf_vsif = {0};
++		bool sink_allm = aconn && aconn->base.display_info.hdmi.allm;
++		bool allm = sink_allm &&
++			(vrr_params.state == VRR_STATE_ACTIVE_VARIABLE ||
++			 vrr_params.state == VRR_STATE_ACTIVE_FIXED);
++		bool allm_changed;
++
++		if (allm)
++			mod_build_hf_vsif_infopacket(new_stream, &hf_vsif, allm, allm);
++
++		allm_changed = memcmp(&new_stream->hfvsif_infopacket, &hf_vsif,
++				      sizeof(hf_vsif)) != 0;
++		new_crtc_state->freesync_vrr_info_changed |= allm_changed;
++		new_stream->hfvsif_infopacket = hf_vsif;
++
++		if (allm_changed)
++			drm_dbg_driver(adev_to_drm(adev),
++				       "ALLM: flip on crtc=%u: sink_allm=%d vrr_state=%d -> ALLM_Mode=%d\n",
++				    new_crtc_state->base.crtc->base.id,
++				    sink_allm,
++				    vrr_params.state, allm);
++	}
++
+ 	if (new_crtc_state->freesync_vrr_info_changed)
+ 		drm_dbg_kms(adev_to_drm(adev), "VRR packet update: crtc=%u enabled=%d state=%d",
+ 			      new_crtc_state->base.crtc->base.id,
+@@ -10645,9 +10679,12 @@ static void amdgpu_dm_commit_planes(struct drm_atomic_commit *state,
+ 		}
+ 
+ 		if (acrtc_state->stream) {
+-			if (acrtc_state->freesync_vrr_info_changed)
++			if (acrtc_state->freesync_vrr_info_changed) {
+ 				bundle->stream_update.vrr_infopacket =
+ 					&acrtc_state->stream->vrr_infopacket;
++				bundle->stream_update.hfvsif_infopacket =
++					&acrtc_state->stream->hfvsif_infopacket;
++			}
+ 		}
+ 	}
+ 
+@@ -12049,6 +12086,14 @@ static void get_freesync_config_for_crtc(
+ 	}
+ out:
+ 	new_crtc_state->freesync_config = config;
++
++	drm_dbg_driver(new_con_state->base.connector->dev,
++		       "VRR: cfg vrr_enabled=%d vrr_supported=%d fs_capable=%d vrefresh=%d min=%d max=%d state=%d\n",
++		       new_crtc_state->base.vrr_enabled,
++		       new_crtc_state->vrr_supported,
++		       new_con_state->freesync_capable, vrefresh,
++		       aconnector->min_vfreq, aconnector->max_vfreq,
++		       config.state);
+ }
+ 
+ static void reset_freesync_config_for_crtc(
+@@ -14011,6 +14056,15 @@ void amdgpu_dm_update_freesync_caps(struct drm_connector *connector,
+ 	if (!adev->dm.freesync_module || !dc_supports_vrr(sink->ctx->dce_version))
+ 		goto update;
+ 
++	drm_dbg_driver(adev_to_drm(adev),
++		       "VRR: enter signal=%d hdmi_vrr=%d mrange[%d-%d] hdmi.vrr_cap[sup=%d min=%d max=%d]\n",
++		       sink->sink_signal, connector->display_info.hdmi.vrr_cap.supported,
++		       connector->display_info.monitor_range.min_vfreq,
++		       connector->display_info.monitor_range.max_vfreq,
++		       connector->display_info.hdmi.vrr_cap.supported,
++		       connector->display_info.hdmi.vrr_cap.vrr_min,
++		       connector->display_info.hdmi.vrr_cap.vrr_max);
++
+ 	edid = drm_edid_raw(drm_edid); // FIXME: Get rid of drm_edid_raw()
+ 
+ 	/* Some eDP panels only have the refresh rate range info in DisplayID */
+@@ -14036,7 +14090,9 @@ void amdgpu_dm_update_freesync_caps(struct drm_connector *connector,
+ 			amdgpu_dm_connector->as_type = ADAPTIVE_SYNC_TYPE_EDP;
+ 		}
+ 
+-	} else if (drm_edid && sink->sink_signal == SIGNAL_TYPE_HDMI_TYPE_A) {
++	} else if (drm_edid &&
++		  (sink->sink_signal == SIGNAL_TYPE_HDMI_TYPE_A ||
++		   sink->sink_signal == SIGNAL_TYPE_HDMI_FRL)) {
+ 		i = parse_hdmi_amd_vsdb(amdgpu_dm_connector, edid, &vsdb_info);
+ 		if (i >= 0) {
+ 			amdgpu_dm_connector->vsdb_info = vsdb_info;
+@@ -14052,6 +14108,59 @@ void amdgpu_dm_update_freesync_caps(struct drm_connector *connector,
+ 				connector->display_info.monitor_range.max_vfreq = vsdb_info.max_refresh_rate_hz;
+ 			}
+ 		}
++
++		drm_dbg_driver(adev_to_drm(adev),
++			       "VRR: amd_vsdb i=%d fs_sup=%d min=%d max=%d fs_capable=%d\n",
++			       i, vsdb_info.freesync_supported,
++			       vsdb_info.min_refresh_rate_hz,
++			       vsdb_info.max_refresh_rate_hz, freesync_capable);
++
++		/*
++		 * If AMD VSDB didn't provide a valid FreeSync range, fall back to
++		 * the HDMI 2.1 VRR capability parsed from the HF-VSDB.
++		 */
++		if (!freesync_capable && connector->display_info.hdmi.vrr_cap.supported) {
++			struct drm_hdmi_vrr_cap *vrr_cap =
++				&connector->display_info.hdmi.vrr_cap;
++
++			drm_dbg_driver(adev_to_drm(adev),
++				       "VRR: HF-VSDB fallback: hdmi_vrr=1 vrr_cap[sup=%d min=%d max=%d] mrange_max=%d\n",
++				       vrr_cap->supported, vrr_cap->vrr_min, vrr_cap->vrr_max,
++				       connector->display_info.monitor_range.max_vfreq);
++
++			if (vrr_cap->supported && vrr_cap->vrr_min > 0) {
++				amdgpu_dm_connector->min_vfreq = vrr_cap->vrr_min;
++				amdgpu_dm_connector->max_vfreq = vrr_cap->vrr_max ?
++					vrr_cap->vrr_max :
++					connector->display_info.monitor_range.max_vfreq;
++
++				/*
++				 * VRRMAX = 0 in the HF-VSDB means "up to the Base
++				 * Refresh Rate". If the EDID also did not provide a
++				 * monitor range max, fall back to the Base Refresh
++				 * Rate (the highest refresh rate of the preferred
++				 * timing) so a valid VRR range is still reported to
++				 * userspace.
++				 */
++				if (!amdgpu_dm_connector->max_vfreq) {
++					struct drm_display_mode *brr_mode =
++						get_highest_refresh_rate_mode(amdgpu_dm_connector, true);
++
++					if (brr_mode)
++						amdgpu_dm_connector->max_vfreq =
++							drm_mode_vrefresh(brr_mode);
++				}
++
++				if (amdgpu_dm_connector->max_vfreq -
++				    amdgpu_dm_connector->min_vfreq > 10)
++					freesync_capable = true;
++
++				connector->display_info.monitor_range.min_vfreq =
++					amdgpu_dm_connector->min_vfreq;
++				connector->display_info.monitor_range.max_vfreq =
++					amdgpu_dm_connector->max_vfreq;
++			}
++		}
+ 	}
+ 
+ 	if (amdgpu_dm_connector->dc_link)
+@@ -14093,6 +14202,11 @@ void amdgpu_dm_update_freesync_caps(struct drm_connector *connector,
+ 	if (dm_con_state)
+ 		dm_con_state->freesync_capable = freesync_capable;
+ 
++	drm_dbg_driver(adev_to_drm(adev),
++		       "VRR: caps result: freesync_capable=%d min_vfreq=%d max_vfreq=%d\n",
++		       freesync_capable, amdgpu_dm_connector->min_vfreq,
++		       amdgpu_dm_connector->max_vfreq);
++
+ 	if (connector->state && amdgpu_dm_connector->dc_link && !freesync_capable &&
+ 	    amdgpu_dm_connector->dc_link->replay_settings.config.replay_supported) {
+ 		amdgpu_dm_connector->dc_link->replay_settings.config.replay_supported = false;
+diff --git a/drivers/gpu/drm/amd/display/modules/inc/mod_info_packet.h b/drivers/gpu/drm/amd/display/modules/inc/mod_info_packet.h
+--- a/drivers/gpu/drm/amd/display/modules/inc/mod_info_packet.h
++++ b/drivers/gpu/drm/amd/display/modules/inc/mod_info_packet.h
+@@ -67,6 +67,10 @@ struct AS_Df_params {
+ 	struct frame_duration_op decrease;
+ };
+ 
++void mod_build_infopacket_vtem(const struct dc_stream_state *stream,
++		const struct mod_vrr_params *vrr, int fva_factor,
++		struct dc_info_packet *infopacket);
++
+ void mod_build_adaptive_sync_infopacket(const struct dc_stream_state *stream,
+ 		enum adaptive_sync_type asType, const struct AS_Df_params *param,
+ 		struct dc_info_packet *info_packet);
+diff --git a/drivers/gpu/drm/amd/display/modules/info_packet/info_packet.c b/drivers/gpu/drm/amd/display/modules/info_packet/info_packet.c
+--- a/drivers/gpu/drm/amd/display/modules/info_packet/info_packet.c
++++ b/drivers/gpu/drm/amd/display/modules/info_packet/info_packet.c
+@@ -291,6 +291,21 @@ void set_vsc_packet_colorimetry_data(
+ 	info_packet->sb[18] = 0;
+ }
+ 
++static void set_field_with_mask(unsigned char *dest, unsigned int mask, unsigned int value)
++{
++	unsigned int shift = 0;
++
++	if (!mask || !dest)
++		return;
++
++	while (!((mask >> shift) & 1))
++		shift++;
++
++	*dest = *dest & ~mask;
++	value = value & (mask >> shift);
++	*dest = *dest | (value << shift);
++}
++
+ void mod_build_vsc_infopacket(const struct dc_stream_state *stream,
+ 		struct dc_info_packet *info_packet,
+ 		enum dc_color_space cs,
+@@ -644,6 +659,100 @@ void mod_build_hf_vsif_infopacket(const struct dc_stream_state *stream,
+ 		info_packet->valid = true;
+ }
+ 
++static void build_vtem_infopacket_data(const struct dc_stream_state *stream,
++		const struct mod_vrr_params *vrr, int fva_factor,
++		struct dc_info_packet *infopacket)
++{
++	unsigned int field_rate_in_hz;
++
++	/* FVA Factor setting */
++	set_field_with_mask(&infopacket->sb[VTEM_MD0], MASK_VTEM_MD0__FVA_FACTOR_M1,
++			(fva_factor > 0) ? (fva_factor - 1) : 0);
++	/* VRR Parameters */
++	if (vrr->state == VRR_STATE_ACTIVE_VARIABLE ||
++	    vrr->state == VRR_STATE_ACTIVE_FIXED) {
++		set_field_with_mask(&infopacket->sb[VTEM_MD0], MASK_VTEM_MD0__VRR_EN, 1);
++	} else {
++		set_field_with_mask(&infopacket->sb[VTEM_MD0], MASK_VTEM_MD0__VRR_EN, 0);
++	}
++
++	if (vrr->state == VRR_STATE_ACTIVE_FIXED)
++		set_field_with_mask(&infopacket->sb[VTEM_MD0], MASK_VTEM_MD0__M_CONST, vrr->m_const);
++
++	if (!stream->timing.vic) {
++		set_field_with_mask(&infopacket->sb[VTEM_MD1], MASK_VTEM_MD1__BASE_VFRONT,
++				stream->timing.v_front_porch);
++
++
++		/* TODO: In dal2, we check mode flags for a reduced blanking timing.
++		 * Need a way to relay that information to this function.
++		 * if("ReducedBlanking")
++		 * {
++		 *   set_field_with_mask(&infopacket->sb[VRR_VTEM_MD2], MASK__VRR_VTEM_MD2__RB, 1;
++		 * }
++		 */
++
++		field_rate_in_hz = stream->timing.pix_clk_100hz * 100;
++		field_rate_in_hz /= stream->timing.h_total;
++		field_rate_in_hz = (field_rate_in_hz + stream->timing.v_total / 2)
++						/ stream->timing.v_total;
++
++		set_field_with_mask(&infopacket->sb[VTEM_MD2],  MASK_VTEM_MD2__BASE_REFRESH_RATE_98,
++				field_rate_in_hz >> 8);
++		set_field_with_mask(&infopacket->sb[VTEM_MD3], MASK_VTEM_MD3__BASE_REFRESH_RATE_07,
++				field_rate_in_hz);
++
++	}
++
++	/*
++	 * When no VTEM feature is enabled (neither VRR nor FVA), signal a
++	 * zero-length data set (MLDS) by clearing Data_Set_Length. HDMI 2.1
++	 * 10.10.2.4 requires the Source to either stop transmitting the VTEM
++	 * or set Data_Set_Length = 0 when no feature is enabled; keeping the
++	 * VTEM with Data_Set_Length = 0 preserves the every-MTW cadence while
++	 * staying compliant (e.g. HDMI GCTS HF1-58 step 6.2).
++	 */
++	if (vrr->state != VRR_STATE_ACTIVE_VARIABLE &&
++	    vrr->state != VRR_STATE_ACTIVE_FIXED && fva_factor == 0)
++		set_field_with_mask(&infopacket->sb[VTEM_PB6],
++				 MASK_VTEM_PB6__DATA_SET_LENGTH_LSB, 0);
++
++	infopacket->valid = true;
++}
++
++static void build_infopacket_header_vtem(enum signal_type signal,
++		struct dc_info_packet *infopacket)
++{
++	/* HEADER */
++
++	/* HB0, HB1, HB2 indicates PacketType VTEMPacket */
++	infopacket->hb0 = 0x7F;
++	infopacket->hb1 = 0xC0;
++	infopacket->hb2 = 0x00; /* sequence_index */
++
++	set_field_with_mask(&infopacket->sb[VTEM_PB0], MASK_VTEM_PB0__VFR, 1);
++	set_field_with_mask(&infopacket->sb[VTEM_PB2], MASK_VTEM_PB2__ORGANIZATION_ID, 1);
++	set_field_with_mask(&infopacket->sb[VTEM_PB3], MASK_VTEM_PB3__DATA_SET_TAG_MSB, 0);
++	set_field_with_mask(&infopacket->sb[VTEM_PB4], MASK_VTEM_PB4__DATA_SET_TAG_LSB, 1);
++	set_field_with_mask(&infopacket->sb[VTEM_PB5], MASK_VTEM_PB5__DATA_SET_LENGTH_MSB, 0);
++	set_field_with_mask(&infopacket->sb[VTEM_PB6], MASK_VTEM_PB6__DATA_SET_LENGTH_LSB, 4);
++}
++
++void mod_build_infopacket_vtem(const struct dc_stream_state *stream,
++		const struct mod_vrr_params *vrr, int fva_factor,
++		struct dc_info_packet *infopacket)
++{
++	/* VTEM info packet for HdmiVrr */
++
++	memset(infopacket, 0, sizeof(struct dc_info_packet));
++
++	/* VTEM Packet is structured differently */
++	build_infopacket_header_vtem(stream->signal, infopacket);
++	build_vtem_infopacket_data(stream, vrr, fva_factor, infopacket);
++
++	infopacket->valid = true;
++}
++
+ void mod_build_adaptive_sync_infopacket(const struct dc_stream_state *stream,
+ 		enum adaptive_sync_type asType,
+ 		const struct AS_Df_params *param,
+diff --git a/drivers/gpu/drm/drm_edid.c b/drivers/gpu/drm/drm_edid.c
+--- a/drivers/gpu/drm/drm_edid.c
++++ b/drivers/gpu/drm/drm_edid.c
+@@ -6182,6 +6182,33 @@ static void drm_parse_ycbcr420_deep_color_info(struct drm_connector *connector,
+ 	hdmi->y420_dc_modes = dc_mask;
+ }
+ 
++static void drm_parse_hdmi_gaming_info(struct drm_hdmi_info *hdmi, const u8 *db)
++{
++	struct drm_hdmi_vrr_cap *vrr = &hdmi->vrr_cap;
++
++	if (cea_db_payload_len(db) < 8)
++		return;
++
++	hdmi->fapa_start_location = db[8] & DRM_EDID_FAPA_START_LOCATION;
++	hdmi->allm = db[8] & DRM_EDID_ALLM;
++	vrr->fva = db[8] & DRM_EDID_FVA;
++	vrr->cnmvrr = db[8] & DRM_EDID_CNMVRR;
++	vrr->cinema_vrr = db[8] & DRM_EDID_CINEMA_VRR;
++	vrr->mdelta = db[8] & DRM_EDID_MDELTA;
++
++	if (cea_db_payload_len(db) < 9)
++		return;
++
++	vrr->vrr_min = db[9] & DRM_EDID_VRR_MIN_MASK;
++	vrr->supported = (vrr->vrr_min > 0 && vrr->vrr_min <= 48);
++
++	if (cea_db_payload_len(db) < 10)
++		return;
++
++	vrr->vrr_max = (db[9] & DRM_EDID_VRR_MAX_UPPER_MASK) << 2 | db[10];
++	vrr->supported &= (vrr->vrr_max == 0 || vrr->vrr_max >= 100);
++}
++
+ static void drm_parse_dsc_info(struct drm_hdmi_dsc_cap *hdmi_dsc,
+ 			       const u8 *hf_scds)
+ {
+@@ -6308,6 +6335,8 @@ static void drm_parse_hdmi_forum_scds(struct drm_connector *connector,
+ 
+ 	drm_parse_ycbcr420_deep_color_info(connector, hf_scds);
+ 
++	drm_parse_hdmi_gaming_info(&connector->display_info.hdmi, hf_scds);
++
+ 	if (cea_db_payload_len(hf_scds) >= 11 && hf_scds[11]) {
+ 		drm_parse_dsc_info(hdmi_dsc, hf_scds);
+ 		dsc_support = true;
+@@ -6317,6 +6346,19 @@ static void drm_parse_hdmi_forum_scds(struct drm_connector *connector,
+ 		    "[CONNECTOR:%d:%s] HF-VSDB: max TMDS clock: %d KHz, HDMI 2.1 support: %s, DSC 1.2 support: %s\n",
+ 		    connector->base.id, connector->name,
+ 		    max_tmds_clock, str_yes_no(max_frl_rate), str_yes_no(dsc_support));
++	drm_dbg_kms(connector->dev,
++		    "[CONNECTOR:%d:%s] FAPA in blanking: %s, ALLM support: %s, Fast Vactive support: %s\n",
++		    connector->base.id, connector->name, str_yes_no(hdmi->fapa_start_location),
++		    str_yes_no(hdmi->allm), str_yes_no(hdmi->vrr_cap.fva));
++	drm_dbg_kms(connector->dev,
++		    "[CONNECTOR:%d:%s] Negative M VRR support: %s, CinemaVRR support: %s, Mdelta: %d\n",
++		    connector->base.id, connector->name, str_yes_no(hdmi->vrr_cap.cnmvrr),
++		    str_yes_no(hdmi->vrr_cap.cinema_vrr), hdmi->vrr_cap.mdelta);
++	drm_dbg_kms(connector->dev,
++		    "[CONNECTOR:%d:%s] VRRmin: %u, VRRmax: %u, VRR supported: %s\n",
++		    connector->base.id, connector->name, hdmi->vrr_cap.vrr_min,
++		    hdmi->vrr_cap.vrr_max, str_yes_no(hdmi->vrr_cap.supported));
++
+ }
+ 
+ static void drm_parse_hdmi_deep_color_info(struct drm_connector *connector,
+diff --git a/include/drm/drm_connector.h b/include/drm/drm_connector.h
+--- a/include/drm/drm_connector.h
++++ b/include/drm/drm_connector.h
+@@ -254,6 +254,44 @@ struct drm_scdc {
+ 	struct drm_scrambling scrambling;
+ };
+ 
++/**
++ * struct drm_hdmi_vrr_cap - Information about VRR capabilities of a HDMI sink
++ *
++ * Describes the VRR support provided by HDMI 2.1 sink. The information is
++ * fetched fom additional HFVSDB blocks defined for HDMI 2.1.
++ */
++struct drm_hdmi_vrr_cap {
++	/** @fva: flag for Fast VActive (Quick Frame Transport) support */
++	bool fva;
++
++	/** @mcnmvrr: flag for Negative M VRR support */
++	bool cnmvrr;
++
++	/** @mcinema_vrr: flag for Cinema VRR support */
++	bool cinema_vrr;
++
++	/** @mdelta: flag for limited frame-to-frame compensation support */
++	bool mdelta;
++
++	/**
++	 * @vrr_min : minimum supported variable refresh rate in Hz.
++	 * Valid values only inide 1 - 48 range
++	 */
++	u16 vrr_min;
++
++	/**
++	 * @vrr_max : maximum supported variable refresh rate in Hz (optional).
++	 * Valid values are either 0 (max based on video mode) or >= 100
++	 */
++	u16 vrr_max;
++
++	/**
++	 * @supported: flag for vrr support based on checking for VRRmin and
++	 * VRRmax values having correct values.
++	 */
++	bool supported;
++};
++
+ /**
+  * struct drm_hdmi_dsc_cap - DSC capabilities of HDMI sink
+  *
+@@ -330,6 +368,15 @@ struct drm_hdmi_info {
+ 	/** @max_lanes: supported by sink */
+ 	u8 max_lanes;
+ 
++	/** @fapa_start_location: flag for the FAPA in blanking support */
++	bool fapa_start_location;
++
++	/** @allm: flag for Auto Low Latency Mode support by sink */
++	bool allm;
++
++	/** @vrr_cap: VRR capabilities of the sink */
++	struct drm_hdmi_vrr_cap vrr_cap;
++
+ 	/** @dsc_cap: DSC capabilities of the sink */
+ 	struct drm_hdmi_dsc_cap dsc_cap;
+ };

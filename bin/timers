@@ -1,0 +1,169 @@
+#!/bin/bash
+# Show the release timers: schedule, last run and its result, what is queued,
+# and what is running right now.
+#
+# Through bin/repo this forwards to the repository host, so the build box's
+# state is one command away from any machine.
+
+set -e
+
+BUILD_ROOT=$(realpath "${BASH_SOURCE[0]%/*}/..")
+source "$BUILD_ROOT/helpers/message-helpers.sh"
+source "$BUILD_ROOT/helpers/paths.sh"
+
+STATE_DIR="${OMARCHY_STATE_DIR:-/root/.state}"
+
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+  echo "Usage: $0"
+  echo ""
+  echo "Reports each omarchy release timer's schedule, last run and result,"
+  echo "any queued builds, and whether a release is running now."
+  exit 0
+fi
+
+print_header "Omarchy Release Timers"
+
+if ! command -v systemctl >/dev/null 2>&1; then
+  print_warning "systemctl not found — timers live on the repository host"
+  echo "Run this against the host: bin/repo timers (with OMARCHY_REPO_HOST or .repo-host set)"
+  exit 0
+fi
+
+# Discover units from the repo so this never drifts from what setup installs.
+UNITS=()
+for unit in "$BUILD_ROOT"/systemd/*.timer; do
+  [[ -e "$unit" ]] || continue
+  UNITS+=("$(basename "$unit" .timer)")
+done
+
+if [[ ${#UNITS[@]} -eq 0 ]]; then
+  print_warning "No timer units found in $BUILD_ROOT/systemd"
+  exit 0
+fi
+
+# --- schedule ----------------------------------------------------------------
+
+print_info "Schedule"
+if ! systemctl list-timers --all 'omarchy-*' --no-pager 2>/dev/null | sed '/^$/d;s/^/  /'; then
+  echo "  (could not read timers)"
+fi
+echo ""
+
+# --- per-unit state ----------------------------------------------------------
+
+print_info "Units"
+for unit in "${UNITS[@]}"; do
+  # systemctl prints "not-found" AND exits nonzero, so a || fallback would
+  # append a second line and wreck the alignment. Take its output as-is.
+  enabled=$(systemctl is-enabled "$unit.timer" 2>/dev/null || true)
+  enabled=${enabled:-unknown}
+  service_state=$(systemctl is-active "$unit.service" 2>/dev/null || true)
+  result=$(systemctl show "$unit.service" -p Result --value 2>/dev/null || true)
+  exit_status=$(systemctl show "$unit.service" -p ExecMainStatus --value 2>/dev/null || true)
+  finished=$(systemctl show "$unit.service" -p ExecMainExitTimestamp --value 2>/dev/null || true)
+
+  case "$enabled" in
+  enabled) mark="✓" ;;
+  not-found | unknown) mark="✗" ;;
+  *) mark="⚠" ;;
+  esac
+
+  printf '  %s %-28s timer:%-14s' "$mark" "$unit" "$enabled"
+
+  if [[ "$service_state" == "activating" || "$service_state" == "active" ]]; then
+    printf 'RUNNING NOW\n'
+  elif [[ -z "$finished" ]]; then
+    printf 'never run\n'
+  elif [[ "$result" == "success" && "$exit_status" == "0" ]]; then
+    printf 'last: ok (%s)\n' "$finished"
+  else
+    printf 'last: FAILED [%s/exit %s] (%s)\n' "${result:-unknown}" "${exit_status:-?}" "$finished"
+  fi
+done
+echo ""
+
+# --- queued work -------------------------------------------------------------
+
+print_info "Queued builds (state files in $STATE_DIR; architectures: $(published_arches | tr '\n' ' '))"
+queued=false
+for channel in edge rc stable; do
+  for arch in $(published_arches); do
+    state_file=$(sync_queue_file "$channel" "$arch")
+    [[ "$arch" == "x86_64" && ! -f "$state_file" ]] && state_file=$(legacy_sync_queue_file "$channel")
+    if [[ -f "$state_file" ]]; then
+      queued=true
+      since=$(date -r "$state_file" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "unknown")
+      printf '  • %-7s %-8s queued since %s\n' "$channel" "$arch" "$since"
+    fi
+  done
+done
+[[ "$queued" == false ]] && echo "  (nothing queued — all channels up to date)"
+echo ""
+
+# A channel in backoff looks identical to an idle one from the outside, so
+# say so plainly: it is queued but deliberately not being retried yet.
+paused=false
+for channel in edge rc stable; do
+  for arch in $(published_arches); do
+    fail_file=$(sync_fail_file "$channel" "$arch")
+    [[ "$arch" == "x86_64" && ! -f "$fail_file" ]] && fail_file=$(legacy_sync_fail_file "$channel")
+    [[ -f "$fail_file" ]] || continue
+    if [[ "$paused" == false ]]; then
+      print_error "Failing builds (backoff active)"
+      paused=true
+    fi
+    FAILURE_COUNT=0 FAILURE_AT=0 FAILURE_FINGERPRINT=""
+    # shellcheck disable=SC1090
+    source "$fail_file" 2>/dev/null || true
+    delay=600
+    for ((i = 1; i < FAILURE_COUNT; i++)); do
+      delay=$((delay * 2))
+      ((delay >= 21600)) && { delay=21600; break; }
+    done
+    retry_at=$((FAILURE_AT + delay))
+    now=$(date +%s)
+    if ((now < retry_at)); then
+      when="retries at $(date -d "@$retry_at" '+%H:%M:%S' 2>/dev/null || echo "+$((retry_at - now))s")"
+    else
+      when="retries on the next tick"
+    fi
+    printf '  ✗ %-7s %-8s %s consecutive failure(s), %s\n' "$channel" "$arch" "$FAILURE_COUNT" "$when"
+    printf '      last attempt %s on commit %s\n' \
+      "$(date -d "@$FAILURE_AT" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "$FAILURE_AT")" \
+      "${FAILURE_FINGERPRINT:0:12}"
+  done
+done
+if [[ "$paused" == true ]]; then
+  echo "  Any new commit clears the backoff; or: rm $STATE_DIR/.build-failed-<channel>-<arch>"
+  echo ""
+fi
+
+# --- release lock ------------------------------------------------------------
+
+print_info "Release lock"
+lock_file="$REPO_ROOT/.release.lock"
+if [[ -s "$lock_file" ]]; then
+  holder=$(tail -1 "$lock_file" 2>/dev/null)
+  # A recorded holder whose process is gone is a leftover, not a live release.
+  pid=$(sed -n 's/^pid \([0-9]\+\).*/\1/p' <<<"$holder")
+  if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+    print_warning "HELD — $holder"
+  else
+    echo "  free (last holder: $holder)"
+  fi
+else
+  echo "  free"
+fi
+echo ""
+
+# --- recent failures ---------------------------------------------------------
+
+failed=$(systemctl list-units --failed --no-legend 'omarchy-*' 2>/dev/null | sed 's/^/  /')
+if [[ -n "$failed" ]]; then
+  print_error "Failed units"
+  echo "$failed"
+  echo ""
+  echo "  Logs: journalctl -u <unit> -n 50"
+fi
+
+print_info "Full logs: journalctl -u omarchy-auto-release-<channel> -n 50"
