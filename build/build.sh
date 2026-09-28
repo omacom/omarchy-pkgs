@@ -1,5 +1,5 @@
 #!/bin/bash
-# Build script - builds packages based on package metadata
+# Plan a run or build one planned package in an isolated container.
 # Unscoped edge builds exclude skip_build packages. Stable also requires the fast release ring.
 # Explicit --package selections may build packages with skip_build=true.
 
@@ -11,6 +11,10 @@ ARCH=${ARCH:-x86_64}
 export -n ARCH
 MIRROR=${MIRROR:-edge}
 DRY_RUN=${DRY_RUN:-false}
+# bin/build plans the whole run, then invokes this script once per package in
+# a fresh container. PACKAGES retains the original request for validation.
+BUILD_PACKAGE=${BUILD_PACKAGE:-}
+BUILD_PLAN_DIR=${BUILD_PLAN_DIR:-}
 PKGBUILDS_DIR=${PKGBUILDS_DIR:-/pkgbuilds}
 BUILD_OUTPUT_DIR=${BUILD_OUTPUT_DIR:-/build-output/$MIRROR/$ARCH}
 FINAL_OUTPUT_DIR=${FINAL_OUTPUT_DIR:-/pkgs.omarchy.org/$MIRROR/$ARCH}
@@ -21,6 +25,29 @@ SRC_DIR=${SRC_DIR:-/src}
 DEFER_RUNTIME_DEPS=${DEFER_RUNTIME_DEPS:-false}
 
 source "$HELPERS_DIR/package-metadata.sh"
+
+# Where the channel's published database is read from for planning. On the
+# repository host it is the published tree itself. Anywhere else (a CI runner,
+# a fresh clone) that tree is absent, so the database is fetched from the
+# public channel and the same URL serves as pacman's dependency repository.
+# Set OMARCHY_PUBLISHED_REPO_URL= (empty) to disable the remote fallback.
+PUBLISHED_REPO_URL=${OMARCHY_PUBLISHED_REPO_URL-https://pkgs.omarchy.org}
+PUBLISHED_DB_DIR="$FINAL_OUTPUT_DIR"
+PUBLISHED_REPO_SERVER=""
+if [[ ! -f "$FINAL_OUTPUT_DIR/omarchy.db.tar.zst" && ! -f "$FINAL_OUTPUT_DIR/omarchy.db" && -n "$PUBLISHED_REPO_URL" ]]; then
+  remote_channel="$PUBLISHED_REPO_URL/$MIRROR/$ARCH"
+  remote_db_dir=$(mktemp -d /tmp/omarchy-published.XXXXXX) || exit 1
+  # Cache-bust: the channel sits behind a CDN that serves a stale database
+  # for a while after a sync.
+  if curl -fsSL "$remote_channel/omarchy.db.tar.zst?$(date +%s)" -o "$remote_db_dir/omarchy.db.tar.zst"; then
+    PUBLISHED_DB_DIR="$remote_db_dir"
+    PUBLISHED_REPO_SERVER="$remote_channel"
+    echo "==> No local published tree; planning against $remote_channel"
+  else
+    rm -rf "$remote_db_dir"
+    echo "==> No local published tree and $remote_channel is unavailable; treating the channel as empty"
+  fi
+fi
 
 if [[ $DEFER_RUNTIME_DEPS != "false" && $DEFER_RUNTIME_DEPS != "true" ]]; then
   echo "DEFER_RUNTIME_DEPS must be true or false" >&2
@@ -48,6 +75,14 @@ if [[ $DEFER_RUNTIME_DEPS == "true" ]]; then
 fi
 
 if [[ "$DRY_RUN" != true ]]; then
+  if [[ -z "$BUILD_PACKAGE" || -z "$BUILD_PLAN_DIR" ]]; then
+    echo "Use bin/build to plan and run isolated package builds" >&2
+    exit 1
+  fi
+  if ! grep -Fxq -- "$BUILD_PACKAGE" "$BUILD_PLAN_DIR/packages"; then
+    echo "Package is not in the build plan: $BUILD_PACKAGE" >&2
+    exit 1
+  fi
   # Import GPG keys
   /build/import-gpg-keys.sh || exit 1
 
@@ -59,7 +94,7 @@ if [[ "$DRY_RUN" != true ]]; then
   # that breaks the new packages (imagemagick wanting GLIBC_2.44, etc).
   # Done before the Omarchy repos are added so only core/extra participate.
   echo "==> Updating build container packages..."
-  sudo pacman -Syu --noconfirm
+  sudo pacman -Syu --noconfirm || exit 1
 
   # Configure Omarchy repositories for dependency resolution
   echo "==> Configuring Omarchy repositories for dependency resolution..."
@@ -72,31 +107,53 @@ if [[ "$DRY_RUN" != true ]]; then
   echo "  -> omarchy-build (priority 1): $BUILD_OUTPUT_DIR"
 
   # Initialize empty build database if it doesn't exist
-  cd "$BUILD_OUTPUT_DIR"
+  cd "$BUILD_OUTPUT_DIR" || exit 1
   if [[ ! -f "omarchy-build.db.tar.zst" ]]; then
     # Create an empty database
-    repo-add omarchy-build.db.tar.zst >/dev/null 2>&1
-    ln -sf omarchy-build.db.tar.zst omarchy-build.db
+    repo-add omarchy-build.db.tar.zst >/dev/null 2>&1 || exit 1
+    ln -sf omarchy-build.db.tar.zst omarchy-build.db || exit 1
   fi
   # Fold any packages already in the workspace into the database, whether
   # they came with an existing database or were dropped in by an earlier
   # workflow job (OMARCHY_KEEP_BUILD_WORKSPACE). Without this a seeded
   # workspace with no database would leave those packages invisible to
   # dependency resolution.
-  if ls *.pkg.tar.* 2>/dev/null | grep -v '\.sig$' | grep -v 'omarchy-build\.db' | grep -q .; then
-    echo "==> Rebuilding build database from existing packages..."
-    ls *.pkg.tar.* | grep -v '\.sig$' | grep -v 'omarchy-build\.db' | xargs -r repo-add omarchy-build.db.tar.zst >/dev/null 2>&1
-    ln -sf omarchy-build.db.tar.zst omarchy-build.db
+  staged_packages=()
+  for staged in *.pkg.tar.*; do
+    [[ -f "$staged" && "$staged" != *.sig ]] || continue
+    staged_packages+=("$staged")
+  done
+  if (( ${#staged_packages[@]} )); then
+    # Seed once per run. After that, only successful builds update the DB;
+    # rescanning in every container could reintroduce a failed build's partial
+    # outputs or overwrite the new version with an older kept artifact.
+    if [[ ! -e "$BUILD_PLAN_DIR/repository-initialized" ]]; then
+      echo "==> Rebuilding build database from existing packages..."
+      repo-add omarchy-build.db.tar.zst "${staged_packages[@]}" >/dev/null 2>&1 || exit 1
+      ln -sf omarchy-build.db.tar.zst omarchy-build.db || exit 1
+    fi
+    # A resumed/repeated build can produce different bytes under the same
+    # filename. Never let the shared download cache substitute older bytes
+    # for the staged artifacts described by this run's database.
+    for staged in "${staged_packages[@]}"; do
+      sudo rm -f "/var/cache/pacman/pkg/$staged" "/var/cache/pacman/pkg/$staged.sig" || exit 1
+    done
   fi
+  touch "$BUILD_PLAN_DIR/repository-initialized" || exit 1
 
-  # Add omarchy repo if it has a database (stable packages)
+  # Add omarchy repo if it has a database (stable packages). The local tree
+  # is trusted as-is; the public channel is verified against the omarchy
+  # keyring the image already carries.
   if [[ -f "$FINAL_OUTPUT_DIR/omarchy.db.tar.zst" ]] || [[ -f "$FINAL_OUTPUT_DIR/omarchy.db" ]]; then
     sudo sed -i "/^\[core\]$/i [omarchy]\nSigLevel = Optional TrustAll\nServer = file://$FINAL_OUTPUT_DIR\n" /etc/pacman.conf
     echo "  -> omarchy (priority 2): $FINAL_OUTPUT_DIR"
+  elif [[ -n "$PUBLISHED_REPO_SERVER" ]]; then
+    sudo sed -i "/^\[core\]$/i [omarchy]\nSigLevel = Required DatabaseOptional\nServer = $PUBLISHED_REPO_SERVER\n" /etc/pacman.conf
+    echo "  -> omarchy (priority 2): $PUBLISHED_REPO_SERVER"
   fi
 
   # Sync pacman database
-  sudo pacman -Sy
+  sudo pacman -Sy || exit 1
 fi
 
 echo "==> Package Builder"
@@ -109,8 +166,6 @@ if [[ "$DRY_RUN" == true ]]; then
   echo "==> Dry run: yes (plan only; makepkg will not run)"
 fi
 
-FAILED_PACKAGES=""
-SUCCESSFUL_PACKAGES=""
 SKIPPED_PACKAGES=""
 
 # Find package directory
@@ -132,10 +187,10 @@ LOCAL_VERSION_CACHE_LOADED=false
 LOCAL_VERSION_CACHE_DB=""
 
 load_local_versions() {
-  local db="$FINAL_OUTPUT_DIR/omarchy.db.tar.zst"
+  local db="$PUBLISHED_DB_DIR/omarchy.db.tar.zst"
 
   if [[ ! -f "$db" ]]; then
-    db="$FINAL_OUTPUT_DIR/omarchy.db"
+    db="$PUBLISHED_DB_DIR/omarchy.db"
   fi
 
   [[ -f "$db" ]] || return 0
@@ -262,19 +317,34 @@ install_deferred_build_dependencies() {
 # Build a package
 build_package() {
   local pkg="$1"
-  local pkgdir=$(find_package_dir "$pkg")
+  local pkgdir
+  pkgdir=$(find_package_dir "$pkg") || return 1
 
   echo ""
   echo "  -> Processing: $pkg"
 
+  # Install this consumer's freshly built prerequisites in its own container.
+  # Qualifying the repository also upgrades an older dependency baked into
+  # the base image, even if that version would satisfy makepkg's check.
+  if [[ "$DEFER_RUNTIME_DEPS" != true ]]; then
+    local consumer dependency
+    local -a built_deps=()
+    while read -r consumer dependency; do
+      [[ "$consumer" == "$pkg" ]] && built_deps+=("omarchy-build/$dependency")
+    done < "$BUILD_PLAN_DIR/dependencies"
+    if (( ${#built_deps[@]} )); then
+      echo "    Installing freshly built dependencies for $pkg..."
+      sudo /usr/local/bin/pacman-for-makepkg -S --needed --noconfirm -- "${built_deps[@]}" || return 1
+    fi
+  fi
+
   # Copy to build directory
-  cd /src
-  rm -rf "$pkg"
-  cp -r "$pkgdir" "$pkg"
+  cd /src || return 1
+  rm -rf "$pkg" || return 1
+  cp -r "$pkgdir" "$pkg" || return 1
   cd "/src/$pkg" || return 1
 
   refresh_vcs_pkgver_preserving_local_pkgrel "$pkg" || {
-    FAILED_PACKAGES="$FAILED_PACKAGES $pkg"
     return 1
   }
 
@@ -283,7 +353,6 @@ build_package() {
 
   if [[ -z "$pkgbuild_version" ]]; then
     echo "    Failed to read PKGBUILD version"
-    FAILED_PACKAGES="$FAILED_PACKAGES $pkg"
     return 1
   fi
 
@@ -322,7 +391,6 @@ build_package() {
     # is installed in one verified transaction downstream. Only the
     # build-time dependencies are installed, then makepkg skips the check.
     install_deferred_build_dependencies "$pkg" || {
-      FAILED_PACKAGES="$FAILED_PACKAGES $pkg"
       return 1
     }
     makepkg_flags=(-cf --noconfirm --nodeps)
@@ -340,11 +408,9 @@ build_package() {
 
     if [[ ${#package_files[@]} -eq 0 ]]; then
       echo "    Makepkg produced no package files for $pkg"
-      FAILED_PACKAGES="$FAILED_PACKAGES $pkg"
       return 1
     fi
 
-    local dependency_pkg_file=""
     local -a new_pkgs=()
     local pkg_path pkg_file
     for pkg_path in "${package_files[@]}"; do
@@ -358,55 +424,32 @@ build_package() {
         fi
 
         echo "    Expected package file was not produced: $pkg_file"
-        FAILED_PACKAGES="$FAILED_PACKAGES $pkg"
         return 1
       fi
 
-      cp "$pkg_file" "$BUILD_OUTPUT_DIR/"
+      cp "$pkg_file" "$BUILD_OUTPUT_DIR/" || return 1
       new_pkgs+=("$pkg_file")
-
-      if [[ "$(bsdtar -xOf "$pkg_file" .PKGINFO 2>/dev/null | sed -n 's/^pkgname = //p')" == "$pkg" ]]; then
-        dependency_pkg_file="$BUILD_OUTPUT_DIR/$pkg_file"
-      fi
     done
 
-    cd "$BUILD_OUTPUT_DIR"
+    cd "$BUILD_OUTPUT_DIR" || return 1
 
     # Add every output from this build, including split packages.
     if [[ ${#new_pkgs[@]} -gt 0 ]]; then
-      repo-add omarchy-build.db.tar.zst "${new_pkgs[@]}" >/dev/null 2>&1
-      ln -sf omarchy-build.db.tar.zst omarchy-build.db
-      sudo pacman -Sy >/dev/null 2>&1
+      repo-add omarchy-build.db.tar.zst "${new_pkgs[@]}" >/dev/null 2>&1 || return 1
+      ln -sf omarchy-build.db.tar.zst omarchy-build.db || return 1
     fi
 
-    cd /src/$pkg
-
-    # A lower-priority official repository may contain an older package with
-    # the same name. Install the exact artifact we just built before building
-    # its consumers, so pacman cannot select that older provider instead.
-    if [[ "${INSTALL_PACKAGES[$pkg]:-}" == "1" ]]; then
-      if [[ -z "$dependency_pkg_file" ]]; then
-        echo "    Could not find the built $pkg package to install as a dependency"
-        FAILED_PACKAGES="$FAILED_PACKAGES $pkg"
-        return 1
-      fi
-
-      echo "    Installing freshly built $pkg for dependent packages..."
-      if ! sudo /usr/local/bin/pacman-for-makepkg -U --needed --noconfirm "$dependency_pkg_file"; then
-        echo "    Failed to install freshly built dependency $pkg"
-        FAILED_PACKAGES="$FAILED_PACKAGES $pkg"
-        return 1
-      fi
-    fi
+    # A release may publish successful builds even when a peer fails. Record
+    # outputs only after this package's entire split build has completed.
+    mkdir -p "$BUILD_PLAN_DIR/artifacts" || return 1
+    printf '%s\n' "${new_pkgs[@]}" > "$BUILD_PLAN_DIR/artifacts/$pkg" || return 1
 
     echo "    Successfully built $pkg"
-    SUCCESSFUL_PACKAGES="$SUCCESSFUL_PACKAGES $pkg"
     return 0
   else
     echo "    Makepkg failed for $pkg"
     echo "    DEBUG: Files in build directory:"
     ls -lah *.pkg.tar.* 2>&1 | head -20 || echo "    No package files found"
-    FAILED_PACKAGES="$FAILED_PACKAGES $pkg"
     return 1
   fi
 }
@@ -421,11 +464,17 @@ get_package_deps() {
     return
   fi
 
-  # Extract depends and makedepends, filter for packages in our pkgbuilds/
+  # Include test dependencies and target-specific arrays: each container must
+  # receive its prerequisites through the repository, not a previous build.
   (
+    CARCH="$ARCH"
     source "$pkgbuild" 2>/dev/null
-    echo "${depends[@]} ${makedepends[@]}"
-  ) | tr ' ' '\n' | while read -r dep; do
+    for kind in depends makedepends checkdepends; do
+      generic="${kind}[@]"
+      specific="${kind}_${CARCH}[@]"
+      printf '%s\n' "${!generic}" "${!specific}"
+    done
+  ) | awk 'NF && !seen[$0]++' | while read -r dep; do
     # Strip version constraints (e.g., 'hyprshade>=1.0' -> 'hyprshade')
     dep=$(echo "$dep" | sed 's/[<>=].*$//')
     # Check if this dependency exists in our pkgbuilds
@@ -510,9 +559,17 @@ check_needs_build() {
 
   if [[ "$local_version" == "$pkgbuild_version" ]]; then
     return 1  # Already up to date
-  else
-    return 0  # Needs building
   fi
+
+  # Match check-versions: a retained archive is already published even when
+  # the DB now indexes a newer release (for example, 4.0.4rc1 vs 4.0.3).
+  # Rebuilding it would produce different bytes under an immutable filename.
+  if package_version_is_published "$FINAL_OUTPUT_DIR" "$pkg" "$pkgbuild_version" "$ARCH"; then
+    echo "  + $pkg $pkgbuild_version - archive already published; skipping rebuild"
+    return 1
+  fi
+
+  return 0  # Needs building
 }
 
 # Collect packages that should be built for the selected mirror
@@ -522,15 +579,17 @@ collect_packages() {
 
 # Main execution
 if [[ "$DRY_RUN" != true ]]; then
-  cd "$SRC_DIR"
+  cd "$SRC_DIR" || exit 1
+  build_package "$BUILD_PACKAGE"
+  exit $?
 fi
-
-TOTAL_COUNT=0
 
 echo "==> Checking which packages need building..."
 
 # First pass: determine which packages need building
 PACKAGES_TO_BUILD=()
+ORDERED_PACKAGES=()
+PLANNED_DEPENDENCIES=()
 
 # If PACKAGES is specified, only check those packages
 if [[ -n "$PACKAGES" ]]; then
@@ -581,7 +640,7 @@ fi
 if [[ ${#PACKAGES_TO_BUILD[@]} -eq 0 ]]; then
   echo "==> All packages are up to date!"
 else
-  echo "==> ${#PACKAGES_TO_BUILD[@]} package(s) need building: ${PACKAGES_TO_BUILD[@]}"
+  echo "==> ${#PACKAGES_TO_BUILD[@]} package(s) need building: ${PACKAGES_TO_BUILD[*]}"
   echo "==> Determining build order based on dependencies..."
 
   # Second pass: order only the packages that need building
@@ -604,6 +663,7 @@ else
           ((unmet_deps_count[$pkg]++))
           # Track that dep blocks pkg from building
           blocks_packages[$dep]="${blocks_packages[$dep]} $pkg"
+          PLANNED_DEPENDENCIES+=("$pkg $dep")
         fi
       done
     done < <(get_package_deps "$pkg")
@@ -618,7 +678,6 @@ else
   done
 
   # Build packages as dependencies become available
-  ORDERED_PACKAGES=()
   while [[ ${#ready_to_build[@]} -gt 0 ]]; do
     # Take the first ready package
     current="${ready_to_build[0]}"
@@ -640,63 +699,16 @@ else
     exit 1
   fi
 
-  echo "==> Build order: ${ORDERED_PACKAGES[@]}"
+  echo "==> Build order: ${ORDERED_PACKAGES[*]}"
+fi
 
-  if [[ "$DRY_RUN" == true ]]; then
-    echo ""
-    echo "==> Dry run complete. Packages that would build: ${ORDERED_PACKAGES[@]}"
-    exit 0
-  fi
-
-  # Determine which packages need to be installed for other packages being built
-  declare -A INSTALL_PACKAGES
-  for pkg in "${ORDERED_PACKAGES[@]}"; do
-    while IFS= read -r dep; do
-      [[ -z "$dep" ]] && continue
-      # Only install if it's being built in this run
-      for build_pkg in "${ORDERED_PACKAGES[@]}"; do
-        [[ "$dep" == "$build_pkg" ]] && INSTALL_PACKAGES["$dep"]=1
-      done
-    done < <(get_package_deps "$pkg")
-  done
-
-  if [[ ${#INSTALL_PACKAGES[@]} -gt 0 ]]; then
-    echo "==> Packages needed as dependencies: ${!INSTALL_PACKAGES[@]}"
-  fi
-
-  # Build packages in dependency order
-  for pkg in "${ORDERED_PACKAGES[@]}"; do
-    ((TOTAL_COUNT++))
-    build_package "$pkg"
-  done
+# The host consumes plain data, never shell code or parsed human log output.
+if [[ -n "$BUILD_PLAN_DIR" ]]; then
+  mkdir -p "$BUILD_PLAN_DIR" || exit 1
+  printf '%s\n' "${ORDERED_PACKAGES[@]}" | sed '/^$/d' > "$BUILD_PLAN_DIR/packages" || exit 1
+  printf '%s\n' "${PLANNED_DEPENDENCIES[@]}" | sed '/^$/d' > "$BUILD_PLAN_DIR/dependencies" || exit 1
+  printf '%s\n' $SKIPPED_PACKAGES | sed '/^$/d' > "$BUILD_PLAN_DIR/skipped" || exit 1
 fi
 
 echo ""
-echo "========================================"
-echo "==> Build Summary"
-echo "========================================"
-
-# Count results
-SUCCESS_COUNT=$(echo $SUCCESSFUL_PACKAGES | wc -w)
-SKIPPED_COUNT=$(echo $SKIPPED_PACKAGES | wc -w)
-FAILED_COUNT=$(echo $FAILED_PACKAGES | wc -w)
-
-echo "  Total packages: $TOTAL_COUNT"
-echo "  Built:          $SUCCESS_COUNT"
-echo "  Skipped:        $SKIPPED_COUNT (already up-to-date)"
-echo "  Failed:         $FAILED_COUNT"
-
-# List failures if any
-if [[ -n "$FAILED_PACKAGES" ]]; then
-  echo ""
-  echo "Failed packages:"
-  for pkg in $FAILED_PACKAGES; do
-    echo "  - $pkg"
-  done
-  echo ""
-  echo "==> Some packages failed to build"
-  exit 1
-fi
-
-echo ""
-echo "==> All packages processed successfully!"
+echo "==> Plan complete. Packages that would build: ${ORDERED_PACKAGES[*]}"

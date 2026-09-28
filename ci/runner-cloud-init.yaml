@@ -1,0 +1,81 @@
+#cloud-config
+# Ephemeral GitHub Actions runner for omarchy-pkgs package builds.
+#
+# Boots an Ubuntu droplet, installs docker and the runner, registers ONCE with
+# --ephemeral, runs exactly one job, then powers off. The controller (or the
+# reaper) deletes the powered-off droplet. Nothing here holds a long-lived
+# credential: the registration token is single-use and expires in an hour.
+#
+# Substitute before use:
+#   __REPO__            owner/name
+#   __RUNNER_TOKEN__    registration token (gh api -X POST repos/O/R/actions/runners/registration-token)
+#   __RUNNER_LABELS__   e.g. omarchy-builder
+#   __RUNNER_VERSION__  e.g. 2.329.0
+
+# Operators can reach a builder by key while it lives; it powers off after
+# one job anyway. Keys are substituted by the controller (__SSH_KEYS_JSON__).
+disable_root: false
+chpasswd:
+  expire: false
+ssh_authorized_keys: __SSH_KEYS_JSON__
+
+package_update: true
+packages:
+  - docker.io
+  - docker-buildx
+  - unzip
+  - git
+  - curl
+  - jq
+  - rsync
+
+users:
+  - name: runner
+    groups: [docker]
+    shell: /bin/bash
+    sudo: ALL=(ALL) NOPASSWD:ALL
+
+write_files:
+  # defer: write after users/groups exist, so /home/runner is created by
+  # useradd (owned by runner) rather than by this module as root.
+  - path: /home/runner/start.sh
+    permissions: "0755"
+    owner: runner:runner
+    defer: true
+    content: |
+      #!/bin/bash
+      set -euo pipefail
+      cd /home/runner
+      mkdir -p actions-runner && cd actions-runner
+      arch=$(uname -m); [[ $arch == x86_64 ]] && arch=x64
+      curl -fsSL -o runner.tgz \
+        "https://github.com/actions/runner/releases/download/v__RUNNER_VERSION__/actions-runner-linux-${arch}-__RUNNER_VERSION__.tar.gz"
+      tar xzf runner.tgz && rm runner.tgz
+      ./config.sh --unattended --ephemeral \
+        --url "https://github.com/__REPO__" \
+        --token "__RUNNER_TOKEN__" \
+        --name "do-$(hostname)" \
+        --labels "__RUNNER_LABELS__" \
+        --replace
+      ./run.sh
+      # One job done. Power off; the controller deletes powered-off droplets.
+      sudo poweroff
+
+runcmd:
+  # With no account ssh key attached, DO expires root's password, and sshd
+  # then refuses every non-interactive session. Clear it first so operators
+  # can read the logs of a builder that never registers.
+  - chage -d "$(date +%F)" -M -1 root
+  - systemctl enable --now docker
+  # aarch64 builds run under user-mode emulation (DO has no arm droplets).
+  # Register QEMU with the F and C flags via tonistiigi/binfmt, exactly as
+  # helpers/docker-helpers.sh setup_qemu does. Ubuntu's qemu-user-static
+  # registers without C, so sudo inside the emulated container fails with
+  # "effective uid is not 0"; multiarch/qemu-user-static is abandoned at QEMU
+  # 7.2, under which qmake's compiler probe returns nothing on current gcc
+  # ("failed to parse default include paths", PR #517). Pin the emulator
+  # version: the tag is the only thing that decides what every aarch64 build
+  # runs under. Best-effort: an x86-only job never needs it.
+  - docker run --rm --privileged docker.io/tonistiigi/binfmt:qemu-v10.2.3-68 --uninstall qemu-aarch64 --install arm64 || true
+  - chown -R runner:runner /home/runner
+  - sudo -u runner /home/runner/start.sh > /home/runner/runner.log 2>&1

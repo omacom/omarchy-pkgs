@@ -1,0 +1,66 @@
+#!/bin/bash
+# Build a reusable package environment from this checkout's own inputs.
+set -euo pipefail
+
+BUILD_ROOT=$(realpath "${BASH_SOURCE[0]%/*}/..")
+source "$BUILD_ROOT/helpers/paths.sh"
+
+usage() {
+  echo "Usage: bin/builder-image {key|build} [--arch x86_64|aarch64] [--mirror edge|rc|stable] [--tag IMAGE] [--fresh]"
+}
+
+command=${1:-}
+[[ $# -eq 0 ]] || shift
+tag=""
+fresh=false
+while (( $# )); do
+  case "$1" in
+    --arch) ARCH=${2:?Missing architecture}; shift 2 ;;
+    --mirror) MIRROR=${2:?Missing mirror}; shift 2 ;;
+    --tag) tag=${2:?Missing image tag}; shift 2 ;;
+    --fresh) fresh=true; shift ;;
+    *) usage >&2; exit 1 ;;
+  esac
+done
+require_valid_arch "$ARCH"
+validate_mirror "$MIRROR" || { echo "Invalid mirror: $MIRROR" >&2; exit 1; }
+case "$command" in key|build) ;; *) usage >&2; exit 1 ;; esac
+if [[ $command == key && ( -n $tag || $fresh == true ) ]]; then
+  usage >&2
+  exit 1
+fi
+
+# Include the whole build context, conservatively including mounted build
+# scripts too. Normalize timestamps and ownership so fresh checkouts agree;
+# retain file contents, names, executable bits and symlink targets. Bump v1
+# if the image build invocation or this compatibility contract changes.
+hash=$(tar --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner \
+  --format=gnu -cf - -C "$BUILD_DIR" . | sha256sum | cut -d' ' -f1)
+key="v1-$ARCH-$MIRROR-$hash"
+if [[ $command == key ]]; then
+  echo "$key"
+  exit 0
+fi
+
+source "$BUILD_ROOT/helpers/message-helpers.sh"
+source "$BUILD_ROOT/helpers/docker-helpers.sh"
+check_engine
+platform=$(get_platform_arg "$ARCH")
+tag=${tag:-omarchy-pkg-builder:latest-$ARCH-$MIRROR}
+revision=$(git -C "$BUILD_ROOT" rev-parse HEAD 2>/dev/null || echo unknown)
+args=("$platform" --build-arg "MIRROR=$MIRROR"
+  --label "org.omarchy.builder.key=$key"
+  --label "org.opencontainers.image.source=https://github.com/omacom/omarchy-pkgs"
+  --label "org.opencontainers.image.revision=$revision"
+  --label "org.opencontainers.image.created=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  --tag "$tag" --file "$BUILD_DIR/Dockerfile")
+if [[ $fresh == true ]]; then
+  # A daily build must refresh Arch even when its Dockerfile has not changed.
+  args+=(--no-cache)
+  if [[ $CONTAINER_ENGINE == docker ]]; then args+=(--pull); else args+=(--pull=always); fi
+fi
+if [[ $CONTAINER_ENGINE == docker ]]; then
+  docker buildx build --load "${args[@]}" "$BUILD_DIR"
+else
+  podman build "${args[@]}" "$BUILD_DIR"
+fi

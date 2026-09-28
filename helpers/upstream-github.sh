@@ -31,7 +31,7 @@ package_upstream_provider() {
   metadata=$(metadata_file_for_dir "$pkgdir")
   jq -r '
     (.upstream? | objects) as $u
-    | [$u | keys[] | select(. == "github" or . == "git_tags" or . == "npm" or . == "debian")]
+    | [$u | keys[] | select(. == "github" or . == "git_tags" or . == "npm" or . == "debian" or . == "watch")]
     | if length == 1 then .[0] else "" end
   ' "$metadata"
 }
