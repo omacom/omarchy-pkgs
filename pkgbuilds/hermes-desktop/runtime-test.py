@@ -31,6 +31,7 @@ Path(os.environ["TEST_OUTPUT"]).write_text(json.dumps({
     "gpu": os.environ.get("HERMES_DESKTOP_DISABLE_GPU"),
     "ozone": os.environ.get("ELECTRON_OZONE_PLATFORM_HINT"),
     "cwd": os.environ.get("HERMES_DESKTOP_CWD"),
+    "a11y": os.environ.get("HERMES_DESKTOP_RENDERER_ACCESSIBILITY"),
     "inherited": [name for name in ("ELECTRON_RUN_AS_NODE", "PYTHONPATH", "PYTHONHOME") if name in os.environ],
 }))
 ''')
@@ -88,12 +89,13 @@ def with_hermes_node_path(env=None):
            "TEST_OUTPUT": str(output), "TEST_FORBIDDEN": str(forbidden_output)}
     launch = ["bash", str(launcher.resolve())]
 
-    def check_launch(args=(), overrides=None, expected_args=(), store="gnome-libsecret", gpu=None, ozone=None):
+    def check_launch(args=(), overrides=None, expected_args=(), store="gnome-libsecret", gpu=None, ozone=None,
+                     a11y=None):
         subprocess.run(launch + list(args), env={**env, **(overrides or {})}, cwd=home, check=True)
         result = json.loads(output.read_text())
         assert result == {"args": ["--disable-setuid-sandbox", *expected_args],
                           "home": str(home / ".hermes"), "store": store, "gpu": gpu,
-                          "ozone": ozone, "cwd": str(home), "inherited": []}, result
+                          "ozone": ozone, "cwd": str(home), "a11y": a11y, "inherited": []}, result
         assert not forbidden_output.exists(), "launcher invoked the Omarchy installer or sudo"
         output.unlink()
 
@@ -122,6 +124,19 @@ def with_hermes_node_path(env=None):
     (module / "main_desktop.py").write_text(helper)
     (module / "main.py").write_text('raise AssertionError("old helper import after update")\n')
     check_launch([url], wayland, ["--ozone-platform=x11", url], gpu="0")
+    # Later runtimes return a fifth option, the renderer accessibility switch.
+    (module / "main_desktop.py").write_text(helper + '''
+_first_four = _desktop_launch_options
+def _desktop_launch_options():
+    from hermes_cli.config import load_config
+    return (*_first_four(), load_config()["desktop"].get("renderer_accessibility", True))
+''')
+    check_launch([url], wayland, ["--ozone-platform=x11", url], gpu="0")
+    config.write_text(json.dumps({"desktop": {"renderer_accessibility": False}}))
+    check_launch(overrides=wayland, expected_args=["--ozone-platform=wayland"], a11y="0")
+    check_launch(overrides={**wayland, "HERMES_DESKTOP_RENDERER_ACCESSIBILITY": "1"},
+                 expected_args=["--ozone-platform=wayland"], a11y="1")
+    (module / "main_desktop.py").write_text(helper)
     config.unlink()
     (module / "main_desktop.py").write_text(helper + '\nimport os\nos.environ.update(' + repr({
         "ELECTRON_RUN_AS_NODE": "1", "PYTHONPATH": "/invalid", "PYTHONHOME": "/invalid",

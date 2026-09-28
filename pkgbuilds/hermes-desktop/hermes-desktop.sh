@@ -36,7 +36,7 @@ import sys
 
 native, runtime, *args = sys.argv[1:]
 env = os.environ.copy()
-flags, gpu, store, ozone = [], "auto", "auto", "auto"
+flags, gpu, store, ozone, renderer_accessibility = [], "auto", "auto", "auto", True
 if runtime:
     sys.path.insert(0, runtime)
     try:
@@ -47,7 +47,10 @@ if runtime:
             from hermes_cli.main import _desktop_launch_options
         from hermes_constants import with_hermes_node_path
 
-        flags, gpu, store, ozone = _desktop_launch_options()
+        # Newer runtimes append options after the first four; older ones stop there.
+        flags, gpu, store, ozone, *extra = _desktop_launch_options()
+        if extra:
+            renderer_accessibility = extra[0]
         env = with_hermes_node_path(env)
     except ImportError:
         print("Could not load Hermes desktop settings; using launch defaults.", file=sys.stderr)
@@ -57,6 +60,9 @@ if gpu != "auto":
     env.setdefault("HERMES_DESKTOP_DISABLE_GPU", gpu)
 if ozone != "auto":
     env.setdefault("ELECTRON_OZONE_PLATFORM_HINT", ozone)
+# The app keeps its accessibility tree on unless told otherwise, so bridge only the opt-out.
+if not renderer_accessibility:
+    env.setdefault("HERMES_DESKTOP_RENDERER_ACCESSIBILITY", "0")
 env.setdefault("HERMES_DESKTOP_PASSWORD_STORE", store if store != "auto" else "gnome-libsecret")
 
 # Explicit config, environment and command-line choices override the Wayland default.
