@@ -36,36 +36,33 @@ public distribution", so the terms themselves may still move.
 Nothing in the packaging depends on the answer -- it is a question for the
 publisher, and it is recorded here so it is not mistaken for settled.
 
-## The versionless download URL
+## Where releases come from
 
-Every TMOG release is served from one path:
+Since 1.0.0 the site lives under `/rtm/`, and each Linux artifact is published
+under a versioned name with a `.sha256` sidecar beside it:
 
 ```text
-https://tmog.org/downloads/TMOG-Task-Manager-Linux-x86_64.tar.gz
+https://tmog.org/rtm/version.txt
+https://tmog.org/rtm/downloads/TaskManagerOG-<version>-linux-x86_64.tar.gz
+https://tmog.org/rtm/downloads/TaskManagerOG-<version>-linux-x86_64.tar.gz.sha256
 ```
 
-Nothing in it identifies a version, and `downloads/release.json` -- the manifest
-the macOS updater verifies -- describes the DMG only. So the Linux side has no
-manifest to read a checksum out of, and `.omarchy/upstream.sh` computes one from
-the artifact. That download is 7.9 MB and happens only when `/version.txt`
-reports something other than the checked-in `pkgver`, so the six-hourly check
-normally costs a single small request.
+`downloads/release.json` -- the manifest the macOS updater verifies -- still
+describes the DMG only, so `.omarchy/upstream.sh` reads the version from
+`version.txt` and the checksum from the sidecar, and checks that the sidecar
+names the tarball it was asked about. The check costs two small requests and
+never downloads the tarball.
 
-Two details follow from the path being mutable:
+Up to 0.1.1 every release was served from one versionless path,
+`/downloads/TMOG-Task-Manager-Linux-x86_64.tar.gz`, and the hook downloaded it
+to compute a checksum. That path now returns 404, which is what broke the
+upstream sync when 1.0.0 shipped.
 
-- **The `?v=<version>-free` query string** in `source=()` is upstream's own
-  cache key; tmog.org appends it to its Linux download links for the same
-  reason, so a CDN holding an older object under this path cannot answer for a
-  new release.
-- **The hook checks the tarball's top-level directory**, which upstream names
-  `TaskManagerOG-<version>-linux-x86_64`. It is the only evidence available that
-  the bytes that arrived are the release `/version.txt` announced. On a mismatch
-  the hook reports no update and leaves the package alone, which is the right
-  answer whether the cause is a half-published release or a stale object.
-
-`sha256sums` is reported under the key `any` rather than `x86_64`: upstream
-publishes no aarch64 build, so the package has one plain `source=()` array, and
-`any` is `bin/sync-upstream`'s name for the unsuffixed checksum array.
+`sha256sums` is reported under the key `any` rather than `x86_64`: the package
+builds x86_64 alone, so it has one plain `source=()` array, and `any` is
+`bin/sync-upstream`'s name for the unsuffixed checksum array. Upstream began
+publishing an aarch64 tarball (with its own sidecar) at 1.0.0; adding it means
+moving to `source_x86_64`/`source_aarch64` and reporting both keys.
 
 ## Testing
 

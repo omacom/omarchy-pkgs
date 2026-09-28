@@ -17,6 +17,12 @@ jobs:
     permissions:
       contents: write
       pull-requests: write
+    outputs:
+      branch: ${{ steps.branch.outputs.branch }}
+      pushed_at: ${{ steps.pushed.outputs.at }}
+      number: ${{ steps.cpr.outputs.pull-request-number }}
+      operation: ${{ steps.cpr.outputs.pull-request-operation }}
+      head_sha: ${{ steps.cpr.outputs.pull-request-head-sha }}
 
     steps:
       - name: Checkout repository
@@ -24,12 +30,25 @@ jobs:
         with:
           persist-credentials: false
 
+      # A scoped dispatch regenerates only the named packages. Pushed to the
+      # shared branch, that would replace every other pending update in its
+      # PR, so it gets a branch and PR of its own.
+      - name: Choose the PR branch
+        id: branch
+        env:
+          PACKAGES: ${{ github.event.inputs.packages }}
+        run: |
+          read -r -a package_args <<< "${PACKAGES:-}"
+          .github/scripts/sync-pr-branch.sh auto/sync-upstream "${package_args[@]}" | tee -a "$GITHUB_OUTPUT"
+
       # Runs in an Arch container for vercmp: whether a release is an upgrade has
       # to be decided by the same comparator pacman will use on users' machines.
       - name: Update packages from upstream release feeds
+        id: sync
         run: |
           docker run --rm \
             -e PACKAGES="$PACKAGES" \
+            -e UPSTREAM_GITHUB_TOKEN="$UPSTREAM_GITHUB_TOKEN" \
             -e HOST_UID="$(id -u)" \
             -e HOST_GID="$(id -g)" \
             -v "$PWD/bin:/workspace/bin:ro" \
@@ -39,23 +58,29 @@ jobs:
             archlinux:base-devel bash -lc '
               set -euo pipefail
 
-              pacman -Syu --noconfirm git jq
+              pacman -Syu --noconfirm git jq python libarchive
 
               groupadd -g "$HOST_GID" runner
               useradd -m -u "$HOST_UID" -g "$HOST_GID" runner
               chown -R runner:runner /workspace/pkgbuilds
 
+              # The reviewed lane only: packages marked auto_merge ride
+              # track-branches.yml, which merges without a human.
               if [[ -n "${PACKAGES:-}" ]]; then
                 read -r -a package_args <<< "$PACKAGES"
-                runuser -u runner -- ./bin/sync-upstream "${package_args[@]}"
+                runuser -u runner -- ./bin/sync-upstream --lane reviewed "${package_args[@]}"
               else
-                runuser -u runner -- ./bin/sync-upstream
+                runuser -u runner -- ./bin/sync-upstream --lane reviewed
               fi
             '
         env:
           PACKAGES: ${{ github.event.inputs.packages }}
+          UPSTREAM_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+      # Failed feeds leave their recipes untouched; completed updates still
+      # reach review. The failed sync step keeps the workflow red and notifies.
       - name: Check for changes
+        if: ${{ !cancelled() && steps.sync.outcome != 'skipped' }}
         id: changes
         run: |
           if [ -z "$(git status --porcelain)" ]; then
@@ -64,20 +89,29 @@ jobs:
             echo "has_changes=true" >> "$GITHUB_OUTPUT"
           fi
 
+      # Runs created by this push are newer than this; the approve job
+      # waits for them. A minute's slack absorbs runner clock skew.
+      - name: Record push time
+        if: ${{ !cancelled() && steps.changes.outputs.has_changes == 'true' }}
+        id: pushed
+        run: echo "at=$(date -u -d '-1 minute' +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+
       - name: Create Pull Request
-        if: steps.changes.outputs.has_changes == 'true'
+        if: ${{ !cancelled() && steps.changes.outputs.has_changes == 'true' }}
+        id: cpr
         uses: peter-evans/create-pull-request@v7
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           commit-message: 'chore: sync upstream releases'
-          title: 'chore: sync upstream releases'
+          title: "chore: sync upstream releases${{ steps.branch.outputs.scope && format(' ({0})', steps.branch.outputs.scope) || '' }}"
           body: |
             Automated update of packages that track an upstream vendor release
             feed rather than the AUR.
 
-            Each package reports its newest release through
-            `.omarchy/upstream.sh`.
-          branch: auto/sync-upstream
+            Release watches and providers are declared in `.omarchy/package.json`;
+            exceptional feeds use `.omarchy/upstream.sh`. Failed package updates
+            are left untouched; check the workflow result for outstanding failures.
+          branch: ${{ steps.branch.outputs.branch }}
           delete-branch: true
           labels: automated
           reviewers: ryanrhughes
@@ -93,3 +127,35 @@ jobs:
               "🔴 <strong>Upstream sync failed</strong><br><a href=\"${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\">View run</a>" \
               '{content: $content}')" \
             "$BASECAMP_CHATBOT_URL"
+
+  # GitHub holds pull_request runs from a GITHUB_TOKEN push for approval and
+  # creates no pull_request_target run for it, so approve-pr.yml never sees
+  # the sync's own pushes. Once a maintainer has labelled the PR
+  # build-approved, release the held runs for the commit just pushed. A
+  # separate job, so the sync container's token never holds actions: write.
+  approve:
+    needs: sync
+    if: ${{ !cancelled() && needs.sync.outputs.operation == 'updated' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+      actions: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Release held build and test runs if build-approved
+        uses: actions/github-script@v7
+        env:
+          NUMBER: ${{ needs.sync.outputs.number }}
+          BRANCH: ${{ needs.sync.outputs.branch }}
+          HEAD_SHA: ${{ needs.sync.outputs.head_sha }}
+          SINCE: ${{ needs.sync.outputs.pushed_at }}
+        with:
+          script: |
+            const approve = require('./.github/scripts/approve-sync-push.cjs');
+            const { NUMBER, BRANCH, HEAD_SHA, SINCE } = process.env;
+            await approve({ github, context, core, number: Number(NUMBER),
+              branch: BRANCH, headSha: HEAD_SHA, since: SINCE });

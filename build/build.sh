@@ -26,6 +26,29 @@ DEFER_RUNTIME_DEPS=${DEFER_RUNTIME_DEPS:-false}
 
 source "$HELPERS_DIR/package-metadata.sh"
 
+# Where the channel's published database is read from for planning. On the
+# repository host it is the published tree itself. Anywhere else (a CI runner,
+# a fresh clone) that tree is absent, so the database is fetched from the
+# public channel and the same URL serves as pacman's dependency repository.
+# Set OMARCHY_PUBLISHED_REPO_URL= (empty) to disable the remote fallback.
+PUBLISHED_REPO_URL=${OMARCHY_PUBLISHED_REPO_URL-https://pkgs.omarchy.org}
+PUBLISHED_DB_DIR="$FINAL_OUTPUT_DIR"
+PUBLISHED_REPO_SERVER=""
+if [[ ! -f "$FINAL_OUTPUT_DIR/omarchy.db.tar.zst" && ! -f "$FINAL_OUTPUT_DIR/omarchy.db" && -n "$PUBLISHED_REPO_URL" ]]; then
+  remote_channel="$PUBLISHED_REPO_URL/$MIRROR/$ARCH"
+  remote_db_dir=$(mktemp -d /tmp/omarchy-published.XXXXXX) || exit 1
+  # Cache-bust: the channel sits behind a CDN that serves a stale database
+  # for a while after a sync.
+  if curl -fsSL "$remote_channel/omarchy.db.tar.zst?$(date +%s)" -o "$remote_db_dir/omarchy.db.tar.zst"; then
+    PUBLISHED_DB_DIR="$remote_db_dir"
+    PUBLISHED_REPO_SERVER="$remote_channel"
+    echo "==> No local published tree; planning against $remote_channel"
+  else
+    rm -rf "$remote_db_dir"
+    echo "==> No local published tree and $remote_channel is unavailable; treating the channel as empty"
+  fi
+fi
+
 if [[ $DEFER_RUNTIME_DEPS != "false" && $DEFER_RUNTIME_DEPS != "true" ]]; then
   echo "DEFER_RUNTIME_DEPS must be true or false" >&2
   exit 1
@@ -118,10 +141,15 @@ if [[ "$DRY_RUN" != true ]]; then
   fi
   touch "$BUILD_PLAN_DIR/repository-initialized" || exit 1
 
-  # Add omarchy repo if it has a database (stable packages)
+  # Add omarchy repo if it has a database (stable packages). The local tree
+  # is trusted as-is; the public channel is verified against the omarchy
+  # keyring the image already carries.
   if [[ -f "$FINAL_OUTPUT_DIR/omarchy.db.tar.zst" ]] || [[ -f "$FINAL_OUTPUT_DIR/omarchy.db" ]]; then
     sudo sed -i "/^\[core\]$/i [omarchy]\nSigLevel = Optional TrustAll\nServer = file://$FINAL_OUTPUT_DIR\n" /etc/pacman.conf
     echo "  -> omarchy (priority 2): $FINAL_OUTPUT_DIR"
+  elif [[ -n "$PUBLISHED_REPO_SERVER" ]]; then
+    sudo sed -i "/^\[core\]$/i [omarchy]\nSigLevel = Required DatabaseOptional\nServer = $PUBLISHED_REPO_SERVER\n" /etc/pacman.conf
+    echo "  -> omarchy (priority 2): $PUBLISHED_REPO_SERVER"
   fi
 
   # Sync pacman database
@@ -159,10 +187,10 @@ LOCAL_VERSION_CACHE_LOADED=false
 LOCAL_VERSION_CACHE_DB=""
 
 load_local_versions() {
-  local db="$FINAL_OUTPUT_DIR/omarchy.db.tar.zst"
+  local db="$PUBLISHED_DB_DIR/omarchy.db.tar.zst"
 
   if [[ ! -f "$db" ]]; then
-    db="$FINAL_OUTPUT_DIR/omarchy.db"
+    db="$PUBLISHED_DB_DIR/omarchy.db"
   fi
 
   [[ -f "$db" ]] || return 0
@@ -411,6 +439,11 @@ build_package() {
       ln -sf omarchy-build.db.tar.zst omarchy-build.db || return 1
     fi
 
+    # A release may publish successful builds even when a peer fails. Record
+    # outputs only after this package's entire split build has completed.
+    mkdir -p "$BUILD_PLAN_DIR/artifacts" || return 1
+    printf '%s\n' "${new_pkgs[@]}" > "$BUILD_PLAN_DIR/artifacts/$pkg" || return 1
+
     echo "    Successfully built $pkg"
     return 0
   else
@@ -526,9 +559,17 @@ check_needs_build() {
 
   if [[ "$local_version" == "$pkgbuild_version" ]]; then
     return 1  # Already up to date
-  else
-    return 0  # Needs building
   fi
+
+  # Match check-versions: a retained archive is already published even when
+  # the DB now indexes a newer release (for example, 4.0.4rc1 vs 4.0.3).
+  # Rebuilding it would produce different bytes under an immutable filename.
+  if package_version_is_published "$FINAL_OUTPUT_DIR" "$pkg" "$pkgbuild_version" "$ARCH"; then
+    echo "  + $pkg $pkgbuild_version - archive already published; skipping rebuild"
+    return 1
+  fi
+
+  return 0  # Needs building
 }
 
 # Collect packages that should be built for the selected mirror
