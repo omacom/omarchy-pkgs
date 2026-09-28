@@ -89,11 +89,17 @@ EOF
 fixture consumer "checkdepends_${TEST_ARCH}=('broken')"
 fixture transitive "makedepends=('consumer')"
 fixture independent ''
-if run_build transitive consumer broken independent > "$TEST_ROOT/failure.log" 2>&1; then
+failure_status=0
+OMARCHY_BUILD_RESULT_DIR="$TEST_ROOT/results" run_build transitive consumer broken independent > "$TEST_ROOT/failure.log" 2>&1 || failure_status=$?
+if [[ "$failure_status" != 2 ]]; then
   cat "$TEST_ROOT/failure.log"
-  echo 'FAIL: a failed prerequisite did not fail the run' >&2
+  echo "FAIL: expected completed package failure (2), got $failure_status" >&2
   exit 1
 fi
+[[ -f "$TEST_ROOT/results/complete" ]]
+[[ $(cat "$TEST_ROOT/results/failed") == broken ]]
+[[ $(cat "$TEST_ROOT/results/blocked") == $'transitive\nconsumer' || $(cat "$TEST_ROOT/results/blocked") == $'consumer\ntransitive' ]]
+[[ $(cat "$TEST_ROOT/results/artifacts") == "independent-1-1-$TEST_ARCH.pkg.tar.zst" ]]
 grep -q 'consumer blocked by unsuccessful dependency: broken' "$TEST_ROOT/failure.log"
 grep -q 'transitive blocked by unsuccessful dependency: consumer' "$TEST_ROOT/failure.log"
 compgen -G "$TEST_ROOT/build-output/edge/$TEST_ARCH/independent-1-1-*.pkg.tar.zst" >/dev/null
