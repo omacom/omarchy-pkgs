@@ -1,8 +1,8 @@
 #!/bin/bash
-# Run the omarchy-settings recipe's package() against synthetic source trees:
-# an older source keeps today's per-architecture package, and a source that
-# selects its platform profile at runtime ships the same files, backup and
-# optdepends on aarch64 as on x86_64.
+# Run the omarchy-settings and omarchy-settings-dev recipes' package() against
+# synthetic source trees: an older source keeps today's per-architecture
+# package, and a source that selects its platform profile at runtime ships the
+# same files, backup and optdepends on aarch64 as on x86_64.
 set -euo pipefail
 export LC_ALL=C
 
@@ -142,7 +142,7 @@ cp "$fixtures/omarchy_hooks-v4.0.4.conf" "$scratch/legacy/etc/mkinitcpio.conf.d/
 make_source "$scratch/profile" default/settings-runtime-profile "$keyboard_unit"
 cp "$fixtures"/omarchy-13362/*.conf "$scratch/profile/etc/mkinitcpio.conf.d/"
 
-for recipe in omarchy-settings; do
+for recipe in omarchy-settings omarchy-settings-dev; do
   rm -rf "${scratch:?}"/legacy-* "${scratch:?}"/profile-*
   # An older source keeps the per-architecture package it has always had.
   package_as "$recipe" "$scratch/legacy" x86_64 legacy-x86_64 pinned
