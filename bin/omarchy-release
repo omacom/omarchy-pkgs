@@ -18,6 +18,7 @@ set -e
 
 BUILD_ROOT=$(realpath "${BASH_SOURCE[0]%/*}/..")
 source "$BUILD_ROOT/helpers/message-helpers.sh"
+source "$BUILD_ROOT/helpers/docker-helpers.sh"
 source "$BUILD_ROOT/helpers/paths.sh"
 source "$BUILD_ROOT/helpers/host-helpers.sh"
 
@@ -28,7 +29,11 @@ ISO_REPO="${OMARCHY_ISO_REPO:-omacom-io/omarchy-iso}"
 DEV_BRANCH="${OMARCHY_DEV_BRANCH:-quattro}"
 
 PKGS_DB_BASE="${OMARCHY_PKGS_DB_BASE:-https://pkgs.omarchy.org}"
-RC_DB_URL="$PKGS_DB_BASE/rc/x86_64/omarchy.db.tar.zst"
+# The first published architecture supplies the version-ordering floor when
+# cutting pins. Readiness checks below still verify every published
+# architecture before an RC or final release can move forward.
+OBSERVED_ARCH=$(reference_arch)
+RC_DB_URL="$PKGS_DB_BASE/rc/$OBSERVED_ARCH/omarchy.db.tar.zst"
 
 SRCDEST_DIR="$BUILD_ROOT/.srcdest"
 MIRROR_CLONE="$SRCDEST_DIR/omarchy"          # bare mirror (shared with bin/omarchy-pkgs)
@@ -181,12 +186,12 @@ ensure_work_clone() {
 # Prints omarchy's published version in a channel; empty when absent, rc 2 when
 # the database cannot be read (callers must not mistake an outage for absence).
 published_version() {
-  local channel="$1" tmp descs
+  local channel="$1" arch="${2:-$OBSERVED_ARCH}" tmp descs
   tmp=$(mktemp) || return 2
   # A unique query string busts the CDN cache: right after a sync the plain
   # URL can keep serving the previous db for a while, which reads as "not
   # published yet" to status, the wait loop, and ship's pre-checks.
-  if ! curl -sf "$PKGS_DB_BASE/$channel/x86_64/omarchy.db.tar.zst?$(date +%s%N)" -o "$tmp"; then
+  if ! curl -sf "$PKGS_DB_BASE/$channel/$arch/omarchy.db.tar.zst?$(date +%s%N)" -o "$tmp"; then
     rm -f "$tmp"
     return 2
   fi
@@ -205,6 +210,14 @@ published_version() {
     $0 == "%VERSION%" { getline; version = $0; next }
     END { emit() }
   ' <<<"$descs"
+}
+
+all_arches_at_version() { # all_arches_at_version <channel> <pkgver>
+  local channel="$1" want="$2" arch got
+  for arch in $(published_arches); do
+    got=$(published_version "$channel" "$arch" 2>/dev/null) || return 1
+    [[ "${got%-*}" == "$want" ]] || return 1
+  done
 }
 
 # The rc branch of THIS repo carries the current pins. Read them without
@@ -251,8 +264,12 @@ fi
 git -C /root/omarchy-pkgs-rc fetch origin rc
 git -C /root/omarchy-pkgs-rc reset --hard origin/rc
 cd /root/omarchy-pkgs-rc
-OMARCHY_RC_PINS=1 OMARCHY_REPO_ROOT=/root/omarchy-pkgs/pkgs.omarchy.org \
-  bin/repo release --mirror rc --package omarchy omarchy-settings --skip-prod-check
+# The pair is built once per published architecture (helpers/paths.sh on the
+# host decides which), so every architecture'"'"'s rc channel carries the pins.
+for arch in $(BUILD_ROOT=/root/omarchy-pkgs-rc bash -c "source helpers/paths.sh; published_arches"); do
+  OMARCHY_RC_PINS=1 OMARCHY_REPO_ROOT=/root/omarchy-pkgs/pkgs.omarchy.org \
+    bin/repo release --mirror rc --arch "$arch" --package omarchy omarchy-settings --skip-prod-check
+done
 '
 
 trigger_rc_build() {
@@ -278,19 +295,25 @@ host_advance() { # host_advance <from> <to> [extra args...]
   # against this machine's (likely stale) local tree would be wrong.
   if ! resolve_repo_host "$REPO_HOST_OVERRIDE" >/dev/null && ! on_repo_host; then
     print_no_host_help "advance $from -> $to" \
-      "  cd /root/omarchy-pkgs && bin/repo advance --from $from --to $to --skip-prod-check $*"
+      "  cd /root/omarchy-pkgs && bin/repo advance --from $from --to $to --arch all --skip-prod-check $*"
     return 1
   fi
-  "$BUILD_ROOT/bin/repo" advance --from "$from" --to "$to" --skip-prod-check "$@"
+  # --arch all: the host advances every architecture it publishes, so a train
+  # never moves a channel for one architecture and not another.
+  "$BUILD_ROOT/bin/repo" advance --from "$from" --to "$to" --arch all --skip-prod-check "$@"
 }
 
 wait_for_published() { # wait_for_published <channel> <version> [timeout-seconds]
-  local channel="$1" want="$2" timeout="${3:-3600}" waited=0 got
-  print_info "Waiting for $want to appear in the $channel channel (up to $((timeout / 60))m)..."
+  local channel="$1" want="$2" timeout="${3:-3600}" waited=0 arch got pending
+  print_info "Waiting for $want in $channel for: $(published_arches | tr '\n' ' ')"
   while ((waited < timeout)); do
-    got=$(published_version "$channel" 2>/dev/null) || got=""
-    if [[ "${got%-*}" == "$want" ]]; then
-      print_success "$channel now serves omarchy $got"
+    pending=""
+    for arch in $(published_arches); do
+      got=$(published_version "$channel" "$arch" 2>/dev/null) || got=""
+      [[ "${got%-*}" == "$want" ]] || pending+=" $arch=${got:-unreachable}"
+    done
+    if [[ -z "$pending" ]]; then
+      print_success "$channel now serves omarchy $want on every published architecture"
       return 0
     fi
     sleep 60
@@ -298,7 +321,7 @@ wait_for_published() { # wait_for_published <channel> <version> [timeout-seconds
     printf '.' >&2
   done
   echo "" >&2
-  print_warning "Timed out waiting for $want in $channel (currently: ${got:-unknown})"
+  print_warning "Timed out waiting for $want in $channel (pending:$pending)"
   print_info "The build may still be running — re-run this command to resume."
   return 1
 }
@@ -352,8 +375,8 @@ iso_checkout() { # prints a usable omarchy-iso checkout, cloning to tmp if neede
 build_iso() { # build_iso <version> [--rc]
   local version="$1" rc_flag="${2:-}" dir
   dir=$(iso_checkout) || return 1
-  if ! command -v docker >/dev/null || ! docker info >/dev/null 2>&1; then
-    print_warning "Docker unavailable — cannot build the ISO here. Run on a Docker machine:"
+  if [[ -z "$CONTAINER_ENGINE" ]] || ! "$CONTAINER_ENGINE" info >/dev/null 2>&1; then
+    print_warning "No container engine is available — cannot build the ISO here. Run on a Docker or Podman machine:"
     echo "  cd $dir && bin/omarchy-iso-release ${rc_flag:+$rc_flag }$version"
     return 1
   fi
@@ -662,15 +685,13 @@ cmd_rc() {
   if [[ -n "$pin" ]]; then
     local pin_ver="${pin%% *}" pin_commit="${pin##* }"
     if [[ "$pin_commit" == "$head" && "$pin_ver" =~ ^${version//./\\.}rc[0-9]+$ ]]; then
-      local pub
-      pub=$(published_version rc 2>/dev/null) || pub=""
-      if [[ "${pub%-*}" == "$pin_ver" ]]; then
-        print_success "$pin_ver is already cut from this head and published to rc"
+      if all_arches_at_version rc "$pin_ver"; then
+        print_success "$pin_ver is already cut from this head and published to rc on every architecture"
         maybe_iso "$pin_ver" rc "$iso_mode"
         return 0
       fi
       print_info "$pin_ver is pinned from this head but not published yet — re-triggering the build"
-      trigger_rc_build || true
+      trigger_rc_build || return 1
       [[ "$wait" == true ]] && wait_for_published rc "$pin_ver"
       maybe_iso "$pin_ver" rc "$iso_mode"
       return 0
@@ -686,7 +707,7 @@ cmd_rc() {
   new_ver="${new_pin%% *}"
   print_success "Pinned $new_ver (rc branch pushed)"
 
-  trigger_rc_build || true
+  trigger_rc_build || return 1
   if [[ "$wait" == true ]]; then
     wait_for_published rc "$new_ver" || return 1
   fi
@@ -708,9 +729,7 @@ cmd_ship() {
       exit 1
     fi
     version=$(branch_to_version "$branch")
-    local stable_now
-    stable_now=$(published_version stable 2>/dev/null) || stable_now=""
-    if [[ "${stable_now%-*}" == "$version" ]] &&
+    if all_arches_at_version stable "$version" &&
       gh release view "v$version" --repo "$UPSTREAM_REPO" >/dev/null 2>&1; then
       print_success "Nothing to ship — $version is tagged, released, and live on stable"
       exit 0
@@ -752,10 +771,8 @@ cmd_ship() {
       echo "  omarchy-release rc"
       exit 1
     fi
-    local pub
-    pub=$(published_version rc 2>/dev/null) || pub=""
-    if [[ "${pub%-*}" != "$pin_ver" ]]; then
-      print_error "$pin_ver is pinned but rc serves '${pub:-nothing}' — the candidate build hasn't published"
+    if ! all_arches_at_version rc "$pin_ver"; then
+      print_error "$pin_ver is pinned but is not published for every architecture"
       echo "Wait for it (or re-run: omarchy-release rc), then ship."
       exit 1
     fi
@@ -799,10 +816,9 @@ cmd_ship() {
 
   # 2. Final pins into rc. Resolve the tag we just established so the final
   # PKGBUILDs record both its provenance and its exact commit.
-  local rc_pub stable_pub
-  rc_pub=$(published_version rc 2>/dev/null) || rc_pub=""
-  if [[ "${rc_pub%-*}" == "$version" ]]; then
-    print_success "2/7 Final $version already published to rc"
+  local stable_pub
+  if all_arches_at_version rc "$version"; then
+    print_success "2/7 Final $version already published to rc on every architecture"
   else
     if [[ "$pin_ver" != "$version" ]]; then
       print_info "2/7 Pinning final $version from tag v$version..."
@@ -810,22 +826,21 @@ cmd_ship() {
     else
       print_info "2/7 Final $version pinned — re-triggering build"
     fi
-    trigger_rc_build || true
+    trigger_rc_build || exit 1
     wait_for_published rc "$version" || exit 1
   fi
 
   # 3. Promote rc -> stable
-  stable_pub=$(published_version stable 2>/dev/null) || stable_pub=""
-  if [[ "${stable_pub%-*}" == "$version" ]]; then
-    print_success "3/7 Stable already serves $version"
+  if all_arches_at_version stable "$version"; then
+    print_success "3/7 Stable already serves $version on every architecture"
   else
     host_advance rc stable || exit 1
-    stable_pub=$(published_version stable 2>/dev/null) || stable_pub=""
-    if [[ "${stable_pub%-*}" != "$version" ]]; then
-      print_error "Promotion ran but stable serves '${stable_pub:-nothing}' — investigate before continuing"
+    if ! all_arches_at_version stable "$version"; then
+      print_error "Promotion ran but stable does not serve $version on every architecture"
       exit 1
     fi
-    print_success "3/7 Promoted to stable: omarchy $stable_pub"
+    stable_pub=$(published_version stable 2>/dev/null) || stable_pub="$version"
+    print_success "3/7 Promoted to stable: omarchy $stable_pub on every architecture"
   fi
 
   # 4. Final pins onto master (keeps edge overlap publishing and the repo record)
@@ -908,7 +923,7 @@ next_step() { # prints "<command>|<description>"
     last=$(newest_release_branch 2>/dev/null) || last=""
     if [[ -n "$last" && "$STABLE_VER" != "<unreachable>" ]]; then
       last_ver=$(branch_to_version "$last")
-      if [[ "${STABLE_VER%-*}" != "$last_ver" ]] ||
+      if ! all_arches_at_version stable "$last_ver" ||
         { command -v gh >/dev/null && ! gh release view "v$last_ver" --repo "$UPSTREAM_REPO" >/dev/null 2>&1; }; then
         echo "ship|$last_ver is tagged but not fully shipped — resume ship"
         return
@@ -924,7 +939,7 @@ next_step() { # prints "<command>|<description>"
     echo "ship|Final $TRAIN_VER is pinned — finish shipping (re-runs are safe)"
   elif [[ "$pin_commit" != "$TRAIN_HEAD" ]]; then
     echo "rc|$TRAIN has commits newer than $pin_ver — cut the next candidate"
-  elif [[ "${RC_VER%-*}" != "$pin_ver" ]]; then
+  elif ! all_arches_at_version rc "$pin_ver"; then
     echo "rc|$pin_ver is pinned but not published — re-run rc to re-trigger/wait"
   else
     echo "ship|$pin_ver is published to rc — test it, then ship"
@@ -994,20 +1009,24 @@ cmd_doctor() {
   check "makepkg available (checksums)" command -v makepkg
   check "curl available" command -v curl
   check "upstream reachable ($UPSTREAM_URL)" git ls-remote "$UPSTREAM_URL" HEAD
-  local ch
+  local ch arch
   for ch in edge stable; do
-    if published_version "$ch" >/dev/null 2>&1; then
-      print_success "$ch channel db readable"
+    for arch in $(published_arches); do
+      if published_version "$ch" "$arch" >/dev/null 2>&1; then
+        print_success "$ch/$arch channel db readable"
+      else
+        print_error "$ch/$arch channel db readable"
+        failures=$((failures + 1))
+      fi
+    done
+  done
+  for arch in $(published_arches); do
+    if published_version rc "$arch" >/dev/null 2>&1; then
+      print_success "rc/$arch channel db readable"
     else
-      print_error "$ch channel db readable"
-      failures=$((failures + 1))
+      print_warning "rc/$arch channel db not readable — bootstrap it first: bin/repo bootstrap-rc (on the build host)"
     fi
   done
-  if published_version rc >/dev/null 2>&1; then
-    print_success "rc channel db readable"
-  else
-    print_warning "rc channel db not readable — bootstrap it first: bin/repo bootstrap-rc (on the build host)"
-  fi
   local host
   if host=$(repo_host); then
     check "build host ssh ($host)" ssh -o ConnectTimeout=10 "$host" true
@@ -1016,10 +1035,10 @@ cmd_doctor() {
   else
     print_warning "no build host configured — set OMARCHY_REPO_HOST, --host, or write an ssh destination (root@<host> or an ssh-config alias) to $BUILD_ROOT/.repo-host; until then builds trigger on the 6h timer only"
   fi
-  if command -v docker >/dev/null && docker info >/dev/null 2>&1; then
-    print_success "docker available (ISO builds possible here)"
+  if [[ -n "$CONTAINER_ENGINE" ]] && "$CONTAINER_ENGINE" info >/dev/null 2>&1; then
+    print_success "$CONTAINER_ENGINE available (ISO builds possible here)"
   else
-    print_warning "docker unavailable — ISO builds will print instructions instead"
+    print_warning "container engine unavailable — ISO builds will print instructions instead"
   fi
   echo ""
   if ((failures == 0)); then
@@ -1054,6 +1073,25 @@ cmd_self_test() {
   expect "version_is_patch 5.0.0" "$(version_is_patch 5.0.0 && echo yes || echo no)" "no"
   expect "previous_patch_tag 4.0.2" "$(previous_patch_tag 4.0.2)" "v4.0.1"
   expect "previous_patch_tag 4.0.10" "$(previous_patch_tag 4.0.10)" "v4.0.9"
+
+  # Keep release readiness fail-closed when only one architecture has reached
+  # the requested version. This replaces the network reader for this process;
+  # self-test exits immediately afterwards.
+  published_version() {
+    case "$2" in
+      x86_64) echo "${TEST_X86_VERSION:-4.0.2-1}" ;;
+      aarch64) echo "${TEST_ARM_VERSION:-4.0.2-1}" ;;
+    esac
+  }
+  PUBLISHED_ARCHES=x86_64
+  expect "x86-only readiness" "$(all_arches_at_version rc 4.0.2 && echo ready || echo blocked)" "ready"
+  PUBLISHED_ARCHES=aarch64
+  expect "ARM-only readiness" "$(all_arches_at_version rc 4.0.2 && echo ready || echo blocked)" "ready"
+  PUBLISHED_ARCHES="x86_64 aarch64"
+  TEST_ARM_VERSION=4.0.1-1
+  expect "mixed versions block release" "$(all_arches_at_version rc 4.0.2 && echo ready || echo blocked)" "blocked"
+  TEST_ARM_VERSION=4.0.2-1
+  expect "both architectures ready" "$(all_arches_at_version rc 4.0.2 && echo ready || echo blocked)" "ready"
   echo ""
   if ((failures == 0)); then
     print_success "Self-test passed"

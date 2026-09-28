@@ -1,0 +1,386 @@
+diff --git a/fs/btrfs/dev-replace.c b/fs/btrfs/dev-replace.c
+--- a/fs/btrfs/dev-replace.c
++++ b/fs/btrfs/dev-replace.c
+@@ -626,7 +626,7 @@ static int btrfs_dev_replace_start(struct btrfs_fs_info *fs_info,
+ 
+ 	ret = mark_block_group_to_copy(fs_info, src_device);
+ 	if (ret)
+-		return ret;
++		goto leave;
+ 
+ 	down_write(&dev_replace->rwsem);
+ 	dev_replace->replace_task = current;
+diff --git a/fs/btrfs/inode.c b/fs/btrfs/inode.c
+--- a/fs/btrfs/inode.c
++++ b/fs/btrfs/inode.c
+@@ -3436,6 +3436,9 @@ int btrfs_finish_one_ordered(struct btrfs_ordered_extent *ordered_extent)
+ 	 */
+ 	btrfs_remove_ordered_extent(ordered_extent);
+ 
++	/* Cleanup any remaining biocs attached to the OE. */
++	btrfs_cleanup_ordered_bioc_list(ordered_extent);
++
+ 	/* once for us */
+ 	btrfs_put_ordered_extent(ordered_extent);
+ 	/* once for the tree */
+diff --git a/fs/btrfs/ioctl.c b/fs/btrfs/ioctl.c
+--- a/fs/btrfs/ioctl.c
++++ b/fs/btrfs/ioctl.c
+@@ -384,6 +384,7 @@ int btrfs_fileattr_set(struct mnt_idmap *idmap,
+ 		inode_flags &= ~BTRFS_INODE_COMPRESS;
+ 		inode_flags |= BTRFS_INODE_NOCOMPRESS;
+ 	} else if (fsflags & FS_COMPR_FL) {
++		enum btrfs_compression_type comp_type;
+ 
+ 		if (IS_SWAPFILE(&inode->vfs_inode))
+ 			return -ETXTBSY;
+@@ -391,9 +392,23 @@ int btrfs_fileattr_set(struct mnt_idmap *idmap,
+ 		inode_flags |= BTRFS_INODE_COMPRESS;
+ 		inode_flags &= ~BTRFS_INODE_NOCOMPRESS;
+ 
+-		comp = btrfs_compress_type2str(fs_info->compress_type);
+-		if (!comp || comp[0] == 0)
+-			comp = btrfs_compress_type2str(BTRFS_COMPRESS_ZLIB);
++		/*
++		 * Keep the algorithm recorded in the compression property,
++		 * otherwise changing an unrelated attribute would reset it to
++		 * the mount default, since FS_IOC_SETFLAGS callers write back
++		 * the whole flag set they got from FS_IOC_GETFLAGS and that
++		 * includes FS_COMPR_FL for any inode carrying the property.
++		 *
++		 * Inodes with the compress flag set but no property keep using
++		 * the mount default, so they behave as before.
++		 */
++		if (inode->prop_compress)
++			comp_type = inode->prop_compress;
++		else if (fs_info->compress_type)
++			comp_type = fs_info->compress_type;
++		else
++			comp_type = BTRFS_COMPRESS_ZLIB;
++		comp = btrfs_compress_type2str(comp_type);
+ 	} else {
+ 		inode_flags &= ~(BTRFS_INODE_COMPRESS | BTRFS_INODE_NOCOMPRESS);
+ 	}
+diff --git a/fs/btrfs/raid-stripe-tree.c b/fs/btrfs/raid-stripe-tree.c
+--- a/fs/btrfs/raid-stripe-tree.c
++++ b/fs/btrfs/raid-stripe-tree.c
+@@ -310,8 +310,10 @@ static int update_raid_extent_item(struct btrfs_trans_handle *trans,
+ 
+ 	ret = btrfs_search_slot(trans, trans->fs_info->stripe_root, key, path,
+ 				0, 1);
+-	if (ret)
+-		return (ret == 1 ? ret : -EINVAL);
++	if (ret > 0)
++		ret = -ENOENT;
++	if (ret < 0)
++		return ret;
+ 
+ 	leaf = path->nodes[0];
+ 	slot = path->slots[0];
+@@ -337,7 +339,6 @@ int btrfs_insert_one_raid_extent(struct btrfs_trans_handle *trans,
+ 	stripe_extent = kzalloc(item_size, GFP_NOFS);
+ 	if (unlikely(!stripe_extent)) {
+ 		btrfs_abort_transaction(trans, -ENOMEM);
+-		btrfs_end_transaction(trans);
+ 		return -ENOMEM;
+ 	}
+ 
+@@ -374,7 +375,7 @@ int btrfs_insert_raid_extent(struct btrfs_trans_handle *trans,
+ 			     struct btrfs_ordered_extent *ordered_extent)
+ {
+ 	struct btrfs_io_context *bioc;
+-	int ret;
++	int ret = 0;
+ 
+ 	if (!btrfs_fs_incompat(trans->fs_info, RAID_STRIPE_TREE))
+ 		return 0;
+@@ -382,17 +383,23 @@ int btrfs_insert_raid_extent(struct btrfs_trans_handle *trans,
+ 	list_for_each_entry(bioc, &ordered_extent->bioc_list, rst_ordered_entry) {
+ 		ret = btrfs_insert_one_raid_extent(trans, bioc);
+ 		if (ret)
+-			return ret;
++			break;
+ 	}
+ 
+-	while (!list_empty(&ordered_extent->bioc_list)) {
+-		bioc = list_first_entry(&ordered_extent->bioc_list,
++	btrfs_cleanup_ordered_bioc_list(ordered_extent);
++	return ret;
++}
++
++void btrfs_cleanup_ordered_bioc_list(struct btrfs_ordered_extent *ordered)
++{
++	while (!list_empty(&ordered->bioc_list)) {
++		struct btrfs_io_context *bioc;
++
++		bioc = list_first_entry(&ordered->bioc_list,
+ 					typeof(*bioc), rst_ordered_entry);
+ 		list_del(&bioc->rst_ordered_entry);
+ 		btrfs_put_bioc(bioc);
+ 	}
+-
+-	return 0;
+ }
+ 
+ int btrfs_get_raid_extent_offset(struct btrfs_fs_info *fs_info,
+diff --git a/fs/btrfs/raid-stripe-tree.h b/fs/btrfs/raid-stripe-tree.h
+--- a/fs/btrfs/raid-stripe-tree.h
++++ b/fs/btrfs/raid-stripe-tree.h
+@@ -28,6 +28,7 @@ int btrfs_get_raid_extent_offset(struct btrfs_fs_info *fs_info,
+ 				 u32 stripe_index, struct btrfs_io_stripe *stripe);
+ int btrfs_insert_raid_extent(struct btrfs_trans_handle *trans,
+ 			     struct btrfs_ordered_extent *ordered_extent);
++void btrfs_cleanup_ordered_bioc_list(struct btrfs_ordered_extent *ordered);
+ 
+ #ifdef CONFIG_BTRFS_FS_RUN_SANITY_TESTS
+ int btrfs_insert_one_raid_extent(struct btrfs_trans_handle *trans,
+diff --git a/fs/btrfs/scrub.c b/fs/btrfs/scrub.c
+--- a/fs/btrfs/scrub.c
++++ b/fs/btrfs/scrub.c
+@@ -1023,6 +1023,10 @@ static void scrub_stripe_report_errors(struct scrub_ctx *sctx,
+ 
+ skip:
+ 	for_each_set_bit(sector_nr, &extent_bitmap, stripe->nr_sectors) {
++		const u64 sector_logical = stripe->logical +
++					   ((u64)sector_nr << fs_info->sectorsize_bits);
++		const u64 sector_physical = physical +
++					   ((u64)sector_nr << fs_info->sectorsize_bits);
+ 		bool repaired = false;
+ 
+ 		if (scrub_bitmap_test_bit_is_metadata(stripe, sector_nr)) {
+@@ -1051,12 +1055,12 @@ static void scrub_stripe_report_errors(struct scrub_ctx *sctx,
+ 			if (dev) {
+ 				btrfs_err_rl(fs_info,
+ 		"scrub: fixed up error at logical %llu on dev %s physical %llu",
+-					    stripe->logical, btrfs_dev_name(dev),
+-					    physical);
++					    sector_logical, btrfs_dev_name(dev),
++					    sector_physical);
+ 			} else {
+ 				btrfs_err_rl(fs_info,
+ 			   "scrub: fixed up error at logical %llu on mirror %u",
+-					    stripe->logical, stripe->mirror_num);
++					    sector_logical, stripe->mirror_num);
+ 			}
+ 			continue;
+ 		}
+@@ -1065,30 +1069,30 @@ static void scrub_stripe_report_errors(struct scrub_ctx *sctx,
+ 		if (dev) {
+ 			btrfs_err_rl(fs_info,
+ "scrub: unable to fixup (regular) error at logical %llu on dev %s physical %llu",
+-					    stripe->logical, btrfs_dev_name(dev),
+-					    physical);
++					    sector_logical, btrfs_dev_name(dev),
++					    sector_physical);
+ 		} else {
+ 			btrfs_err_rl(fs_info,
+ 	  "scrub: unable to fixup (regular) error at logical %llu on mirror %u",
+-					    stripe->logical, stripe->mirror_num);
++					    sector_logical, stripe->mirror_num);
+ 		}
+ 
+ 		if (scrub_bitmap_test_bit_io_error(stripe, sector_nr))
+ 			if (__ratelimit(&rs) && dev)
+ 				scrub_print_common_warning("i/o error", dev, false,
+-						     stripe->logical, physical);
++						     sector_logical, sector_physical);
+ 		if (scrub_bitmap_test_bit_csum_error(stripe, sector_nr))
+ 			if (__ratelimit(&rs) && dev)
+ 				scrub_print_common_warning("checksum error", dev, false,
+-						     stripe->logical, physical);
++						     sector_logical, sector_physical);
+ 		if (scrub_bitmap_test_bit_meta_error(stripe, sector_nr))
+ 			if (__ratelimit(&rs) && dev)
+ 				scrub_print_common_warning("header error", dev, false,
+-						     stripe->logical, physical);
++						     sector_logical, sector_physical);
+ 		if (scrub_bitmap_test_bit_meta_gen_error(stripe, sector_nr))
+ 			if (__ratelimit(&rs) && dev)
+ 				scrub_print_common_warning("generation error", dev, false,
+-						     stripe->logical, physical);
++						     sector_logical, sector_physical);
+ 	}
+ 
+ 	/* Update the device stats. */
+diff --git a/fs/btrfs/send.c b/fs/btrfs/send.c
+--- a/fs/btrfs/send.c
++++ b/fs/btrfs/send.c
+@@ -2065,7 +2065,7 @@ static int will_overwrite_ref(struct send_ctx *sctx, u64 dir, u64 dir_gen,
+ 
+ 	ret = is_inode_existent(sctx, dir, dir_gen, NULL, &parent_root_dir_gen);
+ 	if (ret <= 0)
+-		return 0;
++		return ret;
+ 
+ 	/*
+ 	 * If we have a parent root we need to verify that the parent dir was
+@@ -6417,6 +6417,13 @@ static int process_extent(struct send_ctx *sctx,
+ 
+ 	if (S_ISLNK(sctx->cur_inode_mode))
+ 		return 0;
++	if (unlikely(!S_ISREG(sctx->cur_inode_mode))) {
++		btrfs_crit(sctx->send_root->fs_info,
++			   "send: extent for non-regular inode %llu root %llu mode 0%llo",
++			   key->objectid, btrfs_root_id(sctx->send_root),
++			   sctx->cur_inode_mode & S_IFMT);
++		return -EUCLEAN;
++	}
+ 
+ 	if (sctx->parent_root && !sctx->cur_inode_new) {
+ 		ret = is_extent_unchanged(sctx, path, key);
+diff --git a/fs/btrfs/tests/extent-io-tests.c b/fs/btrfs/tests/extent-io-tests.c
+--- a/fs/btrfs/tests/extent-io-tests.c
++++ b/fs/btrfs/tests/extent-io-tests.c
+@@ -133,14 +133,14 @@ static int test_find_delalloc(u32 sectorsize, u32 nodesize)
+ 	if (IS_ERR(root)) {
+ 		test_std_err(TEST_ALLOC_ROOT);
+ 		ret = PTR_ERR(root);
+-		goto out;
++		goto out_root_info;
+ 	}
+ 
+ 	inode = btrfs_new_test_inode();
+ 	if (!inode) {
+ 		test_std_err(TEST_ALLOC_INODE);
+ 		ret = -ENOMEM;
+-		goto out;
++		goto out_root_info;
+ 	}
+ 	tmp = &BTRFS_I(inode)->io_tree;
+ 	BTRFS_I(inode)->root = root;
+@@ -333,6 +333,7 @@ static int test_find_delalloc(u32 sectorsize, u32 nodesize)
+ 	process_page_range(inode, 0, total_dirty - 1,
+ 			   PROCESS_UNLOCK | PROCESS_RELEASE);
+ 	iput(inode);
++out_root_info:
+ 	btrfs_free_dummy_root(root);
+ 	btrfs_free_dummy_fs_info(fs_info);
+ 	return ret;
+diff --git a/fs/btrfs/transaction.c b/fs/btrfs/transaction.c
+--- a/fs/btrfs/transaction.c
++++ b/fs/btrfs/transaction.c
+@@ -458,8 +458,19 @@ static int record_root_in_trans(struct btrfs_trans_handle *trans,
+ 		 * through btrfs_record_root_in_trans without having to take the
+ 		 * lock.  smp_wmb() makes sure that all the writes above are
+ 		 * done before we pop in the zero below
++		 *
++		 * If @force is true, it means the call is from
++		 * qgroup_account_snapshot(), which only requires radix tree
++		 * tracking.
++		 * We should not force reloc root creation here, as the root
++		 * may have already been modified, and in that case
++		 * root->commit_root has already been dropped.
++		 *
++		 * Using that commit root will cause the reloc root to refer
++		 * to a deleted extent, causing extent tree corruption.
+ 		 */
+-		ret = btrfs_init_reloc_root(trans, root);
++		if (!force)
++			ret = btrfs_init_reloc_root(trans, root);
+ 		smp_mb__before_atomic();
+ 		clear_bit(BTRFS_ROOT_IN_TRANS_SETUP, &root->state);
+ 	}
+@@ -2583,6 +2594,12 @@ int btrfs_commit_transaction(struct btrfs_trans_handle *trans)
+ 	ret = btrfs_write_and_wait_transaction(trans);
+ 	if (unlikely(ret)) {
+ 		btrfs_err(fs_info, "error while writing out transaction: %pe", ERR_PTR(ret));
++		/*
++		 * Abort before releasing tree_log_mutex, so a log sync waiting
++		 * on it sees the fs error and skips writing super_for_commit
++		 * for this failed transaction. See btrfs_sync_log().
++		 */
++		btrfs_abort_transaction(trans, ret);
+ 		mutex_unlock(&fs_info->tree_log_mutex);
+ 		goto scrub_continue;
+ 	}
+diff --git a/fs/btrfs/volumes.c b/fs/btrfs/volumes.c
+--- a/fs/btrfs/volumes.c
++++ b/fs/btrfs/volumes.c
+@@ -3035,7 +3035,11 @@ int btrfs_init_new_device(struct btrfs_fs_info *fs_info, const char *device_path
+ error_sysfs:
+ 	btrfs_sysfs_remove_device(device);
+ 	mutex_lock(&fs_info->fs_devices->device_list_mutex);
++	if (seeding_dev)
++		btrfs_assign_next_active_device(device, seed_devices->latest_dev);
+ 	mutex_lock(&fs_info->chunk_mutex);
++	if (!list_empty(&device->post_commit_list))
++		list_del_init(&device->post_commit_list);
+ 	list_del_rcu(&device->dev_list);
+ 	list_del(&device->dev_alloc_list);
+ 	fs_info->fs_devices->num_devices--;
+diff --git a/fs/btrfs/zoned.c b/fs/btrfs/zoned.c
+--- a/fs/btrfs/zoned.c
++++ b/fs/btrfs/zoned.c
+@@ -2626,16 +2626,13 @@ static int do_zone_finish(struct btrfs_block_group *block_group, bool fully_writ
+ 	down_read(&dev_replace->rwsem);
+ 	map = block_group->physical_map;
+ 	for (i = 0; i < map->num_stripes; i++) {
+-
+ 		ret = call_zone_finish(block_group, &map->stripes[i]);
+-		if (ret) {
+-			up_read(&dev_replace->rwsem);
+-			return ret;
+-		}
++		if (ret)
++			break;
+ 	}
+ 	up_read(&dev_replace->rwsem);
+ 
+-	if (!fully_written)
++	if (!ret && !fully_written)
+ 		btrfs_dec_block_group_ro(block_group);
+ 
+ 	spin_lock(&fs_info->zone_active_bgs_lock);
+@@ -2648,7 +2645,7 @@ static int do_zone_finish(struct btrfs_block_group *block_group, bool fully_writ
+ 
+ 	clear_and_wake_up_bit(BTRFS_FS_NEED_ZONE_FINISH, &fs_info->flags);
+ 
+-	return 0;
++	return ret;
+ }
+ 
+ int btrfs_zone_finish(struct btrfs_block_group *block_group)
+@@ -2713,6 +2710,7 @@ int btrfs_zone_finish_endio(struct btrfs_fs_info *fs_info, u64 logical, u64 leng
+ {
+ 	struct btrfs_block_group *block_group;
+ 	u64 min_alloc_bytes;
++	int ret = 0;
+ 
+ 	if (!btrfs_is_zoned(fs_info))
+ 		return 0;
+@@ -2732,11 +2730,11 @@ int btrfs_zone_finish_endio(struct btrfs_fs_info *fs_info, u64 logical, u64 leng
+ 	    block_group->start + block_group->zone_capacity)
+ 		goto out;
+ 
+-	do_zone_finish(block_group, true);
++	ret = do_zone_finish(block_group, true);
+ 
+ out:
+ 	btrfs_put_block_group(block_group);
+-	return 0;
++	return ret;
+ }
+ 
+ static void btrfs_zone_finish_endio_workfn(struct work_struct *work)
+diff --git a/fs/btrfs/zstd.c b/fs/btrfs/zstd.c
+--- a/fs/btrfs/zstd.c
++++ b/fs/btrfs/zstd.c
+@@ -307,8 +307,17 @@ struct list_head *zstd_get_workspace(struct btrfs_fs_info *fs_info, int level)
+ 		DEFINE_WAIT(wait);
+ 
+ 		prepare_to_wait(&zwsm->wait, &wait, TASK_UNINTERRUPTIBLE);
+-		schedule();
++		/*
++		 * Re-check after being queued: zstd_put_workspace() only wakes
++		 * a queue that already has a sleeper, so a workspace returned
++		 * since the failed allocation woke nobody.
++		 */
++		ws = zstd_find_workspace(fs_info, level);
++		if (!ws)
++			schedule();
+ 		finish_wait(&zwsm->wait, &wait);
++		if (ws)
++			return ws;
+ 
+ 		goto again;
+ 	}

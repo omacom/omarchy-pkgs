@@ -20,8 +20,8 @@
 # "v", which is stripped for pkgver. Drafts and prereleases are ignored. The
 # provider emits the same JSON contract as an upstream.sh hook, so
 # bin/sync-upstream's validation and min_release_age backstop apply
-# unchanged. Git-tag and npm providers below cover projects without GitHub
-# releases; a feed that fits no convention keeps a bespoke hook.
+# unchanged. Git-tag, npm, and Debian Packages providers below cover projects
+# without GitHub releases; a feed that fits no convention keeps a bespoke hook.
 
 # Return the single declarative provider selected by a package. An empty
 # result means either no provider or an invalid/ambiguous declaration; the
@@ -31,7 +31,7 @@ package_upstream_provider() {
   metadata=$(metadata_file_for_dir "$pkgdir")
   jq -r '
     (.upstream? | objects) as $u
-    | [$u | keys[] | select(. == "github" or . == "git_tags" or . == "npm")]
+    | [$u | keys[] | select(. == "github" or . == "git_tags" or . == "npm" or . == "debian" or . == "watch")]
     | if length == 1 then .[0] else "" end
   ' "$metadata"
 }
@@ -62,6 +62,11 @@ npm_fetch_metadata() {
   local package="$1" encoded
   encoded=$(jq -rn --arg package "$package" '$package | @uri')
   curl -fsSL "https://registry.npmjs.org/$encoded"
+}
+
+debian_fetch_packages() {
+  local url="$1"
+  curl --proto '=https' --proto-redir '=https' -fsSL "$url"
 }
 
 upstream_fetch_source() {
@@ -198,6 +203,71 @@ npm_upstream_release() {
   printf '%s\n' "$release"
 }
 
+# Discover a package version from a plain-text Debian Packages index, then
+# hash the declared immutable sources. This intentionally supports only
+# versions that are already valid Arch pkgver values; feeds needing Debian
+# epoch/revision translation keep a package-specific hook.
+debian_upstream_release() {
+  local package_dir="$1" metadata index_url package packages
+  metadata=$(metadata_file_for_dir "$package_dir")
+  index_url=$(jq -r '.upstream.debian // ""' "$metadata")
+  package=$(jq -r '.upstream.package // ""' "$metadata")
+
+  if [[ ! "$index_url" =~ ^https://[^[:space:]]+$ || ! "$package" =~ ^[a-z0-9][a-z0-9+.-]*$ ]]; then
+    echo "invalid Debian Packages provider configuration" >&2
+    return 1
+  fi
+  if ! jq -e '
+    .upstream.sources | type == "object" and length > 0 and (to_entries | all(
+      (.key | test("\\A[a-z0-9_]+\\z"))
+      and (.value | type == "array" and length > 0 and all(type == "string" and length > 0))
+    ))
+  ' "$metadata" >/dev/null; then
+    echo "invalid Debian Packages source mapping" >&2
+    return 1
+  fi
+  if ! packages=$(debian_fetch_packages "$index_url"); then
+    echo "could not fetch Debian Packages index: $index_url" >&2
+    return 1
+  fi
+  packages=${packages//$'\r'/}
+
+  local best_pkgver="" candidate
+  while IFS= read -r candidate; do
+    if [[ ! "$candidate" =~ ^[A-Za-z0-9][A-Za-z0-9._+]*$ ]]; then
+      echo "$package has an unusable Debian version: ${candidate:-<empty>}" >&2
+      return 1
+    fi
+    if [[ -z "$best_pkgver" || $(vercmp "$candidate" "$best_pkgver") -gt 0 ]]; then
+      best_pkgver="$candidate"
+    fi
+  done < <(awk -v target="$package" '
+    BEGIN { RS = ""; FS = "\n" }
+    {
+      name = version = ""
+      for (i = 1; i <= NF; i++) {
+        if ($i ~ /^Package: /) name = substr($i, 10)
+        if ($i ~ /^Version: /) version = substr($i, 10)
+      }
+      if (name == target) print version
+    }
+  ' <<<"$packages")
+
+  [[ -n "$best_pkgver" ]] || {
+    echo "no usable $package release found in $index_url" >&2
+    return 1
+  }
+
+  local current_pkgver
+  current_pkgver=$(grep -m1 '^pkgver=' "$package_dir/PKGBUILD" | cut -d= -f2- | tr -d "\"'")
+  if [[ $(vercmp "$best_pkgver" "$current_pkgver") -le 0 ]]; then
+    echo '{}'
+    return 0
+  fi
+
+  upstream_hash_sources "$package_dir" "$best_pkgver" "$best_pkgver"
+}
+
 # Emits the newest qualifying release as hook-contract JSON. min_release_age
 # is honored during selection (newest release older than the window wins,
 # even when a younger one exists) and BYPASS_MIN_RELEASE_AGE=1 lifts it.
@@ -206,7 +276,7 @@ npm_upstream_release() {
 # not silently choose from.
 github_upstream_release() {
   local package_dir="$1" min_age="${2:-0}"
-  local metadata repo checksums_name use_digests
+  local metadata repo checksums_name use_digests latest_only
   metadata=$(metadata_file_for_dir "$package_dir")
 
   repo=$(jq -r '(.upstream? | objects | .github) // ""' "$metadata")
@@ -218,8 +288,13 @@ github_upstream_release() {
   # reaches this provider without running the validator first.
   checksums_name=$(jq -r '(.upstream? | objects | .checksums) | strings' "$metadata")
   use_digests=$(jq -r '(.upstream? | objects | .digests) | if . == null then "false" elif type == "boolean" then tostring else "invalid" end' "$metadata")
+  latest_only=$(jq -r '(.upstream? | objects | .latest_only) | if . == null then "false" elif type == "boolean" then tostring else "invalid" end' "$metadata")
   if [[ "$use_digests" == "invalid" ]]; then
     echo "upstream.digests must be true or false" >&2
+    return 1
+  fi
+  if [[ "$latest_only" == "invalid" ]]; then
+    echo "upstream.latest_only must be true or false" >&2
     return 1
   fi
   if [[ -n "$checksums_name" && "$use_digests" == "true" ]]; then
@@ -228,6 +303,27 @@ github_upstream_release() {
   fi
   if [[ -z "$checksums_name" && "$use_digests" != "true" ]]; then
     echo "upstream needs either checksums (a manifest asset name) or digests: true" >&2
+    return 1
+  fi
+  if ! jq -e '
+    def valid_sources:
+      type == "object" and length > 0 and (to_entries | all(
+        (.key | test("\\A[a-z0-9_]+\\z"))
+        and (.value | type == "array" and length > 0 and all(type == "string" and length > 0))
+      ));
+    (.upstream.assets | type == "object" and length > 0 and (to_entries | all(
+      (.key | test("\\A[a-z0-9_]+\\z"))
+      and (.value |
+        (type == "string" and length > 0)
+        or (type == "array" and length > 0 and all(type == "string" and length > 0) and (unique | length) == length)
+      )
+    )))
+    and (if .upstream | has("sources") then
+      (.upstream.sources | valid_sources)
+      and ((.upstream.assets | keys) as $assets | (.upstream.sources | keys) as $sources | ($assets - $sources | length) == ($assets | length))
+    else true end)
+  ' "$metadata" >/dev/null; then
+    echo "invalid upstream.assets or upstream.sources mapping" >&2
     return 1
   fi
   local arches
@@ -242,6 +338,9 @@ github_upstream_release() {
   if ! releases=$(github_fetch_releases "$repo"); then
     echo "could not fetch the release feed for $repo" >&2
     return 1
+  fi
+  if [[ "$latest_only" == "true" ]]; then
+    releases=$(jq '[.[] | select((.draft or .prerelease) | not)][0:1]' <<<"$releases")
   fi
 
   local candidates=0 best_tag="" best_pkgver="" best_published_at=""
@@ -302,39 +401,50 @@ github_upstream_release() {
     return 1
   fi
 
-  local jq_args=(--arg pkgver "$best_pkgver" --arg published_at "$best_published_at")
-  local jq_filter='{pkgver: $pkgver, published_at: $published_at, sha256sums: {}}'
-  local arch template filename checksum checksum_source
+  local result
+  result=$(jq -n --arg pkgver "$best_pkgver" --arg published_at "$best_published_at" \
+    '{pkgver: $pkgver, published_at: $published_at, sha256sums: {}}')
+  local arch template filename checksum checksum_source sums
   for arch in "${arches[@]}"; do
     if [[ ! "$arch" =~ ^[a-z0-9_]+$ ]]; then
       echo "invalid architecture key in upstream.assets: '$arch'" >&2
       return 1
     fi
-    template=$(jq -r --arg arch "$arch" '.upstream.assets[$arch]' "$metadata")
-    filename=${template//\{pkgver\}/$best_pkgver}
-    filename=${filename//\{tag\}/$best_tag}
-    if [[ "$use_digests" == "true" ]]; then
-      # Only a "sha256:<hex>" digest is stripped to its hex; any other shape
-      # falls through empty and fails the check below.
-      checksum=$(jq -r --arg tag "$best_tag" --arg name "$filename" '
-        first(.[] | select(.tag_name == $tag)) | (.assets // [])[]
-        | select(.name == $name) | (.digest // "")
-        | if type == "string" and test("\\Asha256:[0-9a-f]{64}\\z") then ltrimstr("sha256:") else "" end
-      ' <<<"$releases")
-      checksum_source="the release API digest"
-    else
-      # Manifest lines are "<sha256>  <name>", with the name sometimes prefixed
-      # "./" (sha256sum of a local path) or "*" (binary-mode marker).
-      checksum=$(awk -v f="$filename" '$2 == f || $2 == "./" f || $2 == "*" f { print $1; exit }' <<<"$checksums")
-      checksum_source="$checksums_name"
-    fi
-    if [[ ! "$checksum" =~ ^[0-9a-f]{64}$ ]]; then
-      echo "no valid checksum for $filename in $repo $best_tag $checksum_source" >&2
-      return 1
-    fi
-    jq_args+=(--arg "sum_$arch" "$checksum")
-    jq_filter+=" | .sha256sums[\"$arch\"] = [\$sum_$arch]"
+    sums='[]'
+    while IFS= read -r template; do
+      filename=${template//\{pkgver\}/$best_pkgver}
+      filename=${filename//\{tag\}/$best_tag}
+      if [[ "$use_digests" == "true" ]]; then
+        # Only a "sha256:<hex>" digest is stripped to its hex; any other shape
+        # falls through empty and fails the check below.
+        checksum=$(jq -r --arg tag "$best_tag" --arg name "$filename" '
+          first(.[] | select(.tag_name == $tag)) | (.assets // [])[]
+          | select(.name == $name) | (.digest // "")
+          | if type == "string" and test("\\Asha256:[0-9a-f]{64}\\z") then ltrimstr("sha256:") else "" end
+        ' <<<"$releases")
+        checksum_source="the release API digest"
+      else
+        # Manifest lines are "<sha256>  <name>", with the name sometimes prefixed
+        # "./" (sha256sum of a local path) or "*" (binary-mode marker).
+        checksum=$(awk -v f="$filename" '$2 == f || $2 == "./" f || $2 == "*" f { print $1; exit }' <<<"$checksums")
+        checksum_source="$checksums_name"
+      fi
+      if [[ ! "$checksum" =~ ^[0-9a-f]{64}$ ]]; then
+        echo "no valid checksum for $filename in $repo $best_tag $checksum_source" >&2
+        return 1
+      fi
+      sums=$(jq -c --arg checksum "$checksum" '. + [$checksum]' <<<"$sums")
+    done < <(jq -r --arg arch "$arch" '
+      .upstream.assets[$arch] | if type == "array" then .[] else . end
+    ' "$metadata")
+    result=$(jq -c --arg arch "$arch" --argjson sums "$sums" '.sha256sums[$arch] = $sums' <<<"$result")
   done
 
-  jq -n "${jq_args[@]}" "$jq_filter"
+  if jq -e '.upstream | has("sources")' "$metadata" >/dev/null; then
+    local source_release
+    source_release=$(upstream_hash_sources "$package_dir" "$best_pkgver" "$best_tag") || return 1
+    result=$(jq -c --argjson source "$source_release" '.sha256sums += $source.sha256sums' <<<"$result")
+  fi
+
+  printf '%s\n' "$result"
 }

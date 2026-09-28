@@ -114,7 +114,11 @@ BUILT_FILES=""
 # What the scheduled version check queued, when it was the one that asked for
 # this run. Absent for a manual run, which is fine — the report just omits it.
 QUEUED_PACKAGES=""
-QUEUE_FILE="${OMARCHY_STATE_DIR:-/root/.state}/.sync-needed-$MIRROR"
+QUEUE_FILE=$(sync_queue_file "$MIRROR" "$ARCH")
+# A queue written under the pre-architecture name belongs to x86_64.
+if [[ "$ARCH" == "x86_64" && ! -s "$QUEUE_FILE" && -s "$(legacy_sync_queue_file "$MIRROR")" ]]; then
+  QUEUE_FILE=$(legacy_sync_queue_file "$MIRROR")
+fi
 [[ -s "$QUEUE_FILE" ]] && QUEUED_PACKAGES=$(grep -c '' "$QUEUE_FILE")
 
 if [[ "$DRY_RUN" != true ]]; then
@@ -134,11 +138,43 @@ if [[ "$DRY_RUN" == true ]]; then
 else
   print_info "Step 1/6: Building packages..."
 fi
-"$BUILD_ROOT/bin/build" "${BUILD_ARGS[@]}" || {
+BUILD_RESULT_DIR=$(mktemp -d)
+trap 'rm -rf "$BUILD_RESULT_DIR"' EXIT
+build_status=0
+OMARCHY_BUILD_RESULT_DIR="$BUILD_RESULT_DIR" "$BUILD_ROOT/bin/build" "${BUILD_ARGS[@]}" || build_status=$?
+partial=false
+if [[ "$build_status" == 2 && -f "$BUILD_RESULT_DIR/complete" && "$DRY_RUN" != true ]]; then
+  if [[ "${OMARCHY_DEFER_RUNTIME_DEPS:-false}" == true ]]; then
+    print_error "The deferred release pair must succeed together; nothing will be published"
+    notify_error "Release failed: Incomplete release pair" "$RELEASE_CONTEXT"
+    exit 1
+  fi
+  partial=true
+  while IFS= read -r file; do
+    [[ -f "$BUILD_OUTPUT_DIR/$file" ]] || {
+      print_error "Completed build artifact is missing: $file"
+      notify_error "Release failed: Missing completed artifact" "$RELEASE_CONTEXT"
+      exit 1
+    }
+  done < "$BUILD_RESULT_DIR/artifacts"
+  # Exclude partial split outputs or leftovers from failed builds. Moving
+  # them out of the flat publication directory keeps them available for
+  # diagnosis without handing them to sign/promote.
+  unpublished=""
+  for path in "$BUILD_OUTPUT_DIR"/*.pkg.tar.*; do
+    [[ -f "$path" ]] || continue
+    file=${path##*/}
+    if ! grep -Fxq -- "${file%.sig}" "$BUILD_RESULT_DIR/artifacts"; then
+      [[ -n "$unpublished" ]] || unpublished=$(mktemp -d "$BUILD_OUTPUT_DIR/.unpublished.XXXXXX")
+      mv -- "$path" "$unpublished/"
+    fi
+  done
+  print_warning "Some packages failed; publishing the completed packages before retrying the failures"
+elif [[ "$build_status" != 0 ]]; then
   print_error "Build failed"
   notify_error "Release failed: Build step failed" "$RELEASE_CONTEXT"
   exit 1
-}
+fi
 
 if [[ "$DRY_RUN" == true ]]; then
   echo ""
@@ -150,6 +186,12 @@ BUILT_FILES=$(built_package_files "$BUILD_OUTPUT_DIR")
 BUILT_COUNT=$(grep -c '' <<<"$BUILT_FILES")
 [[ -z "$BUILT_FILES" ]] && BUILT_COUNT=0
 print_info "Built $BUILT_COUNT package(s) this run"
+
+if [[ "$partial" == true && "$BUILT_COUNT" == 0 ]]; then
+  print_error "No completed packages to publish"
+  notify_error "Release failed: No completed packages" "$RELEASE_CONTEXT"
+  exit 1
+fi
 
 # Step 2: Sign
 echo ""
@@ -209,7 +251,16 @@ if ((BUILT_COUNT > 0)); then
   summary+="<br><br><strong>$BUILT_COUNT package(s) published:</strong>"
   summary+="$(format_package_list_html "$BUILT_FILES")"
   summary+="<br><br>Live at https://pkgs.omarchy.org/$MIRROR/$ARCH/"
-  notify_success "Release published: $MIRROR" "$summary"
+  if [[ "$partial" == true ]]; then
+    failed=$(tr '\n' ' ' < "$BUILD_RESULT_DIR/failed" | basecamp_html_escape)
+    blocked=$(tr '\n' ' ' < "$BUILD_RESULT_DIR/blocked" | basecamp_html_escape)
+    [[ -z "$failed" ]] || summary+="<br><br>Failed: $failed"
+    [[ -z "$blocked" ]] || summary+="<br>Blocked by failed dependencies: $blocked"
+    summary+="<br>Published packages will be skipped on retry; failed packages remain queued."
+    notify_info "Partial release published: $MIRROR" "$summary"
+  else
+    notify_success "Release published: $MIRROR" "$summary"
+  fi
 else
   # Rare by construction: a release only runs when the version check queued
   # work, so publishing nothing means the check and the builder disagreed
@@ -224,4 +275,10 @@ else
 fi
 
 echo ""
+if [[ "$partial" == true ]]; then
+  print_warning "Completed packages published; unsuccessful packages remain for retry"
+  # Preserve the scheduled queue and failure backoff. The next version
+  # check/build compares against the updated repository and skips successes.
+  exit 1
+fi
 print_success "Release workflow completed successfully!"
