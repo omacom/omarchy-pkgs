@@ -82,7 +82,7 @@ def validate(watch):
     allowed = PROVIDERS | {"pattern", "path", "package", "branch", "variables", "fields",
                            "submodules", "allow_prerelease", "unescape_json", "filenames",
                            "sequence", "version", "revision", "revision_variable",
-                           "mutable_sources", "member", "dist_tag"}
+                           "mutable_sources", "member", "dist_tag", "tag_pattern"}
     if watch.keys() - allowed:
         raise ValueError(f"unknown watch fields: {sorted(watch.keys() - allowed)}")
     value = watch[provider]
@@ -113,6 +113,18 @@ def validate(watch):
         if not isinstance(branch, str) or not branch or branch.startswith("-"):
             raise ValueError("git branch watch needs an explicit branch")
         run(["git", "check-ref-format", "refs/heads/" + branch])
+        # A branch watch whose version template names a tag needs to know
+        # which tags count as releases; anything else is an untagged branch.
+        if "tag_pattern" in watch:
+            if not isinstance(watch["tag_pattern"], str) or not watch["tag_pattern"]:
+                raise ValueError("watch.tag_pattern must be a regular expression string")
+            if "version" not in re.compile(watch["tag_pattern"]).groupindex:
+                raise ValueError("tag_pattern needs a named version group")
+        template = watch.get("version", "{version}")
+        if any(field in template for field in ("{tag", "{distance")) and "tag_pattern" not in watch:
+            raise ValueError("a version built from {tag}/{distance} needs a tag_pattern")
+    elif "tag_pattern" in watch:
+        raise ValueError("tag_pattern only applies to git_branch watches")
     for field in ("variables", "submodules", "fields"):
         mapping = watch.get(field, {})
         if not isinstance(mapping, dict):
@@ -172,6 +184,53 @@ def matches(watch, text, extra=None, full=False):
             yield candidate(watch, {**(extra or {}), **match.groupdict()})
 
 
+def git_branch_tip(url, branch, tag_pattern, cache):
+    """Describe the current tip of an upstream branch:
+    commit, total count, date, and with a tag_pattern
+    the newest release tag reachable from it plus the distance from that tag,
+    so a branch build can be versioned <tag>.r<n>.g<sha>, above the release it
+    follows and below the next one, the way a pkgver() function would.
+
+    One blobless single-branch clone per (url, branch) per run, shared by
+    every package that tracks it, so two recipes pinned from one clone always
+    see the same commit. The clone is read with git only; nothing in it runs.
+    select_release applies the age hold to this tip, without walking back
+    into history (which could select a commit from a merged side branch).
+    """
+    https(url)
+    key = hashlib.sha256(f"{url}#{branch}".encode()).hexdigest()
+    work = Path(cache) / f"{key}.branch.git"
+    if not work.exists():
+        scratch = work.with_name(f"{work.name}.{os.getpid()}.tmp")
+        subprocess.run(["git", "clone", "--quiet", "--bare", "--filter=blob:none", "--single-branch", "--branch", branch, url, str(scratch)], check=True)
+        scratch.replace(work)
+    git = ["git", "-C", str(work)]
+    commit = run([*git, "rev-parse", "HEAD"], text=True).strip()
+    if not re.fullmatch(r"[0-9a-f]{40}", commit):
+        raise ValueError("branch tip is not a commit")
+    count = run([*git, "rev-list", "--count", commit], text=True).strip()
+    date = run([*git, "show", "-s", "--format=%cs", commit], text=True).strip().replace("-", "")
+    timestamp = run([*git, "show", "-s", "--format=%cI", commit], text=True).strip()
+    values = {"version": date, "date": date, "count": count, "commit": commit, "published_at": timestamp}
+    if tag_pattern:
+        pattern = re.compile(tag_pattern)
+        best = None
+        # Only tags in this commit's history count; a release cut on another
+        # branch is not something this branch is "past".
+        for tag in run([*git, "tag", "--merged", commit], text=True).split():
+            match = pattern.fullmatch(tag)
+            if not match:
+                continue
+            version = match.group("version")
+            if best is None or vercmp(version, best[0]) > 0:
+                best = (version, tag)
+        if best is None:
+            raise ValueError(f"no tag on {branch} matches {tag_pattern}")
+        distance = run([*git, "rev-list", "--count", f"{best[1]}..{commit}"], text=True).strip()
+        values.update({"tag": best[1], "version": best[0], "distance": distance})
+    return values
+
+
 def discover(watch, fetch):
     provider = validate(watch)
     feed = watch[provider]
@@ -199,13 +258,8 @@ def discover(watch, fetch):
         for tag, commit in tags.items():
             results.extend(matches(watch, tag, {"tag": tag, "commit": commit}, full=True))
     elif provider == "git_branch":
-        with tempfile.TemporaryDirectory(prefix="upstream-git-") as work:
-            subprocess.run(["git", "clone", "--quiet", "--bare", "--filter=blob:none", "--single-branch", "--branch", watch["branch"], feed, work], check=True)
-            commit = run(["git", "-C", work, "rev-parse", "HEAD"], text=True).strip()
-            count = run(["git", "-C", work, "rev-list", "--count", "HEAD"], text=True).strip()
-            date = run(["git", "-C", work, "show", "-s", "--format=%cs", "HEAD"], text=True).strip().replace("-", "")
-            timestamp = run(["git", "-C", work, "show", "-s", "--format=%cI", "HEAD"], text=True).strip()
-            results.append(candidate(watch, {"version": date, "date": date, "count": count, "commit": commit, "published_at": timestamp}))
+        tip = git_branch_tip(feed, watch["branch"], watch.get("tag_pattern"), fetch.cache)
+        results.append(candidate(watch, tip))
     elif provider == "npm":
         data = fetch.json("https://registry.npmjs.org/" + quote(feed, safe=""))
         version = data["dist-tags"][watch.get("dist_tag", "latest")]
@@ -479,7 +533,8 @@ def sync(package, fetch, min_age=0, check=False):
     path = package / "PKGBUILD"
     original = path.read_text()
     before = read_recipe(path)
-    release = select_release(discover(watch, fetch), min_age, bypass=os.environ.get("BYPASS_MIN_RELEASE_AGE") == "1")
+    bypass = os.environ.get("BYPASS_MIN_RELEASE_AGE") == "1"
+    release = select_release(discover(watch, fetch), min_age, bypass=bypass)
     if release is None:
         return {"status": "skipped", "reason": "minimum release age"}
     current = scalar(before, "pkgver")

@@ -1,7 +1,11 @@
 const BUILD = '.github/workflows/build-pr.yml';
 const TESTS = '.github/workflows/test.yml';
 
+// pullRequest/action/since default to the pull_request_target event. The
+// sync workflows pass them explicitly: GitHub creates no pull_request_target
+// run for a GITHUB_TOKEN push, so they release their own pushes' held runs.
 module.exports = async function approve({ github, context, core, vouchStatus,
+  pullRequest = context.payload.pull_request, action = context.payload.action, since,
   sleep = ms => new Promise(resolve => setTimeout(resolve, ms)), attempts = 36 }) {
   // Missing/failed vouch lookups must not become approval. Denouncements
   // remain absolute, just as they are in the package build gate.
@@ -9,8 +13,8 @@ module.exports = async function approve({ github, context, core, vouchStatus,
     throw new Error(`Cannot approve workflows: vouch status is ${vouchStatus || 'missing'}.`);
   }
 
-  const expected = context.payload.pull_request;
-  const eventTime = Date.parse(expected.updated_at);
+  const expected = pullRequest;
+  const eventTime = Date.parse(since ?? expected.updated_at);
   if (!Number.isFinite(eventTime)) throw new Error('Missing PR event timestamp.');
   const approved = new Set();
   let precedingBuild;
@@ -47,7 +51,7 @@ module.exports = async function approve({ github, context, core, vouchStatus,
     const newestBuild = runs.findLast(run => run.path === BUILD);
     if (!newestBuild || !(Date.parse(newestBuild.created_at) >= eventTime) ||
         !runs.some(run => run.path === TESTS &&
-          (context.payload.action === 'labeled' || Date.parse(run.created_at) >= eventTime))) continue;
+          (action === 'labeled' || Date.parse(run.created_at) >= eventTime))) continue;
 
     if (precedingBuild) {
       const { data: run } = await github.rest.actions.getWorkflowRun({
@@ -71,7 +75,13 @@ module.exports = async function approve({ github, context, core, vouchStatus,
     await github.rest.actions.approveWorkflowRun({ ...context.repo, run_id: run.id });
     approved.add(run.id);
     core.info(`Approved ${run.path} run ${run.id} for PR #${expected.number}.`);
-    if (run.path === BUILD) precedingBuild = run.id;
+    // Only a newer held build needs this one to take the concurrency slot
+    // first. A lone build may sit pending behind an in-flight build of an
+    // older commit (sync branches queue rather than cancel); waiting for it
+    // to start would time out before the tests run was released.
+    if (run.path === BUILD && pending.some(other => other.path === BUILD && other.id > run.id)) {
+      precedingBuild = run.id;
+    }
     if (pending.length === 1) return;
   }
   throw new Error('Timed out waiting for PR workflows. Remove and reapply build-approved to retry.');

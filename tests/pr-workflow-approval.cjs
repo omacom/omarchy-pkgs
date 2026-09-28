@@ -186,6 +186,15 @@ test('a delayed tests workflow is also awaited', async () => {
   assert.deepEqual(state.approved, [1, 2]);
 });
 
+test('a lone build left pending behind an older in-flight build does not hold back the tests', async () => {
+  // Sync branches queue rather than cancel, so an approved build can stay
+  // queued for hours. Only a newer held build needs to wait for it to start.
+  const { state, invoke } = fixture([run(1, BUILD), run(2, TESTS)], { queueUntil: Infinity });
+  await invoke();
+  assert.deepEqual(state.approved, [1, 2]);
+  assert.deepEqual(state.transitions, []);
+});
+
 test('reopening a labeled PR waits for its new tests, even if old tests passed at the same SHA', async () => {
   const { state, invoke } = fixture([
     run(1, TESTS, { created_at: earlier, conclusion: 'success' }), run(2, BUILD),
@@ -312,3 +321,128 @@ for (const [name, overrides] of [
     assert.doesNotMatch(result.stdout, /::notice::Awaiting maintainer build approval/);
   });
 }
+
+// A push to a sync branch must not cancel that PR's multi-hour build; any
+// other PR still cancels its superseded build.
+test('only same-repository sync branches queue behind an in-flight build', () => {
+  const expression = workflow.match(/^  cancel-in-progress: \$\{\{(.*)\}\}$/m)[1];
+  const cancels = (repo, ref) => new Function('github', 'startsWith', `return (${expression})`)(
+    { repository: 'omacom/omarchy-pkgs', head_ref: ref,
+      event: { pull_request: { head: { repo: { full_name: repo } } } } },
+    (text, prefix) => text.startsWith(prefix));
+  assert.equal(cancels('omacom/omarchy-pkgs', 'auto/sync-upstream'), false);
+  assert.equal(cancels('omacom/omarchy-pkgs', 'auto/sync-upstream-ttfx'), false);
+  assert.equal(cancels('omacom/omarchy-pkgs', 'auto/sync-rebuilds'), false);
+  assert.equal(cancels('omacom/omarchy-pkgs', 'ttfx/fix'), true);
+  assert.equal(cancels('someone/omarchy-pkgs', 'auto/sync-upstream'), true);
+  assert.equal(cancels(undefined, ''), true); // workflow_dispatch
+});
+
+// The sync workflows release their own GITHUB_TOKEN pushes: GitHub creates
+// no pull_request_target run for those, so approve-pr.yml never runs.
+const approveSyncPush = require('../.github/scripts/approve-sync-push.cjs');
+function syncFixture(options = {}) {
+  const f = fixture([run(1, BUILD, { head_branch: 'auto/sync-upstream' }),
+    run(2, TESTS, { head_branch: 'auto/sync-upstream' })], options);
+  Object.assign(f.state.pr, {
+    user: { login: 'github-actions[bot]' },
+    head: { ...f.state.pr.head, ref: 'auto/sync-upstream', repo: { id: 42, full_name: 'omacom/omarchy-pkgs' } },
+    base: { repo: { full_name: 'omacom/omarchy-pkgs' } },
+  });
+  const push = overrides => approveSyncPush({
+    github: f.github, context: { repo: { owner: 'omacom', repo: 'omarchy-pkgs' }, payload: {} },
+    core: { info() {} }, number: 390, branch: 'auto/sync-upstream', headSha: pr.head.sha,
+    since: earlier, attempts: 6, sleep: async () => {}, ...overrides,
+  });
+  return { ...f, push };
+}
+
+test('a labelled sync PR has its bot push released', async () => {
+  const { state, push } = syncFixture();
+  await push();
+  assert.deepEqual(state.approved, [1, 2]);
+});
+
+test('an unlabelled sync PR stays held for a maintainer', async () => {
+  const { state, push } = syncFixture();
+  state.pr.labels = [];
+  await push();
+  assert.deepEqual(state.approved, []);
+});
+
+test('runs older than the push are not taken for this push', async () => {
+  const { state, push } = syncFixture();
+  await assert.rejects(push({ since: '2026-09-19T03:00:00Z' }), /Timed out/);
+  assert.deepEqual(state.approved, []);
+});
+
+for (const [name, change] of [
+  ['a contributor PR', current => { current.user.login = 'someone'; }],
+  ['a fork PR', current => { current.head.repo.full_name = 'someone/omarchy-pkgs'; }],
+  ['another branch', current => { current.head.ref = 'auto/sync-rebuilds'; }],
+]) {
+  test(`the sync approver refuses ${name}, even when labelled`, async () => {
+    const { state, push } = syncFixture();
+    change(state.pr);
+    await assert.rejects(push(), /refusing to approve/);
+    assert.deepEqual(state.approved, []);
+  });
+}
+
+for (const [name, change] of [
+  ['closed', current => { current.state = 'closed'; }],
+  ['moved on', current => { current.head.sha = 'newer-sha'; }],
+]) {
+  test(`a sync PR that has ${name} is left alone`, async () => {
+    const { state, push } = syncFixture();
+    change(state.pr);
+    await push();
+    assert.deepEqual(state.approved, []);
+  });
+}
+
+test('the sync approver needs the push it is approving for', async () => {
+  const { state, push } = syncFixture();
+  for (const missing of [{ number: NaN }, { headSha: '' }, { since: '' }, { branch: '' }]) {
+    await assert.rejects(push(missing), /Missing sync PR/);
+  }
+  assert.deepEqual(state.approved, []);
+});
+
+// A scoped dispatch must not push to the shared branch: it would replace the
+// other pending updates in the open sync PR with just the named packages.
+const branchScript = join(__dirname, '../.github/scripts/sync-pr-branch.sh');
+const branchFor = (...names) => Object.fromEntries(execFileSync(branchScript,
+  ['auto/sync-upstream', ...names], { encoding: 'utf8' })
+  .trim().split('\n').map(line => line.split(/=(.*)/s).slice(0, 2)));
+
+test('scheduled runs keep the shared branch; scoped runs get their own', () => {
+  assert.deepEqual(branchFor(), { branch: 'auto/sync-upstream', scope: '' });
+  assert.deepEqual(branchFor('ttfx'), { branch: 'auto/sync-upstream-ttfx', scope: 'ttfx' });
+  assert.deepEqual(branchFor('ttfx', 'strata', 'ttfx'),
+    { branch: 'auto/sync-upstream-strata-ttfx', scope: 'strata ttfx' });
+  assert.equal(branchFor('python-foo.bar').branch, 'auto/sync-upstream-python-foo-bar');
+  const names = ['a-very-long-package-name-one', 'another-very-long-package-name-two'];
+  const long = branchFor(...names, 'third');
+  assert.ok(long.branch.length <= 'auto/sync-upstream-'.length + 60);
+  assert.notEqual(long.branch, branchFor(...names).branch);
+});
+
+test('scoped branch names reject anything that is not a package name', () => {
+  for (const name of ['../x', 'A', 'x y', 'a@{b', '-x', '.x', 'x;true']) {
+    assert.equal(spawnSync(branchScript, ['auto/sync-upstream', name]).status, 1, name);
+  }
+});
+
+test('sync workflows push scoped runs aside and keep actions: write out of the sync job', () => {
+  for (const file of ['sync-upstream.yml', 'sync-rebuilds.yml']) {
+    const text = readFileSync(join(__dirname, '../.github/workflows', file), 'utf8');
+    const sync = text.slice(text.indexOf('\n  sync:\n'), text.indexOf('\n  approve:\n'));
+    const approveJob = text.slice(text.indexOf('\n  approve:\n'));
+    assert.match(sync, /sync-pr-branch\.sh auto\/sync-[\w-]+ "\$\{package_args\[@\]\}"/, file);
+    assert.match(sync, /branch: \$\{\{ steps\.branch\.outputs\.branch \}\}/, file);
+    assert.doesNotMatch(sync, /^ +actions: write$/m, file);
+    assert.match(approveJob, /^      actions: write$/m, file);
+    assert.match(approveJob, /needs\.sync\.outputs\.operation == 'updated'/, file);
+  }
+});

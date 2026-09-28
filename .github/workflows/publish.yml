@@ -36,13 +36,18 @@ jobs:
     outputs:
       matrix: ${{ steps.list.outputs.matrix }}
       count: ${{ steps.list.outputs.count }}
+      rebuild: ${{ steps.list.outputs.rebuild }}
+      rebuild_count: ${{ steps.list.outputs.rebuild_count }}
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
           persist-credentials: false
       - id: list
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
+          set -euo pipefail
           if [[ -n "${{ github.event.inputs.packages }}" ]]; then
             names="${{ github.event.inputs.packages }}"
           else
@@ -53,17 +58,102 @@ jobs:
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
           echo "count=$(jq '.include | length' <<<"$matrix")" >> "$GITHUB_OUTPUT"
           jq -r '.include[] | "\(.package) \(.arch) -> \(.channels)"' <<<"$matrix"
+          # Reuse or rebuild, decided per entry and said out loud. An aarch64
+          # tree with no build artifact (PR artifacts last 7 days; a dispatch
+          # may name any package) goes to the rebuild job, which builds it
+          # natively on GitHub's arm64 runner. x86_64 builds inside the
+          # publish job on the droplet, as before.
+          rebuild=()
+          echo "| package | arch | tree | decision |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| --- | --- | --- | --- |" >> "$GITHUB_STEP_SUMMARY"
+          while read -r entry; do
+            package=$(jq -r .package <<<"$entry"); arch=$(jq -r .arch <<<"$entry")
+            hash=$(git rev-parse "HEAD:pkgbuilds/$package")
+            label="$package-$arch-$hash"
+            found=$(curl -fsS -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${{ github.repository }}/actions/artifacts?name=$label&per_page=5" \
+              | jq -r '[.artifacts[] | select(.expired|not)] | sort_by(.created_at) | last | select(. != null) | "run \(.workflow_run.id), expires \(.expires_at)"')
+            if [[ -n "$found" ]]; then
+              decision="reuse the build artifact ($found)"
+            elif [[ $arch == aarch64 ]]; then
+              decision="no build artifact: rebuild natively on ubuntu-24.04-arm"
+              rebuild+=("$entry")
+            else
+              decision="no build artifact: build in the publish job on the self-hosted builder"
+            fi
+            echo "==> $label: $decision"
+            echo "| $package | $arch | ${hash:0:12} | $decision |" >> "$GITHUB_STEP_SUMMARY"
+          done < <(jq -c '.include[]' <<<"$matrix")
+          echo "rebuild=$(printf '%s\n' "${rebuild[@]}" | jq -sc '{include: .}')" >> "$GITHUB_OUTPUT"
+          echo "rebuild_count=${#rebuild[@]}" >> "$GITHUB_OUTPUT"
+
+  # The aarch64 half of "build it now when there is none". It builds exactly
+  # as build-pr.yml's aarch64 path does (same runner, same builder image,
+  # same bin/build call) and uploads under the same label, so the publish
+  # job collects this run's artifact the way it collects a PR's. No secret
+  # reaches this runner; signing and upload stay on the self-hosted builder.
+  rebuild:
+    needs: changes
+    if: needs.changes.outputs.rebuild_count != '0'
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 180
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.changes.outputs.rebuild) }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      # The same check the publish job makes before building: a re-run for a
+      # package the channel already holds at master's version builds
+      # nothing, and uploads nothing that could shadow the published file.
+      - name: Build ${{ matrix.package }} (${{ matrix.arch }}, native)
+        id: build
+        env:
+          CONTAINER_ENGINE: docker
+        run: |
+          set -euo pipefail
+          plan=$(bin/build --dry-run --mirror edge --arch "${{ matrix.arch }}" --package "${{ matrix.package }}" 2>&1 | grep -E '^==> Plan complete' || true)
+          if [[ -n "$plan" && -z "$(sed -E 's/.*would build: *//' <<<"$plan" | tr -d '[:space:]')" ]]; then
+            echo "==> ${{ matrix.package }} (${{ matrix.arch }}): already published at master's version, nothing to build"
+            echo "built=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          bin/build --mirror edge --arch "${{ matrix.arch }}" --package "${{ matrix.package }}"
+          echo "built=true" >> "$GITHUB_OUTPUT"
+      - name: Pack artifact
+        if: steps.build.outputs.built == 'true'
+        id: pack
+        run: |
+          source helpers/artifact-helpers.sh
+          pack_packages build-output/edge/${{ matrix.arch }} packages.tar
+          tar -tvf packages.tar
+          echo "label=${{ matrix.package }}-${{ matrix.arch }}-$(git rev-parse "HEAD:pkgbuilds/${{ matrix.package }}")" >> "$GITHUB_OUTPUT"
+      - name: Upload artifact
+        if: steps.build.outputs.built == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.pack.outputs.label }}
+          path: packages.tar
+          if-no-files-found: error
+          retention-days: 7
 
   # One job for the whole merge. It collects every PR artifact for the
-  # merged tree (building only what has none), then walks each channel and
+  # merged tree (building only what has none; aarch64 comes from the
+  # rebuild job above), then walks each channel and
   # architecture slot exactly once: pull that database, add every package
   # that belongs in it, upload. Six slots, six round trips, however many
   # packages the merge carried. One process is the only writer, so there
   # is no race between packages; the run-level concurrency group above
   # keeps one merge from overlapping the next.
+  # It waits for the rebuild job and runs whatever that job's result: a
+  # failed rebuild leaves its package without an artifact, and the collect
+  # step below records that and stops before any publish.
   publish:
-    needs: changes
-    if: needs.changes.outputs.count != '0'
+    needs: [changes, rebuild]
+    if: ${{ !cancelled() && needs.changes.result == 'success' && needs.changes.outputs.count != '0' }}
     runs-on: [self-hosted, omarchy-builder]
     environment: publish
     timeout-minutes: 240
@@ -104,15 +194,22 @@ jobs:
             label="$package-$arch-$hash"
             found=$(curl -fsS -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
               "https://api.github.com/repos/${{ github.repository }}/actions/artifacts?name=$label&per_page=5" \
-              | jq -r '[.artifacts[] | select(.expired|not)] | sort_by(.created_at) | last | .archive_download_url // empty')
+              | jq -r '[.artifacts[] | select(.expired|not)] | sort_by(.created_at) | last | select(. != null) | "\(.archive_download_url) \(.workflow_run.id)"')
+            read -r found from_run <<<"$found" || true
             mkdir -p "build-output/edge/$arch"
             if [[ -n "$found" ]]; then
-              echo "==> $label: PR artifact"
+              if [[ $from_run == "${{ github.run_id }}" ]]; then
+                kind=native-rebuild
+                echo "==> $label: artifact from this run's native $arch rebuild"
+              else
+                kind=pr-artifact
+                echo "==> $label: reusing the build artifact from run $from_run"
+              fi
               rm -rf /tmp/artifact; mkdir -p /tmp/artifact
               if curl -fsSL -H "Authorization: Bearer $GH_TOKEN" -o /tmp/artifact.zip "$found" \
                 && unzip -oq /tmp/artifact.zip -d /tmp/artifact \
                 && unpack_packages /tmp/artifact "build-output/edge/$arch"; then
-                jq -nc --arg p "$package" --arg a "$arch" '{package:$p, arch:$a, source:"pr-artifact"}' >> sources.jsonl
+                jq -nc --arg p "$package" --arg a "$arch" --arg s "$kind" '{package:$p, arch:$a, source:$s}' >> sources.jsonl
               else
                 jq -nc --arg p "$package" --arg a "$arch" '{package:$p, arch:$a, source:"artifact-download-failed"}' >> sources.jsonl; failed=1; break
               fi
@@ -127,6 +224,14 @@ jobs:
                 echo "==> $label: already published at master's version, nothing to do"
                 jq -nc --arg p "$package" --arg a "$arch" '{package:$p, arch:$a, source:"already-published"}' >> sources.jsonl
                 continue
+              fi
+              # aarch64 never builds here: this droplet is x86 and would
+              # emulate it. No artifact means the native rebuild failed (see
+              # the rebuild job), or an artifact expired between planning
+              # and now (re-run all jobs).
+              if [[ $arch == aarch64 ]]; then
+                echo "::error::$label: no artifact from the native rebuild; not building aarch64 under emulation"
+                jq -nc --arg p "$package" --arg a "$arch" '{package:$p, arch:$a, source:"native-build-failed"}' >> sources.jsonl; failed=1; break
               fi
               echo "==> $label: no artifact for this tree, building"
               if OMARCHY_KEEP_BUILD_WORKSPACE=1 bin/build --mirror edge --arch "$arch" --package "$package"; then
@@ -269,7 +374,7 @@ jobs:
         run: |
           jq -r --arg outcome "${{ needs.publish.result }}" '
             def pkgs: [.packages[] | select(test("-debug-")|not)] | join(", ");
-            def src: if .source=="pr-artifact" then "PR artifact" elif .source=="built" then "built here" elif .source=="already-published" then "already published, skipped" else "**" + .source + "**" end;
+            def src: if .source=="pr-artifact" then "PR artifact" elif .source=="native-rebuild" then "rebuilt natively on arm64" elif .source=="built" then "built here" elif .source=="already-published" then "already published, skipped" else "**" + .source + "**" end;
             "### Publish " + (if $outcome=="success" then "succeeded" else "FAILED" end) +
             " → **" + .target + "**" + (if .target!="live" then " (proof prefix, not live)" else "" end),
             "",
@@ -322,5 +427,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - run: |
-          echo "publish result: ${{ needs.publish.result }}"
+          echo "changes result: ${{ needs.changes.result }}, publish result: ${{ needs.publish.result }}"
+          [[ "${{ needs.changes.result }}" == "success" ]]
           [[ "${{ needs.publish.result }}" == "success" || "${{ needs.publish.result }}" == "skipped" ]]

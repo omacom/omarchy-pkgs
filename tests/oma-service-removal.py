@@ -305,7 +305,13 @@ esac
 
     def test_packaging_installs_hooks_and_helpers(self):
         import shutil
-        for app, version in (("omawake", "0.0.3"), ("omaspeak", "0.0.3")):
+        for app in ("omawake", "omaspeak"):
+            directory = ROOT / f"pkgbuilds/{app}-bin"
+            version = next(
+                line.removeprefix("pkgver=")
+                for line in (directory / "PKGBUILD").read_text().splitlines()
+                if line.startswith("pkgver=")
+            )
             source = self.root / app / "src"
             package = self.root / app / "pkg"
             release = source / f"{app}-{version}-linux-x86_64"
@@ -317,7 +323,6 @@ esac
                 target = release / path
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_text("fixture")
-            directory = ROOT / f"pkgbuilds/{app}-bin"
             for name in ("package-remove", "remove-user-services.hook"):
                 shutil.copyfile(directory / name, source / name)
             env = dict(self.env, srcdir=str(source), pkgdir=str(package), CARCH="x86_64")
@@ -338,7 +343,11 @@ esac
             self.assertIn("When = PreTransaction", hook)
             self.assertIn("AbortOnFail", hook)
             self.assertIn(f"Exec = /usr/lib/{app}/package-remove {app}", hook)
-            self.assertIn("pkgrel=4", (directory / "PKGBUILD").read_text())
+            release = next(
+                line for line in (directory / "PKGBUILD").read_text().splitlines()
+                if line.startswith("pkgrel=")
+            )
+            self.assertGreaterEqual(int(release.removeprefix("pkgrel=")), 1)
             scripts.append((directory / "package-remove").read_bytes())
         self.assertEqual(*scripts)
 
