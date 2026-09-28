@@ -46,6 +46,26 @@ package_dir_for_name() {
   echo "$pkgdir"
 }
 
+# A metadata file that exists but cannot be opened is not "no metadata": it is
+# a broken checkout, and reading it as empty makes every decision that depends
+# on it silently wrong. The version check runs as root and the build container
+# as an unprivileged user, so a mode-0600 package.json is readable by one and
+# not the other — the two halves then disagree about a package forever, and
+# each release runs with nothing to publish while the queue refills.
+#
+# Every reader below goes through this: a file that is present but unreadable
+# aborts the calling script with a message naming the file and the fix.
+package_require_readable_metadata() {
+  local metadata="$1"
+
+  [[ -e "$metadata" ]] || return 0
+  [[ -r "$metadata" ]] && return 0
+
+  echo "ERROR: package metadata exists but cannot be read as $(id -un): $metadata" >&2
+  echo "       fix the file mode on the checkout (chmod 644) and rerun" >&2
+  exit 2
+}
+
 package_metadata_value() {
   local pkgdir="$1"
   local jq_filter="$2"
@@ -53,6 +73,7 @@ package_metadata_value() {
   local metadata
 
   metadata=$(metadata_file_for_dir "$pkgdir")
+  package_require_readable_metadata "$metadata"
   if [[ ! -f "$metadata" ]]; then
     echo "$default"
     return 0
@@ -66,6 +87,7 @@ package_sync_enabled() {
   local metadata source sync
 
   metadata=$(metadata_file_for_dir "$pkgdir")
+  package_require_readable_metadata "$metadata"
   [[ -f "$metadata" ]] || return 1
 
   source=$(jq -r '.source // ""' "$metadata")
@@ -82,6 +104,10 @@ package_release_ring() {
 
 package_is_fast_ring() {
   local pkgdir="$1"
+  # The ring is read inside a command substitution, where an abort would only
+  # end the subshell; check readability here so an unreadable file stops the
+  # caller rather than reading as "not fast".
+  package_require_readable_metadata "$(metadata_file_for_dir "$pkgdir")"
   [[ "$(package_release_ring "$pkgdir")" == "fast" ]]
 }
 
@@ -94,6 +120,7 @@ package_is_fast_ring() {
 package_min_release_age_seconds() {
   local pkgdir="$1" metadata raw
   metadata=$(metadata_file_for_dir "$pkgdir")
+  package_require_readable_metadata "$metadata"
   if [[ ! -f "$metadata" ]]; then
     echo 0
     return 0
@@ -127,6 +154,7 @@ package_build_skipped() {
   local metadata skip_build
 
   metadata=$(metadata_file_for_dir "$pkgdir")
+  package_require_readable_metadata "$metadata"
   [[ -f "$metadata" ]] || return 1
 
   skip_build=$(jq -r 'if has("skip_build") then .skip_build else false end' "$metadata")
@@ -135,7 +163,11 @@ package_build_skipped() {
 
 package_has_metadata() {
   local pkgdir="$1"
-  [[ -f "$(metadata_file_for_dir "$pkgdir")" ]]
+  local metadata
+
+  metadata=$(metadata_file_for_dir "$pkgdir")
+  package_require_readable_metadata "$metadata"
+  [[ -f "$metadata" ]]
 }
 
 package_has_pkgbuild() {
@@ -209,6 +241,7 @@ package_version_is_published() {
 package_has_channels() {
   local pkgdir="$1" metadata
   metadata=$(metadata_file_for_dir "$pkgdir")
+  package_require_readable_metadata "$metadata"
   [[ -f "$metadata" ]] || return 1
   jq -e 'has("channels")' "$metadata" >/dev/null
 }
@@ -216,6 +249,7 @@ package_has_channels() {
 package_channels() {
   local pkgdir="$1" metadata
   metadata=$(metadata_file_for_dir "$pkgdir")
+  package_require_readable_metadata "$metadata"
   [[ -f "$metadata" ]] || return 0
   jq -r '(.channels // [])[]' "$metadata"
 }
@@ -234,6 +268,7 @@ package_in_channel() {
 package_is_pinned() {
   local pkgdir="$1" metadata
   metadata=$(metadata_file_for_dir "$pkgdir")
+  package_require_readable_metadata "$metadata"
   [[ -f "$metadata" ]] || return 1
   [[ "$(jq -r 'if has("pinned") then .pinned else false end' "$metadata")" == "true" ]]
 }
@@ -291,19 +326,26 @@ package_moves_to_channel() {
 package_dirs() {
   [[ -d "$PKGBUILDS_DIR" ]] || return 0
 
-  find "$PKGBUILDS_DIR" -mindepth 1 -maxdepth 1 -type d -print | sort | while IFS= read -r pkgdir; do
+  # Read from a process substitution rather than piping into the loop, so the
+  # readability guard inside package_has_metadata aborts this function and
+  # not just a pipeline subshell.
+  local pkgdir
+  while IFS= read -r pkgdir; do
     package_has_pkgbuild "$pkgdir" || continue
     package_has_metadata "$pkgdir" || continue
     echo "$pkgdir"
-  done
+  done < <(find "$PKGBUILDS_DIR" -mindepth 1 -maxdepth 1 -type d -print | sort)
 }
 
 packages_for_aur_sync() {
-  package_dirs | while IFS= read -r pkgdir; do
+  local pkgdir dirs
+  dirs=$(package_dirs) || return $?
+  while IFS= read -r pkgdir; do
+    [[ -n "$pkgdir" ]] || continue
     if package_sync_enabled "$pkgdir"; then
       basename "$pkgdir"
     fi
-  done
+  done <<<"$dirs"
 }
 
 package_has_upstream_hook() {
@@ -314,6 +356,7 @@ package_has_upstream_hook() {
 package_has_upstream_provider() {
   local pkgdir="$1" metadata
   metadata=$(metadata_file_for_dir "$pkgdir")
+  package_require_readable_metadata "$metadata"
   [[ -f "$metadata" ]] || return 1
   # Any upstream key counts, valid or not: a malformed declaration must reach
   # bin/sync-upstream and fail loudly there, not vanish from discovery.
@@ -321,11 +364,14 @@ package_has_upstream_provider() {
 }
 
 packages_for_upstream_sync() {
-  package_dirs | while IFS= read -r pkgdir; do
+  local pkgdir dirs
+  dirs=$(package_dirs) || return $?
+  while IFS= read -r pkgdir; do
+    [[ -n "$pkgdir" ]] || continue
     if package_has_upstream_hook "$pkgdir" || package_has_upstream_provider "$pkgdir"; then
       basename "$pkgdir"
     fi
-  done
+  done <<<"$dirs"
 }
 
 # Upstream updates travel in one of two lanes. The reviewed lane is the
@@ -362,6 +408,7 @@ package_rebuild_triggers() {
   local metadata
 
   metadata=$(metadata_file_for_dir "$pkgdir")
+  package_require_readable_metadata "$metadata"
   [[ -f "$metadata" ]] || return 0
 
   jq -r '(.rebuild_on // [])[]' "$metadata"
@@ -373,35 +420,49 @@ package_has_rebuild_triggers() {
 }
 
 packages_for_rebuild_sync() {
-  package_dirs | while IFS= read -r pkgdir; do
+  local pkgdir dirs
+  dirs=$(package_dirs) || return $?
+  while IFS= read -r pkgdir; do
+    [[ -n "$pkgdir" ]] || continue
     if package_has_rebuild_triggers "$pkgdir"; then
       basename "$pkgdir"
     fi
-  done
+  done <<<"$dirs"
 }
 
 packages_for_mirror() {
   local mirror="$1"
 
-  package_dirs | while IFS= read -r pkgdir; do
+  local pkgdir dirs
+  dirs=$(package_dirs) || return $?
+  while IFS= read -r pkgdir; do
+    [[ -n "$pkgdir" ]] || continue
     if package_builds_for_mirror "$pkgdir" "$mirror"; then
       basename "$pkgdir"
     fi
-  done
+  done <<<"$dirs"
 }
 
 packages_for_unscoped_build() {
   local mirror="$1"
   local arch="${2:-${ARCH:-x86_64}}"
 
-  package_dirs | while IFS= read -r pkgdir; do
+  local pkgdir dirs
+  # Enumerate into a variable and loop over that, not `package_dirs | while`
+  # or `done < <(package_dirs)`: both discard the producer's exit status, so
+  # the readability guard aborting inside package_dirs would leave the caller
+  # with a silently shorter list. This way the abort reaches the caller.
+  dirs=$(package_dirs) || return $?
+  while IFS= read -r pkgdir; do
+    [[ -n "$pkgdir" ]] || continue
     if package_builds_for_mirror "$pkgdir" "$mirror" &&
       ! package_build_skipped "$pkgdir" &&
       package_supports_arch "$pkgdir" "$arch"; then
       basename "$pkgdir"
     fi
-  done
+  done <<<"$dirs"
 }
+
 
 package_extract_vcs_hash_from_version() {
   local version="$1"
@@ -485,6 +546,7 @@ validate_package_metadata() {
   local metadata source sync skip_build aur ring pkgrel_type
 
   metadata=$(metadata_file_for_dir "$pkgdir")
+  package_require_readable_metadata "$metadata"
   [[ -f "$metadata" ]] || { echo "missing metadata: $metadata"; return 1; }
 
   jq empty "$metadata" >/dev/null || return 1
