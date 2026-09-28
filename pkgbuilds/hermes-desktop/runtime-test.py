@@ -14,7 +14,9 @@ with tempfile.TemporaryDirectory(prefix="hermes-runtime-check-") as temporary:
     destination = root / "scripts/desktop-update/posix.sh"
     destination.parent.mkdir(parents=True)
     shutil.copyfile(source / "scripts/desktop-update/posix.sh", destination)
-    subprocess.run(["git", "apply", str(patch_file.resolve())], cwd=root, check=True)
+    # Omarchy's installer requires the patch and accepts an upstreamed fix
+    # through its reverse check. Verify that path without changing the release.
+    subprocess.run(["git", "apply", "--reverse", "--check", str(patch_file.resolve())], cwd=root, check=True)
 
     home = root / "home with spaces"
     runtime = home / ".hermes/hermes-agent"
@@ -42,13 +44,14 @@ Path(os.environ["TEST_OUTPUT"]).write_text(json.dumps({
     module = runtime / "hermes_cli"
     module.mkdir()
     (module / "__init__.py").touch()
-    upstream = ast.parse((source / "hermes_cli/main.py").read_text())
+    upstream = ast.parse((source / "hermes_cli/main_desktop.py").read_text())
     option_parser = next(node for node in upstream.body
                         if isinstance(node, ast.FunctionDef) and node.name == "_desktop_launch_options")
-    stores = next(node for node in upstream.body if isinstance(node, ast.Assign)
-                  and any(isinstance(target, ast.Name) and target.id == "_LINUX_PASSWORD_STORES"
-                          for target in node.targets))
-    helper = "import os, shlex\n" + ast.unparse(stores) + "\n" + ast.unparse(option_parser) + "\n"
+    constants = [node for node in upstream.body if isinstance(node, ast.Assign)
+                 and any(isinstance(target, ast.Name)
+                         and target.id in ("_LINUX_PASSWORD_STORES", "_GPU_FLAG_WORDS")
+                         for target in node.targets)]
+    helper = "import os, shlex\n" + "\n".join(map(ast.unparse, constants)) + "\n" + ast.unparse(option_parser) + "\n"
     (module / "main.py").write_text(helper)
     (module / "config.py").write_text('''import json, os
 from pathlib import Path
@@ -72,9 +75,11 @@ def with_hermes_node_path(env=None):
     cli.write_text(forbidden)
     cli.chmod(0o755)
     (cli.parent / "python").symlink_to(sys.executable)
+    # The launcher used to call Omarchy's installer on every start; a launcher
+    # that reaches for it, or for sudo, fails here.
     for command in ("sudo", "omarchy-install-hermes-cli"):
         target = mock_bin / command
-        target.write_text(forbidden if command == "sudo" else '#!/bin/bash\nexit 0\n')
+        target.write_text(forbidden)
         target.chmod(0o755)
 
     output = root / "launch.json"
@@ -89,7 +94,7 @@ def with_hermes_node_path(env=None):
         assert result == {"args": ["--disable-setuid-sandbox", *expected_args],
                           "home": str(home / ".hermes"), "store": store, "gpu": gpu,
                           "ozone": ozone, "cwd": str(home), "inherited": []}, result
-        assert not forbidden_output.exists(), "launcher invoked CLI or sudo"
+        assert not forbidden_output.exists(), "launcher invoked the Omarchy installer or sudo"
         output.unlink()
 
     wayland = {"WAYLAND_DISPLAY": "wayland-1"}
