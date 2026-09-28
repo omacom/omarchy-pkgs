@@ -1,0 +1,118 @@
+name: Refresh builder images
+
+on:
+  schedule:
+    - cron: '23 4 * * *'
+  push:
+    branches: [master]
+    paths:
+      - build/**
+      - bin/builder-image
+      - helpers/paths.sh
+      - helpers/docker-helpers.sh
+      - tests/build-isolation.sh
+      - .github/workflows/builder-images.yml
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - build/**
+      - bin/builder-image
+      - helpers/paths.sh
+      - helpers/docker-helpers.sh
+      - tests/build-isolation.sh
+      - .github/workflows/builder-images.yml
+
+# Complete each refresh before another can replace its tested image tags.
+concurrency:
+  group: builder-images-${{ github.event.pull_request.number || 'master' }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  # Exercise proposed image changes on native runners with a read-only token.
+  # Publishing is a separate master-only job with its own write permission.
+  validate:
+    if: github.event_name == 'pull_request'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    env:
+      CONTAINER_ENGINE: docker
+      CANDIDATE_IMAGE: omarchy-builder-candidate:${{ matrix.arch }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Build a fresh environment
+        run: bin/builder-image build --arch "${{ matrix.arch }}" --mirror edge --tag "$CANDIDATE_IMAGE" --fresh
+      - name: Test isolated package builds
+        env:
+          TEST_BUILDER_IMAGE: ${{ env.CANDIDATE_IMAGE }}
+        run: tests/build-isolation.sh
+
+  refresh:
+    if: github.repository == 'omacom/omarchy-pkgs' && github.ref == 'refs/heads/master'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+    env:
+      CONTAINER_ENGINE: docker
+      REGISTRY_IMAGE: ghcr.io/omacom/omarchy-pkg-builder
+      CANDIDATE_IMAGE: omarchy-builder-candidate:${{ matrix.arch }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Build a fresh environment
+        run: bin/builder-image build --arch "${{ matrix.arch }}" --mirror edge --tag "$CANDIDATE_IMAGE" --fresh
+      - name: Test isolated package builds
+        env:
+          TEST_BUILDER_IMAGE: ${{ env.CANDIDATE_IMAGE }}
+        run: tests/build-isolation.sh
+      - name: Publish tested image
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_ACTOR: ${{ github.actor }}
+          DOCKER_CONFIG: ${{ runner.temp }}/builder-registry-auth
+        run: |
+          set -euo pipefail
+          mkdir -p "$DOCKER_CONFIG"
+          trap 'rm -rf "$DOCKER_CONFIG"' EXIT
+          printf '%s' "$GH_TOKEN" | docker login ghcr.io --username "$GH_ACTOR" --password-stdin
+          key=$(bin/builder-image key --arch "${{ matrix.arch }}" --mirror edge)
+          version="$REGISTRY_IMAGE:$key-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          docker tag "$CANDIDATE_IMAGE" "$version"
+          docker push "$version"
+          # GHCR creates new packages private. Do not advertise an image to
+          # fork PRs until it is public. This is a one-time package setting.
+          anonymous_config=$(mktemp -d "$RUNNER_TEMP/builder-anonymous.XXXXXX")
+          if ! DOCKER_CONFIG="$anonymous_config" docker manifest inspect "$version" >/dev/null; then
+            rm -rf "$anonymous_config"
+            echo "::error::Make the omacom/omarchy-pkg-builder GHCR package public, then rerun this job. The previous matching image remains selected."
+            exit 1
+          fi
+          rm -rf "$anonymous_config"
+          docker tag "$CANDIDATE_IMAGE" "$REGISTRY_IMAGE:$key"
+          docker push "$REGISTRY_IMAGE:$key"
+          digest=$(docker image inspect "$version" --format '{{index .RepoDigests 0}}')
+          printf '### Builder image (%s)\n\nInput key: `%s`\n\nImage: `%s`\n' \
+            "${{ matrix.arch }}" "$key" "$digest" >> "$GITHUB_STEP_SUMMARY"

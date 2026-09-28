@@ -92,6 +92,8 @@ while [[ $# -gt 0 ]]; do
     echo "  OMARCHY_KEEP_BUILD_WORKSPACE=1   keep build-output and reuse packages already there"
     echo "  OMARCHY_SKIP_BUILDER_IMAGE=1     use the existing builder image instead of building it"
     echo "  OMARCHY_DEFER_RUNTIME_DEPS=true  build the omarchy pair with --nodeps (transaction verified later)"
+    echo "  OMARCHY_PUBLISHED_REPO_URL=<url> channel to plan and resolve against when no local tree exists"
+    echo "                                   (default https://pkgs.omarchy.org; empty disables the fallback)"
     echo ""
     exit 0
     ;;
@@ -226,17 +228,27 @@ else
   build_docker_image "$BUILD_DIR" "$ARCH" "$MIRROR"
 fi
 
-print_info "Running package build..."
+print_info "Planning isolated package builds..."
 
 # Create output directories if they don't exist
 mkdir -p "$BUILD_OUTPUT_DIR"
 mkdir -p "$REPO_DIR"
 
+# Share downloaded archives, never /var/lib/pacman or an installed root.
+# Channel/architecture separation preserves each mirror's dependency set.
+PACKAGE_CACHE_DIR="$BUILD_ROOT/cache/pacman/$MIRROR/$ARCH"
+mkdir -p "$PACKAGE_CACHE_DIR"
+PLAN_DIR=$(mktemp -d "$SRC_DIR/build-plan.XXXXXX")
+trap 'rm -rf "$PLAN_DIR"' EXIT
+# Keep manifest directories host-owned so cleanup also works when Docker's
+# builder uid differs from the caller (as on GitHub runners).
+mkdir -p "$PLAN_DIR/artifacts"
+
 # Rootful Docker writes as the image uid, so retain its existing permission
 # workaround. Rootless Podman uses keep-id and must leave ownership/modes alone.
 if [[ "$CONTAINER_ENGINE" == "docker" ]]; then
   make_dir_writable "$BUILD_OUTPUT_DIR"
-  make_dir_writable "$REPO_DIR"
+  make_dir_writable "$PLAN_DIR"
 fi
 
 # Build Docker arguments
@@ -246,9 +258,13 @@ DOCKER_ARGS=(
   -e MIRROR="$MIRROR"
   -e PACKAGES="$PACKAGES"
   -e OMARCHY_RC_PINS="${OMARCHY_RC_PINS:-}"
+  -e OMARCHY_PUBLISHED_REPO_URL="${OMARCHY_PUBLISHED_REPO_URL-https://pkgs.omarchy.org}"
   -e DEFER_RUNTIME_DEPS="$DEFER_RUNTIME_DEPS"
+  -e BUILD_PLAN_DIR=/build-plan
+  -v "$PLAN_DIR:/build-plan"
+  -v "$PACKAGE_CACHE_DIR:/var/cache/pacman/pkg"
   -v "$BUILD_ROOT/build-output:/build-output"
-  -v "$REPO_ROOT:/pkgs.omarchy.org"
+  -v "$REPO_ROOT:/pkgs.omarchy.org:ro"
   -v "$BUILD_DIR:/build:ro"
   -v "$BUILD_ROOT/helpers:/helpers:ro"
   -v "$BUILD_ROOT/pkgbuilds:/pkgbuilds:ro"
@@ -260,18 +276,83 @@ if [[ "$CONTAINER_ENGINE" == "podman" ]]; then
   DOCKER_ARGS+=(-v "$SRC_DIR:/src")
 fi
 
-# Run the builder with assembled args
+# Plan once against the published database, then keep that order throughout
+# the run. Each package sees the staged artifacts but starts with a fresh
+# pacman database and root filesystem, even after a failed build.
 PLATFORM_ARG=$(get_platform_arg "$ARCH")
 
-"$CONTAINER_ENGINE" run "${CONTAINER_RUN_ARGS[@]}" "$PLATFORM_ARG" "${DOCKER_ARGS[@]}" "$IMAGE_TAG" /build/build.sh
+"$CONTAINER_ENGINE" run "${CONTAINER_RUN_ARGS[@]}" "$PLATFORM_ARG" "${DOCKER_ARGS[@]}" \
+  -e DRY_RUN=true "$IMAGE_TAG" /build/build.sh
 
-BUILD_RESULT=$?
+mapfile -t ORDERED_PACKAGES < "$PLAN_DIR/packages"
+mapfile -t SKIPPED_PACKAGES < "$PLAN_DIR/skipped"
+SUCCESSFUL_PACKAGES=()
+FAILED_PACKAGES=()
+BLOCKED_PACKAGES=()
+declare -A BUILD_STATUS=()
 
-# Summary
+for package in "${ORDERED_PACKAGES[@]}"; do
+  blocked_by=""
+  while read -r consumer dependency; do
+    if [[ "$consumer" == "$package" && "${BUILD_STATUS[$dependency]:-}" != success ]]; then
+      blocked_by="$dependency"
+      break
+    fi
+  done < "$PLAN_DIR/dependencies"
+
+  if [[ -n "$blocked_by" ]]; then
+    print_warning "$package blocked by unsuccessful dependency: $blocked_by"
+    BUILD_STATUS[$package]=blocked
+    BLOCKED_PACKAGES+=("$package")
+    continue
+  fi
+
+  print_info "Building $package in a fresh container..."
+  if "$CONTAINER_ENGINE" run "${CONTAINER_RUN_ARGS[@]}" "$PLATFORM_ARG" "${DOCKER_ARGS[@]}" \
+    -e BUILD_PACKAGE="$package" "$IMAGE_TAG" /build/build.sh; then
+    BUILD_STATUS[$package]=success
+    SUCCESSFUL_PACKAGES+=("$package")
+  else
+    BUILD_STATUS[$package]=failed
+    FAILED_PACKAGES+=("$package")
+  fi
+done
+
 echo ""
-if [[ $BUILD_RESULT -eq 0 ]]; then
-  print_success "Build completed successfully!"
-else
-  print_warning "Some packages failed (see details above)"
-  exit $BUILD_RESULT
+print_header "Build Summary"
+echo "  Total packages: ${#ORDERED_PACKAGES[@]}"
+echo "  Built:          ${#SUCCESSFUL_PACKAGES[@]}"
+echo "  Skipped:        ${#SKIPPED_PACKAGES[@]} (up-to-date or excluded)"
+echo "  Failed:         ${#FAILED_PACKAGES[@]}"
+echo "  Blocked:        ${#BLOCKED_PACKAGES[@]}"
+
+# The release caller supplies a fresh directory. A completed result
+# distinguishes package failures from an interrupted/failed orchestrator;
+# only artifacts belonging to fully successful builds may be published.
+if [[ -n "${OMARCHY_BUILD_RESULT_DIR:-}" ]]; then
+  mkdir -p "$OMARCHY_BUILD_RESULT_DIR"
+  : > "$OMARCHY_BUILD_RESULT_DIR/artifacts"
+  for package in "${SUCCESSFUL_PACKAGES[@]}"; do
+    cat "$PLAN_DIR/artifacts/$package" >> "$OMARCHY_BUILD_RESULT_DIR/artifacts"
+  done
+  printf '%s\n' "${FAILED_PACKAGES[@]}" | sed '/^$/d' > "$OMARCHY_BUILD_RESULT_DIR/failed"
+  printf '%s\n' "${BLOCKED_PACKAGES[@]}" | sed '/^$/d' > "$OMARCHY_BUILD_RESULT_DIR/blocked"
+  touch "$OMARCHY_BUILD_RESULT_DIR/complete"
 fi
+
+if (( ${#FAILED_PACKAGES[@]} + ${#BLOCKED_PACKAGES[@]} )); then
+  if (( ${#FAILED_PACKAGES[@]} )); then
+    echo "Failed packages:"
+    printf '  - %s\n' "${FAILED_PACKAGES[@]}"
+  fi
+  if (( ${#BLOCKED_PACKAGES[@]} )); then
+    echo "Packages blocked by failed dependencies:"
+    printf '  - %s\n' "${BLOCKED_PACKAGES[@]}"
+  fi
+  print_warning "Some packages failed (see details above)"
+  # Reserved for a completed run with unsuccessful packages. Other failures
+  # must not let release publish arbitrary files left in the workspace.
+  exit 2
+fi
+
+print_success "Build completed successfully!"

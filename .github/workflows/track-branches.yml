@@ -1,0 +1,161 @@
+name: Track upstream branches
+
+# The unattended lane. Packages marked "auto_merge": true follow a moving
+# upstream branch (omarchy-dev and omarchy-settings-dev on quattro, omasnap-git
+# on main) rather than tagged releases, so nothing in this repository changes
+# when their source does. This workflow makes each new branch tip a commit pin
+# in the recipe, which publish.yml then treats like any other version bump:
+# the PR builds on the droplets, auto-merge lands it when `result` is green,
+# and the merge publishes the artifacts. A tip that fails to build stays an
+# unmerged red PR that the next tick supersedes.
+#
+# The PR and auto-merge use the PAT in PKGS_BOT_TOKEN so they trigger the
+# build and publish workflows. The built-in GITHUB_TOKEN cannot drive this
+# unattended chain. The PAT needs Contents: write and Pull requests: write
+# on this repository, and its owner must be trusted by the build workflow.
+
+on:
+  schedule:
+    # Every 2 hours, off the hour to dodge the scheduling backlog at :00
+    - cron: '35 */2 * * *'
+  workflow_dispatch:
+    inputs:
+      packages:
+        description: 'Specific packages to track (space-separated, leave empty for every auto_merge package)'
+        required: false
+        default: ''
+
+# One tracker at a time: two runs racing on auto/track-branches would each
+# force-push their own pin over the other's.
+concurrency:
+  group: track-branches
+  cancel-in-progress: false
+
+jobs:
+  track:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Require the tracking token
+        env:
+          PKGS_BOT_TOKEN: ${{ secrets.PKGS_BOT_TOKEN }}
+        run: |
+          if [[ -z "$PKGS_BOT_TOKEN" ]]; then
+            echo "::error::Set PKGS_BOT_TOKEN to a PAT with Contents: write and Pull requests: write on this repository, owned by an account trusted to trigger builds."
+            exit 1
+          fi
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      # Same container as the reviewed sync: vercmp decides whether a pin is
+      # an upgrade with the comparator pacman uses on users' machines.
+      - name: Pin tracked branches to their current tips
+        id: sync
+        run: |
+          docker run --rm \
+            -e PACKAGES="$PACKAGES" \
+            -e UPSTREAM_GITHUB_TOKEN="$UPSTREAM_GITHUB_TOKEN" \
+            -e HOST_UID="$(id -u)" \
+            -e HOST_GID="$(id -g)" \
+            -v "$PWD/bin:/workspace/bin:ro" \
+            -v "$PWD/helpers:/workspace/helpers:ro" \
+            -v "$PWD/pkgbuilds:/workspace/pkgbuilds" \
+            -w /workspace \
+            archlinux:base-devel bash -lc '
+              set -euo pipefail
+
+              pacman -Syu --noconfirm git jq python libarchive
+
+              groupadd -g "$HOST_GID" runner
+              useradd -m -u "$HOST_UID" -g "$HOST_GID" runner
+              chown -R runner:runner /workspace/pkgbuilds
+
+              if [[ -n "${PACKAGES:-}" ]]; then
+                read -r -a package_args <<< "$PACKAGES"
+                runuser -u runner -- ./bin/sync-upstream --lane auto-merge "${package_args[@]}"
+              else
+                runuser -u runner -- ./bin/sync-upstream --lane auto-merge
+              fi
+            '
+        env:
+          PACKAGES: ${{ github.event.inputs.packages }}
+          UPSTREAM_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Check for changes
+        if: ${{ !cancelled() && steps.sync.outcome != 'skipped' }}
+        id: changes
+        run: |
+          if [ -z "$(git status --porcelain)" ]; then
+            echo "has_changes=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_changes=true" >> "$GITHUB_OUTPUT"
+            git status --porcelain
+            {
+              echo "### Pinned"
+              git diff --unified=0 -- 'pkgbuilds/*/PKGBUILD' | grep -E '^\+(pkgver|_commit)=' | sed 's/^+/- /'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      # The PR title names what moved, so the merged history reads like a
+      # changelog: "Track upstream branches: omarchy-dev 4.0.0.r6520.g1a2b3c4, ...".
+      - name: Describe the pins
+        if: ${{ !cancelled() && steps.changes.outputs.has_changes == 'true' }}
+        id: describe
+        run: |
+          title=$(git diff --unified=0 -- 'pkgbuilds/*/PKGBUILD' \
+            | awk '/^\+\+\+ b\/pkgbuilds\//{split($2,p,"/"); pkg=p[3]} /^\+pkgver=/{sub(/^\+pkgver=/,""); printf "%s %s, ", pkg, $0}' \
+            | sed 's/, $//')
+          echo "title=Track upstream branches: ${title}" >> "$GITHUB_OUTPUT"
+
+      - name: Open or update the tracking PR
+        if: ${{ !cancelled() && steps.changes.outputs.has_changes == 'true' }}
+        id: pr
+        uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1 # v8.1.1
+        with:
+          token: ${{ secrets.PKGS_BOT_TOKEN }}
+          commit-message: ${{ steps.describe.outputs.title }}
+          title: ${{ steps.describe.outputs.title }}
+          body: |
+            Automated pin of packages that follow a moving upstream branch
+            (`"auto_merge": true` in `.omarchy/package.json`). Each package's
+            `_commit` now points at the branch tip. Fresh tips wait until
+            their commit timestamp is at least `min_release_age` old.
+
+            This PR auto-merges once the build checks pass. A failing build
+            leaves it open; the next tracker run replaces it with the newer tip.
+          branch: auto/track-branches
+          delete-branch: true
+          labels: automated
+
+      # Auto-merge, not a direct merge: branch protection still has to see
+      # `result`, `self-tests` and `build-isolation` green, and this lane
+      # inherits every rule the reviewed lane has except the human.
+      - name: Enable auto-merge
+        if: ${{ !cancelled() && steps.pr.outputs.pull-request-number != '' }}
+        env:
+          GH_TOKEN: ${{ secrets.PKGS_BOT_TOKEN }}
+          PR: ${{ steps.pr.outputs.pull-request-number }}
+        run: |
+          # Idempotent across re-runs of an updated PR: enabling twice errors.
+          if [[ "$(gh pr view "$PR" -R "${{ github.repository }}" --json autoMergeRequest --jq '.autoMergeRequest != null')" == true ]]; then
+            echo "auto-merge already enabled on #$PR"
+            exit 0
+          fi
+          gh pr merge --auto --merge "$PR" -R "${{ github.repository }}"
+
+      - name: Notify Basecamp on failure
+        if: failure() && env.BASECAMP_CHATBOT_URL != ''
+        env:
+          BASECAMP_CHATBOT_URL: ${{ secrets.BASECAMP_CHATBOT_URL }}
+        run: |
+          curl -s -o /dev/null \
+            -H "Content-Type: application/json" \
+            -d "$(jq -n --arg content \
+              "🔴 <strong>Branch tracking failed</strong><br><a href=\"${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\">View run</a>" \
+              '{content: $content}')" \
+            "$BASECAMP_CHATBOT_URL"

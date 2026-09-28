@@ -1,0 +1,127 @@
+diff --git a/drivers/cpufreq/amd-pstate-ut.c b/drivers/cpufreq/amd-pstate-ut.c
+--- a/drivers/cpufreq/amd-pstate-ut.c
++++ b/drivers/cpufreq/amd-pstate-ut.c
+@@ -560,6 +560,11 @@ static int amd_pstate_ut_check_freq_attrs(u32 index)
+ static int __init amd_pstate_ut_init(void)
+ {
+ 	u32 i = 0, arr_size = ARRAY_SIZE(amd_pstate_ut_cases);
++	enum amd_pstate_mode mode = amd_pstate_get_status();
++
++	/* don't test if no running amd-pstate driver */
++	if (mode == AMD_PSTATE_UNDEFINED || mode == AMD_PSTATE_DISABLE)
++		return -EOPNOTSUPP;
+ 
+ 	for (i = 0; i < arr_size; i++) {
+ 		int ret;
+diff --git a/drivers/cpufreq/amd-pstate.c b/drivers/cpufreq/amd-pstate.c
+--- a/drivers/cpufreq/amd-pstate.c
++++ b/drivers/cpufreq/amd-pstate.c
+@@ -199,7 +199,7 @@ static inline int get_mode_idx_from_str(const char *str, size_t size)
+ 
+ static DEFINE_MUTEX(amd_pstate_driver_lock);
+ 
+-static u8 msr_get_epp(struct amd_cpudata *cpudata)
++static int msr_get_epp(struct amd_cpudata *cpudata)
+ {
+ 	u64 value;
+ 	int ret;
+@@ -215,12 +215,12 @@ static u8 msr_get_epp(struct amd_cpudata *cpudata)
+ 
+ DEFINE_STATIC_CALL(amd_pstate_get_epp, msr_get_epp);
+ 
+-static inline s16 amd_pstate_get_epp(struct amd_cpudata *cpudata)
++static inline int amd_pstate_get_epp(struct amd_cpudata *cpudata)
+ {
+ 	return static_call(amd_pstate_get_epp)(cpudata);
+ }
+ 
+-static u8 shmem_get_epp(struct amd_cpudata *cpudata)
++static int shmem_get_epp(struct amd_cpudata *cpudata)
+ {
+ 	u64 epp;
+ 	int ret;
+@@ -526,9 +526,6 @@ static int shmem_init_perf(struct amd_cpudata *cpudata)
+ 	WRITE_ONCE(cpudata->perf, perf);
+ 	WRITE_ONCE(cpudata->prefcore_ranking, cppc_perf.highest_perf);
+ 
+-	if (cppc_state == AMD_PSTATE_ACTIVE)
+-		return 0;
+-
+ 	ret = cppc_get_auto_sel(cpudata->cpu, &auto_sel);
+ 	if (ret) {
+ 		pr_warn("failed to get auto_sel, ret: %d\n", ret);
+@@ -1174,6 +1171,9 @@ static int amd_pstate_power_supply_notifier(struct notifier_block *nb,
+ 	if (cpudata->current_profile != PLATFORM_PROFILE_BALANCED)
+ 		return 0;
+ 
++	if (!policy)
++		return NOTIFY_OK;
++
+ 	epp = amd_pstate_get_balanced_epp(policy);
+ 
+ 	ret = amd_pstate_set_epp(policy, epp);
+@@ -1209,6 +1209,9 @@ static int amd_pstate_profile_set(struct device *dev,
+ 	struct cpufreq_policy *policy __free(put_cpufreq_policy) = cpufreq_cpu_get(cpudata->cpu);
+ 	int ret;
+ 
++	if (!policy)
++		return -ENODEV;
++
+ 	switch (profile) {
+ 	case PLATFORM_PROFILE_LOW_POWER:
+ 		ret = amd_pstate_set_epp(policy, AMD_CPPC_EPP_POWERSAVE);
+@@ -1877,6 +1880,7 @@ static int amd_pstate_epp_cpu_init(struct cpufreq_policy *policy)
+ 	struct amd_cpudata *cpudata;
+ 	union perf_cached perf;
+ 	struct device *dev;
++	int default_epp;
+ 	int ret;
+ 
+ 	/*
+@@ -1925,6 +1929,13 @@ static int amd_pstate_epp_cpu_init(struct cpufreq_policy *policy)
+ 
+ 	policy->boost_supported = READ_ONCE(cpudata->boost_supported);
+ 
++	/* Fetch the firmware programmed default EPP value */
++	default_epp = amd_pstate_get_epp(cpudata);
++	if (default_epp < 0) {
++		ret = default_epp;
++		goto free_cpudata1;
++	}
++
+ 	/*
+ 	 * Set the policy to provide a valid fallback value in case
+ 	 * the default cpufreq governor is neither powersave nor performance.
+@@ -1932,7 +1943,7 @@ static int amd_pstate_epp_cpu_init(struct cpufreq_policy *policy)
+ 	if (amd_pstate_acpi_pm_profile_server() ||
+ 	    amd_pstate_acpi_pm_profile_undefined()) {
+ 		policy->policy = CPUFREQ_POLICY_PERFORMANCE;
+-		cpudata->epp_default_ac = cpudata->epp_default_dc = amd_pstate_get_epp(cpudata);
++		cpudata->epp_default_ac = cpudata->epp_default_dc = default_epp;
+ 		cpudata->current_profile = PLATFORM_PROFILE_PERFORMANCE;
+ 	} else {
+ 		policy->policy = CPUFREQ_POLICY_POWERSAVE;
+diff --git a/drivers/cpufreq/amd-pstate.h b/drivers/cpufreq/amd-pstate.h
+--- a/drivers/cpufreq/amd-pstate.h
++++ b/drivers/cpufreq/amd-pstate.h
+@@ -32,6 +32,7 @@
+  * @min_limit_perf: Cached value of the performance corresponding to policy->min
+  * @max_limit_perf: Cached value of the performance corresponding to policy->max
+  * @bios_min_perf: Cached perf value corresponding to the "Requested CPU Min Frequency" BIOS option
++ * @val: Raw 64-bit value for atomic access via READ_ONCE()/WRITE_ONCE()
+  */
+ union perf_cached {
+ 	struct {
+@@ -89,7 +90,12 @@ struct amd_aperf_mperf {
+  * @epp_default_ac: Default EPP value for AC power source
+  * @epp_default_dc: Default EPP value for DC power source
+  * @dynamic_epp: Whether dynamic EPP is enabled
++ * @raw_epp: Whether the last EPP write was a raw numeric value rather than a
++ *	     named preference
+  * @power_nb: Notifier block for power events
++ * @current_profile: Currently selected platform profile option
++ * @ppdev: Device registered with the platform profile handler
++ * @profile_name: Name under which @ppdev is registered
+  *
+  * The amd_cpudata is key private data for each CPU thread in AMD P-State, and
+  * represents all the attributes and goals that AMD P-State requests at runtime.
