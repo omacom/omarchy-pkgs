@@ -1,0 +1,371 @@
+# Maintainer: the2dl <https://github.com/the2dl>
+# Initial edge package, pinned to the tested upstream source commit.
+
+pkgname=omarchy-moat
+pkgver=0.1.0
+pkgrel=182
+_tetragonver=1.7.1
+pkgdesc='eBPF supply-chain sensor for Omarchy: Tetragon policies, an alert daemon, a bubblewrap sandbox and pre-execution scanners for PKGBUILD, npm, cargo, pip and go'
+arch=('x86_64')
+url='https://github.com/the2dl/omarchy-moat'
+# Apache-2.0: the bundled, unmodified Tetragon v1.7.1 (its eBPF objects are
+# GPL-2.0, see /usr/share/licenses/omarchy-moat/LICENSE.tetragon-bpf).
+# MIT: everything in this repository.
+license=('Apache-2.0' 'MIT')
+depends=(
+	'bash'          # moat-sandbox, the shims and shim-common.sh
+	'bubblewrap>=0.12.0' # descriptor-pinned agent-tool mounts
+	'python'        # the moat-scan-* scanners, stdlib only, python3
+	'python-yaml'   # policy validation, including moatd telemetry --apply
+	'gcc-libs'
+	'glibc'
+	'systemd'
+)
+makedepends=('cargo')
+checkdepends=('shellcheck')
+optdepends=(
+	'gum: interactive confirm prompt when the makepkg shim finds a high severity issue'
+	'fish: the shim PATH snippet is also installed for fish'
+)
+# !debug + !lto: a Rust release build; cargo owns codegen, and the release
+#   profile already sets strip = true, so there is nothing for makepkg to do.
+# !strip: makepkg's tidy-install strips every ELF it finds, which rewrites the
+#   94 upstream CO-RE BPF objects under /usr/lib/tetragon/bpf (26 sections down
+#   to 17) and the two Go binaries. Tetragon is meant to ship byte-identical to
+#   upstream, and a stripped BPF object is a CO-RE relocation waiting to fail.
+options=('!debug' '!lto' '!strip')
+install="${pkgname}.install"
+
+# Keep Tetragon's userspace and CO-RE BPF objects together, byte-identical
+# to the upstream x86_64 release. Other architectures need separate validation.
+_tetarch=amd64
+_commit=9809f4f89c84b37a3596855af55666d8b82b965e
+
+source=(
+	"tetragon-${_tetragonver}-LICENSE::https://raw.githubusercontent.com/cilium/tetragon/v${_tetragonver}/LICENSE"
+	"tetragon-${_tetragonver}-LICENSE.bpf::https://raw.githubusercontent.com/cilium/tetragon/v${_tetragonver}/bpf/LICENSE.GPL-2.0"
+	"${pkgname}-${_commit}.tar.gz::https://github.com/the2dl/omarchy-moat/archive/${_commit}.tar.gz"
+)
+source_x86_64=("https://github.com/cilium/tetragon/releases/download/v${_tetragonver}/tetragon-v${_tetragonver}-amd64.tar.gz")
+
+sha256sums=('f096c31ac0fb2e66df5b7ec20049741ae15accd50c8cd4d100b4db6c9353f6aa'
+            '0d5bf346df9e635a29dcdddf832dc5b002ca6cdc1c5c9c6c567d2a61bb0c5c15'
+            'd0b6ca9b59662332e182147732825399112c337660e81d49926554575dc8d5e5')
+# From the .sha256sum published beside the Tetragon release.
+sha256sums_x86_64=('2f36a7bbb2b3d77a011383a01c8f804fe7761d934a76ff2fdf99ebad6f3e89ae')
+
+# One flag per file, Tetragon's own convention (CONTRACT section 2). All of
+# them are backup= entries: they are the knobs a user turns.
+_confd=(
+	bpf-lib
+	cgroup-rate
+	enable-process-cred
+	enable-process-ns
+	enable-process-environment-variables
+	event-queue-size
+	export-allowlist
+	export-file-compress
+	export-file-max-backups
+	export-file-max-size-mb
+	export-filename
+	filter-environment-variables
+	gops-address
+	health-server-address
+	log-format
+	log-level
+	metrics-server
+	parents-map-enabled
+	process-cache-size
+	server-address
+	tracing-policy-dir
+)
+
+backup=(
+	"${_confd[@]/#/etc/tetragon/tetragon.conf.d/}"
+	etc/moat/moat.toml
+	etc/moat/feeds.toml
+	etc/moat/allowlist.d/default.toml
+	# The shipped baseline (LEARNING section 8). It belongs to the package and
+	# `moatctl allowlist` reports every entry in it as source=shipped,
+	# removable=false -- but it is still under /etc and still a file a site
+	# admin may narrow, so an edit must survive an upgrade as a .pacnew
+	# rather than being silently reverted.
+	etc/moat/allowlist.d/omarchy-default.toml
+	etc/moat/sandbox.conf
+	etc/moat/scanner-allow.conf
+	# moat-ship's destination and redaction settings. Holds no secret as
+	# shipped (prefer [https] token_file), but it is exactly the file a site
+	# admin edits, so an upgrade must leave it alone.
+	etc/moat/ship.toml
+)
+
+# Everything below builds from the verified archive, never a sibling checkout.
+_tree="${pkgname}-${_commit}"
+
+prepare() {
+	cd "${srcdir}/${_tree}/moatd"
+	cargo fetch --locked --target "$(rustc -vV | sed -n 's/^host: //p')"
+}
+
+build() {
+	cd "${srcdir}/${_tree}/moatd"
+	export RUSTUP_TOOLCHAIN=stable
+	export CARGO_TARGET_DIR=target
+	cargo build --release --locked
+}
+
+check() {
+	cd "${srcdir}/${_tree}/moatd"
+	export RUSTUP_TOOLCHAIN=stable
+	export CARGO_TARGET_DIR=target
+	cargo test --release --locked
+
+	# Structural validation of the policy templates against the Tetragon
+	# v1.7.1 grammar: a policy that would be rejected at daemon start is
+	# caught here instead.
+	cd "${srcdir}/${_tree}"
+	python3 policies/check.py policies
+
+	cd "${srcdir}/${_tree}/scanner"
+	python3 -m unittest discover tests
+
+	# Real bubblewrap, unprivileged, entirely inside a mktemp directory.
+	# This works under makepkg because makepkg itself runs unprivileged;
+	# only package() is fakeroot'd, and this is not package().
+	cd "${srcdir}/${_tree}"
+	bash sandbox/tests/run.sh
+	python3 -m unittest discover -s sandbox/tests -p 'test_*.py'
+}
+
+package() {
+	local tetragon="${srcdir}/tetragon-v${_tetragonver}-${_tetarch}"
+	local tree="${srcdir}/${_tree}"
+
+	# --- upstream Tetragon, unmodified ---------------------------------
+	# The tarball stages under /usr/local; Arch packages own /usr.
+	install -Dm755 "${tetragon}/usr/local/bin/tetragon" "${pkgdir}/usr/bin/tetragon"
+	install -Dm755 "${tetragon}/usr/local/bin/tetra"    "${pkgdir}/usr/bin/tetra"
+
+	install -d "${pkgdir}/usr/lib/tetragon/bpf"
+	install -m644 "${tetragon}/usr/local/lib/tetragon/bpf/"*.o "${pkgdir}/usr/lib/tetragon/bpf/"
+
+	install -Dm755 "${tetragon}/usr/local/lib/tetragon/bpftool" "${pkgdir}/usr/lib/tetragon/bpftool"
+	install -Dm755 "${tetragon}/usr/local/lib/tetragon/gops"    "${pkgdir}/usr/lib/tetragon/gops"
+
+	# --- Tetragon configuration (ours, not upstream's) -----------------
+	install -d "${pkgdir}/etc/tetragon/tetragon.conf.d"
+	local f
+	for f in "${_confd[@]}"; do
+		if [[ ${f} == export-allowlist ]]; then
+			# Regenerated byte for byte by `moatd render-policies`
+			# on every tetragon.service start (Tetragon has no policy
+			# hot-reload and policy_names has no glob). Shipped so the
+			# export is already filtered on a first, pre-render start.
+			install -m644 "${tree}/policies/export-allowlist.example" \
+				"${pkgdir}/etc/tetragon/tetragon.conf.d/export-allowlist"
+		else
+			install -m644 "${tree}/policies/tetragon.conf.d/${f}" \
+				"${pkgdir}/etc/tetragon/tetragon.conf.d/${f}"
+		fi
+	done
+
+	# --- policy templates ({{HOME}} placeholders) ----------------------
+	install -d "${pkgdir}/usr/lib/moat/policies"
+	install -m644 "${tree}/policies/"*.yaml "${pkgdir}/usr/lib/moat/policies/"
+	# The policy validator, installed rather than build-only: `moatd telemetry
+	# --apply` re-runs it over what it just rendered and refuses to restart
+	# the sensor if it fails. A profile switch is a policy load, and a bad
+	# policy load is a silent 25-minute outage (docs/SHIPPING.md section 6).
+	install -Dm755 "${tree}/policies/check.py" "${pkgdir}/usr/lib/moat/check.py"
+
+	# --- systemd ------------------------------------------------------
+	install -Dm644 "${tree}/policies/tetragon.service" \
+		"${pkgdir}/usr/lib/systemd/system/tetragon.service"
+	install -Dm644 "${tree}/moatd/systemd/moatd.service" \
+		"${pkgdir}/usr/lib/systemd/system/moatd.service"
+	install -Dm644 "${tree}/moatd/systemd/moat-feeds.service" \
+		"${pkgdir}/usr/lib/systemd/system/moat-feeds.service"
+	install -Dm644 "${tree}/moatd/systemd/moat-feeds.timer" \
+		"${pkgdir}/usr/lib/systemd/system/moat-feeds.timer"
+	# Not enabled by the .install: shipping anything off this machine is a
+	# decision the admin makes, and ship.toml ships with enabled = false.
+	install -Dm644 "${tree}/moatd/systemd/moat-ship.service" \
+		"${pkgdir}/usr/lib/systemd/system/moat-ship.service"
+	# The weekly digest (LEARNING section 5) is a *user* timer: desktop
+	# notifications belong to the session bus, and `moatctl digest --notify`
+	# needs no privilege. It is not enabled by the package; the .install
+	# file tells the user the one command that enables it.
+	install -Dm644 "${tree}/moatd/systemd/user/moat-digest.service" \
+		"${pkgdir}/usr/lib/systemd/user/moat-digest.service"
+	install -Dm644 "${tree}/moatd/systemd/user/moat-digest.timer" \
+		"${pkgdir}/usr/lib/systemd/user/moat-digest.timer"
+	install -Dm644 "${tree}/moatd/systemd/user/moat-triage.service" \
+		"${pkgdir}/usr/lib/systemd/user/moat-triage.service"
+	install -Dm644 "${tree}/moatd/systemd/user/moat-triage.timer" \
+		"${pkgdir}/usr/lib/systemd/user/moat-triage.timer"
+	install -Dm644 "${tree}/moatd/systemd/sysusers.d/moat.conf" \
+		"${pkgdir}/usr/lib/sysusers.d/moat.conf"
+	# /run/moat/policies (the rendered policies) comes from here, not
+	# from the package: it lives on tmpfs. So does
+	# /var/lib/moat/incidents (LEARNING section 4: the snapshots and the
+	# bundle.md the AI analysis reads), 0750 root:moat so the panel and the
+	# user's agent can read what the daemon wrote.
+	install -Dm644 "${tree}/moatd/systemd/tmpfiles.d/moat.conf" \
+		"${pkgdir}/usr/lib/tmpfiles.d/moat.conf"
+
+	# --- our binaries -------------------------------------------------
+	install -Dm755 "${tree}/moatd/target/release/moatd"      "${pkgdir}/usr/bin/moatd"
+	install -Dm755 "${tree}/moatd/target/release/moatctl"    "${pkgdir}/usr/bin/moatctl"
+	install -Dm755 "${tree}/moatd/target/release/moat-feeds" "${pkgdir}/usr/bin/moat-feeds"
+	install -Dm755 "${tree}/moatd/target/release/moat-ship"  "${pkgdir}/usr/bin/moat-ship"
+	install -Dm755 "${tree}/sandbox/moat-triage-sandbox" "${pkgdir}/usr/bin/moat-triage-sandbox"
+	install -Dm755 "${tree}/sandbox/moat-agent" "${pkgdir}/usr/bin/moat-agent"
+	install -Dm755 "${tree}/sandbox/moat-agent-tool" "${pkgdir}/usr/bin/moat-agent-tool"
+	install -Dm755 "${tree}/sandbox/moat-sandbox"          "${pkgdir}/usr/bin/moat-sandbox"
+	install -Dm755 "${tree}/scanner/moat-scan-pkgbuild"    "${pkgdir}/usr/bin/moat-scan-pkgbuild"
+	# The npm/pnpm/yarn/bun shims call this before an install runs; without it
+	# on PATH they print "moat-scan-npm not found, skipping" on every install
+	# and the pre-execution analysis silently does nothing.
+	install -Dm755 "${tree}/scanner/moat-scan-npm"         "${pkgdir}/usr/bin/moat-scan-npm"
+	# One implementation, three names: the cargo, pip/pip3/uv and go shims
+	# each call the tool for their own ecosystem, argv[0] selects the rules
+	# and the MOAT_SCANNER_* override in shim-common.sh is per ecosystem.
+	# The infrastructure (finding shape, allow file, exit codes) and most of
+	# the detection vocabulary are shared, so three files would have been
+	# three copies of it.
+	install -Dm755 "${tree}/scanner/moat-scan-build"       "${pkgdir}/usr/bin/moat-scan-build"
+	local _alias
+	for _alias in cargo pip go; do
+		ln -sf moat-scan-build "${pkgdir}/usr/bin/moat-scan-${_alias}"
+	done
+
+	# --- sandbox shims ------------------------------------------------
+	install -d "${pkgdir}/usr/lib/moat/shims"
+	# Sourced, never executed.
+	install -m644 "${tree}/sandbox/shims/shim-common.sh" "${pkgdir}/usr/lib/moat/shims/shim-common.sh"
+	local shim
+	for shim in npm npx pnpm yarn bun pip pip3 uv cargo go makepkg; do
+		install -m755 "${tree}/sandbox/shims/${shim}" "${pkgdir}/usr/lib/moat/shims/${shim}"
+	done
+
+	# Both snippets are no-ops unless /etc/moat/sandbox.enabled exists,
+	# which `moatctl set sandbox on` creates.
+	install -Dm644 "${tree}/sandbox/profile.d/moat-shims.sh" \
+		"${pkgdir}/etc/profile.d/moat-shims.sh"
+	install -Dm644 "${tree}/sandbox/fish/conf.d/moat-shims.fish" \
+		"${pkgdir}/usr/share/fish/vendor_conf.d/moat-shims.fish"
+
+	# --- configuration ------------------------------------------------
+	install -Dm644 "${tree}/moatd/etc/moat.toml" "${pkgdir}/etc/moat/moat.toml"
+	# feeds.toml carries no credential any more -- the package index is keyless
+	# and signed -- but it does carry the base_url and the pinned key path, so
+	# it stays root-only.
+	install -Dm600 "${tree}/moatd/etc/feeds.toml"    "${pkgdir}/etc/moat/feeds.toml"
+
+	# The pinned feed verification key, world-readable because it is public and
+	# moat-feeds may run as any user that can read the config.
+	#
+	# Conditional on purpose: until the aggregator is deployed there is no
+	# keypair, and a hard failure here would mean moat could not be built at all
+	# before its feed exists. The consequence of it being absent is already the
+	# right one -- `require_signature = true` makes moat-feeds refuse every
+	# artifact and say so -- so an inert feed is the failure mode, not a broken
+	# package. Once secrets/ holds a key, copy the .pub to moatd/etc/ and commit
+	# it; the private half never leaves the aggregator.
+	if [[ -f ${tree}/moatd/etc/feed-key.pub ]]; then
+		install -Dm644 "${tree}/moatd/etc/feed-key.pub" "${pkgdir}/usr/share/moat/feed-key.pub"
+	else
+		echo "==> NOTE: no moatd/etc/feed-key.pub; the package feed will be inert" >&2
+	fi
+	install -Dm644 "${tree}/moatd/etc/allowlist.d/default.toml" \
+		"${pkgdir}/etc/moat/allowlist.d/default.toml"
+	# The shipped baseline (LEARNING section 8): reviewed once by a human,
+	# every entry carrying a comment saying which actor, which rule and why
+	# it is benign. baseline.toml, the *learned* file next to it, is runtime
+	# state written by the daemon and is deliberately NOT shipped.
+	install -Dm644 "${tree}/moatd/etc/allowlist.d/omarchy-default.toml" \
+		"${pkgdir}/etc/moat/allowlist.d/omarchy-default.toml"
+	# Moat's own test-suite entries, shipped as an EXAMPLE and not loaded.
+	# `.example` is not `.toml`, so the loader ignores it. They were in
+	# default.toml until 2026-09-08, where they were a production grant keyed
+	# on source-tree naming -- anyone able to create a directory shaped like a
+	# moat checkout inherited an exec exclusion. Only people who build moat
+	# from source ever wanted them.
+	install -Dm644 "${tree}/moatd/etc/allowlist.d/moat-dev.toml.example" \
+		"${pkgdir}/usr/share/doc/omarchy-moat/moat-dev.toml.example"
+	# ship.toml holds no secret as shipped, which is why it is 0644 and
+	# readable: the header TEMPLATE is diffable, the token lives in its own
+	# 0600 file. An inline token makes moat-ship refuse to start until this
+	# file is 0600.
+	install -Dm644 "${tree}/moatd/etc/ship.toml"         "${pkgdir}/etc/moat/ship.toml"
+	install -Dm644 "${tree}/sandbox/sandbox.conf"        "${pkgdir}/etc/moat/sandbox.conf"
+	install -Dm644 "${tree}/pkg/scanner-allow.conf"        "${pkgdir}/etc/moat/scanner-allow.conf"
+
+	# --- licenses -----------------------------------------------------
+	install -Dm644 "${tree}/pkg/LICENSE.MIT" \
+		"${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
+	install -Dm644 "${srcdir}/tetragon-${_tetragonver}-LICENSE" \
+		"${pkgdir}/usr/share/licenses/${pkgname}/LICENSE.tetragon"
+	install -Dm644 "${srcdir}/tetragon-${_tetragonver}-LICENSE.bpf" \
+		"${pkgdir}/usr/share/licenses/${pkgname}/LICENSE.tetragon-bpf"
+
+	# --- documentation ------------------------------------------------
+	# moatd.service points its Documentation= at README.md here.
+	install -Dm644 "${tree}/README.md"           "${pkgdir}/usr/share/doc/${pkgname}/README.md"
+	install -Dm644 "${tree}/moatd/README.md" "${pkgdir}/usr/share/doc/${pkgname}/moatd.md"
+	install -Dm644 "${tree}/policies/README.md"  "${pkgdir}/usr/share/doc/${pkgname}/policies.md"
+	install -Dm644 "${tree}/sandbox/README.md"   "${pkgdir}/usr/share/doc/${pkgname}/sandbox.md"
+	install -Dm644 "${tree}/scanner/README.md"   "${pkgdir}/usr/share/doc/${pkgname}/scanner.md"
+	install -Dm644 "${tree}/docs/CONTRACT.md"    "${pkgdir}/usr/share/doc/${pkgname}/CONTRACT.md"
+	install -Dm644 "${tree}/docs/TETRAGON-NOTES.md" \
+		"${pkgdir}/usr/share/doc/${pkgname}/TETRAGON-NOTES.md"
+	# /etc/moat/moat.toml's own comments cite these two by section number
+	# ([baseline], [learning], [analysis], [incidents], [digest]), so a user
+	# reading the config needs them on disk.
+	install -Dm644 "${tree}/docs/AGENT-PROTECTION.md" \
+		"${pkgdir}/usr/share/doc/${pkgname}/AGENT-PROTECTION.md"
+	install -Dm644 "${tree}/docs/BASELINE.md" \
+		"${pkgdir}/usr/share/doc/${pkgname}/BASELINE.md"
+	install -Dm644 "${tree}/docs/LEARNING-AND-ANALYSIS.md" \
+		"${pkgdir}/usr/share/doc/${pkgname}/LEARNING-AND-ANALYSIS.md"
+	# moat-ship.service's Documentation= points here, and /etc/moat/ship.toml
+	# and the [telemetry] block of moat.toml both cite it by section.
+	install -Dm644 "${tree}/docs/SHIPPING.md" \
+		"${pkgdir}/usr/share/doc/${pkgname}/SHIPPING.md"
+	install -Dm644 "${tree}/docs/CLI.md" \
+		"${pkgdir}/usr/share/doc/${pkgname}/CLI.md"
+
+	# --- the agent skill ----------------------------------------------
+	# Omarchy's own convention: every directory under
+	# /usr/share/omarchy/default/agents/skills is a skill, and Omarchy links
+	# them into each agent's skill directory (~/.claude/skills,
+	# ~/.gemini/config/skills). We install into that directory rather than
+	# into a private /usr/share/omarchy-moat/skills, because a skill nothing
+	# links is a skill nobody loads -- and the linking convention is
+	# Omarchy's, not ours to reinvent.
+	#
+	# The directory is not owned by the omarchy package (pacman only
+	# conflicts on identical file paths), and the name is namespaced, so
+	# this cannot collide with a skill Omarchy ships.
+	#
+	# Omarchy links these from a one-shot migration, so an already-installed
+	# machine will not pick this up on its own; omarchy-moat.install prints
+	# the single `ln -s` for that case, the same way it prints the one
+	# command that enables the digest timer.
+	local _skills="${pkgdir}/usr/share/omarchy/default/agents/skills/moat-tuning"
+	install -Dm644 "${tree}/skills/moat-tuning/SKILL.md" "${_skills}/SKILL.md"
+	install -d "${_skills}/references"
+	install -m644 "${tree}/skills/moat-tuning/references/"*.md "${_skills}/references/"
+
+	# The mark, in the hicolor set, so anything that shows an icon for this
+	# package (a .desktop entry, a notification, a tray) finds one by name
+	# rather than falling back to a generic cog. Scalable plus the two raster
+	# sizes a 16px tray actually uses -- the handoff is explicit that 16 is a
+	# separate drawing, never a downscale of 32.
+	install -Dm644 "${tree}/assets/svg/mark-accent.svg" \
+		"${pkgdir}/usr/share/icons/hicolor/scalable/apps/omarchy-moat.svg"
+	for _px in 16 24 32 64 128 256; do
+		install -Dm644 "${tree}/assets/png/mark-${_px}.png" \
+			"${pkgdir}/usr/share/icons/hicolor/${_px}x${_px}/apps/omarchy-moat.png"
+	done
+}
