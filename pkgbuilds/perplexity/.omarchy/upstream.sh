@@ -1,0 +1,82 @@
+#!/bin/bash
+# Perplexity ships its desktop app from its own Debian repository. The
+# per-architecture package index carries the filename and SHA256 of every deb,
+# so an update costs two small HTTP requests instead of a 175 MB download. The
+# index's Version field drops the build number the pool filename carries, and
+# upstream rebuilds under the same marketing version, so the version of record
+# here is the full string embedded in the filename.
+set -euo pipefail
+
+BASE_URL="https://packages.perplexity.ai/deb"
+declare -A DEB_ARCHES=([x86_64]=amd64 [aarch64]=arm64)
+
+# Print "<version> <sha256>" for the newest stanza in a Packages index, version
+# meaning the full string from the pool filename. Newest is vercmp's opinion,
+# which is the one bin/sync-upstream and pacman both use; sort -V disagrees
+# with it over versions like 1.0a.
+newest_release() {
+  local index="$1"
+  local debarch="$2"
+  local filename sha256 version best_version="" best_sha256=""
+  local prefix="pool/main/p/perplexity/perplexity_"
+  local suffix="_${debarch}.deb"
+
+  while read -r filename sha256; do
+    # The PKGBUILD reconstructs the pool URL from pkgver alone, so a stanza
+    # naming anything else -- a rename, or a new pool layout -- has to stop
+    # the sync rather than pin a checksum to a URL nobody will fetch.
+    if [[ "$filename" != "${prefix}"*"${suffix}" ]]; then
+      echo "Unexpected pool filename in the upstream index: $filename" >&2
+      return 1
+    fi
+    version="${filename#"$prefix"}"
+    version="${version%"$suffix"}"
+
+    if [[ -z "$best_version" ]] || [[ "$(vercmp "$version" "$best_version")" -gt 0 ]]; then
+      best_version="$version"
+      best_sha256="$sha256"
+    fi
+  done < <(awk '
+    { sub(/\r$/, "") }
+    /^Filename:/ { filename = $2 }
+    /^SHA256:/   { sha256 = $2 }
+    /^$/         { if (filename && sha256) print filename, sha256; filename = sha256 = "" }
+    END          { if (filename && sha256) print filename, sha256 }
+  ' <<<"$index")
+
+  [[ -n "$best_version" ]] || return 1
+  echo "$best_version $best_sha256"
+}
+
+versions=()
+declare -A checksums=()
+
+for arch in "${!DEB_ARCHES[@]}"; do
+  index=$(curl -fsSL "$BASE_URL/dists/stable/main/binary-${DEB_ARCHES[$arch]}/Packages")
+
+  read -r version sha256 <<<"$(newest_release "$index" "${DEB_ARCHES[$arch]}")"
+  if [[ -z "${version:-}" || -z "${sha256:-}" ]]; then
+    echo "No usable release found for $arch in the upstream package index" >&2
+    exit 1
+  fi
+
+  versions+=("$version")
+  checksums[$arch]="$sha256"
+done
+
+# A release lands one architecture at a time, and a single pkgver has to cover
+# both -- including the build number, since that is what the download URLs are
+# built from. Report no update until they agree; the next run picks it up.
+for version in "${versions[@]}"; do
+  if [[ "$version" != "${versions[0]}" ]]; then
+    echo "Upstream architectures are mid-release (${versions[*]}); skipping" >&2
+    echo '{}'
+    exit 0
+  fi
+done
+
+jq -n \
+  --arg pkgver "${versions[0]}" \
+  --arg x86_64 "${checksums[x86_64]}" \
+  --arg aarch64 "${checksums[aarch64]}" \
+  '{pkgver: $pkgver, sha256sums: {x86_64: [$x86_64], aarch64: [$aarch64]}}'

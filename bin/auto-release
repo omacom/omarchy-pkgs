@@ -1,6 +1,10 @@
 #!/bin/bash
 # Run the release workflow for a channel when work is queued.
-# Usage: auto-release <edge|rc|stable>
+# Usage: auto-release <edge|rc|stable> [<arch>|all]
+#
+# With no architecture (what the timers pass), every published architecture
+# is processed in turn, each against its own queue and its own backoff, so a
+# failing aarch64 build never holds up x86_64 or the other way round.
 #
 # Safe to run on a tight schedule. Three guards make that true:
 #
@@ -21,7 +25,7 @@ source "$BUILD_ROOT/helpers/paths.sh"
 source "$BUILD_ROOT/helpers/lock-helpers.sh"
 
 MIRROR="${1:-}"
-STATE_DIR="${OMARCHY_STATE_DIR:-/root/.state}"
+ARCH_ARG="${2:-all}"
 
 # Backoff schedule: 10m, 20m, 40m, 80m, 160m, 320m, then hourly-ish forever
 # (capped at 6h, the cadence this system ran at before frequent timers).
@@ -29,8 +33,9 @@ BACKOFF_BASE_SECONDS="${OMARCHY_BACKOFF_BASE:-600}"
 BACKOFF_MAX_SECONDS="${OMARCHY_BACKOFF_MAX:-21600}"
 
 if [[ -z "$MIRROR" ]]; then
-  print_error "Usage: $0 <mirror>"
+  print_error "Usage: $0 <mirror> [<arch>|all]"
   echo "  mirror: edge, rc, or stable"
+  echo "  arch:   one of $VALID_ARCHES, or all (default) for every published architecture"
   exit 1
 fi
 
@@ -39,16 +44,12 @@ if [[ "$MIRROR" != "edge" && "$MIRROR" != "rc" && "$MIRROR" != "stable" ]]; then
   exit 1
 fi
 
-STATE_FILE="$STATE_DIR/.sync-needed-$MIRROR"
-FAIL_FILE="$STATE_DIR/.build-failed-$MIRROR"
-
-# Nothing queued: stay quiet. At a 5-minute cadence this is most invocations,
-# and a header for each would bury the runs that matter in the journal.
-if [[ ! -f "$STATE_FILE" ]]; then
-  exit 0
+if [[ "$ARCH_ARG" == "all" ]]; then
+  ARCHES=$(published_arches)
+else
+  require_valid_arch "$ARCH_ARG"
+  ARCHES="$ARCH_ARG"
 fi
-
-print_header "Processing Sync for $MIRROR"
 
 # The build inputs are this checkout's contents; its HEAD identifies them.
 current_fingerprint() {
@@ -65,57 +66,103 @@ backoff_seconds() {
   echo "$delay"
 }
 
-FAIL_COUNT=0
-if [[ -f "$FAIL_FILE" ]]; then
-  # shellcheck disable=SC1090
-  source "$FAIL_FILE" 2>/dev/null || true
-  FAIL_COUNT="${FAILURE_COUNT:-0}"
-  failed_at="${FAILURE_AT:-0}"
-  failed_fingerprint="${FAILURE_FINGERPRINT:-}"
+# Returns 0 when this architecture's queue was processed (or was empty), 1 when
+# the release failed. Backoff and "someone else holds the lock" are not
+# failures: they are this tick deciding to do nothing.
+release_arch() {
+  local arch="$1"
+  local state_file fail_file
+  state_file=$(sync_queue_file "$MIRROR" "$arch")
+  fail_file=$(sync_fail_file "$MIRROR" "$arch")
 
-  if [[ "$failed_fingerprint" != "$(current_fingerprint)" ]]; then
-    print_info "Repository changed since the last failure — clearing backoff and retrying"
-    rm -f "$FAIL_FILE"
-    FAIL_COUNT=0
-  else
-    delay=$(backoff_seconds "$FAIL_COUNT")
-    now=$(date +%s)
-    retry_at=$((failed_at + delay))
-    if ((now < retry_at)); then
-      print_warning "$MIRROR has failed $FAIL_COUNT time(s) on this tree — not retrying until $(date -d "@$retry_at" '+%H:%M:%S' 2>/dev/null || echo "+$((retry_at - now))s")"
-      echo "  Push a fix (any new commit clears this), or: rm $FAIL_FILE"
-      exit 0
-    fi
-    print_info "Backoff elapsed — retrying $MIRROR (failure #$((FAIL_COUNT + 1)) if this fails)"
+  # A queue written under the pre-architecture name belongs to x86_64.
+  if [[ "$arch" == "x86_64" && ! -f "$state_file" && -f "$(legacy_sync_queue_file "$MIRROR")" ]]; then
+    state_file=$(legacy_sync_queue_file "$MIRROR")
   fi
-fi
+  if [[ "$arch" == "x86_64" && ! -f "$fail_file" && -f "$(legacy_sync_fail_file "$MIRROR")" ]]; then
+    fail_file=$(legacy_sync_fail_file "$MIRROR")
+  fi
 
-# Non-blocking: a build in progress means this tick has nothing to do.
-if ! try_release_lock; then
-  holder=$(release_lock_holder)
-  print_info "A release is already running (${holder:-holder unknown}) — skipping this tick"
-  exit 0
-fi
+  # Nothing queued: stay quiet. At a 5-minute cadence this is most
+  # invocations, and a header for each would bury the runs that matter in
+  # the journal.
+  [[ -f "$state_file" ]] || return 0
 
-print_info "State file found: $STATE_FILE"
-print_info "Starting release workflow for $MIRROR..."
+  print_header "Processing Sync for $MIRROR ($arch)"
 
-if "$BUILD_ROOT/bin/repo" release --mirror "$MIRROR" --skip-prod-check; then
-  print_success "Release completed successfully for $MIRROR"
-  rm -f "$STATE_FILE"
-  rm -f "$FAIL_FILE"
-  print_success "State file removed: $STATE_FILE"
-else
-  status=$?
-  FAIL_COUNT=$((FAIL_COUNT + 1))
-  cat >"$FAIL_FILE" <<EOF
-FAILURE_COUNT=$FAIL_COUNT
+  local fail_count=0 failed_at failed_fingerprint delay now retry_at
+  if [[ -f "$fail_file" ]]; then
+    FAILURE_COUNT=0 FAILURE_AT=0 FAILURE_FINGERPRINT=""
+    # shellcheck disable=SC1090
+    source "$fail_file" 2>/dev/null || true
+    fail_count="${FAILURE_COUNT:-0}"
+    failed_at="${FAILURE_AT:-0}"
+    failed_fingerprint="${FAILURE_FINGERPRINT:-}"
+
+    if [[ "$failed_fingerprint" != "$(current_fingerprint)" ]]; then
+      print_info "Repository changed since the last failure — clearing backoff and retrying"
+      rm -f "$fail_file"
+      fail_count=0
+    else
+      delay=$(backoff_seconds "$fail_count")
+      now=$(date +%s)
+      retry_at=$((failed_at + delay))
+      if ((now < retry_at)); then
+        print_warning "$MIRROR ($arch) has failed $fail_count time(s) on this tree — not retrying until $(date -d "@$retry_at" '+%H:%M:%S' 2>/dev/null || echo "+$((retry_at - now))s")"
+        echo "  Push a fix (any new commit clears this), or: rm $fail_file"
+        return 0
+      fi
+      print_info "Backoff elapsed — retrying $MIRROR ($arch) (failure #$((fail_count + 1)) if this fails)"
+    fi
+  fi
+
+  # Non-blocking: a build in progress means this tick has nothing to do. The
+  # lock is reentrant, so once this run holds it the remaining architectures
+  # run under the same acquisition.
+  if ! try_release_lock; then
+    local holder
+    holder=$(release_lock_holder)
+    print_info "A release is already running (${holder:-holder unknown}) — skipping this tick"
+    return 0
+  fi
+
+  print_info "State file found: $state_file"
+  print_info "Starting release workflow for $MIRROR ($arch)..."
+
+  if "$BUILD_ROOT/bin/repo" release --mirror "$MIRROR" --arch "$arch" --skip-prod-check; then
+    print_success "Release completed successfully for $MIRROR ($arch)"
+    local completed_state=("$state_file" "$fail_file")
+    if [[ "$arch" == "x86_64" ]]; then
+      completed_state+=("$(legacy_sync_queue_file "$MIRROR")" "$(legacy_sync_fail_file "$MIRROR")")
+    fi
+    if ! rm -f "${completed_state[@]}"; then
+      print_error "Release succeeded, but its queue state could not be cleared"
+      return 1
+    fi
+    print_success "State file removed: $state_file"
+    return 0
+  fi
+
+  fail_count=$((fail_count + 1))
+  if ! cat >"$fail_file" <<EOF
+FAILURE_COUNT=$fail_count
 FAILURE_AT=$(date +%s)
 FAILURE_FINGERPRINT=$(current_fingerprint)
 EOF
-  next=$(backoff_seconds "$FAIL_COUNT")
-  print_error "Release failed for $MIRROR (attempt $FAIL_COUNT)"
-  print_warning "State file retained for retry: $STATE_FILE"
+  then
+    print_error "Could not record failure state: $fail_file"
+    return 1
+  fi
+  local next
+  next=$(backoff_seconds "$fail_count")
+  print_error "Release failed for $MIRROR ($arch) (attempt $fail_count)"
+  print_warning "State file retained for retry: $state_file"
   print_warning "Backing off $((next / 60))m before the next attempt; a new commit retries sooner"
-  exit "$status"
-fi
+  return 1
+}
+
+status=0
+for arch in $ARCHES; do
+  release_arch "$arch" || status=1
+done
+exit "$status"

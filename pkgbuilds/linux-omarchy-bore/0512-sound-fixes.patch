@@ -1,0 +1,507 @@
+diff --git a/sound/core/pcm_native.c b/sound/core/pcm_native.c
+--- a/sound/core/pcm_native.c
++++ b/sound/core/pcm_native.c
+@@ -4023,20 +4023,33 @@ int snd_pcm_mmap_data(struct snd_pcm_substream *substream, struct file *file,
+ 			return -EINVAL;
+ 	}
+ 	runtime = substream->runtime;
+-	if (runtime->state == SNDRV_PCM_STATE_OPEN)
+-		return -EBADFD;
+-	if (!(runtime->info & SNDRV_PCM_INFO_MMAP))
+-		return -ENXIO;
++	/* don't race with buffer reallocation in hw_params/hw_free */
++	if (!atomic_inc_unless_negative(&runtime->buffer_accessing))
++		return -EBUSY;
++	if (runtime->state == SNDRV_PCM_STATE_OPEN) {
++		err = -EBADFD;
++		goto out;
++	}
++	if (!(runtime->info & SNDRV_PCM_INFO_MMAP)) {
++		err = -ENXIO;
++		goto out;
++	}
+ 	if (runtime->access == SNDRV_PCM_ACCESS_RW_INTERLEAVED ||
+-	    runtime->access == SNDRV_PCM_ACCESS_RW_NONINTERLEAVED)
+-		return -EINVAL;
++	    runtime->access == SNDRV_PCM_ACCESS_RW_NONINTERLEAVED) {
++		err = -EINVAL;
++		goto out;
++	}
+ 	size = area->vm_end - area->vm_start;
+ 	offset = area->vm_pgoff << PAGE_SHIFT;
+ 	dma_bytes = PAGE_ALIGN(runtime->dma_bytes);
+-	if ((size_t)size > dma_bytes)
+-		return -EINVAL;
+-	if (offset > dma_bytes - size)
+-		return -EINVAL;
++	if ((size_t)size > dma_bytes) {
++		err = -EINVAL;
++		goto out;
++	}
++	if (offset > dma_bytes - size) {
++		err = -EINVAL;
++		goto out;
++	}
+ 
+ 	area->vm_ops = &snd_pcm_vm_ops_data;
+ 	area->vm_private_data = substream;
+@@ -4046,6 +4059,8 @@ int snd_pcm_mmap_data(struct snd_pcm_substream *substream, struct file *file,
+ 		err = snd_pcm_lib_default_mmap(substream, area);
+ 	if (!err)
+ 		atomic_inc(&substream->mmap_count);
++out:
++	atomic_dec(&runtime->buffer_accessing);
+ 	return err;
+ }
+ EXPORT_SYMBOL(snd_pcm_mmap_data);
+diff --git a/sound/core/ump.c b/sound/core/ump.c
+--- a/sound/core/ump.c
++++ b/sound/core/ump.c
+@@ -1335,6 +1335,8 @@ static void update_legacy_names(struct snd_ump_endpoint *ump)
+ {
+ 	struct snd_rawmidi *rmidi = ump->legacy_rmidi;
+ 
++	if (!rmidi)
++		return;
+ 	update_legacy_substreams(ump, rmidi, SNDRV_RAWMIDI_STREAM_INPUT);
+ 	update_legacy_substreams(ump, rmidi, SNDRV_RAWMIDI_STREAM_OUTPUT);
+ }
+@@ -1343,6 +1345,8 @@ static void ump_legacy_set_rawmidi_name(struct snd_ump_endpoint *ump)
+ {
+ 	struct snd_rawmidi *rmidi = ump->legacy_rmidi;
+ 
++	if (!rmidi)
++		return;
+ 	snprintf(rmidi->name, sizeof(rmidi->name), "%.68s (MIDI 1.0)",
+ 		 ump->core.name);
+ }
+diff --git a/sound/drivers/dummy.c b/sound/drivers/dummy.c
+--- a/sound/drivers/dummy.c
++++ b/sound/drivers/dummy.c
+@@ -807,7 +807,7 @@ static int snd_dummy_capsrc_put(struct snd_kcontrol *kcontrol, struct snd_ctl_el
+ 	left = ucontrol->value.integer.value[0] & 1;
+ 	right = ucontrol->value.integer.value[1] & 1;
+ 	guard(spinlock_irq)(&dummy->mixer_lock);
+-	change = dummy->capture_source[addr][0] != left &&
++	change = dummy->capture_source[addr][0] != left ||
+ 	         dummy->capture_source[addr][1] != right;
+ 	dummy->capture_source[addr][0] = left;
+ 	dummy->capture_source[addr][1] = right;
+diff --git a/sound/hda/codecs/cirrus/cs420x.c b/sound/hda/codecs/cirrus/cs420x.c
+--- a/sound/hda/codecs/cirrus/cs420x.c
++++ b/sound/hda/codecs/cirrus/cs420x.c
+@@ -571,6 +571,7 @@ static const struct hda_model_fixup cs4208_models[] = {
+ 
+ static const struct hda_quirk cs4208_fixup_tbl[] = {
+ 	SND_PCI_QUIRK_VENDOR(0x106b, "Apple", CS4208_MAC_AUTO),
++	SND_PCI_QUIRK(0x8086, 0x7270, "MacBookAir 7,2", CS4208_MAC_AUTO),
+ 	{} /* terminator */
+ };
+ 
+@@ -583,6 +584,7 @@ static const struct hda_quirk cs4208_mac_fixup_tbl[] = {
+ 	SND_PCI_QUIRK(0x106b, 0x7800, "MacPro 6,1", CS4208_MACMINI),
+ 	SND_PCI_QUIRK(0x106b, 0x7b00, "MacBookPro 12,1", CS4208_MBP11),
+ 	SND_PCI_QUIRK(0x106b, 0x7f00, "iMac 16,1", CS4208_MBP11),
++	SND_PCI_QUIRK(0x8086, 0x7270, "MacBookAir 7,2", CS4208_MBA6),
+ 	{} /* terminator */
+ };
+ 
+diff --git a/sound/hda/codecs/conexant.c b/sound/hda/codecs/conexant.c
+--- a/sound/hda/codecs/conexant.c
++++ b/sound/hda/codecs/conexant.c
+@@ -249,6 +249,25 @@ static void cx_update_headset_mic_vref(struct hda_codec *codec, struct hda_jack_
+ 	}
+ }
+ 
++#define SN6140_S3_AFG_D0_DELAY_MS	1000
++
++static void cx_set_power_state(struct hda_codec *codec, hda_nid_t fg,
++			       unsigned int power_state)
++{
++	snd_hda_codec_write_sync(codec, fg, 0, AC_VERB_SET_POWER_STATE, power_state);
++
++	/*
++	 * SN6140 may not respond to AFG D0 immediately after S3.
++	 * Wait before the D0 verb so the power-state command itself succeeds.
++	 */
++	if (codec->core.vendor_id == 0x14f11f87 &&
++	    power_state == AC_PWRST_D0 &&
++	    codec->core.dev.power.power_state.event == PM_EVENT_RESUME)
++		msleep(SN6140_S3_AFG_D0_DELAY_MS);
++
++	snd_hda_codec_set_power_to_all(codec, fg, power_state);
++}
++
+ static int cx_suspend(struct hda_codec *codec)
+ {
+ 	cx_auto_shutdown(codec);
+@@ -1308,6 +1327,7 @@ static const struct hda_codec_ops cx_codec_ops = {
+ 	.init = cx_init,
+ 	.unsol_event = snd_hda_jack_unsol_event,
+ 	.suspend = cx_suspend,
++	.set_power_state = cx_set_power_state,
+ 	.check_power_status = snd_hda_gen_check_power_status,
+ 	.stream_pm = snd_hda_gen_stream_pm,
+ };
+diff --git a/sound/hda/codecs/realtek/alc269.c b/sound/hda/codecs/realtek/alc269.c
+--- a/sound/hda/codecs/realtek/alc269.c
++++ b/sound/hda/codecs/realtek/alc269.c
+@@ -2379,6 +2379,33 @@ static void alc_fixup_headset_mode_alc255_no_hp_mic(struct hda_codec *codec,
+ 	}
+ }
+ 
++/*
++ * On the Acer Aspire A515-57G (and possibly other models sharing this
++ * board), if headphones are already inserted into the combo jack before
++ * the codec powers up (cold boot), the impedance-based headset-type
++ * sensing races and misclassifies the jack, driving the wrong output
++ * configuration (audible as missing center-panned/vocal content). A
++ * genuine physical unplug/replug after boot fixes it by forcing a fresh
++ * sense transient. Mirror that here on cold boot only: give the sense
++ * hardware time to settle, then force a fresh classification.
++ */
++static void alc_fixup_headset_mode_acer_coldboot(struct hda_codec *codec,
++						 const struct hda_fixup *fix, int action)
++{
++	struct alc_spec *spec = codec->spec;
++
++	alc_fixup_headset_mode(codec, fix, action);
++
++	if (action == HDA_FIXUP_ACT_INIT &&
++	    !is_s3_resume(codec) && !is_s4_resume(codec) &&
++		spec->current_headset_mode != ALC_HEADSET_MODE_UNPLUGGED) {
++		msleep(500);
++		spec->current_headset_mode = ALC_HEADSET_MODE_UNKNOWN;
++		spec->current_headset_type = ALC_HEADSET_TYPE_UNKNOWN;
++		alc_fixup_headset_mode(codec, fix, action);
++	}
++}
++
+ static void alc288_update_headset_jack_cb(struct hda_codec *codec,
+ 				       struct hda_jack_callback *jack)
+ {
+@@ -4248,6 +4275,7 @@ enum {
+ 	ALC282_FIXUP_ACER_DISABLE_LINEOUT,
+ 	ALC255_FIXUP_ACER_LIMIT_INT_MIC_BOOST,
+ 	ALC256_FIXUP_ACER_HEADSET_MIC,
++	ALC256_FIXUP_ACER_COLDBOOT,
+ 	ALC285_FIXUP_IDEAPAD_S740_COEF,
+ 	ALC285_FIXUP_HP_LIMIT_INT_MIC_BOOST,
+ 	ALC295_FIXUP_ASUS_DACS,
+@@ -6311,6 +6339,12 @@ static const struct hda_fixup alc269_fixups[] = {
+ 		.chained = true,
+ 		.chain_id = ALC269_FIXUP_HEADSET_MODE_NO_HP_MIC
+ 	},
++	[ALC256_FIXUP_ACER_COLDBOOT] = {
++		.type = HDA_FIXUP_FUNC,
++		.v.func = alc_fixup_headset_mode_acer_coldboot,
++		.chained = true,
++		.chain_id = ALC256_FIXUP_ACER_SFG16_MICMUTE_LED,
++	},
+ 	[ALC285_FIXUP_IDEAPAD_S740_COEF] = {
+ 		.type = HDA_FIXUP_FUNC,
+ 		.v.func = alc285_fixup_ideapad_s740_coef,
+@@ -7148,13 +7182,14 @@ static const struct hda_quirk alc269_fixup_tbl[] = {
+ 	SND_PCI_QUIRK(0x1025, 0x1597, "Acer Nitro 5 AN517-55", ALC2XX_FIXUP_HEADSET_MIC),
+ 	SND_PCI_QUIRK(0x1025, 0x159e, "Acer Nitro 5 AN515-46", ALC2XX_FIXUP_HEADSET_MIC),
+ 	SND_PCI_QUIRK(0x1025, 0x160e, "Acer PT316-51S", ALC2XX_FIXUP_HEADSET_MIC),
+-	SND_PCI_QUIRK(0x1025, 0x1616, "Acer Aspire A515-57", ALC256_FIXUP_ACER_SFG16_MICMUTE_LED),
++	SND_PCI_QUIRK(0x1025, 0x1616, "Acer Aspire A515-57", ALC256_FIXUP_ACER_COLDBOOT),
+ 	SND_PCI_QUIRK(0x1025, 0x161f, "Acer S40-54", ALC256_FIXUP_ACER_MIC_NO_PRESENCE),
+ 	SND_PCI_QUIRK(0x1025, 0x1640, "Acer Aspire A315-44P", ALC256_FIXUP_ACER_SFG16_MICMUTE_LED),
+ 	SND_PCI_QUIRK(0x1025, 0x166c, "Acer Predator PH16-71", ALC2XX_FIXUP_HEADSET_MIC),
+ 	SND_PCI_QUIRK(0x1025, 0x1679, "Acer Nitro 16 AN16-41", ALC2XX_FIXUP_HEADSET_MIC),
+ 	SND_PCI_QUIRK(0x1025, 0x169a, "Acer Swift SFG16", ALC256_FIXUP_ACER_SFG16_MICMUTE_LED),
+ 	SND_PCI_QUIRK(0x1025, 0x171e, "Acer Nitro ANV15-51", ALC245_FIXUP_ACER_MICMUTE_LED),
++	SND_PCI_QUIRK(0x1025, 0x1731, "Acer Predator PHN16-72", ALC2XX_FIXUP_HEADSET_MIC),
+ 	SND_PCI_QUIRK(0x1025, 0x173a, "Acer Swift SFG14-73", ALC245_FIXUP_ACER_MICMUTE_LED),
+ 	SND_PCI_QUIRK(0x1025, 0x1758, "Acer Nitro ANV15-41", ALC245_FIXUP_ACER_MICMUTE_LED),
+ 	SND_PCI_QUIRK(0x1025, 0x1826, "Acer Helios ZPC", ALC287_FIXUP_PREDATOR_SPK_CS35L41_I2C_2),
+@@ -8100,6 +8135,7 @@ static const struct hda_quirk alc269_fixup_tbl[] = {
+ 	SND_PCI_QUIRK(0x17aa, 0x3801, "Lenovo Yoga9 14IAP7", ALC287_FIXUP_YOGA9_14IAP7_BASS_SPK_PIN),
+ 	HDA_CODEC_QUIRK(0x17aa, 0x3802, "DuetITL 2021", ALC287_FIXUP_YOGA7_14ITL_SPEAKERS),
+ 	SND_PCI_QUIRK(0x17aa, 0x3802, "Lenovo Yoga Pro 9 14IRP8", ALC287_FIXUP_TAS2781_I2C),
++	SND_PCI_QUIRK(0x17aa, 0x380b, "Lenovo Yoga Slim 9 14ILL10", ALC287_FIXUP_YOGA9_14IAP7_BASS_SPK_PIN),
+ 	/* Yoga Pro 9 16IMH9 and Legion 7 16ITHG6 share PCI SSID 17aa:3811
+ 	 * with Legion S7 15IMH05; use codec SSID to distinguish them
+ 	 */
+@@ -8287,6 +8323,7 @@ static const struct hda_quirk alc269_fixup_tbl[] = {
+ 	SND_PCI_QUIRK(0x1d05, 0x3034, "TongFang X6KK45xU", ALC2XX_FIXUP_HEADSET_MIC),
+ 	SND_PCI_QUIRK(0x1d05, 0x30ba, "TongFang XxAF5xxx", ALC2XX_FIXUP_HEADSET_MIC),
+ 	SND_PCI_QUIRK(0x1d17, 0x3288, "Haier Boyue G42", ALC269VC_FIXUP_ACER_VCOPPERBOX_PINS),
++	SND_PCI_QUIRK(0x1d19, 0x0006, "VAIO VJS131", ALC233_FIXUP_ASUS_MIC_NO_PRESENCE),
+ 	SND_PCI_QUIRK(0x1d72, 0x1602, "RedmiBook", ALC255_FIXUP_XIAOMI_HEADSET_MIC),
+ 	SND_PCI_QUIRK(0x1d72, 0x1701, "XiaomiNotebook Pro", ALC298_FIXUP_DELL1_MIC_NO_PRESENCE),
+ 	SND_PCI_QUIRK(0x1d72, 0x1901, "RedmiBook 14", ALC256_FIXUP_ASUS_HEADSET_MIC),
+diff --git a/sound/hda/core/device.c b/sound/hda/core/device.c
+--- a/sound/hda/core/device.c
++++ b/sound/hda/core/device.c
+@@ -404,6 +404,7 @@ static void setup_fg_nodes(struct hdac_device *codec)
+  */
+ int snd_hdac_refresh_widgets(struct hdac_device *codec)
+ {
++	hda_nid_t fg = codec->afg ? codec->afg : codec->mfg;
+ 	hda_nid_t start_nid;
+ 	int nums, err = 0;
+ 
+@@ -412,10 +413,10 @@ int snd_hdac_refresh_widgets(struct hdac_device *codec)
+ 	 * widgets array.
+ 	 */
+ 	guard(mutex)(&codec->widget_lock);
+-	nums = snd_hdac_get_sub_nodes(codec, codec->afg, &start_nid);
++	nums = snd_hdac_get_sub_nodes(codec, fg, &start_nid);
+ 	if (!start_nid || nums <= 0 || nums >= 0xff) {
+ 		dev_err(&codec->dev, "cannot read sub nodes for FG 0x%02x\n",
+-			codec->afg);
++			fg);
+ 		return -EINVAL;
+ 	}
+ 
+diff --git a/sound/usb/caiaq/audio.c b/sound/usb/caiaq/audio.c
+--- a/sound/usb/caiaq/audio.c
++++ b/sound/usb/caiaq/audio.c
+@@ -828,16 +828,13 @@ int snd_usb_caiaq_audio_init(struct snd_usb_caiaqdev *cdev)
+ 
+ 	cdev->data_urbs_in = alloc_urbs(cdev, SNDRV_PCM_STREAM_CAPTURE, &ret);
+ 	if (ret < 0) {
+-		kfree(cdev->data_cb_info);
+-		free_urbs(cdev->data_urbs_in);
++		snd_usb_caiaq_audio_free(cdev);
+ 		return ret;
+ 	}
+ 
+ 	cdev->data_urbs_out = alloc_urbs(cdev, SNDRV_PCM_STREAM_PLAYBACK, &ret);
+ 	if (ret < 0) {
+-		kfree(cdev->data_cb_info);
+-		free_urbs(cdev->data_urbs_in);
+-		free_urbs(cdev->data_urbs_out);
++		snd_usb_caiaq_audio_free(cdev);
+ 		return ret;
+ 	}
+ 
+@@ -858,6 +855,9 @@ void snd_usb_caiaq_audio_free(struct snd_usb_caiaqdev *cdev)
+ 
+ 	dev_dbg(dev, "%s(%p)\n", __func__, cdev);
+ 	free_urbs(cdev->data_urbs_in);
++	cdev->data_urbs_in = NULL;
+ 	free_urbs(cdev->data_urbs_out);
++	cdev->data_urbs_out = NULL;
+ 	kfree(cdev->data_cb_info);
++	cdev->data_cb_info = NULL;
+ }
+diff --git a/sound/usb/fcp.c b/sound/usb/fcp.c
+--- a/sound/usb/fcp.c
++++ b/sound/usb/fcp.c
+@@ -191,6 +191,10 @@ static int fcp_usb(struct usb_mixer_interface *mixer, u32 opcode,
+ 	const int max_retries = 5;
+ 	int err;
+ 
++	CLASS(snd_usb_lock, pm)(mixer->chip);
++	if (pm.err < 0)
++		return -EIO;
++
+ 	if (!private->urb)
+ 		return -ENODEV;
+ 
+@@ -1026,6 +1030,10 @@ static int fcp_init(struct usb_mixer_interface *mixer,
+ 	struct usb_device *dev = mixer->chip->dev;
+ 	int err;
+ 
++	CLASS(snd_usb_lock, pm)(mixer->chip);
++	if (pm.err < 0)
++		return -EIO;
++
+ 	err = snd_usb_ctl_msg(dev, usb_rcvctrlpipe(dev, 0),
+ 		FCP_USB_REQ_STEP0,
+ 		USB_RECIP_INTERFACE | USB_TYPE_CLASS | USB_DIR_IN,
+diff --git a/sound/usb/mixer_maps.c b/sound/usb/mixer_maps.c
+--- a/sound/usb/mixer_maps.c
++++ b/sound/usb/mixer_maps.c
+@@ -518,6 +518,19 @@ static const struct usbmix_name_map audient_id14_map[] = {
+ 	{}
+ };
+ 
++/*
++ * Audient iD24: feature unit 12 ("Speaker Playback Volume") sits in the
++ * monitor-mixer branch and does not apply volume to all of its channels;
++ * when userspace adopts it as the master playback volume, the left main
++ * output stays at 0 dB while the right one is attenuated, producing a
++ * stereo imbalance.  Rename it so that it is not picked up as the
++ * stream's master volume control.
++ */
++static const struct usbmix_name_map audient_id24_map[] = {
++	{ 12, "Monitor Mix Playback" },	/* FU, partial channel coverage */
++	{}
++};
++
+ /*
+  * Control map entries
+  */
+@@ -611,6 +624,11 @@ static const struct usbmix_ctl_map usbmix_ctl_maps[] = {
+ 		.id = USB_ID(0x2708, 0x0008),
+ 		.map = audient_id14_map,
+ 	},
++	{
++		/* Audient iD24 */
++		.id = USB_ID(0x2708, 0x000d),
++		.map = audient_id24_map,
++	},
+ 	{
+ 		/* KEF X300A */
+ 		.id = USB_ID(0x27ac, 0x1000),
+diff --git a/sound/usb/mixer_quirks.c b/sound/usb/mixer_quirks.c
+--- a/sound/usb/mixer_quirks.c
++++ b/sound/usb/mixer_quirks.c
+@@ -3480,6 +3480,10 @@ static int snd_rme_digiface_write_reg(struct snd_kcontrol *kcontrol, int item, u
+ 	struct usb_device *dev = chip->dev;
+ 	int err;
+ 
++	CLASS(snd_usb_lock, pm)(chip);
++	if (pm.err < 0)
++		return -EIO;
++
+ 	err = snd_usb_ctl_msg(dev, usb_sndctrlpipe(dev, 0),
+ 			      item,
+ 			      USB_DIR_OUT | USB_TYPE_VENDOR | USB_RECIP_DEVICE,
+@@ -3499,6 +3503,10 @@ static int snd_rme_digiface_read_status(struct snd_kcontrol *kcontrol, u32 statu
+ 	__le32 buf[4] = {};
+ 	int err;
+ 
++	CLASS(snd_usb_lock, pm)(chip);
++	if (pm.err < 0)
++		return -EIO;
++
+ 	err = snd_usb_ctl_msg(dev, usb_rcvctrlpipe(dev, 0),
+ 			      RME_DIGIFACE_READ_STATUS,
+ 			      USB_DIR_IN | USB_TYPE_VENDOR | USB_RECIP_DEVICE,
+diff --git a/sound/usb/mixer_s1810c.c b/sound/usb/mixer_s1810c.c
+--- a/sound/usb/mixer_s1810c.c
++++ b/sound/usb/mixer_s1810c.c
+@@ -474,6 +474,10 @@ snd_s1810c_switch_get(struct snd_kcontrol *kctl,
+ 	u32 state = 0;
+ 	int ret;
+ 
++	CLASS(snd_usb_lock, pm)(mixer->chip);
++	if (pm.err < 0)
++		return -EIO;
++
+ 	guard(mutex)(&private->data_mutex);
+ 	ret = snd_s1810c_get_switch_state(mixer, kctl, &state);
+ 	if (ret < 0)
+@@ -504,6 +508,10 @@ snd_s1810c_switch_set(struct snd_kcontrol *kctl,
+ 	u32 newval = 0;
+ 	int ret = 0;
+ 
++	CLASS(snd_usb_lock, pm)(mixer->chip);
++	if (pm.err < 0)
++		return -EIO;
++
+ 	guard(mutex)(&private->data_mutex);
+ 	ret = snd_s1810c_get_switch_state(mixer, kctl, &curval);
+ 	if (ret < 0)
+diff --git a/sound/usb/mixer_scarlett.c b/sound/usb/mixer_scarlett.c
+--- a/sound/usb/mixer_scarlett.c
++++ b/sound/usb/mixer_scarlett.c
+@@ -707,6 +707,10 @@ static int scarlett_ctl_meter_get(struct snd_kcontrol *kctl,
+ 	int idx = snd_usb_ctrl_intf(elem->head.mixer->hostif) | (elem->head.id << 8);
+ 	int err;
+ 
++	CLASS(snd_usb_lock, pm)(chip);
++	if (pm.err < 0)
++		return -EIO;
++
+ 	err = snd_usb_ctl_msg(chip->dev,
+ 				usb_rcvctrlpipe(chip->dev, 0),
+ 				UAC2_CS_MEM,
+diff --git a/sound/usb/mixer_scarlett2.c b/sound/usb/mixer_scarlett2.c
+--- a/sound/usb/mixer_scarlett2.c
++++ b/sound/usb/mixer_scarlett2.c
+@@ -2603,9 +2603,9 @@ static int scarlett2_usb_rx(struct usb_device *dev, int interface,
+ }
+ 
+ /* Send a proprietary format request to the Scarlett interface */
+-static int scarlett2_usb(
+-	struct usb_mixer_interface *mixer, u32 cmd,
+-	void *req_data, u16 req_size, void *resp_data, u16 resp_size)
++static int scarlett2_usb_nopm(struct usb_mixer_interface *mixer, u32 cmd,
++			      void *req_data, u16 req_size,
++			      void *resp_data, u16 resp_size)
+ {
+ 	struct scarlett2_data *private = mixer->private_data;
+ 	struct usb_device *dev = mixer->chip->dev;
+@@ -2713,6 +2713,18 @@ static int scarlett2_usb(
+ 	return err;
+ }
+ 
++static int scarlett2_usb(struct usb_mixer_interface *mixer, u32 cmd,
++			 void *req_data, u16 req_size,
++			 void *resp_data, u16 resp_size)
++{
++	CLASS(snd_usb_lock, pm)(mixer->chip);
++	if (pm.err < 0)
++		return -EIO;
++
++	return scarlett2_usb_nopm(mixer, cmd, req_data, req_size,
++				  resp_data, resp_size);
++}
++
+ /* Send a USB message to get data; result placed in *buf */
+ static int scarlett2_usb_get(
+ 	struct usb_mixer_interface *mixer,
+@@ -3020,9 +3032,21 @@ static int scarlett2_usb_set_config_buf(
+ /* Send SCARLETT2_USB_DATA_CMD SCARLETT2_USB_CONFIG_SAVE */
+ static void scarlett2_config_save(struct usb_mixer_interface *mixer)
+ {
+-	int err;
++	__le32 req = cpu_to_le32(SCARLETT2_USB_CONFIG_SAVE);
++	int err = scarlett2_usb(mixer, SCARLETT2_USB_DATA_CMD,
++				&req, sizeof(req), NULL, 0);
++
++	if (err < 0)
++		usb_audio_err(mixer->chip, "config save failed: %d\n", err);
++}
++
++/* The USB suspend callback must not acquire another PM reference. */
++static void scarlett2_config_save_nopm(struct usb_mixer_interface *mixer)
++{
++	__le32 req = cpu_to_le32(SCARLETT2_USB_CONFIG_SAVE);
++	int err = scarlett2_usb_nopm(mixer, SCARLETT2_USB_DATA_CMD,
++				     &req, sizeof(req), NULL, 0);
+ 
+-	err = scarlett2_usb_activate_config(mixer, SCARLETT2_USB_CONFIG_SAVE);
+ 	if (err < 0)
+ 		usb_audio_err(mixer->chip, "config save failed: %d\n", err);
+ }
+@@ -8639,7 +8663,7 @@ static void scarlett2_private_suspend(struct usb_mixer_interface *mixer)
+ 	struct scarlett2_data *private = mixer->private_data;
+ 
+ 	if (cancel_delayed_work_sync(&private->work))
+-		scarlett2_config_save(private->mixer);
++		scarlett2_config_save_nopm(private->mixer);
+ 
+ 	scarlett2_cleanup_urb(mixer);
+ }
+diff --git a/sound/usb/mixer_us16x08.c b/sound/usb/mixer_us16x08.c
+--- a/sound/usb/mixer_us16x08.c
++++ b/sound/usb/mixer_us16x08.c
+@@ -151,6 +151,9 @@ static const char *const route_names[] = {
+ static int snd_us16x08_recv_urb(struct snd_usb_audio *chip,
+ 	unsigned char *buf, int size)
+ {
++	CLASS(snd_usb_lock, pm)(chip);
++	if (pm.err < 0)
++		return -EIO;
+ 
+ 	guard(mutex)(&chip->mutex);
+ 	snd_usb_ctl_msg(chip->dev,
+@@ -165,6 +168,10 @@ static int snd_us16x08_recv_urb(struct snd_usb_audio *chip,
+  */
+ static int snd_us16x08_send_urb(struct snd_usb_audio *chip, char *buf, int size)
+ {
++	CLASS(snd_usb_lock, pm)(chip);
++	if (pm.err < 0)
++		return -EIO;
++
+ 	return snd_usb_ctl_msg(chip->dev, usb_sndctrlpipe(chip->dev, 0),
+ 			SND_US16X08_URB_REQUEST, SND_US16X08_URB_REQUESTTYPE,
+ 			0, 0, buf, size);
