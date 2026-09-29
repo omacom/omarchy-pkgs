@@ -1,34 +1,29 @@
 # Optional Cua Hyprland plugin
 
-This package targets **Omarchy x86_64**, with Inkscape `1.4.4-6` and two independent background-input lanes. Release `6` is an edge candidate for Aquamarine `0.15.1-1`; it retains the keyboard-remap patch introduced in release `5`, which includes the Omarchy patch for independent agent keymaps, operation-specific foreground checks, and compatible Num Lock state; the upstream native qualification below covers the unpatched source, not this change. Cua's native qualification is recorded in [the kit's qualification record](https://github.com/trycua/cua/releases/download/cua-hyprland-kit-v1.1.0-omarchy-stable-20260910/QUALIFICATION.md) and [Cua #3698](https://github.com/trycua/cua/pull/3698). Omabot replay and Omarchy's merge decision are recorded in [omarchy-pkgs #346](https://github.com/omacom/omarchy-pkgs/pull/346). Scheduling the recipe does not expand the qualified stable target.
+This package targets **Omarchy x86_64**, with Inkscape `1.4.4-6` and two independent background-input lanes. Release `0.28.2-2` is an edge candidate built from the plugin source published with Driver `0.28.2`, the version `cua-driver-bin` ships, for glibc `2.44+r50+g1848099f063e-1`; it retains the keyboard-remap patch introduced in release `0.26.1-5`, which includes the Omarchy patch for independent agent keymaps, operation-specific foreground checks, and compatible Num Lock state; the upstream native qualification below covers the unpatched source, not this change. Cua's native qualification is recorded in [the kit's qualification record](https://github.com/trycua/cua/releases/download/cua-hyprland-kit-v1.1.0-omarchy-stable-20260910/QUALIFICATION.md) and [Cua #3698](https://github.com/trycua/cua/pull/3698). Omabot replay and Omarchy's merge decision are recorded in [omarchy-pkgs #346](https://github.com/omacom/omarchy-pkgs/pull/346). Scheduling the recipe does not expand the qualified stable target.
 
 The plugin is optional. Cua Driver works independently, and installation does not load the plugin or enable input. The package follows the normal edge-to-RC-to-stable promotion path instead of the fast release ring. Its PKGBUILD limits builds to x86_64. The upstream qualification covers the original stable profile; the updated Aquamarine profile needs its own Omabot validation before promotion.
 
 ## Source and build profile
 
-The package uses the [Driver 0.26.1 plugin source](https://github.com/trycua/cua/releases/tag/cua-driver-rs-v0.26.1),
-including the [desktop-fault cleanup repair](https://github.com/trycua/cua/pull/3702).
-It is not a repackaging of the unmodified 0.24.0 plugin.
+The package uses the [Driver 0.28.2 plugin source](https://github.com/trycua/cua/releases/tag/cua-driver-rs-v0.28.2), including the [desktop-fault cleanup repair](https://github.com/trycua/cua/pull/3702). Every plugin file in it is byte-identical to the Driver 0.26.1 and 0.27.0 sources; only the release identity in `SOURCE-PROVENANCE.json` differs. It is not a repackaging of the unmodified 0.24.0 plugin.
 
-The qualified upstream Driver pairing is `cua-driver-bin 0.27.0-1`, with input protocol v3. Driver 0.27.0 contains the bounded stale-geometry retry validated with the upstream module; its production plugin source is the base for the downstream patch used here. Discovery protocol v2 is separate. A newer Driver release is a changed pairing and requires affected replay before promotion.
+The qualified upstream Driver pairing is `cua-driver-bin 0.27.0-1`, with input protocol v3. Driver 0.27.0 contains the bounded stale-geometry retry validated with the upstream module. This package pairs with `cua-driver-bin 0.28.2`, which speaks the same input protocol v3 to the same plugin source; Driver finds the plugin only through its versioned input socket, not through the plugin's provenance. Discovery protocol v2 is separate. The 0.28.2 pairing is a changed pairing and requires affected replay before promotion.
 
-Profile `omarchy-hypr0562r3-aq0151-remaps`, kit tooling `1.1.0`, and package release `6` pin:
+Profile `omarchy-edge-20260928-remaps`, kit tooling `1.1.0`, and package release `2` pin:
 
 - Hyprland `0.56.2-3`, headers `0.56.2`, and measured executable/header hashes.
 - GCC `16.2.1 20260810`, including compiler bytes and emitted ELF identity.
-- Shared runtime `libstdc++.so.6.0.36`, its bytes, and exact ABI package versions, including Aquamarine `0.15.1-1`.
+- Shared runtime `libstdc++.so.6.0.36`, its bytes, and exact ABI package versions, including Aquamarine `0.15.1-1` and glibc `2.44+r50+g1848099f063e-1`.
 
 This profile derives from Cua's `omarchy-stable-20260910` profile. Arch's
 Hyprland `-3` package splits out `hyprpm` and changes package dependencies;
 its compositor executable and all 498 header/pkg-config files are byte-identical
 to `-2`. Both executables have SHA-256
 `da8fcacf347bcbed83edc40108c6e2298da095e22246bd764e9bb382786cebb2`.
-The checked-in `PROFILE.json` changes only the profile name, package release, and exact Hyprland and Aquamarine package versions. Compiler, libstdc++ runtime, upstream source, compositor executable, and header identities remain unchanged; the separately recorded patch changes the build source. The download wrapper verifies the
-original kit before deriving the updated profile, recipe, and provenance,
-then verifies every derived member against its recorded digest.
+The checked-in `PROFILE.json` changes only the profile name, package release, source release, and exact Hyprland, Aquamarine and glibc package versions. Compiler, libstdc++ runtime, compositor executable, and header identities remain unchanged; the separately recorded patch changes the build source. The download wrapper verifies the original kit and the Driver 0.28.2 source archive before substituting that archive and its manifest into the kit, deriving the updated profile and provenance, and rendering the recipe from the kit's own `PROFILE-PKGBUILD.in`. It then verifies every derived member against its recorded digest, so the result is the kit Cua's `profile_verify.py` accepts as complete for this profile.
 
-The native qualification below was recorded with package release `2` and
-Hyprland `-2`. The downstream keymap change and Aquamarine update need their own application and Driver replay before promotion. Hyprland `0.56.2-3` and Aquamarine `0.15.1-1` must both reach a destination channel before this artifact can be installed there; publication still follows edge → RC → stable.
+The native qualification below was recorded with package `0.26.1-2` and Hyprland `-2`. The downstream keymap change, the Aquamarine and glibc updates, and the Driver 0.28.2 pairing need their own application and Driver replay before promotion. Hyprland `0.56.2-3`, Aquamarine `0.15.1-1` and glibc `2.44+r50+g1848099f063e-1` must all reach a destination channel before this artifact can be installed there; publication still follows edge → RC → stable.
 
 The generated `PKGBUILD` identifies the immutable kit download, outer checksum,
 and member checksums. The kit records the full source and tooling revisions,
@@ -45,9 +40,9 @@ Production input is built in; experimental signed input and tracing are off.
 
 The pristine upstream archive, manifest, and verifier remain unchanged. `independent-keymaps.patch` is applied to a separate source tree, and `DOWNSTREAM-PROVENANCE.json` pins the patch and every resulting source file. Build, check, and package revalidate both trees, including when makepkg integrity checks are skipped. `BUILD-PROVENANCE.json` records the upstream base under `source`, the applied change under `downstream`, and the final module digest; the downstream manifest and patch are installed beside it. This preserves the existing compiler, headers, runtime, and consumer checks without representing the modified module as an unmodified upstream build.
 
-## Aquamarine dependency refresh
+## Dependency refresh
 
-Release `5` required Aquamarine `0.15.0-2`. When the edge mirror moved to `0.15.1-1`, pacman could no longer resolve that dependency, even after a full database refresh. Release `6` derives a new profile from the same verified upstream kit and pins `0.15.1-1` in both the package dependencies and the installed compatibility verifier. Source, patch, compiler, compositor, headers, and libstdc++ hashes remain pinned; the original upstream qualification does not establish compatibility with the changed Aquamarine package.
+Every ABI package is pinned exactly, so an Arch update to any of them makes the published plugin uninstallable until a new profile lands. Release `0.26.1-5` required Aquamarine `0.15.0-2` and stopped resolving when the mirror moved to `0.15.1-1`; release `0.26.1-6` required glibc `2.44+r24+g16be1518495f-1` and stopped resolving when core moved to `2.44+r50+g1848099f063e-1`. In both cases pacman refuses the plugin with `unable to satisfy dependency`, even after a full database refresh. Release `0.28.2-2` derives a new profile from the same verified upstream kit and pins the current versions in both the package dependencies and the installed compatibility verifier. Patch, compiler, compositor, headers, and libstdc++ hashes remain pinned; the original upstream qualification does not establish compatibility with the changed Aquamarine or glibc packages.
 
 A package release bump alone cannot repair future dependency drift: the checked-in profile and derived kit checksums must agree with the new environment, and affected native checks must pass before publication. Do not remove exact dependencies or selectively downgrade a library to bypass a mismatch.
 
@@ -88,7 +83,7 @@ released Driver binary SHA-256
 `bb1b65394e912246220f9f758c9efbbf6260cec16e3562e62a361fa95329377f`,
 and evidence SHA-256
 `b6c47278a3db398ecbb4d7aed2bce44a467e2af37e6d4ccfc236d1e07aa70af7`.
-See the linked qualification record and PR description for exact artifacts and observation limits. Omarchy replay of the 0.27.0 package pairing is recorded in #346; it does not qualify later Driver releases.
+See the linked qualification record and PR description for exact artifacts and observation limits. Omarchy replay of the 0.27.0 package pairing is recorded in #346; it does not qualify later Driver releases, including 0.28.2.
 
 Duplicate motion notifications are retained and counted. They are acceptable
 only when pointer identity, coordinates, focus, held input, and foreground
@@ -145,7 +140,7 @@ kit-provenance digest:
 ```sh
 python3 /usr/share/cua-hyprland-plugin/profile_verify.py \
   --kit /usr/share/cua-hyprland-plugin \
-  --kit-sha256 819779b93655d603d9ebb0d33ea052326c3374674a1d473886106af25e0fffdd \
+  --kit-sha256 593e0b59f4d50059e30d32d5f6ac1472862dd17a573229cfbfbda74779fb8f82 \
   --consumer /usr/lib/cua/hyprland/cua-hyprland-plugin.so
 ```
 
