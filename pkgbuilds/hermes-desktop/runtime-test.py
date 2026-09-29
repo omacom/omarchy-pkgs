@@ -32,6 +32,8 @@ Path(os.environ["TEST_OUTPUT"]).write_text(json.dumps({
     "ozone": os.environ.get("ELECTRON_OZONE_PLATFORM_HINT"),
     "cwd": os.environ.get("HERMES_DESKTOP_CWD"),
     "a11y": os.environ.get("HERMES_DESKTOP_RENDERER_ACCESSIBILITY"),
+    "ignore": os.environ.get("HERMES_DESKTOP_IGNORE_EXISTING"),
+    "root": os.environ.get("HERMES_DESKTOP_HERMES_ROOT"),
     "inherited": [name for name in ("ELECTRON_RUN_AS_NODE", "PYTHONPATH", "PYTHONHOME") if name in os.environ],
 }))
 ''')
@@ -90,17 +92,21 @@ def with_hermes_node_path(env=None):
     launch = ["bash", str(launcher.resolve())]
 
     def check_launch(args=(), overrides=None, expected_args=(), store="gnome-libsecret", gpu=None, ozone=None,
-                     a11y=None):
+                     a11y=None, ignore=None):
         subprocess.run(launch + list(args), env={**env, **(overrides or {})}, cwd=home, check=True)
         result = json.loads(output.read_text())
         assert result == {"args": ["--disable-setuid-sandbox", *expected_args],
                           "home": str(home / ".hermes"), "store": store, "gpu": gpu,
-                          "ozone": ozone, "cwd": str(home), "a11y": a11y, "inherited": []}, result
+                          "ozone": ozone, "cwd": str(home), "a11y": a11y, "ignore": ignore, "root": None,
+                          "inherited": []}, result
         assert not forbidden_output.exists(), "launcher invoked the Omarchy installer or sudo"
         output.unlink()
 
     wayland = {"WAYLAND_DISPLAY": "wayland-1"}
     check_launch(overrides=wayland, expected_args=["--ozone-platform=wayland"])
+    # The runtime's own app finds its runtime unaided; an explicit request to skip it still passes through.
+    check_launch(overrides={**wayland, "HERMES_DESKTOP_IGNORE_EXISTING": "1"},
+                 expected_args=["--ozone-platform=wayland"], ignore="1")
     url = "hermes://open?text=a%20b"
     check_launch(["--ozone-platform=x11", url], {**wayland, "HERMES_DESKTOP_PASSWORD_STORE": "kwallet6"},
                  ["--ozone-platform=x11", url], store="kwallet6")
@@ -164,11 +170,15 @@ def _desktop_launch_options():
     fallback_launcher.write_text(launcher.read_text().replace("/opt/hermes-desktop/Hermes", str(fallback)))
     launch = ["bash", str(fallback_launcher)]
     executable.unlink()
-    check_launch([url], wayland, ["--ozone-platform=wayland", url])
+    # Only the packaged app is told to skip an existing Hermes, unless the environment already says.
+    check_launch([url], wayland, ["--ozone-platform=wayland", url], ignore="1")
+    check_launch([url], {**wayland, "HERMES_DESKTOP_IGNORE_EXISTING": "0"}, ["--ozone-platform=wayland", url],
+                 ignore="0")
     (module / "main_desktop.py").write_text('raise ImportError("incomplete Python dependencies")\n')
-    check_launch([url], wayland, ["--ozone-platform=wayland", url])
+    check_launch([url], wayland, ["--ozone-platform=wayland", url], ignore="1")
     shutil.rmtree(runtime / "venv")
-    check_launch(overrides={"ELECTRON_RUN_AS_NODE": "1", "PYTHONPATH": "/invalid", "PYTHONHOME": "/invalid"})
+    check_launch(overrides={"ELECTRON_RUN_AS_NODE": "1", "PYTHONPATH": "/invalid", "PYTHONHOME": "/invalid"},
+                 ignore="1")
     check_namespace_failure()
 
     gate = ["bash", str(destination), "--self-test-gate", "--install-root", str(runtime),
