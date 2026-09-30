@@ -177,6 +177,7 @@ in `origin` and has no effect on release selection.
 | `elephant-todo` | github | [abenz1267/elephant](https://github.com/abenz1267/elephant) |
 | `elephant-unicode` | github | [abenz1267/elephant](https://github.com/abenz1267/elephant) |
 | `elephant-websearch` | github | [abenz1267/elephant](https://github.com/abenz1267/elephant) |
+| `grok-bot` | regex | [https://api2.cursor.sh/updates/api/update/linux-x64/sand/0.0.0/00000000-0000-0000-0000-000000000000/stable](https://api2.cursor.sh/updates/api/update/linux-x64/sand/0.0.0/00000000-0000-0000-0000-000000000000/stable) |
 | `heroic-games-launcher-bin` | github | [Heroic-Games-Launcher/HeroicGamesLauncher](https://github.com/Heroic-Games-Launcher/HeroicGamesLauncher) |
 | `hyprshade` | pypi | [hyprshade](https://pypi.org/project/hyprshade/) |
 | `lib32-nvidia-580xx-utils` | regex | [https://download.nvidia.com/XFree86/Linux-x86_64/](https://download.nvidia.com/XFree86/Linux-x86_64/) |
@@ -221,7 +222,7 @@ in `origin` and has no effect on release selection.
 
 ## Existing manual holds
 
-`grok-bot`, `libfprint-git`, `libretro-cap32-git`, `libretro-database-git`, `libretro-fbneo-git`, `libretro-uae-git`, `libretro-vice-git`, `quickshell-git`, `supergfxctl`.
+`libfprint-git`, `libretro-cap32-git`, `libretro-database-git`, `libretro-fbneo-git`, `libretro-uae-git`, `libretro-vice-git`, `quickshell-git`, `supergfxctl`.
 
 These packages were already excluded from automatic AUR updates. The migration preserves that policy.
 
