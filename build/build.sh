@@ -448,6 +448,21 @@ build_package() {
     return 0
   else
     echo "    Makepkg failed for $pkg"
+    # makepkg runs check() inside this container and meson writes each test's
+    # output under the build tree, which --rm discards on exit. Only
+    # /build-output is bind-mounted back to the host, so copy any test logs
+    # there. Without this a failing test leaves nothing but a summary line,
+    # and an arch-specific failure cannot be diagnosed from CI.
+    local log_root="/build-output/test-logs/$pkg"
+    local log_file rel
+    while IFS= read -r log_file; do
+      rel=${log_file#./}
+      mkdir -p "$log_root/$(dirname "$rel")" || continue
+      cp "$log_file" "$log_root/$rel" 2>/dev/null || true
+    done < <(find . -type f -path '*/meson-logs/*' 2>/dev/null)
+    if [[ -d $log_root ]]; then
+      echo "    Test logs copied to build-output/test-logs/$pkg"
+    fi
     echo "    DEBUG: Files in build directory:"
     ls -lah *.pkg.tar.* 2>&1 | head -20 || echo "    No package files found"
     return 1
