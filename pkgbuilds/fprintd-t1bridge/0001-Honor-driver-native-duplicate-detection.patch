@@ -1,0 +1,207 @@
+diff --git a/src/device.c b/src/device.c
+index 4de4a10..53faff7 100644
+--- a/src/device.c
++++ b/src/device.c
+@@ -317,8 +317,9 @@ on_nr_enroll_stages_changed (FprintDevice *rdev,
+ 
+   nr_enroll_stages = fp_device_get_nr_enroll_stages (device);
+ 
+-  /* One extra step for our internal identification. */
+-  if (fp_device_has_feature (device, FP_DEVICE_FEATURE_IDENTIFY))
++  /* One extra step only when fprintd performs its own identification. */
++  if (fp_device_has_feature (device, FP_DEVICE_FEATURE_IDENTIFY) &&
++      !fp_device_has_feature (device, FP_DEVICE_FEATURE_DUPLICATES_CHECK))
+     nr_enroll_stages += 1;
+ 
+   g_debug ("Device %s enroll stages changed to %d",
+@@ -2236,7 +2237,8 @@ fprint_device_enroll_start (FprintDBusDevice      *dbus_dev,
+                    clear_err->message);
+     }
+ 
+-  if (fp_device_has_feature (priv->dev, FP_DEVICE_FEATURE_IDENTIFY))
++  if (fp_device_has_feature (priv->dev, FP_DEVICE_FEATURE_IDENTIFY) &&
++      !fp_device_has_feature (priv->dev, FP_DEVICE_FEATURE_DUPLICATES_CHECK))
+     {
+       g_autoptr(GPtrArray) all_prints = load_all_prints (rdev);
+ 
+@@ -2261,9 +2263,10 @@ fprint_device_enroll_start (FprintDBusDevice      *dbus_dev,
+       /* We may still want to try to use verification to check for duplicates
+        * if only one fingerprint was previously enrolled, or add more verify
+        * stages up to a predefined limit */
+-      g_warning ("Device %s does not support duplicate identification and so "
+-                 "fprintd duplicate detection won't work",
+-                 fp_device_get_name (priv->dev));
++      if (!fp_device_has_feature (priv->dev, FP_DEVICE_FEATURE_DUPLICATES_CHECK))
++        g_warning ("Device %s does not support duplicate identification and so "
++                   "fprintd duplicate detection won't work",
++                   fp_device_get_name (priv->dev));
+       enroll_start (rdev);
+     }
+ 
+diff --git a/tests/fprintd.py b/tests/fprintd.py
+--- a/tests/fprintd.py
++++ b/tests/fprintd.py
+@@ -603,6 +603,7 @@
+     device_driver = 'virtual_image'
+     driver_name = 'Virtual image device for debugging'
+     has_identification = True
++    has_native_duplicate_detection = False
+ 
+ class FPrintdVirtualDeviceBaseTest(FPrintdVirtualImageDeviceBaseTests):
+ 
+@@ -900,6 +901,7 @@
+     device_driver = 'virtual_device_storage'
+     driver_name = 'Virtual device with storage and identification for debugging'
+     enroll_stages = 2
++    has_native_duplicate_detection = True
+ 
+     def _send_command(self, con, command, *args):
+         params = ' '.join(str(p) for p in args)
+@@ -962,11 +964,13 @@
+     def _maybe_reduce_enroll_stages(self, stages=-1):
+         # Reduce the number of default enroll stages, we can go a bit faster
+         stages = stages if stages > 0 else self.enroll_stages
+-        if self.has_identification:
++        if self.has_identification and not self.has_native_duplicate_detection:
+             stages += 1 # Adding the extra stage for duplicates-check
+         if self.num_enroll_stages == stages:
+             return
+-        device_stages = stages -1 if self.has_identification else stages
++        device_stages = stages
++        if self.has_identification and not self.has_native_duplicate_detection:
++            device_stages -= 1
+         self.send_command('SET_ENROLL_STAGES', device_stages)
+         while self.num_enroll_stages != stages:
+             ctx.iteration(True)
+@@ -987,6 +991,10 @@
+         self.try_release()
+         super().tearDown()
+ 
++    def test_native_duplicate_detection_uses_device_stage_count(self):
++        self._maybe_reduce_enroll_stages()
++        self.assertEqual(self.num_enroll_stages, self.enroll_stages)
++
+     def test_garbage_collect(self):
+         # We expect collection in this order
+         garbage_collect = [
+@@ -1034,7 +1042,7 @@
+         garbage_collect.pop()
+         self.assertEqual(set(prints), set(garbage_collect + list(enrolled_prints.keys())))
+ 
+-    def test_garbage_collect_on_duplicate(self):
++    def test_native_duplicate_preserves_untracked_print(self):
+         self._maybe_reduce_enroll_stages(stages=1)
+         self.send_command('INSERT', 'stored-print')
+         self.device.Release()
+@@ -1043,30 +1051,12 @@
+         self.assertEqual(self.get_stored_prints(), ['stored-print'])
+         # Device supports listing, so no initial cleanup
+         self.device.EnrollStart('(s)', 'right-thumb')
+-        self.send_image('stored-print')  # During identify
+-        self.wait_for_result('enroll-stage-passed')
+-        self.assertFalse(self.get_stored_prints())
+-
+         self.send_image('stored-print')
+-        self.wait_for_result('enroll-completed')  # During enroll
+-        self.assertEqual(self.get_stored_prints(), ['stored-print'])
+-        self.device.EnrollStop()
+-
+-    def test_garbage_collect_failed_on_duplicate(self):
+-        self._maybe_reduce_enroll_stages(stages=1)
+-        self.send_command('INSERT', 'stored-print')
+-        self.device.Release()
+-        self.device.Claim('(s)', 'testuser')
+-
+-        self.assertEqual(self.get_stored_prints(), ['stored-print'])
+-        # Device supports listing, so no initial cleanup
+-        self.device.EnrollStart('(s)', 'right-thumb')
+-        self.send_image('stored-print')  # During identify
+-        self.send_error(FPrint.DeviceError.PROTO)  # During garbage collecting
+         self.wait_for_result('enroll-duplicate')
+         self.assertEqual(self.get_stored_prints(), ['stored-print'])
+-
+         self.device.EnrollStop()
++        with self.assertFprintError('NoEnrolledPrints'):
++            self.device.ListEnrolledFingers('(s)', 'testuser')
+ 
+     def test_delete(self):
+         # We expect collection in this order
+@@ -1159,6 +1149,57 @@
+             self.assertIn({'scan-type': scan_type}, self._changed_properties)
+             self.assertEqual(self.device.get_cached_property('scan-type').unpack(), scan_type)
+ 
++class FPrintdVirtualStorageSoftwareDuplicateTests(FPrintdVirtualStorageDeviceBaseTest):
++
++    socket_env = 'FP_VIRTUAL_DEVICE_STORAGE_NO_DUPLICATES_CHECK'
++    has_native_duplicate_detection = False
++
++    def setUp(self):
++        super().setUp()
++        self.device.Claim('(s)', 'testuser')
++
++    def tearDown(self):
++        self.try_release()
++        super().tearDown()
++
++    def test_software_duplicate_detection_adds_one_stage(self):
++        self._maybe_reduce_enroll_stages()
++        self.assertEqual(self.num_enroll_stages, self.enroll_stages + 1)
++
++    def test_garbage_collect_on_duplicate(self):
++        self._maybe_reduce_enroll_stages(stages=1)
++        self.send_command('INSERT', 'stored-print')
++        self.device.Release()
++        self.device.Claim('(s)', 'testuser')
++
++        self.assertEqual(self.get_stored_prints(), ['stored-print'])
++        # Device supports listing, so no initial cleanup
++        self.device.EnrollStart('(s)', 'right-thumb')
++        self.send_image('stored-print')  # During identify
++        self.wait_for_result('enroll-stage-passed')
++        self.assertFalse(self.get_stored_prints())
++
++        self.send_image('stored-print')
++        self.wait_for_result('enroll-completed')  # During enroll
++        self.assertEqual(self.get_stored_prints(), ['stored-print'])
++        self.device.EnrollStop()
++
++    def test_garbage_collect_failed_on_duplicate(self):
++        self._maybe_reduce_enroll_stages(stages=1)
++        self.send_command('INSERT', 'stored-print')
++        self.device.Release()
++        self.device.Claim('(s)', 'testuser')
++
++        self.assertEqual(self.get_stored_prints(), ['stored-print'])
++        # Device supports listing, so no initial cleanup
++        self.device.EnrollStart('(s)', 'right-thumb')
++        self.send_image('stored-print')  # During identify
++        self.send_error(FPrint.DeviceError.PROTO)  # During garbage collecting
++        self.wait_for_result('enroll-duplicate')
++        self.assertEqual(self.get_stored_prints(), ['stored-print'])
++
++        self.device.EnrollStop()
++
+ class FPrintdVirtualStorageNoListDeviceTests(FPrintdVirtualStorageDeviceBaseTest):
+ 
+     socket_env = 'FP_VIRTUAL_DEVICE_STORAGE_NO_LIST'
+@@ -1310,7 +1351,8 @@
+             self.driver_name)
+ 
+     def test_enroll_stages_property(self):
+-        self.assertEqual(self.device.get_cached_property('num-enroll-stages').unpack(), 6)
++        expected = 5 if self.has_native_duplicate_detection else 6
++        self.assertEqual(self.device.get_cached_property('num-enroll-stages').unpack(), expected)
+ 
+     def test_scan_type(self):
+         self.assertEqual(self.device.get_cached_property('scan-type').unpack(),
+@@ -3332,9 +3374,6 @@
+ 
+         self.send_image('print-id')
+         out.check_line('Enroll result: enroll-stage-passed', get_timeout())
+-
+-        self.send_image('print-id')
+-        out.check_line('Enroll result: enroll-stage-passed', get_timeout())
+ 
+         self.send_image('print-id')
+         out.check_line('Enroll result: enroll-stage-passed', get_timeout())
+ 
