@@ -3,6 +3,7 @@ import ast
 import json
 import os
 from pathlib import Path
+import shlex
 import shutil
 import subprocess
 import sys
@@ -152,6 +153,58 @@ def _desktop_launch_options():
     check_launch(overrides={**wayland, "HERMES_DESKTOP_DISABLE_GPU": "0"},
                  expected_args=["--ozone-platform=wayland"], gpu="0")
     (module / "main_desktop.py").write_text(helper)
+
+    # Current runtimes have no venv in the checkout. Their multi-line CLI shim
+    # exposes the store interpreter through --print-runtime-command, while the
+    # committed environment carries the dependencies needed to read settings.
+    shutil.move(runtime / "venv", root / "legacy-venv")
+    store_python = home / ".hermes/tools/python/abc/bin/python3"
+    store_python.parent.mkdir(parents=True)
+    store_python.symlink_to(sys.executable)
+    environment = home / ".hermes/installs/abc/environments/def/venv"
+    interpreter = environment / "bin/python"
+    interpreter.parent.mkdir(parents=True)
+    interpreter.symlink_to(sys.executable)
+    (environment / "pyvenv.cfg").write_text(f"home = {Path(sys.executable).parent}\n")
+    site_packages = environment / f"lib/python{sys.version_info.major}.{sys.version_info.minor}/site-packages"
+    site_packages.mkdir(parents=True)
+    (site_packages / "runtime_dependency.py").write_text("available = True\n")
+    (module / "config.py").write_text("""import json, os
+from pathlib import Path
+from runtime_dependency import available
+def load_config():
+    assert available
+    path = Path(os.environ["HERMES_HOME"], "config.yaml")
+    return json.loads(path.read_text()) if path.exists() else {}
+""")
+    pm = runtime / "pm"
+    pm.mkdir()
+    (pm / "__init__.py").touch()
+    (pm / "environments.py").write_text(
+        "from pathlib import Path\n"
+        f"def committed_venv(project_root): return Path({str(environment)!r})\n")
+    command = [str(store_python), "-I", "-c", "import sys"]
+    bootstrap = ("import json, sys\n"
+                 "if sys.argv[1:] == ['--print-runtime-command']:\n"
+                 f"    print(json.dumps({command!r}))\n"
+                 "else:\n"
+                 "    raise SystemExit('unexpected CLI invocation')")
+    shim = runtime / ".hermes/bin/hermes"
+    shim.parent.mkdir(parents=True)
+    shim.write_text(f'#!/bin/sh\nexec {shlex.join([str(store_python), "-I", "-c", bootstrap])} "$@"\n')
+    shim.chmod(0o755)
+    config.write_text(json.dumps({"desktop": {"disable_gpu": True}}))
+    check_launch(overrides=wayland, expected_args=["--ozone-platform=wayland"], gpu="1")
+    shutil.rmtree(runtime / ".hermes")
+    shutil.rmtree(pm)
+    config.unlink()
+    (module / "config.py").write_text("""import json, os
+from pathlib import Path
+def load_config():
+    path = Path(os.environ["HERMES_HOME"], "config.yaml")
+    return json.loads(path.read_text()) if path.exists() else {}
+""")
+    shutil.move(root / "legacy-venv", runtime / "venv")
 
     def check_namespace_failure():
         for code in ("1", "127"):
