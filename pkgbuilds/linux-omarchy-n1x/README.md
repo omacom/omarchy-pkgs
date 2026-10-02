@@ -2,7 +2,7 @@
 
 The `linux-omarchy` kernel built for aarch64 with NVIDIA N1x (RTX Spark) platform support added. It carries the same kernel.org source and signed Omarchy patch set as `linux-omarchy` (currently 7.2.5-6), plus N1x topic patches numbered 1000 and up. The intent is to fold these into `linux-omarchy` itself once it builds for aarch64; until then this package replaces NVIDIA's 7.0-based `linux-n1x` on N1x machines.
 
-The `pkgrel` tracks `linux-omarchy`: `6.2` is the second N1x revision on top of `linux-omarchy` 7.2.5-6.
+The `pkgrel` tracks `linux-omarchy`: `6.4` is the fourth N1x revision on top of `linux-omarchy` 7.2.5-6.
 
 ## N1x patches
 
@@ -14,12 +14,14 @@ Patches 1000–1040 are NVIDIA's SAUCE from `Ubuntu-nvidia-7.0-7.0.0-1021.21_24.
 - `1030-n1x-audio.patch` - MT8901 SoundWire and ASoC (CS42L43 + CS35L56 on the ASUS ProArt P14), plus a fix for 7.2's `asoc_sdw_parse_sdw_endpoints()` signature
 - `1040-n1x-gpu-iommu.patch` - DMA-mode SMMU domains for the integrated GPU (10de:2e00–2e3f); without them GSP fails to boot and the screen stays black
 
+`1050-efi-add-efi_reclaim_reserved-to-use-idle-reserved-memory-as-RAM.patch` is our own: the N1x firmware reserves tens of GiB as the GPU's dedicated memory under Windows (62.5 GiB on the 128 GB ProArt P14), which Linux's driver never uses. `efi_reclaim_reserved=<size>@<start>,...` hands named ranges of it to the kernel, and is ignored unless each range is still entirely reserved, writeback-capable memory. Omarchy sets it per model from `install/hardware`.
+
 SAUCE that was left out:
 
 - `serial: 8250_mtk: Add ACPI support`, the MT7925 CSA patch and the four cpufreq QoS patches are superseded by 7.2
 - the ACPI `_LPI` hierarchical idle series (SAUCE 0039–0054 and 0067–0069) is deferred until it is ported to 7.2. Without it, CPU idle uses the flat LPI states only
 
-Patches 1100–1103 are for the ASUS ProArt P14 (H7407BA) keyboard, 0B05:4B42: the upstream Zenbook A16 support (Fn keys), a keyboard backlight LED for systems without asus-wmi, host-controlled Fn-lock, and turning off the keyboard's OOBE mode, which otherwise keeps fading the backlight in and out.
+Patches 1100–1104 are for the ASUS ProArt P14 (H7407BA) keyboard, 0B05:4B42: the upstream Zenbook A16 support (Fn keys), a keyboard backlight LED for systems without asus-wmi, host-controlled Fn-lock, turning off the keyboard's OOBE mode, which otherwise keeps fading the backlight in and out, and turning the backlight off for sleep.
 
 ## Config
 
@@ -37,6 +39,6 @@ The build produces only `Image` and modules; N1x boots through ACPI and the pack
 
 ## Validation
 
-7.2.5-6.2 on the ASUS ProArt P14 H7407BA with `nvidia-open-dkms` 615.71.09 (2026-10-02): LUKS unlock at Plymouth, internal display and brightness, CUDA, keyboard (Fn keys, backlight, Fn-lock), touchpad, speakers, headphones and microphones, battery and AC, Wi-Fi and Bluetooth, webcam.
+7.2.5-6.4 on the ASUS ProArt P14 H7407BA with `nvidia-open-dkms` 615.71.09 (2026-10-02): LUKS unlock at Plymouth, internal display and brightness, CUDA, keyboard (Fn keys, backlight, Fn-lock), touchpad, speakers, headphones and microphones, battery and AC, Wi-Fi and Bluetooth, webcam, 122 GiB of RAM with `efi_reclaim_reserved=` (the reclaimed ranges kept a written pattern through display, 16 GiB of CUDA work and suspend-to-idle), suspend-to-idle.
 
-Not yet validated: suspend and resume, external displays and USB-C (UCSI fails to initialize its PPM), warm reboot loops.
+Not yet validated: lid-driven suspend and battery drain while suspended, external displays and USB-C (UCSI fails to initialize its PPM), warm reboot loops. The firmware's `deep` sleep returns at once, so Omarchy defaults these machines to `s2idle`.
