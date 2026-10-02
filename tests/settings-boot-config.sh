@@ -102,6 +102,8 @@ for recipe in omarchy-settings omarchy-settings-dev; do
       fi
       # The installer owns the machine-specific live configuration.
       [[ ! -e $pkgdir/etc/default/limine ]]
+      # Older pinned runtime sources have no docked lid unit yet.
+      [[ ! -e $pkgdir/usr/lib/systemd/system/omarchy-docked-lid-inhibit.service ]]
       if printf '%s\n' "${backup[@]}" | grep -Fxq 'etc/default/limine'; then
         echo 'FAIL: installer-owned Limine configuration is in backup metadata' >&2
         exit 1
@@ -126,6 +128,42 @@ for recipe in omarchy-settings omarchy-settings-dev; do
     )
   done
 done
+
+# New runtime sources ship the live definition as a vendor unit. Exercise both
+# recipes and two revisions to ensure a package update replaces that definition
+# without writing an administrator override or activating the service.
+lid_unit=omarchy-docked-lid-inhibit.service
+mkdir -p "$fixture/default/systemd/system"
+for revision in 10 15; do
+  cat >"$fixture/default/systemd/system/$lid_unit" <<UNIT
+[Unit]
+Description=Docked lid packaging fixture
+[Service]
+Type=notify
+NotifyAccess=all
+TimeoutStartSec=$revision
+ExecStart=/usr/bin/omarchy-system-docked-lid-inhibit
+[Install]
+WantedBy=graphical.target
+UNIT
+  for recipe in omarchy-settings omarchy-settings-dev; do
+    (
+      export CARCH=x86_64 OMARCHY_SRC=$fixture srcdir=$scratch/src pkgdir=$scratch/lid-$recipe
+      backup=()
+      source "$BUILD_ROOT/pkgbuilds/$recipe/PKGBUILD"
+      package
+      cmp "$fixture/default/systemd/system/$lid_unit" "$pkgdir/usr/lib/systemd/system/$lid_unit"
+      [[ $(stat -c %a "$pkgdir/usr/lib/systemd/system/$lid_unit") == 644 ]]
+      [[ ! -e $pkgdir/etc/systemd/system/$lid_unit ]]
+      if printf '%s\n' "${backup[@]}" | grep -Fq "$lid_unit"; then
+        echo 'FAIL: the vendor unit must update rather than become a backup file' >&2
+        exit 1
+      fi
+    )
+  done
+done
+rm "$fixture/default/systemd/system/$lid_unit"
+echo 'PASS: stable and development settings package and update the vendor lid unit'
 
 # The aarch64 packages also reach Apple Silicon Macs, whose initramfs needs the
 # asahi hook. Source mkinitcpio.conf and the drop-ins in mkinitcpio's order and
