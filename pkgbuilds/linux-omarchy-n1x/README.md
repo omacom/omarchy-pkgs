@@ -2,7 +2,7 @@
 
 The `linux-omarchy` kernel built for aarch64 with NVIDIA N1x (RTX Spark) platform support added. It carries the same kernel.org source and signed Omarchy patch set as `linux-omarchy` (currently 7.2.5-6), plus N1x topic patches numbered 1000 and up. The intent is to fold these into `linux-omarchy` itself once it builds for aarch64; until then this package replaces NVIDIA's 7.0-based `linux-n1x` on N1x machines.
 
-The `pkgrel` tracks `linux-omarchy`: `6.4` is the fourth N1x revision on top of `linux-omarchy` 7.2.5-6.
+The `pkgrel` tracks `linux-omarchy`: `6.5` is the fifth N1x revision on top of `linux-omarchy` 7.2.5-6.
 
 ## N1x patches
 
@@ -15,6 +15,8 @@ Patches 1000–1040 are NVIDIA's SAUCE from `Ubuntu-nvidia-7.0-7.0.0-1021.21_24.
 - `1040-n1x-gpu-iommu.patch` - DMA-mode SMMU domains for the integrated GPU (10de:2e00–2e3f); without them GSP fails to boot and the screen stays black
 
 `1050-efi-add-efi_reclaim_reserved-to-use-idle-reserved-memory-as-RAM.patch` is our own: the N1x firmware reserves tens of GiB as the GPU's dedicated memory under Windows (62.5 GiB on the 128 GB ProArt P14), which Linux's driver never uses. `efi_reclaim_reserved=<size>@<start>,...` hands named ranges of it to the kernel, and is ignored unless each range is still entirely reserved, writeback-capable memory. Omarchy sets it per model from `install/hardware`.
+
+`1060-ASoC-mediatek-mt8901-give-the-card-the-ACPI-subsystem-ID.patch` is also our own. Cirrus CS35L56 amplifiers name their DSP firmware and speaker tuning after the sound card's PCI subsystem ID, which the ACPI-enumerated MT8901 card does not have, so they ran on ROM defaults: quiet and unvoiced. The patch reads the SoundWire controller's `_SUB` (written device ID first, `33A11043` on the ProArt P14) and passes it to the card, so the amplifiers request `cs35l56-b0-dsp1-misc-104333a1-spkid0*`. Those files are not in linux-firmware yet.
 
 SAUCE that was left out:
 
@@ -39,6 +41,6 @@ The build produces only `Image` and modules; N1x boots through ACPI and the pack
 
 ## Validation
 
-7.2.5-6.4 on the ASUS ProArt P14 H7407BA with `nvidia-open-dkms` 615.71.09 (2026-10-02): LUKS unlock at Plymouth, internal display and brightness, CUDA, keyboard (Fn keys, backlight, Fn-lock), touchpad, speakers, headphones and microphones, battery and AC, Wi-Fi and Bluetooth, webcam, 122 GiB of RAM with `efi_reclaim_reserved=` (the reclaimed ranges kept a written pattern through display, 16 GiB of CUDA work and suspend-to-idle), suspend-to-idle.
+7.2.5-6.5 on the ASUS ProArt P14 H7407BA with `nvidia-open-dkms` 615.71.09 (2026-10-02): LUKS unlock at Plymouth, internal display and brightness, CUDA, keyboard (Fn keys, backlight, Fn-lock), touchpad, speakers, headphones and microphones, battery and AC, Wi-Fi and Bluetooth, webcam, 122 GiB of RAM with `efi_reclaim_reserved=` (the reclaimed ranges kept a written pattern through display, 16 GiB of CUDA work and suspend-to-idle), suspend-to-idle.
 
 Not yet validated: lid-driven suspend and battery drain while suspended, external displays and USB-C (UCSI fails to initialize its PPM), warm reboot loops. The firmware's `deep` sleep returns at once, so Omarchy defaults these machines to `s2idle`.
