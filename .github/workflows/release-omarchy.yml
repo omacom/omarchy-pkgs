@@ -1,0 +1,100 @@
+name: Release Omarchy
+
+# Cuts the omarchy + omarchy-settings release pair automatically when a new
+# release tag appears on basecamp/omarchy. Tagging upstream is the human act;
+# this workflow runs `bin/omarchy-pkgs release latest` and pushes the PKGBUILD
+# bump to master, where the build host's 6-hourly auto-release timer picks it
+# up and publishes to edge. Promoting a final to stable stays manual
+# (`bin/repo migrate`).
+
+on:
+  schedule:
+    # Hourly tag poll. End-to-end latency is dominated by the build host's
+    # 6-hourly timer, so polling faster buys nothing.
+    - cron: '15 * * * *'
+  workflow_dispatch:
+    inputs:
+      target:
+        description: 'Release target (latest, vX.Y.Z, or vX.Y.Z-rcN)'
+        required: false
+        default: 'latest'
+  repository_dispatch:
+    types: [omarchy-release]
+
+concurrency:
+  group: release-omarchy
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: master
+
+      - name: Cut release
+        env:
+          TARGET: ${{ github.event.inputs.target || github.event.client_payload.target || 'latest' }}
+        run: |
+          docker run --rm \
+            -e TARGET="$TARGET" \
+            -e HOST_UID="$(id -u)" \
+            -e HOST_GID="$(id -g)" \
+            -v "$PWD:/workspace" \
+            -w /workspace \
+            archlinux:base-devel bash -lc '
+              set -euo pipefail
+
+              pacman -Syu --noconfirm git
+
+              groupadd -g "$HOST_GID" runner
+              useradd -m -u "$HOST_UID" -g "$HOST_GID" runner
+              runuser -u runner -- git config --global user.name "omarchy-release-bot"
+              runuser -u runner -- git config --global user.email "bot@omarchy.org"
+
+              # --if-newer keeps scheduled polls green when there is nothing
+              # new; an explicitly dispatched target should fail loudly.
+              extra=()
+              if [[ "$TARGET" == "latest" ]]; then extra=(--if-newer); fi
+              runuser -u runner -- ./bin/omarchy-pkgs release "$TARGET" "${extra[@]}" --yes --no-push
+            '
+
+      - name: Push release commit
+        id: push
+        run: |
+          if [[ -n "$(git log origin/master..HEAD --oneline)" ]]; then
+            git push origin HEAD:master
+            echo "released=$(git log -1 --format=%s)" >> "$GITHUB_OUTPUT"
+          else
+            echo "Nothing to release."
+          fi
+
+      - name: Notify Basecamp on release
+        if: steps.push.outputs.released != '' && env.BASECAMP_CHATBOT_URL != ''
+        env:
+          BASECAMP_CHATBOT_URL: ${{ secrets.BASECAMP_CHATBOT_URL }}
+          RELEASED: ${{ steps.push.outputs.released }}
+        run: |
+          curl -s -o /dev/null \
+            -H "Content-Type: application/json" \
+            -d "$(jq -n --arg content \
+              "📦 <strong>${RELEASED}</strong> cut to edge — the build host publishes it on the next auto-release cycle" \
+              '{content: $content}')" \
+            "$BASECAMP_CHATBOT_URL"
+
+      - name: Notify Basecamp on failure
+        if: failure() && env.BASECAMP_CHATBOT_URL != ''
+        env:
+          BASECAMP_CHATBOT_URL: ${{ secrets.BASECAMP_CHATBOT_URL }}
+        run: |
+          curl -s -o /dev/null \
+            -H "Content-Type: application/json" \
+            -d "$(jq -n --arg content \
+              "🔴 <strong>Omarchy release cut failed</strong><br><a href=\"${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\">View run</a>" \
+              '{content: $content}')" \
+            "$BASECAMP_CHATBOT_URL"
