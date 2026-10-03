@@ -1,0 +1,157 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Meir Dick <mdick85@gmail.com>
+Date: Wed, 16 Sep 2026 09:00:00 -0400
+Subject: [PATCH] ASoC: tas2783: do not fail runtime resume on a late
+ peripheral
+
+tas2783_sdca_dev_resume() waits up to five seconds for the peripheral
+to finish re-enumerating after a bus reset and fails the resume if it
+does not. On the HP EliteBook X G2i one of the four amplifiers on the
+link (uid 0x9) can take more than ten seconds to come back. Every PCM
+open on the card goes through this runtime resume, so while that one
+part is late the open fails, WirePlumber's probe fails with it, and the
+card is left with no usable profile (device names shortened to the
+unique_id):
+
+  uid 0x9: Initialization not complete
+  uid 0x9: ASoC error (-22): at snd_soc_pcm_component_pm_runtime_get()
+  $ speaker-test -D hw:0,2
+  Playback open error: -22,Invalid argument
+
+Seen on a second board of the same design (HP EliteBook X Flip G2i).
+
+Treat runtime resume the way system resume already is: if the
+peripheral has re-attached, restore the register cache; if it has not,
+leave the regmap in cache-only mode and return. tas_update_status()
+re-initializes the part when it arrives.
+
+That alone is not enough, because the stream paths then fail for the
+same part: .startup tries to re-initialize it over a bus it is not on
+and returns -EIO, and hw_params refuses a part with no firmware. Every
+codec DAI on the link has to succeed for the PCM to open, so one absent
+amplifier still took the card down. Make both tolerate it: skip the
+re-init when the part is not attached, and leave a part with no
+firmware out of the stream instead of failing it. hw_free already
+tolerates a part that was never added. The card keeps working on the
+amplifiers that are present; the late one joins on the next stream
+start after it attaches.
+
+Report the outcome of the UEFI calibration read at info and warn level
+instead of debug. Whether the factory calibration was found decides
+whether a part runs with its own protection limits, and on this board
+one amplifier is silent without it; that has to be visible in an
+ordinary journal.
+
+Baojun Xu's "ASoC: tas2783-sdw: add firmware download status check"
+(v4, 2026-09-15, patchwork 14815978) works on the initialisation side
+of the same problem and leaves the wait in the resume callback in
+place, so nothing here overlaps it.
+
+Signed-off-by: Meir Dick <mdick85@gmail.com>
+---
+ sound/soc/codecs/tas2783-sdw.c | 62 +++++++++++++++++++++++++++++-----
+ 1 file changed, 53 insertions(+), 9 deletions(-)
+
+diff --git a/sound/soc/codecs/tas2783-sdw.c b/sound/soc/codecs/tas2783-sdw.c
+index d69d80c..a09042b 100644
+--- a/sound/soc/codecs/tas2783-sdw.c
++++ b/sound/soc/codecs/tas2783-sdw.c
+@@ -738,7 +738,9 @@ static void tas2783_set_calib_params_to_device(struct tas2783_prv *tas_dev, u32
+ 		dev_err(tas_dev->dev,
+ 			"unique id not found in the calib data\n");
+ 	else
+-		dev_dbg(tas_dev->dev, "calib data update done\n");
++		dev_info(tas_dev->dev,
++			 "factory calibration applied (%u speakers in UEFI)\n",
++			 dev_count);
+ }
+ 
+ static s32 tas2783_update_calibdata(struct tas2783_prv *tas_dev)
+@@ -788,8 +790,13 @@ static s32 tas2783_update_calibdata(struct tas2783_prv *tas_dev)
+ 	}
+ 
+ 	if (status != EFI_SUCCESS) {
+-		/* Failed got calibration data from EFI. */
+-		dev_dbg(tas_dev->dev, "No calibration data in UEFI.");
++		/*
++		 * Failed to get calibration data from EFI. Say so where an
++		 * ordinary journal shows it: the part runs with the tuning's
++		 * default protection limits, and on some boards one amplifier
++		 * produces no output at all without its factory data.
++		 */
++		dev_warn(tas_dev->dev, "no factory calibration found in UEFI, running uncalibrated\n");
+ 		return 0;
+ 	}
+ 
+@@ -1036,8 +1043,16 @@ static s32 tas_sdw_hw_params(struct snd_pcm_substream *substream,
+ 	s32 ret, retry = 3;
+ 
+ 	if (!tas_dev->fw_dl_success) {
+-		dev_err(tas_dev->dev, "error playback without fw download");
+-		return -EINVAL;
++		/*
++		 * No firmware means the part is not on the bus or has not
++		 * finished coming back. Do not add it to the stream, and do
++		 * not fail the stream for it either: the amplifiers that are
++		 * present keep playing. hw_free tolerates a part that was
++		 * never added.
++		 */
++		dev_warn(tas_dev->dev,
++			 "no firmware loaded, leaving this amplifier out of the stream\n");
++		return 0;
+ 	}
+ 
+ 	sdw_stream = snd_soc_dai_get_dma_data(dai, substream);
+@@ -1141,6 +1156,19 @@ static int tas_sdw_startup(struct snd_pcm_substream *substream,
+ 	if (!tas_dev->force_reinit && tas_dev->fw_dl_success)
+ 		return 0;
+ 
++	/*
++	 * A part that is not on the bus cannot be re-initialized, and
++	 * failing the stream for it would take the other amplifiers on the
++	 * link down with it. Let the stream start without this one;
++	 * tas_update_status() initializes it when it attaches, and the next
++	 * stream picks it up.
++	 */
++	if (tas_dev->status != SDW_SLAVE_ATTACHED) {
++		dev_warn(tas_dev->dev,
++			 "not attached, starting the stream without it\n");
++		return 0;
++	}
++
+ 	tas_dev->hw_init = false;
+ 	regcache_cache_only(tas_dev->regmap, false);
+ 
+@@ -1287,12 +1315,28 @@ static s32 tas2783_sdca_dev_resume(struct device *dev)
+ 	struct tas2783_prv *tas_dev = dev_get_drvdata(dev);
+ 	int ret;
+ 
+-	ret = sdw_slave_wait_for_init(slave, TAS2783_PROBE_TIMEOUT);
+-	if (ret) {
+-		sdw_show_ping_status(slave->bus, true);
+-		return ret;
++	/*
++	 * After a bus reset the peripheral has to re-enumerate and reload its
++	 * firmware, which tas_update_status() does in bus context. One of
++	 * the four amplifiers on the HP EliteBook X G2i (uid 0x9) can take
++	 * over ten seconds to come back. Waiting for it here, with the
++	 * five second timeout that used to be applied, made every PCM open
++	 * on the card fail with -ETIMEDOUT for as long as that one part was
++	 * late: WirePlumber probed the card, the open failed, and the whole
++	 * card was left with no usable profile.
++	 *
++	 * Do not wait. If the peripheral has re-attached, restore the cache
++	 * as before. If it has not, leave the regmap in cache-only mode and
++	 * let it be re-initialized when it arrives; the .startup re-init
++	 * brings a late part into a running stream. The card keeps working
++	 * on the amplifiers that are present in the meantime.
++	 */
++	if (!try_wait_for_completion(&slave->initialization_complete)) {
++		dev_dbg(dev, "runtime resume: not re-enumerated yet, deferring re-init\n");
++		return 0;
+ 	}
+ 
++	slave->unattach_request = 0;
+ 	regcache_cache_only(tas_dev->regmap, false);
+ 	ret = regcache_sync(tas_dev->regmap);
+ 	if (ret) {
