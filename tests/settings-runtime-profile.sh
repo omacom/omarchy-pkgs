@@ -20,6 +20,8 @@ files=(
   bin/omarchy-debug
   bin/omarchy-debug-idle
   bin/omarchy-hw-platform
+  bin/omarchy-security-functions
+  bin/omarchy-sudo-passwordless
   bin/omarchy-upload-log
   config/autostart/limine-snapper-notify.desktop
   config/hypr/hyprland.lua
@@ -28,6 +30,7 @@ files=(
   default/environment.d/10-omarchy-fcitx.conf
   default/fontconfig/conf.avail/50-omarchy.conf
   default/fonts/omarchy/omarchy.ttf
+  default/libalpm/hooks/05-omarchy-passwordless-revoke.hook
   default/hypr/toggles/flags.lua
   default/libalpm/hooks/00-omarchy-platform-guard.hook
   default/libalpm/scripts/omarchy-platform-guard
