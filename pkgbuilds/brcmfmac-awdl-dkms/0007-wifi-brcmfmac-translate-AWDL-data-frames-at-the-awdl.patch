@@ -1,0 +1,300 @@
+From f814eaf30c6bb4aba71b7d0c4a5db327917fd905 Mon Sep 17 00:00:00 2001
+From: Brent Kearney <1550934+brentkearney@users.noreply.github.com>
+Date: Sun, 6 Sep 2026 14:52:58 -0600
+Subject: [PATCH 07/11] wifi: brcmfmac: translate AWDL data frames at the awdl0
+ boundary
+
+AWDL data frames on the air are 802.3 + LLC/SNAP (OUI 00:17:f2, protocol
+0x0800) + a 6-byte data header (03 04 <seq16> 00 00) + the real ethertype.
+The kernel only speaks Ethernet II, so for is_awdl interfaces:
+
+- RX: brcmf_rx_eth_type_trans() strips the encapsulation in place before
+  eth_type_trans(). It is called from both delivery paths -- brcmf_rx_hdrpull
+  (BCDC) and the msgbuf RX completion (PCIe); a first attempt in hdrpull
+  alone was dead code on PCIe. Frames that are already Ethernet II pass.
+- TX: brcmf_awdl_encap() wraps Ethernet II in the same header with a
+  per-interface incrementing sequence; needed_headroom grows by 16. Frames
+  that already carry a length field (raw AF_PACKET senders building the
+  encapsulation themselves) pass untouched.
+
+Also log the destination MAC on each awdl0 TX completion so per-frame fates
+can be read per peer (unicast to a MAC without a firmware peer entry
+completes 0x0003 FW_TOSSED; with one, 0x0000 acked).
+
+With this, EUI-64 neighbour pinning and awdl_peer_op ADD, a remote peer
+completes TCP to us over firmware-native AWDL.
+---
+ .../broadcom/brcm80211/brcmfmac/core.c        | 76 ++++++++++++++++++-
+ .../broadcom/brcm80211/brcmfmac/core.h        |  4 +
+ .../broadcom/brcm80211/brcmfmac/msgbuf.c      | 52 +++++++++++--
+ 3 files changed, 122 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/core.c b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/core.c
+index 8b01fcb..0392b2a 100644
+--- a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/core.c
++++ b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/core.c
+@@ -8,6 +8,7 @@
+ #include <linux/module.h>
+ #include <linux/inetdevice.h>
+ #include <linux/property.h>
++#include <linux/unaligned.h>
+ #include <net/cfg80211.h>
+ #include <net/rtnetlink.h>
+ #include <net/addrconf.h>
+@@ -38,6 +39,17 @@
+ 
+ #define	D11_PHY_HDR_LEN				6
+ 
++/* AWDL data frames on the air are 802.3 + LLC/SNAP (OUI 00:17:f2, protocol
++ * 0x0800) + a 4-byte data header, then the real ethertype. The kernel only
++ * speaks Ethernet II, so the driver translates at the awdl0 boundary in
++ * both directions.
++ */
++#define BRCMF_AWDL_ENCAP_LEN			16
++#define BRCMF_AWDL_DATA_MIN_LEN			(ETH_HLEN + BRCMF_AWDL_ENCAP_LEN)
++
++static const u8 brcmf_awdl_snap[] = { 0xaa, 0xaa, 0x03, 0x00, 0x17, 0xf2,
++				      0x08, 0x00, 0x03, 0x04 };
++
+ struct d11rxhdr_le {
+ 	__le16 RxFrameSize;
+ 	u16 PAD;
+@@ -290,6 +302,55 @@ static bool brcmf_skb_is_iapp(struct sk_buff *skb)
+ #endif
+ }
+ 
++/* Unwrap SNAP + AWDL data header into Ethernet II, in place. skb->data is
++ * the 802.3 header. Frames that are not AWDL-encapsulated pass unchanged.
++ */
++static void brcmf_awdl_decap(struct sk_buff *skb)
++{
++	const struct ethhdr *eh = (const struct ethhdr *)skb->data;
++
++	if (skb->len < BRCMF_AWDL_DATA_MIN_LEN ||
++	    ntohs(eh->h_proto) > ETH_DATA_LEN ||
++	    memcmp(skb->data + ETH_HLEN, brcmf_awdl_snap,
++		   sizeof(brcmf_awdl_snap)))
++		return;
++
++	memmove(skb->data + BRCMF_AWDL_ENCAP_LEN, skb->data, 2 * ETH_ALEN);
++	skb_pull(skb, BRCMF_AWDL_ENCAP_LEN);
++}
++
++/* Every received data frame passes through here, on the BCDC and the msgbuf
++ * (PCIe) paths alike, before the kernel classifies it.
++ */
++__be16 brcmf_rx_eth_type_trans(struct brcmf_if *ifp, struct sk_buff *skb)
++{
++	if (ifp->is_awdl)
++		brcmf_awdl_decap(skb);
++	return eth_type_trans(skb, ifp->ndev);
++}
++
++/* Wrap Ethernet II into 802.3 + SNAP + AWDL data header, in place. Frames
++ * already carrying a length field (raw AF_PACKET senders that build the
++ * encapsulation themselves) pass unchanged. Caller guarantees headroom.
++ */
++static void brcmf_awdl_encap(struct brcmf_if *ifp, struct sk_buff *skb)
++{
++	const struct ethhdr *eh = (const struct ethhdr *)skb->data;
++	u8 *hdr;
++
++	if (ntohs(eh->h_proto) < ETH_P_802_3_MIN)
++		return;
++
++	hdr = skb_push(skb, BRCMF_AWDL_ENCAP_LEN);
++	memmove(hdr, hdr + BRCMF_AWDL_ENCAP_LEN, 2 * ETH_ALEN);
++	put_unaligned_be16(skb->len - ETH_HLEN, hdr + 2 * ETH_ALEN);
++	memcpy(hdr + ETH_HLEN, brcmf_awdl_snap, sizeof(brcmf_awdl_snap));
++	put_unaligned_le16(ifp->awdl_tx_seq++,
++			   hdr + ETH_HLEN + sizeof(brcmf_awdl_snap));
++	hdr[ETH_HLEN + sizeof(brcmf_awdl_snap) + 2] = 0;
++	hdr[ETH_HLEN + sizeof(brcmf_awdl_snap) + 3] = 0;
++}
++
+ static netdev_tx_t brcmf_netdev_start_xmit(struct sk_buff *skb,
+ 					   struct net_device *ndev)
+ {
+@@ -298,6 +359,7 @@ static netdev_tx_t brcmf_netdev_start_xmit(struct sk_buff *skb,
+ 	struct brcmf_pub *drvr = ifp->drvr;
+ 	struct ethhdr *eh;
+ 	int head_delta;
++	unsigned int hdrlen = drvr->hdrlen;
+ 	unsigned int tx_bytes = skb->len;
+ 
+ 	brcmf_dbg(DATA, "Enter, bsscfgidx=%d\n", ifp->bsscfgidx);
+@@ -328,9 +390,12 @@ static netdev_tx_t brcmf_netdev_start_xmit(struct sk_buff *skb,
+ 		goto done;
+ 	}
+ 
++	if (ifp->is_awdl)
++		hdrlen += BRCMF_AWDL_ENCAP_LEN;
++
+ 	/* Make sure there's enough writeable headroom */
+-	if (skb_headroom(skb) < drvr->hdrlen || skb_header_cloned(skb)) {
+-		head_delta = max_t(int, drvr->hdrlen - skb_headroom(skb), 0);
++	if (skb_headroom(skb) < hdrlen || skb_header_cloned(skb)) {
++		head_delta = max_t(int, hdrlen - skb_headroom(skb), 0);
+ 
+ 		brcmf_dbg(INFO, "%s: %s headroom\n", brcmf_ifname(ifp),
+ 			  head_delta ? "insufficient" : "unmodifiable");
+@@ -365,6 +430,9 @@ static netdev_tx_t brcmf_netdev_start_xmit(struct sk_buff *skb,
+ 	/* set pacing shift for packet aggregation */
+ 	sk_pacing_shift_update(skb->sk, 8);
+ 
++	if (ifp->is_awdl)
++		brcmf_awdl_encap(ifp, skb);
++
+ 	ret = brcmf_proto_tx_queue_data(drvr, ifp->ifidx, skb);
+ 	if (ret < 0)
+ 		brcmf_txfinalize(ifp, skb, false);
+@@ -495,7 +563,7 @@ static int brcmf_rx_hdrpull(struct brcmf_pub *drvr, struct sk_buff *skb,
+ 		return -ENODATA;
+ 	}
+ 
+-	skb->protocol = eth_type_trans(skb, (*ifp)->ndev);
++	skb->protocol = brcmf_rx_eth_type_trans(*ifp, skb);
+ 	return 0;
+ }
+ 
+@@ -704,6 +772,8 @@ int brcmf_net_attach(struct brcmf_if *ifp, bool locked)
+ 					: &brcmf_netdev_ops_pri;
+ 
+ 	ndev->needed_headroom += drvr->hdrlen;
++	if (ifp->is_awdl)
++		ndev->needed_headroom += BRCMF_AWDL_ENCAP_LEN;
+ 	ndev->ethtool_ops = &brcmf_ethtool_ops;
+ 
+ 	/* set the mac address & netns */
+diff --git a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/core.h b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/core.h
+index 451bcf8..86c9ef0 100644
+--- a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/core.h
++++ b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/core.h
+@@ -250,6 +250,8 @@ enum brcmf_netif_stop_reason {
+  * @pend_8021x_cnt: tracks outstanding number of 802.1x frames.
+  * @pend_8021x_wait: used for signalling change in count.
+  * @fwil_fwerr: flag indicating fwil layer should return firmware error codes.
++ * @is_awdl: interface carries AWDL data frames (SNAP + AWDL data header).
++ * @awdl_tx_seq: sequence number written into the AWDL data header on TX.
+  */
+ struct brcmf_if {
+ 	struct brcmf_pub *drvr;
+@@ -269,6 +271,7 @@ struct brcmf_if {
+ 	u8 ipv6addr_idx;
+ 	bool fwil_fwerr;
+ 	bool is_awdl;
++	u16 awdl_tx_seq;
+ };
+ 
+ int brcmf_netdev_wait_pend8021x(struct brcmf_if *ifp);
+@@ -285,6 +288,7 @@ void brcmf_txflowblock_if(struct brcmf_if *ifp,
+ 			  enum brcmf_netif_stop_reason reason, bool state);
+ void brcmf_txfinalize(struct brcmf_if *ifp, struct sk_buff *txp, bool success);
+ void brcmf_netif_rx(struct brcmf_if *ifp, struct sk_buff *skb);
++__be16 brcmf_rx_eth_type_trans(struct brcmf_if *ifp, struct sk_buff *skb);
+ void brcmf_netif_mon_rx(struct brcmf_if *ifp, struct sk_buff *skb);
+ void brcmf_net_detach(struct net_device *ndev, bool locked);
+ int brcmf_net_mon_attach(struct brcmf_if *ifp);
+diff --git a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/msgbuf.c b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/msgbuf.c
+index eb3985a..869018d 100644
+--- a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/msgbuf.c
++++ b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/msgbuf.c
+@@ -11,6 +11,7 @@
+ #include <linux/types.h>
+ #include <linux/netdevice.h>
+ #include <linux/etherdevice.h>
++#include <linux/ratelimit.h>
+ 
+ #include <brcmu_utils.h>
+ #include <brcmu_wifi.h>
+@@ -912,11 +913,22 @@ brcmf_msgbuf_process_ioctl_complete(struct brcmf_msgbuf *msgbuf, void *buf)
+ }
+ 
+ 
++/* Firmware-reported completion status of AWDL data frames. brcmfmac never
++ * looks at tx_status; it is the WLFC_CTL_PKTFLAG_* fate of the frame
++ * (0 acked, 4 sent-no-ack i.e. multicast on air, 7 dropped by the firmware).
++ * Observed: awdl0 multicast completes ~1:3 sent:dropped, template or not.
++ * Logged for every frame queued on a non-primary flowring. 2000/s so a
++ * 200-frame burst at 1000/s is logged in full and in order -- the sequence
++ * of fates is the measurement.
++ */
++static DEFINE_RATELIMIT_STATE(brcmf_awdl_txs_rs, HZ, 2000);
++
+ static void
+ brcmf_msgbuf_process_txstatus(struct brcmf_msgbuf *msgbuf, void *buf)
+ {
+ 	struct brcmf_commonring *commonring;
+ 	struct msgbuf_tx_status *tx_status;
++	struct brcmf_if *ifp;
+ 	u32 idx;
+ 	struct sk_buff *skb;
+ 	u16 flowid;
+@@ -934,8 +946,23 @@ brcmf_msgbuf_process_txstatus(struct brcmf_msgbuf *msgbuf, void *buf)
+ 	commonring = msgbuf->flowrings[flowid];
+ 	atomic_dec(&commonring->outstanding_tx);
+ 
+-	brcmf_txfinalize(brcmf_get_ifp(msgbuf->drvr, tx_status->msg.ifidx),
+-			 skb, true);
++	ifp = brcmf_get_ifp(msgbuf->drvr, tx_status->msg.ifidx);
++	/* Key on the flowring's ifidx, which the host assigned when it queued
++	 * the frame, not on what the firmware echoes: repeated runs
++	 * logged nothing for 1227 awdl0 frames each, and a completion
++	 * echoed under ifidx 0 would have been invisible to both filters.
++	 */
++	if (brcmf_flowring_ifidx_get(msgbuf->flow, flowid) &&
++	    __ratelimit(&brcmf_awdl_txs_rs))
++		pr_info("brcmfmac: awdl txstatus ring_ifidx=%u msg_ifidx=%u awdl=%d flow=%u status=%d tx_status=0x%04x meta=%u dst=%pM\n",
++			brcmf_flowring_ifidx_get(msgbuf->flow, flowid),
++			tx_status->msg.ifidx, ifp ? ifp->is_awdl : -1, flowid,
++			(int)(s16)le16_to_cpu(tx_status->compl_hdr.status),
++			le16_to_cpu(tx_status->tx_status),
++			le16_to_cpu(tx_status->metadata_len),
++			skb->len >= ETH_ALEN ? skb->data : (u8 *)"\0\0\0\0\0\0");
++
++	brcmf_txfinalize(ifp, skb, true);
+ }
+ 
+ 
+@@ -1236,7 +1263,7 @@ brcmf_msgbuf_process_rx_complete(struct brcmf_msgbuf *msgbuf, void *buf)
+ 		return;
+ 	}
+ 
+-	skb->protocol = eth_type_trans(skb, ifp->ndev);
++	skb->protocol = brcmf_rx_eth_type_trans(ifp, skb);
+ 	brcmf_netif_rx(ifp, skb);
+ }
+ 
+@@ -1584,14 +1611,25 @@ static int brcmf_msgbuf_stats_read(struct seq_file *seq, void *data)
+ 		if (!msgbuf->flow->rings[i])
+ 			continue;
+ 		ring = msgbuf->flow->rings[i];
+-		if (ring->status != RING_OPEN)
+-			continue;
+-		commonring = msgbuf->flowrings[i];
+ 		hash = &msgbuf->flow->hash[ring->hash_id];
+-		seq_printf(seq, "id %3u: rp %4u, wp %4u, qlen %4u, blocked %u\n"
++		if (ring->status != RING_OPEN) {
++			/* A ring the firmware has not acknowledged holds every
++			 * frame queued to it, invisibly, while tx_packets
++			 * advances. Show it rather than skip it.
++			 */
++			seq_printf(seq, "id %3u: status %d (not open), qlen %4u\n"
++					"        ifidx %u, fifo %u, da %pM\n",
++					i, ring->status,
++					skb_queue_len(&ring->skblist),
++					hash->ifidx, hash->fifo, hash->mac);
++			continue;
++		}
++		commonring = msgbuf->flowrings[i];
++		seq_printf(seq, "id %3u: rp %4u, wp %4u, qlen %4u, blocked %u, outstanding_tx %d\n"
+ 				"        ifidx %u, fifo %u, da %pM\n",
+ 				i, commonring->r_ptr, commonring->w_ptr,
+ 				skb_queue_len(&ring->skblist), ring->blocked,
++				atomic_read(&commonring->outstanding_tx),
+ 				hash->ifidx, hash->fifo, hash->mac);
+ 	}
+ 
+-- 
+2.55.0
+

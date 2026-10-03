@@ -1,0 +1,68 @@
+From 7f8f382014551f3a3370a1de64efa36207b53a80 Mon Sep 17 00:00:00 2001
+From: Brent Kearney <1550934+brentkearney@users.noreply.github.com>
+Date: Mon, 7 Sep 2026 01:28:47 -0600
+Subject: [PATCH 08/11] brcmfmac: msgbuf: tolerate txstatus for a freed
+ flowring
+
+brcmf_msgbuf_delete_flowring() gives up on outstanding frames after ~75 ms
+and frees the ring; the firmware then completes them (tx_status 0x0006
+EXPIRED) against a flow->rings[] slot that is already NULL. The awdl
+txstatus log line dereferenced it (oops in
+brcmf_flowring_ifidx_get from brcmf_msgbuf_process_rx on awdl-if destroy).
+Look the ring up only if it still exists, and reject a flowring id beyond
+max_flowrings before indexing.
+---
+ .../broadcom/brcm80211/brcmfmac/msgbuf.c      | 21 ++++++++++++++++---
+ 1 file changed, 18 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/msgbuf.c b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/msgbuf.c
+index 869018d..1df1a15 100644
+--- a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/msgbuf.c
++++ b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/msgbuf.c
+@@ -932,6 +932,7 @@ brcmf_msgbuf_process_txstatus(struct brcmf_msgbuf *msgbuf, void *buf)
+ 	u32 idx;
+ 	struct sk_buff *skb;
+ 	u16 flowid;
++	u8 ring_ifidx;
+ 
+ 	tx_status = (struct msgbuf_tx_status *)buf;
+ 	idx = le32_to_cpu(tx_status->msg.request_id) - 1;
+@@ -942,6 +943,13 @@ brcmf_msgbuf_process_txstatus(struct brcmf_msgbuf *msgbuf, void *buf)
+ 	if (!skb)
+ 		return;
+ 
++	if (flowid >= msgbuf->max_flowrings) {
++		bphy_err(msgbuf->drvr, "txstatus for flowring %u out of range\n",
++			 flowid);
++		brcmu_pkt_buf_free_skb(skb);
++		return;
++	}
++
+ 	set_bit(flowid, msgbuf->txstatus_done_map);
+ 	commonring = msgbuf->flowrings[flowid];
+ 	atomic_dec(&commonring->outstanding_tx);
+@@ -951,11 +959,18 @@ brcmf_msgbuf_process_txstatus(struct brcmf_msgbuf *msgbuf, void *buf)
+ 	 * the frame, not on what the firmware echoes: repeated runs
+ 	 * logged nothing for 1227 awdl0 frames each, and a completion
+ 	 * echoed under ifidx 0 would have been invisible to both filters.
++	 *
++	 * The ring may already be gone: brcmf_msgbuf_delete_flowring() gives up
++	 * on outstanding frames after ~75 ms and the firmware completes them
++	 * (0x0006 EXPIRED) after the ring was freed -- awdl0's VO multicast
++	 * never completes while the ring is open (observed as a NULL deref
++	 * here on `awdl-if destroy`). The skb and its pktid are unaffected.
+ 	 */
+-	if (brcmf_flowring_ifidx_get(msgbuf->flow, flowid) &&
+-	    __ratelimit(&brcmf_awdl_txs_rs))
++	ring_ifidx = msgbuf->flow->rings[flowid] ?
++		     brcmf_flowring_ifidx_get(msgbuf->flow, flowid) : 0;
++	if (ring_ifidx && __ratelimit(&brcmf_awdl_txs_rs))
+ 		pr_info("brcmfmac: awdl txstatus ring_ifidx=%u msg_ifidx=%u awdl=%d flow=%u status=%d tx_status=0x%04x meta=%u dst=%pM\n",
+-			brcmf_flowring_ifidx_get(msgbuf->flow, flowid),
++			ring_ifidx,
+ 			tx_status->msg.ifidx, ifp ? ifp->is_awdl : -1, flowid,
+ 			(int)(s16)le16_to_cpu(tx_status->compl_hdr.status),
+ 			le16_to_cpu(tx_status->tx_status),
+-- 
+2.55.0
+
