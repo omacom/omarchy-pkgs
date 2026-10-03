@@ -5,3 +5,5 @@ Automatic upstream version bumps are held (`sync: false`) while the packaged rel
 The hold does not require staying on v0.56.2 until #16343 lands. If a newer upstream release does not yet include the fix, update `pkgver`, rebase the patch and refresh its checksum, and test software rendering and accelerated rendering before publishing. Keep `sync: false` while the backport is needed.
 
 Remove `sync: false` and `software-renderer.patch` in the same change once the selected upstream release includes the #16343 behavior. Set `pkgver` to that release, then test software rendering and accelerated rendering before publishing.
+
+`xwayland-dnd-clipboard.patch` is the local backport of [Hyprland #16476](https://github.com/hyprwm/Hyprland/pull/16476). It stops a focus change onto an XWayland window, such as VLC, from replacing a Nautilus drag with the clipboard. Drop that patch on its own once the selected release includes #16476. That is separate from removing the software-renderer hold.
