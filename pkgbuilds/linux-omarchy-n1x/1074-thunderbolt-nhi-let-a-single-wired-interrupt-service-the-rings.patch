@@ -1,0 +1,111 @@
+From 2e77ab868c83eac5caf6b07e34bac50b12e8b559 Mon Sep 17 00:00:00 2001
+From: Ryan Hughes <ryan@heyoodle.com>
+Date: Fri, 2 Oct 2026 20:13:54 -0400
+Subject: [PATCH 1074/1078] thunderbolt: nhi: let a single wired interrupt
+ service the rings
+
+Host interfaces without MSI-X signal every ring through one interrupt.
+On PCIe that is a single MSI, handled by nhi_msi() scheduling
+nhi_interrupt_work(). An edge-triggered MSI can return before the work
+runs, but a level-triggered wired interrupt cannot: it stays asserted
+until the ring notification registers are read, so it would fire again
+as soon as the handler returned.
+
+Factor the notification scan out of nhi_interrupt_work() into
+nhi_handle_interrupts(), which reports whether anything was pending, so
+such a host interface can call it from a threaded handler and report
+spurious interrupts. Initialize nhi->lock before init_interrupts() too,
+since a level-triggered interrupt can already be asserted when it is
+requested.
+---
+ drivers/thunderbolt/nhi.c | 30 ++++++++++++++++++++++++++----
+ drivers/thunderbolt/nhi.h |  1 +
+ 2 files changed, 27 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/thunderbolt/nhi.c b/drivers/thunderbolt/nhi.c
+index a4816db5ca..2e26967b0f 100644
+--- a/drivers/thunderbolt/nhi.c
++++ b/drivers/thunderbolt/nhi.c
+@@ -930,14 +930,24 @@ enum nhi_fw_mode nhi_mailbox_mode(struct tb_nhi *nhi)
+ 	return (enum nhi_fw_mode)val;
+ }
+ 
+-void nhi_interrupt_work(struct work_struct *work)
++/**
++ * nhi_handle_interrupts() - Service the pending ring interrupts
++ * @nhi: Host interface whose ring notification status is scanned
++ *
++ * For host interfaces that signal every ring through one interrupt. Reads
++ * the ring notification status registers, which clear on read, and services
++ * each ring with an event. Must be called from process context.
++ *
++ * Return: %true if any notification status bit was set.
++ */
++bool nhi_handle_interrupts(struct tb_nhi *nhi)
+ {
+-	struct tb_nhi *nhi = container_of(work, typeof(*nhi), interrupt_work);
+ 	int value = 0; /* Suppress uninitialized usage warning. */
+ 	int bit;
+ 	int hop = -1;
+ 	int type = 0; /* current interrupt type 0: TX, 1: RX, 2: RX overflow */
+ 	struct tb_ring *ring;
++	bool handled = false;
+ 
+ 	spin_lock_irq(&nhi->lock);
+ 
+@@ -957,6 +967,7 @@ void nhi_interrupt_work(struct work_struct *work)
+ 		}
+ 		if ((value & (1 << (bit % 32))) == 0)
+ 			continue;
++		handled = true;
+ 		if (type == 2) {
+ 			dev_warn(nhi->dev, "RX overflow for ring %d\n", hop);
+ 			continue;
+@@ -978,6 +989,16 @@ void nhi_interrupt_work(struct work_struct *work)
+ 		spin_unlock(&ring->lock);
+ 	}
+ 	spin_unlock_irq(&nhi->lock);
++
++	return handled;
++}
++EXPORT_SYMBOL_NS_GPL(nhi_handle_interrupts, "THUNDERBOLT_NHI");
++
++void nhi_interrupt_work(struct work_struct *work)
++{
++	struct tb_nhi *nhi = container_of(work, typeof(*nhi), interrupt_work);
++
++	nhi_handle_interrupts(nhi);
+ }
+ 
+ irqreturn_t nhi_msi(int irq, void *data)
+@@ -1225,12 +1246,13 @@ int nhi_probe(struct tb_nhi *nhi)
+ 	/* In case someone left them on. */
+ 	nhi_disable_interrupts(nhi);
+ 
++	/* A level-triggered interrupt may already be pending when requested */
++	spin_lock_init(&nhi->lock);
++
+ 	res = nhi->ops->init_interrupts(nhi);
+ 	if (res)
+ 		return dev_err_probe(dev, res, "cannot enable interrupts, aborting\n");
+ 
+-	spin_lock_init(&nhi->lock);
+-
+ 	res = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(64));
+ 	if (res)
+ 		return dev_err_probe(dev, res, "failed to set DMA mask\n");
+diff --git a/drivers/thunderbolt/nhi.h b/drivers/thunderbolt/nhi.h
+index d488eadadf..4fcf818fea 100644
+--- a/drivers/thunderbolt/nhi.h
++++ b/drivers/thunderbolt/nhi.h
+@@ -32,6 +32,7 @@ enum nhi_fw_mode nhi_mailbox_mode(struct tb_nhi *nhi);
+ void nhi_enable_int_throttling(struct tb_nhi *nhi);
+ void nhi_disable_interrupts(struct tb_nhi *nhi);
+ void nhi_interrupt_work(struct work_struct *work);
++bool nhi_handle_interrupts(struct tb_nhi *nhi);
+ irqreturn_t nhi_msi(int irq, void *data);
+ irqreturn_t ring_msix(int irq, void *data);
+ int nhi_probe(struct tb_nhi *nhi);
+-- 
+2.56.0
+
