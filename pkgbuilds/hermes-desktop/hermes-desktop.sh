@@ -12,7 +12,11 @@ fi
 export HERMES_HOME="$hermes_home"
 runtime="$hermes_home/hermes-agent"
 native="$runtime/apps/desktop/release/linux-unpacked/Hermes"
-if [[ ! -x $native || ! -x $runtime/venv/bin/hermes ]]; then
+# Current runtimes publish their CLI as .hermes/bin/hermes and keep their
+# environments under installs/; older ones had a venv inside the checkout.
+cli="$runtime/.hermes/bin/hermes"
+[[ -x $cli ]] || cli="$runtime/venv/bin/hermes"
+if [[ ! -x $native || ! -x $cli ]]; then
   native=/opt/hermes-desktop/Hermes
   # Only the packaged app, built from the release commit rather than the runtime's
   # checkout, is told to skip an existing Hermes.
@@ -25,9 +29,30 @@ if ! timeout 5 unshare --user --map-root-user true 2>/dev/null; then
   exit 1
 fi
 
+# The runtime's interpreter is the one with its dependencies. A current CLI
+# names it on its exec line or in its shebang; read it, never run the CLI.
+runtime_python="$runtime/venv/bin/python"
+if [[ ! -x $runtime_python && -f $runtime/.hermes/bin/hermes ]]; then
+  runtime_python=$(/usr/bin/python - "$runtime/.hermes/bin/hermes" <<'PY' 2>/dev/null || true
+import shlex
+import sys
+
+lines = open(sys.argv[1], encoding="utf-8").read().splitlines()
+if lines and lines[0].startswith("#!") and lines[0] != "#!/bin/sh":
+    print(shlex.split(lines[0][2:])[0])
+else:
+    for line in lines[1:]:
+        words = shlex.split(line)
+        if len(words) > 1 and words[0] == "exec":
+            print(words[1])
+            break
+PY
+  )
+fi
+
 python=/usr/bin/python
-if [[ -x $runtime/venv/bin/python && -f $runtime/hermes_cli/main.py ]]; then
-  python="$runtime/venv/bin/python"
+if [[ -n $runtime_python && -x $runtime_python && -f $runtime/hermes_cli/main.py ]]; then
+  python="$runtime_python"
 else
   runtime=""
 fi

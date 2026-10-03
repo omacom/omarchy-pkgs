@@ -3,6 +3,7 @@ import ast
 import json
 import os
 from pathlib import Path
+import shlex
 import shutil
 import subprocess
 import sys
@@ -152,6 +153,25 @@ def _desktop_launch_options():
     check_launch(overrides={**wayland, "HERMES_DESKTOP_DISABLE_GPU": "0"},
                  expected_args=["--ozone-platform=wayland"], gpu="0")
     (module / "main_desktop.py").write_text(helper)
+
+    # Current runtimes have no venv in the checkout: the CLI is .hermes/bin/hermes
+    # and names an interpreter under installs/, on its exec line or in a quoted
+    # shebang. The runtime's own app must still run with the runtime's settings.
+    shutil.move(runtime / "venv", root / "legacy-venv")
+    interpreter = home / ".hermes/installs/abc/environments/def/venv/bin/python"
+    interpreter.parent.mkdir(parents=True)
+    interpreter.symlink_to(sys.executable)
+    shim = runtime / ".hermes/bin/hermes"
+    shim.parent.mkdir(parents=True)
+    config.write_text(json.dumps({"desktop": {"disable_gpu": True}}))
+    for body in (f'#!/bin/sh\nexec {shlex.join([str(interpreter), "-I", "-c", "import sys"])} "$@"\n',
+                 f'#!"{interpreter}" -I\nimport sys\n'):
+        shim.write_text(body)
+        shim.chmod(0o755)
+        check_launch(overrides=wayland, expected_args=["--ozone-platform=wayland"], gpu="1")
+    shutil.rmtree(runtime / ".hermes")
+    config.unlink()
+    shutil.move(root / "legacy-venv", runtime / "venv")
 
     def check_namespace_failure():
         for code in ("1", "127"):
