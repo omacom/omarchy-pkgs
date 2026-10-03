@@ -36,8 +36,37 @@ entries() { tar -tf "$REMOTE/edge/x86_64/omarchy.db.tar.zst" | grep '/$' | sort 
 pass() { echo "PASS: $1"; }
 fail() { echo "FAIL: $1"; cat "$T/out"; exit 1; }
 
+# A temporary remote read failure must not be mistaken for a new, empty
+# channel. Let later rclone operations succeed to catch the old fail-open
+# path, which could otherwise publish a partial database.
+mkdir -p "$T/unreadable-remote"
+export REAL_RCLONE=$(command -v rclone)
+cat > "$T/unreadable-remote/rclone" <<'EOF_RCLONE'
+#!/bin/bash
+if [[ $1 == lsf ]]; then
+  echo 'simulated remote listing failure' >&2
+  exit 7
+fi
+exec "$REAL_RCLONE" "$@"
+EOF_RCLONE
+chmod +x "$T/unreadable-remote/rclone"
+if PATH="$T/unreadable-remote:$PATH" pub "$A1"; then
+  fail "unreadable remote must stop publication"
+fi
+grep -q 'Cannot read remote repository' "$T/out" \
+  && [[ ! -e "$REMOTE/edge/x86_64/omarchy.db.tar.zst" ]] \
+  && pass "unreadable remote refused before publication" || fail "unreadable remote refusal"
+
 pub "$A1" && [[ "$(entries)" == "alpha-1.0-1/ " ]] && [[ -f "$REMOTE/edge/x86_64/$(basename "$A1").sig" ]] \
   && pass "first publish creates db with one entry and a signature" || fail "first publish"
+
+db_before=$(sha256sum "$REMOTE/edge/x86_64/omarchy.db.tar.zst" | awk '{print $1}')
+if PATH="$T/unreadable-remote:$PATH" pub "$B1"; then
+  fail "unreadable existing channel must stop publication"
+fi
+grep -q 'Cannot read remote repository' "$T/out" \
+  && [[ "$(sha256sum "$REMOTE/edge/x86_64/omarchy.db.tar.zst" | awk '{print $1}')" == "$db_before" ]] \
+  && pass "unreadable existing channel keeps its database" || fail "existing database unchanged"
 
 sum_before=$(sha256sum "$REMOTE/edge/x86_64/$(basename "$A1")")
 pub "$B1" && [[ "$(entries)" == "alpha-1.0-1/ beta-1.0-1/ " ]] && [[ "$(sha256sum "$REMOTE/edge/x86_64/$(basename "$A1")")" == "$sum_before" ]] \
