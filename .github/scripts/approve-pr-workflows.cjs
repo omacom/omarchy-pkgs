@@ -4,8 +4,10 @@ const TESTS = '.github/workflows/test.yml';
 // pullRequest/action/since default to the pull_request_target event. The
 // sync workflows pass them explicitly: GitHub creates no pull_request_target
 // run for a GITHUB_TOKEN push, so they release their own pushes' held runs.
+// They also pass requireLabel: false, since their PRs are the bot's own.
 module.exports = async function approve({ github, context, core, vouchStatus,
   pullRequest = context.payload.pull_request, action = context.payload.action, since,
+  requireLabel = true,
   sleep = ms => new Promise(resolve => setTimeout(resolve, ms)), attempts = 36 }) {
   // Missing/failed vouch lookups must not become approval. Denouncements
   // remain absolute, just as they are in the package build gate.
@@ -24,7 +26,7 @@ module.exports = async function approve({ github, context, core, vouchStatus,
       ...context.repo, pull_number: expected.number,
     });
     return pr.state === 'open' && pr.head.sha === expected.head.sha &&
-      pr.labels.some(label => label.name === 'build-approved');
+      (!requireLabel || pr.labels.some(label => label.name === 'build-approved'));
   };
 
   // The label and PR-run events arrive independently. Wait for the build

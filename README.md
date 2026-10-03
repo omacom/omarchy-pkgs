@@ -914,8 +914,9 @@ build artifacts.
 
 Sync PRs are pushed with `GITHUB_TOKEN`, so GitHub holds their build and test
 runs for approval on every push and starts no `pull_request_target` workflow
-for them. Once **`build-approved`** is on a sync PR, the sync workflow's own
-`approve` job releases the held runs for each commit it pushes. A push to an
+for them. The sync workflow's own `approve` job releases the held runs for
+each commit it pushes, whether that opens the PR or updates it, so sync PRs
+build without a label; merging still waits for review. A push to an
 `auto/sync-*` branch does not cancel the PR's in-flight build: the new build
 waits for it and then reuses its artifacts, so a long aarch64 build is not
 restarted by every sync.

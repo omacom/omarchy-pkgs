@@ -357,16 +357,19 @@ function syncFixture(options = {}) {
   return { ...f, push };
 }
 
-test('a labelled sync PR has its bot push released', async () => {
-  const { state, push } = syncFixture();
-  await push();
-  assert.deepEqual(state.approved, [1, 2]);
+test('a sync PR has its bot push released without a label', async () => {
+  for (const labels of [[], [{ name: 'build-approved' }]]) {
+    const { state, push } = syncFixture();
+    state.pr.labels = labels;
+    await push();
+    assert.deepEqual(state.approved, [1, 2]);
+  }
 });
 
-test('an unlabelled sync PR stays held for a maintainer', async () => {
-  const { state, push } = syncFixture();
+test('the label-less release is only for the sync approver', async () => {
+  const { state, invoke } = fixture();
   state.pr.labels = [];
-  await push();
+  await invoke();
   assert.deepEqual(state.approved, []);
 });
 
@@ -381,7 +384,7 @@ for (const [name, change] of [
   ['a fork PR', current => { current.head.repo.full_name = 'someone/omarchy-pkgs'; }],
   ['another branch', current => { current.head.ref = 'auto/sync-rebuilds'; }],
 ]) {
-  test(`the sync approver refuses ${name}, even when labelled`, async () => {
+  test(`the sync approver refuses ${name}`, async () => {
     const { state, push } = syncFixture();
     change(state.pr);
     await assert.rejects(push(), /refusing to approve/);
@@ -443,6 +446,7 @@ test('sync workflows push scoped runs aside and keep actions: write out of the s
     assert.match(sync, /branch: \$\{\{ steps\.branch\.outputs\.branch \}\}/, file);
     assert.doesNotMatch(sync, /^ +actions: write$/m, file);
     assert.match(approveJob, /^      actions: write$/m, file);
-    assert.match(approveJob, /needs\.sync\.outputs\.operation == 'updated'/, file);
+    // A freshly opened sync PR is held just like an updated one.
+    assert.match(approveJob, /contains\(fromJSON\('\["created", "updated"\]'\), needs\.sync\.outputs\.operation\)/, file);
   }
 });
