@@ -2,7 +2,7 @@
 
 The `linux-omarchy` kernel built for aarch64 with NVIDIA N1x (RTX Spark) platform support added. It carries the same kernel.org source and signed Omarchy patch set as `linux-omarchy` (currently 7.2.5-6), plus N1x topic patches numbered 1000 and up. The intent is to fold these into `linux-omarchy` itself once it builds for aarch64; until then this package replaces NVIDIA's 7.0-based `linux-n1x` on N1x machines.
 
-The `pkgrel` tracks `linux-omarchy`: `6.7` is the seventh N1x revision on top of `linux-omarchy` 7.2.5-6.
+The `pkgrel` tracks `linux-omarchy`: `6.8` is the eighth N1x revision on top of `linux-omarchy` 7.2.5-6.
 
 ## N1x patches
 
@@ -18,7 +18,7 @@ Patches 1000–1040 are NVIDIA's SAUCE from `Ubuntu-nvidia-7.0-7.0.0-1021.21_24.
 
 `1060-ASoC-mediatek-mt8901-give-the-card-the-ACPI-subsystem-ID.patch` is also our own. Cirrus CS35L56 amplifiers name their DSP firmware and speaker tuning after the sound card's PCI subsystem ID, which the ACPI-enumerated MT8901 card does not have, so they ran on ROM defaults: quiet and unvoiced. The patch reads the SoundWire controller's `_SUB` (written device ID first, `33A11043` on the ProArt P14) and passes it to the card, so the amplifiers request `cs35l56-b0-dsp1-misc-104333a1-spkid0*`. Those files are not in linux-firmware yet.
 
-Patches 1070–1078 make USB4 and Thunderbolt work. The N1x host routers (`\_SB.UBF0..2`, `NVDA8100`, one per USB-C port) are ACPI platform devices rather than PCI NHIs, the firmware hands USB4 to the OS, and it has no connection manager of its own. Without these patches nothing bound them, so PCIe-tunnelled devices (docks, 10G adapters, eGPUs) never appeared, and USB4 docks fell back to USB-C alt modes.
+Patches 1070–1079 make USB4 and Thunderbolt work. The N1x host routers (`\_SB.UBF0..2`, `NVDA8100`, one per USB-C port) are ACPI platform devices rather than PCI NHIs, the firmware hands USB4 to the OS, and it has no connection manager of its own. Without these patches nothing bound them, so PCIe-tunnelled devices (docks, 10G adapters, eGPUs) never appeared, and USB4 docks fell back to USB-C alt modes.
 
 - `1070` reverts NVIDIA's SAUCE that disabled USB4 through a vendor `_DSM`. The ASUS EC doesn't implement that `_DSM`, so the revert also removes a 2 s stall.
 - `1071` has `ucsi_acpi` query the `_DSM` functions before using them, as the ACPI spec asks. The ProArt P14 EC opens its UCSI service on that query, and without it every boot logged `PPM init failed` and `/sys/class/typec` stayed empty.
@@ -26,6 +26,7 @@ Patches 1070–1078 make USB4 and Thunderbolt work. The N1x host routers (`\_SB.
 - `1073`–`1075` let the Thunderbolt core run on a host interface that is not a PCI device, building on 7.2's non-PCI NHI groundwork.
 - `1077` is the glue driver itself, `thunderbolt_platform` (`CONFIG_USB4_PLATFORM_NHI`). It maps the host interface, powers it through power_wrap, and services the rings from the one wired level interrupt.
 - `1078` fixes PCI bus numbering below a hot-added switch. Without it, `pci=hpbussize`, which the unconfigured tunnel root ports need, let a dock's first downstream port take every bus number, so the ports after it (on a CalDigit TS4, the Ethernet controller) were never enumerated.
+- `1079` turns off CL states on the N1x host router's links. With them on, a monitor behind a DisplayPort tunnel failed to sync to its first link training and kept dropping out, so a dock's display usually stayed dark at boot and often on hotplug.
 
 The driver binds only with `power_wrap_drv.usb4_release=0` on the command line. Omarchy sets that together with the PCI hotplug padding.
 
