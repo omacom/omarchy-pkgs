@@ -2,7 +2,7 @@
 
 The `linux-omarchy` kernel built for aarch64 with NVIDIA N1x (RTX Spark) platform support added. It carries the same kernel.org source and signed Omarchy patch set as `linux-omarchy` (currently 7.2.5-6), plus N1x topic patches numbered 1000 and up. The intent is to fold these into `linux-omarchy` itself once it builds for aarch64; until then this package replaces NVIDIA's 7.0-based `linux-n1x` on N1x machines.
 
-The `pkgrel` tracks `linux-omarchy`: `6.8` is the eighth N1x revision on top of `linux-omarchy` 7.2.5-6.
+The `pkgrel` tracks `linux-omarchy`: `6.13` is the thirteenth N1x revision on top of `linux-omarchy` 7.2.5-6.
 
 ## N1x patches
 
@@ -13,6 +13,12 @@ Patches 1000–1040 are NVIDIA's SAUCE from `Ubuntu-nvidia-7.0-7.0.0-1021.21_24.
 - `1020-n1x-power.patch` - CPPC autonomous mode, GIC, watchdog, pmdomain and idle fixes
 - `1030-n1x-audio.patch` - MT8901 SoundWire and ASoC (CS42L43 + CS35L56 on the ASUS ProArt P14), plus a fix for 7.2's `asoc_sdw_parse_sdw_endpoints()` signature
 - `1040-n1x-gpu-iommu.patch` - DMA-mode SMMU domains for the integrated GPU (10de:2e00–2e3f); without them GSP fails to boot and the screen stays black
+
+Patches 1011–1013 are our own, for the Dell XPS 16 (DX16263):
+
+- `1011` fills the battery status from EC RAM. Dell's firmware answers the EC battery service's GetBst with zeros, so the battery read empty at 0 V.
+- `1012` skips the PSYS/PSOC thermal zones on the XPS 16. There they report power, not temperature, and showed up as zones at 600–1245 °C. It is limited to that model until the ProArt P14's zones are checked.
+- `1013` adds `dell-arm64-hotkeys`, which reports the hotkeys Dell's firmware sends as WMI events (mic mute) without the x86-only ACPI-WMI core. The XPS 16's EC never sends its FF-A notifications on BIOS 1.2.0, so on that machine the driver polls the EC's event queue instead (every 250 ms). Its mic-mute LED can only be toggled and stays lit across reboots, so the driver tracks it as `platform::micmute` (which Omarchy's mute script sets) and turns it off at shutdown.
 
 `1050-efi-add-efi_reclaim_reserved-to-use-idle-reserved-memory-as-RAM.patch` is our own: the N1x firmware reserves tens of GiB as the GPU's dedicated memory under Windows (62.5 GiB on the 128 GB ProArt P14), which Linux's driver never uses. `efi_reclaim_reserved=<size>@<start>,...` hands named ranges of it to the kernel, and is ignored unless each range is still entirely reserved, writeback-capable memory. Omarchy sets it per model from `install/hardware`.
 
