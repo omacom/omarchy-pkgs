@@ -1,0 +1,349 @@
+From 837d5c44d682798ae1afb9a04fb1ed48a04ee181 Mon Sep 17 00:00:00 2001
+From: Spencer Bull <spencer@omarchy.org>
+Date: Sun, 4 Oct 2026 02:15:06 -0500
+Subject: [PATCH] nvkms: set eDP 1.5 OLED panels' brightness as a target
+ luminance
+
+nvKmsSetBacklight() only asks RM to set the brightness, and RM leaves it
+to the GPU firmware, which sets an internal eDP panel's brightness as a
+PWM signal or a level in the VESA eDP backlight registers. The OLED
+panel of the Dell XPS 16 (NVIDIA N1x, DX16263) has no PWM input and
+ignores that level: the firmware switches it to DPCD mode and writes the
+level, and the panel stays as it is. The brightness keys moved the
+backlight device and the OSD, and nothing else.
+
+The panel is eDP 1.5 and takes a target luminance in nits. For internal
+eDP 1.5 panels without a PWM input that support luminance control, set
+the brightness that way after RM has, as the kernel's drm_edp_backlight
+helpers do for i915 and amdgpu: luminance control on, target 20 to 400
+nits. Read it back from the panel for actual_brightness, and set it
+again after a modeset brings the panel back up, since the panel forgets
+it when powered off. Panels that take a PWM signal or only a level are
+left to the firmware.
+---
+ src/nvidia-modeset/include/nvkms-private.h |   3 +
+ src/nvidia-modeset/include/nvkms-rm.h      |   3 +
+ src/nvidia-modeset/include/nvkms-types.h   |  10 ++
+ src/nvidia-modeset/src/nvkms-modeset.c     |   3 +
+ src/nvidia-modeset/src/nvkms-rm.c          |   7 +
+ src/nvidia-modeset/src/nvkms.c             | 199 ++++++++++++++++++++-
+ 6 files changed, 224 insertions(+), 1 deletion(-)
+
+diff --git a/src/nvidia-modeset/include/nvkms-private.h b/src/nvidia-modeset/include/nvkms-private.h
+index 5077486..d6d861c 100644
+--- a/src/nvidia-modeset/include/nvkms-private.h
++++ b/src/nvidia-modeset/include/nvkms-private.h
+@@ -76,6 +76,9 @@ const NVEvoApiHandlesRec *nvGetSurfaceHandlesFromOpenDevConst(
+ 
+ void nvKmsServiceNonStallInterrupt(void *dataPtr, NvU32 dataU32);
+ 
++void nvKmsRestoreBacklightOverAux(NVDispEvoRec *pDispEvo,
++                                  const NVConnectorEvoRec *pConnectorEvo);
++
+ #ifdef __cplusplus
+ };
+ #endif
+diff --git a/src/nvidia-modeset/include/nvkms-rm.h b/src/nvidia-modeset/include/nvkms-rm.h
+index 0385bf3..d4ae7bf 100644
+--- a/src/nvidia-modeset/include/nvkms-rm.h
++++ b/src/nvidia-modeset/include/nvkms-rm.h
+@@ -36,6 +36,9 @@ extern "C" {
+ #define NVKMS_RM_HANDLE_SPACE_DEVICE(_i)    ((_i) + 1)
+ #define NVKMS_RM_HANDLE_SPACE_FRAMELOCK(_i) (NV_MAX_DEVICES + (_i) + 1)
+ 
++NvBool nvReadDPCDReg(NVConnectorEvoPtr pConnectorEvo,
++                     NvU32 dpcdAddr,
++                     NvU8 *dpcdData);
+ NvBool nvWriteDPCDReg(NVConnectorEvoPtr pConnectorEvo,
+                       NvU32 dpcdAddr,
+                       NvU8 dpcdData);
+diff --git a/src/nvidia-modeset/include/nvkms-types.h b/src/nvidia-modeset/include/nvkms-types.h
+index f0e917d..655a2a4 100644
+--- a/src/nvidia-modeset/include/nvkms-types.h
++++ b/src/nvidia-modeset/include/nvkms-types.h
+@@ -2175,6 +2175,16 @@ typedef struct _NVDispEvoRec {
+ 
+     struct nvkms_backlight_device *backlightDevice;
+ 
++    /*
++     * The last brightness set over AUX on an internal panel without a PWM
++     * input, to set again after a modeset powers the panel back on.
++     */
++    struct {
++        NvBool set;
++        NvU32 displayId;
++        NvU32 brightness;
++    } auxBacklight;
++
+     /*
+      * Per-API-head RG semaphore callback lists for vblank interrupts with
+      * precise timestamp tracking. This uses RG (Raster Generator) semaphore
+diff --git a/src/nvidia-modeset/src/nvkms-modeset.c b/src/nvidia-modeset/src/nvkms-modeset.c
+index f51f97b..81c6d27 100644
+--- a/src/nvidia-modeset/src/nvkms-modeset.c
++++ b/src/nvidia-modeset/src/nvkms-modeset.c
+@@ -2364,6 +2364,9 @@ KickoffModesetUpdateState(
+             if (pConnectorEvo->pDpLibConnector != NULL) {
+                 nvDPPostSetMode(pConnectorEvo->pDpLibConnector,
+                                 modesetUpdateState);
++                if (nvIsConnectorActiveEvo(pConnectorEvo)) {
++                    nvKmsRestoreBacklightOverAux(pDispEvo, pConnectorEvo);
++                }
+             }  else if (nvConnectorIsDPSerializer(pConnectorEvo)) {
+                 nvDPSerializerPostSetMode(pDispEvo, pConnectorEvo);
+             } else {
+diff --git a/src/nvidia-modeset/src/nvkms-rm.c b/src/nvidia-modeset/src/nvkms-rm.c
+index 7ad713b..203dde1 100644
+--- a/src/nvidia-modeset/src/nvkms-rm.c
++++ b/src/nvidia-modeset/src/nvkms-rm.c
+@@ -1501,6 +1501,13 @@ static NvBool ReadDPCDReg(NVConnectorEvoPtr pConnectorEvo,
+     return TRUE;
+ }
+ 
++NvBool nvReadDPCDReg(NVConnectorEvoPtr pConnectorEvo,
++                     NvU32 dpcdAddr,
++                     NvU8 *dpcdData)
++{
++    return ReadDPCDReg(pConnectorEvo, dpcdAddr, dpcdData);
++}
++
+ NvBool nvWriteDPCDReg(NVConnectorEvoPtr pConnectorEvo,
+                       NvU32 dpcdAddr,
+                       NvU8 dpcdData)
+diff --git a/src/nvidia-modeset/src/nvkms.c b/src/nvidia-modeset/src/nvkms.c
+index 4f9b65b..2e493c7 100644
+--- a/src/nvidia-modeset/src/nvkms.c
++++ b/src/nvidia-modeset/src/nvkms.c
+@@ -7147,12 +7147,199 @@ void nvKmsServiceNonStallInterrupt(void *dataPtr, NvU32 dataU32)
+     nvHsProcessPendingViewportFlips(pDevEvo);
+ }
+ 
++/* eDP backlight registers (VESA eDP 1.5, as in the kernel's drm_dp.h). */
++#define NV_EDP_DPCD_REV                         0x700
++#define NV_EDP_15                               0x06
++#define NV_EDP_GENERAL_CAP_1                    0x701
++#define NV_EDP_TCON_BACKLIGHT_ADJUSTMENT_CAP    (1 << 0)
++#define NV_EDP_BACKLIGHT_ADJUSTMENT_CAP         0x702
++#define NV_EDP_BACKLIGHT_BRIGHTNESS_PWM_PIN_CAP (1 << 0)
++#define NV_EDP_BACKLIGHT_BRIGHTNESS_AUX_SET_CAP (1 << 1)
++#define NV_EDP_GENERAL_CAP_2                    0x703
++#define NV_EDP_PANEL_LUMINANCE_CONTROL_CAPABLE  (1 << 4)
++#define NV_EDP_BACKLIGHT_MODE_SET_REGISTER      0x721
++#define NV_EDP_BACKLIGHT_CONTROL_MODE_PWM       (0 << 0)
++#define NV_EDP_BACKLIGHT_CONTROL_MODE_DPCD      (2 << 0)
++#define NV_EDP_PANEL_LUMINANCE_CONTROL_ENABLE   (1 << 7)
++#define NV_EDP_PANEL_TARGET_LUMINANCE_VALUE     0x734
++
++/*
++ * Luminance range for panels set in nits: the SDR range of common OLED panels
++ * (the Dell XPS 16 DX16263's LG panel declares 20 to 400 nits).
++ */
++#define NV_EDP_LUMINANCE_MIN_NITS               20
++#define NV_EDP_LUMINANCE_MAX_NITS               400
++#define NV_EDP_LUMINANCE_RANGE_NITS \
++    (NV_EDP_LUMINANCE_MAX_NITS - NV_EDP_LUMINANCE_MIN_NITS)
++
++/*
++ * RM leaves the brightness to the GPU firmware, which sets an internal eDP
++ * panel's brightness as a PWM signal or a level in the VESA eDP backlight
++ * registers. An eDP 1.5 OLED panel that takes a target luminance can ignore
++ * that level: on the NVIDIA N1x in the Dell XPS 16 the firmware writes it and
++ * the panel stays as it is. Return the internal panel's connector when it is
++ * such a panel, with no PWM input, so nvkms sets its brightness as a target
++ * luminance, as the kernel's drm_edp_backlight helpers do for i915 and amdgpu.
++ */
++static NVConnectorEvoPtr GetLuminanceBacklightConnector(NVDispEvoRec *pDispEvo,
++                                                        NvU32 display_id,
++                                                        NvU8 *pCap2)
++{
++    NVConnectorEvoPtr pConnectorEvo, pFound = NULL;
++    NvU8 rev = 0, cap1 = 0, gcap2 = 0;
++
++    FOR_ALL_EVO_CONNECTORS(pConnectorEvo, pDispEvo) {
++        if (nvDpyIdToNvU32(pConnectorEvo->displayId) == display_id) {
++            pFound = pConnectorEvo;
++            break;
++        }
++    }
++
++    if (pFound == NULL || !nvConnectorIsInternal(pFound) ||
++        pFound->signalFormat != NVKMS_CONNECTOR_SIGNAL_FORMAT_DP) {
++        return NULL;
++    }
++
++    if (!nvReadDPCDReg(pFound, NV_EDP_DPCD_REV, &rev) ||
++        !nvReadDPCDReg(pFound, NV_EDP_GENERAL_CAP_1, &cap1) ||
++        !nvReadDPCDReg(pFound, NV_EDP_BACKLIGHT_ADJUSTMENT_CAP, pCap2) ||
++        !nvReadDPCDReg(pFound, NV_EDP_GENERAL_CAP_2, &gcap2)) {
++        return NULL;
++    }
++
++    if (rev < NV_EDP_15 ||
++        !(cap1 & NV_EDP_TCON_BACKLIGHT_ADJUSTMENT_CAP) ||
++        (*pCap2 & NV_EDP_BACKLIGHT_BRIGHTNESS_PWM_PIN_CAP) ||
++        !(gcap2 & NV_EDP_PANEL_LUMINANCE_CONTROL_CAPABLE)) {
++        return NULL;
++    }
++
++    return pFound;
++}
++
++static NvBool WriteLuminanceBacklight(NVConnectorEvoPtr pConnectorEvo,
++                                      NvU8 cap2,
++                                      NvU32 brightness)
++{
++    const NvU8 mode = (cap2 & NV_EDP_BACKLIGHT_BRIGHTNESS_AUX_SET_CAP) ?
++        NV_EDP_BACKLIGHT_CONTROL_MODE_DPCD : NV_EDP_BACKLIGHT_CONTROL_MODE_PWM;
++    const NvU32 millinits = 1000 * (NV_EDP_LUMINANCE_MIN_NITS +
++        brightness * NV_EDP_LUMINANCE_RANGE_NITS / 100);
++    NvU32 i;
++
++    if (!nvWriteDPCDReg(pConnectorEvo, NV_EDP_BACKLIGHT_MODE_SET_REGISTER,
++                        mode | NV_EDP_PANEL_LUMINANCE_CONTROL_ENABLE)) {
++        return FALSE;
++    }
++
++    for (i = 0; i < 3; i++) {
++        if (!nvWriteDPCDReg(pConnectorEvo,
++                            NV_EDP_PANEL_TARGET_LUMINANCE_VALUE + i,
++                            (millinits >> (8 * i)) & 0xff)) {
++            return FALSE;
++        }
++    }
++
++    return TRUE;
++}
++
++/* Read the brightness back from the panel, while it is in luminance mode. */
++static NvBool ReadLuminanceBacklight(NVConnectorEvoPtr pConnectorEvo,
++                                     NvU32 *pBrightness)
++{
++    NvU8 mode = 0, b[3] = { 0 };
++    NvU32 i, nits;
++
++    if (!nvReadDPCDReg(pConnectorEvo, NV_EDP_BACKLIGHT_MODE_SET_REGISTER, &mode) ||
++        !(mode & NV_EDP_PANEL_LUMINANCE_CONTROL_ENABLE)) {
++        return FALSE;
++    }
++
++    for (i = 0; i < 3; i++) {
++        if (!nvReadDPCDReg(pConnectorEvo,
++                           NV_EDP_PANEL_TARGET_LUMINANCE_VALUE + i, &b[i])) {
++            return FALSE;
++        }
++    }
++
++    nits = (b[0] | (b[1] << 8) | (b[2] << 16)) / 1000;
++    nits = NV_MAX(nits, NV_EDP_LUMINANCE_MIN_NITS);
++    nits = NV_MIN(nits, NV_EDP_LUMINANCE_MAX_NITS);
++    *pBrightness = ((nits - NV_EDP_LUMINANCE_MIN_NITS) * 100 +
++                    NV_EDP_LUMINANCE_RANGE_NITS / 2) /
++                   NV_EDP_LUMINANCE_RANGE_NITS;
++    return TRUE;
++}
++
++static NvBool SetLuminanceBacklight(NVDispEvoRec *pDispEvo,
++                                    NvU32 display_id,
++                                    NvU32 brightness)
++{
++    NvU8 cap2 = 0;
++    NVConnectorEvoPtr pConnectorEvo =
++        GetLuminanceBacklightConnector(pDispEvo, display_id, &cap2);
++    static NvBool logged = FALSE;
++    NvU32 readBack = 0;
++    NvBool ok;
++
++    if (pConnectorEvo == NULL) {
++        return FALSE;
++    }
++
++    brightness = NV_MIN(brightness, 100);
++    ok = WriteLuminanceBacklight(pConnectorEvo, cap2, brightness);
++
++    if (ok) {
++        pDispEvo->auxBacklight.set = TRUE;
++        pDispEvo->auxBacklight.displayId = display_id;
++        pDispEvo->auxBacklight.brightness = brightness;
++    }
++
++    if (!logged) {
++        nvEvoLogDisp(pDispEvo, EVO_LOG_INFO,
++                     "Setting the eDP panel's brightness as a target luminance: %u%% %s",
++                     brightness,
++                     !ok ? "failed" :
++                     ReadLuminanceBacklight(pConnectorEvo, &readBack) &&
++                     readBack == brightness ? "read back" : "not read back");
++        logged = TRUE;
++    }
++
++    return ok;
++}
++
++/*
++ * The panel forgets a brightness set over AUX when it is powered off; set it
++ * again once a modeset has brought the panel back up.
++ */
++void nvKmsRestoreBacklightOverAux(NVDispEvoRec *pDispEvo,
++                                  const NVConnectorEvoRec *pConnectorEvo)
++{
++    NVConnectorEvoPtr pPanel;
++    NvU8 cap2 = 0;
++
++    if (!pDispEvo->auxBacklight.set ||
++        nvDpyIdToNvU32(pConnectorEvo->displayId) !=
++        pDispEvo->auxBacklight.displayId) {
++        return;
++    }
++
++    pPanel = GetLuminanceBacklightConnector(pDispEvo,
++                                            pDispEvo->auxBacklight.displayId,
++                                            &cap2);
++    if (pPanel != NULL) {
++        WriteLuminanceBacklight(pPanel, cap2, pDispEvo->auxBacklight.brightness);
++    }
++}
++
+ NvBool nvKmsGetBacklight(NvU32 display_id, void *drv_priv, NvU32 *brightness)
+ {
+     NV0073_CTRL_SPECIFIC_BACKLIGHT_BRIGHTNESS_PARAMS params = { 0 };
+     NV_STATUS status = NV_ERR_INVALID_STATE;
+     NVDispEvoRec *pDispEvo = drv_priv;
+     NVDevEvoRec *pDevEvo = pDispEvo->pDevEvo;
++    NVConnectorEvoPtr pConnectorEvo;
++    NvU8 cap2 = 0;
+ 
+     params.displayId = display_id;
+     params.brightnessType = NV0073_CTRL_SPECIFIC_BACKLIGHT_BRIGHTNESS_TYPE_PERCENT100;
+@@ -7166,6 +7353,12 @@ NvBool nvKmsGetBacklight(NvU32 display_id, void *drv_priv, NvU32 *brightness)
+         *brightness = params.brightness;
+     }
+ 
++    pConnectorEvo = GetLuminanceBacklightConnector(pDispEvo, display_id, &cap2);
++    if (pConnectorEvo != NULL &&
++        ReadLuminanceBacklight(pConnectorEvo, brightness)) {
++        return TRUE;
++    }
++
+     return status == NV_OK;
+ }
+ 
+@@ -7175,6 +7368,7 @@ NvBool nvKmsSetBacklight(NvU32 display_id, void *drv_priv, NvU32 brightness)
+     NV_STATUS status = NV_ERR_INVALID_STATE;
+     NVDispEvoRec *pDispEvo = drv_priv;
+     NVDevEvoRec *pDevEvo = pDispEvo->pDevEvo;
++    NvBool luminance;
+ 
+     params.displayId  = display_id;
+     params.brightness = brightness;
+@@ -7185,7 +7379,10 @@ NvBool nvKmsSetBacklight(NvU32 display_id, void *drv_priv, NvU32 brightness)
+                             NV0073_CTRL_CMD_SPECIFIC_SET_BACKLIGHT_BRIGHTNESS,
+                             &params, sizeof(params));
+ 
+-    return status == NV_OK;
++    /* After RM, which may have written a level the panel ignores. */
++    luminance = SetLuminanceBacklight(pDispEvo, display_id, brightness);
++
++    return status == NV_OK || luminance;
+ }
+ 
+ NvBool nvKmsOpenDevHasSubOwnerPermissionOrBetter(const struct NvKmsPerOpenDev *pOpenDev)
