@@ -93,6 +93,11 @@ x86_backup=(
 )
 keyboard_unit=default/systemd/user/omarchy-brightness-keyboard-auto.service
 thunderbolt_unit=default/systemd/user/omarchy-thunderbolt-enroll@.service
+nvpcr_dropins=(
+  default/systemd/system/systemd-tpm2-setup-early.service.d/10-omarchy-nvpcr.conf
+  default/systemd/system/systemd-pcrproduct.service.d/10-omarchy-nvpcr.conf
+  default/systemd/system/systemd-pcrlogin@.service.d/10-omarchy-nvpcr.conf
+)
 platform_guard=(
   usr/share/libalpm/hooks/00-omarchy-platform-guard.hook
   usr/share/libalpm/scripts/omarchy-hw-platform
@@ -140,7 +145,7 @@ in_list() {
 fixtures=$BUILD_ROOT/tests/fixtures/settings-boot
 make_source "$scratch/legacy"
 cp "$fixtures/omarchy_hooks-v4.0.4.conf" "$scratch/legacy/etc/mkinitcpio.conf.d/omarchy_hooks.conf"
-make_source "$scratch/profile" default/settings-runtime-profile "$keyboard_unit" "$thunderbolt_unit"
+make_source "$scratch/profile" default/settings-runtime-profile "$keyboard_unit" "$thunderbolt_unit" "${nvpcr_dropins[@]}"
 cp "$fixtures"/omarchy-13362/*.conf "$scratch/profile/etc/mkinitcpio.conf.d/"
 
 for recipe in omarchy-settings omarchy-settings-dev; do
@@ -176,6 +181,8 @@ for recipe in omarchy-settings omarchy-settings-dev; do
     fail 'a source without the keyboard unit ships none'
   ! in_list usr/lib/systemd/user/omarchy-thunderbolt-enroll@.service "$scratch/legacy-x86_64.files" ||
     fail 'a source without the Thunderbolt enroll unit ships none'
+  ! grep -q 'nvpcr' "$scratch/legacy-x86_64.files" ||
+    fail 'a source without the NvPCR drop-ins ships none'
   echo "PASS: $recipe: an older source keeps its per-architecture package"
 
   # A runtime-profile source ships the same tree and metadata on both.
@@ -208,12 +215,16 @@ for recipe in omarchy-settings omarchy-settings-dev; do
     fail 'the keyboard unit first-run enables ships when the source has it'
   in_list usr/lib/systemd/user/omarchy-thunderbolt-enroll@.service "$scratch/profile-aarch64.files" ||
     fail 'the Thunderbolt enroll unit ships when the source has it'
+  for dropin in "${nvpcr_dropins[@]}"; do
+    in_list "usr/lib/${dropin#default/}" "$scratch/profile-aarch64.files" ||
+      fail 'the NvPCR drop-ins ship when the source has them'
+  done
   comm -13 "$scratch/legacy-x86_64.files" "$scratch/profile-x86_64.files" >"$scratch/added"
   for conf in 00-omarchy-hooks.conf omarchy_hooks.conf; do
     cmp -s "$fixtures/omarchy-13362/$conf" "$scratch/profile-aarch64/etc/mkinitcpio.conf.d/$conf" ||
       fail "runtime-profile source ships its $conf as it is on aarch64"
   done
-  [[ $(cat "$scratch/added") == "$(printf '%s\n' usr/lib/systemd/user/omarchy-brightness-keyboard-auto.service usr/lib/systemd/user/omarchy-thunderbolt-enroll@.service usr/share/omarchy/default/settings-runtime-profile "usr/share/omarchy/$keyboard_unit" "usr/share/omarchy/$thunderbolt_unit" etc/mkinitcpio.conf.d/00-omarchy-hooks.conf | sort)" ]] ||
+  [[ $(cat "$scratch/added") == "$(printf '%s\n' usr/lib/systemd/user/omarchy-brightness-keyboard-auto.service usr/lib/systemd/user/omarchy-thunderbolt-enroll@.service usr/share/omarchy/default/settings-runtime-profile "usr/share/omarchy/$keyboard_unit" "usr/share/omarchy/$thunderbolt_unit" etc/mkinitcpio.conf.d/00-omarchy-hooks.conf "${nvpcr_dropins[@]/#default/usr/lib}" "${nvpcr_dropins[@]/#/usr/share/omarchy/}" | sort)" ]] ||
     fail 'x86_64 gains only the new source files from a runtime-profile source' "$(cat "$scratch/added")"
   echo "PASS: $recipe: a runtime-profile source ships the full set on aarch64"
 done
