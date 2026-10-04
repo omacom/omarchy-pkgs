@@ -1,5 +1,7 @@
 # linux-n1x
 
+Superseded by `linux-omarchy-n1x`, which Omarchy installs on N1x machines instead; this recipe is kept for reference and comparison.
+
 Experimental Arch-style packaging for NVIDIA's public N1x-era kernel lineage.
 The package is pinned to the maintained NVIDIA/Ubuntu 7.0 source that carries
 NVIDIA's N1x platform support:

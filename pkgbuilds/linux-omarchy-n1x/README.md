@@ -1,6 +1,6 @@
 # linux-omarchy-n1x
 
-The `linux-omarchy` kernel built for aarch64 with NVIDIA N1x (RTX Spark) platform support added. It carries the same kernel.org source and signed Omarchy patch set as `linux-omarchy` (currently 7.2.5-6), plus N1x topic patches numbered 1000 and up. The intent is to fold these into `linux-omarchy` itself once it builds for aarch64; until then this package replaces NVIDIA's 7.0-based `linux-n1x` on N1x machines.
+The `linux-omarchy` kernel built for aarch64 with NVIDIA N1x (RTX Spark) platform support added. It carries the same kernel.org source and signed Omarchy patch set as `linux-omarchy` 7.2.5-6, plus N1x topic patches numbered 1000 and up. The intent is to fold these into `linux-omarchy` itself once it builds for aarch64; until then this is the kernel Omarchy installs on N1x machines (`install/hardware/n1x.sh` in omarchy), replacing NVIDIA's 7.0-based `linux-n1x`.
 
 The `pkgrel` counts N1x revisions of this package and starts again at 1 when the kernel version changes. It was `6.1` to `6.9` while it tracked `linux-omarchy`'s release; the ninth revision is now `9`.
 
@@ -57,4 +57,6 @@ The build produces only `Image` and modules; N1x boots through ACPI and the pack
 
 7.2.5-6.5 on the ASUS ProArt P14 H7407BA with `nvidia-open-dkms` 615.71.09 (2026-10-02): LUKS unlock at Plymouth, internal display and brightness, CUDA, keyboard (Fn keys, backlight, Fn-lock), touchpad, speakers, headphones and microphones, battery and AC, Wi-Fi and Bluetooth, webcam, 122 GiB of RAM with `efi_reclaim_reserved=` (the reclaimed ranges kept a written pattern through display, 16 GiB of CUDA work and suspend-to-idle), suspend-to-idle.
 
-Not yet validated: lid-driven suspend and battery drain while suspended, external displays and USB-C (UCSI fails to initialize its PPM), warm reboot loops. The firmware's `deep` sleep returns at once, so Omarchy defaults these machines to `s2idle`.
+7.2.5-6.8 on the same machine (2026-10-03): UCSI and the three USB-C ports' Type-C class devices; a CalDigit TS4 on each of the three USB4 ports with a 40 Gb/s link, its USB3 and 2.5 GbE (`igc`) and a 4K 240 Hz display through its DisplayPort tunnel, at boot and on hotplug; HDMI out; the UHS-II SD reader. Omarchy writes the USB4 kernel options (`power_wrap_drv.usb4_release=0 pci=hpbussize=0x80,hpmmiosize=32M,hpmmioprefsize=32G`) from `install/hardware/n1x.sh`, and a dock or adapter is approved once with `boltctl enroll --policy auto`.
+
+Not yet validated: USB4 devices across suspend (patches 1080 and 1081), lid-driven suspend and battery drain while suspended, warm reboot loops. The firmware's `deep` sleep returns at once, so Omarchy defaults these machines to `s2idle`.
