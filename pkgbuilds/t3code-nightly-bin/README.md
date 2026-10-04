@@ -12,3 +12,4 @@ schemes between channels: installing both does not create isolated profiles.
 The upstream watch accepts only `vX.Y.Z-nightly.YYYYMMDD.N` releases. Arch versions
 replace the hyphen with an underscore; downloads retain upstream's original tag
 and filenames. Both architecture checksums must be available before an update.
+A nightly is picked up once it is 30 minutes old, because upstream publishes the release before its AppImages finish uploading.
