@@ -92,6 +92,7 @@ x86_backup=(
   etc/systemd/zram-generator.conf
 )
 keyboard_unit=default/systemd/user/omarchy-brightness-keyboard-auto.service
+thunderbolt_unit=default/systemd/user/omarchy-thunderbolt-enroll@.service
 platform_guard=(
   usr/share/libalpm/hooks/00-omarchy-platform-guard.hook
   usr/share/libalpm/scripts/omarchy-hw-platform
@@ -139,7 +140,7 @@ in_list() {
 fixtures=$BUILD_ROOT/tests/fixtures/settings-boot
 make_source "$scratch/legacy"
 cp "$fixtures/omarchy_hooks-v4.0.4.conf" "$scratch/legacy/etc/mkinitcpio.conf.d/omarchy_hooks.conf"
-make_source "$scratch/profile" default/settings-runtime-profile "$keyboard_unit"
+make_source "$scratch/profile" default/settings-runtime-profile "$keyboard_unit" "$thunderbolt_unit"
 cp "$fixtures"/omarchy-13362/*.conf "$scratch/profile/etc/mkinitcpio.conf.d/"
 
 for recipe in omarchy-settings omarchy-settings-dev; do
@@ -173,6 +174,8 @@ for recipe in omarchy-settings omarchy-settings-dev; do
   ! grep -q '^limine:' "$scratch/legacy-aarch64.optdepends" || fail "older source's aarch64 package suggests no boot stack"
   ! in_list usr/lib/systemd/user/omarchy-brightness-keyboard-auto.service "$scratch/legacy-x86_64.files" ||
     fail 'a source without the keyboard unit ships none'
+  ! in_list usr/lib/systemd/user/omarchy-thunderbolt-enroll@.service "$scratch/legacy-x86_64.files" ||
+    fail 'a source without the Thunderbolt enroll unit ships none'
   echo "PASS: $recipe: an older source keeps its per-architecture package"
 
   # A runtime-profile source ships the same tree and metadata on both.
@@ -203,12 +206,14 @@ for recipe in omarchy-settings omarchy-settings-dev; do
     fail 'the HOOKS baseline drop-in is backed up where the source has it'
   in_list usr/lib/systemd/user/omarchy-brightness-keyboard-auto.service "$scratch/profile-aarch64.files" ||
     fail 'the keyboard unit first-run enables ships when the source has it'
+  in_list usr/lib/systemd/user/omarchy-thunderbolt-enroll@.service "$scratch/profile-aarch64.files" ||
+    fail 'the Thunderbolt enroll unit ships when the source has it'
   comm -13 "$scratch/legacy-x86_64.files" "$scratch/profile-x86_64.files" >"$scratch/added"
   for conf in 00-omarchy-hooks.conf omarchy_hooks.conf; do
     cmp -s "$fixtures/omarchy-13362/$conf" "$scratch/profile-aarch64/etc/mkinitcpio.conf.d/$conf" ||
       fail "runtime-profile source ships its $conf as it is on aarch64"
   done
-  [[ $(cat "$scratch/added") == "$(printf '%s\n' usr/lib/systemd/user/omarchy-brightness-keyboard-auto.service usr/share/omarchy/default/settings-runtime-profile "usr/share/omarchy/$keyboard_unit" etc/mkinitcpio.conf.d/00-omarchy-hooks.conf | sort)" ]] ||
+  [[ $(cat "$scratch/added") == "$(printf '%s\n' usr/lib/systemd/user/omarchy-brightness-keyboard-auto.service usr/lib/systemd/user/omarchy-thunderbolt-enroll@.service usr/share/omarchy/default/settings-runtime-profile "usr/share/omarchy/$keyboard_unit" "usr/share/omarchy/$thunderbolt_unit" etc/mkinitcpio.conf.d/00-omarchy-hooks.conf | sort)" ]] ||
     fail 'x86_64 gains only the new source files from a runtime-profile source' "$(cat "$scratch/added")"
   echo "PASS: $recipe: a runtime-profile source ships the full set on aarch64"
 done
