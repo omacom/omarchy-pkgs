@@ -113,7 +113,10 @@ RUN ln -sf /usr/lib/os-release /etc/os-release && \
 # aarch64 build depend on an aarch64 repository that only that build can
 # create.
 ARG MIRROR=edge
-RUN pacman-key --recv-keys 40DFB630FF42BCFFB047046CF0134EE680CAC571 --keyserver keys.openpgp.org && \
+# The full fingerprint is what is trusted; a keyserver is only transport, so a
+# second one keeps an outage of the first from failing every build.
+RUN { pacman-key --recv-keys 40DFB630FF42BCFFB047046CF0134EE680CAC571 --keyserver hkps://keys.openpgp.org || \
+      pacman-key --recv-keys 40DFB630FF42BCFFB047046CF0134EE680CAC571 --keyserver hkps://keyserver.ubuntu.com; } && \
     pacman-key --lsign-key 40DFB630FF42BCFFB047046CF0134EE680CAC571 && \
     printf '\n[omarchy]\nSigLevel = Optional\nServer = https://pkgs.omarchy.org/%s/x86_64\n' "${MIRROR}" >> /etc/pacman.conf && \
     pacman -Sy --noconfirm && \
