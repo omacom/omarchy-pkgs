@@ -13,6 +13,14 @@ and amdgpu, but only on eDP 1.5 panels without a PWM input that support
 luminance control; everything else stays with the firmware. Keep it until
 NVIDIA's driver sets these panels itself.
 
+And `0004-drive-both-displays-of-a-dock-on-one-n1x-usb4-port.patch`: on the
+N1x a USB4 port's two DisplayPort IN adapters are two USB-C connectors on one
+DP pad-link, each with its own SOR, but the GPU firmware's head routing map
+lets a pad-link drive one display only. A dock's second display never lit.
+When the firmware rejects a set of displays, nvkms asks again with one USB-C DP
+connector per shared pad-link and accepts the set if that passes. Keep it until
+NVIDIA's firmware routes both adapters itself.
+
 Requires `[omarchy]` before `[extra]` and matching `nvidia-utils=615.71.09`.
 Update both NVIDIA packages together; automatic version tracking is disabled.
 

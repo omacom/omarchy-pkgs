@@ -1,0 +1,212 @@
+From a69166dd2bb693f4d34497aa290eef134846e162 Mon Sep 17 00:00:00 2001
+From: Ryan Hughes <ryan@heyoodle.com>
+Date: Mon, 5 Oct 2026 17:28:24 -0400
+Subject: [PATCH] nvkms: drive both displays of a dock on one N1x USB4 port
+
+On the NVIDIA N1x a USB4 port's two DisplayPort IN adapters are two
+USB-C connectors in the VBIOS DCB that share one DP pad-link, and the
+GPU firmware gives each its own SOR. GET_HEAD_ROUTING_MAP still lets a
+pad-link drive one display only, so with a dock such as the CalDigit
+TS4 the display that connects first lights and every modeset with the
+second fails: "The requested configuration of display devices ... is
+not supported on this GPU". Hyprland is left with an output it cannot
+enable.
+
+When RM rejects a set of displays, ask it again with all but one of the
+USB-C DP connectors that share each pad-link left out, and accept the
+full set if it accepts that one. The pad-links are only queried on that
+path, so configurations RM accepts are handled as before, and SOR
+assignment at modeset still fails if the displays cannot each get an
+SOR.
+
+Verified on the ASUS ProArt P14 (N1x) with a TS4 on USB4 port 0: an LG
+at 3840x2160@240 and a Corsair Xeneon Edge at 2560x720@60 behind the
+dock, on heads 2 and 1, with the internal panel on head 3.
+---
+ src/nvidia-modeset/src/nvkms-rm.c | 132 ++++++++++++++++++++++++------
+ 1 file changed, 108 insertions(+), 24 deletions(-)
+
+diff --git a/src/nvidia-modeset/src/nvkms-rm.c b/src/nvidia-modeset/src/nvkms-rm.c
+index 203dde1..6f26fd3 100644
+--- a/src/nvidia-modeset/src/nvkms-rm.c
++++ b/src/nvidia-modeset/src/nvkms-rm.c
+@@ -4659,6 +4659,102 @@ void nvRmUnregisterDIFREventHandler(NVDevEvoPtr pDevEvo)
+ }
+ 
+ 
++/*!
++ * Ask RM for a head routing map that drives every display in displayMask.
++ */
++static NvBool QueryHeadRoutingMap(NVDevEvoPtr pDevEvo,
++                                  NvU32 displayMask,
++                                  NvU32 *pGrantedMask)
++{
++    NV0073_CTRL_SYSTEM_GET_HEAD_ROUTING_MAP_PARAMS mapParams = { 0 };
++    NvU32 ret;
++
++    mapParams.displayMask = displayMask;
++
++    ret = nvRmApiControl(nvEvoGlobal.clientHandle,
++                         pDevEvo->displayCommonHandle,
++                         NV0073_CTRL_CMD_SYSTEM_GET_HEAD_ROUTING_MAP,
++                         &mapParams,
++                         sizeof(mapParams));
++
++    *pGrantedMask = (ret == NVOS_STATUS_SUCCESS) ? mapParams.displayMask : 0;
++
++    return *pGrantedMask == displayMask;
++}
++
++/*!
++ * Return the DP pad-links a USB-C connector is wired to, or 0.
++ */
++static NvU32 GetUsbcPadlinkMask(const NVConnectorEvoRec *pConnectorEvo)
++{
++    NVDevEvoPtr pDevEvo = pConnectorEvo->pDispEvo->pDevEvo;
++    NV0073_CTRL_DFP_GET_PADLINK_MASK_PARAMS params = { 0 };
++
++    if ((pConnectorEvo->type != NVKMS_CONNECTOR_TYPE_USBC) ||
++        (pConnectorEvo->or.type != NV0073_CTRL_SPECIFIC_OR_TYPE_SOR) ||
++        ((pConnectorEvo->or.protocol != NV0073_CTRL_SPECIFIC_OR_PROTOCOL_SOR_DP_A) &&
++         (pConnectorEvo->or.protocol != NV0073_CTRL_SPECIFIC_OR_PROTOCOL_SOR_DP_B))) {
++        return 0;
++    }
++
++    params.displayId = nvDpyIdToNvU32(pConnectorEvo->displayId);
++
++    if (nvRmApiControl(nvEvoGlobal.clientHandle,
++                       pDevEvo->displayCommonHandle,
++                       NV0073_CTRL_CMD_DFP_GET_PADLINK_MASK,
++                       &params,
++                       sizeof(params)) != NVOS_STATUS_SUCCESS) {
++        return 0;
++    }
++
++    return params.padlinkMask;
++}
++
++/*!
++ * RM's head routing map lets each DP pad-link drive one display, but on
++ * the NVIDIA N1x a USB4 port's two DisplayPort IN adapters are separate
++ * USB-C connectors on the same pad-link, each driven by its own SOR. RM
++ * rejects a dock's second display there although the hardware drives
++ * both. When RM rejects dpyIdList, accept it if RM accepts it with all but
++ * one of the USB-C DP connectors sharing each pad-link left out; SOR
++ * assignment at modeset still fails if the displays cannot each get one.
++ */
++static NvBool IsPossibleWithSharedUsbcPadlinks(NVDispEvoPtr pDispEvo,
++                                               const NVDpyIdList dpyIdList)
++{
++    NVDevEvoPtr pDevEvo = pDispEvo->pDevEvo;
++    NVConnectorEvoPtr pConnectorEvo;
++    NvU32 seenPadlinks = 0;
++    NvU32 reducedMask = 0;
++    NvU32 grantedMask;
++
++    FOR_ALL_EVO_CONNECTORS(pConnectorEvo, pDispEvo) {
++        NvU32 padlinkMask;
++
++        if (!nvDpyIdIsInDpyIdList(pConnectorEvo->displayId, dpyIdList)) {
++            continue;
++        }
++
++        padlinkMask = GetUsbcPadlinkMask(pConnectorEvo);
++
++        if ((padlinkMask != 0) && ((seenPadlinks & padlinkMask) != 0)) {
++            if ((seenPadlinks & padlinkMask) != padlinkMask) {
++                return FALSE;
++            }
++            continue;
++        }
++
++        seenPadlinks |= padlinkMask;
++        reducedMask |= nvDpyIdToNvU32(pConnectorEvo->displayId);
++    }
++
++    if (reducedMask == nvDpyIdListToNvU32(dpyIdList)) {
++        return FALSE;
++    }
++
++    return QueryHeadRoutingMap(pDevEvo, reducedMask, &grantedMask);
++}
++
+ /*!
+  * Determine whether all the dpys in the dpyIdList can be activated together.
+  *
+@@ -4671,8 +4767,7 @@ NvBool nvRmIsPossibleToActivateDpyIdList(NVDispEvoPtr pDispEvo,
+                                          const NVDpyIdList dpyIdList)
+ {
+     NVDevEvoPtr pDevEvo = pDispEvo->pDevEvo;
+-    NV0073_CTRL_SYSTEM_GET_HEAD_ROUTING_MAP_PARAMS mapParams = { 0 };
+-    NvU32 ret = 0;
++    NvU32 grantedMask;
+ 
+     if (pDevEvo->displaylessHw) {
+         return TRUE;
+@@ -4690,32 +4785,23 @@ NvBool nvRmIsPossibleToActivateDpyIdList(NVDispEvoPtr pDispEvo,
+         return FALSE;
+     }
+ 
+-    /* build a mask of all the displays to use */
++    if (QueryHeadRoutingMap(pDevEvo, nvDpyIdListToNvU32(dpyIdList),
++                            &grantedMask)) {
++        return TRUE;
++    }
+ 
+-    mapParams.displayMask = nvDpyIdListToNvU32(dpyIdList);
++    if (IsPossibleWithSharedUsbcPadlinks(pDispEvo, dpyIdList)) {
++        return TRUE;
++    }
+ 
+-    /* ask RM for the head routing */
+-
+-    ret = nvRmApiControl(nvEvoGlobal.clientHandle,
+-                         pDevEvo->displayCommonHandle,
+-                         NV0073_CTRL_CMD_SYSTEM_GET_HEAD_ROUTING_MAP,
+-                         &mapParams,
+-                         sizeof(mapParams));
+-
+-    if ((ret != NVOS_STATUS_SUCCESS) || (mapParams.displayMask == 0)) {
++    if (grantedMask == 0) {
+         char *dpyIdListStr = nvGetDpyIdListStringEvo(pDispEvo, dpyIdList);
+         nvEvoLogDev(pDevEvo, EVO_LOG_ERROR,
+                     "The requested configuration of display devices "
+                     "(%s) is not supported on this GPU.",
+                     nvSafeString(dpyIdListStr, "unknown"));
+         nvFree(dpyIdListStr);
+-
+-        return FALSE;
+-    }
+-
+-    /* make sure we got everything we asked for */
+-
+-    if (mapParams.displayMask != nvDpyIdListToNvU32(dpyIdList)) {
++    } else {
+         char *requestedDpyIdListStr;
+         char *returnedDpyIdListStr;
+ 
+@@ -4724,7 +4810,7 @@ NvBool nvRmIsPossibleToActivateDpyIdList(NVDispEvoPtr pDispEvo,
+ 
+         returnedDpyIdListStr =
+             nvGetDpyIdListStringEvo(pDispEvo,
+-                                    nvNvU32ToDpyIdList(mapParams.displayMask));
++                                    nvNvU32ToDpyIdList(grantedMask));
+ 
+         nvEvoLogDev(pDevEvo, EVO_LOG_ERROR,
+                     "The requested configuration of display devices "
+@@ -4735,11 +4821,9 @@ NvBool nvRmIsPossibleToActivateDpyIdList(NVDispEvoPtr pDispEvo,
+ 
+         nvFree(requestedDpyIdListStr);
+         nvFree(returnedDpyIdListStr);
+-
+-        return FALSE;
+     }
+ 
+-    return TRUE;
++    return FALSE;
+ }
+ 
+ 
+-- 
+2.56.0
+
