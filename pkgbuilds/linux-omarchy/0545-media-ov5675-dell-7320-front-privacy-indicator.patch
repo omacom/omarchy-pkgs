@@ -1,0 +1,193 @@
+From: Matt Wolfgang <mattwolfgang@gmail.com>
+Subject: [PATCH] media: ov5675: Control the Dell 7320 front privacy indicator
+
+The front indicator on the Latitude 7320 Detachable is connected to
+TPS68470 ILEDA. Enable it, verify the enable bit and reject reported short
+faults before entering streaming mode. Do not start capture on a failed
+indicator command. Disable the indicator after successful standby or
+reset/power-down. Leave it enabled if sensor stop/power-down fails.
+
+Limit the PMIC lookup to the exact Dell model and OVTI5678 sensor device.
+Use a managed supplier link to protect the PMIC regmap lifetime. Preserve
+all other indicator output settings and expose no userspace LED switch.
+
+This downstream workaround was tested with the local RGB-IR OVTI5678
+sensor support. It does not add that ACPI ID to the upstream driver or
+resolve the separate RGB-IR format discussion. Refactoring the PMIC
+lookup into a common privacy-indicator provider remains for review.
+
+---
+diff --git a/drivers/media/i2c/ov5675.c b/drivers/media/i2c/ov5675.c
+index 1c31b2a..c3f823f 100644
+--- a/drivers/media/i2c/ov5675.c
++++ b/drivers/media/i2c/ov5675.c
+@@ -3,12 +3,14 @@
+ 
+ #include <linux/acpi.h>
+ #include <linux/clk.h>
++#include <linux/dmi.h>
+ #include <linux/delay.h>
+ #include <linux/gpio/consumer.h>
+ #include <linux/i2c.h>
+ #include <linux/module.h>
+ #include <linux/pm_runtime.h>
+ #include <linux/regulator/consumer.h>
++#include <linux/regmap.h>
+ #include <linux/unaligned.h>
+ 
+ #include <media/v4l2-ctrls.h>
+@@ -500,6 +502,7 @@ struct ov5675 {
+ 	struct v4l2_ctrl_handler ctrl_handler;
+ 	struct clk *xvclk;
+ 	struct gpio_desc *reset_gpio;
++	struct regmap *privacy_led_map;
+ 	struct regulator_bulk_data supplies[OV5675_NUM_SUPPLIES];
+ 
+ 	/* V4L2 Controls */
+@@ -890,6 +893,70 @@ static int ov5675_identify_module(struct ov5675 *ov5675)
+ 	return 0;
+ }
+ 
++/* TPS68470 ILEDA is the front privacy indicator on this exact board. */
++#define OV5675_TPS68470_ILEDCTL 0x28
++#define OV5675_TPS68470_ILEDA_EN BIT(2)
++#define OV5675_TPS68470_ILEDA_FAULT BIT(3)
++
++static void ov5675_put_privacy_pmic(void *data)
++{
++	put_device(data);
++}
++
++static int ov5675_get_privacy_led(struct ov5675 *ov5675)
++{
++	struct device *pmic;
++	int ret;
++
++	if (!dmi_match(DMI_SYS_VENDOR, "Dell Inc.") ||
++	    !dmi_match(DMI_PRODUCT_NAME, "Latitude 7320 Detachable") ||
++	    strcmp(dev_name(ov5675->dev), "i2c-OVTI5678:00"))
++		return 0;
++
++	pmic = bus_find_device_by_name(&i2c_bus_type, NULL, "i2c-INT3472:07");
++	if (!pmic)
++		return -EPROBE_DEFER;
++
++	ret = devm_add_action_or_reset(ov5675->dev, ov5675_put_privacy_pmic, pmic);
++	if (ret)
++		return ret;
++
++	ov5675->privacy_led_map = dev_get_regmap(pmic, NULL);
++	if (!ov5675->privacy_led_map)
++		return -EPROBE_DEFER;
++
++	/* Unbinding the PMIC must unbind this consumer before destroying its map. */
++	if (!device_link_add(ov5675->dev, pmic, DL_FLAG_AUTOREMOVE_CONSUMER))
++		return -EINVAL;
++
++	return 0;
++}
++
++static int ov5675_set_privacy_led(struct ov5675 *ov5675, bool enable)
++{
++	unsigned int value;
++	int ret;
++
++	if (!ov5675->privacy_led_map)
++		return 0;
++
++	ret = regmap_update_bits(ov5675->privacy_led_map, OV5675_TPS68470_ILEDCTL,
++				OV5675_TPS68470_ILEDA_EN,
++				enable ? OV5675_TPS68470_ILEDA_EN : 0);
++	if (ret)
++		return dev_err_probe(ov5675->dev, ret, "privacy LED write failed\n");
++
++	ret = regmap_read(ov5675->privacy_led_map, OV5675_TPS68470_ILEDCTL, &value);
++	if (ret)
++		return ret;
++
++	if (!!(value & OV5675_TPS68470_ILEDA_EN) != enable ||
++	    (enable && (value & OV5675_TPS68470_ILEDA_FAULT)))
++		return dev_err_probe(ov5675->dev, -EIO, "privacy LED verification failed\n");
++
++	return 0;
++}
++
+ static int ov5675_start_streaming(struct ov5675 *ov5675)
+ {
+ 	const struct ov5675_reg_list *reg_list;
+@@ -918,6 +985,11 @@ static int ov5675_start_streaming(struct ov5675 *ov5675)
+ 	if (ret)
+ 		return ret;
+ 
++	/* Do not permit capture unless the privacy indicator is enabled. */
++	ret = ov5675_set_privacy_led(ov5675, true);
++	if (ret)
++		return ret;
++
+ 	ret = ov5675_write_reg(ov5675, OV5675_REG_MODE_SELECT,
+ 			       OV5675_REG_VALUE_08BIT, OV5675_MODE_STREAMING);
+ 	if (ret) {
+@@ -928,11 +1000,18 @@ static int ov5675_start_streaming(struct ov5675 *ov5675)
+ 	return 0;
+ }
+ 
+-static void ov5675_stop_streaming(struct ov5675 *ov5675)
++static int ov5675_stop_streaming(struct ov5675 *ov5675)
+ {
+-	if (ov5675_write_reg(ov5675, OV5675_REG_MODE_SELECT,
+-			     OV5675_REG_VALUE_08BIT, OV5675_MODE_STANDBY))
+-		dev_err(ov5675->dev, "failed to set stream");
++	int ret;
++
++	ret = ov5675_write_reg(ov5675, OV5675_REG_MODE_SELECT,
++			       OV5675_REG_VALUE_08BIT, OV5675_MODE_STANDBY);
++	if (ret) {
++		dev_err(ov5675->dev, "failed to stop stream; keeping privacy LED on\n");
++		return ret;
++	}
++
++	return ov5675_set_privacy_led(ov5675, false);
+ }
+ 
+ static int ov5675_set_stream(struct v4l2_subdev *sd, int enable)
+@@ -955,7 +1034,7 @@ static int ov5675_set_stream(struct v4l2_subdev *sd, int enable)
+ 			pm_runtime_put(ov5675->dev);
+ 		}
+ 	} else {
+-		ov5675_stop_streaming(ov5675);
++		ret = ov5675_stop_streaming(ov5675);
+ 		pm_runtime_put(ov5675->dev);
+ 	}
+ 
+@@ -968,14 +1047,16 @@ static int ov5675_power_off(struct device *dev)
+ {
+ 	struct v4l2_subdev *sd = dev_get_drvdata(dev);
+ 	struct ov5675 *ov5675 = to_ov5675(sd);
++	int reset_ret, ret;
+ 
+ 	usleep_range(90, 100);
+-
+ 	clk_disable_unprepare(ov5675->xvclk);
+-	gpiod_set_value_cansleep(ov5675->reset_gpio, 1);
+-	regulator_bulk_disable(OV5675_NUM_SUPPLIES, ov5675->supplies);
++	reset_ret = gpiod_set_value_cansleep(ov5675->reset_gpio, 1);
++	ret = regulator_bulk_disable(OV5675_NUM_SUPPLIES, ov5675->supplies);
++	if (reset_ret || ret)
++		return reset_ret ? reset_ret : ret;
+ 
+-	return 0;
++	return ov5675_set_privacy_led(ov5675, false);
+ }
+ 
+ static int ov5675_power_on(struct device *dev)
+@@ -1286,6 +1367,10 @@ static int ov5675_probe(struct i2c_client *client)
+ 
+ 	v4l2_i2c_subdev_init(&ov5675->sd, client, &ov5675_subdev_ops);
+ 
++	ret = ov5675_get_privacy_led(ov5675);
++	if (ret)
++		return dev_err_probe(ov5675->dev, ret, "privacy LED unavailable\n");
++
+ 	ret = ov5675_power_on(ov5675->dev);
+ 	if (ret) {
+ 		dev_err(ov5675->dev, "failed to power on: %d\n", ret);

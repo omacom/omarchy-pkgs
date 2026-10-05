@@ -1,0 +1,230 @@
+From: Matt Wolfgang <mattwolfgang@gmail.com>
+Subject: [PATCH] media: Enable the Dell Latitude 7320 Detachable rear camera
+
+The rear OV8856 on this model does not respond with the ACPI power path
+alone. Enable the existing clock, regulator and reset sequence on this
+specific Dell sensor, using TPS68470 VSIO/ANA/CORE and reset GPIO 9.
+Require real supplies rather than accepting dummy regulators.
+
+The DW9714 lens also needs the TPS68470 VCM supply; the default vcc
+lookup supplies a dummy regulator and focus writes fail.
+
+Enable runtime PM before sensor registration so the IPU bridge can create
+the lens, and avoid disabling supplies twice when removing a suspended
+sensor. Use the parsed lane count in the probe debug message rather than
+dereferencing cur_mode before it is initialized.
+
+Other ACPI devices retain their existing regulator/reset selection.
+This is a hardware-tested downstream workaround for review; board-data
+supply mappings and GPIO placement may need restructuring upstream.
+
+---
+diff --git a/drivers/media/i2c/dw9714.c b/drivers/media/i2c/dw9714.c
+index 1d686b1..73db95e 100644
+--- a/drivers/media/i2c/dw9714.c
++++ b/drivers/media/i2c/dw9714.c
+@@ -7,6 +7,7 @@
+ #include <linux/module.h>
+ #include <linux/pm_runtime.h>
+ #include <linux/regulator/consumer.h>
++#include <linux/dmi.h>
+ #include <media/v4l2-ctrls.h>
+ #include <media/v4l2-device.h>
+ #include <media/v4l2-event.h>
+@@ -171,7 +172,12 @@ static int dw9714_probe(struct i2c_client *client)
+ 	if (!dw9714_dev)
+ 		return -ENOMEM;
+ 
+-	dw9714_dev->vcc = devm_regulator_get(&client->dev, "vcc");
++	if (dmi_match(DMI_SYS_VENDOR, "Dell Inc.") &&
++	    dmi_match(DMI_PRODUCT_NAME, "Latitude 7320 Detachable") &&
++	    !strcmp(dev_name(&client->dev), "i2c-OVTI8856:00-VCM"))
++		dw9714_dev->vcc = devm_regulator_get_optional(&client->dev, "VCM");
++	else
++		dw9714_dev->vcc = devm_regulator_get(&client->dev, "vcc");
+ 	if (IS_ERR(dw9714_dev->vcc))
+ 		return PTR_ERR(dw9714_dev->vcc);
+ 
+diff --git a/drivers/media/i2c/ov8856.c b/drivers/media/i2c/ov8856.c
+index 8bedb47..4db0052 100644
+--- a/drivers/media/i2c/ov8856.c
++++ b/drivers/media/i2c/ov8856.c
+@@ -4,7 +4,9 @@
+ #include <linux/acpi.h>
+ #include <linux/clk.h>
+ #include <linux/delay.h>
++#include <linux/dmi.h>
+ #include <linux/gpio/consumer.h>
++#include <linux/gpio/machine.h>
+ #include <linux/i2c.h>
+ #include <linux/module.h>
+ #include <linux/pm_runtime.h>
+@@ -2076,13 +2078,21 @@ static int ov8856_set_stream(struct v4l2_subdev *sd, int enable)
+ 	return ret;
+ }
+ 
++/* Firmware does not manage the TPS68470 supplies on this model. */
++static bool ov8856_dell7320(struct device *dev)
++{
++	return dmi_match(DMI_SYS_VENDOR, "Dell Inc.") &&
++	       dmi_match(DMI_PRODUCT_NAME, "Latitude 7320 Detachable") &&
++	       !strcmp(dev_name(dev), "i2c-OVTI8856:00");
++}
++
+ static int ov8856_power_on(struct device *dev)
+ {
+ 	struct v4l2_subdev *sd = dev_get_drvdata(dev);
+ 	struct ov8856 *ov8856 = to_ov8856(sd);
+ 	int ret;
+ 
+-	if (is_acpi_node(dev_fwnode(dev)))
++	if (is_acpi_node(dev_fwnode(dev)) && !ov8856_dell7320(dev))
+ 		return 0;
+ 
+ 	ret = clk_prepare_enable(ov8856->xvclk);
+@@ -2120,7 +2130,7 @@ static int ov8856_power_off(struct device *dev)
+ 	struct v4l2_subdev *sd = dev_get_drvdata(dev);
+ 	struct ov8856 *ov8856 = to_ov8856(sd);
+ 
+-	if (is_acpi_node(dev_fwnode(dev)))
++	if (is_acpi_node(dev_fwnode(dev)) && !ov8856_dell7320(dev))
+ 		return 0;
+ 
+ 	gpiod_set_value_cansleep(ov8856->reset_gpio, 1);
+@@ -2293,20 +2303,39 @@ static int ov8856_get_hwcfg(struct ov8856 *ov8856)
+ 		dev_warn(dev, "external clock rate %u is unsupported",
+ 			 xvclk_rate);
+ 
+-	if (!is_acpi_node(fwnode)) {
++	if (!is_acpi_node(fwnode) || ov8856_dell7320(dev)) {
+ 		ov8856->reset_gpio = devm_gpiod_get_optional(dev, "reset",
+ 							     GPIOD_OUT_LOW);
+ 		if (IS_ERR(ov8856->reset_gpio))
+ 			return PTR_ERR(ov8856->reset_gpio);
+ 
+-		for (i = 0; i < ARRAY_SIZE(ov8856_supply_names); i++)
+-			ov8856->supplies[i].supply = ov8856_supply_names[i];
++		for (i = 0; i < ARRAY_SIZE(ov8856_supply_names); i++) {
++			static const char * const dell_rails[] = {
++				"VSIO", "ANA", "CORE"
++			};
++			ov8856->supplies[i].supply = ov8856_dell7320(dev) ?
++				dell_rails[i] : ov8856_supply_names[i];
++		}
+ 
+-		ret = devm_regulator_bulk_get(dev,
+-					      ARRAY_SIZE(ov8856_supply_names),
+-					      ov8856->supplies);
+-		if (ret)
+-			return ret;
++		if (ov8856_dell7320(dev)) {
++			/* Real rails are required: never accept dummy supplies. */
++			for (i = 0; i < ARRAY_SIZE(ov8856_supply_names); i++) {
++				struct regulator *supply;
++
++				supply = devm_regulator_get_optional(dev,
++							ov8856->supplies[i].supply);
++				ov8856->supplies[i].consumer = supply;
++				if (IS_ERR(ov8856->supplies[i].consumer))
++					return dev_err_probe(dev,
++						PTR_ERR(ov8856->supplies[i].consumer),
++						"rear power rail unavailable\n");
++			}
++		} else {
++			ret = devm_regulator_bulk_get(dev,
++				ARRAY_SIZE(ov8856_supply_names), ov8856->supplies);
++			if (ret)
++				return ret;
++		}
+ 	}
+ 
+ 	ep = fwnode_graph_get_next_endpoint(fwnode, NULL);
+@@ -2327,7 +2356,7 @@ static int ov8856_get_hwcfg(struct ov8856 *ov8856)
+ 		goto check_hwcfg_error;
+ 	}
+ 
+-	dev_dbg(dev, "Using %u data lanes\n", ov8856->cur_mode->data_lanes);
++	dev_dbg(dev, "Using %u data lanes\n", bus_cfg.bus.mipi_csi2.num_data_lanes);
+ 
+ 	if (bus_cfg.bus.mipi_csi2.num_data_lanes == 2)
+ 		ov8856->priv_lane = &lane_cfg_2;
+@@ -2374,7 +2403,8 @@ static void ov8856_remove(struct i2c_client *client)
+ 	pm_runtime_disable(ov8856->dev);
+ 	mutex_destroy(&ov8856->mutex);
+ 
+-	ov8856_power_off(ov8856->dev);
++	if (!pm_runtime_status_suspended(ov8856->dev))
++		ov8856_power_off(ov8856->dev);
+ }
+ 
+ static int ov8856_probe(struct i2c_client *client)
+@@ -2430,22 +2460,23 @@ static int ov8856_probe(struct i2c_client *client)
+ 		goto probe_error_v4l2_ctrl_handler_free;
+ 	}
+ 
++	/* The IPU bridge may create the lens immediately on registration. */
++	if (full_power)
++		pm_runtime_set_active(ov8856->dev);
++	pm_runtime_enable(ov8856->dev);
++
+ 	ret = v4l2_async_register_subdev_sensor(&ov8856->sd);
+ 	if (ret < 0) {
+ 		dev_err(ov8856->dev, "failed to register V4L2 subdev: %d",
+ 			ret);
+ 		goto probe_error_media_entity_cleanup;
+ 	}
+-
+-	/* Set the device's state to active if it's in D0 state. */
+-	if (full_power)
+-		pm_runtime_set_active(ov8856->dev);
+-	pm_runtime_enable(ov8856->dev);
+ 	pm_runtime_idle(ov8856->dev);
+ 
+ 	return 0;
+ 
+ probe_error_media_entity_cleanup:
++	pm_runtime_disable(ov8856->dev);
+ 	media_entity_cleanup(&ov8856->sd.entity);
+ 
+ probe_error_v4l2_ctrl_handler_free:
+@@ -2489,7 +2520,39 @@ static struct i2c_driver ov8856_i2c_driver = {
+ 	.flags = I2C_DRV_ACPI_WAIVE_D0_PROBE,
+ };
+ 
+-module_i2c_driver(ov8856_i2c_driver);
++static struct gpiod_lookup_table dell7320_rear_gpios = {
++	.dev_id = "i2c-OVTI8856:00",
++	.table = {
++		GPIO_LOOKUP("tps68470-gpio", 9, "reset", GPIO_ACTIVE_LOW),
++		{ }
++	},
++};
++
++static int __init ov8856_init(void)
++{
++	int ret;
++	bool dell = dmi_match(DMI_SYS_VENDOR, "Dell Inc.") &&
++		dmi_match(DMI_PRODUCT_NAME, "Latitude 7320 Detachable");
++
++	if (dell)
++		gpiod_add_lookup_table(&dell7320_rear_gpios);
++
++	ret = i2c_add_driver(&ov8856_i2c_driver);
++	if (ret && dell)
++		gpiod_remove_lookup_table(&dell7320_rear_gpios);
++
++	return ret;
++}
++module_init(ov8856_init);
++
++static void __exit ov8856_exit(void)
++{
++	i2c_del_driver(&ov8856_i2c_driver);
++	if (dmi_match(DMI_SYS_VENDOR, "Dell Inc.") &&
++	    dmi_match(DMI_PRODUCT_NAME, "Latitude 7320 Detachable"))
++		gpiod_remove_lookup_table(&dell7320_rear_gpios);
++}
++module_exit(ov8856_exit);
+ 
+ MODULE_AUTHOR("Ben Kao <ben.kao@intel.com>");
+ MODULE_DESCRIPTION("OmniVision OV8856 sensor driver");
