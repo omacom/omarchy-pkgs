@@ -1,6 +1,6 @@
-# Slack on ARM
+# Slack Desktop
 
-Slack publishes Linux builds for x86_64 only, and the AUR `slack-desktop` recipe repackages that `.deb`. This package runs the same application code on the AArch64 build of the Electron release Slack ships with, so `yay -S slack-desktop` on an ARM Omarchy install resolves to a working package.
+Slack publishes Linux builds for x86_64 only. On x86_64 this package installs that `.deb` unchanged, replacing the AUR `slack-desktop` recipe with one Omarchy controls. On AArch64 it runs the same application code on the AArch64 build of the Electron release Slack ships with, so `slack-desktop` resolves to a working package on ARM Omarchy installs too. Everything below applies to the AArch64 build only.
 
 ## Electron version
 
