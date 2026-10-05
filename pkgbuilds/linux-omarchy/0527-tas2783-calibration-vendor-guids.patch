@@ -1,0 +1,139 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Meir Dick <mdick85@gmail.com>
+Date: Thu, 10 Sep 2026 11:30:00 -0400
+Subject: [PATCH] ASoC: tas2783: read factory calibration from every vendor
+ GUID
+
+The driver looks for the UEFI calibration variable under a single GUID,
+the one Lenovo uses. HP stores the same CALI_DATA blob under its own
+GUID, 02f9af02-7734-4233-b43d-93fe5aa35db3, so on an HP machine the
+driver logs "No calibration data in UEFI" and the amplifiers run
+uncalibrated.
+
+On the HP EliteBook X G2i that is not harmless. The variable is present
+and valid - magic 2783, four speakers, CRC intact, matched by unique_id
+- and without it one of the four TAS2783A parts (uid 0x9) produces no
+output at all while Windows, which applies the calibration, drives it
+normally. The other three tolerate the missing data.
+
+tas2781_hda.c already carries a DELL/HP/LENOVO GUID table for exactly
+this. Use the same table here, plus a second HP GUID,
+53559579-8753-4f5c-9130-e82acfb8d893, which the HP OmniBook X Flip 14
+(board 8EA1) uses for the same variable. The SoundWire part has no
+catlog_id to select a vendor, so try each GUID in turn; a GUID that is
+not present returns EFI_NOT_FOUND and costs nothing.
+
+The 8EA1 GUID is from jml's "ASoC: tas2783: also look for calibration
+data under the OEM GUID" (v2 2/3, patchwork 14763919), which adds it as
+a second #define. Two HP boards with two GUIDs is the argument for a
+table. The upstream version of this patch is prepared as a reply to
+that posting, on top of 3e56757584d6 ("ASoC: tas2783-sdw: make
+multi-byte MBQ registers reachable", broonie for-next), which rewrites
+the calibration write path this touches nearby.
+
+Signed-off-by: Meir Dick <mdick85@gmail.com>
+---
+ sound/soc/codecs/tas2783-sdw.c | 71 +++++++++++++++++++++++-----------
+ 1 file changed, 48 insertions(+), 23 deletions(-)
+
+diff --git a/sound/soc/codecs/tas2783-sdw.c b/sound/soc/codecs/tas2783-sdw.c
+index 7a03f97..d69d80c 100644
+--- a/sound/soc/codecs/tas2783-sdw.c
++++ b/sound/soc/codecs/tas2783-sdw.c
+@@ -47,8 +47,25 @@
+ #define FW_DL_OFFSET	84 /* binary file information */
+ #define FW_FL_HDR	20 /* minimum number of bytes in one chunk */
+ #define TAS2783_PROBE_TIMEOUT 5000
+-#define TAS2783_CALI_GUID EFI_GUID(0x1f52d2a1, 0xbb3a, 0x457d, 0xbc, \
+-				   0x09, 0x43, 0xa3, 0xf4, 0x31, 0x0a, 0x92)
++/*
++ * Vendors store the factory calibration under their own GUID. Same table
++ * and order as tas2781_hda.c; the SoundWire part has no catlog_id to pick
++ * one, so every GUID is tried in turn.
++ */
++static const efi_guid_t tas2783_cali_guid[] = {
++	/* DELL */
++	EFI_GUID(0xcc92382d, 0x6337, 0x41cb, 0xa8, 0x8b, 0x8e, 0xce, 0x74,
++		 0x91, 0xea, 0x9f),
++	/* HP */
++	EFI_GUID(0x02f9af02, 0x7734, 0x4233, 0xb4, 0x3d, 0x93, 0xfe, 0x5a,
++		 0xa3, 0x5d, 0xb3),
++	/* HP, OmniBook X Flip 14 (board 8EA1) */
++	EFI_GUID(0x53559579, 0x8753, 0x4f5c, 0x91, 0x30, 0xe8, 0x2a, 0xcf,
++		 0xb8, 0xd8, 0x93),
++	/* LENOVO & OTHERS */
++	EFI_GUID(0x1f52d2a1, 0xbb3a, 0x457d, 0xbc, 0x09, 0x43, 0xa3, 0xf4,
++		 0x31, 0x0a, 0x92),
++};
+ 
+ static const u32 tas2783_cali_reg[] = {
+ 	TAS2783_CAL_R0,
+@@ -726,11 +743,11 @@ static void tas2783_set_calib_params_to_device(struct tas2783_prv *tas_dev, u32
+ 
+ static s32 tas2783_update_calibdata(struct tas2783_prv *tas_dev)
+ {
+-	efi_guid_t efi_guid = TAS2783_CALI_GUID;
+-	u32 attr, i, *tmp_val;
++	efi_guid_t efi_guid;
++	u32 attr, g, i, *tmp_val;
+ 	unsigned long size;
+ 	s32 ret;
+-	efi_status_t status;
++	efi_status_t status = EFI_NOT_FOUND;
+ 	static efi_char16_t efi_names[][32] = {
+ 		L"SmartAmpCalibrationData", L"CALI_DATA"};
+ 
+@@ -739,27 +756,35 @@ static s32 tas2783_update_calibdata(struct tas2783_prv *tas_dev)
+ 
+ 	/*
+ 	 * In some cases, the calibration is performed in Windows,
+-	 * and data was saved in UEFI. Linux can access it.
++	 * and data was saved in UEFI. Linux can access it. Which GUID
++	 * it sits under depends on the vendor, so try each one.
+ 	 */
+-	for (i = 0; i < ARRAY_SIZE(efi_names); i++) {
+-		size = 0;
+-		status = efi.get_variable(efi_names[i], &efi_guid, &attr,
+-					  &size, NULL);
+-		if (size > TAS2783_CALIB_DATA_SZ) {
+-			dev_err(tas_dev->dev, "cali data too large\n");
+-			break;
+-		}
+-
+-		tas_dev->cali_data.read_sz = size;
+-		if (status == EFI_BUFFER_TOO_SMALL) {
++	for (g = 0; g < ARRAY_SIZE(tas2783_cali_guid) &&
++	     status != EFI_SUCCESS; g++) {
++		efi_guid = tas2783_cali_guid[g];
++		for (i = 0; i < ARRAY_SIZE(efi_names); i++) {
++			size = 0;
+ 			status = efi.get_variable(efi_names[i], &efi_guid, &attr,
+-							&tas_dev->cali_data.read_sz,
+-							tas_dev->cali_data.data);
+-			dev_dbg(tas_dev->dev, "cali get %lu bytes result:%ld\n",
+-				tas_dev->cali_data.read_sz, status);
++						  &size, NULL);
++			if (size > TAS2783_CALIB_DATA_SZ) {
++				dev_err(tas_dev->dev, "cali data too large\n");
++				status = EFI_NOT_FOUND;
++				break;
++			}
++
++			tas_dev->cali_data.read_sz = size;
++			if (status == EFI_BUFFER_TOO_SMALL) {
++				status = efi.get_variable(efi_names[i], &efi_guid,
++							  &attr,
++							  &tas_dev->cali_data.read_sz,
++							  tas_dev->cali_data.data);
++				dev_dbg(tas_dev->dev,
++					"cali get %lu bytes result:%ld\n",
++					tas_dev->cali_data.read_sz, status);
++			}
++			if (status == EFI_SUCCESS)
++				break;
+ 		}
+-		if (status == EFI_SUCCESS)
+-			break;
+ 	}
+ 
+ 	if (status != EFI_SUCCESS) {
