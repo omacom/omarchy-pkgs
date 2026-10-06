@@ -37,8 +37,9 @@ if name == 'uname':
 with open(os.environ['TEST_CALLS'], 'a') as log:
     log.write(json.dumps([name, *sys.argv[1:]]) + '\\n')
 if name == 'muvm':
-    assert sys.argv[1:3] == ['--', 'FEXBash']
-    os.execv(shutil.which('FEXBash'), sys.argv[2:])
+    split = sys.argv.index('--')
+    assert sys.argv[split + 1] == 'FEXBash'
+    os.execv(shutil.which('FEXBash'), sys.argv[split + 1:])
 if name == 'FEXBash':
     os.execv('/bin/bash', ['/bin/bash', *sys.argv[1:]])
 sys.exit(int(os.environ.get('TEST_EXIT', '0')))
@@ -57,6 +58,8 @@ class SteamLauncherTests(unittest.TestCase):
         self.calls_path = self.root / 'calls.jsonl'
         self.env = dict(os.environ, HOME=str(self.user_home), PATH=str(self.tools),
                         TEST_CALLS=str(self.calls_path), TEST_ARCH='aarch64', TEST_EXIT='0')
+        for var in ['GDK_SCALE', 'XCURSOR_SIZE', 'XCURSOR_THEME']:
+            self.env.pop(var, None)
         for name in ['mkdir', 'cat', 'python3']:
             (self.tools / name).symlink_to(shutil.which(name))
         for name in ['uname', 'muvm', 'FEXBash', 'steam']:
@@ -95,10 +98,10 @@ class SteamLauncherTests(unittest.TestCase):
         self.assertIn('\nExec=omarchy-launch-steam %U\n', text)
         self.assertIn('x-scheme-handler/steam;x-scheme-handler/steamlink;', text)
 
-    def assert_fex(self, calls, flags, user_args):
+    def assert_fex(self, calls, flags, user_args, muvm_args=()):
         args = [str(self.fex_launcher), *flags, *user_args]
         self.assertEqual(calls, [
-            ['muvm', '--', 'FEXBash', '-c', 'exec "$@"', 'omarchy-steam', *args],
+            ['muvm', *muvm_args, '--', 'FEXBash', '-c', 'exec "$@"', 'omarchy-steam', *args],
             ['FEXBash', '-c', 'exec "$@"', 'omarchy-steam', *args],
             ['bin_steam.sh', *flags, *user_args],
         ])
@@ -193,6 +196,11 @@ class SteamLauncherTests(unittest.TestCase):
         self.assert_fex(calls, ['-cef-force-occlusion'], args)
         self.assert_desktop()
         self.assertFalse(self.steam_root.exists())
+
+    def test_display_environment_is_passed_into_the_vm(self):
+        self.env.update(GDK_SCALE='2', XCURSOR_SIZE='24')
+        self.assert_fex(self.run_launcher(), ['-cef-force-occlusion'], [],
+                        ['-e', 'GDK_SCALE', '-e', 'XCURSOR_SIZE'])
 
     def test_ui_directory_alone_does_not_disable_bootstrap(self):
         path = self.chunk()
