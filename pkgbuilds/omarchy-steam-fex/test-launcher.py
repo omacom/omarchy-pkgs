@@ -67,7 +67,7 @@ class SteamLauncherTests(unittest.TestCase):
         self.env = dict(os.environ, HOME=str(self.user_home), PATH=str(self.tools),
                         TEST_CALLS=str(self.calls_path), TEST_ARCH='aarch64', TEST_EXIT='0',
                         XDG_RUNTIME_DIR=str(self.runtime), OMARCHY_STEAM_HANDOFF_TIMEOUT='3')
-        for var in ['GDK_SCALE', 'XCURSOR_SIZE', 'XCURSOR_THEME']:
+        for var in ['GDK_SCALE', 'XCURSOR_SIZE', 'XCURSOR_THEME', 'OMARCHY_STEAM_MUVM_ARGS']:
             self.env.pop(var, None)
         for name in ['mkdir', 'cat', 'python3', 'flock', 'sleep']:
             (self.tools / name).symlink_to(shutil.which(name))
@@ -228,6 +228,16 @@ class SteamLauncherTests(unittest.TestCase):
         self.env.update(GDK_SCALE='2', XCURSOR_SIZE='24')
         self.assert_fex(self.run_launcher(), ['-cef-force-occlusion'], [],
                         ['-e', 'GDK_SCALE', '-e', 'XCURSOR_SIZE'])
+
+    def test_extra_muvm_args_are_split_without_globbing(self):
+        (self.root / 'glob-target').touch()
+        self.env.update(GDK_SCALE='2', OMARCHY_STEAM_MUVM_ARGS=f' -p 9757  -p 9757/udp {self.root}/glob-* ')
+        self.assert_fex(self.run_launcher(), ['-cef-force-occlusion'], [],
+                        ['-e', 'GDK_SCALE', '-p', '9757', '-p', '9757/udp', f'{self.root}/glob-*'])
+
+    def test_empty_extra_muvm_args_add_nothing(self):
+        self.env['OMARCHY_STEAM_MUVM_ARGS'] = '   '
+        self.assert_fex(self.run_launcher(), ['-cef-force-occlusion'], [])
 
     def test_shutdown_without_vm_does_not_start_one(self):
         self.assertEqual(self.run_launcher('-shutdown'), [])
