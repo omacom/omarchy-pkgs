@@ -95,6 +95,7 @@ x86_backup=(
   etc/systemd/zram-generator.conf
 )
 keyboard_unit=default/systemd/user/omarchy-brightness-keyboard-auto.service
+framework_unit=default/systemd/user/omarchy-framework16-speaker-levels.service
 nvpcr_dropins=(
   default/systemd/system/systemd-tpm2-setup-early.service.d/10-omarchy-nvpcr.conf
   default/systemd/system/systemd-pcrproduct.service.d/10-omarchy-nvpcr.conf
@@ -148,7 +149,7 @@ in_list() {
 fixtures=$BUILD_ROOT/tests/fixtures/settings-boot
 make_source "$scratch/legacy"
 cp "$fixtures/omarchy_hooks-v4.0.4.conf" "$scratch/legacy/etc/mkinitcpio.conf.d/omarchy_hooks.conf"
-make_source "$scratch/profile" default/settings-runtime-profile "$keyboard_unit" "${nvpcr_dropins[@]}" "$camera_dropin"
+make_source "$scratch/profile" default/settings-runtime-profile "$keyboard_unit" "$framework_unit" "${nvpcr_dropins[@]}" "$camera_dropin"
 cp "$fixtures"/omarchy-13362/*.conf "$scratch/profile/etc/mkinitcpio.conf.d/"
 
 for recipe in omarchy-settings omarchy-settings-dev; do
@@ -186,6 +187,8 @@ for recipe in omarchy-settings omarchy-settings-dev; do
     fail 'a source without the NvPCR drop-ins ships none'
   ! in_list "usr/lib/${camera_dropin#default/}" "$scratch/legacy-x86_64.files" ||
     fail 'a source without the WirePlumber camera drop-in ships none'
+  ! in_list usr/lib/systemd/user/omarchy-framework16-speaker-levels.service "$scratch/legacy-x86_64.files" ||
+    fail 'a source without the Framework speaker unit ships none'
   echo "PASS: $recipe: an older source keeps its per-architecture package"
 
   # A runtime-profile source ships the same tree and metadata on both.
@@ -223,12 +226,16 @@ for recipe in omarchy-settings omarchy-settings-dev; do
   camera_installed=$scratch/profile-aarch64/usr/lib/${camera_dropin#default/}
   cmp -s "$scratch/profile/$camera_dropin" "$camera_installed" && [[ $(stat -c %a "$camera_installed") == 644 ]] ||
     fail 'the WirePlumber camera drop-in ships as it is, mode 644, when the source has it'
+  cmp -s "$scratch/profile/$framework_unit" "$scratch/profile-x86_64/usr/lib/systemd/user/omarchy-framework16-speaker-levels.service" ||
+    fail 'Framework speaker setup can enable the package-owned unit'
+  [[ $(stat -c '%a' "$scratch/profile-x86_64/usr/lib/systemd/user/omarchy-framework16-speaker-levels.service") == 644 ]] ||
+    fail 'the Framework speaker unit ships with normal unit permissions'
   comm -13 "$scratch/legacy-x86_64.files" "$scratch/profile-x86_64.files" >"$scratch/added"
   for conf in 00-omarchy-hooks.conf omarchy_hooks.conf; do
     cmp -s "$fixtures/omarchy-13362/$conf" "$scratch/profile-aarch64/etc/mkinitcpio.conf.d/$conf" ||
       fail "runtime-profile source ships its $conf as it is on aarch64"
   done
-  [[ $(cat "$scratch/added") == "$(printf '%s\n' usr/lib/systemd/user/omarchy-brightness-keyboard-auto.service usr/share/omarchy/default/settings-runtime-profile "usr/share/omarchy/$keyboard_unit" etc/mkinitcpio.conf.d/00-omarchy-hooks.conf "${nvpcr_dropins[@]/#default/usr/lib}" "${nvpcr_dropins[@]/#/usr/share/omarchy/}" "usr/lib/${camera_dropin#default/}" "usr/share/omarchy/$camera_dropin" | sort)" ]] ||
+  [[ $(cat "$scratch/added") == "$(printf '%s\n' usr/lib/systemd/user/omarchy-brightness-keyboard-auto.service usr/lib/systemd/user/omarchy-framework16-speaker-levels.service usr/share/omarchy/default/settings-runtime-profile "usr/share/omarchy/$keyboard_unit" "usr/share/omarchy/$framework_unit" etc/mkinitcpio.conf.d/00-omarchy-hooks.conf "${nvpcr_dropins[@]/#default/usr/lib}" "${nvpcr_dropins[@]/#/usr/share/omarchy/}" "usr/lib/${camera_dropin#default/}" "usr/share/omarchy/$camera_dropin" | sort)" ]] ||
     fail 'x86_64 gains only the new source files from a runtime-profile source' "$(cat "$scratch/added")"
   echo "PASS: $recipe: a runtime-profile source ships the full set on aarch64"
 done
