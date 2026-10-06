@@ -78,6 +78,7 @@ class SteamLauncherTests(unittest.TestCase):
         self.steam_root = self.user_home / '.local/share/Steam'
         self.ui = self.steam_root / 'steamui'
         self.desktop = self.user_home / '.local/share/applications/steam.desktop'
+        self.fex_config = self.user_home / '.config/fex-emu/AppConfig/steamwebhelper.json'
 
     def mock(self, path):
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -125,6 +126,10 @@ class SteamLauncherTests(unittest.TestCase):
         self.assertIn('\nExec=omarchy-launch-steam %U\n', text)
         self.assertIn('x-scheme-handler/steam;x-scheme-handler/steamlink;', text)
 
+    def assert_fex_config(self, path=None):
+        config = json.loads((path or self.fex_config).read_text())
+        self.assertEqual(config['Config'], {'Multiblock': '0'})
+
     def assert_fex(self, calls, flags, user_args, muvm_args=()):
         args = [str(self.fex_launcher), *flags, *user_args]
         self.assertEqual(calls, [
@@ -133,10 +138,45 @@ class SteamLauncherTests(unittest.TestCase):
             ['bin_steam.sh', *flags, *user_args],
         ])
 
-    def test_prepare_without_client_only_writes_user_desktop(self):
+    def test_prepare_without_client_only_writes_user_overrides(self):
         self.assertEqual(self.run_launcher('--prepare'), [])
         self.assert_desktop()
+        self.assert_fex_config()
         self.assertFalse(self.steam_root.exists())
+
+    def test_launch_disables_fex_multiblock_for_steamwebhelper(self):
+        for ready in [False, True]:
+            with self.subTest(ready=ready):
+                shutil.rmtree(self.user_home / '.config', ignore_errors=True)
+                if ready:
+                    self.client_ready()
+                self.run_launcher()
+                self.assert_fex_config()
+
+    def test_existing_fex_appconfig_is_preserved(self):
+        self.fex_config.parent.mkdir(parents=True)
+        custom = '{"Config": {"Multiblock": "1"}}\n'
+        self.fex_config.write_text(custom)
+        modified = self.fex_config.stat().st_mtime_ns
+        for args in [('--prepare',), ()]:
+            self.run_launcher(*args)
+            self.assertEqual(self.fex_config.read_text(), custom)
+            self.assertEqual(self.fex_config.stat().st_mtime_ns, modified)
+
+    def test_existing_fex_appconfig_symlink_is_preserved(self):
+        self.fex_config.parent.mkdir(parents=True)
+        self.fex_config.symlink_to(self.user_home / 'missing.json')
+        self.run_launcher('--prepare')
+        self.assertTrue(self.fex_config.is_symlink())
+        self.assertFalse((self.user_home / 'missing.json').exists())
+
+    def test_legacy_fex_config_directory_is_used_when_present(self):
+        (self.user_home / '.fex-emu').mkdir()
+        self.env['XDG_CONFIG_HOME'] = str(self.root / 'xdg')
+        self.run_launcher('--prepare')
+        self.assert_fex_config(self.user_home / '.fex-emu/AppConfig/steamwebhelper.json')
+        self.assertFalse(self.fex_config.exists())
+        self.assertFalse((self.root / 'xdg').exists())
 
     def test_prepare_patches_matching_chunks_and_preserves_original(self):
         for identifier in ['Ab.cd', '_A2.x9']:
@@ -302,6 +342,7 @@ class SteamLauncherTests(unittest.TestCase):
                 self.env['TEST_EXIT'] = '23'
                 self.assertEqual(self.run_launcher('arg with spaces', expected=23), [['steam', 'arg with spaces']])
                 self.assertFalse(self.desktop.exists())
+                self.assertFalse(self.fex_config.exists())
                 self.calls_path.unlink()
                 self.mock(missing)
 
@@ -312,6 +353,7 @@ class SteamLauncherTests(unittest.TestCase):
         self.assertFalse(self.desktop.exists())
         self.assertEqual(path.read_text(), ORIGINAL)
         self.assertEqual(self.run_launcher('steam://open/main'), [['steam', 'steam://open/main']])
+        self.assertFalse(self.fex_config.exists())
 
     def test_fex_exit_status_is_preserved(self):
         self.env['TEST_EXIT'] = '29'
