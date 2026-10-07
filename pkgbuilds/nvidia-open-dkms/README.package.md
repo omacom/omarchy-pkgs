@@ -37,6 +37,12 @@ a dock's second monitor whenever the dock was replugged within a few seconds.
 On tunnelled links nvkms now reports such a monitor as unplugged until its old
 head is shut down, so the client always sets a mode on it afresh.
 
+And `0007-train-a-tunnelled-link-again-when-the-sink-cannot-decode-it.patch`:
+behind a USB4 dock, a monitor could come out of standby black at a link that
+read as fully trained, while it counted symbol errors on every lane. After
+each modeset on a tunnelled link nvkms now reads the monitor's symbol error
+counters and, if every lane keeps counting errors, trains the link again.
+
 Requires `[omarchy]` before `[extra]` and matching `nvidia-utils=615.71.09`.
 Update both NVIDIA packages together; automatic version tracking is disabled.
 
