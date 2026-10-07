@@ -2,7 +2,7 @@
 
 The `linux-omarchy` kernel built for aarch64 with NVIDIA N1x (RTX Spark) platform support added. It carries the same kernel.org source and signed Omarchy patch set as `linux-omarchy` 7.2.5-6, plus N1x topic patches numbered 1000 and up. The intent is to fold these into `linux-omarchy` itself once it builds for aarch64; until then this is the kernel Omarchy installs on N1x machines (`install/hardware/n1x.sh` in omarchy), replacing NVIDIA's 7.0-based `linux-n1x`.
 
-The `pkgrel` counts N1x revisions of this package and starts again at 1 when the kernel version changes. It was `6.1` to `6.9` while it tracked `linux-omarchy`'s release; the ninth revision became `9`, and `10` adds the Dell XPS 16 patches.
+The `pkgrel` counts N1x revisions of this package and starts again at 1 when the kernel version changes. It was `6.1` to `6.9` while it tracked `linux-omarchy`'s release; the ninth revision became `9`, `10` adds the Dell XPS 16 patches, and `11` brings a dock's displays back after a failed DisplayPort tunnel.
 
 ## N1x patches
 
@@ -24,7 +24,7 @@ Patches 1011–1013 are our own, for the Dell XPS 16 (DX16263):
 
 `1060-ASoC-mediatek-mt8901-give-the-card-the-ACPI-subsystem-ID.patch` is also our own. Cirrus CS35L56 amplifiers name their DSP firmware and speaker tuning after the sound card's PCI subsystem ID, which the ACPI-enumerated MT8901 card does not have, so they ran on ROM defaults: quiet and unvoiced. The patch reads the SoundWire controller's `_SUB` (written device ID first, `33A11043` on the ProArt P14) and passes it to the card, so the amplifiers request `cs35l56-b0-dsp1-misc-104333a1-spkid0*`. Those files are not in linux-firmware yet.
 
-Patches 1070–1081 make USB4 and Thunderbolt work. The N1x host routers (`\_SB.UBF0..2`, `NVDA8100`, one per USB-C port) are ACPI platform devices rather than PCI NHIs, the firmware hands USB4 to the OS, and it has no connection manager of its own. Without these patches nothing bound them, so PCIe-tunnelled devices (docks, 10G adapters, eGPUs) never appeared, and USB4 docks fell back to USB-C alt modes.
+Patches 1070–1082 make USB4 and Thunderbolt work. The N1x host routers (`\_SB.UBF0..2`, `NVDA8100`, one per USB-C port) are ACPI platform devices rather than PCI NHIs, the firmware hands USB4 to the OS, and it has no connection manager of its own. Without these patches nothing bound them, so PCIe-tunnelled devices (docks, 10G adapters, eGPUs) never appeared, and USB4 docks fell back to USB-C alt modes.
 
 - `1070` reverts NVIDIA's SAUCE that disabled USB4 through a vendor `_DSM`. The ASUS EC doesn't implement that `_DSM`, so the revert also removes a 2 s stall.
 - `1071` has `ucsi_acpi` query the `_DSM` functions before using them, as the ACPI spec asks. The ProArt P14 EC opens its UCSI service on that query, and without it every boot logged `PPM init failed` and `/sys/class/typec` stayed empty.
@@ -35,6 +35,7 @@ Patches 1070–1081 make USB4 and Thunderbolt work. The N1x host routers (`\_SB.
 - `1079` turns off CL states on the N1x host router's links. With them on, a monitor behind a DisplayPort tunnel failed to sync to its first link training and kept dropping out, so a dock's display usually stayed dark at boot and often on hotplug.
 - `1080` keeps the routers out of USB4 sleep during suspend. A router only leaves that sleep through the reset it gets when its host interface loses power, which never happens here, so a port with a device attached stopped answering after resume.
 - `1081` stops the driver powering the routers down when it is unbound. The SSPM can turn a router off, but turning it back on does not restore what the boot firmware set up, so the router stayed dead until the next boot.
+- `1082` offers the N1x host router's DP IN adapters again when a monitor is plugged in. The connection manager drops a DP IN adapter whose tunnel fails DPRX negotiation until the adapter reports a hotplug, which the N1x's never do, so after one failure every display behind a dock on that port stayed black until reboot.
 
 The driver binds only with `power_wrap_drv.usb4_release=0` on the command line. Omarchy sets that together with the PCI hotplug padding.
 
