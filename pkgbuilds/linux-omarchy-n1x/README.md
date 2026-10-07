@@ -66,3 +66,11 @@ The build produces only `Image` and modules; N1x boots through ACPI and the pack
 7.2.5-6.8 on the same machine (2026-10-03): UCSI and the three USB-C ports' Type-C class devices; a CalDigit TS4 on each of the three USB4 ports with a 40 Gb/s link, its USB3 and 2.5 GbE (`igc`) and a 4K 240 Hz display through its DisplayPort tunnel, at boot and on hotplug; HDMI out; the UHS-II SD reader. Omarchy writes the USB4 kernel options (`power_wrap_drv.usb4_release=0 pci=hpbussize=0x80,hpmmiosize=32M,hpmmioprefsize=32G`) from `install/hardware/n1x.sh`, and a dock or adapter is approved once with `boltctl enroll --policy auto`.
 
 Not yet validated: USB4 devices across suspend (patches 1080 and 1081), lid-driven suspend and battery drain while suspended, warm reboot loops. The firmware's `deep` sleep returns at once, so Omarchy defaults these machines to `s2idle`.
+
+## GB10 branch
+
+Revision 11 backports the missing-IRQ handling from [Nicolin Chen's SMMUv3 PRI proposal](https://lists.openwall.net/linux-kernel/2026/09/15/2458). Patch 1041 clears PRI when the dedicated interrupt is missing, either interrupt request fails, or the kernel is a crash kernel. The final CR0 write disables a queue that has no handler. It does not import endpoint PRI enablement or alter patch 1040's GPU DMA-domain selection. Linux 7.2.5 predates the proposal's IRQ bookkeeping changes, so this backport retains the existing teardown conventions.
+
+On the Dell Pro Max with GB10, the missing interrupt was observed on SMMU instance 2, separate from the GPU, NVMe and network controllers. This is defensive correctness work; no inference failure has been attributed to it. Compile and target boot validation are required before treating revision 11 as qualified.
+
+The Dell GB10 advertises USB 3.2 Gen 2x2 with DisplayPort Alt Mode, and has no integrated audio codec. Its disabled SSPM ACPI device explains the shared laptop USB4/audio-DSP probe errors; do not force-enable that transport or apply laptop USB4 boot arguments. HDMI, USB and Bluetooth audio and each USB-C data/display path need their own physical qualification. Hierarchical ACPI idle remains deferred as described above.

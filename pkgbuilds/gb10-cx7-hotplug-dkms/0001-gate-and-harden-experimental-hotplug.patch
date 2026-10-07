@@ -1,0 +1,919 @@
+From: The Omarchy Authors <dev@omarchy.org>
+Subject: [PATCH] platform: gate and harden experimental GB10 CX7 power control
+
+Keep the ACPI driver unbound without an explicit experimental opt-in.
+Move GPIO handling entirely to threaded IRQ context. Serialize the two
+GPIO threads and sysfs transitions before taking the PCI rescan/remove
+lock; the PCI notifier never acquires the transition mutex. Drain sysfs,
+then IRQs and notifier callbacks, before releasing hardware references.
+
+Validate firmware fields before shifts and MMIO accesses, propagate mapping
+failures, and balance device/runtime-PM references. This does not supply the
+userspace endpoint removal/rescan coordinator or qualify physical power
+transitions. Carry the changes separately from the pinned NVIDIA source.
+
+---
+--- a/mtk-pcie-hotplug.c
++++ b/mtk-pcie-hotplug.c
+@@ -16,6 +16,8 @@
+ #include <linux/interrupt.h>
+ #include <linux/kernel.h>
+ #include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/pinctrl/machine.h>
+ #include <linux/pci.h>
+ #include <linux/pinctrl/consumer.h>
+ #include <linux/platform_device.h>
+@@ -23,6 +25,10 @@
+ #include <linux/property.h>
+ #include <linux/string.h>
+ #include <linux/uuid.h>
++
++static bool experimental;
++module_param(experimental, bool, 0400);
++MODULE_PARM_DESC(experimental, "Allow binding the unqualified GB10 hotplug driver");
+ 
+ #define HP_PORT_MAX		3
+ #define HP_POLL_CNT_MAX		200
+@@ -150,6 +156,8 @@
+ 	struct gpio_desc *desc;
+ 	struct gpio_acpi_context *ctx;
+ 	struct cx7_hp_dev *hp_dev;
++	int irq;
++	bool wake_enabled;
+ };
+ 
+ struct acpi_gpio_parse_context {
+@@ -211,10 +219,13 @@
+ 	enum cx7_hp_debug_val debug_state;
+ 	bool hotplug_enabled;
+ 	spinlock_t lock;
++	/* Hardware paths: transition_lock, then pci_lock_rescan_remove(). */
++	struct mutex transition_lock;
+ 	struct pci_dev *cached_root_ports[HP_PORT_MAX];
+ 	struct cx7_hp_mmio_runtime mmio;
+ 	struct gpio_device *gdev;
+ 	struct notifier_block pci_notifier;
++	struct pinctrl *pinctrl;
+ };
+ 
+ /* ACPI _DSD device properties GUID: daffd814-6eba-4d8c-8a91-bc9bbf4aa301 */
+@@ -235,7 +246,7 @@
+ {
+ 	struct acpi_device *adev;
+ 	struct device *dev = &hp_dev->pdev->dev;
+-	const union acpi_object *mappings_pkg, *mapping_entry;
++	const union acpi_object *mappings_pkg = NULL, *mapping_entry;
+ 	struct pinctrl_map *pinmap;
+ 	u32 pin_nums = 0;
+ 	int k;
+@@ -303,9 +314,12 @@
+ 		    &prop->package.elements[1];
+ 
+ 		if (!strcmp(prop_name, "pin-nums")) {
+-			if (prop_value->type == ACPI_TYPE_INTEGER) {
+-				pin_nums = prop_value->integer.value;
++			if (prop_value->type != ACPI_TYPE_INTEGER ||
++			    prop_value->integer.value > PCIE_PIN_MAX) {
++				ACPI_FREE(buffer.pointer);
++				return -EINVAL;
+ 			}
++			pin_nums = prop_value->integer.value;
+ 		} else if (!strcmp(prop_name, "pinctrl-mappings")) {
+ 			if (prop_value->type == ACPI_TYPE_PACKAGE)
+ 				mappings_pkg = prop_value;
+@@ -316,6 +330,11 @@
+ 		hp_dev->pd->pin_nums = 0;
+ 		ACPI_FREE(buffer.pointer);
+ 		return 0;
++	}
++
++	if (pin_nums > PCIE_PIN_MAX) {
++		ACPI_FREE(buffer.pointer);
++		return -EINVAL;
+ 	}
+ 
+ 	if (!mappings_pkg) {
+@@ -449,6 +468,10 @@
+  */
+ static void cx7_hp_pinctrl_remove(struct cx7_hp_dev *hp_dev)
+ {
++	if (hp_dev->pinctrl) {
++		devm_pinctrl_put(hp_dev->pinctrl);
++		hp_dev->pinctrl = NULL;
++	}
+ 	if (!hp_dev->pd->pin_nums)
+ 		return;
+ 
+@@ -469,11 +492,9 @@
+ 	struct pinctrl_state *state;
+ 	int ret;
+ 
+-	pinctrl = devm_pinctrl_get(&hp_dev->pdev->dev);
+-	if (IS_ERR(pinctrl)) {
+-		dev_err(&hp_dev->pdev->dev, "Failed to get pinctrl\n");
+-		return PTR_ERR(pinctrl);
+-	}
++	pinctrl = hp_dev->pinctrl;
++	if (!pinctrl)
++		return 0;
+ 
+ 	state = pinctrl_lookup_state(pinctrl, new_state);
+ 	if (IS_ERR(state)) {
+@@ -502,7 +523,7 @@
+ 	char *uevent = NULL;
+ 	char *envp[2];
+ 
+-	uevent = kasprintf(GFP_KERNEL, msg);
++	uevent = kstrdup(msg, GFP_KERNEL);
+ 	if (!uevent) {
+ 		dev_err(&hp_dev->pdev->dev,
+ 			"Failed to allocate uevent string\n");
+@@ -644,7 +665,14 @@
+  */
+ static struct acpi_device *cx7_hp_find_pcie_config_device(void)
+ {
+-	return acpi_dev_get_first_match_dev("PNP0C02", NULL, -1);
++	struct acpi_device *adev = NULL;
++
++	while ((adev = acpi_dev_get_next_match_dev(adev, "PNP0C02", NULL, -1))) {
++		if (fwnode_property_present(acpi_fwnode_handle(adev),
++					    "mac-init-ctrl-offset"))
++			return adev;
++	}
++	return NULL;
+ }
+ 
+ /**
+@@ -693,6 +721,8 @@
+ 		acpi_dev_put(config_adev);
+ 		return -EINVAL;
+ 	}
++	if (val >= 32)
++		goto invalid_properties;
+ 	pd->rp_bus_mmio.mac.ltssm_bit = BIT(val);
+ 
+ 	if (fwnode_property_read_u32
+@@ -702,6 +732,8 @@
+ 		acpi_dev_put(config_adev);
+ 		return -EINVAL;
+ 	}
++	if (val >= 32)
++		goto invalid_properties;
+ 	pd->rp_bus_mmio.mac.phy_rst_bit = BIT(val);
+ 
+ 	if (fwnode_property_read_u32
+@@ -720,6 +752,8 @@
+ 		acpi_dev_put(config_adev);
+ 		return -EINVAL;
+ 	}
++	if (val >= 32)
++		goto invalid_properties;
+ 	pd->rp_bus_mmio.top.update_bit = BIT(val);
+ 
+ 	if (fwnode_property_read_u32
+@@ -728,6 +762,8 @@
+ 		acpi_dev_put(config_adev);
+ 		return -EINVAL;
+ 	}
++	if (val >= 32)
++		goto invalid_properties;
+ 	pd->rp_bus_mmio.top.port_bits[0] = BIT(val);
+ 
+ 	if (fwnode_property_read_u32
+@@ -736,6 +772,8 @@
+ 		acpi_dev_put(config_adev);
+ 		return -EINVAL;
+ 	}
++	if (val >= 32)
++		goto invalid_properties;
+ 	pd->rp_bus_mmio.top.port_bits[1] = BIT(val);
+ 
+ 	if (fwnode_property_read_u32
+@@ -763,6 +801,8 @@
+ 		acpi_dev_put(config_adev);
+ 		return -EINVAL;
+ 	}
++	if (val >= 32)
++		goto invalid_properties;
+ 	pd->rp_bus_mmio.protect.port_bits[0] = BIT(val);
+ 
+ 	if (fwnode_property_read_u32
+@@ -772,6 +812,8 @@
+ 		acpi_dev_put(config_adev);
+ 		return -EINVAL;
+ 	}
++	if (val >= 32)
++		goto invalid_properties;
+ 	pd->rp_bus_mmio.protect.port_bits[1] = BIT(val);
+ 
+ 	if (fwnode_property_read_u32
+@@ -797,6 +839,10 @@
+ 		acpi_dev_put(config_adev);
+ 		return -EINVAL;
+ 	}
++	if (val >= 32)
++		goto invalid_properties;
++	if (bit1 >= 32)
++		goto invalid_properties;
+ 	pd->rp_bus_mmio.ckm.disable_bit = BIT(val) | BIT(bit1);
+ 
+ 	if (fwnode_property_read_u32
+@@ -909,10 +955,24 @@
+ 	}
+ 	pd->num_devices = val;
+ 
++	if (pd->port_nums != 2 || pd->num_devices != 4 ||
++	    pd->vendor_id != 0x15b3 || pd->device_id != 0x1021 ||
++	    pd->ports[0].domain < 0 || pd->ports[1].domain < 0 ||
++	    pd->ports[0].domain == pd->ports[1].domain ||
++	    pd->ports[0].bus != 0 || pd->ports[1].bus != 0 ||
++	    pd->ports[0].devfn != 0 || pd->ports[1].devfn != 0 ||
++	    pd->ltssm_reg > PCI_CFG_SPACE_EXP_SIZE - sizeof(u32) ||
++	    !IS_ALIGNED(pd->ltssm_reg, sizeof(u32)))
++		goto invalid_properties;
++
+ 	dev_dbg(dev, "Successfully parsed all required _DSD properties\n");
+ 
+ 	acpi_dev_put(config_adev);
+ 	return 0;
++
++invalid_properties:
++	acpi_dev_put(config_adev);
++	return dev_err_probe(dev, -EINVAL, "Unsupported PCIe firmware configuration\n");
+ }
+ 
+ /**
+@@ -993,6 +1053,32 @@
+ 		void __iomem *base = NULL;
+ 		u32 addr = parsed.mmio_regions[i].address;
+ 		u32 size = parsed.mmio_regions[i].address_length;
++		u32 offset;
++
++		switch (i) {
++		case 0:
++		case 1:
++			offset = dev->pd->rp_bus_mmio.mac.init_ctrl;
++			break;
++		case 2:
++			offset = dev->pd->rp_bus_mmio.top.ctrl;
++			break;
++		case 3:
++			if (!IS_ALIGNED(dev->pd->rp_bus_mmio.protect.mode, sizeof(u32)) ||
++			    !IS_ALIGNED(dev->pd->rp_bus_mmio.protect.enable, sizeof(u32)))
++				return -EINVAL;
++			offset = max(dev->pd->rp_bus_mmio.protect.mode,
++				     dev->pd->rp_bus_mmio.protect.enable);
++			break;
++		case 4:
++			offset = dev->pd->rp_bus_mmio.ckm.ctrl;
++			break;
++		default:
++			return -EINVAL;
++		}
++		if (size < sizeof(u32) || !IS_ALIGNED(offset, sizeof(u32)) ||
++		    offset > size - sizeof(u32) || !IS_ALIGNED(addr, sizeof(u32)))
++			return -EINVAL;
+ 
+ 		switch (i) {
+ 		case 0:
+@@ -1106,20 +1192,6 @@
+ 				  int stage)
+ {
+ 	switch (stage) {
+-	case BUS_PROTECT_INIT:
+-		{
+-			int ret;
+-
+-			ret = cx7_hp_map_mmio_resources(dev);
+-			if (ret) {
+-				dev_err(&dev->pdev->dev,
+-					"Failed to map MMIO resources during bus init: %d\n",
+-					ret);
+-				return;
+-			}
+-		}
+-		return;
+-
+ 	case BUS_PROTECT_CLEANUP:
+ 		{
+ 			int i;
+@@ -1270,19 +1342,22 @@
+  * remove_device - Remove PCIe devices and power down hardware
+  * @dev: hotplug device
+  */
+-static void remove_device(struct cx7_hp_dev *dev)
+-{
+-	int i;
++static int remove_device(struct cx7_hp_dev *dev)
++{
++	int i, ret;
+ 
+ 	dev_info(&dev->pdev->dev, "Cable removal\n");
+ 
+ 	for (i = 0; i < dev->pd->port_nums; i++)
+ 		cx7_hp_rp_bus_protect(dev, i, BUS_PROTECT_CABLE_REMOVAL);
+ 
+-	gpiod_set_value(dev->pins[PCIE_PIN_PERST].desc, 0);
+-	cx7_hp_change_pinctrl_state(dev, "default");
++	gpiod_set_raw_value_cansleep(dev->pins[PCIE_PIN_PERST].desc, 0);
++	ret = cx7_hp_change_pinctrl_state(dev, "default");
++	if (ret)
++		return ret;
+ 	cx7_hp_ckm_control(dev, true);
+-	gpiod_set_value(dev->pins[PCIE_PIN_EN].desc, 0);
++	gpiod_set_raw_value_cansleep(dev->pins[PCIE_PIN_EN].desc, 0);
++	return 0;
+ }
+ 
+ /**
+@@ -1354,6 +1429,7 @@
+ static int rescan_device(struct cx7_hp_dev *dev)
+ {
+ 	struct pci_dev *pci_dev;
++	bool resumed[HP_PORT_MAX] = {};
+ 	int i, err;
+ 
+ 	err = cx7_hp_change_pinctrl_state(dev, "clkreqn");
+@@ -1365,25 +1441,29 @@
+ 
+ 	for (i = 0; i < dev->pd->port_nums; i++) {
+ 		pci_dev = get_port_root_port(dev, i);
+-		if (!pci_dev)
+-			continue;
++		if (!pci_dev) {
++			err = -ENODEV;
++			goto put_ports;
++		}
+ 
+ 		err = pm_runtime_resume_and_get(&pci_dev->dev);
+ 		if (err < 0) {
+ 			dev_err(&dev->pdev->dev,
+ 				"Runtime resume failed for %s: %d\n",
+ 				pci_name(pci_dev), err);
+-		}
+-	}
+-
+-	gpiod_set_value(dev->pins[PCIE_PIN_PERST].desc, 1);
++			goto put_ports;
++		}
++		resumed[i] = true;
++	}
++
++	gpiod_set_raw_value_cansleep(dev->pins[PCIE_PIN_PERST].desc, 1);
+ 
+ 	for (i = 0; i < dev->pd->port_nums; i++)
+ 		cx7_hp_rp_bus_protect(dev, i, BUS_PROTECT_CABLE_PLUGIN);
+ 
+ 	err = polling_link_to_l0(dev);
+ 	if (err)
+-		return err;
++		goto put_ports;
+ 
+ 	for (i = 0; i < dev->pd->port_nums; i++) {
+ 		pci_dev = get_port_root_port(dev, i);
+@@ -1393,7 +1473,12 @@
+ 
+ 	msleep(CX7_HP_DELAY_LINK_STABLE_MS);
+ 
+-	return 0;
++put_ports:
++	for (i = 0; i < dev->pd->port_nums; i++) {
++		if (resumed[i])
++			pm_runtime_put(&dev->cached_root_ports[i]->dev);
++	}
++	return err;
+ }
+ 
+ /**
+@@ -1426,11 +1511,10 @@
+ 
+ 	switch (state) {
+ 	case STATE_PLUG_OUT:
+-		remove_device(hp_dev);
+ 		break;
+ 	case STATE_PLUG_IN:
+ 		dev_info(&hp_dev->pdev->dev, "Cable plugin\n");
+-		gpiod_set_value(hp_dev->pins[PCIE_PIN_EN].desc, 1);
++		gpiod_set_raw_value_cansleep(hp_dev->pins[PCIE_PIN_EN].desc, 1);
+ 		break;
+ 	case STATE_DEV_POWER_OFF:
+ 	case STATE_DEV_POWER_ON:
+@@ -1439,9 +1523,10 @@
+ 	case STATE_RESCAN:
+ 		ret = rescan_device(hp_dev);
+ 		spin_lock_irqsave(&hp_dev->lock, flags);
+-		if (ret)
++		if (ret) {
++			hp_dev->state = STATE_UNKNOWN;
+ 			dev_err(app_ctx->ctx->dev, "Rescan failed: %d\n", ret);
+-		else
++		} else
+ 			hp_dev->state = STATE_READY;
+ 		spin_unlock_irqrestore(&hp_dev->lock, flags);
+ 		break;
+@@ -1469,7 +1554,9 @@
+ 	int value;
+ 	enum cx7_hp_state state;
+ 
+-	value = gpiod_get_value(app_ctx->desc);
++	value = gpiod_get_raw_value_cansleep(app_ctx->desc);
++	if (value < 0)
++		return IRQ_HANDLED;
+ 
+ 	if (gpio_ctx->pin == hp_dev->prsnt_pin) {
+ 		if (value) {
+@@ -1511,6 +1598,24 @@
+ 	return IRQ_HANDLED;
+ }
+ 
++static irqreturn_t cx7_hp_irq_thread(int irq, void *data)
++{
++	struct cx7_hp_gpio_ctx *pin = data;
++	struct cx7_hp_dev *hp_dev = pin->hp_dev;
++	irqreturn_t ret = IRQ_HANDLED;
++
++	mutex_lock(&hp_dev->transition_lock);
++	if (hp_dev->hotplug_enabled) {
++		pci_lock_rescan_remove();
++		ret = hotplug_irq_handler(irq, data);
++		if (ret == IRQ_WAKE_THREAD)
++			ret = cx7_hp_work(irq, data);
++		pci_unlock_rescan_remove();
++	}
++	mutex_unlock(&hp_dev->transition_lock);
++	return ret;
++}
++
+ /**
+  * acpi_gpio_collect_handler - ACPI resource handler to collect all GPIO resources
+  * @ares: ACPI resource structure
+@@ -1636,7 +1741,8 @@
+ 
+ 	agpio = &ares->data.gpio;
+ 
+-	if (ctx->pin != agpio->pin_table[0])
++	if (!agpio->pin_table || !agpio->pin_table_length ||
++	    ctx->pin != agpio->pin_table[0])
+ 		return AE_OK;
+ 
+ 	ctx->valid = 1;
+@@ -1684,20 +1790,16 @@
+  */
+ static bool pci_devices_present_on_domain(int domain)
+ {
+-	struct pci_bus *bus;
+-	struct pci_dev *dev;
+-	bool has_endpoint_devices = false;
+-
+-	bus = pci_find_bus(domain, 1);
+-	if (!bus)
+-		return false;
+-
+-	list_for_each_entry(dev, &bus->devices, bus_list) {
+-		has_endpoint_devices = true;
+-		break;
+-	}
+-
+-	return has_endpoint_devices;
++	struct pci_bus *root, *bus;
++
++	root = pci_find_bus(domain, 0);
++	if (!root)
++		return true;
++	list_for_each_entry(bus, &root->children, node) {
++		if (!list_empty(&bus->devices))
++			return true;
++	}
++	return false;
+ }
+ 
+ static ssize_t debug_state_show(struct device *dev,
+@@ -1708,10 +1810,15 @@
+ 	if (!hp_dev)
+ 		return -EINVAL;
+ 
+-	return scnprintf(buf, PAGE_SIZE, "%d\n", hp_dev->debug_state);
+-}
+-
+-static ssize_t debug_state_store(struct device *dev,
++	ssize_t ret;
++
++	mutex_lock(&hp_dev->transition_lock);
++	ret = sysfs_emit(buf, "%d\n", hp_dev->debug_state);
++	mutex_unlock(&hp_dev->transition_lock);
++	return ret;
++}
++
++static ssize_t debug_state_set(struct device *dev,
+ 				 struct device_attribute *attr,
+ 				 const char *buf, size_t count)
+ {
+@@ -1736,6 +1843,8 @@
+ 
+ 	switch (val) {
+ 	case CX7_HP_DEBUG_PLUG_OUT:
++		if (hp_dev->state != STATE_READY && hp_dev->state != STATE_UNKNOWN)
++			return -EBUSY;
+ 		/* Safety check: Verify no devices on the bus before hardware shutdown. */
+ 		for (i = 0; i < hp_dev->pd->port_nums; i++) {
+ 			if (pci_devices_present_on_domain
+@@ -1750,10 +1859,16 @@
+ 		hp_dev->state = STATE_PLUG_OUT;
+ 		hp_dev->debug_state = val;
+ 		spin_unlock_irqrestore(&hp_dev->lock, flags);
+-		remove_device(hp_dev);
++		err = remove_device(hp_dev);
++		if (err) {
++			hp_dev->state = STATE_UNKNOWN;
++			return err;
++		}
+ 		return count;
+ 
+ 	case CX7_HP_DEBUG_PLUG_IN:
++		if (hp_dev->state != STATE_DEV_POWER_OFF)
++			return -EBUSY;
+ 		for (i = 0; i < hp_dev->pd->port_nums; i++) {
+ 			if (pci_devices_present_on_domain
+ 			    (hp_dev->pd->ports[i].domain)) {
+@@ -1768,7 +1883,7 @@
+ 		hp_dev->debug_state = val;
+ 		spin_unlock_irqrestore(&hp_dev->lock, flags);
+ 		dev_info(dev, "Cable plugin\n");
+-		gpiod_set_value(hp_dev->pins[PCIE_PIN_EN].desc, 1);
++		gpiod_set_raw_value_cansleep(hp_dev->pins[PCIE_PIN_EN].desc, 1);
+ 		return count;
+ 
+ 	default:
+@@ -1776,6 +1891,21 @@
+ 	}
+ 
+ 	return count;
++}
++
++static ssize_t debug_state_store(struct device *dev,
++				 struct device_attribute *attr,
++				 const char *buf, size_t count)
++{
++	struct cx7_hp_dev *hp_dev = dev_get_drvdata(dev);
++	ssize_t ret;
++
++	mutex_lock(&hp_dev->transition_lock);
++	pci_lock_rescan_remove();
++	ret = debug_state_set(dev, attr, buf, count);
++	pci_unlock_rescan_remove();
++	mutex_unlock(&hp_dev->transition_lock);
++	return ret;
+ }
+ 
+ DEVICE_ATTR_RW(debug_state);
+@@ -1788,7 +1918,7 @@
+ 	if (!hp_dev)
+ 		return -EINVAL;
+ 
+-	return scnprintf(buf, PAGE_SIZE, "%d\n", hp_dev->hotplug_enabled ? 1 : 0);
++	return scnprintf(buf, PAGE_SIZE, "%d\n", READ_ONCE(hp_dev->hotplug_enabled) ? 1 : 0);
+ }
+ 
+ static ssize_t hotplug_enabled_store(struct device *dev,
+@@ -1797,7 +1927,7 @@
+ {
+ 	struct cx7_hp_dev *hp_dev = dev_get_drvdata(dev);
+ 	unsigned long val;
+-	int err;
++	int err, present;
+ 
+ 	if (!hp_dev)
+ 		return -EINVAL;
+@@ -1806,16 +1936,46 @@
+ 	if (err)
+ 		return err;
+ 
+-	hp_dev->hotplug_enabled = (val != 0);
+-	dev_info(dev, "Hotplug %s\n", hp_dev->hotplug_enabled ? "enabled" : "disabled");
++	if (val > 1)
++		return -EINVAL;
++	mutex_lock(&hp_dev->transition_lock);
++	if (!val && hp_dev->state != STATE_READY &&
++	    hp_dev->state != STATE_DEV_POWER_OFF && hp_dev->state != STATE_UNKNOWN) {
++		mutex_unlock(&hp_dev->transition_lock);
++		return -EBUSY;
++	}
++	present = gpiod_get_raw_value_cansleep(hp_dev->pins[PCIE_PIN_PRSNT].desc);
++	if (present < 0) {
++		mutex_unlock(&hp_dev->transition_lock);
++		return present;
++	}
++	WRITE_ONCE(hp_dev->hotplug_enabled, val != 0);
++	if (val)
++		cx7_hp_send_uevent(hp_dev, present ? REMOVAL_EVT : PLUG_IN_EVT);
++	mutex_unlock(&hp_dev->transition_lock);
++	dev_info(dev, "Hotplug %s\n", val ? "enabled" : "disabled");
+ 
+ 	return count;
+ }
+ 
+ DEVICE_ATTR_RW(hotplug_enabled);
++
++static ssize_t state_show(struct device *dev, struct device_attribute *attr, char *buf)
++{
++	struct cx7_hp_dev *hp_dev = dev_get_drvdata(dev);
++
++	ssize_t ret;
++
++	mutex_lock(&hp_dev->transition_lock);
++	ret = sysfs_emit(buf, "%u\n", hp_dev->state);
++	mutex_unlock(&hp_dev->transition_lock);
++	return ret;
++}
++static DEVICE_ATTR_RO(state);
+ 
+ static struct attribute *cx7_hp_attrs[] = {
+ 	&dev_attr_debug_state.attr,
++	&dev_attr_state.attr,
+ 	&dev_attr_hotplug_enabled.attr,
+ 	NULL
+ };
+@@ -1900,17 +2060,32 @@
+ 		return irq;
+ 	}
+ 
+-	if (ctx->wake_capable)
+-		enable_irq_wake(irq);
+-
+-	ret = devm_request_threaded_irq(ctx->dev, irq,
+-					hotplug_irq_handler, cx7_hp_work,
++	ret = devm_request_threaded_irq(ctx->dev, irq, NULL, cx7_hp_irq_thread,
+ 					ctx->irq_flags | IRQF_ONESHOT,
+ 					"pcie_hotplug", app_ctx);
+ 	if (ret)
+-		dev_err(ctx->dev, "Failed to request IRQ %d: %d\n", irq, ret);
++		return ret;
++	app_ctx->irq = irq;
++	if (ctx->wake_capable && !enable_irq_wake(irq))
++		app_ctx->wake_enabled = true;
+ 
+ 	return ret;
++}
++
++static void cx7_hp_free_irqs(struct cx7_hp_dev *hp_dev)
++{
++	int i;
++
++	for (i = 0; i < hp_dev->gpio_count; i++) {
++		struct cx7_hp_gpio_ctx *pin = &hp_dev->pins[i];
++
++		if (!pin->irq)
++			continue;
++		if (pin->wake_enabled)
++			disable_irq_wake(pin->irq);
++		devm_free_irq(&hp_dev->pdev->dev, pin->irq, pin);
++		pin->irq = 0;
++	}
+ }
+ 
+ /**
+@@ -2021,6 +2196,8 @@
+ 				  struct cx7_hp_dev *hp_dev)
+ {
+ 	struct acpi_gpio_walk_context walk_ctx;
++	struct acpi_gpio_mapping *mapping;
++	struct acpi_gpio_params *params;
+ 	struct fwnode_handle *gpio_fwnode = NULL;
+ 	struct acpi_device *gpio_adev = NULL;
+ 	acpi_handle gpio_handle;
+@@ -2077,13 +2254,26 @@
+ 	ret = devm_add_action_or_reset(&pdev->dev, cx7_hp_put_gpio_device,
+ 				       hp_dev->gdev);
+ 	if (ret) {
+-		gpio_device_put(hp_dev->gdev);
+ 		hp_dev->gdev = NULL;
+ 		dev_err(&pdev->dev, "Failed to register GPIO device cleanup\n");
+ 		return ret;
+ 	}
+ 
+-	hp_dev->gpio_count = walk_ctx.count;
++	/* Clock-request pins are managed by pinctrl, not driven as GPIOs. */
++	hp_dev->gpio_count = CX7_HP_MIN_GPIO_COUNT;
++	params = devm_kcalloc(&pdev->dev, hp_dev->gpio_count, sizeof(*params), GFP_KERNEL);
++	mapping = devm_kcalloc(&pdev->dev, 2, sizeof(*mapping), GFP_KERNEL);
++	if (!params || !mapping)
++		return -ENOMEM;
++	for (i = 0; i < hp_dev->gpio_count; i++)
++		params[i].crs_entry_index = i;
++	mapping[0].name = "cx7-gpios";
++	mapping[0].data = params;
++	mapping[0].size = hp_dev->gpio_count;
++	mapping[0].quirks = ACPI_GPIO_QUIRK_NO_IO_RESTRICTION;
++	ret = devm_acpi_dev_add_driver_gpios(&pdev->dev, mapping);
++	if (ret)
++		return ret;
+ 
+ 	hp_dev->pins = devm_kzalloc(&pdev->dev,
+ 				    sizeof(struct cx7_hp_gpio_ctx) *
+@@ -2094,10 +2284,14 @@
+ 	}
+ 
+ 	for (i = 0; i < hp_dev->gpio_count; i++) {
++		if (strcmp(walk_ctx.gpios[0].resource_source,
++			   walk_ctx.gpios[i].resource_source) ||
++		    (i < 2 && walk_ctx.gpios[i].connection_type != ACPI_RESOURCE_GPIO_TYPE_INT) ||
++		    (i >= 2 && walk_ctx.gpios[i].connection_type != ACPI_RESOURCE_GPIO_TYPE_IO))
++			return -EINVAL;
+ 		struct cx7_hp_gpio_ctx *app_ctx = &hp_dev->pins[i];
+ 
+-		app_ctx->desc =
+-		    gpio_device_get_desc(hp_dev->gdev, walk_ctx.gpios[i].pin);
++		app_ctx->desc = devm_gpiod_get_index(&pdev->dev, "cx7", i, GPIOD_ASIS);
+ 		if (IS_ERR(app_ctx->desc)) {
+ 			dev_err(&pdev->dev,
+ 				"Failed to get GPIO descriptor for ACPI pin %u (index %d): %ld\n",
+@@ -2106,6 +2300,8 @@
+ 			return PTR_ERR(app_ctx->desc);
+ 		}
+ 
++		if (app_ctx->desc != gpio_device_get_desc(hp_dev->gdev, walk_ctx.gpios[i].pin))
++			return dev_err_probe(&pdev->dev, -EINVAL, "GPIO mapping differs from _CRS\n");
+ 		app_ctx->hp_dev = hp_dev;
+ 	}
+ 
+@@ -2126,7 +2322,8 @@
+ 	struct device *dev = data;
+ 	struct pci_dev *pdev = to_pci_dev(dev);
+ 	struct cx7_hp_dev *hp_dev;
+-	unsigned long flags;
++	struct pci_dev *bridge;
++	int i;
+ 
+ 	if (action != BUS_NOTIFY_ADD_DEVICE)
+ 		return NOTIFY_DONE;
+@@ -2135,12 +2332,9 @@
+ 	if (!hp_dev || !hp_dev->pd)
+ 		return NOTIFY_DONE;
+ 
+-	spin_lock_irqsave(&hp_dev->lock, flags);
+-	if (!hp_dev->hotplug_enabled) {
+-		spin_unlock_irqrestore(&hp_dev->lock, flags);
++	/* Enumeration may already hold the PCI lock; do not take transition_lock. */
++	if (!READ_ONCE(hp_dev->hotplug_enabled))
+ 		return NOTIFY_DONE;
+-	}
+-	spin_unlock_irqrestore(&hp_dev->lock, flags);
+ 
+ 	if (!pdev || !hp_dev->pd->vendor_id || !hp_dev->pd->device_id)
+ 		return NOTIFY_DONE;
+@@ -2149,10 +2343,19 @@
+ 	    pdev->device != hp_dev->pd->device_id)
+ 		return NOTIFY_DONE;
+ 
+-	if (pdev->bus)
+-		pcie_bus_configure_settings(pdev->bus);
+-
+-	return NOTIFY_OK;
++	for (bridge = pci_upstream_bridge(pdev); bridge;
++	     bridge = pci_upstream_bridge(bridge)) {
++		for (i = 0; i < hp_dev->pd->port_nums; i++) {
++			struct pcie_port_info *port = &hp_dev->pd->ports[i];
++
++			if (pci_domain_nr(bridge->bus) == port->domain &&
++			    bridge->bus->number == port->bus && bridge->devfn == port->devfn) {
++				pcie_bus_configure_settings(pdev->bus);
++				return NOTIFY_OK;
++			}
++		}
++	}
++	return NOTIFY_DONE;
+ }
+ 
+ /**
+@@ -2170,6 +2373,9 @@
+ 	struct cx7_hp_gpio_ctx *app_ctx;
+ 	struct cx7_hp_dev *hp_dev;
+ 	int ret, i;
++
++	if (!experimental)
++		return -ENODEV;
+ 
+ 	pd = devm_kzalloc(&pdev->dev, sizeof(*pd), GFP_KERNEL);
+ 	if (!pd) {
+@@ -2196,6 +2402,7 @@
+ 	hp_dev->prsnt_pin = -1;
+ 	hp_dev->hotplug_enabled = false;
+ 	spin_lock_init(&hp_dev->lock);
++	mutex_init(&hp_dev->transition_lock);
+ 
+ 	for (i = 0; i < HP_PORT_MAX; i++)
+ 		hp_dev->cached_root_ports[i] = NULL;
+@@ -2215,20 +2422,11 @@
+ 			dev_err(&pdev->dev, "Failed to setup GPIO %d\n", i);
+ 			return -ENODEV;
+ 		}
+-
+-		gpiod_set_debounce(app_ctx->desc,
+-				   app_ctx->ctx->debounce_timeout_us);
+-
+-		if (app_ctx->ctx->connection_type ==
+-		    ACPI_RESOURCE_GPIO_TYPE_INT) {
+-			ret = cx7_hp_setup_irq(app_ctx);
+-			if (ret) {
+-				dev_err(&pdev->dev,
+-					"Failed to setup IRQ for GPIO %d\n", i);
+-				return ret;
+-			}
+-		}
+-	}
++	}
++
++	if (hp_dev->boot_pin != hp_dev->pins[PCIE_PIN_BOOT].ctx->pin ||
++	    hp_dev->prsnt_pin != hp_dev->pins[PCIE_PIN_PRSNT].ctx->pin)
++		return -EINVAL;
+ 
+ 	platform_set_drvdata(pdev, hp_dev);
+ 
+@@ -2238,35 +2436,58 @@
+ 		return ret;
+ 	}
+ 
+-	ret = sysfs_create_group(&pdev->dev.kobj, &cx7_hp_attr_group);
+-	if (ret) {
+-		dev_err(&pdev->dev, "Sysfs creation failed: %d\n", ret);
++	if (pd->pin_nums) {
++		hp_dev->pinctrl = devm_pinctrl_get(&pdev->dev);
++		if (IS_ERR(hp_dev->pinctrl)) {
++			ret = PTR_ERR(hp_dev->pinctrl);
++			hp_dev->pinctrl = NULL;
++			goto pinctrl_remove;
++		}
++	}
++	ret = cx7_hp_map_mmio_resources(hp_dev);
++	if (ret)
+ 		goto pinctrl_remove;
+-	}
+-
+-	cx7_hp_rp_bus_protect(hp_dev, 0, BUS_PROTECT_INIT);
++
++	for (i = 0; i < hp_dev->gpio_count; i++) {
++		app_ctx = &hp_dev->pins[i];
++		gpiod_set_debounce(app_ctx->desc, app_ctx->ctx->debounce_timeout_us);
++		if (app_ctx->ctx->connection_type == ACPI_RESOURCE_GPIO_TYPE_INT) {
++			ret = cx7_hp_setup_irq(app_ctx);
++			if (ret)
++				goto free_irqs;
++		}
++	}
+ 
+ 	hp_dev->pci_notifier.notifier_call = cx7_hp_pci_notifier;
+ 	ret = bus_register_notifier(&pci_bus_type, &hp_dev->pci_notifier);
+ 	if (ret) {
+ 		dev_err(&pdev->dev, "Failed to register PCI bus notifier: %d\n",
+ 			ret);
+-		goto sysfs_remove;
+-	}
+-
+-	if (gpiod_get_value(hp_dev->pins[PCIE_PIN_PRSNT].desc)) {
++		goto free_irqs;
++	}
++
++	ret = gpiod_get_raw_value_cansleep(hp_dev->pins[PCIE_PIN_PRSNT].desc);
++	if (ret < 0) {
++		bus_unregister_notifier(&pci_bus_type, &hp_dev->pci_notifier);
++		goto free_irqs;
++	}
++	if (ret) {
+ 		hp_dev->debug_state = CX7_HP_DEBUG_PLUG_OUT;
+-		cx7_hp_send_uevent(hp_dev, REMOVAL_EVT);
+ 	} else {
+ 		hp_dev->debug_state = CX7_HP_DEBUG_PLUG_IN;
+-		cx7_hp_send_uevent(hp_dev, PLUG_IN_EVT);
+-	}
+-
+-	dev_info(&pdev->dev, "PCIe hotplug driver initialized successfully\n");
++	}
++
++	ret = sysfs_create_group(&pdev->dev.kobj, &cx7_hp_attr_group);
++	if (ret) {
++		bus_unregister_notifier(&pci_bus_type, &hp_dev->pci_notifier);
++		goto free_irqs;
++	}
++
++	dev_info(&pdev->dev, "Experimental PCIe hotplug driver bound, power control disabled\n");
+ 	return 0;
+ 
+-sysfs_remove:
+-	sysfs_remove_group(&pdev->dev.kobj, &cx7_hp_attr_group);
++free_irqs:
++	cx7_hp_free_irqs(hp_dev);
+ pinctrl_remove:
+ 	cx7_hp_pinctrl_remove(hp_dev);
+ 	return ret;
+@@ -2287,6 +2508,10 @@
+ 		return;
+ 
+ 	sysfs_remove_group(&pdev->dev.kobj, &cx7_hp_attr_group);
++	mutex_lock(&hp_dev->transition_lock);
++	WRITE_ONCE(hp_dev->hotplug_enabled, false);
++	mutex_unlock(&hp_dev->transition_lock);
++	cx7_hp_free_irqs(hp_dev);
+ 
+ 	bus_unregister_notifier(&pci_bus_type, &hp_dev->pci_notifier);
+ 
