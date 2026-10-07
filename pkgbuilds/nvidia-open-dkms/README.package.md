@@ -21,6 +21,22 @@ When the firmware rejects a set of displays, nvkms asks again with one USB-C DP
 connector per shared pad-link and accepts the set if that passes. Keep it until
 NVIDIA's firmware routes both adapters itself.
 
+And `0005-retrain-the-link-after-the-sink-was-unplugged.patch`: when a
+DisplayPort monitor came back after an unplug while its head was still
+attached, nvkms skipped link training if the link status still read as
+trained. Behind a USB4 dock that is every time the dock's DisplayPort tunnel
+is rebuilt (the dock is replugged, or the monitor drops out as it wakes), so
+the monitor stayed black while the desktop kept it. nvkms now trains the link
+again after an unplug. Keep it until NVIDIA's driver does so itself.
+
+And `0006-set-a-mode-afresh-on-a-sink-that-comes-back-through-a-usb4-tunnel.patch`:
+the DP library revives the head of a monitor that comes back before the
+client noticed it was unplugged. Behind a USB4 dock the DisplayPort tunnel is
+new by then and the revived head leaves the monitor black, which happened to
+a dock's second monitor whenever the dock was replugged within a few seconds.
+On tunnelled links nvkms now reports such a monitor as unplugged until its old
+head is shut down, so the client always sets a mode on it afresh.
+
 Requires `[omarchy]` before `[extra]` and matching `nvidia-utils=615.71.09`.
 Update both NVIDIA packages together; automatic version tracking is disabled.
 
