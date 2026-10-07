@@ -221,7 +221,7 @@ in `origin` and has no effect on release selection.
 
 ## Existing manual holds
 
-`grok-bot`, `libfprint-git`, `libretro-cap32-git`, `libretro-database-git`, `libretro-fbneo-git`, `libretro-uae-git`, `libretro-vice-git`, `quickshell-git`, `supergfxctl`.
+`libfprint-git`, `libretro-cap32-git`, `libretro-database-git`, `libretro-fbneo-git`, `libretro-uae-git`, `libretro-vice-git`, `quickshell-git`, `supergfxctl`.
 
 These packages were already excluded from automatic AUR updates. The migration preserves that policy.
 
