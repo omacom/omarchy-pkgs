@@ -2,7 +2,7 @@
 
 The `linux-omarchy` kernel built for aarch64 with NVIDIA N1x (RTX Spark) platform support added. It carries the same kernel.org source and signed Omarchy patch set as `linux-omarchy` 7.2.5-6, plus N1x topic patches numbered 1000 and up. The intent is to fold these into `linux-omarchy` itself once it builds for aarch64; until then this is the kernel Omarchy installs on N1x machines (`install/hardware/n1x.sh` in omarchy), replacing NVIDIA's 7.0-based `linux-n1x`.
 
-The `pkgrel` counts N1x revisions of this package and starts again at 1 when the kernel version changes. It was `6.1` to `6.9` while it tracked `linux-omarchy`'s release; the ninth revision became `9`, `10` adds the Dell XPS 16 patches, `11` brings a dock's displays back after a failed DisplayPort tunnel, and `12` stops the clock during suspend-to-idle.
+The `pkgrel` counts N1x revisions of this package and starts again at 1 when the kernel version changes. It was `6.1` to `6.9` while it tracked `linux-omarchy`'s release; the ninth revision became `9`, `10` adds the Dell XPS 16 patches, `11` brings a dock's displays back after a failed DisplayPort tunnel, `12` stops the clock during suspend-to-idle, and `13` brings NVIDIA's device sleep patches from 1022.23.
 
 ## N1x patches
 
@@ -39,7 +39,16 @@ Patches 1070–1082 make USB4 and Thunderbolt work. The N1x host routers (`\_SB.
 - `1081` stops the driver powering the routers down when it is unbound. The SSPM can turn a router off, but turning it back on does not restore what the boot firmware set up, so the router stayed dead until the next boot.
 - `1082` offers the N1x host router's DP IN adapters again when a monitor is plugged in. The connection manager drops a DP IN adapter whose tunnel fails DPRX negotiation until the adapter reports a hotplug, which the N1x's never do, so after one failure every display behind a dock on that port stayed black until reboot.
 
-The driver binds only with `power_wrap_drv.usb4_release=0` on the command line. Omarchy sets that together with the PCI hotplug padding.
+Patches 1090–1095 are NVIDIA's SAUCE from `Ubuntu-nvidia-7.0-7.0.0-1022.23_24.04.1`, which has the MT8901 controllers report their sleep states to the SSPM through power_wrap. On this platform the ACPI power resources are empty stubs, so a device only powers down in suspend once the SSPM is told it reached D3:
+
+- `1090` (a255ee68ee85) makes `sspm_ci` tell a request that was never sent (`-EBUSY`) from one whose completion is unknown (`-ETIMEDOUT`).
+- `1091` (fff35e933484) gates a whole PCIe host through power_wrap once every root port on it is in D3cold and none is set to wake the system.
+- `1092` (053c2c7902c3) adds `xhci-mtk-v2` (`CONFIG_USB_XHCI_MTK_V2`) for the NVDA8000/NVDA8001 controllers, which reports their D3 and D0 in system suspend. It is rebased onto 7.2's `xhci_dbc_remove()`, which takes `enable_mutex`. `1093` (522542575927) adds the 2 ms delay before CRS that these controllers need on resume.
+- `1094` (a6a609d1b7ff) and `1095` (03b41c9a041a) bind SPI over ACPI and have the SPI and I2C controllers report D3 in suspend.
+
+NVIDIA's companion watchdog rework (280db0e8cf30) is not carried; it replaces the sbsa_gwdt sleep patch already in `1020`.
+
+The USB4 driver binds only with `power_wrap_drv.usb4_release=0` on the command line. Omarchy sets that together with the PCI hotplug padding.
 
 SAUCE that was left out:
 
