@@ -31,8 +31,9 @@ gh_api() {
   local path=$1; shift
   echo "gh $path $*" >>"$CALLS_FILE"
   case "$path" in
+    */actions/runs\?status=in_progress*) echo '{"workflow_runs":[]}' ;;
     */actions/runs\?*) jq -nc --argjson n "$QUEUED" '{workflow_runs: [range($n) | {id: .}]}' ;;
-    */actions/runs/*/jobs) echo '{"jobs":[{"id":1,"status":"queued","labels":["self-hosted","omarchy-builder"]}]}' ;;
+    */actions/runs/*/jobs\?*) echo '{"jobs":[{"id":'"$(echo "$path" | cut -d/ -f6)"',"status":"queued","labels":["self-hosted","omarchy-builder"]}]}' ;;
     */actions/runners\?*) jq -nc --argjson n "$BUSY" '{runners: [range($n) | {busy: true, labels: [{name: "omarchy-builder"}]}]}' ;;
     */registration-token) echo '{"token":"T"}' ;;
   esac
@@ -55,6 +56,35 @@ DROPLETS="1 active $OLD" QUEUED=0 BUSY=0; run; check "over-age droplet reaped ev
 DROPLETS=$'1 active '"$NOW"$'\n2 active '"$NOW"$'\n3 active '"$NOW"$'\n4 active '"$NOW" QUEUED=3 BUSY=4; MAX_DROPLETS=4; run; check "at cap: no creates" 0 0
 DROPLETS=$'1 active '"$NOW"$'\n2 active '"$NOW" QUEUED=5 BUSY=2; MAX_DROPLETS=3; run; check "cap limits creates to remaining room" 1 0
 DROPLETS="1 off $NOW" QUEUED=1 BUSY=0; MAX_DROPLETS=4; run; check "off droplet is not capacity: reaped and replaced" 1 1
+
+# A large in-progress matrix has no waiting jobs on page one. The queued
+# workflow is on page two of the run listing; the same run can appear in
+# both status queries while GitHub updates it, so count its jobs once.
+gh_api() {
+  case "$1" in
+    *runs?status=queued*page=1) jq -nc '{workflow_runs: [range(100) | {id: .}]}' ;;
+    *runs?status=queued*page=2) echo '{"workflow_runs":[{"id":999}]}' ;;
+    *runs?status=in_progress*) echo '{"workflow_runs":[{"id":999},{"id":1000}]}' ;;
+    *runs/999/jobs*page=1) jq -nc '{jobs: [range(100) | {id: .,status:"completed",labels:["omarchy-builder"]}]}' ;;
+    *runs/999/jobs*page=2) echo '{"jobs":[{"id":9991,"status":"queued","labels":["omarchy-builder"]}]}' ;;
+    *runs/1000/jobs*) echo '{"jobs":[{"id":10001,"status":"queued","labels":["omarchy-builder"]},{"id":10002,"status":"queued","labels":["ubuntu-latest"]},{"id":10003,"status":"in_progress","labels":["omarchy-builder"]}]}' ;;
+    *jobs*) echo '{"jobs":[]}' ;;
+    *) echo "Unexpected API request: $1" >&2; return 1 ;;
+  esac
+}
+[[ $(queued_jobs) == 2 ]] || { echo "FAIL: full queue across pages and workflow states"; exit 1; }
+echo "PASS: later run/job pages and in-progress workflows count each waiting builder once"
+
+gh_api() {
+  case "$1" in
+    *runs?status=queued*) echo '{"workflow_runs":[{"id":1}]}' ;;
+    *runs?status=in_progress*) echo '{"workflow_runs":[]}' ;;
+    *jobs*page=1) jq -nc '{jobs:[range(100)|{id:.,status:"completed",labels:[]}]}' ;;
+    *) return 1 ;;
+  esac
+}
+if queued_jobs >/dev/null; then echo "FAIL: a failed later page looks like an empty queue"; exit 1; fi
+echo "PASS: API failures stop the queue query"
 
 # The create body must carry the tag (reaper scope) and substituted user-data.
 BODY_FILE=$(mktemp); trap 'rm -f "$CALLS_FILE" "$BODY_FILE"' EXIT

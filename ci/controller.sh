@@ -64,14 +64,33 @@ reap() {
 }
 
 # --- demand ----------------------------------------------------------------
+# Emit every item, including later pages of large build matrices. Keep API
+# failures fatal so a failed query cannot look like an empty queue.
+gh_items() {
+  local path=$1 key=$2 page=1 response count separator="?"
+  [[ $path != *"?"* ]] || separator="&"
+  while :; do
+    response=$(gh_api "${path}${separator}per_page=100&page=$page") || return 1
+    count=$(jq -er --arg key "$key" '.[$key] | arrays | length' <<< "$response") || return 1
+    jq -c --arg key "$key" '.[$key][]' <<< "$response" || return 1
+    (( count == 100 )) || break
+    ((page += 1))
+  done
+}
+
 queued_jobs() {
-  local run
-  gh_api "repos/$REPO/actions/runs?status=queued&per_page=50" --get \
-    | jq -r '.workflow_runs[].id' |
+  local status runs run
+  # A workflow can be in progress while most of its matrix is still queued.
+  runs=$(
+    for status in queued in_progress; do
+      gh_items "repos/$REPO/actions/runs?status=$status" workflow_runs || exit 1
+    done
+  ) || return 1
+  jq -r '.id' <<< "$runs" | sort -u |
   while read -r run; do
-    gh_api "repos/$REPO/actions/runs/$run/jobs" \
-      | jq -r --arg l "$LABEL" '.jobs[] | select(.status=="queued") | select(.labels | index($l)) | .id'
-  done | wc -l
+    gh_items "repos/$REPO/actions/runs/$run/jobs" jobs |
+      jq -r --arg l "$LABEL" 'select(.status=="queued") | select(.labels | index($l)) | .id' || return 1
+  done | sort -u | wc -l
 }
 
 live_droplets() {
