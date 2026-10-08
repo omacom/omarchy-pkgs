@@ -19,7 +19,9 @@ done
 cat > "$test_tmp/bin/omarchy-shell" <<'SH'
 #!/bin/bash
 printf '%s %s\n' "${0##*/}" "$*" >> "$SUPERWHISPER_TEST_LOG"
-if [[ $* == *putBarWidget* && ${SUPERWHISPER_SHELL_ABSENT:-0} != 1 ]]; then
+[[ $1 != "-q" ]] || exit 0
+[[ ${SUPERWHISPER_SHELL_ABSENT:-0} != 1 ]] || exit 1
+if [[ $* == *putBarWidget* ]]; then
   count=0
   [[ ! -f $SUPERWHISPER_PANEL_COUNT ]] || read -r count < "$SUPERWHISPER_PANEL_COUNT"
   printf '%s\n' "$((count + 1))" > "$SUPERWHISPER_PANEL_COUNT"
@@ -55,7 +57,7 @@ grep -Fxq 'systemctl --user restart superwhisper.service' "$SUPERWHISPER_TEST_LO
 [[ $(readlink "$XDG_CONFIG_HOME/omarchy/plugins/superwhisper-panel") == "/opt/superwhisper/assets/omarchy-plugin/superwhisper-panel" ]]
 [[ $(readlink "$HOME/.agents/skills/superwhisper") == "/opt/superwhisper/assets/agent-skill/superwhisper" ]]
 bash "$ROOT/pkgbuilds/superwhisper-bin/setup-user"
-(( $(grep -c '^omarchy-shell -q shell putBarWidget ' "$SUPERWHISPER_TEST_LOG") == 3 ))
+(( $(grep -c '^omarchy-shell shell putBarWidget ' "$SUPERWHISPER_TEST_LOG") == 3 ))
 [[ ! -e $XDG_CONFIG_HOME/superwhisper/omarchy-panel.pending ]]
 printf '%s\n' 'PASS: Superwhisper setup migrates portable wrappers with backups, preserves data, and keeps the panel placement'
 
