@@ -80,8 +80,11 @@ changing them, on the box:
   packages then signatures then the db.
 - aarch64 under QEMU with credential-preserving binfmt. PR builds now run
   aarch64 natively on `ubuntu-24.04-arm` (QEMU was up to ~15x slower). When a
-  merged aarch64 tree has no artifact, publish.yml rebuilds it there too, in its
-  own job, and signs and uploads it on the droplet like a PR artifact.
+  merged tree has no artifact, publish.yml rebuilds it in its own job, aarch64
+  there and x86_64 on a droplet, outside the publish lock.
+- Publish itself builds nothing: it signs and uploads on `ubuntu-latest` in the
+  tested builder image pulled from GHCR, and only that job holds the `publish`
+  concurrency group, so a merge waits for seconds of signing, not for builds.
 - Vouch gate: collaborators, `.github/VOUCHED.td`, or the `build-approved`
   label; denounced authors cannot be overridden by the label.
 - Tests run on PRs only; `result`, `self-tests`, `build-isolation` are the
