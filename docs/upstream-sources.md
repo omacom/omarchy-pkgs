@@ -151,7 +151,6 @@ in `origin` and has no effect on release selection.
 | `1password-beta` | debian | [https://downloads.1password.com/linux/debian/amd64/dists/beta/main/binary-amd64/Packages](https://downloads.1password.com/linux/debian/amd64/dists/beta/main/binary-amd64/Packages) |
 | `1password-cli` | json | [https://app-updates.agilebits.com/check/1/0/CLI2/en/0](https://app-updates.agilebits.com/check/1/0/CLI2/en/0) |
 | `aether` | github | [omacom/aether](https://github.com/omacom/aether) |
-| `asusctl` | git_tags | [https://github.com/OpenGamingCollective/asusctl.git](https://github.com/OpenGamingCollective/asusctl.git) |
 | `basecamp-cli` | github | [basecamp/basecamp-cli](https://github.com/basecamp/basecamp-cli) |
 | `bun-bin` | github | [oven-sh/bun](https://github.com/oven-sh/bun) |
 | `claude-code` | regex | [https://downloads.claude.ai/claude-code-releases/latest](https://downloads.claude.ai/claude-code-releases/latest) |
@@ -213,7 +212,6 @@ in `origin` and has no effect on release selection.
 | `vi` | regex | [https://sources.archlinux.org/other/vi/](https://sources.archlinux.org/other/vi/) |
 | `visual-studio-code-bin` | json | [https://update.code.visualstudio.com/api/update/linux-deb-x64/stable/latest](https://update.code.visualstudio.com/api/update/linux-deb-x64/stable/latest) |
 | `walker` | github | [abenz1267/walker](https://github.com/abenz1267/walker) |
-| `xdg-terminal-exec` | git_tags | [https://gitlab.freedesktop.org/Vladimir-csp/xdg-terminal-exec.git](https://gitlab.freedesktop.org/Vladimir-csp/xdg-terminal-exec.git) |
 | `xpadneo-dkms` | github | [atar-axis/xpadneo](https://github.com/atar-axis/xpadneo) |
 | `yaru-icon-theme` | git_tags | [https://github.com/ubuntu/yaru.git](https://github.com/ubuntu/yaru.git) |
 | `yay` | github | [Jguer/yay](https://github.com/Jguer/yay) |
@@ -224,8 +222,6 @@ in `origin` and has no effect on release selection.
 `grok-bot`, `libfprint-git`, `libretro-cap32-git`, `libretro-database-git`, `libretro-fbneo-git`, `libretro-uae-git`, `libretro-vice-git`, `quickshell-git`, `supergfxctl`.
 
 These packages were already excluded from automatic AUR updates. The migration preserves that policy.
-
-`linux-firmware-cirrus` is a deliberate hold: a self-retiring shim that ships Arch's linux-firmware-cirrus 20260910-2 payload to stable while stable's Arch snapshot is on 20260810-2 (Dell XPS 13 DX13260 / 1028:0e54 speaker firmware). It is versioned 20260810-3 so the genuine Arch package supersedes it as soon as the snapshot advances; bumping it to the Arch version would defeat that. Delete the recipe once stable's snapshot carries linux-firmware >= 20260910.
 
 `m1n1-aurora` and `uboot-asahi` are deliberate holds: Apple Silicon boot code, pinned by hand like `linux-aurora`, and bumped only after a cold boot on the qualification Macs. `m1n1-aurora` pins an aurora-silicon/m1n1 commit plus a local patch. `uboot-asahi` follows asahi-alarm's recipe and patch set (asahi-alarm/PKGBUILDs), which a tag watch on AsahiLinux/u-boot cannot carry.
 

@@ -435,7 +435,7 @@ test('scoped branch names reject anything that is not a package name', () => {
 });
 
 test('sync workflows push scoped runs aside and keep actions: write out of the sync job', () => {
-  for (const file of ['sync-upstream.yml', 'sync-rebuilds.yml']) {
+  for (const file of ['sync-upstream.yml']) {
     const text = readFileSync(join(__dirname, '../.github/workflows', file), 'utf8');
     const sync = text.slice(text.indexOf('\n  sync:\n'), text.indexOf('\n  approve:\n'));
     const approveJob = text.slice(text.indexOf('\n  approve:\n'));
@@ -449,4 +449,18 @@ test('sync workflows push scoped runs aside and keep actions: write out of the s
     assert.match(approveJob, /needs\.sync\.outputs\.operation == 'created'/, file);
     assert.match(approveJob, /needs\.sync\.outputs\.operation == 'updated'/, file);
   }
+});
+
+test('rebuild sync opens its PR with the bot token and auto-merges it', () => {
+  const file = 'sync-rebuilds.yml';
+  const text = readFileSync(join(__dirname, '../.github/workflows', file), 'utf8');
+  assert.match(text, /sync-pr-branch\.sh auto\/sync-rebuilds "\$\{package_args\[@\]\}"/, file);
+  assert.match(text, /branch: \$\{\{ steps\.branch\.outputs\.branch \}\}/, file);
+  // A GITHUB_TOKEN merge would not start publish.yml, so the PR and the
+  // merge both go through the PAT.
+  assert.match(text, /token: \$\{\{ secrets\.PKGS_BOT_TOKEN \}\}/, file);
+  assert.doesNotMatch(text, /secrets\.GITHUB_TOKEN/, file);
+  assert.match(text, /gh pr merge --auto --merge "\$PR"/, file);
+  assert.doesNotMatch(text, /^ +actions: write$/m, file);
+  assert.doesNotMatch(text, /\n  approve:\n/, file);
 });
