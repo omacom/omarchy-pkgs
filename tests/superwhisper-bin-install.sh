@@ -50,6 +50,17 @@ bash "$ROOT/pkgbuilds/superwhisper-bin/setup-user"
 [[ $(readlink "$HOME/.local/bin/superwhisper") == "/usr/bin/superwhisper" ]]
 [[ $(readlink "$XDG_DATA_HOME/superwhisper/app/current") == "/opt/superwhisper" ]]
 [[ ! -e $XDG_CONFIG_HOME/hypr ]]
+python3 - "$XDG_CONFIG_HOME/superwhisper/preferences.json" <<'PY_TEST'
+import json
+import os
+import sys
+with open(sys.argv[1]) as profile:
+  preferences = json.load(profile)
+assert preferences["toggleRecordingShortcut"] == "Alt+Space"
+assert preferences["pushToTalkShortcut"] == ""
+assert preferences["cancelRecordingShortcut"] == "Escape"
+assert os.stat(sys.argv[1]).st_mode & 0o777 == 0o600
+PY_TEST
 printf '%s\n' 'PASS: fresh Superwhisper setup uses the package and needs no personal Hyprland config'
 
 # The packaged launcher must put the native include in a file Hyprland never
