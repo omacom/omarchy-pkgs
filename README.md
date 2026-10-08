@@ -893,15 +893,15 @@ The repository includes GitHub workflows and systemd services for automated rele
 #### GitHub Workflows
 
 1. **sync-upstream.yml** (Every 6 hours): Watches direct upstream feeds and updates owned recipes on the reviewed lane. Successful package updates reach a PR even if another feed fails; failed recipes stay untouched and the workflow remains red.
-2. **sync-rebuilds.yml** (Every 6 hours): Bumps pkgrel for packages whose `rebuild_on` dependencies have moved in the official repositories and opens a PR.
+2. **sync-rebuilds.yml** (Every 6 hours): Bumps pkgrel for packages whose `rebuild_on` dependencies have moved in the official repositories, opens a PR, and enables auto-merge. The PR lands once its build checks pass; a rebuild that fails stays an open red PR for a maintainer.
 3. **track-branches.yml** (Every 2 hours): The unattended lane. Pins every `"auto_merge": true` package to the tip of its watched branch once its commit timestamp clears `min_release_age`, opens one PR for all of them, and enables auto-merge. Packages pinned from the same branch move together or not at all, including targeted syncs. The PR builds like any other; a tip that fails to build stays an open red PR until the next tick supersedes it.
 
-The tracking PR and auto-merge use the PAT stored in `PKGS_BOT_TOKEN`, with
+The tracking and rebuild PRs and their auto-merge use the PAT stored in `PKGS_BOT_TOKEN`, with
 Contents and Pull requests write access to this repository and an owner trusted
 to trigger builds. The existing controller PAT can be reused. No GitHub App is
 required. The built-in Actions `GITHUB_TOKEN` cannot drive the unattended
-build-and-publish chain, so the tracker requires this secret before it runs.
-The reviewed sync workflows continue to use `GITHUB_TOKEN` and require
+build-and-publish chain, so both workflows require this secret before they run.
+The reviewed upstream sync continues to use `GITHUB_TOKEN` and requires
 maintainer approval as before. See [setup instructions](docs/upstream-sources.md#enable-unattended-branch-updates).
 
 Scheduled runs regenerate one shared PR (`auto/sync-upstream`, `auto/sync-rebuilds`)
@@ -912,10 +912,10 @@ pending updates. The next scheduled run still picks the same update up in the
 shared PR if it has not merged by then; identical package trees reuse the same
 build artifacts.
 
-Sync PRs are pushed with `GITHUB_TOKEN`, so GitHub holds their build and test
+Upstream sync PRs are pushed with `GITHUB_TOKEN`, so GitHub holds their build and test
 runs for approval on every push and starts no `pull_request_target` workflow
-for them. The sync workflows label their own PRs **`build-approved`**, and
-their `approve` job releases the held runs for each commit they push, including
+for them. The upstream sync labels its own PRs **`build-approved`**, and
+its `approve` job releases the held runs for each commit they push, including
 the push that opens the PR. A push to an `auto/sync-*` branch does not cancel
 the PR's in-flight build: the new build waits for it and then reuses its
 artifacts, so a long aarch64 build is not restarted by every sync.

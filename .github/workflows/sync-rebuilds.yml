@@ -1,5 +1,14 @@
 name: Sync Rebuild Triggers
 
+# Rebuilds ride the unattended lane, like track-branches.yml: the pkgrel bump
+# PR builds on the droplets, auto-merge lands it once `result`, `self-tests`
+# and `build-isolation` are green, and the merge publishes. A rebuild that
+# fails stays an unmerged red PR for a maintainer.
+#
+# The PR and auto-merge use the PAT in PKGS_BOT_TOKEN, because a merge made
+# with the built-in GITHUB_TOKEN does not start publish.yml, and its pushes
+# are held for approval instead of building.
+
 on:
   schedule:
     # Every 6 hours, off the hour to dodge the scheduling backlog at :00
@@ -17,14 +26,17 @@ jobs:
     permissions:
       contents: write
       pull-requests: write
-    outputs:
-      branch: ${{ steps.branch.outputs.branch }}
-      pushed_at: ${{ steps.pushed.outputs.at }}
-      number: ${{ steps.cpr.outputs.pull-request-number }}
-      operation: ${{ steps.cpr.outputs.pull-request-operation }}
-      head_sha: ${{ steps.cpr.outputs.pull-request-head-sha }}
 
     steps:
+      - name: Require the bot token
+        env:
+          PKGS_BOT_TOKEN: ${{ secrets.PKGS_BOT_TOKEN }}
+        run: |
+          if [[ -z "$PKGS_BOT_TOKEN" ]]; then
+            echo "::error::Set PKGS_BOT_TOKEN to a PAT with Contents: write and Pull requests: write on this repository, owned by an account trusted to trigger builds."
+            exit 1
+          fi
+
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
@@ -85,19 +97,12 @@ jobs:
             echo "has_changes=true" >> "$GITHUB_OUTPUT"
           fi
 
-      # Runs created by this push are newer than this; the approve job
-      # waits for them. A minute's slack absorbs runner clock skew.
-      - name: Record push time
-        if: steps.changes.outputs.has_changes == 'true'
-        id: pushed
-        run: echo "at=$(date -u -d '-1 minute' +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
-
       - name: Create Pull Request
         if: steps.changes.outputs.has_changes == 'true'
         id: cpr
         uses: peter-evans/create-pull-request@v7
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+          token: ${{ secrets.PKGS_BOT_TOKEN }}
           commit-message: 'chore: rebuild against updated dependencies'
           title: "chore: rebuild against updated dependencies${{ steps.branch.outputs.scope && format(' ({0})', steps.branch.outputs.scope) || '' }}"
           body: |
@@ -109,14 +114,27 @@ jobs:
             bump is what makes the rebuilt package an upgrade pacman will offer;
             without it the build produces the version already published and no
             one receives it.
+
+            This PR auto-merges once the build checks pass. A failing rebuild
+            leaves it open for a maintainer.
           branch: ${{ steps.branch.outputs.branch }}
           delete-branch: true
-          # The bot is trusted; build-approved lets the approve job below
-          # release GitHub's hold on its pushes without a maintainer.
-          labels: |
-            automated
-            build-approved
-          reviewers: ryanrhughes
+          labels: automated
+
+      # Auto-merge, not a direct merge: branch protection still has to see
+      # the build checks green before the rebuild lands.
+      - name: Enable auto-merge
+        if: steps.cpr.outputs.pull-request-number != ''
+        env:
+          GH_TOKEN: ${{ secrets.PKGS_BOT_TOKEN }}
+          PR: ${{ steps.cpr.outputs.pull-request-number }}
+        run: |
+          # Idempotent across re-runs of an updated PR: enabling twice errors.
+          if [[ "$(gh pr view "$PR" -R "${{ github.repository }}" --json autoMergeRequest --jq '.autoMergeRequest != null')" == true ]]; then
+            echo "auto-merge already enabled on #$PR"
+            exit 0
+          fi
+          gh pr merge --auto --merge "$PR" -R "${{ github.repository }}"
 
       - name: Notify Basecamp on failure
         if: failure() && env.BASECAMP_CHATBOT_URL != ''
@@ -129,36 +147,3 @@ jobs:
               "🔴 <strong>Rebuild trigger sync failed</strong><br><a href=\"${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\">View run</a>" \
               '{content: $content}')" \
             "$BASECAMP_CHATBOT_URL"
-
-  # GitHub holds pull_request runs from a GITHUB_TOKEN push for approval and
-  # creates no pull_request_target run for it, so approve-pr.yml never sees
-  # the sync's own pushes. The sync labels its PR build-approved, so release
-  # the held runs for the commit just pushed, whether it opened the PR or
-  # updated it. A separate job, so the sync container's token never holds
-  # actions: write.
-  approve:
-    needs: sync
-    if: ${{ !cancelled() && (needs.sync.outputs.operation == 'created' || needs.sync.outputs.operation == 'updated') }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    permissions:
-      contents: read
-      pull-requests: read
-      actions: write
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          persist-credentials: false
-      - name: Release held build and test runs
-        uses: actions/github-script@v7
-        env:
-          NUMBER: ${{ needs.sync.outputs.number }}
-          BRANCH: ${{ needs.sync.outputs.branch }}
-          HEAD_SHA: ${{ needs.sync.outputs.head_sha }}
-          SINCE: ${{ needs.sync.outputs.pushed_at }}
-        with:
-          script: |
-            const approve = require('./.github/scripts/approve-sync-push.cjs');
-            const { NUMBER, BRANCH, HEAD_SHA, SINCE } = process.env;
-            await approve({ github, context, core, number: Number(NUMBER),
-              branch: BRANCH, headSha: HEAD_SHA, since: SINCE });
