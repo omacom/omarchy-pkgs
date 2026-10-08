@@ -11,3 +11,5 @@ Omarchy loads the selected backend's generated `~/.config/superwhisper/shortcuts
 The launcher redirects the vendor’s generated Hyprland include to a private, unloaded file for both the daemon and CLI. User setup waits for daemon readiness. The portable updater is disabled and refused by the packaged launcher. The archive is verified before extraction, its version is checked, and the bundled panel uses explicit Omarchy palette references for Qt 6.12.
 
 Fresh profiles start with Alt+Space toggle, no native hold, and Escape cancellation before the daemon starts, avoiding a conflict with Omarchy’s Right Alt binding. Existing preferences remain unchanged.
+
+Panel discovery is asynchronous: user setup retries placement, leaves a pending marker if the shell is unavailable, and retries on the next setup without moving an already placed panel. Bundled component license notices are installed under `/usr/share/licenses/superwhisper-bin/`.
