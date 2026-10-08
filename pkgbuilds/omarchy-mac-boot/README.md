@@ -33,6 +33,8 @@ A new pin publishes on merge, so check what the pinned source needs first. The r
 - It provides, conflicts with and replaces `omarchy-apple-boot` and `omarchy-first-boot`. The scriptlet moves a pending `omarchy-first-boot` marker to `omarchy-mac-first-boot`, drops the dangling enable links of the replaced unit and of the removed migration verifier, and points at a customised `90-omarchy-asahi.conf.pacsave`.
 - `pkgver` is the UTC commit date of the pin, so any pin from `20260925` on upgrades the fork's `20260921-10` on mx-mac Macs. The files the fork shipped that the source no longer does (the image finalize tools, the upstream ARM repository key and the GRUB snapshot-menu hook) are removed by that upgrade.
 - **Device tree overlays (omacom/omarchy-mac-pkgs#3).** Other packages may drop overlays into `/usr/lib/omarchy-mac-boot/dtb-overlays/`, which this package owns; `/etc/default/update-m1n1` applies them and the boot check rebuilds `boot.bin` the same way. With none installed, `boot.bin` is unchanged. A Mac with its own copy of `/etc/default/update-m1n1` keeps it (the shipped one lands as `.pacnew`), and then update-m1n1 applies no overlays until it is merged; from `20261004-3` (omacom/omarchy-mac-pkgs#10) the boot check leaves them out too, with a warning, instead of failing that Mac's `boot.bin` and stopping `omarchy update`. The overlay hook does not run in the transaction that first installs it.
+- **Factory reset keeps `/boot` writable (`20261008-1`, omacom/omarchy-mac-pkgs#20).** A reset reboot unlocks the disk with a key from the Boot partition, and systemd could mount that partition again just before the switch to the real root without unmounting it (systemd/systemd#28021), so `/boot` came up read-only and owner setup's re-key failed. An initramfs drop-in makes the unmount finish before the switch.
+- **First-boot encryption progress on the splash (`20261008-1`, omacom/omarchy-mac-pkgs#18).**
 - `backup=` covers every `/etc` file and `/usr/lib/omarchy/initcpio`. It includes `/etc/default/update-m1n1`, which pins update-m1n1's device-tree order to the C locale. On a Mac that already has its own unowned copy, pacman keeps it and installs the shipped one as `.pacnew`. The snapshot restore hooks in `/etc/boot/hooks` are symlinks to `/usr/bin/omarchy-mac-snapshot-check`, not files, so they stay out of it.
 
 ## Updates
@@ -44,4 +46,4 @@ Updates are reviewed pins, never a branch:
 3. Refresh `sha256sums` with `makepkg -g`.
 4. Check the pin against [Publish order](#publish-order). `omarchy-mac` must be published at or past omacom/omarchy-mac#535, or re-pinned in the same pull request.
 
-`20261004-3` sorts above edge's `20261004-2`, the first draft of that pin (`20261004-1`) and every lab candidate up to `20260928-3`.
+`20261008-1` sorts above edge's `20261004-3` and every earlier pin and lab candidate.
