@@ -15,6 +15,7 @@ CONTROLLER_LIBRARY_ONLY=1 source "$ROOT/ci/controller.sh"
 CALLS_FILE=$(mktemp); trap 'rm -f "$CALLS_FILE"' EXIT
 NOW=$(date -u +%FT%TZ)
 OLD=$(date -u -d '5 hours ago' +%FT%TZ)
+STUCK=$(date -u -d '15 minutes ago' +%FT%TZ)
 
 # Scenario state: DROPLETS is "id status created" lines, QUEUED a count,
 # BUSY a count.
@@ -54,6 +55,8 @@ DROPLETS="1 active $NOW" QUEUED=1 BUSY=1; run; check "one queued, one live but b
 DROPLETS="1 active $NOW" QUEUED=1 BUSY=0; run; check "one queued, one live and idle: it will take it" 0 0
 DROPLETS="1 off $NOW" QUEUED=0 BUSY=0; run; check "powered-off droplet reaped" 0 1
 DROPLETS="1 active $OLD" QUEUED=0 BUSY=0; run; check "over-age droplet reaped even if active" 0 1
+DROPLETS="1 new $STUCK" QUEUED=1 BUSY=0; run; check "droplet stuck provisioning reaped and replaced" 1 1
+DROPLETS="1 new $NOW" QUEUED=1 BUSY=0; run; check "droplet still provisioning is left to boot" 0 0
 DROPLETS=$'1 active '"$NOW"$'\n2 active '"$NOW"$'\n3 active '"$NOW"$'\n4 active '"$NOW" QUEUED=3 BUSY=4; MAX_DROPLETS=4; run; check "at cap: no creates" 0 0
 DROPLETS=$'1 active '"$NOW"$'\n2 active '"$NOW" QUEUED=5 BUSY=2; MAX_DROPLETS=3; run; check "cap limits creates to remaining room" 1 0
 DROPLETS="1 off $NOW" QUEUED=1 BUSY=0; MAX_DROPLETS=4; run; check "off droplet is not capacity: reaped and replaced" 1 1

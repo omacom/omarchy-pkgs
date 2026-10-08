@@ -4,7 +4,8 @@
 # Run from a systemd timer every minute on a small always-on droplet. No
 # inbound endpoint: it polls GitHub for queued jobs wanting our label, creates
 # one ephemeral droplet per job (up to MAX_DROPLETS), and deletes droplets
-# that have powered off or exceeded MAX_AGE_MINUTES. The reaper does not
+# that have powered off, exceeded MAX_AGE_MINUTES, or are still provisioning
+# after MAX_BOOT_MINUTES. The reaper does not
 # trust its own bookkeeping: it lists by tag and acts on what DigitalOcean
 # reports.
 #
@@ -30,6 +31,10 @@ REGIONS=${REGIONS:-${REGION:-}}
 IMAGE=${IMAGE:-ubuntu-24-04-x64}
 MAX_DROPLETS=${MAX_DROPLETS:-4}
 MAX_AGE_MINUTES=${MAX_AGE_MINUTES:-200}
+# A droplet DigitalOcean still reports as "new" this long after creation is
+# stuck provisioning. Left alone it counts as a runner booting, and holds a
+# queued job until MAX_AGE_MINUTES.
+MAX_BOOT_MINUTES=${MAX_BOOT_MINUTES:-10}
 RUNNER_VERSION=${RUNNER_VERSION:-2.337.0}
 CLOUD_INIT=${CLOUD_INIT:-$(dirname "$0")/runner-cloud-init.yaml}
 # Operator public keys authorized on every builder (JSON array of strings).
@@ -60,7 +65,8 @@ reap() {
   while read -r id status created; do
     [[ -n "$id" ]] || continue
     age=$(( (now - $(date -d "$created" +%s)) / 60 ))
-    if [[ $status == off ]] || (( age > MAX_AGE_MINUTES )); then
+    if [[ $status == off ]] || (( age > MAX_AGE_MINUTES )) ||
+       { [[ $status == new ]] && (( age > MAX_BOOT_MINUTES )); }; then
       log "deleting droplet $id (status=$status age=${age}m)"
       do_api "droplets/$id" -X DELETE
     fi
@@ -99,7 +105,10 @@ queued_jobs() {
 }
 
 live_droplets() {
-  do_api "droplets?tag_name=$TAG&per_page=200" | jq '[.droplets[] | select(.status != "off")] | length'
+  # Not the ones reap() just deleted: DigitalOcean can list them for a while.
+  do_api "droplets?tag_name=$TAG&per_page=200" | jq --argjson boot "$MAX_BOOT_MINUTES" '
+    [.droplets[] | select(.status != "off")
+      | select(.status != "new" or (now - (.created_at | fromdateiso8601)) / 60 <= $boot)] | length'
 }
 
 busy_runners() {
