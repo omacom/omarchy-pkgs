@@ -12,11 +12,12 @@ signing on merge exactly as before.
 - `runner-cloud-init.yaml` — Ubuntu 24.04 user-data: docker + buildx, the
   GitHub runner registered `--ephemeral`, runs one job, powers off.
 - `controller.sh` — systemd timer every minute on a small always-on droplet.
-  Polls for queued jobs with our label, creates one g5-32vcpu-64gb-50gb droplet (ric1) per job up
+  Polls for queued jobs with our label, creates one g5-32vcpu-64gb-50gb droplet per job up
   to `MAX_DROPLETS`, deletes droplets that are powered off or older than
-  `MAX_AGE_MINUTES`. When ric1 has sold out of a size, DigitalOcean refuses
-  the create with 422 and the next of `SIZES` is tried; the refusal's message
-  is logged. No inbound endpoint. Plain curl against both APIs, no
+  `MAX_AGE_MINUTES`. Builders go in any region DigitalOcean lists the size in
+  stock in (`REGIONS` only sets which to try first); a refused create, logged
+  with DigitalOcean's message, falls back to the next region, then the next
+  of `SIZES`. No inbound endpoint. Plain curl against both APIs, no
   doctl and no gh: a token in the environment cannot pick the wrong account
   the way a saved doctl context can. Needs curl and jq.
   `tests/controller.sh` exercises every decision against canned responses.

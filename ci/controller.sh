@@ -21,11 +21,12 @@ REPO=${REPO:?owner/name}
 : "${DIGITALOCEAN_TOKEN:?}" "${GITHUB_TOKEN:?}"
 LABEL=${LABEL:-omarchy-builder}
 TAG=${TAG:-omarchy-builder}
-REGION=${REGION:-ric1}
-# Sizes to try, in order. A size can sell out in a region for hours; the
-# create is then refused with 422 and the next size is tried. SIZE, if set,
-# is a single-size list.
+# Sizes to try, in order, in any region DigitalOcean lists them in stock. A
+# size can sell out in a region for hours; the create is then refused with
+# 422 and the next region, then the next size, is tried. REGIONS only orders
+# the regions tried first. SIZE and REGION, if set, are one-item lists.
 SIZES=${SIZES:-${SIZE:-g5-32vcpu-64gb-50gb g5-32vcpu-128gb-50gb}}
+REGIONS=${REGIONS:-${REGION:-}}
 IMAGE=${IMAGE:-ubuntu-24-04-x64}
 MAX_DROPLETS=${MAX_DROPLETS:-4}
 MAX_AGE_MINUTES=${MAX_AGE_MINUTES:-200}
@@ -106,31 +107,59 @@ busy_runners() {
     | jq --arg l "$LABEL" '[.runners[] | select(.busy) | select(any(.labels[]; .name == $l))] | length'
 }
 
+# --- capacity --------------------------------------------------------------
+# "size region" lines to try, best first: SIZES order, then REGIONS order,
+# then every other region where DigitalOcean lists the size in stock.
+candidates() {
+  local page=1 response count catalog=""
+  while :; do
+    response=$(do_api "sizes?per_page=200&page=$page") || return 1
+    count=$(jq -er '.sizes | arrays | length' <<< "$response") || return 1
+    catalog+=$(jq -c '.sizes[]' <<< "$response")$'\n'
+    (( count == 200 )) || break
+    ((page += 1))
+  done
+  jq -rs --arg sizes "$SIZES" --arg regions "$REGIONS" '
+    ($regions | split(" ") | map(select(length > 0))) as $pref
+    | INDEX(.slug) as $by
+    | $sizes | split(" ") | map(select(length > 0)) | .[]
+    | . as $size | $by[$size] // {} | select(.available == true)
+    | .regions as $in
+    | (($pref | map(select(. as $r | $in | index($r)))) + ($in - $pref))[]
+    | "\($size) \(.)"' <<< "$catalog"
+}
+
 # --- create ----------------------------------------------------------------
+# Built once per tick by the first create; a refused pair is dropped from it.
+CANDIDATES=""
 create_droplet() {
-  local token userdata name size body response
+  local token userdata name size region body response
+  [[ -n $CANDIDATES ]] || CANDIDATES=$(candidates) || return 1
   token=$(gh_api "repos/$REPO/actions/runners/registration-token" -X POST | jq -r .token)
   userdata=$(sed -e "s|__REPO__|$REPO|g" -e "s|__RUNNER_TOKEN__|$token|g" \
                  -e "s|__RUNNER_LABELS__|$LABEL|g" -e "s|__RUNNER_VERSION__|$RUNNER_VERSION|g" \
                  -e "s|__SSH_KEYS_JSON__|$SSH_KEYS_JSON|" "$CLOUD_INIT")
   name="$TAG-$(date +%s)-$RANDOM"
-  for size in $SIZES; do
-    body=$(jq -n --arg name "$name" --arg region "$REGION" --arg size "$size" --arg image "$IMAGE" \
+  while read -r size region; do
+    [[ -n $size ]] || continue
+    body=$(jq -n --arg name "$name" --arg region "$region" --arg size "$size" --arg image "$IMAGE" \
       --arg tag "$TAG" --arg ud "$userdata" \
       '{name:$name, region:$region, size:$size, image:$image, tags:[$tag], user_data:$ud, monitoring:false}')
-    log "creating $name ($size)"
+    log "creating $name ($size in $region)"
     if response=$(do_api droplets -X POST -d "$body"); then
       jq -r '"created droplet \(.droplet.id)"' <<< "$response"
       return 0
     fi
-    log "$size refused: $(jq -r .message <<< "$response" 2>/dev/null || echo "$response")"
-  done
-  # Every size refused: the rest of this tick's creates would be too.
-  log "no size in '$SIZES' can be created in $REGION"
+    log "$size in $region refused: $(jq -r .message <<< "$response" 2>/dev/null || echo "$response")"
+    CANDIDATES=$(grep -Fvx "$size $region" <<< "$CANDIDATES" || true)
+  done <<< "$CANDIDATES"
+  # Every size refused everywhere: the rest of this tick's creates would be too.
+  log "no size in '$SIZES' can be created in any region"
   return 1
 }
 
 controller_tick() {
+  CANDIDATES=""
   reap
   local queued live busy available need room
   queued=$(queued_jobs)

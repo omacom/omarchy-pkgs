@@ -22,6 +22,7 @@ do_api() {
   local path=$1; shift
   echo "do $path $*" >>"$CALLS_FILE"
   case "$path" in
+    sizes\?*) echo '{"sizes":[{"slug":"g5-32vcpu-64gb-50gb","available":true,"regions":["ric1"]}]}' ;;
     droplets\?*) printf '%s\n' "$DROPLETS" | jq -Rs '{droplets: [split("\n")[] | select(length>0) | split(" ") | {id: .[0]|tonumber, status: .[1], created_at: .[2]}]}' ;;
     droplets) echo '{"droplet":{"id":999}}' ;;
     droplets/*) echo '{}' ;;
@@ -88,25 +89,43 @@ echo "PASS: API failures stop the queue query"
 
 # The create body must carry the tag (reaper scope) and substituted user-data.
 BODY_FILE=$(mktemp); trap 'rm -f "$CALLS_FILE" "$BODY_FILE"' EXIT
-do_api() { if [[ $1 == droplets ]]; then printf '%s' "${*: -1}" >"$BODY_FILE"; echo '{"droplet":{"id":1}}'; else echo '{"droplets":[]}'; fi; }
+do_api() {
+  case "$1" in
+    droplets) printf '%s' "${*: -1}" >"$BODY_FILE"; echo '{"droplet":{"id":1}}' ;;
+    sizes*) echo '{"sizes":[{"slug":"g5-32vcpu-64gb-50gb","available":true,"regions":["ric1"]}]}' ;;
+    *) echo '{"droplets":[]}' ;;
+  esac
+}
 gh_api() { echo '{"token":"TOK"}'; }
-create_droplet >/dev/null
+CANDIDATES=""; create_droplet >/dev/null
 jq -e '.tags == ["omarchy-builder"] and .size == "g5-32vcpu-64gb-50gb" and (.user_data | test("--token \"TOK\"")) and (.user_data | test("__") | not)' "$BODY_FILE" >/dev/null \
   && echo "PASS: create body carries tag, size, substituted user-data" \
   || { echo "FAIL: create body"; jq . "$BODY_FILE" | head -20; exit 1; }
 
-# A sold-out size is refused with 422; the next size is tried and the
-# refusal's message is logged. When every size is refused, the create fails.
+# Sizes are tried in SIZES order, each in the regions DigitalOcean lists it
+# in stock (REGIONS first); a 422 falls through to the next pair with the
+# refusal's message logged, and a refused pair is not retried in the tick.
+# When every pair is refused, the create fails.
 do_api() {
-  local size; size=$(jq -r .size <<< "${*: -1}"); echo "$size" >>"$CALLS_FILE"
-  [[ $size == big ]] && { echo '{"droplet":{"id":2}}'; return 0; }
-  echo '{"id":"unprocessable_entity","message":"Size is not available in this region."}'; return 22
+  case "$1" in
+    sizes*) echo '{"sizes":[
+      {"slug":"small","available":true,"regions":["r1","r2"]},
+      {"slug":"gone","available":false,"regions":["r1"]},
+      {"slug":"big","available":true,"regions":["r3"]}]}' ;;
+    droplets)
+      local pair; pair=$(jq -r '"\(.size)@\(.region)"' <<< "${*: -1}"); echo "$pair" >>"$CALLS_FILE"
+      [[ $pair == big@r3 ]] && { echo '{"droplet":{"id":2}}'; return 0; }
+      echo '{"id":"unprocessable_entity","message":"Size is not available in this region."}'; return 22 ;;
+  esac
 }
-: >"$CALLS_FILE"; out=$(SIZES="small big" create_droplet)
-[[ $(paste -sd' ' "$CALLS_FILE") == "small big" && $out == *"small refused: Size is not available in this region."* && $out == *"created droplet 2"* ]] \
-  && echo "PASS: a refused size falls back to the next, logging why" \
-  || { echo "FAIL: size fallback"; echo "$out"; cat "$CALLS_FILE"; exit 1; }
-if out=$(SIZES="small" create_droplet); then echo "FAIL: every size refused looks like a create"; exit 1; fi
-[[ $out == *"no size in 'small' can be created"* ]] \
-  && echo "PASS: every size refused fails the create" \
+: >"$CALLS_FILE"; CANDIDATES=""
+out=$(SIZES="small gone big" REGIONS="r2"; create_droplet; create_droplet)
+[[ $(paste -sd' ' "$CALLS_FILE") == "small@r2 small@r1 big@r3 big@r3" \
+   && $out == *"small in r2 refused: Size is not available in this region."* && $out == *"created droplet 2"* ]] \
+  && echo "PASS: a refused size falls back to the next region, then the next size, logging why" \
+  || { echo "FAIL: size and region fallback"; echo "$out"; cat "$CALLS_FILE"; exit 1; }
+CANDIDATES=""
+if out=$(SIZES="small gone" create_droplet); then echo "FAIL: every pair refused looks like a create"; exit 1; fi
+[[ $out == *"no size in 'small gone' can be created in any region"* ]] \
+  && echo "PASS: every size refused everywhere fails the create" \
   || { echo "FAIL: all-refused message"; echo "$out"; exit 1; }
