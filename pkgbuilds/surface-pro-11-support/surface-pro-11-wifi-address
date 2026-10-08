@@ -1,0 +1,103 @@
+#!/bin/bash
+
+# Give the Surface Pro 11's Wi-Fi interface its own MAC address. ath12k
+# reports a Qualcomm placeholder (00:03:7f:...) as the permanent address, and
+# a different one on each boot; the real address is in the
+# MacAddressEmulationAddress EFI variable. The permanent address comes from
+# the Wi-Fi firmware, so this sets the interface's address instead. udev runs
+# it while the interface is being added, before NetworkManager takes it.
+
+set -euo pipefail
+
+iface=${1:?usage: surface-pro-11-wifi-address IFACE}
+
+if [[ ! "$iface" =~ ^[A-Za-z0-9_.-]{1,15}$ ]]; then
+  printf 'Invalid network interface name: %s\n' "$iface" >&2
+  exit 2
+fi
+
+# udev discards the output of RUN programs; send it to the journal there.
+say() {
+  printf '%s\n' "$*"
+  if [[ -n "${SEQNUM:-}" ]] && command -v logger >/dev/null 2>&1; then
+    logger -t surface-pro-11-wifi-address -- "$*"
+  fi
+}
+
+# The rule matches any ath12k interface; act only on the Surface Pro 11 OLED.
+compatible_path="${SP11_WIFI_DT_COMPATIBLE:-/sys/firmware/devicetree/base/compatible}"
+if [[ ! -r "$compatible_path" ]] || \
+  ! tr '\0' '\n' <"$compatible_path" | grep -qx 'microsoft,denali-oled'; then
+  exit 0
+fi
+
+for command_name in ip find od tr grep sed; do
+  if ! command -v "$command_name" >/dev/null 2>&1; then
+    printf 'Required command is unavailable: %s\n' "$command_name" >&2
+    exit 1
+  fi
+done
+
+is_valid_unicast_hex() {
+  local address_hex="$1"
+  local first_octet
+
+  [[ "$address_hex" =~ ^[0-9A-F]{12}$ ]] || return 1
+  [[ "$address_hex" != 000000000000 && "$address_hex" != FFFFFFFFFFFF ]] || return 1
+
+  first_octet="${address_hex:0:2}"
+  (( (16#$first_octet & 1) == 0 ))
+}
+
+# udev passes no environment file, so read the override here.
+config="${SP11_WIFI_CONFIG:-/etc/surface-pro-11-wifi-address.conf}"
+if [[ -z "${SP11_WIFI_ADDRESS:-}" && -r "$config" ]]; then
+  SP11_WIFI_ADDRESS="$(sed -n 's/^SP11_WIFI_ADDRESS=["'\'']\{0,1\}\([0-9A-Fa-f:]*\)["'\'']\{0,1\}$/\1/p' "$config" | tail -n1)"
+fi
+
+address="${SP11_WIFI_ADDRESS:-}"
+if [[ -n "$address" ]]; then
+  address="${address^^}"
+  if [[ ! "$address" =~ ^([0-9A-F]{2}:){5}[0-9A-F]{2}$ ]] || \
+    ! is_valid_unicast_hex "${address//:/}"; then
+    echo 'SP11_WIFI_ADDRESS is not a valid unicast MAC address' >&2
+    exit 2
+  fi
+  address_source='configured override'
+else
+  efi_path="$(find "${SP11_WIFI_EFIVARS:-/sys/firmware/efi/efivars}" -maxdepth 1 \
+    -name 'MacAddressEmulationAddress-*' -print -quit)"
+  if [[ -z "$efi_path" ]]; then
+    echo 'MacAddressEmulationAddress EFI variable is unavailable' >&2
+    exit 1
+  fi
+
+  # efivarfs prepends a four-byte attributes field to the address bytes.
+  efi_hex="$(od -An -tx1 -j4 -N6 "$efi_path" | tr -d ' \n' | \
+    tr '[:lower:]' '[:upper:]')"
+  if ! is_valid_unicast_hex "$efi_hex"; then
+    echo 'Firmware EFI variable does not contain a valid unicast address' >&2
+    exit 1
+  fi
+  printf -v address '%s:%s:%s:%s:%s:%s' \
+    "${efi_hex:0:2}" "${efi_hex:2:2}" "${efi_hex:4:2}" \
+    "${efi_hex:6:2}" "${efi_hex:8:2}" "${efi_hex:10:2}"
+  address_source='firmware Wi-Fi address'
+fi
+
+sysfs="${SP11_WIFI_SYSFS:-/sys/class/net}/$iface"
+current="$(<"$sysfs/address")"
+if [[ "${current^^}" == "$address" ]]; then
+  say "$iface already uses $address"
+  exit 0
+fi
+
+# Changing the address of a running interface drops its connection, so leave
+# an interface that is already up alone until it is added again.
+if (( $(<"$sysfs/flags") & 1 )); then
+  say "$iface is already up; its address is set when it is next added"
+  exit 0
+fi
+
+ip link set dev "$iface" address "$address"
+say "Set $iface address to $address from the $address_source"

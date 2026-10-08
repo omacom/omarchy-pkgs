@@ -93,6 +93,46 @@ grep -q 'DRIVERS=="hci_uart_qca".*SYSTEMD_WANTS}+="surface-pro-11-bluetooth-addr
   <(tr -d '\\\n' <"$package_dir/60-surface-pro-11-bluetooth-address.rules") ||
   fail "each Qualcomm UART Bluetooth controller gets its own address service"
 
+# Wi-Fi: the interface takes the firmware Wi-Fi address while it is still down.
+cat >"$bin/ip" <<'STUB'
+#!/bin/bash
+printf '%s\n' "$*" >"$IP_STATE"
+STUB
+chmod +x "$bin/ip"
+netdir="$scratch/net"
+printf 'microsoft,denali-oled\0microsoft,denali\0qcom,x1e80100\0' >"$scratch/wifi-denali"
+printf 'lenovo,yoga-slim7x\0qcom,x1e80100\0' >"$scratch/wifi-other"
+wifi_address() {
+  local override=$1 current=$2 flags=$3 compatible=${4:-$scratch/wifi-denali} config=${5:-$scratch/none}
+  mkdir -p "$netdir/wlan0"
+  printf '%s\n' "$current" >"$netdir/wlan0/address"
+  printf '%s\n' "$flags" >"$netdir/wlan0/flags"
+  printf '\x07\x00\x00\x00\xc4\xcb\x76\xa1\xab\x85' >"$efivars/MacAddressEmulationAddress-test"
+  rm -f "$scratch/ip.state"
+  env PATH="$bin:$PATH" IP_STATE="$scratch/ip.state" SP11_WIFI_EFIVARS="$efivars" \
+    SP11_WIFI_SYSFS="$netdir" SP11_WIFI_DT_COMPATIBLE="$compatible" SP11_WIFI_CONFIG="$config" \
+    ${override:+SP11_WIFI_ADDRESS="$override"} \
+    bash "$package_dir/surface-pro-11-wifi-address" wlan0 >/dev/null
+  cat "$scratch/ip.state" 2>/dev/null || :
+}
+[[ $(wifi_address '' 00:03:7f:12:7f:94 0x1002) == "link set dev wlan0 address C4:CB:76:A1:AB:85" ]] ||
+  fail "a down Wi-Fi interface takes the firmware Wi-Fi address"
+[[ -z $(wifi_address '' c4:cb:76:a1:ab:85 0x1002) ]] ||
+  fail "an interface that already has the address is left alone"
+[[ -z $(wifi_address '' 00:03:7f:12:7f:94 0x1003) ]] ||
+  fail "an interface that is already up keeps its connection"
+[[ -z $(wifi_address '' 00:03:7f:12:7f:94 0x1002 "$scratch/wifi-other") ]] ||
+  fail "other ath12k machines keep their Wi-Fi address"
+[[ $(wifi_address 02:11:22:33:44:55 00:03:7f:12:7f:94 0x1002) == "link set dev wlan0 address 02:11:22:33:44:55" ]] ||
+  fail "a configured Wi-Fi address overrides the firmware one"
+printf '# local override\nSP11_WIFI_ADDRESS="02:aa:bb:cc:dd:ee"\n' >"$scratch/wifi.conf"
+[[ $(wifi_address '' 00:03:7f:12:7f:94 0x1002 "" "$scratch/wifi.conf") == "link set dev wlan0 address 02:AA:BB:CC:DD:EE" ]] ||
+  fail "the override is read from the configuration file udev cannot pass"
+
+grep -q 'ACTION=="add".*DEVTYPE}=="wlan".*DRIVERS=="ath12k_pci|ath12k_wifi7_pci".*RUN+="/usr/lib/surface-pro-11-support/surface-pro-11-wifi-address %k"' \
+  <(tr -d '\\\n' <"$package_dir/60-surface-pro-11-wifi-address.rules") ||
+  fail "udev sets each ath12k Wi-Fi address while adding the interface"
+
 # Every hook acts only on the Surface Pro 11 OLED.
 printf 'microsoft,denali-oled\0microsoft,denali\0qcom,x1e80100\0' >"$scratch/denali"
 printf 'lenovo,yoga-slim7x\0qcom,x1e80100\0' >"$scratch/other"
