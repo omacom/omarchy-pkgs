@@ -223,8 +223,6 @@ in `origin` and has no effect on release selection.
 
 These packages were already excluded from automatic AUR updates. The migration preserves that policy.
 
-The `linux-firmware-cirrus` shim recipe has been retired. Remove its published edge copy, where Arch supplies the complete firmware. Keep the existing RC/stable copies until their snapshots advance to linux-firmware >= 20260910; the older snapshot's genuine package lacks the Dell speaker firmware fix. Removing the recipe does not remove its published entries.
-
 `m1n1-aurora` and `uboot-asahi` are deliberate holds: Apple Silicon boot code, pinned by hand like `linux-aurora`, and bumped only after a cold boot on the qualification Macs. `m1n1-aurora` pins an aurora-silicon/m1n1 commit plus a local patch. `uboot-asahi` follows asahi-alarm's recipe and patch set (asahi-alarm/PKGBUILDs), which a tag watch on AsahiLinux/u-boot cannot carry.
 
 `cua-driver-bin` is a deliberate hold: Omarchy bumps it by hand, so a Cua release ships only when a maintainer has verified it. It keeps its `.omarchy/upstream.sh` hook and `min_release_age`, so lifting the hold means removing `"sync": false`. `cua-hyprland-plugin` declares no upstream source, so no automation updates it either.
@@ -237,11 +235,3 @@ The `linux-firmware-cirrus` shim recipe has been retired. Remove its published e
 - RustDesk reads hbb_common from the release gitlink; its existing build-time dependency/toolchain checks remain in force.
 - Spotify uses HTTPS and retains its signed Release/Packages verification.
 - Source and build compatibility still need review when upstream code changes. Direct watches remove AUR recipe churn, not the need to maintain packaging.
-
-## Retiring the old Arch overrides
-
-Clean edge first. On x86_64, remove the published OPR entries for `asusctl`, `rog-control-center`, `gpu-screen-recorder`, `intel-lpmd`, `linux-firmware-cirrus`, `pinta`, `umu-launcher`, and `xdg-terminal-exec`. On aarch64, remove `hyprtoolkit`, `hyprland-guiutils`, and `xdg-terminal-exec`. Keep ARM's `pinta`: ALARM does not provide it, and its ARM-only recipe remains maintained here.
-
-Use `bin/repo remove <package> --mirror edge --arch <architecture>` on the complete repository host, then publish the cleaned channel with `bin/repo sync --mirror edge --arch <architecture> --prune`. Verify the official replacement and its dependencies before removal. Removing recipes does not remove published packages.
-
-RC/stable cleanup is part of the next release, after their Arch snapshots advance. Channel advancement copies packages but does not propagate removals: explicitly remove these retired overrides from each destination where an official replacement is now available, including the old `opencode` entry. Preserve `xdg-terminal-exec` until the destination snapshot supplies it and preserve the Cirrus shim until the destination's linux-firmware is at least 20260910. Sync those removals from the complete repository host. Do not clean the published RC/stable repositories during the initial edge cleanup.
