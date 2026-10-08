@@ -94,3 +94,19 @@ create_droplet >/dev/null
 jq -e '.tags == ["omarchy-builder"] and .size == "g5-32vcpu-64gb-50gb" and (.user_data | test("--token \"TOK\"")) and (.user_data | test("__") | not)' "$BODY_FILE" >/dev/null \
   && echo "PASS: create body carries tag, size, substituted user-data" \
   || { echo "FAIL: create body"; jq . "$BODY_FILE" | head -20; exit 1; }
+
+# A sold-out size is refused with 422; the next size is tried and the
+# refusal's message is logged. When every size is refused, the create fails.
+do_api() {
+  local size; size=$(jq -r .size <<< "${*: -1}"); echo "$size" >>"$CALLS_FILE"
+  [[ $size == big ]] && { echo '{"droplet":{"id":2}}'; return 0; }
+  echo '{"id":"unprocessable_entity","message":"Size is not available in this region."}'; return 22
+}
+: >"$CALLS_FILE"; out=$(SIZES="small big" create_droplet)
+[[ $(paste -sd' ' "$CALLS_FILE") == "small big" && $out == *"small refused: Size is not available in this region."* && $out == *"created droplet 2"* ]] \
+  && echo "PASS: a refused size falls back to the next, logging why" \
+  || { echo "FAIL: size fallback"; echo "$out"; cat "$CALLS_FILE"; exit 1; }
+if out=$(SIZES="small" create_droplet); then echo "FAIL: every size refused looks like a create"; exit 1; fi
+[[ $out == *"no size in 'small' can be created"* ]] \
+  && echo "PASS: every size refused fails the create" \
+  || { echo "FAIL: all-refused message"; echo "$out"; exit 1; }

@@ -22,7 +22,10 @@ REPO=${REPO:?owner/name}
 LABEL=${LABEL:-omarchy-builder}
 TAG=${TAG:-omarchy-builder}
 REGION=${REGION:-ric1}
-SIZE=${SIZE:-g5-32vcpu-64gb-50gb}
+# Sizes to try, in order. A size can sell out in a region for hours; the
+# create is then refused with 422 and the next size is tried. SIZE, if set,
+# is a single-size list.
+SIZES=${SIZES:-${SIZE:-g5-32vcpu-64gb-50gb g5-32vcpu-128gb-50gb}}
 IMAGE=${IMAGE:-ubuntu-24-04-x64}
 MAX_DROPLETS=${MAX_DROPLETS:-4}
 MAX_AGE_MINUTES=${MAX_AGE_MINUTES:-200}
@@ -39,7 +42,8 @@ log() { echo "$(date '+%F %T') $*"; }
 # both, so every decision below is exercised against canned responses.
 do_api() { # do_api <path> [curl args...]
   local path=$1; shift
-  curl -fsS -H "Authorization: Bearer $DIGITALOCEAN_TOKEN" \
+  # --fail-with-body: a refused create still prints why.
+  curl -sS --fail-with-body -H "Authorization: Bearer $DIGITALOCEAN_TOKEN" \
     -H "Content-Type: application/json" "https://api.digitalocean.com/v2/$path" "$@"
 }
 gh_api() { # gh_api <path> [curl args...]
@@ -104,17 +108,26 @@ busy_runners() {
 
 # --- create ----------------------------------------------------------------
 create_droplet() {
-  local token userdata name body
+  local token userdata name size body response
   token=$(gh_api "repos/$REPO/actions/runners/registration-token" -X POST | jq -r .token)
   userdata=$(sed -e "s|__REPO__|$REPO|g" -e "s|__RUNNER_TOKEN__|$token|g" \
                  -e "s|__RUNNER_LABELS__|$LABEL|g" -e "s|__RUNNER_VERSION__|$RUNNER_VERSION|g" \
                  -e "s|__SSH_KEYS_JSON__|$SSH_KEYS_JSON|" "$CLOUD_INIT")
   name="$TAG-$(date +%s)-$RANDOM"
-  body=$(jq -n --arg name "$name" --arg region "$REGION" --arg size "$SIZE" --arg image "$IMAGE" \
-    --arg tag "$TAG" --arg ud "$userdata" \
-    '{name:$name, region:$region, size:$size, image:$image, tags:[$tag], user_data:$ud, monitoring:false}')
-  log "creating $name ($SIZE)"
-  do_api droplets -X POST -d "$body" | jq -r '"created droplet \(.droplet.id)"'
+  for size in $SIZES; do
+    body=$(jq -n --arg name "$name" --arg region "$REGION" --arg size "$size" --arg image "$IMAGE" \
+      --arg tag "$TAG" --arg ud "$userdata" \
+      '{name:$name, region:$region, size:$size, image:$image, tags:[$tag], user_data:$ud, monitoring:false}')
+    log "creating $name ($size)"
+    if response=$(do_api droplets -X POST -d "$body"); then
+      jq -r '"created droplet \(.droplet.id)"' <<< "$response"
+      return 0
+    fi
+    log "$size refused: $(jq -r .message <<< "$response" 2>/dev/null || echo "$response")"
+  done
+  # Every size refused: the rest of this tick's creates would be too.
+  log "no size in '$SIZES' can be created in $REGION"
+  return 1
 }
 
 controller_tick() {
