@@ -565,11 +565,25 @@ bin/repo deploy                      # Build locally, then publish from the host
 bin/repo push                        # Upload local builds to the host and publish
 bin/add-package <package>            # Add an Omarchy-owned package with metadata
 bin/package-worktree <package>       # Inspect historical AUR provenance in a scratch workspace
-bin/repo remove <package>            # Remove package
+bin/repo remove <package>            # Remove package (host workflow; CI uses unpublish.yml)
 bin/sync-upstream                    # Update packages that track a vendor release feed
 bin/sync-rebuilds                    # Bump pkgrel for packages whose dependencies moved
 bin/clean-docker                     # Clear Docker images/cache (forces fresh rebuild)
 ```
+
+### Retiring a package
+
+Delete its recipe directory in a PR. Once that merges, take it out of the
+channel databases with the **Unpublish retired packages** workflow:
+
+```
+gh workflow run unpublish.yml -f packages="<pkgbase> ..." -f channels="edge rc stable"
+```
+
+It removes every entry built from those pkgbases (split outputs and `-debug`
+included) from both architectures' databases, and refuses any package that
+still has a recipe on master. Package files stay in the bucket: published
+filenames are immutable, and nothing references them once the entries are gone.
 
 ### Package Metadata Tools
 
