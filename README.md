@@ -923,10 +923,12 @@ artifacts, so a long aarch64 build is not restarted by every sync.
 Package PRs that are trusted to build also merge themselves.
 `auto-merge-pr.yml` enables auto-merge (with `PKGS_BOT_TOKEN`, so the merge
 publishes) on any open, non-draft PR whose author is a collaborator, vouched,
-or a bot, or that carries **`build-approved`**, and that changes nothing
-outside `pkgbuilds/`. The PR lands once `result`, `self-tests` and
+or a bot, or that carries **`build-approved`**, and that changes only
+packages: anything under `pkgbuilds/`, plus the test a package PR brings with
+it (a new file under `tests/`, and `test.yml` lines that only run new
+`./tests/*.sh`). The PR lands once `result`, `self-tests` and
 `build-isolation` pass; a red build stays open. PRs that also touch
-workflows, scripts or build tooling still need a maintainer to merge, as does
+workflows, scripts, build tooling or existing tests still need a maintainer, as does
 the upstream sync (`auto/sync-upstream`), which labels itself. Removing
 `build-approved` withdraws the auto-merge it armed. For a PR opened before
 the workflow existed, run it by hand: `gh workflow run auto-merge-pr.yml -f pr=<number>`.

