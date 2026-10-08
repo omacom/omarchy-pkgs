@@ -223,7 +223,7 @@ in `origin` and has no effect on release selection.
 
 These packages were already excluded from automatic AUR updates. The migration preserves that policy.
 
-The `linux-firmware-cirrus` shim recipe has been retired. Remove its published edge copy, where Arch supplies the complete firmware. Keep the existing RC/stable copies until their snapshots advance to linux-firmware >= 20260910; the older snapshot's genuine package lacks the Dell speaker firmware fix. OPR priority means retirement requires removing the published entry explicitly.
+The `linux-firmware-cirrus` shim recipe has been retired. Remove its published edge copy, where Arch supplies the complete firmware. Keep the existing RC/stable copies until their snapshots advance to linux-firmware >= 20260910; the older snapshot's genuine package lacks the Dell speaker firmware fix. Removing the recipe does not remove its published entries.
 
 `m1n1-aurora` and `uboot-asahi` are deliberate holds: Apple Silicon boot code, pinned by hand like `linux-aurora`, and bumped only after a cold boot on the qualification Macs. `m1n1-aurora` pins an aurora-silicon/m1n1 commit plus a local patch. `uboot-asahi` follows asahi-alarm's recipe and patch set (asahi-alarm/PKGBUILDs), which a tag watch on AsahiLinux/u-boot cannot carry.
 
