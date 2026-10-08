@@ -920,6 +920,17 @@ the push that opens the PR. A push to an `auto/sync-*` branch does not cancel
 the PR's in-flight build: the new build waits for it and then reuses its
 artifacts, so a long aarch64 build is not restarted by every sync.
 
+Package PRs that are trusted to build also merge themselves.
+`auto-merge-pr.yml` enables auto-merge (with `PKGS_BOT_TOKEN`, so the merge
+publishes) on any open, non-draft PR whose author is a collaborator, vouched,
+or a bot, or that carries **`build-approved`**, and that changes nothing
+outside `pkgbuilds/`. The PR lands once `result`, `self-tests` and
+`build-isolation` pass; a red build stays open. PRs that also touch
+workflows, scripts or build tooling still need a maintainer to merge, as does
+the upstream sync (`auto/sync-upstream`), which labels itself. Removing
+`build-approved` withdraws the auto-merge it armed. For a PR opened before
+the workflow existed, run it by hand: `gh workflow run auto-merge-pr.yml -f pr=<number>`.
+
 To approve builds for an unvouched contributor's PR, apply **`build-approved`**.
 Until approval, the PR shows **Awaiting build approval** and its required
 `result` check stays pending, keeping the PR blocked from merging without

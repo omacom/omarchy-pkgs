@@ -464,3 +464,57 @@ test('rebuild sync opens its PR with the bot token and auto-merges it', () => {
   assert.doesNotMatch(text, /^ +actions: write$/m, file);
   assert.doesNotMatch(text, /\n  approve:\n/, file);
 });
+
+const { decide } = require('../.github/scripts/auto-merge-pr.cjs');
+const repository = 'omacom/omarchy-pkgs';
+const mergeable = (overrides = {}) => ({
+  state: 'open', draft: false, labels: [],
+  head: { ref: 'superwhisper-bin', repo: { full_name: repository } }, ...overrides,
+});
+const packageFiles = [{ filename: 'pkgbuilds/superwhisper-bin/PKGBUILD' },
+  { filename: 'pkgbuilds/superwhisper-bin/.omarchy/package.json' }];
+
+test('auto-merge follows the build gate: trusted authors, or build-approved for unknown ones', () => {
+  for (const vouchStatus of ['collaborator', 'vouched', 'bot']) {
+    assert.equal(decide({ pr: mergeable(), files: packageFiles, vouchStatus, repository }).enable, true, vouchStatus);
+  }
+  assert.equal(decide({ pr: mergeable(), files: packageFiles, vouchStatus: 'unknown', repository }).enable, false);
+  const labelled = mergeable({ labels: [{ name: 'build-approved' }] });
+  assert.equal(decide({ pr: labelled, files: packageFiles, vouchStatus: 'unknown', repository }).enable, true);
+  // A denouncement is absolute, and a failed lookup is not approval.
+  for (const vouchStatus of ['denounced', '', undefined, 'error']) {
+    assert.equal(decide({ pr: labelled, files: packageFiles, vouchStatus, repository }).enable, false, String(vouchStatus));
+  }
+});
+
+test('auto-merge only lands PRs that change nothing outside pkgbuilds/', () => {
+  const check = files => decide({ pr: mergeable(), files, vouchStatus: 'collaborator', repository }).enable;
+  assert.equal(check(packageFiles), true);
+  assert.equal(check([...packageFiles, { filename: '.github/workflows/publish.yml' }]), false);
+  assert.equal(check([{ filename: 'bin/build' }]), false);
+  assert.equal(check([{ filename: 'pkgbuilds/x/PKGBUILD', previous_filename: 'helpers/x.sh' }]), false);
+  assert.equal(check([]), false);
+});
+
+test('auto-merge skips drafts, closed PRs and the reviewed upstream sync', () => {
+  const check = pr => decide({ pr, files: packageFiles, vouchStatus: 'bot', repository }).enable;
+  assert.equal(check(mergeable({ draft: true })), false);
+  assert.equal(check(mergeable({ state: 'closed' })), false);
+  for (const ref of ['auto/sync-upstream', 'auto/sync-upstream/walker']) {
+    assert.equal(check(mergeable({ head: { ref, repo: { full_name: repository } } })), false, ref);
+  }
+  // The unattended lanes already enable their own auto-merge; agreeing is harmless.
+  assert.equal(check(mergeable({ head: { ref: 'auto/sync-rebuilds', repo: { full_name: repository } } })), true);
+  // A fork's branch named like ours is just a contributor branch.
+  assert.equal(check(mergeable({ head: { ref: 'auto/sync-upstream', repo: { full_name: 'someone/omarchy-pkgs' } } })), true);
+});
+
+test('auto-merge workflow enables with the bot token and never checks out the PR', () => {
+  const text = readFileSync(join(__dirname, '../.github/workflows/auto-merge-pr.yml'), 'utf8');
+  assert.match(text, /pull_request_target:/);
+  assert.match(text, /ref: \$\{\{ github\.event\.repository\.default_branch \}\}/);
+  assert.doesNotMatch(text, /head\.sha \}\}|head\.ref \}\}|refs\/pull\//);
+  assert.match(text, /GH_TOKEN: \$\{\{ secrets\.PKGS_BOT_TOKEN \}\}/);
+  assert.match(text, /gh pr merge --auto --squash --match-head-commit "\$HEAD_SHA"/);
+  assert.doesNotMatch(text, /^ +(contents|pull-requests|actions): write$/m);
+});
