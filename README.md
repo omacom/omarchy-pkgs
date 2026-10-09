@@ -30,7 +30,10 @@ The filesystem no longer encodes release policy. Instead:
   two hours and auto-merges it once the build checks pass, so a branch tip
   reaches the edge channel without anyone clicking. No PKGBUILD may carry an
   unpinned git source (`tests/pinned-sources.sh`); a branch that has to be
-  followed gets a watch, not a `#branch=` fragment
+  followed gets a watch, not a `#branch=` fragment. `linux-aurora-wip`, the
+  Mac testers' second kernel on Aurora's `aurora-wip`, has a watch but stays
+  on the reviewed lane: the tracker puts every branch pin in one PR, where a
+  red kernel build would hold back the dev pair
 - Omarchy owns every checked-in recipe; upstream watches update release metadata without replacing packaging or architecture support
 - packages can opt out of unscoped builds with `skip_build`; explicit `--package` builds remain available
 - packages follow direct upstream watches/providers in `.omarchy/package.json`, or a custom `.omarchy/upstream.sh` hook
