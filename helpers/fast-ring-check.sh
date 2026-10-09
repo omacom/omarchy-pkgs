@@ -231,7 +231,8 @@ check() {
   local log deps
   # Scriptlets would need a booted system; their output is not under test.
   if ! log=$(pacman -U --noconfirm --noscriptlet --ask 4 "$@" 2>&1); then
-    printf '%s\n' "$log"
+    # To stderr: bin/check-fast-ring discards the transaction's stdout.
+    printf '%s\n' "$log" >&2
     # A dependency is compared with edge like a library: one no channel
     # carries (an AUR-only theme engine, say) is not the fast ring's to
     # judge. The files are still inspected, installed without it.
