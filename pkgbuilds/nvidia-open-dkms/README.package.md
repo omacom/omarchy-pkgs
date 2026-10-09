@@ -45,6 +45,16 @@ read as fully trained, while it counted symbol errors on every lane. After
 each modeset on a tunnelled link nvkms now reads the monitor's symbol error
 counters and, if every lane keeps counting errors, trains the link again.
 
+And `0008-free-the-semaphore-surface-callback-when-the-waiter-is-already-signalled.patch`,
+JD Daniels'
+[NVIDIA PR #1368](https://github.com/NVIDIA/open-gpu-kernel-modules/pull/1368):
+when nvidia-drm asked nvkms to wait on a semaphore surface fence that had
+already signalled, nvkms returned without freeing the callback record it had
+allocated. Under explicit sync that is most composited frames, so the kernel
+leaked a small slab object per frame while anything on screen moved, gigabytes
+of unreclaimable memory over a few days of uptime. nvkms now frees the record
+on that path. Keep it until NVIDIA merges the fix.
+
 Requires `[omarchy]` before `[extra]` and matching `nvidia-utils=615.78.08`.
 Update both NVIDIA packages together; automatic version tracking is disabled.
 
