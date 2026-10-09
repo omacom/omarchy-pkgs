@@ -1,6 +1,6 @@
-From b2025461e50adb7154a2c19bca485705339b09c5 Mon Sep 17 00:00:00 2001
+From 7aeab2522788ef716abd237cf6c7981c433aa4a3 Mon Sep 17 00:00:00 2001
 From: Ryan <ryan@localhost>
-Date: Thu, 1 Oct 2026 21:00:53 -0400
+Date: Fri, 9 Oct 2026 14:24:47 -0400
 Subject: [PATCH] HID: asus: drive the 0B05:4B42 keyboard backlight without
  asus-wmi
 
@@ -14,25 +14,28 @@ arm64 laptops nothing exposes it:
   from hid-asus itself in that case.
 
 - The keyboard silently drops feature reports shorter than the 64 bytes
-  its descriptor declares for report 0x5a, so the 5-byte backlight
-  command never takes effect. Add QUIRK_PAD_FEATURE_REPORTS to zero-pad
-  feature reports to their declared length.
-
-- When registering the listener failed, the backlight state was freed but
-  drvdata->kbd_backlight kept pointing at it, and asus_resume() and
-  asus_remove() then used the freed memory. Clear the pointer.
+  its descriptor declares for report 0x5a. Add QUIRK_PAD_FEATURE_REPORTS
+  to zero-pad feature reports to their declared length.
 
 Enable QUIRK_USE_KBD_BACKLIGHT and QUIRK_PAD_FEATURE_REPORTS for the
 0B05:4B42 keyboard. The keyboard reports SUPPORT_KBD_BACKLIGHT and takes
 levels 0-3; KEY_KBDILLUMTOGGLE from the same keyboard now cycles it
 through the LED class.
 
+[omarchy: rebased onto 47669bec44fe ("HID: asus: refactor the two
+ workqueues and init sequence"), in 7.2.6. The listener and brightness
+ now live in asus_drvdata and go through the shared worker, so the LED
+ class device moved there too. The refactor already sends the backlight
+ and Fn-lock commands as 64-byte reports and no longer frees the
+ backlight state on a listener failure, so the padding now only matters
+ for the shorter init, function query and OOBE commands, and the
+ use-after-free fix this patch carried on 7.2.5 is gone]
 ---
- drivers/hid/hid-asus.c | 64 +++++++++++++++++++++++++++++++++++++++---
- 1 file changed, 60 insertions(+), 4 deletions(-)
+ drivers/hid/hid-asus.c | 59 ++++++++++++++++++++++++++++++++++++++----
+ 1 file changed, 54 insertions(+), 5 deletions(-)
 
 diff --git a/drivers/hid/hid-asus.c b/drivers/hid/hid-asus.c
-index 8f6e4c0140..b8aa285b49 100644
+index e0bc7f956..aaa1dbb46 100644
 --- a/drivers/hid/hid-asus.c
 +++ b/drivers/hid/hid-asus.c
 @@ -100,6 +100,7 @@ MODULE_DESCRIPTION("Asus HID Keyboard and TouchPad");
@@ -43,21 +46,16 @@ index 8f6e4c0140..b8aa285b49 100644
  
  #define I2C_KEYBOARD_QUIRKS			(QUIRK_FIX_NOTEBOOK_REPORT | \
  						 QUIRK_NO_INIT_REPORTS | \
-@@ -112,11 +113,13 @@ MODULE_DESCRIPTION("Asus HID Keyboard and TouchPad");
- 
- struct asus_kbd_leds {
+@@ -169,6 +170,8 @@ struct asus_drvdata {
+ 	bool battery_in_query;
+ 	unsigned long battery_next_query;
  	struct asus_hid_listener listener;
-+	struct led_classdev cdev;	/* only used when asus-wmi is absent */
- 	struct hid_device *hdev;
- 	struct work_struct work;
- 	unsigned int brightness;
- 	spinlock_t lock;
- 	bool removed;
-+	bool standalone;
++	struct led_classdev kbd_led;	/* only used when asus-wmi is absent */
++	bool kbd_led_standalone;
+ 	bool fn_lock;
  };
  
- struct asus_touchpad_info {
-@@ -477,15 +480,30 @@ static int asus_raw_event(struct hid_device *hdev,
+@@ -576,15 +579,30 @@ static int asus_raw_event(struct hid_device *hdev,
  
  static int asus_kbd_set_report(struct hid_device *hdev, const u8 *buf, size_t buf_size)
  {
@@ -90,70 +88,69 @@ index 8f6e4c0140..b8aa285b49 100644
  				  HID_REQ_SET_REPORT);
  }
  
-@@ -636,6 +654,27 @@ static void asus_kbd_backlight_work(struct work_struct *work)
- 		hid_err(led->hdev, "Asus failed to set keyboard backlight: %d\n", ret);
+@@ -759,6 +777,21 @@ static void asus_kbd_backlight_set(struct asus_hid_listener *listener, int brigh
+ 	spin_unlock_irqrestore(&worker->lock, flags);
  }
  
 +static void asus_kbd_led_set(struct led_classdev *cdev,
 +			     enum led_brightness brightness)
 +{
-+	struct asus_kbd_leds *led = container_of(cdev, struct asus_kbd_leds, cdev);
++	struct asus_drvdata *drvdata = container_of(cdev, struct asus_drvdata, kbd_led);
 +
-+	asus_kbd_backlight_set(&led->listener, brightness);
++	asus_kbd_backlight_set(&drvdata->listener, brightness);
 +}
 +
 +static enum led_brightness asus_kbd_led_get(struct led_classdev *cdev)
 +{
-+	struct asus_kbd_leds *led = container_of(cdev, struct asus_kbd_leds, cdev);
-+	enum led_brightness brightness;
-+	unsigned long flags;
++	struct asus_drvdata *drvdata = container_of(cdev, struct asus_drvdata, kbd_led);
 +
-+	spin_lock_irqsave(&led->lock, flags);
-+	brightness = led->brightness;
-+	spin_unlock_irqrestore(&led->lock, flags);
-+
-+	return brightness;
++	return drvdata->kbd_backlight_brightness;
 +}
 +
- /*
-  * We don't care about any other part of the string except the version section.
-  * Example strings: FGA80100.RC72LA.312_T01, FGA80100.RC71LS.318_T01
-@@ -786,9 +825,24 @@ static int asus_kbd_register_leds(struct hid_device *hdev)
- 	spin_lock_init(&drvdata->kbd_backlight->lock);
+ static void asus_work(struct work_struct *work)
+ {
+ 	struct asus_worker *worker = container_of(work, struct asus_worker, work);
+@@ -971,6 +1004,21 @@ static int asus_kbd_register_leds(struct hid_device *hdev)
  
- 	ret = asus_hid_register_listener(&drvdata->kbd_backlight->listener);
+ 	drvdata->listener.brightness_set = asus_kbd_backlight_set;
+ 	ret = asus_hid_register_listener(&drvdata->listener);
 +	if (ret == -ENODEV) {
 +		/*
 +		 * asus-wmi normally owns asus::kbd_backlight and forwards it to
 +		 * us through the listener. Without it (arm64 laptops) the
 +		 * keyboard still takes its level over HID, so expose it here.
 +		 */
-+		drvdata->kbd_backlight->standalone = true;
-+		drvdata->kbd_backlight->cdev.name = "asus::kbd_backlight";
-+		drvdata->kbd_backlight->cdev.max_brightness = ASUS_EV_MAX_BRIGHTNESS;
-+		drvdata->kbd_backlight->cdev.brightness_set = asus_kbd_led_set;
-+		drvdata->kbd_backlight->cdev.brightness_get = asus_kbd_led_get;
-+		ret = devm_led_classdev_register(&hdev->dev,
-+						 &drvdata->kbd_backlight->cdev);
++		drvdata->kbd_led_standalone = true;
++		drvdata->kbd_led.name = "asus::kbd_backlight";
++		drvdata->kbd_led.max_brightness = ASUS_EV_MAX_BRIGHTNESS;
++		drvdata->kbd_led.brightness_set = asus_kbd_led_set;
++		drvdata->kbd_led.brightness_get = asus_kbd_led_get;
++		ret = devm_led_classdev_register(&hdev->dev, &drvdata->kbd_led);
++		if (ret < 0)
++			drvdata->kbd_led_standalone = false;
 +	}
  	if (ret < 0) {
- 		/* No need to have this still around */
- 		devm_kfree(&hdev->dev, drvdata->kbd_backlight);
-+		drvdata->kbd_backlight = NULL;
- 	}
+ 		hid_err(hdev, "Unable to register kbd brightness listener: %d\n", ret);
+ 		drvdata->listener.brightness_set = NULL;
+@@ -1540,7 +1588,7 @@ static int asus_probe(struct hid_device *hdev, const struct hid_device_id *id)
  
- 	return ret;
-@@ -1364,7 +1418,8 @@ static void asus_remove(struct hid_device *hdev)
- 	unsigned long flags;
+ 	return 0;
+ err_stop_hw:
+-	if (drvdata->listener.brightness_set)
++	if (drvdata->listener.brightness_set && !drvdata->kbd_led_standalone)
+ 		asus_hid_unregister_listener(&drvdata->listener);
  
- 	if (drvdata->kbd_backlight) {
--		asus_hid_unregister_listener(&drvdata->kbd_backlight->listener);
-+		if (!drvdata->kbd_backlight->standalone)
-+			asus_hid_unregister_listener(&drvdata->kbd_backlight->listener);
+ 	asus_worker_stop(drvdata->worker);
+@@ -1552,7 +1600,7 @@ static void asus_remove(struct hid_device *hdev)
+ {
+ 	struct asus_drvdata *drvdata = hid_get_drvdata(hdev);
  
- 		spin_lock_irqsave(&drvdata->kbd_backlight->lock, flags);
- 		drvdata->kbd_backlight->removed = true;
-@@ -1496,7 +1551,8 @@ static const struct hid_device_id asus_devices[] = {
+-	if (drvdata->listener.brightness_set)
++	if (drvdata->listener.brightness_set && !drvdata->kbd_led_standalone)
+ 		asus_hid_unregister_listener(&drvdata->listener);
+ 
+ 	asus_worker_stop(drvdata->worker);
+@@ -1676,7 +1724,8 @@ static const struct hid_device_id asus_devices[] = {
  		USB_DEVICE_ID_ASUSTEK_I2C_KEYBOARD), I2C_KEYBOARD_QUIRKS},
  	{ HID_I2C_DEVICE(USB_VENDOR_ID_ASUSTEK,
  		USB_DEVICE_ID_ASUSTEK_I2C_ZENBOOK_KEYBOARD),
@@ -163,3 +160,6 @@ index 8f6e4c0140..b8aa285b49 100644
  	{ HID_I2C_DEVICE(USB_VENDOR_ID_ASUSTEK,
  		USB_DEVICE_ID_ASUSTEK_I2C_TOUCHPAD), I2C_TOUCHPAD_QUIRKS },
  	{ HID_USB_DEVICE(USB_VENDOR_ID_ASUSTEK,
+-- 
+2.56.0
+

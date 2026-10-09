@@ -1,0 +1,209 @@
+diff --git a/drivers/hwmon/Kconfig b/drivers/hwmon/Kconfig
+--- a/drivers/hwmon/Kconfig
++++ b/drivers/hwmon/Kconfig
+@@ -380,6 +380,7 @@ config SENSORS_FAM15H_POWER
+ config SENSORS_APPLESMC
+ 	tristate "Apple SMC (Motion sensor, light sensor, keyboard backlight)"
+ 	depends on INPUT && X86
++	depends on POWER_SUPPLY || POWER_SUPPLY=n
+ 	select NEW_LEDS
+ 	select LEDS_CLASS
+ 	help
+diff --git a/drivers/hwmon/applesmc.c b/drivers/hwmon/applesmc.c
+--- a/drivers/hwmon/applesmc.c
++++ b/drivers/hwmon/applesmc.c
+@@ -33,6 +33,8 @@
+ #include <linux/workqueue.h>
+ #include <linux/err.h>
+ #include <linux/bits.h>
++#include <linux/power_supply.h>
++#include <acpi/battery.h>
+ #include <asm/barrier.h>
+ 
+ /* data port used by Apple SMC */
+@@ -76,6 +78,20 @@
+ 
+ #define TEMP_SENSOR_TYPE	"sp78"
+ 
++/*
++ * BCLM caps charging at a percentage. BFCL only sets when the charging LED
++ * switches from orange to green.
++ */
++#define BATTERY_CHARGE_LIMIT_KEY	"BCLM" /* r/w ui8 */
++#define BATTERY_CHARGE_LIMIT_LED_KEY	"BFCL" /* r/w ui8 */
++
++/*
++ * Points kept between BCLM and BFCL so the LED turns green before charging
++ * stops. Measured on a MacBookAir6,2, where a margin of 1 only just ties;
++ * 3 leaves headroom for other models.
++ */
++#define APPLESMC_BATTERY_CHARGE_LIMIT_LED_MARGIN 3
++
+ /* List of keys used to read/write fan speeds */
+ static const char *const fan_speed_fmt[] = {
+ 	"F%dAc",		/* actual speed */
+@@ -131,6 +147,8 @@ static struct applesmc_registers {
+ 	int num_light_sensors;		/* number of light sensors */
+ 	bool has_accelerometer;		/* has motion sensor */
+ 	bool has_key_backlight;		/* has keyboard backlight */
++	bool has_battery_charge_limit;	/* has BCLM battery charge limit */
++	bool has_battery_charge_limit_led; /* has BFCL MagSafe LED charge limit */
+ 	bool init_complete;		/* true when fully initialized */
+ 	struct applesmc_entry *cache;	/* cached key entries */
+ 	const char **index;		/* temperature key index */
+@@ -633,6 +651,12 @@ static int applesmc_init_smcreg_try(void)
+ 	if (ret)
+ 		return ret;
+ 	ret = applesmc_has_key(BACKLIGHT_KEY, &s->has_key_backlight);
++	if (ret)
++		return ret;
++	ret = applesmc_has_key(BATTERY_CHARGE_LIMIT_KEY, &s->has_battery_charge_limit);
++	if (ret)
++		return ret;
++	ret = applesmc_has_key(BATTERY_CHARGE_LIMIT_LED_KEY, &s->has_battery_charge_limit_led);
+ 	if (ret)
+ 		return ret;
+ 
+@@ -724,6 +748,120 @@ static struct platform_driver applesmc_driver = {
+ 	},
+ };
+ 
++static DEFINE_MUTEX(applesmc_bat_lock);
++
++static int applesmc_bat_get_property(struct power_supply *psy,
++				     const struct power_supply_ext *ext,
++				     void *data,
++				     enum power_supply_property psp,
++				     union power_supply_propval *val)
++{
++	u8 limit;
++	int ret;
++
++	switch (psp) {
++	case POWER_SUPPLY_PROP_CHARGE_CONTROL_END_THRESHOLD:
++		scoped_guard(mutex, &applesmc_bat_lock)
++			ret = applesmc_read_key(BATTERY_CHARGE_LIMIT_KEY, &limit, 1);
++		if (ret)
++			return ret;
++		val->intval = limit;
++		return 0;
++	default:
++		return -EINVAL;
++	}
++}
++
++static int applesmc_bat_set_property(struct power_supply *psy,
++				     const struct power_supply_ext *ext,
++				     void *data,
++				     enum power_supply_property psp,
++				     const union power_supply_propval *val)
++{
++	u8 limit, led_limit, readback;
++	int ret;
++
++	switch (psp) {
++	case POWER_SUPPLY_PROP_CHARGE_CONTROL_END_THRESHOLD:
++		/* 20 is known to work and 10 is not accepted; the floor is unknown. */
++		if (val->intval < 20 || val->intval > 100)
++			return -EINVAL;
++
++		limit = val->intval;
++		/* At 100% charging is never cut short, so no margin is needed. */
++		led_limit = limit < 100 ?
++			limit - APPLESMC_BATTERY_CHARGE_LIMIT_LED_MARGIN : limit;
++
++		scoped_guard(mutex, &applesmc_bat_lock) {
++			ret = applesmc_write_key(BATTERY_CHARGE_LIMIT_KEY, &limit, 1);
++			if (ret)
++				return ret;
++
++			/*
++			 * The SMC silently ignores values it does not accept and
++			 * still reports success, so read the limit back.
++			 */
++			ret = applesmc_read_key(BATTERY_CHARGE_LIMIT_KEY, &readback, 1);
++			if (ret)
++				return ret;
++			if (readback != limit)
++				return -EINVAL;
++
++			if (smcreg.has_battery_charge_limit_led) {
++				ret = applesmc_write_key(BATTERY_CHARGE_LIMIT_LED_KEY,
++							 &led_limit, 1);
++				/* BCLM is already applied, so this is not an error. */
++				if (ret)
++					pr_warn("failed to update MagSafe LED threshold (BFCL): %d\n",
++						ret);
++			}
++		}
++
++		power_supply_changed(psy);
++		return 0;
++	default:
++		return -EINVAL;
++	}
++}
++
++static int applesmc_bat_property_is_writeable(struct power_supply *psy,
++					      const struct power_supply_ext *ext,
++					      void *data,
++					      enum power_supply_property psp)
++{
++	return psp == POWER_SUPPLY_PROP_CHARGE_CONTROL_END_THRESHOLD;
++}
++
++static const enum power_supply_property applesmc_bat_props[] = {
++	POWER_SUPPLY_PROP_CHARGE_CONTROL_END_THRESHOLD,
++};
++
++static const struct power_supply_ext applesmc_bat_ext = {
++	.name			= "applesmc-charge-control",
++	.properties		= applesmc_bat_props,
++	.num_properties		= ARRAY_SIZE(applesmc_bat_props),
++	.get_property		= applesmc_bat_get_property,
++	.set_property		= applesmc_bat_set_property,
++	.property_is_writeable	= applesmc_bat_property_is_writeable,
++};
++
++static int applesmc_bat_add(struct power_supply *battery, struct acpi_battery_hook *hook)
++{
++	return power_supply_register_extension(battery, &applesmc_bat_ext, &pdev->dev, NULL);
++}
++
++static int applesmc_bat_remove(struct power_supply *battery, struct acpi_battery_hook *hook)
++{
++	power_supply_unregister_extension(battery, &applesmc_bat_ext);
++	return 0;
++}
++
++static struct acpi_battery_hook applesmc_bat_hook = {
++	.name = "Apple SMC Battery Charge Control",
++	.add_battery = applesmc_bat_add,
++	.remove_battery = applesmc_bat_remove,
++};
++
+ /*
+  * applesmc_calibrate - Set our "resting" values.  Callers must
+  * hold applesmc_lock.
+@@ -1563,6 +1701,10 @@ static int __init applesmc_init(void)
+ 		goto out_light_ledclass;
+ 	}
+ 
++	if (smcreg.has_battery_charge_limit &&
++	    IS_REACHABLE(CONFIG_ACPI_BATTERY_HOOKS))
++		acpi_battery_hook_register(&applesmc_bat_hook);
++
+ 	return 0;
+ 
+ out_light_ledclass:
+@@ -1589,6 +1731,10 @@ static int __init applesmc_init(void)
+ 
+ static void __exit applesmc_exit(void)
+ {
++	if (smcreg.has_battery_charge_limit &&
++	    IS_REACHABLE(CONFIG_ACPI_BATTERY_HOOKS))
++		acpi_battery_hook_unregister(&applesmc_bat_hook);
++
+ 	hwmon_device_unregister(hwmon_dev);
+ 	applesmc_release_key_backlight();
+ 	applesmc_release_light_sensor();

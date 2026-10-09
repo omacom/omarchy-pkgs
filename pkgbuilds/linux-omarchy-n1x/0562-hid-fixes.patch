@@ -1,0 +1,483 @@
+diff --git a/drivers/hid/amd-sfh-hid/amd_sfh_common.h b/drivers/hid/amd-sfh-hid/amd_sfh_common.h
+--- a/drivers/hid/amd-sfh-hid/amd_sfh_common.h
++++ b/drivers/hid/amd-sfh-hid/amd_sfh_common.h
+@@ -12,11 +12,15 @@
+ 
+ #include <linux/mutex.h>
+ #include <linux/pci.h>
++#include <linux/sizes.h>
+ #include "amd_sfh_hid.h"
+ 
+ #define PCI_DEVICE_ID_AMD_MP2		0x15E4
+ #define PCI_DEVICE_ID_AMD_MP2_1_1	0x164A
+ 
++/* The BAR 2 size must cover the highest register offset (0x10958) */
++#define AMD_SFH_MIN_BAR_SIZE		SZ_128K
++
+ #define AMD_C2P_MSG(regno) (0x10500 + ((regno) * 4))
+ #define AMD_P2C_MSG(regno) (0x10680 + ((regno) * 4))
+ 
+diff --git a/drivers/hid/amd-sfh-hid/amd_sfh_pcie.c b/drivers/hid/amd-sfh-hid/amd_sfh_pcie.c
+--- a/drivers/hid/amd-sfh-hid/amd_sfh_pcie.c
++++ b/drivers/hid/amd-sfh-hid/amd_sfh_pcie.c
+@@ -451,6 +451,16 @@ static int amd_mp2_pci_probe(struct pci_dev *pdev, const struct pci_device_id *i
+ 	if (rc)
+ 		return rc;
+ 
++	if (!(pci_resource_flags(pdev, 2) & IORESOURCE_MEM)) {
++		dev_err(&pdev->dev, "BAR 2 is not IORESOURCE_MEM\n");
++		return -ENODEV;
++	}
++
++	if (pci_resource_len(pdev, 2) < AMD_SFH_MIN_BAR_SIZE) {
++		dev_err(&pdev->dev, "BAR 2 is too small\n");
++		return -EINVAL;
++	}
++
+ 	rc = pcim_iomap_regions(pdev, BIT(2), DRIVER_NAME);
+ 	if (rc)
+ 		return rc;
+diff --git a/drivers/hid/bpf/hid_bpf_dispatch.c b/drivers/hid/bpf/hid_bpf_dispatch.c
+--- a/drivers/hid/bpf/hid_bpf_dispatch.c
++++ b/drivers/hid/bpf/hid_bpf_dispatch.c
+@@ -359,7 +359,7 @@ hid_bpf_release_context(struct hid_bpf_ctx *ctx)
+ 
+ static int
+ __hid_bpf_hw_check_params(struct hid_bpf_ctx *ctx, __u8 *buf, size_t *buf__sz,
+-			  enum hid_report_type rtype)
++			  enum hid_report_type rtype, bool hw_request)
+ {
+ 	struct hid_report_enum *report_enum;
+ 	struct hid_report *report;
+@@ -388,6 +388,10 @@ __hid_bpf_hw_check_params(struct hid_bpf_ctx *ctx, __u8 *buf, size_t *buf__sz,
+ 
+ 	report_len = hid_report_len(report);
+ 
++	/* unnumbered reports need to have a report ID reserved in the first byte */
++	if (hw_request && report_enum->numbered == 0)
++		report_len += 1;
++
+ 	if (*buf__sz > report_len)
+ 		*buf__sz = report_len;
+ 
+@@ -420,7 +424,7 @@ hid_bpf_hw_request(struct hid_bpf_ctx *ctx, __u8 *buf, size_t buf__sz,
+ 		return -EDEADLOCK;
+ 
+ 	/* check arguments */
+-	ret = __hid_bpf_hw_check_params(ctx, buf, &size, rtype);
++	ret = __hid_bpf_hw_check_params(ctx, buf, &size, rtype, true);
+ 	if (ret)
+ 		return ret;
+ 
+@@ -480,7 +484,7 @@ hid_bpf_hw_output_report(struct hid_bpf_ctx *ctx, __u8 *buf, size_t buf__sz)
+ 		return -EDEADLOCK;
+ 
+ 	/* check arguments */
+-	ret = __hid_bpf_hw_check_params(ctx, buf, &size, HID_OUTPUT_REPORT);
++	ret = __hid_bpf_hw_check_params(ctx, buf, &size, HID_OUTPUT_REPORT, true);
+ 	if (ret)
+ 		return ret;
+ 
+@@ -506,7 +510,7 @@ __hid_bpf_input_report(struct hid_bpf_ctx *ctx, enum hid_report_type type, u8 *b
+ 		return -EDEADLOCK;
+ 
+ 	/* check arguments */
+-	ret = __hid_bpf_hw_check_params(ctx, buf, &size, type);
++	ret = __hid_bpf_hw_check_params(ctx, buf, &size, type, false);
+ 	if (ret)
+ 		return ret;
+ 
+diff --git a/drivers/hid/hid-alps.c b/drivers/hid/hid-alps.c
+--- a/drivers/hid/hid-alps.c
++++ b/drivers/hid/hid-alps.c
+@@ -407,6 +407,8 @@ static int u1_raw_event(struct alps_dev *hdata, u8 *data, int size)
+ 		return 1;
+ 
+ 	case U1_SP_ABSOLUTE_REPORT_ID:
++		if (!hdata->input2)
++			return 0;
+ 		sp_x = get_unaligned_le16(data+2);
+ 		sp_y = get_unaligned_le16(data+4);
+ 
+@@ -738,7 +740,6 @@ static int alps_input_configured(struct hid_device *hdev, struct hid_input *hi)
+ 			goto exit;
+ 		}
+ 
+-		data->input2 = input2;
+ 		input2->phys = input->phys;
+ 		input2->name = "DualPoint Stick";
+ 		input2->id.bustype = BUS_I2C;
+@@ -762,11 +763,12 @@ static int alps_input_configured(struct hid_device *hdev, struct hid_input *hi)
+ 		__set_bit(INPUT_PROP_POINTER, input2->propbit);
+ 		__set_bit(INPUT_PROP_POINTING_STICK, input2->propbit);
+ 
+-		if (input_register_device(data->input2)) {
++		if (input_register_device(input2)) {
+ 			input_free_device(input2);
+ 			ret = -ENOENT;
+ 			goto exit;
+ 		}
++		data->input2 = input2;
+ 	}
+ 
+ exit:
+@@ -823,6 +825,24 @@ static int alps_probe(struct hid_device *hdev, const struct hid_device_id *id)
+ 	return 0;
+ }
+ 
++static void alps_remove(struct hid_device *hdev)
++{
++	struct alps_dev *data = hid_get_drvdata(hdev);
++
++	/*
++	 * input2 ("DualPoint Stick") is allocated separately and is not
++	 * tracked in hdev->inputs, so the default remove path
++	 * (hid_hw_stop -> hidinput_disconnect) does not unregister it.
++	 *
++	 * Stop the device first so that no URB callback can touch input2
++	 * while it is being unregistered, then drop it explicitly.
++	 */
++	hid_hw_stop(hdev);
++
++	if (data->input2)
++		input_unregister_device(data->input2);
++}
++
+ static const struct hid_device_id alps_id[] = {
+ 	{ HID_DEVICE(HID_BUS_ANY, HID_GROUP_ANY,
+ 		USB_VENDOR_ID_ALPS_JP, HID_DEVICE_ID_ALPS_U1_DUAL) },
+@@ -845,6 +865,7 @@ static struct hid_driver alps_driver = {
+ 	.input_configured	= alps_input_configured,
+ 	.resume			= pm_ptr(alps_post_resume),
+ 	.reset_resume		= pm_ptr(alps_post_reset),
++	.remove			= alps_remove,
+ };
+ 
+ module_hid_driver(alps_driver);
+diff --git a/drivers/hid/hid-corsair-void.c b/drivers/hid/hid-corsair-void.c
+--- a/drivers/hid/hid-corsair-void.c
++++ b/drivers/hid/hid-corsair-void.c
+@@ -51,20 +51,23 @@
+ /* Receiver report information: (ID 102)                                      */
+ /* -------------------------------------------------------------------------- */
+ /*
+- * When queried, the recevier responds with 4 bytes to describe the firmware
+- * The first 2 bytes are for the receiver, the second 2 are the headset
++ * When queried, the receiver responds with 5 bytes to describe the firmware
++ * The first byte is the ID, then 2 bytes for the receiver, then 2 for the headset
+  * The headset firmware version will be 0 if no headset is connected
+  *
+- * 0: Recevier firmware major version
++ * 0: Report ID
++ *  102 for the firmware packet
++ *
++ * 1: Receiver firmware major version
+  *  Major version of the receiver's firmware
+  *
+- * 1: Recevier firmware minor version
++ * 2: Receiver firmware minor version
+  *  Minor version of the receiver's firmware
+  *
+- * 2: Headset firmware major version
++ * 3: Headset firmware major version
+  *  Major version of the headset's firmware
+  *
+- * 3: Headset firmware minor version
++ * 4: Headset firmware minor version
+  *  Minor version of the headset's firmware
+  */
+ /* -------------------------------------------------------------------------- */
+diff --git a/drivers/hid/hid-elecom.c b/drivers/hid/hid-elecom.c
+--- a/drivers/hid/hid-elecom.c
++++ b/drivers/hid/hid-elecom.c
+@@ -79,7 +79,7 @@ static const __u8 *elecom_report_fixup(struct hid_device *hdev, __u8 *rdesc,
+ 	case USB_DEVICE_ID_ELECOM_M_XT3URBK_00FB:
+ 	case USB_DEVICE_ID_ELECOM_M_XT3URBK_018F:
+ 	case USB_DEVICE_ID_ELECOM_M_XT3DRBK_00FC:
+-	case USB_DEVICE_ID_ELECOM_M_XT4DRBK:
++	case USB_DEVICE_ID_ELECOM_M_XT4DRBK_00FD:
+ 		/*
+ 		 * Report descriptor format:
+ 		 * 12: button bit count
+@@ -104,6 +104,7 @@ static const __u8 *elecom_report_fixup(struct hid_device *hdev, __u8 *rdesc,
+ 		mouse_button_fixup(hdev, rdesc, *rsize, 12, 30, 14, 20, 8);
+ 		break;
+ 	case USB_DEVICE_ID_ELECOM_M_XT3DRBK_018C:
++	case USB_DEVICE_ID_ELECOM_M_XT4DRBK_018E:
+ 		/*
+ 		 * Report descriptor format:
+ 		 * 22: button bit count
+@@ -148,7 +149,8 @@ static const struct hid_device_id elecom_devices[] = {
+ 	{ HID_USB_DEVICE(USB_VENDOR_ID_ELECOM, USB_DEVICE_ID_ELECOM_M_XT3URBK_018F) },
+ 	{ HID_USB_DEVICE(USB_VENDOR_ID_ELECOM, USB_DEVICE_ID_ELECOM_M_XT3DRBK_00FC) },
+ 	{ HID_USB_DEVICE(USB_VENDOR_ID_ELECOM, USB_DEVICE_ID_ELECOM_M_XT3DRBK_018C) },
+-	{ HID_USB_DEVICE(USB_VENDOR_ID_ELECOM, USB_DEVICE_ID_ELECOM_M_XT4DRBK) },
++	{ HID_USB_DEVICE(USB_VENDOR_ID_ELECOM, USB_DEVICE_ID_ELECOM_M_XT4DRBK_00FD) },
++	{ HID_USB_DEVICE(USB_VENDOR_ID_ELECOM, USB_DEVICE_ID_ELECOM_M_XT4DRBK_018E) },
+ 	{ HID_USB_DEVICE(USB_VENDOR_ID_ELECOM, USB_DEVICE_ID_ELECOM_M_DT1URBK) },
+ 	{ HID_USB_DEVICE(USB_VENDOR_ID_ELECOM, USB_DEVICE_ID_ELECOM_M_DT1DRBK) },
+ 	{ HID_USB_DEVICE(USB_VENDOR_ID_ELECOM, USB_DEVICE_ID_ELECOM_M_DT2DRBK) },
+diff --git a/drivers/hid/hid-ids.h b/drivers/hid/hid-ids.h
+--- a/drivers/hid/hid-ids.h
++++ b/drivers/hid/hid-ids.h
+@@ -472,7 +472,8 @@
+ #define USB_DEVICE_ID_ELECOM_M_XT3URBK_018F	0x018f
+ #define USB_DEVICE_ID_ELECOM_M_XT3DRBK_00FC	0x00fc
+ #define USB_DEVICE_ID_ELECOM_M_XT3DRBK_018C	0x018c
+-#define USB_DEVICE_ID_ELECOM_M_XT4DRBK	0x00fd
++#define USB_DEVICE_ID_ELECOM_M_XT4DRBK_00FD	0x00fd
++#define USB_DEVICE_ID_ELECOM_M_XT4DRBK_018E	0x018e
+ #define USB_DEVICE_ID_ELECOM_M_DT1URBK	0x00fe
+ #define USB_DEVICE_ID_ELECOM_M_DT1DRBK	0x00ff
+ #define USB_DEVICE_ID_ELECOM_M_DT2DRBK	0x018d
+@@ -759,6 +760,7 @@
+ #define I2C_DEVICE_ID_ITE_LENOVO_LEGION_Y720	0x837a
+ #define USB_DEVICE_ID_ITE_LENOVO_YOGA900	0x8396
+ #define I2C_DEVICE_ID_ITE_LENOVO_YOGA_SLIM_7X_KEYBOARD	0x8987
++#define I2C_DEVICE_ID_ITE_LENOVO_YOGA_SLIM_7X_G11_KEYBOARD	0x83db
+ #define USB_DEVICE_ID_ITE8595		0x8595
+ #define USB_DEVICE_ID_ITE_MEDION_E1239T	0xce50
+ 
+@@ -1283,6 +1285,9 @@
+ #define USB_DEVICE_ID_SAMSUNG_WIRELESS_UNIVERSAL_KBD	0xa006
+ #define USB_DEVICE_ID_SAMSUNG_WIRELESS_MULTI_HOGP_KBD	0xa064
+ 
++#define USB_VENDOR_ID_SDINNOVATION		0x36ae
++#define USB_DEVICE_ID_SDINNOVATION_GAMING_KBD	0xfeab
++
+ #define USB_VENDOR_ID_SEMICO			0x1a2c
+ #define USB_DEVICE_ID_SEMICO_USB_KEYKOARD	0x0023
+ #define USB_DEVICE_ID_SEMICO_USB_KEYKOARD2	0x0027
+diff --git a/drivers/hid/hid-logitech-hidpp.c b/drivers/hid/hid-logitech-hidpp.c
+--- a/drivers/hid/hid-logitech-hidpp.c
++++ b/drivers/hid/hid-logitech-hidpp.c
+@@ -4656,6 +4656,8 @@ static const struct hid_device_id hidpp_devices[] = {
+ 	  HID_USB_DEVICE(USB_VENDOR_ID_LOGITECH, 0xC082) },
+ 	{ /* Logitech G502 Lightspeed Wireless Gaming Mouse over USB */
+ 	  HID_USB_DEVICE(USB_VENDOR_ID_LOGITECH, 0xC08D) },
++	{ /* Logitech G502 X Lightspeed Wireless Gaming Mouse over USB */
++	  HID_USB_DEVICE(USB_VENDOR_ID_LOGITECH, 0xC098) },
+ 	{ /* Logitech G703 Gaming Mouse over USB */
+ 	  HID_USB_DEVICE(USB_VENDOR_ID_LOGITECH, 0xC087) },
+ 	{ /* Logitech G703 Hero Gaming Mouse over USB */
+diff --git a/drivers/hid/hid-multitouch.c b/drivers/hid/hid-multitouch.c
+--- a/drivers/hid/hid-multitouch.c
++++ b/drivers/hid/hid-multitouch.c
+@@ -79,6 +79,7 @@ MODULE_LICENSE("GPL");
+ #define MT_QUIRK_APPLE_TOUCHBAR		BIT(23)
+ #define MT_QUIRK_YOGABOOK9I		BIT(24)
+ #define MT_QUIRK_KEEP_LATENCY_ON_CLOSE	BIT(25)
++#define MT_QUIRK_IGNORE_FEATURE_ID_MISMATCH	BIT(26)
+ 
+ #define MT_INPUTMODE_TOUCHSCREEN	0x02
+ #define MT_INPUTMODE_TOUCHPAD		0x03
+@@ -235,6 +236,7 @@ static void mt_post_parse(struct mt_device *td, struct mt_application *app);
+ #define MT_CLS_APPLE_TOUCHBAR			0x0114
+ #define MT_CLS_YOGABOOK9I			0x0115
+ #define MT_CLS_EGALAX_P80H84			0x0116
++#define MT_CLS_ASUS_ROG_Z13_FOLIO		0x0117
+ #define MT_CLS_SIS				0x0457
+ 
+ #define MT_DEFAULT_MAXCONTACT	10
+@@ -405,6 +407,16 @@ static const struct mt_class mt_classes[] = {
+ 		.quirks = MT_QUIRK_ALWAYS_VALID |
+ 			MT_QUIRK_CONTACT_CNT_ACCURATE |
+ 			MT_QUIRK_ASUS_CUSTOM_UP },
++	{ .name = MT_CLS_ASUS_ROG_Z13_FOLIO,
++		.quirks = MT_QUIRK_ALWAYS_VALID |
++			MT_QUIRK_IGNORE_DUPLICATES |
++			MT_QUIRK_HOVERING |
++			MT_QUIRK_CONTACT_CNT_ACCURATE |
++			MT_QUIRK_STICKY_FINGERS |
++			MT_QUIRK_WIN8_PTP_BUTTONS |
++			MT_QUIRK_CONFIDENCE |
++			MT_QUIRK_IGNORE_FEATURE_ID_MISMATCH,
++		.export_all_inputs = true },
+ 	{ .name = MT_CLS_VTL,
+ 		.quirks = MT_QUIRK_ALWAYS_VALID |
+ 			MT_QUIRK_CONTACT_CNT_ACCURATE |
+@@ -507,6 +519,7 @@ static const struct attribute_group mt_attribute_group = {
+ 
+ static void mt_get_feature(struct hid_device *hdev, struct hid_report *report)
+ {
++	struct mt_device *td = hid_get_drvdata(hdev);
+ 	int ret;
+ 	u32 size = hid_report_len(report);
+ 	u8 *buf;
+@@ -528,8 +541,14 @@ static void mt_get_feature(struct hid_device *hdev, struct hid_report *report)
+ 		dev_warn(&hdev->dev, "failed to fetch feature %d\n",
+ 			 report->id);
+ 	} else {
+-		/* The report ID in the request and the response should match */
+-		if (report->id != buf[0]) {
++		/*
++		 * The report ID in the request and the response should match.
++		 * Some firmware (e.g. the ASUS ROG Z13 Folio
++		 * touchpad) returns a mismatched ID on this specific fetch;
++		 * tolerate it only for devices explicitly flagged as such.
++		 */
++		if (report->id != buf[0] &&
++		    !(td->mtclass.quirks & MT_QUIRK_IGNORE_FEATURE_ID_MISMATCH)) {
+ 			hid_err(hdev, "Returned feature report did not match the request\n");
+ 			goto free;
+ 		}
+@@ -2726,6 +2745,12 @@ static const struct hid_device_id mt_devices[] = {
+ 		HID_DEVICE(BUS_I2C, HID_GROUP_MULTITOUCH_WIN_8,
+ 			   I2C_VENDOR_ID_HANTICK, I2C_PRODUCT_ID_HANTICK_5288) },
+ 
++	/* Asus ROG Flow Z13 (2025) GZ302EA keyboard-cover touchpad */
++	{ .driver_data = MT_CLS_ASUS_ROG_Z13_FOLIO,
++		HID_DEVICE(BUS_USB, HID_GROUP_MULTITOUCH_WIN_8,
++			USB_VENDOR_ID_ASUSTEK,
++			USB_DEVICE_ID_ASUSTEK_ROG_Z13_FOLIO) },
++
+ 	/* Generic MT device */
+ 	{ HID_DEVICE(HID_BUS_ANY, HID_GROUP_MULTITOUCH, HID_ANY_ID, HID_ANY_ID) },
+ 
+diff --git a/drivers/hid/hid-oxp.c b/drivers/hid/hid-oxp.c
+--- a/drivers/hid/hid-oxp.c
++++ b/drivers/hid/hid-oxp.c
+@@ -1552,9 +1552,9 @@ static int oxp_hid_probe(struct hid_device *hdev,
+ 
+ static void oxp_hid_remove(struct hid_device *hdev)
+ {
+-	cancel_delayed_work(&drvdata.oxp_rgb_queue);
+-	cancel_delayed_work(&drvdata.oxp_btn_queue);
+-	cancel_delayed_work(&drvdata.oxp_mcu_init);
++	cancel_delayed_work_sync(&drvdata.oxp_rgb_queue);
++	cancel_delayed_work_sync(&drvdata.oxp_btn_queue);
++	cancel_delayed_work_sync(&drvdata.oxp_mcu_init);
+ 	hid_hw_close(hdev);
+ 	hid_hw_stop(hdev);
+ }
+diff --git a/drivers/hid/hid-quirks.c b/drivers/hid/hid-quirks.c
+--- a/drivers/hid/hid-quirks.c
++++ b/drivers/hid/hid-quirks.c
+@@ -183,6 +183,7 @@ static const struct hid_device_id hid_quirks[] = {
+ 	{ HID_USB_DEVICE(USB_VENDOR_ID_SAITEK, USB_DEVICE_ID_SAITEK_X52_2), HID_QUIRK_INCREMENT_USAGE_ON_DUPLICATE },
+ 	{ HID_USB_DEVICE(USB_VENDOR_ID_SAITEK, USB_DEVICE_ID_SAITEK_X52_PRO), HID_QUIRK_INCREMENT_USAGE_ON_DUPLICATE },
+ 	{ HID_USB_DEVICE(USB_VENDOR_ID_SAITEK, USB_DEVICE_ID_SAITEK_X65), HID_QUIRK_INCREMENT_USAGE_ON_DUPLICATE },
++	{ HID_USB_DEVICE(USB_VENDOR_ID_SDINNOVATION, USB_DEVICE_ID_SDINNOVATION_GAMING_KBD), HID_QUIRK_ALWAYS_POLL },
+ 	{ HID_USB_DEVICE(USB_VENDOR_ID_SEMICO, USB_DEVICE_ID_SEMICO_USB_KEYKOARD2), HID_QUIRK_NO_INIT_REPORTS },
+ 	{ HID_USB_DEVICE(USB_VENDOR_ID_SEMICO, USB_DEVICE_ID_SEMICO_USB_KEYKOARD), HID_QUIRK_NO_INIT_REPORTS },
+ 	{ HID_USB_DEVICE(USB_VENDOR_ID_SENNHEISER, USB_DEVICE_ID_SENNHEISER_BTD500USB), HID_QUIRK_NOGET },
+@@ -422,13 +423,14 @@ static const struct hid_device_id hid_have_special_driver[] = {
+ #endif
+ #if IS_ENABLED(CONFIG_HID_ELECOM)
+ 	{ HID_BLUETOOTH_DEVICE(USB_VENDOR_ID_ELECOM, USB_DEVICE_ID_ELECOM_BM084) },
+-	{ HID_BLUETOOTH_DEVICE(USB_VENDOR_ID_ELECOM, USB_DEVICE_ID_ELECOM_M_XGL20DLBK) },
++	{ HID_USB_DEVICE(USB_VENDOR_ID_ELECOM, USB_DEVICE_ID_ELECOM_M_XGL20DLBK) },
+ 	{ HID_BLUETOOTH_DEVICE(USB_VENDOR_ID_ELECOM, USB_DEVICE_ID_ELECOM_M_HT1MRBK_01AC) },
+ 	{ HID_USB_DEVICE(USB_VENDOR_ID_ELECOM, USB_DEVICE_ID_ELECOM_M_XT3URBK_00FB) },
+ 	{ HID_USB_DEVICE(USB_VENDOR_ID_ELECOM, USB_DEVICE_ID_ELECOM_M_XT3URBK_018F) },
+ 	{ HID_USB_DEVICE(USB_VENDOR_ID_ELECOM, USB_DEVICE_ID_ELECOM_M_XT3DRBK_00FC) },
+ 	{ HID_USB_DEVICE(USB_VENDOR_ID_ELECOM, USB_DEVICE_ID_ELECOM_M_XT3DRBK_018C) },
+-	{ HID_USB_DEVICE(USB_VENDOR_ID_ELECOM, USB_DEVICE_ID_ELECOM_M_XT4DRBK) },
++	{ HID_USB_DEVICE(USB_VENDOR_ID_ELECOM, USB_DEVICE_ID_ELECOM_M_XT4DRBK_00FD) },
++	{ HID_USB_DEVICE(USB_VENDOR_ID_ELECOM, USB_DEVICE_ID_ELECOM_M_XT4DRBK_018E) },
+ 	{ HID_USB_DEVICE(USB_VENDOR_ID_ELECOM, USB_DEVICE_ID_ELECOM_M_DT1URBK) },
+ 	{ HID_USB_DEVICE(USB_VENDOR_ID_ELECOM, USB_DEVICE_ID_ELECOM_M_DT1DRBK) },
+ 	{ HID_USB_DEVICE(USB_VENDOR_ID_ELECOM, USB_DEVICE_ID_ELECOM_M_DT2DRBK) },
+diff --git a/drivers/hid/hid-roccat.c b/drivers/hid/hid-roccat.c
+--- a/drivers/hid/hid-roccat.c
++++ b/drivers/hid/hid-roccat.c
+@@ -344,8 +344,6 @@ int roccat_connect(const struct class *klass, struct hid_device *hid, int report
+ 		return temp;
+ 	}
+ 
+-	mutex_unlock(&devices_lock);
+-
+ 	init_waitqueue_head(&device->wait);
+ 	INIT_LIST_HEAD(&device->readers);
+ 	mutex_init(&device->readers_lock);
+@@ -356,6 +354,7 @@ int roccat_connect(const struct class *klass, struct hid_device *hid, int report
+ 	device->cbuf_end = 0;
+ 	device->report_size = report_size;
+ 
++	mutex_unlock(&devices_lock);
+ 	return minor;
+ }
+ EXPORT_SYMBOL_GPL(roccat_connect);
+@@ -369,15 +368,12 @@ void roccat_disconnect(int minor)
+ 
+ 	mutex_lock(&devices_lock);
+ 	device = devices[minor];
+-	mutex_unlock(&devices_lock);
+ 
+ 	device->exist = 0; /* TODO exist maybe not needed */
+ 
+ 	device_destroy(device->dev->class, MKDEV(roccat_major, minor));
+ 
+-	mutex_lock(&devices_lock);
+ 	devices[minor] = NULL;
+-	mutex_unlock(&devices_lock);
+ 
+ 	if (device->open) {
+ 		hid_hw_close(device->hid);
+@@ -385,6 +381,8 @@ void roccat_disconnect(int minor)
+ 	} else {
+ 		roccat_free_device(device);
+ 	}
++
++	mutex_unlock(&devices_lock);
+ }
+ EXPORT_SYMBOL_GPL(roccat_disconnect);
+ 
+diff --git a/drivers/hid/hid-winwing.c b/drivers/hid/hid-winwing.c
+--- a/drivers/hid/hid-winwing.c
++++ b/drivers/hid/hid-winwing.c
+@@ -315,7 +315,8 @@ static void winwing_haptic_rumble_cb(struct work_struct *work)
+ static int winwing_play_effect(struct input_dev *dev, void *context,
+ 		struct ff_effect *effect)
+ {
+-	struct winwing_drv_data *data = (struct winwing_drv_data *) context;
++	struct hid_device *hdev = input_get_drvdata(dev);
++	struct winwing_drv_data *data = hid_get_drvdata(hdev);
+ 
+ 	if (effect->type != FF_RUMBLE)
+ 		return 0;
+@@ -342,7 +343,12 @@ static int winwing_init_ff(struct hid_device *hdev, struct hid_input *hidinput)
+ 
+ 	input_set_capability(hidinput->input, EV_FF, FF_RUMBLE);
+ 
+-	return input_ff_create_memless(hidinput->input, data,
++	/*
++	 * input_ff_create_memless() takes ownership of the context pointer
++	 * and frees it on teardown; do not hand it the devm-managed drvdata.
++	 * winwing_play_effect() fetches it from the input device instead.
++	 */
++	return input_ff_create_memless(hidinput->input, NULL,
+ 			winwing_play_effect);
+ }
+ 
+diff --git a/drivers/hid/i2c-hid/i2c-hid-core.c b/drivers/hid/i2c-hid/i2c-hid-core.c
+--- a/drivers/hid/i2c-hid/i2c-hid-core.c
++++ b/drivers/hid/i2c-hid/i2c-hid-core.c
+@@ -123,9 +123,11 @@ static const struct i2c_hid_quirks {
+ 	__u32 quirks;
+ } i2c_hid_quirks[] = {
+ 	{ I2C_VENDOR_ID_HANTICK, I2C_PRODUCT_ID_HANTICK_5288,
+-		I2C_HID_QUIRK_NO_IRQ_AFTER_RESET },
++		I2C_HID_QUIRK_NO_IRQ_AFTER_RESET | I2C_HID_QUIRK_BAD_INPUT_SIZE },
+ 	{ I2C_VENDOR_ID_ITE, I2C_DEVICE_ID_ITE_VOYO_WINPAD_A15,
+ 		I2C_HID_QUIRK_NO_IRQ_AFTER_RESET },
++	{ USB_VENDOR_ID_ITE, I2C_DEVICE_ID_ITE_LENOVO_YOGA_SLIM_7X_G11_KEYBOARD,
++		I2C_HID_QUIRK_NO_IRQ_AFTER_RESET },
+ 	{ I2C_VENDOR_ID_RAYDIUM, I2C_PRODUCT_ID_RAYDIUM_3118,
+ 		I2C_HID_QUIRK_NO_IRQ_AFTER_RESET },
+ 	{ USB_VENDOR_ID_ALPS_JP, HID_ANY_ID,
+diff --git a/drivers/hid/wacom_sys.c b/drivers/hid/wacom_sys.c
+--- a/drivers/hid/wacom_sys.c
++++ b/drivers/hid/wacom_sys.c
+@@ -113,8 +113,9 @@ static int wacom_wac_pen_serial_enforce(struct hid_device *hdev,
+ 
+ 	/* Queue events which have invalid tool type or serial number */
+ 	for (i = 0; i < report->maxfield; i++) {
+-		for (j = 0; j < report->field[i]->maxusage; j++) {
+-			struct hid_field *field = report->field[i];
++		struct hid_field *field = report->field[i];
++
++		for (j = 0; j < field->report_count; j++) {
+ 			struct hid_usage *usage = &field->usage[j];
+ 			unsigned int equivalent_usage = wacom_equivalent_usage(usage->hid);
+ 			unsigned int offset;
