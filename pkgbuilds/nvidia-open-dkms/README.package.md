@@ -1,11 +1,13 @@
-# NVIDIA ARM DisplayPort detach fix
+# NVIDIA ARM open kernel modules for N1x
 
-ARM-only edge package carrying Martin Stark's pending
-[NVIDIA PR #1359](https://github.com/NVIDIA/open-gpu-kernel-modules/pull/1359)
-to fix DisplayPort disconnect cleanup in 615.71.09. Based on
+ARM-only edge package of NVIDIA's open kernel modules 615.78.08 with N1x display fixes. Based on
 [Arch's DKMS recipe](https://gitlab.archlinux.org/archlinux/packaging/packages/nvidia-utils/-/commit/f9ae10b379f8b1d0832ec92bca1c12072aa123e9).
+It used to carry Martin Stark's
+[NVIDIA PR #1359](https://github.com/NVIDIA/open-gpu-kernel-modules/pull/1359)
+as `0001`/`0002`; 615.78.08 has NVIDIA's own version of that DisplayPort
+detach fix, so they are gone.
 
-It also carries `0003-set-oled-edp-brightness-over-aux.patch`: the GPU
+It carries `0003-set-oled-edp-brightness-over-aux.patch`: the GPU
 firmware sets an internal panel's brightness as PWM or a VESA eDP level, and
 the Dell XPS 16 (N1x)'s eDP 1.5 OLED panel ignores both. nvkms also sets it as
 a target luminance, as the kernel's `drm_edp_backlight` helpers do for i915
@@ -43,7 +45,7 @@ read as fully trained, while it counted symbol errors on every lane. After
 each modeset on a tunnelled link nvkms now reads the monitor's symbol error
 counters and, if every lane keeps counting errors, trains the link again.
 
-Requires `[omarchy]` before `[extra]` and matching `nvidia-utils=615.71.09`.
+Requires `[omarchy]` before `[extra]` and matching `nvidia-utils=615.78.08`.
 Update both NVIDIA packages together; automatic version tracking is disabled.
 
 Remove this recipe and the published package/database entry once a fixed
