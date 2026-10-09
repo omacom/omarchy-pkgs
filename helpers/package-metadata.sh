@@ -626,6 +626,15 @@ validate_package_metadata() {
     return 1
   fi
 
+  # The fast ring ships one edge build to every channel at once, so nothing
+  # rebuilds it when a channel moves under it: a package that needs those
+  # rebuilds reaches rc and stable with the release instead. The rest of the
+  # rule is checked on the built package (helpers/fast-ring-check.sh).
+  if package_is_fast_ring "$pkgdir" && jq -e '(.rebuild_on // []) | length > 0' "$metadata" >/dev/null; then
+    echo "invalid release_ring for $(basename "$pkgdir"): a package with rebuild_on cannot be on the fast ring"
+    return 1
+  fi
+
   if ! jq -e '
     def version_map:
       type == "object" and (to_entries | all(.value | type == "string" and length > 0));
