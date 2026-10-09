@@ -40,6 +40,10 @@ out=$(ldd_problems plugin <<<"$LDD")
 [[ $(printf '%s\n' /usr/lib/python3.14/site-packages/x.py | inspect_files) == rule$'\t'/usr/lib/python3.14/site-packages/x.py$'\t'* ]] \
   && pass "a Python module breaks the fast ring's rule" || fail "Python module accepted"
 [[ -z $(printf '%s\n' /usr/bin/bash | inspect_files) ]] && pass "a working binary has no problems" || fail "bash reported"
+ldd() { echo "	not a dynamic executable"; return 1; }
+out=$(printf '%s\n' /usr/bin/bash | inspect_files) && [[ -z $out ]] \
+  && pass "an ELF glibc cannot load (a musl prebuild) does not abort the check" || fail "ldd failure aborted: $out"
+unset -f ldd
 if pacman -Q qt6-base >/dev/null 2>&1; then
   qt=$(readlink -f /usr/lib/libQt6Gui.so.6)
   [[ -z $(printf '%s\n' "$qt" | inspect_files) ]] \

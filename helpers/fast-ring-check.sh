@@ -170,7 +170,10 @@ inspect_files() {
     fi
     kind=$(elf_kind "$path" "$prog")
 
-    out=$(ldd -r "$path" 2>&1 | ldd_problems "$kind")
+    # ldd exits non-zero on what glibc cannot load at all (the musl and
+    # Android prebuilds Electron apps carry beside the glibc one); what it
+    # prints is still the answer.
+    out=$(ldd -r "$path" 2>&1 | ldd_problems "$kind" || true)
     if [[ -n $out ]]; then
       dirs=()
       while IFS= read -r soname; do
@@ -182,7 +185,7 @@ inspect_files() {
       done < <(sed -n 's/.*(NEEDED).*\[\(.*\)\]/\1/p' <<<"$dyn"
                sed -n 's/^[[:space:]]*\([^ ]*\) => not found.*/\1/p' <<<"$out")
       if (( ${#dirs[@]} )); then
-        out=$(LD_LIBRARY_PATH=$(IFS=:; echo "${dirs[*]}") ldd -r "$path" 2>&1 | ldd_problems "$kind")
+        out=$(LD_LIBRARY_PATH=$(IFS=:; echo "${dirs[*]}") ldd -r "$path" 2>&1 | ldd_problems "$kind" || true)
       fi
     fi
     if [[ -n $out ]]; then
