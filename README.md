@@ -184,7 +184,7 @@ combined. And after a fast-ring package builds, `build-pr.yml` runs
 `bin/check-fast-ring`, which installs the package on `edge`, `rc` and `stable`
 from each channel's own repositories and fails the build when:
 
-- a dependency cannot be satisfied on `rc` or `stable`;
+- a dependency that edge provides cannot be satisfied on `rc` or `stable`;
 - a binary needs a library or a versioned symbol (`GLIBC_2.43`, say) that
   `rc` or `stable` does not have yet (`ldd -r`). Edge is the baseline: an
   optional plugin whose library is missing on every channel is not the fast

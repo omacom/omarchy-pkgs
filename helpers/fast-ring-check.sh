@@ -12,14 +12,14 @@
 #
 # `check` installs the packages from the channel's own repositories and
 # writes one problem per line to <results>, as <kind>TAB<path>TAB<detail>:
-#   rule  fails wherever it happens: a dependency the channel cannot
-#         satisfy, an ELF linking Qt or libpython, a file under
+#   rule  fails wherever it happens: packages that cannot be installed,
+#         an ELF linking Qt or libpython, a file under
 #         /usr/lib/python3.X. Those break on a dependency update without a
 #         missing symbol to show it (Qt's private API and plugin version
 #         check, Python's versioned module path), so they need rebuilds the
 #         fast ring cannot give them.
-#   link  an ELF whose libraries, symbol versions or interpreter are
-#         missing (`ldd -r`). Fails only where edge does not show the same
+#   link  a dependency the channel cannot provide, or an ELF whose
+#         libraries, symbol versions or interpreter are missing (`ldd -r`). Fails only where edge does not show the same
 #         line: an optional plugin whose library nobody installs is no
 #         different on stable.
 # The rebuild_on half of the rule is metadata, enforced by
@@ -193,19 +193,30 @@ inspect_files() {
 # check <results> <package file>...
 check() {
   local results=$1 file
-  local -a names=()
+  local -a names=() lines=()
   shift
   : > "$results"
+  local log deps
   # Scriptlets would need a booted system; their output is not under test.
-  if ! pacman -U --noconfirm --noscriptlet --ask 4 "$@"; then
-    problem rule - "the channel cannot satisfy the packages' dependencies" > "$results"
-    return 0
+  if ! log=$(pacman -U --noconfirm --noscriptlet --ask 4 "$@" 2>&1); then
+    printf '%s\n' "$log"
+    # A dependency is compared with edge like a library: one no channel
+    # carries (an AUR-only theme engine, say) is not the fast ring's to
+    # judge. The files are still inspected, installed without it.
+    deps=$(sed -n 's/^warning: cannot resolve "\([^"]*\)", a dependency of "\([^"]*\)"$/\2 needs \1, which this channel cannot provide/p' <<<"$log")
+    if [[ -z $deps ]]; then
+      problem rule - "the packages cannot be installed on this channel" > "$results"
+      return 0
+    fi
+    mapfile -t lines <<<"$deps"
+    problem link - "${lines[@]}" > "$results"
+    pacman -Udd --noconfirm --noscriptlet --ask 4 "$@"
   fi
   for file in "$@"; do
     names+=("$(bsdtar -xOf "$file" .PKGINFO | sed -n 's/^pkgname = //p')")
   done
   # A metapackage installs no files; that is a pass.
-  { pacman -Qlq "${names[@]}" | grep -v '/$' || true; } | inspect_files > "$results"
+  { pacman -Qlq "${names[@]}" | grep -v '/$' || true; } | inspect_files >> "$results"
 }
 
 # channel_failures <edge results> <channel results>: the channel's problems
