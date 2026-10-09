@@ -40,6 +40,13 @@ out=$(ldd_problems plugin <<<"$LDD")
 [[ $(printf '%s\n' /usr/lib/python3.14/site-packages/x.py | inspect_files) == rule$'\t'/usr/lib/python3.14/site-packages/x.py$'\t'* ]] \
   && pass "a Python module breaks the fast ring's rule" || fail "Python module accepted"
 [[ -z $(printf '%s\n' /usr/bin/bash | inspect_files) ]] && pass "a working binary has no problems" || fail "bash reported"
+if pacman -Q qt6-base >/dev/null 2>&1; then
+  qt=$(readlink -f /usr/lib/libQt6Gui.so.6)
+  [[ -z $(printf '%s\n' "$qt" | inspect_files) ]] \
+    && pass "a vendor's Qt-linked library is only link-checked" || fail "vendor Qt flagged"
+  [[ $(printf '%s\n' "$qt" | COMPILED=1 inspect_files) == rule$'\t'*libQt6Core* ]] \
+    && pass "a Qt-linked library compiled here breaks the rule" || fail "compiled Qt accepted"
+fi
 
 T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
 tab=$'\t'

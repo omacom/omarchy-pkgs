@@ -12,12 +12,13 @@
 #
 # `check` installs the packages from the channel's own repositories and
 # writes one problem per line to <results>, as <kind>TAB<path>TAB<detail>:
-#   rule  fails wherever it happens: packages that cannot be installed,
-#         an ELF linking Qt or libpython, a file under
-#         /usr/lib/python3.X. Those break on a dependency update without a
-#         missing symbol to show it (Qt's private API and plugin version
-#         check, Python's versioned module path), so they need rebuilds the
-#         fast ring cannot give them.
+#   rule  fails wherever it happens: packages that cannot be installed, a
+#         file under /usr/lib/python3.X, and, when COMPILED=1 says this
+#         repository compiles the package, an ELF linking Qt or libpython.
+#         Those break on a dependency update without a missing symbol to
+#         show it (Qt's private API and plugin version check, Python's
+#         versioned module path), so they need rebuilds the fast ring
+#         cannot give them.
 #   link  a dependency the channel cannot provide, or an ELF whose
 #         libraries, symbol versions or interpreter are missing (`ldd -r`). Fails only where edge does not show the same
 #         line: an optional plugin whose library nobody installs is no
@@ -152,7 +153,10 @@ inspect_files() {
     dyn=$(readelf -d "$path" 2>/dev/null || true)
     [[ $dyn == *"(NEEDED)"* ]] || continue
 
-    needed=$(sed -n 's/.*(NEEDED).*\[\(.*\)\]/\1/p' <<<"$dyn" | rebuild_sonames)
+    # Only for code compiled here: a vendor's binary is the same bytes
+    # whatever we rebuild, so the link check below is all that applies.
+    needed=""
+    [[ ${COMPILED:-} == 1 ]] && needed=$(sed -n 's/.*(NEEDED).*\[\(.*\)\]/\1/p' <<<"$dyn" | rebuild_sonames)
     if [[ -n $needed ]]; then
       problem rule "$path" "links $(echo $needed), which needs rebuilds the fast ring cannot give it"
       continue
