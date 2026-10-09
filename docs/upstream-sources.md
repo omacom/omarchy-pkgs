@@ -79,7 +79,10 @@ pushed. `BYPASS_MIN_RELEASE_AGE=1` bypasses the hold.
 
 Packages marked `"auto_merge": true` ride the unattended lane
 (`track-branches.yml`) instead of the reviewed sync PR: their bump PR is opened
-and auto-merged as soon as the build checks pass. `bin/sync-upstream --lane
+and auto-merged as soon as the build checks pass. The lane works with every
+provider, not only branch watches, so it also carries release feeds trusted to
+ship without review: the browsers, large vendors' apps, Omacom's own projects,
+and vendor binaries that hold fresh releases with `min_release_age`. `bin/sync-upstream --lane
 reviewed|auto-merge|all` selects a lane; the scheduled workflows each pass their
 own. Packages that pin the same branch move in lockstep: if one of them fails
 to update, the run restores the others and reports the group as failed. A

@@ -391,7 +391,7 @@ on `auto/sync-upstream-<packages>` or `auto/sync-rebuilds-<packages>`.
 |---|---|---|---|
 | `sync-upstream.yml` | every 6 hours | one PR on `auto/sync-upstream` with every new upstream release | **a maintainer merges it** |
 | `sync-rebuilds.yml` | every 6 hours | one PR on `auto/sync-rebuilds` bumping `pkgrel` where a `rebuild_on` dependency moved | itself, when green |
-| `track-branches.yml` | every 2 hours | one PR on `auto/track-branches` pinning `"auto_merge": true` packages to their branch tip | itself, when green |
+| `track-branches.yml` | every 2 hours | one PR on `auto/track-branches` updating `"auto_merge": true` packages to their newest upstream release or branch tip | itself, when green |
 
 - **Each PR is a batch.** One package that fails to build keeps the whole PR
   red and unmerged. Fix that package on `master`. For the two sync workflows,
@@ -427,7 +427,7 @@ Details: [docs/upstream-sources.md](docs/upstream-sources.md),
 | `source` | Always `local`. |
 | `upstream` | Where releases come from. Mutually exclusive with an `.omarchy/upstream.sh` hook. |
 | `min_release_age` | Hold a new upstream release back this long (`"24h"`, `"2d"`). A release whose age cannot be proven fails the sync. |
-| `auto_merge` | `true` moves the package's updates from the reviewed sync PR to `track-branches.yml`. For packages that follow a moving branch. Needs an upstream declaration. |
+| `auto_merge` | `true` moves the package's updates from the reviewed sync PR to `track-branches.yml`. For packages that follow a moving branch, and for trusted vendor and Omacom release feeds. Needs an upstream declaration. |
 | `release_ring` | `fast`: publish to `rc` and `stable` on merge, not only `edge`. Takes effect with the package's next version: bump `pkgrel` in the same PR. |
 | `channels` | The only channels the package may be published to. `omarchy-dev` is held to `["edge"]` this way. |
 | `pinned` | Version is set per release on the `rc` branch. Used by `omarchy` and `omarchy-settings`. |
