@@ -1,0 +1,206 @@
+From 0f0aeba492533b9dba991f131289d4a17c1f3c5d Mon Sep 17 00:00:00 2001
+From: Kaushal Rajeev Butala <kbutala@nvidia.com>
+Date: Thu, 8 Oct 2026 13:33:41 +0530
+Subject: [PATCH] NVIDIA: SAUCE: pinctrl: mt8901: sync wake EINT event mask
+
+MT8901 EINT has a separate event mask that controls whether an EINT can
+be forwarded as a wake event. The current driver clears that mask only
+for the static SoC list, which covers the ACPI event line.
+
+Firmware-described devices can be marked wake-capable independently,
+so PM arms their IRQs through the normal irq_set_wake path. Clear the
+hardware event mask when the IRQ core enables such an EINT as a wake
+source so keyboard, touchpad, and other firmware-declared EINT wake
+sources can reach the SPM without adding board-specific EINT numbers.
+
+Restore the hardware event mask when wake is disabled, otherwise a pin
+that was armed once would remain an SPM wake event until reboot. Keep
+pins from the SoC static event-unmask list unmasked so permanently
+required wake events such as the ACPI event line remain armed.
+
+Make event-mask register programming opt-in for SoCs that declare
+support for it, and re-apply both the static list and dynamically
+armed wake_mask pins on resume in case the event register state is
+lost across system sleep.
+
+Fixes: 927eedaaa809 ("NVIDIA: SAUCE: pinctrl: mt8901: Enable ACPI wake-event EINT support")
+Signed-off-by: Kaushal Rajeev Butala <kbutala@nvidia.com>
+---
+ drivers/pinctrl/mediatek/mtk-eint.c       | 91 ++++++++++++++++++++---
+ drivers/pinctrl/mediatek/mtk-eint.h       |  1 +
+ drivers/pinctrl/mediatek/pinctrl-mt8901.c |  1 +
+ 3 files changed, 82 insertions(+), 11 deletions(-)
+
+diff --git a/drivers/pinctrl/mediatek/mtk-eint.c b/drivers/pinctrl/mediatek/mtk-eint.c
+index 461f1b131..0da6dafa0 100644
+--- a/drivers/pinctrl/mediatek/mtk-eint.c
++++ b/drivers/pinctrl/mediatek/mtk-eint.c
+@@ -166,18 +166,17 @@ static void mtk_eint_unmask(struct irq_data *d)
+ 		mtk_eint_flip_edge(eint, d->hwirq);
+ }
+ 
+-/*
+- * Clear the event_clr bit for a single EINT so its wake-event is not
+- * suppressed. Mirrors mtk_eint_unmask() addressing: register is banked
+- * per instance and word-indexed by (idx / 32).
+- */
+-static void mtk_eint_event_unmask_one(struct mtk_eint *eint,
+-				      unsigned int eint_num)
++static void mtk_eint_write_event_mask(struct mtk_eint *eint,
++				      unsigned int eint_num,
++				      unsigned int reg_offset)
+ {
+ 	unsigned int idx, inst;
+ 	unsigned int mask;
+ 	void __iomem *reg;
+ 
++	if (!eint->hw->has_event_mask)
++		return;
++
+ 	if (eint_num >= eint->hw->ap_num)
+ 		return;
+ 
+@@ -188,10 +187,47 @@ static void mtk_eint_event_unmask_one(struct mtk_eint *eint,
+ 		return;
+ 
+ 	mask = BIT(idx & 0x1f);
+-	reg = mtk_eint_get_offset(eint, eint_num, eint->regs->event_clr);
++	reg = mtk_eint_get_offset(eint, eint_num, reg_offset);
+ 	writel(mask, reg);
+ }
+ 
++/*
++ * Clear the event_clr bit for a single EINT so its wake-event is not
++ * suppressed. Mirrors mtk_eint_unmask() addressing: register is banked
++ * per instance and word-indexed by (idx / 32).
++ */
++static void mtk_eint_event_unmask_one(struct mtk_eint *eint,
++				      unsigned int eint_num)
++{
++	mtk_eint_write_event_mask(eint, eint_num, eint->regs->event_clr);
++}
++
++static bool mtk_eint_is_static_event_unmask_pin(struct mtk_eint *eint,
++						unsigned int eint_num)
++{
++	unsigned int i;
++
++	if (!eint->event_pins)
++		return false;
++
++	for (i = 0; i < eint->num_event_pins; i++) {
++		if (eint->event_pins[i] == eint_num)
++			return true;
++	}
++
++	return false;
++}
++
++/*
++ * Set the event mask for a single EINT so its wake-event is suppressed
++ * again. Callers must skip pins in the SoC's static event-unmask list.
++ */
++static void mtk_eint_event_mask_one(struct mtk_eint *eint,
++				    unsigned int eint_num)
++{
++	mtk_eint_write_event_mask(eint, eint_num, eint->regs->event_set);
++}
++
+ /*
+  * Clear the event mask of every pin in the SoC's eint_event_unmask list so
+  * their wake events reach the SPM after init and resume.
+@@ -200,13 +236,41 @@ static void mtk_eint_apply_event_unmask(struct mtk_eint *eint)
+ {
+ 	unsigned int i;
+ 
+-	if (!eint->event_pins || !eint->num_event_pins)
++	if (!eint->hw->has_event_mask || !eint->event_pins ||
++	    !eint->num_event_pins)
+ 		return;
+ 
+ 	for (i = 0; i < eint->num_event_pins; i++)
+ 		mtk_eint_event_unmask_one(eint, eint->event_pins[i]);
+ }
+ 
++static void mtk_eint_apply_wake_event_unmask(struct mtk_eint *eint)
++{
++	unsigned int eint_num, pin, shift;
++	int inst, port, port_num;
++	u32 bits;
++
++	if (!eint->hw->has_event_mask)
++		return;
++
++	for (inst = 0; inst < eint->nbase; inst++) {
++		port_num = DIV_ROUND_UP(eint->base_pin_num[inst], 32);
++		for (port = 0; port < port_num; port++) {
++			bits = eint->wake_mask[inst][port];
++			while (bits) {
++				shift = __ffs(bits);
++				bits &= ~BIT(shift);
++				pin = port * 32 + shift;
++				if (pin >= eint->base_pin_num[inst])
++					continue;
++
++				eint_num = eint->pin_list[inst][pin];
++				mtk_eint_event_unmask_one(eint, eint_num);
++			}
++		}
++	}
++}
++
+ static unsigned int mtk_eint_get_mask(struct mtk_eint *eint,
+ 				      unsigned int eint_num)
+ {
+@@ -285,10 +349,14 @@ static int mtk_eint_irq_set_wake(struct irq_data *d, unsigned int on)
+ 	unsigned int shift = idx & 0x1f;
+ 	unsigned int port = idx >> 5;
+ 
+-	if (on)
++	if (on) {
+ 		eint->wake_mask[inst][port] |= BIT(shift);
+-	else
++		mtk_eint_event_unmask_one(eint, d->hwirq);
++	} else {
+ 		eint->wake_mask[inst][port] &= ~BIT(shift);
++		if (!mtk_eint_is_static_event_unmask_pin(eint, d->hwirq))
++			mtk_eint_event_mask_one(eint, d->hwirq);
++	}
+ 
+ 	return 0;
+ }
+@@ -483,6 +551,7 @@ int mtk_eint_do_resume(struct mtk_eint *eint)
+ {
+ 	mtk_eint_chip_write_mask(eint, eint->cur_mask);
+ 	mtk_eint_apply_event_unmask(eint);
++	mtk_eint_apply_wake_event_unmask(eint);
+ 
+ 	return 0;
+ }
+diff --git a/drivers/pinctrl/mediatek/mtk-eint.h b/drivers/pinctrl/mediatek/mtk-eint.h
+index cbcca2830..443c4bec2 100644
+--- a/drivers/pinctrl/mediatek/mtk-eint.h
++++ b/drivers/pinctrl/mediatek/mtk-eint.h
+@@ -42,6 +42,7 @@ struct mtk_eint_hw {
+ 	unsigned int	ap_num;
+ 	unsigned int	db_cnt;
+ 	const unsigned int *db_time;
++	bool		has_event_mask;
+ };
+ 
+ struct mtk_eint_pin {
+diff --git a/drivers/pinctrl/mediatek/pinctrl-mt8901.c b/drivers/pinctrl/mediatek/pinctrl-mt8901.c
+index 09f3ec336..4c3cca4e7 100644
+--- a/drivers/pinctrl/mediatek/pinctrl-mt8901.c
++++ b/drivers/pinctrl/mediatek/pinctrl-mt8901.c
+@@ -1410,6 +1410,7 @@ static const struct mtk_eint_hw mt8901_eint_hw = {
+ 	.ap_num    = 209,
+ 	.db_cnt    = 32,
+ 	.db_time   = debounce_time_mt8901,
++	.has_event_mask = true,
+ };
+ 
+ static const unsigned int mt8901_eint_event_unmask[] = {20};
+-- 
+2.56.0
+

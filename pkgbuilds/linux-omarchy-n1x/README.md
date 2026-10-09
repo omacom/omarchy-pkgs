@@ -2,7 +2,7 @@
 
 The `linux-omarchy` kernel built for aarch64 with NVIDIA N1x (RTX Spark) platform support added. It carries the same kernel.org source and signed Omarchy patch set as `linux-omarchy` 7.2.5-6, plus N1x topic patches numbered 1000 and up. The intent is to fold these into `linux-omarchy` itself once it builds for aarch64; until then this is the kernel Omarchy installs on N1x machines (`install/hardware/n1x.sh` in omarchy), replacing NVIDIA's 7.0-based `linux-n1x`.
 
-The `pkgrel` counts N1x revisions of this package and starts again at 1 when the kernel version changes. It was `6.1` to `6.9` while it tracked `linux-omarchy`'s release; the ninth revision became `9`, `10` adds the Dell XPS 16 patches, `11` brings a dock's displays back after a failed DisplayPort tunnel, `12` stops the clock during suspend-to-idle, and `13` brings NVIDIA's device sleep patches from 1022.23.
+The `pkgrel` counts N1x revisions of this package and starts again at 1 when the kernel version changes. It was `6.1` to `6.9` while it tracked `linux-omarchy`'s release; the ninth revision became `9`, `10` adds the Dell XPS 16 patches, `11` brings a dock's displays back after a failed DisplayPort tunnel, `12` stops the clock during suspend-to-idle, `13` brings NVIDIA's device sleep patches from 1022.23, and `14` lets keyboard and touchpad interrupts wake the system from the platform's deepest sleep.
 
 ## N1x patches
 
@@ -45,6 +45,8 @@ Patches 1090–1095 are NVIDIA's SAUCE from `Ubuntu-nvidia-7.0-7.0.0-1022.23_24.
 - `1091` (fff35e933484) gates a whole PCIe host through power_wrap once every root port on it is in D3cold and none is set to wake the system.
 - `1092` (053c2c7902c3) adds `xhci-mtk-v2` (`CONFIG_USB_XHCI_MTK_V2`) for the NVDA8000/NVDA8001 controllers, which reports their D3 and D0 in system suspend. It is rebased onto 7.2's `xhci_dbc_remove()`, which takes `enable_mutex`. `1093` (522542575927) adds the 2 ms delay before CRS that these controllers need on resume.
 - `1094` (a6a609d1b7ff) and `1095` (03b41c9a041a) bind SPI over ACPI and have the SPI and I2C controllers report D3 in suspend.
+
+`1096` (0f0aeba49253, NVIDIA PR #635, merged after 1022.23) clears the MT8901 EINT event mask for every interrupt armed as a wake source, not only the ACPI event line, so the SPM sees keyboard and touchpad wakes. Without it the platform's deepest sleep state could only be left by the ACPI event line, and a key press did not wake it.
 
 NVIDIA's companion watchdog rework (280db0e8cf30) is not carried; it replaces the sbsa_gwdt sleep patch already in `1020`.
 
