@@ -71,6 +71,19 @@ out=$(channel_failures "$T/edge" "$T/stable")
   && pass "the copy beside the binary beats a deeper one" || fail "deeper bundled copy chosen"
 [[ $(channel_failures "$T/stable" "$T/stable") == rule* ]] \
   && pass "rule problems survive comparing a file with itself" || fail "same-file comparison hid rules"
+# The fallback for a dependency no channel has still installs the others,
+# so their libraries are inspected rather than missing on every channel.
+mkdir -p "$T/pkg"
+printf '%s\n' 'pkgname = yaru-gtk-theme' 'depend = gtk-engine-murrine' 'depend = gtk3>=3.24' \
+  'depend = yaru-icon-theme' 'depend = glib2' > "$T/pkg/.PKGINFO"
+bsdtar -cf "$T/a.pkg.tar" -C "$T/pkg" .PKGINFO
+printf '%s\n' 'pkgname = yaru-icon-theme' 'provides = yaru-icons=1' 'depend = hicolor-icon-theme' > "$T/pkg/.PKGINFO"
+bsdtar -cf "$T/b.pkg.tar" -C "$T/pkg" .PKGINFO
+pacman() { local a; for a in "$@"; do [[ $a == -* || $a == 4 ]] || echo "$a"; done > "$T/installed"; }
+install_resolvable_dependencies 'warning: cannot resolve "gtk-engine-murrine", a dependency of "yaru-gtk-theme"' "$T/a.pkg.tar" "$T/b.pkg.tar"
+unset -f pacman
+[[ $(sort "$T/installed" | tr '\n' ' ') == "glib2 gtk3>=3.24 hicolor-icon-theme " ]] \
+  && pass "the resolvable dependencies are installed, minus the missing one and the set's own" || fail "installed: $(tr '\n' ' ' < "$T/installed")"
 cp "$T/stable" "$T/edge2"
 [[ $(channel_failures "$T/edge2" "$T/stable") == rule* ]] && pass "rule problems block even when edge has them" || fail "rule problem excused by edge"
 

@@ -194,6 +194,31 @@ inspect_files() {
   return 0
 }
 
+# install_resolvable_dependencies <pacman log> <package file>...: the
+# packages' dependencies, minus the ones the log says cannot be resolved and
+# the ones the packages provide each other.
+install_resolvable_dependencies() {
+  local log=$1 file dep
+  shift
+  local -a wanted=()
+  local -A skip=()
+  while IFS= read -r dep; do
+    skip[$dep]=1
+  done < <(sed -n 's/^warning: cannot resolve "\([^"]*\)", a dependency of .*/\1/p' <<<"$log")
+  for file in "$@"; do
+    while IFS= read -r dep; do
+      skip[$dep]=1
+    done < <(bsdtar -xOf "$file" .PKGINFO | sed -n 's/^\(pkgname\|provides\) = \([^=<>]*\).*/\2/p')
+  done
+  for file in "$@"; do
+    while IFS= read -r dep; do
+      [[ -n ${skip[$dep]:-} || -n ${skip[${dep%%[<>=]*}]:-} ]] || wanted+=("$dep")
+    done < <(bsdtar -xOf "$file" .PKGINFO | sed -n 's/^depend = //p')
+  done
+  (( ${#wanted[@]} )) || return 0
+  pacman -S --needed --asdeps --noconfirm --noscriptlet --ask 4 "${wanted[@]}"
+}
+
 # check <results> <package file>...
 check() {
   local results=$1 file
@@ -214,6 +239,12 @@ check() {
     fi
     mapfile -t lines <<<"$deps"
     problem link - "${lines[@]}" > "$results"
+    # Everything else they depend on is installed first, from this channel,
+    # so its libraries are the ones inspected and not missing everywhere.
+    if ! install_resolvable_dependencies "$log" "$@"; then
+      problem rule - "the packages' other dependencies cannot be installed on this channel" > "$results"
+      return 0
+    fi
     pacman -Udd --noconfirm --noscriptlet --ask 4 "$@"
   fi
   for file in "$@"; do
