@@ -4,9 +4,10 @@
 # helpers/fast-ring-check.sh for what is checked and why.
 #
 # Usage: bin/check-fast-ring --arch <arch> --channels "<channel>..." <package file>...
-#   Each channel other than edge gets a fresh container from the edge
-#   builder image (omarchy-pkg-builder:latest-<arch>-edge, which bin/build
-#   leaves behind), pointed at that channel's repositories.
+#   Edge and each other channel get a fresh container from the edge builder
+#   image (omarchy-pkg-builder:latest-<arch>-edge, which bin/build leaves
+#   behind), pointed at that channel's repositories. A channel fails on a
+#   problem edge does not share, or on a rule the fast ring never allows.
 set -euo pipefail
 BUILD_ROOT=$(realpath "${BASH_SOURCE[0]%/*}/..")
 source "$BUILD_ROOT/helpers/message-helpers.sh"
@@ -36,18 +37,37 @@ mounts=()
 for file in "$@"; do
   file=$(realpath "$file")
   files+=("/check/${file##*/}")
-  mounts+=(-v "$file:/check/${file##*/}:ro")
+  # --mount, not -v: an epoch puts a colon in the filename.
+  mounts+=(--mount "type=bind,src=$file,dst=/check/${file##*/},readonly")
 done
+
+results=$(mktemp -d)
+trap 'rm -rf "$results"' EXIT
+chmod 777 "$results"
+
+# inspect <channel>: install the packages on <channel> and record what would
+# break there in $results/<channel>.
+inspect() {
+  print_info "Inspecting ${files[*]##*/} on $1 ($ARCH)..."
+  "$CONTAINER_ENGINE" run --rm --user root "$(get_platform_arg "$ARCH")" \
+    -v "$BUILD_ROOT/helpers:/helpers:ro" -v "$results:/results" "${mounts[@]}" "$image" \
+    bash -c '/helpers/fast-ring-check.sh prepare "$1" "$2" >/dev/null && /helpers/fast-ring-check.sh check "/results/$1" "${@:3}" >/dev/null' \
+    _ "$1" "$ARCH" "${files[@]}"
+}
+
+# Edge is the baseline: the build environment's own view of the package.
+inspect edge
 
 failed=()
 for channel in $channels; do
   [[ $channel == edge ]] && continue
   validate_mirror "$channel" || { print_error "Invalid channel: $channel"; exit 2; }
-  print_info "Checking ${files[*]##*/} against $channel ($ARCH)..."
-  if ! "$CONTAINER_ENGINE" run --rm --user root "$(get_platform_arg "$ARCH")" \
-    -v "$BUILD_ROOT/helpers:/helpers:ro" "${mounts[@]}" "$image" \
-    bash -c '/helpers/fast-ring-check.sh prepare "$1" "$2" >/dev/null && /helpers/fast-ring-check.sh check "${@:3}"' \
-    _ "$channel" "$ARCH" "${files[@]}"; then
+  inspect "$channel"
+  problems=$(bash -c 'source "$1"; channel_failures "$2" "$3"' _ \
+    "$BUILD_ROOT/helpers/fast-ring-check.sh" "$results/edge" "$results/$channel")
+  if [[ -n $problems ]]; then
+    print_error "Fails on $channel:"
+    awk -F'\t' '{ printf "  %s: %s\n", $2, $3 }' <<<"$problems"
     failed+=("$channel")
   fi
 done

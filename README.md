@@ -181,12 +181,14 @@ the libraries it was built for.
 
 Both halves are enforced. `rebuild_on` and `"release_ring": "fast"` cannot be
 combined. And after a fast-ring package builds, `build-pr.yml` runs
-`bin/check-fast-ring`, which installs the package on `rc` and `stable` from
-their own repositories and fails the build when:
+`bin/check-fast-ring`, which installs the package on `edge`, `rc` and `stable`
+from each channel's own repositories and fails the build when:
 
-- a dependency cannot be satisfied there;
-- a binary needs a library or a versioned symbol (`GLIBC_2.43`, say) that the
-  channel does not have yet (`ldd -r`);
+- a dependency cannot be satisfied on `rc` or `stable`;
+- a binary needs a library or a versioned symbol (`GLIBC_2.43`, say) that
+  `rc` or `stable` does not have yet (`ldd -r`). Edge is the baseline: an
+  optional plugin whose library is missing on every channel is not the fast
+  ring's concern;
 - a binary links Qt or libpython, or the package installs Python modules.
   These break on a dependency update without a missing symbol to show it:
   Qt's private API and plugin version check, Python's versioned module path.
