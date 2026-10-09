@@ -81,14 +81,32 @@ prepare() {
   printf 'Server = %s\n' "$server" > /etc/pacman.d/mirrorlist
   sed -i '/^\[omarchy\]/,/^$/d' /etc/pacman.conf
   sed -i "/^\[core\]$/i [omarchy]\nSigLevel = Required DatabaseOptional\nServer = https://pkgs.omarchy.org/$channel/$arch\n" /etc/pacman.conf
-  # -uu: a channel's snapshot is older than the image's, so this downgrades.
-  pacman -Syuu --noconfirm
+  pacman -Sy --noconfirm
   # A package edge added and the channel does not have yet would otherwise
   # stay installed and satisfy a dependency no machine on the channel can.
+  # Removed first: its dependencies could hold back the downgrade.
   mapfile -t foreign < <(pacman -Qmq || true)
   if (( ${#foreign[@]} )); then
     pacman -Rdd --noconfirm "${foreign[@]}"
   fi
+  # -uu: a channel's snapshot is older than the image's, so this downgrades.
+  pacman -Suu --noconfirm
+}
+
+# bundled_dir <binary> <directory>...: of the directories holding a bundled
+# copy of one library, the one nearest the binary, where its own launcher
+# would look.
+bundled_dir() {
+  local binary=$1 dir best="" best_len=-1 prefix
+  shift
+  for dir in "$@"; do
+    prefix=$dir
+    until [[ ${binary%/*}/ == "$prefix"/* || -z $prefix ]]; do prefix=${prefix%/*}; done
+    if (( ${#prefix} > best_len )); then
+      best=$dir best_len=${#prefix}
+    fi
+  done
+  printf '%s\n' "$best"
 }
 
 # problem <kind> <path> <detail>...: one record per detail.
@@ -103,17 +121,18 @@ problem() {
 # inspect_files: the installed paths on stdin, one per line. Prints a
 # problem record for everything that would break on this system.
 inspect_files() {
-  local machine path kind out needed dyn prog interp soname
-  local -a paths=() missing=() dirs=() lines=()
+  local machine path kind out needed dyn prog interp soname dir
+  local -a paths=() dirs=() lines=() copies=()
   local -A shipped=()
   mapfile -t paths
   machine=$(readelf -h /usr/bin/bash | sed -n 's/^ *Machine: *//p')
 
-  # Libraries the package carries itself, by soname. Vendor launchers put
-  # their own directory on LD_LIBRARY_PATH, so a binary that does not find
-  # one of these through its runpath is checked with it found there.
+  # Libraries the package carries itself: soname -> directories, one per
+  # line. Vendor launchers put their own directory on LD_LIBRARY_PATH, so a
+  # binary that fails against the system's copy is checked again with the
+  # package's own.
   for path in "${paths[@]}"; do
-    [[ $path =~ \.so(\.[0-9]+)*$ ]] && shipped[${path##*/}]=${path%/*}
+    [[ $path =~ \.so(\.[0-9]+)*$ ]] && shipped[${path##*/}]+="${path%/*}"$'\n'
   done
 
   for path in "${paths[@]}"; do
@@ -145,14 +164,17 @@ inspect_files() {
     kind=$(elf_kind "$path" "$prog")
 
     out=$(ldd -r "$path" 2>&1 | ldd_problems "$kind")
-    mapfile -t missing < <(sed -n 's/^[[:space:]]*\([^ ]*\) => not found.*/\1/p' <<<"$out")
-    dirs=()
-    for soname in "${missing[@]}"; do
-      [[ -n ${shipped[$soname]:-} ]] || { dirs=(); break; }
-      dirs+=("${shipped[$soname]}")
-    done
-    if (( ${#dirs[@]} )); then
-      out=$(LD_LIBRARY_PATH=$(IFS=:; echo "${dirs[*]}") ldd -r "$path" 2>&1 | ldd_problems "$kind")
+    if [[ -n $out ]]; then
+      dirs=()
+      while IFS= read -r soname; do
+        [[ -n ${shipped[$soname]:-} ]] || continue
+        mapfile -t copies < <(printf '%s' "${shipped[$soname]}")
+        dir=$(bundled_dir "$path" "${copies[@]}")
+        [[ " ${dirs[*]} " == *" $dir "* ]] || dirs+=("$dir")
+      done < <(sed -n 's/.*(NEEDED).*\[\(.*\)\]/\1/p' <<<"$dyn")
+      if (( ${#dirs[@]} )); then
+        out=$(LD_LIBRARY_PATH=$(IFS=:; echo "${dirs[*]}") ldd -r "$path" 2>&1 | ldd_problems "$kind")
+      fi
     fi
     if [[ -n $out ]]; then
       # Load addresses differ between runs; drop them so channels compare.
@@ -185,7 +207,9 @@ check() {
 # that block the fast ring. Rule problems always do; link problems only
 # when edge does not have the same one.
 channel_failures() {
-  awk -F'\t' 'NR == FNR { if ($1 == "link") edge[$0] = 1; next }
+  # FILENAME, not NR == FNR: an empty edge file would make that hold for
+  # the channel's lines too, and every failure would vanish.
+  awk -F'\t' 'FILENAME == ARGV[1] { if ($1 == "link") edge[$0] = 1; next }
     $1 == "rule" || !($0 in edge)' "$1" "$2"
 }
 

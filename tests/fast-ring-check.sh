@@ -55,6 +55,11 @@ out=$(channel_failures "$T/edge" "$T/stable")
 [[ $out != *liblttng* ]] && pass "a problem edge shares is not the channel's" || fail "shared problem blocked: $out"
 [[ $out == *libavcodec.so.62* ]] && pass "a library only edge has blocks the channel" || fail "channel-only problem passed: $out"
 [[ $out == *libQt6Core* ]] && pass "a rule problem blocks wherever it happens" || fail "rule problem passed: $out"
+: > "$T/clean-edge"
+[[ $(channel_failures "$T/clean-edge" "$T/stable" | wc -l) -eq 3 ]] \
+  && pass "every channel problem counts when edge has none" || fail "clean edge hid problems"
+[[ $(bundled_dir /opt/a/bin/app /opt/b/lib /opt/a/lib) == /opt/a/lib ]] \
+  && pass "a binary gets its own bundled copy of a library" || fail "bundled copy from another app"
 cp "$T/stable" "$T/edge2"
 [[ $(channel_failures "$T/edge2" "$T/stable") == rule* ]] && pass "rule problems block even when edge has them" || fail "rule problem excused by edge"
 
