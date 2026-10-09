@@ -229,9 +229,9 @@ These packages were already excluded from automatic AUR updates. The migration p
 `sync-upstream.yml` pushes its PR with the built-in `GITHUB_TOKEN`, so GitHub
 holds the PR's build and test runs for approval. The workflow labels its own
 PR `build-approved`, and its `approve` job releases the held runs for each
-commit it pushes. A push to an `auto/sync-*` branch does not cancel the PR's
-build in flight: the new build waits, then reuses every artifact the finished
-one uploaded.
+commit it pushes. A push to an `auto/sync-*` branch, or to the tracker's
+`auto/track-branches`, does not cancel the PR's build in flight: the new
+build waits, then reuses every artifact the finished one uploaded.
 
 Because of that push, GitHub starts no `pull_request_target` workflow for the
 PR, so `auto-merge-pr.yml` never arms it: a maintainer merges it.
