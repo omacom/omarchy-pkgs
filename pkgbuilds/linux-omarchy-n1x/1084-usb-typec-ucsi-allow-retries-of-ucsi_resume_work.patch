@@ -1,0 +1,108 @@
+From a2463e239443d7a132624700153f0cb1fab13b2c Mon Sep 17 00:00:00 2001
+From: Jameson Thies <jthies@google.com>
+Date: Fri, 4 Sep 2026 23:41:23 +0000
+Subject: [PATCH] usb: typec: ucsi: allow retries of ucsi_resume_work
+
+On resume, the UCSI driver will re-enable notifications by sending
+SET_NOTIFICATION_ENABLE. The LPM/PPM may be busy during system
+resume causing SET_NOTIFICATION_ENABLE to fail and preventing the UCSI
+driver from receiving connection status changes.
+
+Change resume work to a delayed workqueue to allow retries on failed
+SET_NOTIFICATION_ENABLED commands. Additionally, cancel resume work
+on suspend to prevent pending resume commands from impacting suspend.
+
+Signed-off-by: Jameson Thies <jthies@google.com>
+Reviewed-by: Benson Leung <bleung@chromium.org>
+Reviewed-by: Heikki Krogerus <heikki.krogerus@linux.intel.com>
+Acked-by: Marco Crivellari <marco.crivellari@suse.com>
+Link: https://patch.msgid.link/20260904234124.2336922-1-jthies@google.com
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+[omarchy: context fix in ucsi_unregister(); 7.2.5 has no
+ ucsi_debugfs_unregister() call there yet]
+---
+ drivers/usb/typec/ucsi/ucsi.c | 18 +++++++++++++-----
+ drivers/usb/typec/ucsi/ucsi.h |  3 ++-
+ 2 files changed, 15 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/usb/typec/ucsi/ucsi.c b/drivers/usb/typec/ucsi/ucsi.c
+index 3362776d2..fab279a4b 100644
+--- a/drivers/usb/typec/ucsi/ucsi.c
++++ b/drivers/usb/typec/ucsi/ucsi.c
+@@ -2158,7 +2158,7 @@ static int ucsi_init(struct ucsi *ucsi)
+ 
+ static void ucsi_resume_work(struct work_struct *work)
+ {
+-	struct ucsi *ucsi = container_of(work, struct ucsi, resume_work);
++	struct ucsi *ucsi = container_of(to_delayed_work(work), struct ucsi, resume_work);
+ 	struct ucsi_connector *con;
+ 	u64 command;
+ 	int ret;
+@@ -2167,6 +2167,11 @@ static void ucsi_resume_work(struct work_struct *work)
+ 	command = UCSI_SET_NOTIFICATION_ENABLE | ucsi->ntfy;
+ 	ret = ucsi_send_command(ucsi, command, NULL, 0);
+ 	if (ret < 0) {
++		if (++ucsi->resume_retries < 5) {
++			queue_delayed_work(system_dfl_long_wq, &ucsi->resume_work,
++					   msecs_to_jiffies(500));
++			return;
++		}
+ 		dev_err(ucsi->dev, "failed to re-enable notifications (%d)\n", ret);
+ 		return;
+ 	}
+@@ -2187,6 +2192,7 @@ int ucsi_suspend(struct ucsi *ucsi)
+ 	 * EC is stopped for suspend; state is re-read on resume.
+ 	 */
+ 	cancel_delayed_work_sync(&ucsi->work);
++	cancel_delayed_work_sync(&ucsi->resume_work);
+ 
+ 	if (!ucsi->connector)
+ 		return 0;
+@@ -2200,8 +2206,10 @@ EXPORT_SYMBOL_GPL(ucsi_suspend);
+ 
+ int ucsi_resume(struct ucsi *ucsi)
+ {
+-	if (ucsi->connector)
+-		queue_work(system_long_wq, &ucsi->resume_work);
++	if (ucsi->connector) {
++		ucsi->resume_retries = 0;
++		queue_delayed_work(system_dfl_long_wq, &ucsi->resume_work, 0);
++	}
+ 	return 0;
+ }
+ EXPORT_SYMBOL_GPL(ucsi_resume);
+@@ -2317,7 +2325,7 @@ struct ucsi *ucsi_create(struct device *dev, const struct ucsi_operations *ops)
+ 	if (!ucsi)
+ 		return ERR_PTR(-ENOMEM);
+ 
+-	INIT_WORK(&ucsi->resume_work, ucsi_resume_work);
++	INIT_DELAYED_WORK(&ucsi->resume_work, ucsi_resume_work);
+ 	INIT_DELAYED_WORK(&ucsi->work, ucsi_init_work);
+ 	mutex_init(&ucsi->ppm_lock);
+ 	init_completion(&ucsi->complete);
+@@ -2383,7 +2391,7 @@ void ucsi_unregister(struct ucsi *ucsi)
+ 
+ 	/* Make sure that we are not in the middle of driver initialization */
+ 	cancel_delayed_work_sync(&ucsi->work);
+-	cancel_work_sync(&ucsi->resume_work);
++	cancel_delayed_work_sync(&ucsi->resume_work);
+ 
+ 	/* Disable notifications */
+ 	ucsi->ops->async_control(ucsi, cmd);
+diff --git a/drivers/usb/typec/ucsi/ucsi.h b/drivers/usb/typec/ucsi/ucsi.h
+index 6e1608d88..e1a4df6aa 100644
+--- a/drivers/usb/typec/ucsi/ucsi.h
++++ b/drivers/usb/typec/ucsi/ucsi.h
+@@ -483,7 +483,8 @@ struct ucsi {
+ 	struct ucsi_connector *connector;
+ 	struct ucsi_debugfs_entry *debugfs;
+ 
+-	struct work_struct resume_work;
++	struct delayed_work resume_work;
++	int resume_retries;
+ 	struct delayed_work work;
+ 	int work_count;
+ #define UCSI_ROLE_SWITCH_RETRY_PER_HZ	10
+-- 
+2.56.0
+

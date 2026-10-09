@@ -2,7 +2,7 @@
 
 The `linux-omarchy` kernel built for aarch64 with NVIDIA N1x (RTX Spark) platform support added. It carries the same kernel.org source and signed Omarchy patch set as `linux-omarchy` 7.2.5-6, plus N1x topic patches numbered 1000 and up. The intent is to fold these into `linux-omarchy` itself once it builds for aarch64; until then this is the kernel Omarchy installs on N1x machines (`install/hardware/n1x.sh` in omarchy), replacing NVIDIA's 7.0-based `linux-n1x`.
 
-The `pkgrel` counts N1x revisions of this package and starts again at 1 when the kernel version changes. It was `6.1` to `6.9` while it tracked `linux-omarchy`'s release; the ninth revision became `9`, `10` adds the Dell XPS 16 patches, `11` brings a dock's displays back after a failed DisplayPort tunnel, `12` stops the clock during suspend-to-idle, `13` brings NVIDIA's device sleep patches from 1022.23, `14` lets keyboard and touchpad interrupts wake the system from the platform's deepest sleep, and `15` brings audio fixes from upstream.
+The `pkgrel` counts N1x revisions of this package and starts again at 1 when the kernel version changes. It was `6.1` to `6.9` while it tracked `linux-omarchy`'s release; the ninth revision became `9`, `10` adds the Dell XPS 16 patches, `11` brings a dock's displays back after a failed DisplayPort tunnel, `12` stops the clock during suspend-to-idle, `13` brings NVIDIA's device sleep patches from 1022.23, `14` lets keyboard and touchpad interrupts wake the system from the platform's deepest sleep, and `15` brings audio and UCSI fixes from upstream.
 
 ## N1x patches
 
@@ -44,6 +44,8 @@ Patches 1070–1082 make USB4 and Thunderbolt work. The N1x host routers (`\_SB.
 - `1080` keeps the routers out of USB4 sleep during suspend. A router only leaves that sleep through the reset it gets when its host interface loses power, which never happens here, so a port with a device attached stopped answering after resume.
 - `1081` stops the driver powering the routers down when it is unbound. The SSPM can turn a router off, but turning it back on does not restore what the boot firmware set up, so the router stayed dead until the next boot.
 - `1082` offers the N1x host router's DP IN adapters again when a monitor is plugged in. The connection manager drops a DP IN adapter whose tunnel fails DPRX negotiation until the adapter reports a hotplug, which the N1x's never do, so after one failure every display behind a dock on that port stayed black until reboot.
+
+`1083` (2542613815) and `1084` (a2463e2394) are UCSI core fixes from linux-next, which `ucsi_acpi` uses for the USB-C ports. `1083` retries `ucsi_init()` when the EC rejects an early command or reports no connectors, as it already did for a missing role switch; before, one bad answer while the EC was still starting left `/sys/class/typec` empty for the whole boot. `1084` retries re-enabling UCSI notifications on resume, up to five times 500 ms apart; an EC that was still busy when the system woke otherwise left the ports deaf to plug events until reboot. Both needed small context changes for 7.2.5.
 
 Patches 1090–1095 are NVIDIA's SAUCE from `Ubuntu-nvidia-7.0-7.0.0-1022.23_24.04.1`, which has the MT8901 controllers report their sleep states to the SSPM through power_wrap. On this platform the ACPI power resources are empty stubs, so a device only powers down in suspend once the SSPM is told it reached D3:
 
