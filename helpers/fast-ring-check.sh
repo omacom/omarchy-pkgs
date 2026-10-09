@@ -81,7 +81,9 @@ prepare() {
   printf 'Server = %s\n' "$server" > /etc/pacman.d/mirrorlist
   sed -i '/^\[omarchy\]/,/^$/d' /etc/pacman.conf
   sed -i "/^\[core\]$/i [omarchy]\nSigLevel = Required DatabaseOptional\nServer = https://pkgs.omarchy.org/$channel/$arch\n" /etc/pacman.conf
-  pacman -Sy --noconfirm
+  # -yy: the image's databases are edge's and newer than the channel's, so
+  # a plain -y would call them current and keep them.
+  pacman -Syy --noconfirm
   # A package edge added and the channel does not have yet would otherwise
   # stay installed and satisfy a dependency no machine on the channel can.
   # Removed first: its dependencies could hold back the downgrade.
