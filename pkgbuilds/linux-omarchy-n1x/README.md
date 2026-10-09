@@ -2,7 +2,7 @@
 
 The `linux-omarchy` kernel built for aarch64 with NVIDIA N1x (RTX Spark) platform support added. It carries the same kernel.org source and signed Omarchy patch set as `linux-omarchy` 7.2.5-6, plus N1x topic patches numbered 1000 and up. The intent is to fold these into `linux-omarchy` itself once it builds for aarch64; until then this is the kernel Omarchy installs on N1x machines (`install/hardware/n1x.sh` in omarchy), replacing NVIDIA's 7.0-based `linux-n1x`.
 
-The `pkgrel` counts N1x revisions of this package and starts again at 1 when the kernel version changes. It was `6.1` to `6.9` while it tracked `linux-omarchy`'s release; the ninth revision became `9`, `10` adds the Dell XPS 16 patches, `11` brings a dock's displays back after a failed DisplayPort tunnel, `12` stops the clock during suspend-to-idle, `13` brings NVIDIA's device sleep patches from 1022.23, `14` lets keyboard and touchpad interrupts wake the system from the platform's deepest sleep, and `15` brings audio and UCSI fixes from upstream.
+The `pkgrel` counts N1x revisions of this package and starts again at 1 when the kernel version changes. It was `6.1` to `6.9` while it tracked `linux-omarchy`'s release; the ninth revision became `9`, `10` adds the Dell XPS 16 patches, `11` brings a dock's displays back after a failed DisplayPort tunnel, `12` stops the clock during suspend-to-idle, `13` brings NVIDIA's device sleep patches from 1022.23, `14` lets keyboard and touchpad interrupts wake the system from the platform's deepest sleep, and `15` brings audio and UCSI fixes from upstream and turns kexec handover off by default.
 
 ## N1x patches
 
@@ -70,6 +70,8 @@ Patches 1100–1104 are for the ASUS ProArt P14 (H7407BA) keyboard, 0B05:4B42: t
 ## Config
 
 `config.aarch64` started from NVIDIA's `arm64-nvidia` annotations for the 1021.21 tree, went through `olddefconfig` on 7.2.5, and then had `linux-omarchy`'s behavioral choices applied (preemption, LSM list, zswap and zram defaults, THP, built-in Btrfs, schedutil, I/O schedulers, binder off, no Canonical trusted keys).
+
+`CONFIG_KEXEC_HANDOVER_ENABLE_DEFAULT` is off since `15`, as in NVIDIA's 63bbd5f0d (LP 2168816). With it on, kexec handover set aside its scratch area as CMA on every boot, about 2.1 GiB on the ProArt P14, and long-term page pins (CUDA host-pinned memory, RDMA registrations) could fail with ENOMEM under memory pressure because pinned pages cannot stay in CMA. Omarchy does not use kexec handover; `kho=on` still turns it on.
 
 ## Building
 
