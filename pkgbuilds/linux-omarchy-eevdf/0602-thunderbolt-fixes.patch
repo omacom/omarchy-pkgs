@@ -1,0 +1,557 @@
+diff --git a/drivers/thunderbolt/ctl.c b/drivers/thunderbolt/ctl.c
+--- a/drivers/thunderbolt/ctl.c
++++ b/drivers/thunderbolt/ctl.c
+@@ -73,7 +73,6 @@ struct tb_ctl {
+ #define tb_ctl_dbg_once(ctl, format, arg...) \
+ 	dev_dbg_once((ctl)->nhi->dev, format, ## arg)
+ 
+-static DECLARE_WAIT_QUEUE_HEAD(tb_cfg_request_cancel_queue);
+ /* Serializes access to request kref_get/put */
+ static DEFINE_MUTEX(tb_cfg_request_lock);
+ 
+@@ -133,41 +132,42 @@ void tb_cfg_request_put(struct tb_cfg_request *req)
+ static int tb_cfg_request_enqueue(struct tb_ctl *ctl,
+ 				  struct tb_cfg_request *req)
+ {
++	tb_cfg_request_get(req);
++
+ 	WARN_ON(test_bit(TB_CFG_REQUEST_ACTIVE, &req->flags));
+ 	WARN_ON(req->ctl);
+ 
+-	mutex_lock(&ctl->request_queue_lock);
++	guard(mutex)(&ctl->request_queue_lock);
+ 	if (!ctl->running) {
+-		mutex_unlock(&ctl->request_queue_lock);
++		tb_cfg_request_put(req);
+ 		return -ENOTCONN;
+ 	}
+ 	req->ctl = ctl;
+ 	list_add_tail(&req->list, &ctl->request_queue);
+ 	set_bit(TB_CFG_REQUEST_ACTIVE, &req->flags);
+-	mutex_unlock(&ctl->request_queue_lock);
+ 	return 0;
+ }
+ 
++static bool tb_cfg_request_is_active(struct tb_cfg_request *req)
++{
++	return test_bit(TB_CFG_REQUEST_ACTIVE, &req->flags);
++}
++
++static bool tb_cfg_request_is_canceled(struct tb_cfg_request *req)
++{
++	return test_bit(TB_CFG_REQUEST_CANCELED, &req->flags);
++}
++
+ static void tb_cfg_request_dequeue(struct tb_cfg_request *req)
+ {
+ 	struct tb_ctl *ctl = req->ctl;
+ 
+-	mutex_lock(&ctl->request_queue_lock);
+-	if (!test_bit(TB_CFG_REQUEST_ACTIVE, &req->flags)) {
+-		mutex_unlock(&ctl->request_queue_lock);
+-		return;
++	guard(mutex)(&ctl->request_queue_lock);
++	if (tb_cfg_request_is_active(req)) {
++		list_del(&req->list);
++		clear_bit(TB_CFG_REQUEST_ACTIVE, &req->flags);
++		tb_cfg_request_put(req);
+ 	}
+-
+-	list_del(&req->list);
+-	clear_bit(TB_CFG_REQUEST_ACTIVE, &req->flags);
+-	if (test_bit(TB_CFG_REQUEST_CANCELED, &req->flags))
+-		wake_up(&tb_cfg_request_cancel_queue);
+-	mutex_unlock(&ctl->request_queue_lock);
+-}
+-
+-static bool tb_cfg_request_is_active(struct tb_cfg_request *req)
+-{
+-	return test_bit(TB_CFG_REQUEST_ACTIVE, &req->flags);
+ }
+ 
+ static struct tb_cfg_request *
+@@ -178,7 +178,7 @@ tb_cfg_request_find(struct tb_ctl *ctl, struct ctl_pkg *pkg)
+ 	mutex_lock(&pkg->ctl->request_queue_lock);
+ 	list_for_each_entry(iter, &pkg->ctl->request_queue, list) {
+ 		tb_cfg_request_get(iter);
+-		if (iter->match(iter, pkg)) {
++		if (!tb_cfg_request_is_canceled(iter) && iter->match(iter, pkg)) {
+ 			req = iter;
+ 			break;
+ 		}
+@@ -512,8 +512,11 @@ static void tb_ctl_rx_callback(struct tb_ring *ring, struct ring_frame *frame,
+ 	trace_tb_rx(pkg->ctl->index, frame->eof, pkg->buffer, frame->size, !req);
+ 
+ 	if (req) {
+-		if (req->copy(req, pkg))
+-			schedule_work(&req->work);
++		scoped_guard(mutex, &pkg->ctl->request_queue_lock) {
++			if (!tb_cfg_request_is_canceled(req) &&
++			    req->copy(req, pkg))
++				schedule_work(&req->work);
++		}
+ 		tb_cfg_request_put(req);
+ 	}
+ 
+@@ -525,11 +528,10 @@ static void tb_cfg_request_work(struct work_struct *work)
+ {
+ 	struct tb_cfg_request *req = container_of(work, typeof(*req), work);
+ 
+-	if (!test_bit(TB_CFG_REQUEST_CANCELED, &req->flags))
++	if (!tb_cfg_request_is_canceled(req))
+ 		req->callback(req->callback_data);
+ 
+ 	tb_cfg_request_dequeue(req);
+-	tb_cfg_request_put(req);
+ }
+ 
+ /**
+@@ -555,10 +557,9 @@ int tb_cfg_request(struct tb_ctl *ctl, struct tb_cfg_request *req,
+ 	INIT_WORK(&req->work, tb_cfg_request_work);
+ 	INIT_LIST_HEAD(&req->list);
+ 
+-	tb_cfg_request_get(req);
+ 	ret = tb_cfg_request_enqueue(ctl, req);
+ 	if (ret)
+-		goto err_put;
++		return ret;
+ 
+ 	ret = tb_ctl_tx(ctl, req->request, req->request_size,
+ 			req->request_type);
+@@ -572,9 +573,6 @@ int tb_cfg_request(struct tb_ctl *ctl, struct tb_cfg_request *req,
+ 
+ err_dequeue:
+ 	tb_cfg_request_dequeue(req);
+-err_put:
+-	tb_cfg_request_put(req);
+-
+ 	return ret;
+ }
+ 
+@@ -588,9 +586,10 @@ int tb_cfg_request(struct tb_ctl *ctl, struct tb_cfg_request *req,
+  */
+ void tb_cfg_request_cancel(struct tb_cfg_request *req, int err)
+ {
+-	set_bit(TB_CFG_REQUEST_CANCELED, &req->flags);
+-	schedule_work(&req->work);
+-	wait_event(tb_cfg_request_cancel_queue, !tb_cfg_request_is_active(req));
++	scoped_guard(mutex, &req->ctl->request_queue_lock)
++		set_bit(TB_CFG_REQUEST_CANCELED, &req->flags);
++	cancel_work_sync(&req->work);
++	tb_cfg_request_dequeue(req);
+ 	req->result.err = err;
+ }
+ 
+diff --git a/drivers/thunderbolt/nhi.c b/drivers/thunderbolt/nhi.c
+--- a/drivers/thunderbolt/nhi.c
++++ b/drivers/thunderbolt/nhi.c
+@@ -15,6 +15,7 @@
+ #include <linux/dma-mapping.h>
+ #include <linux/interrupt.h>
+ #include <linux/iommu.h>
++#include <linux/lockdep.h>
+ #include <linux/module.h>
+ #include <linux/delay.h>
+ #include <linux/property.h>
+@@ -560,6 +561,8 @@ static struct tb_ring *tb_ring_alloc(struct tb_nhi *nhi, u32 hop, int size,
+ 	INIT_LIST_HEAD(&ring->in_flight);
+ 	INIT_WORK(&ring->work, ring_work);
+ 	init_waitqueue_head(&ring->wait);
++	lockdep_register_key(&ring->lock_key);
++	lockdep_init_map(&ring->work.lockdep_map, "ring.work", &ring->lock_key, 0);
+ 
+ 	ring->nhi = nhi;
+ 	ring->hop = hop;
+@@ -599,6 +602,7 @@ static struct tb_ring *tb_ring_alloc(struct tb_nhi *nhi, u32 hop, int size,
+ 			  ring->size * sizeof(*ring->descriptors),
+ 			  ring->descriptors, ring->descriptors_dma);
+ err_free_ring:
++	lockdep_unregister_key(&ring->lock_key);
+ 	kfree(ring);
+ 
+ 	return NULL;
+@@ -848,6 +852,7 @@ void tb_ring_free(struct tb_ring *ring)
+ 	 * to finish before freeing the ring.
+ 	 */
+ 	flush_work(&ring->work);
++	lockdep_unregister_key(&ring->lock_key);
+ 	kfree(ring);
+ }
+ EXPORT_SYMBOL_GPL(tb_ring_free);
+diff --git a/drivers/thunderbolt/switch.c b/drivers/thunderbolt/switch.c
+--- a/drivers/thunderbolt/switch.c
++++ b/drivers/thunderbolt/switch.c
+@@ -774,6 +774,7 @@ static int tb_port_alloc_hopid(struct tb_port *port, bool in, int min_hopid,
+ {
+ 	int port_max_hopid;
+ 	struct ida *ida;
++	int ret;
+ 
+ 	if (in) {
+ 		port_max_hopid = port->config.max_in_hop_id;
+@@ -793,7 +794,11 @@ static int tb_port_alloc_hopid(struct tb_port *port, bool in, int min_hopid,
+ 	if (max_hopid < 0 || max_hopid > port_max_hopid)
+ 		max_hopid = port_max_hopid;
+ 
+-	return ida_alloc_range(ida, min_hopid, max_hopid, GFP_KERNEL);
++	ret = ida_alloc_range(ida, min_hopid, max_hopid, GFP_KERNEL);
++	if (ret >= 0)
++		tb_switch_get(port->sw);
++
++	return ret;
+ }
+ 
+ /**
+@@ -832,6 +837,7 @@ int tb_port_alloc_out_hopid(struct tb_port *port, int min_hopid, int max_hopid)
+ void tb_port_release_in_hopid(struct tb_port *port, int hopid)
+ {
+ 	ida_free(&port->in_hopids, hopid);
++	tb_switch_put(port->sw);
+ }
+ 
+ /**
+@@ -842,6 +848,7 @@ void tb_port_release_in_hopid(struct tb_port *port, int hopid)
+ void tb_port_release_out_hopid(struct tb_port *port, int hopid)
+ {
+ 	ida_free(&port->out_hopids, hopid);
++	tb_switch_put(port->sw);
+ }
+ 
+ static inline bool tb_switch_is_reachable(const struct tb_switch *parent,
+diff --git a/drivers/thunderbolt/tb.c b/drivers/thunderbolt/tb.c
+--- a/drivers/thunderbolt/tb.c
++++ b/drivers/thunderbolt/tb.c
+@@ -89,6 +89,7 @@ static void tb_dp_resource_unavailable(struct tb *tb, struct tb_port *port,
+ 				       const char *reason);
+ static void tb_queue_dp_bandwidth_request(struct tb *tb, u64 route, u8 port,
+ 					  int retry, unsigned long delay);
++static void tb_dp_tunnel_active(struct tb_tunnel *tunnel, void *data);
+ 
+ static void tb_queue_hotplug(struct tb *tb, u64 route, u8 port, bool unplug)
+ {
+@@ -385,7 +386,8 @@ static void tb_switch_discover_tunnels(struct tb_switch *sw,
+ 
+ 		switch (port->config.type) {
+ 		case TB_TYPE_DP_HDMI_IN:
+-			tunnel = tb_tunnel_discover_dp(tb, port, alloc_hopids);
++			tunnel = tb_tunnel_discover_dp(tb, port, alloc_hopids,
++						       tb_dp_tunnel_active, tb);
+ 			tb_increase_tmu_accuracy(tunnel);
+ 			break;
+ 
+@@ -1910,6 +1912,18 @@ static void tb_dp_tunnel_active(struct tb_tunnel *tunnel, void *data)
+ 	struct tb *tb = data;
+ 
+ 	mutex_lock(&tb->lock);
++
++	/*
++	 * If the DPRX read was canceled the tunnel is already being torn
++	 * down by whoever canceled it. Do not touch the adapters here
++	 * because the routers may be gone by now.
++	 */
++	if (tunnel->dprx_canceled) {
++		tb_tunnel_dbg(tunnel, "DPRX read canceled, not activating\n");
++		mutex_unlock(&tb->lock);
++		return;
++	}
++
+ 	if (tb_tunnel_is_active(tunnel)) {
+ 		int consumed_up, consumed_down, ret;
+ 
+@@ -1964,8 +1978,6 @@ static void tb_dp_tunnel_active(struct tb_tunnel *tunnel, void *data)
+ 		tb_dp_resource_unavailable(tb, in, "DPRX negotiation failed");
+ 	}
+ 	mutex_unlock(&tb->lock);
+-
+-	tb_domain_put(tb);
+ }
+ 
+ static void tb_tunnel_one_dp(struct tb *tb, struct tb_port *in,
+@@ -2026,8 +2038,7 @@ static void tb_tunnel_one_dp(struct tb *tb, struct tb_port *in,
+ 	       available_up, available_down);
+ 
+ 	tunnel = tb_tunnel_alloc_dp(tb, in, out, link_nr, available_up,
+-				    available_down, tb_dp_tunnel_active,
+-				    tb_domain_get(tb));
++				    available_down, tb_dp_tunnel_active, tb);
+ 	if (!tunnel) {
+ 		tb_port_dbg(out, "could not allocate DP tunnel\n");
+ 		goto err_reclaim_usb;
+@@ -2048,7 +2059,6 @@ static void tb_tunnel_one_dp(struct tb *tb, struct tb_port *in,
+ 	tb_tunnel_put(tunnel);
+ err_reclaim_usb:
+ 	tb_reclaim_usb3_bandwidth(tb, in, out);
+-	tb_domain_put(tb);
+ err_detach_group:
+ 	tb_detach_bandwidth_group(in);
+ err_dealloc_dp:
+@@ -2950,11 +2960,12 @@ static void tb_stop(struct tb *tb)
+ 	/* tunnels are only present after everything has been initialized */
+ 	list_for_each_entry_safe(tunnel, n, &tcm->tunnel_list, list) {
+ 		/*
+-		 * DMA tunnels require the driver to be functional so we
+-		 * tear them down. Other protocol tunnels can be left
+-		 * intact.
++		 * DMA tunnels and DP tunnels which are not yet active require
++		 * the driver to be functional so we tear them down.
++		 * Other protocol tunnels can be left intact.
+ 		 */
+-		if (tb_tunnel_is_dma(tunnel))
++		if (tb_tunnel_is_dma(tunnel) ||
++		    (tb_tunnel_is_dp(tunnel) && !tb_tunnel_is_active(tunnel)))
+ 			tb_tunnel_deactivate(tunnel);
+ 		tb_tunnel_put(tunnel);
+ 	}
+@@ -3274,11 +3285,11 @@ static void tb_remove_work(struct work_struct *work)
+ 	struct tb *tb = tcm_to_tb(tcm);
+ 
+ 	mutex_lock(&tb->lock);
+-	if (tb->root_switch)
++	if (tb->root_switch) {
+ 		tb_free_unplugged_children(tb->root_switch);
++		tb_free_unplugged_xdomains(tb->root_switch);
++	}
+ 	mutex_unlock(&tb->lock);
+-
+-	tb_free_unplugged_xdomains(tb->root_switch);
+ }
+ 
+ static int tb_runtime_resume(struct tb *tb)
+diff --git a/drivers/thunderbolt/tunnel.c b/drivers/thunderbolt/tunnel.c
+--- a/drivers/thunderbolt/tunnel.c
++++ b/drivers/thunderbolt/tunnel.c
+@@ -510,6 +510,7 @@ struct tb_tunnel *tb_tunnel_discover_pci(struct tb *tb, struct tb_port *down,
+ 		goto err_deactivate;
+ 	}
+ 
++	tb_tunnel_set_active(tunnel, true);
+ 	tb_tunnel_dbg(tunnel, "discovered\n");
+ 	return tunnel;
+ 
+@@ -1093,8 +1094,14 @@ static void tb_dp_dprx_work(struct work_struct *work)
+ 	struct tb_tunnel *tunnel = container_of(work, typeof(*tunnel), dprx_work.work);
+ 	struct tb *tb = tunnel->tb;
+ 
++	/*
++	 * The DPRX read can be canceled while this work is waiting for
++	 * tb->lock. Check the flag only once it is held: while the lock is
++	 * held the tunnel cannot be torn down under us and the adapters are
++	 * safe to access.
++	 */
++	mutex_lock(&tb->lock);
+ 	if (!tunnel->dprx_canceled) {
+-		mutex_lock(&tb->lock);
+ 		if (tb_dp_is_usb4(tunnel->src_port->sw) &&
+ 		    tb_dp_wait_dprx(tunnel, TB_DPRX_WAIT_TIMEOUT)) {
+ 			if (ktime_before(ktime_get(), tunnel->dprx_timeout)) {
+@@ -1106,41 +1113,42 @@ static void tb_dp_dprx_work(struct work_struct *work)
+ 		} else {
+ 			tb_tunnel_set_active(tunnel, true);
+ 		}
+-		mutex_unlock(&tb->lock);
+ 	}
++	mutex_unlock(&tb->lock);
+ 
+-	if (tunnel->callback)
+-		tunnel->callback(tunnel, tunnel->callback_data);
++	tunnel->callback(tunnel, tunnel->callback_data);
+ 	tb_tunnel_put(tunnel);
++	tb_domain_put(tb);
+ }
+ 
+ static int tb_dp_dprx_start(struct tb_tunnel *tunnel)
+ {
+ 	/*
+-	 * Bump up the reference to keep the tunnel around. It will be
+-	 * dropped in tb_dp_dprx_stop() once the tunnel is deactivated.
++	 * Bump up the references to keep the tunnel and the domain around
++	 * until the work has run or has been canceled.
+ 	 */
+ 	tb_tunnel_get(tunnel);
++	tb_domain_get(tunnel->tb);
+ 
+ 	tunnel->dprx_started = true;
++	tunnel->dprx_canceled = false;
++	tunnel->dprx_timeout = dprx_timeout_to_ktime(dprx_timeout);
++	queue_delayed_work(tunnel->tb->wq, &tunnel->dprx_work, 0);
+ 
+-	if (tunnel->callback) {
+-		tunnel->dprx_timeout = dprx_timeout_to_ktime(dprx_timeout);
+-		queue_delayed_work(tunnel->tb->wq, &tunnel->dprx_work, 0);
+-		return -EINPROGRESS;
+-	}
+-
+-	return tb_dp_is_usb4(tunnel->src_port->sw) ?
+-		tb_dp_wait_dprx(tunnel, dprx_timeout) : 0;
++	return -EINPROGRESS;
+ }
+ 
+ static void tb_dp_dprx_stop(struct tb_tunnel *tunnel)
+ {
++	struct tb *tb = tunnel->tb;
++
+ 	if (tunnel->dprx_started) {
+ 		tunnel->dprx_started = false;
+ 		tunnel->dprx_canceled = true;
+-		if (cancel_delayed_work(&tunnel->dprx_work))
++		if (cancel_delayed_work(&tunnel->dprx_work)) {
+ 			tb_tunnel_put(tunnel);
++			tb_domain_put(tb);
++		}
+ 	}
+ }
+ 
+@@ -1582,20 +1590,28 @@ static void tb_dp_dump(struct tb_tunnel *tunnel)
+  * @tb: Pointer to the domain structure
+  * @in: DP in adapter
+  * @alloc_hopid: Allocate HopIDs from visited ports
++ * @callback: Callback that is called when the DP tunnel is fully
++ *	      activated (or there is an error)
++ * @callback_data: Data for @callback
+  *
+  * If @in adapter is active, follows the tunnel to the DP out adapter
+  * and back. Returns the discovered tunnel or %NULL if there was no
+- * tunnel.
++ * tunnel. See tb_tunnel_alloc_dp() for @callback.
+  *
+  * Return: Pointer to &struct tb_tunnel or %NULL if no tunnel found.
+  */
+ struct tb_tunnel *tb_tunnel_discover_dp(struct tb *tb, struct tb_port *in,
+-					bool alloc_hopid)
++					bool alloc_hopid,
++					void (*callback)(struct tb_tunnel *, void *),
++					void *callback_data)
+ {
+ 	struct tb_tunnel *tunnel;
+ 	struct tb_port *port;
+ 	struct tb_path *path;
+ 
++	if (WARN_ON(!callback))
++		return NULL;
++
+ 	if (!tb_dp_port_is_enabled(in))
+ 		return NULL;
+ 
+@@ -1611,6 +1627,9 @@ struct tb_tunnel *tb_tunnel_discover_dp(struct tb *tb, struct tb_port *in,
+ 	tunnel->alloc_bandwidth = tb_dp_alloc_bandwidth;
+ 	tunnel->consumed_bandwidth = tb_dp_consumed_bandwidth;
+ 	tunnel->src_port = in;
++	tunnel->callback = callback;
++	tunnel->callback_data = callback_data;
++	INIT_DELAYED_WORK(&tunnel->dprx_work, tb_dp_dprx_work);
+ 
+ 	path = tb_path_discover(in, TB_DP_VIDEO_HOPID, NULL, -1,
+ 				&tunnel->dst_port, "Video", alloc_hopid);
+@@ -1656,6 +1675,7 @@ struct tb_tunnel *tb_tunnel_discover_dp(struct tb *tb, struct tb_port *in,
+ 
+ 	tb_dp_dump(tunnel);
+ 
++	tb_tunnel_set_active(tunnel, true);
+ 	tb_tunnel_dbg(tunnel, "discovered\n");
+ 	return tunnel;
+ 
+@@ -1677,16 +1697,16 @@ struct tb_tunnel *tb_tunnel_discover_dp(struct tb *tb, struct tb_port *in,
+  *	    %0 if no available bandwidth.
+  * @max_down: Maximum available downstream bandwidth for the DP tunnel.
+  *	      %0 if no available bandwidth.
+- * @callback: Optional callback that is called when the DP tunnel is
+- *	      fully activated (or there is an error)
+- * @callback_data: Optional data for @callback
++ * @callback: Callback that is called when the DP tunnel is fully
++ *	      activated (or there is an error)
++ * @callback_data: Data for @callback
+  *
+  * Allocates a tunnel between @in and @out that is capable of tunneling
+- * Display Port traffic. If @callback is not %NULL it will be called
+- * after tb_tunnel_activate() once the tunnel has been fully activated.
+- * It can call tb_tunnel_is_active() to check if activation was
+- * successful (or if it returns %false there was some sort of issue).
+- * The @callback is called without @tb->lock held.
++ * Display Port traffic. The @callback is called after tb_tunnel_activate()
++ * once the tunnel has been fully activated. It can call
++ * tb_tunnel_is_active() to check if activation was successful (or if it
++ * returns %false there was some sort of issue). The @callback is called
++ * without @tb->lock held.
+  *
+  * Return: Pointer to @struct tb_tunnel or %NULL in case of failure.
+  */
+@@ -1701,7 +1721,7 @@ struct tb_tunnel *tb_tunnel_alloc_dp(struct tb *tb, struct tb_port *in,
+ 	struct tb_path *path;
+ 	bool pm_support;
+ 
+-	if (WARN_ON(!in->cap_adap || !out->cap_adap))
++	if (WARN_ON(!in->cap_adap || !out->cap_adap || !callback))
+ 		return NULL;
+ 
+ 	tunnel = tb_tunnel_alloc(tb, 3, TB_TUNNEL_DP);
+@@ -2288,6 +2308,7 @@ struct tb_tunnel *tb_tunnel_discover_usb3(struct tb *tb, struct tb_port *down,
+ 			tb_usb3_reclaim_available_bandwidth;
+ 	}
+ 
++	tb_tunnel_set_active(tunnel, true);
+ 	tb_tunnel_dbg(tunnel, "discovered\n");
+ 	return tunnel;
+ 
+diff --git a/drivers/thunderbolt/tunnel.h b/drivers/thunderbolt/tunnel.h
+--- a/drivers/thunderbolt/tunnel.h
++++ b/drivers/thunderbolt/tunnel.h
+@@ -66,8 +66,8 @@ enum tb_tunnel_state {
+  * @dprx_canceled: Was DPRX capabilities read poll canceled
+  * @dprx_timeout: If set DPRX capabilities read poll work will timeout after this passes
+  * @dprx_work: Worker that is scheduled to poll completion of DPRX capabilities read
+- * @callback: Optional callback called when DP tunnel is fully activated
+- * @callback_data: Optional data for @callback
++ * @callback: Callback called when DP tunnel is fully activated
++ * @callback_data: Data for @callback
+  * @paths: All paths required by the tunnel
+  */
+ struct tb_tunnel {
+@@ -117,7 +117,9 @@ struct tb_tunnel *tb_tunnel_alloc_pci(struct tb *tb, struct tb_port *up,
+ bool tb_tunnel_reserved_pci(struct tb_port *port, int *reserved_up,
+ 			    int *reserved_down);
+ struct tb_tunnel *tb_tunnel_discover_dp(struct tb *tb, struct tb_port *in,
+-					bool alloc_hopid);
++					bool alloc_hopid,
++					void (*callback)(struct tb_tunnel *, void *),
++					void *callback_data);
+ struct tb_tunnel *tb_tunnel_alloc_dp(struct tb *tb, struct tb_port *in,
+ 				     struct tb_port *out, int link_nr,
+ 				     int max_up, int max_down,
+diff --git a/drivers/thunderbolt/xdomain.c b/drivers/thunderbolt/xdomain.c
+--- a/drivers/thunderbolt/xdomain.c
++++ b/drivers/thunderbolt/xdomain.c
+@@ -1814,7 +1814,6 @@ static void tb_xdomain_state_work(struct work_struct *work)
+ 			tb_xdomain_failed(xd);
+ 		} else {
+ 			xd->state = XDOMAIN_STATE_ENUMERATED;
+-			tb_xdomain_queue_properties_changed(xd);
+ 		}
+ 		break;
+ 
+diff --git a/include/linux/thunderbolt.h b/include/linux/thunderbolt.h
+--- a/include/linux/thunderbolt.h
++++ b/include/linux/thunderbolt.h
+@@ -22,6 +22,7 @@ struct device;
+ #include <linux/device.h>
+ #include <linux/idr.h>
+ #include <linux/list.h>
++#include <linux/lockdep.h>
+ #include <linux/mutex.h>
+ #include <linux/device-id/tb.h>
+ #include <linux/pci.h>
+@@ -565,6 +566,7 @@ struct tb_nhi {
+  * @interval_nsec: Interval counter if interrupt throttling is to be
+  *		   used with this ring (in ns)
+  * @wait: Used to signal that the ring may be empty now
++ * @lock_key: Lock validator class key per-ring
+  */
+ struct tb_ring {
+ 	spinlock_t lock;
+@@ -590,6 +592,7 @@ struct tb_ring {
+ 	void *poll_data;
+ 	unsigned int interval_nsec;
+ 	wait_queue_head_t wait;
++	struct lock_class_key lock_key;
+ };
+ 
+ /* Leave ring interrupt enabled on suspend */

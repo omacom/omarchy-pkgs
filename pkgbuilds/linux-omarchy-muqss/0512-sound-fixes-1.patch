@@ -1,0 +1,661 @@
+diff --git a/include/sound/rawmidi.h b/include/sound/rawmidi.h
+--- a/include/sound/rawmidi.h
++++ b/include/sound/rawmidi.h
+@@ -179,7 +179,8 @@ int snd_rawmidi_info_select(struct snd_card *card, struct snd_rawmidi_info *info
+ int snd_rawmidi_kernel_open_nested(struct snd_rawmidi *rmidi, int subdevice,
+ 				   int mode, struct snd_rawmidi_file *rfile,
+ 				   int depth);
+-int snd_rawmidi_kernel_release(struct snd_rawmidi_file *rfile);
++int snd_rawmidi_kernel_release_nested(struct snd_rawmidi_file *rfile,
++				      int depth);
+ int snd_rawmidi_output_params(struct snd_rawmidi_substream *substream,
+ 			      struct snd_rawmidi_params *params);
+ int snd_rawmidi_input_params(struct snd_rawmidi_substream *substream,
+@@ -201,6 +202,11 @@ static inline int snd_rawmidi_kernel_open(struct snd_rawmidi *rmidi,
+ 	return snd_rawmidi_kernel_open_nested(rmidi, subdevice, mode, rfile, 0);
+ }
+ 
++static inline int snd_rawmidi_kernel_release(struct snd_rawmidi_file *rfile)
++{
++	return snd_rawmidi_kernel_release_nested(rfile, 0);
++}
++
+ /* set up the tied devices */
+ static inline void snd_rawmidi_tie_devices(struct snd_rawmidi *r1,
+ 					   struct snd_rawmidi *r2)
+diff --git a/sound/aoa/soundbus/i2sbus/core.c b/sound/aoa/soundbus/i2sbus/core.c
+--- a/sound/aoa/soundbus/i2sbus/core.c
++++ b/sound/aoa/soundbus/i2sbus/core.c
+@@ -240,6 +240,8 @@ static int i2sbus_add_dev(struct macio_dev *macio,
+ 	}
+ 	for (i = aoa_resource_i2smmio; i <= aoa_resource_rxdbdma; i++) {
+ 		int irq = irq_of_parse_and_map(np, i);
++		if (!irq)
++			goto err;
+ 		if (request_irq(irq, ints[i], 0, dev->rnames[i], dev))
+ 			goto err;
+ 		dev->interrupts[i] = irq;
+diff --git a/sound/core/rawmidi.c b/sound/core/rawmidi.c
+--- a/sound/core/rawmidi.c
++++ b/sound/core/rawmidi.c
+@@ -571,7 +571,6 @@ static void rawmidi_release_priv(struct snd_rawmidi_file *rfile)
+ 	struct snd_rawmidi *rmidi;
+ 
+ 	rmidi = rfile->rmidi;
+-	guard(mutex)(&rmidi->open_mutex);
+ 	if (rfile->input) {
+ 		close_substream(rmidi, rfile->input, 1);
+ 		rfile->input = NULL;
+@@ -585,7 +584,8 @@ static void rawmidi_release_priv(struct snd_rawmidi_file *rfile)
+ }
+ 
+ /* called from sound/core/seq/seq_midi.c */
+-int snd_rawmidi_kernel_release(struct snd_rawmidi_file *rfile)
++int snd_rawmidi_kernel_release_nested(struct snd_rawmidi_file *rfile,
++				      int depth)
+ {
+ 	struct snd_rawmidi *rmidi;
+ 
+@@ -593,11 +593,13 @@ int snd_rawmidi_kernel_release(struct snd_rawmidi_file *rfile)
+ 		return -ENXIO;
+ 
+ 	rmidi = rfile->rmidi;
++	mutex_lock_nested(&rmidi->open_mutex, depth);
+ 	rawmidi_release_priv(rfile);
++	mutex_unlock(&rmidi->open_mutex);
+ 	module_put(rmidi->card->module);
+ 	return 0;
+ }
+-EXPORT_SYMBOL(snd_rawmidi_kernel_release);
++EXPORT_SYMBOL(snd_rawmidi_kernel_release_nested);
+ 
+ static int snd_rawmidi_release(struct inode *inode, struct file *file)
+ {
+@@ -607,7 +609,8 @@ static int snd_rawmidi_release(struct inode *inode, struct file *file)
+ 
+ 	rfile = file->private_data;
+ 	rmidi = rfile->rmidi;
+-	rawmidi_release_priv(rfile);
++	scoped_guard(mutex, &rmidi->open_mutex)
++		rawmidi_release_priv(rfile);
+ 	kfree(rfile);
+ 	module = rmidi->card->module;
+ 	snd_card_file_remove(rmidi->card, file);
+diff --git a/sound/core/ump.c b/sound/core/ump.c
+--- a/sound/core/ump.c
++++ b/sound/core/ump.c
+@@ -1184,7 +1184,8 @@ static int snd_ump_legacy_close(struct snd_rawmidi_substream *substream)
+ 		ump->legacy_substreams[dir][group] = NULL;
+ 	if (dir == SNDRV_RAWMIDI_STREAM_OUTPUT) {
+ 		if (!--ump->legacy_out_opens)
+-			snd_rawmidi_kernel_release(&ump->legacy_out_rfile);
++			snd_rawmidi_kernel_release_nested(&ump->legacy_out_rfile,
++							  SINGLE_DEPTH_NESTING);
+ 	}
+ 	return 0;
+ }
+diff --git a/sound/hda/codecs/conexant.c b/sound/hda/codecs/conexant.c
+--- a/sound/hda/codecs/conexant.c
++++ b/sound/hda/codecs/conexant.c
+@@ -207,7 +207,7 @@ static void cx_remove(struct hda_codec *codec)
+ 	snd_hda_gen_remove(codec);
+ }
+ 
+-static void cx_process_headset_plugin(struct hda_codec *codec)
++static void cx_process_headset_detect_plug_type(struct hda_codec *codec)
+ {
+ 	unsigned int val;
+ 	unsigned int count = 0;
+@@ -223,11 +223,9 @@ static void cx_process_headset_plugin(struct hda_codec *codec)
+ 		count++;
+ 	} while (count < 3);
+ 	val = snd_hda_codec_read(codec, 0x1c, 0, 0xcb0, 0x0);
+-	if (val & 0x800) {
+-		codec_dbg(codec, "headset plugin, type is CTIA\n");
+-		snd_hda_codec_write(codec, 0x19, 0, AC_VERB_SET_PIN_WIDGET_CONTROL, 0x24);
+-	} else if (val & 0x400) {
+-		codec_dbg(codec, "headset plugin, type is OMTP\n");
++	if (val & 0xc00) {
++		codec_dbg(codec, "headset plugin, type is %s\n",
++			  val & 0x800 ? "CTIA" : "OMTP");
+ 		snd_hda_codec_write(codec, 0x19, 0, AC_VERB_SET_PIN_WIDGET_CONTROL, 0x24);
+ 	} else {
+ 		codec_dbg(codec, "headphone plugin\n");
+@@ -243,10 +241,12 @@ static void cx_update_headset_mic_vref(struct hda_codec *codec, struct hda_jack_
+ 	 * Check hp&mic tag to process headset plugin & plugout.
+ 	 */
+ 	mic_present = snd_hda_codec_read(codec, 0x19, 0, AC_VERB_GET_PIN_SENSE, 0x0);
+-	if (!(mic_present & AC_PINSENSE_PRESENCE)) /* mic plugout */
++	if (!(mic_present & AC_PINSENSE_PRESENCE)) { /* mic plugout */
+ 		snd_hda_codec_write(codec, 0x19, 0, AC_VERB_SET_PIN_WIDGET_CONTROL, 0x20);
+-	else
+-		cx_process_headset_plugin(codec);
++	} else {
++		cx_process_headset_detect_plug_type(codec);
++		snd_hda_codec_write(codec, 0x19, 0, AC_VERB_SET_PIN_WIDGET_CONTROL, 0x24);
++	}
+ }
+ 
+ static int cx_suspend(struct hda_codec *codec)
+diff --git a/sound/hda/codecs/realtek/alc269.c b/sound/hda/codecs/realtek/alc269.c
+--- a/sound/hda/codecs/realtek/alc269.c
++++ b/sound/hda/codecs/realtek/alc269.c
+@@ -1370,6 +1370,61 @@ static void alc269_fixup_hp_gpio_led(struct hda_codec *codec,
+ 	alc_fixup_hp_gpio_led(codec, action, 0x08, 0x10);
+ }
+ 
++/*
++ * HP Laptop 15-fd0xxx (SSID 103c:8bb6) Speaker Mute LED fix
++ *
++ * The speaker mute LED is controlled via VREF100 on NID 0x1a.
++ * This pin must remain powered (D0) even during suspend, otherwise
++ * the LED state is lost and the pin defaults to Hi-Z on resume,
++ * causing the LED to stop responding to mute toggles.
++ * Windows keeps this pin powered unconditionally, so matching that
++ * behavior ensures consistent LED operation across suspend/resume.
++ * The mic-mute LED is controlled via GPIO 0 with active-low polarity.
++ */
++static unsigned int hp_8bb6_power_filter(struct hda_codec *codec,
++					 hda_nid_t nid,
++					 unsigned int power_state)
++{
++	if (nid == 0x1a)
++		return AC_PWRST_D0;
++	return snd_hda_gen_path_power_filter(codec, nid, power_state);
++}
++
++static int hp_8bb6_speaker_mute_led_set(struct led_classdev *led_cdev,
++					enum led_brightness brightness)
++{
++	struct hda_codec *codec = dev_to_hda_codec(led_cdev->dev->parent);
++	unsigned int val = (brightness == LED_OFF) ? PIN_IN : PIN_VREF100;
++
++	snd_hda_set_pin_ctl_cache(codec, 0x1a, val);
++	return 0;
++}
++
++static void alc236_fixup_hp_15_fd0xxx(struct hda_codec *codec,
++				      const struct hda_fixup *fix,
++				      int action)
++{
++	struct alc_spec *spec = codec->spec;
++
++	switch (action) {
++	case HDA_FIXUP_ACT_PRE_PROBE:
++		spec->micmute_led_polarity = 1;
++		alc_fixup_hp_gpio_led(codec, action, 0x00, 0x01);
++
++		spec->mute_led_polarity = 0;
++		snd_hda_gen_add_mute_led_cdev(codec, hp_8bb6_speaker_mute_led_set);
++
++		codec->power_filter = hp_8bb6_power_filter;
++		spec->no_shutup_pins = 1;
++		break;
++
++	case HDA_FIXUP_ACT_INIT:
++		if (spec->gen.vmaster_mute.hook)
++			snd_hda_sync_vmaster_hook(&spec->gen.vmaster_mute);
++		break;
++	}
++}
++
+ static void alc285_fixup_hp_gpio_led(struct hda_codec *codec,
+ 				const struct hda_fixup *fix, int action)
+ {
+@@ -4089,6 +4144,7 @@ enum {
+ 	ALC225_FIXUP_DELL_WYSE_MIC_NO_PRESENCE,
+ 	ALC225_FIXUP_S3_POP_NOISE,
+ 	ALC700_FIXUP_INTEL_REFERENCE,
++	ALC700_FIXUP_INTEL_HADES_CANYON,
+ 	ALC274_FIXUP_DELL_BIND_DACS,
+ 	ALC274_FIXUP_DELL_AIO_LINEOUT_VERB,
+ 	ALC298_FIXUP_TPT470_DOCK_FIX,
+@@ -4152,6 +4208,7 @@ enum {
+ 	ALC236_FIXUP_HP_GPIO_LED,
+ 	ALC236_FIXUP_HP_MUTE_LED,
+ 	ALC236_FIXUP_HP_MUTE_LED_MICMUTE_VREF,
++	ALC236_FIXUP_HP_15_FD0XXX,
+ 	ALC236_FIXUP_LENOVO_INV_DMIC,
+ 	ALC298_FIXUP_SAMSUNG_AMP,
+ 	ALC298_FIXUP_SAMSUNG_AMP_V2_2_AMPS,
+@@ -4297,6 +4354,7 @@ enum {
+ 	ALC287_FIXUP_LENOVO_LEGION_AW88399,
+ 	ALC287_FIXUP_YOGA9_14IAP7_BASS_SPK_PIN_HEADSET,
+ 	ALC285_LENOVO_DAC_RENAME,
++	ALC287_FIXUP_YOGA9_SPEAKER2_TO_DAC1,
+ };
+ 
+ /* A special fixup for Lenovo C940 and Yoga Duet 7;
+@@ -4333,6 +4391,19 @@ static void alc287_fixup_lenovo_yoga_book_9i(struct hda_codec *codec,
+ 	__snd_hda_apply_fixup(codec, id, action, 0);
+ }
+ 
++static void alc700_fixup_intel_hades_canyon(struct hda_codec *codec,
++					    const struct hda_fixup *fix,
++					    int action)
++{
++	/*
++	 * Windows may leave coef 0x1b bit 0x0400 cleared, causing broken
++	 * analog playback after rebooting into Linux.  Restore the bit
++	 * during codec initialization.
++	 */
++	if (action == HDA_FIXUP_ACT_INIT)
++		alc_update_coef_idx(codec, 0x1b, 0x0400, 0x0400);
++}
++
+ static const struct hda_fixup alc269_fixups[] = {
+ 	[ALC298_FIXUP_RAZER_BLADE16_2025_PINS] = {
+ 		.type = HDA_FIXUP_PINS,
+@@ -5411,6 +5482,10 @@ static const struct hda_fixup alc269_fixups[] = {
+ 			{}
+ 		}
+ 	},
++	[ALC700_FIXUP_INTEL_HADES_CANYON] = {
++		.type = HDA_FIXUP_FUNC,
++		.v.func = alc700_fixup_intel_hades_canyon,
++	},
+ 	[ALC274_FIXUP_DELL_BIND_DACS] = {
+ 		.type = HDA_FIXUP_FUNC,
+ 		.v.func = alc274_fixup_bind_dacs,
+@@ -5913,6 +5988,10 @@ static const struct hda_fixup alc269_fixups[] = {
+ 		.type = HDA_FIXUP_FUNC,
+ 		.v.func = alc236_fixup_hp_mute_led_micmute_gpio,
+ 	},
++	[ALC236_FIXUP_HP_15_FD0XXX] = {
++		.type = HDA_FIXUP_FUNC,
++		.v.func = alc236_fixup_hp_15_fd0xxx,
++	},
+ 	[ALC236_FIXUP_LENOVO_INV_DMIC] = {
+ 		.type = HDA_FIXUP_FUNC,
+ 		.v.func = alc_fixup_inv_dmic,
+@@ -7010,6 +7089,12 @@ static const struct hda_fixup alc269_fixups[] = {
+ 		.type = HDA_FIXUP_FUNC,
+ 		.v.func = alc285_lenovo_dac_rename,
+ 	},
++	[ALC287_FIXUP_YOGA9_SPEAKER2_TO_DAC1] = {
++		.type = HDA_FIXUP_FUNC,
++		.v.func = alc285_fixup_speaker2_to_dac1,
++		.chained = true,
++		.chain_id = ALC287_FIXUP_TXNW2781_I2C,
++	},
+ };
+ 
+ static const struct hda_quirk alc269_fixup_tbl[] = {
+@@ -7448,6 +7533,7 @@ static const struct hda_quirk alc269_fixup_tbl[] = {
+ 	SND_PCI_QUIRK(0x103c, 0x8b97, "HP", ALC236_FIXUP_HP_MUTE_LED_MICMUTE_VREF),
+ 	SND_PCI_QUIRK(0x103c, 0x8bb3, "HP Slim OMEN", ALC287_FIXUP_CS35L41_I2C_2),
+ 	SND_PCI_QUIRK(0x103c, 0x8bb4, "HP Slim OMEN", ALC287_FIXUP_CS35L41_I2C_2),
++	SND_PCI_QUIRK(0x103c, 0x8bb6, "HP Laptop 15-fd0039nt", ALC236_FIXUP_HP_15_FD0XXX),
+ 	SND_PCI_QUIRK(0x103c, 0x8bbe, "HP Victus 16-r0xxx (MB 8BBE)", ALC245_FIXUP_HP_MUTE_LED_COEFBIT),
+ 	SND_PCI_QUIRK(0x103c, 0x8bc8, "HP Victus 15-fa1xxx", ALC245_FIXUP_HP_MUTE_LED_COEFBIT),
+ 	SND_PCI_QUIRK(0x103c, 0x8bcd, "HP Omen 16-xd0xxx", ALC245_FIXUP_HP_MUTE_LED_V1_COEFBIT),
+@@ -8031,6 +8117,7 @@ static const struct hda_quirk alc269_fixup_tbl[] = {
+ 	SND_PCI_QUIRK(0x17aa, 0x3834, "Lenovo IdeaPad Slim 9i 14ITL5", ALC287_FIXUP_YOGA7_14ITL_SPEAKERS),
+ 	SND_PCI_QUIRK(0x17aa, 0x383d, "Legion Y9000X 2019", ALC285_FIXUP_LEGION_Y9000X_SPEAKERS),
+ 	SND_PCI_QUIRK(0x17aa, 0x3843, "Lenovo Yoga 9i / Yoga Book 9i", ALC287_FIXUP_LENOVO_YOGA_BOOK_9I),
++	SND_PCI_QUIRK(0x17aa, 0x3846, "Lenovo Yoga Pro 9 16IAH10", ALC287_FIXUP_YOGA9_SPEAKER2_TO_DAC1),
+ 	/* Yoga Pro 7 14IMH9 shares PCI SSID 17aa:3847 with Legion 7 16ACHG6;
+ 	 * use codec SSID to distinguish them
+ 	 */
+@@ -8044,14 +8131,15 @@ static const struct hda_quirk alc269_fixup_tbl[] = {
+ 	SND_PCI_QUIRK(0x17aa, 0x3852, "Lenovo Yoga 7 14ITL5", ALC287_FIXUP_YOGA7_14ITL_SPEAKERS),
+ 	SND_PCI_QUIRK(0x17aa, 0x3853, "Lenovo Yoga 7 15ITL5", ALC287_FIXUP_YOGA7_14ITL_SPEAKERS),
+ 	SND_PCI_QUIRK(0x17aa, 0x3855, "Legion 7 16ITHG6", ALC287_FIXUP_LEGION_16ITHG6),
++	SND_PCI_QUIRK(0x17aa, 0x3862, "Lenovo IdeaPad Slim 3 15ABR8", ALC269_FIXUP_LIMIT_INT_MIC_BOOST),
+ 	SND_PCI_QUIRK(0x17aa, 0x3865, "Lenovo 13X", ALC287_FIXUP_CS35L41_I2C_2),
+ 	SND_PCI_QUIRK(0x17aa, 0x3866, "Lenovo 13X", ALC287_FIXUP_CS35L41_I2C_2),
+ 	SND_PCI_QUIRK(0x17aa, 0x3869, "Lenovo Yoga7 14IAL7", ALC287_FIXUP_YOGA9_14IAP7_BASS_SPK_PIN),
+ 	HDA_CODEC_QUIRK(0x17aa, 0x386a, "Lenovo Yoga 7 16IAP7", ALC287_FIXUP_YOGA9_14IAP7_BASS_SPK_PIN),
+ 	HDA_CODEC_QUIRK(0x17aa, 0x386e, "Legion Y9000X 2022 IAH7", ALC287_FIXUP_CS35L41_I2C_2),
+ 	SND_PCI_QUIRK(0x17aa, 0x386e, "Yoga Pro 7 14ARP8", ALC285_FIXUP_YOGA_SPEAKER2_TO_DAC1),
+-	HDA_CODEC_QUIRK(0x17aa, 0x38a8, "Legion Pro 7 16ARX8H", ALC287_FIXUP_TAS2781_I2C), /* this must match before PCI SSID 17aa:386f below */
+ 	HDA_CODEC_QUIRK(0x17aa, 0x38a7, "Legion Pro 7 16ARX8H", ALC287_FIXUP_TAS2781_I2C), /* this must match before PCI SSID 17aa:386f below */
++	HDA_CODEC_QUIRK(0x17aa, 0x38a8, "Legion Pro 7 16ARX8H", ALC287_FIXUP_TAS2781_I2C), /* this must match before PCI SSID 17aa:386f below */
+ 	SND_PCI_QUIRK(0x17aa, 0x386f, "Legion Pro 7i 16IAX7", ALC287_FIXUP_CS35L41_I2C_2),
+ 	SND_PCI_QUIRK(0x17aa, 0x3870, "Lenovo Yoga 7 14ARB7", ALC287_FIXUP_YOGA7_14ARB7_I2C),
+ 	SND_PCI_QUIRK(0x17aa, 0x3874, "Legion 7i 16IAX7", ALC287_FIXUP_CS35L41_I2C_2),
+@@ -8231,6 +8319,8 @@ static const struct hda_quirk alc269_fixup_tbl[] = {
+ 	SND_PCI_QUIRK(0x2782, 0xa128, "Positivo N15RPE-S", ALC269_FIXUP_LIMIT_INT_MIC_BOOST),
+ 	SND_PCI_QUIRK(0x2782, 0xa212, "Lunnen Ground 14", ALC269VC_FIXUP_LUNNEN_GROUND_14),
+ 	SND_PCI_QUIRK(0x7017, 0x2014, "Star Labs StarFighter", ALC233_FIXUP_STARLABS_STARFIGHTER),
++	SND_PCI_QUIRK(0x8086, 0x2073, "Intel NUC 8 Hades Canyon",
++		      ALC700_FIXUP_INTEL_HADES_CANYON),
+ 	SND_PCI_QUIRK(0x8086, 0x2074, "Intel NUC 8", ALC233_FIXUP_INTEL_NUC8_DMIC),
+ 	SND_PCI_QUIRK(0x8086, 0x2080, "Intel NUC 8 Rugged", ALC256_FIXUP_INTEL_NUC8_RUGGED),
+ 	SND_PCI_QUIRK(0x8086, 0x2081, "Intel NUC 10", ALC256_FIXUP_INTEL_NUC10),
+diff --git a/sound/usb/mixer.c b/sound/usb/mixer.c
+--- a/sound/usb/mixer.c
++++ b/sound/usb/mixer.c
+@@ -1237,21 +1237,27 @@ static void init_cur_mix_raw(struct usb_mixer_elem_info *cval, int ch, int idx)
+ }
+ 
+ /*
+- * Additional checks for sticky mixers
++ * Additional checks for sticky GET_CUR
+  *
+- * Some devices' volume control mixers are sticky, which accept SET_CUR but
+- * do absolutely nothing.
++ * Some devices' volume control mixers have sticky GET_CUR, which implies either
++ * stubbed SET_CUR or broken GET_CUR. For the former case, the mixer accepts
++ * SET_CUR but do absolutely nothing, so falling back to soft mixer is the only
++ * way to control the volume. For the latter case, the mixer has effective
++ * SET_CUR despite GET_CUR being constant, and the mixer is usable as long as we
++ * always provide mixer value from the ceche.
+  *
+  * Check the return values of GET_CUR with different SET_CUR values. Consider
+- * the mixer as sticky if GET_CUR always returns a constant value.
++ * GET_CUR as sticky if GET_CUR always returns a constant value.
+  *
+- * Some devices have effective SET_CUR despite GET_CUR being constant. Do not
+- * consider the mixer as sticky if a quirk flag indicates that.
++ * Unfortunately, we can't distinguish between stubbed SET_CUR and broken
++ * GET_CUR with simple read-back tests. Disabling the mixer regardless and
++ * forcing userspace to use soft mixer instead can lead to audible distortion at
++ * low volume on some wireless headphones, probably due to their poorly-
++ * performed lossy codec.
+  *
+- * Gate the registration of sticky mixers to prevent confusing userspace, so
+- * that they won't cause ineffective volume control. However, for mixers with
+- * effective SET_CUR but broken GET_CUR, the registration can continue normally
+- * but further GET_CUR requests will be gated.
++ * Instead, mark GET_CUR as broken regardless and only provide mixer value from
++ * the cache. Users may opt into soft mixer in userspace audio stack if they
++ * need it.
+  */
+ static int check_sticky_volume_control(struct usb_mixer_elem_info *cval,
+ 				       int channel, int saved)
+@@ -1271,24 +1277,13 @@ static int check_sticky_volume_control(struct usb_mixer_elem_info *cval,
+ 			return 0;
+ 	}
+ 
+-	if (cval->head.mixer->chip->quirk_flags & QUIRK_FLAG_MIXER_GET_CUR_BROKEN) {
+-		usb_audio_info(cval->head.mixer->chip,
+-			       "%d:%d: broken mixer GET_CUR (%d/%d/%d => %d)\n",
+-			       cval->head.id, mixer_ctrl_intf(cval->head.mixer),
+-			       cval->min, cval->max, cval->res, saved);
+-
+-		cval->get_cur_broken = 1;
+-		return -ENXIO;
+-	}
+-
+-	usb_audio_err(cval->head.mixer->chip,
+-		      "%d:%d: sticky mixer values (%d/%d/%d => %d), disabling\n",
+-		      cval->head.id, mixer_ctrl_intf(cval->head.mixer),
+-		      cval->min, cval->max, cval->res, saved);
+ 	usb_audio_info(cval->head.mixer->chip,
+-		       "check MIXER_GET_CUR_BROKEN if you believe the mixer is non-sticky");
++		       "%d:%d: broken mixer GET_CUR (%d/%d/%d => %d)\n",
++		       cval->head.id, mixer_ctrl_intf(cval->head.mixer),
++		       cval->min, cval->max, cval->res, saved);
+ 
+-	return -ENODEV;
++	cval->get_cur_broken = 1;
++	return -ENXIO;
+ }
+ 
+ /*
+@@ -1385,8 +1380,6 @@ static int get_min_max_with_quirks(struct usb_mixer_elem_info *cval,
+ 				goto no_checks;
+ 
+ 			ret = check_sticky_volume_control(cval, minchn, saved);
+-			if (ret == -ENODEV)
+-				goto sticky;
+ 			if (ret)
+ 				goto no_checks;
+ 
+@@ -1454,34 +1447,15 @@ static int get_min_max_with_quirks(struct usb_mixer_elem_info *cval,
+ 		}
+ 	}
+ 
+-	return 0;
+-
+-sticky:
+ 	/*
+-	 * It makes no sense to restore the saved value for a sticky mixer,
+-	 * since setting any value is a no-op.
+-	 *
+-	 * However, in some rare cases, SET_CUR is effective despite GET_CUR
+-	 * always returns a constant value. These mixers are not sticky, but
+-	 * there's no way to distinguish them. Without any additional
+-	 * information, the best thing we can do is to set the mixer value to
+-	 * the maximum before bailing out, so that a soft mixer can still reach
+-	 * the maximum hardware volume if the mixer turns out to be non-sticky.
+-	 * Meanwhile, all channels must be synchronized to prevent imbalance
+-	 * volume.
++	 * When GET_CUR is sticky, the saved value is bogus, so mixer values set
++	 * by the sanity checks must be discarded through init_cur_mix_raw().
++	 * After that, we can clear the flag as per QUIRK_FLAG_MIXER_GET_CUR_OK.
+ 	 */
+-	if (!cval->cmask) {
+-		snd_usb_set_cur_mix_value(cval, 0, 0, cval->max);
+-	} else {
+-		idx = 0;
+-		for (i = 0; i < MAX_CHANNELS; i++) {
+-			if (cval->cmask & BIT(i)) {
+-				snd_usb_set_cur_mix_value(cval, i + 1, idx, cval->max);
+-				idx++;
+-			}
+-		}
+-	}
+-	return ret;
++	if (cval->head.mixer->chip->quirk_flags & QUIRK_FLAG_MIXER_GET_CUR_OK)
++		cval->get_cur_broken = 0;
++
++	return 0;
+ }
+ 
+ #define get_min_max(cval, def)	get_min_max_with_quirks(cval, def, NULL)
+diff --git a/sound/usb/mixer_maps.c b/sound/usb/mixer_maps.c
+--- a/sound/usb/mixer_maps.c
++++ b/sound/usb/mixer_maps.c
+@@ -505,13 +505,13 @@ static const struct usbmix_connector_map gigabyte_b450_connector_map[] = {
+ 	{}
+ };
+ 
+-/* Audient iD14: FU 12 advertises Volume on only 4 of its 6 logical channels
+- * and sits on the monitor mixer branch, but it is traced through to the
+- * Speaker output terminal and gets named "Speaker Playback Volume".  Userspace
+- * then adopts it as the stream's hardware volume, and any setting below 0 dB
+- * attenuates some channels but not others (20 dB imbalance at 80%).  Give it a
+- * non-standard name so that it is no longer taken for the stream's master
+- * volume, while remaining reachable for anyone who wants the monitor gain.
++/* Audient iD14 MkI and MkII: FU 12 sits on the monitor mixer branch but is
++ * traced through to the Speaker output terminal, so it is named "Speaker
++ * Playback Volume".  On MkII it controls only 4 of 6 playback channels.  MkI
++ * testing found asymmetric attenuation within the main stereo pair.  Userspace
++ * adopts this control as the stream's hardware volume, causing imbalance below
++ * 0 dB.  Give it a non-standard name so that userspace no longer treats it as
++ * the stream master, while keeping the monitor gain reachable.
+  */
+ static const struct usbmix_name_map audient_id14_map[] = {
+ 	{ 12, "Monitor Mix Playback" },	/* FU, partial coverage */
+@@ -602,7 +602,12 @@ static const struct usbmix_ctl_map usbmix_ctl_maps[] = {
+ 		.map = maya44_map,
+ 	},
+ 	{
+-		/* Audient iD14 */
++		/* Audient iD14 MkI */
++		.id = USB_ID(0x2708, 0x0002),
++		.map = audient_id14_map,
++	},
++	{
++		/* Audient iD14 MkII */
+ 		.id = USB_ID(0x2708, 0x0008),
+ 		.map = audient_id14_map,
+ 	},
+diff --git a/sound/usb/quirks-table.h b/sound/usb/quirks-table.h
+--- a/sound/usb/quirks-table.h
++++ b/sound/usb/quirks-table.h
+@@ -1814,6 +1814,28 @@ YAMAHA_DEVICE(0x7010, "UB99"),
+ 		}
+ 	}
+ },
++{
++	/*
++	 * M-Audio Venom
++	 *
++	 * The AudioControl interface times out on every GET_CUR request,
++	 * which adds around 47 seconds to the card registration and
++	 * freezes the device, blocking streaming.
++	 * Using an explicit composite quirk to skip the mixer entirely.
++	 */
++	USB_DEVICE_VENDOR_SPEC(0x0763, 0x2084),
++	QUIRK_DRIVER_INFO {
++		.vendor_name = "M-Audio",
++		.product_name = "Venom",
++		QUIRK_DATA_COMPOSITE {
++			{ QUIRK_DATA_IGNORE(0) },
++			{ QUIRK_DATA_STANDARD_AUDIO(1) },
++			{ QUIRK_DATA_STANDARD_AUDIO(2) },
++			{ QUIRK_DATA_STANDARD_MIDI(3) },
++			QUIRK_COMPOSITE_END
++		}
++	}
++},
+ 
+ /* Casio devices */
+ {
+diff --git a/sound/usb/quirks.c b/sound/usb/quirks.c
+--- a/sound/usb/quirks.c
++++ b/sound/usb/quirks.c
+@@ -2215,10 +2215,10 @@ static const struct usb_audio_quirk_flags_table quirk_flags_table[] = {
+ 		   QUIRK_FLAG_FORCE_IFACE_RESET | QUIRK_FLAG_IFACE_DELAY),
+ 	DEVICE_FLG(0x03f0, 0x654a, /* HP 320 FHD Webcam */
+ 		   QUIRK_FLAG_GET_SAMPLE_RATE | QUIRK_FLAG_MIC_RES_16),
+-	DEVICE_FLG(0x040b, 0x0897, /* Weltrend Semiconductor, sold as Redragon H510-PRO Wireless headset */
+-		   QUIRK_FLAG_MIXER_GET_CUR_BROKEN),
+ 	DEVICE_FLG(0x041e, 0x3000, /* Creative SB Extigy */
+ 		   QUIRK_FLAG_IGNORE_CTL_ERROR),
++	DEVICE_FLG(0x041e, 0x324d, /* Creative Sound Blaster Play! 3 */
++		   QUIRK_FLAG_MIXER_PLAYBACK_MIN_MUTE),
+ 	DEVICE_FLG(0x041e, 0x4080, /* Creative Live Cam VF0610 */
+ 		   QUIRK_FLAG_GET_SAMPLE_RATE),
+ 	DEVICE_FLG(0x045e, 0x083c, /* MS USB Link headset */
+@@ -2256,8 +2256,9 @@ static const struct usb_audio_quirk_flags_table quirk_flags_table[] = {
+ 	DEVICE_FLG(0x046d, 0x0a8f, /* Logitech H390 headset */
+ 		   QUIRK_FLAG_CTL_MSG_DELAY_1M |
+ 		   QUIRK_FLAG_MIXER_PLAYBACK_MIN_MUTE),
+-	DEVICE_FLG(0x046d, 0x0af7, /* Logitech PRO X 2 LIGHTSPEED */
+-		   QUIRK_FLAG_MIXER_GET_CUR_BROKEN),
++	DEVICE_FLG(0x046d, 0x0aba, /* Logitech PRO X Wireless */
++		   QUIRK_FLAG_MIXER_GET_CUR_OK |
++		   QUIRK_FLAG_MIXER_PLAYBACK_MIN_MUTE),
+ 	DEVICE_FLG(0x0499, 0x1506, /* Yamaha THR5 */
+ 		   QUIRK_FLAG_GENERIC_IMPLICIT_FB),
+ 	DEVICE_FLG(0x0499, 0x1509, /* Steinberg UR22 */
+@@ -2329,9 +2330,11 @@ static const struct usb_audio_quirk_flags_table quirk_flags_table[] = {
+ 	DEVICE_FLG(0x0763, 0x2031, /* M-Audio Fast Track C600 */
+ 		   QUIRK_FLAG_GENERIC_IMPLICIT_FB),
+ 	DEVICE_FLG(0x0763, 0x2080, /* M-Audio Fast Track Ultra */
+-		   QUIRK_FLAG_MIXER_GET_CUR_BROKEN | QUIRK_FLAG_GENERIC_IMPLICIT_FB),
++		   QUIRK_FLAG_GENERIC_IMPLICIT_FB),
+ 	DEVICE_FLG(0x0763, 0x2081, /* M-Audio Fast Track Ultra */
+-		   QUIRK_FLAG_MIXER_GET_CUR_BROKEN | QUIRK_FLAG_GENERIC_IMPLICIT_FB),
++		   QUIRK_FLAG_GENERIC_IMPLICIT_FB),
++	DEVICE_FLG(0x0763, 0x2084, /* M-Audio Venom */
++		   QUIRK_FLAG_GET_SAMPLE_RATE | QUIRK_FLAG_DISABLE_AUTOSUSPEND),
+ 	DEVICE_FLG(0x07fd, 0x000b, /* MOTU M Series 2nd hardware revision */
+ 		   QUIRK_FLAG_CTL_MSG_DELAY_1M),
+ 	DEVICE_FLG(0x08bb, 0x2702, /* LineX FM Transmitter */
+@@ -2370,8 +2373,6 @@ static const struct usb_audio_quirk_flags_table quirk_flags_table[] = {
+ 		   QUIRK_FLAG_SHARE_MEDIA_DEVICE | QUIRK_FLAG_ALIGN_TRANSFER),
+ 	DEVICE_FLG(0x1038, 0x1294, /* SteelSeries Arctis Pro Wireless */
+ 		   QUIRK_FLAG_MIXER_PLAYBACK_MIN_MUTE),
+-	DEVICE_FLG(0x1038, 0x2232, /* SteelSeries Arctis Nova 5 */
+-		   QUIRK_FLAG_MIXER_GET_CUR_BROKEN),
+ 	DEVICE_FLG(0x1101, 0x0003, /* Audioengine D1 */
+ 		   QUIRK_FLAG_GET_SAMPLE_RATE),
+ 	DEVICE_FLG(0x12d1, 0x3a07, /* HUAWEI USB-C HEADSET */
+@@ -2379,8 +2380,6 @@ static const struct usb_audio_quirk_flags_table quirk_flags_table[] = {
+ 		   QUIRK_FLAG_FORCE_IFACE_RESET | QUIRK_FLAG_IFACE_DELAY),
+ 	DEVICE_FLG(0x1224, 0x2a25, /* Jieli Technology USB PHY 2.0 */
+ 		   QUIRK_FLAG_GET_SAMPLE_RATE | QUIRK_FLAG_MIC_RES_16),
+-	DEVICE_FLG(0x1377, 0x6004, /* Sennheiser MOMENTUM 3 */
+-		   QUIRK_FLAG_MIXER_GET_CUR_BROKEN),
+ 	DEVICE_FLG(0x1395, 0x740a, /* Sennheiser DECT */
+ 		   QUIRK_FLAG_GET_SAMPLE_RATE),
+ 	DEVICE_FLG(0x1397, 0x0507, /* Behringer UMC202HD */
+@@ -2393,6 +2392,9 @@ static const struct usb_audio_quirk_flags_table quirk_flags_table[] = {
+ 		   QUIRK_FLAG_IFB_SILENCE_ON_EMPTY),
+ 	DEVICE_FLG(0x13e5, 0x0001, /* Serato Phono */
+ 		   QUIRK_FLAG_IGNORE_CTL_ERROR),
++	DEVICE_FLG(0x152a, 0x85dd, /* SMSL USB DAC */
++		   QUIRK_FLAG_DSD_RAW | QUIRK_FLAG_DISABLE_AUTOSUSPEND |
++		   QUIRK_FLAG_SKIP_IFACE_SETUP),
+ 	DEVICE_FLG(0x152a, 0x880a, /* NeuralDSP Quad Cortex */
+ 		   0), /* Doesn't have the vendor quirk which would otherwise apply */
+ 	DEVICE_FLG(0x1532, 0x055e, /* Razer Nommo V2 X */
+@@ -2505,8 +2507,6 @@ static const struct usb_audio_quirk_flags_table quirk_flags_table[] = {
+ 		   QUIRK_FLAG_CTL_MSG_DELAY_1M),
+ 	DEVICE_FLG(0x2d99, 0x0026, /* HECATE G2 GAMING HEADSET */
+ 		   QUIRK_FLAG_MIXER_PLAYBACK_MIN_MUTE),
+-	DEVICE_FLG(0x2d99, 0xa024, /* Edifier MF200 */
+-		   QUIRK_FLAG_MIXER_GET_CUR_BROKEN),
+ 	DEVICE_FLG(0x2fc6, 0xf06b, /* MOONDROP Moonriver2 Ti */
+ 		   QUIRK_FLAG_CTL_MSG_DELAY),
+ 	DEVICE_FLG(0x2fc6, 0xf0b5, /* iBasso DC-Elite */
+@@ -2647,7 +2647,7 @@ static const char *const snd_usb_audio_quirk_flag_names[] = {
+ 	QUIRK_STRING_ENTRY(MIXER_PLAYBACK_LINEAR_VOL),
+ 	QUIRK_STRING_ENTRY(MIXER_CAPTURE_LINEAR_VOL),
+ 	QUIRK_STRING_ENTRY(IFB_SILENCE_ON_EMPTY),
+-	QUIRK_STRING_ENTRY(MIXER_GET_CUR_BROKEN),
++	QUIRK_STRING_ENTRY(MIXER_GET_CUR_OK),
+ 	QUIRK_STRING_ENTRY(PLAYBACK_URB_FIXUP),
+ 	QUIRK_STRING_ENTRY(ALWAYS_SET_RATE),
+ 	NULL
+diff --git a/sound/usb/usbaudio.h b/sound/usb/usbaudio.h
+--- a/sound/usb/usbaudio.h
++++ b/sound/usb/usbaudio.h
+@@ -243,24 +243,18 @@ extern bool snd_usb_skip_validation;
+  *  from snd_usb_handle_sync_urb. Instead fall through and enqueue a
+  *  packet_info containing only size-0 packets, so the OUT ring keeps
+  *  moving (emits silence). Needed by Behringer Flow 8 (1397:050c).
+- * QUIRK_FLAG_MIXER_GET_CUR_BROKEN
+- *  Some mixers are sticky, which means that setting their current volume is a
+- *  no-op, and reading the current volume returns a constant value. The sticky
+- *  check disables these mixers to prevent confusing userspace. However, some
+- *  devices do have a tunable volume despite the reported current volume being
+- *  constant. As the sticky check can't distinguish between the two categories,
+- *  setting this flag tells that the device should fall into the second
+- *  category when GET_CUR returns a constant value, resulting in the sticky
+- *  check being non-fatal and only disabling GET_CUR instead of the whole mixer.
+- *  The current volume will then be provided by the internal cache that stores
+- *  the last set volume
++ * QUIRK_FLAG_MIXER_GET_CUR_OK
++ *  On some devices, whether their GET_CUR being sticky depends on whether
++ *  hotpluggable components are present. When the hotpluggable components are
++ *  missing on probe, their GET_CUR behavior is classified as broken. Set the
++ *  flag to prevent the heuristics from gating GET_CUR.
+  * QUIRK_FLAG_PLAYBACK_URB_FIXUP
+  *  Set URB_ISO_ASAP flag for isochronous URBs and force nurbs to MAX_URBS.
+  *  This is needed for devices that exhibit boot-time audio stuttering due
+  *  to insufficient buffer depth combined with xHCI scheduling variability.
+  *  The larger buffer (MAX_URBS = 12, ~64ms) absorbs system scheduling
+  *  jitter during boot, while URB_ISO_ASAP ensures consistent xHCI scheduling.
+- * QUIRK_FLAG_ALWAYS_SET_RATE:
++ * QUIRK_FLAG_ALWAYS_SET_RATE
+  *  Issue SET_CUR for the sample rate even when the clock already reports the
+  *  requested rate.  A device advertising a single rate is otherwise never sent
+  *  the request at all, and some require it before streaming will start.
+@@ -297,10 +291,10 @@ enum {
+ 	QUIRK_TYPE_MIXER_PLAYBACK_LINEAR_VOL	= 27,
+ 	QUIRK_TYPE_MIXER_CAPTURE_LINEAR_VOL	= 28,
+ 	QUIRK_TYPE_IFB_SILENCE_ON_EMPTY		= 29,
+-	QUIRK_TYPE_MIXER_GET_CUR_BROKEN		= 30,
++	QUIRK_TYPE_MIXER_GET_CUR_OK		= 30,
+ 	QUIRK_TYPE_PLAYBACK_URB_FIXUP		= 31,
+ 	QUIRK_TYPE_ALWAYS_SET_RATE		= 32,
+-/* Please also edit snd_usb_audio_quirk_flag_names */
++/* Please also edit snd_usb_audio_quirk_flag_names and alsa-configuration.rst */
+ };
+ 
+ #define QUIRK_FLAG(x)	BIT_U64(QUIRK_TYPE_ ## x)
+@@ -335,7 +329,7 @@ enum {
+ #define QUIRK_FLAG_MIXER_PLAYBACK_LINEAR_VOL	QUIRK_FLAG(MIXER_PLAYBACK_LINEAR_VOL)
+ #define QUIRK_FLAG_MIXER_CAPTURE_LINEAR_VOL	QUIRK_FLAG(MIXER_CAPTURE_LINEAR_VOL)
+ #define QUIRK_FLAG_IFB_SILENCE_ON_EMPTY		QUIRK_FLAG(IFB_SILENCE_ON_EMPTY)
+-#define QUIRK_FLAG_MIXER_GET_CUR_BROKEN		QUIRK_FLAG(MIXER_GET_CUR_BROKEN)
++#define QUIRK_FLAG_MIXER_GET_CUR_OK		QUIRK_FLAG(MIXER_GET_CUR_OK)
+ #define QUIRK_FLAG_PLAYBACK_URB_FIXUP		QUIRK_FLAG(PLAYBACK_URB_FIXUP)
+ #define QUIRK_FLAG_ALWAYS_SET_RATE		QUIRK_FLAG(ALWAYS_SET_RATE)
+ 

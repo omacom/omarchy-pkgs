@@ -23,6 +23,14 @@ The filesystem no longer encodes release policy. Instead:
   (`OMARCHY_RC_PINS=1`, which `omarchy-release rc` sets) may build it for rc — master's
   shipped pins can never overwrite an in-flight RC. The dev pair
   (`omarchy-dev`, `omarchy-settings-dev`) is pinned to `edge`
+- packages that follow a moving upstream branch (the dev pair on `quattro`,
+  `omasnap-git` on `main`) still pin an exact commit in their PKGBUILD. A
+  `git_branch` upstream watch moves that pin, and `"auto_merge": true` puts the
+  package on the unattended lane: `track-branches.yml` opens the bump PR every
+  two hours and auto-merges it once the build checks pass, so a branch tip
+  reaches the edge channel without anyone clicking. No PKGBUILD may carry an
+  unpinned git source (`tests/pinned-sources.sh`); a branch that has to be
+  followed gets a watch, not a `#branch=` fragment
 - Omarchy owns every checked-in recipe; upstream watches update release metadata without replacing packaging or architecture support
 - packages can opt out of unscoped builds with `skip_build`; explicit `--package` builds remain available
 - packages follow direct upstream watches/providers in `.omarchy/package.json`, or a custom `.omarchy/upstream.sh` hook
@@ -520,7 +528,8 @@ A package names those dependencies in `.omarchy/package.json`:
 ```
 
 `bin/sync-rebuilds` reads each named package's version from the official
-repositories for every published architecture the package supports and compares
+repositories for every architecture a merge builds (`CI_ARCHES` in
+`helpers/paths.sh`, both by default) that the package supports and compares
 it to `rebuilt_against`. Records are kept per architecture because Arch and
 Arch Linux ARM can carry different dependency versions. pkgrel is bumped once
 when any recorded version moves; that one source revision is then rebuilt by
@@ -539,6 +548,8 @@ repository database, which is also what the ARM builder uses. Testing and
 staging repositories do not count. A legacy flat `rebuilt_against` record is
 read as x86_64 and is migrated naturally the next time a rebuild is needed.
 
+A dependency this repository carries for an architecture (a recipe here that builds for edge on it, such as aquamarine on aarch64) shadows the distribution's, because the builder lists `[omarchy]` first. Its version is the recipe's, and it counts only once edge publishes that version: until then the builder still links against the previous one, so dependents are left alone for that run.
+
 ### Other
 
 ```bash
@@ -554,11 +565,25 @@ bin/repo deploy                      # Build locally, then publish from the host
 bin/repo push                        # Upload local builds to the host and publish
 bin/add-package <package>            # Add an Omarchy-owned package with metadata
 bin/package-worktree <package>       # Inspect historical AUR provenance in a scratch workspace
-bin/repo remove <package>            # Remove package
+bin/repo remove <package>            # Remove package (host workflow; CI uses unpublish.yml)
 bin/sync-upstream                    # Update packages that track a vendor release feed
 bin/sync-rebuilds                    # Bump pkgrel for packages whose dependencies moved
 bin/clean-docker                     # Clear Docker images/cache (forces fresh rebuild)
 ```
+
+### Retiring a package
+
+Delete its recipe directory in a PR. Once that merges, take it out of the
+channel databases with the **Unpublish retired packages** workflow:
+
+```
+gh workflow run unpublish.yml -f packages="<pkgbase> ..." -f channels="edge rc stable"
+```
+
+It removes every entry built from those pkgbases (split outputs and `-debug`
+included) from both architectures' databases, and refuses any package that
+still has a recipe on master. Package files stay in the bucket: published
+filenames are immutable, and nothing references them once the entries are gone.
 
 ### Package Metadata Tools
 
@@ -719,6 +744,7 @@ Fields:
 - `upstream`: optional direct release watch (see [Upstream watches](docs/upstream-sources.md)), or an existing GitHub, git-tag, npm, or Debian provider. GitHub architecture assets may be a string or an ordered array, and can be combined with disjoint versioned `sources` — see [Sync Upstream Releases](#sync-upstream-releases). Mutually exclusive with `.omarchy/upstream.sh`.
 - `min_release_age`: optional quarantine for upstream releases (`"24h"`, `"2d"`, or bare seconds). The newest release older than the window ships; anything younger waits, and a release whose age cannot be proven fails the sync. Bypass deliberately with `BYPASS_MIN_RELEASE_AGE=1 bin/sync-upstream <package>`.
 - `sync`: `false` records an existing manual maintenance hold. Held packages have no upstream watch/provider/hook and are excluded from automatic updates.
+- `auto_merge`: optional boolean; defaults to `false`. `true` moves the package's upstream updates from the reviewed 6-hourly sync PR to the unattended lane: `track-branches.yml` opens its bump PR and auto-merges it when CI is green. Meant for packages that follow a moving branch through a `git_branch` watch, where every tip is a release and there is nothing for a reviewer to read. Requires an upstream watch, provider, or hook.
 - `origin`: optional historical import provenance, with `aur` (package name) and `commit`. It does not control updates.
 - `release_ring`: optional. `fast` means the package is built directly for stable as well as edge, with the artifacts replicated into rc for parity. Packages without a ring build in edge and reach stable through the pipeline (`bin/repo advance`).
 - `channels`: optional array bounding where the package may be built (`edge`, `rc`, `stable`). Without the key a package is a member of every channel and follows the default build rules above; `bin/repo advance` refuses to carry a package anywhere it isn't a member.
@@ -726,7 +752,7 @@ Fields:
 - `skip_build`: optional boolean; defaults to `false`. Set `true` to exclude a package from scheduled version checks and unscoped builds. The package can still be built explicitly with `bin/repo release --package <name>`.
 - `pkgrel`: legacy import customization metadata. Maintained recipes keep their complete package release directly in PKGBUILD; rebuilds increment it there.
 - `rebuild_on`: optional array of package names this package links against closely enough that it must be rebuilt when they change, independent of its own source. Read by `bin/sync-rebuilds`.
-- `rebuilt_against`: written by `bin/sync-rebuilds`. Maps each published architecture to the versions of its `rebuild_on` packages that the current pkgrel was bumped for.
+- `rebuilt_against`: written by `bin/sync-rebuilds`. Maps each built architecture to the versions of its `rebuild_on` packages that the current pkgrel was bumped for.
 - `upstream_commit`: legacy AUR metadata, superseded by `origin.commit`. `bin/package-worktree` can use historical provenance to inspect the original recipe.
 
 ### Build Matrix
@@ -880,8 +906,46 @@ The repository includes GitHub workflows and systemd services for automated rele
 
 #### GitHub Workflows
 
-1. **sync-upstream.yml** (Every 6 hours): Watches direct upstream feeds and updates owned recipes. Successful package updates reach a PR even if another feed fails; failed recipes stay untouched and the workflow remains red.
-2. **sync-rebuilds.yml** (Every 6 hours): Bumps pkgrel for packages whose `rebuild_on` dependencies have moved in the official repositories and opens a PR.
+1. **sync-upstream.yml** (Every 6 hours): Watches direct upstream feeds and updates owned recipes on the reviewed lane. Successful package updates reach a PR even if another feed fails; failed recipes stay untouched and the workflow remains red.
+2. **sync-rebuilds.yml** (Every 6 hours): Bumps pkgrel for packages whose `rebuild_on` dependencies have moved in the official repositories, opens a PR, and enables auto-merge. The PR lands once its build checks pass; a rebuild that fails stays an open red PR for a maintainer.
+3. **track-branches.yml** (Every 2 hours): The unattended lane. Pins every `"auto_merge": true` package to the tip of its watched branch once its commit timestamp clears `min_release_age`, opens one PR for all of them, and enables auto-merge. Packages pinned from the same branch move together or not at all, including targeted syncs. The PR builds like any other; a tip that fails to build stays an open red PR until the next tick supersedes it.
+
+The tracking and rebuild PRs and their auto-merge use the PAT stored in `PKGS_BOT_TOKEN`, with
+Contents and Pull requests write access to this repository and an owner trusted
+to trigger builds. The existing controller PAT can be reused. No GitHub App is
+required. The built-in Actions `GITHUB_TOKEN` cannot drive the unattended
+build-and-publish chain, so both workflows require this secret before they run.
+The reviewed upstream sync continues to use `GITHUB_TOKEN` and requires
+maintainer approval as before. See [setup instructions](docs/upstream-sources.md#enable-unattended-branch-updates).
+
+Scheduled runs regenerate one shared PR (`auto/sync-upstream`, `auto/sync-rebuilds`)
+from master. A manual run with the `packages` input only regenerates those
+packages, so it opens its own PR on `auto/sync-upstream-<packages>` (or
+`auto/sync-rebuilds-<packages>`) rather than replacing the shared PR's other
+pending updates. The next scheduled run still picks the same update up in the
+shared PR if it has not merged by then; identical package trees reuse the same
+build artifacts.
+
+Upstream sync PRs are pushed with `GITHUB_TOKEN`, so GitHub holds their build and test
+runs for approval on every push and starts no `pull_request_target` workflow
+for them. The upstream sync labels its own PRs **`build-approved`**, and
+its `approve` job releases the held runs for each commit they push, including
+the push that opens the PR. A push to an `auto/sync-*` branch does not cancel
+the PR's in-flight build: the new build waits for it and then reuses its
+artifacts, so a long aarch64 build is not restarted by every sync.
+
+Package PRs that are trusted to build also merge themselves.
+`auto-merge-pr.yml` enables auto-merge (with `PKGS_BOT_TOKEN`, so the merge
+publishes) on any open, non-draft PR whose author is a collaborator, vouched,
+or a bot, or that carries **`build-approved`**, and that changes only
+packages: anything under `pkgbuilds/`, plus the test a package PR brings with
+it (a new file under `tests/`, and `test.yml` lines that only run new
+`./tests/*.sh`). The PR lands once `result`, `self-tests` and
+`build-isolation` pass; a red build stays open. PRs that also touch
+workflows, scripts, build tooling or existing tests still need a maintainer, as does
+the upstream sync (`auto/sync-upstream`), which labels itself. Removing
+`build-approved` withdraws the auto-merge it armed. For a PR opened before
+the workflow existed, run it by hand: `gh workflow run auto-merge-pr.yml -f pr=<number>`.
 
 To approve builds for an unvouched contributor's PR, apply **`build-approved`**.
 Until approval, the PR shows **Awaiting build approval** and its required

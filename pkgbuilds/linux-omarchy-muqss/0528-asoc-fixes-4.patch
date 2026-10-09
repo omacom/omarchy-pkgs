@@ -1,0 +1,523 @@
+diff --git a/drivers/spi/spi-cs42l43.c b/drivers/spi/spi-cs42l43.c
+--- a/drivers/spi/spi-cs42l43.c
++++ b/drivers/spi/spi-cs42l43.c
+@@ -11,6 +11,7 @@
+ #include <linux/bitfield.h>
+ #include <linux/cleanup.h>
+ #include <linux/device.h>
++#include <linux/dmi.h>
+ #include <linux/errno.h>
+ #include <linux/gpio/consumer.h>
+ #include <linux/gpio/machine.h>
+@@ -215,12 +216,108 @@ static size_t cs42l43_spi_max_length(struct spi_device *spi)
+ 	return CS42L43_SPI_MAX_LENGTH;
+ }
+ 
++/*
++ * Workaround needed for two speaker ID pins in one ACPI GpioIo() but
++ * the Linux-specific _DSD property only contains one pin.
++ * Create a temporary acpi_gpio_mapping pointing at both pins.
++ */
++static const struct acpi_gpio_params cs42l43_2bit_speaker_id_from_one_gpioio_params[] = {
++	[0] = {
++		.crs_entry_index = 0,
++		.line_index = 0,
++	},
++	[1] = {
++		.crs_entry_index = 0,
++		.line_index = 1,
++	},
++};
++
++static const struct acpi_gpio_mapping cs42l43_2bit_speaker_id_from_one_gpioio_mapping[] = {
++	{
++		.name = "spk-id-quirk-gpios",
++		.data = cs42l43_2bit_speaker_id_from_one_gpioio_params,
++		.size = ARRAY_SIZE(cs42l43_2bit_speaker_id_from_one_gpioio_params),
++	},
++	{ }
++};
++
++static int cs42l43_get_2bit_speaker_id_from_one_gpioio(struct cs42l43_spi *priv, int *result)
++{
++	struct fwnode_reference_args args;
++	struct acpi_device *adev;
++	struct gpio_desc *desc;
++	u32 spkid = 0;
++	int i, ret;
++
++	/* Use the _DSD property to get the node containing the GpioIo() */
++	ret = fwnode_property_get_reference_args(dev_fwnode(priv->dev), "spk-id-gpios",
++						 NULL, 3, 0, &args);
++	if (ret)
++		return ret;
++
++	struct fwnode_handle *fwnode __free(fwnode_handle) = args.fwnode;
++
++	/* An acpi_gpio_mapping must be added to the node that contains the GpioIo() */
++	adev = to_acpi_device_node(fwnode);
++	if (!adev)
++		return -EINVAL;
++
++	ret = acpi_dev_add_driver_gpios(adev, cs42l43_2bit_speaker_id_from_one_gpioio_mapping);
++	if (ret)
++		return ret;
++
++	/* gpiod_get_array() can't read from a mapping in a child node */
++	for (i = 0; i < ARRAY_SIZE(cs42l43_2bit_speaker_id_from_one_gpioio_params); i++) {
++		desc = fwnode_gpiod_get_index(fwnode, "spk-id-quirk", i, GPIOD_IN,
++					      dev_name(priv->dev));
++		if (IS_ERR(desc)) {
++			ret = PTR_ERR(desc);
++			goto out;
++		}
++
++		ret = gpiod_get_value_cansleep(desc);
++		gpiod_put(desc);
++		if (ret < 0)
++			goto out;
++
++		spkid |= (u32)ret << i;
++	}
++
++	dev_dbg(priv->dev, "spk-id-gpios = %u\n", spkid);
++	*result = spkid;
++	ret = 0;
++out:
++	acpi_dev_remove_driver_gpios(adev);
++
++	return ret;
++}
++
++static const struct dmi_system_id cs42l43_spk_id_quirks[] = {
++	{
++		.ident = "Dell XPS 13 DX13260",
++		.matches = {
++			DMI_MATCH(DMI_SYS_VENDOR, "Dell Inc"),
++			DMI_EXACT_MATCH(DMI_PRODUCT_SKU, "0E53"),
++		},
++		.driver_data = cs42l43_get_2bit_speaker_id_from_one_gpioio,
++	},
++	{ }
++};
++
+ static int cs42l43_get_speaker_id_gpios(struct cs42l43_spi *priv, int *result)
+ {
++	const struct dmi_system_id *dmi_id;
+ 	struct gpio_descs *descs;
+ 	u32 spkid;
+ 	int i, ret;
+ 
++	dmi_id = dmi_first_match(cs42l43_spk_id_quirks);
++	if (dmi_id) {
++		int (*get_speaker_id)(struct cs42l43_spi *priv, int *result) = dmi_id->driver_data;
++
++		return get_speaker_id(priv, result);
++	}
++
+ 	descs = gpiod_get_array_optional(priv->dev, "spk-id", GPIOD_IN);
+ 	if (!descs)
+ 		return 0;
+diff --git a/sound/soc/amd/acp-config.c b/sound/soc/amd/acp-config.c
+--- a/sound/soc/amd/acp-config.c
++++ b/sound/soc/amd/acp-config.c
+@@ -51,6 +51,13 @@ static const struct dmi_system_id acp70_acpi_flag_override_table[] = {
+ 			DMI_MATCH(DMI_PRODUCT_NAME, "83V9"),
+ 		},
+ 	},
++	{
++		/* Lenovo Yoga Pro 7 14ASP9 (Strix Point, ACP 7.0) */
++		.matches = {
++			DMI_MATCH(DMI_BOARD_VENDOR, "LENOVO"),
++			DMI_MATCH(DMI_PRODUCT_NAME, "83HN"),
++		},
++	},
+ 	{
+ 		.matches = {
+ 			DMI_MATCH(DMI_BOARD_VENDOR, "ASUSTeK COMPUTER INC"),
+@@ -63,6 +70,13 @@ static const struct dmi_system_id acp70_acpi_flag_override_table[] = {
+ 			DMI_MATCH(DMI_PRODUCT_NAME, "Vivobook 18 M1807GA"),
+ 		},
+ 	},
++	{
++		/* ASUS Zenbook S14 UM5406GA (Strix Point, ACP 7.0) */
++		.matches = {
++			DMI_MATCH(DMI_BOARD_VENDOR, "ASUSTeK COMPUTER INC."),
++			DMI_MATCH(DMI_PRODUCT_NAME, "Zenbook S14 UM5406GA"),
++		},
++	},
+ 	{
+ 		/* HP OmniBook X Flip 14-kc0xxx (Strix Point, ACP 7.2) */
+ 		.matches = {
+diff --git a/sound/soc/amd/acp/Kconfig b/sound/soc/amd/acp/Kconfig
+--- a/sound/soc/amd/acp/Kconfig
++++ b/sound/soc/amd/acp/Kconfig
+@@ -181,6 +181,7 @@ config SND_SOC_AMD_LEGACY_SDW_MACH
+ 	select SND_SOC_RT715_SDW
+ 	select SND_SOC_RT715_SDCA_SDW
+ 	select SND_SOC_RT722_SDCA_SDW
++	select SND_SOC_TAS2783_SDW
+ 	help
+ 	  This option enables Legacy(No DSP) sound card support for SoundWire
+ 	  enabled AMD platforms along with ACP PDM controller.
+diff --git a/sound/soc/amd/acp/amd-acp70-acpi-match.c b/sound/soc/amd/acp/amd-acp70-acpi-match.c
+--- a/sound/soc/amd/acp/amd-acp70-acpi-match.c
++++ b/sound/soc/amd/acp/amd-acp70-acpi-match.c
+@@ -748,7 +748,27 @@ static const struct snd_soc_acpi_link_adr acp70_rt721_only[] = {
+ 	{}
+ };
+ 
++static const struct snd_soc_acpi_link_adr acp70_tas2783a_l0_rt712_vb_l1[] = {
++	{
++		.mask = BIT(0),
++		.num_adr = ARRAY_SIZE(tas2783_2_adr),
++		.adr_d = tas2783_2_adr,
++	},
++	{
++		.mask = BIT(1),
++		.num_adr = ARRAY_SIZE(rt712_vb_1_group1_adr),
++		.adr_d = rt712_vb_1_group1_adr,
++	},
++	{}
++};
++
+ struct snd_soc_acpi_mach snd_soc_acpi_amd_acp70_sdw_machines[] = {
++	{
++		.link_mask = BIT(0) | BIT(1),
++		.links = acp70_tas2783a_l0_rt712_vb_l1,
++		.machine_check = snd_soc_acpi_amd_sdca_is_device_rt712_vb,
++		.drv_name = "amd_sdw",
++	},
+ 	{
+ 		.link_mask = BIT(0),
+ 		.links = acp70_tas2783_2,
+diff --git a/sound/soc/amd/yc/acp6x-mach.c b/sound/soc/amd/yc/acp6x-mach.c
+--- a/sound/soc/amd/yc/acp6x-mach.c
++++ b/sound/soc/amd/yc/acp6x-mach.c
+@@ -248,6 +248,13 @@ static const struct dmi_system_id yc_acp_quirk_table[] = {
+ 			DMI_MATCH(DMI_PRODUCT_NAME, "21J6"),
+ 		}
+ 	},
++	{
++		.driver_data = &acp6x_card,
++		.matches = {
++			DMI_MATCH(DMI_BOARD_VENDOR, "LENOVO"),
++			DMI_MATCH(DMI_PRODUCT_NAME, "21JN"),
++		}
++	},
+ 	{
+ 		.driver_data = &acp6x_card,
+ 		.matches = {
+@@ -381,6 +388,13 @@ static const struct dmi_system_id yc_acp_quirk_table[] = {
+ 			DMI_MATCH(DMI_PRODUCT_NAME, "83Q3"),
+ 		}
+ 	},
++	{
++		.driver_data = &acp6x_card,
++		.matches = {
++			DMI_MATCH(DMI_BOARD_VENDOR, "LENOVO"),
++			DMI_MATCH(DMI_PRODUCT_NAME, "83UU"),
++		}
++	},
+ 	{
+ 		.driver_data = &acp6x_card,
+ 		.matches = {
+diff --git a/sound/soc/codecs/Kconfig b/sound/soc/codecs/Kconfig
+--- a/sound/soc/codecs/Kconfig
++++ b/sound/soc/codecs/Kconfig
+@@ -1989,9 +1989,7 @@ config SND_SOC_RT715_SDCA_SDW
+ config SND_SOC_RT766_SDCA_SDW
+ 	tristate "Realtek RT766 SDCA Codec - SDW"
+ 	depends on SOUNDWIRE
+-	depends on SND_SOC_SDCA
+-	select SND_SOC_SDCA_HID
+-	select SND_SOC_SDCA_IRQ
++	depends on SND_SOC_SDCA_CLASS
+ 	select REGMAP_SOUNDWIRE
+ 	select REGMAP_SOUNDWIRE_MBQ
+ 
+diff --git a/sound/soc/codecs/lpass-wsa-macro.c b/sound/soc/codecs/lpass-wsa-macro.c
+--- a/sound/soc/codecs/lpass-wsa-macro.c
++++ b/sound/soc/codecs/lpass-wsa-macro.c
+@@ -1841,6 +1841,7 @@ static int wsa_macro_enable_interpolator(struct snd_soc_dapm_widget *w,
+ 					 int event)
+ {
+ 	struct snd_soc_component *component = snd_soc_dapm_to_component(w->dapm);
++	unsigned int gain;
+ 	u16 gain_reg;
+ 	u16 reg;
+ 	struct wsa_macro *wsa = snd_soc_component_get_drvdata(component);
+@@ -1882,6 +1883,8 @@ static int wsa_macro_enable_interpolator(struct snd_soc_dapm_widget *w,
+ 					CDC_WSA_RX_PGA_HALF_DB_MASK,
+ 					CDC_WSA_RX_PGA_HALF_DB_ENABLE);
+ 		}
++		gain = snd_soc_component_read(component, gain_reg);
++		snd_soc_component_write(component, gain_reg, gain);
+ 		wsa_macro_config_ear_spkr_gain(component, wsa,
+ 						event, gain_reg);
+ 		break;
+diff --git a/sound/soc/codecs/max98363.c b/sound/soc/codecs/max98363.c
+--- a/sound/soc/codecs/max98363.c
++++ b/sound/soc/codecs/max98363.c
+@@ -200,7 +200,7 @@ static int max98363_sdw_dai_hw_params(struct snd_pcm_substream *substream,
+ 	struct max98363_priv *max98363 =
+ 		snd_soc_component_get_drvdata(component);
+ 
+-	struct sdw_stream_config stream_config;
++	struct sdw_stream_config stream_config = {0};
+ 	struct sdw_port_config port_config;
+ 	enum sdw_data_direction direction;
+ 	struct sdw_stream_runtime *stream;
+diff --git a/sound/soc/codecs/rt1017-sdca-sdw.c b/sound/soc/codecs/rt1017-sdca-sdw.c
+--- a/sound/soc/codecs/rt1017-sdca-sdw.c
++++ b/sound/soc/codecs/rt1017-sdca-sdw.c
+@@ -15,6 +15,7 @@
+ #include <sound/pcm_params.h>
+ #include <sound/soc.h>
+ #include <sound/soc-dapm.h>
++#include <sound/sdw.h>
+ #include <sound/initval.h>
+ #include <sound/tlv.h>
+ 
+@@ -573,11 +574,10 @@ static int rt1017_sdca_pcm_hw_params(struct snd_pcm_substream *substream,
+ {
+ 	struct snd_soc_component *component = dai->component;
+ 	struct rt1017_sdca_priv *rt1017 = snd_soc_component_get_drvdata(component);
+-	struct sdw_stream_config stream_config;
++	struct sdw_stream_config stream_config = {0};
+ 	struct sdw_port_config port_config;
+-	enum sdw_data_direction direction;
+ 	struct sdw_stream_runtime *sdw_stream;
+-	int retval, port, num_channels, ch_mask;
++	int retval, port;
+ 	unsigned int sampling_rate;
+ 
+ 	dev_dbg(dai->dev, "%s %s", __func__, dai->name);
+@@ -591,28 +591,17 @@ static int rt1017_sdca_pcm_hw_params(struct snd_pcm_substream *substream,
+ 
+ 	/* SoundWire specific configuration */
+ 	/* port 1 for playback */
+-	if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK) {
+-		direction = SDW_DATA_DIR_RX;
++	if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK)
+ 		port = 1;
+-	} else {
+-		direction = SDW_DATA_DIR_TX;
++	else
+ 		port = 2;
+-	}
+ 
+-	num_channels = params_channels(params);
+-	ch_mask = (1 << num_channels) - 1;
+-
+-	stream_config.frame_rate = params_rate(params);
+-	stream_config.ch_count = num_channels;
+-	stream_config.bps = snd_pcm_format_width(params_format(params));
+-	stream_config.direction = direction;
+-
+-	port_config.ch_mask = ch_mask;
++	snd_sdw_params_to_config(substream, params, &stream_config, &port_config);
+ 	port_config.num = port;
+ 
+ 	dev_dbg(dai->dev, "frame_rate %d, ch_count %d, bps %d, direction %d, ch_mask %d, port: %d\n",
+-		params_rate(params), num_channels, snd_pcm_format_width(params_format(params)),
+-		direction, ch_mask, port);
++		stream_config.frame_rate, stream_config.ch_count, stream_config.bps,
++		stream_config.direction, port_config.ch_mask, port);
+ 
+ 	retval = sdw_stream_add_slave(rt1017->sdw_slave, &stream_config,
+ 				&port_config, 1, sdw_stream);
+diff --git a/sound/soc/codecs/rt274.c b/sound/soc/codecs/rt274.c
+--- a/sound/soc/codecs/rt274.c
++++ b/sound/soc/codecs/rt274.c
+@@ -619,9 +619,11 @@ static int rt274_hw_params(struct snd_pcm_substream *substream,
+ 	unsigned int val = 0;
+ 	int d_len_code = 0, c_len_code = 0;
+ 
++	/* bit 14 Sample Rate Base, 0: 48kHz 1: 44.1kHz */
+ 	switch (params_rate(params)) {
+-	/* bit 14 0:48K 1:44.1K */
+ 	case 44100:
++		val |= BIT(14);
++		break;
+ 	case 48000:
+ 		break;
+ 	default:
+diff --git a/sound/soc/codecs/rt286.c b/sound/soc/codecs/rt286.c
+--- a/sound/soc/codecs/rt286.c
++++ b/sound/soc/codecs/rt286.c
+@@ -953,7 +953,7 @@ static int rt286_probe(struct snd_soc_component *component)
+ 
+ 	if (rt286->i2c->irq)
+ 		schedule_delayed_work(&rt286->jack_detect_work,
+-				      msecs_to_jiffies(50));
++				      msecs_to_jiffies(1250));
+ 	return 0;
+ }
+ 
+diff --git a/sound/soc/codecs/wm8903.c b/sound/soc/codecs/wm8903.c
+--- a/sound/soc/codecs/wm8903.c
++++ b/sound/soc/codecs/wm8903.c
+@@ -676,7 +676,7 @@ SOC_ENUM("DRC Decay Rate", drc_decay),
+ SOC_ENUM("DRC FF Delay", drc_ff_delay),
+ SOC_SINGLE("DRC Anticlip Switch", WM8903_DRC_0, 1, 1, 0),
+ SOC_SINGLE("DRC QR Switch", WM8903_DRC_0, 2, 1, 0),
+-SOC_SINGLE_TLV("DRC QR Threshold Volume", WM8903_DRC_0, 6, 3, 0, drc_tlv_max),
++SOC_SINGLE_TLV("DRC QR Threshold Volume", WM8903_DRC_1, 6, 3, 0, drc_tlv_max),
+ SOC_ENUM("DRC QR Decay Rate", drc_qr_decay),
+ SOC_SINGLE("DRC Smoothing Switch", WM8903_DRC_0, 3, 1, 0),
+ SOC_SINGLE("DRC Smoothing Hysteresis Switch", WM8903_DRC_0, 0, 1, 0),
+diff --git a/sound/soc/intel/boards/bytcr_rt5651.c b/sound/soc/intel/boards/bytcr_rt5651.c
+--- a/sound/soc/intel/boards/bytcr_rt5651.c
++++ b/sound/soc/intel/boards/bytcr_rt5651.c
+@@ -410,6 +410,23 @@ static const struct dmi_system_id byt_rt5651_quirk_table[] = {
+ 					BYT_RT5651_HP_LR_SWAPPED |
+ 					BYT_RT5651_MONO_SPEAKER),
+ 	},
++	{
++		/* Chuwi Hi8 (CWI513) with a BIOS using generic DMI strings */
++		.callback = byt_rt5651_quirk_cb,
++		.matches = {
++			DMI_MATCH(DMI_BOARD_VENDOR, "Hampoo"),
++			DMI_MATCH(DMI_BOARD_NAME, "Cherry Trail CR"),
++			/* Above matches are too generic, add bios-date match */
++			DMI_MATCH(DMI_BIOS_DATE, "05/21/2016"),
++		},
++		.driver_data = (void *)(BYT_RT5651_MCLK_EN |
++					BYT_RT5651_JD1_1 |
++					BYT_RT5651_OVCD_TH_2000UA |
++					BYT_RT5651_OVCD_SF_1P0 |
++					BYT_RT5651_IN2_MAP |
++					BYT_RT5651_HP_LR_SWAPPED |
++					BYT_RT5651_MONO_SPEAKER),
++	},
+ 	{
+ 		/* Chuwi Vi8 Plus (CWI519) */
+ 		.callback = byt_rt5651_quirk_cb,
+diff --git a/sound/soc/intel/common/soc-acpi-intel-lnl-match.c b/sound/soc/intel/common/soc-acpi-intel-lnl-match.c
+--- a/sound/soc/intel/common/soc-acpi-intel-lnl-match.c
++++ b/sound/soc/intel/common/soc-acpi-intel-lnl-match.c
+@@ -745,6 +745,7 @@ struct snd_soc_acpi_mach snd_soc_acpi_intel_lnl_sdw_machines[] = {
+ 		.links = lnl_cs42l43_l0,
+ 		.drv_name = "sof_sdw",
+ 		.sof_tplg_filename = "sof-lnl-cs42l43-l0.tplg",
++		.machine_check = snd_soc_acpi_intel_force_function_topology,
+ 		.get_function_tplg_files = sof_sdw_get_tplg_files,
+ 	},
+ 	{
+diff --git a/sound/soc/intel/common/soc-acpi-intel-sdca-quirks.c b/sound/soc/intel/common/soc-acpi-intel-sdca-quirks.c
+--- a/sound/soc/intel/common/soc-acpi-intel-sdca-quirks.c
++++ b/sound/soc/intel/common/soc-acpi-intel-sdca-quirks.c
+@@ -53,6 +53,22 @@ bool snd_soc_acpi_intel_no_function_topology(void *arg)
+ }
+ EXPORT_SYMBOL_NS(snd_soc_acpi_intel_no_function_topology, "SND_SOC_ACPI_INTEL_SDCA_QUIRKS");
+ 
++static const struct dmi_system_id force_function_topology_quirk_table[] = {
++	{
++		.matches = {
++			DMI_MATCH(DMI_SYS_VENDOR, "LENOVO"),
++			DMI_MATCH(DMI_PRODUCT_NAME, "83R0"),
++		},
++	},
++	{}
++};
++
++bool snd_soc_acpi_intel_force_function_topology(void *arg)
++{
++	return !dmi_check_system(force_function_topology_quirk_table);
++}
++EXPORT_SYMBOL_NS(snd_soc_acpi_intel_force_function_topology, "SND_SOC_ACPI_INTEL_SDCA_QUIRKS");
++
+ bool snd_soc_acpi_intel_rt712_vb_no_function_topology(void *arg)
+ {
+ 	return snd_soc_acpi_intel_sdca_is_device_rt712_vb(arg) &&
+diff --git a/sound/soc/intel/common/soc-acpi-intel-sdca-quirks.h b/sound/soc/intel/common/soc-acpi-intel-sdca-quirks.h
+--- a/sound/soc/intel/common/soc-acpi-intel-sdca-quirks.h
++++ b/sound/soc/intel/common/soc-acpi-intel-sdca-quirks.h
+@@ -11,6 +11,7 @@
+ 
+ bool snd_soc_acpi_intel_sdca_is_device_rt712_vb(void *arg);
+ bool snd_soc_acpi_intel_no_function_topology(void *arg);
++bool snd_soc_acpi_intel_force_function_topology(void *arg);
+ bool snd_soc_acpi_intel_rt712_vb_no_function_topology(void *arg);
+ 
+ #endif
+diff --git a/sound/soc/qcom/lpass-cpu.c b/sound/soc/qcom/lpass-cpu.c
+--- a/sound/soc/qcom/lpass-cpu.c
++++ b/sound/soc/qcom/lpass-cpu.c
+@@ -1234,8 +1234,8 @@ int asoc_qcom_lpass_cpu_platform_probe(struct platform_device *pdev)
+ 		}
+ 		if (drvdata->mi2s_playback_sd_mode[dai_id] ==
+ 			LPAIF_I2SCTL_MODE_QUAD01) {
+-			variant->dai_driver[dai_id].playback.channels_min = 4;
+-			variant->dai_driver[dai_id].playback.channels_max = 4;
++			variant->dai_driver[i].playback.channels_min = 4;
++			variant->dai_driver[i].playback.channels_max = 4;
+ 		}
+ 	}
+ 
+diff --git a/sound/soc/sdca/sdca_class_function.c b/sound/soc/sdca/sdca_class_function.c
+--- a/sound/soc/sdca/sdca_class_function.c
++++ b/sound/soc/sdca/sdca_class_function.c
+@@ -388,20 +388,27 @@ static int class_function_probe(struct auxiliary_device *auxdev,
+ 
+ 	ret = devm_pm_runtime_enable(dev);
+ 	if (ret)
+-		return ret;
++		goto err_pm;
+ 
+ 	ret = class_function_boot(drv);
+ 	if (ret)
+-		return ret;
++		goto err_pm;
+ 
+ 	ret = devm_snd_soc_register_component(dev, cmp_drv, dais, num_dais);
+-	if (ret)
+-		return dev_err_probe(dev, ret, "failed to register component\n");
++	if (ret) {
++		dev_err_probe(dev, ret, "failed to register component\n");
++		goto err_pm;
++	}
+ 
+ 	pm_runtime_mark_last_busy(dev);
+ 	pm_runtime_put_autosuspend(dev);
+ 
+ 	return 0;
++
++err_pm:
++	pm_runtime_put_sync(dev);
++
++	return ret;
+ }
+ 
+ static void class_function_remove(struct auxiliary_device *auxdev)
+@@ -490,8 +497,6 @@ static int class_function_suspend(struct device *dev)
+ 	struct class_function_drv *drv = auxiliary_get_drvdata(auxdev);
+ 	int ret;
+ 
+-	drv->suspended = true;
+-
+ 	/* Ensure runtime resume runs on resume */
+ 	ret = pm_runtime_resume_and_get(dev);
+ 	if (ret) {
+@@ -499,6 +504,8 @@ static int class_function_suspend(struct device *dev)
+ 		return ret;
+ 	}
+ 
++	drv->suspended = true;
++
+ 	sdca_irq_disable(drv->function, drv->core->irq_info);
+ 
+ 	ret = pm_runtime_force_suspend(dev);
+diff --git a/sound/soc/tegra/tegra186_asrc.c b/sound/soc/tegra/tegra186_asrc.c
+--- a/sound/soc/tegra/tegra186_asrc.c
++++ b/sound/soc/tegra/tegra186_asrc.c
+@@ -828,7 +828,7 @@ static const struct snd_kcontrol_new tegra186_asrc_controls[] = {
+ 		       tegra186_asrc_put_input_threshold),
+ 
+ 	SOC_SINGLE_EXT("Stream6 Input Threshold",
+-		       ASRC_STREAM_REG(TEGRA186_ASRC_RX_THRESHOLD, 4), 0, 3, 0,
++		       ASRC_STREAM_REG(TEGRA186_ASRC_RX_THRESHOLD, 5), 0, 3, 0,
+ 		       tegra186_asrc_get_input_threshold,
+ 		       tegra186_asrc_put_input_threshold),
+ 

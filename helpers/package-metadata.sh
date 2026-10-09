@@ -13,6 +13,7 @@
 #   { "source": "local", "channels": ["edge"] }
 #   { "source": "local", "channels": ["edge", "rc", "stable"] }
 #   { "source": "local", "min_release_age": "24h" }
+#   { "source": "local", "auto_merge": true, "upstream": { "watch": { "git_branch": "...", "branch": "main" } } }
 #   { "source": "local", "upstream": { "github": "owner/repo", "checksums": "SHASUMS256.txt", "assets": { "x86_64": ["name-{tag}-x64.tar.xz"] } } }
 #   { "source": "local", "upstream": { "github": "owner/repo", "digests": true, "assets": { "x86_64": "name-{tag}-x64.tar.xz" } } }
 #   { "source": "local", "upstream": { "git_tags": "https://example/repo.git", "tag_pattern": "v{pkgver}", "sources": { "any": ["https://example/archive/{tag}.tar.gz"] } } }
@@ -327,6 +328,31 @@ packages_for_upstream_sync() {
   done
 }
 
+# Upstream updates travel in one of two lanes. The reviewed lane is the
+# 6-hourly sync PR a maintainer reads before merging. A package that marks
+# "auto_merge": true rides the unattended lane instead: its bump PR is opened
+# and auto-merged by the branch tracker as soon as CI is green, which is how a
+# package that follows a moving branch (omarchy-dev, omasnap-git) gets rebuilt
+# without anyone clicking. The lanes are disjoint so a branch tip can never
+# hold up a reviewed vendor release, or the other way round.
+package_auto_merge() {
+  local pkgdir="$1" metadata
+  metadata=$(metadata_file_for_dir "$pkgdir")
+  [[ -f "$metadata" ]] || return 1
+  [[ "$(jq -r 'if has("auto_merge") then .auto_merge else false end' "$metadata")" == "true" ]]
+}
+
+# package_in_lane <pkgdir> <reviewed|auto-merge|all>
+package_in_lane() {
+  local pkgdir="$1" lane="$2"
+  case "$lane" in
+    all | "") return 0 ;;
+    auto-merge) package_auto_merge "$pkgdir" ;;
+    reviewed) ! package_auto_merge "$pkgdir" ;;
+    *) echo "invalid lane: $lane (expected reviewed, auto-merge, or all)" >&2; return 2 ;;
+  esac
+}
+
 # Packages that must be rebuilt when a dependency they link against changes,
 # even though nothing in their own source moved. `rebuild_on` names those
 # dependencies; `rebuilt_against` records the versions the checked-in pkgrel was
@@ -511,6 +537,15 @@ validate_package_metadata() {
 
   if ! package_min_release_age_seconds "$pkgdir" >/dev/null; then
     echo "invalid min_release_age for $(basename "$pkgdir"): must be a number with optional s/m/h/d suffix"
+    return 1
+  fi
+
+  if ! jq -e 'if has("auto_merge") | not then true else (.auto_merge | type) == "boolean" end' "$metadata" >/dev/null; then
+    echo "invalid auto_merge for $(basename "$pkgdir"): must be boolean"
+    return 1
+  fi
+  if package_auto_merge "$pkgdir" && ! package_has_upstream_provider "$pkgdir" && ! package_has_upstream_hook "$pkgdir"; then
+    echo "invalid auto_merge for $(basename "$pkgdir"): only an upstream watch, provider, or hook can be auto-merged"
     return 1
   fi
 

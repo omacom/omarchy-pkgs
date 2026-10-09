@@ -15,6 +15,7 @@
 #
 # Keep entries sorted alphabetically.
 github:bjarneo
+github:DanWahlin
 github:dhh
 github:f-trycua
 github:HANCORE-linux
@@ -22,4 +23,5 @@ github:kwilczynski
 github:ryanrhughes
 github:scottjones
 github:spencerbull
+github:tcballard
 github:tobi

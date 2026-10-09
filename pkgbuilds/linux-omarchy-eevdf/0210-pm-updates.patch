@@ -1,0 +1,2365 @@
+diff --git a/drivers/acpi/acpi_processor.c b/drivers/acpi/acpi_processor.c
+--- a/drivers/acpi/acpi_processor.c
++++ b/drivers/acpi/acpi_processor.c
+@@ -994,3 +994,357 @@ end:
+ }
+ EXPORT_SYMBOL_NS_GPL(acpi_processor_evaluate_cst, "ACPI_PROCESSOR_IDLE");
+ #endif /* CONFIG_ACPI_PROCESSOR_CSTATE */
++
++#ifdef CONFIG_ACPI_PROCESSOR_IDLE
++struct acpi_lpi_states_array {
++	unsigned int size;
++	unsigned int composite_states_size;
++	struct acpi_lpi_state *entries;
++	struct acpi_lpi_state *composite_states[ACPI_PROCESSOR_MAX_POWER];
++};
++
++static int obj_get_integer(union acpi_object *obj, u32 *value)
++{
++	if (obj->type != ACPI_TYPE_INTEGER)
++		return -EINVAL;
++
++	*value = obj->integer.value;
++	return 0;
++}
++
++#define lpi_state_debug(handle, message, state_idx)	\
++	acpi_handle_debug(handle, message " for _LPI state %u\n", state_idx)
++
++static void process_lpi_state_package(union acpi_object *lpi_pkg,
++				      struct acpi_lpi_state *lpi_state,
++				      acpi_handle handle,
++				      unsigned int state_idx, bool strict)
++{
++	union acpi_object *lpi_pkg_elem, *obj;
++
++	if (lpi_pkg->type != ACPI_TYPE_PACKAGE || lpi_pkg->package.count < 7)
++		return;
++
++	lpi_pkg_elem = lpi_pkg->package.elements;
++
++	/* Get the entry method first and skip the state if that fails. */
++	obj = &lpi_pkg_elem[6];
++	if (obj->type == ACPI_TYPE_BUFFER) {
++		struct acpi_power_register *reg;
++
++		if (obj->buffer.length < sizeof(*reg)) {
++			lpi_state_debug(handle, "Invalid register data", state_idx);
++			return;
++		}
++
++		reg = (struct acpi_power_register *)obj->buffer.pointer;
++		if (reg->space_id != ACPI_ADR_SPACE_FIXED_HARDWARE) {
++			lpi_state_debug(handle, "Unsupported entry method", state_idx);
++			return;
++		}
++
++		lpi_state->entry_method = ACPI_CSTATE_FFH;
++		lpi_state->address = reg->address;
++	} else if (obj->type == ACPI_TYPE_INTEGER) {
++		lpi_state->entry_method = ACPI_CSTATE_INTEGER;
++		lpi_state->address = obj->integer.value;
++	} else {
++		lpi_state_debug(handle, "Invalid entry method", state_idx);
++		return;
++	}
++
++	if (obj_get_integer(&lpi_pkg_elem[0], &lpi_state->min_residency)) {
++		if (strict) {
++			lpi_state_debug(handle, "No min. residency", state_idx);
++			return;
++		}
++
++		lpi_state_debug(handle, "Assuming 10 us min. residency", state_idx);
++		lpi_state->min_residency = 10;
++	}
++
++	if (obj_get_integer(&lpi_pkg_elem[1], &lpi_state->wake_latency)) {
++		if (strict) {
++			lpi_state_debug(handle, "No wake latency", state_idx);
++			return;
++		}
++
++		lpi_state_debug(handle, "Assuming 10 us wake latency", state_idx);
++		lpi_state->wake_latency = 10;
++	}
++
++	if (obj_get_integer(&lpi_pkg_elem[2], &lpi_state->flags))
++		lpi_state->flags = 0;
++
++	if (obj_get_integer(&lpi_pkg_elem[3], &lpi_state->arch_flags))
++		lpi_state->arch_flags = 0;
++
++	if (obj_get_integer(&lpi_pkg_elem[4], &lpi_state->res_cnt_freq))
++		lpi_state->res_cnt_freq = 1;
++
++	if (obj_get_integer(&lpi_pkg_elem[5], &lpi_state->enable_parent_state))
++		lpi_state->enable_parent_state = 0;
++
++	/* Skip elements [7-8] i.e. Residency/Usage counters. */
++
++	/*
++	 * Avoid out-of-bounds access if the size of the package is less than
++	 * expected.
++	 */
++	if (lpi_pkg->package.count < 10)
++		return;
++
++	obj = &lpi_pkg_elem[9];
++	if (obj->type == ACPI_TYPE_STRING)
++		strscpy(lpi_state->desc, obj->string.pointer, ACPI_CX_DESC_LEN);
++}
++
++static int acpi_processor_evaluate_lpi(acpi_handle handle,
++				       struct acpi_lpi_states_array *info,
++				       bool strict)
++{
++	struct acpi_buffer buffer = { ACPI_ALLOCATE_BUFFER, NULL };
++	union acpi_object *lpi_data, *lpi_pkg;
++	unsigned int lpi_pkg_count, state_idx;
++	struct acpi_lpi_state *lpi_state;
++	acpi_status status;
++	int ret = 0;
++
++	status = acpi_evaluate_object(handle, "_LPI", NULL, &buffer);
++	if (ACPI_FAILURE(status)) {
++		acpi_handle_debug(handle, "No _LPI, giving up\n");
++		return -ENODEV;
++	}
++
++	lpi_data = buffer.pointer;
++
++	/* There must be at least 4 elements = 3 elements + 1 package */
++	if (!lpi_data || lpi_data->type != ACPI_TYPE_PACKAGE ||
++	    lpi_data->package.count < 4) {
++		acpi_handle_debug(handle, "Not enough elements in _LPI\n");
++		ret = -ENODATA;
++		goto end;
++	}
++
++	lpi_pkg_count = lpi_data->package.elements[2].integer.value;
++
++	/* Validate number of power states. */
++	if (!lpi_pkg_count || lpi_pkg_count != lpi_data->package.count - 3) {
++		acpi_handle_debug(handle, "Invalid _LPI state count\n");
++		ret = -ENODATA;
++		goto end;
++	}
++
++	lpi_state = kzalloc_objs(*lpi_state, lpi_pkg_count);
++	if (!lpi_state) {
++		ret = -ENOMEM;
++		goto end;
++	}
++
++	info->size = lpi_pkg_count;
++	info->entries = lpi_state;
++
++	/* _LPI State packages start at index 3. */
++	lpi_pkg = &lpi_data->package.elements[3];
++
++	for (state_idx = 1; state_idx <= lpi_pkg_count; state_idx++) {
++		lpi_state->index = state_idx;
++		process_lpi_state_package(lpi_pkg++, lpi_state++, handle,
++					  state_idx, strict);
++	}
++
++	acpi_handle_debug(handle, "Found %u power states\n", lpi_pkg_count);
++end:
++	kfree(buffer.pointer);
++	return ret;
++}
++
++/**
++ * combine_lpi_states - combine local and parent LPI states to form a composite LPI state
++ *
++ * @local: local LPI state
++ * @parent: parent LPI state
++ * @result: composite LPI state
++ */
++static bool combine_lpi_states(struct acpi_lpi_state *local,
++			       struct acpi_lpi_state *parent,
++			       struct acpi_lpi_state *result)
++{
++	if (parent->entry_method == ACPI_CSTATE_INTEGER) {
++		if (!parent->address) /* 0 means autopromotable */
++			return false;
++		result->address = local->address + parent->address;
++	} else {
++		result->address = parent->address;
++	}
++
++	result->min_residency = max(local->min_residency, parent->min_residency);
++	result->wake_latency = local->wake_latency + parent->wake_latency;
++	result->enable_parent_state = parent->enable_parent_state;
++	result->entry_method = local->entry_method;
++
++	result->flags = parent->flags;
++	result->arch_flags = parent->arch_flags;
++	result->index = parent->index;
++
++	scnprintf(result->desc, ACPI_CX_DESC_LEN, "%s+%s", local->desc, parent->desc);
++	return true;
++}
++
++#define ACPI_LPI_STATE_FLAGS_ENABLED			BIT(0)
++
++static void stash_composite_state(struct acpi_lpi_states_array *curr_level,
++				  struct acpi_lpi_state *t)
++{
++	curr_level->composite_states[curr_level->composite_states_size++] = t;
++}
++
++static bool too_many_states(acpi_handle handle, unsigned int state_count)
++{
++	if (state_count < ACPI_PROCESSOR_MAX_POWER)
++		return false;
++
++	acpi_handle_info(handle, "No space for more _LPI states than %d\n",
++			 ACPI_PROCESSOR_MAX_POWER);
++	return true;
++}
++
++static unsigned int flatten_lpi_states(acpi_handle handle,
++				       struct acpi_lpi_state *lpi_states,
++				       unsigned int state_count,
++				       struct acpi_lpi_states_array *curr,
++				       struct acpi_lpi_states_array *prev)
++{
++	struct acpi_lpi_state *parent_lpi = curr->entries;
++	unsigned int j;
++
++	/*
++	 * Combine each of the "raw" _LPI states from the current (processor
++	 * container) level with all of the composite _LPI states from the
++	 * previous (processor or processor container) level.
++	 */
++	for (j = 0; j < curr->size; j++, parent_lpi++) {
++		struct acpi_lpi_state *flpi;
++		int i;
++
++		if (!(parent_lpi->flags & ACPI_LPI_STATE_FLAGS_ENABLED))
++			continue;
++
++		if (too_many_states(handle, state_count))
++			break;
++
++		flpi = &lpi_states[state_count];
++
++		for (i = 0; i < prev->composite_states_size; i++) {
++			struct acpi_lpi_state *local_lpi = prev->composite_states[i];
++
++			if (parent_lpi->index > local_lpi->enable_parent_state)
++				continue;
++
++			if (!combine_lpi_states(local_lpi, parent_lpi, flpi))
++				continue;
++
++			stash_composite_state(curr, flpi);
++			state_count++;
++			flpi++;
++
++			if (state_count >= ACPI_PROCESSOR_MAX_POWER)
++				break;
++		}
++	}
++
++	return state_count;
++}
++
++int acpi_processor_extract_lpi_info(acpi_handle pr_handle,
++				    struct acpi_processor_power *pr_power,
++				    bool strict)
++{
++	struct acpi_lpi_states_array info[2], *prev, *curr;
++	acpi_handle handle = pr_handle;
++	unsigned int state_count = 0;
++	unsigned int i;
++	int ret;
++
++	if (!osc_pc_lpi_support_confirmed)
++		return -EOPNOTSUPP;
++
++	curr = &info[0];
++	curr->composite_states_size = 0;
++
++	ret = acpi_processor_evaluate_lpi(handle, curr, strict);
++	if (ret)
++		return ret;
++
++	/* Copy all of the usable first-level states to power.lpi_states[]. */
++	for (i = 0; i < curr->size; i++) {
++		struct acpi_lpi_state *lpi = &curr->entries[i];
++		struct acpi_lpi_state *flpi;
++
++		/*
++		 * Skip states that are not enabled or have an inadequate entry
++		 * method for this level.
++		 */
++		if (!(lpi->flags & ACPI_LPI_STATE_FLAGS_ENABLED) ||
++		    lpi->entry_method == ACPI_CSTATE_INTEGER)
++			continue;
++
++		if (too_many_states(pr_handle, state_count))
++			break;
++
++		flpi = &pr_power->lpi_states[state_count++];
++		memcpy(flpi, lpi, sizeof(*lpi));
++		stash_composite_state(curr, flpi);
++	}
++
++	kfree(curr->entries);
++
++	/*
++	 * If there are no _LPI states at the first level, there are no _LPI
++	 * states at all.
++	 */
++	if (!state_count)
++		return -ENODATA;
++
++	prev = curr;
++	curr = &info[1];
++
++	for (;;) {
++		struct acpi_lpi_states_array *tmp;
++		struct acpi_device *d;
++
++		if (ACPI_FAILURE(acpi_get_parent(handle, &handle)))
++			break;
++
++		d = acpi_fetch_acpi_dev(handle);
++		if (!d)
++			break;
++
++		if (strcmp(acpi_device_hid(d), ACPI_PROCESSOR_CONTAINER_HID))
++			break;
++
++		curr->composite_states_size = 0;
++
++		ret = acpi_processor_evaluate_lpi(handle, curr, strict);
++		if (ret)
++			break;
++
++		/* flatten all the LPI states in this level of hierarchy */
++		state_count = flatten_lpi_states(pr_handle, pr_power->lpi_states,
++						 state_count, curr, prev);
++
++		kfree(curr->entries);
++
++		tmp = prev, prev = curr, curr = tmp;
++	}
++
++	/* reset the index after flattening */
++	for (i = 0; i < state_count; i++)
++		pr_power->lpi_states[i].index = i;
++
++	pr_power->count = state_count;
++
++	return 0;
++}
++EXPORT_SYMBOL_NS_GPL(acpi_processor_extract_lpi_info, "ACPI_PROCESSOR_IDLE");
++#endif /* CONFIG_ACPI_PROCESSOR_IDLE */
+diff --git a/drivers/acpi/processor_idle.c b/drivers/acpi/processor_idle.c
+--- a/drivers/acpi/processor_idle.c
++++ b/drivers/acpi/processor_idle.c
+@@ -853,237 +853,6 @@ static int acpi_processor_setup_cstates(struct acpi_processor *pr)
+ 
+ #endif /* CONFIG_ACPI_PROCESSOR_CSTATE */
+ 
+-struct acpi_lpi_states_array {
+-	unsigned int size;
+-	unsigned int composite_states_size;
+-	struct acpi_lpi_state *entries;
+-	struct acpi_lpi_state *composite_states[ACPI_PROCESSOR_MAX_POWER];
+-};
+-
+-static int obj_get_integer(union acpi_object *obj, u32 *value)
+-{
+-	if (obj->type != ACPI_TYPE_INTEGER)
+-		return -EINVAL;
+-
+-	*value = obj->integer.value;
+-	return 0;
+-}
+-
+-static int acpi_processor_evaluate_lpi(acpi_handle handle,
+-				       struct acpi_lpi_states_array *info)
+-{
+-	acpi_status status;
+-	int ret = 0;
+-	int pkg_count, state_idx = 1, loop;
+-	struct acpi_buffer buffer = { ACPI_ALLOCATE_BUFFER, NULL };
+-	union acpi_object *lpi_data;
+-	struct acpi_lpi_state *lpi_state;
+-
+-	status = acpi_evaluate_object(handle, "_LPI", NULL, &buffer);
+-	if (ACPI_FAILURE(status)) {
+-		acpi_handle_debug(handle, "No _LPI, giving up\n");
+-		return -ENODEV;
+-	}
+-
+-	lpi_data = buffer.pointer;
+-
+-	/* There must be at least 4 elements = 3 elements + 1 package */
+-	if (!lpi_data || lpi_data->type != ACPI_TYPE_PACKAGE ||
+-	    lpi_data->package.count < 4) {
+-		pr_debug("not enough elements in _LPI\n");
+-		ret = -ENODATA;
+-		goto end;
+-	}
+-
+-	pkg_count = lpi_data->package.elements[2].integer.value;
+-
+-	/* Validate number of power states. */
+-	if (pkg_count < 1 || pkg_count != lpi_data->package.count - 3) {
+-		pr_debug("count given by _LPI is not valid\n");
+-		ret = -ENODATA;
+-		goto end;
+-	}
+-
+-	lpi_state = kzalloc_objs(*lpi_state, pkg_count);
+-	if (!lpi_state) {
+-		ret = -ENOMEM;
+-		goto end;
+-	}
+-
+-	info->size = pkg_count;
+-	info->entries = lpi_state;
+-
+-	/* LPI States start at index 3 */
+-	for (loop = 3; state_idx <= pkg_count; loop++, state_idx++, lpi_state++) {
+-		union acpi_object *element, *pkg_elem, *obj;
+-
+-		element = &lpi_data->package.elements[loop];
+-		if (element->type != ACPI_TYPE_PACKAGE || element->package.count < 7)
+-			continue;
+-
+-		pkg_elem = element->package.elements;
+-
+-		obj = pkg_elem + 6;
+-		if (obj->type == ACPI_TYPE_BUFFER) {
+-			struct acpi_power_register *reg;
+-
+-			if (obj->buffer.length < sizeof(*reg)) {
+-				acpi_handle_debug(handle,
+-					"Invalid register data for _LPI state %d\n",
+-					state_idx);
+-				continue;
+-			}
+-
+-			reg = (struct acpi_power_register *)obj->buffer.pointer;
+-			if (reg->space_id != ACPI_ADR_SPACE_SYSTEM_IO &&
+-			    reg->space_id != ACPI_ADR_SPACE_FIXED_HARDWARE)
+-				continue;
+-
+-			lpi_state->address = reg->address;
+-			lpi_state->entry_method =
+-				reg->space_id == ACPI_ADR_SPACE_FIXED_HARDWARE ?
+-				ACPI_CSTATE_FFH : ACPI_CSTATE_SYSTEMIO;
+-		} else if (obj->type == ACPI_TYPE_INTEGER) {
+-			lpi_state->entry_method = ACPI_CSTATE_INTEGER;
+-			lpi_state->address = obj->integer.value;
+-		} else {
+-			pr_debug("Entry method of state-%d is invalid, disable it.\n",
+-				 state_idx);
+-			continue;
+-		}
+-
+-		lpi_state->index = state_idx;
+-		if (obj_get_integer(pkg_elem + 0, &lpi_state->min_residency)) {
+-			pr_debug("No min. residency found, assuming 10 us\n");
+-			lpi_state->min_residency = 10;
+-		}
+-
+-		if (obj_get_integer(pkg_elem + 1, &lpi_state->wake_latency)) {
+-			pr_debug("No wakeup residency found, assuming 10 us\n");
+-			lpi_state->wake_latency = 10;
+-		}
+-
+-		if (obj_get_integer(pkg_elem + 2, &lpi_state->flags))
+-			lpi_state->flags = 0;
+-
+-		if (obj_get_integer(pkg_elem + 3, &lpi_state->arch_flags))
+-			lpi_state->arch_flags = 0;
+-
+-		if (obj_get_integer(pkg_elem + 4, &lpi_state->res_cnt_freq))
+-			lpi_state->res_cnt_freq = 1;
+-
+-		if (obj_get_integer(pkg_elem + 5, &lpi_state->enable_parent_state))
+-			lpi_state->enable_parent_state = 0;
+-
+-		/* Skip elements [7-8] i.e. Residency/Usage counters. */
+-
+-		/*
+-		 * Avoid out-of-bounds access if the size of the package is less
+-		 * than expected.
+-		 */
+-		if (element->package.count < 10)
+-			continue;
+-
+-		obj = pkg_elem + 9;
+-		if (obj->type == ACPI_TYPE_STRING)
+-			strscpy(lpi_state->desc, obj->string.pointer,
+-				ACPI_CX_DESC_LEN);
+-	}
+-
+-	acpi_handle_debug(handle, "Found %d power states\n", state_idx);
+-end:
+-	kfree(buffer.pointer);
+-	return ret;
+-}
+-
+-/**
+- * combine_lpi_states - combine local and parent LPI states to form a composite LPI state
+- *
+- * @local: local LPI state
+- * @parent: parent LPI state
+- * @result: composite LPI state
+- */
+-static bool combine_lpi_states(struct acpi_lpi_state *local,
+-			       struct acpi_lpi_state *parent,
+-			       struct acpi_lpi_state *result)
+-{
+-	if (parent->entry_method == ACPI_CSTATE_INTEGER) {
+-		if (!parent->address) /* 0 means autopromotable */
+-			return false;
+-		result->address = local->address + parent->address;
+-	} else {
+-		result->address = parent->address;
+-	}
+-
+-	result->min_residency = max(local->min_residency, parent->min_residency);
+-	result->wake_latency = local->wake_latency + parent->wake_latency;
+-	result->enable_parent_state = parent->enable_parent_state;
+-	result->entry_method = local->entry_method;
+-
+-	result->flags = parent->flags;
+-	result->arch_flags = parent->arch_flags;
+-	result->index = parent->index;
+-
+-	scnprintf(result->desc, ACPI_CX_DESC_LEN, "%s+%s", local->desc, parent->desc);
+-	return true;
+-}
+-
+-#define ACPI_LPI_STATE_FLAGS_ENABLED			BIT(0)
+-
+-static void stash_composite_state(struct acpi_lpi_states_array *curr_level,
+-				  struct acpi_lpi_state *t)
+-{
+-	curr_level->composite_states[curr_level->composite_states_size++] = t;
+-}
+-
+-static unsigned int flatten_lpi_states(struct acpi_processor *pr,
+-				       unsigned int flat_state_cnt,
+-				       struct acpi_lpi_states_array *curr_level,
+-				       struct acpi_lpi_states_array *prev_level)
+-{
+-	int i, j, state_count = curr_level->size;
+-	struct acpi_lpi_state *p, *t = curr_level->entries;
+-
+-	curr_level->composite_states_size = 0;
+-	for (j = 0; j < state_count; j++, t++) {
+-		struct acpi_lpi_state *flpi;
+-
+-		if (!(t->flags & ACPI_LPI_STATE_FLAGS_ENABLED))
+-			continue;
+-
+-		if (flat_state_cnt >= ACPI_PROCESSOR_MAX_POWER) {
+-			pr_warn("Limiting number of LPI states to max (%d)\n",
+-				ACPI_PROCESSOR_MAX_POWER);
+-			pr_warn("Please increase ACPI_PROCESSOR_MAX_POWER if needed.\n");
+-			break;
+-		}
+-
+-		flpi = &pr->power.lpi_states[flat_state_cnt];
+-
+-		if (!prev_level) { /* leaf/processor node */
+-			memcpy(flpi, t, sizeof(*t));
+-			stash_composite_state(curr_level, flpi);
+-			flat_state_cnt++;
+-			continue;
+-		}
+-
+-		for (i = 0; i < prev_level->composite_states_size; i++) {
+-			p = prev_level->composite_states[i];
+-			if (t->index <= p->enable_parent_state &&
+-			    combine_lpi_states(p, t, flpi)) {
+-				stash_composite_state(curr_level, flpi);
+-				flat_state_cnt++;
+-				flpi++;
+-				if (flat_state_cnt >= ACPI_PROCESSOR_MAX_POWER)
+-					break;
+-			}
+-		}
+-	}
+-
+-	kfree(curr_level->entries);
+-	return flat_state_cnt;
+-}
+-
+ int __weak acpi_processor_ffh_lpi_probe(unsigned int cpu)
+ {
+ 	return -EOPNOTSUPP;
+@@ -1091,64 +860,16 @@ int __weak acpi_processor_ffh_lpi_probe(unsigned int cpu)
+ 
+ static int acpi_processor_get_lpi_info(struct acpi_processor *pr)
+ {
+-	int ret, i;
+-	acpi_status status;
+-	acpi_handle handle = pr->handle, pr_ahandle;
+-	struct acpi_device *d = NULL;
+-	struct acpi_lpi_states_array info[2], *tmp, *prev, *curr;
+-	unsigned int state_count;
++	int ret;
+ 
+ 	/* make sure our architecture has support */
+ 	ret = acpi_processor_ffh_lpi_probe(pr->id);
+ 	if (ret == -EOPNOTSUPP)
+ 		return ret;
+ 
+-	if (!osc_pc_lpi_support_confirmed)
+-		return -EOPNOTSUPP;
+-
+-	if (!acpi_has_method(handle, "_LPI"))
+-		return -EINVAL;
+-
+-	prev = &info[0];
+-	curr = &info[1];
+-	handle = pr->handle;
+-	ret = acpi_processor_evaluate_lpi(handle, prev);
++	ret = acpi_processor_extract_lpi_info(pr->handle, &pr->power, false);
+ 	if (ret)
+ 		return ret;
+-	state_count = flatten_lpi_states(pr, 0, prev, NULL);
+-
+-	status = acpi_get_parent(handle, &pr_ahandle);
+-	while (ACPI_SUCCESS(status)) {
+-		d = acpi_fetch_acpi_dev(pr_ahandle);
+-		if (!d)
+-			break;
+-
+-		handle = pr_ahandle;
+-
+-		if (strcmp(acpi_device_hid(d), ACPI_PROCESSOR_CONTAINER_HID))
+-			break;
+-
+-		/* can be optional ? */
+-		if (!acpi_has_method(handle, "_LPI"))
+-			break;
+-
+-		ret = acpi_processor_evaluate_lpi(handle, curr);
+-		if (ret)
+-			break;
+-
+-		/* flatten all the LPI states in this level of hierarchy */
+-		state_count = flatten_lpi_states(pr, state_count, curr, prev);
+-
+-		tmp = prev, prev = curr, curr = tmp;
+-
+-		status = acpi_get_parent(handle, &pr_ahandle);
+-	}
+-
+-	/* reset the index after flattening */
+-	for (i = 0; i < state_count; i++)
+-		pr->power.lpi_states[i].index = i;
+-
+-	pr->power.count = state_count;
+ 
+ 	/* Tell driver that _LPI is supported. */
+ 	pr->flags.has_lpi = 1;
+diff --git a/drivers/base/power/main.c b/drivers/base/power/main.c
+--- a/drivers/base/power/main.c
++++ b/drivers/base/power/main.c
+@@ -41,6 +41,9 @@
+ #include "../base.h"
+ #include "power.h"
+ 
++#undef MODULE_PARAM_PREFIX
++#define MODULE_PARAM_PREFIX "pm."
++
+ typedef int (*pm_callback_t)(struct device *);
+ 
+ /*
+@@ -532,6 +535,11 @@ module_param(dpm_watchdog_all_cpu_backtrace, bool, 0644);
+ MODULE_PARM_DESC(dpm_watchdog_all_cpu_backtrace,
+ 		 "Backtrace all CPUs on DPM watchdog timeout");
+ 
++static bool __read_mostly dpm_watchdog_enabled =
++				IS_ENABLED(CONFIG_DPM_WATCHDOG_ENABLED);
++module_param(dpm_watchdog_enabled, bool, 0644);
++MODULE_PARM_DESC(dpm_watchdog_enabled, "Enable DPM watchdog");
++
+ static unsigned int __read_mostly dpm_watchdog_timeout = CONFIG_DPM_WATCHDOG_TIMEOUT;
+ static unsigned int __read_mostly dpm_watchdog_warning_timeout =
+ 						CONFIG_DPM_WATCHDOG_WARNING_TIMEOUT;
+@@ -627,6 +635,9 @@ static void dpm_watchdog_set(struct dpm_watchdog *wd, struct device *dev)
+ {
+ 	struct timer_list *timer = &wd->timer;
+ 
++	if (!dpm_watchdog_enabled)
++		return;
++
+ 	wd->dev = dev;
+ 	wd->tsk = current;
+ 	wd->fatal = dpm_watchdog_timeout == dpm_watchdog_warning_timeout;
+@@ -645,6 +656,9 @@ static void dpm_watchdog_clear(struct dpm_watchdog *wd)
+ {
+ 	struct timer_list *timer = &wd->timer;
+ 
++	if (!dpm_watchdog_enabled)
++		return;
++
+ 	timer_delete_sync(timer);
+ 	timer_destroy_on_stack(timer);
+ }
+diff --git a/drivers/base/power/runtime.c b/drivers/base/power/runtime.c
+--- a/drivers/base/power/runtime.c
++++ b/drivers/base/power/runtime.c
+@@ -469,9 +469,6 @@ static int rpm_callback(int (*cb)(struct device *), struct device *dev)
+ 	if (retval == -EACCES)
+ 		retval = -EAGAIN;
+ 
+-	if (retval != -EAGAIN && retval != -EBUSY)
+-		dev->power.runtime_error = retval;
+-
+ 	return retval;
+ }
+ 
+@@ -751,6 +748,9 @@ static int rpm_suspend(struct device *dev, int rpmflags)
+ 	dev->power.deferred_resume = false;
+ 	wake_up_all(&dev->power.wait_queue);
+ 
++	if (retval != -EAGAIN && retval != -EBUSY)
++		dev->power.runtime_error = retval;
++
+ 	/*
+ 	 * On transient errors, if the callback routine failed an autosuspend,
+ 	 * and if the last_busy time has been updated so that there is a new
+diff --git a/drivers/cpufreq/amd-pstate-ut.c b/drivers/cpufreq/amd-pstate-ut.c
+--- a/drivers/cpufreq/amd-pstate-ut.c
++++ b/drivers/cpufreq/amd-pstate-ut.c
+@@ -59,6 +59,7 @@ static int amd_pstate_ut_check_freq(u32 index);
+ static int amd_pstate_ut_epp(u32 index);
+ static int amd_pstate_ut_check_driver(u32 index);
+ static int amd_pstate_ut_check_freq_attrs(u32 index);
++static int amd_pstate_ut_check_floor_freq(u32 index);
+ 
+ static struct amd_pstate_ut_struct amd_pstate_ut_cases[] = {
+ 	{"amd_pstate_ut_acpi_cpc_valid",    amd_pstate_ut_acpi_cpc_valid   },
+@@ -68,6 +69,7 @@ static struct amd_pstate_ut_struct amd_pstate_ut_cases[] = {
+ 	{"amd_pstate_ut_epp",               amd_pstate_ut_epp              },
+ 	{"amd_pstate_ut_check_driver",      amd_pstate_ut_check_driver     },
+ 	{"amd_pstate_ut_check_freq_attrs",  amd_pstate_ut_check_freq_attrs },
++	{"amd_pstate_ut_check_floor_freq",  amd_pstate_ut_check_floor_freq },
+ };
+ 
+ static bool test_in_list(const char *list, const char *name)
+@@ -275,6 +277,7 @@ static int amd_pstate_set_mode(enum amd_pstate_mode mode)
+ static int amd_pstate_ut_epp(u32 index)
+ {
+ 	static const char * const epp_strings[] = {
++		"dynamic",
+ 		"power",
+ 		"balance_power",
+ 		"balance_performance",
+@@ -282,10 +285,10 @@ static int amd_pstate_ut_epp(u32 index)
+ 	};
+ 	char *buf __free(cleanup_page) = NULL;
+ 	struct cpufreq_policy *policy = NULL;
++	unsigned long orig_dynamic_epp = 0;
+ 	enum amd_pstate_mode orig_mode;
+ 	struct amd_cpudata *cpudata;
+ 	unsigned long orig_policy;
+-	bool orig_dynamic_epp;
+ 	int ret, cpu = 0;
+ 	u16 epp;
+ 	int i;
+@@ -294,9 +297,11 @@ static int amd_pstate_ut_epp(u32 index)
+ 	if (!policy)
+ 		return -ENODEV;
+ 
+-	cpudata = policy->driver_data;
+ 	orig_mode = amd_pstate_get_status();
+-	orig_dynamic_epp = cpudata->dynamic_epp;
++	if (policy->driver_data) {
++		cpudata = policy->driver_data;
++		orig_dynamic_epp = cpudata->dynamic_epp;
++	}
+ 
+ 	/* Drop reference before potential driver change. */
+ 	cpufreq_cpu_put(policy);
+@@ -321,16 +326,6 @@ static int amd_pstate_ut_epp(u32 index)
+ 	orig_policy = cpudata->policy;
+ 	cpudata->policy = CPUFREQ_POLICY_POWERSAVE;
+ 
+-	/*
+-	 * Disable dynamic EPP before running test. If "orig_dynamic_epp" is
+-	 * true, the  driver will do a redundant switch at the end and there
+-	 * is no need for enabling it again at the end of the test.
+-	 */
+-	if (cpudata->dynamic_epp) {
+-		pr_debug("Dynamic EPP is enabled, disabling it\n");
+-		amd_pstate_clear_dynamic_epp(policy);
+-	}
+-
+ 	for (epp = 0; epp <= U8_MAX; epp++) {
+ 		u8 val;
+ 
+@@ -367,6 +362,11 @@ static int amd_pstate_ut_epp(u32 index)
+ 		if (ret < 0)
+ 			goto out;
+ 		strreplace(buf, '\n', '\0');
++		/*
++		 * "dynamic" mode reports the EPP as "dynamic(profile:X)"
++		 * Trim at "(" and just compare tie the epp string.
++		 */
++		strreplace(buf, '(', '\0');
+ 
+ 		if (strcmp(buf, epp_strings[i])) {
+ 			pr_err("String EPP value mismatch: %s != %s\n", buf, epp_strings[i]);
+@@ -380,18 +380,23 @@ static int amd_pstate_ut_epp(u32 index)
+ out:
+ 	if (policy) {
+ 		cpudata->policy = orig_policy;
++		/*
++		 * If the driver had enabled dynamic_epp to begin with,
++		 * restore it here before dropping policy reference.
++		 */
++		if (orig_dynamic_epp) {
++			int ret2;
++
++			ret2 = store_energy_performance_preference(policy,
++								  epp_strings[0],
++								  strlen(epp_strings[0]));
++			if (!ret && (ret2 < 0))
++				ret = ret2;
++		}
+ 		up_write(&policy->rwsem);
+ 		cpufreq_cpu_put(policy);
+ 	}
+ 
+-	if (orig_dynamic_epp) {
+-		int ret2;
+-
+-		ret2 = amd_pstate_set_mode(AMD_PSTATE_DISABLE);
+-		if (!ret && ret2)
+-			ret = ret2;
+-	}
+-
+ 	if (orig_mode != amd_pstate_get_status()) {
+ 		int ret2;
+ 
+@@ -557,6 +562,80 @@ out:
+ 	return ret;
+ }
+ 
++static int amd_pstate_ut_check_floor_freq(u32 index)
++{
++	struct cpufreq_policy *policy __free(put_cpufreq_policy) = NULL;
++	char *buf __free(cleanup_page) = NULL;
++	unsigned int orig_floor_freq;
++	unsigned int floor_freq;
++	int ret, cpu = 0;
++
++	if (!cpu_feature_enabled(X86_FEATURE_CPPC_PERF_PRIO))
++		return -EOPNOTSUPP;
++
++	policy = cpufreq_cpu_get(cpu);
++	if (!policy)
++		return -ENODEV;
++
++	buf = (char *)__get_free_page(GFP_KERNEL);
++	if (!buf)
++		return -ENOMEM;
++
++	guard(rwsem_write)(&policy->rwsem);
++
++	if (!policy->driver_data)
++		return -ENODEV;
++
++	/* Retrieve original floor frequency */
++	memset(buf, 0, PAGE_SIZE);
++	ret = show_amd_pstate_floor_freq(policy, buf);
++	if (ret < 0)
++		return ret;
++
++	ret = kstrtou32(buf, 0, &orig_floor_freq);
++	if (ret)
++		return ret;
++
++	memset(buf, 0, PAGE_SIZE);
++	snprintf(buf, PAGE_SIZE, "%u", policy->cpuinfo.min_freq);
++
++	/* Set floor frequency to cpuinfo.min_freq */
++	ret = store_amd_pstate_floor_freq(policy, buf, strlen(buf));
++	if (ret < 0) {
++		pr_err("Failed to set floor frequency to %s\n", buf);
++		return ret;
++	}
++
++	memset(buf, 0, PAGE_SIZE);
++	ret = show_amd_pstate_floor_freq(policy, buf);
++	if (ret < 0)
++		return ret;
++
++	strreplace(buf, '\n', '\0');
++	ret = kstrtou32(buf, 0, &floor_freq);
++	if (ret)
++		return ret;
++
++	/* Confirm sysfs reflects the change correctly. */
++	if (floor_freq != policy->cpuinfo.min_freq) {
++		pr_err("Floor frequency value mismatch: %u != %u\n",
++		       floor_freq, policy->cpuinfo.min_freq);
++		return -EINVAL;
++	}
++
++	memset(buf, 0, PAGE_SIZE);
++	snprintf(buf, PAGE_SIZE, "%u", orig_floor_freq);
++
++	/* Restore the original value. */
++	ret = store_amd_pstate_floor_freq(policy, buf, strlen(buf));
++	if (ret < 0) {
++		pr_err("Failed to restore floor frequency to %s\n", buf);
++		return ret;
++	}
++
++	return 0;
++}
++
+ static int __init amd_pstate_ut_init(void)
+ {
+ 	u32 i = 0, arr_size = ARRAY_SIZE(amd_pstate_ut_cases);
+@@ -575,10 +654,16 @@ static int __init amd_pstate_ut_init(void)
+ 
+ 		ret = amd_pstate_ut_cases[i].func(i);
+ 
+-		if (ret)
++		if (ret) {
++			/* Platform does not support the feature being tested. */
++			if (ret == -EOPNOTSUPP) {
++				pr_err("%-4d %-20s\t skipped!\n", i+1, amd_pstate_ut_cases[i].name);
++				continue;
++			}
+ 			pr_err("%-4d %-20s\t fail: %d!\n", i+1, amd_pstate_ut_cases[i].name, ret);
+-		else
++		} else {
+ 			pr_info("%-4d %-20s\t success!\n", i+1, amd_pstate_ut_cases[i].name);
++		}
+ 	}
+ 
+ 	return 0;
+diff --git a/drivers/cpufreq/amd-pstate.c b/drivers/cpufreq/amd-pstate.c
+--- a/drivers/cpufreq/amd-pstate.c
++++ b/drivers/cpufreq/amd-pstate.c
+@@ -75,7 +75,7 @@ const char *amd_pstate_get_mode_string(enum amd_pstate_mode mode)
+ 		mode = AMD_PSTATE_UNDEFINED;
+ 	return amd_pstate_mode_string[mode];
+ }
+-EXPORT_SYMBOL_GPL(amd_pstate_get_mode_string);
++EXPORT_SYMBOL_FOR_PSTATE_UT(amd_pstate_get_mode_string);
+ 
+ struct quirk_entry {
+ 	u32 nominal_freq;
+@@ -87,7 +87,6 @@ static struct cpufreq_driver amd_pstate_driver;
+ static struct cpufreq_driver amd_pstate_epp_driver;
+ static int cppc_state = AMD_PSTATE_UNDEFINED;
+ static bool amd_pstate_prefcore = true;
+-static bool dynamic_epp;
+ static struct quirk_entry *quirks;
+ 
+ /*
+@@ -106,6 +105,7 @@ static struct quirk_entry *quirks;
+  *	3		balance_power
+  *	4		power
+  *	5		custom (for raw EPP values)
++ *	6		dynamic (platform profile driven selection)
+  */
+ enum energy_perf_value_index {
+ 	EPP_INDEX_DEFAULT = 0,
+@@ -114,6 +114,7 @@ enum energy_perf_value_index {
+ 	EPP_INDEX_BALANCE_POWERSAVE,
+ 	EPP_INDEX_POWERSAVE,
+ 	EPP_INDEX_CUSTOM,
++	EPP_INDEX_DYNAMIC,
+ 	EPP_INDEX_MAX,
+ };
+ 
+@@ -124,6 +125,7 @@ static const char * const energy_perf_strings[] = {
+ 	[EPP_INDEX_BALANCE_POWERSAVE] = "balance_power",
+ 	[EPP_INDEX_POWERSAVE] = "power",
+ 	[EPP_INDEX_CUSTOM] = "custom",
++	[EPP_INDEX_DYNAMIC] = "dynamic",
+ };
+ static_assert(ARRAY_SIZE(energy_perf_strings) == EPP_INDEX_MAX);
+ 
+@@ -134,7 +136,7 @@ static unsigned int epp_values[] = {
+ 	[EPP_INDEX_BALANCE_POWERSAVE] = AMD_CPPC_EPP_BALANCE_POWERSAVE,
+ 	[EPP_INDEX_POWERSAVE] = AMD_CPPC_EPP_POWERSAVE,
+ };
+-static_assert(ARRAY_SIZE(epp_values) == EPP_INDEX_MAX - 1);
++static_assert(ARRAY_SIZE(epp_values) == EPP_INDEX_MAX - 2);
+ 
+ typedef int (*cppc_mode_transition_fn)(int);
+ 
+@@ -462,7 +464,6 @@ static int msr_init_perf(struct amd_cpudata *cpudata)
+ {
+ 	union perf_cached perf = READ_ONCE(cpudata->perf);
+ 	u64 cap1, numerator, cppc_req;
+-	u8 min_perf;
+ 
+ 	int ret = rdmsrq_safe_on_cpu(cpudata->cpu, MSR_AMD_CPPC_CAP1,
+ 				     &cap1);
+@@ -478,16 +479,6 @@ static int msr_init_perf(struct amd_cpudata *cpudata)
+ 		return ret;
+ 
+ 	WRITE_ONCE(cpudata->cppc_req_cached, cppc_req);
+-	min_perf = FIELD_GET(AMD_CPPC_MIN_PERF_MASK, cppc_req);
+-
+-	/*
+-	 * Clear out the min_perf part to check if the rest of the MSR is 0, if yes, this is an
+-	 * indication that the min_perf value is the one specified through the BIOS option
+-	 */
+-	cppc_req &= ~(AMD_CPPC_MIN_PERF_MASK);
+-
+-	if (!cppc_req)
+-		perf.bios_min_perf = min_perf;
+ 
+ 	perf.highest_perf = numerator;
+ 	perf.max_limit_perf = numerator;
+@@ -495,6 +486,7 @@ static int msr_init_perf(struct amd_cpudata *cpudata)
+ 	perf.nominal_perf = FIELD_GET(AMD_CPPC_NOMINAL_PERF_MASK, cap1);
+ 	perf.lowest_nonlinear_perf = FIELD_GET(AMD_CPPC_LOWNONLIN_PERF_MASK, cap1);
+ 	perf.lowest_perf = FIELD_GET(AMD_CPPC_LOWEST_PERF_MASK, cap1);
++	perf.bios_min_perf = FIELD_GET(AMD_CPPC_MIN_PERF_MASK, cppc_req);
+ 	WRITE_ONCE(cpudata->perf, perf);
+ 	WRITE_ONCE(cpudata->prefcore_ranking, FIELD_GET(AMD_CPPC_HIGHEST_PERF_MASK, cap1));
+ 	WRITE_ONCE(cpudata->floor_perf_cnt, FIELD_GET(AMD_CPPC_FLOOR_PERF_CNT_MASK, cap1));
+@@ -789,6 +781,7 @@ static unsigned int amd_pstate_fast_switch(struct cpufreq_policy *policy,
+ static void amd_pstate_adjust_perf(struct cpufreq_policy *policy,
+ 				   unsigned long _min_perf,
+ 				   unsigned long target_perf,
++				   unsigned long _max_perf,
+ 				   unsigned long capacity)
+ {
+ 	u8 max_perf, min_perf, des_perf, cap_perf;
+@@ -1044,6 +1037,13 @@ static int amd_pstate_init_freq(struct amd_cpudata *cpudata)
+ 		return -EINVAL;
+ 	}
+ 
++	if (perf.bios_min_perf) {
++		u32 bios_min_freq = perf_to_freq(perf, cpudata->nominal_freq, perf.bios_min_perf);
++
++		pr_debug("Found Requested CPU Min Frequency of %uKHz on CPU%d\n",
++			 bios_min_freq, cpudata->cpu);
++	}
++
+ 	return 0;
+ }
+ 
+@@ -1192,6 +1192,24 @@ static int amd_pstate_power_supply_notifier(struct notifier_block *nb,
+ 	return NOTIFY_OK;
+ }
+ 
++static int amd_pstate_get_epp_from_platform_profile(struct cpufreq_policy *policy,
++						    enum platform_profile_option profile)
++{
++	switch (profile) {
++	case PLATFORM_PROFILE_PERFORMANCE:
++		return AMD_CPPC_EPP_PERFORMANCE;
++	case PLATFORM_PROFILE_BALANCED:
++		return amd_pstate_get_balanced_epp(policy);
++	case PLATFORM_PROFILE_LOW_POWER:
++		return AMD_CPPC_EPP_POWERSAVE;
++	default:
++		break;
++	}
++
++	pr_err("Unknown Platform Profile %d\n", profile);
++	return -EOPNOTSUPP;
++}
++
+ static int amd_pstate_profile_probe(void *drvdata, unsigned long *choices)
+ {
+ 	set_bit(PLATFORM_PROFILE_LOW_POWER, choices);
+@@ -1217,31 +1235,19 @@ static int amd_pstate_profile_set(struct device *dev,
+ 	struct amd_cpudata *cpudata = dev_get_drvdata(dev);
+ 	struct cpufreq_policy *policy __free(put_cpufreq_policy) = cpufreq_cpu_get(cpudata->cpu);
+ 	int ret;
++	u8 epp;
+ 
+ 	if (!policy)
+ 		return -ENODEV;
+ 
+-	switch (profile) {
+-	case PLATFORM_PROFILE_LOW_POWER:
+-		ret = amd_pstate_set_epp(policy, AMD_CPPC_EPP_POWERSAVE);
+-		if (ret)
+-			return ret;
+-		break;
+-	case PLATFORM_PROFILE_BALANCED:
+-		ret = amd_pstate_set_epp(policy,
+-					 amd_pstate_get_balanced_epp(policy));
+-		if (ret)
+-			return ret;
+-		break;
+-	case PLATFORM_PROFILE_PERFORMANCE:
+-		ret = amd_pstate_set_epp(policy, AMD_CPPC_EPP_PERFORMANCE);
+-		if (ret)
+-			return ret;
+-		break;
+-	default:
+-		pr_err("Unknown Platform Profile %d\n", profile);
+-		return -EOPNOTSUPP;
+-	}
++	ret = amd_pstate_get_epp_from_platform_profile(policy, profile);
++	if (ret < 0)
++		return ret;
++
++	epp = (u8)ret;
++	ret = amd_pstate_set_epp(policy, epp);
++	if (ret)
++		return ret;
+ 
+ 	cpudata->current_profile = profile;
+ 
+@@ -1267,28 +1273,20 @@ void amd_pstate_clear_dynamic_epp(struct cpufreq_policy *policy)
+ 	kfree(cpudata->profile_name);
+ 	cpudata->dynamic_epp = false;
+ }
+-EXPORT_SYMBOL_GPL(amd_pstate_clear_dynamic_epp);
++EXPORT_SYMBOL_FOR_PSTATE_UT(amd_pstate_clear_dynamic_epp);
+ 
+ static int amd_pstate_set_dynamic_epp(struct cpufreq_policy *policy)
+ {
+ 	struct amd_cpudata *cpudata = policy->driver_data;
++	u64 prev = READ_ONCE(cpudata->cppc_req_cached);
+ 	int ret;
+ 	u8 epp;
+ 
+-	switch (cpudata->current_profile) {
+-	case PLATFORM_PROFILE_PERFORMANCE:
+-		epp = AMD_CPPC_EPP_PERFORMANCE;
+-		break;
+-	case PLATFORM_PROFILE_LOW_POWER:
+-		epp = AMD_CPPC_EPP_POWERSAVE;
+-		break;
+-	case PLATFORM_PROFILE_BALANCED:
+-		epp = amd_pstate_get_balanced_epp(policy);
+-		break;
+-	default:
+-		pr_err("Unknown Platform Profile %d\n", cpudata->current_profile);
+-		return -EOPNOTSUPP;
+-	}
++	ret = amd_pstate_get_epp_from_platform_profile(policy, cpudata->current_profile);
++	if (ret < 0)
++		return ret;
++
++	epp = (u8)ret;
+ 	ret = amd_pstate_set_epp(policy, epp);
+ 	if (ret)
+ 		return ret;
+@@ -1321,6 +1319,9 @@ static int amd_pstate_set_dynamic_epp(struct cpufreq_policy *policy)
+ cleanup:
+ 	amd_pstate_clear_dynamic_epp(policy);
+ 
++	epp = FIELD_GET(AMD_CPPC_EPP_PERF_MASK, prev);
++	/* Restore previous EPP if toggling Dynamic EPP failed. */
++	amd_pstate_set_epp(policy, epp);
+ 	return ret;
+ }
+ 
+@@ -1391,7 +1392,7 @@ static ssize_t show_amd_pstate_hw_prefcore(struct cpufreq_policy *policy,
+ static ssize_t show_energy_performance_available_preferences(
+ 				struct cpufreq_policy *policy, char *buf)
+ {
+-	int offset = 0, i;
++	int i, offset = 0;
+ 	struct amd_cpudata *cpudata = policy->driver_data;
+ 
+ 	if (cpudata->policy == CPUFREQ_POLICY_PERFORMANCE)
+@@ -1414,11 +1415,6 @@ ssize_t store_energy_performance_preference(struct cpufreq_policy *policy,
+ 	bool raw_epp = false;
+ 	u8 epp;
+ 
+-	if (cpudata->dynamic_epp) {
+-		pr_debug("EPP cannot be set when dynamic EPP is enabled\n");
+-		return -EBUSY;
+-	}
+-
+ 	/*
+ 	 * if the value matches a number, use that, otherwise see if
+ 	 * matches an index in the energy_perf_strings array
+@@ -1429,6 +1425,25 @@ ssize_t store_energy_performance_preference(struct cpufreq_policy *policy,
+ 		ret = sysfs_match_string(energy_perf_strings, buf);
+ 		if (ret < 0 || ret == EPP_INDEX_CUSTOM)
+ 			return -EINVAL;
++
++		if (ret == EPP_INDEX_DYNAMIC) {
++			if (cpudata->policy == CPUFREQ_POLICY_PERFORMANCE)
++				return -EBUSY;
++			/*
++			 * Dynamic EPP was already enabled for this CPU.
++			 * Nothing to do.
++			 */
++			if (cpudata->dynamic_epp)
++				return count;
++
++			cpudata->current_profile = PLATFORM_PROFILE_BALANCED;
++			ret = amd_pstate_set_dynamic_epp(policy);
++			if (ret)
++				return ret;
++
++			return count;
++		}
++
+ 		if (ret)
+ 			epp = epp_values[ret];
+ 		else
+@@ -1440,6 +1455,13 @@ ssize_t store_energy_performance_preference(struct cpufreq_policy *policy,
+ 		return -EBUSY;
+ 	}
+ 
++	/*
++	 * Dynamic EPP was enabled previously!
++	 * Switch back to the static EPP mode.
++	 */
++	if (cpudata->dynamic_epp)
++		amd_pstate_clear_dynamic_epp(policy);
++
+ 	ret = amd_pstate_set_epp(policy, epp);
+ 	if (ret)
+ 		return ret;
+@@ -1448,7 +1470,7 @@ ssize_t store_energy_performance_preference(struct cpufreq_policy *policy,
+ 
+ 	return count;
+ }
+-EXPORT_SYMBOL_GPL(store_energy_performance_preference);
++EXPORT_SYMBOL_FOR_PSTATE_UT(store_energy_performance_preference);
+ 
+ ssize_t show_energy_performance_preference(struct cpufreq_policy *policy, char *buf)
+ {
+@@ -1457,7 +1479,7 @@ ssize_t show_energy_performance_preference(struct cpufreq_policy *policy, char *
+ 
+ 	epp = FIELD_GET(AMD_CPPC_EPP_PERF_MASK, cpudata->cppc_req_cached);
+ 
+-	if (cpudata->raw_epp)
++	if (!cpudata->dynamic_epp && cpudata->raw_epp)
+ 		return sysfs_emit(buf, "%u\n", epp);
+ 
+ 	switch (epp) {
+@@ -1477,12 +1499,14 @@ ssize_t show_energy_performance_preference(struct cpufreq_policy *policy, char *
+ 		return -EINVAL;
+ 	}
+ 
++	if (cpudata->dynamic_epp)
++		return sysfs_emit(buf, "dynamic(profile:%s)\n", energy_perf_strings[preference]);
++
+ 	return sysfs_emit(buf, "%s\n", energy_perf_strings[preference]);
+ }
+-EXPORT_SYMBOL_GPL(show_energy_performance_preference);
++EXPORT_SYMBOL_FOR_PSTATE_UT(show_energy_performance_preference);
+ 
+-static ssize_t store_amd_pstate_floor_freq(struct cpufreq_policy *policy,
+-					   const char *buf, size_t count)
++ssize_t store_amd_pstate_floor_freq(struct cpufreq_policy *policy, const char *buf, size_t count)
+ {
+ 	struct amd_cpudata *cpudata = policy->driver_data;
+ 	union perf_cached perf = READ_ONCE(cpudata->perf);
+@@ -1505,13 +1529,15 @@ static ssize_t store_amd_pstate_floor_freq(struct cpufreq_policy *policy,
+ 
+ 	return ret ?: count;
+ }
++EXPORT_SYMBOL_FOR_PSTATE_UT(store_amd_pstate_floor_freq);
+ 
+-static ssize_t show_amd_pstate_floor_freq(struct cpufreq_policy *policy, char *buf)
++ssize_t show_amd_pstate_floor_freq(struct cpufreq_policy *policy, char *buf)
+ {
+ 	struct amd_cpudata *cpudata = policy->driver_data;
+ 
+ 	return sysfs_emit(buf, "%u\n", cpudata->floor_freq);
+ }
++EXPORT_SYMBOL_FOR_PSTATE_UT(show_amd_pstate_floor_freq);
+ 
+ static ssize_t show_amd_pstate_floor_count(struct cpufreq_policy *policy, char *buf)
+ {
+@@ -1579,7 +1605,7 @@ struct freq_attr **amd_pstate_get_current_attrs(void)
+ 		return NULL;
+ 	return current_pstate_driver->attr;
+ }
+-EXPORT_SYMBOL_GPL(amd_pstate_get_current_attrs);
++EXPORT_SYMBOL_FOR_PSTATE_UT(amd_pstate_get_current_attrs);
+ 
+ static struct freq_attr **get_freq_attrs(void)
+ {
+@@ -1764,7 +1790,7 @@ int amd_pstate_get_status(void)
+ {
+ 	return cppc_state;
+ }
+-EXPORT_SYMBOL_GPL(amd_pstate_get_status);
++EXPORT_SYMBOL_FOR_PSTATE_UT(amd_pstate_get_status);
+ 
+ int amd_pstate_update_status(const char *buf, size_t size)
+ {
+@@ -1784,7 +1810,7 @@ int amd_pstate_update_status(const char *buf, size_t size)
+ 
+ 	return 0;
+ }
+-EXPORT_SYMBOL_GPL(amd_pstate_update_status);
++EXPORT_SYMBOL_FOR_PSTATE_UT(amd_pstate_update_status);
+ 
+ static ssize_t status_show(struct device *dev,
+ 			   struct device_attribute *attr, char *buf)
+@@ -1812,50 +1838,12 @@ static ssize_t prefcore_show(struct device *dev,
+ 	return sysfs_emit(buf, "%s\n", str_enabled_disabled(amd_pstate_prefcore));
+ }
+ 
+-static ssize_t dynamic_epp_show(struct device *dev,
+-				struct device_attribute *attr, char *buf)
+-{
+-	return sysfs_emit(buf, "%s\n", str_enabled_disabled(dynamic_epp));
+-}
+-
+-static ssize_t dynamic_epp_store(struct device *a, struct device_attribute *b,
+-				 const char *buf, size_t count)
+-{
+-	bool enabled;
+-	int ret;
+-
+-	ret = kstrtobool(buf, &enabled);
+-	if (ret)
+-		return ret;
+-
+-	guard(mutex)(&amd_pstate_driver_lock);
+-
+-	if (cppc_state != AMD_PSTATE_ACTIVE) {
+-		pr_debug("dynamic_epp can only be toggled in active mode\n");
+-		return -EINVAL;
+-	}
+-
+-	/* Nothing to do */
+-	if (dynamic_epp == enabled)
+-		return count;
+-
+-	/* reinitialize with desired dynamic EPP value */
+-	dynamic_epp = enabled;
+-	ret = amd_pstate_change_driver_mode(cppc_state);
+-	if (ret)
+-		dynamic_epp = false;
+-
+-	return ret ? ret : count;
+-}
+-
+ static DEVICE_ATTR_RW(status);
+ static DEVICE_ATTR_RO(prefcore);
+-static DEVICE_ATTR_RW(dynamic_epp);
+ 
+ static struct attribute *pstate_global_attributes[] = {
+ 	&dev_attr_status.attr,
+ 	&dev_attr_prefcore.attr,
+-	&dev_attr_dynamic_epp.attr,
+ 	NULL
+ };
+ 
+@@ -1938,12 +1926,13 @@ static int amd_pstate_epp_cpu_init(struct cpufreq_policy *policy)
+ 
+ 	policy->boost_supported = READ_ONCE(cpudata->boost_supported);
+ 
+-	/* Fetch the firmware programmed default EPP value */
++	/* Cache the firmware programmed EPP */
+ 	default_epp = amd_pstate_get_epp(cpudata);
+ 	if (default_epp < 0) {
+ 		ret = default_epp;
+ 		goto free_cpudata1;
+ 	}
++	FIELD_MODIFY(AMD_CPPC_EPP_PERF_MASK, &cpudata->cppc_req_cached, default_epp);
+ 
+ 	/*
+ 	 * Set the policy to provide a valid fallback value in case
+@@ -1961,10 +1950,7 @@ static int amd_pstate_epp_cpu_init(struct cpufreq_policy *policy)
+ 		cpudata->current_profile = PLATFORM_PROFILE_BALANCED;
+ 	}
+ 
+-	if (dynamic_epp)
+-		ret = amd_pstate_set_dynamic_epp(policy);
+-	else
+-		ret = amd_pstate_set_epp(policy, cpudata->epp_default_dc);
++	ret = amd_pstate_set_epp(policy, cpudata->epp_default_dc);
+ 	if (ret)
+ 		goto free_cpudata1;
+ 
+@@ -2036,6 +2022,18 @@ static int amd_pstate_epp_set_policy(struct cpufreq_policy *policy)
+ 	if (!policy->cpuinfo.max_freq)
+ 		return -ENODEV;
+ 
++	/* Must be a switch between PERFORMANCE and POWERSAVE */
++	if (cpudata->policy != policy->policy) {
++		/*
++		 * Disable dynamic_epp when switching
++		 * out of CPUFREQ_POLICY_POWERSAVE.
++		 */
++		if (cpudata->dynamic_epp) {
++			WARN_ON_ONCE(cpudata->policy != CPUFREQ_POLICY_POWERSAVE);
++			amd_pstate_clear_dynamic_epp(policy);
++		}
++	}
++
+ 	cpudata->policy = policy->policy;
+ 
+ 	ret = amd_pstate_epp_update_limit(policy, true);
+@@ -2363,19 +2361,8 @@ static int __init amd_prefcore_param(char *str)
+ 	return 0;
+ }
+ 
+-static int __init amd_dynamic_epp_param(char *str)
+-{
+-	if (!strcmp(str, "disable"))
+-		dynamic_epp = false;
+-	if (!strcmp(str, "enable"))
+-		dynamic_epp = true;
+-
+-	return 0;
+-}
+-
+ early_param("amd_pstate", amd_pstate_param);
+ early_param("amd_prefcore", amd_prefcore_param);
+-early_param("amd_dynamic_epp", amd_dynamic_epp_param);
+ 
+ MODULE_AUTHOR("Huang Rui <ray.huang@amd.com>");
+ MODULE_DESCRIPTION("AMD Processor P-state Frequency Driver");
+diff --git a/drivers/cpufreq/amd-pstate.h b/drivers/cpufreq/amd-pstate.h
+--- a/drivers/cpufreq/amd-pstate.h
++++ b/drivers/cpufreq/amd-pstate.h
+@@ -11,6 +11,13 @@
+ #include <linux/pm_qos.h>
+ #include <linux/platform_profile.h>
+ 
++#if IS_MODULE(CONFIG_X86_AMD_PSTATE_UT)
++#define EXPORT_SYMBOL_FOR_PSTATE_UT(symbol) \
++	EXPORT_SYMBOL_FOR_MODULES(symbol, "amd-pstate-ut")
++#else
++#define EXPORT_SYMBOL_FOR_PSTATE_UT(symbol)
++#endif
++
+ /*********************************************************************
+  *                        AMD P-state INTERFACE                       *
+  *********************************************************************/
+@@ -153,6 +160,8 @@ ssize_t store_energy_performance_preference(struct cpufreq_policy *policy,
+ 				    const char *buf, size_t count);
+ ssize_t show_energy_performance_preference(struct cpufreq_policy *policy, char *buf);
+ void amd_pstate_clear_dynamic_epp(struct cpufreq_policy *policy);
++ssize_t store_amd_pstate_floor_freq(struct cpufreq_policy *policy, const char *buf, size_t count);
++ssize_t show_amd_pstate_floor_freq(struct cpufreq_policy *policy, char *buf);
+ 
+ struct freq_attr;
+ 
+diff --git a/drivers/cpufreq/cpufreq.c b/drivers/cpufreq/cpufreq.c
+--- a/drivers/cpufreq/cpufreq.c
++++ b/drivers/cpufreq/cpufreq.c
+@@ -2225,14 +2225,17 @@ EXPORT_SYMBOL_GPL(cpufreq_driver_fast_switch);
+  * @policy: cpufreq policy object of the target CPU.
+  * @min_perf: Minimum (required) performance level (units of @capacity).
+  * @target_perf: Target (desired) performance level (units of @capacity).
++ * @max_perf: Maximum (allowed) performance level (units of @capacity).
+  * @capacity: Capacity of the target CPU.
+  *
+- * Carry out a fast performance level switch of @cpu without sleeping.
++ * Carry out a fast performance level adjustment for the CPU represented by
++ * @policy without sleeping.
+  *
+  * The driver's ->adjust_perf() callback invoked by this function must be
+- * suitable for being called from within RCU-sched read-side critical sections
+- * and it is expected to select a suitable performance level equal to or above
+- * @min_perf and preferably equal to or below @target_perf.
++ * suitable for calling from within RCU-sched read-side critical sections and
++ * it is expected to program the processor to select suitable performance
++ * levels between @min_perf and @max_perf inclusive and preferably close to
++ * @target_perf going forward for the CPU represented by @policy.
+  *
+  * This function must not be called if policy->fast_switch_enabled is unset.
+  *
+@@ -2244,9 +2247,10 @@ EXPORT_SYMBOL_GPL(cpufreq_driver_fast_switch);
+ void cpufreq_driver_adjust_perf(struct cpufreq_policy *policy,
+ 				 unsigned long min_perf,
+ 				 unsigned long target_perf,
++				 unsigned long max_perf,
+ 				 unsigned long capacity)
+ {
+-	cpufreq_driver->adjust_perf(policy, min_perf, target_perf, capacity);
++	cpufreq_driver->adjust_perf(policy, min_perf, target_perf, max_perf, capacity);
+ }
+ 
+ /**
+diff --git a/drivers/cpufreq/intel_pstate.c b/drivers/cpufreq/intel_pstate.c
+--- a/drivers/cpufreq/intel_pstate.c
++++ b/drivers/cpufreq/intel_pstate.c
+@@ -299,7 +299,6 @@ struct pstate_funcs {
+ static struct pstate_funcs pstate_funcs __read_mostly;
+ 
+ static bool hwp_active __ro_after_init;
+-static int hwp_mode_bdw __ro_after_init;
+ static bool per_cpu_limits __ro_after_init;
+ static bool hwp_forced __ro_after_init;
+ static bool hwp_boost __read_mostly;
+@@ -587,21 +586,14 @@ static void intel_pstate_hybrid_hwp_adjust(struct cpudata *cpu)
+ 
+ 	hwp_is_hybrid = true;
+ 
+-	cpu->pstate.turbo_freq = rounddown(cpu->pstate.turbo_pstate * scaling,
+-					   perf_ctl_scaling);
+-	cpu->pstate.max_freq = rounddown(cpu->pstate.max_pstate * scaling,
+-					 perf_ctl_scaling);
+-
+ 	freq = perf_ctl_max_phys * perf_ctl_scaling;
+ 	cpu->pstate.max_pstate_physical = intel_pstate_freq_to_hwp(cpu, freq);
+ 
+-	freq = cpu->pstate.min_pstate * perf_ctl_scaling;
+-	cpu->pstate.min_freq = freq;
+ 	/*
+ 	 * Cast the min P-state value retrieved via pstate_funcs.get_min() to
+ 	 * the effective range of HWP performance levels.
+ 	 */
+-	cpu->pstate.min_pstate = intel_pstate_freq_to_hwp(cpu, freq);
++	cpu->pstate.min_pstate = intel_pstate_freq_to_hwp(cpu, cpu->pstate.min_freq);
+ }
+ 
+ static bool turbo_is_disabled(void)
+@@ -979,12 +971,10 @@ static int hybrid_get_cost(struct device *dev, unsigned long freq,
+ 	 * capacity.  Similarly, P-cores start to be populated when E-cores are
+ 	 * utilized above 60% of the capacity.
+ 	 */
+-	if (hybrid_get_cpu_type(dev->id) == INTEL_CPU_TYPE_ATOM) {
+-		if (hybrid_has_l3(dev->id)) /* E-core */
+-			*cost += 1;
+-	} else { /* P-core */
++	if (hybrid_get_cpu_type(dev->id) == INTEL_CPU_TYPE_CORE) /* P-core */
+ 		*cost += 2;
+-	}
++	else if (hybrid_has_l3(dev->id)) /* E-core */
++		*cost += 1;
+ 
+ 	return 0;
+ }
+@@ -1185,6 +1175,22 @@ static bool hybrid_clear_max_perf_cpu(void)
+ 	return ret;
+ }
+ 
++static void intel_pstate_update_freq_limits(struct cpudata *cpu)
++{
++	int scaling = cpu->pstate.scaling;
++	unsigned int turbo_freq = cpu->pstate.turbo_pstate * scaling;
++	unsigned int max_freq = cpu->pstate.max_pstate * scaling;
++	int perf_ctl_scaling = cpu->pstate.perf_ctl_scaling;
++
++	if (scaling != perf_ctl_scaling) {
++		turbo_freq = rounddown(turbo_freq, perf_ctl_scaling);
++		max_freq = rounddown(max_freq, perf_ctl_scaling);
++	}
++
++	cpu->pstate.turbo_freq = turbo_freq;
++	cpu->pstate.max_freq = max_freq;
++}
++
+ static void __intel_pstate_get_hwp_cap(struct cpudata *cpu)
+ {
+ 	u64 cap;
+@@ -1197,20 +1203,8 @@ static void __intel_pstate_get_hwp_cap(struct cpudata *cpu)
+ 
+ static void intel_pstate_get_hwp_cap(struct cpudata *cpu)
+ {
+-	int scaling = cpu->pstate.scaling;
+-
+ 	__intel_pstate_get_hwp_cap(cpu);
+-
+-	cpu->pstate.max_freq = cpu->pstate.max_pstate * scaling;
+-	cpu->pstate.turbo_freq = cpu->pstate.turbo_pstate * scaling;
+-	if (scaling != cpu->pstate.perf_ctl_scaling) {
+-		int perf_ctl_scaling = cpu->pstate.perf_ctl_scaling;
+-
+-		cpu->pstate.max_freq = rounddown(cpu->pstate.max_freq,
+-						 perf_ctl_scaling);
+-		cpu->pstate.turbo_freq = rounddown(cpu->pstate.turbo_freq,
+-						   perf_ctl_scaling);
+-	}
++	intel_pstate_update_freq_limits(cpu);
+ }
+ 
+ static void hybrid_update_capacity(struct cpudata *cpu)
+@@ -2299,33 +2293,16 @@ static int hwp_get_cpu_scaling(int cpu)
+ 	return intel_pstate_cppc_get_scaling(cpu);
+ }
+ 
+-static void intel_pstate_set_pstate(struct cpudata *cpu, int pstate)
+-{
+-	trace_cpu_frequency(pstate * cpu->pstate.scaling, cpu->cpu);
+-	cpu->pstate.current_pstate = pstate;
+-	/*
+-	 * Generally, there is no guarantee that this code will always run on
+-	 * the CPU being updated, so force the register update to run on the
+-	 * right CPU.
+-	 */
+-	wrmsrq_on_cpu(cpu->cpu, MSR_IA32_PERF_CTL,
+-		      pstate_funcs.get_val(cpu, pstate));
+-}
+-
+-static void intel_pstate_set_min_pstate(struct cpudata *cpu)
+-{
+-	intel_pstate_set_pstate(cpu, cpu->pstate.min_pstate);
+-}
+-
+ static void intel_pstate_get_cpu_pstates(struct cpudata *cpu)
+ {
+ 	int perf_ctl_scaling = pstate_funcs.get_scaling();
+ 
+ 	cpu->pstate.max_pstate_physical = pstate_funcs.get_max_physical(cpu->cpu);
+ 	cpu->pstate.min_pstate = pstate_funcs.get_min(cpu->cpu);
++	cpu->pstate.min_freq = cpu->pstate.min_pstate * perf_ctl_scaling;
+ 	cpu->pstate.perf_ctl_scaling = perf_ctl_scaling;
+ 
+-	if (hwp_active && !hwp_mode_bdw) {
++	if (hwp_active) {
+ 		__intel_pstate_get_hwp_cap(cpu);
+ 
+ 		if (pstate_funcs.get_cpu_scaling) {
+@@ -2345,11 +2322,7 @@ static void intel_pstate_get_cpu_pstates(struct cpudata *cpu)
+ 		cpu->pstate.turbo_pstate = pstate_funcs.get_turbo(cpu->cpu);
+ 	}
+ 
+-	if (cpu->pstate.scaling == perf_ctl_scaling) {
+-		cpu->pstate.min_freq = cpu->pstate.min_pstate * perf_ctl_scaling;
+-		cpu->pstate.max_freq = cpu->pstate.max_pstate * perf_ctl_scaling;
+-		cpu->pstate.turbo_freq = cpu->pstate.turbo_pstate * perf_ctl_scaling;
+-	}
++	intel_pstate_update_freq_limits(cpu);
+ 
+ 	if (pstate_funcs.get_aperf_mperf_shift)
+ 		cpu->aperf_mperf_shift = pstate_funcs.get_aperf_mperf_shift();
+@@ -2882,8 +2855,22 @@ static void intel_pstate_update_perf_limits(struct cpudata *cpu,
+ 		 cpu->min_perf_ratio);
+ }
+ 
++static void intel_pstate_set_pstate(struct cpudata *cpu, int pstate)
++{
++	trace_cpu_frequency(pstate * cpu->pstate.scaling, cpu->cpu);
++	cpu->pstate.current_pstate = pstate;
++	/*
++	 * Generally, there is no guarantee that this code will always run on
++	 * the CPU being updated, so force the register update to run on the
++	 * right CPU.
++	 */
++	wrmsrq_on_cpu(cpu->cpu, MSR_IA32_PERF_CTL,
++		      pstate_funcs.get_val(cpu, pstate));
++}
++
+ static int intel_pstate_set_policy(struct cpufreq_policy *policy)
+ {
++	unsigned int freq = policy->min;
+ 	struct cpudata *cpu;
+ 
+ 	if (!policy->cpuinfo.max_freq)
+@@ -2899,7 +2886,23 @@ static int intel_pstate_set_policy(struct cpufreq_policy *policy)
+ 
+ 	intel_pstate_update_perf_limits(cpu, policy->min, policy->max);
+ 
+-	if (cpu->policy == CPUFREQ_POLICY_PERFORMANCE) {
++	if (hwp_active) {
++		/*
++		 * The active mode only requires an update util hook if HWP
++		 * boost is used and the policy is not "performance".
++		 */
++		if (hwp_boost && cpu->policy != CPUFREQ_POLICY_PERFORMANCE) {
++			intel_pstate_set_update_util_hook(policy->cpu);
++		} else {
++			intel_pstate_clear_update_util_hook(policy->cpu);
++			if (cpu->policy == CPUFREQ_POLICY_PERFORMANCE) {
++				freq = cpu->max_perf_ratio * cpu->pstate.scaling;
++				if (cpu->pstate.scaling != cpu->pstate.perf_ctl_scaling)
++					freq = rounddown(freq, cpu->pstate.perf_ctl_scaling);
++			}
++		}
++		intel_pstate_hwp_set(policy->cpu);
++	} else if (cpu->policy == CPUFREQ_POLICY_PERFORMANCE) {
+ 		int pstate = max(cpu->pstate.min_pstate, cpu->max_perf_ratio);
+ 
+ 		/*
+@@ -2908,25 +2911,17 @@ static int intel_pstate_set_policy(struct cpufreq_policy *policy)
+ 		 */
+ 		intel_pstate_clear_update_util_hook(policy->cpu);
+ 		intel_pstate_set_pstate(cpu, pstate);
++		freq = pstate * cpu->pstate.scaling;
+ 	} else {
+ 		intel_pstate_set_update_util_hook(policy->cpu);
+ 	}
+-
+-	if (hwp_active) {
+-		/*
+-		 * When hwp_boost was active before and dynamically it
+-		 * was turned off, in that case we need to clear the
+-		 * update util hook.
+-		 */
+-		if (!hwp_boost)
+-			intel_pstate_clear_update_util_hook(policy->cpu);
+-		intel_pstate_hwp_set(policy->cpu);
+-	}
+ 	/*
+-	 * policy->cur is never updated with the intel_pstate driver, but it
+-	 * is used as a stale frequency value. So, keep it within limits.
++	 * policy->cur is never updated in the intel_pstate driver, but it is
++	 * used as a stale frequency value, so set it to reflect the actual
++	 * requested P-state in the "performance" policy case and to the min
++	 * otherwise.
+ 	 */
+-	policy->cur = policy->min;
++	policy->cur = freq;
+ 
+ 	mutex_unlock(&intel_pstate_limits_lock);
+ 
+@@ -2969,6 +2964,11 @@ static int intel_pstate_verify_policy(struct cpufreq_policy_data *policy)
+ 	return 0;
+ }
+ 
++static void intel_pstate_set_min_pstate(struct cpudata *cpu)
++{
++	intel_pstate_set_pstate(cpu, cpu->pstate.min_pstate);
++}
++
+ static int intel_cpufreq_cpu_offline(struct cpufreq_policy *policy)
+ {
+ 	struct cpudata *cpu = all_cpu_data[policy->cpu];
+@@ -3242,6 +3242,7 @@ static unsigned int intel_cpufreq_fast_switch(struct cpufreq_policy *policy,
+ static void intel_cpufreq_adjust_perf(struct cpufreq_policy *policy,
+ 				      unsigned long min_perf,
+ 				      unsigned long target_perf,
++				      unsigned long max_perf,
+ 				      unsigned long capacity)
+ {
+ 	struct cpudata *cpu = all_cpu_data[policy->cpu];
+@@ -3272,7 +3273,13 @@ static void intel_cpufreq_adjust_perf(struct cpufreq_policy *policy,
+ 	if (min_pstate > cpu->max_perf_ratio)
+ 		min_pstate = cpu->max_perf_ratio;
+ 
+-	max_pstate = min(cap_pstate, cpu->max_perf_ratio);
++	max_pstate = cap_pstate;
++	if (max_perf < capacity)
++		max_pstate = DIV_ROUND_UP(cap_pstate * max_perf, capacity);
++
++	if (max_pstate > cpu->max_perf_ratio)
++		max_pstate = cpu->max_perf_ratio;
++
+ 	if (max_pstate < min_pstate)
+ 		max_pstate = min_pstate;
+ 
+@@ -3679,14 +3686,14 @@ static inline bool intel_pstate_has_acpi_ppc(void) { return false; }
+ static inline void intel_pstate_request_control_from_smm(void) {}
+ #endif /* CONFIG_ACPI */
+ 
+-#define INTEL_PSTATE_HWP_BROADWELL	0x01
++#define INTEL_PSTATE_HWP_NOT_HYBRID	0x01
+ 
+ #define X86_MATCH_HWP(vfm, hwp_mode)				\
+ 	X86_MATCH_VFM_FEATURE(vfm, X86_FEATURE_HWP, hwp_mode)
+ 
+ static const struct x86_cpu_id hwp_support_ids[] __initconst = {
+-	X86_MATCH_HWP(INTEL_BROADWELL_X,	INTEL_PSTATE_HWP_BROADWELL),
+-	X86_MATCH_HWP(INTEL_BROADWELL_D,	INTEL_PSTATE_HWP_BROADWELL),
++	X86_MATCH_HWP(INTEL_BROADWELL_X,	INTEL_PSTATE_HWP_NOT_HYBRID),
++	X86_MATCH_HWP(INTEL_BROADWELL_D,	INTEL_PSTATE_HWP_NOT_HYBRID),
+ 	X86_MATCH_HWP(INTEL_ANY,		0),
+ 	{}
+ };
+@@ -3811,7 +3818,6 @@ static int __init intel_pstate_init(void)
+ 
+ 		if (!no_hwp) {
+ 			hwp_active = true;
+-			hwp_mode_bdw = id->driver_data;
+ 			intel_pstate.attr = hwp_cpufreq_attrs;
+ 			intel_cpufreq.attr = hwp_cpufreq_attrs;
+ 			intel_cpufreq.flags |= CPUFREQ_NEED_UPDATE_LIMITS;
+@@ -3819,7 +3825,8 @@ static int __init intel_pstate_init(void)
+ 			if (!default_driver)
+ 				default_driver = &intel_pstate;
+ 
+-			pstate_funcs.get_cpu_scaling = hwp_get_cpu_scaling;
++			if (!id->driver_data)
++				pstate_funcs.get_cpu_scaling = hwp_get_cpu_scaling;
+ 
+ 			goto hwp_cpu_matched;
+ 		}
+diff --git a/drivers/idle/intel_idle.c b/drivers/idle/intel_idle.c
+--- a/drivers/idle/intel_idle.c
++++ b/drivers/idle/intel_idle.c
+@@ -1780,6 +1780,7 @@ module_param_named(no_native, no_native, bool, 0444);
+ MODULE_PARM_DESC(no_native, "Ignore cpu specific (native) idle states in lieu of ACPI idle states");
+ 
+ static struct acpi_processor_power acpi_state_table __initdata;
++static bool acpi_lpi_available __initdata;
+ 
+ /**
+  * intel_idle_cst_usable - Check if the _CST information can be used.
+@@ -1804,18 +1805,37 @@ static bool __init intel_idle_cst_usable(void)
+ 	return true;
+ }
+ 
+-static bool __init intel_idle_acpi_cst_extract(void)
++static bool __init intel_idle_acpi_extract_lpi_cstates(void)
+ {
+ 	unsigned int cpu;
+ 
+-	if (no_acpi) {
+-		pr_debug("Not allowed to use ACPI _CST\n");
+-		return false;
++	for_each_possible_cpu(cpu) {
++		struct acpi_processor *pr;
++
++		pr = per_cpu(processors, cpu);
++		if (!pr)
++			continue;
++
++		if (acpi_processor_extract_lpi_info(pr->handle,
++						    &acpi_state_table, true))
++			continue;
++
++		acpi_lpi_available = true;
++		return true;
+ 	}
+ 
+-	for_each_possible_cpu(cpu) {
+-		struct acpi_processor *pr = per_cpu(processors, cpu);
++	pr_debug("No ACPI _LPI idle states\n");
++	return false;
++}
+ 
++static bool __init intel_idle_acpi_extract_cst_cstates(void)
++{
++	unsigned int cpu;
++
++	for_each_possible_cpu(cpu) {
++		struct acpi_processor *pr;
++
++		pr = per_cpu(processors, cpu);
+ 		if (!pr)
+ 			continue;
+ 
+@@ -1827,18 +1847,96 @@ static bool __init intel_idle_acpi_cst_extract(void)
+ 		if (!intel_idle_cst_usable())
+ 			continue;
+ 
+-		if (!acpi_processor_claim_cst_control())
+-			break;
+-
+ 		return true;
+ 	}
+ 
+-	acpi_state_table.count = 0;
+ 	pr_debug("ACPI _CST not found or not usable\n");
+ 	return false;
+ }
+ 
+-static void __init intel_idle_init_cstates_acpi(struct cpuidle_driver *drv)
++static bool __init intel_idle_acpi_extract_cstates(void)
++{
++	if (intel_idle_acpi_extract_lpi_cstates())
++		return true;
++
++	if (intel_idle_acpi_extract_cst_cstates())
++		return true;
++
++	return false;
++}
++
++static bool __init intel_idle_acpi_probe(void)
++{
++	if (no_acpi) {
++		pr_debug("Not allowed to use ACPI for C-states extraction\n");
++		return false;
++	}
++
++	if (intel_idle_acpi_extract_cstates() &&
++	    acpi_processor_claim_cst_control())
++		return true;
++
++	acpi_state_table.count = 0;
++	return false;
++}
++
++static void __init intel_idle_complete_state_init(struct cpuidle_state *state)
++{
++	if (intel_idle_state_needs_timer_stop(state))
++		state->flags |= CPUIDLE_FLAG_TIMER_STOP;
++
++	state->enter = intel_idle;
++	state->enter_dead = intel_idle_enter_dead;
++	state->enter_s2idle = intel_idle_s2idle;
++}
++
++static void __init intel_idle_init_cstates_acpi_lpi(struct cpuidle_driver *drv)
++{
++	int index;
++
++	for (index = 0; index < acpi_state_table.count; index++) {
++		struct acpi_lpi_state *lpi_state;
++		struct cpuidle_state *state;
++
++		if (intel_idle_max_cstate_reached(index))
++			break;
++
++		lpi_state = &acpi_state_table.lpi_states[index];
++
++		state = &drv->states[drv->state_count++];
++
++		scnprintf(state->name, CPUIDLE_NAME_LEN, "C%d_LPI", index + 1);
++		strscpy(state->desc, lpi_state->desc, CPUIDLE_DESC_LEN);
++		state->exit_latency = lpi_state->wake_latency;
++		state->target_residency = lpi_state->min_residency;
++		state->flags = MWAIT2flg(lpi_state->address);
++		/*
++		 * Assume that entering any of the idle states extracted from
++		 * _LPI except for the first two will cause the TLB to be
++		 * flushed and let the core call leave_mm() for them upfront
++		 * to avoid unnecessary wakeups due to TLB shootdowns.
++		 */
++		if (index > 1)
++			state->flags |= CPUIDLE_FLAG_TLB_FLUSHED;
++
++		if (disabled_states_mask & BIT(index + 1))
++			state->flags |= CPUIDLE_FLAG_OFF;
++
++		intel_idle_complete_state_init(state);
++
++		pr_info("%s: MWAIT hint 0x%x\n", state->name, flg2MWAIT(state->flags));
++	}
++
++	/*
++	 * Assume the first idle state in the table to be C1 and if any deeper
++	 * idle states are exposed while X86_FEATURE_NONSTOP_TSC is unset, mark
++	 * the TSC as unstable.
++	 */
++	if (index > 1 && !boot_cpu_has(X86_FEATURE_NONSTOP_TSC))
++		mark_tsc_unstable("TSC halts in idle");
++}
++
++static void __init intel_idle_init_cstates_acpi_cst(struct cpuidle_driver *drv)
+ {
+ 	int cstate, limit = min_t(int, CPUIDLE_STATE_MAX, acpi_state_table.count);
+ 
+@@ -1880,49 +1978,76 @@ static void __init intel_idle_init_cstates_acpi(struct cpuidle_driver *drv)
+ 		if (disabled_states_mask & BIT(cstate))
+ 			state->flags |= CPUIDLE_FLAG_OFF;
+ 
+-		if (intel_idle_state_needs_timer_stop(state))
+-			state->flags |= CPUIDLE_FLAG_TIMER_STOP;
+-
+ 		if (cx->type > ACPI_STATE_C1 && !boot_cpu_has(X86_FEATURE_NONSTOP_TSC))
+ 			mark_tsc_unstable("TSC halts in idle");
+ 
+-		state->enter = intel_idle;
+-		state->enter_dead = intel_idle_enter_dead;
+-		state->enter_s2idle = intel_idle_s2idle;
++		intel_idle_complete_state_init(state);
+ 	}
+ }
+ 
+-static bool __init intel_idle_off_by_default(unsigned int flags, u32 mwait_hint)
++static void __init intel_idle_init_cstates_acpi(struct cpuidle_driver *drv)
+ {
+-	int cstate, limit;
++	if (acpi_lpi_available)
++		intel_idle_init_cstates_acpi_lpi(drv);
++	else
++		intel_idle_init_cstates_acpi_cst(drv);
++}
+ 
+-	/*
+-	 * If there are no _CST C-states, do not disable any C-states by
+-	 * default.
+-	 */
+-	if (!acpi_state_table.count)
+-		return false;
++static bool __init intel_idle_acpi_hint_match(unsigned int flags, u32 acpi_hint,
++					      u32 table_hint)
++{
++	if (flags & CPUIDLE_FLAG_PARTIAL_HINT_MATCH) {
++		acpi_hint &= ~MWAIT_SUBSTATE_MASK;
++		table_hint &= ~MWAIT_SUBSTATE_MASK;
++	}
++	return acpi_hint == table_hint;
++}
++
++static bool __init intel_idle_off_by_default_lpi(unsigned int flags, u32 mwait_hint)
++{
++	int index;
++
++	for (index = 0; index < acpi_state_table.count; index++) {
++		u32 acpi_hint = acpi_state_table.lpi_states[index].address;
++
++		if (intel_idle_acpi_hint_match(flags, acpi_hint, mwait_hint))
++			return false;
++	}
++	return true;
++}
++
++static bool __init intel_idle_off_by_default_cst(unsigned int flags, u32 mwait_hint)
++{
++	int cstate, limit = min_t(int, CPUIDLE_STATE_MAX, acpi_state_table.count);
+ 
+-	limit = min_t(int, CPUIDLE_STATE_MAX, acpi_state_table.count);
+ 	/*
+ 	 * If limit > 0, intel_idle_cst_usable() has returned 'true', so all of
+ 	 * the interesting states are ACPI_CSTATE_FFH.
+ 	 */
+ 	for (cstate = 1; cstate < limit; cstate++) {
+ 		u32 acpi_hint = acpi_state_table.states[cstate].address;
+-		u32 table_hint = mwait_hint;
+ 
+-		if (flags & CPUIDLE_FLAG_PARTIAL_HINT_MATCH) {
+-			acpi_hint &= ~MWAIT_SUBSTATE_MASK;
+-			table_hint &= ~MWAIT_SUBSTATE_MASK;
+-		}
+-
+-		if (acpi_hint == table_hint)
++		if (intel_idle_acpi_hint_match(flags, acpi_hint, mwait_hint))
+ 			return false;
+ 	}
+ 	return true;
+ }
+ 
++static bool __init intel_idle_off_by_default(unsigned int flags, u32 mwait_hint)
++{
++	/*
++	 * If there is no C-states information in the ACPI tables, do not
++	 * disable any C-states by default.
++	 */
++	if (!acpi_state_table.count)
++		return false;
++
++	if (acpi_lpi_available)
++		return intel_idle_off_by_default_lpi(flags, mwait_hint);
++
++	return intel_idle_off_by_default_cst(flags, mwait_hint);
++}
++
+ static inline bool ignore_native(void)
+ {
+ 	return no_native && !no_acpi;
+@@ -1930,7 +2055,7 @@ static inline bool ignore_native(void)
+ #else /* !CONFIG_ACPI_PROCESSOR_CSTATE */
+ #define force_use_acpi	(false)
+ 
+-static inline bool intel_idle_acpi_cst_extract(void) { return false; }
++static inline bool intel_idle_acpi_probe(void) { return false; }
+ static inline void intel_idle_init_cstates_acpi(struct cpuidle_driver *drv) { }
+ static inline bool intel_idle_off_by_default(unsigned int flags, u32 mwait_hint)
+ {
+@@ -2745,7 +2870,7 @@ static int __init intel_idle_init(void)
+ 	if (icpu) {
+ 		if (icpu->state_table)
+ 			cpuidle_state_table = icpu->state_table;
+-		else if (!intel_idle_acpi_cst_extract())
++		else if (!intel_idle_acpi_probe())
+ 			return -ENODEV;
+ 
+ 		auto_demotion_disable_flags = icpu->auto_demotion_disable_flags;
+@@ -2754,8 +2879,8 @@ static int __init intel_idle_init(void)
+ 		if (icpu->c1_demotion_supported)
+ 			c1_demotion_supported = true;
+ 		if (icpu->use_acpi || force_use_acpi)
+-			intel_idle_acpi_cst_extract();
+-	} else if (!intel_idle_acpi_cst_extract()) {
++			intel_idle_acpi_probe();
++	} else if (!intel_idle_acpi_probe()) {
+ 		return -ENODEV;
+ 	}
+ 
+diff --git a/drivers/opp/core.c b/drivers/opp/core.c
+--- a/drivers/opp/core.c
++++ b/drivers/opp/core.c
+@@ -1581,8 +1581,6 @@ static struct opp_table *_update_opp_table_clk(struct device *dev,
+ 					       struct opp_table *opp_table,
+ 					       bool getclk)
+ {
+-	int ret;
+-
+ 	/*
+ 	 * Return early if we don't need to get clk or we have already done it
+ 	 * earlier.
+@@ -1591,39 +1589,35 @@ static struct opp_table *_update_opp_table_clk(struct device *dev,
+ 	    opp_table->clks)
+ 		return opp_table;
+ 
+-	/* Find clk for the device */
+-	opp_table->clk = clk_get(dev, NULL);
++	/*
++	 * There are few platforms which don't want the OPP core to manage
++	 * device's clock settings. In such cases neither the platform
++	 * provides the clks explicitly to us, nor the DT contains a valid
++	 * clk entry. The OPP nodes in DT may still contain "opp-hz" property
++	 * though, which we need to parse and allow the platform to find an
++	 * OPP based on freq later on.
++	 *
++	 * This is a simple solution to take care of such corner cases, i.e.
++	 * make the clk_count 1, which lets us allocate space for frequency
++	 * in opp->rates and also parse the entries in DT. Use
++	 * clk_get_optional() instead of clk_get() so opp_table->clk stays
++	 * NULL for such devices, instead of holding an ERR_PTR(-ENOENT) that
++	 * consumers must remember to special-case.
++	 */
++	opp_table->clk = clk_get_optional(dev, NULL);
+ 
+-	ret = PTR_ERR_OR_ZERO(opp_table->clk);
+-	if (!ret) {
++	if (IS_ERR(opp_table->clk)) {
++		dev_pm_opp_put_opp_table(opp_table);
++		dev_err_probe(dev, PTR_ERR(opp_table->clk), "Couldn't find clock\n");
++		return ERR_CAST(opp_table->clk);
++	}
++
++	if (opp_table->clk)
+ 		opp_table->config_clks = _opp_config_clk_single;
+-		opp_table->clk_count = 1;
+-		return opp_table;
+-	}
+ 
+-	if (ret == -ENOENT) {
+-		/*
+-		 * There are few platforms which don't want the OPP core to
+-		 * manage device's clock settings. In such cases neither the
+-		 * platform provides the clks explicitly to us, nor the DT
+-		 * contains a valid clk entry. The OPP nodes in DT may still
+-		 * contain "opp-hz" property though, which we need to parse and
+-		 * allow the platform to find an OPP based on freq later on.
+-		 *
+-		 * This is a simple solution to take care of such corner cases,
+-		 * i.e. make the clk_count 1, which lets us allocate space for
+-		 * frequency in opp->rates and also parse the entries in DT.
+-		 */
+-		opp_table->clk_count = 1;
++	opp_table->clk_count = 1;
+ 
+-		dev_dbg(dev, "%s: Couldn't find clock: %d\n", __func__, ret);
+-		return opp_table;
+-	}
+-
+-	dev_pm_opp_put_opp_table(opp_table);
+-	dev_err_probe(dev, ret, "Couldn't find clock\n");
+-
+-	return ERR_PTR(ret);
++	return opp_table;
+ }
+ 
+ /*
+diff --git a/include/linux/acpi.h b/include/linux/acpi.h
+--- a/include/linux/acpi.h
++++ b/include/linux/acpi.h
+@@ -315,6 +315,19 @@ static inline int acpi_processor_evaluate_cst(acpi_handle handle, u32 cpu,
+ }
+ #endif
+ 
++#ifdef CONFIG_ACPI_PROCESSOR_IDLE
++int acpi_processor_extract_lpi_info(acpi_handle pr_handle,
++				    struct acpi_processor_power *pr_power,
++				    bool strict);
++#else
++static inline int acpi_processor_extract_lpi_info(acpi_handle pr_handle,
++				    struct acpi_processor_power *pr_power,
++				    bool strict)
++{
++	return -ENODEV;
++}
++#endif
++
+ #ifdef CONFIG_ACPI_HOTPLUG_CPU
+ /* Arch dependent functions for cpu hotplug support */
+ int acpi_map_cpu(acpi_handle handle, phys_cpuid_t physid, u32 acpi_id,
+diff --git a/include/linux/cpufreq.h b/include/linux/cpufreq.h
+--- a/include/linux/cpufreq.h
++++ b/include/linux/cpufreq.h
+@@ -379,6 +379,7 @@ struct cpufreq_driver {
+ 	void		(*adjust_perf)(struct cpufreq_policy *policy,
+ 				       unsigned long min_perf,
+ 				       unsigned long target_perf,
++				       unsigned long max_perf,
+ 				       unsigned long capacity);
+ 
+ 	/*
+@@ -624,6 +625,7 @@ unsigned int cpufreq_driver_fast_switch(struct cpufreq_policy *policy,
+ void cpufreq_driver_adjust_perf(struct cpufreq_policy *policy,
+ 				unsigned long min_perf,
+ 				unsigned long target_perf,
++				unsigned long max_perf,
+ 				unsigned long capacity);
+ bool cpufreq_driver_has_adjust_perf(void);
+ int cpufreq_driver_target(struct cpufreq_policy *policy,
+diff --git a/kernel/power/Kconfig b/kernel/power/Kconfig
+--- a/kernel/power/Kconfig
++++ b/kernel/power/Kconfig
+@@ -268,6 +268,16 @@ config DPM_WATCHDOG
+ 	  captured in pstore device for inspection in subsequent
+ 	  boot session.
+ 
++config DPM_WATCHDOG_ENABLED
++	bool "Enable DPM watchdog by default"
++	depends on DPM_WATCHDOG
++	default y
++	help
++	  If you say Y here, the DPM watchdog will be enabled by default.
++	  If you say N, it will be compiled in but disabled.  It can be
++	  enabled at boot time via the "pm.dpm_watchdog_enabled" kernel
++	  parameter or at runtime via sysfs.
++
+ config DPM_WATCHDOG_TIMEOUT
+ 	int "Watchdog timeout to panic in seconds"
+ 	range 1 120
+diff --git a/kernel/power/swap.c b/kernel/power/swap.c
+--- a/kernel/power/swap.c
++++ b/kernel/power/swap.c
+@@ -430,19 +430,22 @@ static int swap_write_page(struct swap_map_handle *handle, void *buf,
+ 
+ 	if (!handle->cur)
+ 		return -EINVAL;
+-	offset = alloc_swapdev_block(root_swap);
+-	error = write_page(buf, offset, hb);
+-	if (error)
+-		return error;
+-	handle->cur->entries[handle->k++] = offset;
++
++	/*
++	 * If the current map page is full, allocate and link next one first.
++	 * Delaying this until here avoids writing an empty swap map page when
++	 * the image size is an exact MAP_PAGE_ENTRIES multiple.
++	 */
+ 	if (handle->k >= MAP_PAGE_ENTRIES) {
+ 		offset = alloc_swapdev_block(root_swap);
+ 		if (!offset)
+ 			return -ENOSPC;
++
+ 		handle->cur->next_swap = offset;
+ 		error = write_page(handle->cur, handle->cur_swap, hb);
+ 		if (error)
+-			goto out;
++			return error;
++
+ 		clear_page(handle->cur);
+ 		handle->cur_swap = offset;
+ 		handle->k = 0;
+@@ -450,7 +453,7 @@ static int swap_write_page(struct swap_map_handle *handle, void *buf,
+ 		if (hb && low_free_pages() <= handle->reqd_free_pages) {
+ 			error = hib_wait_io(hb);
+ 			if (error)
+-				goto out;
++				return error;
+ 			/*
+ 			 * Recalculate the number of required free pages, to
+ 			 * make sure we never take more than half.
+@@ -458,14 +461,21 @@ static int swap_write_page(struct swap_map_handle *handle, void *buf,
+ 			handle->reqd_free_pages = reqd_free_pages();
+ 		}
+ 	}
+- out:
+-	return error;
++
++	offset = alloc_swapdev_block(root_swap);
++	error = write_page(buf, offset, hb);
++	if (error)
++		return error;
++	handle->cur->entries[handle->k++] = offset;
++	return 0;
+ }
+ 
+ static int flush_swap_writer(struct swap_map_handle *handle)
+ {
+-	if (handle->cur && handle->cur_swap)
++	if (handle->cur && handle->cur_swap && handle->k)
+ 		return write_page(handle->cur, handle->cur_swap, NULL);
++	else if (handle->cur && handle->cur_swap)
++		return 0;
+ 	else
+ 		return -EINVAL;
+ }
+@@ -739,7 +749,7 @@ static int save_compressed_image(struct swap_map_handle *handle,
+ 
+ 		data[thr].cc = crypto_alloc_acomp(hib_comp_algo, 0, CRYPTO_ALG_ASYNC);
+ 		if (IS_ERR_OR_NULL(data[thr].cc)) {
+-			pr_err("Could not allocate comp stream %ld\n", PTR_ERR(data[thr].cc));
++			pr_err("Could not allocate comp stream %pe\n", data[thr].cc);
+ 			ret = -EFAULT;
+ 			goto out_clean;
+ 		}
+@@ -1243,7 +1253,7 @@ static int load_compressed_image(struct swap_map_handle *handle,
+ 
+ 		data[thr].cc = crypto_alloc_acomp(hib_comp_algo, 0, CRYPTO_ALG_ASYNC);
+ 		if (IS_ERR_OR_NULL(data[thr].cc)) {
+-			pr_err("Could not allocate comp stream %ld\n", PTR_ERR(data[thr].cc));
++			pr_err("Could not allocate comp stream %pe\n", data[thr].cc);
+ 			ret = -EFAULT;
+ 			goto out_clean;
+ 		}
+diff --git a/kernel/sched/cpufreq_schedutil.c b/kernel/sched/cpufreq_schedutil.c
+--- a/kernel/sched/cpufreq_schedutil.c
++++ b/kernel/sched/cpufreq_schedutil.c
+@@ -50,6 +50,7 @@ struct sugov_cpu {
+ 
+ 	unsigned long		util;
+ 	unsigned long		bw_min;
++	unsigned long		bw_max;
+ 
+ 	/* The field below is for single-CPU policies only: */
+ #ifdef CONFIG_NO_HZ_COMMON
+@@ -243,6 +244,7 @@ static void sugov_get_util(struct sugov_cpu *sg_cpu, unsigned long boost)
+ 	util = effective_cpu_util(sg_cpu->cpu, util, &min, &max);
+ 	util = max(util, boost);
+ 	sg_cpu->bw_min = min;
++	sg_cpu->bw_max = max;
+ 	sg_cpu->util = sugov_effective_cpu_perf(sg_cpu->cpu, util, min, max);
+ }
+ 
+@@ -495,7 +497,7 @@ static void sugov_update_single_perf(struct update_util_data *hook, u64 time,
+ 		sg_cpu->util = prev_util;
+ 
+ 	cpufreq_driver_adjust_perf(sg_policy->policy, sg_cpu->bw_min,
+-				   sg_cpu->util, max_cap);
++				   sg_cpu->util, sg_cpu->bw_max, max_cap);
+ 
+ 	sg_policy->need_freq_update = false;
+ 	sg_policy->last_freq_update_time = time;
+@@ -601,7 +603,7 @@ static ssize_t rate_limit_us_show(struct gov_attr_set *attr_set, char *buf)
+ {
+ 	struct sugov_tunables *tunables = to_sugov_tunables(attr_set);
+ 
+-	return sprintf(buf, "%u\n", tunables->rate_limit_us);
++	return sysfs_emit(buf, "%u\n", tunables->rate_limit_us);
+ }
+ 
+ static ssize_t
+diff --git a/rust/kernel/cpufreq.rs b/rust/kernel/cpufreq.rs
+--- a/rust/kernel/cpufreq.rs
++++ b/rust/kernel/cpufreq.rs
+@@ -797,7 +797,13 @@ pub trait Driver {
+     }
+ 
+     /// Driver's `adjust_perf` callback.
+-    fn adjust_perf(_policy: &mut Policy, _min_perf: usize, _target_perf: usize, _capacity: usize) {
++    fn adjust_perf(
++        _policy: &mut Policy,
++        _min_perf: usize,
++        _target_perf: usize,
++        _max_perf: usize,
++        _capacity: usize,
++    ) {
+         build_error!(VTABLE_DEFAULT_ERROR)
+     }
+ 
+@@ -1270,12 +1276,13 @@ impl<T: Driver> Registration<T> {
+         ptr: *mut bindings::cpufreq_policy,
+         min_perf: c_ulong,
+         target_perf: c_ulong,
++        max_perf: c_ulong,
+         capacity: c_ulong,
+     ) {
+         // SAFETY: The `ptr` is guaranteed to be valid by the contract with the C code for the
+         // lifetime of `policy`.
+         let policy = unsafe { Policy::from_raw_mut(ptr) };
+-        T::adjust_perf(policy, min_perf, target_perf, capacity);
++        T::adjust_perf(policy, min_perf, target_perf, max_perf, capacity);
+     }
+ 
+     /// Driver's `get_intermediate` callback.

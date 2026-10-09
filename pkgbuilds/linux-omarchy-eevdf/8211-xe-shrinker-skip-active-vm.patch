@@ -1,0 +1,116 @@
+diff --git a/drivers/gpu/drm/xe/xe_bo.c b/drivers/gpu/drm/xe/xe_bo.c
+--- a/drivers/gpu/drm/xe/xe_bo.c
++++ b/drivers/gpu/drm/xe/xe_bo.c
+@@ -28,6 +28,7 @@
+ #include "xe_ggtt.h"
+ #include "xe_map.h"
+ #include "xe_migrate.h"
++#include "xe_module.h"
+ #include "xe_pat.h"
+ #include "xe_pm.h"
+ #include "xe_preempt_fence.h"
+@@ -1244,6 +1245,26 @@ xe_bo_eviction_valuable(struct ttm_buffer_object *bo, const struct ttm_place *pl
+ 	return true;
+ }
+ 
++static bool xe_bo_bound_to_active_vm(struct xe_bo *bo)
++{
++	u64 window = (u64)READ_ONCE(xe_modparam.shrink_active_ms) * NSEC_PER_MSEC;
++	u64 now = ktime_get_ns();
++	struct drm_gpuvm_bo *vm_bo;
++
++	if (!window)
++		return false;
++
++	drm_gem_for_each_gpuvm_bo(vm_bo, &bo->ttm.base) {
++		struct xe_vm *vm = gpuvm_to_vm(vm_bo->vm);
++		u64 last = READ_ONCE(vm->last_exec_ns);
++
++		if (!xe_vm_in_fault_mode(vm) && last && now - last < window)
++			return true;
++	}
++
++	return false;
++}
++
+ /**
+  * xe_bo_shrink() - Try to shrink an xe bo.
+  * @ctx: The struct ttm_operation_ctx used for shrinking.
+@@ -1295,6 +1316,10 @@ long xe_bo_shrink(struct ttm_operation_ctx *ctx, struct ttm_buffer_object *bo,
+ 		goto out_unref;
+ 	}
+ 
++	if (xe_bo_bound_to_active_vm(xe_bo) &&
++	    try_wait_for_completion(&xe->pm_block))
++		goto out_unref;
++
+ 	/* System CCS needs gpu copy when moving PL_TT -> PL_SYSTEM */
+ 	needs_rpm = (!IS_DGFX(xe) && bo->resource->mem_type != XE_PL_SYSTEM &&
+ 		     xe_bo_needs_ccs_pages(xe_bo));
+diff --git a/drivers/gpu/drm/xe/xe_defaults.h b/drivers/gpu/drm/xe/xe_defaults.h
+--- a/drivers/gpu/drm/xe/xe_defaults.h
++++ b/drivers/gpu/drm/xe/xe_defaults.h
+@@ -22,5 +22,6 @@
+ #define XE_DEFAULT_WEDGED_MODE			XE_WEDGED_MODE_UPON_CRITICAL_ERROR
+ #define XE_DEFAULT_WEDGED_MODE_STR		"upon-critical-error"
+ #define XE_DEFAULT_SVM_NOTIFIER_SIZE		512
++#define XE_DEFAULT_SHRINK_ACTIVE_MS		1000
+ 
+ #endif
+diff --git a/drivers/gpu/drm/xe/xe_exec.c b/drivers/gpu/drm/xe/xe_exec.c
+--- a/drivers/gpu/drm/xe/xe_exec.c
++++ b/drivers/gpu/drm/xe/xe_exec.c
+@@ -344,6 +344,7 @@ int xe_exec_ioctl(struct drm_device *dev, void *data, struct drm_file *file)
+ 	if (!xe_vm_in_lr_mode(vm))
+ 		xe_exec_queue_last_fence_set(q, vm, &job->drm.s_fence->finished);
+ 	xe_sched_job_push(job);
++	WRITE_ONCE(vm->last_exec_ns, ktime_get_ns());
+ 	xe_vm_reactivate_rebind(vm);
+ 
+ 	if (!err && !xe_vm_in_lr_mode(vm)) {
+diff --git a/drivers/gpu/drm/xe/xe_module.c b/drivers/gpu/drm/xe/xe_module.c
+--- a/drivers/gpu/drm/xe/xe_module.c
++++ b/drivers/gpu/drm/xe/xe_module.c
+@@ -30,6 +30,7 @@ struct xe_modparam xe_modparam = {
+ #endif
+ 	.wedged_mode =		XE_DEFAULT_WEDGED_MODE,
+ 	.svm_notifier_size =	XE_DEFAULT_SVM_NOTIFIER_SIZE,
++	.shrink_active_ms =	XE_DEFAULT_SHRINK_ACTIVE_MS,
+ 	/* the rest are 0 by default */
+ };
+ 
+@@ -37,6 +38,11 @@ module_param_named(svm_notifier_size, xe_modparam.svm_notifier_size, uint, 0600)
+ MODULE_PARM_DESC(svm_notifier_size, "Set the svm notifier size in MiB, must be power of 2 "
+ 		 "[default=" __stringify(XE_DEFAULT_SVM_NOTIFIER_SIZE) "]");
+ 
++module_param_named(shrink_active_ms, xe_modparam.shrink_active_ms, uint, 0600);
++MODULE_PARM_DESC(shrink_active_ms, "Do not back up a buffer object bound to a VM that submitted work "
++		 "within this many ms, 0=disabled "
++		 "[default=" __stringify(XE_DEFAULT_SHRINK_ACTIVE_MS) "]");
++
+ module_param_named_unsafe(force_execlist, xe_modparam.force_execlist, bool, 0444);
+ MODULE_PARM_DESC(force_execlist, "Force Execlist submission");
+ 
+diff --git a/drivers/gpu/drm/xe/xe_module.h b/drivers/gpu/drm/xe/xe_module.h
+--- a/drivers/gpu/drm/xe/xe_module.h
++++ b/drivers/gpu/drm/xe/xe_module.h
+@@ -25,6 +25,7 @@ struct xe_modparam {
+ #endif
+ 	unsigned int wedged_mode;
+ 	u32 svm_notifier_size;
++	unsigned int shrink_active_ms;
+ };
+ 
+ extern struct xe_modparam xe_modparam;
+diff --git a/drivers/gpu/drm/xe/xe_vm_types.h b/drivers/gpu/drm/xe/xe_vm_types.h
+--- a/drivers/gpu/drm/xe/xe_vm_types.h
++++ b/drivers/gpu/drm/xe/xe_vm_types.h
+@@ -245,6 +245,8 @@ struct xe_vm {
+ 	/** @lru_bulk_move: Bulk LRU move list for this VM's BOs */
+ 	struct ttm_lru_bulk_move lru_bulk_move;
+ 
++	u64 last_exec_ns;
++
+ 	u64 size;
+ 
+ 	struct xe_pt *pt_root[XE_MAX_TILES_PER_DEVICE];

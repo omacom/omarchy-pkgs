@@ -1,0 +1,136 @@
+# Maintainer: Joshua Warren <816217+joshuaswarren@users.noreply.github.com>
+
+pkgname=omarchy-ane-dkms
+_srcname=omarchy-ane
+pkgver=0.4.5
+pkgrel=1
+pkgdesc='Apple Neural Engine driver for Apple Silicon Macs (DKMS)'
+arch=('aarch64')
+groups=('omarchy-platform-apple-silicon')
+url='https://github.com/joshuaswarren/omarchy-ane'
+license=('GPL-2.0-only OR MIT')
+# dtc 1.7.1 is the first release that keeps a labelled node's phandle when it
+# applies an overlay (libfdt 1fad0650, 61e88fdc). Arch's dtc carries epoch 1.
+depends=('dkms' 'dtc>=1:1.7.1' 'python')
+# omarchy-mac-boot reads package-owned overlays from
+# /usr/lib/omarchy-mac-boot/dtb-overlays from 20261004-2 on (omacom/omarchy-mac-pkgs
+# 2a3ed89). An older one does not read them, and its boot check fails on a DKMS
+# module. A system without omarchy-mac-boot (Arch Linux ARM) is not affected.
+conflicts=('omarchy-mac-boot<20261004-2')
+# libdrm: drm.h for libane, which omarchy-ane-run links statically.
+makedepends=('dtc' 'libdrm')
+checkdepends=('fakeroot' 'linux-aurora-headers')
+optdepends=('linux-aurora-headers: build the modules for linux-aurora'
+            'linux-asahi-headers: build the modules for linux-asahi')
+# ANE_ABI_MAJOR of ane.ko (ane/src/uapi/drm/ane_accel.h). omarchy-mlx depends on
+# the ABI, not on a package version.
+provides=('omarchy-ane-abi=1')
+install=omarchy-ane-dkms.install
+source=("$_srcname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
+sha256sums=('f19216e36e552b15c856a1d26b91f296fdebbf9d4322b0e29deadb6dd4029f3b')
+
+prepare() {
+  # The DKMS source tree: dkms.conf, ane/Makefile, ane/ane_stats_show.c,
+  # ane/include/, ane/src/ and ane/t6021/.
+  # PACKAGE_VERSION becomes /sys/module/ane/version.
+  local src="$_srcname-$pkgver" dst="dkms/$_srcname-$pkgver"
+  rm -rf dkms
+  install -d "$dst/ane"
+  cp -r "$src/dkms.conf" "$dst/"
+  cp -r "$src/ane/Makefile" "$src/ane/ane_stats_show.c" "$src/ane/include" \
+    "$src/ane/src" "$src/ane/t6021" "$dst/ane/"
+  sed -i "s/@PKGVER@/$pkgver/" "$dst/dkms.conf"
+
+  # T6000 and T6020 stay opt-in in this package until a row from this package
+  # passes on each: the rows that turned them on ran the kernel's own driver.
+  # The release's flip tool sets the overlay table, the opt-in key,
+  # omarchy-ane-check's UNTESTED list and the firmware hook's DEFAULT_ON.
+  local chip
+  for chip in t6000 t6020; do
+    python "$src/tools/promote_chip.py" --chip "$chip" --to opt-in --apply
+  done
+}
+
+build() {
+  make -C "$_srcname-$pkgver/tools" ane-run
+}
+
+check() {
+  cd "$_srcname-$pkgver"
+  python tools/test_ane_dt.py
+  python tools/test_ane_firmware_fetch.py
+  python tools/test_ane_m2.py
+  python tools/test_ane_smoke.py
+  python tools/test_ane_probe.py
+  python tools/test_validate_ane_soc.py
+  python tools/test_promotion_check.py
+
+  # The opt-in that prepare() set: both overlays carry their key, the firmware
+  # hook leaves T6020 alone, and omarchy-ane-check calls both chips untested.
+  local optin=$srcdir/check-optin chip out
+  rm -rf "$optin"
+  packaging/build-dtbo "$optin/pkg" >/dev/null
+  if grep -q '^DEFAULT_ON = .*"apple,t6020"' packaging/omarchy-ane-firmware-fetch; then
+    echo "check: the firmware hook still fetches on T6020" >&2
+    return 1
+  fi
+  for chip in t6000 t6020; do
+    [[ $(fdtget -t s "$optin/pkg/usr/lib/omarchy-mac-boot/dtb-overlays/$chip/omarchy-ane.dtbo" \
+      / omarchy,opt-in 2>&1) == "ane-$chip" ]] ||
+      { echo "check: the $chip overlay has no omarchy,opt-in key" >&2; return 1; }
+    mkdir -p "$optin/$chip/sys/firmware/devicetree/base"
+    printf 'apple,%s\0' "$chip" >"$optin/$chip/sys/firmware/devicetree/base/compatible"
+    out=$(bash packaging/omarchy-ane-check --root "$optin/$chip" 2>&1 || :)
+    [[ $out == *"UNTESTED SoC: $chip"* ]] ||
+      { echo "check: omarchy-ane-check does not call $chip untested" >&2; return 1; }
+  done
+  echo "check: T6000 and T6020 are opt-in"
+
+  local build=(/usr/lib/modules/*/build)
+  local kver=${build[0]%/build}
+  kver=${kver##*/}
+  rm -rf "$srcdir/check"
+  mkdir -p "$srcdir/check/dkms" "$srcdir/check/src"
+  local dkms_options=(--dkmstree "$srcdir/check/dkms" --sourcetree "$srcdir/check/src" -k "$kver")
+  fakeroot dkms "${dkms_options[@]}" add "$srcdir/dkms/$_srcname-$pkgver"
+  local rc=0
+  fakeroot dkms "${dkms_options[@]}" build "$_srcname/$pkgver" || rc=$?
+  case $rc in
+    0) ls "$srcdir/check/dkms/$_srcname/$pkgver/$kver"/*/module/{ane,ane_t6021}.ko* ;;
+    77)
+      # dkms.conf BUILD_EXCLUSIVE_CONFIG="!CONFIG_DRM_ACCEL_ANE": a kernel that
+      # ships the in-tree ANE driver keeps its own modules.
+      grep -qs '^CONFIG_DRM_ACCEL_ANE=[ym]' "${build[0]}"/{include/config/auto.conf,.config} ||
+        { echo "check: dkms skipped $kver, which has no CONFIG_DRM_ACCEL_ANE" >&2; return 1; }
+      echo "check: no DKMS build: $kver ships the in-tree ANE driver (CONFIG_DRM_ACCEL_ANE)" ;;
+    *) return "$rc" ;;
+  esac
+}
+
+package() {
+  cd "$_srcname-$pkgver"
+  install -d "$pkgdir/usr/src"
+  cp -r --no-preserve=ownership "$srcdir/dkms/$_srcname-$pkgver" "$pkgdir/usr/src/"
+
+  install -Dm755 -t "$pkgdir/usr/bin" \
+    packaging/omarchy-ane-check packaging/omarchy-ane-dt \
+    packaging/omarchy-ane-firmware-fetch packaging/omarchy-ane-smoke
+  install -Dm755 tools/omarchy-ane-probe "$pkgdir/usr/bin/omarchy-ane-probe"
+  # omarchy-ane-smoke runs omarchy-ane-run from its own directory with these programs.
+  install -Dm755 tools/ane-run "$pkgdir/usr/bin/omarchy-ane-run"
+  install -Dm644 fixtures/h14-anec/add/program-0.anec \
+    "$pkgdir/usr/share/omarchy-ane/fixtures/h14-anec/add/program-0.anec"
+  install -Dm644 fixtures/h13-anec/add/program-0.anec \
+    "$pkgdir/usr/share/omarchy-ane/fixtures/h13-anec/add/program-0.anec"
+  install -Dm644 packaging/update-m1n1-dtbs "$pkgdir/usr/lib/omarchy-ane/update-m1n1-dtbs"
+  install -Dm644 -t "$pkgdir/usr/share/libalpm/hooks" \
+    packaging/90-omarchy-ane-dt.hook packaging/90-omarchy-ane-dt-remove.hook \
+    packaging/90-omarchy-ane-firmware.hook
+  # Overlays to /usr/lib/omarchy-mac-boot/dtb-overlays/PREFIX/omarchy-NAME.dtbo
+  # (omarchy-mac-boot ships the directory; without omarchy-mac-boot this
+  # package creates it), and data/ane-soc/SOC.json to /usr/share/omarchy-ane/soc/.
+  # The data-only overlays compile as a check and are never installed.
+  packaging/build-dtbo "$pkgdir"
+
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}
