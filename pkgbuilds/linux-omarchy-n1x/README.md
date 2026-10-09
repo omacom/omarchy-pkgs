@@ -4,6 +4,8 @@ The `linux-omarchy` kernel built for aarch64 with NVIDIA N1x (RTX Spark) platfor
 
 The `pkgrel` counts N1x revisions of this package and starts again at 1 when the kernel version changes. On 7.2.5 it was `6.1` to `6.9` while it tracked `linux-omarchy`'s release; the ninth revision became `9`, `10` added the Dell XPS 16 patches, `11` brought a dock's displays back after a failed DisplayPort tunnel, `12` stopped the clock during suspend-to-idle, `13` brought NVIDIA's device sleep patches from 1022.23, `14` let keyboard and touchpad interrupts wake the system from the platform's deepest sleep, and `15` brought audio and UCSI fixes from upstream and turned kexec handover off by default. `7.2.8-1` moves to 7.2.8 and `linux-omarchy` 7.2.8-5's patch set.
 
+[`UPGRADING-7.3.md`](UPGRADING-7.3.md) has notes for the move to 7.3: what each N1x patch needs there, what upstream already has, and how to verify the result.
+
 ## N1x patches
 
 Patches 1000–1040 are NVIDIA's SAUCE from `Ubuntu-nvidia-7.0-7.0.0-1021.21_24.04.1` (commit `dd99802c8b0c384169bb36293c9517fa67238e47`), rebased onto 7.2.8 with Omarchy's patches applied and grouped by topic:
@@ -64,7 +66,7 @@ The USB4 driver binds only with `power_wrap_drv.usb4_release=0` on the command l
 SAUCE that was left out:
 
 - `serial: 8250_mtk: Add ACPI support`, the MT7925 CSA patch and the four cpufreq QoS patches are superseded by 7.2
-- the ACPI `_LPI` hierarchical idle series (SAUCE 0039–0054 and 0067–0069) is deferred to the 7.3 port. Without it, CPU idle uses the flat LPI states only
+- the ACPI `_LPI` hierarchical idle series (SAUCE 0039–0054 and 0067–0069) is deferred to the 7.3 port (see [`UPGRADING-7.3.md`](UPGRADING-7.3.md)). Without it, CPU idle uses the flat LPI states only
 
 Patches 1100–1104 are for the ASUS ProArt P14 (H7407BA) keyboard, 0B05:4B42: the upstream Zenbook A16 support (Fn keys), a keyboard backlight LED for systems without asus-wmi, host-controlled Fn-lock, turning off the keyboard's OOBE mode, which otherwise keeps fading the backlight in and out, and turning the backlight off for sleep. 7.2.6 brought the upstream hid-asus rework that moves the backlight and Fn-lock writes onto one worker (47669bec44fe), so `1101`, `1102` and `1104` were rebased onto it: the LED class device now lives in the driver data, Fn-lock goes through `asus_kbd_fn_lock_set()`, and the use-after-free fix `1101` used to carry is upstream.
 
