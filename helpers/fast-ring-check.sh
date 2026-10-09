@@ -207,7 +207,7 @@ install_resolvable_dependencies() {
   local -A skip=()
   while IFS= read -r dep; do
     skip[$dep]=1
-  done < <(sed -n 's/^warning: cannot resolve "\([^"]*\)", a dependency of .*/\1/p' <<<"$log")
+  done < <(sed -n 's/.*warning: cannot resolve "\([^"]*\)", a dependency of .*/\1/p' <<<"$log")
   for file in "$@"; do
     while IFS= read -r dep; do
       skip[$dep]=1
@@ -236,7 +236,7 @@ check() {
     # A dependency is compared with edge like a library: one no channel
     # carries (an AUR-only theme engine, say) is not the fast ring's to
     # judge. The files are still inspected, installed without it.
-    deps=$(sed -n 's/^warning: cannot resolve "\([^"]*\)", a dependency of "\([^"]*\)"$/\2 needs \1, which this channel cannot provide/p' <<<"$log")
+    deps=$(sed -n 's/.*warning: cannot resolve "\([^"]*\)", a dependency of "\([^"]*\)"$/\2 needs \1, which this channel cannot provide/p' <<<"$log")
     if [[ -z $deps ]]; then
       problem rule - "the packages cannot be installed on this channel" > "$results"
       return 0

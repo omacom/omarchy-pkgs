@@ -84,7 +84,7 @@ bsdtar -cf "$T/a.pkg.tar" -C "$T/pkg" .PKGINFO
 printf '%s\n' 'pkgname = yaru-icon-theme' 'provides = yaru-icons=1' 'depend = hicolor-icon-theme' > "$T/pkg/.PKGINFO"
 bsdtar -cf "$T/b.pkg.tar" -C "$T/pkg" .PKGINFO
 pacman() { local a; for a in "$@"; do [[ $a == -* || $a == 4 ]] || echo "$a"; done > "$T/installed"; }
-install_resolvable_dependencies 'warning: cannot resolve "gtk-engine-murrine", a dependency of "yaru-gtk-theme"' "$T/a.pkg.tar" "$T/b.pkg.tar"
+install_resolvable_dependencies 'Enter a number (default=1): warning: cannot resolve "gtk-engine-murrine", a dependency of "yaru-gtk-theme"' "$T/a.pkg.tar" "$T/b.pkg.tar"
 unset -f pacman
 [[ $(sort "$T/installed" | tr '\n' ' ') == "glib2 gtk3>=3.24 hicolor-icon-theme " ]] \
   && pass "the resolvable dependencies are installed, minus the missing one and the set's own" || fail "installed: $(tr '\n' ' ' < "$T/installed")"
