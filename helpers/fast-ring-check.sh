@@ -102,7 +102,8 @@ bundled_dir() {
   for dir in "$@"; do
     prefix=$dir
     until [[ ${binary%/*}/ == "$prefix"/* || -z $prefix ]]; do prefix=${prefix%/*}; done
-    if (( ${#prefix} > best_len )); then
+    # Nearest shared ancestor first; among equals, the shallower copy.
+    if (( ${#prefix} > best_len || (${#prefix} == best_len && ${#dir} < ${#best}) )); then
       best=$dir best_len=${#prefix}
     fi
   done
@@ -171,7 +172,9 @@ inspect_files() {
         mapfile -t copies < <(printf '%s' "${shipped[$soname]}")
         dir=$(bundled_dir "$path" "${copies[@]}")
         [[ " ${dirs[*]} " == *" $dir "* ]] || dirs+=("$dir")
-      done < <(sed -n 's/.*(NEEDED).*\[\(.*\)\]/\1/p' <<<"$dyn")
+      # Its own NEEDED entries, and whatever its libraries could not find.
+      done < <(sed -n 's/.*(NEEDED).*\[\(.*\)\]/\1/p' <<<"$dyn"
+               sed -n 's/^[[:space:]]*\([^ ]*\) => not found.*/\1/p' <<<"$out")
       if (( ${#dirs[@]} )); then
         out=$(LD_LIBRARY_PATH=$(IFS=:; echo "${dirs[*]}") ldd -r "$path" 2>&1 | ldd_problems "$kind")
       fi
@@ -207,10 +210,10 @@ check() {
 # that block the fast ring. Rule problems always do; link problems only
 # when edge does not have the same one.
 channel_failures() {
-  # FILENAME, not NR == FNR: an empty edge file would make that hold for
-  # the channel's lines too, and every failure would vanish.
-  awk -F'\t' 'FILENAME == ARGV[1] { if ($1 == "link") edge[$0] = 1; next }
-    $1 == "rule" || !($0 in edge)' "$1" "$2"
+  # Marked by argument, not NR == FNR: an empty edge file would make that
+  # hold for the channel's lines too, and every failure would vanish.
+  awk -F'\t' 'file == "edge" { if ($1 == "link") edge[$0] = 1; next }
+    $1 == "rule" || !($0 in edge)' file=edge "$1" file=channel "$2"
 }
 
 if [[ ${BASH_SOURCE[0]} == "$0" ]]; then

@@ -60,6 +60,10 @@ out=$(channel_failures "$T/edge" "$T/stable")
   && pass "every channel problem counts when edge has none" || fail "clean edge hid problems"
 [[ $(bundled_dir /opt/a/bin/app /opt/b/lib /opt/a/lib) == /opt/a/lib ]] \
   && pass "a binary gets its own bundled copy of a library" || fail "bundled copy from another app"
+[[ $(bundled_dir /opt/app/bin/tool /opt/app/bin/assets/legacy/lib /opt/app/bin) == /opt/app/bin ]] \
+  && pass "the copy beside the binary beats a deeper one" || fail "deeper bundled copy chosen"
+[[ $(channel_failures "$T/stable" "$T/stable") == rule* ]] \
+  && pass "rule problems survive comparing a file with itself" || fail "same-file comparison hid rules"
 cp "$T/stable" "$T/edge2"
 [[ $(channel_failures "$T/edge2" "$T/stable") == rule* ]] && pass "rule problems block even when edge has them" || fail "rule problem excused by edge"
 
