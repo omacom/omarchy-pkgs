@@ -169,6 +169,31 @@ package builds once and goes into both architectures' databases.
 Everything not on the fast ring reaches `rc` and `stable` by promotion: see
 [Releases](#releases).
 
+### What can be on the fast ring
+
+A fast-ring package is still built once, against edge, and that file lands on
+`rc` and `stable` straight away, ahead of the Arch snapshot it was built
+against. So the fast ring is for packages whose files do not care which
+snapshot they run on: vendor binaries, static Go and Rust tools, scripts,
+themes and fonts. A package that needs rebuilding when a dependency moves
+stays off it and reaches `rc` and `stable` with the release, together with
+the libraries it was built for.
+
+Both halves are enforced. `rebuild_on` and `"release_ring": "fast"` cannot be
+combined. And after a fast-ring package builds, `build-pr.yml` runs
+`bin/check-fast-ring`, which installs the package on `rc` and `stable` from
+their own repositories and fails the build when:
+
+- a dependency cannot be satisfied there;
+- a binary needs a library or a versioned symbol (`GLIBC_2.43`, say) that the
+  channel does not have yet (`ldd -r`);
+- a binary links Qt or libpython, or the package installs Python modules.
+  These break on a dependency update without a missing symbol to show it:
+  Qt's private API and plugin version check, Python's versioned module path.
+
+A package that fails the check comes off the fast ring; nothing else about it
+changes.
+
 ## Maintainer tasks
 
 ### Republish a package
@@ -428,7 +453,7 @@ Details: [docs/upstream-sources.md](docs/upstream-sources.md),
 | `upstream` | Where releases come from. Mutually exclusive with an `.omarchy/upstream.sh` hook. |
 | `min_release_age` | Hold a new upstream release back this long (`"24h"`, `"2d"`). A release whose age cannot be proven fails the sync. |
 | `auto_merge` | `true` moves the package's updates from the reviewed sync PR to `track-branches.yml`. For packages that follow a moving branch, and for trusted vendor and Omacom release feeds. Needs an upstream declaration. |
-| `release_ring` | `fast`: publish to `rc` and `stable` on merge, not only `edge`. Takes effect with the package's next version: bump `pkgrel` in the same PR. |
+| `release_ring` | `fast`: publish to `rc` and `stable` on merge, not only `edge`. Only for packages that run on any channel's libraries: see [What can be on the fast ring](#what-can-be-on-the-fast-ring). Takes effect with the package's next version: bump `pkgrel` in the same PR. |
 | `channels` | The only channels the package may be published to. `omarchy-dev` is held to `["edge"]` this way. |
 | `pinned` | Version is set per release on the `rc` branch. Used by `omarchy` and `omarchy-settings`. |
 | `rebuild_on` | Packages whose version change forces a rebuild of this one. |
