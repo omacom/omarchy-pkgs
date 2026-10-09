@@ -11,7 +11,7 @@ Notes for moving this package from 7.2.8 to 7.3, written while rebasing it from 
   - `0601`, `0602` and `0606` carry Sven Peter's DPRX and teardown fixes from 7.3-rc6 (0b457c6733, c222f80be5, 419fa32fa5, 1fd1f67c94, 12f5d8b85a) and the Anker CL-state quirk 395e9f2967. `1082` already runs on them.
   - `0603-usb-updates.patch` carries the workqueue rename (90cd20729640, `system_dfl_long_wq`) and `ucsi_debugfs_unregister()`, so `1083` and `1084` are already the linux-next versions.
   - 7.2.6 stable brought the hid-asus worker rework 47669bec44fe (so `1101`, `1102` and `1104` are already rebased onto it) and the MediaTek EINT teardown 88292b7103 and `devm_gpiochip_add_data()` 9c650317ba.
-- So the 7.3 port mostly means: take the 7.3 shared set from `linux-omarchy-eevdf` when it exists, rebase the N1x commits onto it with the method below, rework `1094`, drop `1100`, and re-test the platform, because the parts 7.3 changes underneath (MediaTek pinctrl as modules, SPI PM macros, arm_ffa shutdown, CS35L56 feedback ports) are what this machine runs on.
+- So the 7.3 port mostly means: take the 7.3 shared set from `linux-omarchy-bore` (what `linux-omarchy` pulls in) when it exists, rebase the N1x commits onto it with the method below, rework `1094`, drop `1100`, and re-test the platform, because the parts 7.3 changes underneath (MediaTek pinctrl as modules, SPI PM macros, arm_ffa shutdown, CS35L56 feedback ports) are what this machine runs on.
 
 ## Method that worked for 7.2.5 to 7.2.8
 
@@ -157,7 +157,7 @@ NVIDIA PR #635 head 0f0aeba49253 (internal 1c829c26a421, LP [2170130](https://bu
 
 ## Checklist
 
-1. Wait for `linux-omarchy-eevdf` 7.3.x. Copy its shared patches, `.sig` files and the `_srcname`/source logic exactly; keep this package's `source_aarch64=(config.aarch64)`, the `make Image modules` build (no DTBs), the raw `Image` install and the headers section.
+1. Wait for `linux-omarchy-bore` 7.3.x (the kernel `linux-omarchy` depends on). Copy its shared patches, including the BORE and ADIOS patches and its BORE rebases of the scheduler patches, `.sig` files and the `_srcname`/source logic exactly; keep this package's `source_aarch64=(config.aarch64)`, the `make Image modules` build (no DTBs), the raw `Image` install and the headers section.
 2. Rebase the N1x commits with the method above. Expected: drop `1100`; rework `1094`; drop `1031`, `1083`, `1084` only if 7.3 final has them (they are 7.4 material today); drop `1032` if the Cirrus patch landed; check `1030` against the OT25 feedback change.
 3. Port `early_enable` (1376a013a1) and 280db0e8cf30 plus #632 only if the watchdog is going to run during sleep; otherwise leave `1020` as it is.
 4. Do not port the hierarchical LPI series in the same release as the rebase. If it is ported later, carry `1021` into its non-coordinated branch and measure s2idle power with it.
