@@ -12,7 +12,11 @@ fi
 export HERMES_HOME="$hermes_home"
 runtime="$hermes_home/hermes-agent"
 native="$runtime/apps/desktop/release/linux-unpacked/Hermes"
-if [[ ! -x $native || ! -x $runtime/venv/bin/hermes ]]; then
+# Current runtimes publish their CLI as .hermes/bin/hermes and keep their
+# environments under installs/; older ones had a venv inside the checkout.
+cli="$runtime/.hermes/bin/hermes"
+[[ -x $cli ]] || cli="$runtime/venv/bin/hermes"
+if [[ ! -x $native || ! -x $cli ]]; then
   native=/opt/hermes-desktop/Hermes
   # Only the packaged app, built from the release commit rather than the runtime's
   # checkout, is told to skip an existing Hermes.
@@ -25,9 +29,40 @@ if ! timeout 5 unshare --user --map-root-user true 2>/dev/null; then
   exit 1
 fi
 
+# Current launchers expose their store interpreter through a read-only machine
+# boundary. Use that interpreter to ask PM for the committed dependency venv.
+runtime_python="$runtime/venv/bin/python"
+if [[ ! -x $runtime_python && -x $runtime/.hermes/bin/hermes ]]; then
+  runtime_command=$("$runtime/.hermes/bin/hermes" --print-runtime-command 2>/dev/null || true)
+  store_python=$(/usr/bin/python - "$runtime_command" <<'PY' 2>/dev/null || true
+import json
+import sys
+
+command = json.loads(sys.argv[1])
+if isinstance(command, list) and command and isinstance(command[0], str):
+    print(command[0])
+PY
+  )
+  if [[ -x $store_python ]]; then
+    runtime_python=$("$store_python" -I - "$runtime" <<'PY' 2>/dev/null || true
+from pathlib import Path
+import sys
+
+runtime = Path(sys.argv[1])
+sys.path.insert(0, str(runtime))
+from pm.environments import committed_venv
+
+environment = committed_venv(runtime)
+if environment is not None:
+    print(environment / "bin/python")
+PY
+    )
+  fi
+fi
+
 python=/usr/bin/python
-if [[ -x $runtime/venv/bin/python && -f $runtime/hermes_cli/main.py ]]; then
-  python="$runtime/venv/bin/python"
+if [[ -n $runtime_python && -x $runtime_python && -f $runtime/hermes_cli/main.py ]]; then
+  python="$runtime_python"
 else
   runtime=""
 fi
