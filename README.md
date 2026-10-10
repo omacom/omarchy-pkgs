@@ -502,6 +502,14 @@ signing key and bucket credentials: `GPG_PRIVATE_KEY`, `GPG_PASSPHRASE`,
 in the bucket for a proof run; it must be empty for live publishing.
 Repository secrets: `PKGS_BOT_TOKEN`, `BASECAMP_CHATBOT_URL`.
 
+## Local repository cleanup
+
+For a local repository tree, `bin/repo clean --local --keep 2` keeps the
+requested number of newest files plus any older version referenced by either
+local database name. It preserves indexed archives and their signatures;
+an unreadable or malformed database stops cleanup before deletion. Add
+`--dry-run` to preview. Cleanup does not update the database or publish files.
+
 ## More
 
 - [ci/README.md](ci/README.md): the x86_64 builder pool and how to operate it
