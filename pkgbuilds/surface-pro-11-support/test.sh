@@ -61,7 +61,7 @@ grep -Fq 'api.libcamera.path = "/base/soc@0/cci@ac15000/i2c-bus@0/camera@60"' "$
 ! grep -q 'monitor.v4l2.rules' "$package_dir/50-surface-pro-11-cameras.conf" ||
   fail "V4L2 devices are not disabled; in WirePlumber 0.5 that stalls camera discovery"
 
-# Bluetooth: the controller gets the firmware Wi-Fi address minus one.
+# Bluetooth: the controller gets the firmware address variable minus one.
 efivars="$scratch/efivars"
 bin="$scratch/bin"
 mkdir -p "$efivars" "$bin"
@@ -83,7 +83,7 @@ bluetooth_address() {
   cat "$scratch/btmgmt.state"
 }
 [[ $(bluetooth_address '\xc4\xcb\x76\xa1\xab\x85') == "C4:CB:76:A1:AB:84" ]] ||
-  fail "the Bluetooth address is the firmware Wi-Fi address minus one"
+  fail "the Bluetooth address is the firmware address variable minus one"
 [[ $(bluetooth_address '\xc4\xcb\x76\xa1\xac\x00') == "C4:CB:76:A1:AB:FF" ]] ||
   fail "the Bluetooth address borrows across octets"
 
@@ -93,7 +93,8 @@ grep -q 'DRIVERS=="hci_uart_qca".*SYSTEMD_WANTS}+="surface-pro-11-bluetooth-addr
   <(tr -d '\\\n' <"$package_dir/60-surface-pro-11-bluetooth-address.rules") ||
   fail "each Qualcomm UART Bluetooth controller gets its own address service"
 
-# Wi-Fi: the interface takes the firmware Wi-Fi address while it is still down.
+# Wi-Fi: the interface takes the firmware address variable minus two while it
+# is still down.
 cat >"$bin/ip" <<'STUB'
 #!/bin/bash
 printf '%s\n' "$*" >"$IP_STATE"
@@ -115,9 +116,9 @@ wifi_address() {
     bash "$package_dir/surface-pro-11-wifi-address" wlan0 >/dev/null
   cat "$scratch/ip.state" 2>/dev/null || :
 }
-[[ $(wifi_address '' 00:03:7f:12:7f:94 0x1002) == "link set dev wlan0 address C4:CB:76:A1:AB:85" ]] ||
-  fail "a down Wi-Fi interface takes the firmware Wi-Fi address"
-[[ -z $(wifi_address '' c4:cb:76:a1:ab:85 0x1002) ]] ||
+[[ $(wifi_address '' 00:03:7f:12:7f:94 0x1002) == "link set dev wlan0 address C4:CB:76:A1:AB:83" ]] ||
+  fail "a down Wi-Fi interface takes the firmware address variable minus two"
+[[ -z $(wifi_address '' c4:cb:76:a1:ab:83 0x1002) ]] ||
   fail "an interface that already has the address is left alone"
 [[ -z $(wifi_address '' 00:03:7f:12:7f:94 0x1003) ]] ||
   fail "an interface that is already up keeps its connection"
