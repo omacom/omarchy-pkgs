@@ -502,6 +502,14 @@ signing key and bucket credentials: `GPG_PRIVATE_KEY`, `GPG_PASSPHRASE`,
 in the bucket for a proof run; it must be empty for live publishing.
 Repository secrets: `PKGS_BOT_TOKEN`, `BASECAMP_CHATBOT_URL`.
 
+## Advisory metadata
+
+`bin/fetch-advisories` queries OSV and writes a versioned advisory feed;
+`bin/sync-advisories` refreshes per-artifact CVE metadata beside published
+packages without rebuilding them. See
+[docs/opr-advisory-sidecar.md](docs/opr-advisory-sidecar.md) for the feed
+contract, refresh commands, and how advisories travel with packages.
+
 ## More
 
 - [ci/README.md](ci/README.md): the x86_64 builder pool and how to operate it
