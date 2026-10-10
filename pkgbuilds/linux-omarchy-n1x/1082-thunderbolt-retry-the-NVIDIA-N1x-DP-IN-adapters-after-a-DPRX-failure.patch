@@ -1,0 +1,125 @@
+From 8b769a8b685abacfdf357e54463aeecc5220a135 Mon Sep 17 00:00:00 2001
+From: Ryan Hughes <ryan@heyoodle.com>
+Date: Tue, 6 Oct 2026 20:28:06 -0400
+Subject: [PATCH] thunderbolt: retry the NVIDIA N1x DP IN adapters after a DPRX
+ failure
+
+When a DP tunnel does not finish DPRX capability negotiation in time,
+the connection manager tears it down and takes the DP IN adapter off
+its DP resources until the adapter reports a hotplug again. The DP IN
+adapters of the N1x host router are wired to the GPU on the same chip
+and never report hotplug, so after one failed negotiation they stayed
+unused until the router was reset, and every monitor behind a dock on
+that port stayed black:
+
+  0:5 <-> 1:13 (DP): not active, tearing down
+  0:5: DP IN resource unavailable: DPRX negotiation failed
+  no suitable DP IN adapter available, not tunneling
+
+That happened after the GPU had missed a monitor's HPD and the dock
+was then replugged.
+
+Add a quirk for the N1x host router: when a DP OUT adapter becomes
+available, offer the host router's DP IN adapters that dropped out
+again, as long as they are not in use and the router still grants them
+as DP resources.
+---
+ drivers/thunderbolt/quirks.c | 13 +++++++++++++
+ drivers/thunderbolt/tb.c     | 29 +++++++++++++++++++++++++++++
+ drivers/thunderbolt/tb.h     |  2 ++
+ 3 files changed, 44 insertions(+)
+
+diff --git a/drivers/thunderbolt/quirks.c b/drivers/thunderbolt/quirks.c
+index 801b9472a..c620febc1 100644
+--- a/drivers/thunderbolt/quirks.c
++++ b/drivers/thunderbolt/quirks.c
+@@ -36,6 +36,12 @@ static void quirk_no_system_sleep(struct tb_switch *sw)
+ 	tb_sw_dbg(sw, "keeping routers awake in system sleep\n");
+ }
+ 
++static void quirk_dp_in_retry(struct tb_switch *sw)
++{
++	sw->quirks |= QUIRK_DP_IN_RETRY;
++	tb_sw_dbg(sw, "retrying DP IN adapters after DPRX failures\n");
++}
++
+ static void quirk_usb3_maximum_bandwidth(struct tb_switch *sw)
+ {
+ 	struct tb_port *port;
+@@ -132,6 +138,13 @@ static const struct tb_quirk tb_quirks[] = {
+ 	 * and stops answering once a device is connected.
+ 	 */
+ 	{ 0x0955, 0x1372, 0x0000, 0x0000, quirk_no_system_sleep },
++	/*
++	 * The DP IN adapters of the NVIDIA N1x host router are wired to the
++	 * GPU on the same chip and never report hotplug, so one DPRX
++	 * negotiation that does not finish (the GPU missed a monitor's HPD)
++	 * would leave them unused until the router is reset.
++	 */
++	{ 0x0955, 0x1372, 0x0000, 0x0000, quirk_dp_in_retry },
+ };
+ 
+ /**
+diff --git a/drivers/thunderbolt/tb.c b/drivers/thunderbolt/tb.c
+index c2fe72780..e2ceb02cb 100644
+--- a/drivers/thunderbolt/tb.c
++++ b/drivers/thunderbolt/tb.c
+@@ -2206,6 +2206,32 @@ static void tb_dp_resource_unavailable(struct tb *tb, struct tb_port *port,
+ 	tb_tunnel_dp(tb);
+ }
+ 
++/*
++ * A DP IN adapter whose tunnel did not finish DPRX negotiation is taken
++ * off the DP resources until it reports a hotplug. Host router DP IN
++ * adapters that never do get another chance when a monitor is plugged in.
++ */
++static void tb_retry_host_dp_in(struct tb *tb)
++{
++	struct tb_cm *tcm = tb_priv(tb);
++	struct tb_switch *sw = tb->root_switch;
++	struct tb_port *port;
++
++	if (!(sw->quirks & QUIRK_DP_IN_RETRY))
++		return;
++
++	tb_switch_for_each_port(sw, port) {
++		if (!tb_port_is_dpin(port) || !list_empty(&port->list))
++			continue;
++		if (tb_port_is_enabled(port) ||
++		    !tb_switch_query_dp_resource(sw, port))
++			continue;
++
++		tb_port_dbg(port, "DP IN resource available again\n");
++		list_add_tail(&port->list, &tcm->dp_resources);
++	}
++}
++
+ static void tb_dp_resource_available(struct tb *tb, struct tb_port *port)
+ {
+ 	struct tb_cm *tcm = tb_priv(tb);
+@@ -2224,6 +2250,9 @@ static void tb_dp_resource_available(struct tb *tb, struct tb_port *port)
+ 	list_add_tail(&port->list, &tcm->dp_resources);
+ 	tb_exit_redrive(port);
+ 
++	if (tb_port_is_dpout(port))
++		tb_retry_host_dp_in(tb);
++
+ 	/* Look for suitable DP IN <-> DP OUT pairs now */
+ 	tb_tunnel_dp(tb);
+ }
+diff --git a/drivers/thunderbolt/tb.h b/drivers/thunderbolt/tb.h
+index 8e1fd42a9..da7636c2f 100644
+--- a/drivers/thunderbolt/tb.h
++++ b/drivers/thunderbolt/tb.h
+@@ -28,6 +28,8 @@
+ #define QUIRK_KEEP_POWER_IN_DP_REDRIVE			BIT(2)
+ /* Host interface keeps its power in system sleep, so routers cannot sleep */
+ #define QUIRK_NO_SYSTEM_SLEEP				BIT(3)
++/* DP IN adapters never report hotplug, so retry them after a DPRX failure */
++#define QUIRK_DP_IN_RETRY				BIT(4)
+ 
+ /**
+  * struct tb_nvm - Structure holding NVM information
+-- 
+2.56.0
+

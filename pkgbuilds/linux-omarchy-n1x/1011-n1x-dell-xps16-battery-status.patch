@@ -1,0 +1,154 @@
+From 8955f10e469f89319fa5bc72f2c9263213690b41 Mon Sep 17 00:00:00 2001
+From: Spencer Bull <spencer@omarchy.org>
+Date: Fri, 2 Oct 2026 18:22:12 -0500
+Subject: [PATCH] platform/arm64: nvidia-ffa-ec: answer the Dell XPS 16 battery
+ status from EC RAM
+
+The Dell XPS 16 (DX16263) firmware answers the EC battery service's
+GetBst with an all-zero payload, so _BST reports the battery empty at
+0 V and the battery never shows a charge.
+
+The same service reads and writes EC RAM, where the firmware's unused
+EGBS method finds the live battery status. When GetBst returns nothing
+on this machine, fill the reply from there, in the layout _BST expects.
+---
+ drivers/platform/arm64/nvidia-ffa-ec.c | 101 +++++++++++++++++++++++++
+ 1 file changed, 101 insertions(+)
+
+diff --git a/drivers/platform/arm64/nvidia-ffa-ec.c b/drivers/platform/arm64/nvidia-ffa-ec.c
+index 92834fd..f3556b7 100644
+--- a/drivers/platform/arm64/nvidia-ffa-ec.c
++++ b/drivers/platform/arm64/nvidia-ffa-ec.c
+@@ -9,9 +9,12 @@
+ #include <linux/acpi.h>
+ #include <linux/arm_ffa.h>
+ #include <linux/delay.h>
++#include <linux/dmi.h>
+ #include <linux/kref.h>
+ #include <linux/list.h>
+ #include <linux/slab.h>
++#include <linux/string.h>
++#include <linux/unaligned.h>
+ 
+ #define DRV_NAME "nvidia-ffa-ec"
+ 
+@@ -808,6 +811,100 @@ out_put:
+ 	return ret;
+ }
+ 
++/*
++ * Dell's N1x firmware answers the battery service's GetBst (command 2) with
++ * an all-zero payload: the EC behind the service does not implement it, so
++ * _BST reports an empty battery at 0 V. The live battery status is in the EC
++ * RAM that the same service exposes through its byte read and write commands,
++ * where the firmware's own, unused EGBS method reads it: select the battery
++ * at 0x03, then the state at 0x10, the rate at 0x12, the remaining capacity at
++ * 0x16 and the voltage at 0x14. Answer GetBst from there, in the layout _BST
++ * expects, whenever the service returns nothing.
++ */
++static const uuid_t nvidia_ec_battery_uuid =
++	UUID_INIT(0x25cb5207, 0xac36, 0x427d,
++		  0xaa, 0xef, 0x3a, 0xa7, 0x88, 0x77, 0xd2, 0x7e);
++
++#define NVIDIA_EC_BAT_GET_BST		0x02
++#define NVIDIA_EC_BST_LEN		20
++#define NVIDIA_EC_RAM_READ		0xf0
++#define NVIDIA_EC_RAM_WRITE		0xf1
++#define NVIDIA_EC_RAM_BAT_SELECT	0x03
++#define NVIDIA_EC_RAM_BAT_STATE		0x10
++#define NVIDIA_EC_RAM_BAT_RATE		0x12
++#define NVIDIA_EC_RAM_BAT_VOLTAGE	0x14
++#define NVIDIA_EC_RAM_BAT_CAPACITY	0x16
++
++static const struct dmi_system_id nvidia_ec_bst_from_ram_dmi[] = {
++	{
++		/* Dell XPS 16 (NVIDIA N1x) */
++		.matches = {
++			DMI_MATCH(DMI_SYS_VENDOR, "Dell Inc."),
++			DMI_MATCH(DMI_PRODUCT_NAME, "XPS 16 DX16263"),
++		},
++	},
++	{ }
++};
++
++/* One EC RAM byte access, as the firmware's ECRB and ECWB methods do it. */
++static int nvidia_ec_ram_access(uuid_t uuid, u8 cmd, u8 index, u8 *data)
++{
++	u8 buf[8] = { cmd, 0, 0, 0, index, *data };
++	int ret;
++
++	ret = nvidia_ffh_do_ffa_send(uuid, buf, sizeof(buf), sizeof(buf));
++	if (ret)
++		return ret;
++
++	if (get_unaligned_le32(buf))
++		return -EIO;
++
++	*data = buf[5];
++	return 0;
++}
++
++static int nvidia_ec_ram_read16(uuid_t uuid, u8 index, u16 *val)
++{
++	u8 lo = 0, hi = 0;
++	int ret;
++
++	ret = nvidia_ec_ram_access(uuid, NVIDIA_EC_RAM_READ, index, &lo);
++	if (!ret)
++		ret = nvidia_ec_ram_access(uuid, NVIDIA_EC_RAM_READ, index + 1, &hi);
++
++	*val = lo | hi << 8;
++	return ret;
++}
++
++static void nvidia_ec_bst_from_ram(uuid_t uuid, u8 *rawdata)
++{
++	u16 rate, capacity, voltage;
++	u8 battery = 1, state = 0;
++
++	if (nvidia_ec_ram_access(uuid, NVIDIA_EC_RAM_WRITE, NVIDIA_EC_RAM_BAT_SELECT, &battery) ||
++	    nvidia_ec_ram_access(uuid, NVIDIA_EC_RAM_READ, NVIDIA_EC_RAM_BAT_STATE, &state) ||
++	    nvidia_ec_ram_read16(uuid, NVIDIA_EC_RAM_BAT_RATE, &rate) ||
++	    nvidia_ec_ram_read16(uuid, NVIDIA_EC_RAM_BAT_CAPACITY, &capacity) ||
++	    nvidia_ec_ram_read16(uuid, NVIDIA_EC_RAM_BAT_VOLTAGE, &voltage))
++		return;
++
++	/* State, present rate, remaining capacity, present voltage, status. */
++	put_unaligned_le32(state, rawdata);
++	put_unaligned_le32(rate, rawdata + 4);
++	put_unaligned_le32(capacity, rawdata + 8);
++	put_unaligned_le32(voltage, rawdata + 12);
++	put_unaligned_le32(0, rawdata + 16);
++}
++
++static bool nvidia_ec_is_get_bst(const uuid_t *uuid, const u8 *rawdata,
++				 unsigned int len)
++{
++	return len >= NVIDIA_EC_BST_LEN &&
++	       uuid_equal(uuid, &nvidia_ec_battery_uuid) &&
++	       get_unaligned_le32(rawdata) == NVIDIA_EC_BAT_GET_BST &&
++	       dmi_check_system(nvidia_ec_bst_from_ram_dmi);
++}
++
+ /* FFH handler — MSFT000C (FFH offset 4) */
+ static int nvidia_ffh_handler_msft000c(struct acpi_ffh_info *info, acpi_integer *value)
+ {
+@@ -856,6 +953,7 @@ static int nvidia_ffh_handler_arml0002(struct acpi_ffh_info *info, acpi_integer
+ {
+ 	struct nvidia_ec_ffa_packet_arml0002 *pkt = (struct nvidia_ec_ffa_packet_arml0002 *)value;
+ 	unsigned int payload_len;
++	bool get_bst;
+ 	uuid_t uuid;
+ 	int ret;
+ 
+@@ -872,7 +970,10 @@ static int nvidia_ffh_handler_arml0002(struct acpi_ffh_info *info, acpi_integer
+ 	}
+ 
+ 	uuid = nvidia_get_uuid_from_aml_buf(pkt->uuid);
++	get_bst = nvidia_ec_is_get_bst(&uuid, pkt->rawdata, payload_len);
+ 	ret = nvidia_ffh_do_ffa_send(uuid, pkt->rawdata, payload_len, payload_len);
++	if (!ret && get_bst && !memchr_inv(pkt->rawdata, 0, NVIDIA_EC_BST_LEN))
++		nvidia_ec_bst_from_ram(uuid, pkt->rawdata);
+ 	pkt->status = ret ? 1 : 0;
+ 	return ret;
+ }

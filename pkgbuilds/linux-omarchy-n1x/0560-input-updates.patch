@@ -1,0 +1,3869 @@
+diff --git a/drivers/input/input.c b/drivers/input/input.c
+--- a/drivers/input/input.c
++++ b/drivers/input/input.c
+@@ -318,7 +318,7 @@ static int input_get_disposition(struct input_dev *dev,
+ static void input_event_dispose(struct input_dev *dev, int disposition,
+ 				unsigned int type, unsigned int code, int value)
+ {
+-	if ((disposition & INPUT_PASS_TO_DEVICE) && dev->event)
++	if ((disposition & INPUT_PASS_TO_DEVICE) && dev->event && dev->ready)
+ 		dev->event(dev, type, code, value);
+ 
+ 	if (disposition & INPUT_PASS_TO_HANDLERS) {
+@@ -568,6 +568,75 @@ void input_release_device(struct input_handle *handle)
+ }
+ EXPORT_SYMBOL(input_release_device);
+ 
++#define INPUT_DO_TOGGLE(dev, type, bits, on)				\
++	do {								\
++		int i;							\
++		bool active;						\
++									\
++		if (!test_bit(EV_##type, dev->evbit))			\
++			break;						\
++									\
++		for_each_set_bit(i, dev->bits##bit, type##_CNT) {	\
++			active = test_bit(i, dev->bits);		\
++			if (!active && !on)				\
++				continue;				\
++									\
++			dev->event(dev, EV_##type, i, on ? active : 0);	\
++		}							\
++	} while (0)
++
++/*
++ * Iterate through the logical state of the input device (LEDs, sounds,
++ * auto-repeat) and explicitly push that state down to the hardware
++ * via dev->event() to match the current logical state (if activate is true),
++ * or forcibly turn off all feedback like LEDs and sounds during teardown
++ * or suspend (if activate is false).
++ *
++ * Primarily used as a state-replay mechanism after a device is opened
++ * or uninhibited, as events might have been dropped by the core while the
++ * hardware was not marked as ready.
++ */
++static void input_dev_toggle(struct input_dev *dev, bool activate)
++{
++	if (!dev->event || !dev->ready)
++		return;
++
++	INPUT_DO_TOGGLE(dev, LED, led, activate);
++	INPUT_DO_TOGGLE(dev, SND, snd, activate);
++
++	if (activate && test_bit(EV_REP, dev->evbit)) {
++		dev->event(dev, EV_REP, REP_PERIOD, dev->rep[REP_PERIOD]);
++		dev->event(dev, EV_REP, REP_DELAY, dev->rep[REP_DELAY]);
++	}
++}
++
++static int input_start_device(struct input_dev *dev)
++{
++	int error;
++
++	lockdep_assert_held(&dev->mutex);
++
++	if (dev->users++ == 0 && !dev->inhibited) {
++		if (dev->open) {
++			error = dev->open(dev);
++			if (error) {
++				dev->users--;
++				return error;
++			}
++		}
++
++		scoped_guard(spinlock_irq, &dev->event_lock) {
++			dev->ready = true;
++			input_dev_toggle(dev, true);
++		}
++
++		if (dev->poller)
++			input_dev_poller_start(dev->poller);
++	}
++
++	return 0;
++}
++
+ /**
+  * input_open_device - open input device
+  * @handle: handle through which device is being accessed
+@@ -586,21 +655,9 @@ int input_open_device(struct input_handle *handle)
+ 
+ 		handle->open++;
+ 
+-		if (handle->handler->passive_observer)
+-			return 0;
+-
+-		if (dev->users++ || dev->inhibited) {
+-			/*
+-			 * Device is already opened and/or inhibited,
+-			 * so we can exit immediately and report success.
+-			 */
+-			return 0;
+-		}
+-
+-		if (dev->open) {
+-			error = dev->open(dev);
++		if (!handle->handler->passive_observer) {
++			error = input_start_device(dev);
+ 			if (error) {
+-				dev->users--;
+ 				handle->open--;
+ 				/*
+ 				 * Make sure we are not delivering any more
+@@ -611,8 +668,8 @@ int input_open_device(struct input_handle *handle)
+ 			}
+ 		}
+ 
+-		if (dev->poller)
+-			input_dev_poller_start(dev->poller);
++		if (handle->open == 1 && handle->handler->start)
++			handle->handler->start(handle);
+ 	}
+ 
+ 	return 0;
+@@ -651,6 +708,12 @@ void input_close_device(struct input_handle *handle)
+ 		if (!--dev->users && !dev->inhibited) {
+ 			if (dev->poller)
+ 				input_dev_poller_stop(dev->poller);
++
++			scoped_guard(spinlock_irq, &dev->event_lock) {
++				input_dev_toggle(dev, false);
++				dev->ready = false;
++			}
++
+ 			if (dev->close)
+ 				dev->close(dev);
+ 		}
+@@ -1702,37 +1765,6 @@ static int input_dev_uevent(const struct device *device, struct kobj_uevent_env
+ 	return 0;
+ }
+ 
+-#define INPUT_DO_TOGGLE(dev, type, bits, on)				\
+-	do {								\
+-		int i;							\
+-		bool active;						\
+-									\
+-		if (!test_bit(EV_##type, dev->evbit))			\
+-			break;						\
+-									\
+-		for_each_set_bit(i, dev->bits##bit, type##_CNT) {	\
+-			active = test_bit(i, dev->bits);		\
+-			if (!active && !on)				\
+-				continue;				\
+-									\
+-			dev->event(dev, EV_##type, i, on ? active : 0);	\
+-		}							\
+-	} while (0)
+-
+-static void input_dev_toggle(struct input_dev *dev, bool activate)
+-{
+-	if (!dev->event)
+-		return;
+-
+-	INPUT_DO_TOGGLE(dev, LED, led, activate);
+-	INPUT_DO_TOGGLE(dev, SND, snd, activate);
+-
+-	if (activate && test_bit(EV_REP, dev->evbit)) {
+-		dev->event(dev, EV_REP, REP_PERIOD, dev->rep[REP_PERIOD]);
+-		dev->event(dev, EV_REP, REP_DELAY, dev->rep[REP_DELAY]);
+-	}
+-}
+-
+ /**
+  * input_reset_device() - reset/restore the state of input device
+  * @dev: input device whose state needs to be reset
+@@ -1756,52 +1788,73 @@ static int input_inhibit_device(struct input_dev *dev)
+ {
+ 	guard(mutex)(&dev->mutex);
+ 
++	if (dev->going_away)
++		return -ENODEV;
++
+ 	if (dev->inhibited)
+ 		return 0;
+ 
+ 	if (dev->users) {
+-		if (dev->close)
+-			dev->close(dev);
+ 		if (dev->poller)
+ 			input_dev_poller_stop(dev->poller);
++
++		scoped_guard(spinlock_irq, &dev->event_lock) {
++			input_dev_toggle(dev, false);
++			dev->ready = false;
++		}
++
++		if (dev->close)
++			dev->close(dev);
+ 	}
+ 
+ 	scoped_guard(spinlock_irq, &dev->event_lock) {
+ 		input_mt_release_slots(dev);
+ 		input_dev_release_keys(dev);
+ 		input_handle_event(dev, EV_SYN, SYN_REPORT, 1);
+-		input_dev_toggle(dev, false);
++		dev->inhibited = true;
+ 	}
+ 
+-	dev->inhibited = true;
+-
+ 	return 0;
+ }
+ 
+ static int input_uninhibit_device(struct input_dev *dev)
+ {
++	struct input_handle *handle;
+ 	int error;
+ 
+ 	guard(mutex)(&dev->mutex);
+ 
++	if (dev->going_away)
++		return -ENODEV;
++
+ 	if (!dev->inhibited)
+ 		return 0;
+ 
++	dev->inhibited = false;
++
+ 	if (dev->users) {
+ 		if (dev->open) {
+ 			error = dev->open(dev);
+-			if (error)
++			if (error) {
++				dev->inhibited = true;
+ 				return error;
++			}
+ 		}
+-		if (dev->poller)
+-			input_dev_poller_start(dev->poller);
++		scoped_guard(spinlock_irq, &dev->event_lock)
++			dev->ready = true;
+ 	}
+ 
+-	dev->inhibited = false;
+-
+ 	scoped_guard(spinlock_irq, &dev->event_lock)
+ 		input_dev_toggle(dev, true);
+ 
++	if (dev->users && dev->poller)
++		input_dev_poller_start(dev->poller);
++
++	list_for_each_entry(handle, &dev->h_list, d_node) {
++		if (handle->open && handle->handler->start)
++			handle->handler->start(handle);
++	}
++
+ 	return 0;
+ }
+ 
+@@ -2655,9 +2708,6 @@ int input_register_handle(struct input_handle *handle)
+ 	 */
+ 	list_add_tail_rcu(&handle->h_node, &handler->h_list);
+ 
+-	if (handler->start)
+-		handler->start(handle);
+-
+ 	return 0;
+ }
+ EXPORT_SYMBOL(input_register_handle);
+diff --git a/drivers/input/keyboard/Kconfig b/drivers/input/keyboard/Kconfig
+--- a/drivers/input/keyboard/Kconfig
++++ b/drivers/input/keyboard/Kconfig
+@@ -119,44 +119,6 @@ config KEYBOARD_ATKBD
+ 	  To compile this driver as a module, choose M here: the
+ 	  module will be called atkbd.
+ 
+-config KEYBOARD_ATKBD_HP_KEYCODES
+-	bool "Use HP keyboard scancodes"
+-	depends on PARISC && KEYBOARD_ATKBD
+-	default y
+-	help
+-	  Say Y here if you have a PA-RISC machine and want to use an AT or
+-	  PS/2 keyboard, and your keyboard uses keycodes that are specific to
+-	  PA-RISC keyboards.
+-
+-	  Say N if you use a standard keyboard.
+-
+-config KEYBOARD_ATKBD_RDI_KEYCODES
+-	bool "Use PrecisionBook keyboard scancodes"
+-	depends on KEYBOARD_ATKBD_HP_KEYCODES
+-	default n
+-	help
+-	  If you have an RDI PrecisionBook, say Y here if you want to use its
+-	  built-in keyboard (as opposed to an external keyboard).
+-
+-	  The PrecisionBook has five keys that conflict with those used by most
+-	  AT and PS/2 keyboards. These are as follows:
+-
+-	    PrecisionBook    Standard AT or PS/2
+-
+-	    F1               F12
+-	    Left Ctrl        Left Alt
+-	    Caps Lock        Left Ctrl
+-	    Right Ctrl       Caps Lock
+-	    Left             102nd key (the key to the right of Left Shift)
+-
+-	  If you say N here, and use the PrecisionBook keyboard, then each key
+-	  in the left-hand column will be interpreted as the corresponding key
+-	  in the right-hand column.
+-
+-	  If you say Y here, and use an external keyboard, then each key in the
+-	  right-hand column will be interpreted as the key shown in the
+-	  left-hand column.
+-
+ config KEYBOARD_QT1050
+ 	tristate "Microchip AT42QT1050 Touch Sensor Chip"
+ 	depends on I2C
+diff --git a/drivers/input/keyboard/atkbd.c b/drivers/input/keyboard/atkbd.c
+--- a/drivers/input/keyboard/atkbd.c
++++ b/drivers/input/keyboard/atkbd.c
+@@ -73,13 +73,6 @@ MODULE_PARM_DESC(terminal, "Enable break codes on an IBM Terminal keyboard conne
+ #define ATKBD_KEYMAP_SIZE	512
+ 
+ static const unsigned short atkbd_set2_keycode[ATKBD_KEYMAP_SIZE] = {
+-#ifdef CONFIG_KEYBOARD_ATKBD_HP_KEYCODES
+-
+-/* XXX: need a more general approach */
+-
+-#include "hpps2atkbd.h"	/* include the keyboard scancodes */
+-
+-#else
+ 	  0, 67, 65, 63, 61, 59, 60, 88,183, 68, 66, 64, 62, 15, 41,117,
+ 	184, 56, 42, 93, 29, 16,  2,  0,185,  0, 44, 31, 30, 17,  3,  0,
+ 	186, 46, 45, 32, 18,  5,  4, 95,187, 57, 47, 33, 20, 19,  6,183,
+@@ -99,7 +92,6 @@ static const unsigned short atkbd_set2_keycode[ATKBD_KEYMAP_SIZE] = {
+ 	110,111,108,112,106,103,  0,119,  0,118,109,  0, 99,104,119,  0,
+ 
+ 	  0,  0,  0, 65, 99,
+-#endif
+ };
+ 
+ static const unsigned short atkbd_set3_keycode[ATKBD_KEYMAP_SIZE] = {
+diff --git a/drivers/input/keyboard/cap11xx.c b/drivers/input/keyboard/cap11xx.c
+--- a/drivers/input/keyboard/cap11xx.c
++++ b/drivers/input/keyboard/cap11xx.c
+@@ -5,6 +5,8 @@
+  * (c) 2014 Daniel Mack <linux@zonque.org>
+  */
+ 
++#include <linux/bits.h>
++#include <linux/delay.h>
+ #include <linux/kernel.h>
+ #include <linux/module.h>
+ #include <linux/interrupt.h>
+@@ -16,63 +18,43 @@
+ #include <linux/gpio/consumer.h>
+ #include <linux/bitfield.h>
+ 
++#define CAP1114_REG_BUTTON_STATUS1	0x03
++#define CAP1114_REG_BUTTON_STATUS2	0x04
++#define CAP1114_REG_CONFIG2			0x40
++#define CAP1114_REG_CONFIG2_VOL_UP_DOWN	BIT(1)
++#define CAP1114_REG_LED_OUTPUT_CONTROL1	0x73
++
+ #define CAP11XX_REG_MAIN_CONTROL	0x00
+ #define CAP11XX_REG_MAIN_CONTROL_GAIN_SHIFT	(6)
+ #define CAP11XX_REG_MAIN_CONTROL_GAIN_MASK	(0xc0)
+ #define CAP11XX_REG_MAIN_CONTROL_DLSEEP		BIT(4)
+-#define CAP11XX_REG_GENERAL_STATUS	0x02
+ #define CAP11XX_REG_SENSOR_INPUT	0x03
+-#define CAP11XX_REG_NOISE_FLAG_STATUS	0x0a
++#define CAP1114_REG_BUTTON_STATUS2	0x04
+ #define CAP11XX_REG_SENOR_DELTA(X)	(0x10 + (X))
+ #define CAP11XX_REG_SENSITIVITY_CONTROL	0x1f
+ #define CAP11XX_REG_SENSITIVITY_CONTROL_DELTA_SENSE_MASK	0x70
+-#define CAP11XX_REG_CONFIG		0x20
+-#define CAP11XX_REG_SENSOR_ENABLE	0x21
+-#define CAP11XX_REG_SENSOR_CONFIG	0x22
+-#define CAP11XX_REG_SENSOR_CONFIG2	0x23
+-#define CAP11XX_REG_SAMPLING_CONFIG	0x24
+-#define CAP11XX_REG_CALIBRATION		0x26
+-#define CAP11XX_REG_INT_ENABLE		0x27
+ #define CAP11XX_REG_REPEAT_RATE		0x28
+ #define CAP11XX_REG_SIGNAL_GUARD_ENABLE	0x29
+-#define CAP11XX_REG_MT_CONFIG		0x2a
+-#define CAP11XX_REG_MT_PATTERN_CONFIG	0x2b
+-#define CAP11XX_REG_MT_PATTERN		0x2d
+-#define CAP11XX_REG_RECALIB_CONFIG	0x2f
+ #define CAP11XX_REG_SENSOR_THRESH(X)	(0x30 + (X))
+-#define CAP11XX_REG_SENSOR_NOISE_THRESH	0x38
+-#define CAP11XX_REG_STANDBY_CHANNEL	0x40
+-#define CAP11XX_REG_STANDBY_CONFIG	0x41
+-#define CAP11XX_REG_STANDBY_SENSITIVITY	0x42
+-#define CAP11XX_REG_STANDBY_THRESH	0x43
+ #define CAP11XX_REG_CONFIG2		0x44
+ #define CAP11XX_REG_CONFIG2_ALT_POL	BIT(6)
+-#define CAP11XX_REG_SENSOR_BASE_CNT(X)	(0x50 + (X))
+-#define CAP11XX_REG_LED_POLARITY	0x73
+ #define CAP11XX_REG_LED_OUTPUT_CONTROL	0x74
+ #define CAP11XX_REG_CALIB_SENSITIVITY_CONFIG	0x80
+ #define CAP11XX_REG_CALIB_SENSITIVITY_CONFIG2	0x81
+-
+-#define CAP11XX_REG_LED_DUTY_CYCLE_1	0x90
+-#define CAP11XX_REG_LED_DUTY_CYCLE_2	0x91
+-#define CAP11XX_REG_LED_DUTY_CYCLE_3	0x92
+ #define CAP11XX_REG_LED_DUTY_CYCLE_4	0x93
+ 
+-#define CAP11XX_REG_LED_DUTY_MIN_MASK	(0x0f)
+-#define CAP11XX_REG_LED_DUTY_MIN_MASK_SHIFT	(0)
+ #define CAP11XX_REG_LED_DUTY_MAX_MASK	(0xf0)
+-#define CAP11XX_REG_LED_DUTY_MAX_MASK_SHIFT	(4)
+ #define CAP11XX_REG_LED_DUTY_MAX_VALUE	(15)
+ 
+-#define CAP11XX_REG_SENSOR_CALIB	(0xb1 + (X))
+-#define CAP11XX_REG_SENSOR_CALIB_LSB1	0xb9
+-#define CAP11XX_REG_SENSOR_CALIB_LSB2	0xba
+ #define CAP11XX_REG_PRODUCT_ID		0xfd
+ #define CAP11XX_REG_MANUFACTURER_ID	0xfe
+ #define CAP11XX_REG_REVISION		0xff
+ 
+ #define CAP11XX_MANUFACTURER_ID	0x5d
+ 
++#define CAP11XX_T_RST_FILT_MIN_US	10000
++#define CAP11XX_T_RST_ON_MIN_MS		400
++
+ #ifdef CONFIG_LEDS_CLASS
+ struct cap11xx_led {
+ 	struct cap11xx_priv *priv;
+@@ -85,6 +67,7 @@ struct cap11xx_priv {
+ 	struct regmap *regmap;
+ 	struct device *dev;
+ 	struct input_dev *idev;
++	struct gpio_desc *reset_gpio;
+ 	const struct cap11xx_hw_model *model;
+ 
+ 	struct cap11xx_led *leds;
+@@ -101,47 +84,32 @@ struct cap11xx_priv {
+ 
+ struct cap11xx_hw_model {
+ 	u8 product_id;
++	u8 led_output_control_reg_base;
++	u8 sensor_input_reg_base;
+ 	unsigned int num_channels;
+ 	unsigned int num_leds;
++	unsigned int num_sensor_thresholds;
+ 	bool has_gain;
++	bool has_grouped_sensors;
+ 	bool has_irq_config;
++	bool has_repeat_en;
+ 	bool has_sensitivity_control;
+ 	bool has_signal_guard;
+ };
+ 
+ static const struct reg_default cap11xx_reg_defaults[] = {
+ 	{ CAP11XX_REG_MAIN_CONTROL,		0x00 },
+-	{ CAP11XX_REG_GENERAL_STATUS,		0x00 },
+-	{ CAP11XX_REG_SENSOR_INPUT,		0x00 },
+-	{ CAP11XX_REG_NOISE_FLAG_STATUS,	0x00 },
+ 	{ CAP11XX_REG_SENSITIVITY_CONTROL,	0x2f },
+-	{ CAP11XX_REG_CONFIG,			0x20 },
+-	{ CAP11XX_REG_SENSOR_ENABLE,		0x3f },
+-	{ CAP11XX_REG_SENSOR_CONFIG,		0xa4 },
+-	{ CAP11XX_REG_SENSOR_CONFIG2,		0x07 },
+-	{ CAP11XX_REG_SAMPLING_CONFIG,		0x39 },
+-	{ CAP11XX_REG_CALIBRATION,		0x00 },
+-	{ CAP11XX_REG_INT_ENABLE,		0x3f },
+ 	{ CAP11XX_REG_REPEAT_RATE,		0x3f },
+-	{ CAP11XX_REG_MT_CONFIG,		0x80 },
+-	{ CAP11XX_REG_MT_PATTERN_CONFIG,	0x00 },
+-	{ CAP11XX_REG_MT_PATTERN,		0x3f },
+-	{ CAP11XX_REG_RECALIB_CONFIG,		0x8a },
+ 	{ CAP11XX_REG_SENSOR_THRESH(0),		0x40 },
+ 	{ CAP11XX_REG_SENSOR_THRESH(1),		0x40 },
+ 	{ CAP11XX_REG_SENSOR_THRESH(2),		0x40 },
+ 	{ CAP11XX_REG_SENSOR_THRESH(3),		0x40 },
+ 	{ CAP11XX_REG_SENSOR_THRESH(4),		0x40 },
+ 	{ CAP11XX_REG_SENSOR_THRESH(5),		0x40 },
+-	{ CAP11XX_REG_SENSOR_NOISE_THRESH,	0x01 },
+-	{ CAP11XX_REG_STANDBY_CHANNEL,		0x00 },
+-	{ CAP11XX_REG_STANDBY_CONFIG,		0x39 },
+-	{ CAP11XX_REG_STANDBY_SENSITIVITY,	0x02 },
+-	{ CAP11XX_REG_STANDBY_THRESH,		0x40 },
++	{ CAP11XX_REG_SENSOR_THRESH(6),		0x40 },
++	{ CAP11XX_REG_SENSOR_THRESH(7),		0x40 },
+ 	{ CAP11XX_REG_CONFIG2,			0x40 },
+-	{ CAP11XX_REG_LED_POLARITY,		0x00 },
+-	{ CAP11XX_REG_SENSOR_CALIB_LSB1,	0x00 },
+-	{ CAP11XX_REG_SENSOR_CALIB_LSB2,	0x00 },
+ };
+ 
+ static bool cap11xx_volatile_reg(struct device *dev, unsigned int reg)
+@@ -149,6 +117,12 @@ static bool cap11xx_volatile_reg(struct device *dev, unsigned int reg)
+ 	switch (reg) {
+ 	case CAP11XX_REG_MAIN_CONTROL:
+ 	case CAP11XX_REG_SENSOR_INPUT:
++	/*
++	 * CAP1114_REG_BUTTON_STATUS1 (CAP11XX_REG_SENSOR_INPUT) and
++	 * CAP1114_REG_BUTTON_STATUS2 is volatile for the CAP1114,
++	 * which supports more than 8 touch channels.
++	 */
++	case CAP1114_REG_BUTTON_STATUS2:
+ 	case CAP11XX_REG_SENOR_DELTA(0):
+ 	case CAP11XX_REG_SENOR_DELTA(1):
+ 	case CAP11XX_REG_SENOR_DELTA(2):
+@@ -257,8 +231,8 @@ static int cap11xx_init_keys(struct cap11xx_priv *priv)
+ 	}
+ 
+ 	if (!of_property_read_u32_array(node, "microchip,input-threshold",
+-					priv->thresholds, priv->model->num_channels)) {
+-		for (i = 0; i < priv->model->num_channels; i++) {
++					priv->thresholds, priv->model->num_sensor_thresholds)) {
++		for (i = 0; i < priv->model->num_sensor_thresholds; i++) {
+ 			if (priv->thresholds[i] > 127) {
+ 				dev_err(dev, "Invalid input-threshold value %u\n",
+ 					priv->thresholds[i]);
+@@ -273,10 +247,13 @@ static int cap11xx_init_keys(struct cap11xx_priv *priv)
+ 		}
+ 	}
+ 
+-	if (!of_property_read_u32_array(node, "microchip,calib-sensitivity",
+-					priv->calib_sensitivities,
+-					priv->model->num_channels)) {
+-		if (priv->model->has_sensitivity_control) {
++	if (of_property_present(node, "microchip,calib-sensitivity")) {
++		if (!priv->model->has_sensitivity_control) {
++			dev_warn(dev,
++				 "This model doesn't support 'calib-sensitivity'\n");
++		} else if (!of_property_read_u32_array(node, "microchip,calib-sensitivity",
++						       priv->calib_sensitivities,
++						       priv->model->num_channels)) {
+ 			for (i = 0; i < priv->model->num_channels; i++) {
+ 				if (!is_power_of_2(priv->calib_sensitivities[i]) ||
+ 				    priv->calib_sensitivities[i] > 4) {
+@@ -296,32 +273,31 @@ static int cap11xx_init_keys(struct cap11xx_priv *priv)
+ 				if (error)
+ 					return error;
+ 			}
+-		} else {
+-			dev_warn(dev,
+-				 "This model doesn't support 'calib-sensitivity'\n");
+ 		}
+ 	}
+ 
+-	for (i = 0; i < priv->model->num_channels; i++) {
+-		if (!of_property_read_u32_index(node, "microchip,signal-guard",
+-						i, &u32_val)) {
+-			if (u32_val > 1)
+-				return -EINVAL;
+-			if (u32_val)
+-				priv->signal_guard_inputs_mask |= 0x01 << i;
+-		}
+-	}
+-
+-	if (priv->signal_guard_inputs_mask) {
+-		if (priv->model->has_signal_guard) {
+-			error = regmap_write(priv->regmap,
+-					     CAP11XX_REG_SIGNAL_GUARD_ENABLE,
+-					     priv->signal_guard_inputs_mask);
+-			if (error)
+-				return error;
+-		} else {
++	if (of_property_present(node, "microchip,signal-guard")) {
++		if (!priv->model->has_signal_guard) {
+ 			dev_warn(dev,
+ 				 "This model doesn't support 'signal-guard'\n");
++		} else {
++			for (i = 0; i < priv->model->num_channels; i++) {
++				if (!of_property_read_u32_index(node, "microchip,signal-guard",
++								i, &u32_val)) {
++					if (u32_val > 1)
++						return -EINVAL;
++					if (u32_val)
++						priv->signal_guard_inputs_mask |= 0x01 << i;
++				}
++			}
++
++			if (priv->signal_guard_inputs_mask) {
++				error = regmap_write(priv->regmap,
++						     CAP11XX_REG_SIGNAL_GUARD_ENABLE,
++						     priv->signal_guard_inputs_mask);
++				if (error)
++					return error;
++			}
+ 		}
+ 	}
+ 
+@@ -332,10 +308,23 @@ static int cap11xx_init_keys(struct cap11xx_priv *priv)
+ 	of_property_read_u32_array(node, "linux,keycodes",
+ 				   priv->keycodes, priv->model->num_channels);
+ 
+-	/* Disable autorepeat. The Linux input system has its own handling. */
+-	error = regmap_write(priv->regmap, CAP11XX_REG_REPEAT_RATE, 0);
+-	if (error)
+-		return error;
++	/*
++	 * CAP1114 needs dedicated configuration to split
++	 * grouped sensors into independent inputs.
++	 */
++	if (priv->model->has_grouped_sensors) {
++		error = regmap_set_bits(priv->regmap, CAP1114_REG_CONFIG2,
++					CAP1114_REG_CONFIG2_VOL_UP_DOWN);
++		if (error)
++			return error;
++	}
++
++	if (priv->model->has_repeat_en) {
++		/* Disable autorepeat. The Linux input system has its own handling. */
++		error = regmap_write(priv->regmap, CAP11XX_REG_REPEAT_RATE, 0);
++		if (error)
++			return error;
++	}
+ 
+ 	return 0;
+ }
+@@ -354,10 +343,25 @@ static irqreturn_t cap11xx_thread_func(int irq_num, void *data)
+ 	if (ret < 0)
+ 		goto out;
+ 
+-	ret = regmap_read(priv->regmap, CAP11XX_REG_SENSOR_INPUT, &status);
++	ret = regmap_read(priv->regmap, priv->model->sensor_input_reg_base, &status);
+ 	if (ret < 0)
+ 		goto out;
+ 
++	if (priv->model->num_channels > 8) {
++		unsigned int status2;
++
++		ret = regmap_read(priv->regmap, priv->model->sensor_input_reg_base + 1, &status2);
++		if (ret < 0)
++			goto out;
++
++		/*
++		 * CAP1114 STATUS1 register only contains data for the first 6 channels.
++		 * the remaining channels is stored in STATUS2.
++		 */
++		status &= GENMASK(5, 0);
++		status |= FIELD_PREP(GENMASK(13, 6), status2);
++	}
++
+ 	for (i = 0; i < priv->idev->keycodemax; i++)
+ 		input_report_key(priv->idev, priv->keycodes[i],
+ 				 status & (1 << i));
+@@ -407,10 +411,16 @@ static int cap11xx_led_set(struct led_classdev *cdev,
+ 	 * limitation. Brightness levels per LED are either
+ 	 * 0 (OFF) and 1 (ON).
+ 	 */
+-	return regmap_update_bits(priv->regmap,
+-				  CAP11XX_REG_LED_OUTPUT_CONTROL,
+-				  BIT(led->reg),
+-				  value ? BIT(led->reg) : 0);
++	if (led->reg >= 8)
++		return regmap_update_bits(priv->regmap,
++					  priv->model->led_output_control_reg_base + 1,
++					  BIT(led->reg - 8),
++					  value ? BIT(led->reg - 8) : 0);
++	else
++		return regmap_update_bits(priv->regmap,
++					  priv->model->led_output_control_reg_base,
++					  BIT(led->reg),
++					  value ? BIT(led->reg) : 0);
+ }
+ 
+ static int cap11xx_init_leds(struct device *dev,
+@@ -420,6 +430,7 @@ static int cap11xx_init_leds(struct device *dev,
+ 	struct cap11xx_led *led;
+ 	int cnt = of_get_child_count(node);
+ 	int error;
++	u32 duty_val;
+ 
+ 	if (!num_leds || !cnt)
+ 		return 0;
+@@ -433,15 +444,26 @@ static int cap11xx_init_leds(struct device *dev,
+ 
+ 	priv->leds = led;
+ 
++	/* Set all LEDs to off */
+ 	error = regmap_update_bits(priv->regmap,
+-				CAP11XX_REG_LED_OUTPUT_CONTROL, 0xff, 0);
++				   priv->model->led_output_control_reg_base,
++				   GENMASK(min(num_leds, 8) - 1, 0), 0);
+ 	if (error)
+ 		return error;
+ 
++	if (num_leds > 8) {
++		error = regmap_update_bits(priv->regmap,
++					   priv->model->led_output_control_reg_base + 1,
++					   GENMASK(num_leds - 8 - 1, 0), 0);
++		if (error)
++			return error;
++	}
++
++	duty_val = FIELD_PREP(CAP11XX_REG_LED_DUTY_MAX_MASK,
++			      CAP11XX_REG_LED_DUTY_MAX_VALUE);
++
+ 	error = regmap_update_bits(priv->regmap, CAP11XX_REG_LED_DUTY_CYCLE_4,
+-				CAP11XX_REG_LED_DUTY_MAX_MASK,
+-				CAP11XX_REG_LED_DUTY_MAX_VALUE <<
+-				CAP11XX_REG_LED_DUTY_MAX_MASK_SHIFT);
++				   CAP11XX_REG_LED_DUTY_MAX_MASK, duty_val);
+ 	if (error)
+ 		return error;
+ 
+@@ -510,9 +532,20 @@ static int cap11xx_i2c_probe(struct i2c_client *i2c_client)
+ 	if (IS_ERR(priv->regmap))
+ 		return PTR_ERR(priv->regmap);
+ 
++	priv->reset_gpio = devm_gpiod_get_optional(dev, "reset", GPIOD_OUT_HIGH);
++	if (IS_ERR(priv->reset_gpio))
++		return dev_err_probe(dev, PTR_ERR(priv->reset_gpio),
++				     "Failed to get 'reset' GPIO\n");
++
++	if (priv->reset_gpio) {
++		usleep_range(CAP11XX_T_RST_FILT_MIN_US, CAP11XX_T_RST_FILT_MIN_US * 2);
++		gpiod_set_value_cansleep(priv->reset_gpio, 0);
++		msleep(CAP11XX_T_RST_ON_MIN_MS);
++	}
++
+ 	error = regmap_read(priv->regmap, CAP11XX_REG_PRODUCT_ID, &val);
+ 	if (error)
+-		return error;
++		return dev_err_probe(dev, error, "Failed to read product ID\n");
+ 
+ 	if (val != cap->product_id) {
+ 		dev_err(dev, "Product ID: Got 0x%02x, expected 0x%02x\n",
+@@ -522,7 +555,7 @@ static int cap11xx_i2c_probe(struct i2c_client *i2c_client)
+ 
+ 	error = regmap_read(priv->regmap, CAP11XX_REG_MANUFACTURER_ID, &val);
+ 	if (error)
+-		return error;
++		return dev_err_probe(dev, error, "Failed to read manufacturer ID\n");
+ 
+ 	if (val != CAP11XX_MANUFACTURER_ID) {
+ 		dev_err(dev, "Manufacturer ID: Got 0x%02x, expected 0x%02x\n",
+@@ -531,11 +564,8 @@ static int cap11xx_i2c_probe(struct i2c_client *i2c_client)
+ 	}
+ 
+ 	error = regmap_read(priv->regmap, CAP11XX_REG_REVISION, &rev);
+-	if (error < 0)
+-		return error;
+-
+-	dev_info(dev, "CAP11XX detected, model %s, revision 0x%02x\n",
+-			 id->name, rev);
++	if (error)
++		return dev_err_probe(dev, error, "Failed to read revision\n");
+ 
+ 	priv->model = cap;
+ 
+@@ -599,47 +629,79 @@ static int cap11xx_i2c_probe(struct i2c_client *i2c_client)
+ }
+ 
+ static const struct cap11xx_hw_model cap1106_model = {
+-	.product_id = 0x55, .num_channels = 6, .num_leds = 0,
++	.product_id = 0x55,
++	.num_channels = 6, .num_leds = 0, .num_sensor_thresholds = 6,
++	.sensor_input_reg_base = CAP11XX_REG_SENSOR_INPUT,
+ 	.has_gain = true,
+ 	.has_irq_config = true,
++	.has_repeat_en = true,
++};
++
++static const struct cap11xx_hw_model cap1114_model = {
++	.product_id = 0x3a,
++	.num_channels = 14, .num_leds = 11, .num_sensor_thresholds = 8,
++	.led_output_control_reg_base = CAP1114_REG_LED_OUTPUT_CONTROL1,
++	.sensor_input_reg_base = CAP1114_REG_BUTTON_STATUS1,
++	.has_grouped_sensors = true,
+ };
+ 
+ static const struct cap11xx_hw_model cap1126_model = {
+-	.product_id = 0x53, .num_channels = 6, .num_leds = 2,
++	.product_id = 0x53,
++	.num_channels = 6, .num_leds = 2, .num_sensor_thresholds = 6,
++	.led_output_control_reg_base = CAP11XX_REG_LED_OUTPUT_CONTROL,
++	.sensor_input_reg_base = CAP11XX_REG_SENSOR_INPUT,
+ 	.has_gain = true,
+ 	.has_irq_config = true,
++	.has_repeat_en = true,
+ };
+ 
+ static const struct cap11xx_hw_model cap1188_model = {
+-	.product_id = 0x50, .num_channels = 8, .num_leds = 8,
++	.product_id = 0x50,
++	.num_channels = 8, .num_leds = 8, .num_sensor_thresholds = 8,
++	.led_output_control_reg_base = CAP11XX_REG_LED_OUTPUT_CONTROL,
++	.sensor_input_reg_base = CAP11XX_REG_SENSOR_INPUT,
+ 	.has_gain = true,
+ 	.has_irq_config = true,
++	.has_repeat_en = true,
+ };
+ 
+ static const struct cap11xx_hw_model cap1203_model = {
+-	.product_id = 0x6d, .num_channels = 3, .num_leds = 0,
++	.product_id = 0x6d,
++	.num_channels = 3, .num_leds = 0, .num_sensor_thresholds = 3,
++	.sensor_input_reg_base = CAP11XX_REG_SENSOR_INPUT,
++	.has_repeat_en = true,
+ };
+ 
+ static const struct cap11xx_hw_model cap1206_model = {
+-	.product_id = 0x67, .num_channels = 6, .num_leds = 0,
++	.product_id = 0x67,
++	.num_channels = 6, .num_leds = 0, .num_sensor_thresholds = 6,
++	.sensor_input_reg_base = CAP11XX_REG_SENSOR_INPUT,
++	.has_repeat_en = true,
+ };
+ 
+ static const struct cap11xx_hw_model cap1293_model = {
+-	.product_id = 0x6f, .num_channels = 3, .num_leds = 0,
++	.product_id = 0x6f,
++	.num_channels = 3, .num_leds = 0, .num_sensor_thresholds = 3,
++	.sensor_input_reg_base = CAP11XX_REG_SENSOR_INPUT,
+ 	.has_gain = true,
++	.has_repeat_en = true,
+ 	.has_sensitivity_control = true,
+ 	.has_signal_guard = true,
+ };
+ 
+ static const struct cap11xx_hw_model cap1298_model = {
+-	.product_id = 0x71, .num_channels = 8, .num_leds = 0,
++	.product_id = 0x71,
++	.num_channels = 8, .num_leds = 0, .num_sensor_thresholds = 8,
++	.sensor_input_reg_base = CAP11XX_REG_SENSOR_INPUT,
+ 	.has_gain = true,
++	.has_repeat_en = true,
+ 	.has_sensitivity_control = true,
+ 	.has_signal_guard = true,
+ };
+ 
+ static const struct of_device_id cap11xx_dt_ids[] = {
+ 	{ .compatible = "microchip,cap1106", .data = &cap1106_model },
++	{ .compatible = "microchip,cap1114", .data = &cap1114_model },
+ 	{ .compatible = "microchip,cap1126", .data = &cap1126_model },
+ 	{ .compatible = "microchip,cap1188", .data = &cap1188_model },
+ 	{ .compatible = "microchip,cap1203", .data = &cap1203_model },
+@@ -652,6 +714,7 @@ MODULE_DEVICE_TABLE(of, cap11xx_dt_ids);
+ 
+ static const struct i2c_device_id cap11xx_i2c_ids[] = {
+ 	{ .name = "cap1106", .driver_data = (kernel_ulong_t)&cap1106_model },
++	{ .name = "cap1114", .driver_data = (kernel_ulong_t)&cap1114_model },
+ 	{ .name = "cap1126", .driver_data = (kernel_ulong_t)&cap1126_model },
+ 	{ .name = "cap1188", .driver_data = (kernel_ulong_t)&cap1188_model },
+ 	{ .name = "cap1203", .driver_data = (kernel_ulong_t)&cap1203_model },
+diff --git a/drivers/input/keyboard/charlieplex_keypad.c b/drivers/input/keyboard/charlieplex_keypad.c
+--- a/drivers/input/keyboard/charlieplex_keypad.c
++++ b/drivers/input/keyboard/charlieplex_keypad.c
+@@ -77,7 +77,9 @@ static int charlieplex_keypad_scan_line(struct charlieplex_keypad *keypad,
+ 	int err;
+ 
+ 	/* Activate only one line as output at a time. */
+-	gpiod_direction_output(line_gpios->desc[oline], 1);
++	err = gpiod_direction_output(line_gpios->desc[oline], 1);
++	if (err)
++		return err;
+ 
+ 	if (keypad->settling_time_us)
+ 		fsleep(keypad->settling_time_us);
+diff --git a/drivers/input/keyboard/hpps2atkbd.h b/drivers/input/keyboard/hpps2atkbd.h
+deleted file mode 100644
+--- a/drivers/input/keyboard/hpps2atkbd.h
++++ /dev/null
+@@ -1,110 +0,0 @@
+-/*
+- * drivers/input/keyboard/hpps2atkbd.h
+- *
+- * Copyright (c) 2004 Helge Deller <deller@gmx.de>
+- * Copyright (c) 2002 Laurent Canet <canetl@esiee.fr>
+- * Copyright (c) 2002 Thibaut Varene <varenet@parisc-linux.org>
+- * Copyright (c) 2000 Xavier Debacker <debackex@esiee.fr>
+- *
+- * HP PS/2 AT-compatible Keyboard, found in PA/RISC Workstations & Laptops
+- *
+- * This file is subject to the terms and conditions of the GNU General Public
+- * License.  See the file "COPYING" in the main directory of this archive
+- * for more details.
+- */
+-
+-
+-/* Is the keyboard an RDI PrecisionBook? */
+-#ifndef CONFIG_KEYBOARD_ATKBD_RDI_KEYCODES
+-# define CONFLICT(x,y) x
+-#else
+-# define CONFLICT(x,y) y
+-#endif
+-
+-/* sadly RDI (Tadpole) decided to ship a different keyboard layout
+-   than HP for their PS/2 laptop keyboard which leads to conflicting
+-   keycodes between a normal HP PS/2 keyboard and a RDI Precisionbook.
+-                                HP:		RDI:            */
+-#define C_07	CONFLICT(	KEY_F12,	KEY_F1		)
+-#define C_11	CONFLICT(	KEY_LEFTALT,	KEY_LEFTCTRL	)
+-#define C_14	CONFLICT(	KEY_LEFTCTRL,	KEY_CAPSLOCK	)
+-#define C_58	CONFLICT(	KEY_CAPSLOCK,	KEY_RIGHTCTRL	)
+-#define C_61	CONFLICT(	KEY_102ND,	KEY_LEFT	)
+-
+-/* Raw SET 2 scancode table */
+-
+-/* 00 */  KEY_RESERVED, KEY_F9,        KEY_RESERVED,  KEY_F5,        KEY_F3,        KEY_F1,       KEY_F2,        C_07,
+-/* 08 */  KEY_ESC,      KEY_F10,       KEY_F8,        KEY_F6,        KEY_F4,        KEY_TAB,      KEY_GRAVE,     KEY_F2,
+-/* 10 */  KEY_RESERVED, C_11,          KEY_LEFTSHIFT, KEY_RESERVED,  C_14,          KEY_Q,        KEY_1,         KEY_F3,
+-/* 18 */  KEY_RESERVED, KEY_LEFTALT,   KEY_Z,         KEY_S,         KEY_A,         KEY_W,        KEY_2,         KEY_F4,
+-/* 20 */  KEY_RESERVED, KEY_C,         KEY_X,         KEY_D,         KEY_E,         KEY_4,        KEY_3,         KEY_F5,
+-/* 28 */  KEY_RESERVED, KEY_SPACE,     KEY_V,         KEY_F,         KEY_T,         KEY_R,        KEY_5,         KEY_F6,
+-/* 30 */  KEY_RESERVED, KEY_N,         KEY_B,         KEY_H,         KEY_G,         KEY_Y,        KEY_6,         KEY_F7,
+-/* 38 */  KEY_RESERVED, KEY_RIGHTALT,  KEY_M,         KEY_J,         KEY_U,         KEY_7,        KEY_8,         KEY_F8,
+-/* 40 */  KEY_RESERVED, KEY_COMMA,     KEY_K,         KEY_I,         KEY_O,         KEY_0,        KEY_9,         KEY_F9,
+-/* 48 */  KEY_RESERVED, KEY_DOT,       KEY_SLASH,     KEY_L,         KEY_SEMICOLON, KEY_P,        KEY_MINUS,     KEY_F10,
+-/* 50 */  KEY_RESERVED, KEY_RESERVED,  KEY_APOSTROPHE,KEY_RESERVED,  KEY_LEFTBRACE, KEY_EQUAL,    KEY_F11,       KEY_SYSRQ,
+-/* 58 */  C_58,         KEY_RIGHTSHIFT,KEY_ENTER,     KEY_RIGHTBRACE,KEY_BACKSLASH, KEY_BACKSLASH,KEY_F12,       KEY_SCROLLLOCK,
+-/* 60 */  KEY_DOWN,     C_61,          KEY_PAUSE,     KEY_UP,        KEY_DELETE,    KEY_END,      KEY_BACKSPACE, KEY_INSERT,
+-/* 68 */  KEY_RESERVED, KEY_KP1,       KEY_RIGHT,     KEY_KP4,       KEY_KP7,       KEY_PAGEDOWN, KEY_HOME,      KEY_PAGEUP,
+-/* 70 */  KEY_KP0,      KEY_KPDOT,     KEY_KP2,       KEY_KP5,       KEY_KP6,       KEY_KP8,      KEY_ESC,       KEY_NUMLOCK,
+-/* 78 */  KEY_F11,      KEY_KPPLUS,    KEY_KP3,       KEY_KPMINUS,   KEY_KPASTERISK,KEY_KP9,      KEY_SCROLLLOCK,KEY_102ND,
+-/* 80 */  KEY_RESERVED, KEY_RESERVED,  KEY_RESERVED,  KEY_RESERVED,  KEY_RESERVED,  KEY_RESERVED, KEY_RESERVED,  KEY_RESERVED,
+-/* 88 */  KEY_RESERVED, KEY_RESERVED,  KEY_RESERVED,  KEY_RESERVED,  KEY_RESERVED,  KEY_RESERVED, KEY_RESERVED,  KEY_RESERVED,
+-/* 90 */  KEY_RESERVED, KEY_RIGHTALT,  255,           KEY_RESERVED,  KEY_RIGHTCTRL, KEY_RESERVED, KEY_RESERVED,  KEY_RESERVED,
+-/* 98 */  KEY_RESERVED, KEY_RESERVED,  KEY_RESERVED,  KEY_RESERVED,  KEY_RESERVED,  KEY_CAPSLOCK, KEY_RESERVED,  KEY_LEFTMETA,
+-/* a0 */  KEY_RESERVED, KEY_RESERVED,  KEY_RESERVED,  KEY_RESERVED,  KEY_RESERVED,  KEY_RESERVED, KEY_RESERVED,  KEY_RIGHTMETA,
+-/* a8 */  KEY_RESERVED, KEY_RESERVED,  KEY_RESERVED,  KEY_RESERVED,  KEY_RESERVED,  KEY_RESERVED, KEY_RESERVED,  KEY_COMPOSE,
+-/* b0 */  KEY_RESERVED, KEY_RESERVED,  KEY_RESERVED,  KEY_RESERVED,  KEY_RESERVED,  KEY_RESERVED, KEY_RESERVED,  KEY_RESERVED,
+-/* b8 */  KEY_RESERVED, KEY_RESERVED,  KEY_RESERVED,  KEY_RESERVED,  KEY_RESERVED,  KEY_RESERVED, KEY_RESERVED,  KEY_RESERVED,
+-/* c0 */  KEY_RESERVED, KEY_RESERVED,  KEY_RESERVED,  KEY_RESERVED,  KEY_RESERVED,  KEY_RESERVED, KEY_RESERVED,  KEY_RESERVED,
+-/* c8 */  KEY_RESERVED, KEY_RESERVED,  KEY_KPSLASH,   KEY_RESERVED,  KEY_RESERVED,  KEY_RESERVED, KEY_RESERVED,  KEY_RESERVED,
+-/* d0 */  KEY_RESERVED, KEY_RESERVED,  KEY_RESERVED,  KEY_RESERVED,  KEY_RESERVED,  KEY_RESERVED, KEY_RESERVED,  KEY_RESERVED,
+-/* d8 */  KEY_RESERVED, KEY_RESERVED,  KEY_KPENTER,   KEY_RESERVED,  KEY_RESERVED,  KEY_RESERVED, KEY_RESERVED,  KEY_RESERVED,
+-/* e0 */  KEY_RESERVED, KEY_RESERVED,  KEY_RESERVED,  KEY_RESERVED,  KEY_RESERVED,  KEY_RESERVED, KEY_RESERVED,  KEY_RESERVED,
+-/* e8 */  KEY_RESERVED, KEY_END,       KEY_RESERVED,  KEY_LEFT,      KEY_HOME,      KEY_RESERVED, KEY_RESERVED,  KEY_RESERVED,
+-/* f0 */  KEY_INSERT,   KEY_DELETE,    KEY_DOWN,      KEY_RESERVED,  KEY_RIGHT,     KEY_UP,       KEY_RESERVED,  KEY_PAUSE,
+-/* f8 */  KEY_RESERVED, KEY_RESERVED,  KEY_PAGEDOWN,  KEY_RESERVED,  KEY_SYSRQ,     KEY_PAGEUP,   KEY_RESERVED,  KEY_RESERVED,
+-
+-/* These are offset for escaped keycodes: */
+-
+-/* 00 */  KEY_RESERVED, KEY_RESERVED,  KEY_RESERVED,  KEY_F7,        KEY_RESERVED,  KEY_RESERVED, KEY_RESERVED,  KEY_RESERVED,
+-/* 08 */  KEY_RESERVED, KEY_RESERVED,  KEY_RESERVED,  KEY_LEFTMETA,  KEY_RIGHTMETA, KEY_RESERVED, KEY_RESERVED,  KEY_RESERVED,
+-/* 10 */  KEY_RESERVED, KEY_RIGHTALT,  KEY_RESERVED,  KEY_RESERVED,  KEY_RIGHTCTRL, KEY_RESERVED, KEY_RESERVED,  KEY_RESERVED,
+-/* 18 */  KEY_RESERVED, KEY_RESERVED,  KEY_RESERVED,  KEY_RESERVED,  KEY_RESERVED,  KEY_RESERVED, KEY_RESERVED,  KEY_RESERVED,
+-/* 20 */  KEY_RESERVED, KEY_RESERVED,  KEY_RESERVED,  KEY_RESERVED,  KEY_RESERVED,  KEY_RESERVED, KEY_RESERVED,  KEY_RESERVED,
+-/* 28 */  KEY_RESERVED, KEY_RESERVED,  KEY_RESERVED,  KEY_RESERVED,  KEY_RESERVED,  KEY_RESERVED, KEY_RESERVED,  KEY_RESERVED,
+-/* 30 */  KEY_RESERVED, KEY_RESERVED,  KEY_RESERVED,  KEY_RESERVED,  KEY_RESERVED,  KEY_RESERVED, KEY_RESERVED,  KEY_RESERVED,
+-/* 38 */  KEY_RESERVED, KEY_RESERVED,  KEY_RESERVED,  KEY_RESERVED,  KEY_RESERVED,  KEY_RESERVED, KEY_RESERVED,  KEY_RESERVED,
+-/* 40 */  KEY_RESERVED, KEY_RESERVED,  KEY_RESERVED,  KEY_RESERVED,  KEY_RESERVED,  KEY_RESERVED, KEY_RESERVED,  KEY_RESERVED,
+-/* 48 */  KEY_RESERVED, KEY_RESERVED,  KEY_RESERVED,  KEY_RESERVED,  KEY_RESERVED,  KEY_RESERVED, KEY_RESERVED,  KEY_RESERVED,
+-/* 50 */  KEY_RESERVED, KEY_RESERVED,  KEY_RESERVED,  KEY_RESERVED,  KEY_RESERVED,  KEY_RESERVED, KEY_RESERVED,  KEY_RESERVED,
+-/* 58 */  KEY_RESERVED, KEY_RESERVED,  KEY_RESERVED,  KEY_RESERVED,  KEY_RESERVED,  KEY_RESERVED, KEY_RESERVED,  KEY_RESERVED,
+-/* 60 */  KEY_RESERVED, KEY_RESERVED,  KEY_RESERVED,  KEY_RESERVED,  KEY_RESERVED,  KEY_RESERVED, KEY_RESERVED,  KEY_RESERVED,
+-/* 68 */  KEY_RESERVED, KEY_RESERVED,  KEY_RESERVED,  KEY_RESERVED,  KEY_RESERVED,  KEY_RESERVED, KEY_RESERVED,  KEY_RESERVED,
+-/* 70 */  KEY_RESERVED, KEY_RESERVED,  KEY_RESERVED,  KEY_RESERVED,  KEY_RESERVED,  KEY_RESERVED, KEY_RESERVED,  KEY_RESERVED,
+-/* 78 */  KEY_RESERVED, KEY_RESERVED,  KEY_RESERVED,  KEY_RESERVED,  KEY_RESERVED,  KEY_RESERVED, KEY_RESERVED,  KEY_RESERVED,
+-/* 80 */  KEY_RESERVED, KEY_RESERVED,  KEY_RESERVED,  KEY_RESERVED,  KEY_RESERVED,  KEY_RESERVED, KEY_RESERVED,  KEY_RESERVED,
+-/* 88 */  KEY_RESERVED, KEY_RESERVED,  KEY_RESERVED,  KEY_RESERVED,  KEY_RESERVED,  KEY_RESERVED, KEY_RESERVED,  KEY_RESERVED,
+-/* 90 */  KEY_RESERVED, KEY_RESERVED,  KEY_RESERVED,  KEY_RESERVED,  KEY_RESERVED,  KEY_RESERVED, KEY_RESERVED,  KEY_RESERVED,
+-/* 98 */  KEY_RESERVED, KEY_RESERVED,  KEY_RESERVED,  KEY_RESERVED,  KEY_RESERVED,  KEY_RESERVED, KEY_RESERVED,  KEY_RESERVED,
+-/* a0 */  KEY_RESERVED, KEY_RESERVED,  KEY_RESERVED,  KEY_RESERVED,  KEY_RESERVED,  KEY_RESERVED, KEY_RESERVED,  KEY_RESERVED,
+-/* a8 */  KEY_RESERVED, KEY_RESERVED,  KEY_RESERVED,  KEY_RESERVED,  KEY_RESERVED,  KEY_RESERVED, KEY_RESERVED,  KEY_RESERVED,
+-/* b0 */  KEY_RESERVED, KEY_RESERVED,  KEY_RESERVED,  KEY_RESERVED,  KEY_RESERVED,  KEY_RESERVED, KEY_RESERVED,  KEY_RESERVED,
+-/* b8 */  KEY_RESERVED, KEY_RESERVED,  KEY_RESERVED,  KEY_RESERVED,  KEY_RESERVED,  KEY_RESERVED, KEY_RESERVED,  KEY_RESERVED,
+-/* c0 */  KEY_RESERVED, KEY_RESERVED,  KEY_RESERVED,  KEY_RESERVED,  KEY_RESERVED,  KEY_RESERVED, KEY_RESERVED,  KEY_RESERVED,
+-/* c8 */  KEY_RESERVED, KEY_RESERVED,  KEY_RESERVED,  KEY_RESERVED,  KEY_RESERVED,  KEY_RESERVED, KEY_RESERVED,  KEY_RESERVED,
+-/* d0 */  KEY_RESERVED, KEY_RESERVED,  KEY_RESERVED,  KEY_RESERVED,  KEY_RESERVED,  KEY_RESERVED, KEY_RESERVED,  KEY_RESERVED,
+-/* d8 */  KEY_RESERVED, KEY_RESERVED,  KEY_RESERVED,  KEY_RESERVED,  KEY_RESERVED,  KEY_RESERVED, KEY_RESERVED,  KEY_RESERVED,
+-/* e0 */  KEY_RESERVED, KEY_RESERVED,  KEY_RESERVED,  KEY_RESERVED,  KEY_RESERVED,  KEY_RESERVED, KEY_RESERVED,  KEY_RESERVED,
+-/* e8 */  KEY_RESERVED, KEY_RESERVED,  KEY_RESERVED,  KEY_RESERVED,  KEY_RESERVED,  KEY_RESERVED, KEY_RESERVED,  KEY_RESERVED,
+-/* f0 */  KEY_RESERVED, KEY_RESERVED,  KEY_RESERVED,  KEY_RESERVED,  KEY_RESERVED,  KEY_RESERVED, KEY_RESERVED,  KEY_RESERVED,
+-/* f8 */  KEY_RESERVED, KEY_RESERVED,  KEY_RESERVED,  KEY_RESERVED,  KEY_RESERVED,  KEY_RESERVED, KEY_RESERVED,  KEY_RESERVED
+-
+-#undef CONFLICT
+-#undef C_07
+-#undef C_11
+-#undef C_14
+-#undef C_58
+-#undef C_61
+-
+diff --git a/drivers/input/keyboard/matrix_keypad.c b/drivers/input/keyboard/matrix_keypad.c
+--- a/drivers/input/keyboard/matrix_keypad.c
++++ b/drivers/input/keyboard/matrix_keypad.c
+@@ -16,7 +16,6 @@
+ #include <linux/interrupt.h>
+ #include <linux/jiffies.h>
+ #include <linux/module.h>
+-#include <linux/gpio.h>
+ #include <linux/input/matrix_keypad.h>
+ #include <linux/slab.h>
+ #include <linux/of.h>
+diff --git a/drivers/input/keyboard/pmic8xxx-keypad.c b/drivers/input/keyboard/pmic8xxx-keypad.c
+--- a/drivers/input/keyboard/pmic8xxx-keypad.c
++++ b/drivers/input/keyboard/pmic8xxx-keypad.c
+@@ -462,15 +462,9 @@ static int pmic8xxx_kp_enable(struct pmic8xxx_kp *kp)
+ 
+ static int pmic8xxx_kp_disable(struct pmic8xxx_kp *kp)
+ {
+-	int rc;
+-
+ 	kp->ctrl_reg &= ~KEYP_CTRL_KEYP_EN;
+ 
+-	rc = regmap_write(kp->regmap, KEYP_CTRL, kp->ctrl_reg);
+-	if (rc < 0)
+-		return rc;
+-
+-	return rc;
++	return regmap_write(kp->regmap, KEYP_CTRL, kp->ctrl_reg);
+ }
+ 
+ static int pmic8xxx_kp_open(struct input_dev *dev)
+diff --git a/drivers/input/keyboard/samsung-keypad.c b/drivers/input/keyboard/samsung-keypad.c
+--- a/drivers/input/keyboard/samsung-keypad.c
++++ b/drivers/input/keyboard/samsung-keypad.c
+@@ -142,7 +142,7 @@ static irqreturn_t samsung_keypad_irq(int irq, void *dev_id)
+ 	unsigned int row_state[SAMSUNG_MAX_COLS];
+ 	bool key_down;
+ 
+-	pm_runtime_get_sync(&keypad->pdev->dev);
++	guard(pm_runtime_active)(&keypad->pdev->dev);
+ 
+ 	do {
+ 		readl(keypad->base + SAMSUNG_KEYIFSTSCLR);
+@@ -158,8 +158,6 @@ static irqreturn_t samsung_keypad_irq(int irq, void *dev_id)
+ 
+ 	} while (key_down && !keypad->stopped);
+ 
+-	pm_runtime_put(&keypad->pdev->dev);
+-
+ 	return IRQ_HANDLED;
+ }
+ 
+@@ -167,7 +165,7 @@ static void samsung_keypad_start(struct samsung_keypad *keypad)
+ {
+ 	unsigned int val;
+ 
+-	pm_runtime_get_sync(&keypad->pdev->dev);
++	guard(pm_runtime_active)(&keypad->pdev->dev);
+ 
+ 	/* Tell IRQ thread that it may poll the device. */
+ 	keypad->stopped = false;
+@@ -182,14 +180,14 @@ static void samsung_keypad_start(struct samsung_keypad *keypad)
+ 	/* KEYIFCOL reg clear. */
+ 	writel(0, keypad->base + SAMSUNG_KEYIFCOL);
+ 
+-	pm_runtime_put(&keypad->pdev->dev);
++	enable_irq(keypad->irq);
+ }
+ 
+ static void samsung_keypad_stop(struct samsung_keypad *keypad)
+ {
+ 	unsigned int val;
+ 
+-	pm_runtime_get_sync(&keypad->pdev->dev);
++	guard(pm_runtime_active)(&keypad->pdev->dev);
+ 
+ 	/* Signal IRQ thread to stop polling and disable the handler. */
+ 	keypad->stopped = true;
+@@ -205,14 +203,6 @@ static void samsung_keypad_stop(struct samsung_keypad *keypad)
+ 	writel(val, keypad->base + SAMSUNG_KEYIFCON);
+ 
+ 	clk_disable(keypad->clk);
+-
+-	/*
+-	 * Now that chip should not generate interrupts we can safely
+-	 * re-enable the handler.
+-	 */
+-	enable_irq(keypad->irq);
+-
+-	pm_runtime_put(&keypad->pdev->dev);
+ }
+ 
+ static int samsung_keypad_open(struct input_dev *input_dev)
+@@ -412,7 +402,8 @@ static int samsung_keypad_probe(struct platform_device *pdev)
+ 	}
+ 
+ 	error = devm_request_threaded_irq(&pdev->dev, keypad->irq, NULL,
+-					  samsung_keypad_irq, IRQF_ONESHOT,
++					  samsung_keypad_irq,
++					  IRQF_ONESHOT | IRQF_NO_AUTOEN,
+ 					  dev_name(&pdev->dev), keypad);
+ 	if (error) {
+ 		dev_err(&pdev->dev, "failed to register keypad interrupt\n");
+@@ -492,15 +483,17 @@ static void samsung_keypad_toggle_wakeup(struct samsung_keypad *keypad,
+ 
+ 	val = readl(keypad->base + SAMSUNG_KEYIFCON);
+ 	if (enable) {
++		enable_irq_wake(keypad->irq);
+ 		val |= SAMSUNG_KEYIFCON_WAKEUPEN;
+-		if (device_may_wakeup(&keypad->pdev->dev))
+-			enable_irq_wake(keypad->irq);
++		writel(val, keypad->base + SAMSUNG_KEYIFCON);
+ 	} else {
+ 		val &= ~SAMSUNG_KEYIFCON_WAKEUPEN;
+-		if (device_may_wakeup(&keypad->pdev->dev))
+-			disable_irq_wake(keypad->irq);
++		writel(val, keypad->base + SAMSUNG_KEYIFCON);
++		disable_irq_wake(keypad->irq);
++
++		if (!input_device_enabled(keypad->input_dev))
++			writel(~0x0, keypad->base + SAMSUNG_KEYIFSTSCLR);
+ 	}
+-	writel(val, keypad->base + SAMSUNG_KEYIFCON);
+ 
+ 	clk_disable(keypad->clk);
+ }
+@@ -516,7 +509,8 @@ static int samsung_keypad_suspend(struct device *dev)
+ 	if (input_device_enabled(input_dev))
+ 		samsung_keypad_stop(keypad);
+ 
+-	samsung_keypad_toggle_wakeup(keypad, true);
++	if (device_may_wakeup(dev))
++		samsung_keypad_toggle_wakeup(keypad, true);
+ 
+ 	return 0;
+ }
+@@ -529,7 +523,8 @@ static int samsung_keypad_resume(struct device *dev)
+ 
+ 	guard(mutex)(&input_dev->mutex);
+ 
+-	samsung_keypad_toggle_wakeup(keypad, false);
++	if (device_may_wakeup(dev))
++		samsung_keypad_toggle_wakeup(keypad, false);
+ 
+ 	if (input_device_enabled(input_dev))
+ 		samsung_keypad_start(keypad);
+diff --git a/drivers/input/keyboard/snvs_pwrkey.c b/drivers/input/keyboard/snvs_pwrkey.c
+--- a/drivers/input/keyboard/snvs_pwrkey.c
++++ b/drivers/input/keyboard/snvs_pwrkey.c
+@@ -39,6 +39,9 @@ struct pwrkey_drv_data {
+ 	int keycode;
+ 	int keystate;  /* 1:pressed */
+ 	int wakeup;
++	bool suspended;     /* Track suspend state */
++	bool pending_press; /* Key pressed during suspend, report from timer callback */
++	spinlock_t lock;    /* Protects keystate, suspended and pending_press */
+ 	struct timer_list check_timer;
+ 	struct input_dev *input;
+ 	u8 minor_rev;
+@@ -49,14 +52,38 @@ static void imx_imx_snvs_check_for_events(struct timer_list *t)
+ 	struct pwrkey_drv_data *pdata = timer_container_of(pdata, t,
+ 							   check_timer);
+ 	struct input_dev *input = pdata->input;
++	bool state_changed = false;
++	bool pending_press;
+ 	u32 state;
+ 
+ 	regmap_read(pdata->snvs, SNVS_HPSR_REG, &state);
+ 	state = state & SNVS_HPSR_BTN ? 1 : 0;
+ 
+-	/* only report new event if status changed */
+-	if (state ^ pdata->keystate) {
+-		pdata->keystate = state;
++	scoped_guard(spinlock_irqsave, &pdata->lock) {
++		pending_press = pdata->pending_press;
++		if (pending_press) {
++			pdata->pending_press = false;
++			pdata->keystate = 1;
++		}
++		/* only report new event if status changed */
++		if (state ^ pdata->keystate) {
++			pdata->keystate = state;
++			state_changed = true;
++		}
++	}
++
++	/*
++	 * Report a press event latched during suspend. If the key is still
++	 * held, state_changed will be 0 (keystate already set to 1 above),
++	 * so no duplicate press is reported. If already released,
++	 * state_changed will fire next to report the release.
++	 */
++	if (pending_press) {
++		input_report_key(input, pdata->keycode, 1);
++		input_sync(input);
++	}
++
++	if (state_changed) {
+ 		input_event(input, EV_KEY, pdata->keycode, state);
+ 		input_sync(input);
+ 		pm_relax(pdata->input->dev.parent);
+@@ -92,8 +119,17 @@ static irqreturn_t imx_snvs_pwrkey_interrupt(int irq, void *dev_id)
+ 			input_sync(input);
+ 			pm_relax(input->dev.parent);
+ 		} else {
++			/*
++			 * If the key is pressed during suspend, latch it so
++			 * the timer callback can report the press event in
++			 * softirq context, avoiding out-of-order events.
++			 */
++			scoped_guard(spinlock_irqsave, &pdata->lock) {
++				if (pdata->suspended)
++					pdata->pending_press = true;
++			}
+ 			mod_timer(&pdata->check_timer,
+-			          jiffies + msecs_to_jiffies(DEBOUNCE_TIME));
++				  jiffies + msecs_to_jiffies(DEBOUNCE_TIME));
+ 		}
+ 	}
+ 
+@@ -112,6 +148,7 @@ static void imx_snvs_pwrkey_act(void *pdata)
+ 
+ static int imx_snvs_pwrkey_probe(struct platform_device *pdev)
+ {
++	struct device *dev = &pdev->dev;
+ 	struct pwrkey_drv_data *pdata;
+ 	struct input_dev *input;
+ 	struct device_node *np;
+@@ -122,37 +159,35 @@ static int imx_snvs_pwrkey_probe(struct platform_device *pdev)
+ 	u32 vid;
+ 
+ 	/* Get SNVS register Page */
+-	np = pdev->dev.of_node;
++	np = dev->of_node;
+ 	if (!np)
+-		return -ENODEV;
++		return dev_err_probe(dev, -ENODEV, "Device tree node not found\n");
+ 
+-	pdata = devm_kzalloc(&pdev->dev, sizeof(*pdata), GFP_KERNEL);
++	pdata = devm_kzalloc(dev, sizeof(*pdata), GFP_KERNEL);
+ 	if (!pdata)
+ 		return -ENOMEM;
+ 
+ 	pdata->snvs = syscon_regmap_lookup_by_phandle(np, "regmap");
+-	if (IS_ERR(pdata->snvs)) {
+-		dev_err(&pdev->dev, "Can't get snvs syscon\n");
+-		return PTR_ERR(pdata->snvs);
+-	}
++	if (IS_ERR(pdata->snvs))
++		return dev_err_probe(dev, PTR_ERR(pdata->snvs), "Can't get snvs syscon\n");
+ 
+ 	if (of_property_read_u32(np, "linux,keycode", &pdata->keycode)) {
+ 		pdata->keycode = KEY_POWER;
+-		dev_warn(&pdev->dev, "KEY_POWER without setting in dts\n");
++		dev_warn(dev, "KEY_POWER without setting in dts\n");
+ 	}
+ 
+-	clk = devm_clk_get_optional_enabled(&pdev->dev, NULL);
+-	if (IS_ERR(clk)) {
+-		dev_err(&pdev->dev, "Failed to get snvs clock (%pe)\n", clk);
+-		return PTR_ERR(clk);
+-	}
++	clk = devm_clk_get_optional_enabled(dev, NULL);
++	if (IS_ERR(clk))
++		return dev_err_probe(dev, PTR_ERR(clk),
++				     "Failed to get snvs clock (%pe)\n", clk);
+ 
+ 	pdata->wakeup = of_property_read_bool(np, "wakeup-source");
+ 
+ 	pdata->irq = platform_get_irq(pdev, 0);
+ 	if (pdata->irq < 0)
+-		return -EINVAL;
++		return pdata->irq;
+ 
++	spin_lock_init(&pdata->lock);
+ 	error = of_property_read_u32(np, "power-off-time-sec", &val);
+ 	if (!error) {
+ 		switch (val) {
+@@ -165,9 +200,8 @@ static int imx_snvs_pwrkey_probe(struct platform_device *pdev)
+ 			bpt = (val / 5) - 1;
+ 			break;
+ 		default:
+-			dev_err(&pdev->dev,
+-				"power-off-time-sec %d out of range\n", val);
+-			return -EINVAL;
++			return dev_err_probe(dev, -EINVAL,
++					     "power-off-time-sec %d out of range\n", val);
+ 		}
+ 
+ 		regmap_update_bits(pdata->snvs, SNVS_LPCR_REG, SNVS_LPCR_BPT_MASK,
+@@ -184,11 +218,9 @@ static int imx_snvs_pwrkey_probe(struct platform_device *pdev)
+ 
+ 	timer_setup(&pdata->check_timer, imx_imx_snvs_check_for_events, 0);
+ 
+-	input = devm_input_allocate_device(&pdev->dev);
+-	if (!input) {
+-		dev_err(&pdev->dev, "failed to allocate the input device\n");
+-		return -ENOMEM;
+-	}
++	input = devm_input_allocate_device(dev);
++	if (!input)
++		return dev_err_probe(dev, -ENOMEM, "failed to allocate the input device\n");
+ 
+ 	input->name = pdev->name;
+ 	input->phys = "snvs-pwrkey/input0";
+@@ -197,37 +229,57 @@ static int imx_snvs_pwrkey_probe(struct platform_device *pdev)
+ 	input_set_capability(input, EV_KEY, pdata->keycode);
+ 
+ 	/* input customer action to cancel release timer */
+-	error = devm_add_action(&pdev->dev, imx_snvs_pwrkey_act, pdata);
+-	if (error) {
+-		dev_err(&pdev->dev, "failed to register remove action\n");
+-		return error;
+-	}
++	error = devm_add_action(dev, imx_snvs_pwrkey_act, pdata);
++	if (error)
++		return dev_err_probe(dev, error, "failed to register remove action\n");
+ 
+ 	pdata->input = input;
+ 	platform_set_drvdata(pdev, pdata);
+ 
+-	error = devm_request_irq(&pdev->dev, pdata->irq,
+-			       imx_snvs_pwrkey_interrupt,
+-			       0, pdev->name, pdev);
+-	if (error) {
+-		dev_err(&pdev->dev, "interrupt not available.\n");
+-		return error;
+-	}
++	error = devm_request_irq(dev, pdata->irq,
++				 imx_snvs_pwrkey_interrupt,
++				 0, pdev->name, pdev);
++	if (error)
++		return dev_err_probe(dev, error, "interrupt not available.\n");
+ 
+ 	error = input_register_device(input);
+-	if (error < 0) {
+-		dev_err(&pdev->dev, "failed to register input device\n");
+-		return error;
+-	}
++	if (error < 0)
++		return dev_err_probe(dev, error, "failed to register input device\n");
+ 
+-	device_init_wakeup(&pdev->dev, pdata->wakeup);
+-	error = dev_pm_set_wake_irq(&pdev->dev, pdata->irq);
++	device_init_wakeup(dev, pdata->wakeup);
++	error = dev_pm_set_wake_irq(dev, pdata->irq);
+ 	if (error)
+-		dev_err(&pdev->dev, "irq wake enable failed.\n");
++		dev_err(dev, "irq wake enable failed.\n");
+ 
+ 	return 0;
+ }
+ 
++static int imx_snvs_pwrkey_suspend(struct device *dev)
++{
++	struct platform_device *pdev = to_platform_device(dev);
++	struct pwrkey_drv_data *pdata = platform_get_drvdata(pdev);
++
++	guard(spinlock_irq)(&pdata->lock);
++	pdata->suspended = true;
++
++	return 0;
++}
++
++static int imx_snvs_pwrkey_resume(struct device *dev)
++{
++	struct platform_device *pdev = to_platform_device(dev);
++	struct pwrkey_drv_data *pdata = platform_get_drvdata(pdev);
++
++	guard(spinlock_irq)(&pdata->lock);
++	pdata->suspended = false;
++
++	return 0;
++}
++
++static DEFINE_SIMPLE_DEV_PM_OPS(imx_snvs_pwrkey_pm_ops,
++				imx_snvs_pwrkey_suspend,
++				imx_snvs_pwrkey_resume);
++
+ static const struct of_device_id imx_snvs_pwrkey_ids[] = {
+ 	{ .compatible = "fsl,sec-v4.0-pwrkey" },
+ 	{ /* sentinel */ }
+@@ -238,6 +290,7 @@ static struct platform_driver imx_snvs_pwrkey_driver = {
+ 	.driver = {
+ 		.name = "snvs_pwrkey",
+ 		.of_match_table = imx_snvs_pwrkey_ids,
++		.pm = pm_ptr(&imx_snvs_pwrkey_pm_ops),
+ 	},
+ 	.probe = imx_snvs_pwrkey_probe,
+ };
+diff --git a/drivers/input/keyboard/tca8418_keypad.c b/drivers/input/keyboard/tca8418_keypad.c
+--- a/drivers/input/keyboard/tca8418_keypad.c
++++ b/drivers/input/keyboard/tca8418_keypad.c
+@@ -254,7 +254,8 @@ static int tca8418_configure(struct tca8418_keypad *keypad_data,
+ 		return error;
+ 
+ 	error = tca8418_write_byte(keypad_data, REG_CFG,
+-				CFG_INT_CFG | CFG_OVR_FLOW_IEN | CFG_KE_IEN);
++				   CFG_INT_CFG | CFG_OVR_FLOW_IEN |
++					CFG_OVR_FLOW_M | CFG_KE_IEN);
+ 
+ 	return error;
+ }
+diff --git a/drivers/input/misc/Kconfig b/drivers/input/misc/Kconfig
+--- a/drivers/input/misc/Kconfig
++++ b/drivers/input/misc/Kconfig
+@@ -842,6 +842,18 @@ config INPUT_IQS7222
+ 	  To compile this driver as a module, choose M here: the
+ 	  module will be called iqs7222.
+ 
++config INPUT_ISA1200_HAPTIC
++	tristate "Imagis ISA1200 haptic feedback unit"
++	depends on I2C
++	select INPUT_FF_MEMLESS
++	select REGMAP_I2C
++	help
++	  Say Y to enable support for the Imagis ISA1200 haptic
++	  feedback unit.
++
++	  To compile this driver as a module, choose M here: the
++	  module will be called isa1200.
++
+ config INPUT_CMA3000
+ 	tristate "VTI CMA3000 Tri-axis accelerometer"
+ 	help
+diff --git a/drivers/input/misc/Makefile b/drivers/input/misc/Makefile
+--- a/drivers/input/misc/Makefile
++++ b/drivers/input/misc/Makefile
+@@ -49,6 +49,7 @@ obj-$(CONFIG_INPUT_IMS_PCU)		+= ims-pcu.o
+ obj-$(CONFIG_INPUT_IQS269A)		+= iqs269a.o
+ obj-$(CONFIG_INPUT_IQS626A)		+= iqs626a.o
+ obj-$(CONFIG_INPUT_IQS7222)		+= iqs7222.o
++obj-$(CONFIG_INPUT_ISA1200_HAPTIC)	+= isa1200.o
+ obj-$(CONFIG_INPUT_KEYSPAN_REMOTE)	+= keyspan_remote.o
+ obj-$(CONFIG_INPUT_KXTJ9)		+= kxtj9.o
+ obj-$(CONFIG_INPUT_M68K_BEEP)		+= m68kspkr.o
+diff --git a/drivers/input/misc/ims-pcu.c b/drivers/input/misc/ims-pcu.c
+--- a/drivers/input/misc/ims-pcu.c
++++ b/drivers/input/misc/ims-pcu.c
+@@ -2234,6 +2234,7 @@ static const struct usb_device_id ims_pcu_id_table[] = {
+ 	},
+ 	{ }
+ };
++MODULE_DEVICE_TABLE(usb, ims_pcu_id_table);
+ 
+ static const struct attribute_group *ims_pcu_sysfs_groups[] = {
+ 	&ims_pcu_attr_group,
+diff --git a/drivers/input/misc/isa1200.c b/drivers/input/misc/isa1200.c
+new file mode 100644
+--- /dev/null
++++ b/drivers/input/misc/isa1200.c
+@@ -0,0 +1,533 @@
++// SPDX-License-Identifier: GPL-2.0+
++
++#include <linux/array_size.h>
++#include <linux/bitmap.h>
++#include <linux/bits.h>
++#include <linux/clk.h>
++#include <linux/delay.h>
++#include <linux/device.h>
++#include <linux/devm-helpers.h>
++#include <linux/err.h>
++#include <linux/gpio/consumer.h>
++#include <linux/i2c.h>
++#include <linux/input.h>
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/property.h>
++#include <linux/pwm.h>
++#include <linux/regmap.h>
++#include <linux/regulator/consumer.h>
++#include <linux/units.h>
++
++/*
++ * System control (LDO regulator)
++ *
++ * LDO voltage to register mapping is linear, but it is split in two parts:
++ * 2.3V - 3.0V map to 0x08 - 0x0f; 3.1V - 3.8V map to 0x00 - 0x7
++ */
++
++#define ISA1200_SCTRL			0x00
++#define ISA1200_LDO_VOLTAGE_BASE	0x08
++#define ISA1200_LDO_VOLTAGE_STEP	100000
++#define ISA1200_LDO_VOLTAGE_2V3		23
++#define ISA1200_LDO_VOLTAGE_3V1		31
++#define ISA1200_LDO_VOLTAGE_MIN		2300000
++#define ISA1200_LDO_VOLTAGE_MAX		3800000
++
++/*
++ * The output frequency is calculated with this formula:
++ *
++ *                 base clock frequency
++ * fout = -----------------------------------------
++ *        (128 - PWM_FREQ) * 2 * PLLDIV * PWM_PERIOD
++ *
++ * The base clock frequency is the clock frequency provided on the
++ * clock input to the chip, divided by the value in HCTRL0
++ *
++ * PWM_FREQ is configured in register HCTRL4, it is common to set this
++ * to 0 to get only two variables to calculate.
++ *
++ * PLLDIV is configured in register HCTRL3 (bits 7..4, so 0..15)
++ * PWM_PERIOD is configured in register HCTRL6
++ * Further the duty cycle can be configured in HCTRL5
++ */
++
++/*
++ * HCTRL0 configures clock or PWM input and selects the divider for
++ * the clock input.
++ */
++#define ISA1200_HCTRL0			0x30
++#define ISA1200_HCTRL0_HAP_ENABLE	BIT(7)
++#define ISA1200_HCTRL0_PWM_GEN_MODE	BIT(4)
++#define ISA1200_HCTRL0_PWM_INPUT_MODE	BIT(3)
++#define ISA1200_HCTRL0_CLKDIV_128	128
++
++/*
++ * HCTRL1 configures the motor type and clock sourse
++ */
++#define ISA1200_HCTRL1			0x31
++#define ISA1200_HCTRL1_EXT_CLOCK	BIT(7)
++#define ISA1200_HCTRL1_DAC_INVERT	BIT(6)
++#define ISA1200_HCTRL1_MODE(n)		(((n) & 1) << 5)
++
++/* HCTRL2 controls software reset of the chip */
++#define ISA1200_HCTRL2			0x32
++#define ISA1200_HCTRL2_SW_RESET		BIT(0)
++
++/*
++ * HCTRL3 controls the PLL divisor
++ *
++ * Bits [0,1] are always set to 1 (we don't know what they are
++ * used for) and bit 4 and upward control the PLL divisor.
++ */
++#define ISA1200_HCTRL3			0x33
++#define ISA1200_HCTRL3_DEFAULT		0x03
++#define ISA1200_HCTRL3_PLLDIV(n)	(((n) & 0xf) << 4)
++
++/* HCTRL4 controls the PWM frequency of external channel */
++#define ISA1200_HCTRL4			0x34
++
++/* HCTRL5 controls the PWM high duty cycle of internal channel */
++#define ISA1200_HCTRL5			0x35
++
++/* HCTRL6 controls the PWM period of internal channel */
++#define ISA1200_HCTRL6			0x36
++#define ISA1200_HCTRL6_PERIOD_SCALE	100
++
++/* The use for these registers is unknown but they exist */
++#define ISA1200_HCTRL7			0x37
++#define ISA1200_HCTRL8			0x38
++#define ISA1200_HCTRL9			0x39
++#define ISA1200_HCTRLA			0x3a
++#define ISA1200_HCTRLB			0x3b
++#define ISA1200_HCTRLC			0x3c
++#define ISA1200_HCTRLD			0x3d
++
++#define ISA1200_EN_PINS_MAX		2
++
++static const struct regulator_bulk_data isa1200_supplies[] = {
++	{ .supply = "vdd" }, { .supply = "vddp" },
++};
++
++struct isa1200_config {
++	u32 ldo_voltage;
++	u32 mode;
++	u32 clkdiv;
++	u32 plldiv;
++	u32 freq;
++	u32 period;
++	u32 duty;
++};
++
++struct isa1200 {
++	struct input_dev *input;
++	struct regmap *map;
++
++	struct clk *clk;
++	struct pwm_device *pwm;
++	struct gpio_descs *enable_gpios;
++	struct regulator_bulk_data *supplies;
++
++	struct work_struct play_work;
++	struct isa1200_config config;
++
++	int level;
++	bool suspended;
++	bool active;
++};
++
++static const struct regmap_config isa1200_regmap_config = {
++	.reg_bits = 8,
++	.val_bits = 8,
++	.max_register = ISA1200_HCTRLD,
++};
++
++static void isa1200_start(struct isa1200 *isa)
++{
++	struct isa1200_config *config = &isa->config;
++	struct device *dev = &isa->input->dev;
++	struct pwm_state state;
++	u8 hctrl0 = 0, hctrl1 = 0;
++	DECLARE_BITMAP(values, ISA1200_EN_PINS_MAX);
++	int err;
++
++	if (!isa->active) {
++		err = regulator_bulk_enable(ARRAY_SIZE(isa1200_supplies),
++					    isa->supplies);
++		if (err) {
++			dev_err(dev, "failed to enable supplies (%d)\n", err);
++			return;
++		}
++
++		err = clk_prepare_enable(isa->clk);
++		if (err) {
++			dev_err(dev, "failed to enable clock (%d)\n", err);
++			regulator_bulk_disable(ARRAY_SIZE(isa1200_supplies),
++					       isa->supplies);
++			return;
++		}
++
++		bitmap_fill(values, ISA1200_EN_PINS_MAX);
++		gpiod_multi_set_value_cansleep(isa->enable_gpios, values);
++
++		usleep_range(200, 300);
++	}
++
++	regmap_write(isa->map, ISA1200_SCTRL, config->ldo_voltage);
++
++	if (isa->clk) {
++		hctrl0 = ISA1200_HCTRL0_PWM_GEN_MODE;
++		hctrl1 = ISA1200_HCTRL1_EXT_CLOCK;
++	}
++
++	if (isa->pwm) {
++		hctrl0 = ISA1200_HCTRL0_PWM_INPUT_MODE;
++		hctrl1 = 0;
++	}
++
++	hctrl0 |= __ffs(config->clkdiv / ISA1200_HCTRL0_CLKDIV_128);
++	hctrl1 |= ISA1200_HCTRL1_DAC_INVERT;
++	hctrl1 |= ISA1200_HCTRL1_MODE(config->mode);
++
++	regmap_write(isa->map, ISA1200_HCTRL0, hctrl0);
++	regmap_write(isa->map, ISA1200_HCTRL1, hctrl1);
++
++	/* Make sure to de-assert software reset */
++	regmap_write(isa->map, ISA1200_HCTRL2, 0x00);
++
++	/* PLL divisor */
++	regmap_write(isa->map, ISA1200_HCTRL3,
++		     ISA1200_HCTRL3_PLLDIV(config->plldiv) |
++		     ISA1200_HCTRL3_DEFAULT);
++
++	/* Frequency */
++	regmap_write(isa->map, ISA1200_HCTRL4, config->freq);
++	/* Duty cycle */
++	regmap_write(isa->map, ISA1200_HCTRL5, config->period >> 1);
++	/* Period */
++	regmap_write(isa->map, ISA1200_HCTRL6, config->period);
++
++	hctrl0 |= ISA1200_HCTRL0_HAP_ENABLE;
++	regmap_write(isa->map, ISA1200_HCTRL0, hctrl0);
++
++	if (isa->clk)
++		regmap_write(isa->map, ISA1200_HCTRL5, config->duty);
++
++	if (isa->pwm) {
++		pwm_get_state(isa->pwm, &state);
++		state.duty_cycle = config->duty;
++		state.enabled = true;
++		pwm_apply_might_sleep(isa->pwm, &state);
++	}
++
++	isa->active = true;
++}
++
++static void isa1200_stop(struct isa1200 *isa)
++{
++	struct pwm_state state;
++	DECLARE_BITMAP(values, ISA1200_EN_PINS_MAX);
++
++	if (!isa->active)
++		return;
++
++	if (isa->pwm) {
++		pwm_get_state(isa->pwm, &state);
++		state.duty_cycle = 0;
++		state.enabled = false;
++		pwm_apply_might_sleep(isa->pwm, &state);
++	}
++
++	regmap_write(isa->map, ISA1200_HCTRL0, 0x00);
++
++	bitmap_zero(values, ISA1200_EN_PINS_MAX);
++	gpiod_multi_set_value_cansleep(isa->enable_gpios, values);
++
++	clk_disable_unprepare(isa->clk);
++	regulator_bulk_disable(ARRAY_SIZE(isa1200_supplies),
++			       isa->supplies);
++
++	isa->active = false;
++}
++
++static void isa1200_play_work(struct work_struct *work)
++{
++	struct isa1200 *isa = container_of(work, struct isa1200, play_work);
++
++	if (!READ_ONCE(isa->suspended)) {
++		if (isa->level)
++			isa1200_start(isa);
++		else
++			isa1200_stop(isa);
++	}
++}
++
++static int isa1200_vibrator_play_effect(struct input_dev *input, void *data,
++					struct ff_effect *effect)
++{
++	struct isa1200 *isa = input_get_drvdata(input);
++	int level;
++
++	/*
++	 * TODO: we currently only support rumble.
++	 * The ISA1200 can control two motors and some devices
++	 * also have two motors mounted.
++	 */
++	level = effect->u.rumble.strong_magnitude;
++	if (!level)
++		level = effect->u.rumble.weak_magnitude;
++
++	dev_dbg(&input->dev, "FF effect type %d level %d\n",
++		effect->type, level);
++
++	if (isa->level != level) {
++		isa->level = level;
++		if (!READ_ONCE(isa->suspended))
++			schedule_work(&isa->play_work);
++	}
++
++	return 0;
++}
++
++static void isa1200_vibrator_close(struct input_dev *input)
++{
++	struct isa1200 *isa = input_get_drvdata(input);
++
++	cancel_work_sync(&isa->play_work);
++	isa1200_stop(isa);
++	isa->level = 0;
++}
++
++static int isa1200_of_probe(struct i2c_client *client)
++{
++	struct isa1200 *isa = i2c_get_clientdata(client);
++	struct isa1200_config *config = &isa->config;
++	struct device *dev = &client->dev;
++	struct fwnode_handle *ldo_node;
++	int err;
++
++	isa->clk = devm_clk_get_optional(dev, NULL);
++	if (IS_ERR(isa->clk))
++		return dev_err_probe(dev, PTR_ERR(isa->clk),
++				     "failed to get clock\n");
++
++	isa->pwm = devm_pwm_get(dev, NULL);
++	if (IS_ERR(isa->pwm)) {
++		err = PTR_ERR(isa->pwm);
++		if (err == -ENODEV || err == -EINVAL)
++			isa->pwm = NULL;
++		else
++			return dev_err_probe(dev, err, "getting PWM\n");
++	}
++
++	if (!isa->clk && !isa->pwm)
++		return dev_err_probe(dev, -EINVAL,
++				     "clock or PWM are required, none were provided\n");
++
++	err = devm_regulator_bulk_get_const(dev, ARRAY_SIZE(isa1200_supplies),
++					    isa1200_supplies, &isa->supplies);
++	if (err)
++		return dev_err_probe(dev, err, "failed to get supplies\n");
++
++	isa->enable_gpios = devm_gpiod_get_array_optional(dev, "control",
++							  GPIOD_OUT_LOW);
++	if (IS_ERR(isa->enable_gpios))
++		return dev_err_probe(dev, PTR_ERR(isa->enable_gpios),
++				     "failed to get enable gpios\n");
++
++	if (isa->enable_gpios && isa->enable_gpios->ndescs > ISA1200_EN_PINS_MAX)
++		return dev_err_probe(dev, -EINVAL, "too many enable gpios\n");
++
++	ldo_node = device_get_named_child_node(dev, "ldo");
++	if (!ldo_node)
++		return dev_err_probe(dev, -ENODEV,
++				     "failed to get embedded LDO node\n");
++
++	err = fwnode_property_read_u32(ldo_node, "regulator-min-microvolt",
++				       &config->ldo_voltage);
++	fwnode_handle_put(ldo_node);
++	if (err)
++		return dev_err_probe(dev, err,
++				     "failed to get ldo voltage\n");
++
++	config->ldo_voltage = clamp(config->ldo_voltage,
++				    ISA1200_LDO_VOLTAGE_MIN,
++				    ISA1200_LDO_VOLTAGE_MAX);
++
++	config->ldo_voltage /= ISA1200_LDO_VOLTAGE_STEP;
++	if (config->ldo_voltage < ISA1200_LDO_VOLTAGE_3V1)
++		config->ldo_voltage = config->ldo_voltage -
++				      ISA1200_LDO_VOLTAGE_2V3 +
++				      ISA1200_LDO_VOLTAGE_BASE;
++	else
++		config->ldo_voltage -= ISA1200_LDO_VOLTAGE_3V1;
++
++	config->mode = 0; /* LRA_MODE */
++	device_property_read_u32(dev, "imagis,mode", &config->mode);
++
++	config->clkdiv = ISA1200_HCTRL0_CLKDIV_128;
++	device_property_read_u32(dev, "imagis,clk-div", &config->clkdiv);
++	if (!config->clkdiv)
++		return dev_err_probe(dev, -EINVAL, "clk-div cannot be zero\n");
++
++	config->clkdiv = clamp(config->clkdiv, ISA1200_HCTRL0_CLKDIV_128,
++			       ISA1200_HCTRL0_CLKDIV_128 << 3);
++
++	err = device_property_read_u32(dev, "imagis,pll-div", &config->plldiv);
++	if (err || !config->plldiv)
++		config->plldiv = 1;
++
++	config->period = 0;
++	config->freq = 0;
++	config->duty = 0;
++
++	if (isa->clk) {
++		err = device_property_read_u32(dev, "imagis,period-ns",
++					       &config->period);
++		if (err)
++			return dev_err_probe(dev, err,
++					     "failed to get period\n");
++
++		/*
++		 * TODO: The scale value is arbitrary, but it fits observations
++		 * quite well, and the exact conversion method is unknown.
++		 * The period property value returned above is the HCTRL6
++		 * register value set by the vendor code, multiplied by 100.
++		 */
++		config->period /= ISA1200_HCTRL6_PERIOD_SCALE;
++		config->duty = config->period >> 1;
++	}
++
++	if (isa->pwm) {
++		struct pwm_state state;
++
++		pwm_init_state(isa->pwm, &state);
++
++		if (!state.period)
++			return dev_err_probe(dev, -EINVAL,
++					     "PWM period cannot be zero\n");
++
++		config->freq = div64_u64(NANO, state.period * config->clkdiv);
++		config->duty = state.period >> 1;
++
++		err = pwm_apply_might_sleep(isa->pwm, &state);
++		if (err)
++			return dev_err_probe(dev, err,
++					     "failed to apply initial PWM state\n");
++	}
++
++	/*
++	 * TODO: If device is using a clock, this property should return the
++	 * value written to the HCTRL5 register by downstrem code. It likely
++	 * needs to be converted into a meaningful duty cycle value, though
++	 * unfortunately the exact conversion mechanism is unknown. If the
++	 * device uses PWM, this property will return the correct duty cycle
++	 * in nanoseconds.
++	 */
++	device_property_read_u32(dev, "imagis,duty-cycle-ns", &config->duty);
++
++	return 0;
++}
++
++static int isa1200_probe(struct i2c_client *client)
++{
++	struct isa1200 *isa;
++	struct device *dev = &client->dev;
++	int err;
++
++	isa = devm_kzalloc(dev, sizeof(*isa), GFP_KERNEL);
++	if (!isa)
++		return -ENOMEM;
++
++	isa->input = devm_input_allocate_device(dev);
++	if (!isa->input)
++		return -ENOMEM;
++
++	i2c_set_clientdata(client, isa);
++
++	err = isa1200_of_probe(client);
++	if (err)
++		return err;
++
++	isa->map = devm_regmap_init_i2c(client, &isa1200_regmap_config);
++	if (IS_ERR(isa->map))
++		return dev_err_probe(dev, PTR_ERR(isa->map),
++				     "failed to initialize register map\n");
++
++	INIT_WORK(&isa->play_work, isa1200_play_work);
++
++	isa->input->name = "isa1200-haptic";
++	isa->input->id.bustype = BUS_I2C;
++	isa->input->close = isa1200_vibrator_close;
++
++	isa->active = false;
++
++	input_set_drvdata(isa->input, isa);
++
++	/* TODO: this hardware can likely support more than rumble */
++	input_set_capability(isa->input, EV_FF, FF_RUMBLE);
++
++	err = input_ff_create_memless(isa->input, NULL,
++				      isa1200_vibrator_play_effect);
++	if (err)
++		return dev_err_probe(dev, err, "failed to create FF dev\n");
++
++	err = input_register_device(isa->input);
++	if (err)
++		return dev_err_probe(dev, err, "failed to register input dev\n");
++
++	return 0;
++}
++
++static int isa1200_suspend(struct device *dev)
++{
++	struct isa1200 *isa = dev_get_drvdata(dev);
++
++	guard(mutex)(&isa->input->mutex);
++
++	if (input_device_enabled(isa->input)) {
++		WRITE_ONCE(isa->suspended, true);
++		cancel_work_sync(&isa->play_work);
++		isa1200_stop(isa);
++	}
++
++	return 0;
++}
++
++static int isa1200_resume(struct device *dev)
++{
++	struct isa1200 *isa = dev_get_drvdata(dev);
++
++	guard(mutex)(&isa->input->mutex);
++
++	if (input_device_enabled(isa->input)) {
++		WRITE_ONCE(isa->suspended, false);
++		if (isa->level)
++			schedule_work(&isa->play_work);
++	}
++
++	return 0;
++}
++
++static DEFINE_SIMPLE_DEV_PM_OPS(isa1200_pm_ops, isa1200_suspend, isa1200_resume);
++
++static const struct of_device_id isa1200_of_match[] = {
++	{ .compatible = "imagis,isa1200" },
++	{ /* sentinel */ }
++};
++MODULE_DEVICE_TABLE(of, isa1200_of_match);
++
++static struct i2c_driver isa1200_i2c_driver = {
++	.driver = {
++		.name = "isa1200",
++		.of_match_table = isa1200_of_match,
++		.pm = pm_sleep_ptr(&isa1200_pm_ops),
++	},
++	.probe = isa1200_probe,
++};
++module_i2c_driver(isa1200_i2c_driver);
++
++MODULE_AUTHOR("Linus Walleij <linusw@kernel.org>");
++MODULE_AUTHOR("Svyatoslav Ryhel <clamor95@gmail.com>");
++MODULE_DESCRIPTION("Imagis ISA1200 haptic feedback unit");
++MODULE_LICENSE("GPL");
+diff --git a/drivers/input/mouse/elan_i2c.h b/drivers/input/mouse/elan_i2c.h
+--- a/drivers/input/mouse/elan_i2c.h
++++ b/drivers/input/mouse/elan_i2c.h
+@@ -102,7 +102,8 @@ struct elan_transport_ops {
+ 	int (*prepare_fw_update)(struct i2c_client *client, u16 ic_type,
+ 				 u8 iap_version, u16 fw_page_size);
+ 	int (*write_fw_block)(struct i2c_client *client, u16 fw_page_size,
+-			      const u8 *page, u16 checksum, int idx);
++			      u16 fw_page_delay, const u8 *page, u16 checksum,
++			      int idx);
+ 	int (*finish_fw_update)(struct i2c_client *client,
+ 				struct completion *reset_done);
+ 
+diff --git a/drivers/input/mouse/elan_i2c_core.c b/drivers/input/mouse/elan_i2c_core.c
+--- a/drivers/input/mouse/elan_i2c_core.c
++++ b/drivers/input/mouse/elan_i2c_core.c
+@@ -16,27 +16,27 @@
+  */
+ 
+ #include <linux/acpi.h>
++#include <linux/completion.h>
+ #include <linux/delay.h>
+ #include <linux/device.h>
+ #include <linux/firmware.h>
+ #include <linux/i2c.h>
+ #include <linux/init.h>
++#include <linux/input.h>
+ #include <linux/input/mt.h>
+ #include <linux/interrupt.h>
+ #include <linux/irq.h>
+-#include <linux/module.h>
+-#include <linux/slab.h>
+-#include <linux/kernel.h>
+-#include <linux/sched.h>
+-#include <linux/string_choices.h>
+-#include <linux/input.h>
+-#include <linux/uaccess.h>
+ #include <linux/jiffies.h>
+-#include <linux/completion.h>
++#include <linux/kernel.h>
++#include <linux/module.h>
+ #include <linux/of.h>
+ #include <linux/pm_wakeirq.h>
+ #include <linux/property.h>
+ #include <linux/regulator/consumer.h>
++#include <linux/sched.h>
++#include <linux/slab.h>
++#include <linux/string_choices.h>
++#include <linux/uaccess.h>
+ #include <linux/unaligned.h>
+ 
+ #include "elan_i2c.h"
+@@ -86,6 +86,7 @@ struct elan_tp_data {
+ 	u16			ic_type;
+ 	u16			fw_validpage_count;
+ 	u16			fw_page_size;
++	u16			fw_page_delay;
+ 	u32			fw_signature_address;
+ 
+ 	u8			min_baseline;
+@@ -127,8 +128,11 @@ static u32 elan_i2c_lookup_quirks(u16 ic_type, u16 product_id)
+ }
+ 
+ static int elan_get_fwinfo(u16 ic_type, u8 iap_version, u16 *validpage_count,
+-			   u32 *signature_address, u16 *page_size)
++			   u32 *signature_address, u16 *page_size,
++			   u16 *page_delay)
+ {
++	*page_delay = 30;
++
+ 	switch (ic_type) {
+ 	case 0x00:
+ 	case 0x06:
+@@ -164,6 +168,7 @@ static int elan_get_fwinfo(u16 ic_type, u8 iap_version, u16 *validpage_count,
+ 		break;
+ 	case 0x19:
+ 		*validpage_count = 2032;
++		*page_delay = 10;
+ 		break;
+ 	default:
+ 		/* unknown ic type clear value */
+@@ -179,6 +184,7 @@ static int elan_get_fwinfo(u16 ic_type, u8 iap_version, u16 *validpage_count,
+ 	if ((ic_type == 0x14 || ic_type == 0x15) && iap_version >= 2) {
+ 		*validpage_count /= 8;
+ 		*page_size = ETP_FW_PAGE_SIZE_512;
++		*page_delay = 50;
+ 	} else if (ic_type >= 0x0D && iap_version >= 1) {
+ 		*validpage_count /= 2;
+ 		*page_size = ETP_FW_PAGE_SIZE_128;
+@@ -368,7 +374,8 @@ static int elan_query_device_info(struct elan_tp_data *data)
+ 	error = elan_get_fwinfo(data->ic_type, data->iap_version,
+ 				&data->fw_validpage_count,
+ 				&data->fw_signature_address,
+-				&data->fw_page_size);
++				&data->fw_page_size,
++				&data->fw_page_delay);
+ 	if (error)
+ 		dev_warn(&data->client->dev,
+ 			 "unexpected iap version %#04x (ic type: %#04x), firmware update will not work\n",
+@@ -479,14 +486,16 @@ static int elan_query_device_parameters(struct elan_tp_data *data)
+  **********************************************************
+  */
+ static int elan_write_fw_block(struct elan_tp_data *data, u16 page_size,
+-			       const u8 *page, u16 checksum, int idx)
++			       u16 page_delay, const u8 *page, u16 checksum,
++			       int idx)
+ {
+ 	int retry = ETP_RETRY_COUNT;
+ 	int error;
+ 
+ 	do {
+ 		error = data->ops->write_fw_block(data->client, page_size,
+-						  page, checksum, idx);
++						  page_delay, page, checksum,
++						  idx);
+ 		if (!error)
+ 			return 0;
+ 
+@@ -525,7 +534,8 @@ static int __elan_update_firmware(struct elan_tp_data *data,
+ 			checksum += ((page[j + 1] << 8) | page[j]);
+ 
+ 		error = elan_write_fw_block(data, data->fw_page_size,
+-					    page, checksum, i);
++					    data->fw_page_delay, page, checksum,
++					    i);
+ 		if (error) {
+ 			dev_err(dev, "write page %d fail: %d\n", i, error);
+ 			return error;
+diff --git a/drivers/input/mouse/elan_i2c_i2c.c b/drivers/input/mouse/elan_i2c_i2c.c
+--- a/drivers/input/mouse/elan_i2c_i2c.c
++++ b/drivers/input/mouse/elan_i2c_i2c.c
+@@ -625,7 +625,8 @@ static int elan_i2c_prepare_fw_update(struct i2c_client *client, u16 ic_type,
+ }
+ 
+ static int elan_i2c_write_fw_block(struct i2c_client *client, u16 fw_page_size,
+-				   const u8 *page, u16 checksum, int idx)
++				   u16 fw_page_delay, const u8 *page, u16 checksum,
++				   int idx)
+ {
+ 	struct device *dev = &client->dev;
+ 	u8 val[3];
+@@ -650,7 +651,7 @@ static int elan_i2c_write_fw_block(struct i2c_client *client, u16 fw_page_size,
+ 	}
+ 
+ 	/* Wait for F/W to update one page ROM data. */
+-	msleep(fw_page_size == ETP_FW_PAGE_SIZE_512 ? 50 : 35);
++	msleep(fw_page_delay);
+ 
+ 	error = elan_i2c_read_cmd(client, ETP_I2C_IAP_CTRL_CMD, val);
+ 	if (error) {
+diff --git a/drivers/input/mouse/elan_i2c_smbus.c b/drivers/input/mouse/elan_i2c_smbus.c
+--- a/drivers/input/mouse/elan_i2c_smbus.c
++++ b/drivers/input/mouse/elan_i2c_smbus.c
+@@ -416,7 +416,8 @@ static int elan_smbus_prepare_fw_update(struct i2c_client *client, u16 ic_type,
+ 
+ 
+ static int elan_smbus_write_fw_block(struct i2c_client *client, u16 fw_page_size,
+-				     const u8 *page, u16 checksum, int idx)
++				     u16 fw_page_delay, const u8 *page, u16 checksum,
++				     int idx)
+ {
+ 	struct device *dev = &client->dev;
+ 	int error;
+diff --git a/drivers/input/mouse/focaltech.c b/drivers/input/mouse/focaltech.c
+--- a/drivers/input/mouse/focaltech.c
++++ b/drivers/input/mouse/focaltech.c
+@@ -78,8 +78,8 @@ struct focaltech_finger_state {
+ 	 * Absolute position (from the bottom left corner) of the
+ 	 * finger.
+ 	 */
+-	unsigned int x;
+-	unsigned int y;
++	int x;
++	int y;
+ };
+ 
+ /*
+@@ -108,7 +108,7 @@ struct focaltech_hw_state {
+ };
+ 
+ struct focaltech_data {
+-	unsigned int x_max, y_max;
++	int x_max, y_max;
+ 	struct focaltech_hw_state state;
+ };
+ 
+@@ -126,17 +126,16 @@ static void focaltech_report_state(struct psmouse *psmouse)
+ 		input_mt_slot(dev, i);
+ 		input_mt_report_slot_state(dev, MT_TOOL_FINGER, active);
+ 		if (active) {
+-			unsigned int clamped_x, clamped_y;
+ 			/*
+ 			 * The touchpad might report invalid data, so we clamp
+ 			 * the resulting values so that we do not confuse
+-			 * userspace.
++			 * userspace or accumulate coordinate wind-up.
+ 			 */
+-			clamped_x = clamp(finger->x, 0U, priv->x_max);
+-			clamped_y = clamp(finger->y, 0U, priv->y_max);
+-			input_report_abs(dev, ABS_MT_POSITION_X, clamped_x);
++			finger->x = clamp(finger->x, 0, priv->x_max);
++			finger->y = clamp(finger->y, 0, priv->y_max);
++			input_report_abs(dev, ABS_MT_POSITION_X, finger->x);
+ 			input_report_abs(dev, ABS_MT_POSITION_Y,
+-					 priv->y_max - clamped_y);
++					 priv->y_max - finger->y);
+ 			input_report_abs(dev, ABS_TOOL_WIDTH, state->width);
+ 		}
+ 	}
+diff --git a/drivers/input/mouse/psmouse-base.c b/drivers/input/mouse/psmouse-base.c
+--- a/drivers/input/mouse/psmouse-base.c
++++ b/drivers/input/mouse/psmouse-base.c
+@@ -256,9 +256,8 @@ static inline void __psmouse_set_state(struct psmouse *psmouse, enum psmouse_sta
+  */
+ void psmouse_set_state(struct psmouse *psmouse, enum psmouse_state new_state)
+ {
+-	serio_pause_rx(psmouse->ps2dev.serio);
++	guard(serio_pause_rx)(psmouse->ps2dev.serio);
+ 	__psmouse_set_state(psmouse, new_state);
+-	serio_continue_rx(psmouse->ps2dev.serio);
+ }
+ 
+ /*
+@@ -267,7 +266,15 @@ void psmouse_set_state(struct psmouse *psmouse, enum psmouse_state new_state)
+  */
+ static int psmouse_handle_byte(struct psmouse *psmouse)
+ {
+-	psmouse_ret_t rc = psmouse->protocol_handler(psmouse);
++	psmouse_ret_t rc;
++
++	/* protocol_handler is NULL when device is being disconnected */
++	if (unlikely(!psmouse->protocol_handler)) {
++		psmouse->pktcnt = 0;
++		return 0;
++	}
++
++	rc = psmouse->protocol_handler(psmouse);
+ 
+ 	switch (rc) {
+ 	case PSMOUSE_BAD_DATA:
+@@ -484,13 +491,16 @@ static int psmouse_poll(struct psmouse *psmouse)
+ 			   PSMOUSE_CMD_POLL | (psmouse->pktsize << 8));
+ }
+ 
+-static bool psmouse_check_pnp_id(const char *id, const char * const ids[])
++static bool psmouse_check_pnp_id(const char *p, const char * const ids[])
+ {
+-	int i;
++	const char * const *id;
++	size_t len;
+ 
+-	for (i = 0; ids[i]; i++)
+-		if (!strcasecmp(id, ids[i]))
++	for (id = ids; *id; id++) {
++		len = strlen(*id);
++		if (!strncasecmp(p, *id, len) && (p[len] == ' ' || p[len] == '\0'))
+ 			return true;
++	}
+ 
+ 	return false;
+ }
+@@ -501,28 +511,26 @@ static bool psmouse_check_pnp_id(const char *id, const char * const ids[])
+ bool psmouse_matches_pnp_id(struct psmouse *psmouse, const char * const ids[])
+ {
+ 	struct serio *serio = psmouse->ps2dev.serio;
+-	char *p, *fw_id_copy, *save_ptr;
+-	bool found = false;
++	const char *p = serio->firmware_id;
+ 
+-	if (strncmp(serio->firmware_id, "PNP: ", 5))
++	if (!strstarts(p, "PNP: "))
+ 		return false;
+ 
+-	fw_id_copy = kstrndup(&serio->firmware_id[5],
+-			      sizeof(serio->firmware_id) - 5,
+-			      GFP_KERNEL);
+-	if (!fw_id_copy)
+-		return false;
++	p += 5;
++	while (*p) {
++		p = skip_spaces(p);
++		if (!*p)
++			break;
+ 
+-	save_ptr = fw_id_copy;
+-	while ((p = strsep(&fw_id_copy, " ")) != NULL) {
+-		if (psmouse_check_pnp_id(p, ids)) {
+-			found = true;
++		if (psmouse_check_pnp_id(p, ids))
++			return true;
++
++		p = strchr(p, ' ');
++		if (!p)
+ 			break;
+-		}
+ 	}
+ 
+-	kfree(save_ptr);
+-	return found;
++	return false;
+ }
+ 
+ /*
+@@ -1311,10 +1319,10 @@ static void psmouse_resync(struct work_struct *work)
+ 	bool failed = false, enabled = false;
+ 	int i;
+ 
+-	mutex_lock(&psmouse_mutex);
++	guard(mutex)(&psmouse_mutex);
+ 
+ 	if (psmouse->state != PSMOUSE_RESYNCING)
+-		goto out;
++		return;
+ 
+ 	if (serio->parent && serio->id.type == SERIO_PS_PSTHRU) {
+ 		parent = psmouse_from_serio(serio->parent);
+@@ -1392,8 +1400,6 @@ static void psmouse_resync(struct work_struct *work)
+ 
+ 	if (parent)
+ 		psmouse_activate(parent);
+- out:
+-	mutex_unlock(&psmouse_mutex);
+ }
+ 
+ /*
+@@ -1404,7 +1410,7 @@ static void psmouse_cleanup(struct serio *serio)
+ 	struct psmouse *psmouse = psmouse_from_serio(serio);
+ 	struct psmouse *parent = NULL;
+ 
+-	mutex_lock(&psmouse_mutex);
++	guard(mutex)(&psmouse_mutex);
+ 
+ 	if (serio->parent && serio->id.type == SERIO_PS_PSTHRU) {
+ 		parent = psmouse_from_serio(serio->parent);
+@@ -1440,8 +1446,6 @@ static void psmouse_cleanup(struct serio *serio)
+ 
+ 		psmouse_activate(parent);
+ 	}
+-
+-	mutex_unlock(&psmouse_mutex);
+ }
+ 
+ /*
+@@ -1452,20 +1456,20 @@ static void psmouse_disconnect(struct serio *serio)
+ 	struct psmouse *psmouse = psmouse_from_serio(serio);
+ 	struct psmouse *parent = NULL;
+ 
+-	mutex_lock(&psmouse_mutex);
++	disable_work_sync(&psmouse->resync_work);
++
++	guard(mutex)(&psmouse_mutex);
+ 
+ 	psmouse_set_state(psmouse, PSMOUSE_CMD_MODE);
+ 
+-	/* make sure we don't have a resync in progress */
+-	mutex_unlock(&psmouse_mutex);
+-	disable_work_sync(&psmouse->resync_work);
+-	mutex_lock(&psmouse_mutex);
+-
+ 	if (serio->parent && serio->id.type == SERIO_PS_PSTHRU) {
+ 		parent = psmouse_from_serio(serio->parent);
+ 		psmouse_deactivate(parent);
+ 	}
+ 
++	scoped_guard(serio_pause_rx, serio)
++		psmouse->protocol_handler = NULL;
++
+ 	if (psmouse->disconnect)
+ 		psmouse->disconnect(psmouse);
+ 
+@@ -1484,8 +1488,6 @@ static void psmouse_disconnect(struct serio *serio)
+ 
+ 	if (parent)
+ 		psmouse_activate(parent);
+-
+-	mutex_unlock(&psmouse_mutex);
+ }
+ 
+ static int psmouse_switch_protocol(struct psmouse *psmouse,
+@@ -1654,14 +1656,12 @@ static int __psmouse_reconnect(struct serio *serio, bool fast_reconnect)
+ 	enum psmouse_type type;
+ 	int rc = -1;
+ 
+-	mutex_lock(&psmouse_mutex);
++	lockdep_assert_held(&psmouse_mutex);
+ 
+ 	if (fast_reconnect) {
+ 		reconnect_handler = psmouse->fast_reconnect;
+-		if (!reconnect_handler) {
+-			rc = -ENOENT;
+-			goto out_unlock;
+-		}
++		if (!reconnect_handler)
++			return -ENOENT;
+ 	} else {
+ 		reconnect_handler = psmouse->reconnect;
+ 	}
+@@ -1713,18 +1713,20 @@ static int __psmouse_reconnect(struct serio *serio, bool fast_reconnect)
+ 	if (parent)
+ 		psmouse_activate(parent);
+ 
+-out_unlock:
+-	mutex_unlock(&psmouse_mutex);
+ 	return rc;
+ }
+ 
+ static int psmouse_reconnect(struct serio *serio)
+ {
++	guard(mutex)(&psmouse_mutex);
++
+ 	return __psmouse_reconnect(serio, false);
+ }
+ 
+ static int psmouse_fast_reconnect(struct serio *serio)
+ {
++	guard(mutex)(&psmouse_mutex);
++
+ 	return __psmouse_reconnect(serio, true);
+ }
+ 
+diff --git a/drivers/input/mouse/synaptics.c b/drivers/input/mouse/synaptics.c
+--- a/drivers/input/mouse/synaptics.c
++++ b/drivers/input/mouse/synaptics.c
+@@ -164,6 +164,7 @@ static const char * const topbuttonpad_pnp_ids[] = {
+ #ifdef CONFIG_MOUSE_PS2_SYNAPTICS_SMBUS
+ static const char * const smbus_pnp_ids[] = {
+ 	/* all of the topbuttonpad_pnp_ids are valid, we just add some extras */
++	"DLL0597", /* Dell Inspiron 3521 */
+ 	"DLL060d", /* Dell Precision M3800 */
+ 	"LEN0048", /* X1 Carbon 3 */
+ 	"LEN0046", /* X250 */
+diff --git a/drivers/input/mouse/synaptics_i2c.c b/drivers/input/mouse/synaptics_i2c.c
+--- a/drivers/input/mouse/synaptics_i2c.c
++++ b/drivers/input/mouse/synaptics_i2c.c
+@@ -261,7 +261,7 @@ static s32 synaptics_i2c_reg_set(struct i2c_client *client, u16 reg, u8 val)
+ 	if (error)
+ 		return error;
+ 
+-	return error;
++	return 0;
+ }
+ 
+ static s32 synaptics_i2c_word_get(struct i2c_client *client, u16 reg)
+diff --git a/drivers/input/rmi4/rmi_f12.c b/drivers/input/rmi4/rmi_f12.c
+--- a/drivers/input/rmi4/rmi_f12.c
++++ b/drivers/input/rmi4/rmi_f12.c
+@@ -155,6 +155,10 @@ static int rmi_f12_read_sensor_tuning(struct f12_data *f12)
+ 		offset += 4;
+ 	}
+ 
++	/* When platform data are provided, we're done */
++	if (sensor->x_mm && sensor->y_mm)
++		return 0;
++
+ 	/*
+ 	 * Use the Query DPM feature when the resolution query register
+ 	 * exists.
+@@ -171,8 +175,10 @@ static int rmi_f12_read_sensor_tuning(struct f12_data *f12)
+ 		}
+ 		dpm_resolution = buf[0];
+ 
+-		sensor->x_mm = sensor->max_x / dpm_resolution;
+-		sensor->y_mm = sensor->max_y / dpm_resolution;
++		if (!sensor->x_mm)
++			sensor->x_mm = sensor->max_x / dpm_resolution;
++		if (!sensor->y_mm)
++			sensor->y_mm = sensor->max_y / dpm_resolution;
+ 	} else {
+ 		if (rmi_register_desc_has_subpacket(item, 3)) {
+ 			rx_receivers = buf[offset];
+@@ -184,8 +190,10 @@ static int rmi_f12_read_sensor_tuning(struct f12_data *f12)
+ 		if (rmi_register_desc_has_subpacket(item, 4))
+ 			offset += 1;
+ 
+-		sensor->x_mm = (pitch_x * rx_receivers) >> 12;
+-		sensor->y_mm = (pitch_y * tx_receivers) >> 12;
++		if (!sensor->x_mm)
++			sensor->x_mm = (pitch_x * rx_receivers) >> 12;
++		if (!sensor->y_mm)
++			sensor->y_mm = (pitch_y * tx_receivers) >> 12;
+ 	}
+ 
+ 	rmi_dbg(RMI_DEBUG_FN, &fn->dev, "%s: x_mm: %d y_mm: %d\n", __func__,
+diff --git a/drivers/input/rmi4/rmi_smbus.c b/drivers/input/rmi4/rmi_smbus.c
+--- a/drivers/input/rmi4/rmi_smbus.c
++++ b/drivers/input/rmi4/rmi_smbus.c
+@@ -177,13 +177,8 @@ static int smb_block_read(struct rmi_transport_dev *xport,
+ 	struct rmi_smb_xport *rmi_smb =
+ 		container_of(xport, struct rmi_smb_xport, xport);
+ 	struct i2c_client *client = rmi_smb->client;
+-	int retval;
+ 
+-	retval = i2c_smbus_read_block_data(client, commandcode, buf);
+-	if (retval < 0)
+-		return retval;
+-
+-	return retval;
++	return i2c_smbus_read_block_data(client, commandcode, buf);
+ }
+ 
+ static int rmi_smb_read_block(struct rmi_transport_dev *xport, u16 rmiaddr,
+diff --git a/drivers/input/serio/Kconfig b/drivers/input/serio/Kconfig
+--- a/drivers/input/serio/Kconfig
++++ b/drivers/input/serio/Kconfig
+@@ -106,6 +106,33 @@ config SERIO_GSCPS2
+ 	  To compile this driver as a module, choose M here: the
+ 	  module will be called gscps2.
+ 
++config SERIO_GSCPS2_RDI_KEYCODES
++	bool "Use PrecisionBook keyboard scancodes"
++	depends on SERIO_GSCPS2
++	default n
++	help
++	  If you have an RDI PrecisionBook, say Y here if you want to use its
++	  built-in keyboard (as opposed to an external keyboard).
++
++	  The PrecisionBook has five keys that conflict with those used by most
++	  AT and PS/2 keyboards. These are as follows:
++
++	    PrecisionBook    Standard AT or PS/2
++
++	    F1               F12
++	    Left Ctrl        Left Alt
++	    Caps Lock        Left Ctrl
++	    Right Ctrl       Caps Lock
++	    Left             102nd key (the key to the right of Left Shift)
++
++	  If you say N here, and use the PrecisionBook keyboard, then each key
++	  in the left-hand column will be interpreted as the corresponding key
++	  in the right-hand column.
++
++	  If you say Y here, and use an external keyboard, then each key in the
++	  right-hand column will be interpreted as the key shown in the
++	  left-hand column.
++
+ config HP_SDC
+ 	tristate "HP System Device Controller i8042 Support"
+ 	depends on (GSC || HP300) && SERIO
+diff --git a/drivers/input/serio/gscps2.c b/drivers/input/serio/gscps2.c
+--- a/drivers/input/serio/gscps2.c
++++ b/drivers/input/serio/gscps2.c
+@@ -22,18 +22,15 @@
+  *                 was usable/enabled ?)
+  */
+ 
+-#include <linux/init.h>
+-#include <linux/module.h>
+-#include <linux/slab.h>
+-#include <linux/serio.h>
++#include <linux/delay.h>
+ #include <linux/input.h>
+ #include <linux/interrupt.h>
+-#include <linux/spinlock.h>
+-#include <linux/delay.h>
++#include <linux/io.h>
+ #include <linux/ioport.h>
++#include <linux/property.h>
++#include <linux/serio.h>
+ 
+ #include <asm/irq.h>
+-#include <asm/io.h>
+ #include <asm/parisc-device.h>
+ 
+ MODULE_AUTHOR("Laurent Canet <canetl@esiee.fr>, Thibaut Varene <varenet@parisc-linux.org>, Helge Deller <deller@gmx.de>");
+@@ -80,6 +77,116 @@ MODULE_LICENSE("GPL");
+ #define GSC_ID_KEYBOARD		0	/* device ID values */
+ #define GSC_ID_MOUSE		1
+ 
++#ifndef CONFIG_SERIO_GSCPS2_RDI_KEYCODES
++# define CONFLICT(x, y) x
++#else
++# define CONFLICT(x, y) y
++#endif
++
++/*
++ * Sadly RDI (Tadpole) decided to ship a different keyboard layout
++ * than HP for their PS/2 laptop keyboard which leads to conflicting
++ * keycodes between a normal HP PS/2 keyboard and a RDI PrecisionBook.
++ *                       HP:            RDI:
++ */
++#define C_07	CONFLICT(KEY_F12,	KEY_F1)
++#define C_11	CONFLICT(KEY_LEFTALT,	KEY_LEFTCTRL)
++#define C_14	CONFLICT(KEY_LEFTCTRL,	KEY_CAPSLOCK)
++#define C_58	CONFLICT(KEY_CAPSLOCK,	KEY_RIGHTCTRL)
++#define C_61	CONFLICT(KEY_102ND,	KEY_LEFT)
++
++/*
++ * Special keycode value recognized by atkbd (ATKBD_KEY_NULL) to silently
++ * discard scancodes without generating input events or "unknown key" warnings.
++ */
++#define KEY_NULL	255
++
++#define KEYMAP_ENTRY(scancode, keycode) (((scancode) << 16) | (keycode))
++
++static const u32 gscps2_keymap[] = {
++	KEYMAP_ENTRY(0x01, KEY_F9),		KEYMAP_ENTRY(0x03, KEY_F5),
++	KEYMAP_ENTRY(0x04, KEY_F3),		KEYMAP_ENTRY(0x05, KEY_F1),
++	KEYMAP_ENTRY(0x06, KEY_F2),		KEYMAP_ENTRY(0x07, C_07),
++	KEYMAP_ENTRY(0x08, KEY_ESC),		KEYMAP_ENTRY(0x09, KEY_F10),
++	KEYMAP_ENTRY(0x0a, KEY_F8),		KEYMAP_ENTRY(0x0b, KEY_F6),
++	KEYMAP_ENTRY(0x0c, KEY_F4),		KEYMAP_ENTRY(0x0d, KEY_TAB),
++	KEYMAP_ENTRY(0x0e, KEY_GRAVE),		KEYMAP_ENTRY(0x0f, KEY_F2),
++	KEYMAP_ENTRY(0x11, C_11),		KEYMAP_ENTRY(0x12, KEY_LEFTSHIFT),
++	KEYMAP_ENTRY(0x14, C_14),		KEYMAP_ENTRY(0x15, KEY_Q),
++	KEYMAP_ENTRY(0x16, KEY_1),		KEYMAP_ENTRY(0x17, KEY_F3),
++	KEYMAP_ENTRY(0x19, KEY_LEFTALT),	KEYMAP_ENTRY(0x1a, KEY_Z),
++	KEYMAP_ENTRY(0x1b, KEY_S),		KEYMAP_ENTRY(0x1c, KEY_A),
++	KEYMAP_ENTRY(0x1d, KEY_W),		KEYMAP_ENTRY(0x1e, KEY_2),
++	KEYMAP_ENTRY(0x1f, KEY_F4),		KEYMAP_ENTRY(0x21, KEY_C),
++	KEYMAP_ENTRY(0x22, KEY_X),		KEYMAP_ENTRY(0x23, KEY_D),
++	KEYMAP_ENTRY(0x24, KEY_E),		KEYMAP_ENTRY(0x25, KEY_4),
++	KEYMAP_ENTRY(0x26, KEY_3),		KEYMAP_ENTRY(0x27, KEY_F5),
++	KEYMAP_ENTRY(0x29, KEY_SPACE),		KEYMAP_ENTRY(0x2a, KEY_V),
++	KEYMAP_ENTRY(0x2b, KEY_F),		KEYMAP_ENTRY(0x2c, KEY_T),
++	KEYMAP_ENTRY(0x2d, KEY_R),		KEYMAP_ENTRY(0x2e, KEY_5),
++	KEYMAP_ENTRY(0x2f, KEY_F6),		KEYMAP_ENTRY(0x31, KEY_N),
++	KEYMAP_ENTRY(0x32, KEY_B),		KEYMAP_ENTRY(0x33, KEY_H),
++	KEYMAP_ENTRY(0x34, KEY_G),		KEYMAP_ENTRY(0x35, KEY_Y),
++	KEYMAP_ENTRY(0x36, KEY_6),		KEYMAP_ENTRY(0x37, KEY_F7),
++	KEYMAP_ENTRY(0x39, KEY_RIGHTALT),	KEYMAP_ENTRY(0x3a, KEY_M),
++	KEYMAP_ENTRY(0x3b, KEY_J),		KEYMAP_ENTRY(0x3c, KEY_U),
++	KEYMAP_ENTRY(0x3d, KEY_7),		KEYMAP_ENTRY(0x3e, KEY_8),
++	KEYMAP_ENTRY(0x3f, KEY_F8),		KEYMAP_ENTRY(0x41, KEY_COMMA),
++	KEYMAP_ENTRY(0x42, KEY_K),		KEYMAP_ENTRY(0x43, KEY_I),
++	KEYMAP_ENTRY(0x44, KEY_O),		KEYMAP_ENTRY(0x45, KEY_0),
++	KEYMAP_ENTRY(0x46, KEY_9),		KEYMAP_ENTRY(0x47, KEY_F9),
++	KEYMAP_ENTRY(0x49, KEY_DOT),		KEYMAP_ENTRY(0x4a, KEY_SLASH),
++	KEYMAP_ENTRY(0x4b, KEY_L),		KEYMAP_ENTRY(0x4c, KEY_SEMICOLON),
++	KEYMAP_ENTRY(0x4d, KEY_P),		KEYMAP_ENTRY(0x4e, KEY_MINUS),
++	KEYMAP_ENTRY(0x4f, KEY_F10),		KEYMAP_ENTRY(0x52, KEY_APOSTROPHE),
++	KEYMAP_ENTRY(0x54, KEY_LEFTBRACE),	KEYMAP_ENTRY(0x55, KEY_EQUAL),
++	KEYMAP_ENTRY(0x56, KEY_F11),		KEYMAP_ENTRY(0x57, KEY_SYSRQ),
++	KEYMAP_ENTRY(0x58, C_58),		KEYMAP_ENTRY(0x59, KEY_RIGHTSHIFT),
++	KEYMAP_ENTRY(0x5a, KEY_ENTER),		KEYMAP_ENTRY(0x5b, KEY_RIGHTBRACE),
++	KEYMAP_ENTRY(0x5c, KEY_BACKSLASH),	KEYMAP_ENTRY(0x5d, KEY_BACKSLASH),
++	KEYMAP_ENTRY(0x5e, KEY_F12),		KEYMAP_ENTRY(0x5f, KEY_SCROLLLOCK),
++	KEYMAP_ENTRY(0x60, KEY_DOWN),		KEYMAP_ENTRY(0x61, C_61),
++	KEYMAP_ENTRY(0x62, KEY_PAUSE),		KEYMAP_ENTRY(0x63, KEY_UP),
++	KEYMAP_ENTRY(0x64, KEY_DELETE),		KEYMAP_ENTRY(0x65, KEY_END),
++	KEYMAP_ENTRY(0x66, KEY_BACKSPACE),	KEYMAP_ENTRY(0x67, KEY_INSERT),
++	KEYMAP_ENTRY(0x69, KEY_KP1),		KEYMAP_ENTRY(0x6a, KEY_RIGHT),
++	KEYMAP_ENTRY(0x6b, KEY_KP4),		KEYMAP_ENTRY(0x6c, KEY_KP7),
++	KEYMAP_ENTRY(0x6d, KEY_PAGEDOWN),	KEYMAP_ENTRY(0x6e, KEY_HOME),
++	KEYMAP_ENTRY(0x6f, KEY_PAGEUP),		KEYMAP_ENTRY(0x70, KEY_KP0),
++	KEYMAP_ENTRY(0x71, KEY_KPDOT),		KEYMAP_ENTRY(0x72, KEY_KP2),
++	KEYMAP_ENTRY(0x73, KEY_KP5),		KEYMAP_ENTRY(0x74, KEY_KP6),
++	KEYMAP_ENTRY(0x75, KEY_KP8),		KEYMAP_ENTRY(0x76, KEY_ESC),
++	KEYMAP_ENTRY(0x77, KEY_NUMLOCK),	KEYMAP_ENTRY(0x78, KEY_F11),
++	KEYMAP_ENTRY(0x79, KEY_KPPLUS),		KEYMAP_ENTRY(0x7a, KEY_KP3),
++	KEYMAP_ENTRY(0x7b, KEY_KPMINUS),	KEYMAP_ENTRY(0x7c, KEY_KPASTERISK),
++	KEYMAP_ENTRY(0x7d, KEY_KP9),		KEYMAP_ENTRY(0x7e, KEY_SCROLLLOCK),
++	KEYMAP_ENTRY(0x7f, KEY_102ND),		KEYMAP_ENTRY(0x91, KEY_RIGHTALT),
++	KEYMAP_ENTRY(0x92, KEY_NULL),		KEYMAP_ENTRY(0x94, KEY_RIGHTCTRL),
++	KEYMAP_ENTRY(0x9d, KEY_CAPSLOCK),	KEYMAP_ENTRY(0x9f, KEY_LEFTMETA),
++	KEYMAP_ENTRY(0xa7, KEY_RIGHTMETA),	KEYMAP_ENTRY(0xaf, KEY_COMPOSE),
++	KEYMAP_ENTRY(0xca, KEY_KPSLASH),	KEYMAP_ENTRY(0xda, KEY_KPENTER),
++	KEYMAP_ENTRY(0xe9, KEY_END),		KEYMAP_ENTRY(0xeb, KEY_LEFT),
++	KEYMAP_ENTRY(0xec, KEY_HOME),		KEYMAP_ENTRY(0xf0, KEY_INSERT),
++	KEYMAP_ENTRY(0xf1, KEY_DELETE),		KEYMAP_ENTRY(0xf2, KEY_DOWN),
++	KEYMAP_ENTRY(0xf4, KEY_RIGHT),		KEYMAP_ENTRY(0xf5, KEY_UP),
++	KEYMAP_ENTRY(0xf7, KEY_PAUSE),		KEYMAP_ENTRY(0xfa, KEY_PAGEDOWN),
++	KEYMAP_ENTRY(0xfc, KEY_SYSRQ),		KEYMAP_ENTRY(0xfd, KEY_PAGEUP),
++
++	/* Escaped keycodes */
++	KEYMAP_ENTRY(0x103, KEY_F7),		KEYMAP_ENTRY(0x10b, KEY_LEFTMETA),
++	KEYMAP_ENTRY(0x10c, KEY_RIGHTMETA),	KEYMAP_ENTRY(0x111, KEY_RIGHTALT),
++	KEYMAP_ENTRY(0x114, KEY_RIGHTCTRL),
++};
++
++static const struct property_entry gscps2_props[] = {
++	PROPERTY_ENTRY_U32_ARRAY("linux,keymap", gscps2_keymap),
++	{ }
++};
++
++static const struct software_node gscps2_keyboard_node = {
++	.name = "gscps2-keyboard",
++	.properties = gscps2_props,
++};
+ 
+ static irqreturn_t gscps2_interrupt(int irq, void *dev);
+ 
+@@ -398,6 +505,17 @@ static int __init gscps2_probe(struct parisc_device *dev)
+ 		goto fail;
+ #endif
+ 
++	if (ps2port->id == GSC_ID_KEYBOARD) {
++		ret = device_add_software_node(&serio->dev,
++					       &gscps2_keyboard_node);
++		if (ret) {
++			dev_err(&dev->dev,
++				"failed to add software node for keyboard: %d\n",
++				ret);
++			goto fail;
++		}
++	}
++
+ 	pr_info("serio: %s port at 0x%08lx irq %d @ %s\n",
+ 		ps2port->port->name,
+ 		hpa,
+@@ -411,11 +529,16 @@ static int __init gscps2_probe(struct parisc_device *dev)
+ 	return 0;
+ 
+ fail:
++	if (ps2port->id == GSC_ID_KEYBOARD)
++		device_remove_software_node(&serio->dev);
++
+ 	free_irq(dev->irq, ps2port);
+ 
+ fail_miserably:
+ 	iounmap(ps2port->addr);
++#if 0
+ 	release_mem_region(dev->hpa.start, GSC_STATUS + 4);
++#endif
+ 
+ fail_nomem:
+ 	kfree(ps2port);
+@@ -434,6 +557,9 @@ static void __exit gscps2_remove(struct parisc_device *dev)
+ {
+ 	struct gscps2port *ps2port = dev_get_drvdata(&dev->dev);
+ 
++	if (ps2port->id == GSC_ID_KEYBOARD)
++		device_remove_software_node(&ps2port->port->dev);
++
+ 	serio_unregister_port(ps2port->port);
+ 	free_irq(dev->irq, ps2port);
+ 	gscps2_flush(ps2port);
+@@ -465,16 +591,25 @@ static struct parisc_driver parisc_ps2_driver __refdata = {
+ 
+ static int __init gscps2_init(void)
+ {
+-	register_parisc_driver(&parisc_ps2_driver);
+-	return 0;
++	int error;
++
++	error = software_node_register(&gscps2_keyboard_node);
++	if (error)
++		return error;
++
++	error = register_parisc_driver(&parisc_ps2_driver);
++	if (error)
++		software_node_unregister(&gscps2_keyboard_node);
++
++	return error;
+ }
+ 
+ static void __exit gscps2_exit(void)
+ {
+ 	unregister_parisc_driver(&parisc_ps2_driver);
++	software_node_unregister(&gscps2_keyboard_node);
+ }
+ 
+ 
+ module_init(gscps2_init);
+ module_exit(gscps2_exit);
+-
+diff --git a/drivers/input/serio/i8042-acpipnpio.h b/drivers/input/serio/i8042-acpipnpio.h
+--- a/drivers/input/serio/i8042-acpipnpio.h
++++ b/drivers/input/serio/i8042-acpipnpio.h
+@@ -3,6 +3,7 @@
+ #define _I8042_ACPIPNPIO_H
+ 
+ #include <linux/acpi.h>
++#include <linux/seq_buf.h>
+ 
+ #ifdef CONFIG_X86
+ #include <asm/x86_init.h>
+@@ -1486,17 +1487,21 @@ static char i8042_pnp_aux_name[32];
+ 
+ static void i8042_pnp_id_to_string(struct pnp_id *id, char *dst, int dst_size)
+ {
+-	strscpy(dst, "PNP:", dst_size);
++	struct seq_buf sb;
++
++	seq_buf_init(&sb, dst, dst_size);
++	seq_buf_printf(&sb, "PNP:");
+ 
+ 	while (id) {
+-		strlcat(dst, " ", dst_size);
+-		strlcat(dst, id->id, dst_size);
++		seq_buf_printf(&sb, " %s", id->id);
+ 		id = id->next;
+ 	}
+ }
+ 
+ static int i8042_pnp_kbd_probe(struct pnp_dev *dev, const struct pnp_device_id *did)
+ {
++	const char *name = pnp_dev_name(dev);
++
+ 	if (pnp_port_valid(dev, 0) && pnp_port_len(dev, 0) == 1)
+ 		i8042_pnp_data_reg = pnp_port_start(dev,0);
+ 
+@@ -1506,11 +1511,8 @@ static int i8042_pnp_kbd_probe(struct pnp_dev *dev, const struct pnp_device_id *
+ 	if (pnp_irq_valid(dev,0))
+ 		i8042_pnp_kbd_irq = pnp_irq(dev, 0);
+ 
+-	strscpy(i8042_pnp_kbd_name, did->id, sizeof(i8042_pnp_kbd_name));
+-	if (strlen(pnp_dev_name(dev))) {
+-		strlcat(i8042_pnp_kbd_name, ":", sizeof(i8042_pnp_kbd_name));
+-		strlcat(i8042_pnp_kbd_name, pnp_dev_name(dev), sizeof(i8042_pnp_kbd_name));
+-	}
++	scnprintf(i8042_pnp_kbd_name, sizeof(i8042_pnp_kbd_name), "%s%s%s",
++		  did->id, strlen(name) ? ":" : "", name);
+ 	i8042_pnp_id_to_string(dev->id, i8042_kbd_firmware_id,
+ 			       sizeof(i8042_kbd_firmware_id));
+ 	i8042_kbd_fwnode = dev_fwnode(&dev->dev);
+@@ -1524,6 +1526,8 @@ static int i8042_pnp_kbd_probe(struct pnp_dev *dev, const struct pnp_device_id *
+ 
+ static int i8042_pnp_aux_probe(struct pnp_dev *dev, const struct pnp_device_id *did)
+ {
++	const char *name = pnp_dev_name(dev);
++
+ 	if (pnp_port_valid(dev, 0) && pnp_port_len(dev, 0) == 1)
+ 		i8042_pnp_data_reg = pnp_port_start(dev,0);
+ 
+@@ -1533,11 +1537,8 @@ static int i8042_pnp_aux_probe(struct pnp_dev *dev, const struct pnp_device_id *
+ 	if (pnp_irq_valid(dev, 0))
+ 		i8042_pnp_aux_irq = pnp_irq(dev, 0);
+ 
+-	strscpy(i8042_pnp_aux_name, did->id, sizeof(i8042_pnp_aux_name));
+-	if (strlen(pnp_dev_name(dev))) {
+-		strlcat(i8042_pnp_aux_name, ":", sizeof(i8042_pnp_aux_name));
+-		strlcat(i8042_pnp_aux_name, pnp_dev_name(dev), sizeof(i8042_pnp_aux_name));
+-	}
++	scnprintf(i8042_pnp_aux_name, sizeof(i8042_pnp_aux_name), "%s%s%s",
++		  did->id, strlen(name) ? ":" : "", name);
+ 	i8042_pnp_id_to_string(dev->id, i8042_aux_firmware_id,
+ 			       sizeof(i8042_aux_firmware_id));
+ 
+diff --git a/drivers/input/touchscreen/elo.c b/drivers/input/touchscreen/elo.c
+--- a/drivers/input/touchscreen/elo.c
++++ b/drivers/input/touchscreen/elo.c
+@@ -257,7 +257,7 @@ static int elo_command_10(struct elo *elo, unsigned char *packet)
+ 
+ static int elo_setup_10(struct elo *elo)
+ {
+-	static const char *elo_types[] = { "Accu", "Dura", "Intelli", "Carroll" };
++	static const char * const elo_types[] = { "Accu", "Dura", "Intelli", "Carroll" };
+ 	struct input_dev *dev = elo->dev;
+ 	unsigned char packet[ELO10_PACKET_LEN] = { ELO10_ID_CMD };
+ 
+@@ -273,7 +273,7 @@ static int elo_setup_10(struct elo *elo)
+ 
+ 	dev_info(&elo->serio->dev,
+ 		 "%sTouch touchscreen, fw: %02x.%02x, features: 0x%02x, controller: 0x%02x\n",
+-		 elo_types[(packet[1] -'0') & 0x03],
++		 elo_types[(packet[1] - '0') & 0x03],
+ 		 packet[5], packet[4], packet[3], packet[7]);
+ 
+ 	return 0;
+diff --git a/drivers/input/touchscreen/inexio.c b/drivers/input/touchscreen/inexio.c
+--- a/drivers/input/touchscreen/inexio.c
++++ b/drivers/input/touchscreen/inexio.c
+@@ -81,7 +81,9 @@ static irqreturn_t inexio_interrupt(struct serio *serio,
+ 	if (INEXIO_RESPONSE_BEGIN_BYTE&pinexio->data[0])
+ 		inexio_process_data(pinexio);
+ 	else
+-		printk(KERN_DEBUG "inexio.c: unknown/unsynchronized data from device, byte %x\n",pinexio->data[0]);
++		dev_dbg(&serio->dev,
++			"unknown/unsynchronized data from device, byte %x\n",
++			pinexio->data[0]);
+ 
+ 	return IRQ_HANDLED;
+ }
+diff --git a/drivers/input/touchscreen/iqs5xx.c b/drivers/input/touchscreen/iqs5xx.c
+--- a/drivers/input/touchscreen/iqs5xx.c
++++ b/drivers/input/touchscreen/iqs5xx.c
+@@ -785,7 +785,8 @@ static int iqs5xx_fw_file_parse(struct i2c_client *client,
+ 		switch (rec_type) {
+ 		case IQS5XX_REC_TYPE_DATA:
+ 			if (rec_addr < IQS5XX_CHKSM ||
+-			    rec_addr > IQS5XX_PMAP_END) {
++			    rec_addr > IQS5XX_PMAP_END ||
++			    rec_len > IQS5XX_PMAP_END + 1 - rec_addr) {
+ 				dev_err(&client->dev,
+ 					"Invalid address at record %u\n",
+ 					rec_num);
+diff --git a/drivers/input/touchscreen/mms114.c b/drivers/input/touchscreen/mms114.c
+--- a/drivers/input/touchscreen/mms114.c
++++ b/drivers/input/touchscreen/mms114.c
+@@ -4,6 +4,8 @@
+ // Copyright (c) 2012 Samsung Electronics Co., Ltd.
+ // Author: Joonyoung Shim <jy0922.shim@samsung.com>
+ 
++#include <linux/bitfield.h>
++#include <linux/bits.h>
+ #include <linux/module.h>
+ #include <linux/delay.h>
+ #include <linux/of.h>
+@@ -52,21 +54,13 @@
+ #define MMS114_TYPE_TOUCHSCREEN		1
+ #define MMS114_TYPE_TOUCHKEY		2
+ 
+-enum mms_type {
+-	TYPE_MMS114	= 114,
+-	TYPE_MMS134S	= 134,
+-	TYPE_MMS136	= 136,
+-	TYPE_MMS152	= 152,
+-	TYPE_MMS345L	= 345,
+-};
+-
+ struct mms114_data {
++	const struct mms_chip	*chip;
+ 	struct i2c_client	*client;
+ 	struct input_dev	*input_dev;
+ 	struct regulator	*core_reg;
+ 	struct regulator	*io_reg;
+ 	struct touchscreen_properties props;
+-	enum mms_type		type;
+ 	unsigned int		contact_threshold;
+ 	unsigned int		moving_threshold;
+ 
+@@ -77,9 +71,23 @@ struct mms114_data {
+ 	u8			cache_mode_control;
+ };
+ 
++struct mms_chip {
++	const char *name;
++	int event_size;
++	bool has_config_regs;
++	int (*get_version)(struct mms114_data *data);
++};
++
++#define MMS114_FLAGS_ID_MASK		GENMASK(3, 0)
++#define MMS114_FLAGS_TYPE_MASK		GENMASK(6, 5)
++#define MMS114_FLAGS_PRESSED_MASK	BIT(7)
++
++#define MMS114_XY_HI_X_MASK		GENMASK(3, 0)
++#define MMS114_XY_HI_Y_MASK		GENMASK(7, 4)
++
+ struct mms114_touch {
+-	u8 id:4, reserved_bit4:1, type:2, pressed:1;
+-	u8 x_hi:4, y_hi:4;
++	u8 flags;
++	u8 xy_hi;
+ 	u8 x_lo;
+ 	u8 y_lo;
+ 	u8 width;
+@@ -87,16 +95,16 @@ struct mms114_touch {
+ 	u8 reserved[2];
+ } __packed;
+ 
+-static int __mms114_read_reg(struct mms114_data *data, unsigned int reg,
+-			     unsigned int len, u8 *val)
++static int __mms114_read_reg(struct mms114_data *data, u8 reg,
++			     unsigned int len, void *val)
+ {
+ 	struct i2c_client *client = data->client;
+ 	struct i2c_msg xfer[2];
+-	u8 buf = reg & 0xff;
++	u8 buf = reg;
+ 	int error;
+ 
+-	if (reg <= MMS114_MODE_CONTROL && reg + len > MMS114_MODE_CONTROL)
+-		BUG();
++	if (WARN_ON(reg <= MMS114_MODE_CONTROL && reg + len > MMS114_MODE_CONTROL))
++		return -EINVAL;
+ 
+ 	/* Write register */
+ 	xfer[0].addr = client->addr;
+@@ -116,12 +124,12 @@ static int __mms114_read_reg(struct mms114_data *data, unsigned int reg,
+ 			"%s: i2c transfer failed (%d)\n", __func__, error);
+ 		return error < 0 ? error : -EIO;
+ 	}
+-	udelay(MMS114_I2C_DELAY);
++	usleep_range(MMS114_I2C_DELAY, MMS114_I2C_DELAY + 50);
+ 
+ 	return 0;
+ }
+ 
+-static int mms114_read_reg(struct mms114_data *data, unsigned int reg)
++static int mms114_read_reg(struct mms114_data *data, u8 reg)
+ {
+ 	u8 val;
+ 	int error;
+@@ -133,15 +141,14 @@ static int mms114_read_reg(struct mms114_data *data, unsigned int reg)
+ 	return error < 0 ? error : val;
+ }
+ 
+-static int mms114_write_reg(struct mms114_data *data, unsigned int reg,
+-			    unsigned int val)
++static int mms114_write_reg(struct mms114_data *data, u8 reg, u8 val)
+ {
+ 	struct i2c_client *client = data->client;
+ 	u8 buf[2];
+ 	int error;
+ 
+-	buf[0] = reg & 0xff;
+-	buf[1] = val & 0xff;
++	buf[0] = reg;
++	buf[1] = val;
+ 
+ 	error = i2c_master_send(client, buf, 2);
+ 	if (error != 2) {
+@@ -149,7 +156,7 @@ static int mms114_write_reg(struct mms114_data *data, unsigned int reg,
+ 			"%s: i2c send failed (%d)\n", __func__, error);
+ 		return error < 0 ? error : -EIO;
+ 	}
+-	udelay(MMS114_I2C_DELAY);
++	usleep_range(MMS114_I2C_DELAY, MMS114_I2C_DELAY + 50);
+ 
+ 	if (reg == MMS114_MODE_CONTROL)
+ 		data->cache_mode_control = val;
+@@ -157,32 +164,119 @@ static int mms114_write_reg(struct mms114_data *data, unsigned int reg,
+ 	return 0;
+ }
+ 
++static int mms114_get_version(struct mms114_data *data)
++{
++	struct device *dev = &data->client->dev;
++	u8 buf[6];
++	int error;
++
++	error = __mms114_read_reg(data, MMS114_TSP_REV, 6, buf);
++	if (error)
++		return error;
++
++	dev_info(dev, "TSP Rev: 0x%x, HW Rev: 0x%x, Firmware Ver: 0x%x\n",
++		 buf[0], buf[1], buf[3]);
++	return 0;
++}
++
++static int mms152_get_version(struct mms114_data *data)
++{
++	struct device *dev = &data->client->dev;
++	u8 buf[3];
++	int group;
++	int error;
++
++	error = __mms114_read_reg(data, MMS152_FW_REV, 3, buf);
++	if (error)
++		return error;
++
++	group = i2c_smbus_read_byte_data(data->client, MMS152_COMPAT_GROUP);
++	if (group < 0)
++		return group;
++
++	dev_info(dev, "TSP FW Rev: bootloader 0x%x / core 0x%x / config 0x%x, Compat group: %c\n",
++		 buf[0], buf[1], buf[2], group);
++	return 0;
++}
++
++static int mms345l_get_version(struct mms114_data *data)
++{
++	struct device *dev = &data->client->dev;
++	u8 buf[3];
++	int error;
++
++	error = __mms114_read_reg(data, MMS152_FW_REV, 3, buf);
++	if (error)
++		return error;
++
++	dev_info(dev, "TSP FW Rev: bootloader 0x%x / core 0x%x / config 0x%x\n",
++		 buf[0], buf[1], buf[2]);
++	return 0;
++}
++
++static const struct mms_chip mms114_descriptor = {
++	.name = "MMS114",
++	.event_size = MMS114_EVENT_SIZE,
++	.has_config_regs = true,
++	.get_version = mms114_get_version,
++};
++
++static const struct mms_chip mms134s_descriptor = {
++	.name = "MMS134S",
++	.event_size = MMS136_EVENT_SIZE,
++	.has_config_regs = true,
++	.get_version = mms114_get_version,
++};
++
++static const struct mms_chip mms136_descriptor = {
++	.name = "MMS136",
++	.event_size = MMS136_EVENT_SIZE,
++	.has_config_regs = true,
++	.get_version = mms114_get_version,
++};
++
++static const struct mms_chip mms152_descriptor = {
++	.name = "MMS152",
++	.event_size = MMS114_EVENT_SIZE,
++	.has_config_regs = false,
++	.get_version = mms152_get_version,
++};
++
++static const struct mms_chip mms345l_descriptor = {
++	.name = "MMS345L",
++	.event_size = MMS114_EVENT_SIZE,
++	.has_config_regs = false,
++	.get_version = mms345l_get_version,
++};
++
+ static void mms114_process_mt(struct mms114_data *data, struct mms114_touch *touch)
+ {
+ 	struct i2c_client *client = data->client;
+ 	struct input_dev *input_dev = data->input_dev;
+-	unsigned int id;
++	unsigned int id = FIELD_GET(MMS114_FLAGS_ID_MASK, touch->flags);
++	unsigned int type = FIELD_GET(MMS114_FLAGS_TYPE_MASK, touch->flags);
++	bool pressed = FIELD_GET(MMS114_FLAGS_PRESSED_MASK, touch->flags);
+ 	unsigned int x;
+ 	unsigned int y;
+ 
+-	if (touch->id == 0 || touch->id > MMS114_MAX_TOUCH) {
+-		dev_err(&client->dev, "Wrong touch id (%d)\n", touch->id);
++	if (id == 0 || id > MMS114_MAX_TOUCH) {
++		dev_err(&client->dev, "Wrong touch id (%d)\n", id);
+ 		return;
+ 	}
+ 
+-	id = touch->id - 1;
+-	x = touch->x_lo | touch->x_hi << 8;
+-	y = touch->y_lo | touch->y_hi << 8;
++	id--;
++	x = touch->x_lo | FIELD_GET(MMS114_XY_HI_X_MASK, touch->xy_hi) << 8;
++	y = touch->y_lo | FIELD_GET(MMS114_XY_HI_Y_MASK, touch->xy_hi) << 8;
+ 
+ 	dev_dbg(&client->dev,
+ 		"id: %d, type: %d, pressed: %d, x: %d, y: %d, width: %d, strength: %d\n",
+-		id, touch->type, touch->pressed,
++		id, type, pressed,
+ 		x, y, touch->width, touch->strength);
+ 
+ 	input_mt_slot(input_dev, id);
+-	input_mt_report_slot_state(input_dev, MT_TOOL_FINGER, touch->pressed);
++	input_mt_report_slot_state(input_dev, MT_TOOL_FINGER, pressed);
+ 
+-	if (touch->pressed) {
++	if (pressed) {
+ 		touchscreen_report_pos(input_dev, &data->props, x, y, true);
+ 		input_report_abs(input_dev, ABS_MT_TOUCH_MAJOR, touch->width);
+ 		input_report_abs(input_dev, ABS_MT_PRESSURE, touch->strength);
+@@ -195,21 +289,23 @@ static void mms114_process_touchkey(struct mms114_data *data,
+ 	struct i2c_client *client = data->client;
+ 	struct input_dev *input_dev = data->input_dev;
+ 	unsigned int keycode_id;
++	unsigned int id = FIELD_GET(MMS114_FLAGS_ID_MASK, touch->flags);
++	bool pressed = FIELD_GET(MMS114_FLAGS_PRESSED_MASK, touch->flags);
+ 
+-	if (touch->id == 0)
++	if (id == 0)
+ 		return;
+ 
+-	if (touch->id > data->num_keycodes) {
++	if (id > data->num_keycodes) {
+ 		dev_err(&client->dev, "Wrong touch id for touchkey (%d)\n",
+-			touch->id);
++			id);
+ 		return;
+ 	}
+ 
+-	keycode_id = touch->id - 1;
++	keycode_id = id - 1;
+ 	dev_dbg(&client->dev, "keycode id: %d, pressed: %d\n", keycode_id,
+-		touch->pressed);
++		pressed);
+ 
+-	input_report_key(input_dev, data->keycodes[keycode_id], touch->pressed);
++	input_report_key(input_dev, data->keycodes[keycode_id], pressed);
+ }
+ 
+ static irqreturn_t mms114_interrupt(int irq, void *dev_id)
+@@ -218,8 +314,8 @@ static irqreturn_t mms114_interrupt(int irq, void *dev_id)
+ 	struct i2c_client *client = data->client;
+ 	struct mms114_touch touch[MMS114_MAX_TOUCH];
+ 	struct mms114_touch *t;
++	int event_size = data->chip->event_size;
+ 	int packet_size;
+-	int event_size;
+ 	int touch_size;
+ 	int index;
+ 	int error;
+@@ -234,23 +330,17 @@ static irqreturn_t mms114_interrupt(int irq, void *dev_id)
+ 		goto out;
+ 	}
+ 
+-	/* MMS136 has slightly different event size */
+-	if (data->type == TYPE_MMS134S || data->type == TYPE_MMS136)
+-		event_size = MMS136_EVENT_SIZE;
+-	else
+-		event_size = MMS114_EVENT_SIZE;
+-
+ 	touch_size = packet_size / event_size;
+ 
+-	error = __mms114_read_reg(data, MMS114_INFORMATION, packet_size,
+-			(u8 *)touch);
+-	if (error < 0)
++	error = __mms114_read_reg(data, MMS114_INFORMATION, packet_size, touch);
++	if (error)
+ 		goto out;
+ 
+ 	for (index = 0; index < touch_size; index++) {
+ 		t = (struct mms114_touch *)((u8 *)touch + index * event_size);
++		unsigned int type = FIELD_GET(MMS114_FLAGS_TYPE_MASK, t->flags);
+ 
+-		switch (t->type) {
++		switch (type) {
+ 		case MMS114_TYPE_TOUCHSCREEN:
+ 			mms114_process_mt(data, t);
+ 			break;
+@@ -261,7 +351,7 @@ static irqreturn_t mms114_interrupt(int irq, void *dev_id)
+ 
+ 		default:
+ 			dev_err(&client->dev, "Wrong touch type (%d)\n",
+-				t->type);
++				type);
+ 			break;
+ 		}
+ 	}
+@@ -290,65 +380,17 @@ static int mms114_set_active(struct mms114_data *data, bool active)
+ 	return mms114_write_reg(data, MMS114_MODE_CONTROL, val);
+ }
+ 
+-static int mms114_get_version(struct mms114_data *data)
+-{
+-	struct device *dev = &data->client->dev;
+-	u8 buf[6];
+-	int group;
+-	int error;
+-
+-	switch (data->type) {
+-	case TYPE_MMS345L:
+-		error = __mms114_read_reg(data, MMS152_FW_REV, 3, buf);
+-		if (error)
+-			return error;
+-
+-		dev_info(dev, "TSP FW Rev: bootloader 0x%x / core 0x%x / config 0x%x\n",
+-			 buf[0], buf[1], buf[2]);
+-		break;
+-
+-	case TYPE_MMS152:
+-		error = __mms114_read_reg(data, MMS152_FW_REV, 3, buf);
+-		if (error)
+-			return error;
+-
+-		group = i2c_smbus_read_byte_data(data->client,
+-						  MMS152_COMPAT_GROUP);
+-		if (group < 0)
+-			return group;
+-
+-		dev_info(dev, "TSP FW Rev: bootloader 0x%x / core 0x%x / config 0x%x, Compat group: %c\n",
+-			 buf[0], buf[1], buf[2], group);
+-		break;
+-
+-	case TYPE_MMS114:
+-	case TYPE_MMS134S:
+-	case TYPE_MMS136:
+-		error = __mms114_read_reg(data, MMS114_TSP_REV, 6, buf);
+-		if (error)
+-			return error;
+-
+-		dev_info(dev, "TSP Rev: 0x%x, HW Rev: 0x%x, Firmware Ver: 0x%x\n",
+-			 buf[0], buf[1], buf[3]);
+-		break;
+-	}
+-
+-	return 0;
+-}
+-
+ static int mms114_setup_regs(struct mms114_data *data)
+ {
+ 	const struct touchscreen_properties *props = &data->props;
+ 	int val;
+ 	int error;
+ 
+-	error = mms114_get_version(data);
+-	if (error < 0)
++	error = data->chip->get_version(data);
++	if (error)
+ 		return error;
+ 
+-	/* MMS114, MMS134S and MMS136 have configuration and power on registers */
+-	if (data->type != TYPE_MMS114 && data->type != TYPE_MMS134S &&
+-	    data->type != TYPE_MMS136)
++	if (!data->chip->has_config_regs)
+ 		return 0;
+ 
+ 	error = mms114_set_active(data, true);
+@@ -366,21 +408,21 @@ static int mms114_setup_regs(struct mms114_data *data)
+ 	if (error < 0)
+ 		return error;
+ 
+-	val = props->max_x & 0xff;
++	val = props->max_y & 0xff;
+ 	error = mms114_write_reg(data, MMS114_Y_RESOLUTION, val);
+ 	if (error < 0)
+ 		return error;
+ 
+ 	if (data->contact_threshold) {
+ 		error = mms114_write_reg(data, MMS114_CONTACT_THRESHOLD,
+-				data->contact_threshold);
++					 data->contact_threshold);
+ 		if (error < 0)
+ 			return error;
+ 	}
+ 
+ 	if (data->moving_threshold) {
+ 		error = mms114_write_reg(data, MMS114_MOVING_THRESHOLD,
+-				data->moving_threshold);
++					 data->moving_threshold);
+ 		if (error < 0)
+ 			return error;
+ 	}
+@@ -466,9 +508,9 @@ static int mms114_parse_legacy_bindings(struct mms114_data *data)
+ 	}
+ 
+ 	device_property_read_u32(dev, "contact-threshold",
+-				&data->contact_threshold);
++				 &data->contact_threshold);
+ 	device_property_read_u32(dev, "moving-threshold",
+-				&data->moving_threshold);
++				 &data->moving_threshold);
+ 
+ 	if (device_property_read_bool(dev, "x-invert"))
+ 		props->invert_x = true;
+@@ -484,7 +526,6 @@ static int mms114_probe(struct i2c_client *client)
+ {
+ 	struct mms114_data *data;
+ 	struct input_dev *input_dev;
+-	const void *match_data;
+ 	int error;
+ 	int i;
+ 
+@@ -504,12 +545,10 @@ static int mms114_probe(struct i2c_client *client)
+ 	data->client = client;
+ 	data->input_dev = input_dev;
+ 
+-	match_data = device_get_match_data(&client->dev);
+-	if (!match_data)
++	data->chip = i2c_get_match_data(client);
++	if (!data->chip)
+ 		return -EINVAL;
+ 
+-	data->type = (enum mms_type)match_data;
+-
+ 	data->num_keycodes = device_property_count_u32(&client->dev,
+ 						       "linux,keycodes");
+ 	if (data->num_keycodes == -EINVAL) {
+@@ -521,7 +560,7 @@ static int mms114_probe(struct i2c_client *client)
+ 		return data->num_keycodes;
+ 	} else if (data->num_keycodes > MMS114_MAX_TOUCHKEYS) {
+ 		dev_warn(&client->dev,
+-			"Found %d linux,keycodes but max is %d, ignoring the rest\n",
++			 "Found %d linux,keycodes but max is %d, ignoring the rest\n",
+ 			 data->num_keycodes, MMS114_MAX_TOUCHKEYS);
+ 		data->num_keycodes = MMS114_MAX_TOUCHKEYS;
+ 	}
+@@ -566,8 +605,7 @@ static int mms114_probe(struct i2c_client *client)
+ 				     0, data->props.max_y, 0, 0);
+ 	}
+ 
+-	if (data->type == TYPE_MMS114 || data->type == TYPE_MMS134S ||
+-	    data->type == TYPE_MMS136) {
++	if (data->chip->has_config_regs) {
+ 		/*
+ 		 * The firmware handles movement and pressure fuzz, so
+ 		 * don't duplicate that in software.
+@@ -582,8 +620,8 @@ static int mms114_probe(struct i2c_client *client)
+ 	}
+ 
+ 	input_dev->name = devm_kasprintf(&client->dev, GFP_KERNEL,
+-					 "MELFAS MMS%d Touchscreen",
+-					 data->type);
++					 "MELFAS %s Touchscreen",
++					 data->chip->name);
+ 	if (!input_dev->name)
+ 		return -ENOMEM;
+ 
+@@ -679,29 +717,22 @@ static int mms114_resume(struct device *dev)
+ static DEFINE_SIMPLE_DEV_PM_OPS(mms114_pm_ops, mms114_suspend, mms114_resume);
+ 
+ static const struct i2c_device_id mms114_id[] = {
+-	{ .name = "mms114" },
++	{ .name = "mms114", .driver_data = (kernel_ulong_t)&mms114_descriptor },
++	{ .name = "mms134s", .driver_data = (kernel_ulong_t)&mms134s_descriptor },
++	{ .name = "mms136", .driver_data = (kernel_ulong_t)&mms136_descriptor },
++	{ .name = "mms152", .driver_data = (kernel_ulong_t)&mms152_descriptor },
++	{ .name = "mms345l", .driver_data = (kernel_ulong_t)&mms345l_descriptor },
+ 	{ }
+ };
+ MODULE_DEVICE_TABLE(i2c, mms114_id);
+ 
+ #ifdef CONFIG_OF
+ static const struct of_device_id mms114_dt_match[] = {
+-	{
+-		.compatible = "melfas,mms114",
+-		.data = (void *)TYPE_MMS114,
+-	}, {
+-		.compatible = "melfas,mms134s",
+-		.data = (void *)TYPE_MMS134S,
+-	}, {
+-		.compatible = "melfas,mms136",
+-		.data = (void *)TYPE_MMS136,
+-	}, {
+-		.compatible = "melfas,mms152",
+-		.data = (void *)TYPE_MMS152,
+-	}, {
+-		.compatible = "melfas,mms345l",
+-		.data = (void *)TYPE_MMS345L,
+-	},
++	{ .compatible = "melfas,mms114", .data = &mms114_descriptor },
++	{ .compatible = "melfas,mms134s", .data = &mms134s_descriptor },
++	{ .compatible = "melfas,mms136", .data = &mms136_descriptor },
++	{ .compatible = "melfas,mms152", .data = &mms152_descriptor },
++	{ .compatible = "melfas,mms345l", .data = &mms345l_descriptor },
+ 	{ }
+ };
+ MODULE_DEVICE_TABLE(of, mms114_dt_match);
+@@ -722,4 +753,4 @@ module_i2c_driver(mms114_driver);
+ /* Module information */
+ MODULE_AUTHOR("Joonyoung Shim <jy0922.shim@samsung.com>");
+ MODULE_DESCRIPTION("MELFAS mms114 Touchscreen driver");
+-MODULE_LICENSE("GPL v2");
++MODULE_LICENSE("GPL");
+diff --git a/drivers/input/touchscreen/sur40.c b/drivers/input/touchscreen/sur40.c
+--- a/drivers/input/touchscreen/sur40.c
++++ b/drivers/input/touchscreen/sur40.c
+@@ -128,8 +128,8 @@ struct sur40_image_header {
+ /* polling interval (ms) */
+ #define POLL_INTERVAL 1
+ 
+-/* maximum number of contacts FIXME: this is a guess? */
+-#define MAX_CONTACTS 64
++/* maximum number of contacts */
++#define MAX_CONTACTS 52
+ 
+ /* control commands */
+ #define SUR40_GET_VERSION 0xb0 /* 12 bytes string    */
+diff --git a/drivers/input/touchscreen/wacom_w8001.c b/drivers/input/touchscreen/wacom_w8001.c
+--- a/drivers/input/touchscreen/wacom_w8001.c
++++ b/drivers/input/touchscreen/wacom_w8001.c
+@@ -417,6 +417,13 @@ static int w8001_detect(struct w8001 *w8001)
+ 	return 0;
+ }
+ 
++static void w8001_append_suffix(char *dest, const char *suffix, size_t dest_sz)
++{
++	size_t used = strnlen(dest, dest_sz);
++
++	strscpy(dest + used, suffix, dest_sz - used);
++}
++
+ static int w8001_setup_pen(struct w8001 *w8001, char *basename,
+ 			   size_t basename_sz)
+ {
+@@ -453,7 +460,7 @@ static int w8001_setup_pen(struct w8001 *w8001, char *basename,
+ 	}
+ 
+ 	w8001->id = 0x90;
+-	strlcat(basename, " Penabled", basename_sz);
++	w8001_append_suffix(basename, " Penabled", basename_sz);
+ 
+ 	return 0;
+ }
+@@ -503,14 +510,14 @@ static int w8001_setup_touch(struct w8001 *w8001, char *basename,
+ 	case 2:
+ 		w8001->pktlen = W8001_PKTLEN_TOUCH93;
+ 		w8001->id = 0x93;
+-		strlcat(basename, " 1FG", basename_sz);
++		w8001_append_suffix(basename, " 1FG", basename_sz);
+ 		break;
+ 
+ 	case 1:
+ 	case 3:
+ 	case 4:
+ 		w8001->pktlen = W8001_PKTLEN_TOUCH9A;
+-		strlcat(basename, " 1FG", basename_sz);
++		w8001_append_suffix(basename, " 1FG", basename_sz);
+ 		w8001->id = 0x9a;
+ 		break;
+ 
+@@ -534,7 +541,7 @@ static int w8001_setup_touch(struct w8001 *w8001, char *basename,
+ 		input_abs_set_res(dev, ABS_MT_POSITION_X, touch.panel_res);
+ 		input_abs_set_res(dev, ABS_MT_POSITION_Y, touch.panel_res);
+ 
+-		strlcat(basename, " 2FG", basename_sz);
++		w8001_append_suffix(basename, " 2FG", basename_sz);
+ 		if (w8001->max_pen_x && w8001->max_pen_y)
+ 			w8001->id = 0xE3;
+ 		else
+@@ -542,7 +549,7 @@ static int w8001_setup_touch(struct w8001 *w8001, char *basename,
+ 		break;
+ 	}
+ 
+-	strlcat(basename, " Touchscreen", basename_sz);
++	w8001_append_suffix(basename, " Touchscreen", basename_sz);
+ 
+ 	return 0;
+ }
+diff --git a/drivers/mfd/rohm-bd71828.c b/drivers/mfd/rohm-bd71828.c
+--- a/drivers/mfd/rohm-bd71828.c
++++ b/drivers/mfd/rohm-bd71828.c
+@@ -5,7 +5,8 @@
+  * ROHM BD718[15/28/79] and BD72720 PMIC driver
+  */
+ 
+-#include <linux/gpio_keys.h>
++#include <linux/device/devres.h>
++#include <linux/gfp_types.h>
+ #include <linux/i2c.h>
+ #include <linux/input.h>
+ #include <linux/interrupt.h>
+@@ -18,6 +19,7 @@
+ #include <linux/mfd/rohm-generic.h>
+ #include <linux/module.h>
+ #include <linux/of.h>
++#include <linux/property.h>
+ #include <linux/regmap.h>
+ #include <linux/types.h>
+ 
+@@ -37,19 +39,6 @@
+ 		},							   \
+ 	}
+ 
+-static struct gpio_keys_button button = {
+-	.code = KEY_POWER,
+-	.gpio = -1,
+-	.type = EV_KEY,
+-	.wakeup = 1,
+-};
+-
+-static const struct gpio_keys_platform_data bd71828_powerkey_data = {
+-	.buttons = &button,
+-	.nbuttons = 1,
+-	.name = "bd71828-pwrkey",
+-};
+-
+ static const struct resource bd71815_rtc_irqs[] = {
+ 	DEFINE_RES_IRQ_NAMED(BD71815_INT_RTC0, "bd70528-rtc-alm-0"),
+ 	DEFINE_RES_IRQ_NAMED(BD71815_INT_RTC1, "bd70528-rtc-alm-1"),
+@@ -174,10 +163,6 @@ static struct mfd_cell bd71828_mfd_cells[] = {
+ 		.name = "bd71828-rtc",
+ 		.resources = bd71828_rtc_irqs,
+ 		.num_resources = ARRAY_SIZE(bd71828_rtc_irqs),
+-	}, {
+-		.name = "gpio-keys",
+-		.platform_data = &bd71828_powerkey_data,
+-		.pdata_size = sizeof(bd71828_powerkey_data),
+ 	},
+ };
+ 
+@@ -242,11 +227,8 @@ static const struct mfd_cell bd72720_mfd_cells[] = {
+ 		.name = "bd72720-rtc",
+ 		.resources = bd72720_rtc_irqs,
+ 		.num_resources = ARRAY_SIZE(bd72720_rtc_irqs),
+-	}, {
+-		.name = "gpio-keys",
+-		.platform_data = &bd71828_powerkey_data,
+-		.pdata_size = sizeof(bd71828_powerkey_data),
+ 	},
++	/* Power button is registered separately */
+ };
+ 
+ static const struct regmap_range bd71815_volatile_ranges[] = {
+@@ -877,6 +859,84 @@ static int set_clk_mode(struct device *dev, struct regmap *regmap,
+ 				  OUT32K_MODE_CMOS);
+ }
+ 
++static const struct property_entry bd71828_powerkey_parent_props[] = {
++	PROPERTY_ENTRY_STRING("label", "bd71828-pwrkey"),
++	{ }
++};
++
++static const struct property_entry bd71828_powerkey_props[] = {
++	PROPERTY_ENTRY_U32("linux,code", KEY_POWER),
++	PROPERTY_ENTRY_BOOL("wakeup-source"),
++	{ }
++};
++
++#define GPIO_KEYS  0	/* Node corresponding to gpio-keys device itself */
++#define PWRON_KEY  1	/* Node describing power button in gpio-keys */
++
++static int bd71828_i2c_register_swnodes(const struct software_node *nodes)
++{
++	const struct software_node * const node_group[] = {
++		&nodes[GPIO_KEYS], &nodes[PWRON_KEY], NULL
++	};
++
++	return software_node_register_node_group(node_group);
++}
++
++static void bd71828_i2c_unregister_swnodes(void *data)
++{
++	const struct software_node *nodes = data;
++	const struct software_node * const node_group[] = {
++		&nodes[GPIO_KEYS], &nodes[PWRON_KEY], NULL
++	};
++
++	software_node_unregister_node_group(node_group);
++}
++
++static int bd71828_i2c_register_pwrbutton(struct device *dev, int button_irq,
++					  struct irq_domain *irq_domain)
++{
++	const struct resource res[] = {
++		DEFINE_RES_IRQ_NAMED(button_irq, "bd71828-pwrkey"),
++	};
++	struct mfd_cell gpio_keys_cell = {
++		.name = "gpio-keys",
++		.resources = res,
++		.num_resources = ARRAY_SIZE(res),
++	};
++	struct software_node *nodes;
++	int ret;
++
++	nodes = devm_kcalloc(dev, 2, sizeof(*nodes), GFP_KERNEL);
++	if (!nodes)
++		return -ENOMEM;
++
++	nodes[GPIO_KEYS].name = devm_kasprintf(dev, GFP_KERNEL, "%s-power-key", dev_name(dev));
++	if (!nodes[GPIO_KEYS].name)
++		return -ENOMEM;
++
++	nodes[GPIO_KEYS].properties = bd71828_powerkey_parent_props;
++
++	nodes[PWRON_KEY].parent = &nodes[GPIO_KEYS];
++	nodes[PWRON_KEY].properties = bd71828_powerkey_props;
++
++	ret = bd71828_i2c_register_swnodes(nodes);
++	if (ret)
++		return ret;
++
++	ret = devm_add_action_or_reset(dev, bd71828_i2c_unregister_swnodes, nodes);
++	if (ret)
++		return ret;
++
++	gpio_keys_cell.swnode = &nodes[GPIO_KEYS];
++
++	ret = devm_mfd_add_devices(dev, PLATFORM_DEVID_AUTO, &gpio_keys_cell, 1,
++				   NULL, 0, irq_domain);
++	if (ret)
++		return dev_err_probe(dev, ret, "Failed to register power-button");
++
++	return 0;
++}
++
+ static struct i2c_client *bd71828_dev;
+ static void bd71828_power_off(void)
+ {
+@@ -929,6 +989,7 @@ static struct regmap *bd72720_do_regmaps(struct i2c_client *i2c)
+ static int bd71828_i2c_probe(struct i2c_client *i2c)
+ {
+ 	struct regmap_irq_chip_data *irq_data;
++	struct irq_domain *irq_domain;
+ 	int ret;
+ 	struct regmap *regmap = NULL;
+ 	const struct regmap_config *regmap_config;
+@@ -1022,23 +1083,23 @@ static int bd71828_i2c_probe(struct i2c_client *i2c)
+ 					"Failed to enable main level IRQs\n");
+ 		}
+ 	}
+-	if (button_irq) {
+-		ret = regmap_irq_get_virq(irq_data, button_irq);
+-		if (ret < 0)
+-			return dev_err_probe(&i2c->dev, ret,
+-					     "Failed to get the power-key IRQ\n");
+-
+-		button.irq = ret;
+-	}
+ 
+ 	ret = set_clk_mode(&i2c->dev, regmap, clkmode_reg);
+ 	if (ret)
+ 		return ret;
+ 
++	irq_domain = regmap_irq_get_domain(irq_data);
++
+ 	ret = devm_mfd_add_devices(&i2c->dev, PLATFORM_DEVID_AUTO, mfd, cells,
+-				   NULL, 0, regmap_irq_get_domain(irq_data));
++				   NULL, 0, irq_domain);
+ 	if (ret)
+-		return	dev_err_probe(&i2c->dev, ret, "Failed to create subdevices\n");
++		return dev_err_probe(&i2c->dev, ret, "Failed to create subdevices\n");
++
++	if (button_irq) {
++		ret = bd71828_i2c_register_pwrbutton(&i2c->dev, button_irq, irq_domain);
++		if (ret)
++			return ret;
++	}
+ 
+ 	if (of_device_is_system_power_controller(i2c->dev.of_node) &&
+ 	    chip_type == ROHM_CHIP_TYPE_BD71828) {
+diff --git a/drivers/mfd/rohm-bd718x7.c b/drivers/mfd/rohm-bd718x7.c
+--- a/drivers/mfd/rohm-bd718x7.c
++++ b/drivers/mfd/rohm-bd718x7.c
+@@ -7,7 +7,8 @@
+ // Datasheet for BD71837MWV available from
+ // https://www.rohm.com/datasheet/BD71837MWV/bd71837mwv-e
+ 
+-#include <linux/gpio_keys.h>
++#include <linux/device/devres.h>
++#include <linux/gfp_types.h>
+ #include <linux/i2c.h>
+ #include <linux/input.h>
+ #include <linux/interrupt.h>
+@@ -15,37 +16,16 @@
+ #include <linux/mfd/core.h>
+ #include <linux/module.h>
+ #include <linux/of.h>
++#include <linux/property.h>
+ #include <linux/regmap.h>
+ #include <linux/types.h>
+ 
+-static struct gpio_keys_button button = {
+-	.code = KEY_POWER,
+-	.gpio = -1,
+-	.type = EV_KEY,
+-};
+-
+-static struct gpio_keys_platform_data bd718xx_powerkey_data = {
+-	.buttons = &button,
+-	.nbuttons = 1,
+-	.name = "bd718xx-pwrkey",
+-};
+-
+ static struct mfd_cell bd71837_mfd_cells[] = {
+-	{
+-		.name = "gpio-keys",
+-		.platform_data = &bd718xx_powerkey_data,
+-		.pdata_size = sizeof(bd718xx_powerkey_data),
+-	},
+ 	{ .name = "bd71837-clk", },
+ 	{ .name = "bd71837-pmic", },
+ };
+ 
+ static struct mfd_cell bd71847_mfd_cells[] = {
+-	{
+-		.name = "gpio-keys",
+-		.platform_data = &bd718xx_powerkey_data,
+-		.pdata_size = sizeof(bd718xx_powerkey_data),
+-	},
+ 	{ .name = "bd71847-clk", },
+ 	{ .name = "bd71847-pmic", },
+ };
+@@ -125,10 +105,89 @@ static int bd718xx_init_press_duration(struct regmap *regmap,
+ 	return 0;
+ }
+ 
++static const struct property_entry bd718xx_powerkey_parent_props[] = {
++	PROPERTY_ENTRY_STRING("label", "bd718xx-pwrkey"),
++	{ }
++};
++
++static const struct property_entry bd718xx_powerkey_props[] = {
++	PROPERTY_ENTRY_U32("linux,code", KEY_POWER),
++	{ }
++};
++
++static const struct resource bd718xx_powerkey_resources[] = {
++	DEFINE_RES_IRQ_NAMED(BD718XX_INT_PWRBTN_S, "bd718xx-pwrkey"),
++};
++
++#define GPIO_KEYS  0	/* Node corresponding to gpio-keys device itself */
++#define PWRON_KEY  1	/* Node describing power button in gpio-keys */
++
++static int bd718xx_i2c_register_swnodes(const struct software_node *nodes)
++{
++	const struct software_node * const node_group[] = {
++		&nodes[GPIO_KEYS], &nodes[PWRON_KEY], NULL
++	};
++
++	return software_node_register_node_group(node_group);
++}
++
++static void bd718xx_i2c_unregister_swnodes(void *data)
++{
++	const struct software_node *nodes = data;
++	const struct software_node * const node_group[] = {
++		&nodes[GPIO_KEYS], &nodes[PWRON_KEY], NULL
++	};
++
++	software_node_unregister_node_group(node_group);
++}
++
++static int bd718xx_i2c_register_pwrbutton(struct device *dev,
++					  struct irq_domain *irq_domain)
++{
++	struct mfd_cell gpio_keys_cell = {
++		.name = "gpio-keys",
++		.resources = bd718xx_powerkey_resources,
++		.num_resources = ARRAY_SIZE(bd718xx_powerkey_resources),
++	};
++	struct software_node *nodes;
++	int ret;
++
++	nodes = devm_kcalloc(dev, 2, sizeof(*nodes), GFP_KERNEL);
++	if (!nodes)
++		return -ENOMEM;
++
++	nodes[GPIO_KEYS].name = devm_kasprintf(dev, GFP_KERNEL, "%s-power-key", dev_name(dev));
++	if (!nodes[GPIO_KEYS].name)
++		return -ENOMEM;
++
++	nodes[GPIO_KEYS].properties = bd718xx_powerkey_parent_props;
++
++	nodes[PWRON_KEY].parent = &nodes[GPIO_KEYS];
++	nodes[PWRON_KEY].properties = bd718xx_powerkey_props;
++
++	ret = bd718xx_i2c_register_swnodes(nodes);
++	if (ret)
++		return ret;
++
++	ret = devm_add_action_or_reset(dev, bd718xx_i2c_unregister_swnodes, nodes);
++	if (ret)
++		return ret;
++
++	gpio_keys_cell.swnode = &nodes[GPIO_KEYS];
++
++	ret = devm_mfd_add_devices(dev, PLATFORM_DEVID_AUTO, &gpio_keys_cell, 1,
++				   NULL, 0, irq_domain);
++	if (ret)
++		return dev_err_probe(dev, ret, "Failed to register power-button");
++
++	return 0;
++}
++
+ static int bd718xx_i2c_probe(struct i2c_client *i2c)
+ {
+ 	struct regmap *regmap;
+ 	struct regmap_irq_chip_data *irq_data;
++	struct irq_domain *irq_domain;
+ 	int ret;
+ 	unsigned int chip_type;
+ 	struct mfd_cell *mfd;
+@@ -169,20 +228,18 @@ static int bd718xx_i2c_probe(struct i2c_client *i2c)
+ 	if (ret)
+ 		return ret;
+ 
+-	ret = regmap_irq_get_virq(irq_data, BD718XX_INT_PWRBTN_S);
+-
+-	if (ret < 0)
+-		return dev_err_probe(&i2c->dev, ret, "Failed to get the IRQ\n");
+-
+-	button.irq = ret;
++	irq_domain = regmap_irq_get_domain(irq_data);
+ 
+ 	ret = devm_mfd_add_devices(&i2c->dev, PLATFORM_DEVID_AUTO,
+-				   mfd, cells, NULL, 0,
+-				   regmap_irq_get_domain(irq_data));
++				   mfd, cells, NULL, 0, irq_domain);
+ 	if (ret)
+-		dev_err_probe(&i2c->dev, ret, "Failed to create subdevices\n");
++		return dev_err_probe(&i2c->dev, ret, "Failed to create subdevices\n");
+ 
+-	return ret;
++	ret = bd718xx_i2c_register_pwrbutton(&i2c->dev, irq_domain);
++	if (ret)
++		return ret;
++
++	return 0;
+ }
+ 
+ static const struct of_device_id bd718xx_of_match[] = {
+diff --git a/include/linux/input.h b/include/linux/input.h
+--- a/include/linux/input.h
++++ b/include/linux/input.h
+@@ -117,7 +117,8 @@ enum input_clock_type {
+  *	user opens device and dev->close() is called when the very
+  *	last user closes the device
+  * @going_away: marks devices that are in a middle of unregistering and
+- *	causes input_open_device*() fail with -ENODEV.
++ *	causes input_open_device() and input_inhibit/uninhibit_device()
++ *	to fail with -ENODEV.
+  * @dev: driver model's view of this device
+  * @h_list: list of input handles associated with the device. When
+  *	accessing the list dev->mutex must be held
+@@ -128,11 +129,14 @@ enum input_clock_type {
+  * @devres_managed: indicates that devices is managed with devres framework
+  *	and needs not be explicitly unregistered or freed.
+  * @timestamp: storage for a timestamp set by input_set_timestamp called
+- *  by a driver
++ *	by a driver
+  * @inhibited: indicates that the input device is inhibited. If that is
+- * the case then input core ignores any events generated by the device.
+- * Device's close() is called when it is being inhibited and its open()
+- * is called when it is being uninhibited.
++ *	the case then input core ignores any events generated by the device.
++ *	Device's close() is called when it is being inhibited and its open()
++ *	is called when it is being uninhibited.
++ * @ready: indicates that the device has been successfully opened and is
++ *	prepared to process events (like LEDs or sounds) sent from the
++ *	input core.
+  */
+ struct input_dev {
+ 	const char *name;
+@@ -209,6 +213,7 @@ struct input_dev {
+ 	ktime_t timestamp[INPUT_CLK_MAX];
+ 
+ 	bool inhibited;
++	bool ready;
+ };
+ #define to_input_dev(d) container_of(d, struct input_dev, dev)
+ 
+@@ -284,8 +289,9 @@ struct input_handle;
+  * @connect: called when attaching a handler to an input device
+  * @disconnect: disconnects a handler from input device
+  * @start: starts handler for given handle. This function is called by
+- *	input core right after connect() method and also when a process
+- *	that "grabbed" a device releases it
++ *	input core when device is open and ready to process events,
++ *	and also when device is uninhibited or when a process that "grabbed"
++ *	a device releases it
+  * @passive_observer: set to %true by drivers only interested in observing
+  *	data stream from devices if there are other users present. Such
+  *	drivers will not result in starting underlying hardware device
+diff --git a/include/linux/input/elan-i2c-ids.h b/include/linux/input/elan-i2c-ids.h
+--- a/include/linux/input/elan-i2c-ids.h
++++ b/include/linux/input/elan-i2c-ids.h
+@@ -18,7 +18,7 @@
+ #ifndef __ELAN_I2C_IDS_H
+ #define __ELAN_I2C_IDS_H
+ 
+-#include <linux/mod_devicetable.h>
++#include <linux/device-id/acpi.h>
+ 
+ static const struct acpi_device_id elan_acpi_id[] = {
+ 	{ "ELAN0000", 0 },

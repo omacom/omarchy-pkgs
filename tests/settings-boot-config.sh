@@ -100,6 +100,10 @@ for recipe in omarchy-settings omarchy-settings-dev; do
         echo 'FAIL: backup names a 00-omarchy-hooks.conf the source does not ship' >&2
         exit 1
       fi
+      if printf '%s\n' "${backup[@]}" | grep -Fxq etc/sysctl.d/90-omarchy-arp.conf; then
+        echo 'FAIL: backup names a 90-omarchy-arp.conf the source does not ship' >&2
+        exit 1
+      fi
       # The installer owns the machine-specific live configuration.
       [[ ! -e $pkgdir/etc/default/limine ]]
       if printf '%s\n' "${backup[@]}" | grep -Fxq 'etc/default/limine'; then
@@ -126,6 +130,27 @@ for recipe in omarchy-settings omarchy-settings-dev; do
     )
   done
 done
+
+# A source that answers ARP per interface ships its sysctl drop-in, and the
+# package keeps local edits to it. The fixture above, like an older source,
+# does not ship one, and the loop checked it stays out of backup.
+printf 'net.ipv4.conf.all.arp_ignore=1\n' > "$fixture/etc/sysctl.d/90-omarchy-arp.conf"
+for recipe in omarchy-settings omarchy-settings-dev; do
+  for target_arch in aarch64 x86_64; do
+    (
+      export CARCH=$target_arch OMARCHY_SRC=$fixture
+      export srcdir=$scratch/src pkgdir=$scratch/arp-$recipe-$target_arch
+      backup=()
+      # shellcheck disable=SC1090 # Exercise each recipe's actual package function.
+      source "$BUILD_ROOT/pkgbuilds/$recipe/PKGBUILD"
+      package
+      cmp "$fixture/etc/sysctl.d/90-omarchy-arp.conf" "$pkgdir/etc/sysctl.d/90-omarchy-arp.conf"
+      printf '%s\n' "${backup[@]}" | grep -Fxq etc/sysctl.d/90-omarchy-arp.conf
+      echo "PASS: $recipe $CARCH ships the ARP sysctl drop-in and backs it up"
+    )
+  done
+done
+rm "$fixture/etc/sysctl.d/90-omarchy-arp.conf"
 
 # The aarch64 packages also reach Apple Silicon Macs, whose initramfs needs the
 # asahi hook. Source mkinitcpio.conf and the drop-ins in mkinitcpio's order and

@@ -1,0 +1,92 @@
+From ef5d2d246cd98c7f574a8ea9d4f3ef8c010db75e Mon Sep 17 00:00:00 2001
+From: Ryan Hughes <ryan@heyoodle.com>
+Date: Fri, 9 Oct 2026 14:23:21 -0400
+Subject: [PATCH] usb: typec: ucsi: retry init when the PPM answers early
+ commands incorrectly
+
+On some platforms the PPM is not ready to answer commands correctly
+for a short window during boot. On the Lenovo ThinkPad X1 Carbon
+Gen 14 (21V7, tested on BIOS 1.12 and 1.14) roughly half of all boots
+fail ucsi_init() with either -ENODEV (GET_CAPABILITY completes but
+reports zero connectors) or -EINVAL (a standard command is rejected,
+logged as "possible UCSI driver bug"). The failure is not a timeout:
+increasing the sync command completion wait does not change the rate.
+
+Since ucsi_init_work() only requeues on -EPROBE_DEFER, a single bad
+answer during that window leaves UCSI dead for the whole session, so
+Type-C events are never handled again; most visibly, the machine
+silently never resumes charging after the charger is replugged.
+Manually reloading ucsi_acpi a few seconds later has succeeded on
+every attempt observed, which suggests simply retrying is enough.
+
+Retry -ENODEV and -EINVAL the same way as the role switch wait, log
+the retries at debug level, keep the loud report for the case where
+the retries are exhausted, and note when init only succeeded after
+retrying.
+
+Tested on the affected machine: across 8 consecutive boots with this
+patch, 5 hit the failure (matching the historical ~50-60% rate) and
+all 5 recovered on the first retry ("PPM init succeeded after 2
+attempts"). 0 of 8 boots ended with UCSI unusable, where ~5 of 8
+would have without the patch.
+
+Signed-off-by: Jacob Riff <jacob@riff.dk>
+Acked-by: Heikki Krogerus <heikki.krogerus@linux.intel.com>
+Link: https://patch.msgid.link/20260824173536.2395830-1-jacob@riff.dk
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/usb/typec/ucsi/ucsi.c | 34 ++++++++++++++++++++++++++--------
+ 1 file changed, 26 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/usb/typec/ucsi/ucsi.c b/drivers/usb/typec/ucsi/ucsi.c
+index c1450639c..35e70211f 100644
+--- a/drivers/usb/typec/ucsi/ucsi.c
++++ b/drivers/usb/typec/ucsi/ucsi.c
+@@ -2223,18 +2223,36 @@ static void ucsi_init_work(struct work_struct *work)
+ 	int ret;
+ 
+ 	ret = ucsi_init(ucsi);
+-	if (ret)
+-		dev_err_probe(ucsi->dev, ret, "PPM init failed\n");
++	if (!ret) {
++		if (ucsi->work_count)
++			dev_info(ucsi->dev,
++				 "PPM init succeeded after %u attempts\n",
++				 ucsi->work_count + 1);
++		return;
++	}
+ 
+-	if (ret == -EPROBE_DEFER) {
+-		if (ucsi->work_count++ > UCSI_ROLE_SWITCH_WAIT_COUNT) {
+-			dev_err(ucsi->dev, "PPM init failed, stop trying\n");
++	/*
++	 * On some platforms the PPM is not ready to answer commands
++	 * correctly for a short window during boot: standard commands are
++	 * rejected or GET_CAPABILITY reports zero connectors, seen as
++	 * -EINVAL or -ENODEV from ucsi_init(), and a retry moments later
++	 * succeeds (observed on Lenovo ThinkPad X1 Carbon Gen 14, where
++	 * this affects roughly half of all boots). Retry those like the
++	 * USB role switch wait instead of giving up on the first attempt.
++	 */
++	if (ret == -EPROBE_DEFER || ret == -ENODEV || ret == -EINVAL) {
++		if (ucsi->work_count++ < UCSI_ROLE_SWITCH_WAIT_COUNT) {
++			dev_dbg(ucsi->dev, "PPM init failed (%pe), retrying\n",
++				ERR_PTR(ret));
++			queue_delayed_work(system_dfl_long_wq, &ucsi->work,
++					   UCSI_ROLE_SWITCH_INTERVAL);
+ 			return;
+ 		}
+-
+-		queue_delayed_work(system_dfl_long_wq, &ucsi->work,
+-				   UCSI_ROLE_SWITCH_INTERVAL);
++		dev_err(ucsi->dev, "PPM init failed, stop trying\n");
++		return;
+ 	}
++
++	dev_err_probe(ucsi->dev, ret, "PPM init failed\n");
+ }
+ 
+ /**
+-- 
+2.56.0
+
