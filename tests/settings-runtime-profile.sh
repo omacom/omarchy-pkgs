@@ -212,3 +212,19 @@ for recipe in omarchy-settings omarchy-settings-dev; do
     fail 'x86_64 gains only the new source files from a runtime-profile source' "$(cat "$scratch/added")"
   echo "PASS: $recipe: a runtime-profile source ships the full set on aarch64"
 done
+
+# New services must be discoverable by systemd, not only in the source archive.
+optional_units=(omarchy-thunderbolt-authorization omarchy-usb-authorization omarchy-gpd-pocket-4-rotate)
+for unit in "${optional_units[@]}"; do
+  printf 'fixture for %s\n' "$unit" >"$scratch/profile/default/systemd/user/$unit.service"
+done
+for recipe in omarchy-settings omarchy-settings-dev; do
+  for architecture in x86_64 aarch64; do
+    package_as "$recipe" "$scratch/profile" "$architecture" services checkout
+    for unit in "${optional_units[@]}"; do
+      cmp "$scratch/profile/default/systemd/user/$unit.service" "$scratch/services/usr/lib/systemd/user/$unit.service" ||
+        fail "$recipe installs $unit unchanged for $architecture"
+    done
+  done
+  echo "PASS: $recipe installs authorization and rotation user units on both architectures"
+done
