@@ -72,16 +72,25 @@ jobs:
               "https://api.github.com/repos/${{ github.repository }}/actions/artifacts?name=$label&per_page=5" \
               | jq -r '[.artifacts[] | select(.expired|not)] | sort_by(.created_at) | last | select(. != null) | "run \(.workflow_run.id), expires \(.expires_at)"')
             # The plan the publish job makes, made here before a runner is
-            # asked for: a tree the channel already holds at master's version
+            # asked for: a tree the channels already hold at master's version
             # (a re-run, or a dispatch naming a package that is fine) needs
             # no build, and an x86 rebuild would wait minutes for a droplet
-            # to find that out in seconds.
-            plan=""
-            [[ -n "$found" ]] || plan=$(bin/build --dry-run --mirror edge --arch "$arch" --package "$package" 2>&1 | grep -E '^==> Plan complete' || true)
+            # to find that out in seconds. Every slot the entry publishes
+            # into is asked, not only the one it builds for: an arch=any
+            # package can be current in x86_64 and absent from aarch64, and
+            # then the published file is copied across, never rebuilt.
+            missing="" current=""
+            if [[ -z "$found" ]]; then
+              slots=$(bin/publish-slots "$package" "$(jq -r .channels <<<"$entry")" "$(jq -r .publish_arches <<<"$entry")")
+              missing=$(awk '$2=="missing"{print $1}' <<<"$slots" | xargs)
+              current=$(awk '$2=="current"{print $1; exit}' <<<"$slots")
+            fi
             if [[ -n "$found" ]]; then
               decision="reuse the build artifact ($found)"
-            elif [[ -n "$plan" && -z "$(sed -E 's/.*would build: *//' <<<"$plan" | tr -d '[:space:]')" ]]; then
+            elif [[ -z "$missing" ]]; then
               decision="already published at master's version, nothing to build"
+            elif [[ -n "$current" ]]; then
+              decision="published in $current, missing from $missing: copy the published files there"
             elif [[ $arch == aarch64 ]]; then
               decision="no build artifact: rebuild natively on ubuntu-24.04-arm"
               rebuild+=("$(jq -c '. + {runner: "[\"ubuntu-24.04-arm\"]"}' <<<"$entry")")
@@ -206,6 +215,10 @@ jobs:
           # build failed. A failed build ends the run before any publish, and
           # the record says so instead of the report job finding nothing.
           : > sources.jsonl
+          # only-slots.txt: "<package> <arch> <slot>..." for a package copied
+          # from a slot that holds it; the publish step writes those slots
+          # and leaves the ones already current alone.
+          : > only-slots.txt
           failed=0
           while read -r package arch channels publish_arches; do
             hash=$(git rev-parse "HEAD:pkgbuilds/$package")
@@ -232,16 +245,34 @@ jobs:
                 jq -nc --arg p "$package" --arg a "$arch" '{package:$p, arch:$a, source:"artifact-download-failed"}' >> sources.jsonl; failed=1; break
               fi
             else
-              # bin/build plans against the public channel first. If the
-              # channel already holds master's version there is nothing to
-              # build and nothing to publish: a re-run for a package that
-              # turned out to be fine. Record it and move on.
-              plan=$(CONTAINER_ENGINE=docker bin/build --dry-run --mirror edge --arch "$arch" --package "$package" 2>&1 | grep -E '^==> Plan complete' || true)
-              # "Packages that would build:" followed by nothing means none.
-              if [[ -n "$plan" && -z "$(sed -E 's/.*would build: *//' <<<"$plan" | tr -d '[:space:]')" ]]; then
+              # bin/publish-slots plans every slot this entry publishes
+              # into against the public channels. If all of them hold
+              # master's version there is nothing to build and nothing to
+              # publish: a re-run for a package that turned out to be fine.
+              # Record it and move on.
+              if ! slots=$(CONTAINER_ENGINE=docker bin/publish-slots "$package" "$channels" "$publish_arches"); then
+                echo "::error::$label: could not plan its slots"
+                jq -nc --arg p "$package" --arg a "$arch" '{package:$p, arch:$a, source:"plan-failed"}' >> sources.jsonl; failed=1; break
+              fi
+              missing=$(awk '$2=="missing"{print $1}' <<<"$slots" | xargs)
+              current=$(awk '$2=="current"{print $1; exit}' <<<"$slots")
+              if [[ -z "$missing" ]]; then
                 echo "==> $label: already published at master's version, nothing to do"
                 jq -nc --arg p "$package" --arg a "$arch" '{package:$p, arch:$a, source:"already-published"}' >> sources.jsonl
                 continue
+              fi
+              # Some slots hold it and some do not (arch=any published for
+              # one architecture only, a fast-ring package that missed a
+              # channel). The missing ones get the published bytes.
+              if [[ -n "$current" ]]; then
+                echo "==> $label: published in $current, copying its files to: $missing"
+                if bin/fetch-published --mirror "${current%/*}" --arch "${current#*/}" --package "$package" --out "build-output/edge/$arch"; then
+                  jq -nc --arg p "$package" --arg a "$arch" '{package:$p, arch:$a, source:"published-copy"}' >> sources.jsonl
+                  echo "$package $arch $missing" >> only-slots.txt
+                  continue
+                fi
+                echo "::error::$label: could not fetch the published files from $current"
+                jq -nc --arg p "$package" --arg a "$arch" '{package:$p, arch:$a, source:"published-copy-failed"}' >> sources.jsonl; failed=1; break
               fi
               # Nothing builds here. No artifact means the rebuild failed (see
               # the rebuild job), or an artifact expired between planning and
@@ -321,13 +352,18 @@ jobs:
             for f in build-output/edge/*/*.pkg.tar.zst; do
               printf "%s %s\n" "$f" "$(bsdtar -xOf "$f" .PKGINFO | awk -F" = " "\$1==\"pkgbase\"{print \$2}")"
             done' > pkgbase.txt
+          source helpers/package-metadata.sh
           declare -A slot_files=()
           while read -r package arch channels publish_arches; do
+            # The recipe directory is not always the pkgbase its files carry.
+            base=$(package_pkgbase "pkgbuilds/$package" "$arch")
+            only=$(awk -v p="$package" -v a="$arch" '$1==p && $2==a {$1=$2=""; print}' only-slots.txt)
             for f in build-output/edge/"$arch"/*.pkg.tar.zst; do
               # Only files this package produced (its PKGINFO pkgbase).
-              [[ $(awk -v f="$f" '$1==f{print $2}' pkgbase.txt) == "$package" ]] || continue
+              [[ $(awk -v f="$f" '$1==f{print $2}' pkgbase.txt) == "$base" ]] || continue
               for mirror in ${channels//,/ }; do
                 for parch in ${publish_arches//,/ }; do
+                  [[ -z "$only" || " $only " == *" $mirror/$parch "* ]] || continue
                   slot_files["$mirror/$parch"]+="$f "
                 done
               done
@@ -401,7 +437,7 @@ jobs:
         run: |
           jq -r --arg outcome "${{ needs.publish.result }}" '
             def pkgs: [.packages[] | select(test("-debug-")|not)] | join(", ");
-            def src: if .source=="pr-artifact" then "PR artifact" elif .source=="rebuild" or .source=="native-rebuild" then "rebuilt at merge" elif .source=="built" then "built here" elif .source=="already-published" then "already published, skipped" else "**" + .source + "**" end;
+            def src: if .source=="pr-artifact" then "PR artifact" elif .source=="rebuild" or .source=="native-rebuild" then "rebuilt at merge" elif .source=="built" then "built here" elif .source=="already-published" then "already published, skipped" elif .source=="published-copy" then "copied from a channel that had it" else "**" + .source + "**" end;
             "### Publish " + (if $outcome=="success" then "succeeded" else "FAILED" end) +
             " → **" + .target + "**" + (if .target!="live" then " (proof prefix, not live)" else "" end),
             "",
