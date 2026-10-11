@@ -1,0 +1,449 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Maulik Shah <maulik.shah@oss.qualcomm.com>
+Date: Tue, 7 Jul 2026 14:51:33 +0530
+Subject: [PATCH] irqchip/qcom-pdc: Restructure version support
+
+The PDC irqchip driver updates IRQ_ENABLE and IRQ_CFG for three different
+versions v2.7, v3.0 and v3.2. These registers are organized in hardware as
+below on various SoCs:
+
++---------------------------------------------------------------+
+| SM8350, SM8450    | SM8550, Hamoa     | SM8650, SM8750        |
+|---------------------------------------------------------------|
+|       v2.7        |       v3.0        |       v3.2            |
+|---------------------------------------------------------------|
+|   IRQ_ENABLE_BANK | IRQ_ENABLE_BANK   |       NA              |
+|---------------------------------------------------------------|
+|   IRQ_CFG         | IRQ_CFG           | IRQ_CFG               |
+|                   |                   |                       |
+|                   |                   | [31:6] Unused         |
+|                   | [31:5] Unused     |    [5] GPIO_STATUS    |
+|                   |    [4] GPIO_STATUS|    [4] GPIO_MASK      |
+|   [31:3] Unused   |    [3] GPIO_MASK  |    [3] IRQ_ENABLE     |
+|    [0:2] Type     |  [0:2] Type       |  [0:2] Type           |
++---------------------------------------------------------------|
+
+All SoCs PDC chips support "pass through mode" in which all interrupts are
+forwarded to the GIC without any latching in the PDC hardware.
+
+So far the driver did not utilize GPIO_STATUS and GPIO_MASK from IRQ_CFG
+register for v3.0 and v3.2 since they are only needed to be configured when
+PDC runs in a specific mode named "second level interrupt controller". In
+that mode it can latch the GPIO interrupts in GPIO_STATUS and forward GPIO
+interrupts to GIC as LEVEL_HIGH type SPI interrupt.
+
+All the SoCs defaulted to pass through mode with the exception of some x1e
+types. x1e PDC may be set to secondary controller mode for builds on CRD
+boards whereas it may be set to pass through mode for IoT-EVK boards.
+
+Restructure in preparation to add the second level interrupt controller
+mode utilizing GPIO_STATUS and GPIO_MASK bits which changed the bit
+positions between v3.0 and v3.2.
+
+No functional change intended.
+
+[ tglx: Massaged change log ]
+
+Signed-off-by: Maulik Shah <maulik.shah@oss.qualcomm.com>
+Signed-off-by: Thomas Gleixner <tglx@kernel.org>
+Reviewed-by: Konrad Dybcio <konrad.dybcio@oss.qualcomm.com>
+Link: https://patch.msgid.link/20260707-hamoa_pdc_v3-v4-1-dfd1f4a3ae89@oss.qualcomm.com
+(cherry picked from commit 83e089ef0d4e045efa743dcbc8de5ea0a9e4195d)
+---
+ drivers/irqchip/qcom-pdc.c | 224 +++++++++++++++++++++++++------------
+ 1 file changed, 154 insertions(+), 70 deletions(-)
+
+diff --git a/drivers/irqchip/qcom-pdc.c b/drivers/irqchip/qcom-pdc.c
+index 2014dbb0bc43..3d272a8e506e 100644
+--- a/drivers/irqchip/qcom-pdc.c
++++ b/drivers/irqchip/qcom-pdc.c
+@@ -21,21 +21,12 @@
+ #include <linux/slab.h>
+ #include <linux/types.h>
+ 
+-#define PDC_MAX_GPIO_IRQS	256
+-#define PDC_DRV_SIZE		0x10000
+-
+-/* Valid only on HW version < 3.2 */
+-#define IRQ_ENABLE_BANK		0x10
+-#define IRQ_ENABLE_BANK_MAX	(IRQ_ENABLE_BANK + BITS_TO_BYTES(PDC_MAX_GPIO_IRQS))
++#define PDC_MAX_IRQS			256
++#define IRQ_ENABLE_BANK_MAX		BITS_TO_BYTES(PDC_MAX_IRQS)
+ #define IRQ_ENABLE_BANK_INDEX_MASK	GENMASK(31, 5)
+ #define IRQ_ENABLE_BANK_BIT_MASK	GENMASK(4, 0)
+-#define IRQ_i_CFG		0x110
+-
+-/* Valid only on HW version >= 3.2 */
+-#define IRQ_i_CFG_IRQ_ENABLE	3
+-
+-#define IRQ_i_CFG_TYPE_MASK		GENMASK(2, 0)
+ 
++#define PDC_DRV_SIZE			0x10000
+ #define PDC_VERSION_REG			0x1000
+ #define PDC_VERSION_MAJOR		GENMASK(23, 16)
+ #define PDC_VERSION_MINOR		GENMASK(15, 8)
+@@ -46,22 +37,113 @@
+ 
+ /* Notable PDC versions */
+ #define PDC_VERSION_3_2			PDC_VERSION(3, 2, 0)
++#define PDC_VERSION_3_0			PDC_VERSION(3, 0, 0)
++#define PDC_VERSION_2_7			PDC_VERSION(2, 7, 0)
++
++/*
++ * PDC Hardware registers layout per version:
++ *
++ * IRQ_ENABLE_BANK[b], b = 0....BITS_TO_BYTES(PDC_MAX_IRQS)
++ * IRQ_CFG[n], n = 0....PDC_MAX_IRQS
++ *
++ * +---------------------------------------------------------------+
++ * |       v2.7        |       v3.0        |       v3.2            |
++ * |---------------------------------------------------------------|
++ * |       BASE        |       BASE        |       BASE            |
++ * |---------------------------------------------------------------|
++ * |                                                               |
++ * |   IRQ_ENABLE_BANK | IRQ_ENABLE_BANK   |       NA              |
++ * |---------------------------------------------------------------|
++ * |   IRQ_CFG         | IRQ_CFG           | IRQ_CFG               |
++ * |                   |                   |                       |
++ * |                   |                   | [31:6] Unused         |
++ * |                   | [31:5] Unused     |    [5] GPIO_STATUS    |
++ * |                   |    [4] GPIO_STATUS|    [4] GPIO_MASK      |
++ * |   [31:3] Unused   |    [3] GPIO_MASK  |    [3] IRQ_ENABLE     |
++ * |    [0:2] Type     |  [0:2] Type       |  [0:2] Type           |
++ * +---------------------------------------------------------------+
++ */
++
++/**
++ * struct pdc_regs: PDC registers location
++ *
++ * @irq_en_reg:     IRQ_ENABLE_BANK register location
++ * @irq_cfg_reg:    IRQ_CFG register location
++ */
++struct pdc_regs {
++	u32	irq_en_reg;
++	u32	irq_cfg_reg;
++};
++
++/**
++ * struct pdc_irq_cfg: bit fields for PDC IRQ_CFG register
++ *
++ * @irq_enable:     bit number for IRQ_ENABLE field
++ * @irq_type:       GENMASK for IRQ_TYPE field
++ */
++struct pdc_irq_cfg {
++	u32	irq_enable;
++	u32	irq_type;
++};
++
++/**
++ * struct pdc_desc: PDC driver state
++ *
++ * @base:           PDC base register for DRV2 / HLOS
++ * @prev_base:      PDC DRV1 base, applicable only for x1e RTL bug.
++ * @version:        PDC version
++ * @regs:           PDC regs (IRQ_ENABLE_BANK and IRQ_CFG)
++ * @cfg_fields:     Fields of IRQ_CFG reg
++ */
++struct pdc_desc {
++	void __iomem			*base;
++	void __iomem			*prev_base;
++	u32				version;
++	const struct pdc_regs		*regs;
++	const struct pdc_irq_cfg	*cfg_fields;
++};
++
++static const struct pdc_regs pdc_v3_2 = {
++	.irq_cfg_reg	= 0x110,
++};
++
++static const struct pdc_irq_cfg pdc_cfg_v3_2 = {
++	.irq_enable	= 3,
++	.irq_type	= GENMASK(2, 0),
++};
++
++static const struct pdc_regs pdc_v3_0 = {
++	.irq_en_reg	= 0x10,
++	.irq_cfg_reg	= 0x110,
++};
++
++static const struct pdc_irq_cfg pdc_cfg_v3_0 = {
++	.irq_type	= GENMASK(2, 0),
++};
++
++static const struct pdc_regs pdc_v2_7 = {
++	.irq_en_reg	= 0x10,
++	.irq_cfg_reg	= 0x110,
++};
++
++static const struct pdc_irq_cfg pdc_cfg_v2_7 = {
++	.irq_type	= GENMASK(2, 0),
++};
+ 
+ struct pdc_pin_region {
+-	u32 pin_base;
+-	u32 parent_base;
+-	u32 cnt;
++	u32	pin_base;
++	u32	parent_base;
++	u32	cnt;
+ };
+ 
+ #define pin_to_hwirq(r, p)	((r)->parent_base + (p) - (r)->pin_base)
+ 
+ static DEFINE_RAW_SPINLOCK(pdc_lock);
+-static void __iomem *pdc_base;
+-static void __iomem *pdc_prev_base;
+ static struct pdc_pin_region *pdc_region;
+ static int pdc_region_cnt;
+ static unsigned int pdc_version;
+ static bool pdc_x1e_quirk;
++static struct pdc_desc *pdc;
+ 
+ static void pdc_base_reg_write(void __iomem *base, int reg, u32 i, u32 val)
+ {
+@@ -70,12 +152,12 @@ static void pdc_base_reg_write(void __iomem *base, int reg, u32 i, u32 val)
+ 
+ static void pdc_reg_write(int reg, u32 i, u32 val)
+ {
+-	pdc_base_reg_write(pdc_base, reg, i, val);
++	pdc_base_reg_write(pdc->base, reg, i, val);
+ }
+ 
+ static u32 pdc_reg_read(int reg, u32 i)
+ {
+-	return readl_relaxed(pdc_base + reg + i * sizeof(u32));
++	return readl_relaxed(pdc->base + reg + i * sizeof(u32));
+ }
+ 
+ static void pdc_x1e_irq_enable_write(u32 bank, u32 enable)
+@@ -86,24 +168,24 @@ static void pdc_x1e_irq_enable_write(u32 bank, u32 enable)
+ 	switch (bank) {
+ 	case 0 ... 1:
+ 		/* Use previous DRV (client) region and shift to bank 3-4 */
+-		base = pdc_prev_base;
++		base = pdc->prev_base;
+ 		bank += 3;
+ 		break;
+ 	case 2 ... 4:
+ 		/* Use our own region and shift to bank 0-2 */
+-		base = pdc_base;
++		base = pdc->base;
+ 		bank -= 2;
+ 		break;
+ 	case 5:
+ 		/* No fixup required for bank 5 */
+-		base = pdc_base;
++		base = pdc->base;
+ 		break;
+ 	default:
+ 		WARN_ON(1);
+ 		return;
+ 	}
+ 
+-	pdc_base_reg_write(base, IRQ_ENABLE_BANK, bank, enable);
++	pdc_base_reg_write(base, pdc->regs->irq_en_reg, bank, enable);
+ }
+ 
+ static void pdc_enable_intr_bank(int pin_out, bool on)
+@@ -114,21 +196,21 @@ static void pdc_enable_intr_bank(int pin_out, bool on)
+ 	index = FIELD_GET(IRQ_ENABLE_BANK_INDEX_MASK, pin_out);
+ 	mask = FIELD_GET(IRQ_ENABLE_BANK_BIT_MASK, pin_out);
+ 
+-	enable = pdc_reg_read(IRQ_ENABLE_BANK, index);
++	enable = pdc_reg_read(pdc->regs->irq_en_reg, index);
+ 	__assign_bit(mask, &enable, on);
+ 
+ 	if (pdc_x1e_quirk)
+ 		pdc_x1e_irq_enable_write(index, enable);
+ 	else
+-		pdc_reg_write(IRQ_ENABLE_BANK, index, enable);
++		pdc_reg_write(pdc->regs->irq_en_reg, index, enable);
+ }
+ 
+ static void pdc_enable_intr_cfg(int pin_out, bool on)
+ {
+-	unsigned long enable = pdc_reg_read(IRQ_i_CFG, pin_out);
++	unsigned long enable = pdc_reg_read(pdc->regs->irq_cfg_reg, pin_out);
+ 
+-	__assign_bit(IRQ_i_CFG_IRQ_ENABLE, &enable, on);
+-	pdc_reg_write(IRQ_i_CFG, pin_out, enable);
++	__assign_bit(pdc->cfg_fields->irq_enable, &enable, on);
++	pdc_reg_write(pdc->regs->irq_cfg_reg, pin_out, enable);
+ }
+ 
+ static void __pdc_enable_intr(int pin_out, bool on)
+@@ -224,9 +306,9 @@ static int qcom_pdc_gic_set_type(struct irq_data *d, unsigned int type)
+ 		return -EINVAL;
+ 	}
+ 
+-	old_pdc_type = pdc_reg_read(IRQ_i_CFG, d->hwirq);
+-	pdc_type |= (old_pdc_type & ~IRQ_i_CFG_TYPE_MASK);
+-	pdc_reg_write(IRQ_i_CFG, d->hwirq, pdc_type);
++	old_pdc_type = pdc_reg_read(pdc->regs->irq_cfg_reg, d->hwirq);
++	pdc_type |= (old_pdc_type & ~pdc->cfg_fields->irq_type);
++	pdc_reg_write(pdc->regs->irq_cfg_reg, d->hwirq, pdc_type);
+ 
+ 	ret = irq_chip_set_type_parent(d, type);
+ 	if (ret)
+@@ -317,8 +399,7 @@ static int qcom_pdc_alloc(struct irq_domain *domain, unsigned int virq,
+ 	parent_fwspec.param[1]    = pin_to_hwirq(region, hwirq);
+ 	parent_fwspec.param[2]    = type;
+ 
+-	return irq_domain_alloc_irqs_parent(domain, virq, nr_irqs,
+-					    &parent_fwspec);
++	return irq_domain_alloc_irqs_parent(domain, virq, nr_irqs, &parent_fwspec);
+ }
+ 
+ static const struct irq_domain_ops qcom_pdc_ops = {
+@@ -327,8 +408,9 @@ static const struct irq_domain_ops qcom_pdc_ops = {
+ 	.free		= irq_domain_free_irqs_common,
+ };
+ 
+-static int pdc_setup_pin_mapping(struct device_node *np)
++static int pdc_setup_pin_mapping(struct device *dev)
+ {
++	struct device_node *np = dev->of_node;
+ 	int ret, n, i;
+ 
+ 	n = of_property_count_elems_of_size(np, "qcom,pdc-ranges", sizeof(u32));
+@@ -336,25 +418,22 @@ static int pdc_setup_pin_mapping(struct device_node *np)
+ 		return -EINVAL;
+ 
+ 	pdc_region_cnt = n / 3;
+-	pdc_region = kzalloc_objs(*pdc_region, pdc_region_cnt);
++	pdc_region = devm_kcalloc(dev, pdc_region_cnt, sizeof(*pdc_region), GFP_KERNEL);
+ 	if (!pdc_region) {
+ 		pdc_region_cnt = 0;
+ 		return -ENOMEM;
+ 	}
+ 
+ 	for (n = 0; n < pdc_region_cnt; n++) {
+-		ret = of_property_read_u32_index(np, "qcom,pdc-ranges",
+-						 n * 3 + 0,
++		ret = of_property_read_u32_index(np, "qcom,pdc-ranges", n * 3 + 0,
+ 						 &pdc_region[n].pin_base);
+ 		if (ret)
+ 			return ret;
+-		ret = of_property_read_u32_index(np, "qcom,pdc-ranges",
+-						 n * 3 + 1,
++		ret = of_property_read_u32_index(np, "qcom,pdc-ranges", n * 3 + 1,
+ 						 &pdc_region[n].parent_base);
+ 		if (ret)
+ 			return ret;
+-		ret = of_property_read_u32_index(np, "qcom,pdc-ranges",
+-						 n * 3 + 2,
++		ret = of_property_read_u32_index(np, "qcom,pdc-ranges", n * 3 + 2,
+ 						 &pdc_region[n].cnt);
+ 		if (ret)
+ 			return ret;
+@@ -366,11 +445,11 @@ static int pdc_setup_pin_mapping(struct device_node *np)
+ 	return 0;
+ }
+ 
+-
+ static int qcom_pdc_probe(struct platform_device *pdev, struct device_node *parent)
+ {
+ 	struct irq_domain *parent_domain, *pdc_domain;
+ 	struct device_node *node = pdev->dev.of_node;
++	struct device *dev = &pdev->dev;
+ 	resource_size_t res_size;
+ 	struct resource res;
+ 	int ret;
+@@ -383,6 +462,29 @@ static int qcom_pdc_probe(struct platform_device *pdev, struct device_node *pare
+ 	if (res_size > resource_size(&res))
+ 		pr_warn("%pOF: invalid reg size, please fix DT\n", node);
+ 
++	pdc = devm_kzalloc(dev, sizeof(*pdc), GFP_KERNEL);
++	if (!pdc)
++		return -ENOMEM;
++
++	pdc->base = devm_ioremap(dev, res.start, res_size);
++	if (!pdc->base) {
++		pr_err("%pOF: unable to map PDC registers\n", node);
++		return -ENXIO;
++	}
++
++	pdc->version = pdc_reg_read(PDC_VERSION_REG, 0);
++
++	if (pdc->version >= PDC_VERSION_3_2) {
++		pdc->cfg_fields = &pdc_cfg_v3_2;
++		pdc->regs = &pdc_v3_2;
++	} else if (pdc->version >= PDC_VERSION_3_0) {
++		pdc->cfg_fields = &pdc_cfg_v3_0;
++		pdc->regs = &pdc_v3_0;
++	} else {
++		pdc->cfg_fields = &pdc_cfg_v2_7;
++		pdc->regs = &pdc_v2_7;
++	}
++
+ 	/*
+ 	 * PDC has multiple DRV regions, each one provides the same set of
+ 	 * registers for a particular client in the system. Due to a hardware
+@@ -392,8 +494,9 @@ static int qcom_pdc_probe(struct platform_device *pdev, struct device_node *pare
+ 	 * region with the expected offset to preserve support for old DTs.
+ 	 */
+ 	if (of_device_is_compatible(node, "qcom,x1e80100-pdc")) {
+-		pdc_prev_base = ioremap(res.start - PDC_DRV_SIZE, IRQ_ENABLE_BANK_MAX);
+-		if (!pdc_prev_base) {
++		pdc->prev_base = devm_ioremap(dev, res.start - PDC_DRV_SIZE,
++					      pdc->regs->irq_en_reg + IRQ_ENABLE_BANK_MAX);
++		if (!pdc->prev_base) {
+ 			pr_err("%pOF: unable to map previous PDC DRV region\n", node);
+ 			return -ENXIO;
+ 		}
+@@ -401,48 +504,29 @@ static int qcom_pdc_probe(struct platform_device *pdev, struct device_node *pare
+ 		pdc_x1e_quirk = true;
+ 	}
+ 
+-	pdc_base = ioremap(res.start, res_size);
+-	if (!pdc_base) {
+-		pr_err("%pOF: unable to map PDC registers\n", node);
+-		ret = -ENXIO;
+-		goto fail;
+-	}
+-
+-	pdc_version = pdc_reg_read(PDC_VERSION_REG, 0);
+-
+ 	parent_domain = irq_find_host(parent);
+ 	if (!parent_domain) {
+ 		pr_err("%pOF: unable to find PDC's parent domain\n", node);
+-		ret = -ENXIO;
+-		goto fail;
++		return -ENXIO;
+ 	}
+ 
+-	ret = pdc_setup_pin_mapping(node);
++	ret = pdc_setup_pin_mapping(dev);
+ 	if (ret) {
+ 		pr_err("%pOF: failed to init PDC pin-hwirq mapping\n", node);
+-		goto fail;
++		return ret;
+ 	}
+ 
+-	pdc_domain = irq_domain_create_hierarchy(parent_domain,
+-					IRQ_DOMAIN_FLAG_QCOM_PDC_WAKEUP,
+-					PDC_MAX_GPIO_IRQS,
+-					of_fwnode_handle(node),
+-					&qcom_pdc_ops, NULL);
++	pdc_domain = irq_domain_create_hierarchy(parent_domain, IRQ_DOMAIN_FLAG_QCOM_PDC_WAKEUP,
++						 PDC_MAX_IRQS, of_fwnode_handle(node),
++						 &qcom_pdc_ops, NULL);
+ 	if (!pdc_domain) {
+ 		pr_err("%pOF: PDC domain add failed\n", node);
+-		ret = -ENOMEM;
+-		goto fail;
++		return -ENOMEM;
+ 	}
+ 
+ 	irq_domain_update_bus_token(pdc_domain, DOMAIN_BUS_WAKEUP);
+ 
+ 	return 0;
+-
+-fail:
+-	kfree(pdc_region);
+-	iounmap(pdc_base);
+-	iounmap(pdc_prev_base);
+-	return ret;
+ }
+ 
+ IRQCHIP_PLATFORM_DRIVER_BEGIN(qcom_pdc)
