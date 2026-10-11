@@ -55,10 +55,102 @@ _etc_overrides_apply() {
   fi
 }
 
+# Keep this fallback in the package scriptlet: older settings releases have
+# neither the fixed internal helper actions nor the installed ALPM hook, and
+# post_remove must work after the helper itself is gone. The hook remains the
+# AbortOnFail boundary; pacman does not abort on a failed scriptlet alone.
+_omarchy_sudo_grants_trusted_path() {
+  local path=$1 kind=$2 owner mode canonical
+  [[ ! -L $path ]] || return 1
+  if [[ $kind == directory ]]; then
+    [[ -d $path ]] || return 1
+  else
+    [[ -f $path ]] || return 1
+  fi
+  canonical=$(/usr/bin/realpath -e -- "$path") || return 1
+  [[ $canonical == "$path" ]] || return 1
+  read -r owner mode < <(/usr/bin/stat -Lc '%u %a' -- "$path") || return 1
+  [[ $owner == 0 && $mode =~ ^[0-7]+$ ]] && ! ((8#$mode & 022))
+}
+
+_omarchy_sudo_grants_reconcile() (
+  local action=$1 fd file boot_rule
+  local blocker=/run/omarchy-sudo-passwordless-package-removing
+  local lock=/run/lock/omarchy-sudo-passwordless.lock
+  local files=()
+
+  # A scriptlet can inherit glob settings from pacman's shell. Never let them
+  # turn a successful sweep into a literal wildcard or an omitted policy.
+  set +f
+  unset GLOBIGNORE
+  shopt -u failglob
+  shopt -s nullglob
+
+  _omarchy_sudo_grants_trusted_path /run directory || return 1
+  if [[ -e $blocker || -L $blocker ]]; then
+    _omarchy_sudo_grants_trusted_path "$blocker" file || return 1
+  fi
+  # Announce before waiting on the publisher's lock. A publisher already inside
+  # its critical section rechecks this marker before reporting success.
+  (umask 077; : >"$blocker") || return 1
+  # Image/bootstrap roots have not run systemd-tmpfiles yet. The validated
+  # parent is private to root, so establish a missing lock directory there.
+  if [[ ! -e /run/lock && ! -L /run/lock ]]; then
+    /usr/bin/install -d -m 0755 -- /run/lock || return 1
+  fi
+  _omarchy_sudo_grants_trusted_path /run/lock directory || return 1
+  if [[ -e $lock || -L $lock ]]; then
+    _omarchy_sudo_grants_trusted_path "$lock" file || return 1
+  fi
+  umask 077
+  exec {fd}>"$lock" || return 1
+  /usr/bin/flock -x -w 60 "$fd" || return 1
+
+  _omarchy_sudo_grants_trusted_path /etc directory || return 1
+  if [[ -e /etc/sudoers.d || -L /etc/sudoers.d ]]; then
+    _omarchy_sudo_grants_trusted_path /etc/sudoers.d directory || return 1
+    # This temporary/legacy namespace is also removed by the boot rule and
+    # pre-transaction hook. Permanent grants have a separate prefix and stay.
+    files=(/etc/sudoers.d/99-omarchy-nopasswd-*)
+    if (( ${#files[@]} )); then
+      /usr/bin/rm -f -- "${files[@]}" || return 1
+    fi
+    for file in /etc/sudoers.d/99-omarchy-nopasswd-*; do
+      [[ ! -e $file && ! -L $file ]] || return 1
+    done
+  fi
+
+  if [[ $action == complete ]]; then
+    # A completed installation may enable publication again only with the
+    # boot cleanup installed. This rule exists in stable 4.0.4 as well; do not
+    # invoke a newer helper action against that release's older command.
+    _omarchy_sudo_grants_trusted_path /etc/tmpfiles.d directory || return 1
+    _omarchy_sudo_grants_trusted_path /etc/tmpfiles.d/omarchy-nopasswd-sudo.conf file || return 1
+    boot_rule=$(/usr/bin/awk '!/^[[:space:]]*(#|$)/ { print }' /etc/tmpfiles.d/omarchy-nopasswd-sudo.conf) || return 1
+    [[ $boot_rule == 'r! /etc/sudoers.d/99-omarchy-nopasswd-*' ]] || return 1
+    /usr/bin/rm -f -- "$blocker" || return 1
+    [[ ! -e $blocker && ! -L $blocker ]] || return 1
+  fi
+)
+
+pre_remove() {
+  _omarchy_sudo_grants_reconcile revoke
+}
+
+post_remove() {
+  _omarchy_sudo_grants_reconcile revoke
+}
+
+pre_upgrade() {
+  _omarchy_sudo_grants_reconcile revoke
+}
+
 post_install() {
-  _etc_overrides_apply
+  _omarchy_sudo_grants_reconcile revoke || return 1
+  _etc_overrides_apply || return 1
+  _omarchy_sudo_grants_reconcile complete
 }
 
 post_upgrade() {
-  _etc_overrides_apply
+  post_install
 }
