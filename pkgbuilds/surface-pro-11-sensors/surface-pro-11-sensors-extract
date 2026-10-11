@@ -1,0 +1,168 @@
+#!/bin/bash
+# Build the Surface Pro 11 sensor configuration root from the machine's own
+# Windows driver store. The files are Microsoft/Qualcomm configuration: they
+# are copied locally and never downloaded or redistributed.
+
+set -euo pipefail
+
+ROOT=${SP11_SENSORS_ROOT:-/var/lib/surface-pro-11-sensors/root}
+SOC=${SP11_SENSORS_SOC:-/sys/devices/soc0}
+COMPATIBLE=${SP11_SENSORS_COMPATIBLE:-/proc/device-tree/compatible}
+CONFIG_GLOB="surfacepro_snscfgcrd8380.inf_arm64_*"
+
+# The combination qualified on hardware. Newer Windows driver releases are
+# accepted with a warning.
+declare -A KNOWN=(
+  [json.lst]=386957a9a6d613c081782969e07ead4051accc2bf0eed52ac4d42f0b60bc3e90
+  [8380_crd_tcs3430_0.json]=68c98cfd3a5533b828ac67bc067933a0c3fd449690c5a8341c2e5f21413a4f15
+  [sns_surface_color.json]=ee0f236b0a001ba73a7029ca7b08186131f1a7f6ef74855ab84557af964cbc3c
+)
+REQUIRED=(json.lst 8380_crd_tcs3430_0.json sns_surface_color.json sns_reg_config
+  hw_platform platform_subtype platform_subtype_id platform_version)
+
+log() { printf 'surface-pro-11-sensors-extract: %s\n' "$*"; }
+warn() { printf 'surface-pro-11-sensors-extract: %s\n' "$*" >&2; }
+
+usage() {
+  cat <<EOF
+Usage: surface-pro-11-sensors-extract [-d DIR]
+
+Copy the Surface Pro 11 sensor configuration from Windows into $ROOT.
+  -d DIR   use DIR instead of scanning NTFS partitions: a driver store
+           FileRepository, or the ${CONFIG_GLOB%_\*} directory itself
+EOF
+}
+
+source_dir=""
+while (($#)); do
+  case $1 in
+    -d) source_dir=${2:?-d requires a directory}; shift 2 ;;
+    -h | --help) usage; exit 0 ;;
+    *) usage >&2; exit 2 ;;
+  esac
+done
+
+# The qualified configuration is for the X Elite OLED model; the LCD and X
+# Plus models share its DMI name but not its sensors.
+if ! { [[ -r $COMPATIBLE ]] && tr '\0' '\n' <"$COMPATIBLE" | grep -qx 'microsoft,denali-oled'; }; then
+  log "not a Surface Pro 11 OLED; nothing to do"
+  exit 0
+fi
+
+if (( EUID != 0 )) && [[ -z ${SP11_SENSORS_ROOT:-} ]]; then
+  warn "must run as root to read Windows partitions and write $ROOT"
+  exit 1
+fi
+
+mounts=()
+cleanup() {
+  local mount
+  for mount in "${mounts[@]}"; do
+    umount "$mount" 2>/dev/null && rmdir "$mount"
+  done
+  [[ -z ${stage:-} ]] || rm -rf "$stage"
+}
+trap cleanup EXIT
+
+# Pick the configuration directory under a driver store or a given path.
+find_config() {
+  local base=$1 candidate
+  if [[ -f $base/json.lst ]]; then
+    printf '%s\n' "$base"
+    return 0
+  fi
+  local -a found=()
+  for candidate in "$base"/$CONFIG_GLOB "$base"/Windows/System32/DriverStore/FileRepository/$CONFIG_GLOB; do
+    [[ -f $candidate/json.lst ]] && found+=("$candidate")
+  done
+  ((${#found[@]})) || return 1
+  # Several driver versions can coexist; the most recently installed wins.
+  ls -1dt "${found[@]}" | head -n1
+}
+
+config=""
+if [[ -n $source_dir ]]; then
+  config=$(find_config "$source_dir") || { warn "no sensor configuration under $source_dir"; exit 1; }
+else
+  while read -r device fstype mountpoint; do
+    [[ $fstype == ntfs ]] || continue
+    # A partition that is already mounted cannot be mounted again read-only.
+    mountpoint=$(printf '%b' "$mountpoint")
+    if [[ -n $mountpoint ]]; then
+      if config=$(find_config "$mountpoint"); then
+        log "Windows driver store found on $device"
+        break
+      fi
+      continue
+    fi
+    mount=$(mktemp -d /run/surface-pro-11-sensors.XXXXXX)
+    if mount -o ro,noexec,nosuid,nodev -t ntfs3 "$device" "$mount" 2>/dev/null; then
+      mounts+=("$mount")
+      if config=$(find_config "$mount"); then
+        log "Windows driver store found on $device"
+        break
+      fi
+    else
+      rmdir "$mount"
+    fi
+  done < <(lsblk -rno PATH,FSTYPE,MOUNTPOINT)
+  if [[ -z $config ]]; then
+    warn "no Windows installation with the Surface sensor configuration found"
+    warn "(BitLocker volumes cannot be read; see -d)"
+    exit 1
+  fi
+fi
+
+for file in "${REQUIRED[@]}"; do
+  [[ -s $config/$file ]] || { warn "missing $file in $config"; exit 1; }
+done
+for file in "${!KNOWN[@]}"; do
+  if [[ $(sha256sum "$config/$file" | cut -d' ' -f1) != "${KNOWN[$file]}" ]]; then
+    warn "$file differs from the qualified version; continuing with the Windows copy"
+  fi
+done
+for file in soc_id revision; do
+  [[ -s $SOC/$file ]] || { warn "missing $SOC/$file"; exit 1; }
+done
+
+mkdir -p "$(dirname "$ROOT")"
+stage=$(mktemp -d "$(dirname "$ROOT")/.root.XXXXXX")
+install -d -m0755 "$stage/sensors/config" "$stage/sensors/persist/registry" "$stage/socinfo"
+find "$config" -maxdepth 1 -type f \( -name '*.json' -o -name 'json.lst' -o -name '*.bin' -o -name '*.pb' \) \
+  -exec install -m0644 -t "$stage/sensors/config" {} +
+tr -d '\r' <"$config/sns_reg_config" >"$stage/sensors/sns_reg.conf"
+
+# The ADSP accepts the CRD sensor profile only with the running SoC's ID and
+# revision; the platform fields come from the Windows configuration. Each
+# value is written as one line, like its sysfs counterpart.
+for file in hw_platform platform_subtype platform_subtype_id platform_version; do
+  printf '%s\n' "$(tr -d '\r\n' <"$config/$file")" >"$stage/socinfo/$file"
+done
+for file in soc_id revision; do
+  printf '%s\n' "$(tr -d '\n' <"$SOC/$file")" >"$stage/socinfo/$file"
+done
+
+# Keep the registry the DSP generated on earlier boots, but never an empty
+# calibration record: it crashes the sensor process.
+if [[ -d $ROOT/sensors/persist ]]; then
+  cp -a "$ROOT/sensors/persist/." "$stage/sensors/persist/"
+fi
+find "$stage/sensors/persist" -name 'color_calibration.bin' -size 0 -delete
+
+{
+  printf 'source %s\n' "$config"
+  (cd "$stage" && find sensors/config sensors/sns_reg.conf socinfo -type f -print0 | sort -z | xargs -0 sha256sum)
+} >"$stage/manifest"
+find "$stage" -type d -exec chmod 0755 {} +
+find "$stage" -type f -exec chmod 0644 {} +
+
+rm -rf "$ROOT.old"
+if [[ -e $ROOT ]]; then
+  mv "$ROOT" "$ROOT.old"
+fi
+mv "$stage" "$ROOT"
+stage=""
+rm -rf "$ROOT.old"
+
+log "installed the sensor configuration from $config into $ROOT"
+log "restart surface-pro-11-sensors.service or reboot to use it"
