@@ -5,7 +5,7 @@ set -euo pipefail
 
 REPO_ROOT=$(realpath "${BASH_SOURCE[0]%/*}/..")
 INSTALL_SCRIPT="$REPO_ROOT/pkgbuilds/voxtype-bin/voxtype-bin.install"
-TEST_ROOT=$(mktemp -d)
+TEST_ROOT=$(realpath "$(mktemp -d)")
 SAVED="$TEST_ROOT/backend-upgrade"
 trap 'rm -rf "$TEST_ROOT"' EXIT
 
@@ -20,11 +20,10 @@ pass() {
 # shellcheck source=/dev/null
 source "$INSTALL_SCRIPT"
 
-# The hook keeps upgrade state in /tmp, where a real upgrade's could be; move
-# it into the test directory.
-eval "$(declare -f _preserve_or_set_backend | sed 's|/tmp/\.voxtype-backend-upgrade|${SAVED}|')"
-declare -f _preserve_or_set_backend | grep -qF '${SAVED}' ||
-  fail "the hook no longer keeps its upgrade state at /tmp/.voxtype-backend-upgrade"
+# The hook keeps upgrade state in /run and restores backends from
+# /usr/lib/voxtype; move both into the test directory.
+_backend_state="$SAVED"
+_backend_root="$TEST_ROOT/lib"
 
 cpu_flags=""
 _cpu_has() { [[ " $cpu_flags " == *" $1 "* ]]; }
@@ -66,3 +65,29 @@ upgrade "sse4_2 avx2" "$TEST_ROOT/lib/voxtype-avx2" avx2 "$TEST_ROOT/lib/voxtype
   "an upgrade keeps a CPU build the host can run"
 upgrade "sse4_2" "$TEST_ROOT/lib/voxtype-vulkan" vulkan "$TEST_ROOT/lib/voxtype-vulkan" \
   "an upgrade keeps a GPU build the user chose"
+
+# What another local user could have written into the state file: only a
+# binary under the backend directory may become /usr/bin/voxtype.
+touch "$TEST_ROOT/payload"
+ln -s "$TEST_ROOT/payload" "$TEST_ROOT/lib/voxtype-escape"
+upgrade "sse4_2 avx2" "$TEST_ROOT/payload" avx2 /usr/lib/voxtype/voxtype-avx2 \
+  "a saved path outside the backend directory is ignored"
+upgrade "sse4_2 avx2" "$TEST_ROOT/lib/../payload" avx2 /usr/lib/voxtype/voxtype-avx2 \
+  "a saved path that climbs out of the backend directory is ignored"
+upgrade "sse4_2 avx2" "$TEST_ROOT/lib/voxtype-escape" avx2 /usr/lib/voxtype/voxtype-avx2 \
+  "a saved symlink that leaves the backend directory is ignored"
+upgrade "sse4_2 avx2" "$TEST_ROOT/lib/voxtype-missing" avx2 /usr/lib/voxtype/voxtype-avx2 \
+  "a saved backend that is gone falls back to the default"
+[[ ! -e $SAVED ]] || fail "the state file survives post_upgrade"
+pass "post_upgrade consumes the state file"
+
+# pre_upgrade must not hand a file an interrupted upgrade left to the next one.
+printf '%s\n' "$TEST_ROOT/lib/voxtype-vulkan" >"$SAVED"
+_resolve_active_binary() { :; }
+pre_upgrade
+[[ ! -e $SAVED ]] || fail "pre_upgrade kept a stale state file when it found no launcher"
+pass "pre_upgrade drops a stale state file when it finds no launcher"
+_resolve_active_binary() { echo "$TEST_ROOT/lib/voxtype-avx2"; }
+pre_upgrade
+[[ $(<"$SAVED") == "$TEST_ROOT/lib/voxtype-avx2" ]] || fail "pre_upgrade did not save the launcher's backend"
+pass "pre_upgrade saves the launcher's backend"
