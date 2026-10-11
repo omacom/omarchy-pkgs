@@ -2,7 +2,7 @@
 
 The `linux-omarchy` kernel built for aarch64 with NVIDIA N1x (RTX Spark) platform support added. It carries the same kernel.org source and signed Omarchy patch set as `linux-omarchy` 7.2.8-5, plus N1x topic patches numbered 1000 and up. Since 7.2.8-5 `linux-omarchy` is a meta package for `linux-omarchy-bore`, so the shared patches, their signatures and the BORE and ADIOS schedulers come from `linux-omarchy-bore`, byte for byte, including its BORE rebases of the `0121`–`0144` scheduler patches. The intent is to fold these into `linux-omarchy` itself once it builds for aarch64; until then this is the kernel Omarchy installs on N1x machines (`install/hardware/n1x.sh` in omarchy), replacing NVIDIA's 7.0-based `linux-n1x`.
 
-The `pkgrel` counts N1x revisions of this package and starts again at 1 when the kernel version changes. On 7.2.5 it was `6.1` to `6.9` while it tracked `linux-omarchy`'s release; the ninth revision became `9`, `10` added the Dell XPS 16 patches, `11` brought a dock's displays back after a failed DisplayPort tunnel, `12` stopped the clock during suspend-to-idle, `13` brought NVIDIA's device sleep patches from 1022.23, `14` let keyboard and touchpad interrupts wake the system from the platform's deepest sleep, and `15` brought audio and UCSI fixes from upstream and turned kexec handover off by default. `7.2.8-1` moves to 7.2.8 and `linux-omarchy` 7.2.8-5's patch set, `2` closes a SoundWire interrupt race that could hang the boot, `3` stops `cppc_cpufreq` registering its artificial energy model, so EAS no longer packs the desktop onto the A725 cores, and `4` ships the Snapdragon laptops' device trees and resets the Iris AHB bridge before hardware mode.
+The `pkgrel` counts N1x revisions of this package and starts again at 1 when the kernel version changes. On 7.2.5 it was `6.1` to `6.9` while it tracked `linux-omarchy`'s release; the ninth revision became `9`, `10` added the Dell XPS 16 patches, `11` brought a dock's displays back after a failed DisplayPort tunnel, `12` stopped the clock during suspend-to-idle, `13` brought NVIDIA's device sleep patches from 1022.23, `14` let keyboard and touchpad interrupts wake the system from the platform's deepest sleep, and `15` brought audio and UCSI fixes from upstream and turned kexec handover off by default. `7.2.8-1` moves to 7.2.8 and `linux-omarchy` 7.2.8-5's patch set, `2` closes a SoundWire interrupt race that could hang the boot, `3` stops `cppc_cpufreq` registering its artificial energy model, so EAS no longer packs the desktop onto the A725 cores, `4` ships the Snapdragon laptops' device trees and resets the Iris AHB bridge before hardware mode, and `5` builds SCMI CPU frequency scaling in, which the Snapdragon laptops need.
 
 [`UPGRADING-7.3.md`](UPGRADING-7.3.md) has notes for the move to 7.3: what each N1x patch needs there, what upstream already has, and how to verify the result.
 
@@ -76,11 +76,13 @@ Patches 1100–1104 are for the ASUS ProArt P14 (H7407BA) keyboard, 0B05:4B42: t
 
 ## Snapdragon laptops
 
-Since `7.2.8-4` this is also the kernel for the Snapdragon X laptops. Their drivers were already on in the config. Two things were missing.
+Since `7.2.8-4` this is also the kernel for the Snapdragon X laptops. Their drivers were already on in the config. Three things were missing.
 
 The laptops get no device tree from their firmware, so the package builds the Windows-on-ARM families' trees (`x1*`, `hamoa*`, `glymur*`, `sc8280xp*`) and installs them under `/boot/dtbs/linux-omarchy-n1x/qcom`. They sit under the package's name so that no file is shared with Arch Linux ARM's `linux-aarch64`, which keeps its own in `/boot/dtbs`. Omarchy's Snapdragon setup lists them for the UKI.
 
 `2000` is "media: iris: reset AHB bridge before enabling HW mode" (cc330f558996, in the media tree for 7.4). This config builds the Iris video decoder, and without the fix its firmware can assert when a video starts after the decoder has been idle. It was reported and tested on the Yoga Slim 7x.
+
+`ARM_SCMI_CPUFREQ` and `ARM_SCMI_PERF_DOMAIN` are built in since `7.2.8-5`. The X1 and X2 CPUs scale through SCMI's performance protocol, and neither module carries an alias, so as modules nothing loaded them: the laptops booted with no cpufreq policies and ran at whatever clock the firmware left. Arch Linux ARM's kernel builds both in. The N1x scales through ACPI CPPC and is unaffected.
 
 Two differences from Arch Linux ARM's kernel matter on these laptops. Omarchy's Snapdragon setup handles both, so the config stays as the N1x needs it.
 
