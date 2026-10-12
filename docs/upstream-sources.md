@@ -73,13 +73,21 @@ because its published history counted every commit and the number must never
 go down.
 
 `min_release_age` holds a branch tip until its commit timestamp is old enough.
-A fresh tip leaves the existing pin alone; the watch never walks backward to
-an older commit. This uses Git's committer date, not the time a commit was
-pushed. `BYPASS_MIN_RELEASE_AGE=1` bypasses the hold.
+A fresh tip falls back to the newest commit on the branch's first-parent
+history that has cleared the window, so a busy branch still advances; it never
+selects a commit from a merged side branch. This uses Git's committer date, not
+the time a commit was pushed, measured from when the run cloned the branch so
+packages pinned from it agree. `BYPASS_MIN_RELEASE_AGE=1` bypasses the hold.
 
 Packages marked `"auto_merge": true` ride the unattended lane
-(`track-branches.yml`) instead of the reviewed sync PR: their bump PR is opened
-and auto-merged as soon as the build checks pass. `bin/sync-upstream --lane
+(`track-branches.yml`), checked hourly instead of every 6 hours. Every lane
+opens its PRs through `package-prs.yml` and auto-merges them as soon as the
+build checks pass. Each package gets its own
+PR on `auto/track-branches-<package>`, and packages that pin the same branch
+share one, so a package whose build fails holds back only itself. The lane works with every
+provider, not only branch watches, so it also carries release feeds trusted to
+ship without review: the browsers, large vendors' apps, Omacom's own projects,
+and vendor binaries that hold fresh releases with `min_release_age`. `bin/sync-upstream --lane
 reviewed|auto-merge|all` selects a lane; the scheduled workflows each pass their
 own. Packages that pin the same branch move in lockstep: if one of them fails
 to update, the run restores the others and reports the group as failed. A
@@ -151,7 +159,6 @@ in `origin` and has no effect on release selection.
 | `1password-beta` | debian | [https://downloads.1password.com/linux/debian/amd64/dists/beta/main/binary-amd64/Packages](https://downloads.1password.com/linux/debian/amd64/dists/beta/main/binary-amd64/Packages) |
 | `1password-cli` | json | [https://app-updates.agilebits.com/check/1/0/CLI2/en/0](https://app-updates.agilebits.com/check/1/0/CLI2/en/0) |
 | `aether` | github | [omacom/aether](https://github.com/omacom/aether) |
-| `asusctl` | git_tags | [https://github.com/OpenGamingCollective/asusctl.git](https://github.com/OpenGamingCollective/asusctl.git) |
 | `basecamp-cli` | github | [basecamp/basecamp-cli](https://github.com/basecamp/basecamp-cli) |
 | `bun-bin` | github | [oven-sh/bun](https://github.com/oven-sh/bun) |
 | `claude-code` | regex | [https://downloads.claude.ai/claude-code-releases/latest](https://downloads.claude.ai/claude-code-releases/latest) |
@@ -162,21 +169,6 @@ in `origin` and has no effect on release selection.
 | `dbxcli-bin` | github | [dropbox/dbxcli](https://github.com/dropbox/dbxcli) |
 | `dropbox` | redirect | [https://www.dropbox.com/download?plat=lnx.x86_64](https://www.dropbox.com/download?plat=lnx.x86_64) |
 | `dropbox-cli` | regex | [https://linux.dropbox.com/packages/](https://linux.dropbox.com/packages/) |
-| `elephant` | github | [abenz1267/elephant](https://github.com/abenz1267/elephant) |
-| `elephant-all` | github | [abenz1267/elephant](https://github.com/abenz1267/elephant) |
-| `elephant-archlinuxpkgs` | github | [abenz1267/elephant](https://github.com/abenz1267/elephant) |
-| `elephant-bluetooth` | github | [abenz1267/elephant](https://github.com/abenz1267/elephant) |
-| `elephant-calc` | github | [abenz1267/elephant](https://github.com/abenz1267/elephant) |
-| `elephant-clipboard` | github | [abenz1267/elephant](https://github.com/abenz1267/elephant) |
-| `elephant-desktopapplications` | github | [abenz1267/elephant](https://github.com/abenz1267/elephant) |
-| `elephant-files` | github | [abenz1267/elephant](https://github.com/abenz1267/elephant) |
-| `elephant-menus` | github | [abenz1267/elephant](https://github.com/abenz1267/elephant) |
-| `elephant-providerlist` | github | [abenz1267/elephant](https://github.com/abenz1267/elephant) |
-| `elephant-runner` | github | [abenz1267/elephant](https://github.com/abenz1267/elephant) |
-| `elephant-symbols` | github | [abenz1267/elephant](https://github.com/abenz1267/elephant) |
-| `elephant-todo` | github | [abenz1267/elephant](https://github.com/abenz1267/elephant) |
-| `elephant-unicode` | github | [abenz1267/elephant](https://github.com/abenz1267/elephant) |
-| `elephant-websearch` | github | [abenz1267/elephant](https://github.com/abenz1267/elephant) |
 | `heroic-games-launcher-bin` | github | [Heroic-Games-Launcher/HeroicGamesLauncher](https://github.com/Heroic-Games-Launcher/HeroicGamesLauncher) |
 | `hyprshade` | pypi | [hyprshade](https://pypi.org/project/hyprshade/) |
 | `lib32-nvidia-580xx-utils` | regex | [https://download.nvidia.com/XFree86/Linux-x86_64/](https://download.nvidia.com/XFree86/Linux-x86_64/) |
@@ -213,7 +205,6 @@ in `origin` and has no effect on release selection.
 | `vi` | regex | [https://sources.archlinux.org/other/vi/](https://sources.archlinux.org/other/vi/) |
 | `visual-studio-code-bin` | json | [https://update.code.visualstudio.com/api/update/linux-deb-x64/stable/latest](https://update.code.visualstudio.com/api/update/linux-deb-x64/stable/latest) |
 | `walker` | github | [abenz1267/walker](https://github.com/abenz1267/walker) |
-| `xdg-terminal-exec` | git_tags | [https://gitlab.freedesktop.org/Vladimir-csp/xdg-terminal-exec.git](https://gitlab.freedesktop.org/Vladimir-csp/xdg-terminal-exec.git) |
 | `xpadneo-dkms` | github | [atar-axis/xpadneo](https://github.com/atar-axis/xpadneo) |
 | `yaru-icon-theme` | git_tags | [https://github.com/ubuntu/yaru.git](https://github.com/ubuntu/yaru.git) |
 | `yay` | github | [Jguer/yay](https://github.com/Jguer/yay) |
@@ -221,11 +212,9 @@ in `origin` and has no effect on release selection.
 
 ## Existing manual holds
 
-`grok-bot`, `libfprint-git`, `libretro-cap32-git`, `libretro-database-git`, `libretro-fbneo-git`, `libretro-uae-git`, `libretro-vice-git`, `quickshell-git`, `supergfxctl`.
+`libfprint-git`, `libretro-cap32-git`, `libretro-database-git`, `libretro-fbneo-git`, `libretro-uae-git`, `libretro-vice-git`, `quickshell-git`, `supergfxctl`.
 
 These packages were already excluded from automatic AUR updates. The migration preserves that policy.
-
-`linux-firmware-cirrus` is a deliberate hold: a self-retiring shim that ships Arch's linux-firmware-cirrus 20260910-2 payload to stable while stable's Arch snapshot is on 20260810-2 (Dell XPS 13 DX13260 / 1028:0e54 speaker firmware). It is versioned 20260810-3 so the genuine Arch package supersedes it as soon as the snapshot advances; bumping it to the Arch version would defeat that. Delete the recipe once stable's snapshot carries linux-firmware >= 20260910.
 
 `m1n1-aurora` and `uboot-asahi` are deliberate holds: Apple Silicon boot code, pinned by hand like `linux-aurora`, and bumped only after a cold boot on the qualification Macs. `m1n1-aurora` pins an aurora-silicon/m1n1 commit plus a local patch. `uboot-asahi` follows asahi-alarm's recipe and patch set (asahi-alarm/PKGBUILDs), which a tag watch on AsahiLinux/u-boot cannot carry.
 
@@ -239,3 +228,183 @@ These packages were already excluded from automatic AUR updates. The migration p
 - RustDesk reads hbb_common from the release gitlink; its existing build-time dependency/toolchain checks remain in force.
 - Spotify uses HTTPS and retains its signed Release/Packages verification.
 - Source and build compatibility still need review when upstream code changes. Direct watches remove AUR recipe churn, not the need to maintain packaging.
+
+## How the sync PRs build
+
+`sync-upstream.yml`, `sync-rebuilds.yml` and `track-branches.yml` each run their
+sync once, split the changed recipes into one PR per package with
+`.github/scripts/package-pr-groups.sh`, and hand them to `package-prs.yml`. That
+pushes each PR with the PAT in `PKGS_BOT_TOKEN`, so its builds start without an
+approval hold, and arms auto-merge. A push to an `auto/sync-*` or
+`auto/track-branches-*` branch does not cancel the PR's build in flight: the new
+build waits, then reuses every artifact the finished one uploaded.
+
+A red PR stays open for a maintainer and holds back only its own package. A
+later run updates it if upstream moves again, and closes it once it conflicts
+with `master`. A run started by hand with `packages` updates the same
+per-package PRs a scheduled run would.
+
+## Declarative providers and hooks
+
+The older provider form, still in use beside `upstream.watch`. Give a new
+package an `upstream.watch`; `helpers/upstream-watch.py check` validates that
+form only.
+
+```bash
+bin/sync-upstream                       # Update every package with an upstream hook
+bin/sync-upstream openai-codex-desktop  # Update specific packages
+```
+
+A package declares where its releases come from either as data or, for an
+unusual feed, a small hook.
+
+A vendor shipping tagged GitHub releases is pure data, declared as `upstream`
+in `.omarchy/package.json` with no code at all:
+
+```json
+"upstream": {
+  "github": "jdx/mise",
+  "checksums": "SHASUMS256.txt",
+  "assets": {
+    "x86_64": "mise-{tag}-linux-x64.tar.xz",
+    "aarch64": "mise-{tag}-linux-arm64.tar.xz"
+  }
+}
+```
+
+`checksums` names the manifest asset the vendor publishes. A vendor publishing
+none sets `"digests": true` instead, and the checksums come from the SHA-256
+digest GitHub's release API reports for every asset — see
+`pkgbuilds/schist-bin/.omarchy/package.json`. Either way the artifacts
+themselves are never downloaded.
+
+An architecture may map to an ordered array when its PKGBUILD downloads more
+than one release asset. Small versioned files outside the release assets can be
+listed under `sources` and are downloaded and hashed when a new version appears:
+
+```json
+"upstream": {
+  "github": "owner/project",
+  "digests": true,
+  "assets": {
+    "x86_64": ["tool-{pkgver}-x86_64", "tool-{pkgver}-x86_64.asc"],
+    "aarch64": ["tool-{pkgver}-aarch64", "tool-{pkgver}-aarch64.asc"]
+  },
+  "sources": {
+    "any": ["https://raw.githubusercontent.com/owner/project/{tag}/LICENSE"]
+  }
+}
+```
+
+Asset and source keys must be disjoint because each key maps to one PKGBUILD
+checksum array (`any` means the unsuffixed `sha256sums`).
+
+Repositories whose historical releases use incompatible tag schemes may set
+`"latest_only": true`. The provider then considers only the newest stable
+GitHub release, while retaining all validation for that release. A quarantine
+will wait for that release to age instead of falling back to an older one.
+
+`{tag}` and `{pkgver}` interpolate into asset names; a leading `v` on the tag is
+stripped for `pkgver`; drafts and prereleases are ignored. Only the 100 most
+recent releases are considered. The provider fails closed on anything it cannot
+read — an unusable tag, timestamp, or checksum stops the sync rather than being
+skipped.
+
+Projects that publish version tags but no checksum manifest can declare the
+tag repository, the exact tag shape, and every source that should be hashed:
+
+```json
+"upstream": {
+  "git_tags": "https://github.com/owner/project.git",
+  "tag_pattern": "v{pkgver}",
+  "sources": {
+    "any": ["https://github.com/owner/project/archive/refs/tags/{tag}.tar.gz"]
+  }
+}
+```
+
+The newest matching tag is selected with pacman's `vercmp`; unrelated tags are
+ignored. `tag_pattern` must contain exactly one `{pkgver}`. Source templates may
+use `{tag}` and `{pkgver}`. Each expanded URL must be HTTPS and is downloaded
+only when the discovered version is newer. A checked-in patch or other local
+source can be included as `file:patch-name.patch`; it is hashed from the package
+directory. Keys such as `any`, `x86_64`, and `aarch64` select the corresponding
+`sha256sums` array.
+
+npm packages use the same source mapping, with `{npm_tarball}` available for
+the tarball named by the selected dist-tag:
+
+```json
+"upstream": {
+  "npm": "@scope/package",
+  "dist_tag": "latest",
+  "sources": {
+    "any": ["{npm_tarball}", "https://example.com/v{pkgver}/CHANGELOG.md"]
+  }
+}
+```
+
+`dist_tag` defaults to `latest`. The registry's publication timestamp is
+carried into the provider result, so `min_release_age` works for npm packages.
+
+A vendor with a plain-text Debian `Packages` index can use it to discover the
+newest exact package version, then hash immutable source URLs:
+
+```json
+"upstream": {
+  "debian": "https://example.com/debian/dists/stable/main/binary-amd64/Packages",
+  "package": "example-app",
+  "sources": {
+    "x86_64": ["https://example.com/tool-{pkgver}-x64.tar.gz"],
+    "aarch64": ["https://example.com/tool-{pkgver}-arm64.tar.gz"]
+  }
+}
+```
+
+This deliberately accepts only Debian versions that are already valid Arch
+`pkgver` values. Feeds needing epoch, revision, or filename translation retain
+a hook. Exactly one of `github`, `git_tags`, `npm`, or `debian` may appear in a
+declaration.
+
+A timestamped provider may also declare `"min_release_age": "24h"`
+(`s`/`m`/`h`/`d` suffix or bare seconds) to quarantine fresh releases until
+maintainers have had time to pull a bad or compromised one. GitHub Releases and
+npm provide publication times; raw git tags and Debian Packages indexes do not,
+so combining either with this policy fails closed. The newest release that has
+cleared the window ships, so a fast release cadence cannot starve updates. The
+window is enforced
+centrally: whatever reports the release must prove its age via `published_at`,
+or the sync fails. A maintainer deliberately shipping inside the window runs
+`BYPASS_MIN_RELEASE_AGE=1 bin/sync-upstream <package>` locally and merges the
+result through a normal PR; scheduled automation never sets the bypass.
+
+A vendor whose feed fits no convention (a Debian package index, a bare
+version.txt) instead provides `.omarchy/upstream.sh`, a hook that reports the
+newest upstream release as JSON on stdout — declaring both an `upstream` block
+and a hook is an error:
+
+```json
+{
+  "pkgver": "1.2.3",
+  "sha256sums": { "x86_64": ["<sha256>"], "aarch64": ["<sha256>"] }
+}
+```
+
+Architecture keys become `sha256sums_<arch>` in the PKGBUILD; the key `any` means
+the unsuffixed `sha256sums` array, and only the arrays a hook names are touched.
+An empty object (`{}`) reports no update, which is how a hook waits out a release
+that has landed for one architecture but not yet the other.
+
+When the reported version is newer than the checked-in one, `bin/sync-upstream`
+rewrites `pkgver` and those checksum arrays and resets `pkgrel` to 1. A version
+that is equal or older leaves the package alone, so a vendor rolling a release
+back cannot walk the repository backwards.
+
+Hooks should read checksums from whatever manifest the vendor publishes rather
+than downloading the artifacts — see `pkgbuilds/openai-codex-desktop/.omarchy/upstream.sh`,
+which reads OpenAI's Debian package index and never fetches the 750 MB of debs
+it describes. Hooks honoring `min_release_age` receive the window as
+`MIN_RELEASE_AGE_SECONDS` and report `published_at` alongside `pkgver`.
+
+`bin/sync-upstream self-test` runs offline fixture tests over the release
+selection, quarantine backstop, duration parsing, and manifest validation.

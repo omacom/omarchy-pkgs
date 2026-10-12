@@ -20,16 +20,18 @@ on:
         description: "Space-separated package directories to build"
         required: true
 
-# A new push normally cancels the PR's in-flight build. The sync bots'
-# branches (auto/sync-*) are the exception: they are force-pushed with fresh
-# upstream releases several times a day, which kept cancelling multi-hour
-# aarch64 builds before they could finish. There the newest run waits
-# instead (GitHub keeps at most one pending run per group, replacing older
-# pending ones), and when it starts it reuses every artifact the finished
-# build uploaded, so only packages whose tree changed are built again.
+# A new push normally cancels the PR's in-flight build. The bots' branches
+# (auto/sync-* and auto/track-branches-*) are the exception: they are
+# force-pushed with fresh upstream releases several times a day, which kept
+# cancelling multi-hour aarch64 builds before they could finish. There the
+# newest run waits instead (GitHub keeps at most one pending run per group,
+# replacing older pending ones), and when it starts it reuses every artifact
+# the finished build uploaded, so only packages whose tree changed are built
+# again. The tracker labels the PR it opens, so a new tracker PR starts two
+# runs at once; cancelling the first left a red `result` on the PR (#901).
 concurrency:
   group: build-${{ github.event.pull_request.number || github.run_id }}
-  cancel-in-progress: ${{ !(github.event.pull_request.head.repo.full_name == github.repository && startsWith(github.head_ref, 'auto/sync-')) }}
+  cancel-in-progress: ${{ !(github.event.pull_request.head.repo.full_name == github.repository && (startsWith(github.head_ref, 'auto/sync-') || startsWith(github.head_ref, 'auto/track-branches'))) }}
 
 jobs:
   # Builds cost real machines, so they run only for trusted authors:
@@ -211,11 +213,37 @@ jobs:
           # git's SIGPIPE (141) failed the step for any PR far enough behind
           # master to differ in more files; sed reads the whole stream.
           git status --short | sed -n '1,10p'
+      # A PR can change a package's directory without changing its version:
+      # an upstream hook, its tests, a README. edge already holds that
+      # version, so the planner builds nothing and there is nothing to pack.
+      # The same check publish.yml's rebuild job makes; without it the pack
+      # step failed on the empty output and the required result went red.
       - name: Build ${{ matrix.package }} (${{ matrix.arch }}, ships to ${{ matrix.channels }})
         id: build
         env:
           CONTAINER_ENGINE: docker
-        run: bin/build --mirror edge --arch ${{ matrix.arch }} --package ${{ matrix.package }}
+        run: |
+          set -euo pipefail
+          plan=$(bin/build --dry-run --mirror edge --arch "${{ matrix.arch }}" --package "${{ matrix.package }}" 2>&1 | grep -E '^==> Plan complete' || true)
+          if [[ -n "$plan" && -z "$(sed -E 's/.*would build: *//' <<<"$plan" | tr -d '[:space:]')" ]]; then
+            echo "==> ${{ matrix.package }} (${{ matrix.arch }}): edge already holds this version, nothing to build"
+            echo "built=false" >> "$GITHUB_OUTPUT"
+            # Arch bumps pkgrel only when the built package changes, which is
+            # the reviewer's call. When the recipe itself changed (comments and
+            # blank lines aside), flag it on the PKGBUILD without failing: the
+            # change ships only once pkgver or pkgrel moves. HEAD is the base
+            # branch; the PR's package directories are overlaid on it.
+            recipe="pkgbuilds/${{ matrix.package }}/PKGBUILD"
+            recipe_lines() { grep -vE '^[[:space:]]*(#|$)' || true; }
+            if ! cmp -s <(git show "HEAD:$recipe" 2>/dev/null | recipe_lines) <(recipe_lines < "$recipe"); then
+              note="PKGBUILD changed, but edge already holds this version of ${{ matrix.package }}, so the change will not ship until pkgver or pkgrel changes. Bump pkgrel if it affects the built package."
+              echo "::warning file=$recipe,title=Change will not ship::$note"
+              echo "$note" >> "$GITHUB_STEP_SUMMARY"
+            fi
+            exit 0
+          fi
+          bin/build --mirror edge --arch "${{ matrix.arch }}" --package "${{ matrix.package }}"
+          echo "built=true" >> "$GITHUB_OUTPUT"
       # makepkg's check() leaves meson's per-test output in the build tree,
       # never on stdout, so a failing test shows only a summary line in this
       # job log. bin/build bind-mounts $SRC_DIR at /src, so those logs outlive
@@ -243,12 +271,14 @@ jobs:
       # successful build uploads: the artifact's existence is what lets the
       # planner above and publish.yml skip rebuilding this exact tree.
       - name: Pack artifact
+        if: steps.build.outputs.built == 'true'
         id: pack
         run: |
           source helpers/artifact-helpers.sh
           pack_packages build-output/edge/${{ matrix.arch }} packages.tar
           tar -tvf packages.tar
       - name: Upload artifact
+        if: steps.build.outputs.built == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.package }}-${{ matrix.arch }}-${{ steps.tree.outputs.hash }}

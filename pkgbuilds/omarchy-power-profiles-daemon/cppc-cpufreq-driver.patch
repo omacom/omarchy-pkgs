@@ -1,0 +1,571 @@
+From d0b09a5248723d68ba3bd38ce50af1b29a119dd6 Mon Sep 17 00:00:00 2001
+From: David Heinemeier Hansson <david@hey.com>
+Date: Fri, 9 Oct 2026 15:46:37 +0200
+Subject: [PATCH] Add CPPC cpufreq driver
+
+Adds a CPU profile driver for the generic ACPI CPPC cpufreq driver
+(cppc_cpufreq) used on ARM64 laptops, which previously only got the
+placeholder driver and so had no working profiles at all.
+
+Balanced and power-saver enable CPPC autonomous frequency selection
+with an energy performance preference of 64 and 192 respectively.
+Performance leaves autonomous selection and runs the performance
+governor.
+
+The driver only probes policies that offer both the schedutil and
+performance governors and writable autonomous selection knobs. A failed
+first activation restores the settings found at probe time, and the
+active profile is reapplied on resume in case firmware reset the CPPC
+registers.
+
+On an NVIDIA N1X laptop, balanced cut median keystroke-to-frame
+latency in Chromium from ~130ms (schedutil) to ~56ms at the same idle
+power, and performance to ~32ms.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/meson.build             |   1 +
+ src/power-profiles-daemon.c |   2 +
+ src/ppd-driver-cppc.c       | 334 ++++++++++++++++++++++++++++++++++++
+ src/ppd-driver-cppc.h       |  16 ++
+ tests/integration_test.py   | 128 ++++++++++++++
+ 5 files changed, 481 insertions(+)
+ create mode 100644 src/ppd-driver-cppc.c
+ create mode 100644 src/ppd-driver-cppc.h
+
+diff --git a/src/meson.build b/src/meson.build
+index 0056466..c6c1eb2 100644
+--- a/src/meson.build
++++ b/src/meson.build
+@@ -93,6 +93,7 @@ sources += [
+   'ppd-action-amdgpu-dpm.c',
+   'ppd-driver-intel-pstate.c',
+   'ppd-driver-amd-pstate.c',
++  'ppd-driver-cppc.c',
+   'ppd-driver-platform-profile.c',
+   'ppd-driver-placeholder.c',
+   'ppd-driver-fake.c',
+diff --git a/src/power-profiles-daemon.c b/src/power-profiles-daemon.c
+index 01aac72..037f6f7 100644
+--- a/src/power-profiles-daemon.c
++++ b/src/power-profiles-daemon.c
+@@ -143,6 +143,7 @@ static void upower_battery_set_power_changed_reason (PpdApp *, PpdPowerChangedRe
+ #include "ppd-driver-platform-profile.h"
+ #include "ppd-driver-intel-pstate.h"
+ #include "ppd-driver-amd-pstate.h"
++#include "ppd-driver-cppc.h"
+ #include "ppd-driver-fake.h"
+ 
+ typedef GType (*GTypeGetFunc) (void);
+@@ -153,6 +154,7 @@ static GTypeGetFunc objects[] = {
+   ppd_driver_platform_profile_get_type,
+   ppd_driver_intel_pstate_get_type,
+   ppd_driver_amd_pstate_get_type,
++  ppd_driver_cppc_get_type,
+ 
+   /* Generic profile driver */
+   ppd_driver_placeholder_get_type,
+diff --git a/src/ppd-driver-cppc.c b/src/ppd-driver-cppc.c
+new file mode 100644
+index 0000000..c03df2a
+--- /dev/null
++++ b/src/ppd-driver-cppc.c
+@@ -0,0 +1,334 @@
++/*
++ * Copyright (c) 2020 Bastien Nocera <hadess@hadess.net>
++ * Copyright (c) 2026 David Heinemeier Hansson <david@hey.com>
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License version 3 as published by
++ * the Free Software Foundation.
++ *
++ */
++
++/*
++ * Profile driver for the generic ACPI CPPC cpufreq driver (cppc_cpufreq),
++ * as used by ARM64 laptops. Balanced and power-saver hand frequency
++ * selection to the platform ("autonomous selection") with an energy
++ * performance preference, while performance runs the performance governor.
++ */
++
++#define G_LOG_DOMAIN "CpuDriver"
++
++#include "ppd-utils.h"
++#include "ppd-driver-cppc.h"
++
++#define CPUFREQ_POLICY_DIR "/sys/devices/system/cpu/cpufreq/"
++
++/* energy_performance_preference_val: 0 is max performance, 255 max efficiency */
++#define EPP_BALANCED "64"
++#define EPP_POWER_SAVER "192"
++
++typedef struct
++{
++  char *path;
++  /* Settings found at probe time, restored if the first activation fails */
++  char *governor;
++  char *auto_select;
++  char *epp;
++} CppcPolicy;
++
++struct _PpdDriverCppc
++{
++  PpdDriverCpu  parent_instance;
++
++  PpdProfile activated_profile;
++  GPtrArray *policies; /* Array of CppcPolicy */
++};
++
++G_DEFINE_TYPE (PpdDriverCppc, ppd_driver_cppc, PPD_TYPE_DRIVER_CPU)
++
++static void
++cppc_policy_free (CppcPolicy *policy)
++{
++  g_free (policy->path);
++  g_free (policy->governor);
++  g_free (policy->auto_select);
++  g_free (policy->epp);
++  g_free (policy);
++}
++
++static GObject*
++ppd_driver_cppc_constructor (GType                  type,
++                             guint                  n_construct_params,
++                             GObjectConstructParam *construct_params)
++{
++  GObject *object;
++
++  object = G_OBJECT_CLASS (ppd_driver_cppc_parent_class)->constructor (type,
++                                                                       n_construct_params,
++                                                                       construct_params);
++  g_object_set (object,
++                "driver-name", "cppc_cpufreq",
++                "profiles", PPD_PROFILE_PERFORMANCE | PPD_PROFILE_BALANCED | PPD_PROFILE_POWER_SAVER,
++                NULL);
++
++  return object;
++}
++
++static char *
++read_policy_file (const char *base,
++                  const char *name)
++{
++  g_autofree char *path = NULL;
++  g_autofree char *contents = NULL;
++  g_autoptr(GError) error = NULL;
++
++  path = g_build_filename (base, name, NULL);
++  if (!g_file_get_contents (path, &contents, NULL, &error)) {
++    g_debug ("Failed to read %s: %s", path, error->message);
++    return NULL;
++  }
++
++  return g_strdup (g_strstrip (contents));
++}
++
++static gboolean
++write_policy_file (const char  *base,
++                   const char  *name,
++                   const char  *value,
++                   GError     **error)
++{
++  g_autofree char *path = NULL;
++
++  path = g_build_filename (base, name, NULL);
++  return ppd_utils_write (path, value, error);
++}
++
++static gboolean
++has_governors (const char *base)
++{
++  g_autofree char *available = NULL;
++  g_auto(GStrv) governors = NULL;
++
++  available = read_policy_file (base, "scaling_available_governors");
++  if (!available)
++    return FALSE;
++
++  governors = g_strsplit_set (available, " \t\n", -1);
++  return g_strv_contains ((const char * const *) governors, "schedutil") &&
++         g_strv_contains ((const char * const *) governors, "performance");
++}
++
++static CppcPolicy *
++probe_policy (const char *base)
++{
++  g_autofree char *driver = NULL;
++  g_autoptr(GError) error = NULL;
++  CppcPolicy *policy;
++
++  driver = read_policy_file (base, "scaling_driver");
++  if (g_strcmp0 (driver, "cppc_cpufreq") != 0)
++    return NULL;
++
++  /* Every profile switches to one of these */
++  if (!has_governors (base)) {
++    g_debug ("%s lacks the schedutil or performance governor", base);
++    return NULL;
++  }
++
++  policy = g_new0 (CppcPolicy, 1);
++  policy->path = g_strdup (base);
++  policy->governor = read_policy_file (base, "scaling_governor");
++  /* Autonomous selection is optional in CPPC, so its knobs may be missing */
++  policy->auto_select = read_policy_file (base, "auto_select");
++  policy->epp = read_policy_file (base, "energy_performance_preference_val");
++
++  if (!policy->governor || !policy->auto_select || !policy->epp) {
++    cppc_policy_free (policy);
++    return NULL;
++  }
++
++  /* Check that the knobs are writable by writing back what they hold */
++  if (!write_policy_file (base, "auto_select", policy->auto_select, &error) ||
++      !write_policy_file (base, "energy_performance_preference_val", policy->epp, &error)) {
++    g_debug ("Failed to write CPPC settings in %s: %s", base, error->message);
++    cppc_policy_free (policy);
++    return NULL;
++  }
++
++  return policy;
++}
++
++static PpdProbeResult
++ppd_driver_cppc_probe (PpdDriver *driver)
++{
++  PpdDriverCppc *cppc = PPD_DRIVER_CPPC (driver);
++  g_autoptr(GDir) dir = NULL;
++  g_autofree char *policy_dir = NULL;
++  const char *dirname;
++
++  policy_dir = ppd_utils_get_sysfs_path (CPUFREQ_POLICY_DIR);
++  dir = g_dir_open (policy_dir, 0, NULL);
++  if (!dir) {
++    g_debug ("Could not open %s", policy_dir);
++    return PPD_PROBE_RESULT_FAIL;
++  }
++
++  while ((dirname = g_dir_read_name (dir)) != NULL) {
++    g_autofree char *base = NULL;
++    CppcPolicy *policy;
++
++    base = g_build_filename (policy_dir, dirname, NULL);
++    policy = probe_policy (base);
++    if (!policy)
++      continue;
++
++    if (!cppc->policies)
++      cppc->policies = g_ptr_array_new_with_free_func ((GDestroyNotify) cppc_policy_free);
++
++    g_ptr_array_add (cppc->policies, policy);
++  }
++
++  g_debug ("%s CPPC autonomous selection settings",
++           cppc->policies && cppc->policies->len ? "Found" : "Didn't find");
++
++  if (cppc->policies && cppc->policies->len)
++    return PPD_PROBE_RESULT_SUCCESS;
++
++  return PPD_PROBE_RESULT_FAIL;
++}
++
++static gboolean
++apply_pref_to_policies (GPtrArray   *policies,
++                        PpdProfile   profile,
++                        GError     **error)
++{
++  if (profile == PPD_PROFILE_UNSET)
++    return TRUE;
++
++  for (guint i = 0; i < policies->len; ++i) {
++    const char *base = ((CppcPolicy *) g_ptr_array_index (policies, i))->path;
++
++    switch (profile) {
++    case PPD_PROFILE_PERFORMANCE:
++      /* Leave autonomous selection first so the governor owns the frequency */
++      if (!write_policy_file (base, "auto_select", "0", error) ||
++          !write_policy_file (base, "scaling_governor", "performance", error))
++        return FALSE;
++      break;
++    case PPD_PROFILE_BALANCED:
++    case PPD_PROFILE_POWER_SAVER:
++      if (!write_policy_file (base, "scaling_governor", "schedutil", error) ||
++          !write_policy_file (base, "energy_performance_preference_val",
++                              profile == PPD_PROFILE_BALANCED ? EPP_BALANCED : EPP_POWER_SAVER,
++                              error) ||
++          !write_policy_file (base, "auto_select", "1", error))
++        return FALSE;
++      break;
++    default:
++      g_assert_not_reached ();
++    }
++  }
++
++  return TRUE;
++}
++
++static void
++restore_probed_settings (GPtrArray *policies)
++{
++  for (guint i = 0; i < policies->len; ++i) {
++    CppcPolicy *policy = g_ptr_array_index (policies, i);
++    g_autoptr(GError) error = NULL;
++
++    if (!write_policy_file (policy->path, "auto_select", "0", &error) ||
++        !write_policy_file (policy->path, "scaling_governor", policy->governor, &error) ||
++        !write_policy_file (policy->path, "energy_performance_preference_val", policy->epp, &error) ||
++        !write_policy_file (policy->path, "auto_select", policy->auto_select, &error))
++      g_warning ("failed to restore CPPC settings in %s: %s", policy->path, error->message);
++  }
++}
++
++static gboolean
++ppd_driver_cppc_activate_profile (PpdDriver                   *driver,
++                                  PpdProfile                   profile,
++                                  PpdProfileActivationReason   reason,
++                                  GError                     **error)
++{
++  PpdDriverCppc *cppc = PPD_DRIVER_CPPC (driver);
++  gboolean ret = FALSE;
++
++  g_return_val_if_fail (cppc->policies != NULL, FALSE);
++  g_return_val_if_fail (cppc->policies->len != 0, FALSE);
++
++  ret = apply_pref_to_policies (cppc->policies, profile, error);
++  if (!ret) {
++    g_autoptr(GError) error_local = NULL;
++
++    /* Policies may be left half-switched, so put them all back */
++    if (cppc->activated_profile == PPD_PROFILE_UNSET)
++      restore_probed_settings (cppc->policies);
++    else if (!apply_pref_to_policies (cppc->policies,
++                                      cppc->activated_profile,
++                                      &error_local))
++      g_warning ("failed to restore previous profile: %s", error_local->message);
++    return ret;
++  }
++
++  cppc->activated_profile = profile;
++
++  return ret;
++}
++
++static gboolean
++ppd_driver_cppc_prepare_for_sleep (PpdDriver  *driver,
++                                   gboolean    start,
++                                   GError    **error)
++{
++  PpdDriverCppc *cppc = PPD_DRIVER_CPPC (driver);
++  g_autoptr(GError) local_error = NULL;
++
++  if (start)
++    return TRUE;
++
++  /* Firmware may reset CPPC registers across suspend */
++  g_debug ("Re-applying CPPC settings");
++  if (!ppd_driver_cppc_activate_profile (driver,
++                                         cppc->activated_profile,
++                                         PPD_PROFILE_ACTIVATION_REASON_RESUME,
++                                         &local_error)) {
++    g_propagate_prefixed_error (error, g_steal_pointer (&local_error),
++                                "Could not reapply CPPC settings on resume: ");
++    return FALSE;
++  }
++
++  return TRUE;
++}
++
++static void
++ppd_driver_cppc_finalize (GObject *object)
++{
++  PpdDriverCppc *driver;
++
++  driver = PPD_DRIVER_CPPC (object);
++  g_clear_pointer (&driver->policies, g_ptr_array_unref);
++  G_OBJECT_CLASS (ppd_driver_cppc_parent_class)->finalize (object);
++}
++
++static void
++ppd_driver_cppc_class_init (PpdDriverCppcClass *klass)
++{
++  GObjectClass *object_class;
++  PpdDriverClass *driver_class;
++
++  object_class = G_OBJECT_CLASS (klass);
++  object_class->constructor = ppd_driver_cppc_constructor;
++  object_class->finalize = ppd_driver_cppc_finalize;
++
++  driver_class = PPD_DRIVER_CLASS (klass);
++  driver_class->probe = ppd_driver_cppc_probe;
++  driver_class->activate_profile = ppd_driver_cppc_activate_profile;
++  driver_class->prepare_to_sleep = ppd_driver_cppc_prepare_for_sleep;
++}
++
++static void
++ppd_driver_cppc_init (PpdDriverCppc *self)
++{
++}
+diff --git a/src/ppd-driver-cppc.h b/src/ppd-driver-cppc.h
+new file mode 100644
+index 0000000..c79356d
+--- /dev/null
++++ b/src/ppd-driver-cppc.h
+@@ -0,0 +1,16 @@
++/*
++ * Copyright (c) 2020 Bastien Nocera <hadess@hadess.net>
++ * Copyright (c) 2026 David Heinemeier Hansson <david@hey.com>
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License version 3 as published by
++ * the Free Software Foundation.
++ *
++ */
++
++#pragma once
++
++#include "ppd-driver-cpu.h"
++
++#define PPD_TYPE_DRIVER_CPPC (ppd_driver_cppc_get_type ())
++G_DECLARE_FINAL_TYPE (PpdDriverCppc, ppd_driver_cppc, PPD, DRIVER_CPPC, PpdDriverCpu)
+diff --git a/tests/integration_test.py b/tests/integration_test.py
+index 0994cf2..5648c1e 100644
+--- a/tests/integration_test.py
++++ b/tests/integration_test.py
+@@ -1258,6 +1258,134 @@ class Tests(dbusmock.DBusTestCase):
+         self.assert_file_eventually_contains(energy_prefs, "power")
+         self.assert_file_eventually_contains(scaling_governor, "powersave")
+ 
++    def create_cppc_policy(
++        self,
++        name,
++        driver="cppc_cpufreq",
++        governors="conservative ondemand userspace powersave performance schedutil",
++    ):
++        """Create a cpufreq policy with CPPC autonomous selection knobs"""
++        policy = os.path.join(
++            self.testbed.get_root_dir(), f"sys/devices/system/cpu/cpufreq/{name}/"
++        )
++        os.makedirs(policy)
++        self.write_file_contents(os.path.join(policy, "scaling_driver"), f"{driver}\n")
++        self.write_file_contents(
++            os.path.join(policy, "scaling_available_governors"), f"{governors}\n"
++        )
++        self.write_file_contents(os.path.join(policy, "scaling_governor"), "schedutil\n")
++        self.write_file_contents(os.path.join(policy, "auto_select"), "0\n")
++        self.write_file_contents(
++            os.path.join(policy, "energy_performance_preference_val"), "127\n"
++        )
++        return policy
++
++    def assert_cppc_policies(self, policies, governor, auto_select, epp=None):
++        """Check the CPPC settings of every policy"""
++        for policy in policies:
++            self.assert_file_eventually_contains(
++                os.path.join(policy, "scaling_governor"), governor
++            )
++            self.assert_file_eventually_contains(
++                os.path.join(policy, "auto_select"), auto_select
++            )
++            if epp is not None:
++                self.assert_file_eventually_contains(
++                    os.path.join(policy, "energy_performance_preference_val"), epp
++                )
++
++    def test_cppc(self):
++        """CPPC cpufreq driver with autonomous selection (no UPower)"""
++
++        policies = [self.create_cppc_policy("policy0"), self.create_cppc_policy("policy1")]
++
++        self.start_daemon()
++
++        profiles = self.get_dbus_property("Profiles")
++        self.assertEqual(len(profiles), 3)
++        self.assertEqual(profiles[0]["Driver"], "multiple")
++        self.assertEqual(profiles[0]["CpuDriver"], "cppc_cpufreq")
++        self.assertEqual(profiles[0]["Profile"], "power-saver")
++
++        self.assert_cppc_policies(policies, "schedutil", "1", "64")
++
++        # Performance leaves autonomous selection and runs the performance governor
++        self.set_dbus_property("ActiveProfile", GLib.Variant.new_string("performance"))
++        self.assertEqual(self.get_dbus_property("ActiveProfile"), "performance")
++        self.assert_cppc_policies(policies, "performance", "0")
++
++        # Power saver goes back to autonomous selection, biased to efficiency
++        self.set_dbus_property("ActiveProfile", GLib.Variant.new_string("power-saver"))
++        self.assertEqual(self.get_dbus_property("ActiveProfile"), "power-saver")
++        self.assert_cppc_policies(policies, "schedutil", "1", "192")
++
++    def test_cppc_reapply_on_resume_from_sleep(self):
++        """CPPC settings are reapplied after resume"""
++
++        policy = self.create_cppc_policy("policy0")
++        auto_select = os.path.join(policy, "auto_select")
++
++        _, obj_logind, _ = self.start_dbus_template("logind", {})
++
++        self.start_daemon()
++        self.assert_dbus_property_eventually_is(
++            "ActiveProfile", "balanced", keep_checking=100
++        )
++        self.assert_file_eventually_contains(auto_select, "1")
++
++        # Simulate firmware resetting autonomous selection across suspend
++        obj_logind.EmitSignal(
++            "org.freedesktop.login1.Manager", "PrepareForSleep", "b", [True]
++        )
++        self.write_file_contents(auto_select, "0\n")
++        obj_logind.EmitSignal(
++            "org.freedesktop.login1.Manager", "PrepareForSleep", "b", [False]
++        )
++
++        self.assert_file_eventually_contains(
++            auto_select, "1", timeout=3000, keep_checking=100
++        )
++
++    def test_cppc_without_autonomous_selection(self):
++        """CPPC cpufreq driver without autonomous selection falls back to placeholder"""
++
++        policy = os.path.join(
++            self.testbed.get_root_dir(), "sys/devices/system/cpu/cpufreq/policy0/"
++        )
++        os.makedirs(policy)
++        self.write_file_contents(os.path.join(policy, "scaling_driver"), "cppc_cpufreq\n")
++        self.write_file_contents(
++            os.path.join(policy, "scaling_available_governors"), "performance schedutil\n"
++        )
++        self.write_file_contents(os.path.join(policy, "scaling_governor"), "schedutil\n")
++
++        self.start_daemon()
++
++        profiles = self.get_dbus_property("Profiles")
++        self.assertEqual(len(profiles), 2)
++        self.assertEqual(profiles[0]["Driver"], "placeholder")
++
++    def test_cppc_without_schedutil(self):
++        """CPPC cpufreq driver without the schedutil governor falls back to placeholder"""
++
++        self.create_cppc_policy("policy0", governors="performance powersave")
++
++        self.start_daemon()
++
++        profiles = self.get_dbus_property("Profiles")
++        self.assertEqual(len(profiles), 2)
++        self.assertEqual(profiles[0]["Driver"], "placeholder")
++
++    def test_cppc_other_cpufreq_driver(self):
++        """CPPC knobs on a non-CPPC cpufreq driver are ignored"""
++
++        self.create_cppc_policy("policy0", driver="acpi-cpufreq")
++
++        self.start_daemon()
++
++        profiles = self.get_dbus_property("Profiles")
++        self.assertEqual(len(profiles), 2)
++        self.assertEqual(profiles[0]["Driver"], "placeholder")
+     # pylint: disable=too-many-statements
+     def test_amd_pstate_min_freq(self):
+         """AMD P-State driver min freq support"""
+-- 
+2.56.0
+

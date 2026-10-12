@@ -1,0 +1,95 @@
+diff --git a/drivers/gpu/drm/xe/xe_defaults.h b/drivers/gpu/drm/xe/xe_defaults.h
+--- a/drivers/gpu/drm/xe/xe_defaults.h
++++ b/drivers/gpu/drm/xe/xe_defaults.h
+@@ -23,5 +23,6 @@
+ #define XE_DEFAULT_WEDGED_MODE_STR		"upon-critical-error"
+ #define XE_DEFAULT_SVM_NOTIFIER_SIZE		512
+ #define XE_DEFAULT_SHRINK_ACTIVE_MS		1000
++#define XE_DEFAULT_SHRINK_DIRECT_BACKUP		false
+ 
+ #endif
+diff --git a/drivers/gpu/drm/xe/xe_module.c b/drivers/gpu/drm/xe/xe_module.c
+--- a/drivers/gpu/drm/xe/xe_module.c
++++ b/drivers/gpu/drm/xe/xe_module.c
+@@ -31,6 +31,7 @@ struct xe_modparam xe_modparam = {
+ 	.wedged_mode =		XE_DEFAULT_WEDGED_MODE,
+ 	.svm_notifier_size =	XE_DEFAULT_SVM_NOTIFIER_SIZE,
+ 	.shrink_active_ms =	XE_DEFAULT_SHRINK_ACTIVE_MS,
++	.shrink_direct_backup =	XE_DEFAULT_SHRINK_DIRECT_BACKUP,
+ 	/* the rest are 0 by default */
+ };
+ 
+@@ -43,6 +44,10 @@ MODULE_PARM_DESC(shrink_active_ms, "Do not back up a buffer object bound to a VM
+ 		 "within this many ms, 0=disabled "
+ 		 "[default=" __stringify(XE_DEFAULT_SHRINK_ACTIVE_MS) "]");
+ 
++module_param_named(shrink_direct_backup, xe_modparam.shrink_direct_backup, bool, 0600);
++MODULE_PARM_DESC(shrink_direct_backup, "Back up buffer objects in direct reclaim too, not only in kswapd "
++		 "[default=" __stringify(XE_DEFAULT_SHRINK_DIRECT_BACKUP) "]");
++
+ module_param_named_unsafe(force_execlist, xe_modparam.force_execlist, bool, 0444);
+ MODULE_PARM_DESC(force_execlist, "Force Execlist submission");
+ 
+diff --git a/drivers/gpu/drm/xe/xe_module.h b/drivers/gpu/drm/xe/xe_module.h
+--- a/drivers/gpu/drm/xe/xe_module.h
++++ b/drivers/gpu/drm/xe/xe_module.h
+@@ -26,6 +26,7 @@ struct xe_modparam {
+ 	unsigned int wedged_mode;
+ 	u32 svm_notifier_size;
+ 	unsigned int shrink_active_ms;
++	bool shrink_direct_backup;
+ };
+ 
+ extern struct xe_modparam xe_modparam;
+diff --git a/drivers/gpu/drm/xe/xe_shrinker.c b/drivers/gpu/drm/xe/xe_shrinker.c
+--- a/drivers/gpu/drm/xe/xe_shrinker.c
++++ b/drivers/gpu/drm/xe/xe_shrinker.c
+@@ -4,6 +4,7 @@
+  */
+ 
+ #include <linux/shrinker.h>
++#include <linux/swap.h>
+ 
+ #include <drm/drm_managed.h>
+ #include <drm/ttm/ttm_backup.h>
+@@ -11,6 +12,7 @@
+ #include <drm/ttm/ttm_tt.h>
+ 
+ #include "xe_bo.h"
++#include "xe_module.h"
+ #include "xe_pm.h"
+ #include "xe_shrinker.h"
+ 
+@@ -170,9 +172,12 @@ static int xe_shrinker_walk(struct xe_shrinker *shrinker,
+ 	return ret;
+ }
+ 
+-static inline bool xe_shrinker_can_backup(const struct shrink_control *sc)
++static inline bool xe_shrinker_can_backup(struct xe_shrinker *shrinker,
++					  const struct shrink_control *sc)
+ {
+-	return (sc->gfp_mask & __GFP_FS) && !sc->opportunistic_compaction;
++	return (sc->gfp_mask & __GFP_FS) && !sc->opportunistic_compaction &&
++	       (current_is_kswapd() || READ_ONCE(xe_modparam.shrink_direct_backup) ||
++		!try_wait_for_completion(&shrinker->xe->pm_block));
+ }
+ 
+ static unsigned long
+@@ -188,7 +193,7 @@ xe_shrinker_count(struct shrinker *shrink, struct shrink_control *sc)
+ 	 * wants, and it needs __GFP_FS.
+ 	 */
+ 	read_lock(&shrinker->lock);
+-	if (xe_shrinker_can_backup(sc))
++	if (xe_shrinker_can_backup(shrinker, sc))
+ 		num_pages = min_t(unsigned long,
+ 				  ttm_backup_bytes_avail() >> PAGE_SHIFT,
+ 				  shrinker->shrinkable_pages);
+@@ -241,7 +246,7 @@ static unsigned long xe_shrinker_scan(struct shrinker *shrink, struct shrink_con
+ 	};
+ 	bool runtime_pm;
+ 	bool purgeable;
+-	bool can_backup = xe_shrinker_can_backup(sc);
++	bool can_backup = xe_shrinker_can_backup(shrinker, sc);
+ 
+ 	nr_to_scan = sc->nr_to_scan;
+ 

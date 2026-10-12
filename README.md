@@ -1,1082 +1,512 @@
 # Omarchy Package Repository
 
-Build system for the Omarchy Package Repository. Builds PKGBUILDs from local sources and AUR, signs them, and syncs to production.
+Recipes and tooling for the packages Omarchy ships from
+`https://pkgs.omarchy.org/<channel>/<arch>`.
 
-**Multi-Architecture**: Supports both x86_64 and aarch64 (ARM64).
+- **Channels:** `edge` → `rc` → `stable`. Packages only move forward.
+- **Architectures:** `x86_64` and `aarch64`.
+- **Recipes:** one directory per package in `pkgbuilds/<package>/`, with a
+  `PKGBUILD` and `.omarchy/package.json`.
 
-## PKGBUILDs
+## Contribute a package
 
-Each package lives directly under `pkgbuilds/<package>/` and carries Omarchy metadata in `.omarchy/package.json`.
+Everything a package PR needs is in `pkgbuilds/<package>/`. No secrets or
+access are required. To work locally you need:
 
-The filesystem no longer encodes release policy. Instead:
+- `git`, `bash`, `jq`, `curl` and a `tar` that reads zstd
+- Docker or Podman that your user can run, to build. With Docker, a build
+  calls `sudo` to fix the ownership of its output.
+- on Arch, to check an upstream declaration: Python 3.11+, `vercmp`, `bsdtar`
 
-- there are three channels forming a forward-only pipeline: `edge` → `rc` → `stable`
-- all packages build for `edge` unless their metadata pins `channels`
-- packages with `"release_ring": "fast"` build natively for **all three** channels —
-  each in its own image against its own base mirror, because rc's Arch snapshot may sit
-  anywhere between stable's and edge's, so an artifact linked against stable's libraries
-  is not necessarily correct for rc
-- a release train opens by advancing edge into rc (`bin/repo advance --from edge --to rc`)
-  and ships by promoting rc into stable (`bin/repo advance --from rc --to stable`)
-- the release pair (`omarchy`, `omarchy-settings`) is marked `"pinned": true`: its version
-  is set per release on the standing `rc` branch, so only a build from that branch's worktree
-  (`OMARCHY_RC_PINS=1`, which `omarchy-release rc` sets) may build it for rc — master's
-  shipped pins can never overwrite an in-flight RC. The dev pair
-  (`omarchy-dev`, `omarchy-settings-dev`) is pinned to `edge`
-- packages that follow a moving upstream branch (the dev pair on `quattro`,
-  `omasnap-git` on `main`) still pin an exact commit in their PKGBUILD. A
-  `git_branch` upstream watch moves that pin, and `"auto_merge": true` puts the
-  package on the unattended lane: `track-branches.yml` opens the bump PR every
-  two hours and auto-merges it once the build checks pass, so a branch tip
-  reaches the edge channel without anyone clicking. No PKGBUILD may carry an
-  unpinned git source (`tests/pinned-sources.sh`); a branch that has to be
-  followed gets a watch, not a `#branch=` fragment
-- Omarchy owns every checked-in recipe; upstream watches update release metadata without replacing packaging or architecture support
-- packages can opt out of unscoped builds with `skip_build`; explicit `--package` builds remain available
-- packages follow direct upstream watches/providers in `.omarchy/package.json`, or a custom `.omarchy/upstream.sh` hook
+Questions and problems: open an issue on this repository.
 
-## Prerequisites
-### aarch64 Builds (Optional)
+### Add a new package
 
-The repository host builds every architecture it publishes on the same
-machine. A foreign architecture runs under QEMU user emulation, which
-`bin/build` checks by actually running a container for the target platform.
-Rootful Docker registers QEMU on first use. Rootless Podman uses the host's
-registration and prints the one-time Arch setup commands when it is missing or
-lacks the credential flag required by `sudo` inside the builder:
+1. Fork the repository and branch from `master`.
+2. Create the recipe:
+
+   ```bash
+   bin/add-package my-package --local --scaffold   # Starter PKGBUILD and metadata
+   bin/add-package my-package --source aur         # Or import an AUR recipe once
+   ```
+
+   An imported recipe is Omarchy's from then on; there is no AUR sync.
+3. Write `pkgbuilds/my-package/PKGBUILD` to Arch packaging standards.
+   - List every architecture it supports in `arch=()`: `x86_64`, `aarch64`,
+     or `any`. CI builds each one.
+   - Pin every git source with `#commit=<sha>` or `#tag=<tag>`. An unpinned
+     source is rejected; `tests/pinned-sources.sh` checks it locally.
+   - Fill the checksums: run `updpkgsums` (from `pacman-contrib`) in the
+     package directory. For a git source it leaves a clone of the source
+     there; delete it before committing.
+4. Declare where new releases come from in
+   `pkgbuilds/my-package/.omarchy/package.json`, so updates arrive without
+   another PR. See [docs/upstream-sources.md](docs/upstream-sources.md).
+
+   ```json
+   {
+     "source": "local",
+     "upstream": { "watch": { "github": "owner/project", "pattern": "v(?P<version>[0-9]+(?:\\.[0-9]+)*)" } }
+   }
+   ```
+
+   Use this `watch` form for a new package. The pattern must match the whole
+   tag, so drop the `v` for a project that tags `1.2.3`. A `github` watch
+   reads GitHub Releases; for a project that only pushes tags, watch the tags:
+
+   ```json
+   "upstream": { "watch": { "git_tags": "https://github.com/owner/project.git", "pattern": "(?P<version>[0-9]+(?:\\.[0-9]+)*)" } }
+   ```
+
+   Check that it finds the current release:
+
+   ```bash
+   python helpers/upstream-watch.py check pkgbuilds/my-package
+   ```
+
+   A working watch on a current recipe prints
+   `{"status": "skipped", ..., "reason": "already current"}`.
+
+   If the package should not be updated automatically, set `"sync": false`
+   and say why in the PR.
+5. Build it:
+
+   ```bash
+   bin/build --package my-package --dry-run       # Show the plan
+   bin/build --package my-package                 # Build for x86_64
+   bin/build --package my-package --arch aarch64  # Emulated on an x86_64 machine; slow
+   ```
+
+   `--dry-run` only shows the plan; it does not validate the recipe. The
+   package lands unsigned in `build-output/edge/<arch>/`. Install it with
+   `pacman -U` to try it. CI builds aarch64 natively, so a local aarch64
+   build is optional.
+6. Open a PR against `master` with one package in it. Say what the package
+   is, and how you tested it.
+
+### Update or fix an existing package
+
+- **New upstream version:** for a package with an `upstream` declaration, a
+  bot proposes the update on its next scheduled run, or later if the package
+  sets `min_release_age`; you don't need to. Otherwise set `pkgver`, run
+  `updpkgsums`, and reset `pkgrel` to 1.
+- **Packaging change at the same version:** bump `pkgrel`. A PR that changes
+  a recipe without moving its version builds nothing and ships nothing; when
+  the `PKGBUILD` itself changed, the PR's build check carries a "Change will
+  not ship" warning. (A `-git` package whose version carries the commit hash
+  is also rebuilt when its pinned commit changes.)
+- Never set `epoch` without agreeing it in the PR first; it is permanent.
+
+### What happens to your PR
+
+1. **It waits for build approval** unless you are a collaborator or listed
+   in `.github/VOUCHED.td`. A maintainer starts the builds by labelling the
+   PR `build-approved`. Until then it shows **Awaiting build approval**, or,
+   for your first PR here, GitHub's own "workflows awaiting approval".
+   Builds cost machines, so they run for trusted authors only.
+2. **CI builds the package** for each architecture and runs the tests. The
+   required checks are `result`, `self-tests` and `build-isolation`.
+3. **It merges itself when green**, if it changes only package files.
+4. **It is published to `edge`** within minutes of merging, and reaches
+   `rc` and `stable` with the next release. Say so in the PR if you think the
+   package should reach `stable` immediately (the fast ring).
+
+Keep a package PR to these files, or it needs a maintainer to merge it by
+hand:
+
+- anything under `pkgbuilds/`
+- a new test under `tests/`, and the one line in `.github/workflows/test.yml`
+  that runs it
+
+Changes to `bin/`, `helpers/`, `build/` or the workflows go in a separate PR,
+first: a PR's packages are built with `master`'s tooling, not its own.
+
+## How a package reaches users
+
+```
+PR touching pkgbuilds/<package>/
+  └─ build-pr.yml       one build per package and architecture, unsigned
+merge to master
+  └─ publish.yml        collect the builds, sign, add to the channel
+                        databases, upload
+pkgs.omarchy.org        served from the R2 bucket omarchy-pkgs through a CDN
+```
+
+To ship a change: open a PR, wait for green, merge. Nothing else is needed.
+
+1. **Build.** `build-pr.yml` builds every package directory the PR touches,
+   once, against `edge`. x86_64 builds on an ephemeral DigitalOcean droplet
+   (runner label `omarchy-builder`), aarch64 on GitHub's `ubuntu-24.04-arm`.
+   Each build is kept as a workflow artifact for 7 days, named
+   `<package>-<arch>-<git tree hash of the package directory>`.
+2. **Merge.** Branch protection requires `result`, `self-tests` and
+   `build-isolation`. Don't merge around a red check.
+3. **Publish.** `publish.yml` runs on every push to `master` that touches
+   `pkgbuilds/**`. It finds the artifact for exactly the merged tree, signs
+   it, and publishes it to every channel and architecture the package ships
+   to. When no artifact exists it builds one first, in a separate job. It
+   reports in a comment on the merged PR and appends to the
+   [publish log](#read-the-publish-log).
+
+A package is built once and that one file is what every channel serves.
+**A published filename never changes its bytes.** To ship a different build
+of the same version, bump `pkgrel`.
+
+## Where a package is published
+
+`bin/build-matrix` decides, from `.omarchy/package.json`:
+
+| Package | Published on merge to |
+|---|---|
+| Default | `edge` |
+| `"release_ring": "fast"` | `edge`, `rc` and `stable` |
+| `"channels": [...]` | never outside the listed channels; the other rows still apply within them |
+| `"pinned": true` (`omarchy`, `omarchy-settings`) | `edge`; `rc` and `stable` only through a release |
+
+A package is published for each architecture in its `arch=()`. An `arch=any`
+package builds once and goes into both architectures' databases.
+
+Everything not on the fast ring reaches `rc` and `stable` by promotion: see
+[Releases](#releases).
+
+## Maintainer tasks
+
+### Republish a package
+
+Use this when a publish run failed or was cancelled, or a package is missing
+from a channel:
 
 ```bash
-# Verify
-podman run --rm --platform linux/arm64 docker.io/library/alpine:latest uname -m
-# Should output: aarch64
+gh workflow run publish.yml -R omacom/omarchy-pkgs -f packages="<package> ..."
 ```
 
-**Note**: emulated builds are much slower than native ones.
+It publishes `master`'s version of each named package, reusing a build
+artifact when one exists and building otherwise. With no artifact, it skips a
+package that `edge` already holds at that version for that architecture; bump
+`pkgrel` to publish that one again. Spell the names as the directories under
+`pkgbuilds/`: an unknown name is ignored and the run still passes.
 
-### Published architectures
+For a run that failed, see [When a publish fails](#when-a-publish-fails).
 
-`helpers/paths.sh` names the architectures this repository publishes:
+### Build a package without publishing
 
 ```bash
-PUBLISHED_ARCHES="${OMARCHY_ARCHES:-x86_64}"
+gh workflow run build-pr.yml -R omacom/omarchy-pkgs -f packages="<package> ..."
+
+bin/build --package <package>                  # Locally; needs Docker or Podman
+bin/build --package <package> --arch aarch64   # Emulated on an x86_64 machine
+bin/build --package <package> --dry-run        # Show the plan only
 ```
 
-That list drives the whole scheduled pipeline. `check-versions` compares
-PKGBUILDs against each architecture's channel databases and writes one queue
-file per channel and architecture (`.sync-needed-<channel>-<arch>`);
-`auto-release <channel>` works through the queues one architecture at a
-time, each with its own backoff (`.build-failed-<channel>-<arch>`), so a
-failing build on one architecture never holds up the other; and the release
-train advances channels with `--arch all`: it takes one host-wide lock and
-verifies every architecture's source database before moving any of them. The
-first entry is the reference architecture the release train observes channels
-through. A remote sync failure can still leave a promotion temporarily partial;
-rerunning the same advance completes it safely.
-
-Adding an architecture to the scheduled pipeline is therefore one checked-in
-change to that list: the next `check-versions` tick queues everything the new
-architecture lacks, and the next `auto-release` tick starts building it. A
-checked-in list also means the rebuild workflow and release host cannot drift
-onto different architecture sets. For a one-off run, override it directly:
+Both build only a version that `edge` does not hold yet. To build a published
+version again locally, plan without the channel:
 
 ```bash
-OMARCHY_ARCHES=x86_64 bin/check-versions
-OMARCHY_ARCHES=aarch64 bin/check-versions
-OMARCHY_ARCHES="x86_64 aarch64" bin/check-versions
+OMARCHY_PUBLISHED_REPO_URL= bin/build --package <package>
 ```
 
-The builder image bootstraps
-`omarchy-keyring` from the x86_64 tree for every architecture, so the first
-build of a new architecture does not depend on a repository that only it can
-create.
+That also drops this repository as a source of dependencies, so it only works
+for a package that depends on nothing else built here.
 
-## Quick Start
+Local output is unsigned, in `build-output/edge/<arch>/`. Don't publish from
+a local checkout.
 
-### Cutting an Omarchy release
+### Retire a package
 
-`bin/omarchy-release` is the front door. A release train has three human
-moments, each one command — and bare `omarchy-release` observes reality
-(branches, pins, published channels, tags) and walks you to the next one:
+1. Delete `pkgbuilds/<package>/` in a PR and merge it.
+2. Remove it from the channel databases:
+
+   ```bash
+   gh workflow run unpublish.yml -R omacom/omarchy-pkgs \
+     -f packages="<pkgbase> ..." -f channels="edge rc stable"
+   ```
+
+   It removes every entry built from those pkgbases, split and `-debug`
+   packages included, from both architectures. It refuses a package that
+   still has a recipe on `master`. Package files stay in the bucket: nothing
+   references them once the entries are gone.
+
+### Check that a version is live
+
+What the recipe says, from an up-to-date checkout of `master` (`<recipe>` is
+the directory name under `pkgbuilds/`):
 
 ```bash
-bin/omarchy-release              # shepherd: status + guided next step
-bin/omarchy-release start 4.0.2  # open the train: branch v4-0-2 + staging PR
-bin/omarchy-release pick         # choose merged PRs to cherry-pick (multi-select)
-bin/omarchy-release rc           # publish the next 4.0.2rcN to the rc channel
-bin/omarchy-release ship         # tag, final pins, promote rc → stable,
-                                 # draft GitHub release, ISO, website — one swoop
-bin/omarchy-release doctor       # verify credentials/connections up front
+bin/repo list --json | jq -r '.[] | select(.name == "<recipe>") | .version'
+bin/repo list                                   # Every recipe, as a table
 ```
 
-Versions are inferred from branch names (`v4-0-2` ⇒ `4.0.2rcN` ⇒ tag
-`v4.0.2`); `start` is the only place a version is typed. Every command is
-idempotent — re-runs skip whatever is already done. `ship` refuses to promote
-a commit no RC was cut from.
-
-### Full release
-
-Ship the tested rc channel to stable (copies packages + signatures, then
-cleans, rebuilds the database, and syncs):
-
-```
-bin/repo advance --from rc --to stable
-```
-
-Open a release train that ships new edge packages by carrying edge into rc
-first:
-
-```
-bin/repo advance --from edge --to rc
-```
-
-### Complete Workflow
-
-The release command is smart and **incremental** - it only builds packages that have changed or are missing. You generally don't need to specify a package manually unless you are debugging a specific failure.
-
-When a package fails, a completed build run still signs and publishes the packages
-that succeeded. Failed packages and their blocked dependents remain queued with
-failure backoff; retries compare against the updated repository and skip the
-published versions. Only artifacts recorded by fully completed package builds
-are eligible for a partial release. An interrupted build, a failed publication
-step, or an incomplete pair using deferred runtime dependencies still stops the
-release. Reports distinguish partial publication from complete success.
+What each channel serves. A database lists every package as
+`<name>-<version>/`:
 
 ```bash
-# Build changed/new packages, sign, promote, clean, update, and sync
-bin/repo release
-
-# Stable Mirror
-bin/repo release --mirror stable
-
-# ARM64
-bin/repo release --arch aarch64
-
-# Force build specific package (useful for debugging failures)
-bin/repo release --package omarchy-nvim
-
-# Show what would build without signing/promoting/syncing
-bin/repo release --dry-run
+for channel in edge rc stable; do for arch in x86_64 aarch64; do
+  db=$(curl -fsSL "https://pkgs.omarchy.org/$channel/$arch/omarchy.db?$RANDOM" | bsdtar -tf - 2>/dev/null)
+  if [[ -z $db ]]; then found="COULD NOT READ THE DATABASE"
+  else found=$(awk -F/ -v p="<package>" '{n=$1; sub(/-[^-]+-[^-]+$/, "", n)} n==p && $2=="" {print $1}' <<<"$db"); fi
+  printf '%-7s %-8s %s\n' "$channel" "$arch" "${found:-not in this channel}"
+done; done
 ```
 
-### Step-by-Step
+Compare the result against
+[Where a package is published](#where-a-package-is-published) before calling
+a missing entry wrong. `<package>` here is the package name, which for a
+split package is not always the recipe directory.
+
+List a whole channel:
 
 ```bash
-bin/repo build                          # Build (unsigned)
-bin/repo sign                           # Sign packages
-bin/repo promote                        # Copy to production
-bin/repo clean                          # Remove old versions
-bin/repo update                         # Update database
-bin/repo sync                           # Sync to remote
+curl -fsSL https://pkgs.omarchy.org/stable/aarch64/omarchy.db | bsdtar -tf - | grep '/$'
 ```
 
-### Building Heavy Packages Locally
+### Read the publish log
 
-Large packages build faster on a local machine than on the server. Build them
-here, then hand the artifacts to the repository host, which signs and publishes
-them:
+A publish run appends one JSON line to
+`https://pkgs.omarchy.org/publish-log.jsonl` when it finishes, newest last.
+A rerun adds another line for the same run. The log records finished runs;
+for a cancelled one, [check the channel](#check-that-a-version-is-live).
+
+| Field | Meaning |
+|---|---|
+| `time`, `commit`, `run` | When, which `master` commit, and the workflow run URL |
+| `event` | `push` for a merge, `workflow_dispatch` for a manual run |
+| `target` | `live`, or the scratch prefix of a proof run |
+| `plan` | Every package, architecture and channel the run set out to publish |
+| `sources` | Per package and architecture, where its files came from. Stops at the first one that failed |
+| `slots` | Per channel and architecture attempted: `status`, and `packages` as file names without `.pkg.tar.zst` |
+
+`sources[].source` is one of:
+
+| Value | Meaning |
+|---|---|
+| `pr-artifact` | Used an existing build artifact, from the PR or an earlier run |
+| `rebuild` | No artifact existed; built during this run |
+| `already-published` | `edge` already held this version; nothing done |
+| `build-failed` | No artifact: the build failed, or the artifact expired |
+| `artifact-download-failed` | The artifact exists but could not be fetched or unpacked |
+| `built`, `native-rebuild`, `native-build-failed` | Written by earlier versions of the workflow: built during the run, or failed to |
+
+`slots[].status` is `published` or `failed`. An empty `slots` means the run
+wrote no channel.
 
 ```bash
-bin/repo deploy --package nvidia-580xx-utils   # Build here, publish from the host
+log=https://pkgs.omarchy.org/publish-log.jsonl
+
+# The last five runs
+curl -fsSL $log | tail -5 |
+  jq -c '{time, run, slots: [.slots[] | "\(.mirror)/\(.arch) \(.status)"]}'
+
+# Every run that published a package, and where
+curl -fsSL $log | jq -c --arg p "<package>" '
+  [.slots[] | select(.status == "published" and any(.packages[]; sub("-[^-]+-[^-]+-[^-]+$"; "") == $p))
+   | "\(.mirror)/\(.arch)"] as $where
+  | select($where | length > 0) | {time, run, published: $where}'
+
+# Every run where something failed
+curl -fsSL $log | jq -c '
+  select(any(.sources[]; .source | test("failed")) or any(.slots[]; .status == "failed"))
+  | {time, run, failed: [.sources[] | select(.source | test("failed")) | "\(.package) \(.arch) \(.source)"]}'
 ```
 
-`deploy` is `build` followed by `push`. The two steps are also available
-separately when a build needs inspecting before it ships:
+A merge also gets a summary of its record as a comment on the PR. The record
+itself is kept as an artifact of the run for 90 days: `gh run download <run-id> -n publish-record-<run-id>`.
+
+## When a publish fails
+
+One package without a usable build stops the run before any channel is
+written, for every package in that merge.
+
+Find the run and read the failure:
 
 ```bash
-bin/repo build --package nvidia-580xx-utils    # Build on the fast machine
-bin/repo push --package nvidia-580xx-utils     # Upload + publish on the host
+gh run list -R omacom/omarchy-pkgs --workflow publish.yml --limit 10
+gh run view <run-id> -R omacom/omarchy-pkgs                # Which job failed
+gh run view <run-id> -R omacom/omarchy-pkgs --log-failed   # Its log
 ```
 
-`push` uploads to the host's `build-output/`, verifies checksums, and runs
-`bin/upload-prebuilt` there. Do not publish from a local checkout instead: only
-the repository host holds the complete repository and the signing key.
-
-**Name the package.** `build` asks the local repository database which packages
-are already built, and a build machine has no such database, so an unscoped run
-treats every package as out of date and rebuilds the whole repository. `deploy`
-refuses to run unscoped when that database is missing. Unscoped builds belong on
-the repository host, where `bin/repo release` does the same job against a real
-database.
-
-Every other command in `bin/` — `sign`, `promote`, `update`, `clean`,
-`advance`, `remove`, `sync`, `release` — works on the published tree. Run them
-from anywhere: with a repository host configured they forward over ssh and run
-there (see [Build trigger and the build host](#build-trigger-and-the-build-host)),
-and `--local` forces execution on the current machine. `build`, `push` and
-`deploy` are the three meant to run on a build machine rather than the host.
-
-## Commands
-
-### Global Flags
-
-These flags can be used with all commands:
-
-- `--mirror <edge|rc|stable>`: Selects the channel (default: `edge`).
-- `--local`: Run on this machine instead of forwarding to the repository host.
-- `--arch <x86_64|aarch64>`: Selects the target architecture (default: `x86_64`).
-
-### Build
-
-```bash
-bin/repo build                                   # All packages (x86_64, edge)
-bin/repo build --arch aarch64                    # ARM64
-bin/repo build --mirror rc                       # Release-candidate channel
-bin/repo build --mirror stable                   # Stable channel
-bin/repo build --package yay cursor-bin          # Specific packages
-bin/repo build --dry-run                         # Show what would build
-```
-
-**Output**: Unsigned `.pkg.tar.zst` in `build-output/`. Only builds packages that are newer than what is in the repository.
-
-Use `--dry-run` to show the build plan without running `makepkg`.
-
-### Sign
-
-```bash
-bin/repo sign
-```
-
-Fetches GPG key from 1Password or environment, signs all packages in `build-output/`. Supports `--arch` and `--mirror`.
-
-### Promote
-
-```bash
-bin/repo promote                    # Copy to production
-bin/repo promote --arch aarch64     # ARM64
-bin/repo promote --dry-run          # Preview
-```
-
-Copies signed packages from `build-output/` → `pkgs.omarchy.org/`.
-
-### Clean
-
-```bash
-bin/repo clean                      # Keep 2 versions
-bin/repo clean --keep 3             # Keep 3 versions
-bin/repo clean --dry-run            # Preview
-```
-
-Removes old package versions from the file system. **Does not update the database.**
-
-### Update
-
-```bash
-bin/repo update                     # Update database
-```
-
-Updates the repository database (adding the newest version of each package). Run this after `promote` or `clean`.
-
-### Sync Repository
-
-```bash
-bin/repo sync                           # Sync current arch/mirror
-bin/repo sync --mirror stable           # Sync stable
-bin/repo sync --arch aarch64            # Sync ARM64
-bin/repo sync --skip-prod-check         # No confirmation
-bin/repo sync --prune                   # Also delete remote packages missing locally
-```
-
-Syncs package repositories to the remote server using rclone based on the configured mirror and architecture.
-
-**Uploads are additive.** A local tree is not authoritative about what belongs on
-the remote — `pkgs.omarchy.org/` is gitignored, and packages built on another
-machine exist only there — so sync never deletes by default. Removing packages
-from the remote requires `--prune`, which only makes sense from a complete tree.
-
-For the same reason sync refuses to publish a repository database built from a
-tree holding fewer packages than the remote database already lists. The database
-is what pacman resolves against, so a partial one hides every package it does not
-know about even though the files are still on the mirror. Use `bin/repo push` to
-publish packages built on another machine.
-
-### Deploy
-
-```bash
-bin/repo deploy --package nvidia-580xx-utils   # Build locally, publish from the host
-bin/repo deploy --host root@example.com        # Point at a specific repo host
-bin/repo deploy --dry-run                      # Show the plan, change nothing
-```
-
-Runs `build` then `push` in one command. The repository host is resolved before
-the build starts, so a missing `--host` fails immediately rather than after a long
-compile.
-
-### Push to the Repository Host
-
-```bash
-bin/repo push                                  # Push everything in build-output
-bin/repo push --package nvidia-580xx-utils     # Push one package
-bin/repo push --mirror stable --arch aarch64   # Pick mirror and architecture
-bin/repo push --host root@example.com          # Override the repo host
-bin/repo push --dry-run                        # Show the plan, transfer nothing
-```
-
-Uploads packages from `build-output/` to the repository host and publishes them there
-with `bin/upload-prebuilt` (sign → promote → update → sync). Use it when a package
-is quicker to build on a local machine than on the server.
-
-Publishing happens on the host rather than locally for two reasons: the GPG
-signing key lives there and nowhere else, and only the host holds the complete
-repository that a correct database and sync require. Local machines therefore
-need no secrets.
-
-The host comes from `--host`, `$OMARCHY_REPO_HOST`, then `.repo-host`. One
-machine both serves pkgs.omarchy.org and runs the scheduled builds, so the
-setting is named for the repository rather than for building, which happens
-wherever you like. The same setting tells `bin/omarchy-pkgs release` which host
-to poke after a release push.
-
-`--package` means the same thing as it does to `build`: a pkgbase, whose every
-output ships together. Pushing `nvidia-580xx-utils` carries `nvidia-580xx-dkms`
-and `opencl-nvidia-580xx` with it, because that is what the build produced. An
-output's own name still selects just that one, for publishing a single package
-on purpose. Omit `--package` to push everything built.
-
-Publishing signs and promotes everything staged on the host, not just what this
-push uploaded, so `push` stops when it finds packages already staged there —
-usually leftovers from a failed run. Remove them on the host, or pass
-`--include-staged` to publish them too.
-
-### Import an initial AUR recipe
-
-```bash
-bin/add-package package-name --source aur
-```
-
-AUR is an optional source for an initial recipe. Imported packages become
-Omarchy-owned immediately; subsequent updates use direct upstream releases.
-There is no scheduled AUR sync. Edit the checked-in PKGBUILD to maintain
-architecture support and packaging behavior.
-
-### Sync Upstream Releases
-
-```bash
-bin/sync-upstream                       # Update every package with an upstream hook
-bin/sync-upstream openai-codex-desktop  # Update specific packages
-```
-
-Some vendors publish a release feed of their own that is faster and more precise
-than the AUR packaging of it. Those packages are `source: local` — Omarchy owns
-the PKGBUILD — and declare where releases come from either as data or, for an
-unusual feed, a small hook.
-
-A vendor shipping tagged GitHub releases is pure data, declared as `upstream`
-in `.omarchy/package.json` with no code at all:
-
-```json
-"upstream": {
-  "github": "jdx/mise",
-  "checksums": "SHASUMS256.txt",
-  "assets": {
-    "x86_64": "mise-{tag}-linux-x64.tar.xz",
-    "aarch64": "mise-{tag}-linux-arm64.tar.xz"
-  }
-}
-```
-
-`checksums` names the manifest asset the vendor publishes. A vendor publishing
-none sets `"digests": true` instead, and the checksums come from the SHA-256
-digest GitHub's release API reports for every asset — see
-`pkgbuilds/schist-bin/.omarchy/package.json`. Either way the artifacts
-themselves are never downloaded.
-
-An architecture may map to an ordered array when its PKGBUILD downloads more
-than one release asset. Small versioned files outside the release assets can be
-listed under `sources` and are downloaded and hashed when a new version appears:
-
-```json
-"upstream": {
-  "github": "owner/project",
-  "digests": true,
-  "assets": {
-    "x86_64": ["tool-{pkgver}-x86_64", "tool-{pkgver}-x86_64.asc"],
-    "aarch64": ["tool-{pkgver}-aarch64", "tool-{pkgver}-aarch64.asc"]
-  },
-  "sources": {
-    "any": ["https://raw.githubusercontent.com/owner/project/{tag}/LICENSE"]
-  }
-}
-```
-
-Asset and source keys must be disjoint because each key maps to one PKGBUILD
-checksum array (`any` means the unsuffixed `sha256sums`).
-
-Repositories whose historical releases use incompatible tag schemes may set
-`"latest_only": true`. The provider then considers only the newest stable
-GitHub release, while retaining all validation for that release. A quarantine
-will wait for that release to age instead of falling back to an older one.
-
-`{tag}` and `{pkgver}` interpolate into asset names; a leading `v` on the tag is
-stripped for `pkgver`; drafts and prereleases are ignored. Only the 100 most
-recent releases are considered. The provider fails closed on anything it cannot
-read — an unusable tag, timestamp, or checksum stops the sync rather than being
-skipped.
-
-Projects that publish version tags but no checksum manifest can declare the
-tag repository, the exact tag shape, and every source that should be hashed:
-
-```json
-"upstream": {
-  "git_tags": "https://github.com/owner/project.git",
-  "tag_pattern": "v{pkgver}",
-  "sources": {
-    "any": ["https://github.com/owner/project/archive/refs/tags/{tag}.tar.gz"]
-  }
-}
-```
-
-The newest matching tag is selected with pacman's `vercmp`; unrelated tags are
-ignored. `tag_pattern` must contain exactly one `{pkgver}`. Source templates may
-use `{tag}` and `{pkgver}`. Each expanded URL must be HTTPS and is downloaded
-only when the discovered version is newer. A checked-in patch or other local
-source can be included as `file:patch-name.patch`; it is hashed from the package
-directory. Keys such as `any`, `x86_64`, and `aarch64` select the corresponding
-`sha256sums` array.
-
-npm packages use the same source mapping, with `{npm_tarball}` available for
-the tarball named by the selected dist-tag:
-
-```json
-"upstream": {
-  "npm": "@scope/package",
-  "dist_tag": "latest",
-  "sources": {
-    "any": ["{npm_tarball}", "https://example.com/v{pkgver}/CHANGELOG.md"]
-  }
-}
-```
-
-`dist_tag` defaults to `latest`. The registry's publication timestamp is
-carried into the provider result, so `min_release_age` works for npm packages.
-
-A vendor with a plain-text Debian `Packages` index can use it to discover the
-newest exact package version, then hash immutable source URLs:
-
-```json
-"upstream": {
-  "debian": "https://example.com/debian/dists/stable/main/binary-amd64/Packages",
-  "package": "example-app",
-  "sources": {
-    "x86_64": ["https://example.com/tool-{pkgver}-x64.tar.gz"],
-    "aarch64": ["https://example.com/tool-{pkgver}-arm64.tar.gz"]
-  }
-}
-```
-
-This deliberately accepts only Debian versions that are already valid Arch
-`pkgver` values. Feeds needing epoch, revision, or filename translation retain
-a hook. Exactly one of `github`, `git_tags`, `npm`, or `debian` may appear in a
-declaration.
-
-A timestamped provider may also declare `"min_release_age": "24h"`
-(`s`/`m`/`h`/`d` suffix or bare seconds) to quarantine fresh releases until
-maintainers have had time to pull a bad or compromised one. GitHub Releases and
-npm provide publication times; raw git tags and Debian Packages indexes do not,
-so combining either with this policy fails closed. The newest release that has
-cleared the window ships, so a fast release cadence cannot starve updates. The
-window is enforced
-centrally: whatever reports the release must prove its age via `published_at`,
-or the sync fails. A maintainer deliberately shipping inside the window runs
-`BYPASS_MIN_RELEASE_AGE=1 bin/sync-upstream <package>` locally and merges the
-result through a normal PR; scheduled automation never sets the bypass.
-
-A vendor whose feed fits no convention (a Debian package index, a bare
-version.txt) instead provides `.omarchy/upstream.sh`, a hook that reports the
-newest upstream release as JSON on stdout — declaring both an `upstream` block
-and a hook is an error:
-
-```json
-{
-  "pkgver": "1.2.3",
-  "sha256sums": { "x86_64": ["<sha256>"], "aarch64": ["<sha256>"] }
-}
-```
-
-Architecture keys become `sha256sums_<arch>` in the PKGBUILD; the key `any` means
-the unsuffixed `sha256sums` array, and only the arrays a hook names are touched.
-An empty object (`{}`) reports no update, which is how a hook waits out a release
-that has landed for one architecture but not yet the other.
-
-When the reported version is newer than the checked-in one, `bin/sync-upstream`
-rewrites `pkgver` and those checksum arrays and resets `pkgrel` to 1. A version
-that is equal or older leaves the package alone, so a vendor rolling a release
-back cannot walk the repository backwards.
-
-Hooks should read checksums from whatever manifest the vendor publishes rather
-than downloading the artifacts — see `pkgbuilds/openai-codex-desktop/.omarchy/upstream.sh`,
-which reads OpenAI's Debian package index and never fetches the 750 MB of debs
-it describes. Hooks honoring `min_release_age` receive the window as
-`MIN_RELEASE_AGE_SECONDS` and report `published_at` alongside `pkgver`.
-
-`bin/sync-upstream self-test` runs offline fixture tests over the release
-selection, quarantine backstop, duration parsing, and manifest validation.
-
-### Sync Rebuild Triggers
-
-```bash
-bin/sync-rebuilds                       # Bump every package whose dependencies moved
-bin/sync-rebuilds quickshell-git        # Update specific packages
-bin/sync-rebuilds --self-test           # Run the regression tests
-```
-
-Some packages have to be rebuilt when something they link against changes, even though nothing in their own source moved. A Qt private-API consumer is the usual case: `Qt_6_PRIVATE_API` symbols are not covered by the soname, so a qt6-base point release can leave an installed binary unable to resolve a symbol at startup, and pacman upgrades Qt out from under it because the dependency is unversioned. The package still builds from the same git commit, so nothing in the normal version check notices.
-
-A package names those dependencies in `.omarchy/package.json`:
-
-```json
-{ "source": "aur", "sync": false, "rebuild_on": ["qt6-base", "qt6-declarative", "qt6-wayland"] }
-```
-
-`bin/sync-rebuilds` reads each named package's version from the official
-repositories for every architecture a merge builds (`CI_ARCHES` in
-`helpers/paths.sh`, both by default) that the package supports and compares
-it to `rebuilt_against`. Records are kept per architecture because Arch and
-Arch Linux ARM can carry different dependency versions. pkgrel is bumped once
-when any recorded version moves; that one source revision is then rebuilt by
-each architecture's normal queue.
-
-The bump is the point of the command, and it has to land in git rather than in the builder. A rebuild that reuses the published version string produces a package pacman will never offer anyone, so merely unlocking the build gate would ship nothing. Bumping pkgrel needs no other change: `bin/check-versions` and the builder both already rebuild when pkgrel moves.
-
-For an AUR-synced package the bump is expressed as the dotted Omarchy pkgrel suffix in the metadata as well as in the PKGBUILD, because the next AUR sync replaces the PKGBUILD wholesale and would otherwise drop it.
-
-The bumped version is checked against the published one as well as the checked-in one, and refused when pacman would not order it higher. The checked-in version is not the floor; what a user already has is, and a checkout that has fallen behind the repository can otherwise be bumped to something that loses to the package it means to replace. That check is skipped with a warning when the published database cannot be read.
-
-x86_64 versions are read from the local pacman database, so the workflow runs
-in an Arch container pointed at `mirror.omarchy.org`, the same mirror as the
-x86_64 builder. aarch64 versions are read directly from the live Arch Linux ARM
-repository database, which is also what the ARM builder uses. Testing and
-staging repositories do not count. A legacy flat `rebuilt_against` record is
-read as x86_64 and is migrated naturally the next time a rebuild is needed.
-
-A dependency this repository carries for an architecture (a recipe here that builds for edge on it, such as aquamarine on aarch64) shadows the distribution's, because the builder lists `[omarchy]` first. Its version is the recipe's, and it counts only once edge publishes that version: until then the builder still links against the previous one, so dependents are left alone for that run.
-
-### Other
-
-```bash
-bin/repo advance --from rc --to stable            # Ship the tested rc channel to stable
-bin/repo advance --from edge --to rc              # Open a train: carry edge forward into rc
-bin/repo advance --from edge --to rc --package x  # Deliberate single-package advance
-bin/repo advance --from rc --to stable --dry-run  # Preview without changing files
-bin/repo bootstrap-rc                             # One-time initial rc seed from stable
-bin/repo timers                      # Timer schedule, last runs, queues, backoff, lock
-bin/omarchy-release                  # Release front door (start / pick / rc / ship)
-bin/repo list                        # List package metadata
-bin/repo deploy                      # Build locally, then publish from the host
-bin/repo push                        # Upload local builds to the host and publish
-bin/add-package <package>            # Add an Omarchy-owned package with metadata
-bin/package-worktree <package>       # Inspect historical AUR provenance in a scratch workspace
-bin/repo remove <package>            # Remove package
-bin/sync-upstream                    # Update packages that track a vendor release feed
-bin/sync-rebuilds                    # Bump pkgrel for packages whose dependencies moved
-bin/clean-docker                     # Clear Docker images/cache (forces fresh rebuild)
-```
-
-### Package Metadata Tools
-
-```bash
-bin/add-package yay                  # Add AUR package, create metadata, sync from AUR
-bin/add-package spotify --fast       # Add package to the fast release ring
-bin/add-package foo --no-sync        # Sync once, then mark AUR sync disabled
-bin/add-package my-package --local   # Create local package metadata
-
-bin/repo list                        # Table view of source package metadata
-bin/repo list --json                 # Agent/script-friendly JSON
-bin/repo list --repo --mirror stable # List packages in a published repo database
-
-bin/package-worktree yay            # Compare with the original imported AUR recipe
-```
-
-## Cutting an Omarchy Release
-
-The `omarchy` and `omarchy-settings` packages are released as a pair, always
-built from the same upstream commit of basecamp/omarchy.
-
-**Use `bin/omarchy-release`** (see [Cutting an Omarchy release](#cutting-an-omarchy-release)
-in Quick Start) — it drives the whole train across all four repositories and
-calls the pin engine below for you.
-
-`bin/omarchy-pkgs` is that engine, available directly for one-off pins and
-debugging. It rewrites both PKGBUILDs in lockstep (same `_tag`/`_commit`/
-`pkgver`/`sha256sums`), validates ordering with `vercmp`, commits, and pushes
-the current branch. Driven by `omarchy-release` it pins to the release branch
-on the `rc` branch and orders against the rc channel; invoked directly it
-targets the current branch and edge.
-
-```bash
-bin/omarchy-pkgs release v4.0.0          # Final release from the upstream v4.0.0 tag
-bin/omarchy-pkgs release rc v4.0.0       # Newest upstream v4.0.0-rcN tag -> 4.0.0rcN
-bin/omarchy-pkgs release beta v4.0.0     # Same for beta (alpha also supported)
-bin/omarchy-pkgs release latest          # Newest upstream tag, rc/beta included (prompts)
-bin/omarchy-pkgs release rc              # Untagged RC from the quattro tip, auto-numbered
-bin/omarchy-pkgs release --commit abc123 --base 4.1.0   # Untagged RC from a commit
-bin/omarchy-pkgs release ... --dry-run   # Show the plan; write nothing
-bin/omarchy-pkgs release ... --no-push   # Full flow, local commit only (testing)
-bin/omarchy-pkgs self-test               # Version normalization + ordering tests
-```
-
-### Versioning rules
-
-- Finals are `X.Y.Z`; pre-releases are `X.Y.ZalphaN` / `X.Y.ZbetaN` /
-  `X.Y.ZrcN` in the **attached** form only. pacman's vercmp orders
-  `4.0.0alpha1 < 4.0.0beta1 < 4.0.0rc1 < 4.0.0`, but separator forms
-  (`4.0.0.rc1`, `4.0.0_rc1`) sort **after** `4.0.0` and would strand users on
-  the pre-release — the tooling normalizes upstream tags (`v4.0.0-rc1`,
-  `v4.0.0-rc.1`, ...) to the attached form and refuses anything it cannot
-  normalize. Upstream tags are cut on the quattro branch.
-- `pkgrel` resets to 1 on every version change. Bump `pkgrel` by hand only to
-  repackage the same source.
-- `epoch` is never set by tooling. It is sticky forever; adding one is a
-  human decision of last resort.
-
-### Where releases land
-
-- **RCs build for the rc channel.** RC testers and RC ISO installs run the real
-  `omarchy` package against the package set stable users will actually get.
-  Stable never sees an rc version; rc testers upgrade rc1 → rc2 → final
-  naturally.
-- **Finals build into rc, then the whole channel promotes.** After testing, the
-  ship step promotes the exact tested artifacts (packages and signatures)
-  forward:
-
-```bash
-bin/repo advance --from rc --to stable
-```
-
-Neither package is on the `fast` ring, and `bin/omarchy-pkgs` never touches
-stable — promotion is always this explicit step.
-
-### Build trigger and the build host
-
-Release commands run from anywhere. `bin/repo` is a **remote control**: with a
-repository host configured, every command that operates on the published tree
-(`release`, `build`, `sign`, `promote`, `update`, `clean`, `advance`,
-`bootstrap-rc`, `remove`, `sync`, `migrate`) executes ON the host over ssh —
-the exact same code, run where the tree lives, so ssh'ing in and running the
-same commands by hand behaves identically. Pass `--local` to force execution
-on the current machine. `list`, `push`, `deploy`, and `setup` never forward
-(`push`/`deploy` exist precisely to move local builds *to* the host).
-
-Without a configured host, commands run locally — which on the build host
-itself (no `.repo-host` there) is exactly right, and elsewhere the exact
-commands to run are printed by the orchestrator, with the 5-minute
-auto-release timer as the backstop.
-
-The host setting is any destination `ssh` accepts, resolved in this order:
-
-1. `--host <dest>` on the command
-2. `OMARCHY_REPO_HOST` environment variable
-3. the git-ignored `.repo-host` file (one line; `#` comments allowed)
-
-The server layout lives under `/root`, so the value is `root@<ip>`,
-`root@<hostname>`, or — nicest — a `Host` alias from `~/.ssh/config` that
-carries the user, key, and port:
-
-```
-# .repo-host
-root@pkgs.example.com
-```
-
-All connections are plain ssh; nothing else is used to reach the host.
-
-**How "this machine is the build host" is detected — and its one caveat.**
-The marker is the published database living in this checkout
-(`pkgs.omarchy.org/<channel>/<arch>/omarchy.db*`), the same convention the
-rest of `bin/` uses. A workstation that once ran a full local
-`bin/repo release` carries that marker too and would infer it is the host.
-An explicitly configured destination always outranks the inference — `--host`,
-`OMARCHY_REPO_HOST`, and `.repo-host` are checked first, and only when none is
-set does local detection apply. So if a machine ever misidentifies itself,
-writing the real host into `.repo-host` is the fix.
-
-## Directory Structure
-
-```
-omarchy-pkgs/
-├── pkgbuilds/                  # Source PKGBUILDs
-│   └── package-name/
-│       ├── PKGBUILD
-│       └── .omarchy/
-│           ├── package.json    # Source/sync/release metadata
-│           └── upstream.sh     # Optional custom vendor release feed hook
-├── build/
-├── build-output/               # Unsigned packages (temporary)
-│   ├── edge/                   # (rc/ and stable/ alongside, each x86_64 + aarch64)
-│   ├── rc/
-│   └── stable/
-├── pkgs.omarchy.org/           # Signed packages (production)
-│   ├── .release.lock           # Host-wide lock: one channel mutation at a time
-│   ├── edge/                   # Each channel: x86_64/ and aarch64/
-│   ├── rc/
-│   └── stable/
-└── bin/                        # CLI tools (on host)
-```
-
-## Package Metadata
-
-Each source package has Omarchy metadata at `pkgbuilds/<package>/.omarchy/package.json`.
-
-Minimal examples:
+Then act on which job failed:
+
+| Failed job | Log says | Do |
+|---|---|---|
+| `rebuild` | `Makepkg failed for <package>` | The recipe does not build. Fix it in a PR. Meanwhile publish the other packages of that merge: `gh workflow run publish.yml -f packages="<the healthy ones>"` |
+| `rebuild` | an error before the package build starts: the builder image, a mirror, the network | Not the recipe. Rerun: `gh run rerun <run-id> --failed` |
+| `publish`, step "Collect artifacts" | `no artifact from the rebuild job` | Either that package's build failed (see the `rebuild` job), or its artifact expired mid-run. For the second, rerun every job: `gh run rerun <run-id>` |
+| `publish`, step "Collect artifacts" | the artifact could not be downloaded or unpacked | Rerun: `gh run rerun <run-id> --failed`. If it fails again the artifact is bad: bump `pkgrel` in a PR to get a fresh build |
+| `publish`, step "Publish" | `Already published with DIFFERENT bytes, refusing to overwrite` | That version is already out with other contents. Bump `pkgrel` in a PR |
+| `publish`, step "Publish" | `Upload incomplete`, or an rclone or gpg error | Storage or signing trouble. Rerun: `gh run rerun <run-id> --failed` |
+| `publish` shows cancelled, and nobody cancelled it | | GitHub keeps one publish waiting at a time; when several merges land close together it cancels the ones in between. Republish their packages with a dispatch |
+
+**The Publish step writes channels in a fixed order:** `edge` then `rc` then
+`stable`, x86_64 before aarch64. It stops at the first one that fails, so the
+earlier ones are complete, and running it again finishes the rest: a file
+already uploaded with the same bytes is only added to the database.
+
+- Rerun it while the build artifact exists: 7 days from when it was built.
+- After that, bump `pkgrel` in a PR to finish the remaining channels.
+
+A run cancelled before the Publish step wrote no channel: republish its
+packages with a dispatch.
+
+- Rerun (`gh run rerun`) repeats that merge's commit.
+- Dispatch (`gh workflow run publish.yml -f packages=...`) publishes
+  `master`'s current version of the named packages.
+
+Afterwards, [check that the version is live](#check-that-a-version-is-live).
+
+## Who can build and merge
+
+Builds cost machines, so `build-pr.yml` runs them only for trusted authors:
+
+- repository collaborators and bots
+- authors listed in `.github/VOUCHED.td`
+- any PR a maintainer labels `build-approved` (that PR only, including later
+  commits): `gh pr edit <number> -R omacom/omarchy-pkgs --add-label build-approved`
+
+`VOUCHED.td` takes one `github:<username>` per line; `-github:<username>
+<reason>` denounces an author.
+
+An unknown author's PR shows **Awaiting build approval** and stays blocked
+until one of those applies. An author denounced in `VOUCHED.td` cannot be
+overridden by the label.
+
+A trusted PR also merges itself. `auto-merge-pr.yml` enables auto-merge when
+the PR is open, not a draft, and changes only packages: files under
+`pkgbuilds/`, new files under `tests/`, and `test.yml` lines that only add a
+`./tests/<name>.sh` call. Anything touching workflows, scripts, build tooling
+or an existing test needs a maintainer to merge it.
+
+- Remove `build-approved` to withdraw the auto-merge it armed for an unknown
+  author. Runs it already released keep going.
+- If the builds do not start a few minutes after labelling, remove the label
+  and apply it again.
+- Evaluate a PR by hand: `gh workflow run auto-merge-pr.yml -f pr=<number>`.
+
+## Automatic updates
+
+Three scheduled workflows open PRs, one per package, through
+`package-prs.yml`. Each PR auto-merges when its build is green, so the open
+ones are the failures. Each workflow takes a `packages` input for a manual run
+on named packages.
+
+| Workflow | Runs | Opens one PR per package on | For |
+|---|---|---|---|
+| `sync-upstream.yml` | every 6 hours | `auto/sync-upstream-<package>` | a new upstream release |
+| `sync-rebuilds.yml` | every 6 hours | `auto/sync-rebuilds-<package>` | a `pkgrel` bump where a `rebuild_on` dependency moved |
+| `track-branches.yml` | hourly | `auto/track-branches-<package>` | `"auto_merge": true` packages: the newest upstream release or branch tip |
+
+- **A red PR holds back only its own package.** Fix it on `master` or on the
+  PR. The next run updates the PR if upstream moves again, and closes it once
+  it conflicts with `master`. Packages pinned from the same upstream branch
+  (`omarchy-dev` and `omarchy-settings-dev`) share a PR, because they move in
+  lockstep.
+- **A package with no upstream declaration or hook gets no upstream updates.** That
+  includes the kernels (`linux-omarchy*`, `linux-ptl`, `linux-aurora`): bump
+  them by PR.
+- A failed run of any of the three posts to Basecamp when
+  `BASECAMP_CHATBOT_URL` is set.
+- Every self-merging path (the three above and `auto-merge-pr.yml`) needs
+  the `PKGS_BOT_TOKEN` secret: a personal access token with Contents and Pull
+  requests write access to this repository, owned by an account trusted to
+  build. A merge made with the built-in `GITHUB_TOKEN` does not start
+  `publish.yml`.
+
+Details: [docs/upstream-sources.md](docs/upstream-sources.md),
+[docs/rebuild-triggers.md](docs/rebuild-triggers.md).
+
+## Package metadata
+
+`pkgbuilds/<package>/.omarchy/package.json`:
 
 ```json
 { "source": "local" }
 { "source": "local", "release_ring": "fast" }
-{ "source": "local", "skip_build": true }
 { "source": "local", "upstream": { "watch": { "github": "abenz1267/walker", "pattern": "v(?P<version>[0-9]+(?:\\.[0-9]+)*)" } } }
 ```
 
-Fields:
-
-- `source`: `local` for maintained packages. The legacy `aur` value is used only during an initial import. A local recipe can follow an upstream watch, provider, or `.omarchy/upstream.sh` hook.
-- `upstream`: optional direct release watch (see [Upstream watches](docs/upstream-sources.md)), or an existing GitHub, git-tag, npm, or Debian provider. GitHub architecture assets may be a string or an ordered array, and can be combined with disjoint versioned `sources` — see [Sync Upstream Releases](#sync-upstream-releases). Mutually exclusive with `.omarchy/upstream.sh`.
-- `min_release_age`: optional quarantine for upstream releases (`"24h"`, `"2d"`, or bare seconds). The newest release older than the window ships; anything younger waits, and a release whose age cannot be proven fails the sync. Bypass deliberately with `BYPASS_MIN_RELEASE_AGE=1 bin/sync-upstream <package>`.
-- `sync`: `false` records an existing manual maintenance hold. Held packages have no upstream watch/provider/hook and are excluded from automatic updates.
-- `auto_merge`: optional boolean; defaults to `false`. `true` moves the package's upstream updates from the reviewed 6-hourly sync PR to the unattended lane: `track-branches.yml` opens its bump PR and auto-merges it when CI is green. Meant for packages that follow a moving branch through a `git_branch` watch, where every tip is a release and there is nothing for a reviewer to read. Requires an upstream watch, provider, or hook.
-- `origin`: optional historical import provenance, with `aur` (package name) and `commit`. It does not control updates.
-- `release_ring`: optional. `fast` means the package is built directly for stable as well as edge, with the artifacts replicated into rc for parity. Packages without a ring build in edge and reach stable through the pipeline (`bin/repo advance`).
-- `channels`: optional array bounding where the package may be built (`edge`, `rc`, `stable`). Without the key a package is a member of every channel and follows the default build rules above; `bin/repo advance` refuses to carry a package anywhere it isn't a member.
-- `pinned`: optional boolean. A pinned package's version is set per release by `omarchy-release` on the `rc` branch, so it is never built for stable (promotion only) and is built for rc only from that branch's worktree (`OMARCHY_RC_PINS=1`). Used by `omarchy` and `omarchy-settings`.
-- `skip_build`: optional boolean; defaults to `false`. Set `true` to exclude a package from scheduled version checks and unscoped builds. The package can still be built explicitly with `bin/repo release --package <name>`.
-- `pkgrel`: legacy import customization metadata. Maintained recipes keep their complete package release directly in PKGBUILD; rebuilds increment it there.
-- `rebuild_on`: optional array of package names this package links against closely enough that it must be rebuilt when they change, independent of its own source. Read by `bin/sync-rebuilds`.
-- `rebuilt_against`: written by `bin/sync-rebuilds`. Maps each built architecture to the versions of its `rebuild_on` packages that the current pkgrel was bumped for.
-- `upstream_commit`: legacy AUR metadata, superseded by `origin.commit`. `bin/package-worktree` can use historical provenance to inspect the original recipe.
-
-### Build Matrix
-
-- **Edge unscoped builds** (`--mirror edge`): packages in `pkgbuilds/*` unless `"skip_build": true` or `channels` excludes edge
-- **Rc unscoped builds** (`--mirror rc`): `"release_ring": "fast"` packages, built natively in the rc image. The pinned release pair joins them only when `OMARCHY_RC_PINS=1` (the `rc` branch worktree, set by `omarchy-release rc`)
-- **Stable unscoped builds** (`--mirror stable`): packages with `"release_ring": "fast"` unless `"skip_build": true`
-- **Explicit builds** (`--package <name>`): the selected package, including packages with `"skip_build": true`, subject to mirror eligibility
-- **Channel moves** (`bin/repo advance`): copies current packages + signatures forward through edge → rc → stable, never rewriting a published filename
-
-## Adding Packages
-
-### Start from an existing recipe
-
-```bash
-bin/add-package package-name --source aur --fast
-# Review the imported files, own any architecture/packaging changes directly,
-# and declare an upstream watch/provider or hook in .omarchy/.
-bin/sync-upstream package-name
-bin/repo release --package package-name
-```
-
-The import records historical provenance in `origin`. It does not opt a package
-into future AUR imports. Upstream watches update only release scalars and source
-checksums; downstream build behavior stays in the recipe. Ordinary source-code
-patches still belong beside PKGBUILD and are applied by `prepare()` as needed.
-
-### Custom package
-
-```bash
-bin/add-package my-package --scaffold
-# Fill in PKGBUILD, package files, and upstream metadata
-bin/repo release --package my-package
-```
-
-## Architecture-Specific Notes
-
-### x86_64
-- Native builds (fast)
-- Mirrors: mirror.omarchy.org, rackspace, pkgbuild.com
-
-### aarch64
-- Built on the repository host like x86_64; under QEMU when the host is x86_64
-- On an ARM host, package builds and the signing/database utility containers
-  run natively; only an explicitly requested x86_64 package build is emulated
-- Uses Arch Linux ARM repositories through the same HTTPS mirror for every
-  channel (Arch Linux ARM publishes no dated snapshots to pin a channel's base)
-- Additional repos: `[alarm]`, `[aur]`
-- Same workflow, just add `--arch aarch64`; the scheduled pipeline runs it
-  automatically once `aarch64` is in `PUBLISHED_ARCHES`
-- Packages whose `arch=()` lacks `aarch64` are skipped, not failed
-
-### Building for Both Architectures
-
-```bash
-# Build x86_64
-bin/repo release --package myapp
-
-# Build aarch64
-bin/repo release --arch aarch64 --package myapp
-
-# Sync both
-bin/repo sync
-bin/repo sync --arch aarch64
-```
-
-## Dependency Resolution
-
-The build system automatically handles inter-package dependencies:
-
-1. Plans dependency order once, including `depends`, `makedepends`,
-   `checkdepends`, and their architecture-specific arrays.
-2. Builds each package in a fresh container. Installed packages and changes
-   to the container's system files cannot carry over to the next build.
-3. Shares successful artifacts through the temporary `[omarchy-build]` repo,
-   installing newly built prerequisites in each consumer's container.
-4. Blocks consumers of a failed prerequisite while continuing independent
-   builds. Any failure still prevents the release from publishing.
-
-Example: If `aether` depends on `hyprshade`, `hyprshade` is built first.
-
-Isolation also lets the release and dev Omarchy pairs build in the same run:
-Flea can install `omarchy` without preventing `omarchy-dev` from installing
-its conflicting settings package in a different container.
-
-Pacman downloads are cached under `cache/pacman/<channel>/<arch>/` across
-containers and runs. The installed package database is never shared. Each
-container updates its base system before resolving build dependencies, so a
-cached builder image cannot cause a partial system upgrade. The existing
-`OMARCHY_KEEP_BUILD_WORKSPACE`, `OMARCHY_SKIP_BUILDER_IMAGE`, and
-`OMARCHY_DEFER_RUNTIME_DEPS` flags retain their behavior.
-
-`tests/build-isolation.sh` exercises conflicting package pairs, failed
-prerequisites, resumed builds, cache replacement, and deferred dependencies
-using real containers and pacman transactions. It uses the prepared builder
-image, or an image named by `TEST_BUILDER_IMAGE`; CI builds the small fixture
-image in `tests/build-isolation.Dockerfile`.
-
-### Daily builder images
-
-`Refresh builder images` builds fresh `edge` environments daily at 04:23 UTC,
-when their inputs change on `master`, and on manual dispatch. x86_64 and
-aarch64 build on native GitHub-hosted runners, without occupying the DO
-package-builder pool. Each candidate must pass `tests/build-isolation.sh`,
-including real package builds, before publication to
-`ghcr.io/omacom/omarchy-pkg-builder`. Only `master` in this repository can
-publish; PR workflows cannot replace the shared images.
-PRs that change image inputs also build and test both candidates on native
-runners, with a read-only token and no registry publication.
-
-The compatibility tag contains the architecture, mirror, and a hash of the
-entire `build/` context, including executable bits and symlink targets but
-excluding checkout timestamps and ownership. This deliberately invalidates
-images when mounted build scripts change too. `v1` identifies the image build
-contract; change it if the invocation or compatibility rules change. Each
-successful refresh also gets a run-specific tag for diagnosis and rollback.
-A failed build, isolation test, or push leaves the previous compatible image
-selected. Scheduled builds use `--pull --no-cache` so unchanged Dockerfiles
-still pick up fresh Arch packages.
-
-To build and test a candidate locally:
-
-```bash
-bin/builder-image key --arch x86_64 --mirror edge
-bin/builder-image build --arch x86_64 --mirror edge --tag builder-candidate:test --fresh
-CONTAINER_ENGINE=docker TEST_BUILDER_IMAGE=builder-candidate:test tests/build-isolation.sh
-```
-
-The workflow uses its repository `GITHUB_TOKEN` with `packages: write`; no
-registry PAT is needed. **First publication needs one package setting:** GHCR
-creates the package private. In the `omacom/omarchy-pkg-builder` package
-settings, change visibility to **Public**, then rerun the failed refresh job.
-The workflow checks anonymous registry access before advancing the compatible
-tag, so fork PRs will not be directed to an image they cannot pull. Subsequent
-refreshes preserve that package visibility. This change only produces images;
-package jobs keep their existing behavior until image consumption is enabled.
-
-## Version Management
-
-Packages are only rebuilt if:
-- PKGBUILD version is newer than repository version
-- Package doesn't exist in production
-
-Neither notices a package that has to be rebuilt because something underneath it changed. That case is handled by turning it into a version change: `bin/sync-rebuilds` bumps pkgrel when a dependency named in `rebuild_on` moves.
-
-## Automated Releases
-
-The repository includes GitHub workflows and systemd services for automated releases.
-
-### How It Works
-
-#### GitHub Workflows
-
-1. **sync-upstream.yml** (Every 6 hours): Watches direct upstream feeds and updates owned recipes on the reviewed lane. Successful package updates reach a PR even if another feed fails; failed recipes stay untouched and the workflow remains red.
-2. **sync-rebuilds.yml** (Every 6 hours): Bumps pkgrel for packages whose `rebuild_on` dependencies have moved in the official repositories and opens a PR.
-3. **track-branches.yml** (Every 2 hours): The unattended lane. Pins every `"auto_merge": true` package to the tip of its watched branch once its commit timestamp clears `min_release_age`, opens one PR for all of them, and enables auto-merge. Packages pinned from the same branch move together or not at all, including targeted syncs. The PR builds like any other; a tip that fails to build stays an open red PR until the next tick supersedes it.
-
-The tracking PR and auto-merge use the PAT stored in `PKGS_BOT_TOKEN`, with
-Contents and Pull requests write access to this repository and an owner trusted
-to trigger builds. The existing controller PAT can be reused. No GitHub App is
-required. The built-in Actions `GITHUB_TOKEN` cannot drive the unattended
-build-and-publish chain, so the tracker requires this secret before it runs.
-The reviewed sync workflows continue to use `GITHUB_TOKEN` and require
-maintainer approval as before. See [setup instructions](docs/upstream-sources.md#enable-unattended-branch-updates).
-
-Scheduled runs regenerate one shared PR (`auto/sync-upstream`, `auto/sync-rebuilds`)
-from master. A manual run with the `packages` input only regenerates those
-packages, so it opens its own PR on `auto/sync-upstream-<packages>` (or
-`auto/sync-rebuilds-<packages>`) rather than replacing the shared PR's other
-pending updates. The next scheduled run still picks the same update up in the
-shared PR if it has not merged by then; identical package trees reuse the same
-build artifacts.
-
-Sync PRs are pushed with `GITHUB_TOKEN`, so GitHub holds their build and test
-runs for approval on every push and starts no `pull_request_target` workflow
-for them. Once **`build-approved`** is on a sync PR, the sync workflow's own
-`approve` job releases the held runs for each commit it pushes. A push to an
-`auto/sync-*` branch does not cancel the PR's in-flight build: the new build
-waits for it and then reuses its artifacts, so a long aarch64 build is not
-restarted by every sync.
-
-To approve builds for an unvouched contributor's PR, apply **`build-approved`**.
-Until approval, the PR shows **Awaiting build approval** and its required
-`result` check stays pending, keeping the PR blocked from merging without
-reporting a failed build. Actual build failures and denouncements still fail.
-Applying the label triggers a package build and automatically releases GitHub's
-pending build and test workflows for that PR's current commit. The approval workflow
-runs only trusted default-branch code; package builds and tests stay in the
-ordinary PR workflows. It may take a few minutes for GitHub to register and
-release all the runs.
-
-The label stays effective for that PR while attached, including later commits;
-it does not vouch for the author's other PRs. Removing it stops further label
-approvals, but does not cancel runs already released. An explicit denouncement
-in `.github/VOUCHED.td` still blocks builds. If the approval workflow times out,
-remove and reapply the label to retry.
-
-#### Systemd Services
-
-All four units run **every 5 minutes**, staggered by a minute each, so a push
-reaches the mirror in minutes rather than hours:
-
-1. **check-versions** (`*:0/5`): Pulls latest from git, compares PKGBUILD versions to published versions for every published architecture, creates one state file per channel and architecture if builds are needed
-2. **auto-release-edge** (`*:1/5`): For each published architecture with a state file, builds all edge packages that need updates
-3. **auto-release-rc** (`*:2/5`): Builds fast-ring packages for rc, from the main checkout like the other two — natively in the rc image, not copied from another channel. The pinned release pair is built separately by `omarchy-release rc` in the `rc` branch worktree
-4. **auto-release-stable** (`*:3/5`): If a state file exists, builds `release_ring=fast` packages for stable and replicates them to rc
-
-That cadence is only safe because of three guards:
-
-- **No overlap.** Every channel-mutating run takes a host-wide lock
-  (`pkgs.omarchy.org/.release.lock`). Scheduled runs take it
-  **non-blocking**: if a build is already going, the tick exits immediately
-  instead of queuing. Waiting would stack one stalled process per tick behind
-  a long build and stampede when it finished. Manual commands still wait, as
-  an operator expects. `check-versions` takes it too — its `git pull` would
-  otherwise swap PKGBUILDs out from under a running build.
-- **Backoff on failure.** A failed release records the attempt in
-  `.build-failed-<channel>-<arch>` and backs off exponentially — 10m, 20m, 40m, up to
-  a 6h ceiling — instead of rebuilding the same broken tree every 5 minutes.
-  **Any new commit clears the backoff immediately**, since a push is the most
-  likely fix. Clear it by hand with
-  `rm /root/.state/.build-failed-<channel>-<arch>`.
-- **Quiet when idle.** With nothing queued a tick exits without output, so the
-  journal shows the runs that mattered rather than 288 no-ops a day.
-
-`bin/repo timers` reports all of this: schedules, last results, what is
-queued, what is failing and when it will retry, and whether the lock is held.
-
-### Build reports
-
-Every release run reports to Basecamp Campfire — not just failures, so a push
-can be followed all the way to the mirror without watching the host:
-
-| Event | Message |
+| Field | Meaning |
 |---|---|
-| 🔨 Started | channel, arch, host, the commit being built, and which packages are queued |
-| ✅ Published | the packages and versions that went out, duration, and the channel URL |
-| 📦 Promoted | what `advance` moved between channels (including the rc bootstrap and fast-ring replication) |
-| 📦 Nothing to publish | a queued run built nothing — see below |
-| 🔴 Failed | which step failed, the commit, and the last 25 log lines |
+| `source` | Always `local`. |
+| `upstream` | Where releases come from. Mutually exclusive with an `.omarchy/upstream.sh` hook. |
+| `min_release_age` | Hold a new upstream release back this long (`"24h"`, `"2d"`). A release whose age cannot be proven fails the sync. |
+| `auto_merge` | `true` moves the package's updates from `sync-upstream.yml` (every 6 hours) to `track-branches.yml` (hourly). For packages that follow a moving branch, and for feeds worth shipping within the hour. Needs an upstream declaration. |
+| `release_ring` | `fast`: publish to `rc` and `stable` on merge, not only `edge`. Takes effect with the package's next version: bump `pkgrel` in the same PR. |
+| `channels` | The only channels the package may be published to. `omarchy-dev` is held to `["edge"]` this way. |
+| `pinned` | Version is set per release on the `rc` branch. Used by `omarchy` and `omarchy-settings`. |
+| `rebuild_on` | Packages whose version change forces a rebuild of this one. |
+| `rebuilt_against` | Written by `bin/sync-rebuilds`. Don't edit. |
+| `skip_build` | Left the package out of the old host's unscoped builds. CI ignores it: a PR that touches the package builds and publishes it. |
+| `sync` | `false` holds the package out of upstream updates, with or without an `upstream` declaration. |
+| `origin` | Where an imported recipe came from. Informational. |
 
-Reports are tied to release *runs*, not timer ticks: a tick with nothing
-queued exits silently, so a quiet day is a quiet chat. That is what makes the
-"nothing to publish" report meaningful rather than routine — a release only
-runs when the version check queued work, so building nothing means the check
-and the builder disagree about what is out of date. It names the packages that
-were queued but not built, which is where to start looking.
+## Releases
 
-By default everything posts to `BASECAMP_CHATBOT_URL`, the same chat the
-AUR/upstream sync workflows use — one variable, nothing extra to configure.
+Cutting an Omarchy release and promoting a channel are **not** in the GitHub
+workflows. They are done with `bin/omarchy-release` and `bin/repo advance`,
+which were written for the old repository host, now abandoned, and work on a
+local copy of the published tree.
 
-If release traffic starts drowning that chat, give it its own: create a second
-Basecamp chat, add a chatbot integration to it, and export its lines URL
-alongside the existing one in `/root/.omarchy/build-credentials`:
+Read [docs/releases.md](docs/releases.md) before cutting a release or
+promoting a channel.
 
-```bash
-export OMARCHY_RELEASE_CHATBOT_URL="https://3.basecamp.com/<account>/integrations/<key>/buckets/<project>/chats/<chat>/lines"
+## Rules
+
+- **Publish through `publish.yml` only.** Don't run `bin/repo release`,
+  `sync`, `push` or `deploy`. A second publisher overwrites the channel
+  database the first one wrote. The release train is the one exception: see
+  [docs/releases.md](docs/releases.md).
+- **Don't bring the old host's release timers back.** They run
+  `bin/repo release` every five minutes. Run `bin/setup` with
+  `--skip-timers`.
+- **Never reuse a published filename for different bytes.** The CDN caches
+  package files by name and keeps serving the old ones. Bump `pkgrel`.
+- **Don't merge a package PR before its builds are green.** `publish.yml`
+  then has to build the missing packages, and one that fails stops the whole
+  merge from publishing.
+- **Don't cancel a publish run.** If one is cancelled, republish its packages
+  with a dispatch.
+- **Check after a manual publish.** Confirm the package and version are in
+  the channel database for each architecture it ships to.
+
+## Layout
+
+```
+pkgbuilds/<package>/           Recipe: PKGBUILD and .omarchy/package.json
+bin/                           Tooling the workflows and local work call
+build/                         Builder image and the in-container build script
+helpers/                       Shell and Python shared by bin/ and the workflows
+ci/                            x86_64 builder pool: controller and runner setup
+systemd/                       Release timers for the repository host (abandoned)
+tests/                         Tests; test.yml runs them on every PR
+docs/                          Reference
+.github/workflows/             The pipeline
+.github/VOUCHED.td             Authors trusted to build
 ```
 
-Release reports then go there while the sync workflows keep posting to
-`BASECAMP_CHATBOT_URL`. With neither set, reports are silently skipped.
-`bin/setup` reports which of the three cases applies.
+| Workflow | Trigger | Does |
+|---|---|---|
+| `build-pr.yml` | PR, dispatch | Builds changed packages; reports `result` |
+| `test.yml` | PR, dispatch | `self-tests` and `build-isolation` |
+| `publish.yml` | push to `master`, dispatch | Signs and publishes |
+| `unpublish.yml` | dispatch | Removes retired packages from channel databases |
+| `auto-merge-pr.yml` | PR events, dispatch | Enables auto-merge on trusted package PRs |
+| `approve-pr.yml` | PR events | Releases GitHub's hold on a `build-approved` PR's runs |
+| `sync-upstream.yml` | every 6 hours, dispatch | Upstream release PR |
+| `sync-rebuilds.yml` | every 6 hours, dispatch | Dependency rebuild PR |
+| `track-branches.yml` | hourly, dispatch | Branch tip PRs |
+| `builder-images.yml` | daily, changes to the image's inputs (push and PR), dispatch | Builds and tests the builder image; publishes it from `master` |
 
-Check on all of it with `bin/repo timers` — schedule, each unit's last run and
-whether it succeeded, what is queued, whether a release is running right now,
-and any failed units. Like the other host commands it forwards over ssh, so
-the build box's state is one command away from any machine:
+Secrets: the `publish` environment (usable from `master` only) holds the
+signing key and bucket credentials: `GPG_PRIVATE_KEY`, `GPG_PASSPHRASE`,
+`R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, `R2_ENDPOINT`. Its variable
+`OMARCHY_PUBLISH_PREFIX` redirects publish and unpublish to a scratch prefix
+in the bucket for a proof run; it must be empty for live publishing.
+Repository secrets: `PKGS_BOT_TOKEN`, `BASECAMP_CHATBOT_URL`.
 
-```bash
-bin/repo timers           # runs on the repository host when one is configured
-bin/repo timers --local   # inspect this machine instead
-```
+## More
 
-State files are stored in `/root/.state/`:
-- `.sync-needed-<channel>-<arch>` — the packages queued for that channel and
-  architecture, one per line; the release run reads them to name what it is
-  building
-- `.build-failed-<channel>-<arch>` — consecutive failure count, timestamp, and
-  the commit it failed on (drives the backoff; removing it forces a retry)
-
-Legacy files without the architecture suffix are consumed once as x86_64
-state, so upgrading the host does not lose an in-flight build.
-
-### Schedule (America/New_York)
-
-| Minute of every hour | Action |
-|------|--------|
-| :00, :05, :10, … | check-versions (git pull + creates state files) |
-| :01, :06, :11, … | auto-release-edge |
-| :02, :07, :12, … | auto-release-rc |
-| :03, :08, :13, … | auto-release-stable |
-
-Each unit is a no-op unless its channel has queued work, another run holds the
-lock, or the channel is in failure backoff.
-
-### Installation
-
-```bash
-ssh root@<host> 'cd /root/omarchy-pkgs && bin/setup'
-```
-
-`bin/setup` installs the dependencies, ensures Docker is running, creates the
-state directory, and installs and enables the release timers. It works on
-Debian/Ubuntu and on Arch, and is idempotent, so run it again whenever a
-dependency is added.
-
-The host does not need to be Arch: makepkg, repo-add and package signing all
-run inside containers, so it needs only Docker, rclone, bsdtar, jq, git and
-rsync. Docker is left alone when it already works, rather than replacing a
-working installation from Docker's own repository with the distribution's.
-
-```bash
-bin/repo setup --check         # Report what is missing, change nothing
-bin/repo setup --skip-timers   # Prepare the host without the release timers
-```
-
-Signing credentials (`/root/.omarchy/build-credentials`) and the rclone remote
-hold secrets, so setup reports on them rather than creating them.
-
-### Management
-
-```bash
-# Everything at a glance: schedules, last runs, queues, backoff, lock
-bin/repo timers                     # forwards to the host when one is configured
-
-# Manual trigger (edge, rc, stable)
-systemctl start omarchy-check-versions.service
-systemctl start omarchy-auto-release-edge.service
-
-# View logs
-journalctl -u omarchy-auto-release-edge.service -n 50
-
-# Clear a channel stuck in failure backoff (a new commit also clears it)
-rm /root/.state/.build-failed-edge
-
-# Release lock left behind by a killed run (bin/repo timers shows if it is live)
-rm /root/omarchy-pkgs/pkgs.omarchy.org/.release.lock
-```
-
-The main checkout is pulled by `check-versions` on its 5-minute tick, so the
-host stays current on whatever branch it has checked out — it must be `master`.
+- [ci/README.md](ci/README.md): the x86_64 builder pool and how to operate it
+- [docs/builds.md](docs/builds.md): dependency order, isolation, builder images
+- [docs/upstream-sources.md](docs/upstream-sources.md): declaring upstream releases
+- [docs/rebuild-triggers.md](docs/rebuild-triggers.md): rebuilding when a dependency moves
+- [docs/releases.md](docs/releases.md): cutting a release, versioning rules
+- [docs/repository-host.md](docs/repository-host.md): the old host pipeline (abandoned)

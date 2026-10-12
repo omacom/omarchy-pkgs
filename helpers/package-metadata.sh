@@ -333,7 +333,8 @@ packages_for_upstream_sync() {
 # "auto_merge": true rides the unattended lane instead: its bump PR is opened
 # and auto-merged by the branch tracker as soon as CI is green, which is how a
 # package that follows a moving branch (omarchy-dev, omasnap-git) gets rebuilt
-# without anyone clicking. The lanes are disjoint so a branch tip can never
+# without anyone clicking, and how trusted release feeds (browsers, large
+# vendors, Omacom's own projects) ship without waiting for review. The lanes are disjoint so a branch tip can never
 # hold up a reviewed vendor release, or the other way round.
 package_auto_merge() {
   local pkgdir="$1" metadata

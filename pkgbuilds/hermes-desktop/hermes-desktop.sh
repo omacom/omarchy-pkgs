@@ -2,7 +2,6 @@
 set -euo pipefail
 
 unset ELECTRON_RUN_AS_NODE PYTHONPATH PYTHONHOME
-export HERMES_DESKTOP_IGNORE_EXISTING=1
 
 hermes_home=$(realpath -ms -- "${HERMES_HOME:-$HOME/.hermes}")
 parent=${hermes_home%/*}
@@ -15,6 +14,9 @@ runtime="$hermes_home/hermes-agent"
 native="$runtime/apps/desktop/release/linux-unpacked/Hermes"
 if [[ ! -x $native || ! -x $runtime/venv/bin/hermes ]]; then
   native=/opt/hermes-desktop/Hermes
+  # Only the packaged app, built from the release commit rather than the runtime's
+  # checkout, is told to skip an existing Hermes.
+  export HERMES_DESKTOP_IGNORE_EXISTING=${HERMES_DESKTOP_IGNORE_EXISTING:-1}
 fi
 
 # Both app locations use namespaces, never a user-writable setuid helper.
@@ -36,7 +38,7 @@ import sys
 
 native, runtime, *args = sys.argv[1:]
 env = os.environ.copy()
-flags, gpu, store, ozone = [], "auto", "auto", "auto"
+flags, gpu, store, ozone, a11y = [], "auto", "auto", "auto", True
 if runtime:
     sys.path.insert(0, runtime)
     try:
@@ -47,7 +49,10 @@ if runtime:
             from hermes_cli.main import _desktop_launch_options
         from hermes_constants import with_hermes_node_path
 
-        flags, gpu, store, ozone = _desktop_launch_options()
+        # Newer runtimes append renderer_accessibility; the packaged release returns four.
+        flags, gpu, store, ozone, *extra = _desktop_launch_options()
+        if extra:
+            a11y = extra[0]
         env = with_hermes_node_path(env)
     except ImportError:
         print("Could not load Hermes desktop settings; using launch defaults.", file=sys.stderr)
@@ -58,6 +63,9 @@ if gpu != "auto":
 if ozone != "auto":
     env.setdefault("ELECTRON_OZONE_PLATFORM_HINT", ozone)
 env.setdefault("HERMES_DESKTOP_PASSWORD_STORE", store if store != "auto" else "gnome-libsecret")
+# The app keeps its accessibility tree on unless told otherwise, so bridge only the opt-out.
+if not a11y:
+    env.setdefault("HERMES_DESKTOP_RENDERER_ACCESSIBILITY", "0")
 
 # Explicit config, environment and command-line choices override the Wayland default.
 if (env.get("WAYLAND_DISPLAY") or env.get("XDG_SESSION_TYPE") == "wayland") and (

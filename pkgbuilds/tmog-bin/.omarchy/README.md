@@ -1,4 +1,4 @@
-# tmog-bin - repackaging a vendor tarball from a versionless URL
+# tmog-bin - repackaging a versioned vendor tarball
 
 ## Overview
 
@@ -42,16 +42,22 @@ Since 1.0.0 the site lives under `/rtm/`, and each Linux artifact is published
 under a versioned name with a `.sha256` sidecar beside it:
 
 ```text
-https://tmog.org/rtm/version.txt
+https://tmog.org/rtm/downloads/release-linux.json
 https://tmog.org/rtm/downloads/TaskManagerOG-<version>-linux-x86_64.tar.gz
 https://tmog.org/rtm/downloads/TaskManagerOG-<version>-linux-x86_64.tar.gz.sha256
 ```
 
-`downloads/release.json` -- the manifest the macOS updater verifies -- still
-describes the DMG only, so `.omarchy/upstream.sh` reads the version from
-`version.txt` and the checksum from the sidecar, and checks that the sidecar
-names the tarball it was asked about. The check costs two small requests and
-never downloads the tarball.
+`.omarchy/upstream.sh` reads the version from the Linux x86_64 manifest,
+validating its schema, platform, architecture, and version. The shared
+`version.txt` can advance before Linux artifacts are published (it announced
+1.0.1 while the Linux manifest and artifacts were still at 1.0.0).
+
+The Linux manifest's checksum describes the AppImage, not the tarball, so the
+hook still reads the tarball's checksum from its own sidecar and checks that
+the sidecar names the requested artifact. Missing or invalid manifests and
+checksums fail the sync; there is no fallback to the shared version or an
+unchecked download. An unchanged Linux version costs one small request; an
+update costs two, and neither downloads the tarball.
 
 Up to 0.1.1 every release was served from one versionless path,
 `/downloads/TMOG-Task-Manager-Linux-x86_64.tar.gz`, and the hook downloaded it
@@ -67,6 +73,8 @@ moving to `source_x86_64`/`source_aarch64` and reporting both keys.
 ## Testing
 
 ```bash
+bash pkgbuilds/tmog-bin/.omarchy/upstream-test.sh
+bin/sync-upstream self-test
 bin/sync-upstream tmog-bin
 bin/repo build --package tmog-bin
 ```

@@ -1,83 +1,118 @@
-# CI spike: build PRs on ephemeral DigitalOcean droplets
+# The x86_64 builder pool
 
-Status: spike. Nothing here publishes. The repository host keeps building and
-signing on merge exactly as before.
+x86_64 package builds run on DigitalOcean droplets that exist for one job
+each. aarch64 builds run on GitHub's `ubuntu-24.04-arm` runners and need
+nothing here.
 
-## Pieces
+## How it works
 
-- `.github/workflows/build-pr.yml` — on a PR touching `pkgbuilds/**`, one job
-  per changed package on runners labelled `omarchy-builder`. aarch64 jobs
-  run on GitHub's native `ubuntu-24.04-arm` runners instead. Uploads the unsigned
-  `.pkg.tar.zst` as a workflow artifact (7 days).
-- `runner-cloud-init.yaml` — Ubuntu 24.04 user-data: docker + buildx, the
-  GitHub runner registered `--ephemeral`, runs one job, powers off.
-- `controller.sh` — systemd timer every minute on a small always-on droplet.
-  Polls for queued jobs with our label, creates one g5-32vcpu-64gb-50gb droplet (ric1) per job up
-  to `MAX_DROPLETS`, deletes droplets that are powered off or older than
-  `MAX_AGE_MINUTES`. No inbound endpoint. Plain curl against both APIs, no
-  doctl and no gh: a token in the environment cannot pick the wrong account
-  the way a saved doctl context can. Needs curl and jq.
-  `tests/controller.sh` exercises every decision against canned responses.
-- `controller-box/` — the always-on droplet: unit, timer, env template,
-  cloud-init, and `create.sh` to stand it up with one API call.
+- **Jobs ask for a runner labelled `omarchy-builder`.** `build-pr.yml` builds
+  x86_64 packages there, and so does the `rebuild` job in `publish.yml`.
+- **A controller creates one droplet per queued job.** `controller.sh` runs
+  from a systemd timer every minute on a small always-on droplet (tag
+  `omarchy-controller`). It polls GitHub for queued jobs with the label and
+  creates droplets up to `MAX_DROPLETS`. It has no inbound endpoint.
+- **A droplet runs one job and powers off.** `runner-cloud-init.yaml` installs
+  Docker and the GitHub runner, registers it `--ephemeral` with a
+  registration token that expires in an hour, runs the job, and powers off, also when the runner download or
+  registration fails. The controller removes any other failed droplet at
+  `MAX_AGE_MINUTES`.
+- **The controller deletes droplets** that are powered off, older than
+  `MAX_AGE_MINUTES`, or still provisioning after `MAX_BOOT_MINUTES`, and
+  replaces a stuck one in the same tick.
+- **Sizes and regions fall back.** Each tick tries every size in `SIZES`, in
+  every region DigitalOcean lists it in stock. `REGIONS` only sets which
+  regions go first. A refused create is logged with DigitalOcean's message.
 
-## Standing up the controller box
+No secret reaches a builder. Signing and upload happen in the `publish` job on
+a GitHub-hosted runner.
 
-    DIGITALOCEAN_TOKEN=<omarchy account> GITHUB_TOKEN=<fine-grained PAT> \
-      REPO=omacom/omarchy-pkgs ci/controller-box/create.sh <branch>
+## Operate it
 
-The GitHub PAT is fine-grained, scoped to the one repo: Actions read,
-Administration read+write (registration tokens). The DO token is baked into
-the box's env file, so it is the account that pays for builder droplets.
-Watch it with `journalctl -u omarchy-controller -f` on the box.
+SSH to the controller droplet as root. It is the droplet tagged
+`omarchy-controller` in the DigitalOcean account that pays for the builders;
+the operators' keys were installed when it was created.
 
-## What the spike proved (2026-09-17, fork ryanrhughes/omarchy-pkgs)
+```bash
+journalctl -u omarchy-controller -n 50 --no-pager   # What it is doing
+journalctl -u omarchy-controller -f                 # Follow it
+systemctl list-timers omarchy-controller.timer      # Is it ticking
+```
 
-- `bin/build` works from a bare clone: with no local published tree it
-  plans against and resolves from `https://pkgs.omarchy.org/<mirror>/<arch>`.
-- Droplet create → runner registered: ~70 s. omarchy-fish PR job: 2 min
-  including the builder image build. Droplet powers off after the job.
-- linux-omarchy on a c-32 droplet: 30 min wall clock for the build job
-  (23:39 → 00:09), 254 MB artifact. Cold start ~90 s before the job began.
-- A PR whose PKGBUILD fails to build turns the required check red and GitHub
-  refuses the merge (`mergeStateStatus=BLOCKED`, `gh pr merge` refuses
-  without `--admin`).
-- Controller: one queued job + one busy droplet ⇒ creates exactly one more;
-  reaps powered-off droplets on the next tick.
+| Log line | Meaning |
+|---|---|
+| `creating <name> (<size> in <region>)` | A queued job is getting a droplet |
+| `<size> in <region> refused: <message>` | DigitalOcean refused; the next region or size is tried |
+| `no size in '<sizes>' can be created in any region` | Every create was refused. Read the `refused:` lines above it for why: out of stock (add a size to `SIZES`), or the account's droplet limit |
+| `at cap (<live>/<max>, <busy> busy) with <queued> queued` | `MAX_DROPLETS` is reached. Raise it if the queue is long |
+| `deleting droplet <id> (status=<status> age=<n>m)` | Reaping a finished, old or stuck droplet |
 
-## Not done (required before this touches the real repo)
+Check the pool from anywhere:
 
-- Tooling from base: check out master's `bin/ helpers/ build/` and overlay
-  only the PR's `pkgbuilds/<name>`; today a PR can edit the build script
-  and it runs on the droplet. The vouch gate limits who can do that, not
-  what they can do.
-- DigitalOcean cloud firewall on the `omarchy-builder` tag: no inbound, no
-  egress to private ranges or the metadata address.
-- A fine-grained GitHub token for the real repository (the one on the
-  controller box is scoped to the fork), and the publish environment's
-  secrets set there.
-- Disable the host's auto-release timers for any channel CI publishes to,
-  so two writers never touch one database.
+```bash
+gh api repos/omacom/omarchy-pkgs/actions/runners --jq \
+  '"online \([.runners[]|select(.status=="online")]|length), busy \([.runners[]|select(.busy)]|length)"'
+```
 
-## Done since the spike README was first written
+Jobs queued with no runner online for several minutes means the controller is
+not creating droplets: read its journal. See what is waiting:
 
-- Controller as a systemd timer on its own droplet, plain curl, self-test.
-- Build once against edge; one artifact per package per architecture,
-  published into every channel it belongs to (fast ring: all three at
-  once). arch=any builds once for every architecture database.
-- Publish is incremental and immutable: pull the channel db, refuse
-  different bytes under an existing name, accept identical bytes, upload
-  packages then signatures then the db.
-- aarch64 under QEMU with credential-preserving binfmt. PR builds now run
-  aarch64 natively on `ubuntu-24.04-arm` (QEMU was up to ~15x slower). When a
-  merged aarch64 tree has no artifact, publish.yml rebuilds it there too, in its
-  own job, and signs and uploads it on the droplet like a PR artifact.
-- Vouch gate: collaborators, `.github/VOUCHED.td`, or the `build-approved`
-  label; denounced authors cannot be overridden by the label.
-- Tests run on PRs only; `result`, `self-tests`, `build-isolation` are the
-  required checks with strict up-to-date branches.
+```bash
+gh run list -R omacom/omarchy-pkgs --workflow build-pr.yml --status queued
+```
 
-## Cleanup
+Only x86_64 jobs use this pool. A queued aarch64 job is waiting on GitHub's
+own runners.
 
-    doctl compute droplet list --tag-name omarchy-builder
-    doctl compute droplet delete -f <id>
+### Change settings
+
+Edit `/etc/omarchy-controller.env` on the box. The next tick reads it.
+
+| Setting | Default in `controller-box/controller.env.example` | |
+|---|---|---|
+| `MAX_DROPLETS` | 6 | Builders alive at once. The DigitalOcean account's droplet limit also applies |
+| `SIZES` | `g5-32vcpu-64gb-50gb g5-32vcpu-128gb-50gb` | Tried in order |
+| `REGIONS` | empty | Regions to try first; empty means any |
+| `MAX_AGE_MINUTES` | 200 | Delete a droplet older than this |
+| `MAX_BOOT_MINUTES` | 10 | Delete a droplet still provisioning after this |
+| `DO_SSH_KEYS` | Ryan, DHH and Emir's account key IDs | Attached to every builder. Without one, DigitalOcean emails a root password per builder |
+
+### Change the controller
+
+Merge the change to `master`. The unit pulls `/opt/omarchy-pkgs` before every
+tick, so it is live within a minute. The unit and timer files are copies made
+when the box was created; after changing them, on the box:
+
+```bash
+cp /opt/omarchy-pkgs/ci/controller-box/omarchy-controller.{service,timer} /etc/systemd/system/
+systemctl daemon-reload
+```
+
+`tests/controller.sh` exercises every controller decision against canned API
+responses. Run it before merging a change.
+
+### Reach a builder
+
+Operators can SSH to a builder as root while it lives. It powers off after its
+one job.
+
+### Clean up by hand
+
+The controller reaps on its own. To do it manually, delete droplets tagged
+`omarchy-builder` in the DigitalOcean account.
+
+## Stand up a controller
+
+```bash
+DIGITALOCEAN_TOKEN=<account that pays for builders> GITHUB_TOKEN=<fine-grained PAT> \
+  REPO=omacom/omarchy-pkgs ci/controller-box/create.sh
+```
+
+- The GitHub PAT is fine-grained and scoped to this repository: Actions read,
+  Administration read and write (for runner registration tokens).
+- The DigitalOcean token is written into the box's env file, so it is the
+  account that pays. It needs ssh_key:read to attach `DO_SSH_KEYS`; without
+  it every create is refused with 403.
+- `ADMIN_GITHUB_USERS` names whose GitHub SSH keys get root on the box and
+  the builders. Set it; the default is a fixed list in `create.sh`.
+- The script refuses to create a second controller.
