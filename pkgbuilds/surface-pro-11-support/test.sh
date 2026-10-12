@@ -60,6 +60,8 @@ grep -Fq 'api.libcamera.path = "/base/soc@0/cci@ac15000/i2c-bus@0/camera@60"' "$
   fail "the infrared sensor is hidden from camera pickers"
 ! grep -q 'monitor.v4l2.rules' "$package_dir/50-surface-pro-11-cameras.conf" ||
   fail "V4L2 devices are not disabled; in WirePlumber 0.5 that stalls camera discovery"
+grep -A1 -- '- BlackLevel:' "$package_dir/imx681.yaml" | grep -q 'blackLevel: 4096$' ||
+  fail "the front camera tuning carries the measured IMX681 black level"
 
 bin="$scratch/bin"
 mkdir -p "$bin"
