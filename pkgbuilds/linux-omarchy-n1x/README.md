@@ -93,7 +93,7 @@ Two differences from Arch Linux ARM's kernel matter on these laptops. Omarchy's 
 
 ### Surface Pro 11
 
-`2100`-`2166` bring up the Microsoft Surface Pro 11 (X1E80100, `microsoft,denali-oled`), replacing its separate `linux-sp11` package. They come from github.com/turbineBMW/linux `sp11/v7.3` and apply after `2000`.
+`2100`-`2166` bring up the Microsoft Surface Pro 11 (X1E80100, `microsoft,denali-oled`), replacing its separate `linux-sp11` package. They come from github.com/turbineBMW/linux `sp11/n1x-7.2.8` (v7.2.8 with this recipe's patches as commits) and apply after `2000`.
 
 - `2100`-`2108` are from mainline 7.3: Maulik Shah's PDC pass-through series (83e089ef0d4e, 60caa95aa14a, 45af2d61edf6, ad01c2b2f291), the PDC kernel-doc fix (d307a7e7d939), the OS PDC DRV span (c39df6b350ef), the pinctrl PDC acknowledge (f790ea0b699d), the revert of the x1e80100 PDC bypass (77fbc756d9cb) and the x1e80100 deepest idle state (95f827ceb21e). Together they let the X1 clusters and the system power domain reach their deepest idle states.
 - `2110`-`2120` are Microsoft's HID over SPI series, for the touchscreen and pen.
