@@ -1,0 +1,76 @@
+#!/bin/bash
+# Download the files a channel publishes for one source package, checked
+# against that channel's database.
+#
+#   fetch-published --mirror <edge|rc|stable> --arch <arch> --package <recipe> --out <dir>
+#
+# For a package one slot already holds and another is missing (see
+# bin/publish-slots). A published filename means one set of bytes
+# everywhere, so the missing slot gets the published file, never a rebuild.
+#
+# Every file is fetched past the CDN cache and must match the SHA-256 the
+# database records. Fails, leaving nothing in <dir>, when the channel does
+# not hold one complete build: a package the recipe names is absent, the
+# packages are at different versions, or a file does not match.
+set -euo pipefail
+BUILD_ROOT=$(realpath "${BASH_SOURCE[0]%/*}/..")
+source "$BUILD_ROOT/helpers/paths.sh"
+source "$BUILD_ROOT/helpers/package-metadata.sh"
+
+URL=${OMARCHY_PUBLISHED_REPO_URL:-https://pkgs.omarchy.org}
+MIRROR="" ARCH="" PACKAGE="" OUT=""
+while [[ $# -gt 0 ]]; do
+  case $1 in
+  --mirror) MIRROR=$2; require_valid_mirror "$MIRROR"; shift 2 ;;
+  --arch) ARCH=$2; require_valid_arch "$ARCH"; shift 2 ;;
+  --package) PACKAGE=$2; shift 2 ;;
+  --out) OUT=$2; shift 2 ;;
+  -h|--help) sed -n '2,14p' "$0"; exit 0 ;;
+  *) echo "fetch-published: unknown argument: $1" >&2; exit 1 ;;
+  esac
+done
+[[ -n "$MIRROR" && -n "$ARCH" && -n "$PACKAGE" && -n "$OUT" ]] || { sed -n '2,5p' "$0" >&2; exit 1; }
+
+[[ -f "$PKGBUILDS_DIR/$PACKAGE/PKGBUILD" ]] || { echo "fetch-published: no recipe for $PACKAGE" >&2; exit 1; }
+base=$(package_pkgbase "$PKGBUILDS_DIR/$PACKAGE" "$ARCH")
+channel="$URL/$MIRROR/$ARCH"
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+curl -fsSL --retry 2 "$channel/omarchy.db.tar.zst?$(date +%s)" -o "$work/db.tar.zst"
+
+# "<sha256> <filename> <name> <version>" for every package built from this
+# pkgbase. A package without %BASE% is its own base.
+tar --zstd -xOf "$work/db.tar.zst" --wildcards '*/desc' | awk -v want="$base" '
+  function emit() {
+    if (file != "" && (base == want || (base == "" && name == want))) print (sum == "" ? "-" : sum), file, name, version
+    file=""; name=""; base=""; sum=""; version=""
+  }
+  $0 == "%FILENAME%" { emit(); getline; file=$0; next }
+  $0 == "%NAME%" { getline; name=$0; next }
+  $0 == "%BASE%" { getline; base=$0; next }
+  $0 == "%VERSION%" { getline; version=$0; next }
+  $0 == "%SHA256SUM%" { getline; sum=$0; next }
+  END { emit() }
+' > "$work/want"
+[[ -s "$work/want" ]] || { echo "fetch-published: $channel lists no package built from $PACKAGE (pkgbase $base)" >&2; exit 1; }
+
+# One complete build, or nothing: a slot holding half of a split package, or
+# its packages at two versions, is not a source to copy from.
+(( $(awk '{print $4}' "$work/want" | sort -u | wc -l) == 1 )) || {
+  echo "fetch-published: $channel holds $PACKAGE at more than one version:" >&2; awk '{print "  " $2}' "$work/want" >&2; exit 1; }
+for name in $(cd "$PKGBUILDS_DIR/$PACKAGE" && env -u OMARCHY_SRC CARCH="$ARCH" bash -c 'source PKGBUILD >/dev/null 2>&1; printf "%s\n" "${pkgname[@]}"'); do
+  awk -v n="$name" '$3==n{found=1} END{exit !found}' "$work/want" || {
+    echo "fetch-published: $channel does not list $name, which $PACKAGE builds" >&2; exit 1; }
+done
+
+mkdir -p "$work/files"
+while read -r sum file _; do
+  [[ "$sum" != - ]] || { echo "fetch-published: $channel records no SHA-256 for $file" >&2; exit 1; }
+  # jq's @uri keeps the epoch colon of a filename a valid URL path.
+  curl -fsSL --retry 2 "$channel/$(jq -rn --arg f "$file" '$f|@uri')?$(date +%s)" -o "$work/files/$file"
+  got=$(sha256sum "$work/files/$file" | cut -d' ' -f1)
+  [[ "$got" == "$sum" ]] || { echo "fetch-published: $file from $channel is $got, the database says $sum" >&2; exit 1; }
+  echo "==> fetched $file from $MIRROR/$ARCH"
+done < "$work/want"
+mkdir -p "$OUT"
+mv "$work/files"/* "$OUT/"

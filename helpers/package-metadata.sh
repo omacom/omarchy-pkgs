@@ -180,6 +180,18 @@ package_arches() {
   ')
 }
 
+# The pkgbase a recipe builds: what its packages record as %BASE% in a channel
+# database and as pkgbase in their .PKGINFO. Usually the recipe directory's
+# name, but not always (yaru-icon-theme builds pkgbase yaru).
+package_pkgbase() {
+  local pkgdir="$1"
+
+  (cd "$pkgdir" && env -u OMARCHY_SRC CARCH="${2:-${ARCH:-x86_64}}" bash -c '
+    source PKGBUILD >/dev/null 2>&1
+    printf "%s\n" "${pkgbase:-${pkgname[0]}}"
+  ')
+}
+
 package_supports_arch() {
   local pkgdir="$1"
   local target="${2:-${ARCH:-x86_64}}"
