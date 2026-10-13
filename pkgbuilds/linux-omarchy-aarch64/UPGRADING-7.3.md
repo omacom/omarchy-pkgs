@@ -1,4 +1,4 @@
-# Porting linux-omarchy-n1x to 7.3
+# Porting linux-omarchy for aarch64 to 7.3
 
 Notes for moving this package from 7.2.8 to 7.3, written while rebasing it from 7.2.5 to 7.2.8 (2026-10-09). The upstream state below is mainline v7.3-rc6 (a90ee4305c4, 2026-10-04), mainline master at af32da41b0 (2026-10-09, the net-7.3-rc7 merge) and linux-next next-20261008 (aac26bee2287). Re-check every "not upstream" and "only in linux-next" claim against the final 7.3 tag before relying on it.
 

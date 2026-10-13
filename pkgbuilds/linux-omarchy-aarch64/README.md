@@ -1,6 +1,8 @@
-# linux-omarchy-n1x
+# linux-omarchy-aarch64
 
-The `linux-omarchy` kernel built for aarch64 with NVIDIA N1x (RTX Spark) platform support added. It carries the same kernel.org source and signed Omarchy patch set as `linux-omarchy` 7.2.8-5, plus N1x topic patches numbered 1000 and up. Since 7.2.8-5 `linux-omarchy` is a meta package for `linux-omarchy-bore`, so the shared patches, their signatures and the BORE and ADIOS schedulers come from `linux-omarchy-bore`, byte for byte, including its BORE rebases of the `0121`–`0144` scheduler patches. The intent is to fold these into `linux-omarchy` itself once it builds for aarch64; until then this is the kernel Omarchy installs on N1x machines (`install/hardware/n1x.sh` in omarchy), replacing NVIDIA's 7.0-based `linux-n1x`.
+The `linux-omarchy` kernel for aarch64, with NVIDIA N1x (RTX Spark) and Snapdragon laptop support added. This folder builds the packages `linux-omarchy` and `linux-omarchy-headers` for aarch64, as the `linux-omarchy` folder does for x86_64; until 7.2.8-8 they were named `linux-omarchy-n1x` and `linux-omarchy-n1x-headers`, which the new ones replace on upgrade. The folder's name is the recipe's `pkgbase`, which is how the build and publish tooling keeps the two recipes' files apart.
+
+It carries the same kernel.org source and signed Omarchy patch set as `linux-omarchy` 7.2.8-5, plus N1x topic patches numbered 1000 and up. Since 7.2.8-5 `linux-omarchy` is a meta package for `linux-omarchy-bore`, so the shared patches, their signatures and the BORE and ADIOS schedulers come from `linux-omarchy-bore`, byte for byte, including its BORE rebases of the `0121`–`0144` scheduler patches. The intent is to fold these into `linux-omarchy` itself once it builds for aarch64; until then this is the kernel Omarchy installs on N1x machines (`install/hardware/n1x.sh` in omarchy), replacing NVIDIA's 7.0-based `linux-n1x`.
 
 The `pkgrel` counts N1x revisions of this package and starts again at 1 when the kernel version changes. On 7.2.5 it was `6.1` to `6.9` while it tracked `linux-omarchy`'s release; the ninth revision became `9`, `10` added the Dell XPS 16 patches, `11` brought a dock's displays back after a failed DisplayPort tunnel, `12` stopped the clock during suspend-to-idle, `13` brought NVIDIA's device sleep patches from 1022.23, `14` let keyboard and touchpad interrupts wake the system from the platform's deepest sleep, and `15` brought audio and UCSI fixes from upstream and turned kexec handover off by default. `7.2.8-1` moves to 7.2.8 and `linux-omarchy` 7.2.8-5's patch set, `2` closes a SoundWire interrupt race that could hang the boot, `3` stops `cppc_cpufreq` registering its artificial energy model, so EAS no longer packs the desktop onto the A725 cores, `4` ships the Snapdragon laptops' device trees and resets the Iris AHB bridge before hardware mode, `5` builds SCMI CPU frequency scaling in, which the Snapdragon laptops need, and `6` lets suspend-to-idle reach the platform's deepest idle state, which brings sleep from 6-15 W to under 1 W.
 
@@ -104,7 +106,7 @@ On 7.2.8 it went through `olddefconfig` again and took the architecture-independ
 The package is large and hardware-specific, so unscoped repository builds skip it. Build it explicitly, natively on aarch64 where possible:
 
 ```bash
-bin/repo build --arch aarch64 --package linux-omarchy-n1x
+bin/repo build --arch aarch64 --package linux-omarchy-aarch64
 ```
 
 The build produces `Image`, modules and the Snapdragon laptops' device trees; N1x boots through ACPI and needs none. It installs the raw arm64 `Image` as `vmlinuz` for Limine's aarch64 Linux protocol.
