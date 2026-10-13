@@ -93,12 +93,12 @@ Two differences from Arch Linux ARM's kernel matter on these laptops. Omarchy's 
 
 ### Surface Pro 11
 
-`2100`-`2166` bring up the Microsoft Surface Pro 11 (X1E80100, `microsoft,denali-oled`), replacing its separate `linux-sp11` package. They come from github.com/turbineBMW/linux `sp11/n1x-7.2.8` (v7.2.8 with this recipe's patches as commits) and apply after `2000`.
+`2100`-`2169` bring up the Microsoft Surface Pro 11 (X1E80100, `microsoft,denali-oled`), replacing its separate `linux-sp11` package. They come from github.com/turbineBMW/linux `sp11/n1x-7.2.8` (v7.2.8 with this recipe's patches as commits) and apply after `2000`.
 
 - `2100`-`2108` are from mainline 7.3: Maulik Shah's PDC pass-through series (83e089ef0d4e, 60caa95aa14a, 45af2d61edf6, ad01c2b2f291), the PDC kernel-doc fix (d307a7e7d939), the OS PDC DRV span (c39df6b350ef), the pinctrl PDC acknowledge (f790ea0b699d), the revert of the x1e80100 PDC bypass (77fbc756d9cb) and the x1e80100 deepest idle state (95f827ceb21e). Together they let the X1 clusters and the system power domain reach their deepest idle states.
 - `2110`-`2120` are Microsoft's HID over SPI series, for the touchscreen and pen.
 - `2121`-`2154` are the Surface Pro 11's own patches: the platform support and Denali device tree, the Surface Aggregator keyboard cover (tablet-mode resync, LE out-of-band pairing), CAMSS C-PHY, the OV13858 and VD55G0 sensors, and the fixes listed below.
-- `2160` is mainline 7.3's x1e80100 CAMCC node (6a3568f938c9), which 7.2.8 lacks, and `2161`-`2166` add the camera nodes, the IMX681 driver and the IR illuminator. `2166` exposes the IMX681 analogue gain as a linear value, so stock libcamera drives the front camera without a sensor helper.
+- `2160` is mainline 7.3's x1e80100 CAMCC node (6a3568f938c9), which 7.2.8 lacks, and `2161`-`2166` add the camera nodes, the IMX681 driver and the IR illuminator. `2166` exposes the IMX681 analogue gain as a linear value, so stock libcamera drives the front camera without a sensor helper. `2167`-`2169` light the camera privacy LED (TLMM gpio225) while the front, rear or IR camera streams: the device tree describes the LED and points the three sensors at it, and the VD55G0 driver registers as a sensor subdevice so the V4L2 core finds it, powering the sensor off only once if its probe is deferred until the LED driver loads.
 
 Most of them touch only Surface or Denali code. These also run on other machines:
 
