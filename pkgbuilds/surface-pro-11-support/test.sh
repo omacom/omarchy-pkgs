@@ -117,4 +117,110 @@ iptsd_sleep denali post suspend
 [[ $(wc -l <"$scratch/systemctl.log") == 2 ]] ||
   fail "a resume without a matching stop starts nothing"
 
+# Flex Keyboard: pair on attach when there is no working bond, reconnect on
+# detach. bluetoothctl, btmgmt and the pairing tool are stubs that record what
+# they were asked to do.
+cat >"$bin/bluetoothctl" <<'STUB'
+#!/bin/bash
+case $1 in
+  show) printf '\tPowered: yes\n' ;;
+  info)
+    [[ -e $BT_STATE/paired ]] || exit 1
+    printf '\tPaired: yes\n\tBonded: yes\n'
+    if [[ -e $BT_STATE/connected ]]; then printf '\tConnected: yes\n'; else printf '\tConnected: no\n'; fi
+    ;;
+  connect) echo "connect $2" >>"$BT_STATE/log"; [[ ! -e $BT_STATE/connectable ]] || : >"$BT_STATE/connected" ;;
+  remove) echo "remove $2" >>"$BT_STATE/log"; rm -f "$BT_STATE/paired" "$BT_STATE/connected" ;;
+  *) echo "$*" >>"$BT_STATE/log" ;;
+esac
+STUB
+cat >"$bin/btmgmt" <<'STUB'
+#!/bin/bash
+echo "btmgmt $*" >>"$BT_STATE/log"
+STUB
+cat >"$bin/logger" <<'STUB'
+#!/bin/bash
+STUB
+cat >"$bin/fake-flex-pair" <<'STUB'
+#!/bin/bash
+echo "pair $*" >>"$BT_STATE/log"
+[[ ${PAIR_FAILS:-} ]] && exit 1
+: >"$BT_STATE/paired"; : >"$BT_STATE/connected"
+STUB
+chmod +x "$bin/bluetoothctl" "$bin/btmgmt" "$bin/logger" "$bin/fake-flex-pair"
+
+keyboard=C5:45:77:5A:A0:E8
+flex_reset() {
+  rm -rf "$scratch/bt" "$scratch/run" "$scratch/hid"
+  mkdir -p "$scratch/bt" "$scratch/run" "$scratch/hid"
+  : >"$scratch/bt/log"
+}
+flex_attach() { mkdir -p "$scratch/hid/0019:045E:0C8B.0002" "$scratch/hid/0019:045E:0C8F.0001"; }
+flex_bond() { echo "$keyboard" >"$scratch/bt/address"; : >"$scratch/bt/paired"; }
+flex() {
+  PATH="$bin:$PATH" BT_STATE="$scratch/bt" SP11_FLEX_COMPATIBLE="$scratch/$1" \
+    SP11_FLEX_HID_DEVICES="$scratch/hid" SP11_FLEX_ADDRESS_FILE="$scratch/bt/address" \
+    SP11_FLEX_RUN_DIR="$scratch/run" SP11_FLEX_PAIR_TOOL="$bin/fake-flex-pair" SP11_FLEX_NO_SLEEP=1 \
+    bash "$package_dir/surface-pro-11-flex-$2" >/dev/null 2>&1 || true
+}
+flex_did() { grep -qx "$1" "$scratch/bt/log"; }
+
+flex_reset; flex_attach
+flex other autopair
+! flex_did "pair --no-detach" || fail "the Flex Keyboard is left alone on other hardware"
+
+flex_reset; flex_attach
+flex denali autopair
+flex_did "pair --no-detach" || fail "an attached keyboard with no bond is paired over the wire"
+
+flex_reset; flex_attach; flex_bond; : >"$scratch/bt/connected"
+flex denali autopair
+[[ ! -s $scratch/bt/log ]] || fail "a working bond is left alone"
+
+# The bond would even connect on request: only the marker says it is stale.
+flex_reset; flex_attach; flex_bond; : >"$scratch/bt/connectable"; : >"$scratch/run/flex-needs-repair"
+flex denali autopair
+flex_did "remove $keyboard" && flex_did "pair --no-detach" ||
+  fail "a bond that failed to reconnect on detach is replaced on the next attach"
+[[ ! -e $scratch/run/flex-needs-repair ]] || fail "a successful pair clears the repair marker"
+
+flex_reset; flex_attach; flex_bond
+flex denali autopair
+flex_did "btmgmt power off" && flex_did "remove $keyboard" && flex_did "pair --no-detach" ||
+  fail "a bond that will not connect even after a controller reset is replaced"
+
+flex_reset; flex_attach; flex_bond; : >"$scratch/bt/connectable"
+flex denali autopair
+! flex_did "pair --no-detach" || fail "a bond that connects on request is kept"
+
+flex_reset; mkdir -p "$scratch/hid/0019:045E:0C8B.0002"
+flex denali autopair
+! flex_did "pair --no-detach" || fail "without the kernel's pairing channel nothing is paired"
+
+flex_reset
+flex denali autopair
+! flex_did "pair --no-detach" || fail "a detached keyboard is not paired"
+
+flex_reset; flex_bond; : >"$scratch/bt/connectable"
+flex denali reconnect
+flex_did "connect $keyboard" && [[ ! -e $scratch/run/flex-needs-repair ]] ||
+  fail "a detached keyboard is connected over Bluetooth"
+
+flex_reset; flex_bond
+flex denali reconnect
+[[ -e $scratch/run/flex-needs-repair ]] || fail "a detached keyboard that never connects is marked for re-pairing"
+
+flex_reset; flex_attach; flex_bond
+flex denali reconnect
+! flex_did "connect $keyboard" || fail "an attached keyboard is not connected over Bluetooth"
+
+python -c 'import ast, sys; ast.parse(open(sys.argv[1]).read())' "$package_dir/surface-pro-11-flex-pair" ||
+  fail "the pairing tool is valid Python"
+for unit in surface-pro-11-flex-autopair surface-pro-11-flex-reconnect; do
+  grep -qx 'ConditionFirmware=device-tree-compatible(microsoft,denali-oled)' "$package_dir/$unit.service" ||
+    fail "$unit runs only on the Surface Pro 11 OLED"
+  grep -q "start $unit.service" "$package_dir/70-surface-pro-11-flex-keyboard.rules" ||
+    fail "attaching or detaching the keyboard starts $unit"
+done
+
 echo "ok - surface-pro-11-support verifies its hardware setup"
