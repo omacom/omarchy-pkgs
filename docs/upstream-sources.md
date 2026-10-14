@@ -73,13 +73,18 @@ because its published history counted every commit and the number must never
 go down.
 
 `min_release_age` holds a branch tip until its commit timestamp is old enough.
-A fresh tip leaves the existing pin alone; the watch never walks backward to
-an older commit. This uses Git's committer date, not the time a commit was
-pushed. `BYPASS_MIN_RELEASE_AGE=1` bypasses the hold.
+A fresh tip falls back to the newest commit on the branch's first-parent
+history that has cleared the window, so a busy branch still advances; it never
+selects a commit from a merged side branch. This uses Git's committer date, not
+the time a commit was pushed, measured from when the run cloned the branch so
+packages pinned from it agree. `BYPASS_MIN_RELEASE_AGE=1` bypasses the hold.
 
 Packages marked `"auto_merge": true` ride the unattended lane
-(`track-branches.yml`) instead of the reviewed sync PR: their bump PR is opened
-and auto-merged as soon as the build checks pass. The lane works with every
+(`track-branches.yml`), checked hourly instead of every 6 hours. Every lane
+opens its PRs through `package-prs.yml` and auto-merges them as soon as the
+build checks pass. Each package gets its own
+PR on `auto/track-branches-<package>`, and packages that pin the same branch
+share one, so a package whose build fails holds back only itself. The lane works with every
 provider, not only branch watches, so it also carries release feeds trusted to
 ship without review: the browsers, large vendors' apps, Omacom's own projects,
 and vendor binaries that hold fresh releases with `min_release_age`. `bin/sync-upstream --lane
@@ -224,22 +229,20 @@ These packages were already excluded from automatic AUR updates. The migration p
 - Spotify uses HTTPS and retains its signed Release/Packages verification.
 - Source and build compatibility still need review when upstream code changes. Direct watches remove AUR recipe churn, not the need to maintain packaging.
 
-## How the sync PR builds
+## How the sync PRs build
 
-`sync-upstream.yml` pushes its PR with the built-in `GITHUB_TOKEN`, so GitHub
-holds the PR's build and test runs for approval. The workflow labels its own
-PR `build-approved`, and its `approve` job releases the held runs for each
-commit it pushes. A push to an `auto/sync-*` branch, or to the tracker's
-`auto/track-branches`, does not cancel the PR's build in flight: the new
+`sync-upstream.yml`, `sync-rebuilds.yml` and `track-branches.yml` each run their
+sync once, split the changed recipes into one PR per package with
+`.github/scripts/package-pr-groups.sh`, and hand them to `package-prs.yml`. That
+pushes each PR with the PAT in `PKGS_BOT_TOKEN`, so its builds start without an
+approval hold, and arms auto-merge. A push to an `auto/sync-*` or
+`auto/track-branches-*` branch does not cancel the PR's build in flight: the new
 build waits, then reuses every artifact the finished one uploaded.
 
-Because of that push, GitHub starts no `pull_request_target` workflow for the
-PR, so `auto-merge-pr.yml` never arms it: a maintainer merges it.
-
-A run started by hand with `packages` opens its own PR on
-`auto/sync-upstream-<packages>`. The next scheduled run still picks the same
-update up in the shared PR if it has not merged by then; identical package
-trees reuse the same build artifacts.
+A red PR stays open for a maintainer and holds back only its own package. A
+later run updates it if upstream moves again, and closes it once it conflicts
+with `master`. A run started by hand with `packages` updates the same
+per-package PRs a scheduled run would.
 
 ## Declarative providers and hooks
 

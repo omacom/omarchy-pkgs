@@ -1,6 +1,6 @@
 # Superwhisper
 
-Packages the vendor's signed portable x86_64 Linux archive under `/opt/superwhisper`, with a launcher, desktop entries, user service, fonts, icons and the fcitx5 text-commit addon. Local models are downloaded through Superwhisper's settings; they are not bundled in the package.
+Packages the vendor's signed portable x86_64 or aarch64 Linux archive under `/opt/superwhisper`, with a launcher, desktop entries, user service, fonts, icons and the fcitx5 text-commit addon. Local models are downloaded through Superwhisper's settings; they are not bundled in the package.
 
 `sync-upstream` follows stable releases from `superultrainc/superwhisper-linux-releases` (`v1.0.0` and later); prereleases are ignored. The vendor version is kept in `_version`. The recipe verifies the archive's SHA256 and Minisign signature against the checked-in vendor release key. Packaging never runs the downloaded installer.
 

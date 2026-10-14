@@ -37,7 +37,8 @@ A dependency this repository carries for an architecture (a recipe here that bui
 
 ## The workflow
 
-`sync-rebuilds.yml` runs `bin/sync-rebuilds` every 6 hours, opens one PR on
-`auto/sync-rebuilds` and enables auto-merge. The PR lands once `result`,
-`self-tests` and `build-isolation` pass, and the merge publishes. A rebuild that
-fails stays an open red PR for a maintainer.
+`sync-rebuilds.yml` runs `bin/sync-rebuilds` every 6 hours and opens one PR per
+package on `auto/sync-rebuilds-<package>` with auto-merge enabled. Each PR lands
+once `result`, `self-tests` and `build-isolation` pass, and the merge publishes.
+A rebuild that fails stays an open red PR for a maintainer without holding back
+the others.

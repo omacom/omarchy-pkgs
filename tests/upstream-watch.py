@@ -250,14 +250,41 @@ b2sums=('old' 'local-b2')
         with self.redirect_clone(repo), self.assertRaisesRegex(ValueError, 'no tag'):
             w.git_branch_tip('https://example.test/tool.git', 'main', r'release-(?P<version>[0-9.]+)', self.root / 'other-cache')
 
-    def test_git_branch_min_age_holds_the_tip_instead_of_selecting_history(self):
+    def test_git_branch_min_age_falls_back_to_the_newest_old_enough_tip(self):
         repo, shas = self.branch_fixture(fresh_tip=True)
         watch = {'git_branch': 'https://example.test/tool.git', 'branch': 'main'}
         with self.redirect_clone(repo):
             releases = w.discover(watch, self.fetch)
+            held = w.discover(watch, self.fetch, min_age=3600)
         self.assertEqual(w.select_release(releases)['values']['commit'], shas[-1])
+        # The backstop still refuses the fresh tip itself...
         self.assertIsNone(w.select_release(releases, min_age=3600))
         self.assertEqual(w.select_release(releases, min_age=3600, bypass=True)['values']['commit'], shas[-1])
+        # ...and the watch offers the commit before it instead of nothing.
+        self.assertEqual(w.select_release(held, min_age=3600)['values']['commit'], shas[-2])
+        self.assertEqual(held[0]['values']['count'], str(len(shas) - 1))
+
+    def test_git_branch_min_age_never_falls_back_into_a_merged_side_branch(self):
+        repo, shas = self.branch_fixture()
+        git = ['git', '-C', str(repo), '-c', 'user.name=Test', '-c', 'user.email=test@example.test']
+        old = {**os.environ, 'GIT_COMMITTER_DATE': '2020-01-02T00:00:00+00:00', 'GIT_AUTHOR_DATE': '2020-01-02T00:00:00+00:00'}
+        subprocess.run([*git, 'checkout', '-q', '-b', 'side'], check=True)
+        (repo / 'side').write_text('x')
+        subprocess.run([*git, 'add', '.'], check=True)
+        subprocess.run([*git, 'commit', '-qm', 'side'], env=old, check=True)
+        subprocess.run([*git, 'checkout', '-q', 'main'], check=True)
+        subprocess.run([*git, 'merge', '-q', '--no-ff', '-m', 'merge side', 'side'], check=True)
+        watch = {'git_branch': 'https://example.test/tool.git', 'branch': 'main'}
+        with self.redirect_clone(repo):
+            held = w.discover(watch, self.fetch, min_age=3600)
+        self.assertEqual(w.select_release(held, min_age=3600)['values']['commit'], shas[-1])
+
+    def test_git_branch_min_age_holds_when_nothing_is_old_enough(self):
+        repo, shas = self.branch_fixture(fresh_tip=True)
+        watch = {'git_branch': 'https://example.test/tool.git', 'branch': 'main'}
+        with self.redirect_clone(repo):
+            held = w.discover(watch, self.fetch, min_age=10 ** 10)
+        self.assertIsNone(w.select_release(held, min_age=10 ** 10))
 
     def branch_sync_fixture(self):
         repo, shas = self.branch_fixture()

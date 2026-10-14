@@ -1,6 +1,6 @@
 # Only the build runner is under test; source-free fixtures need no Omarchy
 # bootstrap, signing key, mirror, or production repository.
-FROM archlinux:base-devel
+FROM ghcr.io/archlinux/archlinux:base-devel
 RUN pacman -Syu --noconfirm git jq sudo && \
     useradd -m -u 1000 builder && \
     echo 'builder ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/builder && \

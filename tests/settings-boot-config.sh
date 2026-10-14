@@ -7,57 +7,8 @@ scratch=$(mktemp -d)
 trap 'rm -rf "$scratch"' EXIT
 fixture=$scratch/src/omarchy
 
-files=(
-  config/autostart/limine-snapper-notify.desktop
-  etc/fastfetch/config.jsonc
-  etc/mkinitcpio.conf.d/omarchy_hooks.conf
-  etc/mkinitcpio.conf.d/thunderbolt_module.conf
-  etc/limine-entry-tool.d/omarchy-defaults.conf
-  etc/limine-entry-tool.d/omarchy-uki.conf
-  etc/security/faillock.conf
-  etc/nsswitch.conf
-  etc/cups/cups-browsed.conf
-  etc/cups/cups-files.conf
-  etc/plymouth/plymouthd.conf
-  etc/sysctl.d/99-omarchy-sysctl.conf
-  default/uwsm/env.d/10-omarchy
-  default/environment.d/10-omarchy-fcitx.conf
-  default/fontconfig/conf.avail/50-omarchy.conf
-  default/xdg-terminal-exec/hyprland-xdg-terminals.list
-  default/applications/mimeapps.list
-  default/systemd/user/bt-agent.service
-  default/systemd/user/omarchy-sleep-lock.service
-  default/systemd/user/omarchy-recover-internal-monitor.service
-  default/systemd/user/omarchy-migrate-notify.service
-  default/systemd/user/omarchy-tailscale-receive.service
-  default/systemd/user/omarchy-fcitx5.service
-  default/systemd/user/omarchy-crash-watch.service
-  default/systemd/user/app.slice.d/10-oomd.conf
-  default/systemd/zram-generator.conf.d/90-omarchy.conf
-  default/systemd/system/plocate-updatedb.service.d/10-omarchy.conf
-  default/systemd/system-sleep/unmount-fuse
-  default/bashrc
-  default/limine/default.conf
-  default/limine/limine.conf
-  default/snapper/root
-  default/sddm/omarchy/Main.qml
-  default/sddm/hyprland.lua
-  default/wayland-sessions/omarchy.desktop
-  default/plymouth/omarchy.plymouth
-  default/fonts/omarchy/omarchy.ttf
-  default/hypr/toggles/flags.lua
-  default/nautilus-python/extensions/localsend.py
-  default/nautilus-python/extensions/transcode.py
-  default/tensaku/state.toml
-  applications/example.desktop
-  bin/omarchy-upload-log
-  bin/omarchy-debug
-  bin/omarchy-debug-idle
-  logo.txt
-  logo.svg
-  icon.txt
-  icon.png
-)
+# Every source path the settings recipes install by name.
+mapfile -t files < "$BUILD_ROOT/tests/fixtures/settings-source-files"
 for path in "${files[@]}"; do
   mkdir -p "$(dirname "$fixture/$path")"
   printf 'fixture for %s\n' "$path" > "$fixture/$path"

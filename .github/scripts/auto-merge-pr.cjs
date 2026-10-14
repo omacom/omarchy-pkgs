@@ -14,9 +14,6 @@
 //   test.yml runs on PRs only; an existing test may also run on master
 //   (builder-images.yml runs tests/build-isolation.sh with packages: write),
 //   so editing one still needs a maintainer.
-// - Not the upstream sync. It labels its own PR build-approved to release
-//   GitHub's hold on its pushes, which is no one's approval; it stays on the
-//   reviewed lane.
 const PACKAGES = 'pkgbuilds/';
 const TESTS = 'tests/';
 const TEST_WORKFLOW = '.github/workflows/test.yml';
@@ -38,7 +35,6 @@ function packageChange(file) {
   if (file.filename === TEST_WORKFLOW) return file.status === 'modified' && onlyRunsTests(file.patch);
   return false;
 }
-const REVIEWED_BRANCHES = /^auto\/sync-upstream(\/|$)/;
 
 function decide({ pr, files, vouchStatus, repository }) {
   if (pr.state !== 'open') return { enable: false, reason: 'PR is not open' };
@@ -53,10 +49,6 @@ function decide({ pr, files, vouchStatus, repository }) {
   }
   if (!trusted) {
     return { enable: false, reason: `author not trusted to build (${vouchStatus || 'missing'}${labelled ? ', labelled' : ''})` };
-  }
-
-  if (pr.head.repo?.full_name === repository && REVIEWED_BRANCHES.test(pr.head.ref)) {
-    return { enable: false, reason: `${pr.head.ref} stays on the reviewed lane` };
   }
 
   if (!files.length) return { enable: false, reason: 'PR changes no files' };

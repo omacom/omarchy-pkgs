@@ -1,9 +1,11 @@
 name: Sync Rebuild Triggers
 
-# Rebuilds ride the unattended lane, like track-branches.yml: the pkgrel bump
-# PR builds on the droplets, auto-merge lands it once `result`, `self-tests`
-# and `build-isolation` are green, and the merge publishes. A rebuild that
-# fails stays an unmerged red PR for a maintainer.
+# Rebuilds ride the unattended lane, like track-branches.yml: each package's
+# pkgrel bump gets its own PR on auto/sync-rebuilds-<package>, opened by
+# package-prs.yml. It builds on the droplets, auto-merge lands it once
+# `result`, `self-tests` and `build-isolation` are green, and the merge
+# publishes. A rebuild that fails stays an unmerged red PR for a maintainer
+# without holding back any other package.
 #
 # The PR and auto-merge use the PAT in PKGS_BOT_TOKEN, because a merge made
 # with the built-in GITHUB_TOKEN does not start publish.yml, and its pushes
@@ -20,12 +22,19 @@ on:
         required: false
         default: ''
 
+# One sync at a time: two runs racing on one auto/sync-rebuilds-* branch
+# would each force-push their own bump over the other's.
+concurrency:
+  group: sync-rebuilds
+  cancel-in-progress: false
+
 jobs:
   sync:
     runs-on: ubuntu-latest
     permissions:
-      contents: write
-      pull-requests: write
+      contents: read
+    outputs:
+      groups: ${{ steps.groups.outputs.groups }}
 
     steps:
       - name: Require the bot token
@@ -42,23 +51,13 @@ jobs:
         with:
           persist-credentials: false
 
-      # A scoped dispatch regenerates only the named packages. Pushed to the
-      # shared branch, that would replace every other pending update in its
-      # PR, so it gets a branch and PR of its own.
-      - name: Choose the PR branch
-        id: branch
-        env:
-          PACKAGES: ${{ github.event.inputs.packages }}
-        run: |
-          read -r -a package_args <<< "${PACKAGES:-}"
-          .github/scripts/sync-pr-branch.sh auto/sync-rebuilds "${package_args[@]}" | tee -a "$GITHUB_OUTPUT"
-
       # Runs in an Arch container against the mirror the x86_64 builder itself
       # uses, because the question being asked is what that builder will link
       # against and a different mirror can be hours ahead of it. Recording a
       # version the build never saw is the one failure this command must not
       # have: nothing re-fires once the record matches.
       - name: Bump pkgrel for packages whose dependencies moved
+        id: sync
         run: |
           docker run --rm \
             -e PACKAGES="$PACKAGES" \
@@ -68,7 +67,7 @@ jobs:
             -v "$PWD/helpers:/workspace/helpers:ro" \
             -v "$PWD/pkgbuilds:/workspace/pkgbuilds" \
             -w /workspace \
-            archlinux:base-devel bash -lc '
+            ghcr.io/archlinux/archlinux:base-devel bash -lc '
               set -euo pipefail
 
               printf "Server = https://mirror.omarchy.org/\$repo/os/\$arch\n" > /etc/pacman.d/mirrorlist
@@ -88,56 +87,53 @@ jobs:
         env:
           PACKAGES: ${{ github.event.inputs.packages }}
 
-      - name: Check for changes
-        id: changes
+      - name: Group the bumps into PRs
+        if: ${{ !cancelled() && steps.sync.outcome != 'skipped' }}
+        id: groups
         run: |
-          if [ -z "$(git status --porcelain)" ]; then
-            echo "has_changes=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "has_changes=true" >> "$GITHUB_OUTPUT"
-          fi
+          groups=$(.github/scripts/package-pr-groups.sh auto/sync-rebuilds "$RUNNER_TEMP/pins.patch")
+          echo "groups=$groups" >> "$GITHUB_OUTPUT"
 
-      - name: Create Pull Request
-        if: steps.changes.outputs.has_changes == 'true'
-        id: cpr
-        uses: peter-evans/create-pull-request@v7
+      - name: Hand the bumps to the PR jobs
+        if: ${{ !cancelled() && steps.groups.outputs.groups != '' && steps.groups.outputs.groups != '[]' }}
+        uses: actions/upload-artifact@v4
         with:
-          token: ${{ secrets.PKGS_BOT_TOKEN }}
-          commit-message: 'chore: rebuild against updated dependencies'
-          title: "chore: rebuild against updated dependencies${{ steps.branch.outputs.scope && format(' ({0})', steps.branch.outputs.scope) || '' }}"
-          body: |
-            Automated pkgrel bump for packages that link against a dependency
-            which has moved in the official repositories.
+          name: package-pins
+          path: ${{ runner.temp }}/pins.patch
+          retention-days: 1
 
-            Each package names those dependencies in `rebuild_on` and carries the
-            versions its current pkgrel was bumped for in `rebuilt_against`. The
-            bump is what makes the rebuilt package an upgrade pacman will offer;
-            without it the build produces the version already published and no
-            one receives it.
+  prs:
+    needs: sync
+    if: ${{ !cancelled() && needs.sync.outputs.groups != '' }}
+    permissions:
+      contents: read
+    uses: ./.github/workflows/package-prs.yml
+    with:
+      groups: ${{ needs.sync.outputs.groups }}
+      prefix: auto/sync-rebuilds
+      title: Rebuild against updated dependencies
+      body: |
+        Automated pkgrel bump for a package that links against a dependency
+        which has moved in the official repositories.
 
-            This PR auto-merges once the build checks pass. A failing rebuild
-            leaves it open for a maintainer.
-          branch: ${{ steps.branch.outputs.branch }}
-          delete-branch: true
-          labels: automated
+        Each package names those dependencies in `rebuild_on` and carries the
+        versions its current pkgrel was bumped for in `rebuilt_against`. The
+        bump is what makes the rebuilt package an upgrade pacman will offer;
+        without it the build produces the version already published and no
+        one receives it.
 
-      # Auto-merge, not a direct merge: branch protection still has to see
-      # the build checks green before the rebuild lands.
-      - name: Enable auto-merge
-        if: steps.cpr.outputs.pull-request-number != ''
-        env:
-          GH_TOKEN: ${{ secrets.PKGS_BOT_TOKEN }}
-          PR: ${{ steps.cpr.outputs.pull-request-number }}
-        run: |
-          # Idempotent across re-runs of an updated PR: enabling twice errors.
-          if [[ "$(gh pr view "$PR" -R "${{ github.repository }}" --json autoMergeRequest --jq '.autoMergeRequest != null')" == true ]]; then
-            echo "auto-merge already enabled on #$PR"
-            exit 0
-          fi
-          gh pr merge --auto --merge "$PR" -R "${{ github.repository }}"
+        This PR auto-merges once the build checks pass. A failing rebuild
+        leaves it open for a maintainer without holding back any other package.
+    secrets:
+      PKGS_BOT_TOKEN: ${{ secrets.PKGS_BOT_TOKEN }}
 
+  notify:
+    needs: [sync, prs]
+    if: ${{ failure() }}
+    runs-on: ubuntu-latest
+    steps:
       - name: Notify Basecamp on failure
-        if: failure() && env.BASECAMP_CHATBOT_URL != ''
+        if: ${{ env.BASECAMP_CHATBOT_URL != '' }}
         env:
           BASECAMP_CHATBOT_URL: ${{ secrets.BASECAMP_CHATBOT_URL }}
         run: |

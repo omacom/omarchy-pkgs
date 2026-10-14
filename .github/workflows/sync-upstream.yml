@@ -1,5 +1,17 @@
 name: Sync Upstream Releases
 
+# Bumps every package whose upstream release feed has moved, except the
+# "auto_merge": true packages that track-branches.yml checks hourly. Each
+# package gets its own PR on auto/sync-upstream-<package>, opened by
+# package-prs.yml: the PR builds on the droplets, auto-merge lands it when
+# `result` is green, and the merge publishes. A package that fails to build
+# stays an open red PR for a maintainer without holding back any other; the
+# next run updates it if upstream moves again. `min_release_age` still
+# quarantines fresh releases before they are proposed.
+#
+# The PRs and auto-merge use the PAT in PKGS_BOT_TOKEN, so their pushes
+# build without an approval hold and their merges start publish.yml.
+
 on:
   schedule:
     # Every 6 hours, off the hour to dodge the scheduling backlog at :00
@@ -11,35 +23,34 @@ on:
         required: false
         default: ''
 
+# One sync at a time: two runs racing on one auto/sync-upstream-* branch
+# would each force-push their own update over the other's.
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
 jobs:
   sync:
     runs-on: ubuntu-latest
     permissions:
-      contents: write
-      pull-requests: write
+      contents: read
     outputs:
-      branch: ${{ steps.branch.outputs.branch }}
-      pushed_at: ${{ steps.pushed.outputs.at }}
-      number: ${{ steps.cpr.outputs.pull-request-number }}
-      operation: ${{ steps.cpr.outputs.pull-request-operation }}
-      head_sha: ${{ steps.cpr.outputs.pull-request-head-sha }}
+      groups: ${{ steps.groups.outputs.groups }}
 
     steps:
+      - name: Require the bot token
+        env:
+          PKGS_BOT_TOKEN: ${{ secrets.PKGS_BOT_TOKEN }}
+        run: |
+          if [[ -z "$PKGS_BOT_TOKEN" ]]; then
+            echo "::error::Set PKGS_BOT_TOKEN to a PAT with Contents: write and Pull requests: write on this repository, owned by an account trusted to trigger builds."
+            exit 1
+          fi
+
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           persist-credentials: false
-
-      # A scoped dispatch regenerates only the named packages. Pushed to the
-      # shared branch, that would replace every other pending update in its
-      # PR, so it gets a branch and PR of its own.
-      - name: Choose the PR branch
-        id: branch
-        env:
-          PACKAGES: ${{ github.event.inputs.packages }}
-        run: |
-          read -r -a package_args <<< "${PACKAGES:-}"
-          .github/scripts/sync-pr-branch.sh auto/sync-upstream "${package_args[@]}" | tee -a "$GITHUB_OUTPUT"
 
       # Runs in an Arch container for vercmp: whether a release is an upgrade has
       # to be decided by the same comparator pacman will use on users' machines.
@@ -55,7 +66,7 @@ jobs:
             -v "$PWD/helpers:/workspace/helpers:ro" \
             -v "$PWD/pkgbuilds:/workspace/pkgbuilds" \
             -w /workspace \
-            archlinux:base-devel bash -lc '
+            ghcr.io/archlinux/archlinux:base-devel bash -lc '
               set -euo pipefail
 
               pacman -Syu --noconfirm git jq python libarchive
@@ -64,8 +75,8 @@ jobs:
               useradd -m -u "$HOST_UID" -g "$HOST_GID" runner
               chown -R runner:runner /workspace/pkgbuilds
 
-              # The reviewed lane only: packages marked auto_merge ride
-              # track-branches.yml, which merges without a human.
+              # Packages marked auto_merge ride track-branches.yml instead,
+              # which checks them hourly.
               if [[ -n "${PACKAGES:-}" ]]; then
                 read -r -a package_args <<< "$PACKAGES"
                 runuser -u runner -- ./bin/sync-upstream --lane reviewed "${package_args[@]}"
@@ -78,50 +89,50 @@ jobs:
           UPSTREAM_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       # Failed feeds leave their recipes untouched; completed updates still
-      # reach review. The failed sync step keeps the workflow red and notifies.
-      - name: Check for changes
+      # get their PRs. The failed sync step keeps the workflow red and notifies.
+      - name: Group the updates into PRs
         if: ${{ !cancelled() && steps.sync.outcome != 'skipped' }}
-        id: changes
+        id: groups
         run: |
-          if [ -z "$(git status --porcelain)" ]; then
-            echo "has_changes=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "has_changes=true" >> "$GITHUB_OUTPUT"
-          fi
+          groups=$(.github/scripts/package-pr-groups.sh auto/sync-upstream "$RUNNER_TEMP/pins.patch")
+          echo "groups=$groups" >> "$GITHUB_OUTPUT"
 
-      # Runs created by this push are newer than this; the approve job
-      # waits for them. A minute's slack absorbs runner clock skew.
-      - name: Record push time
-        if: ${{ !cancelled() && steps.changes.outputs.has_changes == 'true' }}
-        id: pushed
-        run: echo "at=$(date -u -d '-1 minute' +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
-
-      - name: Create Pull Request
-        if: ${{ !cancelled() && steps.changes.outputs.has_changes == 'true' }}
-        id: cpr
-        uses: peter-evans/create-pull-request@v7
+      - name: Hand the updates to the PR jobs
+        if: ${{ !cancelled() && steps.groups.outputs.groups != '' && steps.groups.outputs.groups != '[]' }}
+        uses: actions/upload-artifact@v4
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          commit-message: 'chore: sync upstream releases'
-          title: "chore: sync upstream releases${{ steps.branch.outputs.scope && format(' ({0})', steps.branch.outputs.scope) || '' }}"
-          body: |
-            Automated update of packages that track an upstream vendor release
-            feed rather than the AUR.
+          name: package-pins
+          path: ${{ runner.temp }}/pins.patch
+          retention-days: 1
 
-            Release watches and providers are declared in `.omarchy/package.json`;
-            exceptional feeds use `.omarchy/upstream.sh`. Failed package updates
-            are left untouched; check the workflow result for outstanding failures.
-          branch: ${{ steps.branch.outputs.branch }}
-          delete-branch: true
-          # The bot is trusted; build-approved lets the approve job below
-          # release GitHub's hold on its pushes without a maintainer.
-          labels: |
-            automated
-            build-approved
-          reviewers: ryanrhughes
+  prs:
+    needs: sync
+    if: ${{ !cancelled() && needs.sync.outputs.groups != '' }}
+    permissions:
+      contents: read
+    uses: ./.github/workflows/package-prs.yml
+    with:
+      groups: ${{ needs.sync.outputs.groups }}
+      prefix: auto/sync-upstream
+      title: Sync upstream releases
+      body: |
+        Automated update of a package that tracks an upstream vendor release
+        feed rather than the AUR.
 
+        Release watches and providers are declared in `.omarchy/package.json`;
+        exceptional feeds use `.omarchy/upstream.sh`. This PR auto-merges once
+        the build checks pass. A failing build leaves it open for a maintainer
+        without holding back any other package.
+    secrets:
+      PKGS_BOT_TOKEN: ${{ secrets.PKGS_BOT_TOKEN }}
+
+  notify:
+    needs: [sync, prs]
+    if: ${{ failure() }}
+    runs-on: ubuntu-latest
+    steps:
       - name: Notify Basecamp on failure
-        if: failure() && env.BASECAMP_CHATBOT_URL != ''
+        if: ${{ env.BASECAMP_CHATBOT_URL != '' }}
         env:
           BASECAMP_CHATBOT_URL: ${{ secrets.BASECAMP_CHATBOT_URL }}
         run: |
@@ -131,36 +142,3 @@ jobs:
               "🔴 <strong>Upstream sync failed</strong><br><a href=\"${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\">View run</a>" \
               '{content: $content}')" \
             "$BASECAMP_CHATBOT_URL"
-
-  # GitHub holds pull_request runs from a GITHUB_TOKEN push for approval and
-  # creates no pull_request_target run for it, so approve-pr.yml never sees
-  # the sync's own pushes. The sync labels its PR build-approved, so release
-  # the held runs for the commit just pushed, whether it opened the PR or
-  # updated it. A separate job, so the sync container's token never holds
-  # actions: write.
-  approve:
-    needs: sync
-    if: ${{ !cancelled() && (needs.sync.outputs.operation == 'created' || needs.sync.outputs.operation == 'updated') }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    permissions:
-      contents: read
-      pull-requests: read
-      actions: write
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          persist-credentials: false
-      - name: Release held build and test runs
-        uses: actions/github-script@v7
-        env:
-          NUMBER: ${{ needs.sync.outputs.number }}
-          BRANCH: ${{ needs.sync.outputs.branch }}
-          HEAD_SHA: ${{ needs.sync.outputs.head_sha }}
-          SINCE: ${{ needs.sync.outputs.pushed_at }}
-        with:
-          script: |
-            const approve = require('./.github/scripts/approve-sync-push.cjs');
-            const { NUMBER, BRANCH, HEAD_SHA, SINCE } = process.env;
-            await approve({ github, context, core, number: Number(NUMBER),
-              branch: BRANCH, headSha: HEAD_SHA, since: SINCE });
