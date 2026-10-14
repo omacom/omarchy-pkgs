@@ -18,7 +18,7 @@ PR's packages do not see each other's fresh builds; they resolve from `edge`.
 4. Blocks consumers of a failed prerequisite while continuing independent
    builds.
 
-Example: If `aether` depends on `hyprshade`, `hyprshade` is built first.
+Example: `steam` on aarch64 depends on `gtk2`, so `gtk2` is built first.
 
 Isolation also lets the release and dev Omarchy pairs build in the same run:
 Flea can install `omarchy` without preventing `omarchy-dev` from installing

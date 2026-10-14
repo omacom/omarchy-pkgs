@@ -160,7 +160,6 @@ in `origin` and has no effect on release selection.
 | `1password-cli` | json | [https://app-updates.agilebits.com/check/1/0/CLI2/en/0](https://app-updates.agilebits.com/check/1/0/CLI2/en/0) |
 | `aether` | github | [omacom/aether](https://github.com/omacom/aether) |
 | `basecamp-cli` | github | [basecamp/basecamp-cli](https://github.com/basecamp/basecamp-cli) |
-| `bun-bin` | github | [oven-sh/bun](https://github.com/oven-sh/bun) |
 | `claude-code` | regex | [https://downloads.claude.ai/claude-code-releases/latest](https://downloads.claude.ai/claude-code-releases/latest) |
 | `cliamp` | github | [bjarneo/cliamp](https://github.com/bjarneo/cliamp) |
 | `crush-bin` | github | [charmbracelet/crush](https://github.com/charmbracelet/crush) |
@@ -170,27 +169,22 @@ in `origin` and has no effect on release selection.
 | `dropbox` | redirect | [https://www.dropbox.com/download?plat=lnx.x86_64](https://www.dropbox.com/download?plat=lnx.x86_64) |
 | `dropbox-cli` | regex | [https://linux.dropbox.com/packages/](https://linux.dropbox.com/packages/) |
 | `heroic-games-launcher-bin` | github | [Heroic-Games-Launcher/HeroicGamesLauncher](https://github.com/Heroic-Games-Launcher/HeroicGamesLauncher) |
-| `hyprshade` | pypi | [hyprshade](https://pypi.org/project/hyprshade/) |
 | `lib32-nvidia-580xx-utils` | regex | [https://download.nvidia.com/XFree86/Linux-x86_64/](https://download.nvidia.com/XFree86/Linux-x86_64/) |
 | `limine-mkinitcpio-hook` | git_tags | [https://gitlab.com/Zesko/limine-entry-tool.git](https://gitlab.com/Zesko/limine-entry-tool.git) |
 | `limine-snapper-sync` | git_tags | [https://gitlab.com/Zesko/limine-snapper-sync.git](https://gitlab.com/Zesko/limine-snapper-sync.git) |
 | `lmstudio-bin` | regex | [https://lmstudio.ai/download](https://lmstudio.ai/download) |
 | `localsend` | github | [localsend/localsend](https://github.com/localsend/localsend) |
-| `localsend-bin` | github | [localsend/localsend](https://github.com/localsend/localsend) |
 | `macbook12-spi-driver-dkms` | git_branch | [https://github.com/marc-git/macbook12-spi-driver.git](https://github.com/marc-git/macbook12-spi-driver.git) |
 | `omarchy-dev`, `omarchy-settings-dev` | git_branch (auto-merge) | [https://github.com/basecamp/omarchy.git](https://github.com/basecamp/omarchy.git) `quattro` |
 | `omasnap-git` | git_branch (auto-merge) | [https://github.com/omacom/omasnap.git](https://github.com/omacom/omasnap.git) `main` |
-| `makima-bin` | github | [cyber-sushi/makima](https://github.com/cyber-sushi/makima) |
 | `minecraft-launcher` | archive | [https://launcher.mojang.com/download/Minecraft.deb](https://launcher.mojang.com/download/Minecraft.deb) |
 | `nautilus-dropbox` | github | [dropbox/nautilus-dropbox](https://github.com/dropbox/nautilus-dropbox) |
-| `nautilus-open-any-terminal` | git_tags | [https://github.com/Stunkymonkey/nautilus-open-any-terminal.git](https://github.com/Stunkymonkey/nautilus-open-any-terminal.git) |
 | `nordvpn-bin` | debian | [https://repo.nordvpn.com/deb/nordvpn/debian/dists/stable/main/binary-amd64/Packages](https://repo.nordvpn.com/deb/nordvpn/debian/dists/stable/main/binary-amd64/Packages) |
 | `nvidia-580xx-utils` | regex | [https://download.nvidia.com/XFree86/Linux-x86_64/](https://download.nvidia.com/XFree86/Linux-x86_64/) |
 | `omarchy-chromium-bin` | github | [omacom/omarchy-chromium](https://github.com/omacom/omarchy-chromium) |
 | `omarchy-emacs` | git_tags | [https://github.com/scottjones/omarchy-emacs.git](https://github.com/scottjones/omarchy-emacs.git) |
 | `omazed` | git_tags | [https://github.com/aps6/omazed.git](https://github.com/aps6/omazed.git) |
 | `once-bin` | github | [basecamp/once](https://github.com/basecamp/once) |
-| `openai-codex-bin` | github | [openai/codex](https://github.com/openai/codex) |
 | `python-mediapipe` | github | [google-ai-edge/mediapipe](https://github.com/google-ai-edge/mediapipe) |
 | `python-sounddevice` | pypi | [sounddevice](https://pypi.org/project/sounddevice/) |
 | `python-terminaltexteffects` | pypi | [terminaltexteffects](https://pypi.org/project/terminaltexteffects/) |
