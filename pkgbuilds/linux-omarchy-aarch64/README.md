@@ -69,6 +69,8 @@ Patches 1090–1095 are NVIDIA's SAUCE from `Ubuntu-nvidia-7.0-7.0.0-1022.23_24.
 
 `1096` (0f0aeba49253, NVIDIA PR #635, merged after 1022.23) clears the MT8901 EINT event mask for every interrupt armed as a wake source, not only the ACPI event line, so the SPM sees keyboard and touchpad wakes. Without it the platform's deepest sleep state could only be left by the ACPI event line, and a key press did not wake it.
 
+`1097` keeps the generic ACPI xHCI path when firmware marks both supported SSPM mailbox devices absent. The DGX Spark uses the same NVDA8000/NVDA8001 controller IDs as N1x laptops, but can hide that mailbox; requiring Power Wrap there prevents all USB controllers from starting. A present mailbox still requires successful Power Wrap initialization.
+
 NVIDIA's companion watchdog rework (280db0e8cf30) is not carried; it replaces the sbsa_gwdt sleep patch already in `1020` and needs the upstream `early_enable` parameter (1376a013a1, linux-next) first.
 
 The USB4 driver binds only with `power_wrap_drv.usb4_release=0` on the command line. Omarchy sets that together with the PCI hotplug padding.
