@@ -75,6 +75,8 @@ NVIDIA's companion watchdog rework (280db0e8cf30) is not carried; it replaces th
 
 The USB4 driver binds only with `power_wrap_drv.usb4_release=0` on the command line. Omarchy sets that together with the PCI hotplug padding.
 
+`1098` checks for a firmware-present SSPM mailbox before arming the USB4 resource-release hook or probing the SSPM-only ACPI SPI and DSP power drivers. GB10 firmware can describe those devices with SSPM absent. The SPI device-tree path and Power Wrap's other setup are unchanged; a present mailbox that fails still reports its existing errors. This does not enable SPI, audio DSP or USB4 power management on a machine without that interface.
+
 SAUCE that was left out:
 
 - `serial: 8250_mtk: Add ACPI support`, the MT7925 CSA patch and the four cpufreq QoS patches are superseded by 7.2
