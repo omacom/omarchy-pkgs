@@ -8,6 +8,15 @@ The `pkgrel` counts N1x revisions of this package and starts again at 1 when the
 
 [`UPGRADING-7.3.md`](UPGRADING-7.3.md) has notes for the move to 7.3: what each N1x patch needs there, what upstream already has, and how to verify the result.
 
+## DGX Spark
+
+`1099` leaves the firmware DVFSRC flag unchanged on the NVIDIA DGX Spark.
+The N1x probe-time SYSRAM write triggers idle resets on that machine even
+though it reports the same PLID. The exception matches the exact DMI vendor
+and product; BestPerf and the rest of power_wrap remain enabled. Other GB10
+products have not been tested, and the firmware reset mechanism is still
+unknown.
+
 ## N1x patches
 
 Patches 1000–1040 are NVIDIA's SAUCE from `Ubuntu-nvidia-7.0-7.0.0-1021.21_24.04.1` (commit `dd99802c8b0c384169bb36293c9517fa67238e47`), rebased onto 7.2.8 with Omarchy's patches applied and grouped by topic:
