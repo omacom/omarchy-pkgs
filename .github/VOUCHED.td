@@ -20,6 +20,7 @@ github:dhh
 github:f-trycua
 github:HANCORE-linux
 github:kwilczynski
+github:malik-na
 github:ryanrhughes
 github:scottjones
 github:spencerbull
