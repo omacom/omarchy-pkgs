@@ -40,6 +40,12 @@ echo "==> Removing package files..."
 for file in $FILES; do
   rm -f "$file"
   echo "  ✓ Removed $file"
+  [[ "$file" == *.sig ]] && continue
+  adv_stem="${file%.pkg.tar.*}"
+  if [[ -f "${adv_stem}.advisory.json" ]]; then
+    rm -f "${adv_stem}.advisory.json" "${adv_stem}.advisory.json.sig"
+    echo "  ✓ Removed ${adv_stem}.advisory.json"
+  fi
 done
 
 echo ""

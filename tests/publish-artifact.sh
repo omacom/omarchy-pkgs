@@ -69,6 +69,15 @@ if pub "$C1"; then fail "aarch64 package into x86_64 should refuse"; else grep -
 cp "$B1" "$T/renamed-1.0-1-x86_64.pkg.tar.zst"
 if pub "$T/renamed-1.0-1-x86_64.pkg.tar.zst"; then fail "filename/PKGINFO mismatch should refuse"; else grep -q 'does not match PKGINFO' "$T/out" && pass "filename must match PKGINFO" || fail "mismatch reason"; fi
 
+# An advisory beside the package is uploaded, and a later publish replaces it.
+adv="$(dirname "$A2")/$(basename "${A2%.pkg.tar.*}").advisory.json"
+printf 'cve-v1\n' >"$adv"
+pub "$A2" && [[ "$(cat "$REMOTE/edge/x86_64/$(basename "$adv")")" == "cve-v1" ]] \
+  && pass "advisory beside the package is uploaded" || fail "advisory upload"
+printf 'cve-v2\n' >"$adv"
+pub "$A2" && [[ "$(cat "$REMOTE/edge/x86_64/$(basename "$adv")")" == "cve-v2" ]] \
+  && pass "republish overwrites the advisory" || fail "advisory overwrite"
+
 # db must verify: pacman can read it and each package's signature checks
 gpg --batch --quiet --import <<<"$GPG_PRIVATE_KEY" 2>/dev/null || true
 ( cd "$REMOTE/edge/x86_64" && for f in *.pkg.tar.zst; do gpg --batch --quiet --verify "$f.sig" "$f" 2>/dev/null || { echo "FAIL: signature $f"; exit 1; }; done ) && pass "all signatures verify"

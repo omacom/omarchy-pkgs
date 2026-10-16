@@ -106,8 +106,14 @@ REPO_ROOT="${OMARCHY_REPO_ROOT:-$BUILD_ROOT/pkgs.omarchy.org}"
 # Function to update architecture and mirror-specific paths
 # Call this after changing ARCH or MIRROR variables
 update_arch_paths() {
-  BUILD_OUTPUT_DIR="$BUILD_ROOT/build-output/$MIRROR/$ARCH" # Unsigned packages
-  REPO_DIR="$REPO_ROOT/$MIRROR/$ARCH"                       # Repository (signed packages)
+  # OMARCHY_BUILD_OUTPUT_DIR lets a test point promotion at a throwaway tree.
+  # The published repository already has OMARCHY_REPO_ROOT for the same reason.
+  if [[ -n "${OMARCHY_BUILD_OUTPUT_DIR:-}" ]]; then
+    BUILD_OUTPUT_DIR="$OMARCHY_BUILD_OUTPUT_DIR"
+  else
+    BUILD_OUTPUT_DIR="$BUILD_ROOT/build-output/$MIRROR/$ARCH"
+  fi
+  REPO_DIR="$REPO_ROOT/$MIRROR/$ARCH"
 }
 
 # Initialize architecture-specific directories with default ARCH and MIRROR
