@@ -1,0 +1,106 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dante Loi <danteloi1993@gmail.com>
+Date: Wed, 14 Oct 2026 10:24:09 +0200
+Subject: [PATCH] elanmoc: Discard replies 04f3:0c90 kept from a previous
+ session
+
+04f3:0c90 keeps replies queued on its IN endpoints across the USB reset
+done on open. A reply the previous session never read, such as one left
+by closing the device right after a cancelled verification, is then
+taken for the reply to the first command of the new session: opening
+fails with "device sent more data than requested", or every later reply
+is read one command late, which shows up as "Packet too short for user
+id!" when a two byte status lands where the user id was expected.
+
+Before sending any command, read both reply endpoints until they time
+out and discard what they return.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ libfprint/drivers/elanmoc/elanmoc.c | 51 +++++++++++++++++++++++++++++
+ libfprint/drivers/elanmoc/elanmoc.h |  3 ++
+ 2 files changed, 54 insertions(+)
+
+diff --git a/libfprint/drivers/elanmoc/elanmoc.c b/libfprint/drivers/elanmoc/elanmoc.c
+index 951ea0fc..0eecd35f 100644
+--- a/libfprint/drivers/elanmoc/elanmoc.c
++++ b/libfprint/drivers/elanmoc/elanmoc.c
+@@ -1204,6 +1204,50 @@ elanmoc_probe (FpDevice *device)
+   fpi_device_probe_complete (device, NULL, NULL, NULL);
+ }
+ 
++/* 04f3:0c90 keeps queued replies across a USB reset. One the previous
++ * session never read would be taken for the reply to the first command of
++ * this one, leaving every later reply one command late. Discard whatever both
++ * reply endpoints hold before sending anything; a timeout means the endpoint
++ * is empty. */
++static gboolean
++elanmoc_drain_replies (FpDevice *device, GError **error)
++{
++  const guint8 endpoints[] = { ELAN_EP_CMD_IN, ELAN_EP_MOC_CMD_IN };
++
++  for (guint i = 0; i < G_N_ELEMENTS (endpoints); i++)
++    {
++      guint packets;
++
++      for (packets = 0; packets < ELAN_MOC_DRAIN_MAX_PACKETS; packets++)
++        {
++          g_autoptr(FpiUsbTransfer) transfer = fpi_usb_transfer_new (device);
++          g_autoptr(GError) local_error = NULL;
++
++          fpi_usb_transfer_fill_bulk (transfer, endpoints[i], ELAN_MOC_PACKET_SIZE);
++          if (!fpi_usb_transfer_submit_sync (transfer, ELAN_MOC_DRAIN_TIMEOUT, &local_error))
++            {
++              if (g_error_matches (local_error, G_USB_DEVICE_ERROR, G_USB_DEVICE_ERROR_TIMED_OUT))
++                break;
++
++              g_propagate_error (error, g_steal_pointer (&local_error));
++              return FALSE;
++            }
++
++          fp_dbg ("Discarded %" G_GSSIZE_FORMAT " stale bytes on endpoint 0x%02x",
++                  transfer->actual_length, endpoints[i]);
++        }
++
++      if (packets == ELAN_MOC_DRAIN_MAX_PACKETS)
++        {
++          g_set_error (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_PROTO,
++                       "Endpoint 0x%02x keeps sending replies", endpoints[i]);
++          return FALSE;
++        }
++    }
++
++  return TRUE;
++}
++
+ static void
+ elanmoc_open (FpDevice *device)
+ {
+@@ -1217,6 +1261,13 @@ elanmoc_open (FpDevice *device)
+   if (!g_usb_device_claim_interface (fpi_device_get_usb_device (device), 0, 0, &error))
+     goto error;
+ 
++  if (fpi_device_get_driver_data (device) == ELANMOC_QUIRK_NO_ENUM &&
++      !elanmoc_drain_replies (device, &error))
++    {
++      g_usb_device_release_interface (fpi_device_get_usb_device (device), 0, 0, NULL);
++      goto error;
++    }
++
+   productid = g_usb_device_get_pid (fpi_device_get_usb_device (device));
+   switch (productid)
+     {
+diff --git a/libfprint/drivers/elanmoc/elanmoc.h b/libfprint/drivers/elanmoc/elanmoc.h
+index bf957de0..57e9acc4 100644
+--- a/libfprint/drivers/elanmoc/elanmoc.h
++++ b/libfprint/drivers/elanmoc/elanmoc.h
+@@ -35,6 +35,9 @@ G_DECLARE_FINAL_TYPE (FpiDeviceElanmoc, fpi_device_elanmoc, FPI, DEVICE_ELANMOC,
+ #define ELAN_EP_IMG_IN (0x2 | LIBUSB_ENDPOINT_IN)
+ 
+ #define ELAN_MOC_CMD_TIMEOUT 5000
++#define ELAN_MOC_PACKET_SIZE 64
++#define ELAN_MOC_DRAIN_TIMEOUT 20
++#define ELAN_MOC_DRAIN_MAX_PACKETS 32
+ #define ELAN_MOC_CAL_RETRY 500
+ #define ELAN_MOC_ENROLL_TIMES 9
+ #define ELAN_MAX_USER_ID_LEN 92

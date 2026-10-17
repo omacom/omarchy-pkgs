@@ -1,0 +1,352 @@
+From 400c39d7013a7cb39a5745df3d73edc0dcb028b7 Mon Sep 17 00:00:00 2001
+From: M Lintang Maulana Zulfan <lintangmaulanazulfan@gmail.com>
+Date: Sat, 1 Aug 2026 17:58:12 +0700
+Subject: [PATCH] elanmoc: Add support for ELAN 04f3:0c90
+
+This sensor is found in the ASUS Vivobook X1404ZA. It speaks the elanmoc
+protocol, but adding the PID alone is not enough: it does not implement
+three of the commands the driver assumes are present, and disagrees with
+it on two values.
+
+  set mode argument    0x03            -> 0x00
+  enroll steps         9               -> 11
+  re-enroll check      40 ff 22        -> not implemented
+  get user id          43 21 <slot>    -> 40 ff 12 <slot>
+  verify               40 ff 73        -> 40 ff 03
+
+The set mode argument is the one that actually blocks matching. In mode
+0x03 the sensor still detects a finger and still reports image quality,
+but never compares it against a template: the wait-for-finger command
+then only ever answers with a quality code or 0xfd.
+
+The reply to 40 ff 03 uses the same convention elanmoc_identify_cb
+already assumes for 40 ff 73 - second byte is the matched slot number,
+0xfd means no match - so that callback is reused unchanged.
+
+The reply to 40 ff 12 carries one extra byte before the stored blob, so
+the buffer is shifted by one before create_print_from_response() reads
+it.
+
+Storage cannot be enumerated because 43 21 is not implemented, so the
+STORAGE features are dropped during probe and libfprint keeps the print
+metadata on the host. Templates still live on the chip.
+
+The device is dropped from the unsupported list in
+fprint-list-udev-hwdb.c, which otherwise makes the udev-hwdb test abort
+now that a driver claims it, and data/autosuspend.hwdb is regenerated
+accordingly.
+
+Note that scripts/sync-unsupported-devices.py will put the device back
+into that list until it is also removed from the Unsupported-Devices wiki
+page.
+
+Findings come from a USB capture of the vendor driver on the same
+machine. Enroll and identify were both verified on the hardware.
+---
+ data/autosuspend.hwdb               |   2 +-
+ libfprint/drivers/elanmoc/elanmoc.c | 137 ++++++++++++++++++++++++++--
+ libfprint/drivers/elanmoc/elanmoc.h |  17 ++++
+ libfprint/fprint-list-udev-hwdb.c   |   1 -
+ 4 files changed, 149 insertions(+), 8 deletions(-)
+
+diff --git a/data/autosuspend.hwdb b/data/autosuspend.hwdb
+index 5482fc95..8ca5d691 100644
+--- a/data/autosuspend.hwdb
++++ b/data/autosuspend.hwdb
+@@ -160,6 +160,7 @@ usb:v04F3p0C58*
+  ID_PERSIST=0
+ 
+ # Supported by libfprint driver elanmoc
++usb:v04F3p0C90*
+ usb:v04F3p0C7D*
+ usb:v04F3p0C7E*
+ usb:v04F3p0C82*
+@@ -408,7 +409,6 @@ usb:v04F3p0C80*
+ usb:v04F3p0C85*
+ usb:v04F3p0C8A*
+ usb:v04F3p0C8E*
+-usb:v04F3p0C90*
+ usb:v04F3p0CA2*
+ usb:v04F3p24CC*
+ usb:v04F3p2706*
+diff --git a/libfprint/drivers/elanmoc/elanmoc.c b/libfprint/drivers/elanmoc/elanmoc.c
+index 23bd901a..20615324 100644
+--- a/libfprint/drivers/elanmoc/elanmoc.c
++++ b/libfprint/drivers/elanmoc/elanmoc.c
+@@ -24,7 +24,12 @@
+ 
+ G_DEFINE_TYPE (FpiDeviceElanmoc, fpi_device_elanmoc, FP_TYPE_DEVICE)
+ 
++/* 04f3:0c90 does not implement {0x43,0x21,idx} (get user id), so the
++ * on-chip storage cannot be enumerated. */
++#define ELANMOC_QUIRK_NO_ENUM 1
++
+ static const FpIdEntry id_table[] = {
++  { .vid = 0x04f3,  .pid = 0x0c90,  .driver_data = ELANMOC_QUIRK_NO_ENUM },
+   { .vid = 0x04f3,  .pid = 0x0c7d,  },
+   { .vid = 0x04f3,  .pid = 0x0c7e,  },
+   { .vid = 0x04f3,  .pid = 0x0c82,  },
+@@ -137,6 +142,25 @@ fp_cmd_receive_cb (FpiUsbTransfer *transfer,
+   fpi_ssm_mark_completed (transfer->ssm);
+ }
+ 
++/* Argument of the 0x14 (set mode) command.
++ *
++ * libfprint uses 0x03. A USB capture of the Windows driver talking to
++ * 04f3:0c90 shows 0x00, sent once at the start of the session and used for
++ * both verify and enroll.
++ *
++ * On this sensor mode 0x03 still detects a finger and still reports image
++ * quality, but never performs a match: 0x03 (wait finger) then only ever
++ * answers with a quality code or 0xfd. Mode 0x00 is required for matching
++ * to happen at all. */
++static guint8
++elanmoc_mode_value (FpDevice *dev)
++{
++  if (fpi_device_get_driver_data (dev) == ELANMOC_QUIRK_NO_ENUM)
++    return 0x00;
++
++  return 0x03;
++}
++
+ typedef enum {
+   ELAN_MOC_CMD_SEND = 0,
+   ELAN_MOC_CMD_GET,
+@@ -455,6 +479,17 @@ elan_enroll_run_state (FpiSsm *ssm, FpDevice *dev)
+       break;
+ 
+     case MOC_ENROLL_REENROLL_CHECK:
++      /* 04f3:0c90 never answers opcode 0x22 (re-enroll check): the read on
++       * endpoint 0x83 just times out. The opcode does not appear anywhere in
++       * a USB capture of the Windows driver doing enroll and verify either.
++       * Skip it and treat this as a fresh enrollment, which is what
++       * elanmoc_reenroll_cb does when buffer_in[1] == 0x00. */
++      if (fpi_device_get_driver_data (dev) == ELANMOC_QUIRK_NO_ENUM)
++        {
++          self->num_frames = 0;
++          fpi_ssm_next_state (ssm);
++          break;
++        }
+       data = fpi_ssm_get_data (ssm);
+       cmd_buf = elanmoc_compose_cmd (&elanmoc_check_reenroll_cmd);
+       memcpy (cmd_buf + 3, data, ELAN_USERDATE_SIZE);
+@@ -503,7 +538,9 @@ create_print_from_response (FpiDeviceElanmoc *self,
+   g_autofree gchar *userid_safe = NULL;
+   int userid_len = 0;
+ 
+-  if (buffer_in[0] != 0x43)
++  /* On 04f3:0c90 the user id comes from 0x12 instead of 0x43 0x21, so the
++   * reply starts with 0x40 rather than 0x43. */
++  if (buffer_in[0] != 0x43 && buffer_in[0] != 0x40)
+     {
+       g_propagate_error (error,
+                          fpi_device_error_new_msg (FP_DEVICE_ERROR_PROTO,
+@@ -566,7 +603,9 @@ elanmoc_get_userid_cb (FpiDeviceElanmoc *self,
+       return;
+     }
+ 
+-  if (buffer_in[0] != 0x43)
++  /* On 04f3:0c90 the user id comes from 0x12 instead of 0x43 0x21, so the
++   * reply starts with 0x40 rather than 0x43. */
++  if (buffer_in[0] != 0x43 && buffer_in[0] != 0x40)
+     {
+       fpi_ssm_mark_failed (self->task_ssm,
+                            fpi_device_error_new_msg (FP_DEVICE_ERROR_PROTO,
+@@ -659,7 +698,9 @@ elanmoc_match_report_cb (FpiDeviceElanmoc *self,
+       return;
+     }
+ 
+-  if (buffer_in[0] != 0x43)
++  /* On 04f3:0c90 the user id comes from 0x12 instead of 0x43 0x21, so the
++   * reply starts with 0x40 rather than 0x43. */
++  if (buffer_in[0] != 0x43 && buffer_in[0] != 0x40)
+     {
+       fpi_ssm_mark_failed (self->task_ssm,
+                            fpi_device_error_new_msg (FP_DEVICE_ERROR_PROTO,
+@@ -667,7 +708,31 @@ elanmoc_match_report_cb (FpiDeviceElanmoc *self,
+       return;
+     }
+ 
+-  print = create_print_from_response (self, buffer_in, length_in, &error);
++  /* The 0x12 reply carries one extra byte at offset 2, so the stored blob
++   * starts at offset 3 instead of 2 as it does in a 0x43 0x21 reply:
++   *
++   *   40 00 00 00 00 1c 46 50 31 2d ...
++   *    |  |  |        |  |
++   *    |  |  |        |  `- 'F', start of "FP1-20260801-A-..."
++   *    |  |  |        `---- 0x1c = 28, the exact length of that string
++   *    |  |  `------------- extra byte
++   *    |  `---------------- status
++   *    `------------------- header
++   *
++   * Shift by one so create_print_from_response() can be reused unchanged,
++   * putting the header and status bytes back where it expects them. */
++  if (fpi_device_get_driver_data (device) == ELANMOC_QUIRK_NO_ENUM)
++    {
++      g_autofree guint8 *shifted = g_memdup2 (buffer_in + 1, length_in - 1);
++
++      shifted[0] = buffer_in[0];
++      shifted[1] = buffer_in[1];
++      print = create_print_from_response (self, shifted, length_in - 1, &error);
++    }
++  else
++    {
++      print = create_print_from_response (self, buffer_in, length_in, &error);
++    }
+ 
+   if (!print)
+     {
+@@ -739,6 +804,19 @@ identify_status_report (FpiDeviceElanmoc *self, int verify_status_id,
+     case RSP_VERIFY_OK:
+       {
+         fp_dbg ("Identify was successful! for user: %d mesg_code: %d ", data, verify_status_id);
++
++        /* 04f3:0c90 does not answer 0x43 0x21 (get user id); the equivalent
++         * is 40 ff 12 <slot>, which replies with 64 bytes. */
++        if (fpi_device_get_driver_data (device) == ELANMOC_QUIRK_NO_ENUM)
++          {
++            cmd_buf = elanmoc_compose_cmd (&elanmoc_get_match_cmd);
++            cmd_buf[3] = data;
++            elanmoc_get_cmd (device, cmd_buf, elanmoc_get_match_cmd.cmd_len,
++                             elanmoc_get_match_cmd.resp_len, 0,
++                             elanmoc_match_report_cb);
++            break;
++          }
++
+         cmd_buf = elanmoc_compose_cmd (&elanmoc_get_userid_cmd);
+         cmd_buf[2] = data;
+         elanmoc_get_cmd (device, cmd_buf, elanmoc_get_userid_cmd.cmd_len, elanmoc_get_userid_cmd.resp_len, 0, elanmoc_match_report_cb);
+@@ -787,12 +865,30 @@ elan_identify_run_state (FpiSsm *ssm, FpDevice *dev)
+     case IDENTIFY_SET_MODE:
+       fp_info ("elanmoc %s IDENTIFY_SET_MODE", __func__);
+       cmd_buf = elanmoc_compose_cmd (&elanmoc_set_mod_cmd);
+-      cmd_buf[3] = 0x03;
++      cmd_buf[3] = elanmoc_mode_value (dev);
+       elanmoc_get_cmd (dev, cmd_buf, elanmoc_set_mod_cmd.cmd_len, elanmoc_set_mod_cmd.resp_len, 0, elanmoc_cmd_ack_cb);
+       break;
+ 
+     case IDENTIFY_WAIT_FINGER:
+       fp_info ("elanmoc %s IDENTIFY_WAIT_FINGER", __func__);
++      /* 04f3:0c90 does not support elanmoc_verify_cmd (0x73). The
++       * equivalent is 40 ff 03, and its reply follows the same convention
++       * that elanmoc_identify_cb already assumes:
++       *
++       *   0x00-0x08  match, this is the slot number
++       *   0xfd       no match
++       *   0xfb/0xfe  image dirty / not enough area
++       *   0x41-0x44  finger too high/left/low/right
++       *
++       * so the callback is reused as is. */
++      if (fpi_device_get_driver_data (dev) == ELANMOC_QUIRK_NO_ENUM)
++        {
++          cmd_buf = elanmoc_compose_cmd (&elanmoc_wait_finger_cmd);
++          elanmoc_get_cmd (dev, cmd_buf, elanmoc_wait_finger_cmd.cmd_len,
++                           elanmoc_wait_finger_cmd.resp_len, 1,
++                           elanmoc_identify_cb);
++          break;
++        }
+       cmd_buf = elanmoc_compose_cmd (&elanmoc_verify_cmd);
+       elanmoc_get_cmd (dev, cmd_buf, elanmoc_verify_cmd.cmd_len, elanmoc_verify_cmd.resp_len, 1, elanmoc_identify_cb);
+       break;
+@@ -1031,7 +1127,7 @@ dev_init_handler (FpiSsm *ssm, FpDevice *dev)
+ 
+     case DEV_SET_MODE:
+       cmd_buf = elanmoc_compose_cmd (&elanmoc_set_mod_cmd);
+-      cmd_buf[3] = 0x03;
++      cmd_buf[3] = elanmoc_mode_value (dev);
+       elanmoc_get_cmd (dev, cmd_buf, elanmoc_set_mod_cmd.cmd_len, elanmoc_set_mod_cmd.resp_len, 0, elanmoc_cmd_ack_cb);
+       break;
+ 
+@@ -1053,6 +1149,28 @@ dev_init_handler (FpiSsm *ssm, FpDevice *dev)
+     }
+ }
+ 
++static void
++elanmoc_probe (FpDevice *device)
++{
++  /* 04f3:0c90 does not answer {0x43,0x21,idx} (get user id), so its
++   * storage cannot be enumerated. Drop the STORAGE features: libfprint then
++   * keeps the print metadata on the host and uses the sensor purely for
++   * matching. Templates still live on the chip.
++   *
++   * This must happen during PROBE - fpi_device_update_features() asserts
++   * current_action == FPI_DEVICE_ACTION_PROBE. */
++  if (fpi_device_get_driver_data (device) == ELANMOC_QUIRK_NO_ENUM)
++    {
++      fpi_device_update_features (device,
++                                  FP_DEVICE_FEATURE_STORAGE |
++                                  FP_DEVICE_FEATURE_STORAGE_LIST |
++                                  FP_DEVICE_FEATURE_STORAGE_DELETE |
++                                  FP_DEVICE_FEATURE_STORAGE_CLEAR, 0);
++    }
++
++  fpi_device_probe_complete (device, NULL, NULL, NULL);
++}
++
+ static void
+ elanmoc_open (FpDevice *device)
+ {
+@@ -1069,6 +1187,12 @@ elanmoc_open (FpDevice *device)
+   productid = g_usb_device_get_pid (fpi_device_get_usb_device (device));
+   switch (productid)
+     {
++    /* A USB capture of the Windows driver shows 11 enroll steps: the
++     * enroll command carries 0x0b as the total and counts 0x00..0x0a. */
++    case 0x0c90:
++      self->max_moc_enroll_time = 11;
++      break;
++
+     case 0x0c8c:
+       self->max_moc_enroll_time = 11;
+       break;
+@@ -1150,6 +1274,7 @@ fpi_device_elanmoc_class_init (FpiDeviceElanmocClass *klass)
+   dev_class->nr_enroll_stages = ELAN_MOC_ENROLL_TIMES;
+   dev_class->temp_hot_seconds = -1;
+ 
++  dev_class->probe = elanmoc_probe;
+   dev_class->open = elanmoc_open;
+   dev_class->close = elanmoc_close;
+   dev_class->enroll = elanmoc_enroll;
+diff --git a/libfprint/drivers/elanmoc/elanmoc.h b/libfprint/drivers/elanmoc/elanmoc.h
+index a948d401..bf957de0 100644
+--- a/libfprint/drivers/elanmoc/elanmoc.h
++++ b/libfprint/drivers/elanmoc/elanmoc.h
+@@ -127,6 +127,23 @@ static const struct elanmoc_cmd elanmoc_get_userid_cmd = {
+   .resp_len = 97,
+ };
+ 
++/* Verify sequence used by 04f3:0c90, recovered from a USB capture of the
++ * Windows driver:
++ *   40 ff 03        wait for finger, 2 byte reply on ep 0x84,
++ *                   second byte = matched slot number
++ *   40 ff 12 <slot> fetch that slot's user id, 64 byte reply on ep 0x83 */
++static const struct elanmoc_cmd elanmoc_wait_finger_cmd = {
++  .cmd_header = {0x40, 0xff, 0x03},
++  .cmd_len = 3,
++  .resp_len = 2,
++};
++
++static const struct elanmoc_cmd elanmoc_get_match_cmd = {
++  .cmd_header = {0x40, 0xff, 0x12},
++  .cmd_len = 4,
++  .resp_len = 64,
++};
++
+ static const struct elanmoc_cmd elanmoc_set_mod_cmd = {
+   .cmd_header = {0x40, 0xff, 0x14},
+   .cmd_len = 4,
+diff --git a/libfprint/fprint-list-udev-hwdb.c b/libfprint/fprint-list-udev-hwdb.c
+index 539f3e69..14adec10 100644
+--- a/libfprint/fprint-list-udev-hwdb.c
++++ b/libfprint/fprint-list-udev-hwdb.c
+@@ -56,7 +56,6 @@ static const FpIdEntry allowlist_id_table[] = {
+   { .vid = 0x04f3, .pid = 0x0c85 },
+   { .vid = 0x04f3, .pid = 0x0c8a },
+   { .vid = 0x04f3, .pid = 0x0c8e },
+-  { .vid = 0x04f3, .pid = 0x0c90 },
+   { .vid = 0x04f3, .pid = 0x0ca2 },
+   { .vid = 0x04f3, .pid = 0x24cc },
+   { .vid = 0x04f3, .pid = 0x2706 },
+-- 
+GitLab
+
