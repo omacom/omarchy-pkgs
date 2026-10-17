@@ -74,6 +74,9 @@ def with_hermes_node_path(env=None):
     unshare.write_text('#!/bin/bash\nexit "${TEST_NAMESPACE_RESULT:-0}"\n')
     unshare.chmod(0o755)
     forbidden = '#!/bin/bash\ntouch "$TEST_FORBIDDEN"\nexit 99\n'
+    notify = mock_bin / "notify-send"
+    notify.write_text('#!/bin/bash\nprintf \'%s\\n\' "$@" >>"${TEST_NOTIFICATIONS:-/dev/null}"\n')
+    notify.chmod(0o755)
     cli = runtime / "venv/bin/hermes"
     cli.parent.mkdir(parents=True)
     cli.write_text(forbidden)
@@ -234,11 +237,33 @@ def load_config():
     check_launch([url], wayland, ["--ozone-platform=wayland", url], ignore="1")
     check_launch([url], {**wayland, "HERMES_DESKTOP_IGNORE_EXISTING": "0"}, ["--ozone-platform=wayland", url],
                  ignore="0")
+    # A checkout with a command still opens the packaged app, marker or not.
+    (runtime / ".git").mkdir()
+    check_launch([url], wayland, ["--ozone-platform=wayland", url], ignore="1")
+    (runtime / ".git").rmdir()
     (module / "main_desktop.py").write_text('raise ImportError("incomplete Python dependencies")\n')
     check_launch([url], wayland, ["--ozone-platform=wayland", url], ignore="1")
     shutil.rmtree(runtime / "venv")
     check_launch(overrides={"ELECTRON_RUN_AS_NODE": "1", "PYTHONPATH": "/invalid", "PYTHONHOME": "/invalid"},
                  ignore="1")
+    # A checkout with neither command nor bootstrap marker is a bootstrap that
+    # stopped early: refused with guidance on stderr and as a notification, not
+    # handed to the packaged app, which would update it to today's main and set
+    # it up with this release's installer, over and over. The marker, as the
+    # finished bootstrap writes it, opens the packaged app as before.
+    (runtime / ".git").mkdir()
+    notifications = root / "notifications"
+    for args in ([], [url]):
+        result = subprocess.run(launch + args, env={**env, **wayland, "TEST_NOTIFICATIONS": str(notifications)},
+                                capture_output=True, text=True)
+        assert result.returncode != 0 and "omarchy install hermes cli --now" in result.stderr, result
+        assert "omarchy install hermes cli --now" in notifications.read_text()
+        assert not output.exists() and not forbidden_output.exists()
+        notifications.unlink()
+    (runtime / ".hermes-bootstrap-complete").touch()
+    check_launch(overrides=wayland, expected_args=["--ozone-platform=wayland"], ignore="1")
+    (runtime / ".hermes-bootstrap-complete").unlink()
+    (runtime / ".git").rmdir()
     check_namespace_failure()
 
     gate = ["bash", str(destination), "--self-test-gate", "--install-root", str(runtime),
