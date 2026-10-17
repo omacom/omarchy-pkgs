@@ -1,0 +1,116 @@
+#!/bin/bash
+
+# Give a Snapdragon Surface's Wi-Fi interface its own MAC address. ath12k
+# reports a Qualcomm placeholder (00:03:7f:...) as the permanent address, and
+# a different one on each boot. The real address is two below the
+# MacAddressEmulationAddress EFI variable, as Windows uses it; the variable
+# itself is the address a Surface Dock borrows for Ethernet, and Bluetooth is
+# the one between. The Surface Pro 11 and Surface Laptop 8 share this
+# layout. The permanent address comes from the Wi-Fi firmware, so this sets
+# the interface's address instead. udev runs it while the interface is being
+# added, before NetworkManager takes it.
+
+set -euo pipefail
+
+# udev discards the output of RUN programs; send it to the journal there.
+say() {
+  printf '%s\n' "$*"
+  if [[ -n "${SEQNUM:-}" ]] && command -v logger >/dev/null 2>&1; then
+    logger -t surface-wifi-address -- "$*"
+  fi
+}
+
+# Report an error where it can be seen, then exit with the given status.
+fail() {
+  local status=$1
+  shift
+  say "$*" >&2
+  exit "$status"
+}
+
+iface=${1:?usage: surface-wifi-address IFACE}
+
+if [[ ! "$iface" =~ ^[A-Za-z0-9_.-]{1,15}$ ]]; then
+  fail 2 "Invalid network interface name: $iface"
+fi
+
+# The rule matches any ath12k interface; act only on Microsoft machines. The
+# address variable is checked below, unless an override makes it unnecessary.
+vendor_path="${SURFACE_WIFI_DMI:-/sys/class/dmi/id}/sys_vendor"
+if [[ ! -r "$vendor_path" || "$(<"$vendor_path")" != 'Microsoft Corporation' ]]; then
+  exit 0
+fi
+
+for command_name in ip find od tr grep sed; do
+  if ! command -v "$command_name" >/dev/null 2>&1; then
+    fail 1 "Required command is unavailable: $command_name"
+  fi
+done
+
+is_valid_unicast_hex() {
+  local address_hex="$1"
+  local first_octet
+
+  [[ "$address_hex" =~ ^[0-9A-F]{12}$ ]] || return 1
+  [[ "$address_hex" != 000000000000 && "$address_hex" != FFFFFFFFFFFF ]] || return 1
+
+  first_octet="${address_hex:0:2}"
+  (( (16#$first_octet & 1) == 0 ))
+}
+
+# udev passes no environment file, so read the override here.
+config="${SURFACE_WIFI_CONFIG:-/etc/surface-wifi-address.conf}"
+if [[ -z "${SURFACE_WIFI_ADDRESS:-}" && -r "$config" ]]; then
+  SURFACE_WIFI_ADDRESS="$(sed -n 's/^SURFACE_WIFI_ADDRESS=["'\'']\{0,1\}\([0-9A-Fa-f:]*\)["'\'']\{0,1\}$/\1/p' "$config" | tail -n1)"
+fi
+
+address="${SURFACE_WIFI_ADDRESS:-}"
+if [[ -n "$address" ]]; then
+  address="${address^^}"
+  if [[ ! "$address" =~ ^([0-9A-F]{2}:){5}[0-9A-F]{2}$ ]] || \
+    ! is_valid_unicast_hex "${address//:/}"; then
+    fail 2 'SURFACE_WIFI_ADDRESS is not a valid unicast MAC address'
+  fi
+  address_source='configured override'
+else
+  efi_path="$(find "${SURFACE_WIFI_EFIVARS:-/sys/firmware/efi/efivars}" -maxdepth 1 \
+    -name 'MacAddressEmulationAddress-*' -print -quit 2>/dev/null || :)"
+  # Without the variable there is nothing to derive the address from.
+  if [[ -z "$efi_path" ]]; then
+    exit 0
+  fi
+
+  # efivarfs prepends a four-byte attributes field to the address bytes.
+  efi_hex="$(od -An -tx1 -j4 -N6 "$efi_path" | tr -d ' \n' | \
+    tr '[:lower:]' '[:upper:]')"
+  if ! is_valid_unicast_hex "$efi_hex"; then
+    fail 1 'Firmware EFI variable does not contain a valid unicast address'
+  fi
+  printf -v wifi_hex '%012X' $(( 16#$efi_hex - 2 ))
+  if ! is_valid_unicast_hex "$wifi_hex"; then
+    fail 1 'Derived Wi-Fi address is not a valid unicast address'
+  fi
+  printf -v address '%s:%s:%s:%s:%s:%s' \
+    "${wifi_hex:0:2}" "${wifi_hex:2:2}" "${wifi_hex:4:2}" \
+    "${wifi_hex:6:2}" "${wifi_hex:8:2}" "${wifi_hex:10:2}"
+  address_source='firmware address variable minus two'
+fi
+
+sysfs="${SURFACE_WIFI_SYSFS:-/sys/class/net}/$iface"
+current="$(<"$sysfs/address")"
+if [[ "${current^^}" == "$address" ]]; then
+  say "$iface already uses $address"
+  exit 0
+fi
+
+# Changing the address of a running interface drops its connection, so leave
+# an interface that is already up alone until it is added again.
+if (( $(<"$sysfs/flags") & 1 )); then
+  say "$iface is already up; its address is set when it is next added"
+  exit 0
+fi
+
+if ! ip link set dev "$iface" address "$address"; then
+  fail 1 "Could not set $iface address to $address"
+fi
+say "Set $iface address to $address from the $address_source"
