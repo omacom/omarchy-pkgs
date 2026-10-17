@@ -1,0 +1,121 @@
+#!/bin/bash
+set -euo pipefail
+
+if (( $# < 3 )); then
+  echo "Usage: ${0##*/} AUDIO_PACKAGE CAMERA_PACKAGE LINUX_HEADERS_PACKAGE..." >&2
+  exit 2
+fi
+
+audio_package=$1
+camera_package=$2
+shift 2
+
+for package in "$audio_package" "$camera_package"; do
+  [[ -f "$package" ]] || { echo "Package not found: $package" >&2; exit 1; }
+done
+
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+mkdir -p "$work/package" "$work/source" "$work/tree" "$work/install" \
+  "$work/home" "$work/fakebin"
+
+for command in curl wget git; do
+  printf '#!/bin/sh\necho "Unexpected network command: %s" >&2\nexit 99\n' \
+    "$command" > "$work/fakebin/$command"
+  chmod +x "$work/fakebin/$command"
+done
+
+bsdtar -xf "$audio_package" -C "$work/package"
+bsdtar -xf "$camera_package" -C "$work/package"
+
+shopt -s nullglob
+audio_sources=("$work/package/usr/src/snd_hda_macbookpro-"*)
+camera_sources=("$work/package/usr/src/facetimehd-"*)
+(( ${#audio_sources[@]} == 1 )) || {
+  echo "Expected one snd_hda_macbookpro source directory in $audio_package" >&2
+  exit 1
+}
+(( ${#camera_sources[@]} == 1 )) || {
+  echo "Expected one facetimehd source directory in $camera_package" >&2
+  exit 1
+}
+
+audio_version=${audio_sources[0]##*/snd_hda_macbookpro-}
+camera_version=${camera_sources[0]##*/facetimehd-}
+cp -a "${audio_sources[0]}" "$work/source/"
+cp -a "${camera_sources[0]}" "$work/source/"
+
+dkms_args=(
+  --dkmstree "$work/tree"
+  --sourcetree "$work/source"
+  --installtree "$work/install"
+)
+build_env=(env "HOME=$work/home" "PATH=$work/fakebin:$PATH")
+
+module_exists() {
+  local module_base=$1 suffix
+
+  for suffix in '' .gz .xz .zst; do
+    [[ -s "$module_base$suffix" ]] && return 0
+  done
+  return 1
+}
+
+"${build_env[@]}" dkms add -m snd_hda_macbookpro -v "$audio_version" "${dkms_args[@]}"
+"${build_env[@]}" dkms add -m facetimehd -v "$camera_version" "${dkms_args[@]}"
+
+for headers_package in "$@"; do
+  [[ -f "$headers_package" ]] || {
+    echo "Headers package not found: $headers_package" >&2
+    exit 1
+  }
+
+  kernelver=$(bsdtar -tf "$headers_package" | sed -n \
+    's|^usr/lib/modules/\([^/]*\)/build/Makefile$|\1|p')
+  [[ -n "$kernelver" && "$kernelver" != *$'\n'* ]] || {
+    echo "Could not identify one kernel version in $headers_package" >&2
+    exit 1
+  }
+
+  header_root="$work/headers-$kernelver"
+  mkdir -p "$header_root" "$work/install/$kernelver"
+  bsdtar -xf "$headers_package" -C "$header_root"
+  kernel_source="$header_root/usr/lib/modules/$kernelver/build"
+
+  "${build_env[@]}" dkms build \
+    -m snd_hda_macbookpro -v "$audio_version" -k "$kernelver" --arch x86_64 \
+    --kernelsourcedir "$kernel_source" "${dkms_args[@]}"
+  "${build_env[@]}" dkms build \
+    -m facetimehd -v "$camera_version" -k "$kernelver" --arch x86_64 \
+    --kernelsourcedir "$kernel_source" "${dkms_args[@]}"
+
+  fakeroot "${build_env[@]}" dkms install --no-depmod \
+    -m snd_hda_macbookpro -v "$audio_version" -k "$kernelver" --arch x86_64 \
+    "${dkms_args[@]}"
+  fakeroot "${build_env[@]}" dkms install --no-depmod \
+    -m facetimehd -v "$camera_version" -k "$kernelver" --arch x86_64 \
+    "${dkms_args[@]}"
+
+  audio_module="$work/tree/snd_hda_macbookpro/$audio_version/$kernelver/x86_64/module/snd-hda-codec-cs8409.ko"
+  camera_module="$work/tree/facetimehd/$camera_version/$kernelver/x86_64/module/facetimehd.ko"
+  [[ -s "$audio_module" ]] || {
+    echo "DKMS did not produce snd-hda-codec-cs8409 for $kernelver" >&2
+    exit 1
+  }
+  [[ -s "$camera_module" ]] || {
+    echo "DKMS did not produce facetimehd for $kernelver" >&2
+    exit 1
+  }
+  module_exists "$work/install/$kernelver/updates/dkms/snd-hda-codec-cs8409.ko" || {
+    echo "DKMS did not install snd-hda-codec-cs8409 for $kernelver" >&2
+    exit 1
+  }
+  module_exists "$work/install/$kernelver/updates/dkms/facetimehd.ko" || {
+    echo "DKMS did not install facetimehd for $kernelver" >&2
+    exit 1
+  }
+
+  echo "PASS $kernelver"
+  echo "  audio  srcversion=$(modinfo -F srcversion "$audio_module") vermagic=$(modinfo -F vermagic "$audio_module")"
+  echo "  camera srcversion=$(modinfo -F srcversion "$camera_module") vermagic=$(modinfo -F vermagic "$camera_module")"
+done
