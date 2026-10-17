@@ -1,0 +1,44 @@
+# Maintainer: David Heinemeier Hansson <david@hey.com>
+
+pkgname=herdr
+pkgver=0.9.1
+pkgrel=2
+pkgdesc="Herdr terminal workspace manager for AI coding agents"
+arch=('x86_64' 'aarch64')
+url="https://github.com/herdrdev/herdr"
+license=('Apache-2.0')
+depends=('gcc-libs' 'glibc')
+makedepends=('cargo')
+replaces=('omarchy-herdr')
+conflicts=('omarchy-herdr')
+options=('!debug' '!lto')
+
+_zigver=0.16.0
+source=("herdr-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
+source_x86_64=("zig-x86_64-linux-$_zigver.tar.xz::https://ziglang.org/download/$_zigver/zig-x86_64-linux-$_zigver.tar.xz")
+source_aarch64=("zig-aarch64-linux-$_zigver.tar.xz::https://ziglang.org/download/$_zigver/zig-aarch64-linux-$_zigver.tar.xz")
+sha256sums=('03403d3ef80dcf2b954dd5d27eb636e6c4f5279d240b48de272b7f53e4b73093')
+sha256sums_x86_64=('70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00')
+sha256sums_aarch64=('ea4b09bfb22ec6f6c6ceac57ab63efb6b46e17ab08d21f69f3a48b38e1534f17')
+
+prepare() {
+  cd "herdr-$pkgver"
+
+  cargo fetch --locked --target "$CARCH-unknown-linux-gnu"
+}
+
+build() {
+  cd "herdr-$pkgver"
+
+  export CARGO_TARGET_DIR=target
+  export ZIG="$srcdir/zig-$CARCH-linux-$_zigver/zig"
+  export ZIG_GLOBAL_CACHE_DIR="$srcdir/zig-cache"
+  cargo build --frozen --release
+}
+
+package() {
+  cd "herdr-$pkgver"
+
+  install -Dm755 target/release/herdr "$pkgdir/usr/bin/herdr"
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

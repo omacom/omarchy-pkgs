@@ -1,0 +1,42 @@
+# Maintainer: David Heinemeier Hansson <david@hey.com>
+
+pkgname=ttfx
+pkgver=0.5.0
+pkgrel=3
+pkgdesc="Terminal text effects as a single static binary — Rust port of terminaltexteffects"
+arch=('x86_64' 'aarch64')
+url="https://github.com/omacom/ttfx"
+license=('MIT')
+depends=('gcc-libs' 'glibc')
+makedepends=('cargo')
+options=('!debug')
+
+source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
+sha256sums=('2882c7e47011a95f4d136303f7320da71613299840f67f88fd1385ef53d5f2a0')
+
+prepare() {
+  cd "$pkgname-$pkgver"
+
+  cargo fetch --locked --target "$CARCH-unknown-linux-gnu"
+}
+
+build() {
+  cd "$pkgname-$pkgver"
+
+  export CARGO_TARGET_DIR=target
+  cargo build --frozen --release
+}
+
+package() {
+  cd "$pkgname-$pkgver"
+
+  install -Dm755 "target/release/ttfx" "$pkgdir/usr/bin/ttfx"
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+  install -Dm644 NOTICE "$pkgdir/usr/share/licenses/$pkgname/NOTICE"
+  install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+
+  "target/release/ttfx" --print-completion bash |
+    install -Dm644 /dev/stdin "$pkgdir/usr/share/bash-completion/completions/ttfx"
+  "target/release/ttfx" --print-completion zsh |
+    install -Dm644 /dev/stdin "$pkgdir/usr/share/zsh/site-functions/_ttfx"
+}

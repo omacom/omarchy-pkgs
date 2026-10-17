@@ -1,0 +1,146 @@
+# Maintainer: Ryan Hughes <ryan@omarchy.org>
+pkgname=omarchy-nvim
+pkgver=2026.9.21
+pkgrel=5
+pkgdesc="Pre-built LazyVim configuration with cached plugins"
+arch=('any')
+url="https://github.com/LazyVim/LazyVim"
+license=('MIT')
+depends=('neovim>=0.9.0' 'git')
+makedepends=('git' 'nodejs' 'npm' 'tree-sitter-cli')
+conflicts=('omarchy-lazyvim')
+options=('!debug')
+source=("https://github.com/LazyVim/starter/archive/refs/heads/main.tar.gz")
+sha256sums=('d865d50211358358d3c3c1e356773c1e3de1e8964215d85eb1b4c77521e17488')
+
+build() {
+  cd "$srcdir"
+
+  # Create isolated environment for building
+  export HOME="$srcdir/build-home"
+  export XDG_CONFIG_HOME="$HOME/.config"
+  export XDG_DATA_HOME="$HOME/.local/share"
+  export XDG_STATE_HOME="$HOME/.local/state"
+  export XDG_CACHE_HOME="$HOME/.cache"
+
+  mkdir -p "$XDG_CONFIG_HOME" "$XDG_DATA_HOME" "$XDG_STATE_HOME" "$XDG_CACHE_HOME"
+
+  # Setup LazyVim starter
+  cp -r "$srcdir/starter-main" "$XDG_CONFIG_HOME/nvim"
+  rm -rf "$XDG_CONFIG_HOME/nvim/.git"
+
+  # Copy our custom configs
+  cp -r "$startdir/lua" "$XDG_CONFIG_HOME/nvim/"
+  cp -r "$startdir/plugin" "$XDG_CONFIG_HOME/nvim/"
+  cp "$startdir/lazyvim.json" "$XDG_CONFIG_HOME/nvim/"
+
+  echo "Installing LazyVim plugins..."
+  nvim --headless \
+    "+Lazy! sync" \
+    "+qa!" || true
+
+  echo "Slimming plugin repos..."
+  slim_lazy_repos "$XDG_DATA_HOME/nvim"
+}
+
+slim_lazy_repos() {
+  local data_dir="$1"
+  local dir
+
+  for dir in "$data_dir"/lazy/*/; do
+    [[ -d "$dir/.git" ]] || continue
+
+    # Exclude test suites via sparse-checkout rather than rm: the worktree
+    # stays clean, so the restore pass in package() does not resurrect them
+    # and future :Lazy checkouts keep honoring the exclusion. snacks.nvim
+    # alone ships 18 MB of tests.
+    git -C "$dir" sparse-checkout set --no-cone '/*' '!/test/' '!/tests/' '!/spec/'
+
+    # Cut history down to the checked-out tips: drop the refs that pin older
+    # objects, mark every remaining tip as a shallow boundary, then gc. This
+    # is half the package -- ~70 MB of .git across the plugins. `git fetch`
+    # into a shallow repo stays shallow and re-fetches tags, so :Lazy update
+    # still works.
+    #
+    # Keep refs/remotes/origin/HEAD. It pins no objects (it is a symref, and
+    # stays readable after its target ref is gone), but lazy.nvim resolves the
+    # default branch through it for plugins parked on a detached HEAD by a
+    # version pin -- lazy.nvim, LazyVim and blink.cmp. Without it, get_branch()
+    # returns nil and every lockfile write asserts, so :Lazy install/update/sync
+    # dies with E5113 on a fresh install.
+    git -C "$dir" for-each-ref --format='%(refname)' refs/remotes refs/tags |
+      while IFS= read -r ref; do
+        [[ $ref == refs/remotes/origin/HEAD ]] && continue
+        git -C "$dir" update-ref -d "$ref"
+      done
+    rm -f "$dir/.git/FETCH_HEAD" "$dir/.git/ORIG_HEAD"
+    {
+      git -C "$dir" rev-parse HEAD
+      git -C "$dir" for-each-ref --format='%(objectname)' refs/heads
+    } | sort -u >"$dir/.git/shallow"
+    git -C "$dir" reflog expire --expire=all --all
+
+    # lazy.nvim clones with --filter=blob:none, which marks the pack as a
+    # promisor pack that gc refuses to repack or prune. The repo is shallow
+    # at its tips now, so everything reachable exists locally: drop the
+    # promisor markers and the stale commit-graph, then gc for real. Future
+    # fetches simply run unfiltered.
+    git -C "$dir" config --unset-all remote.origin.promisor || true
+    git -C "$dir" config --unset-all remote.origin.partialclonefilter || true
+    rm -f "$dir/.git/objects/pack/"*.promisor "$dir/.git/objects/info/commit-graph"
+    rm -rf "$dir/.git/objects/info/commit-graphs"
+    git -C "$dir" -c gc.writeCommitGraph=false gc --prune=now --quiet
+  done
+}
+
+restore_lazy_worktrees() {
+  local data_dir="$1"
+  local dir
+
+  for dir in "$data_dir"/lazy/*/; do
+    [[ -d "$dir/.git" ]] || continue
+    git --git-dir="$dir/.git" --work-tree="$dir" restore .
+  done
+}
+
+package() {
+  cd "$srcdir"
+
+  install -dm755 "$pkgdir/usr/share/$pkgname"
+
+  cp -a "$XDG_CONFIG_HOME/nvim" "$pkgdir/usr/share/$pkgname/config"
+  cp -a "$XDG_DATA_HOME/nvim" "$pkgdir/usr/share/$pkgname/data"
+
+  # Remove everything from site/ directory but keep the directory to prevent error
+  rm -rf "$pkgdir/usr/share/$pkgname/data/site"/*
+  mkdir -p "$pkgdir/usr/share/$pkgname/data/site"
+
+  # Fix permissions to be readable by all users
+  chmod -R 755 "$pkgdir/usr/share/$pkgname"
+  find "$pkgdir/usr/share/$pkgname" -type f -exec chmod 644 {} \;
+
+  # Restore plugin worktree modes after the package-wide chmod so users seeded
+  # from /etc/skel do not need a first-login omarchy-nvim-setup cleanup pass.
+  restore_lazy_worktrees "$pkgdir/usr/share/$pkgname/data"
+
+  # Seed new users via /etc/skel. The installer installs omarchy-nvim before
+  # creating the first user, so this handles initial ISO installs and future
+  # users without an extra overwrite step.
+  install -dm755 "$pkgdir/etc/skel/.config" "$pkgdir/etc/skel/.local/share"
+  cp -a "$pkgdir/usr/share/$pkgname/config" "$pkgdir/etc/skel/.config/nvim"
+  cp -a "$pkgdir/usr/share/$pkgname/data" "$pkgdir/etc/skel/.local/share/nvim"
+  ln -snf "../../../../.local/state/omarchy/current/theme/neovim.lua" \
+    "$pkgdir/etc/skel/.config/nvim/lua/plugins/theme.lua"
+
+  # Ship the plugin cache once, now that /etc/skel has its copy. Keeping a
+  # second one under /usr/share made omarchy-nvim the largest package in an
+  # Omarchy install after noto-fonts-cjk — ~116 MiB installed, ~88 MB of it read
+  # off the ISO on every install. config/ stays: migrations read it from there.
+  rm -rf "$pkgdir/usr/share/$pkgname/data"
+
+  # Install setup/refresh commands to /usr/bin. setup fills missing pieces;
+  # refresh explicitly backs up and overwrites with the same /etc/skel defaults
+  # used for newly-created users.
+  install -Dm755 "$startdir/omarchy-nvim-setup" "$pkgdir/usr/bin/omarchy-nvim-setup"
+  ln -s omarchy-nvim-setup "$pkgdir/usr/bin/omarchy-nvim-refresh"
+}

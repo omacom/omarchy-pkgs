@@ -1,0 +1,57 @@
+# Maintainer: wysbd <aur@wysbd.dev>
+
+pkgname="hyprland-preview-share-picker"
+pkgver=0.2.1
+pkgrel=3
+pkgdesc="An alternative share picker for hyprland with window and monitor previews"
+arch=(x86_64 aarch64)
+url="https://github.com/WhySoBad/hyprland-preview-share-picker"
+license=(MIT)
+depends=('gtk4' 'gtk4-layer-shell' 'xdg-desktop-portal-hyprland' 'hyprland')
+makedepends=(cargo)
+optdepends=(
+  'slurp: default tool for selecting share regions'
+)
+_protocols_commit=3a5c2bda1c1a4e55cc1330c782547695a93f05b2
+source=("$pkgname-$pkgver.tar.gz::https://github.com/WhySoBad/hyprland-preview-share-picker/archive/refs/tags/v$pkgver.tar.gz"
+        "hyprland-protocols-$_protocols_commit.tar.gz::https://github.com/hyprwm/hyprland-protocols/archive/$_protocols_commit.tar.gz")
+sha256sums=('dfbd6773884c24bb300d756420cc540dda0c3518e910e20d1538e7dd6c0990da'
+            'SKIP')
+
+prepare() {
+    cd "$pkgname-$pkgver"
+
+    # Link the hyprland-protocols submodule
+    rmdir lib/hyprland-protocols 2>/dev/null || true
+    ln -sf "$srcdir/hyprland-protocols-$_protocols_commit" lib/hyprland-protocols
+
+    # Replace build.rs with a simple version that doesn't require git
+    cat > build.rs << 'EOF'
+fn main() {
+    println!("cargo::rustc-env=GIT_VERSION=v0.2.1-r0-release");
+}
+EOF
+
+    export RUSTUP_TOOLCHAIN=stable
+    cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+    cd "$pkgname-$pkgver"
+
+    export RUSTUP_TOOLCHAIN=stable
+    export CARGO_TARGET_DIR=target
+
+    cargo build --frozen --release
+
+    ./target/release/hyprland-preview-share-picker schema > schema.json
+}
+
+package() {
+    cd "$pkgname-$pkgver"
+
+    install -Dm0755 -T "target/release/hyprland-preview-share-picker" "$pkgdir/usr/bin/hyprland-preview-share-picker"
+
+    install -dm0755 "$pkgdir/usr/share/hyprland-preview-share-picker"
+    install -Dm0644 "schema.json" "$pkgdir/usr/share/hyprland-preview-share-picker"
+}

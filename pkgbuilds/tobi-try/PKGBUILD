@@ -1,0 +1,35 @@
+# Maintainer: dhh
+
+pkgname='tobi-try'
+pkgver=1.10.1
+pkgrel=3
+pkgdesc='Fresh directories for every vibe.'
+url='https://github.com/tobi/try'
+arch=('any')
+license=('MIT')
+depends=('ruby')
+provides=('try')
+conflicts=('try')
+options=('!debug')
+
+source=("try-${pkgver}.rb::https://raw.githubusercontent.com/tobi/try/v${pkgver}/try.rb"
+        "fuzzy.rb::https://raw.githubusercontent.com/tobi/try/v${pkgver}/lib/fuzzy.rb"
+        "tui.rb::https://raw.githubusercontent.com/tobi/try/v${pkgver}/lib/tui.rb")
+sha256sums=('2e52bcd81244ff59e4a51dda5d7ba446dabaa0d1c5e23f02902431ca8d091be9'
+            'cf815ed12c8147bbc7f67008cfc1f3fd05df1638ff290e2079188f1b9bf8f190'
+            '0ea1b79975f2bcf36dbb29c5b76738e7cac81cedde24bf3bde85d8e2a42fd225')
+
+build() {
+  cd "${srcdir}"
+
+  # Ensure shebang points to system Ruby (so no mise conflicts)
+  sed -i '1c#!/usr/bin/ruby' "try-${pkgver}.rb"
+}
+
+package() {
+  install -Dm755 "${srcdir}/try-${pkgver}.rb" "${pkgdir}/usr/lib/${pkgname}/try.rb"
+  install -Dm644 "${srcdir}/tui.rb" "${pkgdir}/usr/lib/${pkgname}/lib/tui.rb"
+  install -Dm644 "${srcdir}/fuzzy.rb" "${pkgdir}/usr/lib/${pkgname}/lib/fuzzy.rb"
+  install -dm755 "${pkgdir}/usr/bin"
+  ln -sf "/usr/lib/${pkgname}/try.rb" "${pkgdir}/usr/bin/try"
+}

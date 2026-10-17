@@ -1,0 +1,288 @@
+#!/bin/bash
+set -euo pipefail
+
+BUILD_ROOT=$(realpath "${BASH_SOURCE[0]%/*}/..")
+source "$BUILD_ROOT/helpers/message-helpers.sh"
+source "$BUILD_ROOT/helpers/paths.sh"
+source "$BUILD_ROOT/helpers/package-metadata.sh"
+
+PACKAGE=""
+DEST_DIR=""
+COMMIT_OVERRIDE=""
+
+usage() {
+  cat <<EOF
+Usage: $0 <package> [OPTIONS]
+
+Create a scratch workspace for inspecting an AUR-backed package.
+
+The workspace contains:
+  upstream/  Raw AUR package at the recorded origin.commit, or HEAD
+  patched/   Raw AUR package with Omarchy .omarchy patches/hooks/pkgrel applied
+  current/   Current checked-in package directory
+
+Options:
+  --dir <path>       Workspace directory (default: mktemp under /tmp)
+  --commit <sha>     Use a specific AUR commit instead of origin.commit
+  -h, --help         Show this help message
+
+Examples:
+  $0 v4l2-relayd
+  $0 v4l2-relayd --dir /tmp/v4l2-relayd-worktree
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --dir)
+      DEST_DIR="$2"
+      shift 2
+      ;;
+    --commit)
+      COMMIT_OVERRIDE="$2"
+      shift 2
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    --*)
+      print_error "Unknown option: $1"
+      exit 1
+      ;;
+    *)
+      if [[ -n "$PACKAGE" ]]; then
+        print_error "Only one package can be inspected at a time"
+        exit 1
+      fi
+      PACKAGE="$1"
+      shift
+      ;;
+  esac
+done
+
+if [[ -z "$PACKAGE" ]]; then
+  print_error "Package name required"
+  usage
+  exit 1
+fi
+
+PACKAGE_DIR="$PKGBUILDS_DIR/$PACKAGE"
+METADATA="$PACKAGE_DIR/.omarchy/package.json"
+
+if [[ ! -f "$METADATA" ]]; then
+  print_error "Missing package metadata: $METADATA"
+  exit 1
+fi
+
+if [[ "$(jq -r '.origin.aur // .aur // (if .source == "aur" then "legacy" else "" end)' "$METADATA")" == "" ]]; then
+  print_error "package-worktree only supports AUR-backed packages"
+  exit 1
+fi
+
+AUR_PACKAGE=$(jq -r --arg package "$PACKAGE" '.origin.aur // .aur // $package' "$METADATA")
+UPSTREAM_COMMIT=${COMMIT_OVERRIDE:-$(jq -r '.origin.commit // .upstream_commit // ""' "$METADATA")}
+
+if [[ -z "$DEST_DIR" ]]; then
+  DEST_DIR=$(mktemp -d "${TMPDIR:-/tmp}/omarchy-${PACKAGE}.XXXXXX")
+else
+  mkdir -p "$DEST_DIR"
+  DEST_DIR=$(realpath "$DEST_DIR")
+fi
+
+UPSTREAM_DIR="$DEST_DIR/upstream"
+PATCHED_DIR="$DEST_DIR/patched"
+CURRENT_DIR="$DEST_DIR/current"
+
+get_pkgbuild_field() {
+  local package_dir="$1"
+  local field="$2"
+  local value=""
+
+  if [[ -f "$package_dir/PKGBUILD" ]]; then
+    value=$(grep -m1 "^${field}=" "$package_dir/PKGBUILD" | cut -d= -f2- | tr -d "\"'") || true
+    if [[ -n "$value" ]]; then
+      echo "$value"
+      return
+    fi
+  fi
+
+  if [[ -f "$package_dir/.SRCINFO" ]]; then
+    awk -F' = ' -v field="$field" '$1 ~ "^[[:space:]]*" field "$" { print $2; exit }' "$package_dir/.SRCINFO"
+  fi
+}
+
+set_pkgrel() {
+  local package_dir="$1"
+  local pkgrel="$2"
+
+  sed -i "s/^pkgrel=.*/pkgrel=$pkgrel/" "$package_dir/PKGBUILD"
+}
+
+copy_aur_contents() {
+  local aur_dir="$1"
+  local target_dir="$2"
+
+  mkdir -p "$target_dir"
+  shopt -s dotglob nullglob
+  local item base
+  for item in "$aur_dir"/*; do
+    base=$(basename "$item")
+    [[ "$base" == ".git" ]] && continue
+    cp -a "$item" "$target_dir/"
+  done
+  shopt -u dotglob nullglob
+}
+
+remove_aur_only_files() {
+  local package_dir="$1"
+
+  rm -f "$package_dir/.SRCINFO" "$package_dir/.gitignore"
+}
+
+apply_omarchy_patches() {
+  local package_dir="$1"
+  local patches_dir="$package_dir/.omarchy/patches"
+  local applied=false
+
+  [[ -d "$patches_dir" ]] || return 1
+
+  shopt -s nullglob
+  local patch_files=("$patches_dir"/*.patch)
+  shopt -u nullglob
+  [[ ${#patch_files[@]} -gt 0 ]] || return 1
+
+  local patch_file
+  for patch_file in "${patch_files[@]}"; do
+    print_info "  Applying $(basename "$patch_file")"
+    if ! (cd "$package_dir" && patch -p1 --forward --batch --no-backup-if-mismatch < "$patch_file"); then
+      print_error "Failed to apply patch: $patch_file"
+      return 2
+    fi
+    applied=true
+  done
+
+  [[ "$applied" == true ]]
+}
+
+run_post_sync_hook() {
+  local package_dir="$1"
+  local aur_pkgrel="$2"
+  local hook="$package_dir/.omarchy/post-sync.sh"
+
+  [[ -f "$hook" ]] || return 1
+
+  print_info "  Running post-sync.sh"
+  if ! (
+    cd "$package_dir"
+    PACKAGE_NAME="$PACKAGE" \
+      AUR_PACKAGE_NAME="$AUR_PACKAGE" \
+      AUR_PKGREL="$aur_pkgrel" \
+      bash ".omarchy/post-sync.sh"
+  ); then
+    print_error "post-sync.sh failed"
+    return 2
+  fi
+}
+
+apply_pkgrel_metadata() {
+  local package_dir="$1"
+  local aur_pkgrel="$2"
+  local previous_pkgver="$3"
+  local metadata="$package_dir/.omarchy/package.json"
+
+  jq -e 'has("pkgrel")' "$metadata" >/dev/null || return 1
+
+  local current_pkgver suffix offset base
+  current_pkgver=$(get_pkgbuild_field "$package_dir" pkgver)
+
+  if [[ -n "$previous_pkgver" && "$current_pkgver" != "$previous_pkgver" ]]; then
+    print_info "  Skipping stale pkgrel metadata (pkgver changed: $previous_pkgver -> $current_pkgver)"
+    return 1
+  fi
+
+  suffix=$(jq -r '.pkgrel.suffix // 1' "$metadata")
+  offset=$(jq -r '.pkgrel.offset // 0' "$metadata")
+  base=$((aur_pkgrel + offset))
+
+  print_info "  Applying pkgrel metadata: $base.$suffix"
+  set_pkgrel "$package_dir" "$base.$suffix"
+}
+
+apply_auto_pkgrel_suffix() {
+  local package_dir="$1"
+  local aur_pkgrel="$2"
+
+  print_info "  Applying automatic pkgrel suffix: $aur_pkgrel.1"
+  set_pkgrel "$package_dir" "$aur_pkgrel.1"
+}
+
+print_header "Package Worktree: $PACKAGE"
+print_info "Workspace: $DEST_DIR"
+print_info "AUR package: $AUR_PACKAGE"
+
+if [[ -n "$UPSTREAM_COMMIT" ]]; then
+  print_info "Upstream commit: $UPSTREAM_COMMIT"
+else
+  print_warning "No origin.commit recorded; using AUR HEAD"
+fi
+
+rm -rf "$UPSTREAM_DIR" "$PATCHED_DIR" "$CURRENT_DIR"
+
+git clone "https://aur.archlinux.org/${AUR_PACKAGE}.git" "$UPSTREAM_DIR" >/dev/null 2>&1
+if [[ -n "$UPSTREAM_COMMIT" ]]; then
+  git -C "$UPSTREAM_DIR" checkout --detach "$UPSTREAM_COMMIT" >/dev/null 2>&1
+fi
+rm -rf "$UPSTREAM_DIR/.git"
+
+copy_aur_contents "$UPSTREAM_DIR" "$PATCHED_DIR"
+rm -rf "$PATCHED_DIR/.omarchy"
+cp -a "$PACKAGE_DIR/.omarchy" "$PATCHED_DIR/.omarchy"
+cp -a "$PACKAGE_DIR" "$CURRENT_DIR"
+
+AUR_PKGREL=$(get_pkgbuild_field "$UPSTREAM_DIR" pkgrel)
+PREVIOUS_PKGVER=$(get_pkgbuild_field "$PACKAGE_DIR" pkgver || true)
+CUSTOMIZED=false
+PKGREL_APPLIED=false
+
+print_info "Creating patched/ from upstream/ + .omarchy customizations"
+if apply_omarchy_patches "$PATCHED_DIR"; then
+  CUSTOMIZED=true
+else
+  patch_status=$?
+  if [[ $patch_status -eq 2 ]]; then
+    exit 1
+  fi
+fi
+
+if run_post_sync_hook "$PATCHED_DIR" "$AUR_PKGREL"; then
+  CUSTOMIZED=true
+else
+  hook_status=$?
+  if [[ $hook_status -eq 2 ]]; then
+    exit 1
+  fi
+fi
+
+if apply_pkgrel_metadata "$PATCHED_DIR" "$AUR_PKGREL" "$PREVIOUS_PKGVER"; then
+  PKGREL_APPLIED=true
+fi
+
+if [[ "$CUSTOMIZED" == true && "$PKGREL_APPLIED" == false ]]; then
+  apply_auto_pkgrel_suffix "$PATCHED_DIR" "$AUR_PKGREL"
+fi
+
+remove_aur_only_files "$PATCHED_DIR"
+remove_aur_only_files "$CURRENT_DIR"
+
+cat <<EOF
+
+Created package workspace:
+  $DEST_DIR/upstream  raw AUR package
+  $DEST_DIR/patched   AUR + Omarchy customizations
+  $DEST_DIR/current   checked-in package
+
+Useful diffs:
+  diff -ruN "$DEST_DIR/upstream" "$DEST_DIR/patched"
+  diff -ruN "$DEST_DIR/patched" "$DEST_DIR/current"
+EOF

@@ -1,0 +1,134 @@
+name: Open package PRs
+
+# Shared by the three bot lanes (sync-upstream.yml, sync-rebuilds.yml and
+# track-branches.yml). The caller's sync job rewrites recipes, groups the
+# changes with .github/scripts/package-pr-groups.sh and uploads them as the
+# `package-pins` artifact. This opens or updates one PR per group and arms
+# auto-merge, so every green package lands on its own and only the failures
+# stay open. A single batch PR let one red package hold back every other one
+# (#788, #837).
+#
+# Everything goes through the PAT in PKGS_BOT_TOKEN: its pushes build without
+# an approval hold, and a merge made with it starts publish.yml. A merge made
+# with the built-in GITHUB_TOKEN would not publish.
+
+on:
+  workflow_call:
+    inputs:
+      groups:
+        description: 'JSON from package-pr-groups.sh: [{"branch", "packages"}]'
+        required: true
+        type: string
+      prefix:
+        description: 'Branch prefix the caller owns, e.g. auto/sync-upstream'
+        required: true
+        type: string
+      title:
+        description: 'PR title; ": <package> <version>, ..." is appended'
+        required: true
+        type: string
+      body:
+        description: 'PR body'
+        required: true
+        type: string
+    secrets:
+      PKGS_BOT_TOKEN:
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  pr:
+    if: ${{ inputs.groups != '[]' }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        group: ${{ fromJSON(inputs.groups) }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Fetch the pins
+        uses: actions/download-artifact@v4
+        with:
+          name: package-pins
+          path: ${{ runner.temp }}
+
+      # The PR title names what moved, so the merged history reads like a
+      # changelog: "Sync upstream releases: zed 1.23.2-1".
+      - name: Apply this PR's packages
+        id: apply
+        env:
+          PACKAGES: ${{ matrix.group.packages }}
+          TITLE: ${{ inputs.title }}
+        run: |
+          read -r -a packages <<<"$PACKAGES"
+          git apply $(printf -- '--include=pkgbuilds/%s/* ' "${packages[@]}") "$RUNNER_TEMP/pins.patch"
+          git status --porcelain
+          field() { sed -n "s/^$2=//p" "pkgbuilds/$1/PKGBUILD" | head -1 | tr -d "\"'"; }
+          versions=$(for package in "${packages[@]}"; do
+            printf '%s %s-%s, ' "$package" "$(field "$package" pkgver)" "$(field "$package" pkgrel)"
+          done)
+          title="$TITLE: ${versions%, }"
+          echo "title=$title" >> "$GITHUB_OUTPUT"
+          echo "- $title" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Open or update the PR
+        id: pr
+        uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1 # v8.1.1
+        with:
+          token: ${{ secrets.PKGS_BOT_TOKEN }}
+          commit-message: ${{ steps.apply.outputs.title }}
+          title: ${{ steps.apply.outputs.title }}
+          body: ${{ inputs.body }}
+          branch: ${{ matrix.group.branch }}
+          delete-branch: true
+          labels: automated
+
+      # Auto-merge, not a direct merge: branch protection still has to see
+      # `result`, `self-tests` and `build-isolation` green. auto-merge-pr.yml
+      # may arm the same PR at the same moment; either one arming it is the
+      # outcome wanted.
+      - name: Enable auto-merge
+        if: ${{ steps.pr.outputs.pull-request-number != '' }}
+        env:
+          GH_TOKEN: ${{ secrets.PKGS_BOT_TOKEN }}
+          PR: ${{ steps.pr.outputs.pull-request-number }}
+        run: |
+          armed() { [[ "$(gh pr view "$PR" -R "$GITHUB_REPOSITORY" --json autoMergeRequest --jq '.autoMergeRequest != null')" == true ]]; }
+          if armed; then
+            echo "auto-merge already enabled on #$PR"
+            exit 0
+          fi
+          gh pr merge --auto --merge "$PR" -R "$GITHUB_REPOSITORY" || armed
+
+  # A PR on this lane's prefix that the run did not refresh, and that
+  # conflicts with master, is stale: master moved its packages on without it.
+  # Close it rather than leave a red PR behind. Not being refreshed is not
+  # enough on its own, since a feed that failed this run (one of dozens timing
+  # out is routine) leaves a still-valid PR unrefreshed too. The lane's old
+  # batch PR, on the bare prefix, is retired outright.
+  close-superseded:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Close superseded PRs
+        env:
+          GH_TOKEN: ${{ secrets.PKGS_BOT_TOKEN }}
+          GROUPS_JSON: ${{ inputs.groups }}
+          PREFIX: ${{ inputs.prefix }}
+        run: |
+          gh pr list -R "$GITHUB_REPOSITORY" --state open --limit 500 --json number,headRefName,mergeable \
+            --jq '.[] | select(.headRefName == env.PREFIX or (.headRefName | startswith(env.PREFIX + "-"))) | "\(.number) \(.headRefName) \(.mergeable)"' |
+          while read -r number branch mergeable; do
+            jq -e --arg branch "$branch" 'any(.[]; .branch == $branch)' <<<"$GROUPS_JSON" >/dev/null && continue
+            [[ $branch == "$PREFIX" || $mergeable == CONFLICTING ]] || continue
+            echo "closing #$number ($branch): superseded"
+            gh pr close "$number" -R "$GITHUB_REPOSITORY" --delete-branch \
+              --comment "Superseded: master has moved these packages on, or per-package PRs carry them now."
+          done

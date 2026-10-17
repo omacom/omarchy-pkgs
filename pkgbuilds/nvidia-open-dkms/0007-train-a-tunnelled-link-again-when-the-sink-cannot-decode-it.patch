@@ -1,0 +1,196 @@
+From 79f9a2910cf40ca2871317974aa03708c63528db Mon Sep 17 00:00:00 2001
+From: Ryan Hughes <ryan@heyoodle.com>
+Date: Wed, 7 Oct 2026 10:15:27 -0400
+Subject: [PATCH] displayport: train a tunnelled link again when the sink
+ cannot decode it
+
+Behind a USB4 dock, an LG ULTRAGEAR+ at 4K 240 Hz (HBR3 x4, DSC and FEC)
+sometimes comes out of standby black although the modeset and link
+training succeeded. Its link status reads clock recovery, equalization,
+symbol lock and interlane alignment on every lane, so nothing raises an
+IRQ_HPD and isLinkLost() sees a good link, but its symbol error counters
+saturate on every lane. Any new link training brings the picture back.
+
+After each modeset on a tunnelled single-stream 8b/10b link, read the
+sink's symbol error counters over 20 ms a second later, and if every
+active lane counted 0x1000 errors or more, train the link again at the
+same configuration in flush mode, as the IRQ link-loss path does. Check
+again after each retrain, up to three times per modeset.
+---
+ src/common/displayport/inc/dp_auxdefs.h       | 10 +++
+ src/common/displayport/inc/dp_connectorimpl.h | 13 ++++
+ .../displayport/src/dp_connectorimpl.cpp      | 78 +++++++++++++++++++
+ 3 files changed, 101 insertions(+)
+
+diff --git a/src/common/displayport/inc/dp_auxdefs.h b/src/common/displayport/inc/dp_auxdefs.h
+index 4910e4b..2f5e916 100644
+--- a/src/common/displayport/inc/dp_auxdefs.h
++++ b/src/common/displayport/inc/dp_auxdefs.h
+@@ -86,6 +86,16 @@
+ //
+ #define HDCP_SEND_QSE_MESSAGE_COOLDOWN          1000
+ 
++//
++// After a modeset on a USB4-tunnelled link, read the sink's symbol error
++// counters this long after the modeset, over a window of this length; train
++// again if every lane counted at least the limit, up to the retrain count.
++//
++#define DP_TUNNEL_LINK_CHECK_DELAY_MS           1000
++#define DP_TUNNEL_LINK_CHECK_WINDOW_MS          20
++#define DP_TUNNEL_LINK_SYMBOL_ERROR_LIMIT       0x1000
++#define DP_TUNNEL_LINK_MAX_RETRAINS             3
++
+ #define DPCD_OUI_NVIDIA                         0x00044B
+ 
+ //
+diff --git a/src/common/displayport/inc/dp_connectorimpl.h b/src/common/displayport/inc/dp_connectorimpl.h
+index 0ea3100..8d3d9ad 100644
+--- a/src/common/displayport/inc/dp_connectorimpl.h
++++ b/src/common/displayport/inc/dp_connectorimpl.h
+@@ -336,6 +336,12 @@ namespace DisplayPort
+         //
+         bool        bRetrainAfterUnplug;
+ 
++        //
++        // Times the link was trained again since the last modeset because the
++        // sink could not decode it (see checkTunnelLinkErrors()).
++        //
++        unsigned    tunnelLinkRetrains;
++
+         // Force max link config during mode-set for DP compliance testing devices
+         bool        bForceMaxLinkConfig;
+ 
+@@ -625,6 +631,7 @@ namespace DisplayPort
+         char tagSendQseMessage;
+         char tagDpBwAllocationChanged;
+         char tagHDCPStreamEncrEnable;
++        char tagCheckTunnelLinkErrors;
+ 
+         //
+         //  Enable disable TMDS mode
+@@ -637,6 +644,12 @@ namespace DisplayPort
+         //      Uses: fireEvents()
+         virtual void expired(const void * tag);
+ 
++        //
++        //  Train a USB4-tunnelled link again if the sink counts symbol
++        //  errors on every lane although the link status reads as trained.
++        //
++        void checkTunnelLinkErrors();
++
+         // Generate Events.
+         //      useTimer specifies whether we fire the events on the timer
+         //      context, or this context.
+diff --git a/src/common/displayport/src/dp_connectorimpl.cpp b/src/common/displayport/src/dp_connectorimpl.cpp
+index 3a81e1a..29fb0a3 100644
+--- a/src/common/displayport/src/dp_connectorimpl.cpp
++++ b/src/common/displayport/src/dp_connectorimpl.cpp
+@@ -126,6 +126,7 @@ ConnectorImpl::ConnectorImpl(MainLink * main, AuxBus * auxBus, Timer * timer, Co
+       bKeepOptLinkAlive(false),
+       bSwAutoReadWarActive(false),
+       bRetrainAfterUnplug(false),
++      tunnelLinkRetrains(0),
+       bForceMaxLinkConfig(false),
+       bNoFallbackInPostLQA(false),
+       bIsEncryptionQseValid(true),
+@@ -3024,6 +3025,10 @@ void ConnectorImpl::expired(const void * tag)
+             }
+         }
+     }
++    else if (tag == &tagCheckTunnelLinkErrors)
++    {
++        checkTunnelLinkErrors();
++    }
+     else if (tag == &tagDpBwAllocationChanged)
+     {
+         for (Device * i = enumDevices(0); i; i = enumDevices(i))
+@@ -4380,6 +4385,13 @@ void ConnectorImpl::notifyAttachEnd(bool modesetCancelled)
+     hdcpCapsRetries = 0;
+     timer->queueCallback(this, &tagDelayedHdcpCapRead, 2000);
+ 
++    if (hal->isDpInTunnelingSupported() && !linkUseMultistream())
++    {
++        tunnelLinkRetrains = 0;
++        timer->cancelCallback(this, &tagCheckTunnelLinkErrors);
++        timer->queueCallback(this, &tagCheckTunnelLinkErrors, DP_TUNNEL_LINK_CHECK_DELAY_MS);
++    }
++
+     fireEvents();
+ }
+ 
+@@ -5927,6 +5939,72 @@ bool ConnectorImpl::isLinkLost()
+     return false;
+ }
+ 
++//
++// A sink behind a USB4 DP tunnel can come out of standby with every lane
++// reporting clock recovery, equalization, symbol lock and interlane
++// alignment, while it cannot decode the link: its symbol error counters
++// saturate and the screen stays black. Nothing raises an IRQ_HPD then, so
++// check the counters once after each modeset and train the link again if
++// every active lane keeps counting errors.
++//
++void ConnectorImpl::checkTunnelLinkErrors()
++{
++    NvU8 counts[NV_DPCD_SYMBOL_ERROR_COUNT_LANEX_BYTE0__SIZE * 2];
++    AuxRetry aux(auxBus);
++    GroupImpl * group = getActiveGroupForSST();
++
++    if (!connectorActive || !previousPlugged || !intransitionGroups.isEmpty() ||
++        !hal->isDpInTunnelingSupported() || linkUseMultistream() ||
++        !isLinkActive() || activeLinkConfig.bIs128b132bChannelCoding ||
++        isLinkInD3() || !group || !group->isHeadAttached())
++    {
++        return;
++    }
++
++    // The counters reset when read; the second read covers the wait only.
++    if (aux.read(NV_DPCD_SYMBOL_ERROR_COUNT_LANEX_BYTE0(0), counts, sizeof(counts)) != AuxRetry::ack)
++        return;
++    timer->sleep(DP_TUNNEL_LINK_CHECK_WINDOW_MS);
++    if (aux.read(NV_DPCD_SYMBOL_ERROR_COUNT_LANEX_BYTE0(0), counts, sizeof(counts)) != AuxRetry::ack)
++        return;
++
++    for (unsigned lane = 0; lane < activeLinkConfig.lanes; lane++)
++    {
++        NvU8 high = counts[lane * 2 + 1];
++        unsigned errors = (DRF_VAL(_DPCD, _SYMBOL_ERROR_COUNT_LANEX_BYTE1, _VALUE, high) << 8) |
++                          counts[lane * 2];
++
++        if (!DRF_VAL(_DPCD, _SYMBOL_ERROR_COUNT_LANEX_BYTE1, _VALID, high) ||
++            errors < DP_TUNNEL_LINK_SYMBOL_ERROR_LIMIT)
++        {
++            return;
++        }
++    }
++
++    if (tunnelLinkRetrains >= DP_TUNNEL_LINK_MAX_RETRAINS)
++    {
++        DP_PRINTF(DP_ERROR, "DP-CONN> Sink still cannot decode the tunnelled link after %u retrains.",
++                  tunnelLinkRetrains);
++        return;
++    }
++    tunnelLinkRetrains++;
++
++    DP_PRINTF(DP_WARNING, "DP-CONN> Sink counts symbol errors on every lane, training the tunnelled link again.");
++
++    LinkConfiguration originalActiveLinkConfig = activeLinkConfig;
++    if (enableFlush())
++    {
++        if (!train(originalActiveLinkConfig, false))
++        {
++            DP_PRINTF(DP_ERROR, "DP-CONN> Could not train the tunnelled link again. Forcing config");
++            train(originalActiveLinkConfig, true);
++        }
++        disableFlush();
++    }
++
++    timer->queueCallback(this, &tagCheckTunnelLinkErrors, DP_TUNNEL_LINK_CHECK_DELAY_MS);
++}
++
+ bool ConnectorImpl::isLinkActive()
+ {
+     return (activeLinkConfig.isValid());
+-- 
+2.56.0
+

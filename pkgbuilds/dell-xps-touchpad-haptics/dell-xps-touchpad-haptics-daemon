@@ -1,0 +1,381 @@
+#!/usr/bin/env python3
+
+"""Haptic feedback daemon for Synaptics touchpads with Manual Trigger."""
+
+import fcntl
+import glob
+import os
+import select
+import signal
+import struct
+import sys
+import time
+import errno
+from pathlib import Path
+
+VENDOR = "06CB"
+REPORT_ID = 0x37
+DEFAULT_INTENSITY = 100
+DEBUG = os.environ.get("DELL_XPS_TOUCHPAD_HAPTICS_DEBUG", "").lower() not in (
+    "",
+    "0",
+    "false",
+    "no",
+)
+USER_HOME = Path(
+    os.environ.get("DELL_XPS_TOUCHPAD_HAPTICS_HOME", str(Path.home()))
+)
+CONFIG_PATH = USER_HOME / ".config/omarchy/dell-haptic.conf"
+
+EVENT_FORMAT = "llHHi"
+EVENT_SIZE = struct.calcsize(EVENT_FORMAT)
+EV_KEY = 0x01
+BTN_LEFT = 272
+BTN_RIGHT = 273
+BTN_MIDDLE = 274
+BUTTON_NAMES = {
+    BTN_LEFT: "left",
+    BTN_RIGHT: "right",
+    BTN_MIDDLE: "middle",
+}
+DEVICE_GONE_ERRNOS = {
+    errno.ENODEV,
+    errno.ENXIO,
+    errno.EIO,
+}
+UNSUPPORTED_READBACK_ERRNOS = {
+    getattr(errno, "EREMOTEIO", 121),
+    errno.EINVAL,
+    errno.EOPNOTSUPP,
+}
+READBACK_UNSUPPORTED = object()
+
+STATE = {
+    "apply_requested": None,
+    "intensity": DEFAULT_INTENSITY,
+    "config_mtime_ns": None,
+    "readback_supported": None,
+    "report": struct.pack("BB", REPORT_ID, DEFAULT_INTENSITY),
+}
+
+
+class DeviceDisconnected(Exception):
+    pass
+
+
+def HIDIOCSFEATURE(length):
+    return 0xC0000000 | (length << 16) | (ord("H") << 8) | 0x06
+
+
+def HIDIOCGFEATURE(length):
+    return 0xC0000000 | (length << 16) | (ord("H") << 8) | 0x07
+
+
+def clamp_intensity(value):
+    return max(0, min(100, value))
+
+
+def level_for_intensity(intensity):
+    if intensity <= 30:
+        return "low"
+    if intensity < 75:
+        return "mid"
+    return "high"
+
+
+def log(message):
+    print(message, flush=True)
+
+
+def log_debug(message):
+    if DEBUG:
+        log(message)
+
+
+def load_intensity():
+    try:
+        raw = CONFIG_PATH.read_text(encoding="utf-8")
+    except OSError:
+        return DEFAULT_INTENSITY
+
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+
+        key, value = (part.strip() for part in line.split("=", 1))
+        if key != "INTENSITY":
+            continue
+
+        try:
+            return clamp_intensity(int(value))
+        except ValueError:
+            print(
+                f"Ignoring invalid intensity in {CONFIG_PATH}: {value!r}; using default {DEFAULT_INTENSITY}",
+                file=sys.stderr,
+                flush=True,
+            )
+            return DEFAULT_INTENSITY
+
+    return DEFAULT_INTENSITY
+
+
+def config_mtime_ns():
+    try:
+        return CONFIG_PATH.stat().st_mtime_ns
+    except OSError:
+        return None
+
+
+def refresh_intensity(signum=None, _frame=None, force=False):
+    mtime_ns = config_mtime_ns()
+    previous_intensity = STATE["intensity"]
+    previous_mtime_ns = STATE["config_mtime_ns"]
+
+    if not force and signum != signal.SIGHUP and mtime_ns == STATE["config_mtime_ns"]:
+        return
+
+    intensity = load_intensity()
+    STATE["intensity"] = intensity
+    STATE["config_mtime_ns"] = mtime_ns
+    STATE["report"] = struct.pack("BB", REPORT_ID, intensity)
+
+    if force:
+        reason = "startup"
+    elif signum == signal.SIGHUP:
+        reason = "sighup"
+    else:
+        reason = "config-change"
+
+    if (
+        force
+        or signum == signal.SIGHUP
+        or mtime_ns != previous_mtime_ns
+        or intensity != previous_intensity
+    ):
+        log(
+            f"Loaded haptic level={level_for_intensity(intensity)} intensity={intensity} reason={reason} config={CONFIG_PATH}"
+        )
+
+        return True
+
+    return False
+
+
+def request_refresh(signum, _frame):
+    refresh_intensity(signum=signum)
+    STATE["apply_requested"] = "sighup"
+
+
+def send_haptic_report(hidraw_fd, ioctl_req, report):
+    try:
+        fcntl.ioctl(hidraw_fd, ioctl_req, report)
+        return True
+    except OSError as error:
+        if error.errno in DEVICE_GONE_ERRNOS:
+            raise DeviceDisconnected(error) from error
+
+        print(f"Failed to send haptic report: {error}", file=sys.stderr, flush=True)
+        return False
+
+
+def read_haptic_report(hidraw_fd, ioctl_req):
+    if STATE["readback_supported"] is False:
+        return READBACK_UNSUPPORTED
+
+    report = bytearray((REPORT_ID, 0))
+
+    try:
+        fcntl.ioctl(hidraw_fd, ioctl_req, report, True)
+    except OSError as error:
+        if error.errno in DEVICE_GONE_ERRNOS:
+            raise DeviceDisconnected(error) from error
+
+        if error.errno in UNSUPPORTED_READBACK_ERRNOS:
+            if STATE["readback_supported"] is not False:
+                log(
+                    f"Haptic gain readback is unsupported on this device ({error}); continuing in write-only mode"
+                )
+            STATE["readback_supported"] = False
+            return READBACK_UNSUPPORTED
+
+        print(f"Failed to read haptic report: {error}", file=sys.stderr, flush=True)
+        return None
+
+    STATE["readback_supported"] = True
+    return report[1]
+
+
+def apply_current_report(hidraw_fd, ioctl_set_req, ioctl_get_req, reason):
+    intensity = STATE["intensity"]
+
+    if not send_haptic_report(hidraw_fd, ioctl_set_req, STATE["report"]):
+        log(f"Failed to apply haptic level={level_for_intensity(intensity)} intensity={intensity} reason={reason}")
+        return False
+
+    readback = read_haptic_report(hidraw_fd, ioctl_get_req)
+    if readback is READBACK_UNSUPPORTED:
+        log(
+            f"Applied haptic level={level_for_intensity(intensity)} intensity={intensity} reason={reason} readback=unsupported"
+        )
+        return True
+
+    if readback is None:
+        log(
+            f"Applied haptic level={level_for_intensity(intensity)} intensity={intensity} reason={reason} readback=unavailable"
+        )
+        return True
+
+    readback_level = level_for_intensity(readback)
+    if readback == intensity:
+        log(
+            f"Verified haptic level={readback_level} intensity={intensity} reason={reason} readback={readback}"
+        )
+    else:
+        log(
+            f"Haptic gain mismatch expected={intensity}({level_for_intensity(intensity)}) readback={readback}({readback_level}) reason={reason}"
+        )
+
+    return True
+
+
+def find_hidraw():
+    for path in sorted(glob.glob("/sys/class/hidraw/hidraw*")):
+        uevent = os.path.join(path, "device", "uevent")
+        try:
+            with open(uevent, encoding="utf-8") as file:
+                content = file.read().upper()
+            if f"0000{VENDOR}" in content:
+                return os.path.join("/dev", os.path.basename(path))
+        except OSError:
+            continue
+    return None
+
+
+def find_touchpad_event():
+    for path in sorted(glob.glob("/sys/class/input/event*/device/name")):
+        try:
+            with open(path, encoding="utf-8") as file:
+                name = file.read().strip().upper()
+            if VENDOR in name and "TOUCHPAD" in name:
+                event = path.split("/")[-3]
+                return os.path.join("/dev/input", event)
+        except OSError:
+            continue
+    return None
+
+
+def open_device_pair():
+    waiting_logged = False
+
+    while True:
+        hidraw = find_hidraw()
+        event = find_touchpad_event()
+
+        if not hidraw or not event:
+            if not waiting_logged:
+                log("Waiting for Synaptics haptic touchpad devices to appear")
+                waiting_logged = True
+            time.sleep(1)
+            continue
+
+        hidraw_fd = None
+        event_fd = None
+
+        try:
+            hidraw_fd = os.open(hidraw, os.O_RDWR)
+            event_fd = os.open(event, os.O_RDONLY)
+            return hidraw, event, hidraw_fd, event_fd
+        except OSError as error:
+            try:
+                os.close(hidraw_fd)
+            except Exception:
+                pass
+            try:
+                os.close(event_fd)
+            except Exception:
+                pass
+
+            log(f"Retrying touchpad device open after {error}")
+            waiting_logged = True
+            time.sleep(1)
+
+
+def main():
+    refresh_intensity(force=True)
+    signal.signal(signal.SIGHUP, request_refresh)
+
+    ioctl_set_req = HIDIOCSFEATURE(len(STATE["report"]))
+    ioctl_get_req = HIDIOCGFEATURE(len(STATE["report"]))
+
+    while True:
+        hidraw_fd = None
+        event_fd = None
+
+        try:
+            hidraw, event, hidraw_fd, event_fd = open_device_pair()
+
+            log(
+                f"Haptic touchpad ready hidraw={hidraw} input={event} level={level_for_intensity(STATE['intensity'])} intensity={STATE['intensity']} debug={int(DEBUG)} config={CONFIG_PATH}"
+            )
+            apply_current_report(hidraw_fd, ioctl_set_req, ioctl_get_req, "startup")
+
+            while True:
+                if STATE["apply_requested"]:
+                    apply_current_report(
+                        hidraw_fd,
+                        ioctl_set_req,
+                        ioctl_get_req,
+                        STATE["apply_requested"],
+                    )
+                    STATE["apply_requested"] = None
+
+                ready, _, _ = select.select([event_fd], [], [], 0.5)
+                if not ready:
+                    if refresh_intensity():
+                        apply_current_report(
+                            hidraw_fd,
+                            ioctl_set_req,
+                            ioctl_get_req,
+                            "config-change",
+                        )
+                    continue
+
+                try:
+                    data = os.read(event_fd, EVENT_SIZE)
+                except OSError as error:
+                    if error.errno in DEVICE_GONE_ERRNOS:
+                        raise DeviceDisconnected(error) from error
+                    raise
+
+                if len(data) < EVENT_SIZE:
+                    continue
+
+                _, _, ev_type, code, value = struct.unpack(EVENT_FORMAT, data)
+                if ev_type == EV_KEY and code in (BTN_LEFT, BTN_RIGHT, BTN_MIDDLE) and value in (0, 1):
+                    if refresh_intensity():
+                        apply_current_report(
+                            hidraw_fd,
+                            ioctl_set_req,
+                            ioctl_get_req,
+                            "config-change",
+                        )
+
+                    if send_haptic_report(hidraw_fd, ioctl_set_req, STATE["report"]):
+                        log_debug(
+                            f"Applied haptic report button={BUTTON_NAMES.get(code, code)} event={'press' if value == 1 else 'release'} level={level_for_intensity(STATE['intensity'])} intensity={STATE['intensity']}"
+                        )
+        except DeviceDisconnected as error:
+            log(f"Touchpad device disappeared ({error}); waiting for it to return")
+            time.sleep(1)
+        except KeyboardInterrupt:
+            return
+        finally:
+            if event_fd is not None:
+                os.close(event_fd)
+            if hidraw_fd is not None:
+                os.close(hidraw_fd)
+
+
+if __name__ == "__main__":
+    main()

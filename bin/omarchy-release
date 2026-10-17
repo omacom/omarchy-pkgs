@@ -1,0 +1,1139 @@
+#!/bin/bash
+# omarchy-release — the front door for cutting Omarchy releases.
+#
+# A release train has three human moments, each one command:
+#   start  open the train: release branch + staging PR (+ advance edge -> rc)
+#   rc     cut a candidate: pin PKGBUILDs to the branch head, publish to rc
+#   ship   make it official: final pins, promote rc -> stable, tag, GH release,
+#          ISO, website
+#
+# Run bare `omarchy-release` to be shepherded: it observes reality (branches,
+# pins, published channels, tags) and offers the correct next step. Every
+# subcommand is idempotent — a re-run checks what is already done and skips it.
+#
+# Versions are inferred from branch names: branch v4-0-2 -> RCs 4.0.2rcN ->
+# tag v4.0.2. `start` is the only place a version is typed.
+
+set -e
+
+BUILD_ROOT=$(realpath "${BASH_SOURCE[0]%/*}/..")
+source "$BUILD_ROOT/helpers/message-helpers.sh"
+source "$BUILD_ROOT/helpers/docker-helpers.sh"
+source "$BUILD_ROOT/helpers/paths.sh"
+source "$BUILD_ROOT/helpers/host-helpers.sh"
+
+UPSTREAM_URL="${OMARCHY_UPSTREAM_URL:-https://github.com/basecamp/omarchy.git}"
+UPSTREAM_REPO="${OMARCHY_UPSTREAM_REPO:-basecamp/omarchy}"
+SITE_REPO="${OMARCHY_SITE_REPO:-omacom-io/omarchy-site}"
+ISO_REPO="${OMARCHY_ISO_REPO:-omacom-io/omarchy-iso}"
+DEV_BRANCH="${OMARCHY_DEV_BRANCH:-quattro}"
+
+PKGS_DB_BASE="${OMARCHY_PKGS_DB_BASE:-https://pkgs.omarchy.org}"
+# The first published architecture supplies the version-ordering floor when
+# cutting pins. Readiness checks below still verify every published
+# architecture before an RC or final release can move forward.
+OBSERVED_ARCH=$(reference_arch)
+RC_DB_URL="$PKGS_DB_BASE/rc/$OBSERVED_ARCH/omarchy.db.tar.zst"
+
+SRCDEST_DIR="$BUILD_ROOT/.srcdest"
+MIRROR_CLONE="$SRCDEST_DIR/omarchy"          # bare mirror (shared with bin/omarchy-pkgs)
+WORK_CLONE="$SRCDEST_DIR/omarchy-work"       # working clone for pick/cherry-pick
+RC_WORKTREE="$BUILD_ROOT/.worktrees/rc"      # pkgs repo rc branch worktree
+
+ASSUME_YES=false
+REPO_HOST_OVERRIDE=""
+
+show_usage() {
+  cat <<EOF
+Usage: $0 [command] [options]
+
+Run with no command to be shepherded through whatever the next step is.
+
+Commands:
+  start [X.Y.Z]      Open a release train: create branch v X-Y-Z on $UPSTREAM_REPO
+                     (from the previous tag for a patch, from $DEV_BRANCH for a
+                     minor/major), open the release-notes staging PR, and for a
+                     minor/major advance edge -> rc on the build host
+  pick [pr#|sha ...] Cherry-pick merged PRs onto the release branch; with no
+                     args, choose from a list of merged $DEV_BRANCH PRs
+  rc                 Cut the next X.Y.ZrcN into the rc channel
+  ship               Tag, final pins, promote rc -> stable, draft GitHub release,
+                     ISO (prompted), website bump
+  status             Show where the train stands (read-only)
+  doctor             Verify every credential and connection the flow needs
+  self-test          Run helper unit tests
+
+Options:
+  --yes              Skip confirmation prompts (for scripting/CI)
+  --host <host>      Build host ssh destination (else \$OMARCHY_REPO_HOST or .repo-host)
+  --iso / --no-iso   (rc, ship) Build the ISO without asking / skip it
+  --no-wait          (rc, ship) Do not poll for the published build
+  -h, --help         Show this help
+EOF
+}
+
+confirm() {
+  local prompt="$1" reply
+  [[ "$ASSUME_YES" == true ]] && return 0
+  read -r -p "$prompt [y/N] " reply
+  [[ "$reply" =~ ^[Yy]$ ]]
+}
+
+# --- version <-> branch ------------------------------------------------------
+
+version_to_branch() { # 4.0.2 -> v4-0-2
+  local v="${1#v}"
+  [[ "$v" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
+  echo "v${v//./-}"
+}
+
+branch_to_version() { # v4-0-2 -> 4.0.2
+  local b="$1"
+  [[ "$b" =~ ^v([0-9]+)-([0-9]+)-([0-9]+)$ ]] || return 1
+  echo "${BASH_REMATCH[1]}.${BASH_REMATCH[2]}.${BASH_REMATCH[3]}"
+}
+
+version_is_patch() { # Z > 0
+  [[ "$1" =~ ^[0-9]+\.[0-9]+\.([0-9]+)$ ]] && ((BASH_REMATCH[1] > 0))
+}
+
+previous_patch_tag() { # 4.0.2 -> v4.0.1
+  [[ "$1" =~ ^([0-9]+\.[0-9]+)\.([0-9]+)$ ]] || return 1
+  echo "v${BASH_REMATCH[1]}.$((BASH_REMATCH[2] - 1))"
+}
+
+# --- upstream queries --------------------------------------------------------
+
+ls_remote() { git ls-remote "$UPSTREAM_URL" "$@"; }
+
+tag_exists() { [[ -n "$(ls_remote "refs/tags/$1" | head -1)" ]]; }
+
+branch_head() { ls_remote "refs/heads/$1" | awk '{print $1}'; }
+
+resolve_tag_commit() {
+  local tag="$1" peeled sha
+  peeled=$(ls_remote "refs/tags/$tag^{}" | awk '{print $1}')
+  sha=$(ls_remote "refs/tags/$tag" | awk '{print $1}')
+  echo "${peeled:-$sha}"
+}
+
+# Newest v*-*-* release branch, optionally only untagged ones. Shipping tags
+# the version, so "tag exists" is what closes a train — but ship itself also
+# needs to find a tagged train whose remaining steps (release, ISO, website)
+# didn't finish, so it can resume.
+newest_release_branch() { # newest_release_branch [--untagged]
+  local untagged_only=false
+  [[ "${1:-}" == "--untagged" ]] && untagged_only=true
+  local branch best_ver="" best_branch="" ver
+  while IFS= read -r branch; do
+    ver=$(branch_to_version "$branch") || continue
+    if [[ "$untagged_only" == true ]] && tag_exists "v$ver"; then
+      continue
+    fi
+    if [[ -z "$best_ver" ]] || [[ $(vercmp "$ver" "$best_ver") -gt 0 ]]; then
+      best_ver="$ver" best_branch="$branch"
+    fi
+  done < <(ls_remote 'refs/heads/v*' | awk -F/ '{print $3}')
+  [[ -n "$best_branch" ]] && echo "$best_branch"
+}
+
+open_train_branch() { newest_release_branch --untagged; }
+
+# Reads go over anonymous HTTPS; pushes go over SSH like every checkout the
+# operator owns. Pushing over HTTPS would drag in git's credential-helper
+# config, which breaks the moment a stale absolute gh path is baked into it.
+ssh_push_url() { # https://github.com/a/b.git -> git@github.com:a/b.git
+  local url="$1"
+  if [[ "$url" =~ ^https://github\.com/(.+)$ ]]; then
+    echo "git@github.com:${BASH_REMATCH[1]}"
+  else
+    echo "$url"
+  fi
+}
+UPSTREAM_PUSH_URL="${OMARCHY_UPSTREAM_PUSH_URL:-$(ssh_push_url "$UPSTREAM_URL")}"
+
+ensure_mirror_clone() {
+  if [[ -d "$MIRROR_CLONE" ]]; then
+    git -C "$MIRROR_CLONE" fetch --quiet origin
+  else
+    mkdir -p "$SRCDEST_DIR"
+    print_info "Cloning $UPSTREAM_URL (cached in $SRCDEST_DIR)..."
+    git clone --mirror --quiet "$UPSTREAM_URL" "$MIRROR_CLONE"
+  fi
+  git -C "$MIRROR_CLONE" remote set-url --push origin "$UPSTREAM_PUSH_URL"
+}
+
+# A clone made with `git clone --mirror` sets remote.origin.mirror=true. Git
+# otherwise rejects an explicit SHA:ref push as an invalid combination with
+# mirror mode, so disable that remote setting for narrowly targeted pushes.
+push_upstream_ref() { # push_upstream_ref <source-sha> <destination-ref>
+  git -c remote.origin.mirror=false -C "$MIRROR_CLONE" push --quiet origin "$1:$2"
+}
+
+ensure_work_clone() {
+  if [[ -d "$WORK_CLONE" ]]; then
+    git -C "$WORK_CLONE" fetch --quiet origin
+  else
+    mkdir -p "$SRCDEST_DIR"
+    print_info "Cloning $UPSTREAM_URL working copy..."
+    git clone --quiet "$UPSTREAM_URL" "$WORK_CLONE"
+  fi
+  git -C "$WORK_CLONE" remote set-url --push origin "$UPSTREAM_PUSH_URL"
+}
+
+# --- published channel state -------------------------------------------------
+
+# Prints omarchy's published version in a channel; empty when absent, rc 2 when
+# the database cannot be read (callers must not mistake an outage for absence).
+published_version() {
+  local channel="$1" arch="${2:-$OBSERVED_ARCH}" tmp descs
+  tmp=$(mktemp) || return 2
+  # A unique query string busts the CDN cache: right after a sync the plain
+  # URL can keep serving the previous db for a while, which reads as "not
+  # published yet" to status, the wait loop, and ship's pre-checks.
+  if ! curl -sf "$PKGS_DB_BASE/$channel/$arch/omarchy.db.tar.zst?$(date +%s%N)" -o "$tmp"; then
+    rm -f "$tmp"
+    return 2
+  fi
+  if ! descs=$(tar -xO --zstd -f "$tmp" --wildcards '*/desc' 2>/dev/null); then
+    rm -f "$tmp"
+    return 2
+  fi
+  rm -f "$tmp"
+  awk '
+    function emit() {
+      if (!found && name == "omarchy" && version != "") { print version; found = 1 }
+      name = ""; version = ""
+    }
+    $0 == "%FILENAME%" { emit(); next }
+    $0 == "%NAME%"    { getline; name = $0; next }
+    $0 == "%VERSION%" { getline; version = $0; next }
+    END { emit() }
+  ' <<<"$descs"
+}
+
+all_arches_at_version() { # all_arches_at_version <channel> <pkgver>
+  local channel="$1" want="$2" arch got
+  for arch in $(published_arches); do
+    got=$(published_version "$channel" "$arch" 2>/dev/null) || return 1
+    [[ "${got%-*}" == "$want" ]] || return 1
+  done
+}
+
+# The rc branch of THIS repo carries the current pins. Read them without
+# touching the working tree.
+rc_branch_pin() { # prints "pkgver commit", empty when no rc branch
+  local ref="origin/rc" pkgbuild
+  git -C "$BUILD_ROOT" fetch --quiet origin rc 2>/dev/null || true
+  pkgbuild=$(git -C "$BUILD_ROOT" show "$ref:pkgbuilds/omarchy/PKGBUILD" 2>/dev/null) || return 0
+  local pkgver commit
+  pkgver=$(grep -E '^pkgver=' <<<"$pkgbuild" | head -1 | cut -d= -f2)
+  commit=$(grep -E '^_commit=' <<<"$pkgbuild" | head -1 | cut -d= -f2 | tr -d "'\"")
+  [[ -n "$pkgver" ]] && echo "$pkgver $commit"
+}
+
+# --- build host --------------------------------------------------------------
+#
+# Every command runs from anywhere: when this machine IS the build host
+# (on_repo_host — the published database lives here), host operations execute
+# locally; otherwise they go over ssh to the configured destination. The
+# destination is anything ssh accepts — root@<ip>, root@<hostname>, or an
+# ~/.ssh/config Host alias — from --host, $OMARCHY_REPO_HOST, or .repo-host.
+
+repo_host() { resolve_repo_host "$REPO_HOST_OVERRIDE"; }
+
+print_no_host_help() { # print_no_host_help <what> <script>
+  print_warning "Not on the build host, and none configured (--host, OMARCHY_REPO_HOST, or $BUILD_ROOT/.repo-host — any ssh destination, e.g. root@<host> or an ssh-config alias)"
+  echo "Run this on the build host to $1:" >&2
+  echo "$2" >&2
+}
+
+# Builds the pinned release pair for the rc channel from the rc branch's own
+# worktree, creating it on first use. OMARCHY_RC_PINS marks this as the one
+# build allowed to set those packages' rc versions; OMARCHY_REPO_ROOT points
+# the worktree at the primary checkout's channel tree so all three channels
+# stay in one place. Fast-ring packages are not built here — the scheduled rc
+# release covers those from master.
+RC_TRIGGER_SCRIPT='
+set -e
+git -C /root/omarchy-pkgs fetch origin rc
+if [ ! -d /root/omarchy-pkgs-rc ]; then
+  git -C /root/omarchy-pkgs worktree add /root/omarchy-pkgs-rc rc 2>/dev/null ||
+    git -C /root/omarchy-pkgs worktree add --track -b rc /root/omarchy-pkgs-rc origin/rc
+fi
+git -C /root/omarchy-pkgs-rc fetch origin rc
+git -C /root/omarchy-pkgs-rc reset --hard origin/rc
+cd /root/omarchy-pkgs-rc
+# The pair is built once per published architecture (helpers/paths.sh on the
+# host decides which), so every architecture'"'"'s rc channel carries the pins.
+for arch in $(BUILD_ROOT=/root/omarchy-pkgs-rc bash -c "source helpers/paths.sh; published_arches"); do
+  OMARCHY_RC_PINS=1 OMARCHY_REPO_ROOT=/root/omarchy-pkgs/pkgs.omarchy.org \
+    bin/repo release --mirror rc --arch "$arch" --package omarchy omarchy-settings --skip-prod-check
+done
+'
+
+trigger_rc_build() {
+  local host
+  if host=$(repo_host); then
+    print_info "Building the RC on $host (this takes a while)..."
+    ssh "$host" "source /root/.omarchy/build-credentials 2>/dev/null; $RC_TRIGGER_SCRIPT"
+  elif on_repo_host; then
+    print_info "Building the RC locally (this is the build host)..."
+    bash -c "$RC_TRIGGER_SCRIPT"
+  else
+    print_no_host_help "build the release candidate" "$RC_TRIGGER_SCRIPT"
+    return 1
+  fi
+}
+
+host_advance() { # host_advance <from> <to> [extra args...]
+  local from="$1" to="$2"
+  shift 2
+  # bin/repo is the remote control: with a host configured it forwards this
+  # over ssh itself; on the host it runs locally. Only the "neither" case —
+  # a workstation with no host — must be refused here, because running it
+  # against this machine's (likely stale) local tree would be wrong.
+  if ! resolve_repo_host "$REPO_HOST_OVERRIDE" >/dev/null && ! on_repo_host; then
+    print_no_host_help "advance $from -> $to" \
+      "  cd /root/omarchy-pkgs && bin/repo advance --from $from --to $to --arch all --skip-prod-check $*"
+    return 1
+  fi
+  # --arch all: the host advances every architecture it publishes, so a train
+  # never moves a channel for one architecture and not another.
+  "$BUILD_ROOT/bin/repo" advance --from "$from" --to "$to" --arch all --skip-prod-check "$@"
+}
+
+wait_for_published() { # wait_for_published <channel> <version> [timeout-seconds]
+  local channel="$1" want="$2" timeout="${3:-3600}" waited=0 arch got pending
+  print_info "Waiting for $want in $channel for: $(published_arches | tr '\n' ' ')"
+  while ((waited < timeout)); do
+    pending=""
+    for arch in $(published_arches); do
+      got=$(published_version "$channel" "$arch" 2>/dev/null) || got=""
+      [[ "${got%-*}" == "$want" ]] || pending+=" $arch=${got:-unreachable}"
+    done
+    if [[ -z "$pending" ]]; then
+      print_success "$channel now serves omarchy $want on every published architecture"
+      return 0
+    fi
+    sleep 60
+    waited=$((waited + 60))
+    printf '.' >&2
+  done
+  echo "" >&2
+  print_warning "Timed out waiting for $want in $channel (pending:$pending)"
+  print_info "The build may still be running — re-run this command to resume."
+  return 1
+}
+
+# --- pkgs rc branch (pin commits) --------------------------------------------
+
+# The rc branch is rebuilt as origin/master + pin commit(s) for each cut and
+# force-pushed; the build host follows with reset --hard. History on it is
+# disposable — the pins fully describe the release.
+prepare_rc_worktree() {
+  git -C "$BUILD_ROOT" fetch --quiet origin
+  if [[ ! -d "$RC_WORKTREE" ]]; then
+    mkdir -p "$(dirname "$RC_WORKTREE")"
+    git -C "$BUILD_ROOT" worktree add --quiet -B rc "$RC_WORKTREE" origin/master
+  else
+    git -C "$RC_WORKTREE" checkout --quiet -B rc origin/master
+    git -C "$RC_WORKTREE" reset --quiet --hard origin/master
+  fi
+}
+
+cut_pins() { # cut_pins <omarchy-pkgs release args...>
+  prepare_rc_worktree
+  # The pin engine's "edge DB" is the ordering floor and rc auto-numbering
+  # source; in the pipeline model that floor is the rc channel.
+  (cd "$RC_WORKTREE" &&
+    OMARCHY_EDGE_DB_URL="$RC_DB_URL" bin/omarchy-pkgs release "$@" --no-push --yes)
+  git -C "$RC_WORKTREE" push --force-with-lease origin rc
+}
+
+# --- ISO ---------------------------------------------------------------------
+
+iso_checkout() { # prints a usable omarchy-iso checkout, cloning to tmp if needed
+  if [[ -n "${OMARCHY_ISO_DIR:-}" && -d "${OMARCHY_ISO_DIR:-}" ]]; then
+    echo "$OMARCHY_ISO_DIR"
+    return 0
+  fi
+  if [[ -d "$BUILD_ROOT/../omarchy-iso/.git" ]]; then
+    realpath "$BUILD_ROOT/../omarchy-iso"
+    return 0
+  fi
+  local tmp="$SRCDEST_DIR/omarchy-iso"
+  if [[ -d "$tmp" ]]; then
+    git -C "$tmp" pull --ff-only --quiet || true
+  else
+    print_info "Cloning $ISO_REPO..." >&2
+    git clone --quiet "https://github.com/$ISO_REPO.git" "$tmp"
+  fi
+  echo "$tmp"
+}
+
+build_iso() { # build_iso <version> [--rc]
+  local version="$1" rc_flag="${2:-}" dir
+  dir=$(iso_checkout) || return 1
+  if [[ -z "$CONTAINER_ENGINE" ]] || ! "$CONTAINER_ENGINE" info >/dev/null 2>&1; then
+    print_warning "No container engine is available — cannot build the ISO here. Run on a Docker or Podman machine:"
+    echo "  cd $dir && bin/omarchy-iso-release ${rc_flag:+$rc_flag }$version"
+    return 1
+  fi
+  print_info "Building ${rc_flag:+RC }ISO $version (this takes a while)..."
+  (cd "$dir" && PATH="$dir/bin:$PATH" bin/omarchy-iso-release ${rc_flag:+"$rc_flag"} "$version")
+}
+
+maybe_iso() { # maybe_iso <version> <rc|final> <iso_mode: ask|yes|no>
+  local version="$1" kind="$2" mode="$3" rc_flag=""
+  [[ "$kind" == "rc" ]] && rc_flag="--rc"
+  case "$mode" in
+  no) return 0 ;;
+  yes) build_iso "$version" "$rc_flag" ;;
+  ask)
+    if confirm "Build and upload the ${kind} ISO for $version?"; then
+      build_iso "$version" "$rc_flag"
+    fi
+    ;;
+  esac
+}
+
+# --- website -----------------------------------------------------------------
+
+update_website() { # update_website <version>
+  local version="$1" tmp="$SRCDEST_DIR/omarchy-site"
+  print_info "Updating $SITE_REPO ISO references to $version..."
+  if [[ -d "$tmp" ]]; then
+    git -C "$tmp" fetch --quiet origin && git -C "$tmp" reset --quiet --hard origin/HEAD
+  else
+    git clone --quiet "git@github.com:$SITE_REPO.git" "$tmp" || {
+      print_warning "Could not clone $SITE_REPO — update the ISO URL there manually"
+      return 1
+    }
+  fi
+  local matches
+  matches=$(grep -rIlE 'omarchy-[0-9]+\.[0-9]+\.[0-9]+(-rc)?\.iso' "$tmp" --exclude-dir=.git || true)
+  if [[ -z "$matches" ]]; then
+    print_warning "No omarchy-<version>.iso references found in $SITE_REPO — update it manually"
+    return 1
+  fi
+  echo "$matches" | while IFS= read -r f; do
+    sed -i -E "s/omarchy-[0-9]+\.[0-9]+\.[0-9]+\.iso/omarchy-$version.iso/g" "$f"
+    echo "  updated: ${f#"$tmp"/}"
+  done
+  if git -C "$tmp" diff --quiet; then
+    print_info "Website already references $version"
+    return 0
+  fi
+  git -C "$tmp" --no-pager diff --stat
+  confirm "Push this ISO URL bump to $SITE_REPO?" || {
+    print_info "Left uncommitted in $tmp"
+    return 1
+  }
+  git -C "$tmp" commit --quiet -am "Point ISO download at omarchy-$version.iso" &&
+    git -C "$tmp" push --quiet origin HEAD
+  print_success "Website updated to omarchy-$version.iso"
+}
+
+# --- commands ----------------------------------------------------------------
+
+cmd_start() {
+  local version="${1:-}"
+  if [[ -z "$version" ]]; then
+    read -r -p "Version to release (X.Y.Z): " version
+  fi
+  version="${version#v}"
+  if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    print_error "Invalid version '$version' (expected X.Y.Z)"
+    exit 1
+  fi
+  local branch
+  branch=$(version_to_branch "$version")
+
+  print_header "Open release train $version"
+
+  if tag_exists "v$version"; then
+    print_error "v$version is already tagged on $UPSTREAM_REPO — this train has shipped"
+    exit 1
+  fi
+
+  # Base: previous tag for a patch, dev branch head for a minor/major.
+  local base_ref base_sha kind
+  if version_is_patch "$version"; then
+    kind="patch"
+    base_ref=$(previous_patch_tag "$version")
+    if ! tag_exists "$base_ref"; then
+      print_error "Base tag $base_ref not found on $UPSTREAM_REPO"
+      exit 1
+    fi
+    base_sha=$(resolve_tag_commit "$base_ref")
+  else
+    kind="minor/major"
+    base_ref="$DEV_BRANCH"
+    base_sha=$(branch_head "$DEV_BRANCH")
+  fi
+
+  if [[ -n "$(branch_head "$branch")" ]]; then
+    print_success "Release branch $branch already exists — adopting it"
+  else
+    print_info "Release type: $kind — branching $branch from $base_ref (${base_sha:0:12})"
+    confirm "Create branch $branch on $UPSTREAM_REPO?" || exit 1
+    ensure_mirror_clone
+    push_upstream_ref "$base_sha" "refs/heads/$branch"
+    print_success "Created $branch"
+  fi
+
+  # Staging PR: the body is the release-notes staging ground. A branch with no
+  # commits beyond its base cannot carry a PR yet; created lazily by pick.
+  if command -v gh >/dev/null; then
+    if gh pr view "$branch" --repo "$UPSTREAM_REPO" >/dev/null 2>&1; then
+      print_success "Staging PR for $branch already open"
+    elif ! gh pr create --repo "$UPSTREAM_REPO" --draft --base "$DEV_BRANCH" --head "$branch" \
+      --title "Release v$version" \
+      --body "Staging ground for the v$version release notes. Edit this body — it becomes the GitHub release text." 2>/dev/null; then
+      print_info "Staging PR not created yet (no commits on $branch) — it opens after the first pick"
+    fi
+  fi
+
+  # Minor/major trains ship new edge packages: carry edge forward into rc so
+  # RC testing runs against the set stable users will get. A failed advance
+  # must not pass silently — RCs would test against the previous rc set.
+  if [[ "$kind" != "patch" ]]; then
+    if ! host_advance edge rc; then
+      print_error "edge → rc advance did not complete — the train is NOT fully open"
+      echo "Fix the advance (it is idempotent), then re-run: omarchy-release start $version"
+      echo "start is idempotent too — the branch and PR above are kept."
+      exit 1
+    fi
+  else
+    print_info "Patch train: rc already mirrors stable — nothing to advance"
+  fi
+
+  echo ""
+  print_success "Train $version is open"
+  print_info "Next: omarchy-release pick   (cherry-pick fixes), then omarchy-release rc"
+}
+
+cmd_pick() {
+  local branch version
+  branch=$(open_train_branch) || true
+  if [[ -z "$branch" ]]; then
+    print_error "No open release train — run: omarchy-release start"
+    exit 1
+  fi
+  version=$(branch_to_version "$branch")
+  print_header "Pick changes onto $branch ($version)"
+
+  ensure_work_clone
+  git -C "$WORK_CLONE" checkout --quiet -B "$branch" "origin/$branch"
+
+  # Changes usually reach a release branch as BACKPORTS — cherry-picks with
+  # new SHAs — so ancestry of the original quattro merge commit proves nothing
+  # on a patch branch. Detect equivalence the way it is actually recorded:
+  # the branch's own commit messages since it left quattro name the PR
+  # ("backport of #N", squash titles "(#N)") or the source commit
+  # ("cherry picked from commit <sha>", which pick -x writes) — or, failing
+  # both, repeat its title verbatim.
+  local base_commit base_date branch_log
+  base_commit=$(git -C "$WORK_CLONE" merge-base "origin/$branch" "origin/$DEV_BRANCH" 2>/dev/null) || base_commit=""
+  base_date=""
+  if [[ -n "$base_commit" ]]; then
+    base_date=$(TZ=UTC git -C "$WORK_CLONE" log -1 --format=%cd \
+      --date=format-local:'%Y-%m-%dT%H:%M:%SZ' "$base_commit" 2>/dev/null) || base_date=""
+  fi
+  branch_log=$(git -C "$WORK_CLONE" log --format='%s %b' "origin/$branch" ${base_commit:+--not "$base_commit"} 2>/dev/null)
+  # Subjects alone, with any trailing "(#N)" stripped, so a change re-applied by
+  # hand — no PR number, no cherry-pick trailer — is still recognised by title.
+  local branch_subjects
+  branch_subjects=$(git -C "$WORK_CLONE" log --format='%s' "origin/$branch" ${base_commit:+--not "$base_commit"} 2>/dev/null |
+    sed -E 's/ \(#[0-9]+\)$//')
+
+  already_on_branch() { # already_on_branch <merge-sha> <pr-number-or-empty> <title-or-empty>
+    local sha="$1" number="$2" title="$3"
+    if [[ -n "$sha" ]]; then
+      git -C "$WORK_CLONE" merge-base --is-ancestor "$sha" "origin/$branch" 2>/dev/null && return 0
+      grep -q "cherry picked from commit $sha" <<<"$branch_log" && return 0
+    fi
+    if [[ -n "$number" ]]; then
+      grep -qE "#$number([^0-9]|$)" <<<"$branch_log" && return 0
+    fi
+    if [[ -n "$title" ]]; then
+      grep -Fxq "$title" <<<"$branch_subjects" && return 0
+    fi
+    return 1
+  }
+
+  local -a shas=() labels=()
+  if [[ $# -gt 0 ]]; then
+    local arg sha title
+    for arg in "$@"; do
+      if [[ "$arg" =~ ^[0-9]+$ ]]; then
+        sha=$(gh pr view "$arg" --repo "$UPSTREAM_REPO" --json mergeCommit --jq '.mergeCommit.oid' 2>/dev/null)
+        title=$(gh pr view "$arg" --repo "$UPSTREAM_REPO" --json title --jq '.title' 2>/dev/null)
+        if [[ -z "$sha" || "$sha" == "null" ]]; then
+          print_error "PR #$arg has no merge commit (not merged?)"
+          exit 1
+        fi
+        if already_on_branch "$sha" "$arg" "$title"; then
+          print_info "PR #$arg is already on $branch — skipping"
+          continue
+        fi
+        shas+=("$sha") labels+=("PR #$arg: $title")
+      else
+        if already_on_branch "$arg" "" ""; then
+          print_info "commit $arg is already on $branch — skipping"
+          continue
+        fi
+        shas+=("$arg") labels+=("commit $arg")
+      fi
+    done
+  else
+    # Interactive: merged dev-branch PRs not already on the release branch
+    # (by ancestry, backport reference, cherry-pick trailer, or title), oldest
+    # first so picks apply in merge order.
+    print_info "Loading merged $DEV_BRANCH PRs not yet on $branch..."
+    # gh pr list orders by CREATION date, so a plain --limit window silently
+    # drops long-lived PRs — opened early, merged recently — which are exactly
+    # the ones a release branch still needs. Pull a wide window and bound it by
+    # the branch point instead: anything merged into $DEV_BRANCH before $branch
+    # left it is already here by ancestry.
+    local list jq_pick
+    jq_pick='sort_by(.mergedAt) | .[] | "\(.mergeCommit.oid)\t\(.number)\t\(.title)"'
+    [[ -n "$base_date" ]] && jq_pick="[.[] | select(.mergedAt >= \"$base_date\")] | $jq_pick"
+    list=$(gh pr list --repo "$UPSTREAM_REPO" --state merged --base "$DEV_BRANCH" \
+      --limit 300 --json number,title,mergeCommit,mergedAt --jq "$jq_pick")
+    local -a cand_shas=() cand_labels=()
+    local sha number title
+    while IFS=$'\t' read -r sha number title; do
+      [[ -z "$sha" || "$sha" == "null" ]] && continue
+      already_on_branch "$sha" "$number" "$title" && continue
+      cand_shas+=("$sha") cand_labels+=("#$number $title")
+    done <<<"$list"
+    if [[ ${#cand_shas[@]} -eq 0 ]]; then
+      print_success "Nothing to pick — every $DEV_BRANCH PR merged since $branch opened is already on it"
+      exit 0
+    fi
+    echo ""
+    local i
+    for i in "${!cand_labels[@]}"; do
+      printf '  %2d) %s\n' "$((i + 1))" "${cand_labels[$i]}"
+    done
+    echo ""
+    local selection
+    read -r -p "Pick which? (e.g. 1,3-5 or 'all'): " selection
+    if [[ "$selection" == "all" ]]; then
+      shas=("${cand_shas[@]}") labels=("${cand_labels[@]}")
+    else
+      local part
+      for part in ${selection//,/ }; do
+        if [[ "$part" =~ ^([0-9]+)-([0-9]+)$ ]]; then
+          for ((i = BASH_REMATCH[1]; i <= BASH_REMATCH[2]; i++)); do
+            shas+=("${cand_shas[$((i - 1))]}") labels+=("${cand_labels[$((i - 1))]}")
+          done
+        elif [[ "$part" =~ ^[0-9]+$ ]]; then
+          shas+=("${cand_shas[$((part - 1))]}") labels+=("${cand_labels[$((part - 1))]}")
+        fi
+      done
+    fi
+  fi
+
+  [[ ${#shas[@]} -eq 0 ]] && { print_info "Nothing selected."; exit 0; }
+
+  local i
+  for i in "${!shas[@]}"; do
+    print_info "Cherry-picking ${labels[$i]}..."
+    if ! git -C "$WORK_CLONE" cherry-pick -x -m 1 "${shas[$i]}" 2>/dev/null &&
+      ! { git -C "$WORK_CLONE" cherry-pick --abort 2>/dev/null; git -C "$WORK_CLONE" cherry-pick -x "${shas[$i]}"; }; then
+      print_error "Cherry-pick conflict on ${labels[$i]}"
+      echo "Resolve it in $WORK_CLONE (git cherry-pick --continue), push, and re-run."
+      exit 1
+    fi
+  done
+
+  git -C "$WORK_CLONE" push --quiet origin "$branch"
+  print_success "Picked ${#shas[@]} change(s) onto $branch"
+
+  # The staging PR can exist now that the branch has commits of its own.
+  if command -v gh >/dev/null && ! gh pr view "$branch" --repo "$UPSTREAM_REPO" >/dev/null 2>&1; then
+    gh pr create --repo "$UPSTREAM_REPO" --draft --base "$DEV_BRANCH" --head "$branch" \
+      --title "Release v$version" \
+      --body "Staging ground for the v$version release notes. Edit this body — it becomes the GitHub release text." 2>/dev/null &&
+      print_success "Opened the release-notes staging PR" || true
+  fi
+  print_info "Next: omarchy-release rc"
+}
+
+cmd_rc() {
+  local iso_mode="$1" wait="$2"
+  local branch version
+  branch=$(open_train_branch) || true
+  if [[ -z "$branch" ]]; then
+    print_error "No open release train — run: omarchy-release start"
+    exit 1
+  fi
+  version=$(branch_to_version "$branch")
+  print_header "Cut RC for train $version"
+
+  local head
+  head=$(branch_head "$branch")
+  print_info "Branch $branch head: ${head:0:12}"
+
+  # Idempotence: if the current rc pin already matches the branch head and is
+  # published, there is nothing to cut.
+  local pin
+  pin=$(rc_branch_pin)
+  if [[ -n "$pin" ]]; then
+    local pin_ver="${pin%% *}" pin_commit="${pin##* }"
+    if [[ "$pin_commit" == "$head" && "$pin_ver" =~ ^${version//./\\.}rc[0-9]+$ ]]; then
+      if all_arches_at_version rc "$pin_ver"; then
+        print_success "$pin_ver is already cut from this head and published to rc on every architecture"
+        maybe_iso "$pin_ver" rc "$iso_mode"
+        return 0
+      fi
+      print_info "$pin_ver is pinned from this head but not published yet — re-triggering the build"
+      trigger_rc_build || return 1
+      [[ "$wait" == true ]] && wait_for_published rc "$pin_ver"
+      maybe_iso "$pin_ver" rc "$iso_mode"
+      return 0
+    fi
+  fi
+
+  confirm "Pin omarchy + omarchy-settings to $branch@${head:0:12} as the next ${version}rcN and publish to rc?" || exit 1
+
+  cut_pins rc --base "$version" --ref "$branch"
+
+  local new_pin new_ver
+  new_pin=$(rc_branch_pin)
+  new_ver="${new_pin%% *}"
+  print_success "Pinned $new_ver (rc branch pushed)"
+
+  trigger_rc_build || return 1
+  if [[ "$wait" == true ]]; then
+    wait_for_published rc "$new_ver" || return 1
+  fi
+  maybe_iso "$new_ver" rc "$iso_mode"
+  echo ""
+  print_info "Test the candidate, then: omarchy-release ship  (or pick + rc again)"
+}
+
+cmd_ship() {
+  local iso_mode="$1" wait="$2"
+  local branch version
+  branch=$(open_train_branch) || true
+  if [[ -z "$branch" ]]; then
+    # A tagged train whose later steps (release, ISO, website) failed is
+    # invisible to open_train_branch — find it so a re-run can resume.
+    branch=$(newest_release_branch) || true
+    if [[ -z "$branch" ]]; then
+      print_error "No release train found — nothing to ship"
+      exit 1
+    fi
+    version=$(branch_to_version "$branch")
+    if all_arches_at_version stable "$version" &&
+      gh release view "v$version" --repo "$UPSTREAM_REPO" >/dev/null 2>&1; then
+      print_success "Nothing to ship — $version is tagged, released, and live on stable"
+      exit 0
+    fi
+    print_info "Resuming tagged-but-incomplete train $version"
+  else
+    version=$(branch_to_version "$branch")
+  fi
+  print_header "Ship $version"
+
+  local head pin pin_ver pin_commit
+  head=$(branch_head "$branch")
+  pin=$(rc_branch_pin)
+  pin_ver="${pin%% *}"
+  pin_commit="${pin##* }"
+
+  # The ship guard: only the exact commit an RC was cut from may ship. There
+  # is no override — a moved branch means an untested tree; cut another rc.
+  if [[ -z "$pin" ]]; then
+    print_error "No RC has been cut for $version — run: omarchy-release rc"
+    exit 1
+  fi
+  if [[ "$pin_ver" == "$version" ]]; then
+    # Final already pinned (resume path). The artifacts come from pin_commit;
+    # a branch that moved afterwards changes nothing already built or tagged.
+    if [[ -n "$head" && "$head" != "$pin_commit" ]]; then
+      print_warning "$branch moved after the final was pinned — shipping the pinned ${pin_commit:0:12}; newer commits need the next patch train"
+    fi
+  else
+    if [[ ! "$pin_ver" =~ ^${version//./\\.}rc[0-9]+$ ]]; then
+      print_error "No RC has been cut for $version (rc branch pins $pin_ver) — run: omarchy-release rc"
+      exit 1
+    fi
+    if [[ "$pin_commit" != "$head" ]]; then
+      local behind
+      behind=$(git -C "$WORK_CLONE" rev-list --count "$pin_commit..origin/$branch" 2>/dev/null || echo "?")
+      print_error "$branch has moved since $pin_ver was cut ($behind commit(s) untested)"
+      echo "Only a commit an RC was cut from can ship. Cut another candidate:"
+      echo "  omarchy-release rc"
+      exit 1
+    fi
+    if ! all_arches_at_version rc "$pin_ver"; then
+      print_error "$pin_ver is pinned but is not published for every architecture"
+      echo "Wait for it (or re-run: omarchy-release rc), then ship."
+      exit 1
+    fi
+  fi
+
+  echo ""
+  print_info "This will, in order (steps already done are skipped):"
+  echo "  1. Tag v$version at the tested $branch@${pin_commit:0:12} on $UPSTREAM_REPO"
+  echo "  2. Pin the final $version from that tag and publish it to rc"
+  echo "  3. Promote the rc channel to stable (packages + signatures + db)"
+  echo "  4. Merge the final pins to master (edge overlap + record)"
+  echo "  5. Create a draft GitHub release from the staging PR body"
+  echo "  6. Build + upload the final ISO (${iso_mode})"
+  echo "  7. Point the website at the new ISO"
+  echo ""
+  confirm "Ship $version?" || exit 1
+
+  # 1. Tag the exact commit the tested RC was built from before any final
+  # package metadata is written or published. A pre-existing tag is only safe
+  # to reuse when it resolves to that same commit.
+  local tag_commit
+  if tag_exists "v$version"; then
+    tag_commit=$(resolve_tag_commit "v$version")
+    if [[ "$tag_commit" != "$pin_commit" ]]; then
+      print_error "Tag v$version points to ${tag_commit:0:12}, not the tested ${pin_commit:0:12}"
+      echo "Refusing to publish final package metadata for the wrong source commit."
+      exit 1
+    fi
+    print_success "1/7 Tag v$version already exists at ${pin_commit:0:12}"
+  else
+    ensure_mirror_clone
+    push_upstream_ref "$pin_commit" "refs/tags/v$version"
+    tag_commit=$(resolve_tag_commit "v$version")
+    if [[ "$tag_commit" != "$pin_commit" ]]; then
+      print_error "Tag push completed but v$version resolves to '${tag_commit:-nothing}'"
+      echo "Expected the tested commit $pin_commit; refusing to continue."
+      exit 1
+    fi
+    print_success "1/7 Tagged v$version at ${pin_commit:0:12}"
+  fi
+
+  # 2. Final pins into rc. Resolve the tag we just established so the final
+  # PKGBUILDs record both its provenance and its exact commit.
+  local stable_pub
+  if all_arches_at_version rc "$version"; then
+    print_success "2/7 Final $version already published to rc on every architecture"
+  else
+    if [[ "$pin_ver" != "$version" ]]; then
+      print_info "2/7 Pinning final $version from tag v$version..."
+      cut_pins "v$version"
+    else
+      print_info "2/7 Final $version pinned — re-triggering build"
+    fi
+    trigger_rc_build || exit 1
+    wait_for_published rc "$version" || exit 1
+  fi
+
+  # 3. Promote rc -> stable
+  if all_arches_at_version stable "$version"; then
+    print_success "3/7 Stable already serves $version on every architecture"
+  else
+    host_advance rc stable || exit 1
+    if ! all_arches_at_version stable "$version"; then
+      print_error "Promotion ran but stable does not serve $version on every architecture"
+      exit 1
+    fi
+    stable_pub=$(published_version stable 2>/dev/null) || stable_pub="$version"
+    print_success "3/7 Promoted to stable: omarchy $stable_pub on every architecture"
+  fi
+
+  # 4. Final pins onto master (keeps edge overlap publishing and the repo record)
+  local master_ver
+  master_ver=$(git -C "$BUILD_ROOT" show origin/master:pkgbuilds/omarchy/PKGBUILD 2>/dev/null | grep -E '^pkgver=' | head -1 | cut -d= -f2)
+  if [[ "$master_ver" == "$version" ]]; then
+    print_success "4/7 master already carries the $version pins"
+  else
+    local pin_sha
+    pin_sha=$(git -C "$BUILD_ROOT" rev-parse origin/rc 2>/dev/null || true)
+    print_info "4/7 Bringing the final pin commit to master..."
+    local sync_wt="$BUILD_ROOT/.worktrees/master-sync"
+    git -C "$BUILD_ROOT" fetch --quiet origin
+    if [[ ! -d "$sync_wt" ]]; then
+      git -C "$BUILD_ROOT" worktree add --quiet -B release-master-sync "$sync_wt" origin/master
+    else
+      git -C "$sync_wt" checkout --quiet -B release-master-sync origin/master
+    fi
+    if (cd "$sync_wt" && git cherry-pick "$pin_sha" && git push --quiet origin HEAD:master); then
+      print_success "4/7 Final pins merged to master"
+    else
+      (cd "$sync_wt" && git cherry-pick --abort 2>/dev/null || true)
+      print_warning "4/7 Could not fast-path the pins to master — cherry-pick $pin_sha onto master manually"
+    fi
+  fi
+
+  # 5. Draft GitHub release from the staging PR body. Requiring the tag makes
+  # this fail closed if step 1 did not finish instead of letting gh create the
+  # tag from the default branch.
+  if gh release view "v$version" --repo "$UPSTREAM_REPO" >/dev/null 2>&1; then
+    print_success "5/7 GitHub release v$version already exists"
+  else
+    local notes
+    notes=$(gh pr view "$branch" --repo "$UPSTREAM_REPO" --json body --jq '.body' 2>/dev/null) || notes=""
+    if [[ -z "$notes" || "$notes" == "null" ]]; then
+      notes="Omarchy $version"
+      print_warning "No staging PR body found — using a bare title; edit the release afterwards"
+    fi
+    gh release create "v$version" --repo "$UPSTREAM_REPO" --title "v$version" \
+      --notes "$notes" --draft --verify-tag
+    print_success "5/7 Draft GitHub release v$version created"
+  fi
+
+  # 6. ISO
+  maybe_iso "$version" final "$iso_mode" || true
+
+  # 7. Website (only meaningful once the final ISO exists)
+  if [[ "$iso_mode" != "no" ]]; then
+    update_website "$version" || true
+  else
+    print_info "7/7 --no-iso: leaving the website untouched"
+  fi
+
+  echo ""
+  print_success "Shipped $version — rc and stable are in parity for the next patch train"
+  print_info "Close the loop: merge or close the staging PR for $branch on $UPSTREAM_REPO"
+}
+
+# --- status / shepherd -------------------------------------------------------
+
+gather_status() {
+  EDGE_VER=$(published_version edge 2>/dev/null) || EDGE_VER="<unreachable>"
+  RC_VER=$(published_version rc 2>/dev/null) || RC_VER="<unreachable>"
+  STABLE_VER=$(published_version stable 2>/dev/null) || STABLE_VER="<unreachable>"
+  TRAIN=$(open_train_branch 2>/dev/null) || TRAIN=""
+  TRAIN_VER=""
+  TRAIN_HEAD=""
+  PIN=""
+  if [[ -n "$TRAIN" ]]; then
+    TRAIN_VER=$(branch_to_version "$TRAIN")
+    TRAIN_HEAD=$(branch_head "$TRAIN")
+    PIN=$(rc_branch_pin)
+  fi
+}
+
+next_step() { # prints "<command>|<description>"
+  if [[ -z "$TRAIN" ]]; then
+    # A tagged train may still have unfinished ship steps (release/ISO/site).
+    local last last_ver
+    last=$(newest_release_branch 2>/dev/null) || last=""
+    if [[ -n "$last" && "$STABLE_VER" != "<unreachable>" ]]; then
+      last_ver=$(branch_to_version "$last")
+      if ! all_arches_at_version stable "$last_ver" ||
+        { command -v gh >/dev/null && ! gh release view "v$last_ver" --repo "$UPSTREAM_REPO" >/dev/null 2>&1; }; then
+        echo "ship|$last_ver is tagged but not fully shipped — resume ship"
+        return
+      fi
+    fi
+    echo "start|No open train — start the next release"
+    return
+  fi
+  local pin_ver="${PIN%% *}" pin_commit="${PIN##* }"
+  if [[ -z "$PIN" || ! "$pin_ver" =~ ^${TRAIN_VER//./\\.}(rc[0-9]+)?$ ]]; then
+    echo "rc|Cut the first candidate for $TRAIN_VER"
+  elif [[ "$pin_ver" == "$TRAIN_VER" ]]; then
+    echo "ship|Final $TRAIN_VER is pinned — finish shipping (re-runs are safe)"
+  elif [[ "$pin_commit" != "$TRAIN_HEAD" ]]; then
+    echo "rc|$TRAIN has commits newer than $pin_ver — cut the next candidate"
+  elif ! all_arches_at_version rc "$pin_ver"; then
+    echo "rc|$pin_ver is pinned but not published — re-run rc to re-trigger/wait"
+  else
+    echo "ship|$pin_ver is published to rc — test it, then ship"
+  fi
+}
+
+print_status() {
+  print_header "Omarchy release status"
+  echo "  Channels (omarchy):"
+  echo "    edge:   $EDGE_VER"
+  echo "    rc:     $RC_VER"
+  echo "    stable: $STABLE_VER"
+  echo ""
+  if [[ -z "$TRAIN" ]]; then
+    echo "  No open release train."
+  else
+    echo "  Open train: $TRAIN_VER (branch $TRAIN @ ${TRAIN_HEAD:0:12})"
+    if [[ -n "$PIN" ]]; then
+      echo "  Current pin: ${PIN%% *} from commit ${PIN##* }"
+    else
+      echo "  Current pin: <none>"
+    fi
+  fi
+  echo ""
+  local step
+  step=$(next_step)
+  echo "  Next: omarchy-release ${step%%|*}  — ${step#*|}"
+}
+
+cmd_shepherd() {
+  gather_status
+  print_status
+  local step cmd
+  step=$(next_step)
+  cmd="${step%%|*}"
+  echo ""
+  if confirm "Run 'omarchy-release $cmd' now?"; then
+    case "$cmd" in
+    start) cmd_start ;;
+    pick) cmd_pick ;;
+    rc) cmd_rc "$ISO_MODE" "$WAIT" ;;
+    ship) cmd_ship "$ISO_MODE" "$WAIT" ;;
+    esac
+  fi
+}
+
+# --- doctor ------------------------------------------------------------------
+
+cmd_doctor() {
+  print_header "omarchy-release doctor"
+  local failures=0
+  check() {
+    local label="$1"; shift
+    if "$@" >/dev/null 2>&1; then
+      print_success "$label"
+    else
+      print_error "$label"
+      failures=$((failures + 1))
+    fi
+  }
+  check "git available" command -v git
+  check "gh available" command -v gh
+  check "gh authenticated" gh auth status
+  check "gh can see $UPSTREAM_REPO" gh repo view "$UPSTREAM_REPO"
+  check "gh can see $SITE_REPO" gh repo view "$SITE_REPO"
+  check "vercmp available (pacman)" command -v vercmp
+  check "makepkg available (checksums)" command -v makepkg
+  check "curl available" command -v curl
+  check "upstream reachable ($UPSTREAM_URL)" git ls-remote "$UPSTREAM_URL" HEAD
+  local ch arch
+  for ch in edge stable; do
+    for arch in $(published_arches); do
+      if published_version "$ch" "$arch" >/dev/null 2>&1; then
+        print_success "$ch/$arch channel db readable"
+      else
+        print_error "$ch/$arch channel db readable"
+        failures=$((failures + 1))
+      fi
+    done
+  done
+  for arch in $(published_arches); do
+    if published_version rc "$arch" >/dev/null 2>&1; then
+      print_success "rc/$arch channel db readable"
+    else
+      print_warning "rc/$arch channel db not readable — bootstrap it first: bin/repo bootstrap-rc (on the build host)"
+    fi
+  done
+  local host
+  if host=$(repo_host); then
+    check "build host ssh ($host)" ssh -o ConnectTimeout=10 "$host" true
+  elif on_repo_host; then
+    print_success "this machine IS the build host — host operations run locally"
+  else
+    print_warning "no build host configured — set OMARCHY_REPO_HOST, --host, or write an ssh destination (root@<host> or an ssh-config alias) to $BUILD_ROOT/.repo-host; until then builds trigger on the 6h timer only"
+  fi
+  if [[ -n "$CONTAINER_ENGINE" ]] && "$CONTAINER_ENGINE" info >/dev/null 2>&1; then
+    print_success "$CONTAINER_ENGINE available (ISO builds possible here)"
+  else
+    print_warning "container engine unavailable — ISO builds will print instructions instead"
+  fi
+  echo ""
+  if ((failures == 0)); then
+    print_success "Ready to release"
+  else
+    print_error "$failures check(s) failed"
+    exit 1
+  fi
+}
+
+# --- self-test ---------------------------------------------------------------
+
+cmd_self_test() {
+  local failures=0
+  expect() { # expect <label> <got> <want>
+    if [[ "$2" == "$3" ]]; then
+      echo "  ok: $1"
+    else
+      echo "  FAIL: $1 — got '$2', want '$3'"
+      failures=$((failures + 1))
+    fi
+  }
+  print_header "omarchy-release self-test"
+  expect "version_to_branch 4.0.2" "$(version_to_branch 4.0.2)" "v4-0-2"
+  expect "version_to_branch v4.1.0" "$(version_to_branch v4.1.0)" "v4-1-0"
+  expect "version_to_branch garbage rejects" "$(version_to_branch 4.0 2>/dev/null || echo reject)" "reject"
+  expect "branch_to_version v4-0-2" "$(branch_to_version v4-0-2)" "4.0.2"
+  expect "branch_to_version v10-2-33" "$(branch_to_version v10-2-33)" "10.2.33"
+  expect "branch_to_version quattro rejects" "$(branch_to_version quattro 2>/dev/null || echo reject)" "reject"
+  expect "version_is_patch 4.0.2" "$(version_is_patch 4.0.2 && echo yes || echo no)" "yes"
+  expect "version_is_patch 4.1.0" "$(version_is_patch 4.1.0 && echo yes || echo no)" "no"
+  expect "version_is_patch 5.0.0" "$(version_is_patch 5.0.0 && echo yes || echo no)" "no"
+  expect "previous_patch_tag 4.0.2" "$(previous_patch_tag 4.0.2)" "v4.0.1"
+  expect "previous_patch_tag 4.0.10" "$(previous_patch_tag 4.0.10)" "v4.0.9"
+
+  # Keep release readiness fail-closed when only one architecture has reached
+  # the requested version. This replaces the network reader for this process;
+  # self-test exits immediately afterwards.
+  published_version() {
+    case "$2" in
+      x86_64) echo "${TEST_X86_VERSION:-4.0.2-1}" ;;
+      aarch64) echo "${TEST_ARM_VERSION:-4.0.2-1}" ;;
+    esac
+  }
+  PUBLISHED_ARCHES=x86_64
+  expect "x86-only readiness" "$(all_arches_at_version rc 4.0.2 && echo ready || echo blocked)" "ready"
+  PUBLISHED_ARCHES=aarch64
+  expect "ARM-only readiness" "$(all_arches_at_version rc 4.0.2 && echo ready || echo blocked)" "ready"
+  PUBLISHED_ARCHES="x86_64 aarch64"
+  TEST_ARM_VERSION=4.0.1-1
+  expect "mixed versions block release" "$(all_arches_at_version rc 4.0.2 && echo ready || echo blocked)" "blocked"
+  TEST_ARM_VERSION=4.0.2-1
+  expect "both architectures ready" "$(all_arches_at_version rc 4.0.2 && echo ready || echo blocked)" "ready"
+  echo ""
+  if ((failures == 0)); then
+    print_success "Self-test passed"
+  else
+    print_error "$failures self-test failure(s)"
+    exit 1
+  fi
+}
+
+# --- dispatch ----------------------------------------------------------------
+
+COMMAND=""
+ISO_MODE="ask"
+WAIT=true
+ARGS=()
+while [[ $# -gt 0 ]]; do
+  case $1 in
+  --yes) ASSUME_YES=true; shift ;;
+  --host)
+    REPO_HOST_OVERRIDE="$2"
+    export OMARCHY_REPO_HOST="$2" # child bin/repo invocations forward to it too
+    shift 2
+    ;;
+  --iso) ISO_MODE="yes"; shift ;;
+  --no-iso) ISO_MODE="no"; shift ;;
+  --no-wait) WAIT=false; shift ;;
+  -h | --help) show_usage; exit 0 ;;
+  start | pick | rc | ship | status | doctor | self-test)
+    COMMAND="$1"; shift ;;
+  *)
+    ARGS+=("$1"); shift ;;
+  esac
+done
+
+case "$COMMAND" in
+start) cmd_start "${ARGS[@]}" ;;
+pick) cmd_pick "${ARGS[@]}" ;;
+rc) cmd_rc "$ISO_MODE" "$WAIT" ;;
+ship) cmd_ship "$ISO_MODE" "$WAIT" ;;
+status) gather_status; print_status ;;
+doctor) cmd_doctor ;;
+self-test) cmd_self_test ;;
+"") cmd_shepherd ;;
+*) print_error "Unknown command: $COMMAND"; show_usage; exit 1 ;;
+esac
