@@ -320,16 +320,37 @@ jobs:
             done' > pkgbase.txt
           declare -A slot_files=()
           while read -r package arch channels publish_arches; do
+            # The pkgbase the recipe builds, which is not always its directory
+            # name (pkgbuilds/yaru-icon-theme builds yaru).
+            base=$(BUILD_ROOT=$PWD bash -c 'source helpers/paths.sh; source helpers/package-metadata.sh; package_pkgbase "pkgbuilds/$1" "$2"' _ "$package" "$arch")
+            matched=0
             for f in build-output/edge/"$arch"/*.pkg.tar.zst; do
+              [[ -e $f ]] || continue
               # Only files this package produced (its PKGINFO pkgbase).
-              [[ $(awk -v f="$f" '$1==f{print $2}' pkgbase.txt) == "$package" ]] || continue
+              [[ $(awk -v f="$f" '$1==f{print $2}' pkgbase.txt) == "$base" ]] || continue
+              matched=$((matched + 1))
               for mirror in ${channels//,/ }; do
                 for parch in ${publish_arches//,/ }; do
                   slot_files["$mirror/$parch"]+="$f "
                 done
               done
             done
+            # A collected artifact must yield this package's files; publishing
+            # none of them would read as success and leave every channel stale.
+            if (( matched == 0 )) && jq -e --arg p "$package" --arg a "$arch" \
+              'select(.package == $p and .arch == $a and .source != "already-published")' sources.jsonl >/dev/null; then
+              echo "::error::$package ($arch): its artifact has no files with pkgbase $base"
+              unmatched=1
+            fi
           done < plan.txt
+          if [[ -n ${unmatched:-} ]]; then
+            jq -n --arg sha "${{ github.sha }}" --arg run "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+              --arg prefix "${OMARCHY_PUBLISH_PREFIX:-}" --arg event "${{ github.event_name }}" \
+              --slurpfile sources sources.jsonl --slurpfile plan <(jq -c '.include[]' <<<'${{ needs.changes.outputs.matrix }}' | jq -sc .) \
+              '{time: (now|todate), commit:$sha, run:$run, event:$event, target: (if $prefix=="" then "live" else $prefix end), plan:$plan[0], sources:$sources, slots:[]}' \
+              > publish-record.json
+            exit 1
+          fi
 
           # Deterministic slot order: edge before rc before stable, x86_64
           # before aarch64, so a failure leaves the earlier rings consistent.
@@ -367,6 +388,83 @@ jobs:
             '{time: (now|todate), commit:$sha, run:$run, event:$event, target: (if $prefix=="" then "live" else $prefix end), plan:$plan[0], sources:$sources, slots:$slots}' \
             > publish-record.json
           cat publish-record.json
+          exit $status
+
+      # A merge publishes a fast-ring build to edge, rc and stable at once,
+      # but the steps above skip a package edge already holds at master's
+      # version: one that just joined the fast ring, or whose rc or stable
+      # copy never landed. Copy edge's file to those channels. Nothing to do
+      # once they agree, which is every run where the publish above went in.
+      - name: Bring the fast ring in line with edge
+        if: success()
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+          RCLONE_CONFIG_R2_TYPE: s3
+          RCLONE_CONFIG_R2_PROVIDER: Cloudflare
+          RCLONE_CONFIG_R2_NO_CHECK_BUCKET: "true"
+          RCLONE_CONFIG_R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          RCLONE_CONFIG_R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          RCLONE_CONFIG_R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          OMARCHY_PUBLISH_PREFIX: ${{ vars.OMARCHY_PUBLISH_PREFIX }}
+        run: |
+          set -euo pipefail
+          # The fast-ring pkgbases of this merge, per channel and architecture.
+          declare -A bases=()
+          while read -r package arch channels publish_arches; do
+            BUILD_ROOT=$PWD bash -c 'source helpers/paths.sh; source helpers/package-metadata.sh; package_is_fast_ring "pkgbuilds/$1"' _ "$package" || continue
+            base=$(BUILD_ROOT=$PWD bash -c 'source helpers/paths.sh; source helpers/package-metadata.sh; package_pkgbase "pkgbuilds/$1" "$2"' _ "$package" "$arch")
+            for mirror in rc stable; do
+              [[ ",$channels," == *",$mirror,"* ]] || continue
+              for parch in ${publish_arches//,/ }; do
+                bases["$mirror $parch"]+="$base "
+              done
+            done
+          done < plan.txt
+          if (( ${#bases[@]} == 0 )); then
+            echo "No fast-ring packages in this merge."
+            exit 0
+          fi
+
+          # The Publish step skips its image pull when it has nothing new.
+          builder=omarchy-pkg-builder:latest-x86_64-edge
+          if ! docker image inspect "$builder" >/dev/null 2>&1; then
+            published="ghcr.io/omacom/omarchy-pkg-builder:$(bin/builder-image key --arch x86_64 --mirror edge)"
+            if docker pull --quiet "$published"; then
+              docker tag "$published" "$builder"
+            else
+              docker buildx build --load -t "$builder" --build-arg MIRROR=edge build
+            fi
+          fi
+
+          # The builder image runs as its own user; let it append the record.
+          mkdir -p "$RUNNER_TEMP/fast-ring"
+          : > "$RUNNER_TEMP/fast-ring/record.jsonl"
+          chmod 0777 "$RUNNER_TEMP/fast-ring"
+          chmod 0666 "$RUNNER_TEMP/fast-ring/record.jsonl"
+          status=0
+          for mirror in rc stable; do
+            for parch in x86_64 aarch64; do
+              list=${bases["$mirror $parch"]:-}
+              [[ -n $list ]] || continue
+              if ! docker run --rm \
+                -e GPG_PRIVATE_KEY -e GPG_PASSPHRASE -e OMARCHY_PUBLISH_PREFIX \
+                -e RCLONE_CONFIG_R2_TYPE -e RCLONE_CONFIG_R2_PROVIDER -e RCLONE_CONFIG_R2_ENDPOINT -e RCLONE_CONFIG_R2_NO_CHECK_BUCKET \
+                -e RCLONE_CONFIG_R2_ACCESS_KEY_ID -e RCLONE_CONFIG_R2_SECRET_ACCESS_KEY \
+                -v "$PWD:/w:ro" -v "$RUNNER_TEMP/fast-ring:/out" -w /w "$builder" \
+                bin/promote-channel --remote R2:omarchy-pkgs --fast-ring --from edge --to "$mirror" --arch "$parch" \
+                  --record /out/record.jsonl $list; then
+                status=1
+                break 2
+              fi
+            done
+          done
+          # Its publishes join the run's record as slots, as the Publish
+          # step's own do.
+          jq -c 'select(.type == "slot") | del(.type)' "$RUNNER_TEMP/fast-ring/record.jsonl" > fast-ring-slots.jsonl
+          jq --slurpfile extra fast-ring-slots.jsonl '.slots += $extra' publish-record.json > publish-record.tmp
+          mv publish-record.tmp publish-record.json
+          echo "fast-ring slots: $(wc -l < fast-ring-slots.jsonl)"
           exit $status
 
       - name: Keep the publish record

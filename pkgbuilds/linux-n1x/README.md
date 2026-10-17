@@ -35,11 +35,12 @@ pairs with Omarchy's `nvidia-open-dkms` and `nvidia-utils` 615.71.09, which
 drive the N1x GPU (PCI `10de:2e03` on the ASUS ProArt P14) including the
 internal panel's backlight.
 
-The package is excluded from unscoped repository builds because it is large
-and hardware-specific. Build it explicitly on native aarch64 when possible:
+CI builds it on its pull request, on Namespace's aarch64 runners. `skip_build`
+keeps the large, hardware-specific package out of an unscoped local
+`bin/build`; to build it locally, name it, on native aarch64 when possible:
 
 ```bash
-bin/repo build --arch aarch64 --package linux-n1x
+bin/build --arch aarch64 --package linux-n1x
 ```
 
 The package installs the raw arm64 `Image` for Limine's aarch64 Linux protocol

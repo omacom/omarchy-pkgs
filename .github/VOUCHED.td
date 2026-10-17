@@ -25,4 +25,5 @@ github:ryanrhughes
 github:scottjones
 github:spencerbull
 github:tcballard
+github:thisisgm
 github:tobi

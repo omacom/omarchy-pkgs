@@ -112,7 +112,7 @@ publishing without manual approval. No GitHub App is required.
    `build-isolation` on `master`; the tracker does not request a protection bypass.
 4. After merging the tracker, run **Track upstream branches** once from Actions
    to verify that its PR builds, auto-merges, and starts **Publish merged packages**.
-   Subsequent runs happen every two hours.
+   Subsequent runs happen hourly.
 
 Checksums retain their algorithms (SHA256, SHA512, BLAKE2, etc.) and source order.
 Changed git sources are hashed with makepkg's git-archive convention. Unchanged

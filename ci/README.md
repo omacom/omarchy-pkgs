@@ -1,8 +1,9 @@
 # The x86_64 builder pool
 
 x86_64 package builds run on DigitalOcean droplets that exist for one job
-each. aarch64 builds run on GitHub's `ubuntu-24.04-arm` runners and need
-nothing here.
+each. aarch64 builds run on GitHub's `ubuntu-24.04-arm` runners, and aarch64
+kernels on Namespace's Apple-backed runners (`package_runner` in
+`helpers/package-metadata.sh`); neither needs anything here.
 
 ## How it works
 
@@ -62,7 +63,7 @@ gh run list -R omacom/omarchy-pkgs --workflow build-pr.yml --status queued
 ```
 
 Only x86_64 jobs use this pool. A queued aarch64 job is waiting on GitHub's
-own runners.
+or Namespace's runners.
 
 ### Change settings
 

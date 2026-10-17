@@ -26,10 +26,9 @@ DEFER_RUNTIME_DEPS=${DEFER_RUNTIME_DEPS:-false}
 
 source "$HELPERS_DIR/package-metadata.sh"
 
-# Where the channel's published database is read from for planning. On the
-# repository host it is the published tree itself. Anywhere else (a CI runner,
-# a fresh clone) that tree is absent, so the database is fetched from the
-# public channel and the same URL serves as pacman's dependency repository.
+# Where the channel's published database is read from for planning: a local
+# copy when one is mounted (the build-plan test uses one), otherwise the public
+# channel, whose URL then also serves as pacman's dependency repository.
 # Set OMARCHY_PUBLISHED_REPO_URL= (empty) to disable the remote fallback.
 PUBLISHED_REPO_URL=${OMARCHY_PUBLISHED_REPO_URL-https://pkgs.omarchy.org}
 PUBLISHED_DB_DIR="$FINAL_OUTPUT_DIR"
@@ -565,8 +564,8 @@ check_needs_build() {
     return 1  # Already up to date
   fi
 
-  # Match check-versions: a retained archive is already published even when
-  # the DB now indexes a newer release (for example, 4.0.4rc1 vs 4.0.3).
+  # A retained archive is already published even when the DB now indexes a
+  # newer release (for example, 4.0.4rc1 vs 4.0.3).
   # Rebuilding it would produce different bytes under an immutable filename.
   if package_version_is_published "$FINAL_OUTPUT_DIR" "$pkg" "$pkgbuild_version" "$ARCH"; then
     echo "  + $pkg $pkgbuild_version - archive already published; skipping rebuild"

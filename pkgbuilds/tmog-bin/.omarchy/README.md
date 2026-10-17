@@ -76,5 +76,5 @@ moving to `source_x86_64`/`source_aarch64` and reporting both keys.
 bash pkgbuilds/tmog-bin/.omarchy/upstream-test.sh
 bin/sync-upstream self-test
 bin/sync-upstream tmog-bin
-bin/repo build --package tmog-bin
+bin/build --package tmog-bin
 ```

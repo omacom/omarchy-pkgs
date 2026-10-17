@@ -118,10 +118,10 @@ On 7.2.8 it went through `olddefconfig` again and took the architecture-independ
 
 ## Building
 
-The package is large and hardware-specific, so unscoped repository builds skip it. Build it explicitly, natively on aarch64 where possible:
+CI builds it on its pull request, on Namespace's aarch64 runners. `skip_build` keeps the large, hardware-specific package out of an unscoped local `bin/build`; to build it locally, name it, natively on aarch64 where possible:
 
 ```bash
-bin/repo build --arch aarch64 --package linux-omarchy-aarch64
+bin/build --arch aarch64 --package linux-omarchy-aarch64
 ```
 
 The build produces `Image`, modules and the Snapdragon laptops' device trees; N1x boots through ACPI and needs none. It installs the raw arm64 `Image` as `vmlinuz` for Limine's aarch64 Linux protocol.

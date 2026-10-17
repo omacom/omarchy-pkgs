@@ -109,7 +109,7 @@ In a fresh worker matching the reviewed profile:
 4. Verify restart-based upgrade, rollback, removal, and reinstallation. Retain
    evidence that binds each result to the package and mapped module bytes.
 
-After the exact package and Driver pairing passes, advance the signed artifact with `bin/repo advance --from edge --to rc --package cua-hyprland-plugin`, validate RC, and then use `bin/repo advance --from rc --to stable --package cua-hyprland-plugin`. Do not rebuild independently in RC or stable.
+After the exact package and Driver pairing passes, promote the signed artifact with **Promote channel** limited to this package (`gh workflow run promote.yml -R omacom/omarchy-pkgs -f direction="edge -> rc" -f packages=cua-hyprland-plugin`), validate RC, and then run it with `-f direction="rc -> stable"`. Promotion copies the published file; nothing is rebuilt for RC or stable.
 
 Portable tests, screenshots, health reports, and a successful build do not
 replace native qualification. Recheck the published Driver package before
@@ -195,6 +195,6 @@ environment. Mirror/channel changes and changes to ABI dependencies, Driver,
 or admitted apps request a new candidate and affected qualification. They do
 not establish compatibility or authorize additional publication channels.
 
-This package participates in scheduled builds, but has no upstream polling, AUR synchronization, or automatic rebuild bump. A checked-in version change or missing artifact can queue it for the normal release pipeline. Build selection, promotion, `push`, and `upload-prebuilt` do not supply native qualification or authorize a broader support claim. Do not silently substitute newly rebuilt bytes during signing or publication.
+This package has no upstream polling or automatic rebuild bump. A checked-in version change builds it on its pull request and publishes it to edge on merge, like any package. Building, publishing and promotion do not supply native qualification or authorize a broader support claim. Do not silently substitute newly rebuilt bytes during signing or publication.
 
 Before calling a release complete, install the signed published package on a fresh consumer, verify its signature and package/module digests, and perform a short activation, background-action, and cleanup smoke. Edge and RC artifacts are compatibility checkpoints, not qualified support for those environments.

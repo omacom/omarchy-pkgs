@@ -1,0 +1,176 @@
+From: Guido Jouret <gjouret@gmail.com>
+Subject: [PATCH] ASoC: tas2783-sdw: per-amp stereo channel map on HP
+ OmniBook Ultra 14 (8EB4)
+
+The HP OmniBook Ultra 14 (board 8EB4) has four TAS2783, two per SoundWire
+link: link 1 uid 0xa (right tweeter) and 0xd (left tweeter), link 2 uid
+0x9 (right woofer) and 0xc (left woofer). Both links carry the same 2ch
+stream.
+
+With HP's per-amp firmware an amp given only DP1 channel 1 is silent and
+an amp given only channel 2 renders the slot at its payload offset
+(measured: left-only playback silent, right-only playback heard from the
+left speakers, each left speaker identified by muting its switch). So the
+generic split of 173cb3147ba2 (channel 1 for tas2783-1/-3, channel 2 for
+-2/-4) loses the left channel on this board, and mirror mode (no split)
+gives the right channel on all four.
+
+On 8EB4 give left amps channel 2 only, landing on slot 0 (L) whether they
+come first or follow a mirror-mode right amp; give a right amp both
+channels when it is first on its link (its channel 2 carries R), else
+channel 2 only (slot 1, R). The position on the link is the codec DAI
+order of the stream, which is the order slaves are added to it and hence
+the order sdw_compute_slave_ports() allocates offsets in. Gated on DMI
+vendor HP / board 8EB4 and the four link/uid pairs; hp8eb4_chmap=0 turns
+it off for A/B tests.
+
+Signed-off-by: Guido Jouret <gjouret@gmail.com>
+---
+
+diff --git a/sound/soc/codecs/tas2783-sdw.c b/sound/soc/codecs/tas2783-sdw.c
+index 7fcf821..9591e56 100644
+--- a/sound/soc/codecs/tas2783-sdw.c
++++ b/sound/soc/codecs/tas2783-sdw.c
+@@ -13,6 +13,7 @@
+ // Author: Kevin Lu <kevin-lu@ti.com>
+ 
+ #include <linux/cleanup.h>
++#include <linux/dmi.h>
+ #include <linux/unaligned.h>
+ #include <linux/crc32.h>
+ #include <linux/efi.h>
+@@ -103,6 +104,8 @@ struct tas2783_prv {
+ 	bool fw_dl_success;
+ 	/* use fallback fw name */
+ 	bool fw_use_fallback;
++	/* HP 8EB4 channel map logged once */
++	bool hp8eb4_logged;
+ };
+ 
+ static const struct reg_default tas2783_reg_default[] = {
+@@ -951,6 +954,114 @@ static void tas_sdw_shutdown(struct snd_pcm_substream *substream,
+ 	snd_soc_dai_set_dma_data(dai, substream, NULL);
+ }
+ 
++/*
++ * HP OmniBook Ultra 14 (board 8EB4): four TAS2783, two per SoundWire link
++ * (link 1: uid 0xa right tweeter, 0xd left tweeter; link 2: uid 0x9 right
++ * woofer, 0xc left woofer). Both links carry the same stereo stream.
++ *
++ * Measured on this board with HP's per-amp firmware: an amp given only DP1
++ * channel 1 stays silent, an amp given only channel 2 renders the bus slot
++ * at its payload offset. Splitting a stereo stream by name-prefix parity
++ * (channel 1 for tas2783-1/-3, channel 2 for -2/-4) therefore leaves the
++ * left channel unreproduced and plays the right channel on the left amps.
++ *
++ * sdw_compute_slave_ports() hands out payload offsets per link in the order
++ * the slaves were added to the stream, i.e. the order of the codec DAIs'
++ * hw_params calls (__soc_pcm_hw_params walks for_each_rtd_codec_dais and
++ * skips DAIs that are not valid for the stream; a repeated hw_params finds
++ * the existing slave runtime and keeps its place). An amp claiming every
++ * channel of the stream takes the whole block and the next amp starts again
++ * at offset 0 (mirror mode); an amp claiming one channel takes the next slot.
++ *  - A left amp claims channel 2 only and lands on slot 0 (L), whether it is
++ *    first on its link or follows a right amp in mirror mode.
++ *  - A right amp claims both channels when it is first on its link (its
++ *    channel 2 then carries R), and channel 2 only when it follows the left
++ *    amp (slot 1, R).
++ * Mirror detection compares a slave's channel count with m_rt->ch_count.
++ * sdw_stream_add_slave() overwrites that with the slave's count, but the CPU
++ * DAI's hw_params (sdw_stream_add_master(), 2 channels) runs after the
++ * codecs' in every hw_params pass and the payload is allocated only at
++ * prepare, so allocation always sees 2. The port's channel count follows
++ * its mask; each amp's first hw_params logs its choice and link position.
++ * hp8eb4_chmap=0 restores the generic behaviour (for A/B tests; takes
++ * effect at the next stream start).
++ */
++static bool hp8eb4_chmap = true;
++module_param(hp8eb4_chmap, bool, 0644);
++MODULE_PARM_DESC(hp8eb4_chmap, "HP OmniBook Ultra 14 (8EB4): per-amp stereo map (default on)");
++
++enum { TAS2783_HP8EB4_NONE, TAS2783_HP8EB4_LEFT, TAS2783_HP8EB4_RIGHT };
++
++static int tas2783_hp8eb4_side(struct sdw_slave *slave)
++{
++	unsigned int link = slave->bus->link_id;
++	unsigned int uid = slave->id.unique_id;
++
++	if (!dmi_match(DMI_SYS_VENDOR, "HP") || !dmi_match(DMI_BOARD_NAME, "8EB4"))
++		return TAS2783_HP8EB4_NONE;
++	if ((link == 1 && uid == 0xd) || (link == 2 && uid == 0xc))
++		return TAS2783_HP8EB4_LEFT;
++	if ((link == 1 && uid == 0xa) || (link == 2 && uid == 0x9))
++		return TAS2783_HP8EB4_RIGHT;
++	return TAS2783_HP8EB4_NONE;
++}
++
++/* Position of @dai among this stream's SoundWire codec DAIs on its own link */
++static int tas2783_link_position(struct snd_pcm_substream *substream,
++				 struct snd_soc_dai *dai)
++{
++	struct snd_soc_pcm_runtime *rtd = snd_soc_substream_to_rtd(substream);
++	struct sdw_bus *bus = dev_to_sdw_dev(dai->dev)->bus;
++	struct snd_soc_dai *codec_dai;
++	int i, pos = 0;
++
++	for_each_rtd_codec_dais(rtd, i, codec_dai) {
++		/* snd_soc_dai_stream_valid() (not exported) */
++		const struct snd_soc_pcm_stream *st =
++			snd_soc_dai_get_pcm_stream(codec_dai, substream->stream);
++
++		if (!st || !st->channels_min ||
++		    codec_dai->dev->bus != &sdw_bus_type ||
++		    dev_to_sdw_dev(codec_dai->dev)->bus != bus)
++			continue;
++		if (codec_dai == dai)
++			return pos;
++		pos++;
++	}
++	return 0;
++}
++
++static void tas2783_hp8eb4_ch_mask(struct tas2783_prv *tas_dev,
++				   struct snd_pcm_substream *substream,
++				   struct snd_pcm_hw_params *params,
++				   struct snd_soc_dai *dai,
++				   struct sdw_stream_config *stream_config,
++				   struct sdw_port_config *port_config)
++{
++	struct sdw_slave *slave = tas_dev->sdw_peripheral;
++	int side = tas2783_hp8eb4_side(slave);
++	int pos;
++
++	if (!hp8eb4_chmap || side == TAS2783_HP8EB4_NONE ||
++	    params_channels(params) != 2)
++		return;
++
++	pos = tas2783_link_position(substream, dai);
++	port_config->ch_mask = (side == TAS2783_HP8EB4_RIGHT && pos == 0) ?
++			       GENMASK(1, 0) : BIT(1);
++	stream_config->ch_count = hweight32(port_config->ch_mask);
++
++	if (!tas_dev->hp8eb4_logged) {
++		tas_dev->hp8eb4_logged = true;
++		dev_info(tas_dev->dev,
++			 "HP 8EB4: link %u uid %#x (%s) plays %s, position %d on link, ch_mask %#x\n",
++			 slave->bus->link_id, slave->id.unique_id,
++			 dai->component->name_prefix ?: "-",
++			 side == TAS2783_HP8EB4_LEFT ? "left" : "right",
++			 pos, port_config->ch_mask);
++	}
++}
++
+ static s32 tas_sdw_hw_params(struct snd_pcm_substream *substream,
+ 			     struct snd_pcm_hw_params *params,
+ 			     struct snd_soc_dai *dai)
+@@ -1032,6 +1143,10 @@ static s32 tas_sdw_hw_params(struct snd_pcm_substream *substream,
+ 	else
+ 		port_config.num = 2;
+ 
++	if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK)
++		tas2783_hp8eb4_ch_mask(tas_dev, substream, params, dai,
++				       &stream_config, &port_config);
++
+ 	ret = sdw_stream_add_slave(sdw_peripheral,
+ 				   &stream_config, &port_config, 1, sdw_stream);
+ 	if (ret)

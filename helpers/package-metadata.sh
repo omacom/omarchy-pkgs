@@ -167,9 +167,19 @@ package_pkgbuild_var() {
   ' _ "$var")
 }
 
+# The pkgbase a recipe builds, as makepkg names it: pkgbase, else the first
+# pkgname. Usually the directory's name, but not always
+# (pkgbuilds/yaru-icon-theme builds pkgbase yaru).
+package_pkgbase() {
+  local pkgdir="$1" base
+  base=$(package_pkgbuild_var "$pkgdir" pkgbase "${2:-}" 2>/dev/null || true)
+  [[ -n "$base" ]] || base=$(package_pkgbuild_var "$pkgdir" pkgname "${2:-}" 2>/dev/null || true)
+  echo "${base:-${pkgdir##*/}}"
+}
+
 # The architectures declared by a PKGBUILD. Set CARCH while reading it so a
 # conditional arch=() assignment is evaluated for the architecture we are
-# actually checking, even when the repository host is a different one.
+# actually checking, even when the machine running the check is a different one.
 package_arches() {
   local pkgdir="$1"
   local arch="${2:-${ARCH:-x86_64}}"
@@ -193,8 +203,8 @@ package_supports_arch() {
 }
 
 # The channel DB indexes only its newest version, but older published archives
-# remain immutable. Both the scheduler and build planner must skip an existing
-# filename even when the checkout differs from the version currently indexed.
+# remain immutable. The build planner must skip an existing filename even when
+# the checkout differs from the version currently indexed.
 package_version_is_published() {
   local repo_dir="$1" package="$2" version="$3" target="$4" path
   for path in "$repo_dir/$package-$version-$target.pkg.tar."* \
@@ -226,11 +236,11 @@ package_in_channel() {
   package_channels "$pkgdir" | grep -qx "$channel"
 }
 
-# A pinned package's version is set per release by the orchestrator on the rc
-# branch, not by whatever the current checkout happens to say. Only a build
-# running from that branch's worktree (OMARCHY_RC_PINS=1) may build it for rc;
-# otherwise master's shipped pins would try to overwrite an in-flight RC with
-# an older version.
+# A pinned package's version is set per release by bin/omarchy-release on the
+# rc branch, not by whatever the current checkout happens to say. Only the
+# release-candidate build (release-rc.yml, which sets OMARCHY_RC_PINS=1 after
+# taking the rc branch's pins) may build it for rc; otherwise master's shipped
+# pins would try to overwrite an in-flight RC with an older version.
 package_is_pinned() {
   local pkgdir="$1" metadata
   metadata=$(metadata_file_for_dir "$pkgdir")
@@ -273,7 +283,7 @@ package_builds_for_mirror() {
   esac
 }
 
-# Whether `bin/repo advance` may carry this package into the given channel:
+# Whether bin/promote-channel may carry this package into the given channel:
 # a member of that channel that is not built there natively. Native builds are
 # authoritative — advancing over them could pair a published filename with
 # different bytes, which the R2 cache would never recover from.
@@ -298,13 +308,6 @@ package_dirs() {
   done
 }
 
-packages_for_aur_sync() {
-  package_dirs | while IFS= read -r pkgdir; do
-    if package_sync_enabled "$pkgdir"; then
-      basename "$pkgdir"
-    fi
-  done
-}
 
 package_has_upstream_hook() {
   local pkgdir="$1"
@@ -373,23 +376,7 @@ package_has_rebuild_triggers() {
   [[ -n "$(package_rebuild_triggers "$pkgdir")" ]]
 }
 
-packages_for_rebuild_sync() {
-  package_dirs | while IFS= read -r pkgdir; do
-    if package_has_rebuild_triggers "$pkgdir"; then
-      basename "$pkgdir"
-    fi
-  done
-}
 
-packages_for_mirror() {
-  local mirror="$1"
-
-  package_dirs | while IFS= read -r pkgdir; do
-    if package_builds_for_mirror "$pkgdir" "$mirror"; then
-      basename "$pkgdir"
-    fi
-  done
-}
 
 packages_for_unscoped_build() {
   local mirror="$1"
