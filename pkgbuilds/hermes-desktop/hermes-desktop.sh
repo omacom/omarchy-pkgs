@@ -86,10 +86,12 @@ if runtime:
             from hermes_cli.main import _desktop_launch_options
         from hermes_constants import with_hermes_node_path
 
-        # Newer runtimes append renderer_accessibility; the packaged release returns four.
-        flags, gpu, store, ozone, *extra = _desktop_launch_options()
+        # Older runtimes return three settings; later versions append ozone and a11y.
+        flags, gpu, store, *extra = _desktop_launch_options()
         if extra:
-            a11y = extra[0]
+            ozone = extra[0]
+        if len(extra) > 1:
+            a11y = extra[1]
         env = with_hermes_node_path(env)
     except ImportError:
         print("Could not load Hermes desktop settings; using launch defaults.", file=sys.stderr)
