@@ -5,6 +5,8 @@ each. aarch64 builds run on GitHub's `ubuntu-24.04-arm` runners, and aarch64
 kernels on Namespace's Apple-backed runners (`package_runner` in
 `helpers/package-metadata.sh`); neither needs anything here.
 
+The binfmt image is pinned by reviewed digest in both the Docker helper and cloud-init; update both references together. Run privileged registration on disposable builders without reusable credentials.
+
 ## How it works
 
 - **Jobs ask for a runner labelled `omarchy-builder`.** `build-pr.yml` builds
