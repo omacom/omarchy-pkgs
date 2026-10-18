@@ -108,6 +108,20 @@ grep -q '^Type=notify$' "$PKG/hm1092-relay.service" || fail "the relay unit wait
 grep -qF 'sd_notify("READY=1")' "$PKG/hm1092-relay" || fail "the relay reports readiness"
 pass "the units agree with the shipped files"
 
+# The README's support matrix quotes the shipped limits; a change to the conf or
+# the fix pack release has to reach it too.
+readme="$PKG/README.md"
+conf_value() { sed -n "s/^$1=//p" "$PKG/hm1092-ir-camera.conf"; }
+burst_s=$(awk -v ms="$(conf_value MAX_ILLUMINATION_MS)" 'BEGIN { print ms / 1000 }')
+duty_pct=$(awk -v f="$(conf_value DUTY_FRACTION)" 'BEGIN { print f * 100 }')
+grep -qF "at most $burst_s s (\`MAX_ILLUMINATION_MS\`)" "$readme" || fail "the README quotes the burst cap of $burst_s s"
+grep -qF "at most $duty_pct % (\`DUTY_FRACTION\`)" "$readme" || fail "the README quotes the duty fraction of $duty_pct %"
+grep -qF "$(conf_value DUTY_WINDOW_S) s window (\`DUTY_WINDOW_S\`)" "$readme" || fail "the README quotes the duty window"
+grep -qF "$(conf_value WIDTH)×$(conf_value HEIGHT) at 30 fps is the only mode" "$readme" || fail "the README quotes the sensor mode"
+grep -qF "release $(sed -n 's/^_fixpack_ver=//p' "$PKG/PKGBUILD") of" "$readme" || fail "the README names the packaged fix pack release"
+grep -q 'README\.md.*/usr/share/doc/\$pkgname/' "$PKG/PKGBUILD" || fail "the package installs the README"
+pass "the README's support matrix matches the shipped limits and is installed"
+
 # ipu-bridge must list the sensor, or it never binds. Mainline does from 7.3 and
 # Omarchy's kernels patch it in before that, so the package relies on them and
 # never displaces their ipu-bridge, which carries other machines' fixes too.
