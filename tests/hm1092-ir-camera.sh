@@ -102,6 +102,10 @@ done < <(grep -ho '/usr/lib/hm1092-ir-camera/[a-z0-9-]*' "$PKG"/*.service "$PKG/
 grep -q '^EnvironmentFile=/etc/hm1092-ir-camera.conf$' "$PKG/hm1092-relay.service" || fail "the relay unit reads the shipped conf"
 grep -q '^ConditionPathExistsGlob=/sys/bus/acpi/devices/HIMX1092:\*$' "$PKG/hm1092-relay.service" ||
   fail "the relay unit is conditional on the sensor"
+# Units ordered after the relay should find the loopback in place, so systemd
+# waits for the relay's READY=1, sent once the device is primed.
+grep -q '^Type=notify$' "$PKG/hm1092-relay.service" || fail "the relay unit waits for the relay's readiness"
+grep -qF 'sd_notify("READY=1")' "$PKG/hm1092-relay" || fail "the relay reports readiness"
 pass "the units agree with the shipped files"
 
 # ipu-bridge must list the sensor, or it never binds. Mainline does from 7.3 and

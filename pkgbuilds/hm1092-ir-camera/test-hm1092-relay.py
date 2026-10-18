@@ -6,13 +6,19 @@ optional here: the conversion tests are skipped without it, and the shell
 suite says so.
 """
 
+import contextlib
 import importlib.machinery
 import importlib.util
+import io
 import os
+import signal
+import socket
 import struct
 import sys
 import tempfile
+import time
 import unittest
+from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.dont_write_bytecode = True  # keep __pycache__ out of the package directory
@@ -244,8 +250,9 @@ class FloodLedBudget(unittest.TestCase):
         with open(os.path.join(self.led, "brightness"), "w") as f:
             f.write("0\n")
         self.now = 1000.0
+        self.messages = []
         self.lamp = relay.FloodLed(self.led, max_burst_s=8.0, duty_window_s=60.0,
-                                   duty_fraction=0.5, clock=lambda: self.now, log=lambda _m: None)
+                                   duty_fraction=0.5, clock=lambda: self.now, log=self.messages.append)
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -268,16 +275,53 @@ class FloodLedBudget(unittest.TestCase):
         self.assertFalse(self.lamp.tick())
         self.assertEqual(self.brightness(), "0")
 
+    def test_a_capped_consumer_stays_dark_until_it_leaves(self):
+        self.assertTrue(self.lamp.assert_on())
+        self.now += 8.1
+        self.assertFalse(self.lamp.tick())
+        self.now += 0.2
+        self.assertFalse(self.lamp.assert_on())
+        self.assertEqual(self.brightness(), "0")
+        self.lamp.end_session()
+        self.assertTrue(self.lamp.assert_on())
+
+    def test_a_rebuilt_source_does_not_restart_the_burst(self):
+        self.lamp.assert_on()
+        self.now += 5.0
+        self.lamp.set(False)  # the stall path drops the source and darkens
+        self.now += 0.1
+        self.assertTrue(self.lamp.assert_on())
+        self.now += 3.0
+        self.assertFalse(self.lamp.tick())
+        self.assertEqual(self.brightness(), "0")
+
+    def test_holding_dark_is_logged_once(self):
+        self.lamp.assert_on()
+        self.now += 8.1
+        self.lamp.tick()
+        for _ in range(25):
+            self.now += 0.2
+            self.lamp.assert_on()
+            self.lamp.tick()
+        self.assertEqual(sum("held dark" in m for m in self.messages), 1, self.messages)
+
     def test_the_rolling_duty_budget_blocks_relighting(self):
         for _ in range(4):
             self.lamp.assert_on()
             self.now += 7.5
-            self.lamp.set(False)
+            self.lamp.end_session()
             self.now += 0.5
         self.assertFalse(self.lamp.assert_on())
         self.assertEqual(self.brightness(), "0")
         self.now += 40
         self.assertTrue(self.lamp.assert_on())
+
+    def test_rejects_limits_that_would_disable_the_safeguards(self):
+        for limits in ({"duty_fraction": 5}, {"duty_fraction": 0}, {"duty_fraction": float("nan")},
+                       {"max_burst_s": 0}, {"max_burst_s": -1}, {"max_burst_s": float("inf")},
+                       {"duty_window_s": 0}, {"duty_window_s": float("inf")}):
+            with self.subTest(**limits), self.assertRaises(ValueError):
+                relay.FloodLed(self.led, **limits)
 
     def test_off_is_tolerated_when_the_attribute_vanished(self):
         self.lamp.assert_on()
@@ -323,6 +367,128 @@ class ConfigFromEnvironment(unittest.TestCase):
         self.assertTrue(cfg.rotate180)
         self.assertEqual((cfg.width, cfg.height), (1296, 736))
         self.assertEqual(cfg.ir_led, "")
+
+
+class FakeSink:
+    """The loopback, driven by a script of (seconds since start, consumer count)
+    events. Its fd is always readable, so main() never sleeps in select()."""
+
+    def __init__(self, script, stop_after):
+        self.script, self.stop_after = list(script), stop_after
+        self.r, self.w = os.pipe()
+        os.write(self.w, b"x")
+        self.start = None
+        self.writes = []
+
+    def fileno(self):
+        return self.r
+
+    def elapsed(self):
+        return time.monotonic() - self.start
+
+    def pending_events(self):
+        if self.start is None:
+            self.start = time.monotonic()
+        if self.elapsed() >= self.stop_after:
+            os.kill(os.getpid(), signal.SIGTERM)
+        due = [count for at, count in self.script if at <= self.elapsed()]
+        self.script = [(at, count) for at, count in self.script if at > self.elapsed()]
+        return due
+
+    def write(self, frame):
+        data = bytes(frame)
+        at = None if self.start is None else self.elapsed()  # None: the priming frame
+        self.writes.append((at, data.count(0) == len(data)))
+
+    def close(self):
+        os.close(self.r)
+        os.close(self.w)
+
+
+class FakeCapture:
+    stride = 1344
+
+    def __init__(self, _path, width, height):
+        self.r, self.w = os.pipe()
+        os.write(self.w, b"x")
+        self.frame = bytes([0x90, 0x01]) * (self.stride // 2 * height)
+
+    def fileno(self):
+        return self.r
+
+    def read(self):
+        return self.frame
+
+    def close(self):
+        os.close(self.r)
+        os.close(self.w)
+
+
+@unittest.skipUnless(np is not None, "python-numpy is not installed")
+class RelayLoop(unittest.TestCase):
+    """main() against a fake loopback and capture, with a 50 ms burst."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        led = os.path.join(self.tmp.name, "class", "leds", "HIMX1092_00::ir_flood_led")
+        os.makedirs(led)
+        with open(os.path.join(led, "brightness"), "w") as f:
+            f.write("0")
+        self.env = {"HM1092_SYS_ROOT": self.tmp.name, "MAX_ILLUMINATION_MS": "50"}
+
+    def tearDown(self):
+        signal.signal(signal.SIGTERM, signal.SIG_DFL)
+        signal.signal(signal.SIGINT, signal.default_int_handler)
+        self.tmp.cleanup()
+
+    def run_relay(self, sink):
+        graph = mock.Mock(complete=True, capture_node="/dev/video8", sensor="hm1092",
+                          csi="Intel IPU7 CSI2 2", capture="Intel IPU7 ISYS Capture 8")
+        with mock.patch.dict(os.environ, self.env, clear=True), \
+                mock.patch.object(relay.Graph, "discover", return_value=graph), \
+                mock.patch.object(relay, "ensure_loopback", return_value="/dev/video51"), \
+                mock.patch.object(relay, "Loopback", return_value=sink), \
+                mock.patch.object(relay, "Capture", FakeCapture), \
+                mock.patch.object(relay, "TICK_S", 0.01), \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(relay.main([]), 0)
+        return [(at, black) for at, black in sink.writes if at is not None]
+
+    def test_a_consumer_held_dark_keeps_receiving_frames(self):
+        writes = self.run_relay(FakeSink([(0, 1)], stop_after=0.3))
+        last_live = max(at for at, black in writes if not black)
+        self.assertLess(last_live, 0.2)
+        dark_after_cap = [at for at, black in writes if black and at > last_live]
+        self.assertGreater(len(dark_after_cap), 5)
+        self.assertGreater(max(dark_after_cap), 0.25)
+
+    def test_the_burst_starts_over_for_the_next_consumer(self):
+        writes = self.run_relay(FakeSink([(0, 1), (0.15, 0), (0.2, 1)], stop_after=0.35))
+        self.assertTrue(any(not black and at < 0.1 for at, black in writes))
+        self.assertTrue(any(not black and at >= 0.2 for at, black in writes))
+
+
+class Readiness(unittest.TestCase):
+    def notify(self, notify_socket):
+        env = {} if notify_socket is None else {"NOTIFY_SOCKET": notify_socket}
+        with mock.patch.dict(os.environ, env, clear=True), \
+                mock.patch.object(relay.socket, "socket") as factory:
+            relay.sd_notify("READY=1")
+        return factory, factory.return_value.__enter__.return_value
+
+    def test_sd_notify_sends_a_datagram_to_the_notify_socket(self):
+        factory, sk = self.notify("/run/systemd/notify")
+        factory.assert_called_once_with(socket.AF_UNIX, socket.SOCK_DGRAM)
+        sk.connect.assert_called_once_with("/run/systemd/notify")
+        sk.sendall.assert_called_once_with(b"READY=1")
+
+    def test_sd_notify_maps_an_abstract_address(self):
+        _factory, sk = self.notify("@/org/freedesktop/systemd1/notify")
+        sk.connect.assert_called_once_with("\0/org/freedesktop/systemd1/notify")
+
+    def test_sd_notify_is_silent_outside_systemd(self):
+        factory, _sk = self.notify(None)
+        factory.assert_not_called()
 
 
 class ScaleCadence(unittest.TestCase):

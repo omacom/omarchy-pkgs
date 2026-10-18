@@ -22,6 +22,7 @@ process in the kernel with the LED lit.
 
 import ctypes
 import fcntl
+import math
 import mmap
 import os
 import re
@@ -34,7 +35,7 @@ import time
 
 # ---------------------------------------------------------------------------
 # V4L2 through ctypes. Layouts and ioctl numbers are x86_64 as compiled from
-# linux/videodev2.h; tests/test_relay.py pins the struct sizes.
+# linux/videodev2.h; test-hm1092-relay.py pins the struct sizes.
 
 VIDIOC_G_FMT = 0xC0D05604
 VIDIOC_S_FMT = 0xC0D05605
@@ -439,8 +440,19 @@ def find_flood_led(sys_root="/sys"):
 
 
 class FloodLed:
+    """A burst is one consumer's light: it starts when the LED first lights for
+    that consumer and ends max_burst_s later, or when the consumer leaves. Once
+    it ends, the LED stays dark until end_session(). Dropping and rebuilding a
+    stalled source inside a burst does not start a new one."""
+
     def __init__(self, led_dir, max_burst_s=8.0, duty_window_s=60.0, duty_fraction=0.5,
                  clock=boottime, log=log):
+        if not 0 < max_burst_s < math.inf:
+            raise ValueError(f"MAX_ILLUMINATION_MS must be a positive duration, not {max_burst_s * 1000:g}")
+        if not 0 < duty_window_s < math.inf:
+            raise ValueError(f"DUTY_WINDOW_S must be a positive duration, not {duty_window_s:g}")
+        if not 0 < duty_fraction <= 1:
+            raise ValueError(f"DUTY_FRACTION must lie in (0, 1], not {duty_fraction:g}")
         self.path = os.path.join(led_dir, "brightness")
         self.max_burst_s = max_burst_s
         self.duty_window_s = duty_window_s
@@ -449,6 +461,8 @@ class FloodLed:
         self.log = log
         self.on = False
         self.burst_start = None
+        self.session_start = None
+        self.held_dark = None
         self.history = []
 
     def _write(self, value):
@@ -470,15 +484,34 @@ class FloodLed:
         t = self.clock() if t is None else t
         return self.spent(t) >= self.duty_budget_s
 
+    def refusal(self, t):
+        """Why the LED must stay dark at t, or None when it may light."""
+        if self.session_start is not None and t - self.session_start >= self.max_burst_s:
+            return f"the {self.max_burst_s:g} s burst is used up until the consumer leaves"
+        if self.budget_exhausted(t):
+            return f"{self.duty_budget_s:g} s of light in {self.duty_window_s:g} s are used up"
+        return None
+
+    def _hold_dark(self, reason):
+        if self.on:
+            self.set(False)
+        if reason != self.held_dark:
+            self.held_dark = reason
+            self.log(f"illuminator held dark: {reason}")
+        return False
+
     def assert_on(self):
         """Light the LED unconditionally; the write is cheap and the LED may
-        have been reset behind our back. False when the budget forbids it."""
+        have been reset behind our back. False when the burst or budget
+        forbids it."""
         t = self.clock()
-        if self.budget_exhausted(t):
-            if self.on:
-                self.set(False)
-            return False
+        reason = self.refusal(t)
+        if reason:
+            return self._hold_dark(reason)
         self._write(b"1")
+        self.held_dark = None
+        if self.session_start is None:
+            self.session_start = t
         if not self.on:
             self.on = True
             self.burst_start = t
@@ -504,13 +537,13 @@ class FloodLed:
     def tick(self):
         """Called every pass while streaming. False once this burst or the
         rolling budget is used up; the LED is already off by then."""
-        if not self.on:
-            return True
-        t = self.clock()
-        if t - self.burst_start >= self.max_burst_s or self.budget_exhausted(t):
-            self.set(False)
-            return False
-        return True
+        reason = self.refusal(self.clock())
+        return self._hold_dark(reason) if reason else True
+
+    def end_session(self):
+        self.set(False)
+        self.session_start = None
+        self.held_dark = None
 
     def close(self):
         self.set(False)
@@ -602,7 +635,11 @@ def main(argv=None):
     if not led_dir:
         log("no IR flood LED found; frames would be too dark to match")
         return 1
-    lamp = FloodLed(led_dir, cfg.max_burst_s, cfg.duty_window_s, cfg.duty_fraction)
+    try:
+        lamp = FloodLed(led_dir, cfg.max_burst_s, cfg.duty_window_s, cfg.duty_fraction)
+    except ValueError as e:
+        log(f"refusing to drive the IR flood LED: {e}")
+        return 1
     lamp.set(False)
 
     graph = Graph.discover(cfg.dev_root, cfg.sensor)
@@ -666,10 +703,17 @@ def main(argv=None):
                 if count != consumers:
                     consumers = count
                     log(f"consumers: {consumers}")
+                    if consumers == 0:
+                        lamp.end_session()
 
             if consumers > 0 and source is None:
                 if not lamp.assert_on():
-                    log("illuminator budget exhausted, holding dark")
+                    # A consumer blocks in DQBUF until a frame arrives; keep
+                    # it moving so its own timeout ends the session.
+                    try:
+                        sink.write(black)
+                    except OSError:
+                        pass
                     select.select([sink, wake_r], [], [sink], TICK_S)
                     drain_wakeups()
                     continue
@@ -697,7 +741,7 @@ def main(argv=None):
             if frames and frames % 30 == 0:
                 lamp.assert_on()
             if not lamp.tick():
-                close_source("illuminator cap reached, dropping the source")
+                close_source("dropping the source while the illuminator is held dark")
                 try:
                     sink.write(black)
                 except OSError:
