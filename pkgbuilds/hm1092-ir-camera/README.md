@@ -113,7 +113,7 @@ protection. `/etc/hm1092-ir-camera.conf` sets its limits:
 ### Lifecycle
 
 - Before suspend, the sleep hook stops the relay and turns the LED off; after
-  resume it starts the relay again. This is not yet verified on hardware.
+  resume it starts the relay again, and the next reader gets light as usual.
 - An upgrade neither restarts the relay nor reloads the module. Reboot after
   upgrading.
 - After removal the loopback device stays until the next reboot.
