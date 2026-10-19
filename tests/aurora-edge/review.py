@@ -47,6 +47,8 @@ class KernelRecipeTests(unittest.TestCase):
                 self.assertNotIn('\n' + name + '=', original, 'Neo fragment overrides shared setting')
                 self.assertNotIn('# ' + name + ' is not set', original, 'Neo fragment flips shared disabled setting')
         self.assertIn('CONFIG_MT7932_FULLMAC=m', fragment)
+        # The J700 sound card links its maxim,max98360a speaker amp; without the codec the card never probes.
+        self.assertIn('\nCONFIG_SND_SOC_MAX98357A=m\n', original)
 
     def test_generated_release_keeps_boot_bundle_suffix(self):
         recipe = ROOT / 'pkgbuilds/linux-aurora/PKGBUILD'
