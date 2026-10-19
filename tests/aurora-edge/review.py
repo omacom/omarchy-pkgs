@@ -63,7 +63,8 @@ class KernelRecipeTests(unittest.TestCase):
         expected = {'CONFIG_SERIAL_APPLE_DOCKCHANNEL', 'CONFIG_SERIAL_APPLE_DOCKCHANNEL_EARLYCON',
                     'CONFIG_SYSFB_SIMPLEFB', 'CONFIG_DMABUF_HEAPS', 'CONFIG_DMABUF_HEAPS_SYSTEM',
                     'CONFIG_UDMABUF', 'CONFIG_THERMAL_NETLINK', 'CONFIG_NVME_HWMON', 'CONFIG_TRUSTED_KEYS',
-                    'CONFIG_APPLE_SEP'}
+                    'CONFIG_APPLE_SEP', 'CONFIG_HID_APPLE_MTP_HAPTIC', 'CONFIG_SENSORS_APPLE_PMP_J613',
+                    'CONFIG_SND_SOC_MAX98357A'}
         self.assertEqual({line.split('=', 1)[0] for line in common.splitlines()
                           if line.startswith('CONFIG_')}, expected)
         recipe = (package / 'PKGBUILD').read_text()
