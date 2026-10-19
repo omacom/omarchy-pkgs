@@ -9,3 +9,7 @@ Remove `sync: false` and `software-renderer.patch` in the same change once the s
 ## Output and VRR fixes
 
 `wl-output-global-grace.patch` keeps a removed `wl_output` global for five seconds before destroying it, as wlroots does. Without it, an output that comes and goes within a roundtrip, such as a dock's monitor flapping while its tunnel comes up, disconnects every client that has not bound it yet with "global wl_output (N) is unavailable". `monitor-rule-vrr.patch` makes a config reload apply a monitor rule's `vrr`; without it, changing only `vrr` is ignored until the next session. Neither is upstream yet. Rebase both with `--fuzz=0` on a version bump, and drop each once the selected release carries the fix.
+
+## Clipboard clear backport
+
+`data-control-clear-selection.patch` backports [Hyprland #16117](https://github.com/hyprwm/Hyprland/pull/16117), merged after v0.56.2. Without it, clipboard managers and `wl-paste --watch` (wlr- and ext-data-control clients) are never told that the clipboard was cleared, whether by the copying app exiting or by an explicit clear, so they keep showing contents that can no longer be pasted. Drop it once the selected release includes #16117.
