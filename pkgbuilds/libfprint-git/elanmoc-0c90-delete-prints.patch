@@ -1,0 +1,176 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dante Loi <danteloi1993@gmail.com>
+Date: Wed, 14 Oct 2026 12:07:15 +0200
+Subject: [PATCH] elanmoc: Let 04f3:0c90 delete the prints it stores
+
+04f3:0c90 cannot list its stored prints: it does not implement
+43 21 <slot>, and 40 ff 12 <slot> answers 40 ff for every slot but the
+one that just matched. That is why its STORAGE features were dropped,
+but delete went with them, so nothing could remove a print from the
+sensor. Deleting a finger in fprintd left its print behind, and
+enrolling a finger again added another one: the sensor can then match
+the stale print, whose user id belongs to no enrolled print any more,
+and report the enrolled finger as no match. The sensor also fills up,
+with no way to free a slot.
+
+The sensor deletes a print by user id with 40 ff 13, but only with the
+id where 40 ff 11 (commit) carries it:
+
+  40 ff 13 00 00 <uuid0> <uuid1> <len> <user id>
+
+It then answers 40 00 and its enrolled count drops. With the id at
+offset 3, where the driver puts it for the other PIDs, it answers 40 ff
+and keeps the print; 40 ff is also its answer for a user id it does not
+hold. Use the commit layout on 04f3:0c90, take 40 ff as the print being
+gone already, which is all fprintd asks of a delete, and drop only
+STORAGE_LIST. fp_device_list_prints() checks for STORAGE alone, so fail
+listing on this PID right away.
+
+fprintd then deletes a finger's print along with the finger, replaces
+it when the finger is enrolled again, and drops a print its duplicate
+check matches but no user owns. 40 ff 98 (clear) gets no answer and
+leaves every print in place, so STORAGE_CLEAR stays off, and fprintd
+only warns that it cannot clear the sensor before a first enrollment.
+
+Refuse to enroll into a full sensor with DATA_FULL, as the re-enroll
+check this PID skips does on the others.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ libfprint/drivers/elanmoc/elanmoc.c | 68 ++++++++++++++++++++++++-----
+ libfprint/drivers/elanmoc/elanmoc.h |  4 ++
+ 2 files changed, 60 insertions(+), 12 deletions(-)
+
+diff --git a/libfprint/drivers/elanmoc/elanmoc.c b/libfprint/drivers/elanmoc/elanmoc.c
+index 0eecd35f..4615a291 100644
+--- a/libfprint/drivers/elanmoc/elanmoc.c
++++ b/libfprint/drivers/elanmoc/elanmoc.c
+@@ -486,6 +486,12 @@ elan_enroll_run_state (FpiSsm *ssm, FpDevice *dev)
+        * elanmoc_reenroll_cb does when buffer_in[1] == 0x00. */
+       if (fpi_device_get_driver_data (dev) == ELANMOC_QUIRK_NO_ENUM)
+         {
++          /* elanmoc_reenroll_cb() is also where a full sensor is refused */
++          if (self->curr_enrolled >= ELAN_0C90_MAX_ENROLL_NUM)
++            {
++              fpi_ssm_mark_failed (ssm, fpi_device_error_new (FP_DEVICE_ERROR_DATA_FULL));
++              break;
++            }
+           self->num_frames = 0;
+           fpi_ssm_next_state (ssm);
+           break;
+@@ -667,6 +673,15 @@ elanmoc_list (FpDevice *device)
+ {
+   FpiDeviceElanmoc *self = FPI_DEVICE_ELANMOC (device);
+ 
++  /* elanmoc_probe() drops STORAGE_LIST for 04f3:0c90, but
++   * fp_device_list_prints() only checks for STORAGE, which it keeps. */
++  if (fpi_device_get_driver_data (device) == ELANMOC_QUIRK_NO_ENUM)
++    {
++      fpi_device_list_complete (device, NULL,
++                                fpi_device_error_new (FP_DEVICE_ERROR_NOT_SUPPORTED));
++      return;
++    }
++
+   self->list_result = g_ptr_array_new_with_free_func (g_object_unref);
+   self->task_ssm = fpi_ssm_new (FP_DEVICE (self),
+                                 elan_list_run_state,
+@@ -980,6 +995,32 @@ elanmoc_delete_cb (FpiDeviceElanmoc *self,
+       fpi_ssm_mark_failed (self->task_ssm, error);
+       return;
+     }
++
++  /* 04f3:0c90 answers 40 00 once the print is gone, and 40 ff when it holds
++   * no print with that user id. fprintd only needs the print gone, and does
++   * not enroll a finger again while deleting its old print fails, so take
++   * the latter as success as well. */
++  if (fpi_device_get_driver_data (FP_DEVICE (self)) == ELANMOC_QUIRK_NO_ENUM)
++    {
++      if (length_in < 2 || buffer_in[0] != 0x40 ||
++          (buffer_in[1] != ELAN_MSG_OK && buffer_in[1] != ELAN_MSG_NOT_FOUND))
++        {
++          fpi_ssm_mark_failed (self->task_ssm,
++                               fpi_device_error_new_msg (FP_DEVICE_ERROR_PROTO,
++                                                         "Failed to delete print (reply 0x%02x 0x%02x)",
++                                                         length_in > 0 ? buffer_in[0] : 0,
++                                                         length_in > 1 ? buffer_in[1] : 0));
++          return;
++        }
++
++      if (buffer_in[1] == ELAN_MSG_NOT_FOUND)
++        fp_info ("Print to delete is not stored on the device");
++
++      fpi_device_delete_complete (FP_DEVICE (self), NULL);
++      fpi_ssm_next_state (self->task_ssm);
++      return;
++    }
++
+   if (buffer_in[0] != 0x40 && buffer_in[1] != 0x00)
+     {
+       fpi_ssm_mark_failed (self->task_ssm,
+@@ -1003,7 +1044,13 @@ elan_delete_run_state (FpiSsm *ssm, FpDevice *dev)
+     {
+     case DELETE_SEND_CMD:
+       cmd_buf = elanmoc_compose_cmd (&elanmoc_delete_cmd);
+-      memcpy (cmd_buf + 3, data, ELAN_USERDATE_SIZE);
++      /* 04f3:0c90 looks for the user id where 40 ff 11 (commit) carries it,
++       * two bytes further in. Given it at offset 3 it answers 40 ff and
++       * keeps the print. */
++      if (fpi_device_get_driver_data (dev) == ELANMOC_QUIRK_NO_ENUM)
++        memcpy (cmd_buf + 5, data, ELAN_USERDATE_SIZE);
++      else
++        memcpy (cmd_buf + 3, data, ELAN_USERDATE_SIZE);
+       elanmoc_get_cmd (dev, cmd_buf, elanmoc_delete_cmd.cmd_len, elanmoc_delete_cmd.resp_len, 0, elanmoc_delete_cb);
+       break;
+     }
+@@ -1185,21 +1232,18 @@ dev_init_handler (FpiSsm *ssm, FpDevice *dev)
+ static void
+ elanmoc_probe (FpDevice *device)
+ {
+-  /* 04f3:0c90 does not answer {0x43,0x21,idx} (get user id), so its
+-   * storage cannot be enumerated. Drop the STORAGE features: libfprint then
+-   * keeps the print metadata on the host and uses the sensor purely for
+-   * matching. Templates still live on the chip.
++  /* 04f3:0c90 does not answer {0x43,0x21,idx} (get user id), and 40 ff 12
++   * only returns the user id of the slot that just matched, so its storage
++   * cannot be enumerated. It does delete a print by user id, which fprintd
++   * needs to remove a finger, to replace the print of a finger enrolled
++   * again, and to drop a print that the enrollment check matches but no
++   * user owns. Without that every print stays on the sensor, so only drop
++   * STORAGE_LIST.
+    *
+    * This must happen during PROBE - fpi_device_update_features() asserts
+    * current_action == FPI_DEVICE_ACTION_PROBE. */
+   if (fpi_device_get_driver_data (device) == ELANMOC_QUIRK_NO_ENUM)
+-    {
+-      fpi_device_update_features (device,
+-                                  FP_DEVICE_FEATURE_STORAGE |
+-                                  FP_DEVICE_FEATURE_STORAGE_LIST |
+-                                  FP_DEVICE_FEATURE_STORAGE_DELETE |
+-                                  FP_DEVICE_FEATURE_STORAGE_CLEAR, 0);
+-    }
++    fpi_device_update_features (device, FP_DEVICE_FEATURE_STORAGE_LIST, 0);
+ 
+   fpi_device_probe_complete (device, NULL, NULL, NULL);
+ }
+diff --git a/libfprint/drivers/elanmoc/elanmoc.h b/libfprint/drivers/elanmoc/elanmoc.h
+index 57e9acc4..dbdc6f11 100644
+--- a/libfprint/drivers/elanmoc/elanmoc.h
++++ b/libfprint/drivers/elanmoc/elanmoc.h
+@@ -42,6 +42,8 @@ G_DECLARE_FINAL_TYPE (FpiDeviceElanmoc, fpi_device_elanmoc, FPI, DEVICE_ELANMOC,
+ #define ELAN_MOC_ENROLL_TIMES 9
+ #define ELAN_MAX_USER_ID_LEN 92
+ #define ELAN_MAX_ENROLL_NUM 9
++/* 04f3:0c90 holds 9 prints, 40 ff 03 reports a match as slot 0x00-0x08 */
++#define ELAN_0C90_MAX_ENROLL_NUM 9
+ 
+ #define ELAN_MSG_VERIFY_ERR 0xfd
+ #define ELAN_MSG_DIRTY 0xfb
+@@ -51,6 +53,8 @@ G_DECLARE_FINAL_TYPE (FpiDeviceElanmoc, fpi_device_elanmoc, FPI, DEVICE_ELANMOC,
+ #define ELAN_MSG_TOO_LOW 0x43
+ #define ELAN_MSG_TOO_RIGHT 0x44
+ #define ELAN_MSG_OK 0x00
++/* 04f3:0c90: no print with the user id given to 40 ff 13 (delete) */
++#define ELAN_MSG_NOT_FOUND 0xff
+ 
+ #define ELAN_MAX_HDR_LEN 3
+ #define ELAN_USERDATE_SIZE (ELAN_MAX_USER_ID_LEN + 3)

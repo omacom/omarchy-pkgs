@@ -1,0 +1,103 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dante Loi <danteloi1993@gmail.com>
+Date: Wed, 14 Oct 2026 10:15:09 +0200
+Subject: [PATCH] elanmoc: Keep the identify SSM alive until the matched user
+ id arrives
+
+On a match, elanmoc_identify_cb() sends the command that fetches the
+matched slot's user id and then advances the task SSM, which completes
+it and clears self->task_ssm while that command is still in flight. If
+the command then fails (the sensor dropping off the bus on suspend, or a
+transfer error), elanmoc_match_report_cb() calls fpi_ssm_mark_failed()
+on a NULL SSM: the error is lost, the identify action never completes,
+and the device stays busy until fprintd is restarted.
+
+Return from the match branch without advancing, and complete the SSM
+from elanmoc_match_report_cb() instead, so every failure there reaches
+task_ssm_done() and fails the action.
+
+The IN transfers do not set short_is_error, so also reject replies too
+short for the bytes these callbacks read: a one byte identify reply was
+taken as a match on slot 0, and a short user id reply was read past its
+end.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ libfprint/drivers/elanmoc/elanmoc.c | 49 ++++++++++++++++++++++++-----
+ 1 file changed, 41 insertions(+), 8 deletions(-)
+
+diff --git a/libfprint/drivers/elanmoc/elanmoc.c b/libfprint/drivers/elanmoc/elanmoc.c
+index 20615324..951ea0fc 100644
+--- a/libfprint/drivers/elanmoc/elanmoc.c
++++ b/libfprint/drivers/elanmoc/elanmoc.c
+@@ -698,6 +698,17 @@ elanmoc_match_report_cb (FpiDeviceElanmoc *self,
+       return;
+     }
+ 
++  /* The reply is read without short_is_error. It must hold at least the
++   * header, status, both UUID bytes and the user id length, plus the extra
++   * byte of a 0x12 reply, before any of them is read. */
++  if (length_in < (fpi_device_get_driver_data (device) == ELANMOC_QUIRK_NO_ENUM ? 6 : 5))
++    {
++      fpi_ssm_mark_failed (self->task_ssm,
++                           fpi_device_error_new_msg (FP_DEVICE_ERROR_PROTO,
++                                                     "Packet too short for user id!"));
++      return;
++    }
++
+   /* On 04f3:0c90 the user id comes from 0x12 instead of 0x43 0x21, so the
+    * reply starts with 0x40 rather than 0x43. */
+   if (buffer_in[0] != 0x43 && buffer_in[0] != 0x40)
+@@ -754,6 +765,7 @@ elanmoc_match_report_cb (FpiDeviceElanmoc *self,
+     fpi_device_identify_report (device, NULL, print, NULL);
+ 
+   fpi_device_identify_complete (device, NULL);
++  fpi_ssm_mark_completed (self->task_ssm);
+ }
+ 
+ static void
+@@ -843,15 +855,36 @@ elanmoc_identify_cb (FpiDeviceElanmoc *self,
+       return;
+     }
+ 
+-  if (buffer_in[1] == ELAN_MSG_VERIFY_ERR)
+-    identify_status_report (self, RSP_VERIFY_FAIL,
+-                            buffer_in[1], error);
+-  else if (buffer_in[1] <= ELAN_MAX_ENROLL_NUM)
+-    identify_status_report (self, RSP_VERIFY_OK, buffer_in[1], error);
+-  else
+-    identify_status_report (self, RSP_VERIFY_FAIL, buffer_in[1], error);
+-  fpi_ssm_next_state (self->task_ssm);
++  /* A one byte reply would otherwise read the zeroed second byte of the
++   * buffer as a match on slot 0. */
++  if (length_in < 2)
++    {
++      fpi_ssm_mark_failed (self->task_ssm,
++                           fpi_device_error_new_msg (FP_DEVICE_ERROR_PROTO,
++                                                     "Can't get response!!"));
++      return;
++    }
+ 
++  if (buffer_in[1] == ELAN_MSG_VERIFY_ERR)
++    {
++      identify_status_report (self, RSP_VERIFY_FAIL,
++                              buffer_in[1], error);
++    }
++  else if (buffer_in[1] <= ELAN_MAX_ENROLL_NUM)
++    {
++      /* A match still needs the user id of the slot, which a further command
++       * fetches. elanmoc_match_report_cb() completes the task SSM: completing
++       * it here would leave a failure of that command (the sensor dropping off
++       * the bus on suspend, say) without an SSM to report to, and the
++       * identify action, with it the device, busy for good. */
++      identify_status_report (self, RSP_VERIFY_OK, buffer_in[1], error);
++      return;
++    }
++  else
++    {
++      identify_status_report (self, RSP_VERIFY_FAIL, buffer_in[1], error);
++    }
++  fpi_ssm_next_state (self->task_ssm);
+ }
+ 
+ static void
