@@ -10,7 +10,8 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
 NAMES = ['linux-aurora', 'mesa-aurora', 'aura', 'uboot-aurora', 'aurora-bless',
-         'speakerguardd', 'aurora-audio', 'alsa-ucm-conf-aurora', 'omarchy-aurora-firmware']
+         'speakerguardd', 'aurora-audio', 'alsa-ucm-conf-aurora', 'omarchy-aurora-firmware',
+         'aurora-sep']
 
 
 def srcinfo(name):
@@ -40,6 +41,7 @@ class EdgeMetadataTests(unittest.TestCase):
                              'bankstown', 'lsp-plugins-lv2', 'speakersafetyd', 'speakerguardd'],
             'omarchy-aurora-firmware': ['bash', 'iw', 'kmod', 'omarchy-mac-boot',
                                        'wireless-regdb', 'linux-aurora>=7.1.12.aurora5'],
+            'aurora-sep': ['coreutils', 'fprintd', 'keyutils', 'kmod', 'sh'],
         }
         for name, dependencies in expected.items():
             with self.subTest(package=name):
