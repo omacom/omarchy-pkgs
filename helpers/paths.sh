@@ -67,7 +67,8 @@ PKGBUILDS_DIR="$BUILD_ROOT/pkgbuilds"
 # A local copy of a channel, mounted into the build container. bin/build
 # creates it empty; with no local database, build/build.sh plans against the
 # channel's published database instead.
-REPO_ROOT="$BUILD_ROOT/pkgs.omarchy.org"
+# Advisory ingest can use an isolated, downloaded channel snapshot.
+REPO_ROOT="${OMARCHY_REPO_ROOT:-$BUILD_ROOT/pkgs.omarchy.org}"
 
 # Function to update architecture and mirror-specific paths
 # Call this after changing ARCH or MIRROR variables

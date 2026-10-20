@@ -72,12 +72,45 @@ fail() { echo "FAIL: $1"; cat "$T/out"; exit 1; }
 pub rc $(mkpkg alpha 1) $(mkpkg fast 1) $(mkpkg pinned 1) $(mkpkg ahead 3)
 pub edge $(mkpkg alpha 2) $(mkpkg split 1 split-extra) $(mkpkg fast 2) $(mkpkg pinned 2) \
   $(mkpkg edgeonly 1) $(mkpkg ahead 2) $(mkpkg big 1) $(mkpkg dropped 1)
+# Signed metadata is copied unchanged with a moving artifact. Other packages
+# deliberately have no advisory, which must not prevent their promotion.
+adv=alpha-1.0-2-x86_64.advisory.json
+printf 'alpha-advisory-v1\n' > "$REMOTE/edge/x86_64/$adv"
+GNUPGHOME="$T/g" gpg --batch --yes --detach-sign "$REMOTE/edge/x86_64/$adv"
+fast_adv=fast-1.0-2-x86_64.advisory.json
+printf 'fast-advisory\n' > "$REMOTE/edge/x86_64/$fast_adv"
+GNUPGHOME="$T/g" gpg --batch --yes --detach-sign "$REMOTE/edge/x86_64/$fast_adv"
 rc_before=$(entries rc)
 
 : > "$T/record"
 promote --dry-run && [[ "$(entries rc)" == "$rc_before" ]] \
   && [[ $(plan_action alpha) == promote && $(plan_action split-extra) == promote ]] \
   && pass "dry run plans the promotion and publishes nothing" || fail "dry run"
+
+# A transport failure after package download must not publish a partial batch.
+# publish_batch is called under ||, so it must check the helper's result explicitly.
+export ADVISORY_REAL_RCLONE=$(command -v rclone)
+export ADVISORY_FAIL_SOURCE="$REMOTE/edge/x86_64"
+mkdir -p "$T/fail-copy"
+cat > "$T/fail-copy/rclone" <<'EOF'
+#!/bin/bash
+set -euo pipefail
+if [[ $1 == copy && $2 == "$ADVISORY_FAIL_SOURCE" ]]; then
+  "$ADVISORY_REAL_RCLONE" "$@"
+  rm -f "$3"/*.advisory.json.sig
+  exit 1
+fi
+exec "$ADVISORY_REAL_RCLONE" "$@"
+EOF
+chmod +x "$T/fail-copy/rclone"
+: > "$T/record"
+if PATH="$T/fail-copy:$PATH" promote; then
+  fail "an advisory transport failure should refuse"
+else
+  [[ "$(entries rc)" == "$rc_before" && ! -e "$REMOTE/rc/x86_64/$adv" ]] \
+    && jq -e -s '[.[] | select(.type=="slot")] | length == 1 and .[0].status == "failed"' "$T/record" >/dev/null \
+    && pass "an advisory copy failure records a failed slot and leaves rc unchanged" || fail "copy failure handling"
+fi
 
 : > "$T/record"
 promote || fail "promotion failed"
@@ -95,12 +128,21 @@ cmp -s "$REMOTE/edge/x86_64/alpha-1.0-2-x86_64.pkg.tar.zst" "$REMOTE/rc/x86_64/a
   && [[ -f "$REMOTE/rc/x86_64/alpha-1.0-2-x86_64.pkg.tar.zst.sig" ]] \
   && pass "rc serves the same bytes edge does, signed" || fail "promoted bytes differ"
 
+cmp -s "$REMOTE/edge/x86_64/$adv" "$REMOTE/rc/x86_64/$adv" \
+  && cmp -s "$REMOTE/edge/x86_64/$adv.sig" "$REMOTE/rc/x86_64/$adv.sig" \
+  && GNUPGHOME="$T/g" gpg --batch --quiet --verify "$REMOTE/rc/x86_64/$adv.sig" "$REMOTE/rc/x86_64/$adv" 2>/dev/null \
+  && [[ ! -e "$REMOTE/rc/x86_64/$fast_adv" ]] \
+  && pass "only moving packages carry their advisory and valid signature" || fail "advisory carry"
+
 jq -e -s '[.[] | select(.type=="slot")] | length == 1 and .[0].status == "published" and (.[0].packages | index("split-extra-1.0-1-x86_64"))' "$T/record" >/dev/null \
   && pass "the record names every published package in its slot" || fail "slot record: $(cat "$T/record")"
 
+printf 'alpha-advisory-v2\n' > "$REMOTE/edge/x86_64/$adv"
 : > "$T/record"
 promote && grep -q 'already up to date' "$T/out" && [[ $(plan_action alpha) == current ]] \
   && pass "a second run finds nothing to do" || fail "rerun"
+[[ $(cat "$REMOTE/rc/x86_64/$adv") == "alpha-advisory-v1" ]] \
+  && pass "a version that does not move keeps its existing advisory" || fail "unmoved advisory"
 
 # Batches split between pkgbases, never inside one; each batch is a slot.
 pub edge $(mkpkg alpha 3) $(mkpkg split 2 split-extra) $(mkpkg big 2)
@@ -160,3 +202,9 @@ fastring --to rc && [[ $(plan_action fast) == current ]] && pass "--fast-ring is
 if "$BIN/promote-channel" --remote "$REMOTE" --fast-ring --from rc --to stable --arch x86_64 >"$T/out" 2>&1; then
   fail "--fast-ring from rc should refuse"
 else grep -q 'fast ring follows edge' "$T/out" && pass "--fast-ring only follows edge" || fail "fast-ring direction reason"; fi
+
+for channel in rc stable; do
+  cmp -s "$REMOTE/edge/x86_64/$fast_adv" "$REMOTE/$channel/x86_64/$fast_adv" \
+    && GNUPGHOME="$T/g" gpg --batch --quiet --verify "$REMOTE/$channel/x86_64/$fast_adv.sig" "$REMOTE/$channel/x86_64/$fast_adv" 2>/dev/null \
+    && pass "fast-ring carry preserves the signed advisory in $channel" || fail "fast-ring advisory in $channel"
+done

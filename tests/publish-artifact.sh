@@ -69,11 +69,42 @@ if pub "$C1"; then fail "aarch64 package into x86_64 should refuse"; else grep -
 cp "$B1" "$T/renamed-1.0-1-x86_64.pkg.tar.zst"
 if pub "$T/renamed-1.0-1-x86_64.pkg.tar.zst"; then fail "filename/PKGINFO mismatch should refuse"; else grep -q 'does not match PKGINFO' "$T/out" && pass "filename must match PKGINFO" || fail "mismatch reason"; fi
 
+# An advisory beside the package is uploaded, and a later publish replaces it.
+adv="$(dirname "$A2")/$(basename "${A2%.pkg.tar.*}").advisory.json"
+printf 'cve-v1\n' >"$adv"
+GNUPGHOME="$T/g" gpg --batch --yes --detach-sign "$adv"
+pub "$A2" && [[ "$(cat "$REMOTE/edge/x86_64/$(basename "$adv")")" == "cve-v1" ]] \
+  && pass "advisory beside the package is uploaded" || fail "advisory upload"
+printf 'cve-v2\n' >"$adv"
+GNUPGHOME="$T/g" gpg --batch --yes --detach-sign "$adv"
+pub "$A2" && [[ "$(cat "$REMOTE/edge/x86_64/$(basename "$adv")")" == "cve-v2" ]] \
+  && pass "republish overwrites the advisory" || fail "advisory overwrite"
+GNUPGHOME="$T/g" gpg --batch --quiet --verify "$REMOTE/edge/x86_64/$(basename "$adv").sig" "$REMOTE/edge/x86_64/$(basename "$adv")" 2>/dev/null \
+  && pass "refreshed advisory signature verifies" || fail "advisory signature"
+# An unsigned refresh cannot reuse the old signature as valid authentication.
+# rclone copy retains that old remote .sig; consumers must verify, not just
+# check that a signature file exists. Restore a signed refresh afterwards.
+printf 'unsigned-refresh\n' > "$adv"
+rm "$adv.sig"
+pub "$A2" || fail "unsigned advisory refresh"
+if GNUPGHOME="$T/g" gpg --batch --quiet --verify "$REMOTE/edge/x86_64/$(basename "$adv").sig" "$REMOTE/edge/x86_64/$(basename "$adv")" 2>/dev/null; then
+  fail "an old signature must not authenticate an unsigned refresh"
+else
+  pass "an unsigned advisory refresh does not retain a valid old signature"
+fi
+printf 'cve-v2\n' > "$adv"
+GNUPGHOME="$T/g" gpg --batch --yes --detach-sign "$adv"
+pub "$A2" || fail "restore signed advisory"
+# A skipped same-version package must not sneak in an advisory update.
+printf 'cve-v3\n' > "$adv"
+
 # --newer-only: an RC carried into edge never takes edge backwards.
 pub --newer-only "$A1" && grep -q 'already serves alpha 1.0-2' "$T/out" && [[ "$(entries)" == "alpha-1.0-2/ beta-1.0-1/ " ]] \
   && pass "--newer-only skips an older version" || fail "--newer-only older"
 pub --newer-only "$A2" && grep -q 'nothing published' "$T/out" && [[ "$(entries)" == "alpha-1.0-2/ beta-1.0-1/ " ]] \
   && pass "--newer-only skips the version already served" || fail "--newer-only same"
+[[ $(cat "$REMOTE/edge/x86_64/$(basename "$adv")") == "cve-v2" ]] \
+  && pass "--newer-only leaves skipped package advisories unchanged" || fail "skipped advisory"
 A3=$(mkpkg alpha 3 any); D1=$(mkpkg delta 1 any)
 pub --newer-only "$A1" "$A3" "$D1" && [[ "$(entries)" == "alpha-1.0-3/ beta-1.0-1/ delta-1.0-1/ " ]] \
   && pass "--newer-only publishes newer and new packages, drops the rest" || fail "--newer-only mixed"
@@ -81,3 +112,9 @@ pub --newer-only "$A1" "$A3" "$D1" && [[ "$(entries)" == "alpha-1.0-3/ beta-1.0-
 # db must verify: pacman can read it and each package's signature checks
 gpg --batch --quiet --import <<<"$GPG_PRIVATE_KEY" 2>/dev/null || true
 ( cd "$REMOTE/edge/x86_64" && for f in *.pkg.tar.zst; do gpg --batch --quiet --verify "$f.sig" "$f" 2>/dev/null || { echo "FAIL: signature $f"; exit 1; }; done ) && pass "all signatures verify"
+
+# Unpublish retains immutable artifacts in the bucket, including their metadata.
+"$ROOT/bin/unpublish-packages" --remote "$REMOTE" --mirror edge --arch x86_64 alpha >"$T/out" 2>&1 \
+  && [[ "$(entries)" == "beta-1.0-1/ delta-1.0-1/ " ]] \
+  && [[ -f "$REMOTE/edge/x86_64/$(basename "$A2")" && -f "$REMOTE/edge/x86_64/$(basename "$adv")" && -f "$REMOTE/edge/x86_64/$(basename "$adv").sig" ]] \
+  && pass "unpublish retires database entries and retains package advisories" || fail "unpublish advisory retention"
