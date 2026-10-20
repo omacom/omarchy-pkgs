@@ -95,6 +95,7 @@ x86_backup=(
   etc/systemd/zram-generator.conf
 )
 keyboard_unit=default/systemd/user/omarchy-brightness-keyboard-auto.service
+clipboard_unit=default/systemd/user/omarchy-clipboard-persist.service
 nvpcr_dropins=(
   default/systemd/system/systemd-tpm2-setup-early.service.d/10-omarchy-nvpcr.conf
   default/systemd/system/systemd-pcrproduct.service.d/10-omarchy-nvpcr.conf
@@ -147,7 +148,7 @@ in_list() {
 fixtures=$BUILD_ROOT/tests/fixtures/settings-boot
 make_source "$scratch/legacy"
 cp "$fixtures/omarchy_hooks-v4.0.4.conf" "$scratch/legacy/etc/mkinitcpio.conf.d/omarchy_hooks.conf"
-make_source "$scratch/profile" default/settings-runtime-profile "$keyboard_unit" "${nvpcr_dropins[@]}"
+make_source "$scratch/profile" default/settings-runtime-profile "$keyboard_unit" "$clipboard_unit" "${nvpcr_dropins[@]}"
 cp "$fixtures"/omarchy-13362/*.conf "$scratch/profile/etc/mkinitcpio.conf.d/"
 
 for recipe in omarchy-settings omarchy-settings-dev; do
@@ -213,6 +214,15 @@ for recipe in omarchy-settings omarchy-settings-dev; do
     fail 'the HOOKS baseline drop-in is backed up where the source has it'
   in_list usr/lib/systemd/user/omarchy-brightness-keyboard-auto.service "$scratch/profile-aarch64.files" ||
     fail 'the keyboard unit first-run enables ships when the source has it'
+  for target_arch in x86_64 aarch64; do
+    unit=usr/lib/systemd/user/omarchy-clipboard-persist.service
+    ! in_list "$unit" "$scratch/legacy-$target_arch.files" ||
+      fail 'an older source does not gain a clipboard persistence unit'
+    cmp -s "$scratch/profile/$clipboard_unit" "$scratch/profile-$target_arch/$unit" ||
+      fail 'the clipboard persistence unit ships unchanged at the systemd user-unit path'
+    [[ $(stat -c %a "$scratch/profile-$target_arch/$unit") == 644 ]] ||
+      fail 'the clipboard persistence unit is installed with mode 0644'
+  done
   for dropin in "${nvpcr_dropins[@]}"; do
     in_list "usr/lib/${dropin#default/}" "$scratch/profile-aarch64.files" ||
       fail 'the NvPCR drop-ins ship when the source has them'
@@ -222,7 +232,7 @@ for recipe in omarchy-settings omarchy-settings-dev; do
     cmp -s "$fixtures/omarchy-13362/$conf" "$scratch/profile-aarch64/etc/mkinitcpio.conf.d/$conf" ||
       fail "runtime-profile source ships its $conf as it is on aarch64"
   done
-  [[ $(cat "$scratch/added") == "$(printf '%s\n' usr/lib/systemd/user/omarchy-brightness-keyboard-auto.service usr/share/omarchy/default/settings-runtime-profile "usr/share/omarchy/$keyboard_unit" etc/mkinitcpio.conf.d/00-omarchy-hooks.conf "${nvpcr_dropins[@]/#default/usr/lib}" "${nvpcr_dropins[@]/#/usr/share/omarchy/}" | sort)" ]] ||
+  [[ $(cat "$scratch/added") == "$(printf '%s\n' usr/lib/systemd/user/omarchy-brightness-keyboard-auto.service usr/lib/systemd/user/omarchy-clipboard-persist.service usr/share/omarchy/default/settings-runtime-profile "usr/share/omarchy/$keyboard_unit" "usr/share/omarchy/$clipboard_unit" etc/mkinitcpio.conf.d/00-omarchy-hooks.conf "${nvpcr_dropins[@]/#default/usr/lib}" "${nvpcr_dropins[@]/#/usr/share/omarchy/}" | sort)" ]] ||
     fail 'x86_64 gains only the new source files from a runtime-profile source' "$(cat "$scratch/added")"
   echo "PASS: $recipe: a runtime-profile source ships the full set on aarch64"
 done
