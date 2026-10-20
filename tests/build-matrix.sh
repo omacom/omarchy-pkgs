@@ -25,7 +25,7 @@ for kernel in linux-omarchy-n1x linux-n1x linux-aurora linux-omarchy; do
 done
 pass "an aarch64 kernel builds on the Apple-backed runner at Namespace"
 
-for kernel in linux-omarchy linux-omarchy-bore linux-ptl; do
+for kernel in linux-omarchy linux-omarchy-bore linux-omarchy-eevdf; do
   check "$DROPLET" "$kernel" x86_64
 done
 pass "an x86_64 kernel stays on the droplet pool"

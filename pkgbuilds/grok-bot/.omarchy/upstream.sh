@@ -77,32 +77,27 @@ emit() {
     '{pkgver: $pkgver, sha256sums: {x86_64: [$x86_64], aarch64: [$aarch64]}}'
 }
 
-# Not an upgrade. sync-upstream ignores the checksums unless the version is newer.
-if [[ "$(vercmp "$version" "$current_pkgver")" -le 0 ]]; then
-  if [[ "$version" == "$current_pkgver" && "$commit" != "$current_commit" ]]; then
-    echo "Grok Bot ${version} was republished at ${commit} (recipe has ${current_commit}); refusing to keep the old debs" >&2
-    exit 1
-  fi
-  eval "$(bash -c 'source ./PKGBUILD >/dev/null; printf "deb_x86_64=%q\ndeb_aarch64=%q\n" "${sha256sums_x86_64[0]}" "${sha256sums_aarch64[0]}"')"
-  emit "$deb_x86_64" "$deb_aarch64"
-  exit 0
-fi
-
+# The debs the feed's commit serves, and their checksums, into checksums[].
 tmpdir=$(mktemp -d)
 trap 'rm -rf "$tmpdir"' EXIT
 declare -A checksums=()
-for arch in "${ARCHES[@]}"; do
-  deb="grok-bot_${version}_${DEB_ARCH[$arch]}.deb"
-  url="https://downloads.cursor.com/grokbot/stable/${commit}/linux/${FEED_ARCH[$arch]}/${deb}"
-  curl_https --max-time 300 -o "$tmpdir/$deb" "$url"
-  checksums[$arch]=$(sha256sum "$tmpdir/$deb" | awk '{print $1}')
-  [[ "${checksums[$arch]}" =~ ^[0-9a-f]{64}$ ]] || {
-    echo "Bad checksum for Grok Bot ${arch}" >&2
-    exit 1
-  }
-done
+fetch_debs() {
+  local arch deb url
+  for arch in "${ARCHES[@]}"; do
+    deb="grok-bot_${version}_${DEB_ARCH[$arch]}.deb"
+    url="https://downloads.cursor.com/grokbot/stable/${commit}/linux/${FEED_ARCH[$arch]}/${deb}"
+    curl_https --max-time 300 -o "$tmpdir/$deb" "$url"
+    checksums[$arch]=$(sha256sum "$tmpdir/$deb" | awk '{print $1}')
+    [[ "${checksums[$arch]}" =~ ^[0-9a-f]{64}$ ]] || {
+      echo "Bad checksum for Grok Bot ${arch}" >&2
+      exit 1
+    }
+  done
+}
 
-python3 - "$commit" <<'PY'
+# Point the recipe's _commit, which the source URL depends on, at the feed's.
+write_commit() {
+  python3 - "$commit" <<'PY'
 import pathlib, sys
 commit = sys.argv[1]
 path = pathlib.Path("PKGBUILD")
@@ -120,5 +115,29 @@ if found != 1:
     raise SystemExit(f"expected one _commit= assignment, found {found}")
 path.write_text("".join(out))
 PY
+}
+
+# Not an upgrade. sync-upstream ignores the checksums unless the version is newer.
+if [[ "$(vercmp "$version" "$current_pkgver")" -le 0 ]]; then
+  eval "$(bash -c 'source ./PKGBUILD >/dev/null; printf "deb_x86_64=%q\ndeb_aarch64=%q\n" "${sha256sums_x86_64[0]}" "${sha256sums_aarch64[0]}"')"
+  if [[ "$version" == "$current_pkgver" && "$commit" != "$current_commit" ]]; then
+    # The same version under a new commit. Cursor moves a build to a new path
+    # and removes the old one, so the recipe has to follow; but only when the
+    # debs are the same bytes, since a changed build under an old version
+    # needs a person and a pkgrel.
+    fetch_debs
+    if [[ "${checksums[x86_64]}" != "$deb_x86_64" || "${checksums[aarch64]}" != "$deb_aarch64" ]]; then
+      echo "Grok Bot ${version} was republished at ${commit} with different debs (recipe has ${current_commit}); refusing to keep the old ones" >&2
+      exit 1
+    fi
+    echo "Grok Bot ${version} moved to ${commit} with the same debs; following it" >&2
+    write_commit
+  fi
+  emit "$deb_x86_64" "$deb_aarch64"
+  exit 0
+fi
+
+fetch_debs
+write_commit
 
 emit "${checksums[x86_64]}" "${checksums[aarch64]}"

@@ -45,7 +45,13 @@ RUN if [ "${TARGETARCH}" = "amd64" ]; then \
             printf 'Server = https://mirror.omarchy.org/$repo/os/$arch\n' > /etc/pacman.d/mirrorlist; \
         fi; \
     else \
-        printf 'Server = https://fl.us.mirror.archlinuxarm.org/aarch64/$repo\n' > /etc/pacman.d/mirrorlist; \
+        if [ "${MIRROR}" = "stable" ]; then \
+            printf 'Server = https://arm-stable-mirror.omarchy.org/$arch/$repo\n' > /etc/pacman.d/mirrorlist; \
+        elif [ "${MIRROR}" = "rc" ]; then \
+            printf 'Server = https://arm-rc-mirror.omarchy.org/$arch/$repo\n' > /etc/pacman.d/mirrorlist; \
+        else \
+            printf 'Server = https://arm-mirror.omarchy.org/$arch/$repo\n' > /etc/pacman.d/mirrorlist; \
+        fi; \
     fi
 
 # Bootstrap keyrings (required before pacstrap can verify packages)

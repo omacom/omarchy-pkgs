@@ -400,7 +400,7 @@ test('package PRs split per package and keep branch siblings together', () => {
       writeFileSync(join(pkg, 'PKGBUILD'), `pkgname=${name}\npkgver=1\npkgrel=1\n`);
       writeFileSync(join(pkg, '.omarchy/package.json'), JSON.stringify({ upstream: { watch } }));
     };
-    const branch = { git_branch: 'https://github.com/basecamp/omarchy.git', branch: 'quattro' };
+    const branch = { git_branch: 'https://github.com/omacom/omarchy.git', branch: 'quattro' };
     write('omarchy-dev', branch);
     write('omarchy-settings-dev', branch);
     write('omasnap-git', { git_branch: 'https://github.com/omacom/omasnap.git', branch: 'main' });

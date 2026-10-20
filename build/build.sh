@@ -236,6 +236,21 @@ get_local_version() {
   fi
 }
 
+# package_version_is_published for a plan read from the public channel: its
+# retained archives are only reachable there, so a version the database no
+# longer indexes (master's stable pin once edge indexes the next RC) would
+# otherwise read as unpublished and be rebuilt.
+remote_version_is_published() {
+  local package="$1" version="$2" target ext
+  [[ -n "$PUBLISHED_REPO_SERVER" ]] || return 1
+  for target in "$ARCH" any; do
+    for ext in zst xz; do
+      curl -fsSI -o /dev/null "$PUBLISHED_REPO_SERVER/$package-$version-$target.pkg.tar.$ext" && return 0
+    done
+  done
+  return 1
+}
+
 # Check if package should be built for current architecture
 # Returns 0 (success) if should build, 1 if should skip
 should_build_for_arch() {
@@ -567,7 +582,8 @@ check_needs_build() {
   # A retained archive is already published even when the DB now indexes a
   # newer release (for example, 4.0.4rc1 vs 4.0.3).
   # Rebuilding it would produce different bytes under an immutable filename.
-  if package_version_is_published "$FINAL_OUTPUT_DIR" "$pkg" "$pkgbuild_version" "$ARCH"; then
+  if package_version_is_published "$FINAL_OUTPUT_DIR" "$pkg" "$pkgbuild_version" "$ARCH" ||
+    remote_version_is_published "$pkg" "$pkgbuild_version"; then
     echo "  + $pkg $pkgbuild_version - archive already published; skipping rebuild"
     return 1
   fi

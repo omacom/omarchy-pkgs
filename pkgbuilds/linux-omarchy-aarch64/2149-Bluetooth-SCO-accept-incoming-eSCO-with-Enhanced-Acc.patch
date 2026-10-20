@@ -1,0 +1,260 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Brandon Williams <turbine.bmw@gmail.com>
+Date: Tue, 15 Sep 2026 08:44:19 -0400
+Subject: [PATCH] Bluetooth: SCO: accept incoming eSCO with Enhanced Accept and
+ HCI data path
+
+The deferred accept path (BT_DEFER_SETUP, used by BlueZ/PipeWire)
+answers an incoming (e)SCO Connection Request with the legacy Accept
+Synchronous Connection Request command, which has no data path
+parameter.  The controller then routes the audio wherever its
+firmware/NVM default points.
+
+On the Qualcomm WCN7850 in the Surface Pro 11 (Windows-tuned firmware
+that advertises "HFP non-HCI data transport"), that default is the
+platform PCM path.  HCI traces of iPhone HFP calls show the host
+transmitting eSCO packets continuously while not a single inbound eSCO
+packet ever reaches the host, and the controller wedges (command tx
+timeout, memdump, hardware error) some tens of seconds into the call.
+
+When the controller supports Enhanced Accept Synchronous Connection
+Request (Supported Commands octet 29 bit 4), use it and set
+Input/Output_Data_Path to 0x00 (HCI) explicitly, with coding formats
+derived from the socket's BT_VOICE air mode, mirroring
+hci_enhanced_setup_sync() for outgoing links.  Controllers without the
+command keep the legacy accept.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Signed-off-by: Brandon Williams <turbine.bmw@gmail.com>
+---
+ include/net/bluetooth/hci.h      |  28 +++++++++
+ include/net/bluetooth/hci_core.h |   6 ++
+ net/bluetooth/hci_conn.c         | 102 +++++++++++++++++++++++++++++++
+ net/bluetooth/sco.c              |  31 +---------
+ 4 files changed, 137 insertions(+), 30 deletions(-)
+
+diff --git a/include/net/bluetooth/hci.h b/include/net/bluetooth/hci.h
+index 50f0eef71fb1..a1f0c899f788 100644
+--- a/include/net/bluetooth/hci.h
++++ b/include/net/bluetooth/hci.h
+@@ -1021,6 +1021,34 @@ struct hci_cp_enhanced_setup_sync_conn {
+ 	__u8     retrans_effort;
+ } __packed;
+ 
++#define HCI_OP_ENHANCED_ACCEPT_SYNC_CONN_REQ	0x043e
++struct hci_cp_enhanced_accept_sync_conn_req {
++	bdaddr_t bdaddr;
++	__le32   tx_bandwidth;
++	__le32   rx_bandwidth;
++	struct	 hci_coding_format tx_coding_format;
++	struct	 hci_coding_format rx_coding_format;
++	__le16	 tx_codec_frame_size;
++	__le16	 rx_codec_frame_size;
++	__le32	 in_bandwidth;
++	__le32	 out_bandwidth;
++	struct	 hci_coding_format in_coding_format;
++	struct	 hci_coding_format out_coding_format;
++	__le16   in_coded_data_size;
++	__le16	 out_coded_data_size;
++	__u8	 in_pcm_data_format;
++	__u8	 out_pcm_data_format;
++	__u8	 in_pcm_sample_payload_msb_pos;
++	__u8	 out_pcm_sample_payload_msb_pos;
++	__u8	 in_data_path;
++	__u8	 out_data_path;
++	__u8	 in_transport_unit_size;
++	__u8	 out_transport_unit_size;
++	__le16   max_latency;
++	__le16   pkt_type;
++	__u8     retrans_effort;
++} __packed;
++
+ struct hci_rp_logical_link_cancel {
+ 	__u8     status;
+ 	__u8     phy_handle;
+diff --git a/include/net/bluetooth/hci_core.h b/include/net/bluetooth/hci_core.h
+index 9084fcd7125a..0f5ec0d8f1ac 100644
+--- a/include/net/bluetooth/hci_core.h
++++ b/include/net/bluetooth/hci_core.h
+@@ -1569,6 +1569,7 @@ static inline bool hci_is_le_conn_scanning(struct hci_dev *hdev)
+ 
+ int hci_disconnect(struct hci_conn *conn, __u8 reason);
+ bool hci_setup_sync(struct hci_conn *conn, __u16 handle);
++void hci_accept_sync_conn(struct hci_conn *conn, __u16 setting);
+ void hci_sco_setup(struct hci_conn *conn, __u8 status);
+ bool hci_iso_setup_path(struct hci_conn *conn);
+ int hci_le_create_cis_pending(struct hci_dev *hdev);
+@@ -2008,6 +2009,11 @@ void hci_conn_del_sysfs(struct hci_conn *conn);
+ /* Use enhanced synchronous connection if command is supported and its quirk
+  * has not been set.
+  */
++/* Enhanced Accept Synchronous Connection Request: octet 29 bit 4 */
++#define enhanced_accept_sync_conn_capable(dev) \
++	(((dev)->commands[29] & 0x10) && \
++	 !hci_test_quirk((dev), HCI_QUIRK_BROKEN_ENHANCED_SETUP_SYNC_CONN))
++
+ #define enhanced_sync_conn_capable(dev) \
+ 	(((dev)->commands[29] & 0x08) && \
+ 	 !hci_test_quirk((dev), HCI_QUIRK_BROKEN_ENHANCED_SETUP_SYNC_CONN))
+diff --git a/net/bluetooth/hci_conn.c b/net/bluetooth/hci_conn.c
+index 6f5131c771b3..0eb94e5d96b9 100644
+--- a/net/bluetooth/hci_conn.c
++++ b/net/bluetooth/hci_conn.c
+@@ -25,6 +25,7 @@
+ #include <linux/export.h>
+ #include <linux/debugfs.h>
+ #include <linux/errqueue.h>
++#include <linux/of.h>
+ 
+ #include <net/bluetooth/bluetooth.h>
+ #include <net/bluetooth/hci_core.h>
+@@ -468,6 +469,107 @@ static void hci_enhanced_setup_sync_destroy(struct hci_dev *hdev, void *data,
+ 	kfree(conn_handle);
+ }
+ 
++/* Accept an incoming (e)SCO connection request.
++ *
++ * The legacy Accept Synchronous Connection Request command carries no data
++ * path field, so the controller routes the audio wherever its firmware/NVM
++ * default says. On controllers whose firmware is tuned for a platform PCM
++ * path (Qualcomm WCN7850 with "HFP non-HCI data transport"), that default
++ * sends the peer's audio to an interface Linux does not drive, and the host
++ * never sees an inbound SCO packet. When the controller implements the
++ * Enhanced Accept command, use it and pin both directions to the HCI data
++ * path (0x00), exactly as hci_enhanced_setup_sync() does for outgoing links.
++ * This is limited to the Surface Pro 11 (microsoft,denali), where it was
++ * tested; other machines may route SCO through an offload path on purpose.
++ */
++void hci_accept_sync_conn(struct hci_conn *conn, __u16 setting)
++{
++	struct hci_dev *hdev = conn->hdev;
++
++	if (enhanced_accept_sync_conn_capable(hdev) &&
++	    of_machine_is_compatible("microsoft,denali")) {
++		struct hci_cp_enhanced_accept_sync_conn_req cp;
++
++		memset(&cp, 0, sizeof(cp));
++		bacpy(&cp.bdaddr, &conn->dst);
++		cp.pkt_type = cpu_to_le16(conn->pkt_type);
++		cp.tx_bandwidth = cpu_to_le32(0x00001f40);
++		cp.rx_bandwidth = cpu_to_le32(0x00001f40);
++		cp.tx_codec_frame_size = cpu_to_le16(60);
++		cp.rx_codec_frame_size = cpu_to_le16(60);
++		cp.in_coded_data_size = cpu_to_le16(16);
++		cp.out_coded_data_size = cpu_to_le16(16);
++		cp.in_pcm_data_format = 2;
++		cp.out_pcm_data_format = 2;
++		cp.in_data_path = 0x00;	/* HCI */
++		cp.out_data_path = 0x00;	/* HCI */
++
++		switch (setting & SCO_AIRMODE_MASK) {
++		case SCO_AIRMODE_TRANSP:
++			cp.tx_coding_format.id = 0x03;
++			cp.rx_coding_format.id = 0x03;
++			cp.in_coding_format.id = 0x03;
++			cp.out_coding_format.id = 0x03;
++			cp.in_bandwidth = cpu_to_le32(0x1f40);
++			cp.out_bandwidth = cpu_to_le32(0x1f40);
++			cp.in_transport_unit_size = 1;
++			cp.out_transport_unit_size = 1;
++			if (conn->pkt_type & ESCO_2EV3)
++				cp.max_latency = cpu_to_le16(0x0008);
++			else
++				cp.max_latency = cpu_to_le16(0x000D);
++			cp.retrans_effort = 0x02;
++			break;
++		case SCO_AIRMODE_CVSD:
++		default:
++			cp.tx_coding_format.id = 0x02;
++			cp.rx_coding_format.id = 0x02;
++			cp.in_coding_format.id = 0x04;
++			cp.out_coding_format.id = 0x04;
++			cp.in_bandwidth = cpu_to_le32(16000);
++			cp.out_bandwidth = cpu_to_le32(16000);
++			cp.in_transport_unit_size = 16;
++			cp.out_transport_unit_size = 16;
++			cp.max_latency = cpu_to_le16(0xffff);
++			cp.retrans_effort = 0xff;
++			break;
++		}
++
++		bt_dev_dbg(hdev, "enhanced accept, air mode %u, HCI data path",
++			   setting & SCO_AIRMODE_MASK);
++		hci_send_cmd(hdev, HCI_OP_ENHANCED_ACCEPT_SYNC_CONN_REQ,
++			     sizeof(cp), &cp);
++	} else {
++		struct hci_cp_accept_sync_conn_req cp;
++
++		bacpy(&cp.bdaddr, &conn->dst);
++		cp.pkt_type = cpu_to_le16(conn->pkt_type);
++
++		cp.tx_bandwidth   = cpu_to_le32(0x00001f40);
++		cp.rx_bandwidth   = cpu_to_le32(0x00001f40);
++		cp.content_format = cpu_to_le16(setting);
++
++		switch (setting & SCO_AIRMODE_MASK) {
++		case SCO_AIRMODE_TRANSP:
++			if (conn->pkt_type & ESCO_2EV3)
++				cp.max_latency = cpu_to_le16(0x0008);
++			else
++				cp.max_latency = cpu_to_le16(0x000D);
++			cp.retrans_effort = 0x02;
++			break;
++		case SCO_AIRMODE_CVSD:
++		default:
++			cp.max_latency = cpu_to_le16(0xffff);
++			cp.retrans_effort = 0xff;
++			break;
++		}
++
++		hci_send_cmd(hdev, HCI_OP_ACCEPT_SYNC_CONN_REQ,
++			     sizeof(cp), &cp);
++	}
++}
++EXPORT_SYMBOL(hci_accept_sync_conn);
++
+ bool hci_setup_sync(struct hci_conn *conn, __u16 handle)
+ {
+ 	int result;
+diff --git a/net/bluetooth/sco.c b/net/bluetooth/sco.c
+index 3d4362a09df4..06b6b1f54248 100644
+--- a/net/bluetooth/sco.c
++++ b/net/bluetooth/sco.c
+@@ -906,36 +906,7 @@ static void sco_conn_defer_accept(struct hci_conn *conn, u16 setting)
+ 
+ 		hci_send_cmd(hdev, HCI_OP_ACCEPT_CONN_REQ, sizeof(cp), &cp);
+ 	} else {
+-		struct hci_cp_accept_sync_conn_req cp;
+-
+-		bacpy(&cp.bdaddr, &conn->dst);
+-		cp.pkt_type = cpu_to_le16(conn->pkt_type);
+-
+-		cp.tx_bandwidth   = cpu_to_le32(0x00001f40);
+-		cp.rx_bandwidth   = cpu_to_le32(0x00001f40);
+-		cp.content_format = cpu_to_le16(setting);
+-
+-		switch (setting & SCO_AIRMODE_MASK) {
+-		case SCO_AIRMODE_TRANSP:
+-			if (conn->pkt_type & ESCO_2EV3)
+-				cp.max_latency = cpu_to_le16(0x0008);
+-			else
+-				cp.max_latency = cpu_to_le16(0x000D);
+-			cp.retrans_effort = 0x02;
+-			break;
+-		case SCO_AIRMODE_CVSD:
+-			cp.max_latency = cpu_to_le16(0xffff);
+-			cp.retrans_effort = 0xff;
+-			break;
+-		default:
+-			/* use CVSD settings as fallback */
+-			cp.max_latency = cpu_to_le16(0xffff);
+-			cp.retrans_effort = 0xff;
+-			break;
+-		}
+-
+-		hci_send_cmd(hdev, HCI_OP_ACCEPT_SYNC_CONN_REQ,
+-			     sizeof(cp), &cp);
++		hci_accept_sync_conn(conn, setting);
+ 	}
+ }
+ 

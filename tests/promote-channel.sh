@@ -29,7 +29,6 @@ recipe alpha '{"source": "local"}'
 recipe split-recipe '{"source": "local"}' split
 recipe fast '{"source": "local", "release_ring": "fast"}'
 recipe pinned '{"source": "local", "pinned": true}'
-recipe edgeonly '{"source": "local", "channels": ["edge"]}'
 recipe ahead '{"source": "local"}'
 recipe big '{"source": "local"}'
 # Built for x86_64 once; the recipe has since dropped it.
@@ -71,7 +70,7 @@ fail() { echo "FAIL: $1"; cat "$T/out"; exit 1; }
 # rc: what stable users have now. edge: newer builds of most of it.
 pub rc $(mkpkg alpha 1) $(mkpkg fast 1) $(mkpkg pinned 1) $(mkpkg ahead 3)
 pub edge $(mkpkg alpha 2) $(mkpkg split 1 split-extra) $(mkpkg fast 2) $(mkpkg pinned 2) \
-  $(mkpkg edgeonly 1) $(mkpkg ahead 2) $(mkpkg big 1) $(mkpkg dropped 1)
+  $(mkpkg ahead 2) $(mkpkg big 1) $(mkpkg dropped 1)
 rc_before=$(entries rc)
 
 : > "$T/record"
@@ -84,12 +83,11 @@ promote || fail "promotion failed"
 [[ "$(entries rc)" == "ahead-1.0-3 alpha-1.0-2 big-1.0-1 fast-1.0-1 pinned-1.0-1 split-1.0-1 split-extra-1.0-1 " ]] \
   && pass "newer and missing packages reach rc; nothing else changes" || fail "rc entries: $(entries rc)"
 
-[[ $(plan_action fast) == hold && $(plan_action pinned) == hold && $(plan_action edgeonly) == hold && $(plan_action ahead) == hold ]] \
+[[ $(plan_action fast) == hold && $(plan_action pinned) == hold && $(plan_action ahead) == hold ]] \
   && jq -e 'select(.name=="pinned") | .reason | test("pinned")' "$T/record" >/dev/null \
-  && jq -e 'select(.name=="edgeonly") | .reason | test("channels exclude rc")' "$T/record" >/dev/null \
   && jq -e 'select(.name=="ahead") | .reason | test("rc is ahead")' "$T/record" >/dev/null \
   && jq -e 'select(.name=="dropped") | .reason | test("no longer builds for x86_64")' "$T/record" >/dev/null \
-  && pass "fast ring, pinned, edge-only, rc-ahead and dropped-arch packages are held back, each with its reason" || fail "hold reasons"
+  && pass "fast ring, pinned, rc-ahead and dropped-arch packages are held back, each with its reason" || fail "hold reasons"
 
 cmp -s "$REMOTE/edge/x86_64/alpha-1.0-2-x86_64.pkg.tar.zst" "$REMOTE/rc/x86_64/alpha-1.0-2-x86_64.pkg.tar.zst" \
   && [[ -f "$REMOTE/rc/x86_64/alpha-1.0-2-x86_64.pkg.tar.zst.sig" ]] \

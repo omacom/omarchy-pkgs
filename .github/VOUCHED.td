@@ -14,14 +14,19 @@
 #   -github:username reason for denouncement
 #
 # Keep entries sorted alphabetically.
+github:Acelogic
+github:birkskyum
 github:bjarneo
 github:DanWahlin
 github:dhh
+github:DjDeveloperr
 github:f-trycua
 github:HANCORE-linux
+github:jdvmi00
 github:kwilczynski
 github:malik-na
 github:ryanrhughes
+github:RyanTheTide
 github:scottjones
 github:spencerbull
 github:tcballard

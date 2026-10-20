@@ -10,8 +10,6 @@
 #   { "source": "local", "skip_build": true }
 #   { "source": "local", "rebuild_on": ["qt6-base"] }
 #   { "source": "local", "upstream": { "watch": { "github": "owner/repo", "pattern": "v(?P<version>[0-9.]+)" } } }
-#   { "source": "local", "channels": ["edge"] }
-#   { "source": "local", "channels": ["edge", "rc", "stable"] }
 #   { "source": "local", "min_release_age": "24h" }
 #   { "source": "local", "auto_merge": true, "upstream": { "watch": { "git_branch": "...", "branch": "main" } } }
 #   { "source": "local", "upstream": { "github": "owner/repo", "checksums": "SHASUMS256.txt", "assets": { "x86_64": ["name-{tag}-x64.tar.xz"] } } }
@@ -214,28 +212,6 @@ package_version_is_published() {
   return 1
 }
 
-# Channel membership: where a package may be published. Packages without a
-# `channels` key are members of every channel (they flow edge -> rc -> stable).
-package_has_channels() {
-  local pkgdir="$1" metadata
-  metadata=$(metadata_file_for_dir "$pkgdir")
-  [[ -f "$metadata" ]] || return 1
-  jq -e 'has("channels")' "$metadata" >/dev/null
-}
-
-package_channels() {
-  local pkgdir="$1" metadata
-  metadata=$(metadata_file_for_dir "$pkgdir")
-  [[ -f "$metadata" ]] || return 0
-  jq -r '(.channels // [])[]' "$metadata"
-}
-
-package_in_channel() {
-  local pkgdir="$1" channel="$2"
-  package_has_channels "$pkgdir" || return 0
-  package_channels "$pkgdir" | grep -qx "$channel"
-}
-
 # A pinned package's version is set per release by bin/omarchy-release on the
 # rc branch, not by whatever the current checkout happens to say. Only the
 # release-candidate build (release-rc.yml, which sets OMARCHY_RC_PINS=1 after
@@ -255,12 +231,8 @@ package_builds_for_mirror() {
   package_has_pkgbuild "$pkgdir" || return 1
   package_has_metadata "$pkgdir" || return 1
 
-  # An explicit `channels` key is the outer bound on where a package may be
-  # built at all.
-  if package_has_channels "$pkgdir" && ! package_in_channel "$pkgdir" "$mirror"; then
-    return 1
-  fi
-
+  # Every package publishes to edge. The fast ring also publishes to rc and
+  # stable at merge; everything else reaches them through bin/promote-channel.
   case "$mirror" in
     edge)
       return 0
@@ -284,12 +256,11 @@ package_builds_for_mirror() {
 }
 
 # Whether bin/promote-channel may carry this package into the given channel:
-# a member of that channel that is not built there natively. Native builds are
-# authoritative — advancing over them could pair a published filename with
-# different bytes, which the R2 cache would never recover from.
+# any package not built there natively. Native builds are authoritative —
+# advancing over them could pair a published filename with different bytes,
+# which the R2 cache would never recover from.
 package_moves_to_channel() {
   local pkgdir="$1" channel="$2"
-  package_in_channel "$pkgdir" "$channel" || return 1
   # Pinned packages build natively in rc from the release pin. That the
   # advancing environment lacks OMARCHY_RC_PINS (so *it* may not build them)
   # does not make the edge copy movable over the pin's artifact — edge's
@@ -512,14 +483,10 @@ validate_package_metadata() {
     return 1
   fi
 
-  if ! jq -e '
-    if has("channels") | not then true
-    else .channels | type == "array" and length > 0
-      and all(. == "edge" or . == "rc" or . == "stable")
-      and (unique | length) == length
-    end
-  ' "$metadata" >/dev/null; then
-    echo "invalid channels for $(basename "$pkgdir"): must be a non-empty array of unique edge/rc/stable values"
+  # The release ring alone decides where a package publishes. A stale
+  # `channels` key would read as a restriction nothing enforces.
+  if jq -e 'has("channels")' "$metadata" >/dev/null; then
+    echo "invalid channels for $(basename "$pkgdir"): channels is gone; every package publishes to edge and moves on by promotion, or set \"release_ring\": \"fast\""
     return 1
   fi
 
