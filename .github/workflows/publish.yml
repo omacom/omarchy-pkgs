@@ -24,11 +24,10 @@ on:
         description: "Space-separated package directories to publish from master"
         required: true
 
-# Merges serialize. Two publishes into one channel at once would race on
-# the database; queued is fine, cancelled is not.
-concurrency:
-  group: publish
-  cancel-in-progress: false
+# Only the publish job serializes (see its concurrency group): two publishes
+# into one channel at once would race on the database. Builds run outside the
+# lock, so a merge waits behind another merge's signing and upload, seconds,
+# never behind its kernel build.
 
 jobs:
   changes:
@@ -58,11 +57,10 @@ jobs:
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
           echo "count=$(jq '.include | length' <<<"$matrix")" >> "$GITHUB_OUTPUT"
           jq -r '.include[] | "\(.package) \(.arch) -> \(.channels)"' <<<"$matrix"
-          # Reuse or rebuild, decided per entry and said out loud. An aarch64
-          # tree with no build artifact (PR artifacts last 7 days; a dispatch
-          # may name any package) goes to the rebuild job, which builds it
-          # natively on GitHub's arm64 runner. x86_64 builds inside the
-          # publish job on the droplet, as before.
+          # Reuse or rebuild, decided per entry and said out loud. A tree with
+          # no build artifact (PR artifacts last 7 days; a dispatch may name
+          # any package) goes to the rebuild job, on the runner build-matrix
+          # names for it: the one its PR build would have had.
           rebuild=()
           echo "| package | arch | tree | decision |" >> "$GITHUB_STEP_SUMMARY"
           echo "| --- | --- | --- | --- |" >> "$GITHUB_STEP_SUMMARY"
@@ -73,13 +71,20 @@ jobs:
             found=$(curl -fsS -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
               "https://api.github.com/repos/${{ github.repository }}/actions/artifacts?name=$label&per_page=5" \
               | jq -r '[.artifacts[] | select(.expired|not)] | sort_by(.created_at) | last | select(. != null) | "run \(.workflow_run.id), expires \(.expires_at)"')
+            # The plan the publish job makes, made here before a runner is
+            # asked for: a tree the channel already holds at master's version
+            # (a re-run, or a dispatch naming a package that is fine) needs
+            # no build, and an x86 rebuild would wait minutes for a droplet
+            # to find that out in seconds.
+            plan=""
+            [[ -n "$found" ]] || plan=$(bin/build --dry-run --mirror edge --arch "$arch" --package "$package" 2>&1 | grep -E '^==> Plan complete' || true)
             if [[ -n "$found" ]]; then
               decision="reuse the build artifact ($found)"
-            elif [[ $arch == aarch64 ]]; then
-              decision="no build artifact: rebuild natively on ubuntu-24.04-arm"
-              rebuild+=("$entry")
+            elif [[ -n "$plan" && -z "$(sed -E 's/.*would build: *//' <<<"$plan" | tr -d '[:space:]')" ]]; then
+              decision="already published at master's version, nothing to build"
             else
-              decision="no build artifact: build in the publish job on the self-hosted builder"
+              decision="no build artifact: rebuild on $(jq -r '.runner | fromjson | join(", ")' <<<"$entry")"
+              rebuild+=("$entry")
             fi
             echo "==> $label: $decision"
             echo "| $package | $arch | ${hash:0:12} | $decision |" >> "$GITHUB_STEP_SUMMARY"
@@ -87,16 +92,19 @@ jobs:
           echo "rebuild=$(printf '%s\n' "${rebuild[@]}" | jq -sc '{include: .}')" >> "$GITHUB_OUTPUT"
           echo "rebuild_count=${#rebuild[@]}" >> "$GITHUB_OUTPUT"
 
-  # The aarch64 half of "build it now when there is none". It builds exactly
-  # as build-pr.yml's aarch64 path does (same runner, same builder image,
-  # same bin/build call) and uploads under the same label, so the publish
-  # job collects this run's artifact the way it collects a PR's. No secret
-  # reaches this runner; signing and upload stay on the self-hosted builder.
+  # "Build it now when there is none". Each entry builds exactly as
+  # build-pr.yml builds it (same runner kind, same builder image, same
+  # bin/build call) and uploads under the same label, so the publish job
+  # collects this run's artifact the way it collects a PR's. No secret
+  # reaches these runners, and they hold no lock: entries build in parallel,
+  # and other merges publish while they do.
   rebuild:
     needs: changes
     if: needs.changes.outputs.rebuild_count != '0'
-    runs-on: ubuntu-24.04-arm
-    timeout-minutes: 180
+    runs-on: ${{ fromJSON(matrix.runner) }}
+    # The droplets are x86, so aarch64 never builds there. omarchy-mac-boot
+    # under QEMU took 2h47m; native arm64 and x86 kernels fit easily.
+    timeout-minutes: 240
     permissions:
       contents: read
     strategy:
@@ -109,7 +117,7 @@ jobs:
       # The same check the publish job makes before building: a re-run for a
       # package the channel already holds at master's version builds
       # nothing, and uploads nothing that could shadow the published file.
-      - name: Build ${{ matrix.package }} (${{ matrix.arch }}, native)
+      - name: Build ${{ matrix.package }} (${{ matrix.arch }})
         id: build
         env:
           CONTAINER_ENGINE: docker
@@ -140,23 +148,30 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-  # One job for the whole merge. It collects every PR artifact for the
-  # merged tree (building only what has none; aarch64 comes from the
-  # rebuild job above), then walks each channel and
+  # One job for the whole merge. It collects every artifact for the merged
+  # tree (PR builds, or the rebuild job above), then walks each channel and
   # architecture slot exactly once: pull that database, add every package
   # that belongs in it, upload. Six slots, six round trips, however many
   # packages the merge carried. One process is the only writer, so there
-  # is no race between packages; the run-level concurrency group above
-  # keeps one merge from overlapping the next.
+  # is no race between packages; the concurrency group keeps one merge's
+  # publish from overlapping the next. It builds nothing, so it runs on a
+  # hosted runner in about a minute instead of waiting for a droplet.
   # It waits for the rebuild job and runs whatever that job's result: a
   # failed rebuild leaves its package without an artifact, and the collect
   # step below records that and stops before any publish.
   publish:
     needs: [changes, rebuild]
     if: ${{ !cancelled() && needs.changes.result == 'success' && needs.changes.outputs.count != '0' }}
-    runs-on: [self-hosted, omarchy-builder]
+    runs-on: ubuntu-latest
     environment: publish
-    timeout-minutes: 240
+    timeout-minutes: 30
+    # queue: max, because by default a group holds one waiting job: a third
+    # merge arriving cancels the second one's publish, and nothing reruns it.
+    # With it up to 100 wait, in the order they reach this job.
+    concurrency:
+      group: publish
+      cancel-in-progress: false
+      queue: max
     steps:
       - uses: actions/checkout@v4
         with:
@@ -172,8 +187,8 @@ jobs:
           EOF_MATRIX
           cat plan.txt
 
-      # Fetch each package's PR artifact into build-output/edge/<arch>/, or
-      # build it when no artifact exists for exactly this tree. An artifact
+      # Fetch each package's artifact into build-output/edge/<arch>/: the PR's,
+      # or the rebuild job's when the PR's had expired. An artifact
       # carries its package files inside packages.tar (see build-pr.yml and
       # helpers/artifact-helpers.sh: the upload action rejects the colon in
       # an epoch filename).
@@ -199,8 +214,8 @@ jobs:
             mkdir -p "build-output/edge/$arch"
             if [[ -n "$found" ]]; then
               if [[ $from_run == "${{ github.run_id }}" ]]; then
-                kind=native-rebuild
-                echo "==> $label: artifact from this run's native $arch rebuild"
+                kind=rebuild
+                echo "==> $label: artifact from this run's $arch rebuild"
               else
                 kind=pr-artifact
                 echo "==> $label: reusing the build artifact from run $from_run"
@@ -225,20 +240,11 @@ jobs:
                 jq -nc --arg p "$package" --arg a "$arch" '{package:$p, arch:$a, source:"already-published"}' >> sources.jsonl
                 continue
               fi
-              # aarch64 never builds here: this droplet is x86 and would
-              # emulate it. No artifact means the native rebuild failed (see
-              # the rebuild job), or an artifact expired between planning
-              # and now (re-run all jobs).
-              if [[ $arch == aarch64 ]]; then
-                echo "::error::$label: no artifact from the native rebuild; not building aarch64 under emulation"
-                jq -nc --arg p "$package" --arg a "$arch" '{package:$p, arch:$a, source:"native-build-failed"}' >> sources.jsonl; failed=1; break
-              fi
-              echo "==> $label: no artifact for this tree, building"
-              if OMARCHY_KEEP_BUILD_WORKSPACE=1 bin/build --mirror edge --arch "$arch" --package "$package"; then
-                jq -nc --arg p "$package" --arg a "$arch" '{package:$p, arch:$a, source:"built"}' >> sources.jsonl
-              else
-                jq -nc --arg p "$package" --arg a "$arch" '{package:$p, arch:$a, source:"build-failed"}' >> sources.jsonl; failed=1; break
-              fi
+              # Nothing builds here. No artifact means the rebuild failed (see
+              # the rebuild job), or an artifact expired between planning and
+              # now (re-run all jobs).
+              echo "::error::$label: no artifact from the rebuild job"
+              jq -nc --arg p "$package" --arg a "$arch" '{package:$p, arch:$a, source:"build-failed"}' >> sources.jsonl; failed=1; break
             fi
           done < plan.txt
           ls -1 build-output/edge/*/*.pkg.tar.zst 2>/dev/null || true
@@ -280,8 +286,26 @@ jobs:
             cat publish-record.json
             exit 0
           fi
-          docker image inspect omarchy-pkg-builder:latest-x86_64-edge >/dev/null 2>&1 \
-            || docker buildx build --load -t omarchy-pkg-builder:latest-x86_64-edge --build-arg MIRROR=edge build
+          # A fresh runner has no images, and building this one here cost
+          # every publish about 100 s (and 20 s more to start a container
+          # from it) for the 14 s of signing and upload it is needed for.
+          # builder-images.yml already publishes the tested image for exactly
+          # these build inputs under their key; pull that. Build only when no
+          # image carries the key: a merge that changed build/ publishes
+          # before the refresh it triggered has finished.
+          builder=omarchy-pkg-builder:latest-x86_64-edge
+          if ! docker image inspect "$builder" >/dev/null 2>&1; then
+            key=$(bin/builder-image key --arch x86_64 --mirror edge)
+            published="ghcr.io/omacom/omarchy-pkg-builder:$key"
+            if docker pull --quiet "$published" &&
+              [[ $(docker image inspect "$published" --format '{{index .Config.Labels "org.omarchy.builder.key"}}') == "$key" ]]; then
+              docker tag "$published" "$builder"
+              echo "==> Builder image: pulled $published"
+            else
+              echo "==> Builder image: none published for $key, building it"
+              docker buildx build --load -t "$builder" --build-arg MIRROR=edge build
+            fi
+          fi
 
           # Group the merge's files by the (channel, architecture) slot each
           # belongs to. A package's files live under build-output/edge/<built
@@ -296,16 +320,37 @@ jobs:
             done' > pkgbase.txt
           declare -A slot_files=()
           while read -r package arch channels publish_arches; do
+            # The pkgbase the recipe builds, which is not always its directory
+            # name (pkgbuilds/yaru-icon-theme builds yaru).
+            base=$(BUILD_ROOT=$PWD bash -c 'source helpers/paths.sh; source helpers/package-metadata.sh; package_pkgbase "pkgbuilds/$1" "$2"' _ "$package" "$arch")
+            matched=0
             for f in build-output/edge/"$arch"/*.pkg.tar.zst; do
+              [[ -e $f ]] || continue
               # Only files this package produced (its PKGINFO pkgbase).
-              [[ $(awk -v f="$f" '$1==f{print $2}' pkgbase.txt) == "$package" ]] || continue
+              [[ $(awk -v f="$f" '$1==f{print $2}' pkgbase.txt) == "$base" ]] || continue
+              matched=$((matched + 1))
               for mirror in ${channels//,/ }; do
                 for parch in ${publish_arches//,/ }; do
                   slot_files["$mirror/$parch"]+="$f "
                 done
               done
             done
+            # A collected artifact must yield this package's files; publishing
+            # none of them would read as success and leave every channel stale.
+            if (( matched == 0 )) && jq -e --arg p "$package" --arg a "$arch" \
+              'select(.package == $p and .arch == $a and .source != "already-published")' sources.jsonl >/dev/null; then
+              echo "::error::$package ($arch): its artifact has no files with pkgbase $base"
+              unmatched=1
+            fi
           done < plan.txt
+          if [[ -n ${unmatched:-} ]]; then
+            jq -n --arg sha "${{ github.sha }}" --arg run "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+              --arg prefix "${OMARCHY_PUBLISH_PREFIX:-}" --arg event "${{ github.event_name }}" \
+              --slurpfile sources sources.jsonl --slurpfile plan <(jq -c '.include[]' <<<'${{ needs.changes.outputs.matrix }}' | jq -sc .) \
+              '{time: (now|todate), commit:$sha, run:$run, event:$event, target: (if $prefix=="" then "live" else $prefix end), plan:$plan[0], sources:$sources, slots:[]}' \
+              > publish-record.json
+            exit 1
+          fi
 
           # Deterministic slot order: edge before rc before stable, x86_64
           # before aarch64, so a failure leaves the earlier rings consistent.
@@ -345,6 +390,83 @@ jobs:
           cat publish-record.json
           exit $status
 
+      # A merge publishes a fast-ring build to edge, rc and stable at once,
+      # but the steps above skip a package edge already holds at master's
+      # version: one that just joined the fast ring, or whose rc or stable
+      # copy never landed. Copy edge's file to those channels. Nothing to do
+      # once they agree, which is every run where the publish above went in.
+      - name: Bring the fast ring in line with edge
+        if: success()
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+          RCLONE_CONFIG_R2_TYPE: s3
+          RCLONE_CONFIG_R2_PROVIDER: Cloudflare
+          RCLONE_CONFIG_R2_NO_CHECK_BUCKET: "true"
+          RCLONE_CONFIG_R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          RCLONE_CONFIG_R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          RCLONE_CONFIG_R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          OMARCHY_PUBLISH_PREFIX: ${{ vars.OMARCHY_PUBLISH_PREFIX }}
+        run: |
+          set -euo pipefail
+          # The fast-ring pkgbases of this merge, per channel and architecture.
+          declare -A bases=()
+          while read -r package arch channels publish_arches; do
+            BUILD_ROOT=$PWD bash -c 'source helpers/paths.sh; source helpers/package-metadata.sh; package_is_fast_ring "pkgbuilds/$1"' _ "$package" || continue
+            base=$(BUILD_ROOT=$PWD bash -c 'source helpers/paths.sh; source helpers/package-metadata.sh; package_pkgbase "pkgbuilds/$1" "$2"' _ "$package" "$arch")
+            for mirror in rc stable; do
+              [[ ",$channels," == *",$mirror,"* ]] || continue
+              for parch in ${publish_arches//,/ }; do
+                bases["$mirror $parch"]+="$base "
+              done
+            done
+          done < plan.txt
+          if (( ${#bases[@]} == 0 )); then
+            echo "No fast-ring packages in this merge."
+            exit 0
+          fi
+
+          # The Publish step skips its image pull when it has nothing new.
+          builder=omarchy-pkg-builder:latest-x86_64-edge
+          if ! docker image inspect "$builder" >/dev/null 2>&1; then
+            published="ghcr.io/omacom/omarchy-pkg-builder:$(bin/builder-image key --arch x86_64 --mirror edge)"
+            if docker pull --quiet "$published"; then
+              docker tag "$published" "$builder"
+            else
+              docker buildx build --load -t "$builder" --build-arg MIRROR=edge build
+            fi
+          fi
+
+          # The builder image runs as its own user; let it append the record.
+          mkdir -p "$RUNNER_TEMP/fast-ring"
+          : > "$RUNNER_TEMP/fast-ring/record.jsonl"
+          chmod 0777 "$RUNNER_TEMP/fast-ring"
+          chmod 0666 "$RUNNER_TEMP/fast-ring/record.jsonl"
+          status=0
+          for mirror in rc stable; do
+            for parch in x86_64 aarch64; do
+              list=${bases["$mirror $parch"]:-}
+              [[ -n $list ]] || continue
+              if ! docker run --rm \
+                -e GPG_PRIVATE_KEY -e GPG_PASSPHRASE -e OMARCHY_PUBLISH_PREFIX \
+                -e RCLONE_CONFIG_R2_TYPE -e RCLONE_CONFIG_R2_PROVIDER -e RCLONE_CONFIG_R2_ENDPOINT -e RCLONE_CONFIG_R2_NO_CHECK_BUCKET \
+                -e RCLONE_CONFIG_R2_ACCESS_KEY_ID -e RCLONE_CONFIG_R2_SECRET_ACCESS_KEY \
+                -v "$PWD:/w:ro" -v "$RUNNER_TEMP/fast-ring:/out" -w /w "$builder" \
+                bin/promote-channel --remote R2:omarchy-pkgs --fast-ring --from edge --to "$mirror" --arch "$parch" \
+                  --record /out/record.jsonl $list; then
+                status=1
+                break 2
+              fi
+            done
+          done
+          # Its publishes join the run's record as slots, as the Publish
+          # step's own do.
+          jq -c 'select(.type == "slot") | del(.type)' "$RUNNER_TEMP/fast-ring/record.jsonl" > fast-ring-slots.jsonl
+          jq --slurpfile extra fast-ring-slots.jsonl '.slots += $extra' publish-record.json > publish-record.tmp
+          mv publish-record.tmp publish-record.json
+          echo "fast-ring slots: $(wc -l < fast-ring-slots.jsonl)"
+          exit $status
+
       - name: Keep the publish record
         if: always()
         uses: actions/upload-artifact@v4
@@ -374,7 +496,7 @@ jobs:
         run: |
           jq -r --arg outcome "${{ needs.publish.result }}" '
             def pkgs: [.packages[] | select(test("-debug-")|not)] | join(", ");
-            def src: if .source=="pr-artifact" then "PR artifact" elif .source=="native-rebuild" then "rebuilt natively on arm64" elif .source=="built" then "built here" elif .source=="already-published" then "already published, skipped" else "**" + .source + "**" end;
+            def src: if .source=="pr-artifact" then "PR artifact" elif .source=="rebuild" or .source=="native-rebuild" then "rebuilt at merge" elif .source=="built" then "built here" elif .source=="already-published" then "already published, skipped" else "**" + .source + "**" end;
             "### Publish " + (if $outcome=="success" then "succeeded" else "FAILED" end) +
             " → **" + .target + "**" + (if .target!="live" then " (proof prefix, not live)" else "" end),
             "",

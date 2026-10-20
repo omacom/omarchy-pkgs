@@ -69,6 +69,15 @@ if pub "$C1"; then fail "aarch64 package into x86_64 should refuse"; else grep -
 cp "$B1" "$T/renamed-1.0-1-x86_64.pkg.tar.zst"
 if pub "$T/renamed-1.0-1-x86_64.pkg.tar.zst"; then fail "filename/PKGINFO mismatch should refuse"; else grep -q 'does not match PKGINFO' "$T/out" && pass "filename must match PKGINFO" || fail "mismatch reason"; fi
 
+# --newer-only: an RC carried into edge never takes edge backwards.
+pub --newer-only "$A1" && grep -q 'already serves alpha 1.0-2' "$T/out" && [[ "$(entries)" == "alpha-1.0-2/ beta-1.0-1/ " ]] \
+  && pass "--newer-only skips an older version" || fail "--newer-only older"
+pub --newer-only "$A2" && grep -q 'nothing published' "$T/out" && [[ "$(entries)" == "alpha-1.0-2/ beta-1.0-1/ " ]] \
+  && pass "--newer-only skips the version already served" || fail "--newer-only same"
+A3=$(mkpkg alpha 3 any); D1=$(mkpkg delta 1 any)
+pub --newer-only "$A1" "$A3" "$D1" && [[ "$(entries)" == "alpha-1.0-3/ beta-1.0-1/ delta-1.0-1/ " ]] \
+  && pass "--newer-only publishes newer and new packages, drops the rest" || fail "--newer-only mixed"
+
 # db must verify: pacman can read it and each package's signature checks
 gpg --batch --quiet --import <<<"$GPG_PRIVATE_KEY" 2>/dev/null || true
 ( cd "$REMOTE/edge/x86_64" && for f in *.pkg.tar.zst; do gpg --batch --quiet --verify "$f.sig" "$f" 2>/dev/null || { echo "FAIL: signature $f"; exit 1; }; done ) && pass "all signatures verify"

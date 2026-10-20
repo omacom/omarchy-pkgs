@@ -1,0 +1,689 @@
+From 157172df1a685ea33c3a51e0d7c9330033d914d4 Mon Sep 17 00:00:00 2001
+From: srinivasareddy dasari <srinivasa.dasari@mediatek.com>
+Date: Wed, 24 Jun 2026 15:03:08 +0800
+Subject: [PATCH 5/6] NVIDIA: SAUCE: spi: mt65xx: enable ACPI and power
+ management
+
+BugLink: https://bugs.launchpad.net/bugs/2167886
+
+Add ACPI support for NVDA0210 controllers and skip DT-only clock,
+pad-selection, and property handling on ACPI systems.
+
+Integrate Power Wrap for controller power control and add runtime and
+system suspend/resume callbacks. Schedule autosuspend after successful
+controller registration.
+
+Treat failed Power Wrap suspend requests as ambiguous. Recover D0
+immediately, keep runtime PM active only after D0 and clocks are restored,
+and otherwise leave the device suspended so the next resume retries before
+hardware access. Retry failed noirq rollback from regular system resume.
+
+Balance probe/remove and clock error paths, use ACPI_FREE() for ACPI paths,
+and retain internal linkage for the local nbit helper.
+
+Signed-off-by: srinivasareddy dasari <srinivasa.dasari@mediatek.com>
+Signed-off-by: Bharat Dintakurti <bdintakurti@nvidia.com>
+Acked-by: Jamie Nguyen <jamien@nvidia.com>
+Acked-by: Carol L Soto <csoto@nvidia.com>
+Signed-off-by: Brad Figg <bfigg@nvidia.com>
+---
+ drivers/spi/spi-mt65xx.c | 447 ++++++++++++++++++++++++++++++++-------
+ 1 file changed, 374 insertions(+), 73 deletions(-)
+
+diff --git a/drivers/spi/spi-mt65xx.c b/drivers/spi/spi-mt65xx.c
+index 96f8555..5a48c1b 100644
+--- a/drivers/spi/spi-mt65xx.c
++++ b/drivers/spi/spi-mt65xx.c
+@@ -4,6 +4,7 @@
+  * Author: Leilk Liu <leilk.liu@mediatek.com>
+  */
+ 
++#include <linux/acpi.h>
+ #include <linux/clk.h>
+ #include <linux/device.h>
+ #include <linux/err.h>
+@@ -17,10 +18,15 @@
+ #include <linux/platform_device.h>
+ #include <linux/platform_data/spi-mt65xx.h>
+ #include <linux/pm_runtime.h>
++#include <linux/property.h>
+ #include <linux/spi/spi.h>
+ #include <linux/spi/spi-mem.h>
+ #include <linux/dma-mapping.h>
+ #include <linux/pm_qos.h>
++#include <linux/soc/mediatek/mtk-pwrap.h>
++
++#define MTK_SPI_CLK_FREQ_DEFAULT	52000000  /* 52 MHz default SPI clock */
++#define MTK_SPI_AUTOSUSPEND_DELAY_MS	100
+ 
+ #define SPI_CFG0_REG			0x0000
+ #define SPI_CFG1_REG			0x0004
+@@ -155,6 +161,10 @@ struct mtk_spi_compatible {
+  * @dev:		Device pointer
+  * @tx_dma:		DMA start for SPI-MEM TX
+  * @rx_dma:		DMA start for SPI-MEM RX
++ * @pwrap_ctrl:	Power Wrap control data for ACPI-enumerated controllers
++ * @power_state:	True only when Power Wrap has confirmed controller D0
++ * @pwrap_state_unknown:	A D-state request failed without confirmed recovery
++ * @d3_retry_used:	Automatic D3 retry used for this idle period
+  */
+ struct mtk_spi {
+ 	void __iomem *base;
+@@ -175,6 +185,10 @@ struct mtk_spi {
+ 	struct device *dev;
+ 	dma_addr_t tx_dma;
+ 	dma_addr_t rx_dma;
++	void *pwrap_ctrl;
++	bool power_state;
++	bool pwrap_state_unknown;
++	bool d3_retry_used;
+ };
+ 
+ static const struct mtk_spi_compatible mtk_common_compat;
+@@ -281,6 +295,12 @@ static const struct of_device_id mtk_spi_of_match[] = {
+ };
+ MODULE_DEVICE_TABLE(of, mtk_spi_of_match);
+ 
++static const struct acpi_device_id mtk_spi_acpi_match[] = {
++	{ "NVDA0210", (kernel_ulong_t)&mtk_ipm_compat },
++	{}
++};
++MODULE_DEVICE_TABLE(acpi, mtk_spi_acpi_match);
++
+ static void mtk_spi_reset(struct mtk_spi *mdata)
+ {
+ 	u32 reg_val;
+@@ -471,6 +491,12 @@ static int mtk_spi_hw_init(struct spi_controller *host,
+ static int mtk_spi_prepare_message(struct spi_controller *host,
+ 				   struct spi_message *msg)
+ {
++	struct mtk_spi *mdata = spi_controller_get_devdata(host);
++
++	if (mdata->pwrap_state_unknown)
++		return -EIO;
++
++	mdata->d3_retry_used = false;
+ 	return mtk_spi_hw_init(host, msg->spi);
+ }
+ 
+@@ -563,7 +589,7 @@ static void mtk_spi_setup_packet(struct spi_controller *host)
+ 	writel(reg_val, mdata->base + SPI_CFG1_REG);
+ }
+ 
+-inline u32 mtk_spi_set_nbit(u32 nbit)
++static inline u32 mtk_spi_set_nbit(u32 nbit)
+ {
+ 	switch (nbit) {
+ 	default:
+@@ -1002,6 +1028,10 @@ static int mtk_spi_mem_exec_op(struct spi_mem *mem,
+ 	char *tx_tmp_buf, *rx_tmp_buf;
+ 	int ret = 0;
+ 
++	if (mdata->pwrap_state_unknown)
++		return -EIO;
++
++	mdata->d3_retry_used = false;
+ 	mdata->use_spimem = true;
+ 	reinit_completion(&mdata->spimem_done);
+ 
+@@ -1172,12 +1202,134 @@ static const struct spi_controller_mem_caps mtk_spi_mem_caps = {
+ 	.per_op_freq = true,
+ };
+ 
++static int mtk_spi_init_pad_sel(struct device *dev, struct mtk_spi *mdata)
++{
++	int i;
++
++	mdata->pad_num = of_property_count_u32_elems(dev->of_node,
++			"mediatek,pad-select");
++	if (mdata->pad_num < 0)
++		return dev_err_probe(dev, -EINVAL,
++			"No 'mediatek,pad-select' property\n");
++
++	mdata->pad_sel = devm_kmalloc_array(dev, mdata->pad_num,
++						sizeof(u32), GFP_KERNEL);
++	if (!mdata->pad_sel)
++		return -ENOMEM;
++
++	for (i = 0; i < mdata->pad_num; i++) {
++		of_property_read_u32_index(dev->of_node,
++						"mediatek,pad-select",
++						i, &mdata->pad_sel[i]);
++		if (mdata->pad_sel[i] > MT8173_SPI_MAX_PAD_SEL)
++			return dev_err_probe(dev, -EINVAL,
++							"wrong pad-sel[%d]: %u\n",
++							i, mdata->pad_sel[i]);
++	}
++	return 0;
++}
++
++static int mtk_spi_init_clocks_of(struct device *dev, struct mtk_spi *mdata)
++{
++	int ret;
++
++	mdata->parent_clk = devm_clk_get(dev, "parent-clk");
++	if (IS_ERR(mdata->parent_clk))
++		return dev_err_probe(dev, PTR_ERR(mdata->parent_clk),
++						"failed to get parent-clk\n");
++
++	mdata->sel_clk = devm_clk_get(dev, "sel-clk");
++	if (IS_ERR(mdata->sel_clk))
++		return dev_err_probe(dev, PTR_ERR(mdata->sel_clk),
++						"failed to get sel-clk\n");
++
++	mdata->spi_clk = devm_clk_get(dev, "spi-clk");
++	if (IS_ERR(mdata->spi_clk))
++		return dev_err_probe(dev, PTR_ERR(mdata->spi_clk),
++						"failed to get spi-clk\n");
++
++	mdata->spi_hclk = devm_clk_get_optional(dev, "hclk");
++	if (IS_ERR(mdata->spi_hclk))
++		return dev_err_probe(dev, PTR_ERR(mdata->spi_hclk),
++						"failed to get hclk\n");
++
++	ret = clk_set_parent(mdata->sel_clk, mdata->parent_clk);
++	if (ret < 0)
++		return dev_err_probe(dev, ret, "failed to clk_set_parent\n");
++
++	ret = clk_prepare_enable(mdata->spi_hclk);
++	if (ret < 0)
++		return dev_err_probe(dev, ret, "failed to enable hclk\n");
++
++	ret = clk_prepare_enable(mdata->spi_clk);
++	if (ret < 0) {
++		clk_disable_unprepare(mdata->spi_hclk);
++		return dev_err_probe(dev, ret, "failed to enable spi_clk\n");
++	}
++
++	mdata->spi_clk_hz = clk_get_rate(mdata->spi_clk);
++
++	if (mdata->dev_comp->no_need_unprepare) {
++		clk_disable(mdata->spi_clk);
++		clk_disable(mdata->spi_hclk);
++	} else {
++		clk_disable_unprepare(mdata->spi_clk);
++		clk_disable_unprepare(mdata->spi_hclk);
++	}
++
++	return 0;
++}
++
++#ifdef CONFIG_ACPI
++static int mtk_spi_init_clocks_acpi(struct device *dev, struct mtk_spi *mdata)
++{
++	struct acpi_device *adev = ACPI_COMPANION(dev);
++	struct acpi_buffer buffer = { ACPI_ALLOCATE_BUFFER, NULL };
++	acpi_status status;
++	const char *path;
++	int ret;
++
++	if (!adev)
++		return -ENODEV;
++
++	if (device_property_read_u32(dev, "clock-frequency",
++						&mdata->spi_clk_hz))
++		mdata->spi_clk_hz = MTK_SPI_CLK_FREQ_DEFAULT;
++
++	status = acpi_get_name(adev->handle, ACPI_FULL_PATHNAME, &buffer);
++	if (ACPI_FAILURE(status))
++		return dev_err_probe(dev, -EINVAL, "failed to get ACPI path\n");
++	path = buffer.pointer;
++
++	mdata->pwrap_ctrl = mtk_pwrap_dev_probe(path);
++	if (!mdata->pwrap_ctrl) {
++		ret = dev_err_probe(dev, -ENODEV,
++				    "pwrap probe failed for %s\n", path);
++		goto out_free;
++	}
++
++	mdata->power_state = true;
++	ret = 0;
++
++out_free:
++	ACPI_FREE(buffer.pointer);
++	return ret;
++}
++#else
++static int mtk_spi_init_clocks_acpi(struct device *dev, struct mtk_spi *mdata)
++{
++	return -ENODEV;
++}
++#endif
++
+ static int mtk_spi_probe(struct platform_device *pdev)
+ {
+ 	struct device *dev = &pdev->dev;
+ 	struct spi_controller *host;
+ 	struct mtk_spi *mdata;
+-	int i, irq, ret, addr_bits;
++	int irq, ret, addr_bits;
++	bool has_of = dev->of_node != NULL;
++	bool has_acpi = has_acpi_companion(dev);
+ 
+ 	host = devm_spi_alloc_host(dev, sizeof(*mdata));
+ 	if (!host)
+@@ -1214,27 +1366,10 @@ static int mtk_spi_probe(struct platform_device *pdev)
+ 		init_completion(&mdata->spimem_done);
+ 	}
+ 
+-	if (mdata->dev_comp->need_pad_sel) {
+-		mdata->pad_num = of_property_count_u32_elems(dev->of_node,
+-			"mediatek,pad-select");
+-		if (mdata->pad_num < 0)
+-			return dev_err_probe(dev, -EINVAL,
+-				"No 'mediatek,pad-select' property\n");
+-
+-		mdata->pad_sel = devm_kmalloc_array(dev, mdata->pad_num,
+-						    sizeof(u32), GFP_KERNEL);
+-		if (!mdata->pad_sel)
+-			return -ENOMEM;
+-
+-		for (i = 0; i < mdata->pad_num; i++) {
+-			of_property_read_u32_index(dev->of_node,
+-						   "mediatek,pad-select",
+-						   i, &mdata->pad_sel[i]);
+-			if (mdata->pad_sel[i] > MT8173_SPI_MAX_PAD_SEL)
+-				return dev_err_probe(dev, -EINVAL,
+-						     "wrong pad-sel[%d]: %u\n",
+-						     i, mdata->pad_sel[i]);
+-		}
++	if (mdata->dev_comp->need_pad_sel && has_of) {
++		ret = mtk_spi_init_pad_sel(dev, mdata);
++		if (ret)
++			return ret;
+ 	}
+ 
+ 	platform_set_drvdata(pdev, host);
+@@ -1254,58 +1389,32 @@ static int mtk_spi_probe(struct platform_device *pdev)
+ 	else
+ 		dma_set_max_seg_size(dev, SZ_256K);
+ 
+-	mdata->parent_clk = devm_clk_get(dev, "parent-clk");
+-	if (IS_ERR(mdata->parent_clk))
+-		return dev_err_probe(dev, PTR_ERR(mdata->parent_clk),
+-				     "failed to get parent-clk\n");
+-
+-	mdata->sel_clk = devm_clk_get(dev, "sel-clk");
+-	if (IS_ERR(mdata->sel_clk))
+-		return dev_err_probe(dev, PTR_ERR(mdata->sel_clk), "failed to get sel-clk\n");
+-
+-	mdata->spi_clk = devm_clk_get(dev, "spi-clk");
+-	if (IS_ERR(mdata->spi_clk))
+-		return dev_err_probe(dev, PTR_ERR(mdata->spi_clk), "failed to get spi-clk\n");
+-
+-	mdata->spi_hclk = devm_clk_get_optional(dev, "hclk");
+-	if (IS_ERR(mdata->spi_hclk))
+-		return dev_err_probe(dev, PTR_ERR(mdata->spi_hclk), "failed to get hclk\n");
+-
+-	ret = clk_set_parent(mdata->sel_clk, mdata->parent_clk);
+-	if (ret < 0)
+-		return dev_err_probe(dev, ret, "failed to clk_set_parent\n");
+-
+-	ret = clk_prepare_enable(mdata->spi_hclk);
+-	if (ret < 0)
+-		return dev_err_probe(dev, ret, "failed to enable hclk\n");
+-
+-	ret = clk_prepare_enable(mdata->spi_clk);
+-	if (ret < 0) {
+-		clk_disable_unprepare(mdata->spi_hclk);
+-		return dev_err_probe(dev, ret, "failed to enable spi_clk\n");
+-	}
+-
+-	mdata->spi_clk_hz = clk_get_rate(mdata->spi_clk);
+-
+-	if (mdata->dev_comp->no_need_unprepare) {
+-		clk_disable(mdata->spi_clk);
+-		clk_disable(mdata->spi_hclk);
++	if (has_of) {
++		ret = mtk_spi_init_clocks_of(dev, mdata);
++	} else if (has_acpi) {
++		/* ACPI: clocks are managed by firmware via SSPM/SCMI */
++		ret = mtk_spi_init_clocks_acpi(dev, mdata);
+ 	} else {
+-		clk_disable_unprepare(mdata->spi_clk);
+-		clk_disable_unprepare(mdata->spi_hclk);
++		return dev_err_probe(dev, -ENODEV, "no OF or ACPI node\n");
+ 	}
++	if (ret)
++		return ret;
+ 
+ 	cpu_latency_qos_add_request(&mdata->qos_request, PM_QOS_DEFAULT_VALUE);
+ 
+-	if (mdata->dev_comp->need_pad_sel) {
+-		if (mdata->pad_num != host->num_chipselect)
+-			return dev_err_probe(dev, -EINVAL,
++	if (mdata->dev_comp->need_pad_sel && has_of) {
++		if (mdata->pad_num != host->num_chipselect) {
++			ret = dev_err_probe(dev, -EINVAL,
+ 				"pad_num does not match num_chipselect(%d != %d)\n",
+ 				mdata->pad_num, host->num_chipselect);
++			goto err_cleanup;
++		}
+ 
+-		if (!host->cs_gpiods && host->num_chipselect > 1)
+-			return dev_err_probe(dev, -EINVAL,
++		if (!host->cs_gpiods && host->num_chipselect > 1) {
++			ret = dev_err_probe(dev, -EINVAL,
+ 				"cs_gpios not specified and num_chipselect > 1\n");
++			goto err_cleanup;
++		}
+ 	}
+ 
+ 	if (mdata->dev_comp->dma_ext)
+@@ -1320,18 +1429,51 @@ static int mtk_spi_probe(struct platform_device *pdev)
+ 	ret = devm_request_threaded_irq(dev, irq, mtk_spi_interrupt,
+ 					mtk_spi_interrupt_thread,
+ 					IRQF_ONESHOT, dev_name(dev), host);
+-	if (ret)
+-		return dev_err_probe(dev, ret, "failed to register irq\n");
++	if (ret) {
++		dev_err_probe(dev, ret, "failed to register irq\n");
++		goto err_cleanup;
++	}
+ 
++	/*
++	 * ACPI: the pwrap is powered on in probe and the clk pointers are
++	 * NULL, so the controller is genuinely active here. On the DT path
++	 * the clocks are disabled at the end of mtk_spi_init_clocks_of(), so
++	 * declaring the device active would skip the first runtime_resume and
++	 * run transfers against gated clocks. Only mark active for ACPI.
++	 */
++	if (has_acpi) {
++		ret = pm_runtime_set_active(dev);
++		if (ret) {
++			dev_err_probe(dev, ret, "failed to set runtime active\n");
++			goto err_cleanup;
++		}
++		/* Configure autosuspend before runtime PM can idle the controller. */
++		pm_runtime_set_autosuspend_delay(dev, MTK_SPI_AUTOSUSPEND_DELAY_MS);
++		pm_runtime_use_autosuspend(dev);
++	}
+ 	pm_runtime_enable(dev);
+ 
+ 	ret = spi_register_controller(host);
+ 	if (ret) {
+ 		pm_runtime_disable(dev);
+-		return dev_err_probe(dev, ret, "failed to register host\n");
++		if (has_acpi)
++			pm_runtime_dont_use_autosuspend(dev);
++		dev_err_probe(dev, ret, "failed to register host\n");
++		goto err_cleanup;
+ 	}
++	if (has_acpi)
++		pm_request_autosuspend(dev);
+ 
+ 	return 0;
++
++err_cleanup:
++	cpu_latency_qos_remove_request(&mdata->qos_request);
++	if (has_acpi && mdata->pwrap_ctrl) {
++		mtk_pwrap_dev_remove(mdata->pwrap_ctrl);
++		mdata->pwrap_ctrl = NULL;
++		mdata->power_state = false;
++	}
++	return ret;
+ }
+ 
+ static void mtk_spi_remove(struct platform_device *pdev)
+@@ -1349,6 +1491,9 @@ static void mtk_spi_remove(struct platform_device *pdev)
+ 	ret = pm_runtime_get_sync(&pdev->dev);
+ 	if (ret < 0) {
+ 		dev_warn(&pdev->dev, "Failed to resume hardware (%pe)\n", ERR_PTR(ret));
++	} else if (has_acpi_companion(&pdev->dev) && !mdata->power_state) {
++		dev_warn(&pdev->dev,
++			 "power state unconfirmed, skipping hardware reset\n");
+ 	} else {
+ 		/*
+ 		 * If pm runtime resume failed, clks are disabled and
+@@ -1363,17 +1508,50 @@ static void mtk_spi_remove(struct platform_device *pdev)
+ 		}
+ 	}
+ 
++	if (has_acpi_companion(&pdev->dev) && mdata->pwrap_ctrl) {
++		mtk_pwrap_dev_remove(mdata->pwrap_ctrl);
++		mdata->pwrap_ctrl = NULL;
++		mdata->power_state = false;
++	}
++
+ 	pm_runtime_put_noidle(&pdev->dev);
+ 	pm_runtime_disable(&pdev->dev);
++	if (has_acpi_companion(&pdev->dev))
++		pm_runtime_dont_use_autosuspend(&pdev->dev);
+ }
+ 
+ #ifdef CONFIG_PM_SLEEP
++static int mtk_spi_pwrap_resume(struct device *dev, struct mtk_spi *mdata)
++{
++	int ret;
++
++	if (!has_acpi_companion(dev) || !mdata->pwrap_ctrl ||
++	    mdata->power_state)
++		return 0;
++
++	ret = mtk_pwrap_dev_resume(mdata->pwrap_ctrl, 0);
++	if (ret) {
++		mdata->pwrap_state_unknown = true;
++		return ret;
++	}
++
++	mdata->power_state = true;
++	mdata->pwrap_state_unknown = false;
++	return 0;
++}
++
+ static int mtk_spi_suspend(struct device *dev)
+ {
+ 	int ret;
+ 	struct spi_controller *host = dev_get_drvdata(dev);
+ 	struct mtk_spi *mdata = spi_controller_get_devdata(host);
+ 
++	/* Do not skip D3 after a previous failed D-state recovery. */
++	if (mdata->pwrap_state_unknown) {
++		dev_err(dev, "pwrap state unconfirmed, aborting suspend\n");
++		return -EIO;
++	}
++
+ 	ret = spi_controller_suspend(host);
+ 	if (ret)
+ 		return ret;
+@@ -1383,18 +1561,35 @@ static int mtk_spi_suspend(struct device *dev)
+ 		clk_disable_unprepare(mdata->spi_hclk);
+ 	}
+ 
+-	pinctrl_pm_select_sleep_state(dev);
++	if (dev->of_node)
++		pinctrl_pm_select_sleep_state(dev);
+ 
+ 	return 0;
+ }
+ 
+ static int mtk_spi_resume(struct device *dev)
+ {
++	bool clocks_enabled = false;
+ 	int ret;
+ 	struct spi_controller *host = dev_get_drvdata(dev);
+ 	struct mtk_spi *mdata = spi_controller_get_devdata(host);
+ 
+-	pinctrl_pm_select_default_state(dev);
++	/*
++	 * A failed noirq D3 request may still have reached firmware.  The PM
++	 * core skips ->resume_noirq() for the device whose ->suspend_noirq()
++	 * failed, so confirm D0 here before enabling clocks or reopening the
++	 * SPI queue.
++	 */
++	if (!pm_runtime_suspended(dev)) {
++		ret = mtk_spi_pwrap_resume(dev, mdata);
++		if (ret) {
++			dev_err(dev, "pwrap resume recovery failed (%d)\n", ret);
++			return ret;
++		}
++	}
++
++	if (dev->of_node)
++		pinctrl_pm_select_default_state(dev);
+ 
+ 	if (!pm_runtime_suspended(dev)) {
+ 		ret = clk_prepare_enable(mdata->spi_clk);
+@@ -1409,23 +1604,81 @@ static int mtk_spi_resume(struct device *dev)
+ 			clk_disable_unprepare(mdata->spi_clk);
+ 			return ret;
+ 		}
++		clocks_enabled = true;
+ 	}
+ 
+ 	ret = spi_controller_resume(host);
+-	if (ret < 0) {
+-		clk_disable_unprepare(mdata->spi_clk);
++	if (ret < 0 && clocks_enabled) {
+ 		clk_disable_unprepare(mdata->spi_hclk);
++		clk_disable_unprepare(mdata->spi_clk);
+ 	}
+ 
+ 	return ret;
+ }
++
++static int mtk_spi_suspend_noirq(struct device *dev)
++{
++	struct spi_controller *host = dev_get_drvdata(dev);
++	struct mtk_spi *mdata = spi_controller_get_devdata(host);
++	int ret, rollback_ret;
++
++	if (has_acpi_companion(dev) && mdata->pwrap_ctrl && mdata->power_state) {
++		ret = mtk_pwrap_dev_suspend(mdata->pwrap_ctrl, 0);
++		/* A failed request leaves the hardware state ambiguous. */
++		mdata->power_state = false;
++		mdata->pwrap_state_unknown = !!ret;
++		if (ret) {
++			dev_err(dev, "pwrap suspend failed (%d)\n", ret);
++
++			rollback_ret = mtk_spi_pwrap_resume(dev, mdata);
++			if (rollback_ret)
++				dev_err(dev, "pwrap D0 rollback failed (%d)\n",
++					rollback_ret);
++			return ret;
++		}
++	}
++
++	return 0;
++}
++
++static int mtk_spi_resume_noirq(struct device *dev)
++{
++	struct spi_controller *host = dev_get_drvdata(dev);
++	struct mtk_spi *mdata = spi_controller_get_devdata(host);
++	int ret;
++
++	/*
++	 * If the device was runtime suspended across system sleep, the pwrap
++	 * is intentionally off. Leave it off and let the next transfer's
++	 * runtime_resume power it on. Otherwise we would power it back on for
++	 * a device that stays runtime suspended, leaking power on an idle
++	 * controller that may never see another transaction.
++	 */
++	if (pm_runtime_status_suspended(dev))
++		return 0;
++
++	ret = mtk_spi_pwrap_resume(dev, mdata);
++	if (ret) {
++		dev_err(dev, "pwrap resume failed (%d)\n", ret);
++		return ret;
++	}
++
++	return 0;
++}
+ #endif /* CONFIG_PM_SLEEP */
+ 
+ #ifdef CONFIG_PM
++static int mtk_spi_runtime_resume(struct device *dev);
++
+ static int mtk_spi_runtime_suspend(struct device *dev)
+ {
+ 	struct spi_controller *host = dev_get_drvdata(dev);
+ 	struct mtk_spi *mdata = spi_controller_get_devdata(host);
++	int ret, rollback_ret;
++
++	/* A failed system resume left D0 unconfirmed and clocks disabled. */
++	if (mdata->pwrap_state_unknown)
++		return -EBUSY;
+ 
+ 	if (mdata->dev_comp->no_need_unprepare) {
+ 		clk_disable(mdata->spi_clk);
+@@ -1435,6 +1688,36 @@ static int mtk_spi_runtime_suspend(struct device *dev)
+ 		clk_disable_unprepare(mdata->spi_hclk);
+ 	}
+ 
++	if (has_acpi_companion(dev) && mdata->pwrap_ctrl && mdata->power_state) {
++		ret = mtk_pwrap_dev_suspend(mdata->pwrap_ctrl, 0);
++		/* A failed request leaves the hardware state ambiguous. */
++		mdata->power_state = false;
++		mdata->pwrap_state_unknown = !!ret;
++		if (ret) {
++			dev_err(dev, "pwrap suspend failed (%d)\n", ret);
++
++			rollback_ret = mtk_spi_runtime_resume(dev);
++			if (rollback_ret) {
++				dev_err(dev, "pwrap D0 rollback failed (%d)\n",
++					rollback_ret);
++				/*
++				 * Reporting an error would leave runtime PM active with
++				 * clocks off and D0 unconfirmed. Complete suspend so the
++				 * normal resume path retries D0 before enabling clocks.
++				 */
++				return 0;
++			}
++
++			/* Keep D0 active; retry once without repeated SSPM polling. */
++			if (!mdata->d3_retry_used) {
++				mdata->d3_retry_used = true;
++				pm_runtime_mark_last_busy(dev);
++			}
++			return -EBUSY;
++		}
++		mdata->d3_retry_used = false;
++	}
++
+ 	return 0;
+ }
+ 
+@@ -1444,6 +1727,22 @@ static int mtk_spi_runtime_resume(struct device *dev)
+ 	struct mtk_spi *mdata = spi_controller_get_devdata(host);
+ 	int ret;
+ 
++	if (has_acpi_companion(dev) && mdata->pwrap_ctrl && !mdata->power_state) {
++		ret = mtk_pwrap_dev_resume(mdata->pwrap_ctrl, 0);
++		if (ret) {
++			mdata->pwrap_state_unknown = true;
++			/*
++			 * Keep a firmware timeout retryable. Runtime PM still leaves
++			 * the device suspended, while -EAGAIN avoids permanently
++			 * setting runtime_error for this transient failure.
++			 */
++			dev_err(dev, "pwrap resume failed (%d)\n", ret);
++			return ret == -ETIMEDOUT ? -EAGAIN : ret;
++		}
++		mdata->power_state = true;
++		mdata->pwrap_state_unknown = false;
++	}
++
+ 	if (mdata->dev_comp->no_need_unprepare) {
+ 		ret = clk_enable(mdata->spi_clk);
+ 		if (ret < 0) {
+@@ -1477,6 +1776,7 @@ static int mtk_spi_runtime_resume(struct device *dev)
+ 
+ static const struct dev_pm_ops mtk_spi_pm = {
+ 	SET_SYSTEM_SLEEP_PM_OPS(mtk_spi_suspend, mtk_spi_resume)
++	SET_NOIRQ_SYSTEM_SLEEP_PM_OPS(mtk_spi_suspend_noirq, mtk_spi_resume_noirq)
+ 	SET_RUNTIME_PM_OPS(mtk_spi_runtime_suspend,
+ 			   mtk_spi_runtime_resume, NULL)
+ };
+@@ -1486,6 +1786,7 @@ static struct platform_driver mtk_spi_driver = {
+ 		.name = "mtk-spi",
+ 		.pm	= &mtk_spi_pm,
+ 		.of_match_table = mtk_spi_of_match,
++		.acpi_match_table = ACPI_PTR(mtk_spi_acpi_match),
+ 	},
+ 	.probe = mtk_spi_probe,
+ 	.remove = mtk_spi_remove,
+-- 
+2.56.0
+

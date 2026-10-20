@@ -1,0 +1,674 @@
+diff --git a/drivers/bluetooth/btintel_pcie.c b/drivers/bluetooth/btintel_pcie.c
+--- a/drivers/bluetooth/btintel_pcie.c
++++ b/drivers/bluetooth/btintel_pcie.c
+@@ -402,7 +402,7 @@ static int btintel_pcie_send_sync(struct btintel_pcie_data *data,
+ 
+ 	tfd_index = data->ia.tr_hia[BTINTEL_PCIE_TXQ_NUM];
+ 
+-	if (tfd_index > txq->count)
++	if (tfd_index >= txq->count)
+ 		return -ERANGE;
+ 
+ 	if (skb->len > BTINTEL_PCIE_BUFFER_SIZE - BTINTEL_PCIE_HCI_TYPE_LEN) {
+@@ -1707,7 +1707,7 @@ static irqreturn_t btintel_pcie_irq_msix_handler(int irq, void *dev_id)
+ static int btintel_pcie_setup_irq(struct btintel_pcie_data *data)
+ {
+ 	int err;
+-	int num_irqs, i;
++	int num_irqs, i, j;
+ 
+ 	for (i = 0; i < BTINTEL_PCIE_MSIX_VEC_MAX; i++)
+ 		data->msix_entries[i].entry = i;
+@@ -1736,6 +1736,10 @@ static int btintel_pcie_setup_irq(struct btintel_pcie_data *data)
+ 						KBUILD_MODNAME,
+ 						msix_entry);
+ 		if (err) {
++			for (j = 0; j < i; j++)
++				devm_free_irq(&data->pdev->dev,
++					      data->msix_entries[j].vector,
++					      &data->msix_entries[j]);
+ 			pci_free_irq_vectors(data->pdev);
+ 			data->alloc_vecs = 0;
+ 			return err;
+@@ -1807,6 +1811,13 @@ static int btintel_pcie_config_pcie(struct pci_dev *pdev,
+ 	if (IS_ERR(data->base_addr))
+ 		return PTR_ERR(data->base_addr);
+ 
++	/* Do shared hardware reset to ensure a clean start before
++	 * configuring interrupts.
++	 */
++	err = btintel_pcie_reset_bt(data);
++	if (err)
++		return err;
++
+ 	err = btintel_pcie_setup_irq(data);
+ 	if (err)
+ 		return err;
+@@ -3023,7 +3034,7 @@ static void btintel_pcie_remove(struct pci_dev *pdev)
+ 		struct msix_entry *msix_entry;
+ 
+ 		msix_entry = &data->msix_entries[i];
+-		free_irq(msix_entry->vector, msix_entry);
++		devm_free_irq(&pdev->dev, msix_entry->vector, msix_entry);
+ 	}
+ 
+ 	pci_free_irq_vectors(pdev);
+diff --git a/include/net/bluetooth/rfcomm.h b/include/net/bluetooth/rfcomm.h
+--- a/include/net/bluetooth/rfcomm.h
++++ b/include/net/bluetooth/rfcomm.h
+@@ -207,6 +207,7 @@ struct rfcomm_dlc {
+ #define RFCOMM_AUTH_REJECT  7
+ #define RFCOMM_DEFER_SETUP  8
+ #define RFCOMM_ENC_DROP     9
++#define RFCOMM_CLOSED       10
+ 
+ /* Scheduling flags and events */
+ #define RFCOMM_SCHED_WAKEUP 31
+diff --git a/net/bluetooth/hci_core.c b/net/bluetooth/hci_core.c
+--- a/net/bluetooth/hci_core.c
++++ b/net/bluetooth/hci_core.c
+@@ -4113,9 +4113,11 @@ static int hci_send_cmd_sync(struct hci_dev *hdev, struct sk_buff *skb)
+ 
+ 	bt_dev_dbg(hdev, "skb %p", skb);
+ 
++	hci_dev_lock(hdev);
+ 	kfree_skb(hdev->sent_cmd);
+ 
+ 	hdev->sent_cmd = skb_clone(skb, GFP_KERNEL);
++	hci_dev_unlock(hdev);
+ 	if (!hdev->sent_cmd) {
+ 		skb_queue_head(&hdev->cmd_q, skb);
+ 		queue_work(hdev->workqueue, &hdev->cmd_work);
+@@ -4136,8 +4138,10 @@ static int hci_send_cmd_sync(struct hci_dev *hdev, struct sk_buff *skb)
+ 
+ 	if (READ_ONCE(hdev->req_status) == HCI_REQ_PEND &&
+ 	    !hci_dev_test_and_set_flag(hdev, HCI_CMD_PENDING)) {
++		hci_dev_lock(hdev);
+ 		kfree_skb(hdev->req_skb);
+ 		hdev->req_skb = skb_get(hdev->sent_cmd);
++		hci_dev_unlock(hdev);
+ 	}
+ 
+ 	return err;
+diff --git a/net/bluetooth/hci_sock.c b/net/bluetooth/hci_sock.c
+--- a/net/bluetooth/hci_sock.c
++++ b/net/bluetooth/hci_sock.c
+@@ -1212,8 +1212,10 @@ static int hci_sock_bind(struct socket *sock, struct sockaddr_unsized *addr,
+ 	 */
+ 	hdev = hci_pi(sk)->hdev;
+ 	if (hdev && hci_dev_test_flag(hdev, HCI_UNREGISTER)) {
++		write_lock(&hci_sk_list.lock);
+ 		hci_pi(sk)->hdev = NULL;
+ 		sk->sk_state = BT_OPEN;
++		write_unlock(&hci_sk_list.lock);
+ 		hci_dev_put(hdev);
+ 	}
+ 	hdev = NULL;
+diff --git a/net/bluetooth/hci_sync.c b/net/bluetooth/hci_sync.c
+--- a/net/bluetooth/hci_sync.c
++++ b/net/bluetooth/hci_sync.c
+@@ -32,8 +32,10 @@ static void hci_cmd_sync_complete(struct hci_dev *hdev, u8 result, u16 opcode,
+ 	WRITE_ONCE(hdev->req_status, HCI_REQ_DONE);
+ 
+ 	/* Free the request command so it is not used as response */
++	hci_dev_lock(hdev);
+ 	kfree_skb(hdev->req_skb);
+ 	hdev->req_skb = NULL;
++	hci_dev_unlock(hdev);
+ 
+ 	if (skb) {
+ 		struct sock *sk = hci_skb_sk(skb);
+@@ -3060,15 +3062,21 @@ static int hci_le_set_ext_scan_param_sync(struct hci_dev *hdev, u8 type,
+ 	 */
+ 	if (hci_dev_test_flag(hdev, HCI_PA_SYNC)) {
+ 		struct hci_cp_le_add_to_accept_list *sent;
++		bdaddr_t bdaddr;
+ 
++		hci_dev_lock(hdev);
+ 		sent = hci_sent_cmd_data(hdev, HCI_OP_LE_ADD_TO_ACCEPT_LIST);
++		if (sent)
++			bacpy(&bdaddr, &sent->bdaddr);
++		hci_dev_unlock(hdev);
++
+ 		if (sent) {
+ 			struct hci_conn *conn;
+ 
+ 			rcu_read_lock();
+ 
+ 			conn = hci_conn_hash_lookup_ba(hdev, PA_LINK,
+-						       &sent->bdaddr);
++						       &bdaddr);
+ 			if (conn) {
+ 				struct bt_iso_qos *qos = &conn->iso_qos;
+ 
+diff --git a/net/bluetooth/iso.c b/net/bluetooth/iso.c
+--- a/net/bluetooth/iso.c
++++ b/net/bluetooth/iso.c
+@@ -61,6 +61,7 @@ enum {
+ 	BT_SK_BIG_SYNC,
+ 	BT_SK_PA_SYNC,
+ 	BT_SK_KILLED,
++	BT_SK_CONNECTING,
+ };
+ 
+ struct iso_pinfo {
+@@ -350,6 +351,9 @@ static int __iso_chan_add(struct iso_conn *conn, struct sock *sk,
+ 		return -EBUSY;
+ 	}
+ 
++	if (iso_pi(sk)->conn)
++		return -EISCONN;
++
+ 	if (!conn->hcon) {
+ 		BT_ERR("conn->hcon missing");
+ 		return -EIO;
+@@ -410,6 +414,11 @@ static int iso_connect_bis(struct sock *sk)
+ 	hci_dev_lock(hdev);
+ 	lock_sock(sk);
+ 
++	if (iso_pi(sk)->conn) {
++		err = -EISCONN;
++		goto unlock;
++	}
++
+ 	if (!bis_capable(hdev)) {
+ 		err = -EOPNOTSUPP;
+ 		goto unlock;
+@@ -561,6 +570,13 @@ static int iso_connect_cis(struct sock *sk)
+ 
+ 	lockdep_assert_held(&hcon->hdev->lock);
+ 
++	/* The socket lock keeps the current attachment and its hcon stable. */
++	if (iso_pi(sk)->conn && iso_pi(sk)->conn->hcon != hcon) {
++		hci_conn_drop(hcon);
++		err = -EISCONN;
++		goto unlock;
++	}
++
+ 	conn = iso_conn_add(hcon);
+ 	if (!conn) {
+ 		hci_conn_drop(hcon);
+@@ -1262,17 +1278,26 @@ static int iso_sock_connect(struct socket *sock, struct sockaddr_unsized *addr,
+ 	    addr->sa_family != AF_BLUETOOTH)
+ 		return -EINVAL;
+ 
+-	if (sk->sk_state != BT_OPEN && sk->sk_state != BT_BOUND)
+-		return -EBADFD;
++	lock_sock(sk);
+ 
+-	if (sk->sk_type != SOCK_SEQPACKET)
+-		return -EINVAL;
++	if ((sk->sk_state != BT_OPEN && sk->sk_state != BT_BOUND) ||
++	    test_bit(BT_SK_CONNECTING, &iso_pi(sk)->flags)) {
++		err = -EBADFD;
++		goto done;
++	}
++
++	if (sk->sk_type != SOCK_SEQPACKET) {
++		err = -EINVAL;
++		goto done;
++	}
+ 
+ 	/* Check if the address type is of LE type */
+-	if (!bdaddr_type_is_le(sa->iso_bdaddr_type))
+-		return -EINVAL;
++	if (!bdaddr_type_is_le(sa->iso_bdaddr_type)) {
++		err = -EINVAL;
++		goto done;
++	}
+ 
+-	lock_sock(sk);
++	set_bit(BT_SK_CONNECTING, &iso_pi(sk)->flags);
+ 
+ 	bacpy(&iso_pi(sk)->dst, &sa->iso_bdaddr);
+ 	iso_pi(sk)->dst_type = sa->iso_bdaddr_type;
+@@ -1284,16 +1309,18 @@ static int iso_sock_connect(struct socket *sock, struct sockaddr_unsized *addr,
+ 	else
+ 		err = iso_connect_bis(sk);
+ 
+-	if (err)
+-		return err;
+-
+ 	lock_sock(sk);
+ 
++	clear_bit(BT_SK_CONNECTING, &iso_pi(sk)->flags);
++	if (err)
++		goto done;
++
+ 	if (!test_bit(BT_SK_DEFER_SETUP, &bt_sk(sk)->flags)) {
+ 		err = bt_sock_wait_state(sk, BT_CONNECTED,
+ 					 sock_sndtimeo(sk, flags & O_NONBLOCK));
+ 	}
+ 
++done:
+ 	release_sock(sk);
+ 	return err;
+ }
+@@ -1333,6 +1360,11 @@ static int iso_listen_bis(struct sock *sk)
+ 	hci_dev_lock(hdev);
+ 	lock_sock(sk);
+ 
++	if (sk->sk_state != BT_BOUND || iso_pi(sk)->conn) {
++		err = -EBADFD;
++		goto unlock;
++	}
++
+ 	/* Fail if user set invalid QoS */
+ 	if (iso_pi(sk)->qos_user_set && !check_bcast_qos(&iso_pi(sk)->qos)) {
+ 		iso_pi(sk)->qos = default_qos;
+diff --git a/net/bluetooth/mgmt.c b/net/bluetooth/mgmt.c
+--- a/net/bluetooth/mgmt.c
++++ b/net/bluetooth/mgmt.c
+@@ -1493,7 +1493,7 @@ static void cmd_complete_rsp(struct mgmt_pending_cmd *cmd, void *data)
+ 		return;
+ 	}
+ 
+-	cmd_status_rsp(cmd, data);
++	cmd_status_rsp(cmd, &match->mgmt_status);
+ }
+ 
+ static int generic_cmd_complete(struct mgmt_pending_cmd *cmd, u8 status)
+diff --git a/net/bluetooth/rfcomm/core.c b/net/bluetooth/rfcomm/core.c
+--- a/net/bluetooth/rfcomm/core.c
++++ b/net/bluetooth/rfcomm/core.c
+@@ -62,10 +62,9 @@ static void rfcomm_make_uih(struct sk_buff *skb, u8 addr);
+ 
+ static void rfcomm_process_connect(struct rfcomm_session *s);
+ 
+-static struct rfcomm_session *rfcomm_session_create(bdaddr_t *src,
+-							bdaddr_t *dst,
+-							u8 sec_level,
+-							int *err);
++static struct socket *rfcomm_session_connect(bdaddr_t *src, bdaddr_t *dst,
++					     u8 sec_level, int *err);
++static struct rfcomm_session *rfcomm_session_add(struct socket *sock, int state);
+ static struct rfcomm_session *rfcomm_session_get(bdaddr_t *src, bdaddr_t *dst);
+ static struct rfcomm_session *rfcomm_session_del(struct rfcomm_session *s);
+ 
+@@ -365,28 +364,17 @@ static int rfcomm_check_channel(u8 channel)
+ 	return channel < 1 || channel > 30;
+ }
+ 
+-static int __rfcomm_dlc_open(struct rfcomm_dlc *d, bdaddr_t *src, bdaddr_t *dst, u8 channel)
++static int __rfcomm_dlc_open(struct rfcomm_dlc *d, struct rfcomm_session *s,
++			     u8 channel)
+ {
+-	struct rfcomm_session *s;
+-	int err = 0;
+ 	u8 dlci;
+ 
+-	BT_DBG("dlc %p state %ld %pMR -> %pMR channel %d",
+-	       d, d->state, src, dst, channel);
+-
+-	if (rfcomm_check_channel(channel))
+-		return -EINVAL;
++	BT_DBG("dlc %p state %ld session %p channel %d",
++	       d, d->state, s, channel);
+ 
+ 	if (d->state != BT_OPEN && d->state != BT_CLOSED)
+ 		return 0;
+ 
+-	s = rfcomm_session_get(src, dst);
+-	if (!s) {
+-		s = rfcomm_session_create(src, dst, d->sec_level, &err);
+-		if (!s)
+-			return err;
+-	}
+-
+ 	dlci = __dlci(__session_dir(s), channel);
+ 
+ 	/* Check if DLCI already exists */
+@@ -421,14 +409,84 @@ static int __rfcomm_dlc_open(struct rfcomm_dlc *d, bdaddr_t *src, bdaddr_t *dst,
+ 
+ int rfcomm_dlc_open(struct rfcomm_dlc *d, bdaddr_t *src, bdaddr_t *dst, u8 channel)
+ {
+-	int r;
++	struct rfcomm_session *s;
++	struct socket *sock;
++	int err;
++
++	BT_DBG("dlc %p state %ld %pMR -> %pMR channel %d",
++	       d, d->state, src, dst, channel);
++
++	if (rfcomm_check_channel(channel))
++		return -EINVAL;
+ 
+ 	rfcomm_lock();
+ 
+-	r = __rfcomm_dlc_open(d, src, dst, channel);
++	clear_bit(RFCOMM_CLOSED, &d->flags);
++
++	/* Do not page the remote device for a DLC that cannot be opened
++	 * anyway.  __rfcomm_dlc_open() looks at the state again once the
++	 * lock has been re-acquired below.
++	 */
++	if (d->state != BT_OPEN && d->state != BT_CLOSED) {
++		rfcomm_unlock();
++		return 0;
++	}
++
++	s = rfcomm_session_get(src, dst);
++	if (s) {
++		err = __rfcomm_dlc_open(d, s, channel);
++		rfcomm_unlock();
++		return err;
++	}
++	rfcomm_unlock();
++
++	/* There is no session for this pair yet.  kernel_connect() ends up in
++	 * l2cap_chan_connect(), which takes hdev->lock, and the HCI event
++	 * path takes rfcomm_mutex while holding hdev->lock, so the socket has
++	 * to be connected with rfcomm_mutex released.
++	 */
++	sock = rfcomm_session_connect(src, dst, d->sec_level, &err);
++	if (!sock)
++		return err;
++
++	rfcomm_lock();
++
++	/* The DLC may have been closed while the socket was connecting.  It
++	 * was not on a session, so rfcomm_dlc_close() could only mark it;
++	 * attaching it now would leave it with no owner.
++	 */
++	if (test_bit(RFCOMM_CLOSED, &d->flags)) {
++		rfcomm_unlock();
++		sock_release(sock);
++		return -ECONNRESET;
++	}
++
++	/* Another opener may have added a session for the same pair in the
++	 * meantime; that one is used and this socket is dropped.
++	 */
++	s = rfcomm_session_get(src, dst);
++	if (!s) {
++		s = rfcomm_session_add(sock, BT_BOUND);
++		if (s) {
++			s->initiator = 1;
++			sock = NULL;
++		}
++	}
++
++	err = s ? __rfcomm_dlc_open(d, s, channel) : -ENOMEM;
+ 
+ 	rfcomm_unlock();
+-	return r;
++
++	if (sock)
++		sock_release(sock);
++
++	/* Over an existing ACL link the connection can complete before the
++	 * session reaches the list, and that wakeup is then lost, so let
++	 * krfcommd look at the socket state now.
++	 */
++	rfcomm_schedule();
++
++	return err;
+ }
+ 
+ static void __rfcomm_dlc_disconn(struct rfcomm_dlc *d)
+@@ -508,8 +566,14 @@ int rfcomm_dlc_close(struct rfcomm_dlc *d, int err)
+ 	rfcomm_lock();
+ 
+ 	s = d->session;
+-	if (!s)
++	if (!s) {
++		/* Not on a session yet: rfcomm_dlc_open() may be connecting a
++		 * socket for it with rfcomm_mutex released.  Leave a mark so
++		 * that it does not attach the DLC once it holds the lock again.
++		 */
++		set_bit(RFCOMM_CLOSED, &d->flags);
+ 		goto no_session;
++	}
+ 
+ 	/* after waiting on the mutex check the session still exists
+ 	 * then check the dlc still exists
+@@ -757,12 +821,12 @@ static struct rfcomm_session *rfcomm_session_close(struct rfcomm_session *s,
+ 	return rfcomm_session_del(s);
+ }
+ 
+-static struct rfcomm_session *rfcomm_session_create(bdaddr_t *src,
+-							bdaddr_t *dst,
+-							u8 sec_level,
+-							int *err)
++/* Creates the L2CAP socket a new session will run on and starts connecting
++ * it.  Must be called with rfcomm_mutex released.
++ */
++static struct socket *rfcomm_session_connect(bdaddr_t *src, bdaddr_t *dst,
++					     u8 sec_level, int *err)
+ {
+-	struct rfcomm_session *s = NULL;
+ 	struct sockaddr_l2 addr;
+ 	struct socket *sock;
+ 	struct sock *sk;
+@@ -792,24 +856,16 @@ static struct rfcomm_session *rfcomm_session_create(bdaddr_t *src,
+ 		l2cap_pi(sk)->chan->mode = L2CAP_MODE_ERTM;
+ 	release_sock(sk);
+ 
+-	s = rfcomm_session_add(sock, BT_BOUND);
+-	if (!s) {
+-		*err = -ENOMEM;
+-		goto failed;
+-	}
+-
+-	s->initiator = 1;
+-
+ 	bacpy(&addr.l2_bdaddr, dst);
+ 	addr.l2_family = AF_BLUETOOTH;
+ 	addr.l2_psm    = cpu_to_le16(L2CAP_PSM_RFCOMM);
+ 	addr.l2_cid    = 0;
+ 	addr.l2_bdaddr_type = BDADDR_BREDR;
+ 	*err = kernel_connect(sock, (struct sockaddr_unsized *)&addr, sizeof(addr), O_NONBLOCK);
+-	if (*err == 0 || *err == -EINPROGRESS)
+-		return s;
++	if (*err && *err != -EINPROGRESS)
++		goto failed;
+ 
+-	return rfcomm_session_del(s);
++	return sock;
+ 
+ failed:
+ 	sock_release(sock);
+diff --git a/net/bluetooth/rfcomm/sock.c b/net/bluetooth/rfcomm/sock.c
+--- a/net/bluetooth/rfcomm/sock.c
++++ b/net/bluetooth/rfcomm/sock.c
+@@ -48,8 +48,11 @@ static void rfcomm_sock_kill(struct sock *sk);
+ static void rfcomm_sk_data_ready(struct rfcomm_dlc *d, struct sk_buff *skb)
+ {
+ 	struct sock *sk = d->owner;
+-	if (!sk)
++
++	if (!sk) {
++		kfree_skb(skb);
+ 		return;
++	}
+ 
+ 	atomic_add(skb->len, &sk->sk_rmem_alloc);
+ 	skb_queue_tail(&sk->sk_receive_queue, skb);
+diff --git a/net/bluetooth/rfcomm/tty.c b/net/bluetooth/rfcomm/tty.c
+--- a/net/bluetooth/rfcomm/tty.c
++++ b/net/bluetooth/rfcomm/tty.c
+@@ -128,7 +128,7 @@ static void rfcomm_dev_shutdown(struct tty_port *port)
+ {
+ 	struct rfcomm_dev *dev = container_of(port, struct rfcomm_dev, port);
+ 
+-	if (dev->tty_dev->parent)
++	if (dev->tty_dev && dev->tty_dev->parent)
+ 		device_move(dev->tty_dev, NULL, DPM_ORDER_DEV_LAST);
+ 
+ 	/* close the dlc */
+diff --git a/net/bluetooth/sco.c b/net/bluetooth/sco.c
+--- a/net/bluetooth/sco.c
++++ b/net/bluetooth/sco.c
+@@ -84,12 +84,14 @@ static void sco_conn_free(struct kref *ref)
+ 	if (conn->sk)
+ 		sco_pi(conn->sk)->conn = NULL;
+ 
+-	if (conn->hcon) {
+-		conn->hcon->sco_data = NULL;
+-		hci_conn_drop(conn->hcon);
+-	}
++	/* hcon->sco_data is cleared and the association's reference on the
++	 * sco_conn is dropped in sco_conn_del() under hdev->lock, and the
++	 * hci_conn is now owned by the socket (held in __sco_chan_add() and
++	 * dropped in sco_chan_del()/sco_sock_destruct()), so there is nothing
++	 * left to release towards hcon here.
++	 */
+ 
+-	/* Ensure no more work items will run since hci_conn has been dropped */
++	/* Ensure no more work items will run before the connection is freed */
+ 	disable_delayed_work_sync(&conn->timeout_work);
+ 
+ 	kfree(conn);
+@@ -188,25 +190,19 @@ static void sco_sock_clear_timer(struct sock *sk)
+ }
+ 
+ /* ---- SCO connections ---- */
+-/* Consumes a reference on @hcon, which the returned sco_conn owns until it is
+- * freed. On failure (NULL return) the reference is left for the caller to drop.
++/* Returns a new reference the caller must drop with sco_conn_put(). The
++ * hcon->sco_data association holds its own reference on the sco_conn for the
++ * connection's lifetime; it is dropped in sco_conn_del() under hdev->lock.
++ * @hcon is not consumed: the hci_conn reference is taken and owned by the
++ * socket in __sco_chan_add().
+  */
+ static struct sco_conn *sco_conn_add(struct hci_conn *hcon)
+ {
+ 	struct sco_conn *conn = hcon->sco_data;
+ 
+ 	conn = sco_conn_hold_unless_zero(conn);
+-	if (conn) {
+-		if (!conn->hcon) {
+-			sco_conn_lock(conn);
+-			conn->hcon = hcon;
+-			sco_conn_unlock(conn);
+-		} else {
+-			/* conn already owns a reference on hcon */
+-			hci_conn_drop(hcon);
+-		}
++	if (conn)
+ 		return conn;
+-	}
+ 
+ 	conn = kzalloc_obj(struct sco_conn);
+ 	if (!conn)
+@@ -227,7 +223,10 @@ static struct sco_conn *sco_conn_add(struct hci_conn *hcon)
+ 
+ 	BT_DBG("hcon %p conn %p", hcon, conn);
+ 
+-	return conn;
++	/* kref_init() above set the association reference owned by
++	 * hcon->sco_data; hand the caller its own reference.
++	 */
++	return sco_conn_hold(conn);
+ }
+ 
+ /* Delete channel.
+@@ -242,6 +241,19 @@ static void sco_chan_del(struct sock *sk, int err)
+ 	BT_DBG("sk %p, conn %p, err %d", sk, conn, err);
+ 
+ 	if (conn) {
++		struct hci_conn *hcon;
++
++		sco_conn_lock(conn);
++		hcon = conn->hcon;
++		sco_conn_unlock(conn);
++
++		/* Drop the socket's hci_conn reference BEFORE clearing
++		 * conn->sk, so sco_conn_del() on another CPU cannot free
++		 * the hci_conn while we still hold a pointer to it.
++		 */
++		if (hcon)
++			hci_conn_drop(hcon);
++
+ 		sco_conn_lock(conn);
+ 		conn->sk = NULL;
+ 		sco_conn_unlock(conn);
+@@ -266,6 +278,13 @@ static void sco_conn_del(struct hci_conn *hcon, int err)
+ 
+ 	BT_DBG("hcon %p conn %p, err %d", hcon, conn, err);
+ 
++	/* Detach from the hci_conn and drop the association's reference.
++	 * The caller holds hdev->lock, which serialises this against the
++	 * read of hcon->sco_data in sco_recv_scodata().
++	 */
++	hcon->sco_data = NULL;
++	sco_conn_put(conn);
++
+ 	sco_conn_lock(conn);
+ 	sk = sco_sock_hold(conn);
+ 	sco_conn_unlock(conn);
+@@ -290,6 +309,11 @@ static void __sco_chan_add(struct sco_conn *conn, struct sock *sk,
+ 	sco_pi(sk)->conn = sco_conn_hold(conn);
+ 	conn->sk = sk;
+ 
++	/* The socket owns an hci_conn reference for as long as it stays
++	 * attached; it is dropped in sco_chan_del()/sco_sock_destruct().
++	 */
++	hci_conn_hold(conn->hcon);
++
+ 	if (parent)
+ 		bt_accept_enqueue(parent, sk, true);
+ }
+@@ -371,6 +395,7 @@ static int sco_connect(struct sock *sk)
+ 	if (sk->sk_state != BT_OPEN && sk->sk_state != BT_BOUND) {
+ 		release_sock(sk);
+ 		sco_conn_put(conn);
++		hci_conn_drop(hcon);
+ 		err = -EBADFD;
+ 		goto unlock;
+ 	}
+@@ -379,9 +404,13 @@ static int sco_connect(struct sock *sk)
+ 	sco_conn_put(conn);
+ 	if (err) {
+ 		release_sock(sk);
++		hci_conn_drop(hcon);
+ 		goto unlock;
+ 	}
+ 
++	/* __sco_chan_add() took its own hci_conn reference; drop ours. */
++	hci_conn_drop(hcon);
++
+ 	/* Update source addr of the socket */
+ 	bacpy(&sco_pi(sk)->src, &hcon->src);
+ 
+@@ -495,9 +524,25 @@ static struct sock *sco_get_sock_listen(bdaddr_t *src)
+ 
+ static void sco_sock_destruct(struct sock *sk)
+ {
++	struct sco_conn *conn = sco_pi(sk)->conn;
++
+ 	BT_DBG("sk %p", sk);
+ 
+-	sco_conn_put(sco_pi(sk)->conn);
++	/* If the channel was not already torn down via sco_chan_del(), drop
++	 * the socket's own references here.
++	 */
++	if (conn) {
++		struct hci_conn *hcon;
++
++		sco_conn_lock(conn);
++		hcon = conn->hcon;
++		sco_conn_unlock(conn);
++
++		if (hcon)
++			hci_conn_drop(hcon);
++		sco_pi(sk)->conn = NULL;
++		sco_conn_put(conn);
++	}
+ 
+ 	skb_queue_purge(&sk->sk_receive_queue);
+ 	skb_queue_purge(&sk->sk_write_queue);
+@@ -1511,12 +1556,10 @@ static void sco_connect_cfm(struct hci_conn *hcon, __u8 status)
+ 	if (!status) {
+ 		struct sco_conn *conn;
+ 
+-		conn = sco_conn_add(hci_conn_hold(hcon));
++		conn = sco_conn_add(hcon);
+ 		if (conn) {
+ 			sco_conn_ready(conn);
+ 			sco_conn_put(conn);
+-		} else {
+-			hci_conn_drop(hcon);
+ 		}
+ 	} else
+ 		sco_conn_del(hcon, bt_to_errno(status));

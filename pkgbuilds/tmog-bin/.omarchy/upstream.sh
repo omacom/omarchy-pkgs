@@ -1,18 +1,21 @@
 #!/bin/bash
-# TMOG publishes no manifest for its Linux builds -- release.json describes the
-# macOS DMG only -- so the version comes from /rtm/version.txt. Each Linux
-# artifact is published under a versioned name with a `<artifact>.sha256`
-# sidecar beside it, and that sidecar is the checksum reported here, so the
-# six-hourly check costs two tiny requests and never the tarball itself.
+# The Linux x86_64 manifest supplies the version: the shared version.txt can
+# advance before Linux ships. Its checksum describes the AppImage, so keep
+# using the tarball's own <artifact>.sha256 sidecar for the package checksum.
+# The six-hourly check costs at most two tiny requests, never the tarball.
 set -euo pipefail
 
 BASE_URL="https://tmog.org/rtm"
 
 current=$(grep -m1 '^pkgver=' PKGBUILD | cut -d= -f2- | tr -d "\"'")
 
-version=$(curl -fsSL "$BASE_URL/version.txt" | tr -d '[:space:]')
-if [[ ! $version =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-  echo "Unusable version from $BASE_URL/version.txt: '$version'" >&2
+manifest_url="$BASE_URL/downloads/release-linux.json"
+manifest=$(curl -fsSL "$manifest_url")
+if ! version=$(jq -er '
+  select(.schemaVersion == 1 and .platform == "Linux" and .architecture == "x86_64")
+  | .version | select(type == "string" and test("\\A[0-9]+\\.[0-9]+\\.[0-9]+\\z"))
+' <<<"$manifest"); then
+  echo "Unusable Linux x86_64 release manifest from $manifest_url" >&2
   exit 1
 fi
 
@@ -22,12 +25,12 @@ if [[ $version == "$current" ]]; then
 fi
 
 # The sidecar names the file it describes; insisting on that name catches a
-# sidecar left over from another release or architecture. A failed download or
-# a file without a trailing newline leaves `read` short, which the check below
-# reports rather than letting set -e exit silently.
+# sidecar left over from another release or architecture. Fetch separately so
+# a failed curl cannot be hidden by process substitution or a partial response.
 artifact="TaskManagerOG-${version}-linux-x86_64.tar.gz"
+checksum=$(curl -fsSL "$BASE_URL/downloads/$artifact.sha256")
 sha256="" name=""
-read -r sha256 name < <(curl -fsSL "$BASE_URL/downloads/$artifact.sha256") || true
+read -r sha256 name <<<"$checksum"
 if [[ ! $sha256 =~ ^[0-9a-f]{64}$ || ${name#\*} != "$artifact" ]]; then
   echo "Unusable checksum for $artifact: '$sha256 $name'" >&2
   exit 1

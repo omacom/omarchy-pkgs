@@ -1,0 +1,207 @@
+name: Promote channel
+
+# Carries a channel's packages forward into the next one: edge -> rc to put
+# what has landed on edge in front of RC testers, rc -> stable to ship what
+# they tested. Run it from the Actions tab; the run is the record of who
+# promoted what, and when.
+#
+# bin/promote-channel decides what moves, per architecture: every pkgbase
+# the source holds a newer version of, or one the destination lacks, unless
+# its recipe on master keeps it out (a fast-ring package is published to rc
+# and stable at merge, the pinned release pair reaches rc only through a
+# release, and a `channels` list can exclude the destination). The exact
+# files the source serves are copied, checked against the source database,
+# and published with bin/publish-artifact, so a filename keeps one set of
+# bytes in every channel.
+#
+# Every run writes its plan to the step summary and keeps the full record as
+# an artifact. A run that publishes appends it to the publish log
+# (https://pkgs.omarchy.org/publish-log.jsonl) with "kind": "promote".
+
+on:
+  workflow_dispatch:
+    inputs:
+      direction:
+        description: "Which channel moves forward"
+        type: choice
+        options: ["edge -> rc", "rc -> stable"]
+        default: "edge -> rc"
+      packages:
+        description: "Only these pkgbases (space-separated); empty means everything eligible"
+        required: false
+        default: ""
+      dry_run:
+        description: "Plan only: show what would move and publish nothing"
+        type: boolean
+        default: false
+
+jobs:
+  promote:
+    runs-on: ubuntu-latest
+    environment: publish
+    # A first promotion into a sparse channel moves gigabytes.
+    timeout-minutes: 180
+    # The publish job's group: one writer per channel database at a time,
+    # and the plan is made inside the lock so nothing moves under it.
+    # queue: max, as there: a waiting job is queued, not replaced.
+    concurrency:
+      group: publish
+      cancel-in-progress: false
+      queue: max
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Check inputs
+        id: inputs
+        env:
+          DIRECTION: ${{ github.event.inputs.direction }}
+          PACKAGES: ${{ github.event.inputs.packages }}
+        run: |
+          set -euo pipefail
+          case $DIRECTION in
+          "edge -> rc") echo "from=edge" >> "$GITHUB_OUTPUT"; echo "to=rc" >> "$GITHUB_OUTPUT" ;;
+          "rc -> stable") echo "from=rc" >> "$GITHUB_OUTPUT"; echo "to=stable" >> "$GITHUB_OUTPUT" ;;
+          *) echo "::error::Unknown direction: $DIRECTION"; exit 1 ;;
+          esac
+          for p in $PACKAGES; do
+            [[ $p =~ ^[a-z0-9@._+-]+$ ]] || { echo "::error::Not a package name: $p"; exit 1; }
+          done
+
+      - name: Promote
+        id: promote
+        env:
+          FROM: ${{ steps.inputs.outputs.from }}
+          TO: ${{ steps.inputs.outputs.to }}
+          PACKAGES: ${{ github.event.inputs.packages }}
+          DRY_RUN: ${{ github.event.inputs.dry_run }}
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+          RCLONE_CONFIG_R2_TYPE: s3
+          RCLONE_CONFIG_R2_PROVIDER: Cloudflare
+          RCLONE_CONFIG_R2_NO_CHECK_BUCKET: "true"
+          RCLONE_CONFIG_R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          RCLONE_CONFIG_R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          RCLONE_CONFIG_R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          OMARCHY_PUBLISH_PREFIX: ${{ vars.OMARCHY_PUBLISH_PREFIX }}
+        run: |
+          set -euo pipefail
+          # repo-add, gpg, bsdtar and vercmp are Arch tools: run in the tested
+          # builder image, as the publish job does.
+          builder=ghcr.io/omacom/omarchy-pkg-builder:$(bin/builder-image key --arch x86_64 --mirror edge)
+          # A change to build/ runs before builder-images.yml has published an
+          # image under its new key; build that image here instead.
+          docker pull --quiet "$builder" || docker buildx build --load -t "$builder" --build-arg MIRROR=edge build
+          mkdir -p "$RUNNER_TEMP/promote"
+          : > "$RUNNER_TEMP/promote/record.jsonl"
+          # The builder image runs as its own unprivileged user, which does
+          # not own the runner's files; let it append to the record.
+          chmod 0777 "$RUNNER_TEMP/promote"
+          chmod 0666 "$RUNNER_TEMP/promote/record.jsonl"
+          flags=()
+          [[ $DRY_RUN == true ]] && flags+=(--dry-run)
+          # One architecture after the other; a failure stops before the next
+          # one, so a channel never moves for one architecture alone without
+          # the record saying so.
+          for arch in x86_64 aarch64; do
+            docker run --rm \
+              -e GPG_PRIVATE_KEY -e GPG_PASSPHRASE -e OMARCHY_PUBLISH_PREFIX \
+              -e RCLONE_CONFIG_R2_TYPE -e RCLONE_CONFIG_R2_PROVIDER -e RCLONE_CONFIG_R2_ENDPOINT -e RCLONE_CONFIG_R2_NO_CHECK_BUCKET \
+              -e RCLONE_CONFIG_R2_ACCESS_KEY_ID -e RCLONE_CONFIG_R2_SECRET_ACCESS_KEY \
+              -v "$PWD:/w:ro" -v "$RUNNER_TEMP/promote:/out" -w /w "$builder" \
+              bin/promote-channel --remote R2:omarchy-pkgs --from "$FROM" --to "$TO" --arch "$arch" \
+                --record /out/record.jsonl "${flags[@]}" $PACKAGES
+          done
+
+      - name: Write the record
+        if: always() && steps.inputs.outcome == 'success'
+        env:
+          FROM: ${{ steps.inputs.outputs.from }}
+          TO: ${{ steps.inputs.outputs.to }}
+          DRY_RUN: ${{ github.event.inputs.dry_run }}
+          PACKAGES: ${{ github.event.inputs.packages }}
+          OUTCOME: ${{ steps.promote.outcome }}
+          ACTOR: ${{ github.triggering_actor }}
+          OMARCHY_PUBLISH_PREFIX: ${{ vars.OMARCHY_PUBLISH_PREFIX }}
+        run: |
+          set -euo pipefail
+          touch "$RUNNER_TEMP/promote/record.jsonl"
+          # sources: [] stands in for the field publish runs fill, so the
+          # publish log's queries read both kinds of line.
+          jq -s --arg sha "${{ github.sha }}" --arg run "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            --arg prefix "${OMARCHY_PUBLISH_PREFIX:-}" --arg event "${{ github.event_name }}" \
+            --arg from "$FROM" --arg to "$TO" --arg actor "$ACTOR" --arg packages "$PACKAGES" \
+            --argjson dry_run "$DRY_RUN" --arg outcome "$OUTCOME" '
+            {time: (now|todate), kind: "promote", from: $from, to: $to, actor: $actor,
+             commit: $sha, run: $run, event: $event,
+             target: (if $prefix == "" then "live" else $prefix end),
+             dry_run: $dry_run, packages: ($packages | split(" ") | map(select(length > 0))),
+             result: (if $outcome == "success" then "success" else "failed" end),
+             sources: [],
+             plan: [.[] | select(.type == "plan") | del(.type)],
+             slots: [.[] | select(.type == "slot") | del(.type)]}' \
+            "$RUNNER_TEMP/promote/record.jsonl" > promote-record.json
+          jq '{kind, from, to, actor, dry_run, result, slots: (.slots | length)}' promote-record.json
+
+          # The step summary: what moved, what stayed and why.
+          jq -r '
+            def mib: if . < 1048576 then ((. / 1024 | ceil | tostring) + " KiB") else ((. / 1048576 * 10 | floor / 10 | tostring) + " MiB") end;
+            "### " + (if .dry_run then "Plan" else "Promotion " + (if .result == "success" then "succeeded" else "FAILED" end) end)
+              + ": `" + .from + "` → `" + .to + "` on **" + .target + "**" + (if .target != "live" then " (proof prefix, not live)" else "" end),
+            "",
+            "Run by @" + .actor + " from " + .commit[0:7] + (if (.packages | length) > 0 then ", limited to " + (.packages | join(", ")) else "" end) + ".",
+            "",
+            (.plan | group_by(.arch)[] |
+              "#### " + .[0].arch + ": " + ([.[] | select(.action == "promote")] | length | tostring) + " to promote ("
+                + ([.[] | select(.action == "promote") | .size] | add // 0 | mib) + "), "
+                + ([.[] | select(.action == "hold")] | length | tostring) + " held back, "
+                + ([.[] | select(.action == "current")] | length | tostring) + " already current",
+              "",
+              (if any(.[]; .action == "promote") then
+                "| package | " + $ARGS.named.to + " now | promoted to | size |", "| --- | --- | --- | --- |",
+                (.[] | select(.action == "promote") | "| " + .name + " | " + (.to_version // "—") + " | " + .from_version + " | " + (.size | mib) + " |")
+              else empty end),
+              "",
+              (if any(.[]; .action == "hold") then
+                "<details><summary>Held back</summary>", "",
+                "| package | " + $ARGS.named.to + " | " + $ARGS.named.from + " | why |", "| --- | --- | --- | --- |",
+                (.[] | select(.action == "hold") | "| " + .name + " | " + (.to_version // "—") + " | " + .from_version + " | " + .reason + " |"),
+                "", "</details>", ""
+              else empty end)),
+            (if (.slots | length) > 0 then
+              "#### Publishes", "",
+              (.slots[] | "- `" + .mirror + "/" + .arch + "`: " + (if .status == "published" then "" else "**" + .status + "** " end)
+                + ([.packages[] | select(test("-debug-") | not)] | join(", ")))
+            else empty end)
+          ' --arg from "$FROM" --arg to "$TO" promote-record.json >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Keep the record
+        if: always() && steps.inputs.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: promote-record-${{ github.run_id }}
+          path: promote-record.json
+          retention-days: 90
+
+      - name: Append to the publish log in the bucket
+        # A plan changed nothing, so only the run's summary and artifact keep it.
+        if: always() && steps.inputs.outcome == 'success' && github.event.inputs.dry_run != 'true'
+        env:
+          RCLONE_CONFIG_R2_TYPE: s3
+          RCLONE_CONFIG_R2_PROVIDER: Cloudflare
+          RCLONE_CONFIG_R2_NO_CHECK_BUCKET: "true"
+          RCLONE_CONFIG_R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          RCLONE_CONFIG_R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          RCLONE_CONFIG_R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+        run: |
+          curl -fsSL https://downloads.rclone.org/rclone-current-linux-amd64.zip -o rclone.zip && unzip -jq rclone.zip '*/rclone' && chmod +x rclone
+          ./rclone copy R2:omarchy-pkgs/publish-log.jsonl . --s3-no-head 2>/dev/null || : > publish-log.jsonl
+          # The log keeps what moved and how much stayed back; the artifact
+          # keeps every package the plan looked at.
+          jq -c '.plan as $plan | .plan = [$plan[] | select(.action == "promote")]
+            | .held = ([$plan[] | select(.action == "hold")] | group_by(.arch)
+                | map({arch: .[0].arch, count: length, reasons: (group_by(.reason | sub(" \\(.*"; "")) | map({(.[0].reason | sub(" \\(.*"; "")): length}) | add)}))' \
+            promote-record.json >> publish-log.jsonl
+          ./rclone copyto publish-log.jsonl R2:omarchy-pkgs/publish-log.jsonl --s3-no-head
+          echo "log now has $(wc -l < publish-log.jsonl) entries"

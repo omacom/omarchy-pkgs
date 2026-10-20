@@ -95,8 +95,8 @@ setup_qemu() {
   # the F and C flags (tonistiigi/binfmt always sets both). The image tag pins
   # the QEMU version every emulated build runs under; multiarch/qemu-user-static
   # stopped at QEMU 7.2, which breaks qmake's compiler probe on current gcc.
-  # Keep ci/runner-cloud-init.yaml on the same tag. Uninstall first: install
-  # leaves an existing registration (an older emulator) in place and exits 0.
+  # Uninstall first: install leaves an existing registration (an older
+  # emulator) in place and exits 0.
   local platform_arch
   case "$target_arch" in
     aarch64) platform_arch=arm64 ;;

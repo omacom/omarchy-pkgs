@@ -26,6 +26,8 @@ VERSION = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+]*\Z")
 SCALAR = re.compile(r"[A-Za-z0-9._+/-]+\Z")
 SUM = re.compile(r"(md5|sha1|sha224|sha256|sha384|sha512|b2)sums(_[a-z0-9_]+)?\Z")
 HASHES = {"b2": "blake2b"}
+# How many times a redirect watch probes before it calls the feed unmatched.
+REDIRECT_PROBES = 5
 
 
 def run(args, **kwargs):
@@ -184,9 +186,9 @@ def matches(watch, text, extra=None, full=False):
             yield candidate(watch, {**(extra or {}), **match.groupdict()})
 
 
-def git_branch_tip(url, branch, tag_pattern, cache):
-    """Describe the current tip of an upstream branch:
-    commit, total count, date, and with a tag_pattern
+def git_branch_tip(url, branch, tag_pattern, cache, min_age=0):
+    """Describe the newest commit on an upstream branch that has cleared
+    min_age: commit, total count, date, and with a tag_pattern
     the newest release tag reachable from it plus the distance from that tag,
     so a branch build can be versioned <tag>.r<n>.g<sha>, above the release it
     follows and below the next one, the way a pkgver() function would.
@@ -194,20 +196,33 @@ def git_branch_tip(url, branch, tag_pattern, cache):
     One blobless single-branch clone per (url, branch) per run, shared by
     every package that tracks it, so two recipes pinned from one clone always
     see the same commit. The clone is read with git only; nothing in it runs.
-    select_release applies the age hold to this tip, without walking back
-    into history (which could select a commit from a merged side branch).
+    A tip younger than min_age falls back along first-parent history, the
+    commits that were themselves the branch tip, never into a merged side
+    branch. Holding the whole branch instead stalled a busy branch for as
+    long as it kept getting commits. Age is measured from when the clone was
+    made, so siblings synced seconds apart cannot straddle the window.
     """
     https(url)
     key = hashlib.sha256(f"{url}#{branch}".encode()).hexdigest()
     work = Path(cache) / f"{key}.branch.git"
+    cloned_at = work.with_name(f"{key}.branch.time")
     if not work.exists():
         scratch = work.with_name(f"{work.name}.{os.getpid()}.tmp")
+        started = dt.datetime.now(dt.timezone.utc).isoformat()
         subprocess.run(["git", "clone", "--quiet", "--bare", "--filter=blob:none", "--single-branch", "--branch", branch, url, str(scratch)], check=True)
+        cloned_at.write_text(started)
         scratch.replace(work)
     git = ["git", "-C", str(work)]
     commit = run([*git, "rev-parse", "HEAD"], text=True).strip()
     if not re.fullmatch(r"[0-9a-f]{40}", commit):
         raise ValueError("branch tip is not a commit")
+    if min_age:
+        now = dt.datetime.fromisoformat(cloned_at.read_text().strip())
+        for line in run([*git, "log", "--first-parent", "--format=%H %cI", commit], text=True).splitlines():
+            sha, committed = line.split()
+            if (now - dt.datetime.fromisoformat(committed)).total_seconds() >= min_age:
+                commit = sha
+                break
     count = run([*git, "rev-list", "--count", commit], text=True).strip()
     date = run([*git, "show", "-s", "--format=%cs", commit], text=True).strip().replace("-", "")
     timestamp = run([*git, "show", "-s", "--format=%cI", commit], text=True).strip()
@@ -231,7 +246,7 @@ def git_branch_tip(url, branch, tag_pattern, cache):
     return values
 
 
-def discover(watch, fetch):
+def discover(watch, fetch, min_age=0):
     provider = validate(watch)
     feed = watch[provider]
     results = []
@@ -258,7 +273,7 @@ def discover(watch, fetch):
         for tag, commit in tags.items():
             results.extend(matches(watch, tag, {"tag": tag, "commit": commit}, full=True))
     elif provider == "git_branch":
-        tip = git_branch_tip(feed, watch["branch"], watch.get("tag_pattern"), fetch.cache)
+        tip = git_branch_tip(feed, watch["branch"], watch.get("tag_pattern"), fetch.cache, min_age)
         results.append(candidate(watch, tip))
     elif provider == "npm":
         data = fetch.json("https://registry.npmjs.org/" + quote(feed, safe=""))
@@ -286,8 +301,16 @@ def discover(watch, fetch):
         values.update({name: json_path(data, path) for name, path in watch.get("fields", {}).items()})
         results.append(candidate(watch, values))
     elif provider == "redirect":
-        final_url = run(["curl", "--proto", "=https", "--proto-redir", "=https", "-fsSLI", "--max-time", "60", "-o", "/dev/null", "-w", "%{url_effective}", feed], text=True)
-        results.extend(matches(watch, final_url))
+        # A download redirect can be a staged rollout: some requests land on a
+        # newer build the pattern deliberately rejects (Dropbox, 2026-10-04:
+        # 4 of 100 HEADs ended at 274.3.4801 instead of 272.4.3798), so one
+        # probe that misses is not an answer. Keep the first one that matches.
+        for _ in range(REDIRECT_PROBES):
+            final_url = run(["curl", "--proto", "=https", "--proto-redir", "=https", "-fsSLI", "--max-time", "60", "--retry", "2",
+                             "-o", "/dev/null", "-w", "%{url_effective}", feed], text=True)
+            results.extend(matches(watch, final_url))
+            if results:
+                break
     elif provider == "regex":
         text = fetch.text(feed)
         if watch.get("unescape_json"):
@@ -534,7 +557,7 @@ def sync(package, fetch, min_age=0, check=False):
     original = path.read_text()
     before = read_recipe(path)
     bypass = os.environ.get("BYPASS_MIN_RELEASE_AGE") == "1"
-    release = select_release(discover(watch, fetch), min_age, bypass=bypass)
+    release = select_release(discover(watch, fetch, 0 if bypass else min_age), min_age, bypass=bypass)
     if release is None:
         return {"status": "skipped", "reason": "minimum release age"}
     current = scalar(before, "pkgver")

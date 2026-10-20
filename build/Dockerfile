@@ -142,9 +142,10 @@ RUN useradd -m -G wheel -s /bin/bash builder && \
     chown -R builder:builder /home/builder
 
 # Arch Linux ARM's makepkg.conf still defaults PKGEXT to .pkg.tar.xz; every
-# tool downstream of the build (sign.sh, push-build, sync-rebuilds, the
-# notifier) expects .pkg.tar.zst, so an aarch64 package would build and then
-# be skipped at signing. Pin the extension so both architectures match.
+# tool downstream of the build (artifact packing, publish-artifact,
+# sync-rebuilds) expects .pkg.tar.zst, so an aarch64 package would build and
+# then be left out of its artifact. Pin the extension so both architectures
+# match.
 RUN sed -i 's/^#MAKEFLAGS=.*/MAKEFLAGS="-j$(nproc)"/' /etc/makepkg.conf && \
     sed -i 's/^COMPRESSZST=.*/COMPRESSZST=(zstd -c -z -q --threads=0 -)/' /etc/makepkg.conf && \
     sed -i "s|^PKGEXT=.*|PKGEXT='.pkg.tar.zst'|" /etc/makepkg.conf && \
