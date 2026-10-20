@@ -83,6 +83,13 @@ instead; test rc on that snapshot before shipping. One exception: `ship` carries
 ISO or website step, and a later `ship` exits once stable holds the version
 and the GitHub release exists. Finish a failed ISO or website step by hand.
 
+`rc` and `ship` build the ISO for the machine they run on, natively; built
+for the other architecture it would run emulated. Release the other one from
+a machine of that architecture, in parallel, with the command they print:
+`bin/omarchy-iso-release --rc 4.5.0rc1` in omarchy-iso for x86_64 (uploaded
+as `omarchy-4.5.0rc1.iso`), or with `--arch aarch64` for aarch64 (uploaded as
+`omarchy-4.5.0rc1-aarch64.iso`). Drop `--rc` for a final.
+
 ## Promoting a channel
 
 Run **Promote channel** (`.github/workflows/promote.yml`) from the Actions
