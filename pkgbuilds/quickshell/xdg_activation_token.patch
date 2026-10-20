@@ -1,0 +1,176 @@
+diff --git c/src/core/activationtoken.hpp i/src/core/activationtoken.hpp
+new file mode 100644
+index 0000000..7e8b3da
+--- /dev/null
++++ i/src/core/activationtoken.hpp
+@@ -0,0 +1,17 @@
++#pragma once
++
++#include <qstring.h>
++
++namespace qs::core {
++
++// Requests an xdg-activation token tied to the most recent user input, so a
++// client acting on that input (e.g. a clicked notification) can raise its own
++// window. Set by the platform integration; returns an empty string when the
++// platform has no activation protocol.
++inline QString (*activationTokenProvider)() = nullptr;
++
++inline QString requestActivationToken() {
++	return activationTokenProvider ? activationTokenProvider() : QString();
++}
++
++} // namespace qs::core
+diff --git c/src/services/notifications/notification.cpp i/src/services/notifications/notification.cpp
+index b58087f..08def3a 100644
+--- c/src/services/notifications/notification.cpp
++++ i/src/services/notifications/notification.cpp
+@@ -10,6 +10,7 @@
+ #include <qtmetamacros.h>
+ #include <qtypes.h>
+ 
++#include "../../core/activationtoken.hpp"
+ #include "../../core/desktopentry.hpp"
+ #include "../../core/iconimageprovider.hpp"
+ #include "../../core/logcat.hpp"
+@@ -48,6 +49,13 @@ void NotificationAction::invoke() {
+ 		return;
+ 	}
+ 
++	// Sent before ActionInvoked, as the spec requires, so the client can raise
++	// its window when it handles the action.
++	auto token = qs::core::requestActivationToken();
++	if (!token.isEmpty()) {
++		NotificationServer::instance()->ActivationToken(this->notification->id(), token);
++	}
++
+ 	NotificationServer::instance()->ActionInvoked(this->notification->id(), this->mIdentifier);
+ 
+ 	if (!this->notification->bindableResident().value()) {
+diff --git c/src/services/notifications/server.hpp i/src/services/notifications/server.hpp
+index 8bd92a3..35dc9de 100644
+--- c/src/services/notifications/server.hpp
++++ i/src/services/notifications/server.hpp
+@@ -61,6 +61,7 @@ signals:
+ 	// NOLINTBEGIN
+ 	void NotificationClosed(quint32 id, quint32 reason);
+ 	void ActionInvoked(quint32 id, QString action);
++	void ActivationToken(quint32 id, QString activationToken);
+ 	void NotificationReplied(quint32 id, QString replyText);
+ 	// NOLINTEND
+ 
+diff --git c/src/wayland/CMakeLists.txt i/src/wayland/CMakeLists.txt
+index 1768186..165e1a0 100644
+--- c/src/wayland/CMakeLists.txt
++++ i/src/wayland/CMakeLists.txt
+@@ -80,8 +80,11 @@ qt_add_library(quickshell-wayland STATIC
+ 	xdgshell.cpp
+ 	util.cpp
+ 	output_tracking.cpp
++	xdg_activation.cpp
+ )
+ 
++wl_proto(wlp-xdg-activation xdg-activation-v1 "${WAYLAND_PROTOCOLS}/staging/xdg-activation")
++
+ # required for wl_proxy_safe_deref
+ target_link_libraries(quickshell-wayland PRIVATE ${CMAKE_DL_LIBS})
+ target_link_options(quickshell PRIVATE "LINKER:--export-dynamic-symbol=wl_proxy_get_listener")
+@@ -137,6 +140,7 @@ add_subdirectory(windowmanager)
+ # widgets for qmenu
+ target_link_libraries(quickshell-wayland PRIVATE
+ 	Qt::Quick Qt::Widgets Qt::WaylandClient Qt::WaylandClientPrivate
++	wlp-xdg-activation
+ )
+ 
+ target_link_libraries(quickshell-wayland-init PRIVATE Qt::Quick)
+diff --git c/src/wayland/init.cpp i/src/wayland/init.cpp
+index 579e42a..e31d476 100644
+--- c/src/wayland/init.cpp
++++ i/src/wayland/init.cpp
+@@ -13,6 +13,7 @@
+ void installWlProxySafeDeref(); // NOLINT(misc-use-internal-linkage)
+ void installPlatformMenuHook(); // NOLINT(misc-use-internal-linkage)
+ void installPopupPositioner();  // NOLINT(misc-use-internal-linkage)
++void installXdgActivationTokenProvider(); // NOLINT(misc-use-internal-linkage)
+ 
+ namespace {
+ 
+@@ -38,6 +39,7 @@ class WaylandPlugin: public QsEnginePlugin {
+ 	void init() override {
+ 		installPlatformMenuHook();
+ 		installPopupPositioner();
++		installXdgActivationTokenProvider();
+ 	}
+ 
+ 	void registerTypes() override {
+diff --git c/src/wayland/xdg_activation.cpp i/src/wayland/xdg_activation.cpp
+new file mode 100644
+index 0000000..b494f54
+--- /dev/null
++++ i/src/wayland/xdg_activation.cpp
+@@ -0,0 +1,65 @@
++#include <private/qwaylanddisplay_p.h>
++#include <private/qwaylandinputdevice_p.h>
++#include <private/qwaylandintegration_p.h>
++#include <private/qwaylandwindow_p.h>
++#include <qstring.h>
++#include <qwayland-xdg-activation-v1.h>
++#include <qwaylandclientextension.h>
++
++#include "../core/activationtoken.hpp"
++
++namespace {
++
++class XdgActivationToken: public QtWayland::xdg_activation_token_v1 {
++public:
++	explicit XdgActivationToken(::xdg_activation_token_v1* token)
++	    : QtWayland::xdg_activation_token_v1(token) {}
++	~XdgActivationToken() override { this->destroy(); }
++	Q_DISABLE_COPY_MOVE(XdgActivationToken);
++
++	QString token;
++
++protected:
++	void xdg_activation_token_v1_done(const QString& token) override { this->token = token; }
++};
++
++class XdgActivation
++    : public QWaylandClientExtensionTemplate<XdgActivation>
++    , public QtWayland::xdg_activation_v1 {
++public:
++	explicit XdgActivation(): QWaylandClientExtensionTemplate(1) { this->initialize(); }
++
++	static XdgActivation* instance() {
++		static auto* instance = new XdgActivation(); // NOLINT
++		return instance->isInitialized() ? instance : nullptr;
++	}
++};
++
++QString requestToken() {
++	auto* activation = XdgActivation::instance();
++	auto* integration = QtWaylandClient::QWaylandIntegration::instance();
++	if (!activation || !integration) return {};
++
++	auto* display = integration->display();
++	auto token = XdgActivationToken(activation->get_activation_token());
++
++	if (auto* device = display->lastInputDevice()) {
++		token.set_serial(display->lastInputSerial(), device->wl_seat());
++	}
++
++	if (auto* window = display->lastInputWindow()) {
++		token.set_surface(window->wlSurface());
++	}
++
++	token.commit();
++	// The compositor answers with the done event; wait for it so callers get
++	// the token synchronously.
++	display->forceRoundTrip();
++	return token.token;
++}
++
++} // namespace
++
++void installXdgActivationTokenProvider() { // NOLINT(misc-use-internal-linkage)
++	qs::core::activationTokenProvider = &requestToken;
++}
