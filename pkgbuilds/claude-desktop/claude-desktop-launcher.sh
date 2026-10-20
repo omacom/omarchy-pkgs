@@ -38,7 +38,7 @@ password_store_flags=(--password-store=gnome-libsecret)
 
 for flag in "${user_flags[@]}" "$@"; do
   case "$flag" in
-    --password-store=*) password_store_flags=() ;;
+    --password-store | --password-store=*) password_store_flags=() ;;
   esac
 done
 
