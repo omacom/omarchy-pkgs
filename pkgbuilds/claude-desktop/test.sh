@@ -38,6 +38,7 @@ grep -q -- "$scratch/claude-desktop" "$scratch/launcher" ||
 export CLAUDE_ARGS="$scratch/args"
 export HOME="$home"
 export XDG_SESSION_TYPE=wayland
+export XDG_CURRENT_DESKTOP=Hyprland
 unset XDG_CONFIG_HOME WAYLAND_DISPLAY
 
 run_launcher() {
@@ -88,3 +89,14 @@ grep -qx -- '--password-store' <<<"$flags" ||
 grep -qx -- 'basic' <<<"$flags" ||
   fail "the value of a backend spelled with a space reaches the application" "$flags"
 echo "ok - a backend spelled with a space is the only one that reaches the application"
+
+# A desktop Electron can detect has a backend of its own: GNOME stores in the
+# keyring, KDE in kwallet. The launcher leaves those alone, so a machine
+# without a Secret Service provider keeps working.
+for desktop in GNOME KDE; do
+  rm -f "$config/claude-desktop-flags.conf"
+  XDG_CURRENT_DESKTOP="$desktop" flags=$(run_launcher)
+  [[ $(backend_flags <<<"$flags") == 0 ]] ||
+    fail "a desktop Electron can detect keeps its own backend" "$flags"
+done
+echo "ok - a desktop Electron can detect keeps its own backend"
