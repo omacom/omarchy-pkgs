@@ -117,6 +117,31 @@ iptsd_sleep denali post suspend
 [[ $(wc -l <"$scratch/systemctl.log") == 2 ]] ||
   fail "a resume without a matching stop starts nothing"
 
+# Lid: wake on the lid only when suspending with it closed; an open lid's
+# false edge in CX collapse would wake the machine at once.
+cat >"$bin/busctl" <<'STUB'
+#!/bin/bash
+[[ -n ${LID_CLOSED:-} ]] || exit 1
+echo "b $LID_CLOSED"
+STUB
+chmod +x "$bin/busctl"
+lid_wakeup="$scratch/lid-wakeup"
+lid_sleep() {
+  PATH="$bin:$PATH" SP11_LID_WAKE_SYSFS="$lid_wakeup" SP11_LID_WAKE_COMPATIBLE="$scratch/$1" \
+    bash "$package_dir/surface-pro-11-lid-wake-sleep" "${@:2}"
+}
+echo enabled >"$lid_wakeup"
+LID_CLOSED=false lid_sleep denali pre suspend >/dev/null
+[[ $(<"$lid_wakeup") == disabled ]] || fail "suspending with the lid open turns lid wake off"
+LID_CLOSED=true lid_sleep denali pre suspend >/dev/null
+[[ $(<"$lid_wakeup") == enabled ]] || fail "suspending with the lid closed arms lid wake"
+LID_CLOSED= lid_sleep denali pre suspend >/dev/null
+[[ $(<"$lid_wakeup") == disabled ]] || fail "an unknown lid state counts as open"
+echo enabled >"$lid_wakeup"
+LID_CLOSED=false lid_sleep other pre suspend
+LID_CLOSED=false lid_sleep denali post suspend
+[[ $(<"$lid_wakeup") == enabled ]] || fail "the lid hook acts only before suspend on the Surface Pro 11"
+
 # Flex Keyboard: pair on attach when there is no working bond, reconnect on
 # detach. bluetoothctl, btmgmt and the pairing tool are stubs that record what
 # they were asked to do.
