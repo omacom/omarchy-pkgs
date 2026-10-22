@@ -28,4 +28,10 @@ configure_kernel() {
     echo 'linux-aurora requires Rust drivers; toolchain/configuration disabled CONFIG_RUST' >&2
     return 1
   }
+  # Aurora's native Steam runs in a 4K page process tree. The kernel keeps the
+  # support off until booted with user4k=on, but it has to be built in.
+  grep -qx 'CONFIG_ARM64_USER4K_EXPERIMENTAL=y' "$output_dir/.config" || {
+    echo 'linux-aurora requires 4K user pages; Kconfig disabled CONFIG_ARM64_USER4K_EXPERIMENTAL' >&2
+    return 1
+  }
 }
