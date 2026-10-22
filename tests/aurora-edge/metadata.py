@@ -9,7 +9,7 @@ import subprocess
 import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
-NAMES = ['linux-aurora', 'mesa-aurora', 'aura', 'uboot-aurora', 'aurora-bless',
+NAMES = ['linux-aurora', 'mesa-aurora', 'mesa-aurora-fex-guest', 'aura', 'uboot-aurora', 'aurora-bless',
          'speakerguardd', 'aurora-audio', 'alsa-ucm-conf-aurora', 'omarchy-aurora-firmware']
 
 
@@ -120,6 +120,26 @@ class EdgeMetadataTests(unittest.TestCase):
         for package in srcinfo('mesa-aurora').values():
             for dependency in ['llvm-libs', 'spirv-tools']:
                 self.assertNotIn(dependency, package['depends'])
+
+    def test_fex_guest_mesa_moves_in_lockstep_with_host_mesa(self):
+        # The x86 guest driver must be the same Mesa as the host driver.
+        for key in ['_commit', 'epoch', 'pkgver', 'pkgrel']:
+            values = {subprocess.check_output(
+                ['bash', '-c', 'source "$1"; printf %s "${!2}"', 'fixture',
+                 str(ROOT / 'pkgbuilds' / name / 'PKGBUILD'), key], text=True)
+                for name in ['mesa-aurora', 'mesa-aurora-fex-guest']}
+            self.assertEqual(len(values), 1, key)
+        host = srcinfo('mesa-aurora')['mesa-aurora']
+        guest = srcinfo('mesa-aurora-fex-guest')['mesa-aurora-fex-guest']
+        self.assertEqual(guest['source'][0], host['source'][0])
+        self.assertEqual(guest['arch'], ['any'])
+        # Pinned to the host driver at runtime, without needing it to build.
+        version = host['epoch'][0] + ':' + host['pkgver'][0]
+        self.assertEqual(guest['depends'], ['mesa-aurora=' + version, 'vulkan-aurora=' + version])
+        build_dependencies = subprocess.check_output(
+            ['bash', '-c', 'source "$1"; printf "%s\\n" "${depends[@]}"', 'fixture',
+             str(ROOT / 'pkgbuilds' / 'mesa-aurora-fex-guest' / 'PKGBUILD')], text=True)
+        self.assertEqual(build_dependencies.strip(), '')
 
     def test_mesa_epoch_and_existing_neo_versions_upgrade(self):
         installed = {'mesa-aurora': '1:26.3.0_devel-932.a0bcbcb28528',

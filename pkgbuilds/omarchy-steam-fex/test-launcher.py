@@ -36,6 +36,8 @@ if name == 'uname':
     sys.exit(0)
 with open(os.environ['TEST_CALLS'], 'a') as log:
     log.write(json.dumps([name, *sys.argv[1:]]) + '\\n')
+with open(os.environ['TEST_CALLS'] + '.provider', 'a') as log:
+    log.write(json.dumps([name, os.environ.get('STEAM_COMPAT_GRAPHICS_PROVIDER')]) + '\\n')
 if name == 'muvm':
     assert sys.argv[1:3] == ['--', 'FEXBash']
     os.execv(shutil.which('FEXBash'), sys.argv[2:])
@@ -57,6 +59,9 @@ class SteamLauncherTests(unittest.TestCase):
         self.calls_path = self.root / 'calls.jsonl'
         self.env = dict(os.environ, HOME=str(self.user_home), PATH=str(self.tools),
                         TEST_CALLS=str(self.calls_path), TEST_ARCH='aarch64', TEST_EXIT='0')
+        self.env.pop('STEAM_COMPAT_GRAPHICS_PROVIDER', None)
+        self.provider = self.root / 'guestos/aurora-fex-mesa/graphics_provider.json'
+        self.env['AURORA_FEX_GRAPHICS_PROVIDER'] = str(self.provider)
         for name in ['mkdir', 'cat', 'python3']:
             (self.tools / name).symlink_to(shutil.which(name))
         for name in ['uname', 'muvm', 'FEXBash', 'steam']:
@@ -228,6 +233,33 @@ class SteamLauncherTests(unittest.TestCase):
     def test_fex_exit_status_is_preserved(self):
         self.env['TEST_EXIT'] = '29'
         self.assert_fex(self.run_launcher(expected=29), ['-cef-force-occlusion'], [])
+
+
+    def providers(self):
+        path = Path(str(self.calls_path) + '.provider')
+        return [json.loads(line) for line in path.read_text().splitlines()]
+
+    def test_mounted_aurora_provider_is_exported_on_every_route(self):
+        self.provider.parent.mkdir(parents=True)
+        self.provider.write_text('{}')
+        self.run_launcher()
+        self.assertEqual({value for _, value in self.providers()}, {str(self.provider)})
+        self.fex_launcher.unlink()
+        self.run_launcher()
+        self.assertEqual(self.providers()[-1], ['steam', str(self.provider)])
+
+    def test_missing_aurora_provider_leaves_steam_default(self):
+        self.fex_launcher.unlink()
+        self.run_launcher()
+        self.assertEqual(self.providers(), [['steam', None]])
+
+    def test_caller_provider_wins(self):
+        self.provider.parent.mkdir(parents=True)
+        self.provider.write_text('{}')
+        self.env['STEAM_COMPAT_GRAPHICS_PROVIDER'] = '/custom/graphics_provider.json'
+        self.fex_launcher.unlink()
+        self.run_launcher()
+        self.assertEqual(self.providers(), [['steam', '/custom/graphics_provider.json']])
 
 
 if __name__ == '__main__':
