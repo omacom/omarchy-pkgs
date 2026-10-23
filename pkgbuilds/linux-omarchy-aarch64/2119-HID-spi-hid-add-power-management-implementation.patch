@@ -1,0 +1,236 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jingyuan Liang <jingyliang@chromium.org>
+Date: Tue, 9 Jun 2026 04:41:01 +0000
+Subject: [PATCH] HID: spi-hid: add power management implementation
+
+Implement HID over SPI driver power management callbacks.
+
+Signed-off-by: Jingyuan Liang <jingyliang@chromium.org>
+---
+ drivers/hid/spi-hid/spi-hid-acpi.c |   1 +
+ drivers/hid/spi-hid/spi-hid-core.c | 133 +++++++++++++++++++++++++++--
+ drivers/hid/spi-hid/spi-hid-of.c   |   1 +
+ drivers/hid/spi-hid/spi-hid.h      |   1 +
+ 4 files changed, 131 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/hid/spi-hid/spi-hid-acpi.c b/drivers/hid/spi-hid/spi-hid-acpi.c
+index 298e3ba44d8a..15cfc4e6cc2f 100644
+--- a/drivers/hid/spi-hid/spi-hid-acpi.c
++++ b/drivers/hid/spi-hid/spi-hid-acpi.c
+@@ -238,6 +238,7 @@ static struct spi_driver spi_hid_acpi_driver = {
+ 	.driver = {
+ 		.name	= "spi_hid_acpi",
+ 		.owner	= THIS_MODULE,
++		.pm	= &spi_hid_core_pm,
+ 		.acpi_match_table = spi_hid_acpi_match,
+ 		.probe_type = PROBE_PREFER_ASYNCHRONOUS,
+ 		.dev_groups = spi_hid_groups,
+diff --git a/drivers/hid/spi-hid/spi-hid-core.c b/drivers/hid/spi-hid/spi-hid-core.c
+index 698e72102c11..517f06913477 100644
+--- a/drivers/hid/spi-hid/spi-hid-core.c
++++ b/drivers/hid/spi-hid/spi-hid-core.c
+@@ -36,6 +36,8 @@
+ #include <linux/list.h>
+ #include <linux/module.h>
+ #include <linux/mutex.h>
++#include <linux/pm.h>
++#include <linux/pm_wakeirq.h>
+ #include <linux/slab.h>
+ #include <linux/spi/spi.h>
+ #include <linux/string.h>
+@@ -245,6 +247,96 @@ static const char *spi_hid_power_mode_string(enum hidspi_power_state power_state
+ 	}
+ }
+ 
++static int spi_hid_suspend(struct spi_hid *shid)
++{
++	int error;
++	struct device *dev = &shid->spi->dev;
++
++	guard(mutex)(&shid->power_lock);
++	if (shid->power_state == HIDSPI_OFF)
++		return 0;
++
++	if (shid->hid) {
++		error = hid_driver_suspend(shid->hid, PMSG_SUSPEND);
++		if (error) {
++			dev_err(dev, "%s failed to suspend hid driver: %d\n",
++				__func__, error);
++			return error;
++		}
++	}
++
++	disable_irq(shid->spi->irq);
++
++	if (!device_may_wakeup(dev)) {
++		set_bit(SPI_HID_RESET_PENDING, &shid->flags);
++
++		shid->ops->assert_reset(shid->ops);
++
++		error = shid->ops->power_down(shid->ops);
++		if (error) {
++			dev_err(dev, "%s: could not power down\n", __func__);
++			shid->regulator_error_count++;
++			shid->regulator_last_error = error;
++			/* Undo partial suspend before returning error */
++			shid->ops->deassert_reset(shid->ops);
++			clear_bit(SPI_HID_RESET_PENDING, &shid->flags);
++			enable_irq(shid->spi->irq);
++			if (shid->hid)
++				hid_driver_reset_resume(shid->hid);
++			return error;
++		}
++
++		shid->power_state = HIDSPI_OFF;
++	}
++	return 0;
++}
++
++static int spi_hid_resume(struct spi_hid *shid)
++{
++	int error;
++	struct device *dev = &shid->spi->dev;
++
++	guard(mutex)(&shid->power_lock);
++
++	if (!device_may_wakeup(dev)) {
++		if (shid->power_state == HIDSPI_OFF) {
++			shid->ops->assert_reset(shid->ops);
++
++			shid->ops->sleep_minimal_reset_delay(shid->ops);
++
++			error = shid->ops->power_up(shid->ops);
++			if (error) {
++				dev_err(dev, "%s: could not power up\n", __func__);
++				shid->regulator_error_count++;
++				shid->regulator_last_error = error;
++				return error;
++			}
++			shid->power_state = HIDSPI_ON;
++			shid->ops->deassert_reset(shid->ops);
++		}
++	}
++
++	enable_irq(shid->spi->irq);
++
++	if (shid->hid) {
++		error = hid_driver_reset_resume(shid->hid);
++		if (error) {
++			dev_err(dev, "%s: failed to reset resume hid driver: %d\n",
++				__func__, error);
++			/* Undo partial resume before returning error */
++			disable_irq(shid->spi->irq);
++			if (!device_may_wakeup(dev)) {
++				set_bit(SPI_HID_RESET_PENDING, &shid->flags);
++				shid->ops->assert_reset(shid->ops);
++				shid->ops->power_down(shid->ops);
++				shid->power_state = HIDSPI_OFF;
++			}
++			return error;
++		}
++	}
++	return 0;
++}
++
+ static void spi_hid_stop_hid(struct spi_hid *shid)
+ {
+ 	struct hid_device *hid;
+@@ -795,6 +887,11 @@ static irqreturn_t spi_hid_dev_irq(int irq, void *_shid)
+ 	trace_spi_hid_header_transfer(shid);
+ 
+ 	scoped_guard(mutex, &shid->io_lock) {
++		if (shid->power_state == HIDSPI_OFF) {
++			dev_warn(dev, "Device is off, ignoring interrupt\n");
++			goto out;
++		}
++
+ 		error = spi_hid_input_sync(shid, shid->input->header,
+ 					   sizeof(shid->input->header), true);
+ 		if (error) {
+@@ -802,11 +899,6 @@ static irqreturn_t spi_hid_dev_irq(int irq, void *_shid)
+ 			goto err;
+ 		}
+ 
+-		if (shid->power_state == HIDSPI_OFF) {
+-			dev_warn(dev, "Device is off after header was received\n");
+-			goto out;
+-		}
+-
+ 		trace_spi_hid_input_header_complete(shid,
+ 						    shid->input_transfer[0].tx_buf,
+ 						    shid->input_transfer[0].len,
+@@ -1251,10 +1343,19 @@ int spi_hid_core_probe(struct spi_device *spi, struct spihid_ops *ops,
+ 		dev_err(dev, "%s: unable to request threaded IRQ\n", __func__);
+ 		return error;
+ 	}
++	if (device_may_wakeup(dev)) {
++		error = dev_pm_set_wake_irq(dev, spi->irq);
++		if (error) {
++			dev_err(dev, "%s: failed to set wake IRQ\n", __func__);
++			return error;
++		}
++	}
+ 
+ 	error = shid->ops->power_up(shid->ops);
+ 	if (error) {
+ 		dev_err(dev, "%s: could not power up\n", __func__);
++		if (device_may_wakeup(dev))
++			dev_pm_clear_wake_irq(dev);
+ 		return error;
+ 	}
+ 
+@@ -1284,9 +1385,31 @@ void spi_hid_core_remove(struct spi_device *spi)
+ 	error = shid->ops->power_down(shid->ops);
+ 	if (error)
+ 		dev_err(dev, "failed to disable regulator\n");
++
++	if (device_may_wakeup(dev))
++		dev_pm_clear_wake_irq(dev);
+ }
+ EXPORT_SYMBOL_GPL(spi_hid_core_remove);
+ 
++static int spi_hid_core_pm_suspend(struct device *dev)
++{
++	struct spi_hid *shid = dev_get_drvdata(dev);
++
++	return spi_hid_suspend(shid);
++}
++
++static int spi_hid_core_pm_resume(struct device *dev)
++{
++	struct spi_hid *shid = dev_get_drvdata(dev);
++
++	return spi_hid_resume(shid);
++}
++
++const struct dev_pm_ops spi_hid_core_pm = {
++	SYSTEM_SLEEP_PM_OPS(spi_hid_core_pm_suspend, spi_hid_core_pm_resume)
++};
++EXPORT_SYMBOL_GPL(spi_hid_core_pm);
++
+ MODULE_DESCRIPTION("HID over SPI transport driver");
+ MODULE_AUTHOR("Dmitry Antipov <dmanti@microsoft.com>");
+ MODULE_LICENSE("GPL");
+diff --git a/drivers/hid/spi-hid/spi-hid-of.c b/drivers/hid/spi-hid/spi-hid-of.c
+index ba7d5338f5d8..561cf453e44a 100644
+--- a/drivers/hid/spi-hid/spi-hid-of.c
++++ b/drivers/hid/spi-hid/spi-hid-of.c
+@@ -230,6 +230,7 @@ static struct spi_driver spi_hid_of_driver = {
+ 	.driver = {
+ 		.name	= "spi_hid_of",
+ 		.owner	= THIS_MODULE,
++		.pm	= &spi_hid_core_pm,
+ 		.of_match_table = spi_hid_of_match,
+ 		.probe_type = PROBE_PREFER_ASYNCHRONOUS,
+ 		.dev_groups = spi_hid_groups,
+diff --git a/drivers/hid/spi-hid/spi-hid.h b/drivers/hid/spi-hid/spi-hid.h
+index f5a5f4d54beb..17b2fdf192ed 100644
+--- a/drivers/hid/spi-hid/spi-hid.h
++++ b/drivers/hid/spi-hid/spi-hid.h
+@@ -41,5 +41,6 @@ int spi_hid_core_probe(struct spi_device *spi, struct spihid_ops *ops,
+ void spi_hid_core_remove(struct spi_device *spi);
+ 
+ extern const struct attribute_group *spi_hid_groups[];
++extern const struct dev_pm_ops spi_hid_core_pm;
+ 
+ #endif /* SPI_HID_H */

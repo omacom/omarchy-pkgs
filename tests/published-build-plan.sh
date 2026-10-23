@@ -1,19 +1,19 @@
 #!/bin/bash
-# The timer and builder must agree when an older archive remains published.
+# build/build.sh's dry-run plan, which publish.yml reads to decide what to
+# build: it builds new versions and releases, and skips a version the channel
+# already indexes or still holds as an older archive.
 set -euo pipefail
 BUILD_ROOT=$(realpath "${BASH_SOURCE[0]%/*}/..")
 TEST_ROOT=$(mktemp -d)
 trap 'rm -rf "$TEST_ROOT"' EXIT
-mkdir -p "$TEST_ROOT/bin" "$TEST_ROOT/pkgbuilds" "$TEST_ROOT/state"
-cp "$BUILD_ROOT/bin/check-versions" "$TEST_ROOT/bin/"
+mkdir -p "$TEST_ROOT/pkgbuilds"
 cp -r "$BUILD_ROOT/helpers" "$BUILD_ROOT/build" "$TEST_ROOT/"
-export OMARCHY_STATE_DIR="$TEST_ROOT/state"
-unset OMARCHY_REPO_ROOT OMARCHY_RC_PINS OMARCHY_DEFER_RUNTIME_DEPS
+unset OMARCHY_RC_PINS OMARCHY_DEFER_RUNTIME_DEPS
 
 fixture() {
   local name=$1 version=$2 release=$3
   mkdir -p "$TEST_ROOT/pkgbuilds/$name/.omarchy"
-  printf '{"source":"local","channels":["edge"]}\n' > "$TEST_ROOT/pkgbuilds/$name/.omarchy/package.json"
+  printf '{"source":"local"}\n' > "$TEST_ROOT/pkgbuilds/$name/.omarchy/package.json"
   cat > "$TEST_ROOT/pkgbuilds/$name/PKGBUILD" <<EOF
 pkgname=$name
 pkgver=$version
@@ -54,9 +54,6 @@ for arch in x86_64 aarch64; do
   [[ "$arch" == x86_64 ]] && other=aarch64
   touch "$repo/other-arch-1-1-$other.pkg.tar.zst"
 
-  "$TEST_ROOT/bin/check-versions" --arch "$arch" > "$TEST_ROOT/check.log" 2>&1
-  sort "$TEST_ROOT/state/.sync-needed-edge-$arch" > "$TEST_ROOT/queue"
-  diff -u "$TEST_ROOT/expected" "$TEST_ROOT/queue"
 
   for selection in '' 'omarchy omarchy-settings current update rebuild unindexed signature-only other-arch new-package'; do
     ARCH="$arch" MIRROR=edge DRY_RUN=true PACKAGES="$selection" \
@@ -64,8 +61,34 @@ for arch in x86_64 aarch64; do
       FINAL_OUTPUT_DIR="$repo" BUILD_PLAN_DIR="$TEST_ROOT/plan" \
       "$TEST_ROOT/build/build.sh" > "$TEST_ROOT/plan.log" 2>&1
     sort "$TEST_ROOT/plan/packages" > "$TEST_ROOT/planned"
-    diff -u "$TEST_ROOT/queue" "$TEST_ROOT/planned"
+    diff -u "$TEST_ROOT/expected" "$TEST_ROOT/planned"
     grep -q 'omarchy 4.0.3-1 - archive already published' "$TEST_ROOT/plan.log"
   done
-  printf 'PASS: %s scheduler and explicit/unscoped plans skip retained archives, allow new versions and releases\n' "$arch"
+  printf 'PASS: %s explicit and unscoped plans skip retained archives, allow new versions and releases\n' "$arch"
+done
+
+# CI has no local published tree: build.sh reads the public channel's
+# database, and a retained archive is only there to see over HTTP. Serve the
+# same channels and plan against them with nothing mounted.
+port=$(python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')
+python3 -m http.server --bind 127.0.0.1 --directory "$TEST_ROOT/pkgs.omarchy.org" "$port" >/dev/null 2>&1 &
+server=$!
+trap 'kill "$server" 2>/dev/null; rm -rf "$TEST_ROOT"' EXIT
+for _ in {1..50}; do
+  curl -fsS -o /dev/null "http://127.0.0.1:$port/" 2>/dev/null && break
+  sleep 0.1
+done
+for arch in x86_64 aarch64; do
+  mkdir -p "$TEST_ROOT/empty-$arch"
+  rm -rf "$TEST_ROOT/plan"
+  ARCH="$arch" MIRROR=edge DRY_RUN=true PACKAGES='' \
+    OMARCHY_PUBLISHED_REPO_URL="http://127.0.0.1:$port" \
+    PKGBUILDS_DIR="$TEST_ROOT/pkgbuilds" HELPERS_DIR="$TEST_ROOT/helpers" \
+    FINAL_OUTPUT_DIR="$TEST_ROOT/empty-$arch" BUILD_PLAN_DIR="$TEST_ROOT/plan" \
+    "$TEST_ROOT/build/build.sh" > "$TEST_ROOT/plan.log" 2>&1
+  grep -q "planning against http://127.0.0.1:$port/edge/$arch" "$TEST_ROOT/plan.log"
+  sort "$TEST_ROOT/plan/packages" > "$TEST_ROOT/planned"
+  diff -u "$TEST_ROOT/expected" "$TEST_ROOT/planned"
+  grep -q 'omarchy 4.0.3-1 - archive already published' "$TEST_ROOT/plan.log"
+  printf 'PASS: %s plans against the public channel skip archives it retains\n' "$arch"
 done

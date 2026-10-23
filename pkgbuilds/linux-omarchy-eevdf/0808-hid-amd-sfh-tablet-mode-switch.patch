@@ -1,0 +1,436 @@
+diff --git a/drivers/hid/amd-sfh-hid/Kconfig b/drivers/hid/amd-sfh-hid/Kconfig
+--- a/drivers/hid/amd-sfh-hid/Kconfig
++++ b/drivers/hid/amd-sfh-hid/Kconfig
+@@ -6,6 +6,7 @@ menu "AMD SFH HID Support"
+ config AMD_SFH_HID
+ 	tristate "AMD Sensor Fusion Hub"
+ 	depends on X86
++	select AUXILIARY_BUS
+ 	help
+ 	  If you say yes to this option, support will be included for the
+ 	  AMD Sensor Fusion Hub.
+diff --git a/drivers/hid/amd-sfh-hid/amd_sfh_client.c b/drivers/hid/amd-sfh-hid/amd_sfh_client.c
+--- a/drivers/hid/amd-sfh-hid/amd_sfh_client.c
++++ b/drivers/hid/amd-sfh-hid/amd_sfh_client.c
+@@ -383,3 +383,19 @@ int amd_sfh_hid_client_deinit(struct amd_mp2_dev *privdata)
+ 
+ 	return 0;
+ }
++
++bool amd_sfh_op_idx_enabled(struct amd_mp2_dev *mp2)
++{
++	struct amdtp_cl_data *cl = mp2->cl_data;
++	int i;
++
++	if (!cl)
++		return false;
++
++	for (i = 0; i < cl->num_hid_devices; i++)
++		if (cl->sensor_idx[i] == op_idx &&
++		    READ_ONCE(cl->sensor_sts[i]) == SENSOR_ENABLED)
++			return true;
++
++	return false;
++}
+diff --git a/drivers/hid/amd-sfh-hid/amd_sfh_common.h b/drivers/hid/amd-sfh-hid/amd_sfh_common.h
+--- a/drivers/hid/amd-sfh-hid/amd_sfh_common.h
++++ b/drivers/hid/amd-sfh-hid/amd_sfh_common.h
+@@ -10,6 +10,7 @@
+ #ifndef AMD_SFH_COMMON_H
+ #define AMD_SFH_COMMON_H
+ 
++#include <linux/auxiliary_bus.h>
+ #include <linux/mutex.h>
+ #include <linux/pci.h>
+ #include <linux/sizes.h>
+@@ -74,6 +75,7 @@ struct amd_mp2_dev {
+ 	u8 init_done;
+ 	u8 rver;
+ 	u8 mp2_ver;
++	struct auxiliary_device *tm_auxdev;
+ };
+ 
+ struct amd_mp2_ops {
+@@ -110,4 +112,9 @@ static inline u64 amd_get_p2c_val(struct amd_mp2_dev *mp2, u32 idx)
+ {
+ 	return mp2->rver == 1 ? AMD_P2C_MSG_V1(idx) :  AMD_P2C_MSG(idx);
+ }
++
++bool amd_sfh_op_idx_enabled(struct amd_mp2_dev *mp2);
++void sfh_set_emp2(struct amd_mp2_dev *mp2);
++void sfh_deinit_emp2(void);
++
+ #endif
+diff --git a/drivers/hid/amd-sfh-hid/amd_sfh_pcie.c b/drivers/hid/amd-sfh-hid/amd_sfh_pcie.c
+--- a/drivers/hid/amd-sfh-hid/amd_sfh_pcie.c
++++ b/drivers/hid/amd-sfh-hid/amd_sfh_pcie.c
+@@ -8,11 +8,13 @@
+  *	    Basavaraj Natikar <Basavaraj.Natikar@amd.com>
+  */
+ 
++#include <linux/auxiliary_bus.h>
+ #include <linux/bitops.h>
+ #include <linux/delay.h>
+ #include <linux/devm-helpers.h>
+ #include <linux/dma-mapping.h>
+ #include <linux/dmi.h>
++#include <linux/idr.h>
+ #include <linux/interrupt.h>
+ #include <linux/io-64-nonatomic-lo-hi.h>
+ #include <linux/iopoll.h>
+@@ -242,6 +244,8 @@ int amd_mp2_get_sensor_num(struct amd_mp2_dev *privdata, u8 *sensor_id)
+ static void amd_mp2_pci_remove(void *privdata)
+ {
+ 	struct amd_mp2_dev *mp2 = privdata;
++
++	sfh_deinit_emp2();
+ 	amd_sfh_hid_client_deinit(privdata);
+ 	mp2->mp2_ops->stop_all(mp2);
+ 	pcim_intx(mp2->pdev, false);
+@@ -378,6 +382,51 @@ static const struct attribute_group *amd_sfh_groups[] = {
+ 	NULL,
+ };
+ 
++static DEFINE_IDA(sfh_tm_ida);
++
++static void amd_sfh_maybe_register_tm(struct amd_mp2_dev *mp2)
++{
++	struct auxiliary_device *adev;
++	bool present;
++	int id;
++
++	if (mp2->tm_auxdev)
++		return;
++
++	present = mp2->sfh1_1_ops ? mp2->dev_en.is_sra_present
++				  : (mp2->mp2_ver == MP2_VER_V2 &&
++				     amd_sfh_op_idx_enabled(mp2));
++	if (!present)
++		return;
++
++	id = ida_alloc(&sfh_tm_ida, GFP_KERNEL);
++	if (id < 0)
++		return;
++
++	adev = auxiliary_device_create(&mp2->pdev->dev, KBUILD_MODNAME,
++				       "tabletmode", NULL, id);
++	if (!adev) {
++		ida_free(&sfh_tm_ida, id);
++		dev_warn(&mp2->pdev->dev, "tabletmode auxdev create failed\n");
++		return;
++	}
++
++	mp2->tm_auxdev = adev;
++}
++
++static void amd_sfh_unregister_tm(struct amd_mp2_dev *mp2)
++{
++	int id;
++
++	if (!mp2->tm_auxdev)
++		return;
++
++	id = mp2->tm_auxdev->id;
++	auxiliary_device_destroy(mp2->tm_auxdev);
++	mp2->tm_auxdev = NULL;
++	ida_free(&sfh_tm_ida, id);
++}
++
+ static void sfh1_1_init_work(struct work_struct *work)
+ {
+ 	struct amd_mp2_dev *mp2 = container_of(work, struct amd_mp2_dev, work);
+@@ -394,6 +443,7 @@ static void sfh1_1_init_work(struct work_struct *work)
+ 	if (rc)
+ 		dev_warn(&mp2->pdev->dev, "failed to update sysfs group\n");
+ 
++	amd_sfh_maybe_register_tm(mp2);
+ }
+ 
+ static void sfh_init_work(struct work_struct *work)
+@@ -410,8 +460,10 @@ static void sfh_init_work(struct work_struct *work)
+ 		return;
+ 	}
+ 
++	sfh_set_emp2(mp2);
+ 	amd_sfh_clear_intr(mp2);
+ 	mp2->init_done = 1;
++	amd_sfh_maybe_register_tm(mp2);
+ }
+ 
+ static void amd_sfh_remove(struct pci_dev *pdev)
+@@ -419,6 +471,7 @@ static void amd_sfh_remove(struct pci_dev *pdev)
+ 	struct amd_mp2_dev *mp2 = pci_get_drvdata(pdev);
+ 
+ 	flush_work(&mp2->work);
++	amd_sfh_unregister_tm(mp2);
+ 	if (mp2->init_done)
+ 		mp2->mp2_ops->remove(mp2);
+ }
+@@ -439,6 +492,7 @@ static int amd_mp2_pci_probe(struct pci_dev *pdev, const struct pci_device_id *i
+ 
+ 	privdata->pdev = pdev;
+ 	dev_set_drvdata(&pdev->dev, privdata);
++
+ 	rc = pcim_enable_device(pdev);
+ 	if (rc)
+ 		return rc;
+diff --git a/drivers/hid/amd-sfh-hid/sfh1_1/amd_sfh_interface.c b/drivers/hid/amd-sfh-hid/sfh1_1/amd_sfh_interface.c
+--- a/drivers/hid/amd-sfh-hid/sfh1_1/amd_sfh_interface.c
++++ b/drivers/hid/amd-sfh-hid/sfh1_1/amd_sfh_interface.c
+@@ -9,12 +9,14 @@
+  */
+ #include <linux/amd-pmf.h>
+ #include <linux/amd-pmf-io.h>
++#include <linux/cleanup.h>
+ #include <linux/io-64-nonatomic-lo-hi.h>
+ #include <linux/iopoll.h>
+ 
+ #include "amd_sfh_interface.h"
+ 
+ static struct amd_mp2_dev *emp2;
++static DEFINE_MUTEX(emp2_lock);
+ 
+ static int amd_sfh_wait_response(struct amd_mp2_dev *mp2, u8 sid, u32 cmd_id)
+ {
+@@ -79,15 +81,48 @@ static struct amd_mp2_ops amd_sfh_ops = {
+ 
+ void sfh_deinit_emp2(void)
+ {
++	guard(mutex)(&emp2_lock);
+ 	emp2 = NULL;
+ }
+ 
++void sfh_set_emp2(struct amd_mp2_dev *mp2)
++{
++	guard(mutex)(&emp2_lock);
++	emp2 = mp2;
++}
++
+ void sfh_interface_init(struct amd_mp2_dev *mp2)
+ {
+ 	mp2->mp2_ops = &amd_sfh_ops;
++	guard(mutex)(&emp2_lock);
+ 	emp2 = mp2;
+ }
+ 
++static int amd_sfh_op_mode_info(u32 *op_mode)
++{
++	struct sfh_op_mode mode;
++	bool present;
++
++	if (!op_mode)
++		return -EINVAL;
++	if (!emp2)
++		return -ENODEV;
++
++	present = emp2->sfh1_1_ops ? emp2->dev_en.is_sra_present
++				   : (emp2->mp2_ver == MP2_VER_V2 &&
++				      amd_sfh_op_idx_enabled(emp2));
++	if (!present)
++		return -ENODEV;
++
++	mode.val = readl(emp2->mmio + amd_get_c2p_val(emp2, 3));
++	dev_dbg(&emp2->pdev->dev, "op-mode: %s (mode=%u)\n",
++		mode.op_mode.mode == SFH_MODE_TABLET ? "tablet" : "laptop",
++		mode.op_mode.mode);
++	*op_mode = mode.op_mode.mode;
++
++	return 0;
++}
++
+ static int amd_sfh_mode_info(u32 *platform_type, u32 *laptop_placement)
+ {
+ 	struct sfh_op_mode mode;
+@@ -161,6 +196,8 @@ static int amd_sfh_als_info(u32 *ambient_light)
+ 
+ int amd_get_sfh_info(struct amd_sfh_info *sfh_info, enum sfh_message_type op)
+ {
++	guard(mutex)(&emp2_lock);
++
+ 	if (sfh_info) {
+ 		switch (op) {
+ 		case MT_HPD:
+@@ -170,6 +207,8 @@ int amd_get_sfh_info(struct amd_sfh_info *sfh_info, enum sfh_message_type op)
+ 		case MT_SRA:
+ 			return amd_sfh_mode_info(&sfh_info->platform_type,
+ 						 &sfh_info->laptop_placement);
++		case MT_OP_MODE:
++			return amd_sfh_op_mode_info(&sfh_info->op_mode);
+ 		}
+ 	}
+ 	return -EINVAL;
+diff --git a/drivers/hid/amd-sfh-hid/sfh1_1/amd_sfh_interface.h b/drivers/hid/amd-sfh-hid/sfh1_1/amd_sfh_interface.h
+--- a/drivers/hid/amd-sfh-hid/sfh1_1/amd_sfh_interface.h
++++ b/drivers/hid/amd-sfh-hid/sfh1_1/amd_sfh_interface.h
+@@ -185,7 +185,6 @@ struct sfh_op_mode {
+ };
+ 
+ void sfh_interface_init(struct amd_mp2_dev *mp2);
+-void sfh_deinit_emp2(void);
+ void amd_sfh1_1_set_desc_ops(struct amd_mp2_ops *mp2_ops);
+ int amd_sfh_float_to_int(u32 flt32_val);
+ #endif
+diff --git a/drivers/input/misc/Kconfig b/drivers/input/misc/Kconfig
+--- a/drivers/input/misc/Kconfig
++++ b/drivers/input/misc/Kconfig
+@@ -911,6 +911,21 @@ config INPUT_SOC_BUTTON_ARRAY
+ 	  To compile this driver as a module, choose M here: the
+ 	  module will be called soc_button_array.
+ 
++config INPUT_AMD_SFH_TABLETMODE
++	tristate "AMD SFH tablet-mode switch"
++	depends on AMD_SFH_HID
++	select AUXILIARY_BUS
++	help
++	  Expose SW_TABLET_MODE for AMD convertible laptops whose
++	  operation-mode sensor is provided by the AMD Sensor Fusion Hub.
++
++	  Userspace components such as systemd-logind and modern desktop
++	  environments react to SW_TABLET_MODE when the device is folded
++	  into tablet posture.
++
++	  To compile this driver as a module, choose M here: the module
++	  will be called amd_sfh_tabletmode.
++
+ config INPUT_DRV260X_HAPTICS
+ 	tristate "TI DRV260X haptics support"
+ 	depends on INPUT && I2C
+diff --git a/drivers/input/misc/Makefile b/drivers/input/misc/Makefile
+--- a/drivers/input/misc/Makefile
++++ b/drivers/input/misc/Makefile
+@@ -15,6 +15,7 @@ obj-$(CONFIG_INPUT_AD714X_SPI)		+= ad714x-spi.o
+ obj-$(CONFIG_INPUT_ADXL34X)		+= adxl34x.o
+ obj-$(CONFIG_INPUT_ADXL34X_I2C)		+= adxl34x-i2c.o
+ obj-$(CONFIG_INPUT_ADXL34X_SPI)		+= adxl34x-spi.o
++obj-$(CONFIG_INPUT_AMD_SFH_TABLETMODE)	+= amd_sfh_tabletmode.o
+ obj-$(CONFIG_INPUT_APANEL)		+= apanel.o
+ obj-$(CONFIG_INPUT_ARIEL_PWRBUTTON)	+= ariel-pwrbutton.o
+ obj-$(CONFIG_INPUT_ARIZONA_HAPTICS)	+= arizona-haptics.o
+diff --git a/drivers/input/misc/amd_sfh_tabletmode.c b/drivers/input/misc/amd_sfh_tabletmode.c
+new file mode 100644
+--- /dev/null
++++ b/drivers/input/misc/amd_sfh_tabletmode.c
+@@ -0,0 +1,81 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++/*
++ * AMD SFH tablet-mode switch driver
++ *
++ * Copyright (c) 2026, Advanced Micro Devices, Inc.
++ * All Rights Reserved.
++ *
++ * Author: Basavaraj Natikar <Basavaraj.Natikar@amd.com>
++ */
++
++#include <linux/amd-pmf-io.h>
++#include <linux/auxiliary_bus.h>
++#include <linux/input.h>
++#include <linux/module.h>
++#include <linux/pci_ids.h>
++
++#define POLL_INTERVAL_MS	200
++
++static void sfh_tm_poll(struct input_dev *input)
++{
++	struct amd_sfh_info info = {};
++
++	if (amd_get_sfh_info(&info, MT_OP_MODE))
++		return;
++
++	input_report_switch(input, SW_TABLET_MODE,
++			    info.op_mode == SFH_MODE_TABLET);
++	input_sync(input);
++}
++
++static int sfh_tm_probe(struct auxiliary_device *auxdev,
++			const struct auxiliary_device_id *id)
++{
++	struct device *dev = &auxdev->dev;
++	struct amd_sfh_info info = {};
++	struct input_dev *input;
++	int error;
++
++	error = amd_get_sfh_info(&info, MT_OP_MODE);
++	if (error)
++		return error == -EINVAL ? -ENODEV : error;
++
++	input = devm_input_allocate_device(dev);
++	if (!input)
++		return -ENOMEM;
++
++	input->name		= "AMD SFH tablet mode switch";
++	input->phys		= "amd-sfh/tabletmode";
++	input->id.bustype	= BUS_HOST;
++	input->id.vendor	= PCI_VENDOR_ID_AMD;
++	input_set_capability(input, EV_SW, SW_TABLET_MODE);
++
++	error = input_setup_polling(input, sfh_tm_poll);
++	if (error)
++		return error;
++	input_set_poll_interval(input, POLL_INTERVAL_MS);
++
++	sfh_tm_poll(input);
++
++	error = input_register_device(input);
++	if (error)
++		return error;
++
++	return 0;
++}
++
++static const struct auxiliary_device_id sfh_tm_id_table[] = {
++	{ .name = "amd_sfh.tabletmode" },
++	{}
++};
++MODULE_DEVICE_TABLE(auxiliary, sfh_tm_id_table);
++
++static struct auxiliary_driver sfh_tm_driver = {
++	.name		= "tabletmode",
++	.id_table	= sfh_tm_id_table,
++	.probe		= sfh_tm_probe,
++};
++module_auxiliary_driver(sfh_tm_driver);
++
++MODULE_DESCRIPTION("AMD SFH tablet mode switch");
++MODULE_LICENSE("GPL");
+diff --git a/include/linux/amd-pmf-io.h b/include/linux/amd-pmf-io.h
+--- a/include/linux/amd-pmf-io.h
++++ b/include/linux/amd-pmf-io.h
+@@ -19,11 +19,13 @@
+  * @MT_HPD: Message ID to know the Human presence info from MP2 FW
+  * @MT_ALS: Message ID to know the Ambient light info from MP2 FW
+  * @MT_SRA: Message ID to know the SRA data from MP2 FW
++ * @MT_OP_MODE: Message ID to know the operating-mode (tablet/laptop) info
+  */
+ enum sfh_message_type {
+ 	MT_HPD,
+ 	MT_ALS,
+ 	MT_SRA,
++	MT_OP_MODE,
+ };
+ 
+ /**
+@@ -44,12 +46,24 @@ enum sfh_hpd_info {
+  * @user_present: Populates the user presence information
+  * @platform_type: Operating modes (clamshell, flat, tent, etc.)
+  * @laptop_placement: Device states (ontable, onlap, outbag)
++ * @op_mode: Operating-mode field (see enum sfh_dev_mode); used for tablet detection
+  */
+ struct amd_sfh_info {
+ 	u32 ambient_light;
+ 	u8 user_present;
+ 	u32 platform_type;
+ 	u32 laptop_placement;
++	u32 op_mode;
++};
++
++/**
++ * enum sfh_dev_mode - SFH operating-mode field (sfh_op_mode.mode, bits 0-2)
++ * @SFH_MODE_LAPTOP: Device is in laptop/clamshell posture
++ * @SFH_MODE_TABLET: Device is in tablet posture
++ */
++enum sfh_dev_mode {
++	SFH_MODE_LAPTOP	= 1,
++	SFH_MODE_TABLET	= 3,
+ };
+ 
+ /**

@@ -7,57 +7,8 @@ scratch=$(mktemp -d)
 trap 'rm -rf "$scratch"' EXIT
 fixture=$scratch/src/omarchy
 
-files=(
-  config/autostart/limine-snapper-notify.desktop
-  etc/fastfetch/config.jsonc
-  etc/mkinitcpio.conf.d/omarchy_hooks.conf
-  etc/mkinitcpio.conf.d/thunderbolt_module.conf
-  etc/limine-entry-tool.d/omarchy-defaults.conf
-  etc/limine-entry-tool.d/omarchy-uki.conf
-  etc/security/faillock.conf
-  etc/nsswitch.conf
-  etc/cups/cups-browsed.conf
-  etc/cups/cups-files.conf
-  etc/plymouth/plymouthd.conf
-  etc/sysctl.d/99-omarchy-sysctl.conf
-  default/uwsm/env.d/10-omarchy
-  default/environment.d/10-omarchy-fcitx.conf
-  default/fontconfig/conf.avail/50-omarchy.conf
-  default/xdg-terminal-exec/hyprland-xdg-terminals.list
-  default/applications/mimeapps.list
-  default/systemd/user/bt-agent.service
-  default/systemd/user/omarchy-sleep-lock.service
-  default/systemd/user/omarchy-recover-internal-monitor.service
-  default/systemd/user/omarchy-migrate-notify.service
-  default/systemd/user/omarchy-tailscale-receive.service
-  default/systemd/user/omarchy-fcitx5.service
-  default/systemd/user/omarchy-crash-watch.service
-  default/systemd/user/app.slice.d/10-oomd.conf
-  default/systemd/zram-generator.conf.d/90-omarchy.conf
-  default/systemd/system/plocate-updatedb.service.d/10-omarchy.conf
-  default/systemd/system-sleep/unmount-fuse
-  default/bashrc
-  default/limine/default.conf
-  default/limine/limine.conf
-  default/snapper/root
-  default/sddm/omarchy/Main.qml
-  default/sddm/hyprland.lua
-  default/wayland-sessions/omarchy.desktop
-  default/plymouth/omarchy.plymouth
-  default/fonts/omarchy/omarchy.ttf
-  default/hypr/toggles/flags.lua
-  default/nautilus-python/extensions/localsend.py
-  default/nautilus-python/extensions/transcode.py
-  default/tensaku/state.toml
-  applications/example.desktop
-  bin/omarchy-upload-log
-  bin/omarchy-debug
-  bin/omarchy-debug-idle
-  logo.txt
-  logo.svg
-  icon.txt
-  icon.png
-)
+# Every source path the settings recipes install by name.
+mapfile -t files < "$BUILD_ROOT/tests/fixtures/settings-source-files"
 for path in "${files[@]}"; do
   mkdir -p "$(dirname "$fixture/$path")"
   printf 'fixture for %s\n' "$path" > "$fixture/$path"
@@ -100,6 +51,10 @@ for recipe in omarchy-settings omarchy-settings-dev; do
         echo 'FAIL: backup names a 00-omarchy-hooks.conf the source does not ship' >&2
         exit 1
       fi
+      if printf '%s\n' "${backup[@]}" | grep -Fxq etc/sysctl.d/90-omarchy-arp.conf; then
+        echo 'FAIL: backup names a 90-omarchy-arp.conf the source does not ship' >&2
+        exit 1
+      fi
       # The installer owns the machine-specific live configuration.
       [[ ! -e $pkgdir/etc/default/limine ]]
       if printf '%s\n' "${backup[@]}" | grep -Fxq 'etc/default/limine'; then
@@ -126,6 +81,27 @@ for recipe in omarchy-settings omarchy-settings-dev; do
     )
   done
 done
+
+# A source that answers ARP per interface ships its sysctl drop-in, and the
+# package keeps local edits to it. The fixture above, like an older source,
+# does not ship one, and the loop checked it stays out of backup.
+printf 'net.ipv4.conf.all.arp_ignore=1\n' > "$fixture/etc/sysctl.d/90-omarchy-arp.conf"
+for recipe in omarchy-settings omarchy-settings-dev; do
+  for target_arch in aarch64 x86_64; do
+    (
+      export CARCH=$target_arch OMARCHY_SRC=$fixture
+      export srcdir=$scratch/src pkgdir=$scratch/arp-$recipe-$target_arch
+      backup=()
+      # shellcheck disable=SC1090 # Exercise each recipe's actual package function.
+      source "$BUILD_ROOT/pkgbuilds/$recipe/PKGBUILD"
+      package
+      cmp "$fixture/etc/sysctl.d/90-omarchy-arp.conf" "$pkgdir/etc/sysctl.d/90-omarchy-arp.conf"
+      printf '%s\n' "${backup[@]}" | grep -Fxq etc/sysctl.d/90-omarchy-arp.conf
+      echo "PASS: $recipe $CARCH ships the ARP sysctl drop-in and backs it up"
+    )
+  done
+done
+rm "$fixture/etc/sysctl.d/90-omarchy-arp.conf"
 
 # The aarch64 packages also reach Apple Silicon Macs, whose initramfs needs the
 # asahi hook. Source mkinitcpio.conf and the drop-ins in mkinitcpio's order and

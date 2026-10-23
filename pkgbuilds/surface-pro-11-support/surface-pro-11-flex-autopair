@@ -1,0 +1,128 @@
+#!/bin/bash
+# Auto-pair the Surface Pro Flex Keyboard over Bluetooth when it is attached,
+# the way Windows does: on the pogo attach, make sure there is a WORKING bond.
+# No bond, a bond that will not bring the link up even after a controller
+# reset (stale: another OS re-keyed the keyboard), or a marker left by
+# surface-pro-11-flex-reconnect after a failed detached reconnect -> run the wired
+# out-of-band handshake and pair, no detach and no user action. A healthy bond
+# (link up while attached) is a no-op. Triggered by udev when the wired
+# keyboard endpoint appears (70-surface-pro-11-flex-keyboard.rules).
+#
+# Why a marker and not a live probe: a stale LTK does not raise a clean
+# authentication-failure event on this controller; the link just silently fails
+# to come up, which is indistinguishable from a temporary block (another LE
+# link holding the radio). So the reliable "this bond does not work" signal is
+# an actual reconnect that exhausted its retries on detach, which the reconnect
+# helper records in the marker. That cannot be confused with a transient block.
+set -u
+
+compatible=${SP11_FLEX_COMPATIBLE:-/proc/device-tree/compatible}
+hid_devices=${SP11_FLEX_HID_DEVICES:-/sys/bus/hid/devices}
+address_file=${SP11_FLEX_ADDRESS_FILE:-/var/lib/surface-pro-11-support/flex-keyboard-address}
+run_dir=${SP11_FLEX_RUN_DIR:-/run/surface-pro-11-support}
+marker=$run_dir/flex-needs-repair
+
+[[ -r $compatible ]] && tr '\0' '\n' <"$compatible" | grep -qx 'microsoft,denali-oled' || exit 0
+mkdir -p "$run_dir"
+
+# Waits are skipped in the package tests.
+nap(){ [[ -n ${SP11_FLEX_NO_SLEEP:-} ]] || sleep "$1"; }
+lock=$run_dir/flex-autopair.lock
+tool=${SP11_FLEX_PAIR_TOOL:-/usr/bin/surface-pro-11-flex-pair}
+ADDR_TYPE=2   # LE random static
+
+log(){ logger -t surface-pro-11-flex-autopair -- "$*" 2>/dev/null; printf 'surface-pro-11-flex-autopair: %s\n' "$*"; }
+
+exec 9>"$lock" || true
+flock -n 9 || { log "another run holds the lock; skipping"; exit 0; }
+
+attached(){ ls "$hid_devices" 2>/dev/null | grep -q '045E:0C8B'; }
+bonded(){
+    local info; info=$(bluetoothctl info "$1" 2>/dev/null) || return 1
+    grep -q 'Paired: yes' <<<"$info" && grep -q 'Bonded: yes' <<<"$info"
+}
+have_oob_channel(){ ls "$hid_devices" 2>/dev/null | grep -q '045E:0C8F'; }
+connected(){ bluetoothctl info "$1" 2>/dev/null | grep -qE '^[[:space:]]+Connected: yes'; }
+
+# A connect that never happens is usually a wedged in-flight LE connection
+# attempt in the kernel (it then answers every new connect with a silent
+# "busy" until the controller is reset). The recovery that works is a
+# controller power-cycle. It briefly drops other Bluetooth links, which
+# reconnect on their own; the wired keyboard is unaffected.
+recycle_controller(){
+    log "resetting the Bluetooth controller (clears a wedged connection attempt)"
+    btmgmt power off >/dev/null 2>&1; nap 2; btmgmt power on >/dev/null 2>&1
+    for _ in $(seq 1 15); do bluetoothctl show 2>/dev/null | grep -q 'Powered: yes' && break; nap 1; done
+    nap 2
+}
+
+# Classify an existing bond while the keyboard is attached. Returns 0 when the
+# bond is healthy, 1 when it is stale. (Verdict by exit status, not stdout: the
+# steps below log, and a command substitution would swallow that.)
+# A healthy bond brings the LE link up even on the wire. If it does not come
+# up, try an explicit connect; if that fails, reset the controller and try once
+# more. A bond that still will not connect, with the keyboard attached and
+# advertising to us, is stale: another OS (Windows) re-keyed the keyboard.
+verify_bond(){
+    local k="$1"
+    for _ in $(seq 1 10); do connected "$k" && return 0; nap 1; done
+    timeout 15 bluetoothctl connect "$k" >/dev/null 2>&1; nap 2
+    connected "$k" && return 0
+    log "bond present ($k) but the link will not come up; retrying after a controller reset"
+    recycle_controller
+    timeout 15 bluetoothctl connect "$k" >/dev/null 2>&1; nap 2
+    connected "$k" && return 0
+    return 1
+}
+
+for _ in $(seq 1 20); do
+    if attached && bluetoothctl show 2>/dev/null | grep -q 'Powered: yes'; then break; fi
+    nap 1
+done
+attached || { log "keyboard not attached; nothing to do"; exit 0; }
+
+K=""
+[ -r "$address_file" ] && K=$(tr -cd '0-9A-Fa-f:' < "$address_file")
+
+NEED_PAIR=0
+if [ -n "$K" ] && bonded "$K"; then
+    if [ -e "$marker" ]; then
+        log "bond present ($K) but a prior detached reconnect failed -- stale bond; replacing it"
+        NEED_PAIR=1
+    else
+        if verify_bond "$K"; then
+            log "bond healthy ($K); nothing to do"; exit 0
+        fi
+        log "bond ($K) will not connect even after a controller reset --" \
+            "another OS re-keyed the keyboard; replacing the stale bond"
+        NEED_PAIR=1
+    fi
+    if [ "$NEED_PAIR" = 1 ]; then
+        bluetoothctl remove "$K" >/dev/null 2>&1
+        btmgmt cancelpair -t "$ADDR_TYPE" "$K" >/dev/null 2>&1
+        nap 2
+    fi
+else
+    NEED_PAIR=1
+fi
+
+[ "$NEED_PAIR" = 1 ] || exit 0
+
+if ! have_oob_channel; then
+    log "no OOB coupling channel (0C8F); this kernel lacks the pairing patch -- skipping"
+    exit 0
+fi
+
+log "pairing over the wire (no detach) ..."
+for attempt in 1 2; do
+    if "$tool" --no-detach; then
+        rm -f "$marker"
+        log "auto-pair complete"; exit 0
+    fi
+    [ "$attempt" = 1 ] || break
+    log "no connection was made during pairing; retrying once after a controller reset"
+    btmgmt cancelpair -t "$ADDR_TYPE" "${K:-00:00:00:00:00:00}" >/dev/null 2>&1
+    recycle_controller
+done
+log "auto-pair did not complete after a controller reset; will retry on the next attach."
+exit 1

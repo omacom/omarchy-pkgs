@@ -21,9 +21,9 @@ OFFICIAL_REPOS=" core extra multilib core-debug extra-debug "
 PUBLISHED_BASE_URL="${OMARCHY_PUBLISHED_BASE_URL:-https://pkgs.omarchy.org}"
 PUBLISHED_MIRRORS=(edge stable)
 
-# Arch Linux ARM has no dated snapshots. This is the same live repository the
-# aarch64 builder resolves; override it only when the builder mirror changes.
-ALARM_BASE_URL="${OMARCHY_ALARM_BASE_URL:-https://fl.us.mirror.archlinuxarm.org/aarch64}"
+# The edge mirror of Arch Linux ARM the aarch64 builder resolves
+# (build/Dockerfile); override it only when the builder mirror changes.
+ALARM_BASE_URL="${OMARCHY_ALARM_BASE_URL:-https://arm-mirror.omarchy.org/aarch64}"
 ALARM_REPOS=(core extra alarm aur)
 
 usage() {
@@ -329,6 +329,43 @@ write_pkgrel() {
   mv "$scratch" "$pkgbuild"
 }
 
+# A package built against a trigger's ABI pins it exactly, once per architecture
+# because Arch Linux ARM can trail x86_64: depends_x86_64=('hyprland=0.56.2').
+# Rebuilding against a newer trigger has to move that pin with it, or the
+# rebuilt package demands the version it no longer loads into. Unpinned
+# dependencies, and pins outside the per-architecture arrays, are left alone.
+write_pins() {
+  local package_dir="$1"
+  local current="$2"
+  local pkgbuild="$package_dir/PKGBUILD"
+  local scratch="$pkgbuild.sync-rebuilds"
+  local arch trigger version pattern
+
+  cp "$pkgbuild" "$scratch" || return 1
+  while IFS=$'\t' read -r arch trigger version; do
+    pattern=$(printf '%s' "$trigger" | sed 's/[][\.*^$+?(){}|/]/\\&/g')
+    if ! awk -v array="depends_$arch" -v pattern="$pattern" -v pin="$trigger=$(version_pkgver "$version")" '
+      $0 ~ "^" array "=\\(" { inside = 1 }
+      inside { gsub("[\"\047]" pattern "=[^\"\047]*[\"\047]", "\047" pin "\047") }
+      inside && /\)/ { inside = 0 }
+      { print }
+    ' "$scratch" > "$scratch.new"; then
+      rm -f "$scratch" "$scratch.new"
+      return 1
+    fi
+    mv "$scratch.new" "$scratch"
+  done < <(jq -r 'to_entries[] | .key as $arch | .value | to_entries[] | [$arch, .key, .value] | @tsv' <<<"$current")
+
+  if ! bash -n "$scratch" 2>/dev/null; then
+    print_error "PKGBUILD with moved pins is not valid shell"
+    rm -f "$scratch"
+    return 1
+  fi
+
+  chmod --reference="$pkgbuild" "$scratch"
+  mv "$scratch" "$pkgbuild"
+}
+
 write_metadata() {
   local package_dir="$1"
   local filter="$2"
@@ -547,6 +584,12 @@ sync_package() {
 
   if ! write_pkgrel "$package_dir" "$next_pkgrel"; then
     print_error "  Failed to bump pkgrel for $package"
+    ((++FAILED))
+    return 0
+  fi
+
+  if ! write_pins "$package_dir" "$current"; then
+    print_error "  Failed to move pinned trigger versions for $package"
     ((++FAILED))
     return 0
   fi
@@ -792,6 +835,17 @@ cmd_self_test() {
   check "run succeeds" 0 "$(run_case "$root")"
   check "pkgrel untouched" 1 "$(pkgrel_of "$root/pkgbuilds/t-current")"
 
+  echo "A rebuild moves the trigger's exact pin for the architecture it ran for:"
+  root=$(selftest_root pins)
+  selftest_package "$root" t-pins 1 '{"source":"local","rebuild_on":["dep-a"],"rebuilt_against":{"dep-a":"1.0-1"}}'
+  printf "depends_x86_64=('dep-a=1.0' 'dep-b')\ndepends_aarch64=('dep-a=1.0')\n" >> "$root/pkgbuilds/t-pins/PKGBUILD"
+  selftest_pacman "$root" dep-a=2.0-1
+  selftest_published "$root"
+  check "run succeeds" 0 "$(run_case "$root")"
+  check "pkgrel bumped" 2 "$(pkgrel_of "$root/pkgbuilds/t-pins")"
+  check "x86_64 pin moved" "depends_x86_64=('dep-a=2.0' 'dep-b')" "$(grep '^depends_x86_64=' "$root/pkgbuilds/t-pins/PKGBUILD")"
+  check "aarch64 pin left for its own run" "depends_aarch64=('dep-a=1.0')" "$(grep '^depends_aarch64=' "$root/pkgbuilds/t-pins/PKGBUILD")"
+
   echo "Metadata that does not parse fails the run instead of vanishing from it:"
   root=$(selftest_root unreadable)
   selftest_package "$root" t-broken 1 '{"source":"local","rebuild_on":["dep-a"'
@@ -877,7 +931,7 @@ cmd_self_test() {
 
   echo "A dependency carried here for ARM is read from its recipe once edge publishes it:"
   root=$(selftest_root carried)
-  selftest_package "$root" t-carried 1.1 '{"source":"local","channels":["edge"]}' 0.15.1 aarch64
+  selftest_package "$root" t-carried 1.1 '{"source":"local"}' 0.15.1 aarch64
   selftest_package "$root" t-linked 3 '{"source":"local","rebuild_on":["t-carried"],"rebuilt_against":{"x86_64":{"t-carried":"0.15.1-1"},"aarch64":{"t-carried":"0.15.0-2"}}}' 1.0 'x86_64 aarch64'
   selftest_pacman "$root" t-carried=0.15.1-1
   selftest_published "$root"
@@ -896,7 +950,7 @@ cmd_self_test() {
 
   echo "A carried dependency that edge does not publish yet leaves its dependents alone:"
   root=$(selftest_root carried-in-flight)
-  selftest_package "$root" t-carried 1.2 '{"source":"local","channels":["edge"]}' 0.15.1 aarch64
+  selftest_package "$root" t-carried 1.2 '{"source":"local"}' 0.15.1 aarch64
   selftest_package "$root" t-linked 4 '{"source":"local","rebuild_on":["t-carried"],"rebuilt_against":{"aarch64":{"t-carried":"0.15.1-1.1"}}}' 1.0 aarch64
   selftest_pacman "$root"
   selftest_published "$root"
@@ -911,7 +965,7 @@ cmd_self_test() {
 
   echo "A carried dependency whose edge database cannot be read fails the run:"
   root=$(selftest_root carried-unreadable)
-  selftest_package "$root" t-carried 1.1 '{"source":"local","channels":["edge"]}' 0.15.1 aarch64
+  selftest_package "$root" t-carried 1.1 '{"source":"local"}' 0.15.1 aarch64
   selftest_package "$root" t-linked 3 '{"source":"local","rebuild_on":["t-carried"],"rebuilt_against":{"aarch64":{"t-carried":"0.15.0-2"}}}' 1.0 aarch64
   selftest_pacman "$root"
   selftest_published "$root"

@@ -1,0 +1,1191 @@
+From 235f75f6a454bd41c286d0890dad182fa357d1dd Mon Sep 17 00:00:00 2001
+From: Brandon Williams <turbine.bmw@gmail.com>
+Date: Tue, 13 Oct 2026 09:38:16 -0400
+Subject: [PATCH] cpufreq: Cap the maximum frequency on Snapdragon X
+
+On the Qualcomm Snapdragon X series the CPUs have no energy-performance
+preference and boost is off by default, so the boost switch can't tell
+the profiles apart and the daemon falls back to the placeholder driver.
+Windows on these machines implements its power modes in the OS, chiefly
+by capping the processor's maximum performance per mode.
+
+Give the cpufreq driver a second method, picked per scaling driver:
+apple-cpufreq keeps the boost switch, and scmi and qcom-cpufreq-hw cap
+each policy's scaling_max_freq at a share of the policy's highest
+non-boost frequency, rounded to the nearest supported frequency: 60% in
+power-saver and 75% in balanced, on battery and on AC alike, so that
+switching from performance to balanced always backs off. The caps are
+based on scaling_available_frequencies, because cpuinfo_max_freq keeps
+the boost frequency once boost has been on. Generic OPP tables
+(cpufreq-dt), as on many single-board computers, are left out: the caps
+are only measured on Snapdragon X, and balanced being the default
+profile would slow those machines down.
+
+The caps method leaves the boost switch and the governor alone.
+Performance, which is uncapped, allows the boost frequencies, also where
+a kernel only reveals them in cpuinfo_max_freq once boost is on, so
+whether they are used stays up to the boost switch. On the Surface Pro
+11 tested here the firmware doesn't grant the X1E's boost level at all,
+so the daemon has no business switching it.
+
+The profile is re-applied after resume, for both methods, in case
+anything changed the boost switch or lifted the caps. The caps are
+lifted to the hardware maximum when the daemon stops, since a cap left
+behind would slow the machine down until reboot. A cluster whose CPUs
+are all offline returns EBUSY and is skipped when probing and when
+capping; it is picked up, like a policy that appears later, at the next
+profile change or resume, since the daemon's sandbox (PrivateNetwork=yes)
+keeps udev events from reaching it. A policy that disappears is dropped.
+A cluster that is offline when the daemon stops keeps its cap, which is
+logged. Other write failures are reported, and a profile change only
+fails if nothing could be capped.
+
+On a Snapdragon X Elite (X1E-80-100), a sustained all-core job drew
+31.5 W uncapped, 19.6 W at the balanced cap and 15.1 W at the
+power-saver cap: 39% and 50% less energy for the same work, taking 16%
+and 37% longer. Idle power was unchanged.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ README.md                 |  29 ++
+ src/ppd-driver-cpufreq.c  | 598 ++++++++++++++++++++++++++++++++++----
+ tests/integration_test.py | 358 +++++++++++++++++++++++
+ 3 files changed, 931 insertions(+), 54 deletions(-)
+
+diff --git a/README.md b/README.md
+index 0aebff6..edf0ade 100644
+--- a/README.md
++++ b/README.md
+@@ -258,6 +258,35 @@ it on. The scaling governor is not changed. The boost switch has no setting
+ that depends on the power source, so it follows the selected profile on
+ battery and on AC alike.
+ 
++On machines whose CPU frequency is managed by Arm SCMI or Qualcomm firmware,
++such as the Qualcomm Snapdragon X series, the same driver caps each policy's
++`scaling_max_freq` instead, at a share of the policy's highest non-boost
++frequency rounded to the nearest supported frequency: 60% in "power-saver" and
++75% in "balanced", on battery and on AC alike. Boost is off by default on these
++machines, so on its own it can't tell the profiles apart. The boost switch is
++left alone: "performance", which is uncapped, allows the boost frequencies, so
++whether they are used stays up to the switch. This is used if every CPU
++frequency policy uses the `scmi` or `qcom-cpufreq-hw` scaling driver and none
++offers an energy-performance preference:
++
++```sh
++$ cat /sys/devices/system/cpu/cpufreq/policy*/scaling_driver
++scmi
++scmi
++scmi
++```
++
++The scaling governor and the minimum frequency are not changed. The caps are
++re-applied after resume. When the daemon stops, they are lifted to the
++hardware maximum, so another tool's lower `scaling_max_freq` is not preserved
++(see [Conflicts](#conflicts)).
++
++A cluster whose CPUs are all offline is skipped, even at startup. When it comes
++back online, or a new policy appears, it keeps the cap it last had until the
++next profile change or resume, which caps it like the others. A cluster that is
++offline when the daemon stops can't have its cap lifted, and keeps it until it
++is written again or the system restarts.
++
+ ## Multiple driver and multiple action operations
+ 
+ Power-profiles daemon will load all supported drivers and actions by default.
+diff --git a/src/ppd-driver-cpufreq.c b/src/ppd-driver-cpufreq.c
+index d285178..5d15814 100644
+--- a/src/ppd-driver-cpufreq.c
++++ b/src/ppd-driver-cpufreq.c
+@@ -1,5 +1,6 @@
+ /*
+  * Copyright (c) 2026 Daaboulex
++ * Copyright (c) 2026 Brandon Williams <turbine.bmw@gmail.com>
+  *
+  * This program is free software; you can redistribute it and/or modify it
+  * under the terms of the GNU General Public License version 3 as published by
+@@ -9,15 +10,25 @@
+ 
+ /*
+  * Generic cpufreq CPU driver, for cpufreq scaling drivers that have no
+- * energy performance preference interface. It only uses the global boost
+- * switch, see "Frequency Boost Support" in
+- * https://docs.kernel.org/admin-guide/pm/cpufreq.html
++ * energy performance preference interface. Each supported scaling driver
++ * uses one of two methods:
+  *
+- * It is only used when every cpufreq policy runs a scaling driver listed in
+- * boost_scaling_drivers, where turning boost off is known to cap the CPU at
+- * its sustainable frequency. Any other system keeps its current driver.
++ * - boost: the global boost switch, see "Frequency Boost Support" in
++ *   https://docs.kernel.org/admin-guide/pm/cpufreq.html
++ *   Used where turning boost off is known to cap the CPU at its sustainable
++ *   frequency.
+  *
+- * There is no power_changed handler: the boost switch has no setting that
++ * - caps: each policy's scaling_max_freq, capped at a share of the policy's
++ *   highest non-boost frequency, the way Windows' processor power management
++ *   caps maximum performance per power mode. Used where boost is off by
++ *   default or absent, so it can't tell the profiles apart. The boost switch
++ *   is left alone: performance, which is uncapped, allows the boost
++ *   frequencies, so whether they are used stays up to the switch.
++ *
++ * It is only used when every cpufreq policy runs one of the scaling drivers
++ * in the table below. Any other system keeps its current driver.
++ *
++ * There is no power_changed handler: neither method has a setting that
+  * depends on the power source, so the selected profile alone decides it,
+  * on battery and on AC alike.
+  */
+@@ -26,6 +37,7 @@
+ 
+ #include <errno.h>
+ #include <fcntl.h>
++#include <stdlib.h>
+ #include <glib/gstdio.h>
+ #include <upower.h>
+ 
+@@ -35,21 +47,60 @@
+ #define CPUFREQ_POLICY_DIR "/sys/devices/system/cpu/cpufreq/"
+ #define CPUFREQ_BOOST_PATH "/sys/devices/system/cpu/cpufreq/boost"
+ 
+-static const char * const boost_scaling_drivers[] = {
+-  "apple-cpufreq",
+-  NULL
++/* Share of each policy's maximum frequency allowed per profile with the caps
++ * method. Measured on a Snapdragon X Elite, 75% costs ~16% of sustained
++ * throughput for ~39% less energy, and 60% ~37% for ~50% less. */
++#define POWER_SAVER_PERCENT        60
++#define BALANCED_PERCENT           75
++#define UNCAPPED_PERCENT           100
++
++typedef enum {
++  CPUFREQ_METHOD_NONE,
++  CPUFREQ_METHOD_BOOST,
++  CPUFREQ_METHOD_CAPS,
++} CpufreqMethod;
++
++static const struct {
++  const char *scaling_driver;
++  CpufreqMethod method;
++} scaling_drivers[] = {
++  { "apple-cpufreq", CPUFREQ_METHOD_BOOST },
++  /* Arm SCMI and Qualcomm firmware-managed DVFS, as on the Snapdragon X
++   * series */
++  { "scmi", CPUFREQ_METHOD_CAPS },
++  { "qcom-cpufreq-hw", CPUFREQ_METHOD_CAPS },
+ };
+ 
++typedef struct {
++  char *dir;
++  guint64 max_freq; /* highest non-boost frequency, the base for the caps */
++  guint64 top_freq; /* highest frequency including boost, for no cap */
++  guint64 *freqs; /* ascending non-boost frequencies */
++  guint n_freqs;
++} Policy;
++
+ struct _PpdDriverCpufreq
+ {
+   PpdDriverCpu  parent_instance;
+ 
+   PpdProfile activated_profile;
++  CpufreqMethod method;
+   char *boost_path;
++  GPtrArray *policies; /* of Policy, with the caps method */
+ };
+ 
+ G_DEFINE_TYPE (PpdDriverCpufreq, ppd_driver_cpufreq, PPD_TYPE_DRIVER_CPU)
+ 
++static void
++policy_free (Policy *policy)
++{
++  g_free (policy->dir);
++  g_free (policy->freqs);
++  g_free (policy);
++}
++
++G_DEFINE_AUTOPTR_CLEANUP_FUNC (Policy, policy_free)
++
+ static GObject*
+ ppd_driver_cpufreq_constructor (GType                  type,
+                                 guint                  n_construct_params,
+@@ -68,70 +119,277 @@ ppd_driver_cpufreq_constructor (GType                  type,
+   return object;
+ }
+ 
++static CpufreqMethod
++scaling_driver_to_method (const char *scaling_driver)
++{
++  for (guint i = 0; i < G_N_ELEMENTS (scaling_drivers); i++) {
++    if (g_str_equal (scaling_drivers[i].scaling_driver, scaling_driver))
++      return scaling_drivers[i].method;
++  }
++
++  return CPUFREQ_METHOD_NONE;
++}
++
++static char *
++read_attr (const char *dir,
++           const char *attr)
++{
++  g_autofree char *path = NULL;
++  g_autofree char *contents = NULL;
++
++  path = g_build_filename (dir, attr, NULL);
++  if (!g_file_get_contents (path, &contents, NULL, NULL))
++    return NULL;
++
++  return g_strdup (g_strstrip (contents));
++}
++
+ static gboolean
+-scaling_drivers_use_boost (void)
++read_freq (const char *dir,
++           const char *attr,
++           guint64    *freq)
++{
++  g_autofree char *contents = read_attr (dir, attr);
++
++  return contents &&
++         g_ascii_string_to_unsigned (contents, 10, 1, G_MAXUINT64, freq, NULL);
++}
++
++static int
++compare_freqs (gconstpointer a,
++               gconstpointer b)
++{
++  guint64 fa = *(const guint64 *) a;
++  guint64 fb = *(const guint64 *) b;
++
++  return (fa > fb) - (fa < fb);
++}
++
++/* Parses a list of frequencies, skipping invalid ones, sorted ascending */
++static guint64 *
++read_freqs (const char *dir,
++            const char *attr,
++            guint      *n_freqs)
++{
++  g_autofree char *contents = NULL;
++  g_auto(GStrv) tokens = NULL;
++  guint64 *freqs;
++
++  *n_freqs = 0;
++  contents = read_attr (dir, attr);
++  if (!contents)
++    return NULL;
++
++  tokens = g_strsplit_set (contents, " \n", -1);
++  if (g_strv_length (tokens) == 0)
++    return NULL;
++
++  freqs = g_new0 (guint64, g_strv_length (tokens));
++  for (guint i = 0; tokens[i] != NULL; i++) {
++    guint64 freq;
++
++    if (*tokens[i] == '\0')
++      continue;
++    if (!g_ascii_string_to_unsigned (tokens[i], 10, 1, G_MAXUINT64, &freq, NULL)) {
++      g_debug ("%s/%s lists an invalid frequency '%s'", dir, attr, tokens[i]);
++      continue;
++    }
++    freqs[(*n_freqs)++] = freq;
++  }
++
++  if (*n_freqs == 0) {
++    g_free (freqs);
++    return NULL;
++  }
++  qsort (freqs, *n_freqs, sizeof (guint64), compare_freqs);
++
++  return freqs;
++}
++
++static Policy *
++probe_policy (const char *dir)
++{
++  g_autofree char *epp_path = NULL;
++  g_autofree guint64 *boost_freqs = NULL;
++  g_autoptr(Policy) policy = NULL;
++  guint n_boost_freqs;
++
++  epp_path = g_build_filename (dir, "energy_performance_preference", NULL);
++  if (g_file_test (epp_path, G_FILE_TEST_EXISTS)) {
++    g_debug ("%s has an energy-performance preference", dir);
++    return NULL;
++  }
++
++  policy = g_new0 (Policy, 1);
++  policy->dir = g_strdup (dir);
++  if (!read_freq (dir, "cpuinfo_max_freq", &policy->top_freq)) {
++    g_debug ("%s has no valid cpuinfo_max_freq", dir);
++    return NULL;
++  }
++
++  /* cpuinfo_max_freq includes boost frequencies once boost has been on, so
++   * the caps are based on the highest frequency outside boost, from the
++   * frequency table every supported scaling driver has */
++  policy->freqs = read_freqs (dir, "scaling_available_frequencies", &policy->n_freqs);
++  if (policy->n_freqs == 0) {
++    g_debug ("%s has no scaling_available_frequencies", dir);
++    return NULL;
++  }
++  policy->max_freq = policy->freqs[policy->n_freqs - 1];
++
++  boost_freqs = read_freqs (dir, "scaling_boost_frequencies", &n_boost_freqs);
++  if (n_boost_freqs)
++    policy->top_freq = MAX (policy->top_freq, boost_freqs[n_boost_freqs - 1]);
++  policy->top_freq = MAX (policy->top_freq, policy->max_freq);
++
++  return g_steal_pointer (&policy);
++}
++
++/* Paths of the cpufreq policy directories */
++static GPtrArray *
++list_policy_dirs (void)
+ {
+   g_autoptr(GDir) dir = NULL;
+   g_autofree char *policy_dir = NULL;
++  GPtrArray *dirs = g_ptr_array_new_with_free_func (g_free);
+   const char *dirname;
+-  guint policies = 0;
+ 
+   policy_dir = ppd_utils_get_sysfs_path (CPUFREQ_POLICY_DIR);
+   dir = g_dir_open (policy_dir, 0, NULL);
+   if (!dir) {
+     g_debug ("Could not open %s", policy_dir);
+-    return FALSE;
++    return dirs;
+   }
+ 
+   while ((dirname = g_dir_read_name (dir)) != NULL) {
+-    g_autofree char *path = NULL;
+-    g_autofree char *contents = NULL;
+-    g_autoptr(GError) error = NULL;
+-
+-    if (!g_str_has_prefix (dirname, "policy"))
+-      continue;
+-
+-    path = g_build_filename (policy_dir,
+-                             dirname,
+-                             "scaling_driver",
+-                             NULL);
+-    if (!g_file_get_contents (path, &contents, NULL, &error)) {
+-      g_debug ("Failed to read %s: %s", path, error->message);
+-      continue;
+-    }
+-
+-    if (!g_strv_contains (boost_scaling_drivers, g_strchomp (contents))) {
+-      g_debug ("%s uses scaling driver %s, which this driver does not handle",
+-               dirname, contents);
+-      return FALSE;
+-    }
+-
+-    policies++;
++    if (g_str_has_prefix (dirname, "policy"))
++      g_ptr_array_add (dirs, g_build_filename (policy_dir, dirname, NULL));
+   }
+ 
+-  return policies > 0;
++  return dirs;
++}
++
++/* Every readable policy must use a supported scaling driver, all with the
++ * same method. A policy whose CPUs are all offline can't be read and is
++ * skipped. Only one cpufreq driver can be registered at a time, so the
++ * readable ones should agree; a mix is rejected rather than guessed at. */
++static CpufreqMethod
++probe_scaling_driver (GPtrArray *policy_dirs)
++{
++  g_autoptr(GPtrArray) dirs = list_policy_dirs ();
++  CpufreqMethod method = CPUFREQ_METHOD_NONE;
++
++  for (guint i = 0; i < dirs->len; i++) {
++    const char *base = g_ptr_array_index (dirs, i);
++    g_autofree char *contents = NULL;
++    CpufreqMethod policy_method;
++
++    contents = read_attr (base, "scaling_driver");
++    if (!contents) {
++      g_debug ("Skipping %s, its scaling driver can't be read", base);
++      continue;
++    }
++
++    policy_method = scaling_driver_to_method (contents);
++    if (policy_method == CPUFREQ_METHOD_NONE ||
++        (method != CPUFREQ_METHOD_NONE && policy_method != method)) {
++      g_debug ("%s uses scaling driver %s, which this driver does not handle",
++               base, contents);
++      return CPUFREQ_METHOD_NONE;
++    }
++
++    method = policy_method;
++    g_ptr_array_add (policy_dirs, g_strdup (base));
++  }
++
++  return method;
++}
++
++/* The path of the global boost switch if it can be written, or NULL */
++static char *
++find_boost_switch (void)
++{
++  g_autofree char *path = NULL;
++  int fd;
++
++  path = ppd_utils_get_sysfs_path (CPUFREQ_BOOST_PATH);
++  fd = g_open (path, O_WRONLY);
++  if (fd == -1) {
++    g_debug ("Could not open the cpufreq boost switch %s for writing: %s",
++             path, g_strerror (errno));
++    return NULL;
++  }
++  g_close (fd, NULL);
++
++  g_debug ("Found cpufreq boost switch at %s", path);
++  return g_steal_pointer (&path);
++}
++
++static gboolean
++probe_boost (PpdDriverCpufreq *cpufreq)
++{
++  cpufreq->boost_path = find_boost_switch ();
++  return cpufreq->boost_path != NULL;
++}
++
++static gboolean
++probe_caps (PpdDriverCpufreq *cpufreq,
++            GPtrArray        *policy_dirs)
++{
++  g_autoptr(GPtrArray) policies = NULL;
++
++  policies = g_ptr_array_new_with_free_func ((GDestroyNotify) policy_free);
++  for (guint i = 0; i < policy_dirs->len; i++) {
++    const char *dir = g_ptr_array_index (policy_dirs, i);
++    g_autofree char *driver = NULL;
++    Policy *policy;
++
++    policy = probe_policy (dir);
++    if (policy) {
++      g_ptr_array_add (policies, policy);
++      continue;
++    }
++
++    /* A cluster going offline during probe is picked up later */
++    driver = read_attr (dir, "scaling_driver");
++    if (!driver) {
++      g_debug ("Skipping %s, it went offline", dir);
++      continue;
++    }
++
++    /* Every policy must be capped, or the profiles would mean little */
++    return FALSE;
++  }
++
++  if (policies->len == 0)
++    return FALSE;
++
++  g_debug ("Capping %u cpufreq policies", policies->len);
++  cpufreq->policies = g_steal_pointer (&policies);
++  return TRUE;
+ }
+ 
+ static PpdProbeResult
+ ppd_driver_cpufreq_probe (PpdDriver *driver)
+ {
+   PpdDriverCpufreq *cpufreq = PPD_DRIVER_CPUFREQ (driver);
+-  int fd;
++  g_autoptr(GPtrArray) policy_dirs = NULL;
++  gboolean ret = FALSE;
+ 
+-  if (!scaling_drivers_use_boost ())
+-    return PPD_PROBE_RESULT_FAIL;
+-
+-  cpufreq->boost_path = ppd_utils_get_sysfs_path (CPUFREQ_BOOST_PATH);
+-  fd = g_open (cpufreq->boost_path, O_WRONLY);
+-  if (fd == -1) {
+-    g_debug ("Could not open the cpufreq boost switch %s for writing: %s",
+-             cpufreq->boost_path, g_strerror (errno));
++  policy_dirs = g_ptr_array_new_with_free_func (g_free);
++  cpufreq->method = probe_scaling_driver (policy_dirs);
++  switch (cpufreq->method) {
++  case CPUFREQ_METHOD_NONE:
+     return PPD_PROBE_RESULT_FAIL;
++  case CPUFREQ_METHOD_BOOST:
++    ret = probe_boost (cpufreq);
++    break;
++  case CPUFREQ_METHOD_CAPS:
++    ret = probe_caps (cpufreq, policy_dirs);
++    break;
+   }
+-  g_close (fd, NULL);
+ 
+-  g_debug ("Found cpufreq boost switch at %s", cpufreq->boost_path);
+-  return PPD_PROBE_RESULT_SUCCESS;
++  return ret ? PPD_PROBE_RESULT_SUCCESS : PPD_PROBE_RESULT_FAIL;
+ }
+ 
+ static const char *
+@@ -148,6 +406,182 @@ profile_to_boost (PpdProfile profile)
+   g_return_val_if_reached (NULL);
+ }
+ 
++static guint
++profile_to_percent (PpdProfile profile)
++{
++  switch (profile) {
++  case PPD_PROFILE_POWER_SAVER:
++    return POWER_SAVER_PERCENT;
++  case PPD_PROFILE_BALANCED:
++    return BALANCED_PERCENT;
++  case PPD_PROFILE_PERFORMANCE:
++    return UNCAPPED_PERCENT;
++  }
++
++  g_return_val_if_reached (UNCAPPED_PERCENT);
++}
++
++/* The supported frequency nearest to the share of the maximum, rather than
++ * the one below it, so sparse frequency tables don't collapse to their
++ * minimum. A tie goes to the lower one. */
++static guint64
++policy_cap (Policy *policy,
++            guint   percent)
++{
++  guint64 target;
++  guint64 cap = policy->freqs[0];
++
++  if (percent >= 100)
++    return policy->top_freq;
++
++  target = policy->max_freq * percent / 100;
++
++  for (guint i = 1; i < policy->n_freqs; i++) {
++    guint64 freq = policy->freqs[i];
++    guint64 distance = freq > target ? freq - target : target - freq;
++    guint64 best = cap > target ? cap - target : target - cap;
++
++    if (distance < best)
++      cap = freq;
++  }
++
++  return cap;
++}
++
++static gboolean
++write_cap (Policy   *policy,
++           guint64   cap,
++           GError  **error)
++{
++  g_autofree char *path = NULL;
++  g_autofree char *value = NULL;
++
++  path = g_build_filename (policy->dir, "scaling_max_freq", NULL);
++  value = g_strdup_printf ("%" G_GUINT64_FORMAT, cap);
++  if (ppd_utils_write (path, value, error))
++    return TRUE;
++
++  if (error && !*error)
++    g_set_error (error, G_IO_ERROR, G_IO_ERROR_FAILED, "Could not write to %s", path);
++  return FALSE;
++}
++
++static gboolean
++has_policy (PpdDriverCpufreq *cpufreq,
++            const char       *dir)
++{
++  for (guint i = 0; i < cpufreq->policies->len; i++) {
++    Policy *policy = g_ptr_array_index (cpufreq->policies, i);
++
++    if (g_str_equal (policy->dir, dir))
++      return TRUE;
++  }
++
++  return FALSE;
++}
++
++/* Policies whose CPUs were all offline at probe, or that appeared since, are
++ * picked up once they can be read, the next time a profile is applied. */
++static void
++pick_up_new_policies (PpdDriverCpufreq *cpufreq)
++{
++  g_autoptr(GPtrArray) dirs = list_policy_dirs ();
++
++  for (guint i = 0; i < dirs->len; i++) {
++    const char *base = g_ptr_array_index (dirs, i);
++    g_autofree char *driver = NULL;
++    Policy *policy;
++
++    if (has_policy (cpufreq, base))
++      continue;
++
++    driver = read_attr (base, "scaling_driver");
++    if (!driver || scaling_driver_to_method (driver) != CPUFREQ_METHOD_CAPS)
++      continue;
++
++    policy = probe_policy (base);
++    if (policy) {
++      g_debug ("Capping %s too", base);
++      g_ptr_array_add (cpufreq->policies, policy);
++    }
++  }
++}
++
++/* A policy whose CPUs are all offline returns EBUSY; cap the others. Other
++ * failures are reported, and the change only fails if nothing was capped. */
++static gboolean
++apply_caps (PpdDriverCpufreq  *cpufreq,
++            PpdProfile         profile,
++            GError           **error)
++{
++  GPtrArray *policies = cpufreq->policies;
++  g_autoptr(GError) last_error = NULL;
++  guint percent;
++  guint written = 0;
++
++  pick_up_new_policies (cpufreq);
++
++  percent = profile_to_percent (profile);
++  for (guint i = 0; i < policies->len;) {
++    Policy *policy = g_ptr_array_index (policies, i);
++    guint64 cap = policy_cap (policy, percent);
++
++    /* Kernels without scaling_boost_frequencies only reveal the boost
++     * frequencies in cpuinfo_max_freq once boost is on. Allowing them
++     * leaves the choice to the boost switch. */
++    if (percent >= 100) {
++      guint64 freq;
++
++      if (read_freq (policy->dir, "cpuinfo_max_freq", &freq))
++        policy->top_freq = cap = MAX (cap, freq);
++    }
++
++    g_clear_error (&last_error);
++    if (!write_cap (policy, cap, &last_error)) {
++      if (g_error_matches (last_error, G_IO_ERROR, G_IO_ERROR_NOT_FOUND)) {
++        /* Gone; picked up again if it comes back */
++        g_debug ("%s disappeared", policy->dir);
++        g_ptr_array_remove_index (policies, i);
++        continue;
++      }
++      if (g_error_matches (last_error, G_IO_ERROR, G_IO_ERROR_BUSY))
++        g_debug ("Skipping inactive %s", policy->dir);
++      else
++        g_warning ("Could not cap %s: %s", policy->dir, last_error->message);
++      i++;
++      continue;
++    }
++    written++;
++    i++;
++  }
++
++  if (written == 0) {
++    if (!last_error)
++      g_set_error (&last_error, G_IO_ERROR, G_IO_ERROR_NOT_FOUND, "No cpufreq policy to cap");
++    g_propagate_error (error, g_steal_pointer (&last_error));
++    return FALSE;
++  }
++
++  return TRUE;
++}
++
++static gboolean
++apply_profile (PpdDriverCpufreq  *cpufreq,
++               PpdProfile         profile,
++               GError           **error)
++{
++  switch (cpufreq->method) {
++  case CPUFREQ_METHOD_BOOST:
++    return ppd_utils_write (cpufreq->boost_path, profile_to_boost (profile), error);
++  case CPUFREQ_METHOD_CAPS:
++    return apply_caps (cpufreq, profile, error);
++  case CPUFREQ_METHOD_NONE:
++    break;
++  }
++
++  g_return_val_if_reached (FALSE);
++}
++
+ static gboolean
+ ppd_driver_cpufreq_activate_profile (PpdDriver                   *driver,
+                                      PpdProfile                   profile,
+@@ -156,18 +590,16 @@ ppd_driver_cpufreq_activate_profile (PpdDriver                   *driver,
+ {
+   PpdDriverCpufreq *cpufreq = PPD_DRIVER_CPUFREQ (driver);
+ 
+-  g_return_val_if_fail (cpufreq->boost_path != NULL, FALSE);
++  g_return_val_if_fail (cpufreq->method != CPUFREQ_METHOD_NONE, FALSE);
+ 
+   if (profile == PPD_PROFILE_UNSET)
+     return TRUE;
+ 
+-  if (!ppd_utils_write (cpufreq->boost_path, profile_to_boost (profile), error)) {
++  if (!apply_profile (cpufreq, profile, error)) {
+     if (cpufreq->activated_profile != PPD_PROFILE_UNSET) {
+       g_autoptr(GError) error_local = NULL;
+ 
+-      if (!ppd_utils_write (cpufreq->boost_path,
+-                            profile_to_boost (cpufreq->activated_profile),
+-                            &error_local))
++      if (!apply_profile (cpufreq, cpufreq->activated_profile, &error_local))
+         g_warning ("failed to restore previous profile: %s", error_local->message);
+     }
+     return FALSE;
+@@ -177,12 +609,68 @@ ppd_driver_cpufreq_activate_profile (PpdDriver                   *driver,
+   return TRUE;
+ }
+ 
++/* Re-apply the profile after resume in case anything changed the boost
++ * switch or lifted the caps. A cluster coming back online keeps the cap it
++ * had, or none if it was offline at probe, until the next profile change or
++ * resume: the daemon's sandbox (PrivateNetwork=yes) keeps udev events from
++ * reaching it. */
++static gboolean
++ppd_driver_cpufreq_prepare_for_sleep (PpdDriver  *driver,
++                                      gboolean    start,
++                                      GError    **error)
++{
++  PpdDriverCpufreq *cpufreq = PPD_DRIVER_CPUFREQ (driver);
++  g_autoptr(GError) local_error = NULL;
++
++  if (start || cpufreq->activated_profile == PPD_PROFILE_UNSET)
++    return TRUE;
++
++  g_debug ("Re-applying the cpufreq profile");
++  if (!apply_profile (cpufreq, cpufreq->activated_profile, &local_error)) {
++    g_propagate_prefixed_error (error, g_steal_pointer (&local_error),
++                                "Could not reapply the cpufreq profile on resume: ");
++    return FALSE;
++  }
++
++  return TRUE;
++}
++
++/* A cap left behind would slow the machine down until reboot */
++static void
++ppd_driver_cpufreq_dispose (GObject *object)
++{
++  PpdDriverCpufreq *cpufreq = PPD_DRIVER_CPUFREQ (object);
++
++  if (cpufreq->method == CPUFREQ_METHOD_CAPS &&
++      cpufreq->policies &&
++      cpufreq->activated_profile != PPD_PROFILE_UNSET) {
++    g_debug ("Lifting cpufreq caps");
++    for (guint i = 0; i < cpufreq->policies->len; i++) {
++      Policy *policy = g_ptr_array_index (cpufreq->policies, i);
++      g_autoptr(GError) error = NULL;
++
++      if (write_cap (policy, policy->top_freq, &error))
++        continue;
++      /* The kernel keeps an offline policy's limit until it is written again */
++      if (g_error_matches (error, G_IO_ERROR, G_IO_ERROR_BUSY))
++        g_warning ("%s is offline, its cap stays until it is written again or the system restarts",
++                   policy->dir);
++      else
++        g_warning ("Could not lift the cap on %s: %s", policy->dir, error->message);
++    }
++    cpufreq->activated_profile = PPD_PROFILE_UNSET;
++  }
++
++  G_OBJECT_CLASS (ppd_driver_cpufreq_parent_class)->dispose (object);
++}
++
+ static void
+ ppd_driver_cpufreq_finalize (GObject *object)
+ {
+   PpdDriverCpufreq *cpufreq = PPD_DRIVER_CPUFREQ (object);
+ 
+   g_clear_pointer (&cpufreq->boost_path, g_free);
++  g_clear_pointer (&cpufreq->policies, g_ptr_array_unref);
+   G_OBJECT_CLASS (ppd_driver_cpufreq_parent_class)->finalize (object);
+ }
+ 
+@@ -194,11 +682,13 @@ ppd_driver_cpufreq_class_init (PpdDriverCpufreqClass *klass)
+ 
+   object_class = G_OBJECT_CLASS (klass);
+   object_class->constructor = ppd_driver_cpufreq_constructor;
++  object_class->dispose = ppd_driver_cpufreq_dispose;
+   object_class->finalize = ppd_driver_cpufreq_finalize;
+ 
+   driver_class = PPD_DRIVER_CLASS (klass);
+   driver_class->probe = ppd_driver_cpufreq_probe;
+   driver_class->activate_profile = ppd_driver_cpufreq_activate_profile;
++  driver_class->prepare_to_sleep = ppd_driver_cpufreq_prepare_for_sleep;
+ }
+ 
+ static void
+diff --git a/tests/integration_test.py b/tests/integration_test.py
+index 8c37bc2..e331acd 100644
+--- a/tests/integration_test.py
++++ b/tests/integration_test.py
+@@ -509,6 +509,14 @@ class Tests(dbusmock.DBusTestCase):
+                 )
+             GLib.MainContext.default().iteration(False)
+ 
++    def wait_for_sleep_monitor(self):
++        """Wait until the daemon listens for logind's PrepareForSleep"""
++        self.assert_eventually(
++            lambda: self.have_text_in_log("Suspension state monitor required")
++        )
++        # Let the bus register the match rule
++        time.sleep(0.2)
++
+     def assert_file_eventually_contains(
+         self, path, contents, timeout=800, keep_checking=0
+     ):
+@@ -1651,6 +1659,356 @@ class Tests(dbusmock.DBusTestCase):
+         with open(boost, "rb") as f:
+             self.assertEqual(f.read(), b"1\n")
+ 
++    X1E_FREQS = (
++        "710400 806400 998400 1190400 1440000 1670400 1920000 2188800 "
++        "2515200 2707200 2976000 3206400 3417600"
++    )
++
++    def create_cpufreq_policy(
++        self, name, driver, freqs, epp=False, boost_freqs=None, cpuinfo_max=None
++    ):
++        policy = os.path.join(
++            self.testbed.get_root_dir(), "sys/devices/system/cpu/cpufreq", name
++        )
++        os.makedirs(policy)
++        top = freqs.split()[-1]
++        self.write_file_contents(os.path.join(policy, "scaling_driver"), driver + "\n")
++        self.write_file_contents(
++            os.path.join(policy, "cpuinfo_max_freq"), (cpuinfo_max or top) + "\n"
++        )
++        if boost_freqs:
++            self.write_file_contents(
++                os.path.join(policy, "scaling_boost_frequencies"), boost_freqs + " \n"
++            )
++        self.write_file_contents(os.path.join(policy, "scaling_max_freq"), top + "\n")
++        self.write_file_contents(
++            os.path.join(policy, "scaling_available_frequencies"), freqs + " \n"
++        )
++        if epp:
++            self.write_file_contents(
++                os.path.join(policy, "energy_performance_preference"), "default\n"
++            )
++        return os.path.join(policy, "scaling_max_freq")
++
++    def start_upower(self, on_battery):
++        _, upowerd, _ = self.start_dbus_template(
++            "upower", {"DaemonVersion": "0.99", "OnBattery": on_battery}
++        )
++        return upowerd
++
++    def test_cpufreq_caps(self):
++        """Profiles cap each cpufreq policy at a share of its maximum"""
++        max0 = self.create_cpufreq_policy("policy0", "scmi", self.X1E_FREQS)
++        max4 = self.create_cpufreq_policy("policy4", "scmi", self.X1E_FREQS)
++        small = self.create_cpufreq_policy(
++            "policy8", "scmi", "500000 1000000 1500000 2000000"
++        )
++        boost = os.path.join(
++            self.testbed.get_root_dir(), "sys/devices/system/cpu/cpufreq/boost"
++        )
++        self.write_file_contents(boost, "0\n")
++
++        upowerd = self.start_upower(True)
++        self.start_daemon()
++        profiles = self.get_dbus_property("Profiles")
++        self.assertEqual(len(profiles), 3)
++        self.assertEqual(profiles[0]["CpuDriver"], "cpufreq")
++        self.assertEqual(self.get_dbus_property("ActiveProfile"), "balanced")
++        self.assert_file_eventually_contains(max0, "2515200")
++        self.assert_file_eventually_contains(max4, "2515200")
++        self.assert_file_eventually_contains(small, "1500000")
++
++        self.set_dbus_property("ActiveProfile", GLib.Variant.new_string("power-saver"))
++        self.assert_file_eventually_contains(max0, "1920000")
++        self.assert_file_eventually_contains(small, "1000000")
++
++        self.set_dbus_property("ActiveProfile", GLib.Variant.new_string("performance"))
++        self.assert_file_eventually_contains(max0, "3417600")
++        self.assert_file_eventually_contains(small, "2000000")
++
++        self.set_dbus_property("ActiveProfile", GLib.Variant.new_string("balanced"))
++        self.assert_file_eventually_contains(max0, "2515200")
++
++        # The boost switch is never touched
++        self.assertEqual(self.read_file_contents(boost), b"0\n")
++
++        # Balanced is capped on AC too
++        upowerd.Set("org.freedesktop.UPower", "OnBattery", False)
++        self.assert_file_eventually_contains(max0, "2515200", keep_checking=200)
++
++    def test_cpufreq_caps_replace_existing_cap(self):
++        """A cap left behind by something else is replaced"""
++        max0 = self.create_cpufreq_policy("policy0", "qcom-cpufreq-hw", self.X1E_FREQS)
++        self.write_file_contents(max0, "1920000\n")
++
++        self.start_daemon()
++        self.assertEqual(self.get_dbus_property("ActiveProfile"), "balanced")
++        self.assert_file_eventually_contains(max0, "2515200")
++        self.set_dbus_property("ActiveProfile", GLib.Variant.new_string("power-saver"))
++        self.assert_file_eventually_contains(max0, "1920000")
++
++    def test_cpufreq_caps_leave_boost_alone(self):
++        """The caps method never changes the boost switch"""
++        self.create_cpufreq_policy("policy0", "scmi", self.X1E_FREQS)
++        boost = os.path.join(
++            self.testbed.get_root_dir(), "sys/devices/system/cpu/cpufreq/boost"
++        )
++        self.write_file_contents(boost, "1\n")
++
++        self.start_daemon()
++        for profile in ("power-saver", "performance", "balanced"):
++            self.set_dbus_property("ActiveProfile", GLib.Variant.new_string(profile))
++            self.assert_file_eventually_contains(boost, "1\n", keep_checking=100)
++        self.stop_daemon()
++        self.assertEqual(self.read_file_contents(boost), b"1\n")
++
++    def test_cpufreq_caps_vanished_policy(self):
++        """A policy that disappears is dropped without warnings"""
++        max0 = self.create_cpufreq_policy("policy0", "scmi", self.X1E_FREQS)
++        max4 = self.create_cpufreq_policy("policy4", "scmi", self.X1E_FREQS)
++        self.start_daemon()
++        # Drivers are probed after the bus name is acquired
++        self.assert_eventually(
++            lambda: self.have_text_in_log("Capping 2 cpufreq policies")
++        )
++
++        shutil.rmtree(os.path.dirname(max4))
++        self.set_dbus_property("ActiveProfile", GLib.Variant.new_string("power-saver"))
++        self.assert_file_eventually_contains(max0, "1920000")
++        self.set_dbus_property("ActiveProfile", GLib.Variant.new_string("balanced"))
++        self.assert_file_eventually_contains(max0, "2515200")
++        self.assertTrue(self.have_text_in_log("disappeared"))
++        self.assertFalse(self.have_text_in_log("Could not cap"))
++
++    def test_cpufreq_caps_nearest_frequency(self):
++        """Caps round to the nearest supported frequency, down on a tie"""
++        max0 = self.create_cpufreq_policy(
++            "policy0", "scmi", "400000 650000 800000 1000000"
++        )
++        max4 = self.create_cpufreq_policy("policy4", "scmi", "500000 700000 1000000")
++
++        self.start_daemon()
++        # 75% is 750000: 800000 is nearer than 650000
++        self.assert_file_eventually_contains(max0, "800000")
++        self.assert_file_eventually_contains(max4, "700000")
++        # 60% is 600000: 650000 is nearer than 400000, and on policy4
++        # 500000 and 700000 are equally near
++        self.set_dbus_property("ActiveProfile", GLib.Variant.new_string("power-saver"))
++        self.assert_file_eventually_contains(max0, "650000")
++        self.assert_file_eventually_contains(max4, "500000")
++
++    def test_cpufreq_caps_ignore_cpufreq_dt(self):
++        """Generic OPP tables (cpufreq-dt) keep the placeholder driver"""
++        max0 = self.create_cpufreq_policy("policy0", "cpufreq-dt", self.X1E_FREQS)
++
++        self.start_daemon()
++        self.assertEqual(self.get_dbus_property("Profiles")[0]["Driver"], "placeholder")
++        self.set_dbus_property("ActiveProfile", GLib.Variant.new_string("power-saver"))
++        self.assertEqual(self.get_dbus_property("ActiveProfile"), "power-saver")
++        self.assert_file_eventually_contains(max0, "3417600\n", keep_checking=200)
++
++    def test_cpufreq_caps_new_policy(self):
++        """A policy that appears after startup is capped at the next change"""
++        self.create_cpufreq_policy("policy0", "scmi", self.X1E_FREQS)
++        self.start_daemon()
++        self.assertEqual(self.get_dbus_property("Profiles")[0]["CpuDriver"], "cpufreq")
++
++        max4 = self.create_cpufreq_policy("policy4", "scmi", self.X1E_FREQS)
++        self.set_dbus_property("ActiveProfile", GLib.Variant.new_string("power-saver"))
++        self.assert_file_eventually_contains(max4, "1920000")
++
++    def test_cpufreq_caps_boost_frequencies(self):
++        """Caps ignore boost frequencies, and performance lifts to them"""
++        # cpuinfo_max_freq keeps the boost frequency once boost has been on
++        max4 = self.create_cpufreq_policy(
++            "policy4",
++            "scmi",
++            self.X1E_FREQS,
++            boost_freqs="4012800",
++            cpuinfo_max="4012800",
++        )
++        boost = os.path.join(
++            self.testbed.get_root_dir(), "sys/devices/system/cpu/cpufreq/boost"
++        )
++        self.write_file_contents(boost, "0\n")
++
++        self.start_daemon()
++        self.assert_file_eventually_contains(max4, "2515200")
++        self.set_dbus_property("ActiveProfile", GLib.Variant.new_string("power-saver"))
++        self.assert_file_eventually_contains(max4, "1920000")
++        self.set_dbus_property("ActiveProfile", GLib.Variant.new_string("performance"))
++        self.assert_file_eventually_contains(max4, "4012800")
++        self.assertEqual(self.read_file_contents(boost), b"0\n")
++
++    def test_cpufreq_caps_boost_reveals_max(self):
++        """Without boost frequency lists, performance follows cpuinfo_max_freq"""
++        max4 = self.create_cpufreq_policy("policy4", "scmi", self.X1E_FREQS)
++        # An empty list, as some kernels show without boost frequencies
++        self.write_file_contents(
++            os.path.join(os.path.dirname(max4), "scaling_boost_frequencies"), "\n"
++        )
++        boost = os.path.join(
++            self.testbed.get_root_dir(), "sys/devices/system/cpu/cpufreq/boost"
++        )
++        self.write_file_contents(boost, "0\n")
++
++        self.start_daemon()
++        self.assert_file_eventually_contains(max4, "2515200")
++
++        # Something turns boost on, and the kernel raises cpuinfo_max_freq
++        self.write_file_contents(boost, "1\n")
++        self.write_file_contents(
++            os.path.join(os.path.dirname(max4), "cpuinfo_max_freq"), "4012800\n"
++        )
++        self.set_dbus_property("ActiveProfile", GLib.Variant.new_string("performance"))
++        self.assert_file_eventually_contains(max4, "4012800")
++
++        # Stopping from a capped profile lifts to the discovered maximum, not
++        # the one seen at probe
++        self.set_dbus_property("ActiveProfile", GLib.Variant.new_string("power-saver"))
++        self.assert_file_eventually_contains(max4, "1920000")
++        self.stop_daemon()
++        self.assertEqual(self.read_file_contents(max4), b"4012800")
++
++    def test_cpufreq_boost_reapply_on_resume(self):
++        """The boost method is re-applied after resume too"""
++        boost = self.create_cpufreq_boost("apple-cpufreq")
++        _, obj_logind, _ = self.start_dbus_template("logind", {})
++        self.start_daemon()
++        self.assert_file_eventually_contains(boost, "1")
++        self.wait_for_sleep_monitor()
++
++        self.write_file_contents(boost, "0\n")
++        obj_logind.EmitSignal(
++            "org.freedesktop.login1.Manager", "PrepareForSleep", "b", [True]
++        )
++        obj_logind.EmitSignal(
++            "org.freedesktop.login1.Manager", "PrepareForSleep", "b", [False]
++        )
++        self.assert_file_eventually_contains(boost, "1", timeout=3000)
++
++    def test_cpufreq_caps_left_alone(self):
++        """Mixed scaling drivers and EPP keep the placeholder"""
++        cpufreq_dir = os.path.join(
++            self.testbed.get_root_dir(), "sys/devices/system/cpu/cpufreq/"
++        )
++        cases = {
++            "scmi and apple-cpufreq": (("scmi", False), ("apple-cpufreq", False)),
++            "energy preference": (("scmi", True),),
++            "no frequency table": (("scmi", False),),
++        }
++        for case, policies in cases.items():
++            with self.subTest(case=case):
++                shutil.rmtree(cpufreq_dir, ignore_errors=True)
++                for index, (driver, epp) in enumerate(policies):
++                    self.create_cpufreq_policy(
++                        f"policy{index}", driver, self.X1E_FREQS, epp=epp
++                    )
++                if case == "no frequency table":
++                    os.remove(
++                        os.path.join(
++                            cpufreq_dir, "policy0", "scaling_available_frequencies"
++                        )
++                    )
++                self.start_daemon()
++                try:
++                    self.assertEqual(
++                        self.get_dbus_property("Profiles")[0]["Driver"], "placeholder"
++                    )
++                finally:
++                    self.stop_daemon(delete_profile=True)
++
++    def test_cpufreq_caps_with_platform_profile(self):
++        """Caps and a platform profile work together"""
++        max0 = self.create_cpufreq_policy("policy0", "scmi", self.X1E_FREQS)
++        self.create_platform_profile()
++        self.start_daemon()
++
++        profiles = self.get_dbus_property("Profiles")
++        self.assertEqual(len(profiles), 3)
++        self.assertEqual(profiles[0]["Driver"], "multiple")
++        self.assertEqual(profiles[0]["CpuDriver"], "cpufreq")
++        self.assertEqual(profiles[0]["PlatformDriver"], "platform_profile")
++
++        self.set_dbus_property("ActiveProfile", GLib.Variant.new_string("power-saver"))
++        self.assert_file_eventually_contains(max0, "1920000")
++        self.assertEqual(
++            self.read_sysfs_file("sys/firmware/acpi/platform_profile"), b"low-power"
++        )
++
++    def test_cpufreq_caps_lifted_on_exit(self):
++        """Stopping the daemon lifts the caps"""
++        max0 = self.create_cpufreq_policy(
++            "policy0", "scmi", self.X1E_FREQS, boost_freqs="4012800"
++        )
++        boost = os.path.join(
++            self.testbed.get_root_dir(), "sys/devices/system/cpu/cpufreq/boost"
++        )
++        self.write_file_contents(boost, "0\n")
++        self.start_daemon()
++        self.set_dbus_property("ActiveProfile", GLib.Variant.new_string("power-saver"))
++        self.assert_file_eventually_contains(max0, "1920000")
++
++        # Stopping from a capped profile lifts the cap to the boost maximum
++        self.stop_daemon()
++        self.assertEqual(self.read_file_contents(max0), b"4012800")
++        self.assertEqual(self.read_file_contents(boost), b"0\n")
++
++    def test_cpufreq_caps_unwritable_policy(self):
++        """A policy that can't be written is reported and the others are capped"""
++        max0 = self.create_cpufreq_policy("policy0", "scmi", self.X1E_FREQS)
++        max4 = self.create_cpufreq_policy("policy4", "scmi", self.X1E_FREQS)
++        os.remove(max4)
++        os.makedirs(max4)
++
++        self.start_daemon()
++        self.assertEqual(self.get_dbus_property("Profiles")[0]["CpuDriver"], "cpufreq")
++        self.set_dbus_property("ActiveProfile", GLib.Variant.new_string("power-saver"))
++        self.assertEqual(self.get_dbus_property("ActiveProfile"), "power-saver")
++        self.assert_file_eventually_contains(max0, "1920000")
++        self.assertTrue(self.have_text_in_log("Could not cap"))
++
++    def test_cpufreq_caps_unreadable_policy(self):
++        """An unreadable policy at startup, such as an offline cluster, is skipped"""
++        max0 = self.create_cpufreq_policy("policy0", "scmi", self.X1E_FREQS)
++        max4 = self.create_cpufreq_policy("policy4", "scmi", self.X1E_FREQS)
++        driver4 = os.path.join(os.path.dirname(max4), "scaling_driver")
++        os.remove(driver4)
++        os.makedirs(driver4)
++
++        self.start_daemon()
++        self.assertEqual(self.get_dbus_property("Profiles")[0]["CpuDriver"], "cpufreq")
++        self.set_dbus_property("ActiveProfile", GLib.Variant.new_string("power-saver"))
++        self.assert_file_eventually_contains(max0, "1920000")
++        self.assertEqual(self.read_file_contents(max4), b"3417600\n")
++
++        # The cluster comes back online: the next profile change caps it
++        os.rmdir(driver4)
++        self.write_file_contents(driver4, "scmi\n")
++        self.set_dbus_property("ActiveProfile", GLib.Variant.new_string("balanced"))
++        self.assert_file_eventually_contains(max4, "2515200")
++        self.set_dbus_property("ActiveProfile", GLib.Variant.new_string("power-saver"))
++        self.assert_file_eventually_contains(max4, "1920000")
++
++    def test_cpufreq_caps_reapply_on_resume(self):
++        """Caps are re-applied after resume"""
++        max0 = self.create_cpufreq_policy("policy0", "scmi", self.X1E_FREQS)
++        _, obj_logind, _ = self.start_dbus_template("logind", {})
++        self.start_daemon()
++        self.set_dbus_property("ActiveProfile", GLib.Variant.new_string("power-saver"))
++        self.assert_file_eventually_contains(max0, "1920000")
++        self.wait_for_sleep_monitor()
++
++        # Something lifts the cap across suspend
++        self.write_file_contents(max0, "3417600\n")
++        obj_logind.EmitSignal(
++            "org.freedesktop.login1.Manager", "PrepareForSleep", "b", [True]
++        )
++        obj_logind.EmitSignal(
++            "org.freedesktop.login1.Manager", "PrepareForSleep", "b", [False]
++        )
++        self.assert_file_eventually_contains(max0, "1920000", timeout=3000)
++
+     def test_cpufreq_yields_to_amd_pstate(self):
+         """A hardware-specific CPU driver wins over the generic cpufreq driver"""
+ 

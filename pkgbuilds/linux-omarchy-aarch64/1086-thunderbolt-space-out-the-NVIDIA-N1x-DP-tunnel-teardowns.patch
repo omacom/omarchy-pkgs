@@ -1,0 +1,122 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ryan Hughes <ryan@heyoodle.com>
+Date: Wed, 14 Oct 2026 15:59:30 -0400
+Subject: [PATCH] thunderbolt: space out the NVIDIA N1x DP tunnel teardowns
+
+Unplugging a dock with two monitors tears down both DP tunnels within
+a few milliseconds, and each teardown drops HPD on its DP IN adapter
+towards the GPU. The N1x GPU firmware handles only the first of the
+two drops. It keeps reporting the other monitor as connected, and
+after a replug that monitor never finishes DPRX negotiation and stays
+black until the next system sleep:
+
+  0:5 <-> 1:13 (DP): deactivating
+  0:6 <-> 1:14 (DP): deactivating
+  nvidia-modeset: WARNING: DPCONN> Zombie? :  1 00000000419641c3
+
+Add a quirk for the N1x host router that waits between DP tunnel
+teardowns, 100 ms by default, adjustable with the dp_teardown_delay
+module parameter.
+---
+ drivers/thunderbolt/quirks.c | 13 +++++++++++++
+ drivers/thunderbolt/tb.c     | 30 ++++++++++++++++++++++++++++--
+ drivers/thunderbolt/tb.h     |  2 ++
+ 3 files changed, 43 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/thunderbolt/quirks.c b/drivers/thunderbolt/quirks.c
+index 6852e4b..d9dd309 100644
+--- a/drivers/thunderbolt/quirks.c
++++ b/drivers/thunderbolt/quirks.c
+@@ -42,6 +42,12 @@ static void quirk_dp_in_retry(struct tb_switch *sw)
+ 	tb_sw_dbg(sw, "retrying DP IN adapters after DPRX failures\n");
+ }
+ 
++static void quirk_dp_teardown_delay(struct tb_switch *sw)
++{
++	sw->quirks |= QUIRK_DP_TEARDOWN_DELAY;
++	tb_sw_dbg(sw, "spacing out DP tunnel teardowns\n");
++}
++
+ static void quirk_usb3_maximum_bandwidth(struct tb_switch *sw)
+ {
+ 	struct tb_port *port;
+@@ -148,6 +154,13 @@ static const struct tb_quirk tb_quirks[] = {
+ 	 * would leave them unused until the router is reset.
+ 	 */
+ 	{ 0x0955, 0x1372, 0x0000, 0x0000, quirk_dp_in_retry },
++	/*
++	 * When a dock with two monitors is unplugged, the N1x GPU firmware
++	 * misses the second of two HPD drops that arrive within a few
++	 * milliseconds and keeps reporting that monitor as connected until
++	 * the next system sleep, so it cannot be used again after a replug.
++	 */
++	{ 0x0955, 0x1372, 0x0000, 0x0000, quirk_dp_teardown_delay },
+ };
+ 
+ /**
+diff --git a/drivers/thunderbolt/tb.c b/drivers/thunderbolt/tb.c
+index 68a192d..a180989 100644
+--- a/drivers/thunderbolt/tb.c
++++ b/drivers/thunderbolt/tb.c
+@@ -52,6 +52,14 @@ MODULE_PARM_DESC(asym_threshold,
+ 		"threshold (Mb/s) when to Gen 4 switch link symmetry. 0 disables. (default: "
+ 		__MODULE_STRING(TB_ASYM_THRESHOLD) ")");
+ 
++#define TB_DP_TEARDOWN_DELAY	100	/* ms */
++
++static unsigned int dp_teardown_delay = TB_DP_TEARDOWN_DELAY;
++module_param(dp_teardown_delay, uint, 0644);
++MODULE_PARM_DESC(dp_teardown_delay,
++		"delay (ms) between DP tunnel teardowns on routers that need it (default: "
++		__MODULE_STRING(TB_DP_TEARDOWN_DELAY) ")");
++
+ struct tb_pci_rescan {
+ 	struct delayed_work work;
+ 	struct kref kref;
+@@ -1796,10 +1804,28 @@ static void tb_free_invalid_tunnels(struct tb *tb)
+ 	struct tb_cm *tcm = tb_priv(tb);
+ 	struct tb_tunnel *tunnel;
+ 	struct tb_tunnel *n;
++	bool dp_freed = false;
+ 
+ 	list_for_each_entry_safe(tunnel, n, &tcm->tunnel_list, list) {
+-		if (tb_tunnel_is_invalid(tunnel))
+-			tb_deactivate_and_free_tunnel(tunnel);
++		if (!tb_tunnel_is_invalid(tunnel))
++			continue;
++
++		/*
++		 * Tearing down a DP tunnel drops HPD towards the graphics
++		 * driver. Some GPUs miss one of two drops that arrive
++		 * together, so give them time to handle each.
++		 */
++		if (tb_tunnel_is_dp(tunnel)) {
++			if (dp_freed &&
++			    tb->root_switch->quirks & QUIRK_DP_TEARDOWN_DELAY) {
++				tb_tunnel_dbg(tunnel, "waiting %u ms before tearing down\n",
++					      dp_teardown_delay);
++				msleep(dp_teardown_delay);
++			}
++			dp_freed = true;
++		}
++
++		tb_deactivate_and_free_tunnel(tunnel);
+ 	}
+ }
+ 
+diff --git a/drivers/thunderbolt/tb.h b/drivers/thunderbolt/tb.h
+index ce03453..27de83a 100644
+--- a/drivers/thunderbolt/tb.h
++++ b/drivers/thunderbolt/tb.h
+@@ -30,6 +30,8 @@
+ #define QUIRK_NO_SYSTEM_SLEEP				BIT(3)
+ /* DP IN adapters never report hotplug, so retry them after a DPRX failure */
+ #define QUIRK_DP_IN_RETRY				BIT(4)
++/* GPU misses one of two HPD drops that arrive together, so space them out */
++#define QUIRK_DP_TEARDOWN_DELAY				BIT(5)
+ 
+ /**
+  * struct tb_nvm - Structure holding NVM information
+-- 
+2.56.0
+
