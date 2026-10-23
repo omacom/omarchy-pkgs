@@ -116,6 +116,23 @@ def with_hermes_node_path(env=None):
     check_launch(overrides={"ELECTRON_RUN_AS_NODE": "1", "PYTHONPATH": "/invalid", "PYTHONHOME": "/invalid"})
 
     config = home / ".hermes/config.yaml"
+    # Runtimes installed by the 2026.8.18 package return only three settings.
+    legacy_helper = helper + '''
+_first_four = _desktop_launch_options
+def _desktop_launch_options():
+    return _first_four()[:3]
+'''
+    (module / "main.py").write_text(legacy_helper)
+    check_launch([url], wayland, ["--ozone-platform=wayland", url])
+    config.write_text(json.dumps({"desktop": {"disable_gpu": True, "password_store": "kwallet5",
+                                              "electron_flags": ["--test=a b"]}}))
+    check_launch([url], wayland, ["--ozone-platform=wayland", "--test=a b", url],
+                 store="kwallet5", gpu="1")
+    check_launch([url], {**wayland, "HERMES_DESKTOP_DISABLE_GPU": "0",
+                        "HERMES_DESKTOP_PASSWORD_STORE": "basic", "ELECTRON_OZONE_PLATFORM_HINT": "x11"},
+                 ["--test=a b", url], store="basic", gpu="0", ozone="x11")
+    (module / "main.py").write_text(helper)
+
     config.write_text(json.dumps({"desktop": {"disable_gpu": True, "password_store": "kwallet5",
                                               "ozone_platform_hint": "x11",
                                               "electron_flags": '--force-device-scale-factor=1.5 "--test=a b"'}}))
@@ -234,6 +251,8 @@ def load_config():
     check_launch([url], wayland, ["--ozone-platform=wayland", url], ignore="1")
     check_launch([url], {**wayland, "HERMES_DESKTOP_IGNORE_EXISTING": "0"}, ["--ozone-platform=wayland", url],
                  ignore="0")
+    (module / "main_desktop.py").write_text(legacy_helper)
+    check_launch([url], wayland, ["--ozone-platform=wayland", url], ignore="1")
     (module / "main_desktop.py").write_text('raise ImportError("incomplete Python dependencies")\n')
     check_launch([url], wayland, ["--ozone-platform=wayland", url], ignore="1")
     shutil.rmtree(runtime / "venv")
