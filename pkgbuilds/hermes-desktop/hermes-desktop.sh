@@ -17,6 +17,20 @@ native="$runtime/apps/desktop/release/linux-unpacked/Hermes"
 cli="$runtime/.hermes/bin/hermes"
 [[ -x $cli ]] || cli="$runtime/venv/bin/hermes"
 if [[ ! -x $native || ! -x $cli ]]; then
+  # The packaged app pins its first-launch install to its release only into an
+  # empty directory. A checkout with no command and no bootstrap marker is a
+  # bootstrap that stopped early; given to the packaged app, it is updated to
+  # today's upstream main and set up with this release's installer, which
+  # stops working as upstream moves on, and that is retried without end. It
+  # is reported instead: Omarchy's installer sets it up from the release.
+  if [[ -e $runtime/.git && ! -x $cli && ! -f $runtime/.hermes-bootstrap-complete ]]; then
+    message="Hermes Desktop found an unfinished Hermes at $runtime, which the packaged app cannot finish. Run 'omarchy install hermes cli --now' to set it up, then open Hermes again."
+    echo "$message" >&2
+    if command -v notify-send >/dev/null 2>&1; then
+      notify-send --app-name='Hermes Desktop' 'Hermes Desktop' "$message" 2>/dev/null || true
+    fi
+    exit 1
+  fi
   native=/opt/hermes-desktop/Hermes
   # Only the packaged app, built from the release commit rather than the runtime's
   # checkout, is told to skip an existing Hermes.
