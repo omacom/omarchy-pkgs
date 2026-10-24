@@ -1,0 +1,737 @@
+From f94a8c9f338b3606fad914c1a54f420b5504f9f8 Mon Sep 17 00:00:00 2001
+From: minpeter <kali2005611@gmail.com>
+Date: Sun, 18 Oct 2026 23:12:16 +0900
+Subject: [PATCH] synaptics: drive the ThinkPad side LED like the Windows
+ driver
+
+Lenovo's Windows driver for the ThinkPad X1 Carbon Gen 10 reader
+(synaWudfBioUsb136.dll 6.0.69.1136, package n32gf28w) lights the LED
+beside the power button reader through VCSFW_CMD_LED_EX2 (0x39): solid
+green while a finger is expected, a 500 ms dark blink when a sample is
+taken or a print matches, and one second of amber blinks when a sample
+is rejected or a print does not match. Each event sends one 124 byte
+entry of a six event table; some models replace its green and amber
+duty cycles, picked by BIOS version.
+
+Send the same entries at the same points of verify, identify and
+enroll, turn the LED off on cancel, suspend and close, and keep the
+driver's timing rule: an event arriving while a timed one plays is
+dropped, and solid green returns once it ends if a finger is still
+expected. Green that already shows is not sent again: fprintd restarts
+verification on every retry, which can repeat within milliseconds.
+
+That driver sends them with blocking transfers from its own threads.
+Here they are queued and sent asynchronously on the bulk endpoints the
+sensor commands use, only while no sensor command waits for its reply;
+a command state about to use the endpoints waits for the LED exchange.
+
+Drive it only where that driver does: on Lenovo machines with the
+readers it binds (06cb:00f9, 00fb, 00fc, 0126, 0129 and 016d), except
+on BIOS R39ET machines, where it turns the LED off. No LED commands are
+sent in emulation, and a sensor that rejects one gets no further LED
+commands until reopened.
+
+Tested on a ThinkPad X1 Carbon Gen 10 (06cb:00fc, BIOS N3AET91W) only.
+---
+ libfprint/drivers/synaptics/synaptics.c | 470 ++++++++++++++++++++++++
+ libfprint/drivers/synaptics/synaptics.h |  13 +
+ 2 files changed, 483 insertions(+)
+
+diff --git a/libfprint/drivers/synaptics/synaptics.c b/libfprint/drivers/synaptics/synaptics.c
+index c44fd82..ec131cd 100644
+--- a/libfprint/drivers/synaptics/synaptics.c
++++ b/libfprint/drivers/synaptics/synaptics.c
+@@ -68,6 +68,417 @@ static const FpIdEntry id_table[] = {
+   { .vid = 0,  .pid = 0,  .driver_data = 0 },   /* terminating entry */
+ };
+ 
++/*
++ * Side LED of the power button reader on some ThinkPads, driven as Lenovo's
++ * Windows driver does (synaWudfBioUsb136.dll 6.0.69.1136, package n32gf28w):
++ * every event sends one 124 byte entry of a six event table with LED_EX2.
++ */
++#define SYNAPTICS_LED_STEPS 6
++#define SYNAPTICS_LED_STEP_LEN 20
++#define SYNAPTICS_LED_CMD_LEN \
++  (SENSOR_FW_CMD_HEADER_LEN + 4 + SYNAPTICS_LED_STEPS * SYNAPTICS_LED_STEP_LEN)
++
++/* Numbered as the entries of the Windows table */
++typedef enum {
++  SYNAPTICS_LED_OFF,
++  SYNAPTICS_LED_READY,
++  SYNAPTICS_LED_ENROLL_ACCEPTED,
++  SYNAPTICS_LED_ENROLL_REJECTED,
++  SYNAPTICS_LED_MATCH,
++  SYNAPTICS_LED_NO_MATCH,
++} SynapticsLedEvent;
++
++/* The readers Lenovo's driver binds (synaWudfBioUsbUwp.inf) */
++static const guint16 led_readers[] = {
++  0x00F9, 0x00FB, 0x00FC, 0x0126, 0x0129, 0x016D,
++};
++
++/* Per model duty cycles of CLedImpl::SetLedConfigByBiosVersion */
++static const struct
++{
++  const gchar *bios;
++  guint8       green;
++  guint8       amber;
++} led_duties[] = {
++  { "N36ET", 0xdc, 0x3c },
++  { "N3CET", 0xdc, 0x64 },
++  { "N3FE",  0x10, 0x0f },
++  { "N3OET", 0xff, 0x64 },
++  { "R29E",  0xfa, 0x3c },
++  { "N3VE",  0x10, 0x0f },
++  { "N46ET", 0xc8, 0x4b },
++  { "N47ET", 0xff, 0x78 },
++  { "N45ET", 0xff, 0x64 },
++  { "N3HET", 0x1e, 0x01 },
++  { "N42ET", 0x3f, 0x10 },
++  { "N44ET", 0x19, 0x0a },
++  { "R2DET", 0x96, 0x46 },
++  { "N4IET", 0xc8, 0x96 },
++  { "N4HET", 0x82, 0x64 },
++  { "N4JET", 0x82, 0x64 },
++  { "N4KET", 0xff, 0xff },
++  { "R2WET", 0xff, 0x46 },
++  { "N4LET", 0xff, 0x50 },
++  { "N4FET", 0xc8, 0x1e },
++  { "N4GET", 0xff, 0xff },
++  { "N4UET", 0xff, 0x3c },
++  { "N4TET", 0x50, 0x32 },
++  { "N4VET", 0xff, 0x50 },
++  { "N4WET", 0xd2, 0x3c },
++  { "R3BET", 0xff, 0x50 },
++  { "R3CET", 0xc8, 0x50 },
++  { "R3HET", 0xdc, 0x23 },
++};
++
++/* Like Windows, the first entry found anywhere in the BIOS version wins */
++static void
++synaptics_led_set_duties (FpiDeviceSynaptics *self,
++                          const gchar        *bios_version)
++{
++  gsize i;
++
++  self->led_green_duty = 0x96;
++  self->led_amber_duty = 0x3c;
++
++  for (i = 0; bios_version && i < G_N_ELEMENTS (led_duties); i++)
++    {
++      if (strstr (bios_version, led_duties[i].bios))
++        {
++          self->led_green_duty = led_duties[i].green;
++          self->led_amber_duty = led_duties[i].amber;
++          return;
++        }
++    }
++}
++
++static void
++synaptics_led_init (FpiDeviceSynaptics *self)
++{
++  g_autofree gchar *vendor = NULL;
++  g_autofree gchar *bios_version = NULL;
++  guint16 pid = g_usb_device_get_pid (fpi_device_get_usb_device (FP_DEVICE (self)));
++  gboolean known_reader = FALSE;
++  gsize i;
++
++  self->led_waiting = FALSE;
++  self->led_busy_until = 0;
++  self->led_enabled = FALSE;
++  self->led_ready_shown = FALSE;
++
++  /* Recorded test traffic carries no LED commands */
++  if (fpi_device_emulation_mode_enabled (FP_DEVICE (self)))
++    return;
++
++  for (i = 0; i < G_N_ELEMENTS (led_readers); i++)
++    known_reader |= led_readers[i] == pid;
++
++  /* Only where Lenovo's driver drives it: Lenovo machines with the readers
++   * it binds, except BIOS R39ET machines, where it turns the LED off. */
++  if (!known_reader ||
++      !g_file_get_contents ("/sys/class/dmi/id/sys_vendor", &vendor, NULL, NULL) ||
++      !g_str_has_prefix (vendor, "LENOVO"))
++    return;
++
++  g_file_get_contents ("/sys/class/dmi/id/bios_version", &bios_version, NULL, NULL);
++  if (bios_version && strstr (bios_version, "R39ET"))
++    return;
++
++  self->led_enabled = TRUE;
++  synaptics_led_set_duties (self, bios_version);
++}
++
++static void
++synaptics_led_step (guint8 *step,
++                    guint32 time_ms,
++                    guint8  channels,
++                    guint8  duty,
++                    guint8  green,
++                    guint8  amber)
++{
++  FP_WRITE_UINT32_LE (step, time_ms);
++  step[4] = channels;
++  step[5] = duty;
++  step[8] = step[9] = green;
++  step[12] = step[13] = amber;
++}
++
++/* Returns how long the event plays in ms, 0 if it holds until the next one */
++static guint32
++synaptics_led_build_cmd (FpiDeviceSynaptics *self,
++                         SynapticsLedEvent   event,
++                         guint8             *cmd)
++{
++  guint8 *steps = cmd + SENSOR_FW_CMD_HEADER_LEN + 4;
++  guint32 duration = 0;
++  guint n_steps = SYNAPTICS_LED_STEPS;
++  guint i;
++
++  memset (cmd, 0, SYNAPTICS_LED_CMD_LEN);
++  cmd[0] = SENSOR_CMD_LED_EX2;
++
++  switch (event)
++    {
++    case SYNAPTICS_LED_OFF:
++      break;
++
++    case SYNAPTICS_LED_READY:
++      synaptics_led_step (steps, 0xffff, 0x07, self->led_green_duty,
++                          self->led_green_duty, 0);
++      break;
++
++    case SYNAPTICS_LED_ENROLL_ACCEPTED:
++    case SYNAPTICS_LED_MATCH:
++      duration = 500;
++      n_steps = 4;
++      synaptics_led_step (steps, 500, 0x07, 0, 0, 0);
++      break;
++
++    case SYNAPTICS_LED_ENROLL_REJECTED:
++    case SYNAPTICS_LED_NO_MATCH:
++      duration = 1000;
++      n_steps = 2;
++      synaptics_led_step (steps, 166, 0x01, self->led_amber_duty, 0,
++                          self->led_amber_duty);
++      synaptics_led_step (steps + SYNAPTICS_LED_STEP_LEN, 166, 0x01, 0, 0, 0);
++      break;
++    }
++
++  /* The Windows table marks the steps of each entry with 0x20 at byte 7 */
++  for (i = 0; i < n_steps; i++)
++    steps[i * SYNAPTICS_LED_STEP_LEN + 7] = 0x20;
++
++  FP_WRITE_UINT32_LE (cmd + SENSOR_FW_CMD_HEADER_LEN, duration);
++
++  return duration;
++}
++
++typedef struct
++{
++  guint8  data[SYNAPTICS_LED_CMD_LEN];
++  guint32 duration;
++} SynapticsLedCmd;
++
++static void synaptics_led_flush (FpiDeviceSynaptics *self);
++
++static void
++synaptics_led_exchange_done (FpiDeviceSynaptics *self,
++                             GError             *error)
++{
++  self->led_in_flight = FALSE;
++
++  if (error)
++    {
++      fp_info ("Disabling the side LED: %s", error->message);
++      self->led_enabled = FALSE;
++      self->led_waiting = FALSE;
++      g_queue_clear_full (&self->led_queue, g_free);
++      g_clear_pointer (&self->led_rearm_source, g_source_destroy);
++      g_error_free (error);
++    }
++
++  synaptics_led_flush (self);
++}
++
++static void
++synaptics_led_reply_cb (FpiUsbTransfer *transfer,
++                        FpDevice       *device,
++                        gpointer        user_data,
++                        GError         *error)
++{
++  FpiByteReader reader;
++  guint16 status;
++
++  if (!error)
++    {
++      fpi_byte_reader_init (&reader, transfer->buffer, transfer->actual_length);
++      if (!fpi_byte_reader_get_uint16_le (&reader, &status))
++        error = fpi_device_error_new_msg (FP_DEVICE_ERROR_PROTO,
++                                          "LED reply too short");
++      else if (status != 0)
++        error = fpi_device_error_new_msg (FP_DEVICE_ERROR_PROTO,
++                                          "LED command failed: %d", status);
++    }
++
++  synaptics_led_exchange_done (FPI_DEVICE_SYNAPTICS (device), error);
++}
++
++static void
++synaptics_led_request_cb (FpiUsbTransfer *transfer,
++                          FpDevice       *device,
++                          gpointer        user_data,
++                          GError         *error)
++{
++  FpiUsbTransfer *reply;
++
++  if (error)
++    {
++      synaptics_led_exchange_done (FPI_DEVICE_SYNAPTICS (device), error);
++      return;
++    }
++
++  reply = fpi_usb_transfer_new (device);
++  fpi_usb_transfer_fill_bulk (reply, USB_EP_REPLY, MAX_TRANSFER_LEN);
++  fpi_usb_transfer_submit (reply, 1000, NULL, synaptics_led_reply_cb, NULL);
++}
++
++/* LED and sensor commands share the bulk endpoints and the sensor answers
++ * one command at a time: an LED command only goes out while no sensor
++ * command waits for its reply. */
++static gboolean
++synaptics_led_may_send (FpiDeviceSynaptics *self)
++{
++  if (self->led_in_flight || self->cmd_cancelling)
++    return FALSE;
++
++  if (!self->cmd_ssm)
++    return TRUE;
++
++  switch (fpi_ssm_get_cur_state (self->cmd_ssm))
++    {
++    case SYNAPTICS_CMD_WAIT_INTERRUPT:
++      return TRUE;
++
++    case SYNAPTICS_CMD_SEND_PENDING:
++    case SYNAPTICS_CMD_SEND_ASYNC:
++    case SYNAPTICS_CMD_SUSPENDED:
++      /* Held before sending anything or reporting the suspension */
++      return self->led_ssm_held;
++
++    default:
++      return FALSE;
++    }
++}
++
++/* Sends the next queued LED command or, with none it may send, lets a held
++ * command state machine run on. */
++static void
++synaptics_led_flush (FpiDeviceSynaptics *self)
++{
++  g_autofree SynapticsLedCmd *cmd = NULL;
++  FpiUsbTransfer *transfer;
++
++  if (self->led_in_flight)
++    return;
++
++  if (synaptics_led_may_send (self))
++    cmd = g_queue_pop_head (&self->led_queue);
++
++  if (!cmd)
++    {
++      if (self->led_ssm_held)
++        {
++          self->led_ssm_held = FALSE;
++          fpi_ssm_jump_to_state (self->cmd_ssm,
++                                 fpi_ssm_get_cur_state (self->cmd_ssm));
++        }
++      return;
++    }
++
++  /* The firmware plays the entry from now on */
++  self->led_busy_until = MAX (self->led_busy_until,
++                              g_get_monotonic_time () +
++                              cmd->duration * G_TIME_SPAN_MILLISECOND);
++
++  transfer = fpi_usb_transfer_new (FP_DEVICE (self));
++  fpi_usb_transfer_fill_bulk (transfer, USB_EP_REQUEST, SYNAPTICS_LED_CMD_LEN);
++  transfer->short_is_error = TRUE;
++  memcpy (transfer->buffer, cmd->data, SYNAPTICS_LED_CMD_LEN);
++  self->led_in_flight = TRUE;
++  fpi_usb_transfer_submit (transfer, 1000, NULL, synaptics_led_request_cb, NULL);
++}
++
++/* For command states about to use the bulk endpoints: TRUE holds the state
++ * until the LED exchange in flight is done, and the queued LED commands too
++ * if asked; the state then runs again. */
++static gboolean
++synaptics_led_hold_ssm (FpiDeviceSynaptics *self,
++                        gboolean            send_queued)
++{
++  if (!self->led_in_flight &&
++      (!send_queued || self->cmd_cancelling ||
++       g_queue_is_empty (&self->led_queue)))
++    return FALSE;
++
++  self->led_ssm_held = TRUE;
++  synaptics_led_flush (self);
++  return TRUE;
++}
++
++static void synaptics_led_rearm_cb (FpDevice *device,
++                                    gpointer  user_data);
++
++static void
++synaptics_led_set (FpiDeviceSynaptics *self,
++                   SynapticsLedEvent   event)
++{
++  gint64 now = g_get_monotonic_time ();
++  SynapticsLedCmd *cmd;
++
++  if (!self->led_enabled)
++    return;
++
++  /* fprintd restarts verification on every retry, which can repeat within
++   * milliseconds: green that already shows is not sent again. */
++  if (event == SYNAPTICS_LED_READY && self->led_ready_shown)
++    return;
++
++  /* Like _vfmUtilSetLedEvent: events are dropped while a timed one plays,
++   * after which solid green returns if a finger is still expected. */
++  if (now < self->led_busy_until)
++    {
++      if (self->led_waiting && !self->led_rearm_source)
++        {
++          self->led_rearm_source =
++            fpi_device_add_timeout (FP_DEVICE (self),
++                                    (self->led_busy_until - now + 999) / 1000,
++                                    synaptics_led_rearm_cb, NULL, NULL);
++        }
++      return;
++    }
++
++  cmd = g_new (SynapticsLedCmd, 1);
++  cmd->duration = synaptics_led_build_cmd (self, event, cmd->data);
++  /* Also while it is queued, so that no later event overtakes it */
++  self->led_busy_until = now + cmd->duration * G_TIME_SPAN_MILLISECOND;
++  g_queue_push_tail (&self->led_queue, cmd);
++  self->led_ready_shown = event == SYNAPTICS_LED_READY;
++  synaptics_led_flush (self);
++}
++
++static void
++synaptics_led_rearm_cb (FpDevice *device,
++                        gpointer  user_data)
++{
++  FpiDeviceSynaptics *self = FPI_DEVICE_SYNAPTICS (device);
++
++  self->led_rearm_source = NULL;
++
++  if (self->led_waiting)
++    synaptics_led_set (self, SYNAPTICS_LED_READY);
++}
++
++static void
++synaptics_led_stop_rearm (FpiDeviceSynaptics *self)
++{
++  g_clear_pointer (&self->led_rearm_source, g_source_destroy);
++}
++
++/* A finger is expected, as when the Windows driver starts a capture */
++static void
++synaptics_led_finger_needed (FpiDeviceSynaptics *self)
++{
++  self->led_waiting = TRUE;
++  synaptics_led_set (self, SYNAPTICS_LED_READY);
++}
++
++static void
++synaptics_led_finish (FpiDeviceSynaptics *self,
++                      SynapticsLedEvent   event)
++{
++  self->led_waiting = FALSE;
++  synaptics_led_set (self, event);
++}
++
+ 
+ static void
+ cmd_receive_cb (FpiUsbTransfer *transfer,
+@@ -155,6 +566,7 @@ cmd_receive_cb (FpiUsbTransfer *transfer,
+       if (resp.response_id == BMKT_RSP_CANCEL_OP_OK)
+         {
+           fp_dbg ("Received cancellation success response");
++          synaptics_led_finish (self, SYNAPTICS_LED_OFF);
+           fpi_ssm_mark_failed (transfer->ssm,
+                                g_error_new_literal (G_IO_ERROR,
+                                                     G_IO_ERROR_CANCELLED,
+@@ -280,6 +692,9 @@ synaptics_cmd_run_state (FpiSsm   *ssm,
+     case SYNAPTICS_CMD_SEND_PENDING:
+       if (self->cmd_pending_transfer)
+         {
++          if (synaptics_led_hold_ssm (self, TRUE))
++            break;
++
+           self->cmd_pending_transfer->ssm = ssm;
+           fpi_usb_transfer_submit (self->cmd_pending_transfer,
+                                    1000,
+@@ -295,6 +710,9 @@ synaptics_cmd_run_state (FpiSsm   *ssm,
+       break;
+ 
+     case SYNAPTICS_CMD_GET_RESP:
++      if (synaptics_led_hold_ssm (self, FALSE))
++        break;
++
+       transfer = fpi_usb_transfer_new (dev);
+       transfer->ssm = ssm;
+       fpi_usb_transfer_fill_bulk (transfer, USB_EP_REPLY, MAX_TRANSFER_LEN);
+@@ -307,6 +725,9 @@ synaptics_cmd_run_state (FpiSsm   *ssm,
+       break;
+ 
+     case SYNAPTICS_CMD_WAIT_INTERRUPT:
++      /* The bulk endpoints are free while waiting */
++      synaptics_led_flush (self);
++
+       /* Interruptions are permitted only during an interrupt transfer */
+       fpi_device_critical_leave (dev);
+ 
+@@ -322,6 +743,9 @@ synaptics_cmd_run_state (FpiSsm   *ssm,
+       break;
+ 
+     case SYNAPTICS_CMD_SEND_ASYNC:
++      if (synaptics_led_hold_ssm (self, TRUE))
++        break;
++
+       transfer = fpi_usb_transfer_new (dev);
+       transfer->ssm = ssm;
+       fpi_usb_transfer_fill_bulk (transfer, USB_EP_REQUEST, SENSOR_FW_CMD_HEADER_LEN);
+@@ -340,12 +764,17 @@ synaptics_cmd_run_state (FpiSsm   *ssm,
+ 
+     case SYNAPTICS_CMD_SUSPENDED:
+       /* The resume handler continues to the next state! */
++      if (synaptics_led_hold_ssm (self, TRUE))
++        break;
++
+       fpi_device_critical_leave (dev);
+       fpi_device_suspend_complete (dev, NULL);
+       break;
+ 
+     case SYNAPTICS_CMD_RESUME:
+       fpi_device_critical_enter (dev);
++      if (self->led_waiting)
++        synaptics_led_set (self, SYNAPTICS_LED_READY);
+       fpi_ssm_jump_to_state (ssm, SYNAPTICS_CMD_WAIT_INTERRUPT);
+       break;
+     }
+@@ -365,6 +794,11 @@ cmd_ssm_done (FpiSsm *ssm, FpDevice *dev, GError *error)
+ 
+   fpi_device_critical_leave (dev);
+   self->cmd_complete_on_removal = FALSE;
++
++  /* LED commands that waited for the sensor command */
++  self->cmd_cancelling = FALSE;
++  self->led_ssm_held = FALSE;
++  synaptics_led_flush (self);
+ }
+ 
+ static void
+@@ -605,6 +1039,7 @@ verify_msg_cb (FpiDeviceSynaptics *self,
+       break;
+ 
+     case BMKT_RSP_VERIFY_FAIL:
++      self->led_waiting = FALSE;
+       if (resp->result == BMKT_SENSOR_STIMULUS_ERROR)
+         {
+           fp_info ("Match error occurred");
+@@ -615,6 +1050,7 @@ verify_msg_cb (FpiDeviceSynaptics *self,
+       else if (resp->result == BMKT_FP_NO_MATCH)
+         {
+           fp_info ("Print didn't match");
++          synaptics_led_set (self, SYNAPTICS_LED_NO_MATCH);
+           fpi_device_verify_report (device, FPI_MATCH_FAIL, NULL, NULL);
+           verify_complete_after_finger_removal (self);
+         }
+@@ -637,6 +1073,7 @@ verify_msg_cb (FpiDeviceSynaptics *self,
+     case BMKT_RSP_VERIFY_OK:
+       fp_info ("Verify was successful! for user: %s finger: %d score: %f",
+                verify_resp->user_id, verify_resp->finger_id, verify_resp->match_result);
++      synaptics_led_finish (self, SYNAPTICS_LED_MATCH);
+       fpi_device_verify_report (device, FPI_MATCH_SUCCESS, NULL, NULL);
+       verify_complete_after_finger_removal (self);
+       break;
+@@ -669,6 +1106,7 @@ verify (FpDevice *device)
+ 
+   self->action_starting = TRUE;
+   fpi_device_critical_enter (device);
++  synaptics_led_finger_needed (self);
+   synaptics_sensor_cmd (self, 0, BMKT_CMD_VERIFY_USER, user_id, user_id_len, verify_msg_cb);
+ }
+ 
+@@ -732,6 +1170,7 @@ identify_msg_cb (FpiDeviceSynaptics *self,
+       }
+ 
+     case BMKT_RSP_ID_FAIL:
++      self->led_waiting = FALSE;
+       if (resp->result == BMKT_SENSOR_STIMULUS_ERROR)
+         {
+           fp_info ("Match error occurred");
+@@ -742,6 +1181,7 @@ identify_msg_cb (FpiDeviceSynaptics *self,
+       else if (resp->result == BMKT_FP_NO_MATCH)
+         {
+           fp_info ("Print didn't match");
++          synaptics_led_set (self, SYNAPTICS_LED_NO_MATCH);
+           fpi_device_identify_report (device, NULL, NULL, NULL);
+           identify_complete_after_finger_removal (self, NULL);
+         }
+@@ -779,6 +1219,8 @@ identify_msg_cb (FpiDeviceSynaptics *self,
+                                                   (GEqualFunc) fp_print_equal,
+                                                   &index);
+ 
++        synaptics_led_finish (self, found ? SYNAPTICS_LED_MATCH : SYNAPTICS_LED_NO_MATCH);
++
+         if (found)
+           fpi_device_identify_report (device, g_ptr_array_index (prints, index), print, NULL);
+         else
+@@ -810,6 +1252,7 @@ identify (FpDevice *device)
+ 
+   self->action_starting = TRUE;
+   fpi_device_critical_enter (device);
++  synaptics_led_finger_needed (self);
+ 
+   init_identify_msg (device);
+   compose_and_send_identify_msg (device);
+@@ -959,17 +1402,29 @@ enroll_msg_cb (FpiDeviceSynaptics *self,
+          * touches. */
+         if (self->enroll_stage == done_stages)
+           {
++            synaptics_led_set (self, SYNAPTICS_LED_ENROLL_REJECTED);
+             fpi_device_enroll_progress (device,
+                                         done_stages,
+                                         NULL,
+                                         fpi_device_retry_new (FP_DEVICE_RETRY_GENERAL));
+           }
++        else
++          {
++            synaptics_led_set (self, SYNAPTICS_LED_ENROLL_ACCEPTED);
++          }
+ 
+         while (self->enroll_stage < done_stages)
+           {
+             self->enroll_stage += 1;
+             fpi_device_enroll_progress (device, self->enroll_stage, NULL, NULL);
+           }
++
++        /* The sensor waits for the next touch right away, as the Windows
++         * driver does by starting its next capture. */
++        if (enroll_resp->progress < 100)
++          synaptics_led_set (self, SYNAPTICS_LED_READY);
++        else
++          self->led_waiting = FALSE;
+         break;
+       }
+ 
+@@ -988,6 +1443,7 @@ enroll_msg_cb (FpiDeviceSynaptics *self,
+     case BMKT_RSP_ENROLL_FAIL:
+       {
+         fp_info ("Enrollment has failed!: %d", resp->result);
++        synaptics_led_finish (self, SYNAPTICS_LED_ENROLL_REJECTED);
+         if (resp->result == BMKT_FP_DATABASE_FULL)
+           {
+             fpi_device_enroll_complete (device,
+@@ -1010,6 +1466,7 @@ enroll_msg_cb (FpiDeviceSynaptics *self,
+         FpPrint *print = NULL;
+ 
+         fp_info ("Enrollment was successful!");
++        self->led_waiting = FALSE;
+ 
+         fpi_device_get_enroll_data (device, &print);
+ 
+@@ -1067,6 +1524,7 @@ enroll (FpDevice *device)
+ 
+   self->action_starting = TRUE;
+   fpi_device_critical_enter (device);
++  synaptics_led_finger_needed (self);
+ 
+   synaptics_sensor_cmd (self, 0, BMKT_CMD_ENROLL_USER, payload, user_id_len + 2, enroll_msg_cb);
+ }
+@@ -1436,6 +1894,8 @@ dev_init (FpDevice *device)
+   if (!g_usb_device_claim_interface (fpi_device_get_usb_device (device), 0, 0, &error))
+     goto error;
+ 
++  synaptics_led_init (self);
++
+   synaptics_sensor_cmd (self, 0, BMKT_CMD_FPS_INIT, NULL, 0, fps_init_msg_cb);
+ 
+   return;
+@@ -1451,6 +1911,8 @@ dev_exit (FpDevice *device)
+ 
+   G_DEBUG_HERE ();
+ 
++  synaptics_led_stop_rearm (self);
++  synaptics_led_finish (self, SYNAPTICS_LED_OFF);
+   synaptics_sensor_cmd (self, 0, BMKT_CMD_POWER_DOWN_NOTIFY, NULL, 0, fps_deinit_cb);
+ }
+ 
+@@ -1459,6 +1921,11 @@ cancel (FpDevice *dev)
+ {
+   FpiDeviceSynaptics *self = FPI_DEVICE_SYNAPTICS (dev);
+ 
++  /* No LED command may go out between the cancel request and its reply */
++  self->led_waiting = FALSE;
++  synaptics_led_stop_rearm (self);
++  self->cmd_cancelling = TRUE;
++
+   /* We just send out a cancel command and hope for the best. */
+   synaptics_sensor_cmd (self, -1, BMKT_CMD_CANCEL_OP, NULL, 0, NULL);
+ 
+@@ -1488,6 +1955,9 @@ suspend (FpDevice *dev)
+   g_assert (self->cmd_ssm);
+   g_assert (fpi_ssm_get_cur_state (self->cmd_ssm) == SYNAPTICS_CMD_WAIT_INTERRUPT);
+   self->cmd_suspended = TRUE;
++  synaptics_led_stop_rearm (self);
++  /* Goes out now; the suspend state waits for it */
++  synaptics_led_set (self, SYNAPTICS_LED_OFF);
+ 
+   /* Cancel the current transfer.
+    * The CMD SSM will go into the suspend state and signal readiness. */
+diff --git a/libfprint/drivers/synaptics/synaptics.h b/libfprint/drivers/synaptics/synaptics.h
+index 6138db3..d437421 100644
+--- a/libfprint/drivers/synaptics/synaptics.h
++++ b/libfprint/drivers/synaptics/synaptics.h
+@@ -37,6 +37,7 @@ G_DECLARE_FINAL_TYPE (FpiDeviceSynaptics, fpi_device_synaptics, FPI, DEVICE_SYNA
+ #define USB_INTERRUPT_DATA_SIZE 7
+ 
+ #define SENSOR_CMD_GET_VERSION 1
++#define SENSOR_CMD_LED_EX2 57
+ #define SENSOR_CMD_ACE_COMMAND 167
+ #define SENSOR_CMD_ASYNCMSG_READ 168
+ 
+@@ -113,6 +114,7 @@ struct _FpiDeviceSynaptics
+   FpiUsbTransfer       *cmd_pending_transfer;
+   gboolean              cmd_complete_on_removal;
+   gboolean              cmd_suspended;
++  gboolean              cmd_cancelling;
+   guint8                id_idx;
+ 
+   bmkt_sensor_version_t mis_version;
+@@ -128,4 +130,15 @@ struct _FpiDeviceSynaptics
+   struct syna_enroll_resp_data enroll_resp_data;
+   syna_state_t                 state;
+   GError                      *delay_error;
++
++  gboolean                     led_enabled;
++  gboolean                     led_waiting;
++  gboolean                     led_ready_shown;
++  gboolean                     led_in_flight;
++  gboolean                     led_ssm_held;
++  GQueue                       led_queue;
++  GSource                     *led_rearm_source;
++  gint64                       led_busy_until;
++  guint8                       led_green_duty;
++  guint8                       led_amber_duty;
+ };
+-- 
+2.53.0
+
