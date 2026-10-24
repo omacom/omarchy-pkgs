@@ -1,5 +1,5 @@
 #!/bin/bash
-# limine-mkinitcpio-hook: the x86_64 package is upstream's as before. On
+# limine-mkinitcpio-hook preserves failed builds on both architectures. On
 # aarch64, limine-apple-gate leaves every machine but an Apple Silicon Mac as
 # the x86_64 package behaves; a Mac keeps /boot current through mkinitcpio's
 # own kernel hook, and Limine waits until Omarchy activates it.
@@ -259,13 +259,13 @@ manifest() {
 scripts=/usr/share/libalpm/scripts
 gate=$scripts/limine-apple-gate
 upstream_hook=$upstream/install/arch-linux/limine-mkinitcpio-hook
-for file in etc/pacman.d/hooks/90-mkinitcpio-install.hook usr/local/bin/mkinitcpio \
+for file in etc/pacman.d/hooks/90-mkinitcpio-install.hook \
   usr/share/libalpm/hooks/{60-limine-mkinitcpio-remove-pre,80-limine-efi-deploy,90-limine-mkinitcpio-remove-post}.hook; do
   cmp -s "$upstream_hook/$file" "$PKG_X86/$file" || fail "x86_64 ships upstream's $file unchanged"
 done
 [[ ! -e $PKG_X86$gate && ! -e $PKG_X86/usr/share/libalpm/hooks/90-mkinitcpio-apple-install.hook ]] ||
   fail "x86_64 ships no Apple Silicon file"
-pass "x86_64 packages upstream's hooks and wrapper unchanged"
+pass "x86_64 keeps upstream hooks and preserves failed mkinitcpio status"
 
 differences=$(diff <(manifest "$PKG_X86") <(manifest "$PKG_ARM") || true)
 changed=$(sed -n 's/^> \(\S*\) .*/\1/p' <<<"$differences")
@@ -530,3 +530,15 @@ for m in mac-dormant mac-active; do
   [[ $(wrapper "$TEST_ROOT/root-aarch64" "$m") == 'mkinitcpio -P' ]] || fail "$m runs plain mkinitcpio"
 done
 pass "the mkinitcpio wrapper is upstream's everywhere but a Mac, where it is plain mkinitcpio"
+
+# A failed builder must stop before the wrapper's later prompt can mask it.
+for pair in 'root-x86_64 x86' 'root-aarch64 qualcomm' 'root-aarch64 mac-active'; do
+  read -r directory model <<< "$pair"
+  root=$TEST_ROOT/$directory
+  sed "s|/usr/|$root/usr/|g" "$root/usr/local/bin/mkinitcpio" > "$TEST_ROOT/failing-wrapper"
+  printf '#!/bin/bash\nexit 23\n' > "$root/usr/bin/mkinitcpio"
+  rc=0
+  on "$model" bash "$TEST_ROOT/failing-wrapper" -P </dev/null >/dev/null 2>&1 || rc=$?
+  [[ $rc == 23 ]] || fail "$model wrapper lost the failed builder status: $rc"
+done
+pass "failed mkinitcpio returns its status on x86, Qualcomm and Apple Silicon"
