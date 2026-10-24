@@ -23,11 +23,14 @@ RUN apk add --no-cache \
 
 # Map Docker TARGETARCH (amd64/arm64) to Arch naming (x86_64/aarch64)
 # Create pacman.conf from scratch so we control it entirely
+# x86_64 also gets [multilib]: recipes that ship 32-bit x86 code (lib32-*
+# packages, and x86 guest drivers for FEX on Apple Silicon) build against it.
+# It is listed after [extra], so [core] and [extra] still win any provider tie.
 RUN mkdir -p /etc/pacman.d && \
     case "${TARGETARCH}" in \
     amd64) \
         echo "x86_64" > /tmp/arch && \
-        REPOS="[core]\nInclude = /etc/pacman.d/mirrorlist\n\n[extra]\nInclude = /etc/pacman.d/mirrorlist\n" ;; \
+        REPOS="[core]\nInclude = /etc/pacman.d/mirrorlist\n\n[extra]\nInclude = /etc/pacman.d/mirrorlist\n\n[multilib]\nInclude = /etc/pacman.d/mirrorlist\n" ;; \
     arm64) \
         echo "aarch64" > /tmp/arch && \
         REPOS="[core]\nInclude = /etc/pacman.d/mirrorlist\n\n[extra]\nInclude = /etc/pacman.d/mirrorlist\n\n[alarm]\nInclude = /etc/pacman.d/mirrorlist\n\n[aur]\nInclude = /etc/pacman.d/mirrorlist\n" ;; \
