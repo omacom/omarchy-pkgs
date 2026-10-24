@@ -15,7 +15,12 @@ The device tree names every firmware file the kernel will ask for
 `/usr/lib/firmware{,/updates}`, finds each one by file name in
 `Windows/System32/DriverStore/FileRepository` on an NTFS partition it can
 mount read-only: with `--stage`, any such partition, and with `--install`,
-only those on internal disks. A DSP device-tree image the device tree calls
+only those on internal disks. Disk names and partition numbers are not assumed;
+EFI, Linux and recovery partitions without a driver store are ignored. Directory
+and firmware names are matched case-insensitively. An existing Windows mount is
+read in place and is never remounted or unmounted by this tool. Otherwise the
+tool tries a temporary read-only `ntfs3` mount, then `ntfs-3g` when available;
+it never forces or repairs an NTFS volume. A DSP device-tree image the device tree calls
 `*_dtb.mbn` is also found under its Windows name, `*_dtbs.elf`, when the exact
 name is missing. If Windows carries several variants and linux-firmware has a
 companion image from the same device-tree node, the sibling image's hash
@@ -79,7 +84,29 @@ so a listed ADSP image would bypass the check.
   (a Windows install of the *same model*: the files are tied to the vendor's
   signing keys). It rebuilds the boot image; reboot afterwards.
 
-BitLocker volumes cannot be read; turn BitLocker off in Windows first.
+`--list-required` includes firmware already installed in the live system, so the
+A16 preflight can verify every staged copy before disk cleanup.
+
+Staged files are checked against their manifest's SHA-256 before reuse. A corrupt
+or incomplete stage does not hide a readable Windows source: rerunning staging
+replaces the bad copy. If Windows is no longer available, corrupt files are
+reported and left uninstalled rather than silently trusted.
+
+BitLocker volumes are opened read-only with cryptsetup, or Dislocker when
+cryptsetup cannot read their metadata. A clear-key protector, present when
+protection is suspended, can be used automatically. Otherwise
+`--unlock-bitlocker` prompts on the local terminal for the Windows recovery key.
+The key is read by the unlock tool with echo disabled; it is not passed in command
+arguments, saved, or written to the firmware log. Cancelling stops the command.
+Windows stays encrypted. Temporary NTFS mounts, FUSE mounts and decrypted
+mappings are released before staging succeeds. An existing owner mount is
+reused without being changed or unmounted. Install the optional cryptsetup and
+dislocker packages for these paths; the ARM ISO includes them and ntfs-3g.
+An exported Windows `FileRepository` can still be supplied with `-d`. Conflicting
+firmware from multiple Windows installations is still refused unless the bytes
+agree or an installed companion image identifies a unique match. Missing files
+remain explicitly reported; partial extraction is not proof that all hardware
+will work.
 
 ## Retirement
 
@@ -89,3 +116,13 @@ machine is covered, drop the package and prune the `/usr/lib/firmware/updates`
 entries listed in the manifest.
 
 Derived from Canonical's `qcom-firmware-extract` (GPL-2+).
+
+## Board requirements outside the device tree
+
+`required.d/<compatible>.list` adds firmware requested directly by a driver.
+Each line is a Linux firmware path followed by an optional Windows basename.
+The A16 list preserves QCC2072 `board.bin`, including with `--stage-installed`,
+and accepts the NCM820A ELF named by ASUS's Wi-Fi INF. It does not select a
+random `bdwlan.eXX` variant. Conflicting copies are refused by the same
+companion/ambiguity rules as DSP firmware. Existing Linux firmware can be
+exported into a dedicated directory and imported with `-d` before installation.

@@ -6,11 +6,16 @@ package_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 extractor="$package_dir/qcom-firmware-extract"
 scratch=$(mktemp -d)
 trap 'rm -rf "$scratch"' EXIT
+export QCOM_FW_PROVIDED_DIR="$scratch/provided.d"
+export QCOM_FW_REQUIRED_DIR="$scratch/required.d"
 
 # macOS' install(1) gives -D a different meaning. Prefer GNU coreutils when
 # this focused test runs on a contributor's Mac; Arch uses GNU install already.
 test_bin="$scratch/bin"
 mkdir -p "$test_bin"
+# Default to no disks; partition fixtures below supply their own enumerator.
+printf '#!/bin/sh\nexit 0\n' > "$test_bin/lsblk"
+chmod +x "$test_bin/lsblk"
 if command -v ginstall >/dev/null 2>&1; then
   ln -s "$(command -v ginstall)" "$test_bin/install"
 fi
@@ -62,6 +67,14 @@ run_extractor() {
     QCOM_FW_TEST_EUID=0 \
     PATH="$test_bin:$PATH" \
     bash "$extractor" "$@"
+}
+
+stage_manifest() {
+  local directory=$1 name
+  shift
+  for name; do
+    printf '%s %s test\n' "$name" "$(sha256sum "$directory/$name" | cut -d' ' -f1)"
+  done
 }
 
 # A different remote processor must not supply the matching companion.
@@ -209,6 +222,11 @@ stub_windows_partition() {
     local -a columns=()
     printf 'lsblk\n' >>"$TEST_SCAN_LOG"
     [[ -z ${TEST_NO_WINDOWS-} ]] || return 0
+    if [[ ${*: -2:1} == PATH && ${*: -1} == /dev/nvme0n1p3 ]]; then
+      printf '%s\n' /dev/nvme0n1p3
+      [[ -z ${TEST_MOUNTED_DEV:-} ]] || printf '%s\n' "${TEST_MOUNTED_DEV// /\\x20}"
+      return 0
+    fi
     for arg; do
       if [[ $previous == -*o ]]; then IFS=, read -ra columns <<<"$arg"; fi
       previous=$arg
@@ -217,7 +235,7 @@ stub_windows_partition() {
       row=""
       for column in "${columns[@]}"; do
         case $column in
-          PATH) row+=" $path" ;;
+          PATH) row+=" ${path// /\\x20}" ;;
           FSTYPE) row+=" $fstype" ;;
           TRAN) row+=" $tran" ;;
           RM) row+=" $rm" ;;
@@ -230,10 +248,30 @@ stub_windows_partition() {
   mount() {
     local device=${*: -2:1} mount_point=${*: -1}
     printf 'mount %s\n' "$device" >>"$TEST_SCAN_LOG"
-    cp -R "$TEST_WINDOWS/${device##*/}/." "$mount_point/"
+    printf 'mount-args %s\n' "$*" >>"$TEST_SCAN_LOG"
+    [[ ${TEST_ALL_MOUNTS_FAIL:-0} != 1 ]] || return 1
+    [[ ${TEST_NTFS3_FAIL:-0} != 1 || $2 != ntfs3 ]] || return 1
+    if [[ $device == /dev/mapper/qcom-fw-* || $device == */dislocker-file ]]; then
+      cp -R "$TEST_WINDOWS/nvme0n1p3/." "$mount_point/"
+    else
+      cp -R "$TEST_WINDOWS/${device##*/}/." "$mount_point/"
+    fi
   }
-  umount() { find "$1" -mindepth 1 -delete; }
-  export -f lsblk mount umount
+  findmnt() {
+    local arg previous='' device=''
+    for arg; do
+      [[ $previous != -S ]] || device=$arg
+      previous=$arg
+    done
+    [[ -n ${TEST_MOUNTED_DEV:-} && $device == "$TEST_MOUNTED_DEV" ]] || return 1
+    printf '%s\n' "${TEST_MOUNTED_PATH// /\\x20}"
+  }
+  umount() {
+    printf 'umount %s\n' "$1" >>"$TEST_SCAN_LOG"
+    [[ ${TEST_UMOUNT_FAIL:-0} != 1 ]] || return 1
+    find "$1" -mindepth 1 -delete
+  }
+  export -f lsblk mount findmnt umount
   export TEST_WINDOWS=$1 TEST_SCAN_LOG=$2
 }
 
@@ -337,7 +375,7 @@ stub_windows_partition() {
   dtb_stage="$rerun/dtb-stage"
   mkdir -p "$dtb_stage/${dtb%/*}"
   printf 'staged-dtb' >"$dtb_stage/$dtb"
-  printf '%s %s %s\n' "$dtb" 0 test >"$dtb_stage/manifest"
+  stage_manifest "$dtb_stage" "$dtb" >"$dtb_stage/manifest"
   reset_installed
   run_rerun --install --no-rebuild --stage-dir "$dtb_stage"
   [[ $(installed "$dtb") == staged-dtb && $(installed "$adsp") == windows-adsp ]]
@@ -376,7 +414,7 @@ stub_windows_partition() {
   mkdir -p "$moved/${old_adsp%/*}" "$moved/${dtb%/*}"
   printf 'moved-adsp' >"$moved/$old_adsp"
   printf 'staged-dtb' >"$moved/$dtb"
-  printf '%s 0 test\n%s 0 test\n' "$old_adsp" "$dtb" >"$moved/manifest"
+  stage_manifest "$moved" "$old_adsp" "$dtb" >"$moved/manifest"
   reset_installed
   run_rerun --install --no-rebuild --stage-dir "$moved"
   [[ $(installed "$adsp") == windows-adsp && $(installed "$dtb") == staged-dtb ]]
@@ -384,7 +422,7 @@ stub_windows_partition() {
   TEST_NO_WINDOWS=1 run_rerun --install --no-rebuild --stage-dir "$moved"
   [[ -s $TEST_SCAN_LOG ]]
   [[ $(installed "$adsp") == moved-adsp && $(installed "$dtb") == staged-dtb ]]
-  printf '%s 0 test\n' "$dtb" >"$moved/manifest"
+  stage_manifest "$moved" "$dtb" >"$moved/manifest"
   reset_installed
   TEST_NO_WINDOWS=1 run_rerun --install --no-rebuild --stage-dir "$moved"
   [[ ! -e $rerun/firmware/updates/$adsp ]]
@@ -393,7 +431,7 @@ stub_windows_partition() {
   # The stage does not override Windows refusing ambiguous variants.
   mkdir -p "${windows_store%_1}_2"
   printf 'other-adsp' >"${windows_store%_1}_2/qcadsp.mbn"
-  printf '%s 0 test\n%s 0 test\n' "$old_adsp" "$dtb" >"$moved/manifest"
+  stage_manifest "$moved" "$old_adsp" "$dtb" >"$moved/manifest"
   reset_installed
   run_rerun --install --no-rebuild --stage-dir "$moved" 2>"$rerun/warnings"
   grep -Fq "refusing ambiguous qcadsp.mbn" "$rerun/warnings"
@@ -433,6 +471,131 @@ stub_windows_partition() {
     done
   )
   echo "ok - an installed system reads only internal disks, the live session all"
+
+  # A16 dual boot: EFI/Linux/recovery partitions, another Windows disk, and
+  # differently cased directory/file names must not select the wrong source.
+  (
+    rerun="$scratch/a16-discovery"
+    rerun_dt="$rerun/device-tree"
+    adsp=qcom/glymur/ASUSTeK/UX3607OA/qcadsp8480.mbn
+    dtb=qcom/glymur/ASUSTeK/UX3607OA/adsp_dtbs.elf
+    export TEST_WINDOWS="$rerun/disks" TEST_SCAN_LOG="$rerun/scan.log"
+    export TEST_PARTITIONS=$'/dev/nvme0n1p1|vfat|nvme|0|0\n/dev/nvme0n1p2|ntfs|nvme|0|0\n/dev/nvme0n1p3|ntfs|nvme|0|0\n/dev/nvme0n1p4|btrfs|nvme|0|0\n/dev/nvme1n1p7|ntfs|nvme|0|0'
+    store="$TEST_WINDOWS/nvme0n1p3/WINDOWS/system32/driverstore/filerepository/a16.inf_1"
+    other="$TEST_WINDOWS/nvme1n1p7/Windows/System32/DriverStore/FileRepository/other.inf_1"
+    mkdir -p "$rerun/root/run" "$rerun_dt/remoteproc@0" "$store" "$other" \
+      "$TEST_WINDOWS/nvme0n1p2/Recovery" "$TEST_WINDOWS/nvme0n1p3/Windows.old"
+    printf '%s\0%s\0' "$adsp" "$dtb" >"$rerun_dt/remoteproc@0/firmware-name"
+    printf 'a16-adsp' >"$store/QCADSP8480.MBN"
+    printf 'a16-dtb' >"$store/ADSP_DTBS.ELF"
+    printf 'wrong-recovery-copy' >"$TEST_WINDOWS/nvme0n1p2/Recovery/qcadsp8480.mbn"
+    printf 'wrong-old-copy' >"$TEST_WINDOWS/nvme0n1p3/Windows.old/qcadsp8480.mbn"
+    reset_installed
+    run_rerun --stage "$rerun/dual-boot"
+    [[ $(<"$rerun/dual-boot/$adsp") == a16-adsp && $(<"$rerun/dual-boot/$dtb") == a16-dtb ]]
+    ! grep -Eq '^mount /dev/nvme0n1p[14]$' "$TEST_SCAN_LOG"
+    echo "ok - A16 dual boot finds the real Windows driver store across partitions and case differences"
+
+    printf 'other-board-adsp' >"$other/qcadsp8480.mbn"
+    output=$(run_rerun --stage "$rerun/conflicting-windows" 2>&1)
+    [[ ! -e $rerun/conflicting-windows/$adsp && $output == *'refusing ambiguous qcadsp8480.mbn'* ]]
+    printf 'a16-adsp' >"$other/qcadsp8480.mbn"
+    run_rerun --stage "$rerun/identical-windows"
+    [[ $(<"$rerun/identical-windows/$adsp") == a16-adsp ]]
+    echo "ok - two Windows installations cannot silently supply conflicting A16 firmware"
+
+    # A copied stage is trusted only while its bytes match the saved checksum.
+    printf 'corrupt-copy' >"$rerun/dual-boot/$adsp"
+    reset_installed
+    output=$(TEST_NO_WINDOWS=1 run_rerun --install --no-rebuild --stage-dir "$rerun/dual-boot" 2>&1)
+    [[ ! -e $rerun/firmware/updates/$adsp && $(installed "$dtb") == a16-dtb ]]
+    [[ $output == *'SHA-256 does not match its manifest'* ]]
+    run_rerun --stage "$rerun/dual-boot"
+    [[ $(<"$rerun/dual-boot/$adsp") == a16-adsp ]]
+    reset_installed
+    run_rerun --install --no-rebuild --stage-dir "$rerun/dual-boot"
+    [[ $(installed "$adsp") == a16-adsp && ! -e $TEST_SCAN_LOG ]]
+    echo "ok - corrupt staged firmware is refused, recovered from Windows, and verified on reuse"
+
+    cryptsetup() {
+      printf 'cryptsetup %s\n' "$*" >>"$TEST_SCAN_LOG"
+      [[ $1 == close ]] && return 0
+      [[ $1 == open && ${TEST_CRYPTSETUP_CLEARKEY:-0} == 1 ]]
+    }
+    dislocker-fuse() {
+      printf 'dislocker-fuse %s\n' "$*" >>"$TEST_SCAN_LOG"
+      [[ ${TEST_DISLOCKER_CANCEL:-0} != 1 ]] || kill -TERM "$BASHPID"
+      [[ ${TEST_DISLOCKER_CLEARKEY:-0} == 1 ]] || return 1
+      touch "${*: -1}/dislocker-file"
+    }
+    export -f cryptsetup dislocker-fuse
+    # Locked volumes need an explicit local prompt; they are never mounted raw.
+    export TEST_PARTITIONS=$'/dev/nvme0n1p3|BitLocker|nvme|0|0'
+    reset_installed
+    output=$(run_rerun --stage "$rerun/bitlocker" 2>&1)
+    [[ $output == *'use --unlock-bitlocker to enter its recovery key locally'* ]]
+    [[ ! -s $rerun/bitlocker/manifest ]]
+    ! grep -q '^mount ' "$TEST_SCAN_LOG"
+
+    reset_installed
+    TEST_CRYPTSETUP_CLEARKEY=1 run_rerun --stage "$rerun/bitlocker-cryptsetup"
+    [[ $(<"$rerun/bitlocker-cryptsetup/$adsp") == a16-adsp ]]
+    grep -q '^cryptsetup open --type bitlk --readonly --batch-mode --key-file /dev/null ' "$TEST_SCAN_LOG"
+    grep -q '^mount-args -t ntfs3 -o ro,nosuid,nodev,noexec /dev/mapper/qcom-fw-' "$TEST_SCAN_LOG"
+    [[ $(tail -n1 "$TEST_SCAN_LOG") == 'cryptsetup close qcom-fw-'* ]]
+    echo "ok - clear-key BitLocker uses a read-only mapper and closes it after NTFS"
+
+    reset_installed
+    printf '#!/bin/sh\nexit 0\n' >"$test_bin/mount.ntfs-3g"
+    chmod +x "$test_bin/mount.ntfs-3g"
+    TEST_DISLOCKER_CLEARKEY=1 run_rerun --stage "$rerun/bitlocker-dislocker"
+    [[ $(<"$rerun/bitlocker-dislocker/$dtb") == a16-dtb ]]
+    grep -q '^dislocker-fuse -r -c -V /dev/nvme0n1p3 -- -o ro ' "$TEST_SCAN_LOG"
+    grep -q '^mount-args -t ntfs-3g -o ro,nosuid,nodev,noexec,loop .*dislocker-file ' "$TEST_SCAN_LOG"
+    [[ $(tail -n2 "$TEST_SCAN_LOG" | head -n1) == *'/qcom-firmware-extract.'* ]]
+    [[ $(tail -n1 "$TEST_SCAN_LOG") == *'/qcom-bitlocker.'* ]]
+    echo "ok - unsupported BitLocker metadata falls back to read-only Dislocker with nested cleanup"
+
+    reset_installed
+    status=0
+    TEST_DISLOCKER_CANCEL=1 run_rerun --stage "$rerun/bitlocker-cancel" >/dev/null 2>&1 || status=$?
+    [[ $status == 143 ]]
+    [[ -z $(find "$rerun/root/run" -name 'qcom-bitlocker.*' -print) ]]
+    echo "ok - cancellation during unlock releases its pending mount directory"
+
+    reset_installed
+    if TEST_DISLOCKER_CLEARKEY=1 TEST_UMOUNT_FAIL=1 run_rerun --stage "$rerun/bitlocker-busy" >/dev/null 2>&1; then
+      echo 'not ok - a busy firmware mount was reported as successful cleanup' >&2
+      exit 1
+    fi
+    echo "ok - cleanup failure cannot report successful staging"
+
+    # An already-unlocked owner mount is reused and remains owned by its caller.
+    export TEST_PARTITIONS=$'/dev/nvme0n1p3|BitLocker|nvme|0|0\n/dev/mapper/Windows System|ntfs||0|0'
+    export TEST_MOUNTED_DEV='/dev/mapper/Windows System' TEST_MOUNTED_PATH="$rerun/Mounted Windows"
+    mkdir -p "$TEST_MOUNTED_PATH/Windows/System32/DriverStore/FileRepository/a16.inf_1"
+    cp "$store/"* "$TEST_MOUNTED_PATH/Windows/System32/DriverStore/FileRepository/a16.inf_1/"
+    reset_installed
+    run_rerun --stage "$rerun/bitlocker" --unlock-bitlocker
+    ! grep -q '^cryptsetup ' "$TEST_SCAN_LOG"
+    [[ $(<"$rerun/bitlocker/$adsp") == a16-adsp ]]
+    [[ -s $TEST_MOUNTED_PATH/Windows/System32/DriverStore/FileRepository/a16.inf_1/QCADSP8480.MBN ]]
+    ! grep -q '^mount ' "$TEST_SCAN_LOG"
+    echo "ok - an unlocked Windows mount is reused without mounting or unmounting the owner's volume"
+
+    unset TEST_MOUNTED_DEV TEST_MOUNTED_PATH
+    export TEST_PARTITIONS='/dev/nvme0n1p3|ntfs|nvme|0|0'
+    printf '#!/bin/sh\nexit 0\n' >"$test_bin/mount.ntfs-3g"
+    chmod +x "$test_bin/mount.ntfs-3g"
+    reset_installed
+    TEST_NTFS3_FAIL=1 run_rerun --stage "$rerun/ntfs-fallback"
+    [[ $(<"$rerun/ntfs-fallback/$adsp") == a16-adsp ]]
+    grep -Fq 'mount-args -t ntfs-3g -o ro,nosuid,nodev,noexec' "$TEST_SCAN_LOG"
+    output=$(TEST_ALL_MOUNTS_FAIL=1 run_rerun --stage "$rerun/unreadable" 2>&1)
+    [[ ! -s $rerun/unreadable/manifest && $output == *'could not mount /dev/nvme0n1p3 read-only'* ]]
+    [[ $output == *'use -d with a readable FileRepository copy'* ]]
+    echo "ok - NTFS fallback remains read-only and unreadable Windows volumes give an actionable report"
+  )
 )
 
 # A board package can list firmware names that must not come from Windows.
@@ -583,7 +746,7 @@ cdsp_stage="$board/cdsp-stage"
 mkdir -p "$cdsp_stage/${cdsp%/*}"
 printf 'staged-cdsp' >"$cdsp_stage/$cdsp"
 printf 'staged-cdsp-dtb' >"$cdsp_stage/$cdsp_dtb"
-printf '%s 0 test\n%s 0 test\n' "$cdsp" "$cdsp_dtb" >"$cdsp_stage/manifest"
+stage_manifest "$cdsp_stage" "$cdsp" "$cdsp_dtb" >"$cdsp_stage/manifest"
 
 (
   stub_windows_partition "$board/windows" "$board/scan.log"
@@ -632,3 +795,89 @@ printf '%s 0 test\n%s 0 test\n' "$cdsp" "$cdsp_dtb" >"$cdsp_stage/manifest"
   [[ ! -e $board_updates/$soccp && ! -e $board_updates/$cdsp && ! -e $board_updates/$cdsp_dtb ]]
   echo "ok - while Windows is read for other firmware, listed names are not installed"
 )
+
+# A manually imported live-system file must survive into the installed target.
+(
+  local_stage="$scratch/live-import"
+  mkdir -p "$local_stage/dt/dsp" "$local_stage/fw/qcom/a16" "$local_stage/provided" "$local_stage/bin"
+  printf 'asus,ux3607oa\0' > "$local_stage/dt/compatible"
+  printf '%s\0' qcom/a16/adsp.mbn qcom/a16/adsp_dtbs.elf qcom/a16/zap.mbn > "$local_stage/dt/dsp/firmware-name"
+  printf 'live-adsp' > "$local_stage/fw/qcom/a16/adsp.mbn"
+  printf 'live-dtb' | xz > "$local_stage/fw/qcom/a16/adsp_dtbs.elf.xz"
+  printf 'live-zap' | zstd -q > "$local_stage/fw/qcom/a16/zap.mbn.zst"
+  cat > "$local_stage/bin/lsblk" <<'MOCK'
+#!/bin/bash
+printf 'unexpected scan\n' >> "$TEST_SCAN_LOG"
+exit 1
+MOCK
+  chmod +x "$local_stage/bin/lsblk"
+  export PATH="$local_stage/bin:$test_bin:$PATH"
+  export QCOM_FW_DT_ROOT="$local_stage/dt"
+  export QCOM_FW_FIRMWARE_ROOT="$local_stage/fw"
+  export QCOM_FW_PROVIDED_DIR="$local_stage/provided"
+  export QCOM_FW_ROOT="$local_stage/root"
+  export QCOM_FW_TEST_EUID=0
+  export TEST_SCAN_LOG="$local_stage/scans"
+  set_kernel_config CONFIG_FW_LOADER_COMPRESS_ZSTD=y CONFIG_FW_LOADER_COMPRESS_XZ=y
+  bash "$extractor" --stage "$local_stage/stage" --stage-installed
+  [[ ! -e $TEST_SCAN_LOG ]]
+  [[ $(cat "$local_stage/stage/qcom/a16/adsp.mbn") == live-adsp ]]
+  [[ $(cat "$local_stage/stage/qcom/a16/adsp_dtbs.elf") == live-dtb ]]
+  [[ $(cat "$local_stage/stage/qcom/a16/zap.mbn") == live-zap ]]
+  [[ $(wc -l < "$local_stage/stage/manifest") == 3 ]]
+  rm "$local_stage/fw/qcom/a16/"*
+  bash "$extractor" --install --no-rebuild --stage-dir "$local_stage/stage"
+  [[ ! -e $TEST_SCAN_LOG ]]
+  cmp "$local_stage/stage/qcom/a16/adsp.mbn" "$local_stage/fw/updates/qcom/a16/adsp.mbn"
+  cmp "$local_stage/stage/qcom/a16/adsp_dtbs.elf" "$local_stage/fw/updates/qcom/a16/adsp_dtbs.elf"
+  cmp "$local_stage/stage/qcom/a16/zap.mbn" "$local_stage/fw/updates/qcom/a16/zap.mbn"
+  echo 'ok - live firmware stages and installs plain, xz and zstd payloads without disk access'
+
+  rm -r "$local_stage/fw/updates"
+  printf 'invalid xz' > "$local_stage/fw/qcom/a16/adsp.mbn.xz"
+  if bash "$extractor" --stage "$local_stage/broken" --stage-installed; then
+    echo 'not ok - corrupt installed firmware was accepted' >&2
+    exit 1
+  fi
+  [[ ! -e $local_stage/broken/qcom/a16/adsp.mbn ]]
+  [[ -z $(find "$local_stage/broken" -name '.firmware.*' -print) ]]
+  echo 'ok - a corrupt compressed live import fails before staging partial bytes'
+)
+
+# PCI calibration is not a device-tree firmware-name property. A board list
+# must preserve it through staging and installation, with a model-specific
+# Windows alias, without affecting a different Snapdragon model.
+(
+  required_case="$scratch/required"
+  mkdir -p "$required_case"/{dt,fw,required,store,stage}
+  export QCOM_FW_DT_ROOT="$required_case/dt"
+  export QCOM_FW_FIRMWARE_ROOT="$required_case/fw"
+  export QCOM_FW_REQUIRED_DIR="$required_case/required"
+  export QCOM_FW_PROVIDED_DIR="$required_case/provided"
+  export QCOM_FW_ROOT="$required_case/root"
+  export QCOM_FW_TEST_EUID=0
+  export PATH="$test_bin:$PATH"
+  name=ath12k/QCC2072/hw1.0/board.bin
+  cp "$package_dir/asus-zenbook-a16-required.list" "$QCOM_FW_REQUIRED_DIR/asus,ux3607oa.list"
+  printf 'asus,ux3607oa\0qcom,glymur\0' > "$QCOM_FW_DT_ROOT/compatible"
+  [[ $(bash "$extractor" --list-missing) == "$name" ]]
+  printf 'correct-ncm820a-calibration' > "$required_case/store/bdwlan_qcc2072_1p0_ncm820A.elf"
+  printf 'wrong-radio-calibration' > "$required_case/store/bdwlan.e01"
+  printf 'unrelated-board' > "$required_case/store/board.bin"
+  bash "$extractor" --stage "$required_case/stage" -d "$required_case/store"
+  cmp "$required_case/store/bdwlan_qcc2072_1p0_ncm820A.elf" "$required_case/stage/$name"
+  bash "$extractor" --install --no-rebuild --stage-dir "$required_case/stage"
+  cmp "$required_case/stage/$name" "$QCOM_FW_FIRMWARE_ROOT/updates/$name"
+  [[ -z $(bash "$extractor" --list-missing) ]]
+  [[ $(bash "$extractor" --list-required) == "$name" ]]
+  bash "$extractor" --stage "$required_case/restage" --stage-installed -d "$required_case/store"
+  cmp "$required_case/stage/$name" "$required_case/restage/$name"
+  rm -rf "$QCOM_FW_FIRMWARE_ROOT/updates"
+  mkdir "$required_case/store/other"
+  printf 'conflicting-ncm820a' > "$required_case/store/other/bdwlan_qcc2072_1p0_ncm820A.elf"
+  bash "$extractor" --stage "$required_case/ambiguous" -d "$required_case/store"
+  [[ ! -e $required_case/ambiguous/$name ]]
+  printf 'lenovo,yoga-slim7x\0qcom,x1e80100\0' > "$QCOM_FW_DT_ROOT/compatible"
+  [[ -z $(bash "$extractor" --list-missing) ]]
+)
+echo 'ok - board-scoped PCI calibration survives Windows and installed-Linux staging; conflicting variants are refused'

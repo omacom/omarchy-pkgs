@@ -9,6 +9,11 @@
 #                     installer copies DIR into the target). Missing firmware
 #                     is reported without aborting staging. A rerun adds the
 #                     files earlier runs did not find.
+#   --stage-installed Also stage firmware already available in the live system,
+#                     decompressing it when necessary. Use with --stage so a
+#                     manually imported file survives into the installed target.
+#   --unlock-bitlocker Allow a local recovery-key prompt for encrypted Windows.
+#                     Access is read-only. Clear-key volumes need no prompt.
 #   --install         Installed system or the installer's chroot: take each
 #                     file from the stage (--stage-dir, default
 #                     /var/lib/omarchy/firmware-stage), else from a Windows
@@ -16,6 +21,8 @@
 #                     /usr/lib/firmware/updates, record a manifest, add the
 #                     zap shader to the initramfs, and rebuild the boot image
 #                     (unless --no-rebuild). This is the default mode.
+#   --list-required   Print all required firmware names, including installed
+#                     files. Used to verify a complete installer stage.
 #   --list-missing    Print the device-tree firmware names not present under
 #                     /usr/lib/firmware and not listed for this board (below),
 #                     one per line. Needs no root.
@@ -49,6 +56,7 @@ DT_ROOT=${QCOM_FW_DT_ROOT:-/sys/firmware/devicetree/base}
 FW_ROOT=${QCOM_FW_FIRMWARE_ROOT:-/usr/lib/firmware}
 KERNEL_CONFIG=${QCOM_FW_KERNEL_CONFIG:-/proc/config.gz}
 PROVIDED_DIR=${QCOM_FW_PROVIDED_DIR:-/usr/share/qcom-firmware-extract/provided.d}
+REQUIRED_DIR=${QCOM_FW_REQUIRED_DIR:-/usr/share/qcom-firmware-extract/required.d}
 # Destination prefix for the installed-system and mount paths (tests only).
 ROOT=${QCOM_FW_ROOT:-}
 # The effective user ID the root checks see (tests only).
@@ -57,12 +65,13 @@ STATE_DIR="$ROOT/var/lib/omarchy/qcom-firmware"
 MANIFEST="$STATE_DIR/manifest"
 INITCPIO_CONF="$ROOT/etc/mkinitcpio.conf.d/qcom-firmware.conf"
 DEFAULT_STAGE_DIR="$ROOT/var/lib/omarchy/firmware-stage"
-DRIVERSTORE_PATH="Windows/System32/DriverStore/FileRepository"
 
 mode=install
 stage_dir=""
 driverstore=""
 rebuild=yes
+stage_installed=no
+unlock_bitlocker=no
 
 usage() {
   sed -n '2,/^# SPDX/{/^# SPDX/d;s/^# \{0,1\}//p}' "$0"
@@ -71,9 +80,12 @@ usage() {
 while (($#)); do
   case $1 in
     --stage) mode=stage; stage_dir=${2:?--stage needs a directory}; shift ;;
+    --stage-installed) stage_installed=yes ;;
+    --unlock-bitlocker) unlock_bitlocker=yes ;;
     --stage-dir) stage_dir=${2:?--stage-dir needs a directory}; shift ;;
     --install) mode=install ;;
     --list-missing) mode=list ;;
+    --list-required) mode=required ;;
     --no-rebuild) rebuild=no ;;
     -d) driverstore=${2:?-d needs a directory}; shift ;;
     -h | --help) usage; exit 0 ;;
@@ -89,6 +101,30 @@ warn() { printf 'qcom-firmware-extract: %s\n' "$*" >&2; }
 # 1. What does this machine ask for, and what is already there?
 # ---------------------------------------------------------------------------
 
+# PCI drivers can request files that are not named by a firmware-name property.
+# Each board list contains a Linux path and an optional Windows basename. Keep
+# variants board-scoped; never guess a calibration file from another laptop.
+declare -A required_aliases=()
+load_required_names() {
+  local compatible list name alias extra
+  [[ -r $DT_ROOT/compatible && -d $REQUIRED_DIR ]] || return 0
+  while IFS= read -r compatible; do
+    [[ -n $compatible && $compatible != */* ]] || continue
+    list="$REQUIRED_DIR/$compatible.list"
+    [[ -r $list ]] || continue
+    while read -r name alias extra; do
+      [[ -n $name && $name != \#* ]] || continue
+      [[ $name != /* && $name != ../* && $name != */../* &&
+         $name != */.. && $alias != */* && -z $extra ]] || {
+        warn "invalid required firmware entry in $list"
+        return 1
+      }
+      required_aliases[$name]=$alias
+    done < "$list"
+  done < <(tr '\0' '\n' < "$DT_ROOT/compatible")
+}
+load_required_names
+
 # Prints "<node-name> <firmware path>" for every firmware-name entry in the
 # device tree. A property can hold several NUL-separated strings.
 dt_firmware_names() {
@@ -102,6 +138,9 @@ dt_firmware_names() {
         [[ -n $name ]] && printf '%s %s\n' "$node" "$name"
       done
     done
+  for name in "${!required_aliases[@]}"; do
+    printf 'required/%s %s\n' "${name%/*}" "$name"
+  done
 }
 
 # The kernel tries plain firmware in every directory, then zstd and xz if built
@@ -167,12 +206,14 @@ while read -r node name; do
     provided_names+=("$name")
     continue
   fi
-  firmware_file "$name" >/dev/null && continue
+  if [[ $mode != required && ( $mode != stage || $stage_installed != yes ) ]]; then
+    firmware_file "$name" >/dev/null && continue
+  fi
   missing_nodes+=("$node")
   missing_names+=("$name")
 done < <(dt_firmware_names)
 
-if [[ $mode == list ]]; then
+if [[ $mode == list || $mode == required ]]; then
   ((${#missing_names[@]})) && printf '%s\n' "${missing_names[@]}"
   exit 0
 fi
@@ -202,68 +243,213 @@ fi
 
 declare -a sources=()   # driver stores to search together (-d or Windows)
 declare -a mounts=()    # temporary mounts to undo
+declare -a bitlocker_maps=()
+bitlocker_tty_state=""
+pending_bitlocker_mount=""
 stage_source=""         # the installer's stage, used before the driver stores
 declare -A manifest=()  # the manifest this run updates, lines by firmware name
 declare -A staged=()    # names the stage manifest lists
 cleanup() {
-  local m
-  for m in "${mounts[@]-}"; do
-    [[ -n $m ]] || continue
-    umount "$m" 2>/dev/null || true
-    rmdir "$m" 2>/dev/null || true
+  local status=$? i m
+  if [[ -n $bitlocker_tty_state ]]; then
+    stty "$bitlocker_tty_state" </dev/tty || status=1
+  fi
+  if [[ -n $pending_bitlocker_mount ]]; then
+    if mountpoint -q "$pending_bitlocker_mount"; then
+      umount "$pending_bitlocker_mount" || status=1
+    fi
+    rmdir "$pending_bitlocker_mount" || status=1
+  fi
+  # NTFS must be unmounted before its decrypted backing file or mapping.
+  for ((i=${#mounts[@]}-1; i>=0; i--)); do
+    m=${mounts[$i]}
+    if umount "$m"; then
+      rmdir "$m" || status=1
+    else
+      warn "could not release firmware mount $m; installation must not continue"
+      status=1
+    fi
   done
+  for m in "${bitlocker_maps[@]}"; do
+    cryptsetup close "$m" || status=1
+  done
+  exit "$status"
 }
 trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+open_bitlocker() {
+  local dev=$1 map="qcom-fw-$BASHPID-$RANDOM" fuse=""
+  opened_bitlocker_device=""
+  if command -v cryptsetup >/dev/null &&
+    cryptsetup open --type bitlk --readonly --batch-mode --key-file /dev/null "$dev" "$map" 2>/dev/null; then
+    bitlocker_maps+=("$map")
+    opened_bitlocker_device="/dev/mapper/$map"
+    return 0
+  fi
+  # New Windows metadata can be unsupported by cryptsetup; Dislocker also
+  # accepts the suspended-protection clear key without changing encryption.
+  if command -v dislocker-fuse >/dev/null; then
+    fuse=$(mktemp -d "$ROOT/run/qcom-bitlocker.XXXXXX") || exit 1
+    pending_bitlocker_mount=$fuse
+    if dislocker-fuse -r -c -V "$dev" -- -o ro "$fuse" >/dev/null 2>&1; then
+      mounts+=("$fuse")
+      pending_bitlocker_mount=""
+      opened_bitlocker_device="$fuse/dislocker-file"
+      return 0
+    fi
+    rmdir "$fuse" || exit 1
+    pending_bitlocker_mount=""
+  fi
+  if [[ $unlock_bitlocker != yes ]]; then
+    warn "BitLocker volume $dev is locked; use --unlock-bitlocker to enter its recovery key locally, or -d with a readable driver store"
+    return 1
+  fi
+  if ! { : >/dev/tty; } 2>/dev/null; then
+    warn "BitLocker recovery-key entry needs an interactive terminal; no key is accepted in command arguments or logs"
+    exit 1
+  fi
+  bitlocker_tty_state=$(stty -g </dev/tty) || exit 1
+  stty -echo </dev/tty || exit 1
+  printf '\nWindows on %s is encrypted. Enter its 48-digit BitLocker recovery key.\nAccess is temporary and read-only; Windows stays encrypted. Ctrl+C cancels.\n' "$dev" >/dev/tty
+  if command -v cryptsetup >/dev/null && cryptsetup bitlkDump "$dev" >/dev/null 2>&1; then
+    if ! cryptsetup open --type bitlk --readonly --tries 3 "$dev" "$map" </dev/tty >/dev/tty 2>&1; then
+      warn "could not unlock $dev; no firmware was read from it"
+      exit 1
+    fi
+    bitlocker_maps+=("$map")
+    opened_bitlocker_device="/dev/mapper/$map"
+  elif command -v dislocker-fuse >/dev/null; then
+    fuse=$(mktemp -d "$ROOT/run/qcom-bitlocker.XXXXXX") || exit 1
+    pending_bitlocker_mount=$fuse
+    printf 'BitLocker recovery key: ' >/dev/tty
+    # Dislocker redraws entered digits on stdout; keep that out of the console.
+    if ! dislocker-fuse -r -p -V "$dev" -- -o ro "$fuse" </dev/tty >/dev/null 2>/dev/tty; then
+      rmdir "$fuse" || exit 1
+      pending_bitlocker_mount=""
+      warn "could not unlock $dev; no firmware was read from it"
+      exit 1
+    fi
+    mounts+=("$fuse")
+    pending_bitlocker_mount=""
+    opened_bitlocker_device="$fuse/dislocker-file"
+  else
+    warn "install cryptsetup and dislocker for BitLocker access, or use -d with a readable driver store"
+    exit 1
+  fi
+  stty "$bitlocker_tty_state" </dev/tty || exit 1
+  bitlocker_tty_state=""
+}
 
 # Mount Windows driver stores read-only, preferring internal disks. With
 # "internal-only", removable and external disks are left alone.
+# Resolve each directory component case-insensitively, as Windows does. Do
+# not recursively search unrelated recovery images or Windows.old trees.
+windows_driver_stores() {
+  local component directory match
+  local -a directories=("$1") next=()
+  for component in Windows System32 DriverStore FileRepository; do
+    next=()
+    for directory in "${directories[@]}"; do
+      while IFS= read -r -d '' match; do
+        next+=("$match")
+      done < <(find "$directory" -mindepth 1 -maxdepth 1 -type d -iname "$component" -print0 2>/dev/null)
+    done
+    directories=("${next[@]}")
+    ((${#directories[@]})) || return 0
+  done
+  printf '%s\0' "${directories[@]}"
+}
+
 scan_windows_partitions() {
-  local scope=${1:-all} dev removable hotplug fstype tran mp bitlocker="" skipped=""
+  local scope=${1:-all} dev removable hotplug fstype tran mp store found read_device mount_options mount_type child skipped=""
   if [[ $CHECKED_EUID != 0 ]]; then
     warn "must run as root to read the Windows partitions"
     exit 1
   fi
   local -a internal=() external=()
+  local -A encrypted=()
   # read merges empty columns, so the always-set RM and HOTPLUG come first
   # and an empty TRAN comes last.
   while read -r dev removable hotplug fstype tran; do
     [[ $fstype == ntfs || $fstype == BitLocker ]] || continue
+    # Raw lsblk, like findmnt below, hex-escapes spaces in mapper names.
+    printf -v dev '%b' "$dev"
+    [[ $fstype != BitLocker ]] || encrypted[$dev]=1
     if [[ $removable == 0 && $hotplug == 0 && $tran != usb ]]; then
-      if [[ $fstype == ntfs ]]; then internal+=("$dev"); else bitlocker+=" $dev"; fi
+      internal+=("$dev")
     elif [[ $scope == internal-only ]]; then
       skipped+=" $dev"
-    elif [[ $fstype == ntfs ]]; then
-      external+=("$dev")
     else
-      bitlocker+=" $dev"
+      external+=("$dev")
     fi
   done < <(lsblk -rpno PATH,RM,HOTPLUG,FSTYPE,TRAN 2>/dev/null)
   [[ -z $skipped ]] || log "not reading removable or external disk partition(s):$skipped; use -d for a driver store on one"
 
   for dev in "${internal[@]}" "${external[@]}"; do
-    mp=$(mktemp -d "$ROOT/run/qcom-firmware-extract.XXXXXX")
-    if mount -t ntfs3 -o ro,nosuid,nodev,noexec "$dev" "$mp" 2>/dev/null; then
-      mounts+=("$mp")
-      if [[ -d "$mp/$DRIVERSTORE_PATH" ]]; then
-        log "Windows driver store found on $dev"
-        sources+=("$mp/$DRIVERSTORE_PATH")
+    # Reuse an owner's existing mount, including an unlocked BitLocker mapping.
+    # Never remount it or add it to our cleanup list. Raw findmnt escapes spaces
+    # and other special bytes as \xNN; decode each complete path after reading.
+    found=0
+    while IFS= read -r mp; do
+      printf -v mp '%b' "$mp"
+      while IFS= read -r -d '' store; do
+        log "Windows driver store found on $dev at $store (existing mount)"
+        sources+=("$store")
+        found=1
+      done < <(windows_driver_stores "$mp")
+    done < <(
+      if [[ -n ${encrypted[$dev]-} ]]; then
+        # An owner may already have unlocked this volume through device-mapper.
+        while IFS= read -r child; do
+          printf -v child '%b' "$child"
+          findmnt -rn -S "$child" -o TARGET 2>/dev/null || true
+        done < <(lsblk -rpno PATH "$dev" 2>/dev/null)
+      else
+        findmnt -rn -S "$dev" -o TARGET 2>/dev/null || true
       fi
+    )
+    ((found)) && continue
+    read_device=$dev
+    mount_options=ro,nosuid,nodev,noexec
+    mount_type=ntfs3
+    if [[ -n ${encrypted[$dev]-} ]]; then
+      open_bitlocker "$dev" || continue
+      read_device=$opened_bitlocker_device
+      if [[ $read_device == */dislocker-file ]]; then
+        mount_options+=,loop
+        # Keep a failed FUSE read out of the kernel NTFS journal-replay path.
+        command -v mount.ntfs-3g >/dev/null && mount_type=ntfs-3g
+      fi
+    fi
+    mp=$(mktemp -d "$ROOT/run/qcom-firmware-extract.XXXXXX")
+    if mount -t "$mount_type" -o "$mount_options" "$read_device" "$mp" 2>/dev/null ||
+      { [[ $mount_type == ntfs3 ]] && command -v mount.ntfs-3g >/dev/null && mount -t ntfs-3g -o "$mount_options" "$read_device" "$mp" 2>/dev/null; }; then
+      mounts+=("$mp")
+      while IFS= read -r -d '' store; do
+        log "Windows driver store found on $dev"
+        sources+=("$store")
+      done < <(windows_driver_stores "$mp")
     else
-      warn "could not mount $dev read-only (ntfs3); skipping it"
+      warn "could not mount $dev read-only (ntfs3 or ntfs-3g); skipping it; use -d with a readable FileRepository copy"
       rmdir "$mp" 2>/dev/null || true
     fi
   done
-  [[ -n $bitlocker ]] && warn "BitLocker volume(s) skipped:$bitlocker; turn BitLocker off in Windows to let the firmware be read"
   return 0
 }
 
-firmware_sha256() {
+firmware_bytes() {
   local file=$1
   case "$file" in
     *.zst) zstd -qdc -- "$file" ;;
     *.xz) xz -dc -- "$file" ;;
     *) cat -- "$file" ;;
-  esac | sha256sum | cut -d' ' -f1
+  esac
+}
+
+firmware_sha256() {
+  firmware_bytes "$1" | sha256sum | cut -d' ' -f1
 }
 
 # Match ambiguous DTBs to an installed sibling firmware blob from the same node.
@@ -313,23 +499,27 @@ unique_candidate() {
 # Windows can ship DSP device-tree images under another name: a device tree
 # may ask for adsp_dtb.mbn where Windows has adsp_dtbs.elf (e.g. Surface Pro 11).
 windows_firmware_names() {
-  printf '%s\n' "$1"
-  if [[ $1 == *_dtb.mbn ]]; then
-    printf '%s\n' "${1%_dtb.mbn}_dtbs.elf"
+  local name=$1
+  if [[ -n ${required_aliases[$name]-} ]]; then
+    printf '%s\n' "${required_aliases[$name]}"
+  fi
+  printf '%s\n' "${name##*/}"
+  if [[ $name == *_dtb.mbn ]]; then
+    printf '%s\n' "${name##*/}" | sed 's/_dtb.mbn$/_dtbs.elf/'
   fi
 }
 
 # Require a companion match when several firmware variants exist. Returns 1
 # when the sources have no candidate and 2 when it refuses ambiguous ones.
 find_in_sources() {
-  local base=$1 node=$2 candidate name
+  local firmware=$1 node=$2 candidate name
   local -a candidates=()
   while IFS= read -r name; do
     while IFS= read -r -d '' candidate; do
       candidates+=("$candidate")
     done < <(find "${sources[@]}" -type f -iname "$name" -print0 2>/dev/null)
     ((${#candidates[@]})) && break
-  done < <(windows_firmware_names "$base")
+  done < <(windows_firmware_names "$firmware")
 
   ((${#candidates[@]})) || return 1
   if unique_candidate "${candidates[@]}"; then
@@ -340,7 +530,7 @@ find_in_sources() {
     return 0
   fi
 
-  warn "refusing ambiguous $base: no unique variant matches its installed companion firmware"
+  warn "refusing ambiguous ${firmware##*/}: no unique variant matches its installed companion firmware"
   return 2
 }
 
@@ -381,11 +571,19 @@ write_manifest() {
 # A file in DIR counts as staged when the stage manifest lists it. In --stage
 # mode, that manifest is also the one the run updates.
 use_stage() {
-  local name
+  local name expected actual
   stage_source=$1
   read_manifest "$1/manifest"
   for name in "${!manifest[@]}"; do
-    staged[$name]=1
+    read -r _ expected _ <<<"${manifest[$name]}"
+    if [[ -f $stage_source/$name ]]; then
+      actual=$(sha256sum "$stage_source/$name" | cut -d' ' -f1) || actual=""
+      if [[ $expected =~ ^[[:xdigit:]]{64}$ && $actual == "${expected,,}" ]]; then
+        staged[$name]=1
+      else
+        warn "ignoring staged $name: SHA-256 does not match its manifest; retrying other firmware sources"
+      fi
+    fi
   done
 }
 
@@ -413,7 +611,7 @@ locate_firmware() {
     return 0
   fi
   if ((${#sources[@]})); then
-    src=$(find_in_sources "$(basename "$name")" "$node") || status=$?
+    src=$(find_in_sources "$name" "$node") || status=$?
     if ((status == 0)); then
       printf '%s\n' "$src"
       return 0
@@ -423,7 +621,7 @@ locate_firmware() {
   fi
   [[ -n $stage_source ]] || return 1
   local -a sources=("$stage_source")
-  src=$(find_in_sources "$(basename "$name")" "$node") || return 1
+  src=$(find_in_sources "$name" "$node") || return 1
   is_staged "${src#"$stage_source"/}" || return 1
   printf '%s\n' "$src"
 }
@@ -437,6 +635,28 @@ if [[ $mode == stage ]]; then
   # looks only for the rest, so an empty or partial stage blocks nothing.
   if [[ -f "$stage_dir/manifest" ]]; then
     use_stage "$stage_dir"
+  fi
+  if [[ $stage_installed == yes ]]; then
+    mkdir -p "$stage_dir"
+    stage_source=$stage_dir
+    for name in "${missing_names[@]}"; do
+      is_staged "$name" && continue
+      if src=$(firmware_file "$name"); then
+        # Stage plain bytes so a target kernel's decompressor configuration
+        # cannot invalidate a live-system import. Install only complete output.
+        temporary=$(mktemp "$stage_dir/.firmware.XXXXXX")
+        if ! firmware_bytes "$src" > "$temporary"; then
+          rm -f "$temporary"
+          warn "could not read installed firmware: $src"
+          exit 1
+        fi
+        install -Dm644 "$temporary" "$stage_dir/$name"
+        rm -f "$temporary"
+        set_manifest_line "$name" "$(sha256sum "$stage_dir/$name" | cut -d' ' -f1)" "$src"
+        staged[$name]=1
+      fi
+    done
+    write_manifest "$stage_dir/manifest"
   fi
   if ! stage_incomplete; then
     log "already staged in $stage_dir"
@@ -463,7 +683,7 @@ if [[ $mode == stage ]]; then
     fi
     src=""
     if ((${#sources[@]})); then
-      src=$(find_in_sources "$(basename "$name")" "$node") || true
+      src=$(find_in_sources "$name" "$node") || true
     fi
     if [[ -z $src ]]; then
       warn "not found in the driver store: $name"
