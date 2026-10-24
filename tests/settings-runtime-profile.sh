@@ -95,6 +95,8 @@ x86_backup=(
   etc/systemd/zram-generator.conf
 )
 keyboard_unit=default/systemd/user/omarchy-brightness-keyboard-auto.service
+# Workarounds for systemd 262 that 262.1 made unnecessary. Sources from before
+# their removal still carry them; the recipes no longer install them.
 nvpcr_dropins=(
   default/systemd/system/systemd-tpm2-setup-early.service.d/10-omarchy-nvpcr.conf
   default/systemd/system/systemd-pcrproduct.service.d/10-omarchy-nvpcr.conf
@@ -181,8 +183,6 @@ for recipe in omarchy-settings omarchy-settings-dev; do
   ! grep -q '^limine:' "$scratch/legacy-aarch64.optdepends" || fail "older source's aarch64 package suggests no boot stack"
   ! in_list usr/lib/systemd/user/omarchy-brightness-keyboard-auto.service "$scratch/legacy-x86_64.files" ||
     fail 'a source without the keyboard unit ships none'
-  ! grep -q 'nvpcr' "$scratch/legacy-x86_64.files" ||
-    fail 'a source without the NvPCR drop-ins ships none'
   echo "PASS: $recipe: an older source keeps its per-architecture package"
 
   # A runtime-profile source ships the same tree and metadata on both.
@@ -214,15 +214,17 @@ for recipe in omarchy-settings omarchy-settings-dev; do
   in_list usr/lib/systemd/user/omarchy-brightness-keyboard-auto.service "$scratch/profile-aarch64.files" ||
     fail 'the keyboard unit first-run enables ships when the source has it'
   for dropin in "${nvpcr_dropins[@]}"; do
-    in_list "usr/lib/${dropin#default/}" "$scratch/profile-aarch64.files" ||
-      fail 'the NvPCR drop-ins ship when the source has them'
+    for carch in x86_64 aarch64; do
+      ! in_list "usr/lib/${dropin#default/}" "$scratch/profile-$carch.files" ||
+        fail "a source that still has the NvPCR drop-ins leaves them out of /usr/lib on $carch"
+    done
   done
   comm -13 "$scratch/legacy-x86_64.files" "$scratch/profile-x86_64.files" >"$scratch/added"
   for conf in 00-omarchy-hooks.conf omarchy_hooks.conf; do
     cmp -s "$fixtures/omarchy-13362/$conf" "$scratch/profile-aarch64/etc/mkinitcpio.conf.d/$conf" ||
       fail "runtime-profile source ships its $conf as it is on aarch64"
   done
-  [[ $(cat "$scratch/added") == "$(printf '%s\n' usr/lib/systemd/user/omarchy-brightness-keyboard-auto.service usr/share/omarchy/default/settings-runtime-profile "usr/share/omarchy/$keyboard_unit" etc/mkinitcpio.conf.d/00-omarchy-hooks.conf "${nvpcr_dropins[@]/#default/usr/lib}" "${nvpcr_dropins[@]/#/usr/share/omarchy/}" | sort)" ]] ||
+  [[ $(cat "$scratch/added") == "$(printf '%s\n' usr/lib/systemd/user/omarchy-brightness-keyboard-auto.service usr/share/omarchy/default/settings-runtime-profile "usr/share/omarchy/$keyboard_unit" etc/mkinitcpio.conf.d/00-omarchy-hooks.conf "${nvpcr_dropins[@]/#/usr/share/omarchy/}" | sort)" ]] ||
     fail 'x86_64 gains only the new source files from a runtime-profile source' "$(cat "$scratch/added")"
   echo "PASS: $recipe: a runtime-profile source ships the full set on aarch64"
 done
