@@ -20,10 +20,15 @@ eleven HID-over-SPI commits retain their original authorship, sign-offs,
 copyright notices, and published specification reference.
 
 Signed-off-by: Brandon Williams <turbine.bmw@gmail.com>
+[omarchy: rebased onto 7.3. 7.3 already changes the Surface Pro 11 DMIC
+rate (to 2400000), so the change to 3200000 is left out. The
+spi-geni-qcom match table now carries .data, so the qcom,geni-qspi entry
+points at geni_spi too and is_qspi is set after se.base. The
+rx_dma_coherent unmap moved with the code into __spi_unmap_msg()]
 ---
  .../bindings/input/hid-over-spi.yaml          |   7 +
  .../bindings/spi/qcom,spi-geni-qcom.yaml      |   4 +-
- .../boot/dts/qcom/x1-microsoft-denali.dtsi    |  98 +++-
+ .../boot/dts/qcom/x1-microsoft-denali.dtsi    |  96 +++-
  drivers/acpi/platform_profile.c               |  43 +-
  drivers/dma/qcom/gpi.c                        | 480 +++++++++++++++++-
  drivers/hid/spi-hid/spi-hid-acpi.c            |  14 +-
@@ -34,12 +39,12 @@ Signed-off-by: Brandon Williams <turbine.bmw@gmail.com>
  drivers/hid/spi-hid/spi-hid.h                 |   3 +-
  .../surface/surface_aggregator_registry.c     |   2 +
  drivers/soc/qcom/qcom-geni-se.c               |  12 +-
- drivers/spi/spi-geni-qcom.c                   | 316 +++++++++++-
+ drivers/spi/spi-geni-qcom.c                   | 312 +++++++++++-
  drivers/spi/spi.c                             |  29 +-
  include/dt-bindings/dma/qcom-gpi.h            |   1 +
  include/linux/soc/qcom/geni-se.h              |   1 +
  include/linux/spi/spi.h                       |   5 +
- 18 files changed, 1172 insertions(+), 123 deletions(-)
+ 18 files changed, 1169 insertions(+), 120 deletions(-)
 
 diff --git a/Documentation/devicetree/bindings/input/hid-over-spi.yaml b/Documentation/devicetree/bindings/input/hid-over-spi.yaml
 index 27cf311e0aab..1bf761085459 100644
@@ -81,7 +86,7 @@ index edf399681d7a..55d9f62abc46 100644
    clocks:
      maxItems: 1
 diff --git a/arch/arm64/boot/dts/qcom/x1-microsoft-denali.dtsi b/arch/arm64/boot/dts/qcom/x1-microsoft-denali.dtsi
-index 9cf8e1a5e0bf..5a32f393a704 100644
+index 89761a3c2f2d..141948160b3b 100644
 --- a/arch/arm64/boot/dts/qcom/x1-microsoft-denali.dtsi
 +++ b/arch/arm64/boot/dts/qcom/x1-microsoft-denali.dtsi
 @@ -7,6 +7,7 @@
@@ -139,15 +144,6 @@ index 9cf8e1a5e0bf..5a32f393a704 100644
  	vreg_edp_3p3: regulator-edp-3p3 {
  		compatible = "regulator-fixed";
  
-@@ -867,7 +896,7 @@ &lpass_vamacro {
- 	pinctrl-names = "default";
- 
- 	vdd-micb-supply = <&vreg_l1b_1p8>;
--	qcom,dmic-sample-rate = <4800000>;
-+	qcom,dmic-sample-rate = <3200000>;
- };
- 
- &mdss {
 @@ -987,6 +1016,14 @@ &pcie6a_port0 {
  };
  
@@ -939,8 +935,7 @@ index a5055a6273af..c6bf91be2b64 100644
  			goto terminate_exit;
  		}
 +	}
- 
--		/* reprogram channel CNTXT */
++
 +	if (rotate_sp11_qspi) {
 +		/*
 +		 * Leave EV control and channel-control interrupts available for the
@@ -952,7 +947,8 @@ index a5055a6273af..c6bf91be2b64 100644
 +			goto terminate_exit;
 +		ieob_disabled = true;
 +		tasklet_kill(&gpii->ev_task);
-+
+ 
+-		/* reprogram channel CNTXT */
 +		ret = gpi_send_cmd(gpii, NULL, GPI_EV_CMD_RESET);
 +		if (ret) {
 +			dev_err(gpii->gpi_dev->dev,
@@ -1747,10 +1743,10 @@ index 2192e4e6389a..7b42e0038eb0 100644
  	&ssam_node_hid_kip_penstash,
  	&ssam_node_hid_kip_touchpad,
 diff --git a/drivers/soc/qcom/qcom-geni-se.c b/drivers/soc/qcom/qcom-geni-se.c
-index 107fa2057654..9640c66ec8b6 100644
+index 873bfbd6b2b7..d114b7f10769 100644
 --- a/drivers/soc/qcom/qcom-geni-se.c
 +++ b/drivers/soc/qcom/qcom-geni-se.c
-@@ -117,7 +117,15 @@ struct geni_se_desc {
+@@ -122,7 +122,15 @@ struct geni_se_desc {
  static const char * const icc_path_names[] = {"qup-core", "qup-config",
  						"qup-memory"};
  
@@ -1767,7 +1763,7 @@ index 107fa2057654..9640c66ec8b6 100644
  
  /**
   * struct se_fw_hdr - Serial Engine firmware configuration header
-@@ -1552,7 +1560,7 @@ int geni_load_se_firmware(struct geni_se *se, enum geni_se_protocol_type protoco
+@@ -1557,7 +1565,7 @@ int geni_load_se_firmware(struct geni_se *se, enum geni_se_protocol_type protoco
  	enum geni_se_xfer_mode mode = GENI_SE_FIFO;
  	int ret;
  
@@ -1777,10 +1773,10 @@ index 107fa2057654..9640c66ec8b6 100644
  		return -EINVAL;
  	}
 diff --git a/drivers/spi/spi-geni-qcom.c b/drivers/spi/spi-geni-qcom.c
-index 1fd9cf6e30f7..051d6ad6d180 100644
+index 6c57f8309a3b..bb760bed392d 100644
 --- a/drivers/spi/spi-geni-qcom.c
 +++ b/drivers/spi/spi-geni-qcom.c
-@@ -10,6 +10,7 @@
+@@ -12,6 +12,7 @@
  #include <linux/dma/qcom-gpi-dma.h>
  #include <linux/interrupt.h>
  #include <linux/io.h>
@@ -1788,7 +1784,7 @@ index 1fd9cf6e30f7..051d6ad6d180 100644
  #include <linux/log2.h>
  #include <linux/module.h>
  #include <linux/platform_device.h>
-@@ -19,8 +20,12 @@
+@@ -21,8 +22,12 @@
  #include <linux/soc/qcom/geni-se.h>
  #include <linux/spi/spi.h>
  #include <linux/spinlock.h>
@@ -1801,7 +1797,7 @@ index 1fd9cf6e30f7..051d6ad6d180 100644
  #define SE_SPI_CPHA		0x224
  #define CPHA			BIT(0)
  
-@@ -38,9 +43,14 @@
+@@ -40,9 +45,14 @@
  #define SE_SPI_DEMUX_SEL	0x250
  #define CS_DEMUX_OUTPUT_SEL	GENMASK(3, 0)
  
@@ -1816,7 +1812,7 @@ index 1fd9cf6e30f7..051d6ad6d180 100644
  #define SE_SPI_WORD_LEN		0x268
  #define WORD_LEN_MSK		GENMASK(9, 0)
  #define MIN_WORD_LEN		4
-@@ -56,6 +66,9 @@
+@@ -58,6 +68,9 @@
  #define SPI_CS_CLK_DELAY_MSK		GENMASK(19, 10)
  #define SPI_CS_CLK_DELAY_SHFT		10
  
@@ -1826,7 +1822,7 @@ index 1fd9cf6e30f7..051d6ad6d180 100644
  #define SE_SPI_SLAVE_EN				(0x2BC)
  #define SPI_SLAVE_EN				BIT(0)
  
-@@ -102,11 +115,94 @@ struct spi_geni_master {
+@@ -111,12 +124,95 @@ struct spi_geni_master {
  	int irq;
  	bool cs_flag;
  	bool abort_failed;
@@ -1835,6 +1831,7 @@ index 1fd9cf6e30f7..051d6ad6d180 100644
  	struct dma_chan *tx;
  	struct dma_chan *rx;
  	int cur_xfer_mode;
+ 	const struct geni_spi_desc *dev_data;
  };
  
 +static bool spi_geni_qspi_has_transfer_controls(const struct spi_transfer *xfer)
@@ -1921,7 +1918,7 @@ index 1fd9cf6e30f7..051d6ad6d180 100644
  static void spi_slv_setup(struct spi_geni_master *mas)
  {
  	struct geni_se *se = &mas->se;
-@@ -169,7 +265,6 @@ static void handle_se_timeout(struct spi_controller *spi)
+@@ -179,7 +275,6 @@ static void handle_se_timeout(struct spi_controller *spi)
  		geni_se_cancel_m_cmd(se);
  
  		spin_unlock_irq(&mas->lock);
@@ -1929,7 +1926,7 @@ index 1fd9cf6e30f7..051d6ad6d180 100644
  		time_left = wait_for_completion_timeout(&mas->cancel_done, HZ);
  		if (time_left)
  			goto reset_if_dma;
-@@ -228,14 +323,18 @@ static void handle_gpi_timeout(struct spi_controller *spi)
+@@ -243,14 +338,18 @@ static void handle_gpi_timeout(struct spi_controller *spi)
  {
  	struct spi_geni_master *mas = spi_controller_get_devdata(spi);
  
@@ -1949,7 +1946,7 @@ index 1fd9cf6e30f7..051d6ad6d180 100644
  	switch (mas->cur_xfer_mode) {
  	case GENI_SE_FIFO:
  	case GENI_SE_DMA:
-@@ -407,6 +506,9 @@ static int setup_gsi_xfer(struct spi_transfer *xfer, struct spi_geni_master *mas
+@@ -426,6 +525,9 @@ static int setup_gsi_xfer(struct spi_transfer *xfer, struct spi_geni_master *mas
  	struct dma_slave_config config = {};
  	struct gpi_spi_config peripheral = {};
  	struct dma_async_tx_descriptor *tx_desc, *rx_desc;
@@ -1959,7 +1956,7 @@ index 1fd9cf6e30f7..051d6ad6d180 100644
  	int ret;
  
  	config.peripheral_config = &peripheral;
-@@ -419,7 +521,16 @@ static int setup_gsi_xfer(struct spi_transfer *xfer, struct spi_geni_master *mas
+@@ -438,7 +540,16 @@ static int setup_gsi_xfer(struct spi_transfer *xfer, struct spi_geni_master *mas
  		mas->cur_speed_hz = xfer->speed_hz;
  	}
  
@@ -1977,7 +1974,7 @@ index 1fd9cf6e30f7..051d6ad6d180 100644
  		peripheral.cmd = SPI_DUPLEX;
  	} else if (xfer->tx_buf) {
  		peripheral.cmd = SPI_TX;
-@@ -456,12 +567,22 @@ static int setup_gsi_xfer(struct spi_transfer *xfer, struct spi_geni_master *mas
+@@ -475,12 +586,22 @@ static int setup_gsi_xfer(struct spi_transfer *xfer, struct spi_geni_master *mas
  	 *    (e.g. TPM TIS SPI uses cs_change=1 on single-transfer messages to
  	 *     keep CS asserted across header, wait-state and data phases)
  	 */
@@ -2004,7 +2001,7 @@ index 1fd9cf6e30f7..051d6ad6d180 100644
  						  DMA_DEV_TO_MEM, flags);
  		if (!rx_desc) {
  			dev_err(mas->dev, "Err setting up rx desc\n");
-@@ -481,12 +602,31 @@ static int setup_gsi_xfer(struct spi_transfer *xfer, struct spi_geni_master *mas
+@@ -500,12 +621,31 @@ static int setup_gsi_xfer(struct spi_transfer *xfer, struct spi_geni_master *mas
  		return -EIO;
  	}
  
@@ -2038,7 +2035,7 @@ index 1fd9cf6e30f7..051d6ad6d180 100644
  
  	if (peripheral.cmd & SPI_RX)
  		dma_async_issue_pending(mas->rx);
-@@ -518,6 +658,10 @@ static bool geni_can_dma(struct spi_controller *ctlr,
+@@ -537,6 +677,10 @@ static bool geni_can_dma(struct spi_controller *ctlr,
  	if (mas->cur_xfer_mode == GENI_GPI_DMA)
  		return true;
  
@@ -2049,7 +2046,7 @@ index 1fd9cf6e30f7..051d6ad6d180 100644
  	/* Set SE DMA mode for SPI target. */
  	if (ctlr->target)
  		return true;
-@@ -537,6 +681,8 @@ static int spi_geni_prepare_message(struct spi_controller *spi,
+@@ -556,6 +700,8 @@ static int spi_geni_prepare_message(struct spi_controller *spi,
  	struct spi_geni_master *mas = spi_controller_get_devdata(spi);
  	int ret;
  
@@ -2058,7 +2055,7 @@ index 1fd9cf6e30f7..051d6ad6d180 100644
  	switch (mas->cur_xfer_mode) {
  	case GENI_SE_FIFO:
  	case GENI_SE_DMA:
-@@ -609,8 +755,8 @@ static int spi_geni_init(struct spi_geni_master *mas)
+@@ -628,8 +774,8 @@ static int spi_geni_init(struct spi_geni_master *mas)
  {
  	struct spi_controller *spi = dev_get_drvdata(mas->dev);
  	struct geni_se *se = &mas->se;
@@ -2069,7 +2066,7 @@ index 1fd9cf6e30f7..051d6ad6d180 100644
  	int ret = -ENXIO;
  
  	PM_RUNTIME_ACQUIRE_IF_ENABLED(mas->dev, pm);
-@@ -620,7 +766,9 @@ static int spi_geni_init(struct spi_geni_master *mas)
+@@ -639,7 +785,9 @@ static int spi_geni_init(struct spi_geni_master *mas)
  		return ret;
  	}
  
@@ -2080,26 +2077,24 @@ index 1fd9cf6e30f7..051d6ad6d180 100644
  
  	if (spi->target) {
  		if (proto != GENI_SE_SPI_SLAVE) {
-@@ -629,19 +777,33 @@ static int spi_geni_init(struct spi_geni_master *mas)
+@@ -648,19 +796,33 @@ static int spi_geni_init(struct spi_geni_master *mas)
  		}
  		spi_slv_setup(mas);
  	} else if (proto == GENI_SE_INVALID_PROTO) {
--		ret = geni_load_se_firmware(se, GENI_SE_SPI);
--		if (ret) {
--			dev_err(mas->dev, "spi master firmware load failed ret: %d\n", ret);
 +		if (mas->is_qspi) {
 +			dev_err(mas->dev, "preloaded protocol-9 QSPI firmware is absent\n");
++			return ret;
++		}
++
+ 		ret = geni_load_se_firmware(se, GENI_SE_SPI);
+ 		if (ret) {
+-			dev_err(mas->dev, "spi master firmware load failed ret: %d\n", ret);
++			dev_err(mas->dev, "SPI firmware load failed ret: %d\n", ret);
  			return ret;
  		}
 -	} else if (proto != GENI_SE_SPI) {
 -		dev_err(mas->dev, "Invalid proto %d\n", proto);
 -		return -EINVAL;
-+
-+		ret = geni_load_se_firmware(se, GENI_SE_SPI);
-+		if (ret) {
-+			dev_err(mas->dev, "SPI firmware load failed ret: %d\n", ret);
-+			return ret;
-+		}
 +		proto = GENI_SE_SPI;
 +	} else if (proto != expected_proto) {
 +		dev_err(mas->dev, "Invalid proto %d, expected %d\n",
@@ -2120,7 +2115,7 @@ index 1fd9cf6e30f7..051d6ad6d180 100644
  
  	/*
  	 * Hardware programming guide suggests to configure
-@@ -659,7 +821,21 @@ static int spi_geni_init(struct spi_geni_master *mas)
+@@ -678,7 +840,21 @@ static int spi_geni_init(struct spi_geni_master *mas)
  	else
  		mas->oversampling = 1;
  
@@ -2143,7 +2138,7 @@ index 1fd9cf6e30f7..051d6ad6d180 100644
  	switch (fifo_disable) {
  	case 1:
  		ret = spi_geni_grab_gpi_chan(mas);
-@@ -691,6 +867,7 @@ static int spi_geni_init(struct spi_geni_master *mas)
+@@ -710,6 +886,7 @@ static int spi_geni_init(struct spi_geni_master *mas)
  		break;
  	}
  
@@ -2151,7 +2146,7 @@ index 1fd9cf6e30f7..051d6ad6d180 100644
  	/* We never control CS manually */
  	if (!spi->target) {
  		spi_tx_cfg = readl(se->base + SE_SPI_TRANS_CFG);
-@@ -719,7 +896,10 @@ static bool geni_spi_handle_tx(struct spi_geni_master *mas)
+@@ -738,7 +915,10 @@ static bool geni_spi_handle_tx(struct spi_geni_master *mas)
  {
  	struct geni_se *se = &mas->se;
  	unsigned int max_bytes;
@@ -2162,7 +2157,7 @@ index 1fd9cf6e30f7..051d6ad6d180 100644
  	unsigned int bytes_per_fifo_word = geni_byte_per_fifo_word(mas);
  	unsigned int i = 0;
  
-@@ -732,8 +912,27 @@ static bool geni_spi_handle_tx(struct spi_geni_master *mas)
+@@ -751,8 +931,27 @@ static bool geni_spi_handle_tx(struct spi_geni_master *mas)
  	max_bytes = (mas->tx_fifo_depth - mas->tx_wm) * bytes_per_fifo_word;
  	if (mas->tx_rem_bytes < max_bytes)
  		max_bytes = mas->tx_rem_bytes;
@@ -2191,7 +2186,7 @@ index 1fd9cf6e30f7..051d6ad6d180 100644
  	while (i < max_bytes) {
  		unsigned int j;
  		unsigned int bytes_to_write;
-@@ -747,7 +946,8 @@ static bool geni_spi_handle_tx(struct spi_geni_master *mas)
+@@ -766,7 +965,8 @@ static bool geni_spi_handle_tx(struct spi_geni_master *mas)
  	}
  	mas->tx_rem_bytes -= max_bytes;
  	if (!mas->tx_rem_bytes) {
@@ -2201,7 +2196,7 @@ index 1fd9cf6e30f7..051d6ad6d180 100644
  		return false;
  	}
  	return true;
-@@ -801,12 +1001,22 @@ static int setup_se_xfer(struct spi_transfer *xfer,
+@@ -820,12 +1020,22 @@ static int setup_se_xfer(struct spi_transfer *xfer,
  				struct spi_geni_master *mas,
  				u16 mode, struct spi_controller *spi)
  {
@@ -2224,7 +2219,7 @@ index 1fd9cf6e30f7..051d6ad6d180 100644
  	/*
  	 * Ensure that our interrupt handler isn't still running from some
  	 * prior command before we start messing with the hardware behind
-@@ -841,14 +1051,22 @@ static int setup_se_xfer(struct spi_transfer *xfer,
+@@ -860,14 +1070,22 @@ static int setup_se_xfer(struct spi_transfer *xfer,
  	if (xfer->tx_buf) {
  		m_cmd |= SPI_TX_ONLY;
  		mas->tx_rem_bytes = xfer->len;
@@ -2249,7 +2244,7 @@ index 1fd9cf6e30f7..051d6ad6d180 100644
  
  	/*
  	 * Select DMA mode if sgt are present; and with only 1 entry
-@@ -882,7 +1100,37 @@ static int setup_se_xfer(struct spi_transfer *xfer,
+@@ -901,7 +1119,37 @@ static int setup_se_xfer(struct spi_transfer *xfer,
  	 * interrupt could come in at any time now.
  	 */
  	spin_lock_irq(&mas->lock);
@@ -2287,7 +2282,7 @@ index 1fd9cf6e30f7..051d6ad6d180 100644
  
  	trace_geni_spi_transfer(mas->dev, len, m_cmd);
  
-@@ -893,7 +1141,7 @@ static int setup_se_xfer(struct spi_transfer *xfer,
+@@ -912,7 +1160,7 @@ static int setup_se_xfer(struct spi_transfer *xfer,
  		if (m_cmd & SPI_TX_ONLY)
  			geni_se_tx_init_dma(se, sg_dma_address(xfer->tx_sg.sgl),
  				sg_dma_len(xfer->tx_sg.sgl));
@@ -2296,7 +2291,7 @@ index 1fd9cf6e30f7..051d6ad6d180 100644
  		if (geni_spi_handle_tx(mas))
  			writel(mas->tx_wm, se->base + SE_GENI_TX_WATERMARK_REG);
  	}
-@@ -915,6 +1163,10 @@ static int spi_geni_transfer_one(struct spi_controller *spi,
+@@ -934,6 +1182,10 @@ static int spi_geni_transfer_one(struct spi_controller *spi,
  	/* Terminate and return success for 0 byte length transfer */
  	if (!xfer->len)
  		return 0;
@@ -2307,7 +2302,7 @@ index 1fd9cf6e30f7..051d6ad6d180 100644
  
  	if (mas->cur_xfer_mode == GENI_SE_FIFO || mas->cur_xfer_mode == GENI_SE_DMA) {
  		ret = setup_se_xfer(xfer, mas, slv->mode, spi);
-@@ -950,7 +1202,10 @@ static irqreturn_t geni_spi_isr(int irq, void *data)
+@@ -971,7 +1223,10 @@ static irqreturn_t geni_spi_isr(int irq, void *data)
  	spin_lock(&mas->lock);
  
  	if (mas->cur_xfer_mode == GENI_SE_FIFO) {
@@ -2319,15 +2314,15 @@ index 1fd9cf6e30f7..051d6ad6d180 100644
  			geni_spi_handle_rx(mas);
  
  		if (m_irq & M_TX_FIFO_WATERMARK_EN)
-@@ -1083,6 +1338,7 @@ static int spi_geni_probe(struct platform_device *pdev)
+@@ -1101,6 +1356,7 @@ static int spi_geni_probe(struct platform_device *pdev)
+ 	mas->se.dev = dev;
  	mas->se.wrapper = dev_get_drvdata(dev->parent);
  	mas->se.base = base;
- 	mas->se.clk = clk;
 +	mas->is_qspi = device_is_compatible(dev, "qcom,geni-qspi");
  
- 	ret = devm_pm_opp_set_clkname(&pdev->dev, "se");
- 	if (ret)
-@@ -1096,6 +1352,8 @@ static int spi_geni_probe(struct platform_device *pdev)
+ 	mas->dev_data = device_get_match_data(&pdev->dev);
+ 	if (!mas->dev_data)
+@@ -1112,6 +1368,8 @@ static int spi_geni_probe(struct platform_device *pdev)
  
  	spi->bus_num = -1;
  	spi->mode_bits = SPI_CPOL | SPI_CPHA | SPI_LOOP | SPI_CS_HIGH;
@@ -2336,7 +2331,7 @@ index 1fd9cf6e30f7..051d6ad6d180 100644
  	spi->bits_per_word_mask = SPI_BPW_RANGE_MASK(4, 32);
  	spi->num_chipselect = 4;
  	spi->max_speed_hz = 50000000;
-@@ -1107,6 +1365,11 @@ static int spi_geni_probe(struct platform_device *pdev)
+@@ -1123,6 +1381,11 @@ static int spi_geni_probe(struct platform_device *pdev)
  	spi->auto_runtime_pm = true;
  	spi->handle_err = spi_geni_handle_err;
  	spi->use_gpio_descriptors = true;
@@ -2348,7 +2343,7 @@ index 1fd9cf6e30f7..051d6ad6d180 100644
  
  	init_completion(&mas->cs_done);
  	init_completion(&mas->cancel_done);
-@@ -1144,7 +1407,7 @@ static int spi_geni_probe(struct platform_device *pdev)
+@@ -1148,7 +1411,7 @@ static int spi_geni_probe(struct platform_device *pdev)
  	 * TX is required per GSI spec, see setup_gsi_xfer().
  	 */
  	if (mas->cur_xfer_mode == GENI_GPI_DMA)
@@ -2357,19 +2352,36 @@ index 1fd9cf6e30f7..051d6ad6d180 100644
  
  	ret = devm_request_irq(dev, mas->irq, geni_spi_isr, 0, dev_name(dev), spi);
  	if (ret)
-@@ -1225,6 +1488,7 @@ static const struct dev_pm_ops spi_geni_pm_ops = {
+@@ -1234,6 +1497,7 @@ static const struct geni_spi_desc sa8255p_geni_spi = {
  };
  
  static const struct of_device_id spi_geni_dt_match[] = {
-+	{ .compatible = "qcom,geni-qspi" },
- 	{ .compatible = "qcom,geni-spi" },
++	{ .compatible = "qcom,geni-qspi", .data = &geni_spi },
+ 	{ .compatible = "qcom,geni-spi", .data = &geni_spi },
+ 	{ .compatible = "qcom,sa8255p-geni-spi", .data = &sa8255p_geni_spi },
  	{}
- };
 diff --git a/drivers/spi/spi.c b/drivers/spi/spi.c
-index 12b3a3b29a89..6e996906cf9b 100644
+index 5b5b3bc5f0d8..8c5d02cef697 100644
 --- a/drivers/spi/spi.c
 +++ b/drivers/spi/spi.c
-@@ -1282,9 +1282,18 @@ static int __spi_map_msg(struct spi_controller *ctlr, struct spi_message *msg)
+@@ -1430,9 +1430,13 @@ int __spi_unmap_msg(struct spi_controller *ctlr, struct spi_message *msg)
+ 		/* The sync has already been done after each transfer. */
+ 		unsigned long attrs = DMA_ATTR_SKIP_CPU_SYNC;
+ 
+-		if (xfer->rx_sg_mapped)
+-			spi_unmap_buf_attrs(ctlr, rx_dev, &xfer->rx_sg,
+-					    DMA_FROM_DEVICE, attrs);
++		if (xfer->rx_sg_mapped) {
++			if (xfer->rx_dma_coherent)
++				sg_free_table(&xfer->rx_sg);
++			else
++				spi_unmap_buf_attrs(ctlr, rx_dev, &xfer->rx_sg,
++						    DMA_FROM_DEVICE, attrs);
++		}
+ 		xfer->rx_sg_mapped = false;
+ 
+ 		if (xfer->tx_sg_mapped)
+@@ -1495,9 +1499,18 @@ int __spi_map_msg(struct spi_controller *ctlr, struct spi_message *msg)
  		}
  
  		if (xfer->rx_buf != NULL) {
@@ -2391,24 +2403,7 @@ index 12b3a3b29a89..6e996906cf9b 100644
  			if (ret)
  				goto unwind;
  
-@@ -1310,9 +1319,13 @@ static int __spi_unmap_msg(struct spi_controller *ctlr, struct spi_message *msg)
- 		/* The sync has already been done after each transfer. */
- 		unsigned long attrs = DMA_ATTR_SKIP_CPU_SYNC;
- 
--		if (xfer->rx_sg_mapped)
--			spi_unmap_buf_attrs(ctlr, rx_dev, &xfer->rx_sg,
--					    DMA_FROM_DEVICE, attrs);
-+		if (xfer->rx_sg_mapped) {
-+			if (xfer->rx_dma_coherent)
-+				sg_free_table(&xfer->rx_sg);
-+			else
-+				spi_unmap_buf_attrs(ctlr, rx_dev, &xfer->rx_sg,
-+						    DMA_FROM_DEVICE, attrs);
-+		}
- 		xfer->rx_sg_mapped = false;
- 
- 		if (xfer->tx_sg_mapped)
-@@ -1332,7 +1345,7 @@ static void spi_dma_sync_for_device(struct spi_controller *ctlr,
+@@ -1522,7 +1535,7 @@ static void spi_dma_sync_for_device(struct spi_controller *ctlr,
  
  	if (xfer->tx_sg_mapped)
  		dma_sync_sgtable_for_device(tx_dev, &xfer->tx_sg, DMA_TO_DEVICE);
@@ -2417,7 +2412,7 @@ index 12b3a3b29a89..6e996906cf9b 100644
  		dma_sync_sgtable_for_device(rx_dev, &xfer->rx_sg, DMA_FROM_DEVICE);
  }
  
-@@ -1342,7 +1355,7 @@ static void spi_dma_sync_for_cpu(struct spi_controller *ctlr,
+@@ -1532,7 +1545,7 @@ static void spi_dma_sync_for_cpu(struct spi_controller *ctlr,
  	struct device *rx_dev = ctlr->cur_rx_dma_dev;
  	struct device *tx_dev = ctlr->cur_tx_dma_dev;
  
@@ -2438,7 +2433,7 @@ index ebda2a37f52a..68fc1414af55 100644
  
  #endif /* __DT_BINDINGS_DMA_QCOM_GPI_H__ */
 diff --git a/include/linux/soc/qcom/geni-se.h b/include/linux/soc/qcom/geni-se.h
-index 0991ef7ec092..d64a07c9397b 100644
+index 5f18d281e6a4..78b7feb75fe1 100644
 --- a/include/linux/soc/qcom/geni-se.h
 +++ b/include/linux/soc/qcom/geni-se.h
 @@ -37,6 +37,7 @@ enum geni_se_protocol_type {
@@ -2450,10 +2445,10 @@ index 0991ef7ec092..d64a07c9397b 100644
  };
  
 diff --git a/include/linux/spi/spi.h b/include/linux/spi/spi.h
-index 4c285d3ede1d..c7c68735f7ff 100644
+index 88d17fce02dc..e32aeaba4872 100644
 --- a/include/linux/spi/spi.h
 +++ b/include/linux/spi/spi.h
-@@ -1007,6 +1007,10 @@ struct spi_res {
+@@ -1025,6 +1025,10 @@ struct spi_res {
   * @transfer_list: transfers are sequenced through @spi_message.transfers
   * @tx_sg_mapped: If true, the @tx_sg is mapped for DMA
   * @rx_sg_mapped: If true, the @rx_sg is mapped for DMA
@@ -2464,7 +2459,7 @@ index 4c285d3ede1d..c7c68735f7ff 100644
   * @tx_sg: Scatterlist for transmit, currently not for client use
   * @rx_sg: Scatterlist for receive, currently not for client use
   * @offload_flags: Flags that are only applicable to specialized SPI offload
-@@ -1111,6 +1115,7 @@ struct spi_transfer {
+@@ -1129,6 +1133,7 @@ struct spi_transfer {
  
  	bool		tx_sg_mapped;
  	bool		rx_sg_mapped;
