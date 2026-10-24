@@ -60,11 +60,14 @@ def derive(payload, profile_data, verify):
             provenance["profile_sha256"] == sha256(payload["PROFILE.json"]), "upstream kit provenance mismatch")
     profile = verify.validate_profile(verify.read_json(profile_data))
     require(profile_data == verify.json_bytes(profile), "profile is not in the kit's canonical form")
-    packages = upstream["runtime"]["packages"]
-    require(set(ABI_RUNTIME) <= set(packages), "upstream profile lacks an ABI runtime package")
+    require(set(ABI_RUNTIME) <= set(upstream["runtime"]["packages"]), "upstream profile lacks an ABI runtime package")
+    # Versions may follow Omarchy's own profile_measure.py run; everything else stays Cua's measurement,
+    # so a rebuilt Hyprland, GCC or libstdc++ still needs a new kit.
+    packages = profile["runtime"]["packages"]
     expected = dict(upstream, profile_id=profile["profile_id"], package_release=profile["package_release"],
-                    runtime=dict(upstream["runtime"], packages={name: packages[name] for name in ABI_RUNTIME}))
-    require(profile == expected, "profile changes more than its ID, release and ABI runtime scope")
+                    runtime=dict(upstream["runtime"], packages=packages))
+    require(set(packages) == set(ABI_RUNTIME) and profile == expected,
+            "profile changes more than its ID, release and ABI package versions")
     provenance["profile_sha256"] = sha256(profile_data)
     derived = {name: data for name, data in payload.items() if name != "SHA256SUMS"}
     derived["PROFILE.json"] = profile_data
