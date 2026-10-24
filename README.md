@@ -517,16 +517,21 @@ or an existing test needs a maintainer to merge it.
 
 ## Automatic updates
 
-Three scheduled workflows open PRs, one per package, through
+Two scheduled workflows open PRs, one per package, through
 `package-prs.yml`. Each PR auto-merges when its build is green, so the open
 ones are the failures. Each workflow takes a `packages` input for a manual run
 on named packages.
 
 | Workflow | Runs | Opens one PR per package on | For |
 |---|---|---|---|
-| `sync-upstream.yml` | every 6 hours | `auto/sync-upstream-<package>` | a new upstream release |
+| `sync-upstream.yml` | every 6 hours | `auto/sync-upstream-<package>` | upstream updates for packages without `"auto_merge": true` |
+| `sync-upstream.yml` | hourly | `auto/track-branches-<package>` | `"auto_merge": true` packages: the newest upstream release or branch tip |
 | `sync-rebuilds.yml` | every 6 hours | `auto/sync-rebuilds-<package>` | a `pkgrel` bump where a `rebuild_on` dependency moved |
-| `track-branches.yml` | hourly | `auto/track-branches-<package>` | `"auto_merge": true` packages: the newest upstream release or branch tip |
+
+For a manual upstream run, choose the `hourly` or `six-hourly` package group
+with the `cadence` input (default: `six-hourly`). The historical PR branch
+prefixes remain unchanged so existing PRs keep receiving updates. The separate
+`track-branches.yml` workflow has been retired.
 
 - **A red PR holds back only its own package.** Fix it on `master` or on the
   PR. The next run updates the PR if upstream moves again, and closes it once
@@ -536,9 +541,16 @@ on named packages.
 - **A package with no upstream declaration or hook gets no upstream updates.** That
   includes the kernels (`linux-omarchy*`, `linux-aurora`): bump
   them by PR.
-- A failed run of any of the three posts to Basecamp when
-  `BASECAMP_CHATBOT_URL` is set.
-- Every self-merging path (the three above and `auto-merge-pr.yml`) needs
+- `sync-upstream.yml` reports each completed run to Basecamp when
+  `BASECAMP_CHATBOT_URL` is set, identifying the hourly or six-hourly group.
+  Individual package update and PR check
+  failures leave the completed sync green; its notification and Actions
+  summary give counts and link to the affected PRs. PR update results and
+  current PR check results are counted separately: checks still running (or
+  not started yet) are pending, and the sync does not wait for builds.
+  Feed-fetch, setup, and missing-result failures still fail the workflow.
+  A failed `sync-rebuilds.yml` run also posts to Basecamp.
+- Every self-merging path (both workflows and `auto-merge-pr.yml`) needs
   the `PKGS_BOT_TOKEN` secret: a personal access token with Contents and Pull
   requests write access to this repository, owned by an account trusted to
   build. A merge made with the built-in `GITHUB_TOKEN` does not start
@@ -562,7 +574,7 @@ Details: [docs/upstream-sources.md](docs/upstream-sources.md),
 | `source` | Always `local`. |
 | `upstream` | Where releases come from. Mutually exclusive with an `.omarchy/upstream.sh` hook. |
 | `min_release_age` | Hold a new upstream release back this long (`"24h"`, `"2d"`). A release whose age cannot be proven fails the sync. |
-| `auto_merge` | `true` moves the package's updates from `sync-upstream.yml` (every 6 hours) to `track-branches.yml` (hourly). For packages that follow a moving branch, and for feeds worth shipping within the hour. Needs an upstream declaration. |
+| `auto_merge` | `true` selects the hourly group in `sync-upstream.yml`; other packages are checked every 6 hours. Both groups auto-merge passing PRs. For packages that follow a moving branch, and for feeds worth shipping within the hour. Needs an upstream declaration. |
 | `release_ring` | `fast`: publish to `rc` and `stable` on merge, not only `edge`. Only for packages that run on any channel's libraries: see [What can be on the fast ring](#what-can-be-on-the-fast-ring). Takes effect with the package's next version: bump `pkgrel` in the same PR. |
 | `pinned` | Version is set per release on the `rc` branch. Used by `omarchy` and `omarchy-settings`. |
 | `rebuild_on` | Packages whose version change forces a rebuild of this one. |
@@ -626,9 +638,8 @@ docs/                          Reference
 | `unpublish.yml` | dispatch | Removes retired packages from channel databases |
 | `auto-merge-pr.yml` | PR events, dispatch | Enables auto-merge on trusted package PRs |
 | `approve-pr.yml` | PR events | Releases GitHub's hold on a `build-approved` PR's runs |
-| `sync-upstream.yml` | every 6 hours, dispatch | Upstream release PR |
+| `sync-upstream.yml` | hourly and every 6 hours, dispatch | Upstream release and branch-tip PRs, with a result notification for either package group |
 | `sync-rebuilds.yml` | every 6 hours, dispatch | Dependency rebuild PR |
-| `track-branches.yml` | hourly, dispatch | Branch tip PRs |
 | `package-prs.yml` | called by the sync workflows | Opens, updates and closes their PRs |
 | `builder-images.yml` | daily, changes to the image's inputs (push and PR), dispatch | Builds and tests the builder image; publishes it from `master` |
 

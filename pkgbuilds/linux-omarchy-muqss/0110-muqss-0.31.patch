@@ -3783,7 +3783,7 @@ diff --git a/kernel/sched/MuQSS.c b/kernel/sched/MuQSS.c
 new file mode 100644
 --- /dev/null
 +++ b/kernel/sched/MuQSS.c
-@@ -0,0 +1,10795 @@
+@@ -0,0 +1,10796 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + *  kernel/sched/MuQSS.c, was kernel/sched.c
@@ -5370,15 +5370,19 @@ new file mode 100644
 +{
 +	unsigned int migrate = p->psi_flags & ~TSK_ONCPU;
 +
-+	if (migrate)
++	if (migrate) {
++		lockdep_assert_held(task_rq(p)->lock);
 +		psi_task_change(p, migrate, 0);
++	}
 +	return migrate;
 +}
 +
 +static inline void psi_migrate_end(struct task_struct *p, unsigned int migrate)
 +{
-+	if (migrate)
++	if (migrate) {
++		lockdep_assert_held(task_rq(p)->lock);
 +		psi_task_change(p, 0, migrate);
++	}
 +}
 +#else /* !CONFIG_PSI */
 +static inline unsigned int psi_migrate_begin(struct task_struct *p)
@@ -7261,51 +7265,34 @@ new file mode 100644
 +		 */
 +		hrexpiry_schedule_exit(rq);
 +		sched_info_dequeue(rq, prev);
-+		/*
-+		 * We move the ownership of prev to the new cpu now. Note that
-+		 * this does not lock ttwu out: pointing task_cpu() at wake_cpu
-+		 * below sends a concurrent ttwu_runnable() to the *new*
-+		 * runqueue's lock rather than the one dropped here, and
-+		 * __task_rq_lock() does not spin on task_on_rq_migrating() the
-+		 * way mainline's does. See the re-check before enqueueing.
-+		 *
-+		 * This bypasses set_task_cpu(), so any PSI state prev is still
-+		 * counted for has to be moved by hand, exactly as that does.
-+		 * psi_sched_switch() saw prev off the CPU as a sleep, since it
-+		 * is no longer queued, so a task in iowait is carrying
-+		 * TSK_IOWAIT here and enqueue_task() below would clear it on
-+		 * the new CPU that never counted it.
-+		 */
-+		migrate = psi_migrate_begin(prev);
-+		task_thread_info(prev)->cpu = prev->wake_cpu;
-+		psi_migrate_end(prev, migrate);
++		/* Take pi_lock before rq->lock to serialize with wakeups. */
 +		raw_spin_unlock(rq->lock);
-+
 +		raw_spin_lock(&prev->pi_lock);
-+		rq = __task_rq_lock(prev, NULL);
++		raw_spin_lock(rq->lock);
++
 +		/*
-+		 * Complete the handover only while it is still ours to
-+		 * complete. ttwu() reaches prev here despite the comment
-+		 * above: ttwu_runnable() only accepts TASK_ON_RQ_QUEUED, so a
-+		 * wakeup that finds prev still TASK_ON_RQ_MIGRATING falls
-+		 * through it and enqueues prev itself. Once it has, prev can be
-+		 * picked and run on another CPU, and take_task() empties its
-+		 * skiplist node again.
-+		 *
-+		 * task_queued() only asks whether that node is linked, so at
-+		 * that point it reads "prev still needs enqueueing" when it
-+		 * means "prev is running elsewhere", and puts a task that is on
-+		 * a CPU back on a runqueue for a second CPU to pick up. One
-+		 * task then runs on two CPUs off one stack, which shows up
-+		 * downstream as skiplist corruption, PSI counting the task
-+		 * twice, and a scribbled kernel stack.
-+		 *
-+		 * on_rq is what actually tracks the handover - return_task()
-+		 * set TASK_ON_RQ_MIGRATING and whoever takes prev over clears
-+		 * it - and pi_lock, held here and taken by ttwu() before it
-+		 * does anything, serialises the two.
++		 * A wakeup or affinity change may have completed the handover
++		 * while the locks were dropped. TASK_WAKING also covers a
++		 * wakeup queued on a remote wake_list but not yet activated.
++		 * Leave those tasks to their new owner.
 +		 */
-+		if (likely(task_on_rq_migrating(prev))) {
++		if (likely(task_cpu(prev) == cpu_of(rq) &&
++			   task_on_rq_migrating(prev) &&
++			   READ_ONCE(prev->__state) != TASK_WAKING)) {
++			/*
++			 * PSI state is per CPU. Clear it under the source lock,
++			 * then restore it under the destination lock. Keep pi_lock
++			 * held across both operations so a wakeup cannot observe
++			 * the partial transfer. Only hold one rq lock at a time,
++			 * since the destination need not follow the source in
++			 * runqueue lock order (and may share the same lock).
++			 */
++			migrate = psi_migrate_begin(prev);
++			WRITE_ONCE(task_thread_info(prev)->cpu, prev->wake_cpu);
++			raw_spin_unlock(rq->lock);
++			rq = task_rq(prev);
++			raw_spin_lock(rq->lock);
++			psi_migrate_end(prev, migrate);
 +			enqueue_task(rq, prev, 0);
 +			prev->on_rq = TASK_ON_RQ_QUEUED;
 +			/* Wake up the CPU if it's not already running */
@@ -8372,6 +8359,12 @@ new file mode 100644
 +
 +	arch_scale_freq_tick();
 +	sched_clock_tick();
++	if (IS_ENABLED(CONFIG_PSI) && IS_ENABLED(CONFIG_IRQ_TIME_ACCOUNTING)) {
++		/* Charge the executing task and serialize the per-CPU PSI update. */
++		rq_lock(rq);
++		psi_account_irqtime(rq, rq->curr, NULL);
++		rq_unlock(rq);
++	}
 +	update_clocks(rq);
 +	update_load_avg(rq, 0);
 +	update_cpu_clock_tick(rq, rq->curr);
@@ -8743,13 +8736,20 @@ new file mode 100644
 +static void (*check_siblings)(struct rq *this_rq) = &check_no_siblings;
 +static void (*wake_siblings)(struct rq *this_rq) = &wake_no_siblings;
 +
-+/* Iterate over smt siblings when we've scheduled a process on cpu and decide
-+ * whether they should continue running or be descheduled. */
++/*
++ * SMT topology masks retain offline siblings. Both sibling passes must only
++ * reschedule active CPUs, otherwise they can set NEED_RESCHED on an idle task
++ * that is entering the CPU-dead path. __schedule() calls these with interrupts
++ * disabled, so sched_cpu_deactivate()'s synchronize_rcu() drains any pass that
++ * saw the CPU active before it proceeds with offlining.
++ *
++ * Decide whether siblings should continue running or be descheduled.
++ */
 +static void check_smt_siblings(struct rq *this_rq)
 +{
 +	int other_cpu;
 +
-+	for_each_cpu(other_cpu, &this_rq->thread_mask) {
++	for_each_cpu_and(other_cpu, &this_rq->thread_mask, cpu_active_mask) {
 +		struct task_struct *p;
 +		struct rq *rq;
 +
@@ -8766,7 +8766,7 @@ new file mode 100644
 +{
 +	int other_cpu;
 +
-+	for_each_cpu(other_cpu, &this_rq->thread_mask) {
++	for_each_cpu_and(other_cpu, &this_rq->thread_mask, cpu_active_mask) {
 +		struct rq *rq;
 +
 +		rq = cpu_rq(other_cpu);
@@ -9020,6 +9020,7 @@ new file mode 100644
 +		 */
 +		++*switch_count;
 +
++		psi_account_irqtime(rq, prev, next);
 +		psi_sched_switch(prev, next, !task_on_rq_queued(prev));
 +
 +		trace_sched_switch(preempt, prev, next, prev->__state);

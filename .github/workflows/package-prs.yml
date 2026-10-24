@@ -1,7 +1,7 @@
 name: Open package PRs
 
-# Shared by the three bot lanes (sync-upstream.yml, sync-rebuilds.yml and
-# track-branches.yml). The caller's sync job rewrites recipes, groups the
+# Shared by the upstream package groups and sync-rebuilds.yml.
+# The caller's sync job rewrites recipes, groups the
 # changes with .github/scripts/package-pr-groups.sh and uploads them as the
 # `package-pins` artifact. This opens or updates one PR per group and arms
 # auto-merge, so every green package lands on its own and only the failures
@@ -31,6 +31,10 @@ on:
         description: 'PR body'
         required: true
         type: string
+      report-package-failures:
+        description: 'Report package failures as data without failing the sync'
+        type: boolean
+        default: false
     secrets:
       PKGS_BOT_TOKEN:
         required: true
@@ -64,6 +68,7 @@ jobs:
       # changelog: "Sync upstream releases: zed 1.23.2-1".
       - name: Apply this PR's packages
         id: apply
+        continue-on-error: ${{ inputs.report-package-failures }}
         env:
           PACKAGES: ${{ matrix.group.packages }}
           TITLE: ${{ inputs.title }}
@@ -81,6 +86,8 @@ jobs:
 
       - name: Open or update the PR
         id: pr
+        if: ${{ steps.apply.outcome == 'success' }}
+        continue-on-error: ${{ inputs.report-package-failures }}
         uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1 # v8.1.1
         with:
           token: ${{ secrets.PKGS_BOT_TOKEN }}
@@ -96,7 +103,9 @@ jobs:
       # may arm the same PR at the same moment; either one arming it is the
       # outcome wanted.
       - name: Enable auto-merge
-        if: ${{ steps.pr.outputs.pull-request-number != '' }}
+        id: merge
+        if: ${{ steps.pr.outcome == 'success' && steps.pr.outputs.pull-request-number != '' }}
+        continue-on-error: ${{ inputs.report-package-failures }}
         env:
           GH_TOKEN: ${{ secrets.PKGS_BOT_TOKEN }}
           PR: ${{ steps.pr.outputs.pull-request-number }}
@@ -107,6 +116,40 @@ jobs:
             exit 0
           fi
           gh pr merge --auto --merge "$PR" -R "$GITHUB_REPOSITORY" || armed
+
+      # Step outcomes retain failures even when continue-on-error lets the
+      # batch finish green. Artifacts preserve every matrix leg's result;
+      # a reusable workflow output would retain only the last finisher.
+      # Stable branch keys let "rerun failed jobs" replace just those reports
+      # while retaining the successful jobs' results from the same run.
+      - name: Record this package's result
+        id: result
+        if: ${{ !cancelled() && inputs.report-package-failures }}
+        env:
+          GROUP_JSON: ${{ toJSON(matrix.group) }}
+          STEPS_JSON: ${{ toJSON(steps) }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/package-pr-results"
+          key=$(jq -r '.branch' <<< "$GROUP_JSON" | sha256sum | cut -d' ' -f1)
+          echo "key=$key" >> "$GITHUB_OUTPUT"
+          jq -n --argjson group "$GROUP_JSON" --argjson steps "$STEPS_JSON" '
+            $group + {
+              apply: ($steps.apply.outcome // "skipped"),
+              pr: ($steps.pr.outcome // "skipped"),
+              merge: ($steps.merge.outcome // "skipped"),
+              number: ($steps.pr.outputs["pull-request-number"] // "")
+            }
+          ' > "$RUNNER_TEMP/package-pr-results/$key.json"
+
+      - name: Upload this package's result
+        if: ${{ !cancelled() && inputs.report-package-failures }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: package-pr-result-${{ steps.result.outputs.key }}
+          path: ${{ runner.temp }}/package-pr-results/*.json
+          overwrite: true
+          if-no-files-found: error
+          retention-days: 1
 
   # A PR on this lane's prefix that the run did not refresh, and that
   # conflicts with master, is stale: master moved its packages on without it.

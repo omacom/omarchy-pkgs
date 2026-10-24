@@ -53,6 +53,23 @@ package() { touch SHOULD-NOT-RUN; }
         with patch.object(w, "discover", return_value=[release]), patch.object(self.fetch, "file", side_effect=file or self.fake_file):
             return w.sync(self.package, self.fetch)
 
+    def test_fetches_stay_on_http1_and_send_the_token_only_to_the_api(self):
+        calls = []
+
+        def run(command, **kwargs):
+            calls.append((command, kwargs.get("input")))
+            Path(command[command.index("-o") + 1]).write_text("ok")
+
+        with patch.dict(os.environ, {"UPSTREAM_GITHUB_TOKEN": "job-token"}), patch.object(w.subprocess, "run", side_effect=run):
+            self.fetch.file("https://api.github.com/repos/owner/tool/releases?per_page=100")
+            self.fetch.file("https://download.example.test/tool/")
+        (api, api_input), (vendor, vendor_input) = calls
+        self.assertIn("--http1.1", api)
+        self.assertIn("--http1.1", vendor)
+        self.assertEqual(api_input, 'header = "Authorization: Bearer job-token"\n')
+        self.assertIsNone(vendor_input)
+        self.assertNotIn("job-token", " ".join(api + vendor))
+
     def test_updates_both_arches_without_running_build_functions(self):
         result = self.sync_release(self.release())
         self.assertEqual(result["after"], "0:2.0-1")

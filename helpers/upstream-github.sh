@@ -43,14 +43,43 @@ package_upstream_provider() {
 # run; a page with no stable release at all (drafts and prereleases only)
 # fails the sync instead, because a provider-tracked feed suddenly shipping
 # nothing stable is an anomaly worth a loud error, not a silent skip.
+#
+# Without a token the API allows 60 requests an hour per runner IP, shared
+# with every other job on it. The workflows pass the job's GITHUB_TOKEN as
+# UPSTREAM_GITHUB_TOKEN (1,000 an hour per repository); it goes to the API
+# only, through curl's stdin config so it never lands on a command line.
+# HTTP/1.1 because GitHub's HTTP/2 stream resets fail the fetch outright.
+# Timeouts, 408, 429, 500, 502, 503 and 504 retry with curl's backoff (1s,
+# 2s, 4s, honoring Retry-After). No retry starts after 60s and no attempt
+# runs past 30s, so a dead or stalled upstream holds the run for about 90s
+# at most. The body goes to a file, which curl empties before each retry;
+# on stdout a partial attempt would stay in front of the retried response.
+github_curl_options=(--http1.1 --retry 3 --retry-max-time 60 --connect-timeout 20 --max-time 30 -fsSL)
+
+github_curl() {
+  local output status=0
+  output=$(mktemp "${TMPDIR:-/tmp}/upstream-github.XXXXXX") || return 1
+  curl "${github_curl_options[@]}" -o "$output" "$@" || status=$?
+  if (( status == 0 )); then
+    cat "$output" || status=$?
+  fi
+  rm -f "$output"
+  return "$status"
+}
+
 github_fetch_releases() {
   local repo="$1"
-  curl -fsSL "https://api.github.com/repos/$repo/releases?per_page=100"
+  local url="https://api.github.com/repos/$repo/releases?per_page=100"
+  if [[ -n "${UPSTREAM_GITHUB_TOKEN:-}" ]]; then
+    github_curl --config - "$url" <<<"header = \"Authorization: Bearer $UPSTREAM_GITHUB_TOKEN\""
+  else
+    github_curl "$url"
+  fi
 }
 
 github_fetch_checksums() {
   local repo="$1" tag="$2" asset="$3"
-  curl -fsSL "https://github.com/$repo/releases/download/$tag/$asset"
+  github_curl "https://github.com/$repo/releases/download/$tag/$asset"
 }
 
 git_tags_fetch_refs() {
