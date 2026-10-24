@@ -97,6 +97,24 @@ if runtime:
 env["HERMES_DESKTOP_CWD"] = os.getcwd()
 if gpu != "auto":
     env.setdefault("HERMES_DESKTOP_DISABLE_GPU", gpu)
+elif "HERMES_DESKTOP_DISABLE_GPU" not in env:
+    # Low-VRAM NVIDIA cards (<=4 GiB, e.g. GTX 1050) abort Chromium's GPU process
+    # (error_code=1002 / SIGTRAP) mid-boot. Only when neither the Hermes gpu
+    # setting nor HERMES_DESKTOP_DISABLE_GPU chose, soft-default software rendering
+    # there. A missing or broken driver means unknown VRAM, never a failed launch.
+    import subprocess
+
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=5, check=False,
+        ).stdout.splitlines()
+        vram = int(out[0].strip()) if out and out[0].strip().isdigit() else None
+    except (OSError, subprocess.SubprocessError):
+        vram = None
+    if vram is not None and vram <= 4096:
+        env["HERMES_DESKTOP_DISABLE_GPU"] = "1"
+        env.setdefault("HERMES_DESKTOP_NVIDIA_SWIFTSHADER", "1")
 if ozone != "auto":
     env.setdefault("ELECTRON_OZONE_PLATFORM_HINT", ozone)
 env.setdefault("HERMES_DESKTOP_PASSWORD_STORE", store if store != "auto" else "gnome-libsecret")
