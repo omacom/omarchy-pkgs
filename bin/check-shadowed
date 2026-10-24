@@ -1,0 +1,169 @@
+#!/bin/bash
+# Omarchy's pacman.conf orders [omarchy] above [extra] and [multilib], and pacman
+# takes the first repository carrying a name without comparing versions across the
+# rest. So a package here that falls behind Arch is not dead weight: -Syu stops
+# offering the newer official build, and the -Syyuu in omarchy-refresh-pacman
+# downgrades to ours. Publishing a name Arch also ships is a promise to stay ahead
+# of it.
+#
+# [core] keeps its place above [omarchy], so a name Arch ships from core is
+# unreachable here rather than shadowed. That is worth reporting and not worth
+# failing over: users get Arch's build either way.
+#
+# This reads the PKGBUILDs, which is what a pull request changes. It says nothing
+# about what the mirror currently serves -- a build that never published leaves an
+# older package in the repository than the PKGBUILD here claims.
+set -euo pipefail
+
+BUILD_ROOT=$(realpath "${BASH_SOURCE[0]%/*}/..")
+source "$BUILD_ROOT/helpers/message-helpers.sh"
+source "$BUILD_ROOT/helpers/paths.sh"
+source "$BUILD_ROOT/helpers/package-metadata.sh"
+
+# Loaded in pacman's own resolution order, so the first repository carrying a name
+# is the one that answers for it.
+OUTRANKING_REPOS=(core)
+SHADOWED_REPOS=(extra multilib)
+
+print_header "Shadowed Package Check"
+
+for tool in pacman vercmp; do
+  command -v "$tool" >/dev/null || {
+    print_error "$tool is required; run this on Arch or in the archlinux container"
+    exit 1
+  }
+done
+
+declare -A official_repo official_version
+
+load_repo() {
+  local repo="$1" listing name version rest
+
+  # Not `|| true`: a listing that fails after emitting some rows would leave a
+  # partial repository behind and check fewer names while reporting success.
+  if ! listing=$(pacman -Sl "$repo" 2>/dev/null); then
+    print_error "[$repo] could not be listed; enable it and sync the package databases first"
+    exit 1
+  fi
+
+  if [[ -z $listing ]]; then
+    print_error "[$repo] lists no packages; enable it and sync the package databases first"
+    exit 1
+  fi
+
+  while read -r _ name version rest; do
+    [[ -n $name ]] || continue
+    [[ -n ${official_repo[$name]:-} ]] && continue
+    official_repo[$name]="$repo"
+    official_version[$name]="$version"
+  done <<<"$listing"
+}
+
+for repo in "${OUTRANKING_REPOS[@]}" "${SHADOWED_REPOS[@]}"; do
+  load_repo "$repo"
+done
+
+# The PKGBUILD is the only place pkgname and epoch are recorded, and makepkg
+# sources it too, so read it the same way rather than parsing it by hand. That
+# means supplying the variables makepkg exports: three PKGBUILDs here read CARCH
+# or SRCDEST at the top level and would die under set -u without them.
+package_versions() {
+  (
+    set +eu
+    cd "$1" || exit 1
+
+    CARCH="${CARCH:-x86_64}"
+    SRCDEST="${SRCDEST:-$PWD}"
+    startdir="$PWD"
+    srcdir="$PWD/src"
+    pkgdir="$PWD/pkg"
+
+    # shellcheck disable=SC1091
+    source PKGBUILD 2>/dev/null
+    local status=$?
+
+    # A PKGBUILD that failed partway can leave a stale pkgver assigned from the
+    # lines that did run, so the status decides this rather than the variables.
+    [[ $status -eq 0 ]] || exit 1
+    [[ -n "${pkgname:-}" && -n "${pkgver:-}" && -n "${pkgrel:-}" ]] || exit 1
+
+    local version="${pkgver}-${pkgrel}"
+    [[ -n "${epoch:-}" ]] && version="${epoch}:${version}"
+
+    local name
+    for name in "${pkgname[@]}"; do
+      echo "$name $version"
+    done
+  )
+}
+
+examined=0
+names=0
+shadowed=0
+stale=0
+unreachable=0
+unreadable=0
+
+while IFS= read -r pkgdir; do
+  package=$(basename "$pkgdir")
+
+  # Empty output counts as unreadable too: a PKGBUILD that calls exit at the top
+  # level ends the subshell successfully without ever naming a package, and
+  # skipping it quietly is how one drifts behind Arch unnoticed.
+  if ! versions=$(package_versions "$pkgdir") || [[ -z $versions ]]; then
+    print_error "$package: could not read pkgname and pkgver from its PKGBUILD"
+    unreadable=$((unreadable + 1))
+    continue
+  fi
+
+  examined=$((examined + 1))
+
+  while read -r name ours; do
+    [[ -n $name ]] || continue
+    names=$((names + 1))
+
+    repo="${official_repo[$name]:-}"
+    [[ -n $repo ]] || continue
+
+    theirs="${official_version[$name]}"
+
+    if [[ " ${OUTRANKING_REPOS[*]} " == *" $repo "* ]]; then
+      print_info "$name also exists in $repo, which outranks [omarchy]; ours is unreachable"
+      unreachable=$((unreachable + 1))
+      continue
+    fi
+
+    shadowed=$((shadowed + 1))
+
+    if [[ "$(vercmp "$theirs" "$ours")" -gt 0 ]]; then
+      print_error "$name shadows $repo/$name with an older build: ours $ours, $repo $theirs"
+      stale=$((stale + 1))
+    else
+      print_info "$name shadows $repo/$name (ours $ours, $repo $theirs)"
+    fi
+  done <<<"$versions"
+done < <(package_dirs)
+
+echo
+
+if ((unreadable > 0)); then
+  print_error "$unreadable PKGBUILD(s) could not be read, so they went unchecked"
+  exit 1
+fi
+
+# Nothing examined means the tree was not found, not that the tree is clean. A
+# check that passes when it compared nothing is worse than no check at all.
+if ((examined == 0)); then
+  print_error "No packages were examined; expected PKGBUILDs under $PKGBUILDS_DIR"
+  exit 1
+fi
+
+if ((stale > 0)); then
+  print_error "$stale of $shadowed shadowed package(s) are behind the official repositories"
+  echo "Either update them, or drop them so pacman resolves the official build."
+  exit 1
+fi
+
+print_success "Checked $examined package(s) ($names names) against ${SHADOWED_REPOS[*]}: $shadowed shadowed, none behind"
+((unreachable > 0)) && print_info "$unreachable name(s) are unreachable behind ${OUTRANKING_REPOS[*]}"
+exit 0
