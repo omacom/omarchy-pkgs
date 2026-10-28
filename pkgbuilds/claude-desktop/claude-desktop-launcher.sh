@@ -29,4 +29,22 @@ if [[ -n "${WAYLAND_DISPLAY:-}" || "${XDG_SESSION_TYPE:-}" == wayland ]]; then
   done
 fi
 
-exec /usr/lib/claude-desktop/claude-desktop "${platform_flags[@]}" "${user_flags[@]}" "$@"
+# Electron picks its safeStorage backend from the desktop it detects. On
+# Hyprland it detects neither GNOME nor KDE, so it falls back to basic_text,
+# stores the OAuth tokens unencrypted, and reports that no system keyring is
+# available even though one is running. Ask for the keyring where the
+# detection has nothing to go on, and leave a desktop that has a backend of
+# its own to keep it.
+password_store_flags=()
+case "${XDG_CURRENT_DESKTOP:-}" in
+  *GNOME* | *KDE*) ;;
+  *) password_store_flags=(--password-store=gnome-libsecret) ;;
+esac
+
+for flag in "${user_flags[@]}" "$@"; do
+  case "$flag" in
+    --password-store | --password-store=*) password_store_flags=() ;;
+  esac
+done
+
+exec /usr/lib/claude-desktop/claude-desktop "${platform_flags[@]}" "${password_store_flags[@]}" "${user_flags[@]}" "$@"
