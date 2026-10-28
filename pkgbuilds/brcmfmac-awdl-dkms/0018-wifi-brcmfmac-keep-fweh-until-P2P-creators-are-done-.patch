@@ -1,0 +1,152 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Net Mojo <56850867+netmojo@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 12:00:00 -0600
+Subject: [PATCH 18/19] wifi: brcmfmac: keep fweh until P2P creators are done
+ with it
+
+A P2P_DEVICE create holds the wiphy lock while it waits for the
+firmware's IF_ADD event, and when the wait ends it calls
+brcmf_fweh_p2pdev_setup(), which writes to drvr->fweh. A bus reset
+enters brcmf_detach() without that lock. brcmf_fweh_detach() cancels the
+event worker and frees fweh straight away, so a create that times out
+after that writes to freed memory.
+
+Split brcmf_fweh_detach(). brcmf_fweh_detach_events() cancels the event
+worker where the old call was, so no IF event can reach an interface
+that detach is removing. brcmf_fweh_detach() frees fweh after the
+interfaces are gone.
+
+Before it frees fweh, detach takes and releases the wiphy lock. P2P
+creation now refuses to start unless the bus is up, and that check runs
+under the wiphy lock, after detach has set BRCMF_BUS_DOWN. A create
+already past the check holds the lock until it has finished with fweh,
+so once detach has had the lock, nothing can still reach fweh.
+
+Signed-off-by: Net Mojo <56850867+netmojo@users.noreply.github.com>
+---
+ .../broadcom/brcm80211/brcmfmac/core.c        | 16 ++++++++++++++--
+ .../broadcom/brcm80211/brcmfmac/fweh.c        | 19 +++++++++++++++++--
+ .../broadcom/brcm80211/brcmfmac/fweh.h        |  1 +
+ .../broadcom/brcm80211/brcmfmac/p2p.c         |  6 ++++++
+ 4 files changed, 38 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/core.c b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/core.c
+index 8914394..cea985e 100644
+--- a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/core.c
++++ b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/core.c
+@@ -1628,8 +1628,10 @@ void brcmf_detach(struct device *dev)
+ 	brcmf_bus_change_state(bus_if, BRCMF_BUS_DOWN);
+ 	/* Stop event producers before draining their worker. */
+ 	brcmf_bus_stop(drvr->bus_if);
+-	/* Drain IF events before their interfaces and protocol state go away. */
+-	brcmf_fweh_detach(drvr);
++	/* Drain IF events before their interfaces and protocol state go away.
++	 * fweh itself stays allocated until the interfaces are removed below.
++	 */
++	brcmf_fweh_detach_events(drvr);
+ 	if (drvr->config)
+ 		brcmf_cfg80211_awdl_stop(drvr->config);
+ 	/* make sure primary interface removed last */
+@@ -1661,6 +1663,16 @@ void brcmf_detach(struct device *dev)
+ 		rtnl_unlock();
+ 	}
+ 
++	/* A P2P create that passed its BRCMF_BUS_UP check before detach began
++	 * holds the wiphy lock while it waits out its IF_ADD timeout, and then
++	 * calls brcmf_fweh_p2pdev_setup(). Creates check the bus state under
++	 * that lock, so once it has been taken after BRCMF_BUS_DOWN, no create
++	 * can still reach fweh and it can be freed.
++	 */
++	wiphy_lock(drvr->wiphy);
++	wiphy_unlock(drvr->wiphy);
++	brcmf_fweh_detach(drvr);
++
+ 	brcmf_proto_detach(drvr);
+ 
+ 	if (drvr->mon_if) {
+diff --git a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/fweh.c b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/fweh.c
+index 3e06c23..5416f00 100644
+--- a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/fweh.c
++++ b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/fweh.c
+@@ -374,11 +374,11 @@ int brcmf_fweh_attach(struct brcmf_pub *drvr)
+ }
+ 
+ /**
+- * brcmf_fweh_detach() - cleanup firmware event handling.
++ * brcmf_fweh_detach_events() - stop firmware event dispatch.
+  *
+  * @drvr: driver information object.
+  */
+-void brcmf_fweh_detach(struct brcmf_pub *drvr)
++void brcmf_fweh_detach_events(struct brcmf_pub *drvr)
+ {
+ 	struct brcmf_fweh_info *fweh = drvr->fweh;
+ 
+@@ -390,6 +390,21 @@ void brcmf_fweh_detach(struct brcmf_pub *drvr)
+ 		cancel_work_sync(&fweh->event_work);
+ 		WARN_ON(!list_empty(&fweh->event_q));
+ 	}
++}
++
++/**
++ * brcmf_fweh_detach() - cleanup firmware event handling.
++ *
++ * @drvr: driver information object.
++ */
++void brcmf_fweh_detach(struct brcmf_pub *drvr)
++{
++	struct brcmf_fweh_info *fweh = drvr->fweh;
++
++	if (!fweh)
++		return;
++
++	brcmf_fweh_detach_events(drvr);
+ 	drvr->fweh = NULL;
+ 	kfree(fweh->event_mask);
+ 	kfree(fweh);
+diff --git a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/fweh.h b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/fweh.h
+index 53c4b58..0c8ce7c 100644
+--- a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/fweh.h
++++ b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/fweh.h
+@@ -349,6 +349,7 @@ struct brcmf_fweh_info {
+ const char *brcmf_fweh_event_name(enum brcmf_fweh_event_code code);
+ 
+ int brcmf_fweh_attach(struct brcmf_pub *drvr);
++void brcmf_fweh_detach_events(struct brcmf_pub *drvr);
+ void brcmf_fweh_detach(struct brcmf_pub *drvr);
+ int brcmf_fweh_register(struct brcmf_pub *drvr, enum brcmf_fweh_event_code code,
+ 			int (*handler)(struct brcmf_if *ifp,
+diff --git a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/p2p.c b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/p2p.c
+index 5102824..3b335d2 100644
+--- a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/p2p.c
++++ b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/p2p.c
+@@ -19,6 +19,7 @@
+ #include "p2p.h"
+ #include "cfg80211.h"
+ #include "feature.h"
++#include "bus.h"
+ 
+ /* parameters used for p2p escan */
+ #define P2PAPI_SCAN_NPROBES 1
+@@ -2190,6 +2191,9 @@ static struct wireless_dev *brcmf_p2p_create_p2pdev(struct brcmf_p2p_info *p2p,
+ 	int err;
+ 	u32 bsscfgidx;
+ 
++	if (drvr->bus_if->state != BRCMF_BUS_UP)
++		return ERR_PTR(-ENODEV);
++
+ 	if (p2p->bss_idx[P2PAPI_BSSCFG_DEVICE].vif)
+ 		return ERR_PTR(-ENOSPC);
+ 
+@@ -2304,6 +2308,8 @@ struct wireless_dev *brcmf_p2p_add_vif(struct wiphy *wiphy, const char *name,
+ 	int connidx;
+ 	u8 *p2p_intf_addr;
+ 
++	if (drvr->bus_if->state != BRCMF_BUS_UP)
++		return ERR_PTR(-ENODEV);
+ 	if (brcmf_cfg80211_vif_event_armed(cfg))
+ 		return ERR_PTR(-EBUSY);
+ 
+-- 
+2.56.0
+
