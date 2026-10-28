@@ -1,21 +1,108 @@
 diff --git c/src/core/generation.cpp i/src/core/generation.cpp
-index ad5dca2..878abbc 100644
+index ad5dca2..ea41464 100644
 --- c/src/core/generation.cpp
 +++ i/src/core/generation.cpp
-@@ -38,7 +38,7 @@ static QHash<const QQmlEngine*, EngineGeneration*> g_generations; // NOLINT
+@@ -11,6 +11,7 @@
+ #include <qlist.h>
+ #include <qlogging.h>
+ #include <qloggingcategory.h>
++#include <qmutex.h>
+ #include <qnamespace.h>
+ #include <qobject.h>
+ #include <qqmlcontext.h>
+@@ -38,8 +39,8 @@ static QHash<const QQmlEngine*, EngineGeneration*> g_generations; // NOLINT
  EngineGeneration::EngineGeneration(const QDir& rootPath, QmlScanner scanner)
      : rootPath(rootPath)
      , scanner(std::move(scanner))
 -    , urlInterceptor(this->rootPath)
-+    , urlInterceptor(this->rootPath, this->scanner)
-     , interceptNetFactory(this->rootPath, this->scanner.fileIntercepts)
+-    , interceptNetFactory(this->rootPath, this->scanner.fileIntercepts)
++    , urlInterceptor(this->rootPath, this->scanner, this->scannerMutex)
++    , interceptNetFactory(this->rootPath, this->scanner.fileIntercepts, this->scannerMutex)
      , engine(new QQmlEngine()) {
  	g_generations.insert(this->engine, this);
+ 
+@@ -184,6 +185,7 @@ void EngineGeneration::setWatchingFiles(bool watching) {
+ 		if (this->watcher == nullptr) {
+ 			this->watcher = new QFileSystemWatcher();
+ 
++			QMutexLocker locker(&this->scannerMutex);
+ 			for (auto& file: this->scanner.scannedFiles) {
+ 				this->watcher->addPath(file);
+ 				this->watcher->addPath(QFileInfo(file).dir().absolutePath());
+@@ -219,11 +221,14 @@ void EngineGeneration::setWatchingFiles(bool watching) {
+ 
+ bool EngineGeneration::setExtraWatchedFiles(const QVector<QString>& files) {
+ 	this->extraWatchedFiles.clear();
+-	for (const auto& file: files) {
+-		if (!this->scanner.scannedFiles.contains(file)) {
+-			this->extraWatchedFiles.append(file);
+-			QByteArray data;
+-			this->scanner.readAndHashFile(file, data);
++	{
++		QMutexLocker locker(&this->scannerMutex);
++		for (const auto& file: files) {
++			if (!this->scanner.scannedFiles.contains(file)) {
++				this->extraWatchedFiles.append(file);
++				QByteArray data;
++				this->scanner.readAndHashFile(file, data);
++			}
+ 		}
+ 	}
+ 
+@@ -244,7 +249,12 @@ void EngineGeneration::onFileChanged(const QString& name) {
+ 		auto fileInfo = QFileInfo(name);
+ 		if (fileInfo.isFile() && fileInfo.size() == 0) return;
+ 
+-		if (!this->scanner.hasFileContentChanged(name)) {
++		bool changed;
++		{
++			QMutexLocker locker(&this->scannerMutex);
++			changed = this->scanner.hasFileContentChanged(name);
++		}
++		if (!changed) {
+ 			qCDebug(logQmlScanner) << "Ignoring file change with unchanged content:" << name;
+ 			return;
+ 		}
+@@ -257,7 +267,12 @@ void EngineGeneration::onDirectoryChanged() {
+ 	// try to find any files that were just deleted from a replace operation
+ 	for (auto& file: this->deletedWatchedFiles) {
+ 		if (QFileInfo(file).exists()) {
+-			if (!this->scanner.hasFileContentChanged(file)) {
++			bool changed;
++			{
++				QMutexLocker locker(&this->scannerMutex);
++				changed = this->scanner.hasFileContentChanged(file);
++			}
++			if (!changed) {
+ 				qCDebug(logQmlScanner) << "Ignoring restored file with unchanged content:" << file;
+ 				continue;
+ 			}
+diff --git c/src/core/generation.hpp i/src/core/generation.hpp
+index 4543408..f4b300a 100644
+--- c/src/core/generation.hpp
++++ i/src/core/generation.hpp
+@@ -5,6 +5,7 @@
+ #include <qfilesystemwatcher.h>
+ #include <qhash.h>
+ #include <qlist.h>
++#include <qmutex.h>
+ #include <qobject.h>
+ #include <qqmlengine.h>
+ #include <qqmlerror.h>
+@@ -57,6 +58,8 @@ public:
+ 	RootWrapper* wrapper = nullptr;
+ 	QDir rootPath;
+ 	QmlScanner scanner;
++	// Guards every post-construction access to scanner state shared with Qt's loader thread.
++	QMutex scannerMutex;
+ 	QsUrlInterceptor urlInterceptor;
+ 	QsInterceptNetworkAccessManagerFactory interceptNetFactory;
+ 	QQmlEngine* engine = nullptr;
 diff --git c/src/core/qsintercept.cpp i/src/core/qsintercept.cpp
-index 6687681..8f14178 100644
+index 6687681..f2431d2 100644
 --- c/src/core/qsintercept.cpp
 +++ i/src/core/qsintercept.cpp
-@@ -2,6 +2,7 @@
+@@ -2,11 +2,13 @@
  #include <cstring>
  
  #include <qdir.h>
@@ -23,7 +110,13 @@ index 6687681..8f14178 100644
  #include <qhash.h>
  #include <qiodevice.h>
  #include <qlogging.h>
-@@ -16,6 +17,7 @@
+ #include <qloggingcategory.h>
+ #include <qminmax.h>
++#include <qmutex.h>
+ #include <qnetworkaccessmanager.h>
+ #include <qnetworkrequest.h>
+ #include <qobject.h>
+@@ -16,6 +18,7 @@
  #include <qurl.h>
  
  #include "logcat.hpp"
@@ -31,7 +124,7 @@ index 6687681..8f14178 100644
  
  QS_LOGGING_CATEGORY(logQsIntercept, "quickshell.interceptor", QtWarningMsg);
  
-@@ -24,6 +26,13 @@ QUrl QsUrlInterceptor::intercept(
+@@ -24,6 +27,14 @@ QUrl QsUrlInterceptor::intercept(
      QQmlAbstractUrlInterceptor::DataType type
  ) {
  	auto url = originalUrl;
@@ -39,17 +132,68 @@ index 6687681..8f14178 100644
 +	    && url.isLocalFile())
 +	{
 +		auto path = QFileInfo(url.toLocalFile()).absoluteFilePath();
++		QMutexLocker locker(&this->scannerMutex);
 +		this->scanner.scanDir(QFileInfo(path).dir());
 +		if (this->scanner.fileIntercepts.contains(path)) url.setScheme("qs");
 +	}
  
  	if (url.scheme() == "root") {
  		url.setScheme("qs");
+@@ -87,11 +98,13 @@ qint64 QsInterceptDataReply::readData(char* data, qint64 maxSize) {
+ QsInterceptNetworkAccessManager::QsInterceptNetworkAccessManager(
+     const QDir& configRoot,
+     const QHash<QString, QString>& fileIntercepts,
++    QMutex& scannerMutex,
+     QObject* parent
+ )
+     : QNetworkAccessManager(parent)
+     , configRoot(configRoot)
+-    , fileIntercepts(fileIntercepts) {}
++    , fileIntercepts(fileIntercepts)
++    , scannerMutex(scannerMutex) {}
+ 
+ QNetworkReply* QsInterceptNetworkAccessManager::createRequest(
+     QNetworkAccessManager::Operation op,
+@@ -106,10 +119,14 @@ QNetworkReply* QsInterceptNetworkAccessManager::createRequest(
+ 		if (path.startsWith("@/qs/")) path = this->configRoot.filePath(path.sliced(5));
+ 		// otherwise pass through to fs
+ 
+-		qCDebug(logQsIntercept) << "Got intercept for" << path << "contains"
+-		                        << this->fileIntercepts.value(path);
++		QString data;
++		{
++			QMutexLocker locker(&this->scannerMutex);
++			data = this->fileIntercepts.value(path);
++		}
++		qCDebug(logQsIntercept) << "Got intercept for" << path << "contains" << data;
+ 
+-		if (auto data = this->fileIntercepts.value(path); !data.isEmpty()) {
++		if (!data.isEmpty()) {
+ 			return new QsInterceptDataReply(data, this);
+ 		}
+ 
+@@ -127,5 +144,7 @@ QNetworkReply* QsInterceptNetworkAccessManager::createRequest(
+ }
+ 
+ QNetworkAccessManager* QsInterceptNetworkAccessManagerFactory::create(QObject* parent) {
+-	return new QsInterceptNetworkAccessManager(this->configRoot, this->fileIntercepts, parent);
++	return new QsInterceptNetworkAccessManager(
++	    this->configRoot, this->fileIntercepts, this->scannerMutex, parent
++	);
+ }
 diff --git c/src/core/qsintercept.hpp i/src/core/qsintercept.hpp
-index c3d8b55..ccfd651 100644
+index c3d8b55..019dbfa 100644
 --- c/src/core/qsintercept.hpp
 +++ i/src/core/qsintercept.hpp
-@@ -14,14 +14,19 @@
+@@ -3,6 +3,7 @@
+ #include <qdir.h>
+ #include <qhash.h>
+ #include <qloggingcategory.h>
++#include <qmutex.h>
+ #include <qnetworkaccessmanager.h>
+ #include <qnetworkreply.h>
+ #include <qnetworkrequest.h>
+@@ -14,14 +15,21 @@
  
  QS_DECLARE_LOGGING_CATEGORY(logQsIntercept);
  
@@ -58,23 +202,98 @@ index c3d8b55..ccfd651 100644
  class QsUrlInterceptor: public QQmlAbstractUrlInterceptor {
  public:
 -	explicit QsUrlInterceptor(const QDir& configRoot): configRoot(configRoot) {}
-+	QsUrlInterceptor(const QDir& configRoot, QmlScanner& scanner)
++	QsUrlInterceptor(const QDir& configRoot, QmlScanner& scanner, QMutex& scannerMutex)
 +	    : configRoot(configRoot)
-+	    , scanner(scanner) {}
++	    , scanner(scanner)
++	    , scannerMutex(scannerMutex) {}
  
  	QUrl intercept(const QUrl& originalUrl, QQmlAbstractUrlInterceptor::DataType type) override;
  
  private:
  	QDir configRoot;
 +	QmlScanner& scanner;
++	QMutex& scannerMutex;
  };
  
  class QsInterceptDataReply: public QNetworkReply {
+@@ -47,6 +55,7 @@ public:
+ 	QsInterceptNetworkAccessManager(
+ 	    const QDir& configRoot,
+ 	    const QHash<QString, QString>& fileIntercepts,
++	    QMutex& scannerMutex,
+ 	    QObject* parent = nullptr
+ 	);
+ 
+@@ -60,19 +69,23 @@ protected:
+ private:
+ 	QDir configRoot;
+ 	const QHash<QString, QString>& fileIntercepts;
++	QMutex& scannerMutex;
+ };
+ 
+ class QsInterceptNetworkAccessManagerFactory: public QQmlNetworkAccessManagerFactory {
+ public:
+ 	QsInterceptNetworkAccessManagerFactory(
+ 	    const QDir& configRoot,
+-	    const QHash<QString, QString>& fileIntercepts
++	    const QHash<QString, QString>& fileIntercepts,
++	    QMutex& scannerMutex
+ 	)
+ 	    : configRoot(configRoot)
+-	    , fileIntercepts(fileIntercepts) {}
++	    , fileIntercepts(fileIntercepts)
++	    , scannerMutex(scannerMutex) {}
+ 	QNetworkAccessManager* create(QObject* parent) override;
+ 
+ private:
+ 	QDir configRoot;
+ 	const QHash<QString, QString>& fileIntercepts;
++	QMutex& scannerMutex;
+ };
+diff --git c/src/core/rootwrapper.cpp i/src/core/rootwrapper.cpp
+index 1e75819..546669c 100644
+--- c/src/core/rootwrapper.cpp
++++ i/src/core/rootwrapper.cpp
+@@ -6,6 +6,7 @@
+ #include <qfileinfo.h>
+ #include <qfilesystemwatcher.h>
+ #include <qlogging.h>
++#include <qmutex.h>
+ #include <qobject.h>
+ #include <qqmlcomponent.h>
+ #include <qqmlengine.h>
+@@ -118,7 +119,11 @@ void RootWrapper::reloadGraph(bool hard) {
+ 			qCritical().noquote() << msg;
+ 		}
+ 
+-		auto newFiles = generation->scanner.scannedFiles;
++		QVector<QString> newFiles;
++		{
++			QMutexLocker locker(&generation->scannerMutex);
++			newFiles = generation->scanner.scannedFiles;
++		}
+ 		generation->destroy();
+ 
+ 		if (this->generation != nullptr) {
+@@ -211,5 +216,6 @@ void RootWrapper::onWatchedFilesChanged() { this->reloadGraph(false); }
+ void RootWrapper::updateTooling() {
+ 	if (!this->generation) return;
+ 	auto configDir = QFileInfo(this->rootPath).dir();
++	QMutexLocker locker(&this->generation->scannerMutex);
+ 	qs::core::QmlToolingSupport::updateTooling(configDir, this->generation->scanner);
+ }
 diff --git c/src/core/scan.cpp i/src/core/scan.cpp
-index 9f33302..de443ba 100644
+index 9f33302..7e6fdba 100644
 --- c/src/core/scan.cpp
 +++ i/src/core/scan.cpp
-@@ -14,6 +14,7 @@
+@@ -1,5 +1,6 @@
+ #include "scan.hpp"
+ #include <cmath>
++#include <memory>
+ #include <utility>
+ 
+ #include <qcontainerfwd.h>
+@@ -14,6 +15,7 @@
  #include <qlogging.h>
  #include <qloggingcategory.h>
  #include <qpair.h>
@@ -82,7 +301,7 @@ index 9f33302..de443ba 100644
  #include <qstring.h>
  #include <qtextstream.h>
  
-@@ -22,6 +23,12 @@
+@@ -22,6 +24,12 @@
  
  QS_LOGGING_CATEGORY(logQmlScanner, "quickshell.qmlscanner", QtWarningMsg);
  
@@ -95,7 +314,7 @@ index 9f33302..de443ba 100644
  bool QmlScanner::readAndHashFile(const QString& path, QByteArray& data) {
  	auto file = QFile(path);
  	if (!file.open(QFile::ReadOnly)) return false;
-@@ -65,13 +72,19 @@ void QmlScanner::scanDir(const QDir& dir) {
+@@ -65,13 +73,19 @@ void QmlScanner::scanDir(const QDir& dir) {
  			) << "Found qmldir file, qmldir synthesization will be disabled for directory"
  			  << path;
  			seenQmldir = true;
@@ -120,7 +339,7 @@ index 9f33302..de443ba 100644
  			}
  		} else if (name.at(0).isUpper() && name.endsWith(".qml.json")) {
  			if (this->scanQmlJson(dir.filePath(name))) {
-@@ -121,9 +134,10 @@ void QmlScanner::scanDir(const QDir& dir) {
+@@ -121,9 +135,10 @@ void QmlScanner::scanDir(const QDir& dir) {
  		qCDebug(logQmlScanner) << "Synthesized qmldir for" << path << qPrintable("\n" + qmldir);
  		this->fileIntercepts.insert(QDir(path).filePath("qmldir"), qmldir);
  	}
@@ -132,7 +351,7 @@ index 9f33302..de443ba 100644
  	if (this->scannedFiles.contains(path)) return false;
  	this->scannedFiles.push_back(path);
  
-@@ -159,6 +173,9 @@ bool QmlScanner::scanQmlFile(const QString& path, bool& singleton, bool& interna
+@@ -159,6 +174,9 @@ bool QmlScanner::scanQmlFile(const QString& path, bool& singleton, bool& interna
  		if (!sourceMasked && inHeader) {
  			if (!singleton && line == "pragma Singleton") {
  				singleton = true;
@@ -142,7 +361,7 @@ index 9f33302..de443ba 100644
  			} else if (line.startsWith("import")) {
  				// we don't care about "import qs" as we always load the root folder
  				if (auto importCursor = line.indexOf(" qs."); importCursor != -1) {
-@@ -226,6 +243,15 @@ bool QmlScanner::scanQmlFile(const QString& path, bool& singleton, bool& interna
+@@ -226,6 +244,15 @@ bool QmlScanner::scanQmlFile(const QString& path, bool& singleton, bool& interna
  			}
  		}
  
@@ -158,7 +377,7 @@ index 9f33302..de443ba 100644
  		if (!hideMask && sourceMasked) overrideText.append("// MASKED: " % rawLine % '\n');
  		else overrideText.append(rawLine % '\n');
  
-@@ -285,7 +311,7 @@ bool QmlScanner::scanQmlFile(const QString& path, bool& singleton, bool& interna
+@@ -285,7 +312,7 @@ bool QmlScanner::scanQmlFile(const QString& path, bool& singleton, bool& interna
  void QmlScanner::scanQmlRoot(const QString& path) {
  	bool singleton = false;
  	bool internal = false;
@@ -167,6 +386,26 @@ index 9f33302..de443ba 100644
  }
  
  bool QmlScanner::scanQmlJson(const QString& path) {
+@@ -369,11 +396,15 @@ QPair<QString, QString> QmlScanner::jsonToQml(const QJsonValue& value, int inden
+ }
+ 
+ QJSEngine* QmlScanner::preprocEngine() {
+-	static auto* engine = [] {
+-		auto* engine = new QJSEngine();
+-		engine->globalObject().setPrototype(engine->newQObject(new qs::scan::env::PreprocEnv()));
++	// Interception can scan QML on Qt's loading thread. A QJSEngine is a QObject and must
++	// only be used on its owning thread. Destroy each engine when that thread exits.
++	static thread_local auto engine = [] {
++		auto engine = std::make_unique<QJSEngine>();
++		auto* env = new qs::scan::env::PreprocEnv();
++		env->setParent(engine.get());
++		engine->globalObject().setPrototype(engine->newQObject(env));
+ 		return engine;
+ 	}();
+ 
+-	return engine;
++	return engine.get();
+ }
 diff --git c/src/core/scan.hpp i/src/core/scan.hpp
 index 7d807e1..932c0b0 100644
 --- c/src/core/scan.hpp
@@ -188,6 +427,130 @@ index 7d807e1..932c0b0 100644
  	bool scanQmlJson(const QString& path);
  	[[nodiscard]] static QPair<QString, QString> jsonToQml(const QJsonValue& value, int indent = 0);
  
+diff --git c/src/core/test/CMakeLists.txt i/src/core/test/CMakeLists.txt
+index b35b42d..80b32c6 100644
+--- c/src/core/test/CMakeLists.txt
++++ i/src/core/test/CMakeLists.txt
+@@ -9,3 +9,4 @@ qs_test(ringbuffer ringbuf.cpp)
+ qs_test(scriptmodel scriptmodel.cpp)
+ qs_test(stacklist stacklist.cpp)
+ qs_test(objectmodel objectmodel.cpp)
++qs_test(omarchyscannerthread omarchyscannerthread.cpp)
+diff --git c/src/core/test/omarchyscannerthread.cpp i/src/core/test/omarchyscannerthread.cpp
+new file mode 100644
+index 0000000..0000000
+--- /dev/null
++++ i/src/core/test/omarchyscannerthread.cpp
+@@ -0,0 +1,109 @@
++// Regression for OmarchyLoadPatch: URL interception may run on several threads.
++// This deliberately exercises the production QmlScanner and QsUrlInterceptor.
++#include <atomic>
++#include <barrier>
++#include <thread>
++#include <vector>
++
++#include <qdir.h>
++#include <qfile.h>
++#include <qguiapplication.h>
++#include <qlogging.h>
++#include <qstring.h>
++#include <qtemporarydir.h>
++#include <qurl.h>
++
++#include "../generation.hpp"
++
++static bool writeFile(const QString& path, const QByteArray& content) {
++    QFile file(path);
++    return file.open(QFile::WriteOnly | QFile::Truncate) && file.write(content) == content.size();
++}
++
++int main(int argc, char** argv) {
++    QGuiApplication app(argc, argv);
++    QTemporaryDir temp;
++    if (!temp.isValid()) return 2;
++    const auto rootPath = temp.filePath("root");
++    const auto outsidePath = temp.filePath("external-plugins");
++    const auto pluginDir = [&](int thread, int index) {
++        return outsidePath + QString("/plugin-%1-%2").arg(thread).arg(index);
++    };
++    if (!QDir().mkpath(rootPath) || !QDir().mkpath(outsidePath)) return 3;
++    const auto rootFile = rootPath + "/shell.qml";
++    if (!writeFile(rootFile, "//@ pragma OmarchyLoadPatch\nimport QtQuick\nQtObject {}\n"))
++        return 4;
++
++    constexpr int threadCount = 8;
++    constexpr int dirsPerThread = 64;
++    const QByteArray content =
++        "import QtQuick\nimport \"sub\"\n"
++        "//@ if hasQtVersion(99, 0)\nBrokenType {}\n//@ endif\n"
++        "Item { Helper {} ; Child {} }\n";
++    for (int t = 0; t < threadCount; ++t) {
++        for (int i = 0; i < dirsPerThread; ++i) {
++            const auto dir = pluginDir(t, i);
++            if (!QDir().mkpath(dir + "/sub")
++                || !writeFile(dir + "/Widget.qml", content)
++                || !writeFile(dir + "/Helper.qml", "import QtQuick\nItem {}\n")
++                || !writeFile(dir + "/sub/Child.qml", "import QtQuick\nItem {}\n"))
++                return 5;
++        }
++    }
++
++    auto scanner = QmlScanner(QDir(rootPath));
++    scanner.scanQmlRoot(rootFile);
++    if (!scanner.omarchyLoadPatch || !scanner.scanErrors.isEmpty()) return 6;
++    auto* generation = new EngineGeneration(QDir(rootPath), std::move(scanner));
++    std::barrier start(threadCount);
++    std::atomic<int> failures = 0;
++    std::vector<std::thread> threads;
++    threads.reserve(threadCount);
++
++    for (int t = 0; t < threadCount; ++t) {
++        threads.emplace_back([&, t]() {
++            start.arrive_and_wait();
++            for (int i = 0; i < dirsPerThread; ++i) {
++                const auto path = pluginDir(t, i) + "/Widget.qml";
++                const auto rewritten = generation->urlInterceptor.intercept(
++                    QUrl::fromLocalFile(path), QQmlAbstractUrlInterceptor::QmlFile
++                );
++                if (rewritten.scheme() != "qs") ++failures;
++            }
++        });
++    }
++    for (auto& thread: threads) thread.join();
++
++    // Verify the transformations, not merely that interception changed the URL scheme.
++    const auto expectedRoot =
++        QStringLiteral("//@ pragma OmarchyLoadPatch\nimport QtQuick 6.11\nQtObject {}\n");
++    const auto expectedWidget = QStringLiteral(
++        "import QtQuick 6.11\nimport \"sub\"\n"
++        "//@ if hasQtVersion(99, 0)\n// MASKED: BrokenType {}\n//@ endif\n"
++        "Item { Helper {} ; Child {} }\n"
++    );
++    const auto expectedType = QStringLiteral("import QtQuick 6.11\nItem {}\n");
++    const auto& rewrites = generation->scanner.fileIntercepts;
++    int contentFailures = rewrites.value(rootFile) != expectedRoot ? 1 : 0;
++    for (int t = 0; t < threadCount; ++t) {
++        for (int i = 0; i < dirsPerThread; ++i) {
++            const auto dir = pluginDir(t, i);
++            if (rewrites.value(dir + "/Widget.qml") != expectedWidget) ++contentFailures;
++            if (rewrites.value(dir + "/Helper.qml") != expectedType) ++contentFailures;
++            if (rewrites.value(dir + "/sub/Child.qml") != expectedType) ++contentFailures;
++        }
++    }
++
++    const auto dirCount = generation->scanner.scannedDirs.size();
++    const auto rewrittenCount = rewrites.size();
++    const auto scanErrors = generation->scanner.scanErrors.size();
++    qInfo().noquote() << "SCANNER_REGRESSION threads" << threadCount
++                       << "directories" << dirCount
++                       << "rewrites" << rewrittenCount
++                       << "interceptFailures" << failures.load()
++                       << "contentFailures" << contentFailures
++                       << "scanErrors" << scanErrors;
++    generation->destroy();
++    return failures.load() == 0 && contentFailures == 0 && scanErrors == 0
++               && dirCount >= threadCount * dirsPerThread ? 0 : 7;
++}
 diff --git c/src/launch/launch.cpp i/src/launch/launch.cpp
 index 1edd60c..f2542ae 100644
 --- c/src/launch/launch.cpp
