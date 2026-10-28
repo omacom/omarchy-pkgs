@@ -1,0 +1,179 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jim Martin <jimmartin@gmail.com>
+Date: Thu, 8 Oct 2026 13:45:04 -0500
+Subject: [PATCH] usb: dwc3: qcom: set the HS PHY interrupt trigger before a
+ new host starts
+
+When the controller suspends in host mode,
+dwc3_qcom_enable_port_interrupts() selects the trigger of the DP and DM
+HS PHY interrupts from the speed of the device on each port: a falling
+edge on one line for a connected device, a rising edge on both lines for
+an empty port. After a role switch these interrupts keep the triggers
+chosen for the previous host session, so the first suspend of the new
+host has to reprogram them. These interrupts go through the PDC, where
+changing the trigger type can clear an edge that is already latched. A
+device that connects while the controller suspends is then missed, and
+the controller is not woken for it.
+
+Add a pre_host_init glue callback, called by dwc3_host_init() before it
+creates the xHCI; an error stops the host from being created. dwc3-qcom
+uses it to program the empty-port trigger before the new host starts.
+The xHCI still finds any device that is already attached when it
+starts, and a later suspend no longer changes the trigger of an empty
+port. The wake interrupts stay disabled until the controller suspends,
+as before.
+
+The first host start is left as it was: it keeps the triggers from the
+device tree, so its first suspend still changes them. On the Surface
+Laptop 8, also programming them at the first start delayed a USB4 dock
+attached at boot by about 30 seconds. The delay was seen with the
+experimental USB4 host router driver; whether it also occurs without
+that driver has not been tested, and its cause is not understood. Once
+it is, the first start should be programmed like the others. Nothing is
+changed before probe has completed, so a deferred probe leaves the
+triggers as it found them.
+
+Assisted-by: Opus 5.5
+Signed-off-by: Jim Martin <jimmartin@gmail.com>
+---
+ drivers/usb/dwc3/core.h      | 10 +++++++
+ drivers/usb/dwc3/dwc3-qcom.c | 54 ++++++++++++++++++++++++++++++++++++
+ drivers/usb/dwc3/host.c      |  4 +++
+ 3 files changed, 68 insertions(+)
+
+diff --git a/drivers/usb/dwc3/core.h b/drivers/usb/dwc3/core.h
+index 1c8d441ea9f..fde972fc894 100644
+--- a/drivers/usb/dwc3/core.h
++++ b/drivers/usb/dwc3/core.h
+@@ -1002,10 +1002,12 @@ struct dwc3_scratchpad_array {
+  *				need to be passed on to glue layer
+  * @pre_set_role: Notify glue of role switch notifications
+  * @pre_run_stop: Notify run stop enable/disable information to glue
++ * @pre_host_init: Prepare glue before creating a host; return zero or an error
+  */
+ struct dwc3_glue_ops {
+ 	void	(*pre_set_role)(struct dwc3 *dwc, enum usb_role role);
+ 	void	(*pre_run_stop)(struct dwc3 *dwc, bool is_on);
++	int	(*pre_host_init)(struct dwc3 *dwc);
+ };
+ 
+ /**
+@@ -1669,6 +1671,14 @@ static inline void dwc3_pre_set_role(struct dwc3 *dwc, enum usb_role role)
+ 		dwc->glue_ops->pre_set_role(dwc, role);
+ }
+ 
++static inline int dwc3_pre_host_init(struct dwc3 *dwc)
++{
++	if (dwc->glue_ops && dwc->glue_ops->pre_host_init)
++		return dwc->glue_ops->pre_host_init(dwc);
++
++	return 0;
++}
++
+ static inline void dwc3_pre_run_stop(struct dwc3 *dwc, bool is_on)
+ {
+ 	if (dwc->glue_ops && dwc->glue_ops->pre_run_stop)
+diff --git a/drivers/usb/dwc3/dwc3-qcom.c b/drivers/usb/dwc3/dwc3-qcom.c
+index 0905516ab56..518aca47acf 100644
+--- a/drivers/usb/dwc3/dwc3-qcom.c
++++ b/drivers/usb/dwc3/dwc3-qcom.c
+@@ -81,6 +81,8 @@ struct dwc3_qcom {
+ 	enum usb_dr_mode	mode;
+ 	bool			is_suspended;
+ 	bool			pm_suspended;
++	bool			probe_completed;
++	bool			host_init_seen;
+ 	struct icc_path		*icc_path_ddr;
+ 	struct icc_path		*icc_path_apps;
+ 
+@@ -565,6 +567,56 @@ static int dwc3_qcom_setup_irq(struct dwc3_qcom *qcom, struct platform_device *p
+ 	return 0;
+ }
+ 
++static int dwc3_qcom_prepare_connect_irq(struct dwc3_qcom *qcom, int irq)
++{
++	int ret;
++
++	if (!irq)
++		return 0;
++
++	ret = irq_set_irq_type(irq, IRQ_TYPE_EDGE_RISING);
++	if (ret)
++		dev_err(qcom->dev, "failed to prepare connection IRQ %d: %d\n", irq, ret);
++	return ret;
++}
++
++static int dwc3_qcom_pre_host_init(struct dwc3 *dwc)
++{
++	struct dwc3_qcom *qcom = to_dwc3_qcom(dwc);
++	int i, ret;
++
++	/*
++	 * The first host start keeps the device tree triggers, as before.
++	 * Programming them here delayed a USB4 dock attached at boot by about
++	 * 30 s on the Surface Laptop 8, for a reason not yet understood.
++	 */
++	if (!READ_ONCE(qcom->host_init_seen)) {
++		WRITE_ONCE(qcom->host_init_seen, true);
++		return 0;
++	}
++
++	/* Preserve the device tree IRQ types until probe can no longer defer. */
++	if (!READ_ONCE(qcom->probe_completed))
++		return 0;
++
++	/*
++	 * Changing a PDC trigger can clear a pending connection event. Select
++	 * the disconnected-port polarity before the new host starts, while
++	 * xHCI will still be able to observe any already-connected device.
++	 * Wake IRQs remain disabled until the controller suspends.
++	 */
++	for (i = 0; i < qcom->num_ports; i++) {
++		ret = dwc3_qcom_prepare_connect_irq(qcom, qcom->ports[i].dp_hs_phy_irq);
++		if (ret)
++			return ret;
++		ret = dwc3_qcom_prepare_connect_irq(qcom, qcom->ports[i].dm_hs_phy_irq);
++		if (ret)
++			return ret;
++	}
++
++	return 0;
++}
++
+ static void dwc3_qcom_set_role_notifier(struct dwc3 *dwc, enum usb_role next_role)
+ {
+ 	struct dwc3_qcom *qcom = to_dwc3_qcom(dwc);
+@@ -612,6 +664,7 @@ static void dwc3_qcom_run_stop_notifier(struct dwc3 *dwc, bool is_on)
+ static struct dwc3_glue_ops dwc3_qcom_glue_ops = {
+ 	.pre_set_role	= dwc3_qcom_set_role_notifier,
+ 	.pre_run_stop	= dwc3_qcom_run_stop_notifier,
++	.pre_host_init	= dwc3_qcom_pre_host_init,
+ };
+ 
+ static int dwc3_qcom_probe(struct platform_device *pdev)
+@@ -727,6 +780,7 @@ static int dwc3_qcom_probe(struct platform_device *pdev)
+ 	device_init_wakeup(&pdev->dev, wakeup_source);
+ 
+ 	qcom->is_suspended = false;
++	WRITE_ONCE(qcom->probe_completed, true);
+ 
+ 	return 0;
+ 
+diff --git a/drivers/usb/dwc3/host.c b/drivers/usb/dwc3/host.c
+index 3fb8be8be59..c1a3b2db929 100644
+--- a/drivers/usb/dwc3/host.c
++++ b/drivers/usb/dwc3/host.c
+@@ -135,6 +135,10 @@ int dwc3_host_init(struct dwc3 *dwc)
+ 	int			ret, irq;
+ 	int			prop_idx = 0;
+ 
++	ret = dwc3_pre_host_init(dwc);
++	if (ret)
++		return ret;
++
+ 	/*
+ 	 * Some platforms need to power off all Root hub ports immediately after DWC3 set to host
+ 	 * mode to avoid VBUS glitch happen when xhci get reset later.
+-- 
+2.56.0
+

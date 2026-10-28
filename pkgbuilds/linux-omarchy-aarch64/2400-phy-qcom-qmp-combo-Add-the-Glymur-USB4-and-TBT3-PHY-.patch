@@ -1,0 +1,763 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jim Martin <jimmartin@gmail.com>
+Date: Thu, 8 Oct 2026 13:55:30 -0500
+Subject: [PATCH] phy: qcom: qmp-combo: Add the Glymur USB4 and TBT3 PHY
+ sequences
+
+The preliminary USB4 support programs a USB4 PHY from per-block serdes,
+lane and PCS tables. Glymur has no such tables, so its combo PHY
+registers no USB4 PHY and a USB4 router cannot use the port.
+
+The Glymur USB4 and TBT3 start-up is one ordered sequence over the
+whole combo PHY (common block, USB4 serdes and PCS, both lane blocks),
+followed by an RX IVCM calibration check that resets the USB4 PCS and
+retries once when the PHY asks for recalibration. Add the two sequences
+as tables of offsets into the complete PHY register space and a
+configure_usb4_phy() hook that runs them in place of the generic tables:
+
+- the common block and the USB3 PCS are put into software reset before
+  the sequence, and the common block and the USB4 PCS are released and
+  started after it; the DP tunnelling clock bit of PHY_MODE_CTRL, which
+  the first record rewrites, is preserved;
+- the lane RX equalisation (RX_MODE_RATE3_B4) is board specific and
+  comes from the new qcom,usb4-rx-eq property; USB4 is refused when a
+  board does not provide it;
+- the USB4 serdes and PCS offsets and the USB4 always-on clamp register
+  are added to the Glymur layout. Without the clamp entry, USB4 mode
+  entry would set CLAMP_EN at offset 0 of the always-on block, which is
+  the USB3 clamp.
+
+The USB4 PHY is now also created for configurations that provide the
+hook instead of tables.
+
+The values match what the platform's Windows driver programs on the
+Surface Laptop 8.
+
+Assisted-by: Opus 5.5
+Signed-off-by: Jim Martin <jimmartin@gmail.com>
+---
+ drivers/phy/qualcomm/phy-qcom-qmp-combo.c     | 130 ++++-
+ .../phy-qcom-qmp-glymur-usb4-tables.h         | 500 ++++++++++++++++++
+ 2 files changed, 629 insertions(+), 1 deletion(-)
+ create mode 100644 drivers/phy/qualcomm/phy-qcom-qmp-glymur-usb4-tables.h
+
+diff --git a/drivers/phy/qualcomm/phy-qcom-qmp-combo.c b/drivers/phy/qualcomm/phy-qcom-qmp-combo.c
+index 6a9c3f2d939..7326970a842 100644
+--- a/drivers/phy/qualcomm/phy-qcom-qmp-combo.c
++++ b/drivers/phy/qualcomm/phy-qcom-qmp-combo.c
+@@ -323,6 +323,7 @@ static const unsigned int qmp_v8_n3_usb43dpphy_regs_layout[QPHY_LAYOUT_SIZE] = {
+ 	[QPHY_PCS_LFPS_RXTERM_IRQ_CLEAR]	= QPHY_V8_PCS_USB_LFPS_RXTERM_IRQ_CLEAR,
+ 
+ 	[QPHY_PCS_CLAMP_ENABLE]			= QPHY_V8_PCS_AON_USB3_AON_CLAMP_ENABLE,
++	[QPHY_PCS_USB4_CLAMP_ENABLE]		= QPHY_V8_PCS_AON_USB4_AON_CLAMP_ENABLE,
+ 	[QPHY_AON_TOGGLE_ENABLE]		= QPHY_V8_PCS_AON_USB3_AON_TOGGLE_ENABLE,
+ 	[QPHY_DP_AON_TOGGLE_ENABLE]		= QPHY_V8_PCS_AON_DP_AON_TOGGLE_ENABLE,
+ 
+@@ -2585,6 +2586,7 @@ struct qmp_phy_cfg {
+ 	int (*configure_dp_phy)(struct qmp_combo *qmp);
+ 	void (*configure_dp_tx)(struct qmp_combo *qmp);
+ 	int (*calibrate_dp_phy)(struct qmp_combo *qmp);
++	int (*configure_usb4_phy)(struct qmp_combo *qmp);
+ 	void (*dp_aux_init)(struct qmp_combo *qmp);
+ 
+ 	/* DP PHY AUX_CFG2 register value (hardware-specific) */
+@@ -2687,6 +2689,7 @@ struct qmp_combo {
+ 	enum tbt_phy_submode usb4_phy_submode;
+ 	unsigned int usb4_init_count;
+ 	bool com_powered_on;
++	u32 usb4_rx_eq;
+ 
+ 	struct clk_fixed_rate pipe_clk_fixed;
+ 	struct clk_hw dp_link_hw;
+@@ -2711,6 +2714,7 @@ static int qmp_v4_configure_dp_phy(struct qmp_combo *qmp);
+ static void qmp_v8_dp_aux_init(struct qmp_combo *qmp);
+ static int qmp_v8_configure_dp_clocks(struct qmp_combo *qmp);
+ static int qmp_v8_configure_dp_phy(struct qmp_combo *qmp);
++static int qmp_v8_configure_usb4_phy(struct qmp_combo *qmp);
+ 
+ static inline void qphy_setbits(void __iomem *base, u32 offset, u32 val)
+ {
+@@ -2826,6 +2830,8 @@ static const struct qmp_combo_offsets qmp_combo_usb43dp_offsets_v8 = {
+ 	.dp_dp_phy	= 0x2400,
+ 	.txa		= 0x4000,
+ 	.txb		= 0x5000,
++	.usb4_serdes	= 0x3000,
++	.usb4_pcs	= 0x3800,
+ };
+ 
+ static const struct qmp_phy_cfg sar2130p_usb3dpphy_cfg = {
+@@ -3498,6 +3504,7 @@ static const struct qmp_phy_cfg glymur_usb3dpphy_cfg = {
+ 	.dp_aux_init		= qmp_v8_dp_aux_init,
+ 	.configure_dp_tx	= qmp_v4_configure_dp_tx,
+ 	.configure_dp_clocks	= qmp_v8_configure_dp_clocks,
++	.configure_usb4_phy	= qmp_v8_configure_usb4_phy,
+ 	.configure_dp_phy	= qmp_v8_configure_dp_phy,
+ 
+ 	.dp_aux_cfg2		= QSERDES_DP_PHY_AUX_CFG2_V8,
+@@ -4539,6 +4546,111 @@ static int qmp_combo_dp_power_off(struct phy *phy)
+ 	return 0;
+ }
+ 
++#include "phy-qcom-qmp-glymur-usb4-tables.h"
++
++/* USB4 PCS status bits of the RX IVCM calibration check */
++#define QPHY_V8_USB4_PCS_STATUS_1C	0x1c
++#define QPHY_V8_USB4_IVCM_RECALIBRATE	GENMASK(2, 1)
++#define QPHY_V8_USB4_IVCM_RESULT_MASK	GENMASK(5, 0)
++#define QPHY_V8_USB4_IVCM_EXPECTED	0x20
++
++static int qmp_v8_usb4_wait_ready(struct qmp_combo *qmp)
++{
++	u32 status;
++
++	return readl_poll_timeout(qmp->usb4_pcs + qmp->cfg->regs[QPHY_PCS_STATUS],
++				  status, !(status & PHYSTATUS), 1000,
++				  PHY_INIT_COMPLETE_TIMEOUT);
++}
++
++static int qmp_v8_usb4_calibrate(struct qmp_combo *qmp)
++{
++	void __iomem *pcs = qmp->usb4_pcs;
++	u32 lane_a, lane_b;
++	int attempt, ret;
++
++	usleep_range(100, 110);
++	if (!(readl(pcs + QPHY_V8_USB4_PCS_STATUS_1C) &
++	      QPHY_V8_USB4_IVCM_RECALIBRATE))
++		return 0;
++
++	writel(0x22, qmp->tx + QSERDES_V8_LALB_RX_IVCM_CAL_CTRL1);
++	writel(0x22, qmp->tx2 + QSERDES_V8_LALB_RX_IVCM_CAL_CTRL1);
++
++	ret = -EIO;
++	for (attempt = 0; attempt < 2; attempt++) {
++		writel(SW_RESET, pcs + qmp->cfg->regs[QPHY_SW_RESET]);
++		udelay(1);
++		writel(0, pcs + qmp->cfg->regs[QPHY_SW_RESET]);
++
++		ret = qmp_v8_usb4_wait_ready(qmp);
++		if (ret)
++			break;
++
++		lane_a = readl(qmp->tx + QSERDES_V8_LALB_IVCM_CAL_STATUS);
++		lane_b = readl(qmp->tx2 + QSERDES_V8_LALB_IVCM_CAL_STATUS);
++		if ((lane_a & QPHY_V8_USB4_IVCM_RESULT_MASK) == QPHY_V8_USB4_IVCM_EXPECTED &&
++		    (lane_b & QPHY_V8_USB4_IVCM_RESULT_MASK) == QPHY_V8_USB4_IVCM_EXPECTED)
++			break;
++		ret = -EIO;
++	}
++
++	writel(0, qmp->tx + QSERDES_V8_LALB_RX_IVCM_CAL_CTRL1);
++	writel(0, qmp->tx2 + QSERDES_V8_LALB_RX_IVCM_CAL_CTRL1);
++	return ret;
++}
++
++static int qmp_v8_configure_usb4_phy(struct qmp_combo *qmp)
++{
++	const struct qmp_phy_init_tbl *table;
++	unsigned int count;
++	u32 tunnel_clock;
++	int ret;
++
++	if (qmp->usb4_rx_eq > 0xff)
++		return -EINVAL;
++
++	switch (qmp->usb4_phy_submode) {
++	case PHY_SUBMODE_USB4:
++		table = glymur_usb4_init_tbl;
++		count = ARRAY_SIZE(glymur_usb4_init_tbl);
++		break;
++	case PHY_SUBMODE_TBT3:
++		table = glymur_tbt3_init_tbl;
++		count = ARRAY_SIZE(glymur_tbt3_init_tbl);
++		break;
++	default:
++		return -EINVAL;
++	}
++
++	/* Clock and regulator ownership remains with qmp_combo_com_init(). */
++	tunnel_clock = readl(qmp->com + QPHY_V3_DP_COM_PHY_MODE_CTRL) &
++		       DP_TUNNELING_CLOCK_GEN_EN;
++	writel(SW_RESET, qmp->com + QPHY_V3_DP_COM_SW_RESET);
++	writel(SW_RESET, qmp->pcs + qmp->cfg->regs[QPHY_SW_RESET]);
++
++	/* First record preserves the DP tunnel clock bit; retain all other order. */
++	writel(table[0].val | tunnel_clock, qmp->com + table[0].offset);
++	qmp_configure(qmp->dev, qmp->com, table + 1, count - 1);
++
++	/* Board-specific RX equalisation, the same on both lanes */
++	writel(qmp->usb4_rx_eq, qmp->tx + QSERDES_V8_LALB_RX_MODE_RATE3_B4);
++	writel(qmp->usb4_rx_eq, qmp->tx2 + QSERDES_V8_LALB_RX_MODE_RATE3_B4);
++
++	writel(0, qmp->com + QPHY_V3_DP_COM_SW_RESET);
++	writel(0, qmp->usb4_pcs + qmp->cfg->regs[QPHY_SW_RESET]);
++	writel(SERDES_START | PCS_START,
++	       qmp->usb4_pcs + qmp->cfg->regs[QPHY_START_CTRL]);
++	usleep_range(1000, 1100);
++
++	ret = qmp_v8_usb4_wait_ready(qmp);
++	if (ret)
++		return ret;
++
++	/* A failed calibration is returned to the caller. */
++	return qmp_v8_usb4_calibrate(qmp);
++}
++
+ static int qmp_combo_usb_power_on(struct phy *phy)
+ {
+ 	struct qmp_combo *qmp = phy_get_drvdata(phy);
+@@ -4559,6 +4671,9 @@ static int qmp_combo_usb_power_on(struct phy *phy)
+ 	unsigned int val;
+ 	int ret;
+ 
++	if (qmp->qmpphy_mode == QMPPHY_MODE_USB4 && cfg->configure_usb4_phy)
++		return cfg->configure_usb4_phy(qmp);
++
+ 	if (qmp->qmpphy_mode == QMPPHY_MODE_USB4) {
+ 		pcs = qmp->usb4_pcs;
+ 		serdes = qmp->usb4_serdes;
+@@ -4762,6 +4877,10 @@ static int qmp_combo_usb4_init(struct phy *phy)
+ 
+ 	guard(mutex)(&qmp->phy_mutex);
+ 
++	if (qmp->cfg->configure_usb4_phy && qmp->usb4_rx_eq > 0xff)
++		return dev_err_probe(qmp->dev, -EINVAL,
++				     "USB4 requires qcom,usb4-rx-eq board tuning\n");
++
+ 	if (!qmp->p2rr2p_pipe_clk) {
+ 		dev_err(qmp->dev, "missing p2rr2p_pipe clock handle. Update your Device Tree.\n");
+ 		return -EINVAL;
+@@ -5645,6 +5764,15 @@ static int qmp_combo_parse_dt(struct qmp_combo *qmp)
+ 				     "failed to get p2rr2p_pipe clock\n");
+ 	}
+ 
++	qmp->usb4_rx_eq = U32_MAX;
++	if (qmp->cfg->configure_usb4_phy &&
++	    of_property_present(dev->of_node, "qcom,usb4-rx-eq")) {
++		ret = of_property_read_u32(dev->of_node, "qcom,usb4-rx-eq",
++					   &qmp->usb4_rx_eq);
++		if (ret || qmp->usb4_rx_eq > 0xff)
++			return dev_err_probe(dev, -EINVAL, "invalid USB4 RXEQ tuning\n");
++	}
++
+ 	return 0;
+ }
+ 
+@@ -5881,7 +6009,7 @@ static int qmp_combo_probe(struct platform_device *pdev)
+ 
+ 	phy_set_drvdata(qmp->dp_phy, qmp);
+ 
+-	if (qmp->cfg->usb4_serdes_tbl) {
++	if (qmp->cfg->usb4_serdes_tbl || qmp->cfg->configure_usb4_phy) {
+ 		qmp->usb4_phy = devm_phy_create(dev, dev->of_node, &qmp_combo_usb4_phy_ops);
+ 		if (IS_ERR(qmp->usb4_phy)) {
+ 			ret = PTR_ERR(qmp->usb4_phy);
+diff --git a/drivers/phy/qualcomm/phy-qcom-qmp-glymur-usb4-tables.h b/drivers/phy/qualcomm/phy-qcom-qmp-glymur-usb4-tables.h
+new file mode 100644
+index 00000000000..86ea849b620
+--- /dev/null
++++ b/drivers/phy/qualcomm/phy-qcom-qmp-glymur-usb4-tables.h
+@@ -0,0 +1,500 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/*
++ * Glymur USB4 and TBT3 PHY programming sequences, in write order.
++ * Offsets are relative to the start of the QMP combo PHY register space,
++ * not to its sub-blocks.
++ */
++
++static const struct qmp_phy_init_tbl glymur_usb4_init_tbl[] = {
++	QMP_PHY_INIT_CFG(0x0000, 0x04),
++	QMP_PHY_INIT_CFG(0x0004, 0x00),
++	QMP_PHY_INIT_CFG(0x0008, 0x01),
++	QMP_PHY_INIT_CFG(0x001c, 0x15),
++	QMP_PHY_INIT_CFG(0x010c, 0x00),
++	QMP_PHY_INIT_CFG(0x3000, 0xcc),
++	QMP_PHY_INIT_CFG(0x3004, 0x01),
++	QMP_PHY_INIT_CFG(0x300c, 0xff),
++	QMP_PHY_INIT_CFG(0x3010, 0x06),
++	QMP_PHY_INIT_CFG(0x3014, 0x16),
++	QMP_PHY_INIT_CFG(0x3018, 0x36),
++	QMP_PHY_INIT_CFG(0x301c, 0x02),
++	QMP_PHY_INIT_CFG(0x3020, 0x24),
++	QMP_PHY_INIT_CFG(0x3024, 0x43),
++	QMP_PHY_INIT_CFG(0x3028, 0x43),
++	QMP_PHY_INIT_CFG(0x3030, 0xab),
++	QMP_PHY_INIT_CFG(0x3034, 0x02),
++	QMP_PHY_INIT_CFG(0x3038, 0x02),
++	QMP_PHY_INIT_CFG(0x303c, 0x11),
++	QMP_PHY_INIT_CFG(0x3040, 0xff),
++	QMP_PHY_INIT_CFG(0x3048, 0x0f),
++	QMP_PHY_INIT_CFG(0x304c, 0x03),
++	QMP_PHY_INIT_CFG(0x3050, 0x8c),
++	QMP_PHY_INIT_CFG(0x3054, 0x1f),
++	QMP_PHY_INIT_CFG(0x3058, 0x96),
++	QMP_PHY_INIT_CFG(0x305c, 0x1e),
++	QMP_PHY_INIT_CFG(0x3060, 0x9c),
++	QMP_PHY_INIT_CFG(0x3064, 0x01),
++	QMP_PHY_INIT_CFG(0x306c, 0xff),
++	QMP_PHY_INIT_CFG(0x3070, 0x06),
++	QMP_PHY_INIT_CFG(0x3074, 0x16),
++	QMP_PHY_INIT_CFG(0x3078, 0x36),
++	QMP_PHY_INIT_CFG(0x307c, 0x02),
++	QMP_PHY_INIT_CFG(0x3080, 0x1a),
++	QMP_PHY_INIT_CFG(0x3084, 0x41),
++	QMP_PHY_INIT_CFG(0x3088, 0x41),
++	QMP_PHY_INIT_CFG(0x3090, 0x55),
++	QMP_PHY_INIT_CFG(0x3094, 0x75),
++	QMP_PHY_INIT_CFG(0x3098, 0x01),
++	QMP_PHY_INIT_CFG(0x309c, 0x00),
++	QMP_PHY_INIT_CFG(0x30a0, 0xff),
++	QMP_PHY_INIT_CFG(0x30a8, 0x4d),
++	QMP_PHY_INIT_CFG(0x30ac, 0x03),
++	QMP_PHY_INIT_CFG(0x30c0, 0x01),
++	QMP_PHY_INIT_CFG(0x30cc, 0x76),
++	QMP_PHY_INIT_CFG(0x30d0, 0x02),
++	QMP_PHY_INIT_CFG(0x30d8, 0x60),
++	QMP_PHY_INIT_CFG(0x30e0, 0x10),
++	QMP_PHY_INIT_CFG(0x30e4, 0x82),
++	QMP_PHY_INIT_CFG(0x30e8, 0x0a),
++	QMP_PHY_INIT_CFG(0x30f4, 0x7f),
++	QMP_PHY_INIT_CFG(0x30f8, 0x7f),
++	QMP_PHY_INIT_CFG(0x30fc, 0x0a),
++	QMP_PHY_INIT_CFG(0x3110, 0x1a),
++	QMP_PHY_INIT_CFG(0x3120, 0x04),
++	QMP_PHY_INIT_CFG(0x3124, 0x04),
++	QMP_PHY_INIT_CFG(0x313c, 0x00),
++	QMP_PHY_INIT_CFG(0x3140, 0x00),
++	QMP_PHY_INIT_CFG(0x3170, 0xf0),
++	QMP_PHY_INIT_CFG(0x3174, 0xf6),
++	QMP_PHY_INIT_CFG(0x3180, 0x2a),
++	QMP_PHY_INIT_CFG(0x3188, 0x88),
++	QMP_PHY_INIT_CFG(0x318c, 0x05),
++	QMP_PHY_INIT_CFG(0x319c, 0x07),
++	QMP_PHY_INIT_CFG(0x31bc, 0x0f),
++	QMP_PHY_INIT_CFG(0x32d8, 0x40),
++	QMP_PHY_INIT_CFG(0x32dc, 0x03),
++	QMP_PHY_INIT_CFG(0x32e0, 0x60),
++	QMP_PHY_INIT_CFG(0x3300, 0x20),
++	QMP_PHY_INIT_CFG(0x3308, 0x20),
++	QMP_PHY_INIT_CFG(0x32f0, 0x25),
++	QMP_PHY_INIT_CFG(0x32f4, 0x33),
++	QMP_PHY_INIT_CFG(0x32fc, 0xaf),
++	QMP_PHY_INIT_CFG(0x3800, 0x00),
++	QMP_PHY_INIT_CFG(0x3840, 0x01),
++	QMP_PHY_INIT_CFG(0x3844, 0x03),
++	QMP_PHY_INIT_CFG(0x38ac, 0xcf),
++	QMP_PHY_INIT_CFG(0x38b0, 0x0f),
++	QMP_PHY_INIT_CFG(0x38e4, 0x03),
++	QMP_PHY_INIT_CFG(0x38e8, 0xc1),
++	QMP_PHY_INIT_CFG(0x3918, 0x51),
++	QMP_PHY_INIT_CFG(0x3944, 0x51),
++	QMP_PHY_INIT_CFG(0x3a9c, 0x55),
++	QMP_PHY_INIT_CFG(0x3ae0, 0x36),
++	QMP_PHY_INIT_CFG(0x3b00, 0x4b),
++	QMP_PHY_INIT_CFG(0x3b10, 0x00),
++	QMP_PHY_INIT_CFG(0x3b14, 0x28),
++	QMP_PHY_INIT_CFG(0x3b40, 0x83),
++	QMP_PHY_INIT_CFG(0x3b44, 0xdb),
++	QMP_PHY_INIT_CFG(0x3b48, 0x26),
++	QMP_PHY_INIT_CFG(0x3b50, 0x18),
++	QMP_PHY_INIT_CFG(0x3b5c, 0x83),
++	QMP_PHY_INIT_CFG(0x3b64, 0x2a),
++	QMP_PHY_INIT_CFG(0x3b6c, 0x18),
++	QMP_PHY_INIT_CFG(0x3ba0, 0x0f),
++	QMP_PHY_INIT_CFG(0x3ba8, 0xff),
++	QMP_PHY_INIT_CFG(0x405c, 0x85),
++	QMP_PHY_INIT_CFG(0x4084, 0x0d),
++	QMP_PHY_INIT_CFG(0x40a8, 0x80),
++	QMP_PHY_INIT_CFG(0x40ac, 0x8e),
++	QMP_PHY_INIT_CFG(0x40cc, 0x0c),
++	QMP_PHY_INIT_CFG(0x40d0, 0x40),
++	QMP_PHY_INIT_CFG(0x40d8, 0x01),
++	QMP_PHY_INIT_CFG(0x40ec, 0x20),
++	QMP_PHY_INIT_CFG(0x40f4, 0x10),
++	QMP_PHY_INIT_CFG(0x4100, 0x02),
++	QMP_PHY_INIT_CFG(0x410c, 0x13),
++	QMP_PHY_INIT_CFG(0x4110, 0x09),
++	QMP_PHY_INIT_CFG(0x55c4, 0x05),
++	QMP_PHY_INIT_CFG(0x5470, 0x09),
++	QMP_PHY_INIT_CFG(0x45c4, 0x05),
++	QMP_PHY_INIT_CFG(0x4470, 0x09),
++	QMP_PHY_INIT_CFG(0x4128, 0x1c),
++	QMP_PHY_INIT_CFG(0x4130, 0x50),
++	QMP_PHY_INIT_CFG(0x4174, 0x1c),
++	QMP_PHY_INIT_CFG(0x417c, 0x7c),
++	QMP_PHY_INIT_CFG(0x4180, 0x64),
++	QMP_PHY_INIT_CFG(0x4184, 0x04),
++	QMP_PHY_INIT_CFG(0x4188, 0x57),
++	QMP_PHY_INIT_CFG(0x418c, 0x12),
++	QMP_PHY_INIT_CFG(0x4190, 0x1a),
++	QMP_PHY_INIT_CFG(0x4194, 0xce),
++	QMP_PHY_INIT_CFG(0x4198, 0xc4),
++	QMP_PHY_INIT_CFG(0x419c, 0xce),
++	QMP_PHY_INIT_CFG(0x41a0, 0x60),
++	QMP_PHY_INIT_CFG(0x41a4, 0x04),
++	QMP_PHY_INIT_CFG(0x41a8, 0x24),
++	QMP_PHY_INIT_CFG(0x41ac, 0x5b),
++	QMP_PHY_INIT_CFG(0x41b0, 0x1b),
++	QMP_PHY_INIT_CFG(0x41d8, 0x0c),
++	QMP_PHY_INIT_CFG(0x4250, 0x26),
++	QMP_PHY_INIT_CFG(0x4254, 0x26),
++	QMP_PHY_INIT_CFG(0x4258, 0x26),
++	QMP_PHY_INIT_CFG(0x425c, 0x26),
++	QMP_PHY_INIT_CFG(0x4278, 0x11),
++	QMP_PHY_INIT_CFG(0x42a4, 0x32),
++	QMP_PHY_INIT_CFG(0x42bc, 0x19),
++	QMP_PHY_INIT_CFG(0x42c4, 0x14),
++	QMP_PHY_INIT_CFG(0x42f4, 0xff),
++	QMP_PHY_INIT_CFG(0x42fc, 0xff),
++	QMP_PHY_INIT_CFG(0x4314, 0x0a),
++	QMP_PHY_INIT_CFG(0x4318, 0x10),
++	QMP_PHY_INIT_CFG(0x4358, 0x55),
++	QMP_PHY_INIT_CFG(0x43ac, 0xa3),
++	QMP_PHY_INIT_CFG(0x43b4, 0x0e),
++	QMP_PHY_INIT_CFG(0x43b8, 0x14),
++	QMP_PHY_INIT_CFG(0x43bc, 0x00),
++	QMP_PHY_INIT_CFG(0x43c0, 0x66),
++	QMP_PHY_INIT_CFG(0x43d0, 0xff),
++	QMP_PHY_INIT_CFG(0x43d4, 0xff),
++	QMP_PHY_INIT_CFG(0x4410, 0x04),
++	QMP_PHY_INIT_CFG(0x4414, 0x02),
++	QMP_PHY_INIT_CFG(0x4428, 0x55),
++	QMP_PHY_INIT_CFG(0x4434, 0x02),
++	QMP_PHY_INIT_CFG(0x444c, 0x51),
++	QMP_PHY_INIT_CFG(0x4454, 0xff),
++	QMP_PHY_INIT_CFG(0x445c, 0x17),
++	QMP_PHY_INIT_CFG(0x4460, 0x1f),
++	QMP_PHY_INIT_CFG(0x4468, 0xd0),
++	QMP_PHY_INIT_CFG(0x446c, 0x08),
++	QMP_PHY_INIT_CFG(0x448c, 0xc8),
++	QMP_PHY_INIT_CFG(0x44ac, 0x18),
++	QMP_PHY_INIT_CFG(0x44b0, 0x28),
++	QMP_PHY_INIT_CFG(0x44c4, 0x44),
++	QMP_PHY_INIT_CFG(0x450c, 0x00),
++	QMP_PHY_INIT_CFG(0x4518, 0x2c),
++	QMP_PHY_INIT_CFG(0x45a4, 0x58),
++	QMP_PHY_INIT_CFG(0x45ac, 0x11),
++	QMP_PHY_INIT_CFG(0x45e8, 0x10),
++	QMP_PHY_INIT_CFG(0x4624, 0x1f),
++	QMP_PHY_INIT_CFG(0x4670, 0x20),
++	QMP_PHY_INIT_CFG(0x4684, 0x02),
++	QMP_PHY_INIT_CFG(0x4898, 0x77),
++	QMP_PHY_INIT_CFG(0x505c, 0x85),
++	QMP_PHY_INIT_CFG(0x5084, 0x0d),
++	QMP_PHY_INIT_CFG(0x50a8, 0x80),
++	QMP_PHY_INIT_CFG(0x50ac, 0x8e),
++	QMP_PHY_INIT_CFG(0x50cc, 0x0c),
++	QMP_PHY_INIT_CFG(0x50d0, 0x40),
++	QMP_PHY_INIT_CFG(0x50d8, 0x01),
++	QMP_PHY_INIT_CFG(0x50ec, 0x20),
++	QMP_PHY_INIT_CFG(0x50f4, 0x10),
++	QMP_PHY_INIT_CFG(0x5100, 0x02),
++	QMP_PHY_INIT_CFG(0x510c, 0x13),
++	QMP_PHY_INIT_CFG(0x5110, 0x09),
++	QMP_PHY_INIT_CFG(0x5128, 0x1c),
++	QMP_PHY_INIT_CFG(0x5130, 0x50),
++	QMP_PHY_INIT_CFG(0x5174, 0x1c),
++	QMP_PHY_INIT_CFG(0x517c, 0x7c),
++	QMP_PHY_INIT_CFG(0x5180, 0x64),
++	QMP_PHY_INIT_CFG(0x5184, 0x04),
++	QMP_PHY_INIT_CFG(0x5188, 0x57),
++	QMP_PHY_INIT_CFG(0x518c, 0x12),
++	QMP_PHY_INIT_CFG(0x5190, 0x1a),
++	QMP_PHY_INIT_CFG(0x5194, 0xce),
++	QMP_PHY_INIT_CFG(0x5198, 0xc4),
++	QMP_PHY_INIT_CFG(0x519c, 0xce),
++	QMP_PHY_INIT_CFG(0x51a0, 0x60),
++	QMP_PHY_INIT_CFG(0x51a4, 0x04),
++	QMP_PHY_INIT_CFG(0x51a8, 0x24),
++	QMP_PHY_INIT_CFG(0x51ac, 0x5b),
++	QMP_PHY_INIT_CFG(0x51b0, 0x1b),
++	QMP_PHY_INIT_CFG(0x51d8, 0x0c),
++	QMP_PHY_INIT_CFG(0x5250, 0x26),
++	QMP_PHY_INIT_CFG(0x5254, 0x26),
++	QMP_PHY_INIT_CFG(0x5258, 0x26),
++	QMP_PHY_INIT_CFG(0x525c, 0x26),
++	QMP_PHY_INIT_CFG(0x5278, 0x11),
++	QMP_PHY_INIT_CFG(0x52a4, 0x32),
++	QMP_PHY_INIT_CFG(0x52bc, 0x19),
++	QMP_PHY_INIT_CFG(0x52c4, 0x14),
++	QMP_PHY_INIT_CFG(0x52f4, 0xff),
++	QMP_PHY_INIT_CFG(0x52fc, 0xff),
++	QMP_PHY_INIT_CFG(0x5314, 0x0a),
++	QMP_PHY_INIT_CFG(0x5318, 0x10),
++	QMP_PHY_INIT_CFG(0x5358, 0x55),
++	QMP_PHY_INIT_CFG(0x53ac, 0xa3),
++	QMP_PHY_INIT_CFG(0x53b4, 0x0e),
++	QMP_PHY_INIT_CFG(0x53b8, 0x14),
++	QMP_PHY_INIT_CFG(0x53bc, 0x00),
++	QMP_PHY_INIT_CFG(0x53c0, 0x66),
++	QMP_PHY_INIT_CFG(0x53d0, 0xff),
++	QMP_PHY_INIT_CFG(0x53d4, 0xff),
++	QMP_PHY_INIT_CFG(0x5410, 0x04),
++	QMP_PHY_INIT_CFG(0x5414, 0x02),
++	QMP_PHY_INIT_CFG(0x5428, 0x55),
++	QMP_PHY_INIT_CFG(0x5434, 0x02),
++	QMP_PHY_INIT_CFG(0x544c, 0x51),
++	QMP_PHY_INIT_CFG(0x5454, 0xff),
++	QMP_PHY_INIT_CFG(0x545c, 0x17),
++	QMP_PHY_INIT_CFG(0x5460, 0x1f),
++	QMP_PHY_INIT_CFG(0x5468, 0xd0),
++	QMP_PHY_INIT_CFG(0x546c, 0x08),
++	QMP_PHY_INIT_CFG(0x548c, 0xc8),
++	QMP_PHY_INIT_CFG(0x54ac, 0x18),
++	QMP_PHY_INIT_CFG(0x54b0, 0x28),
++	QMP_PHY_INIT_CFG(0x54c4, 0x44),
++	QMP_PHY_INIT_CFG(0x550c, 0x00),
++	QMP_PHY_INIT_CFG(0x5518, 0x2c),
++	QMP_PHY_INIT_CFG(0x55a4, 0x58),
++	QMP_PHY_INIT_CFG(0x55ac, 0x11),
++	QMP_PHY_INIT_CFG(0x55e8, 0x10),
++	QMP_PHY_INIT_CFG(0x5624, 0x1f),
++	QMP_PHY_INIT_CFG(0x5670, 0x20),
++	QMP_PHY_INIT_CFG(0x5684, 0x02),
++	QMP_PHY_INIT_CFG(0x5898, 0x77),
++};
++
++static const struct qmp_phy_init_tbl glymur_tbt3_init_tbl[] = {
++	QMP_PHY_INIT_CFG(0x0000, 0x04),
++	QMP_PHY_INIT_CFG(0x0004, 0x00),
++	QMP_PHY_INIT_CFG(0x0008, 0x01),
++	QMP_PHY_INIT_CFG(0x001c, 0x15),
++	QMP_PHY_INIT_CFG(0x010c, 0x00),
++	QMP_PHY_INIT_CFG(0x3000, 0xcc),
++	QMP_PHY_INIT_CFG(0x3004, 0x01),
++	QMP_PHY_INIT_CFG(0x300c, 0xff),
++	QMP_PHY_INIT_CFG(0x3010, 0x06),
++	QMP_PHY_INIT_CFG(0x3014, 0x16),
++	QMP_PHY_INIT_CFG(0x3018, 0x36),
++	QMP_PHY_INIT_CFG(0x301c, 0x02),
++	QMP_PHY_INIT_CFG(0x3020, 0x24),
++	QMP_PHY_INIT_CFG(0x3024, 0x43),
++	QMP_PHY_INIT_CFG(0x3028, 0x43),
++	QMP_PHY_INIT_CFG(0x3030, 0xab),
++	QMP_PHY_INIT_CFG(0x3034, 0x02),
++	QMP_PHY_INIT_CFG(0x3038, 0x02),
++	QMP_PHY_INIT_CFG(0x303c, 0x11),
++	QMP_PHY_INIT_CFG(0x3040, 0xff),
++	QMP_PHY_INIT_CFG(0x3048, 0x0f),
++	QMP_PHY_INIT_CFG(0x304c, 0x03),
++	QMP_PHY_INIT_CFG(0x3050, 0x8c),
++	QMP_PHY_INIT_CFG(0x3054, 0x1f),
++	QMP_PHY_INIT_CFG(0x3058, 0x96),
++	QMP_PHY_INIT_CFG(0x305c, 0x1e),
++	QMP_PHY_INIT_CFG(0x3060, 0x9c),
++	QMP_PHY_INIT_CFG(0x3064, 0x01),
++	QMP_PHY_INIT_CFG(0x306c, 0xff),
++	QMP_PHY_INIT_CFG(0x3070, 0x06),
++	QMP_PHY_INIT_CFG(0x3074, 0x16),
++	QMP_PHY_INIT_CFG(0x3078, 0x36),
++	QMP_PHY_INIT_CFG(0x307c, 0x02),
++	QMP_PHY_INIT_CFG(0x3080, 0x1a),
++	QMP_PHY_INIT_CFG(0x3084, 0x41),
++	QMP_PHY_INIT_CFG(0x3088, 0x41),
++	QMP_PHY_INIT_CFG(0x3090, 0x55),
++	QMP_PHY_INIT_CFG(0x3094, 0x75),
++	QMP_PHY_INIT_CFG(0x3098, 0x01),
++	QMP_PHY_INIT_CFG(0x309c, 0x00),
++	QMP_PHY_INIT_CFG(0x30a0, 0xff),
++	QMP_PHY_INIT_CFG(0x30a8, 0x4d),
++	QMP_PHY_INIT_CFG(0x30ac, 0x03),
++	QMP_PHY_INIT_CFG(0x30c0, 0x01),
++	QMP_PHY_INIT_CFG(0x30cc, 0x46),
++	QMP_PHY_INIT_CFG(0x30d0, 0x02),
++	QMP_PHY_INIT_CFG(0x30d8, 0x60),
++	QMP_PHY_INIT_CFG(0x30e0, 0x10),
++	QMP_PHY_INIT_CFG(0x30e4, 0x82),
++	QMP_PHY_INIT_CFG(0x30e8, 0x0a),
++	QMP_PHY_INIT_CFG(0x30f4, 0x7f),
++	QMP_PHY_INIT_CFG(0x30f8, 0x7f),
++	QMP_PHY_INIT_CFG(0x30fc, 0x0a),
++	QMP_PHY_INIT_CFG(0x3110, 0x1a),
++	QMP_PHY_INIT_CFG(0x3120, 0x04),
++	QMP_PHY_INIT_CFG(0x3124, 0x04),
++	QMP_PHY_INIT_CFG(0x313c, 0x00),
++	QMP_PHY_INIT_CFG(0x3140, 0x54),
++	QMP_PHY_INIT_CFG(0x3170, 0xf0),
++	QMP_PHY_INIT_CFG(0x3174, 0xf6),
++	QMP_PHY_INIT_CFG(0x3180, 0x2a),
++	QMP_PHY_INIT_CFG(0x3188, 0x88),
++	QMP_PHY_INIT_CFG(0x318c, 0x05),
++	QMP_PHY_INIT_CFG(0x319c, 0x07),
++	QMP_PHY_INIT_CFG(0x31bc, 0x0f),
++	QMP_PHY_INIT_CFG(0x32d8, 0x40),
++	QMP_PHY_INIT_CFG(0x32dc, 0x03),
++	QMP_PHY_INIT_CFG(0x32e0, 0x60),
++	QMP_PHY_INIT_CFG(0x3300, 0x20),
++	QMP_PHY_INIT_CFG(0x3308, 0x20),
++	QMP_PHY_INIT_CFG(0x32f0, 0x25),
++	QMP_PHY_INIT_CFG(0x32f4, 0x33),
++	QMP_PHY_INIT_CFG(0x32fc, 0xaf),
++	QMP_PHY_INIT_CFG(0x3800, 0x00),
++	QMP_PHY_INIT_CFG(0x3840, 0x01),
++	QMP_PHY_INIT_CFG(0x3844, 0x03),
++	QMP_PHY_INIT_CFG(0x38ac, 0xcf),
++	QMP_PHY_INIT_CFG(0x38b0, 0x1f),
++	QMP_PHY_INIT_CFG(0x38e4, 0x03),
++	QMP_PHY_INIT_CFG(0x38e8, 0xc1),
++	QMP_PHY_INIT_CFG(0x3918, 0x51),
++	QMP_PHY_INIT_CFG(0x3944, 0x51),
++	QMP_PHY_INIT_CFG(0x3a9c, 0x55),
++	QMP_PHY_INIT_CFG(0x3ae0, 0x36),
++	QMP_PHY_INIT_CFG(0x3b00, 0x4b),
++	QMP_PHY_INIT_CFG(0x3b10, 0x00),
++	QMP_PHY_INIT_CFG(0x3b14, 0x28),
++	QMP_PHY_INIT_CFG(0x3b40, 0x83),
++	QMP_PHY_INIT_CFG(0x3b44, 0xdb),
++	QMP_PHY_INIT_CFG(0x3b48, 0x26),
++	QMP_PHY_INIT_CFG(0x3b50, 0x18),
++	QMP_PHY_INIT_CFG(0x3b5c, 0x83),
++	QMP_PHY_INIT_CFG(0x3b64, 0x2a),
++	QMP_PHY_INIT_CFG(0x3b6c, 0x18),
++	QMP_PHY_INIT_CFG(0x3ba0, 0x0f),
++	QMP_PHY_INIT_CFG(0x3ba8, 0xff),
++	QMP_PHY_INIT_CFG(0x405c, 0x85),
++	QMP_PHY_INIT_CFG(0x4084, 0x0d),
++	QMP_PHY_INIT_CFG(0x40a8, 0x80),
++	QMP_PHY_INIT_CFG(0x40ac, 0x8e),
++	QMP_PHY_INIT_CFG(0x40cc, 0x0c),
++	QMP_PHY_INIT_CFG(0x40d0, 0x40),
++	QMP_PHY_INIT_CFG(0x40d8, 0x01),
++	QMP_PHY_INIT_CFG(0x40ec, 0x20),
++	QMP_PHY_INIT_CFG(0x40f4, 0x10),
++	QMP_PHY_INIT_CFG(0x4100, 0x02),
++	QMP_PHY_INIT_CFG(0x410c, 0x13),
++	QMP_PHY_INIT_CFG(0x4110, 0x09),
++	QMP_PHY_INIT_CFG(0x4128, 0x1c),
++	QMP_PHY_INIT_CFG(0x4130, 0x50),
++	QMP_PHY_INIT_CFG(0x4174, 0x1c),
++	QMP_PHY_INIT_CFG(0x417c, 0x7c),
++	QMP_PHY_INIT_CFG(0x4180, 0x64),
++	QMP_PHY_INIT_CFG(0x4184, 0x04),
++	QMP_PHY_INIT_CFG(0x4188, 0x57),
++	QMP_PHY_INIT_CFG(0x418c, 0x12),
++	QMP_PHY_INIT_CFG(0x4190, 0x1a),
++	QMP_PHY_INIT_CFG(0x4194, 0xce),
++	QMP_PHY_INIT_CFG(0x4198, 0xc4),
++	QMP_PHY_INIT_CFG(0x419c, 0xce),
++	QMP_PHY_INIT_CFG(0x41a0, 0x60),
++	QMP_PHY_INIT_CFG(0x41a4, 0x04),
++	QMP_PHY_INIT_CFG(0x41a8, 0x24),
++	QMP_PHY_INIT_CFG(0x41ac, 0x5b),
++	QMP_PHY_INIT_CFG(0x41b0, 0x1b),
++	QMP_PHY_INIT_CFG(0x41d8, 0x0c),
++	QMP_PHY_INIT_CFG(0x4250, 0x57),
++	QMP_PHY_INIT_CFG(0x4254, 0x27),
++	QMP_PHY_INIT_CFG(0x4258, 0x57),
++	QMP_PHY_INIT_CFG(0x425c, 0x27),
++	QMP_PHY_INIT_CFG(0x4278, 0x11),
++	QMP_PHY_INIT_CFG(0x42a4, 0x32),
++	QMP_PHY_INIT_CFG(0x42bc, 0x19),
++	QMP_PHY_INIT_CFG(0x42c4, 0x14),
++	QMP_PHY_INIT_CFG(0x42f4, 0xff),
++	QMP_PHY_INIT_CFG(0x42fc, 0xff),
++	QMP_PHY_INIT_CFG(0x4314, 0x0a),
++	QMP_PHY_INIT_CFG(0x4318, 0x10),
++	QMP_PHY_INIT_CFG(0x4358, 0x55),
++	QMP_PHY_INIT_CFG(0x43ac, 0xa3),
++	QMP_PHY_INIT_CFG(0x43b4, 0x0e),
++	QMP_PHY_INIT_CFG(0x43b8, 0x14),
++	QMP_PHY_INIT_CFG(0x43bc, 0x00),
++	QMP_PHY_INIT_CFG(0x43c0, 0x66),
++	QMP_PHY_INIT_CFG(0x43d0, 0xff),
++	QMP_PHY_INIT_CFG(0x43d4, 0xff),
++	QMP_PHY_INIT_CFG(0x4410, 0x04),
++	QMP_PHY_INIT_CFG(0x4414, 0x02),
++	QMP_PHY_INIT_CFG(0x4428, 0x55),
++	QMP_PHY_INIT_CFG(0x4434, 0x02),
++	QMP_PHY_INIT_CFG(0x444c, 0x51),
++	QMP_PHY_INIT_CFG(0x4454, 0xff),
++	QMP_PHY_INIT_CFG(0x445c, 0x17),
++	QMP_PHY_INIT_CFG(0x4460, 0x1f),
++	QMP_PHY_INIT_CFG(0x4468, 0xd0),
++	QMP_PHY_INIT_CFG(0x446c, 0x08),
++	QMP_PHY_INIT_CFG(0x448c, 0xc8),
++	QMP_PHY_INIT_CFG(0x44ac, 0x18),
++	QMP_PHY_INIT_CFG(0x44b0, 0x28),
++	QMP_PHY_INIT_CFG(0x44c4, 0x44),
++	QMP_PHY_INIT_CFG(0x450c, 0x00),
++	QMP_PHY_INIT_CFG(0x4518, 0x2c),
++	QMP_PHY_INIT_CFG(0x45a4, 0x58),
++	QMP_PHY_INIT_CFG(0x45ac, 0x11),
++	QMP_PHY_INIT_CFG(0x45e8, 0x10),
++	QMP_PHY_INIT_CFG(0x4624, 0x1f),
++	QMP_PHY_INIT_CFG(0x4670, 0x20),
++	QMP_PHY_INIT_CFG(0x4684, 0x02),
++	QMP_PHY_INIT_CFG(0x4898, 0x77),
++	QMP_PHY_INIT_CFG(0x505c, 0x85),
++	QMP_PHY_INIT_CFG(0x5084, 0x0d),
++	QMP_PHY_INIT_CFG(0x50a8, 0x80),
++	QMP_PHY_INIT_CFG(0x50ac, 0x8e),
++	QMP_PHY_INIT_CFG(0x50cc, 0x0c),
++	QMP_PHY_INIT_CFG(0x50d0, 0x40),
++	QMP_PHY_INIT_CFG(0x50d8, 0x01),
++	QMP_PHY_INIT_CFG(0x50ec, 0x20),
++	QMP_PHY_INIT_CFG(0x50f4, 0x10),
++	QMP_PHY_INIT_CFG(0x5100, 0x02),
++	QMP_PHY_INIT_CFG(0x510c, 0x13),
++	QMP_PHY_INIT_CFG(0x5110, 0x09),
++	QMP_PHY_INIT_CFG(0x5128, 0x1c),
++	QMP_PHY_INIT_CFG(0x5130, 0x50),
++	QMP_PHY_INIT_CFG(0x5174, 0x1c),
++	QMP_PHY_INIT_CFG(0x517c, 0x7c),
++	QMP_PHY_INIT_CFG(0x5180, 0x64),
++	QMP_PHY_INIT_CFG(0x5184, 0x04),
++	QMP_PHY_INIT_CFG(0x5188, 0x57),
++	QMP_PHY_INIT_CFG(0x518c, 0x12),
++	QMP_PHY_INIT_CFG(0x5190, 0x1a),
++	QMP_PHY_INIT_CFG(0x5194, 0xce),
++	QMP_PHY_INIT_CFG(0x5198, 0xc4),
++	QMP_PHY_INIT_CFG(0x519c, 0xce),
++	QMP_PHY_INIT_CFG(0x51a0, 0x60),
++	QMP_PHY_INIT_CFG(0x51a4, 0x04),
++	QMP_PHY_INIT_CFG(0x51a8, 0x24),
++	QMP_PHY_INIT_CFG(0x51ac, 0x5b),
++	QMP_PHY_INIT_CFG(0x51b0, 0x1b),
++	QMP_PHY_INIT_CFG(0x51d8, 0x0c),
++	QMP_PHY_INIT_CFG(0x5250, 0x57),
++	QMP_PHY_INIT_CFG(0x5254, 0x27),
++	QMP_PHY_INIT_CFG(0x5258, 0x57),
++	QMP_PHY_INIT_CFG(0x525c, 0x27),
++	QMP_PHY_INIT_CFG(0x5278, 0x11),
++	QMP_PHY_INIT_CFG(0x52a4, 0x32),
++	QMP_PHY_INIT_CFG(0x52bc, 0x19),
++	QMP_PHY_INIT_CFG(0x52c4, 0x14),
++	QMP_PHY_INIT_CFG(0x52f4, 0xff),
++	QMP_PHY_INIT_CFG(0x52fc, 0xff),
++	QMP_PHY_INIT_CFG(0x5314, 0x0a),
++	QMP_PHY_INIT_CFG(0x5318, 0x10),
++	QMP_PHY_INIT_CFG(0x5358, 0x55),
++	QMP_PHY_INIT_CFG(0x53ac, 0xa3),
++	QMP_PHY_INIT_CFG(0x53b4, 0x0e),
++	QMP_PHY_INIT_CFG(0x53b8, 0x14),
++	QMP_PHY_INIT_CFG(0x53bc, 0x00),
++	QMP_PHY_INIT_CFG(0x53c0, 0x66),
++	QMP_PHY_INIT_CFG(0x53d0, 0xff),
++	QMP_PHY_INIT_CFG(0x53d4, 0xff),
++	QMP_PHY_INIT_CFG(0x5410, 0x04),
++	QMP_PHY_INIT_CFG(0x5414, 0x02),
++	QMP_PHY_INIT_CFG(0x5428, 0x55),
++	QMP_PHY_INIT_CFG(0x5434, 0x02),
++	QMP_PHY_INIT_CFG(0x544c, 0x51),
++	QMP_PHY_INIT_CFG(0x5454, 0xff),
++	QMP_PHY_INIT_CFG(0x545c, 0x17),
++	QMP_PHY_INIT_CFG(0x5460, 0x1f),
++	QMP_PHY_INIT_CFG(0x5468, 0xd0),
++	QMP_PHY_INIT_CFG(0x546c, 0x08),
++	QMP_PHY_INIT_CFG(0x548c, 0xc8),
++	QMP_PHY_INIT_CFG(0x54ac, 0x18),
++	QMP_PHY_INIT_CFG(0x54b0, 0x28),
++	QMP_PHY_INIT_CFG(0x54c4, 0x44),
++	QMP_PHY_INIT_CFG(0x550c, 0x00),
++	QMP_PHY_INIT_CFG(0x5518, 0x2c),
++	QMP_PHY_INIT_CFG(0x55a4, 0x58),
++	QMP_PHY_INIT_CFG(0x55ac, 0x11),
++	QMP_PHY_INIT_CFG(0x55e8, 0x10),
++	QMP_PHY_INIT_CFG(0x5624, 0x1f),
++	QMP_PHY_INIT_CFG(0x5670, 0x20),
++	QMP_PHY_INIT_CFG(0x5684, 0x02),
++	QMP_PHY_INIT_CFG(0x5898, 0x77),
++};
+-- 
+2.56.0
+

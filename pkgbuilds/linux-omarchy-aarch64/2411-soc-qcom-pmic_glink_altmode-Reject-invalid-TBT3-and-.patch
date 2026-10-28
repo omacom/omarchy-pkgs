@@ -1,0 +1,115 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jim Martin <jimmartin@gmail.com>
+Date: Thu, 8 Oct 2026 15:50:57 -0500
+Subject: [PATCH] soc: qcom: pmic_glink_altmode: Reject invalid TBT3 and USB4
+ cable data
+
+The TBT3 and USB4 notifications report the cable type in the Enter_USB
+encoding: passive, re-timer, re-driver or optical.
+
+pmic_glink_altmode_enable_tbt() treats every non-zero type the same. It
+sets TBT_CABLE_ACTIVE_PASSIVE (bit 25) in the Enter Mode VDO, where the
+active cable flag is TBT_ENTER_MODE_ACTIVE_CABLE (bit 24), and it never
+sets TBT_CABLE_RETIMER or TBT_CABLE_OPTICAL. A mux or retimer consumer
+therefore cannot tell a re-timed or optical cable from a re-driver, and
+reads a wrong Enter Mode VDO for every active cable.
+
+Both functions also replace an out-of-range cable speed with the slowest
+one, and pmic_glink_altmode_enable_usb4() copies an out-of-range cable
+type into the EUDO. Neither guess describes the attached cable, so the
+consumer may enter a mode that the cable does not support.
+
+Set the active cable bit at its Enter Mode position, add the retimer and
+optical flags to both VDOs, and drop a notification whose cable type or
+speed is out of range. Report the USB4 error with dev_err() like the TBT3
+one.
+
+Fixes: 0539c5a6fdef ("soc: qcom: pmic_glink_altmode: Consume TBT3/USB4 mode notifications")
+Assisted-by: Opus 5.5
+Signed-off-by: Jim Martin <jimmartin@gmail.com>
+---
+ drivers/soc/qcom/pmic_glink_altmode.c | 42 +++++++++++++++++++--------
+ 1 file changed, 30 insertions(+), 12 deletions(-)
+
+diff --git a/drivers/soc/qcom/pmic_glink_altmode.c b/drivers/soc/qcom/pmic_glink_altmode.c
+index 13c434f8d03..b8c476c0b4b 100644
+--- a/drivers/soc/qcom/pmic_glink_altmode.c
++++ b/drivers/soc/qcom/pmic_glink_altmode.c
+@@ -211,9 +211,25 @@ static void pmic_glink_altmode_enable_tbt(struct pmic_glink_altmode *altmode,
+ {
+ 	struct usbc_sc8280x_tbt_data *tbt = &port->tbt_data;
+ 	struct typec_thunderbolt_data tbt_data = {};
+-	u32 cable_speed;
++	u32 cable_speed, cable_flags = 0;
+ 	int ret;
+ 
++	/* PAN cable types use the same encoding as Enter_USB. */
++	switch (tbt->cable_type) {
++	case EUDO_CABLE_TYPE_PASSIVE:
++	case EUDO_CABLE_TYPE_RE_DRIVER:
++		break;
++	case EUDO_CABLE_TYPE_RE_TIMER:
++		cable_flags = TBT_CABLE_RETIMER;
++		break;
++	case EUDO_CABLE_TYPE_OPTICAL:
++		cable_flags = TBT_CABLE_OPTICAL;
++		break;
++	default:
++		dev_err(altmode->dev, "Invalid TBT3 cable type: %u\n", tbt->cable_type);
++		return;
++	}
++
+ 	/* Device Discover Mode VDO */
+ 	tbt_data.device_mode = TBT_MODE;
+ 	tbt_data.device_mode |= TBT_SET_ADAPTER(TBT_ADAPTER_TBT3);
+@@ -226,15 +242,13 @@ static void pmic_glink_altmode_enable_tbt(struct pmic_glink_altmode *altmode,
+ 	} else if (tbt->usb_speed == 1) {
+ 		cable_speed = TBT_CABLE_10_AND_20GBPS;
+ 	} else {
+-		dev_err(altmode->dev,
+-			"Got illegal TBT3 cable speed value (%u), falling back to passive\n",
+-			tbt->usb_speed);
+-		cable_speed = TBT_CABLE_USB3_PASSIVE;
++		dev_err(altmode->dev, "Invalid TBT3 cable speed: %u\n", tbt->usb_speed);
++		return;
+ 	}
+ 	tbt_data.cable_mode |= TBT_SET_CABLE_SPEED(cable_speed);
+ 
+-	if (tbt->cable_type) {
+-		tbt_data.cable_mode |= TBT_CABLE_ACTIVE_PASSIVE;
++	if (tbt->cable_type != EUDO_CABLE_TYPE_PASSIVE) {
++		tbt_data.cable_mode |= TBT_CABLE_ACTIVE_PASSIVE | cable_flags;
+ 		tbt_data.cable_mode |= TBT_SET_CABLE_ROUNDED(tbt->rounded_cable);
+ 	}
+ 
+@@ -242,8 +256,8 @@ static void pmic_glink_altmode_enable_tbt(struct pmic_glink_altmode *altmode,
+ 	tbt_data.enter_vdo |= TBT_MODE;
+ 	tbt_data.enter_vdo |= TBT_ENTER_MODE_CABLE_SPEED(cable_speed);
+ 
+-	if (tbt->cable_type) {
+-		tbt_data.enter_vdo |= TBT_CABLE_ACTIVE_PASSIVE;
++	if (tbt->cable_type != EUDO_CABLE_TYPE_PASSIVE) {
++		tbt_data.enter_vdo |= TBT_ENTER_MODE_ACTIVE_CABLE | cable_flags;
+ 		tbt_data.enter_vdo |= TBT_SET_CABLE_ROUNDED(tbt->rounded_cable);
+ 	}
+ 
+@@ -278,9 +292,13 @@ static void pmic_glink_altmode_enable_usb4(struct pmic_glink_altmode *altmode,
+ 	} else if (tbt->usb_speed == 1) {
+ 		data.eudo |= FIELD_PREP(EUDO_CABLE_SPEED_MASK, EUDO_CABLE_SPEED_USB4_GEN3);
+ 	} else {
+-		pr_err("Got illegal USB4 cable speed value (%u), falling back to G2\n",
+-		       tbt->usb_speed);
+-		data.eudo |= FIELD_PREP(EUDO_CABLE_SPEED_MASK, EUDO_CABLE_SPEED_USB4_GEN2);
++		dev_err(altmode->dev, "Invalid USB4 cable speed: %u\n", tbt->usb_speed);
++		return;
++	}
++
++	if (tbt->cable_type > EUDO_CABLE_TYPE_OPTICAL) {
++		dev_err(altmode->dev, "Invalid USB4 cable type: %u\n", tbt->cable_type);
++		return;
+ 	}
+ 
+ 	data.eudo |= FIELD_PREP(EUDO_CABLE_TYPE_MASK, tbt->cable_type);
+-- 
+2.56.0
+

@@ -1,0 +1,93 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jim Martin <jimmartin@gmail.com>
+Date: Thu, 8 Oct 2026 13:43:17 -0500
+Subject: [PATCH] drm/msm/dpu: size the core clock per layer mixer
+
+_dpu_core_perf_calc_clk() takes the pixel rate of the whole line,
+vtotal * hdisplay * vrefresh, as the minimum core clock of a CRTC. When
+the CRTC uses more than one layer mixer, each mixer only processes its
+own part of the line, so the core clock needed is that rate divided by
+the number of mixers. The clock is also raised to the largest plane
+clock, and a plane that spans the whole line is normally fetched by a
+single pipe, whose clock is again the full line rate.
+
+Divide the mode clock by the number of mixers, and let dpu_plane_split()
+also split a rectangle whose clock exceeds the clock of one mixer when
+the CRTC has more than one mixer, so that a full-width plane no longer
+holds the core clock at the full line rate.
+
+On a 2304x1536 120 Hz eDP panel driven by two mixers the core clock
+request drops from about 458 MHz to about 229 MHz. A plane that is
+split this way uses two pipe rectangles instead of one, either the two
+rectangles of one SSPP or, where multirect is not possible, two SSPPs.
+
+Assisted-by: Opus 5.5
+Signed-off-by: Jim Martin <jimmartin@gmail.com>
+---
+ drivers/gpu/drm/msm/disp/dpu1/dpu_core_perf.c |  4 ++++
+ drivers/gpu/drm/msm/disp/dpu1/dpu_plane.c     | 12 ++++++++++--
+ 2 files changed, 14 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_core_perf.c b/drivers/gpu/drm/msm/disp/dpu1/dpu_core_perf.c
+index fea173e3746..8f33bf4aa30 100644
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_core_perf.c
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_core_perf.c
+@@ -92,6 +92,7 @@ static u64 _dpu_core_perf_calc_bw(const struct dpu_perf_cfg *perf_cfg,
+ static u64 _dpu_core_perf_calc_clk(const struct dpu_perf_cfg *perf_cfg,
+ 		struct drm_crtc *crtc, struct drm_crtc_state *state)
+ {
++	struct dpu_crtc_state *cstate = to_dpu_crtc_state(state);
+ 	struct drm_plane *plane;
+ 	struct dpu_plane_state *pstate;
+ 	struct drm_display_mode *mode;
+@@ -100,6 +101,9 @@ static u64 _dpu_core_perf_calc_clk(const struct dpu_perf_cfg *perf_cfg,
+ 	mode = &state->adjusted_mode;
+ 
+ 	mode_clk = (u64)mode->vtotal * mode->hdisplay * drm_mode_vrefresh(mode);
++	/* Each layer mixer processes its own share of the line. */
++	if (cstate->num_mixers > 1)
++		mode_clk = div_u64(mode_clk, cstate->num_mixers);
+ 
+ 	drm_atomic_crtc_for_each_plane(plane, crtc) {
+ 		pstate = to_dpu_plane_state(plane->state);
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_plane.c b/drivers/gpu/drm/msm/disp/dpu1/dpu_plane.c
+index 7b92082d35a..660fd812f7f 100644
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_plane.c
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_plane.c
+@@ -880,6 +880,7 @@ static int dpu_plane_split(struct drm_plane *plane,
+ 	struct dpu_sw_pipe_cfg *r_pipe_cfg;
+ 	const struct drm_display_mode *mode = &crtc_state->adjusted_mode;
+ 	uint32_t max_linewidth;
++	u64 mixer_clk;
+ 	u32 num_lm;
+ 	int stage_id, num_stages;
+ 
+@@ -887,6 +888,8 @@ static int dpu_plane_split(struct drm_plane *plane,
+ 
+ 	/* In non-virtual plane case, one mixer pair is always needed. */
+ 	num_lm = dpu_crtc_get_num_lm(crtc_state);
++	mixer_clk = div_u64((u64)mode->vtotal * mode->hdisplay *
++			    drm_mode_vrefresh(mode), max(num_lm, 1U));
+ 	if (dpu_use_virtual_planes)
+ 		num_stages = (num_lm + 1) / 2;
+ 	else
+@@ -948,9 +951,14 @@ static int dpu_plane_split(struct drm_plane *plane,
+ 		DPU_DEBUG_PLANE(pdpu, "Got clip src:" DRM_RECT_FMT " dst: " DRM_RECT_FMT "\n",
+ 				DRM_RECT_ARG(&pipe_cfg->src_rect), DRM_RECT_ARG(&pipe_cfg->dst_rect));
+ 
+-		/* Split wide rect into 2 rect */
++		/*
++		 * Split wide rect into 2 rect. Also split a rect that needs a
++		 * faster clock than a layer mixer, so that one pipe does not
++		 * set the core clock for a line the mixers share.
++		 */
+ 		if ((drm_rect_width(&pipe_cfg->src_rect) > max_linewidth) ||
+-		     _dpu_plane_calc_clk(mode, pipe_cfg) > max_mdp_clk_rate) {
++		     _dpu_plane_calc_clk(mode, pipe_cfg) > max_mdp_clk_rate ||
++		     (num_lm > 1 && _dpu_plane_calc_clk(mode, pipe_cfg) > mixer_clk)) {
+ 
+ 			if (drm_rect_width(&pipe_cfg->src_rect) > 2 * max_linewidth) {
+ 				DPU_DEBUG_PLANE(pdpu, "invalid src " DRM_RECT_FMT " line:%u\n",
+-- 
+2.56.0
+

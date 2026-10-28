@@ -1,0 +1,169 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jim Martin <jimmartin@gmail.com>
+Date: Thu, 8 Oct 2026 13:48:12 -0500
+Subject: [PATCH] drm/msm/dpu: route the Glymur DP0 controller to the USB4 DP
+ IN adapter
+
+On Glymur the stream of DisplayPort controller 0 can either leave
+through the combo PHY or be handed to the USB4 router's DP IN adapter,
+for DisplayPort tunnelled over USB4. The choice is made by a 2-bit field
+in the MDP top block (MDP_DP_USB4_MUX), which the DPU
+driver does not program, so a DP stream can never reach the router.
+
+Add an optional set_usb4_dp_route() operation to msm_kms_funcs and
+implement it for the Glymur DPU. The DP driver calls it when its USB4
+provider switches the controller between the PHY (0) and the router
+(1). The register lives in the MDP power domain and loses its value
+when the DPU is runtime suspended or the system sleeps, so the DPU
+keeps the requested route, writes it immediately only while it is
+runtime active, and writes it again from dpu_runtime_resume().
+
+Assisted-by: Opus 5.5
+Signed-off-by: Jim Martin <jimmartin@gmail.com>
+---
+ drivers/gpu/drm/msm/disp/dpu1/dpu_hw_top.c | 12 ++++++
+ drivers/gpu/drm/msm/disp/dpu1/dpu_hw_top.h |  3 ++
+ drivers/gpu/drm/msm/disp/dpu1/dpu_kms.c    | 43 ++++++++++++++++++++++
+ drivers/gpu/drm/msm/disp/dpu1/dpu_kms.h    |  5 +++
+ drivers/gpu/drm/msm/msm_kms.h              |  2 +
+ 5 files changed, 65 insertions(+)
+
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_top.c b/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_top.c
+index 1ebd75d4f9b..0be29e88e70 100644
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_top.c
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_top.c
+@@ -22,6 +22,18 @@
+ #define TRAFFIC_SHAPER_WR_CLIENT(num)     (0x060 + (num * 4))
+ #define TRAFFIC_SHAPER_FIXPOINT_FACTOR    4
+ 
++#define MDP_DP_USB4_MUX 0x464
++#define MDP_DP_USB4_MUX_DP0_MASK 0x3
++
++void dpu_hw_setup_usb4_dp_route(struct dpu_hw_mdp *mdp, u32 resource)
++{
++	struct dpu_hw_blk_reg_map *c = &mdp->hw;
++	u32 val = DPU_REG_READ(c, MDP_DP_USB4_MUX);
++
++	DPU_REG_WRITE(c, MDP_DP_USB4_MUX,
++		      (val & ~MDP_DP_USB4_MUX_DP0_MASK) | resource);
++}
++
+ static void dpu_hw_setup_split_pipe(struct dpu_hw_mdp *mdp,
+ 		struct split_pipe_cfg *cfg)
+ {
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_top.h b/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_top.h
+index 80279d87c2c..7d3b986e85b 100644
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_top.h
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_top.h
+@@ -156,6 +156,9 @@ struct dpu_hw_mdp {
+ 	struct dpu_hw_mdp_ops ops;
+ };
+ 
++/* Caller must hold the DPU runtime-PM reference; Glymur DP0 only. */
++void dpu_hw_setup_usb4_dp_route(struct dpu_hw_mdp *mdp, u32 resource);
++
+ struct dpu_hw_mdp *dpu_hw_mdptop_init(struct drm_device *dev,
+ 				      const struct dpu_mdp_cfg *cfg,
+ 				      void __iomem *addr,
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_kms.c b/drivers/gpu/drm/msm/disp/dpu1/dpu_kms.c
+index 453b9ef3787..fb3a67865e3 100644
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_kms.c
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_kms.c
+@@ -1066,8 +1066,49 @@ static void dpu_kms_mdp_snapshot(struct msm_disp_state *disp_state, struct msm_k
+ 	pm_runtime_put_sync(&dpu_kms->pdev->dev);
+ }
+ 
++static void dpu_kms_restore_usb4_dp_route(struct dpu_kms *dpu_kms)
++{
++	mutex_lock(&dpu_kms->usb4_route_lock);
++	if (dpu_kms->usb4_dp_route_valid && dpu_kms->hw_mdp) {
++		dpu_hw_setup_usb4_dp_route(dpu_kms->hw_mdp, dpu_kms->usb4_dp_route);
++		dev_dbg(&dpu_kms->pdev->dev, "USB4 DP route restored: resource=%u\n",
++			dpu_kms->usb4_dp_route);
++	}
++	mutex_unlock(&dpu_kms->usb4_route_lock);
++}
++
++static int dpu_kms_set_usb4_dp_route(struct msm_kms *kms, unsigned int resource)
++{
++	struct dpu_kms *dpu_kms = to_dpu_kms(kms);
++	struct device *dev = &dpu_kms->pdev->dev;
++	int ret;
++
++	if (resource > 3)
++		return -EINVAL;
++	if (!of_device_is_compatible(dev->of_node, "qcom,glymur-dpu") ||
++	    !dpu_kms->hw_mdp)
++		return -EOPNOTSUPP;
++
++	/*
++	 * Only program an active DPU. Otherwise (runtime suspended, or runtime
++	 * PM disabled during system sleep) cache the route: the resume
++	 * callback restores it.
++	 */
++	ret = pm_runtime_get_if_active(dev);
++	mutex_lock(&dpu_kms->usb4_route_lock);
++	dpu_kms->usb4_dp_route = resource;
++	dpu_kms->usb4_dp_route_valid = true;
++	if (ret > 0)
++		dpu_hw_setup_usb4_dp_route(dpu_kms->hw_mdp, resource);
++	mutex_unlock(&dpu_kms->usb4_route_lock);
++	if (ret > 0)
++		pm_runtime_put(dev);
++	return 0;
++}
++
+ static const struct msm_kms_funcs kms_funcs = {
+ 	.hw_init         = dpu_kms_hw_init,
++	.set_usb4_dp_route = dpu_kms_set_usb4_dp_route,
+ 	.irq_preinstall  = dpu_core_irq_preinstall,
+ 	.irq_postinstall = dpu_irq_postinstall,
+ 	.irq_uninstall   = dpu_core_irq_uninstall,
+@@ -1391,6 +1432,7 @@ static int dpu_dev_probe(struct platform_device *pdev)
+ 		return -ENOMEM;
+ 
+ 	dpu_kms->pdev = pdev;
++	mutex_init(&dpu_kms->usb4_route_lock);
+ 
+ 	ret = devm_pm_opp_set_clkname(dev, "core");
+ 	if (ret)
+@@ -1485,6 +1527,7 @@ static int __maybe_unused dpu_runtime_resume(struct device *dev)
+ 	}
+ 
+ 	dpu_vbif_init_memtypes(dpu_kms);
++	dpu_kms_restore_usb4_dp_route(dpu_kms);
+ 
+ 	drm_for_each_encoder(encoder, ddev)
+ 		dpu_encoder_virt_runtime_resume(encoder);
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_kms.h b/drivers/gpu/drm/msm/disp/dpu1/dpu_kms.h
+index e39831a397b..d66042fd933 100644
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_kms.h
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_kms.h
+@@ -84,6 +84,11 @@ struct dpu_kms {
+ 	struct dpu_hw_vbif *hw_vbif;
+ 	struct dpu_hw_mdp *hw_mdp;
+ 
++	/* Desired DP-IN route, restored after the MDP power domain resumes. */
++	struct mutex usb4_route_lock;
++	u32 usb4_dp_route;
++	bool usb4_dp_route_valid;
++
+ 	bool has_danger_ctrl;
+ 
+ 	struct platform_device *pdev;
+diff --git a/drivers/gpu/drm/msm/msm_kms.h b/drivers/gpu/drm/msm/msm_kms.h
+index f25b31e502d..8a939766d5f 100644
+--- a/drivers/gpu/drm/msm/msm_kms.h
++++ b/drivers/gpu/drm/msm/msm_kms.h
+@@ -23,6 +23,8 @@
+  * for constructing the appropriate planes/crtcs/encoders/connectors.
+  */
+ struct msm_kms_funcs {
++	/* Optional DP-IN routing, including power-domain state restoration. */
++	int (*set_usb4_dp_route)(struct msm_kms *kms, unsigned int resource);
+ 	/* hw initialization: */
+ 	int (*hw_init)(struct msm_kms *kms);
+ 	/* irq handling: */
+-- 
+2.56.0
+

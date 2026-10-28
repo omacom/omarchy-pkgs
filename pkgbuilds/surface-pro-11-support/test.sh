@@ -248,4 +248,87 @@ for unit in surface-pro-11-flex-autopair surface-pro-11-flex-reconnect; do
     fail "attaching or detaching the keyboard starts $unit"
 done
 
+# Touchpad: after resume a job of its own puts the attached keyboard's touchpad
+# back in touchpad mode. systemd-run is a stub that records what it was asked to
+# run.
+cat >"$bin/systemd-run" <<'STUB'
+#!/bin/bash
+echo "systemd-run $*" >>"$TOUCHPAD_LOG"
+STUB
+chmod +x "$bin/systemd-run"
+touchpad_sleep() {
+  : >"$scratch/touchpad.log"
+  PATH="$bin:$PATH" TOUCHPAD_LOG="$scratch/touchpad.log" SP11_TOUCHPAD_COMPATIBLE="$scratch/$1" \
+    python "$package_dir/surface-pro-11-touchpad-mode-sleep" "${@:2}"
+}
+touchpad_sleep denali post suspend
+grep -q -- "--no-block .*surface-pro-11-touchpad-mode-sleep check$" "$scratch/touchpad.log" ||
+  fail "after resume the touchpad is checked in a job that does not hold up the resume"
+touchpad_sleep denali pre suspend
+[[ ! -s $scratch/touchpad.log ]] || fail "the touchpad hook acts only after resume"
+touchpad_sleep other post suspend
+[[ ! -s $scratch/touchpad.log ]] || fail "the touchpad hook does nothing on other hardware"
+
+# The touchpad's mode and switches, read and written through a fake hidraw node.
+touchpad="$scratch/touchpad/0019:045E:0C8D.0005"
+mkdir -p "$touchpad/hidraw/hidraw4" "$scratch/drivers/hid-multitouch" "$scratch/dev"
+ln -s "$scratch/drivers/hid-multitouch" "$touchpad/driver"
+: >"$scratch/dev/hidraw4"
+# The touchpad's Device Configuration collection, as the keyboard reports it.
+printf '\x05\x0d\x09\x0e\xa1\x01\x85\x84\x09\x22\xa1\x02\x09\x52\x15\x00\x25\x0a\x75\x08\x95\x01\xb1\x02\xc0\x09\x22\xa1\x00\x85\x85\x09\x57\x09\x58\x75\x01\x95\x02\x25\x01\xb1\x02\x95\x06\xb1\x03\xc0\xc0' \
+  >"$scratch/config.rdesc"
+cp "$scratch/config.rdesc" "$touchpad/report_descriptor"
+touchpad_check() { # $1 = Input Mode, $2 = switch report byte, $3 = reply length
+  python - "$package_dir/surface-pro-11-touchpad-mode-sleep" "$scratch" "$@" <<'EOF'
+import sys
+hook = {'__name__': 'hook'}
+exec(open(sys.argv[1]).read(), hook)
+scratch, mode, switches, length = sys.argv[2], int(sys.argv[3], 0), int(sys.argv[4], 0), int(sys.argv[5])
+hook['HID'], hook['DEV'] = scratch + '/touchpad', scratch + '/dev'
+report = {0x84: mode, 0x85: switches}
+
+class Fcntl:
+    def ioctl(self, fd, request, buf):
+        nr = request & 0xff
+        if nr == 0x07:
+            buf[1] = report[buf[0]]
+            return length
+        print(f'set {buf.hex()}')
+        return len(buf)
+
+hook['fcntl'] = Fcntl()
+try:
+    print(hook['check']('0019:045E:0C8D.0005') or 'left alone')
+except OSError as e:
+    print(f'error {e}')
+EOF
+}
+[[ $(touchpad_check 3 0x17 2) == "left alone" ]] ||
+  fail "a touchpad in touchpad mode with both switches on is left alone"
+[[ $(touchpad_check 0 0x17 2) == $'set 8403\nset 8517\nresumed in input mode 0 with switches 0x17, restored touchpad mode' ]] ||
+  fail "a touchpad in mouse mode is put back in touchpad mode, keeping the rest of the switch report"
+[[ $(touchpad_check 3 0x14 2) == $'set 8403\nset 8517\n'* ]] ||
+  fail "a touchpad left with its surface and button switches off gets them back"
+[[ $(touchpad_check 0 0x17 1) == "error short reply to feature report 0x84" ]] ||
+  fail "a short reply to the mode read changes nothing"
+printf '\x05\x0d\x09\x0e\xa1\x01\x85\x84\x09\x22\xa1\x02\x09\x52\x15\x00\x25\x0a\x75\x10' >"$touchpad/report_descriptor"
+[[ $(touchpad_check 0 0x17 2) == "left alone" ]] ||
+  fail "a touchpad whose configuration reports are laid out differently is left alone"
+
+cp "$scratch/config.rdesc" "$touchpad/report_descriptor"
+rm -rf "$touchpad/hidraw/hidraw4"
+[[ $(SP11_TOUCHPAD_COMPATIBLE="$scratch/denali" SP11_TOUCHPAD_HID="$scratch/touchpad" SP11_TOUCHPAD_SETTLE=0 \
+  SP11_TOUCHPAD_TRIES=1 python "$package_dir/surface-pro-11-touchpad-mode-sleep" check 2>&1) == \
+  "surface-pro-11-touchpad-mode: 0019:045E:0C8D.0005 gave up: IndexError"* ]] ||
+  fail "a touchpad that goes away during the check is reported, not a crash"
+
+grep -q '^MatchBus=bluetooth$' "$package_dir/50-surface-pro-11-flex-keyboard.quirks" &&
+  grep -q '^MatchProduct=0x0C7A$' "$package_dir/50-surface-pro-11-flex-keyboard.quirks" &&
+  grep -q '^AttrTPKComboLayout=below$' "$package_dir/50-surface-pro-11-flex-keyboard.quirks" ||
+  fail "the detached keyboard's touchpad gets palm rejection"
+grep -q '^AttrEventCode=-BTN_RIGHT$' "$package_dir/50-surface-pro-11-flex-keyboard.quirks" ||
+  fail "the detached keyboard's clickpad hides its right button, like the attached one"
+grep -q 'usr/share/libinput/50-surface-pro-11-flex-keyboard.quirks' "$package_dir/PKGBUILD" ||
+  fail "the touchpad quirk is installed where libinput reads quirks"
+
 echo "ok - surface-pro-11-support verifies its hardware setup"

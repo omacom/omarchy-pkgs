@@ -1,0 +1,492 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jim Martin <jimmartin@gmail.com>
+Date: Thu, 8 Oct 2026 15:51:01 -0500
+Subject: [PATCH] thunderbolt: qcom: Add the Glymur USB4 router startup
+ sequence
+
+Before the Glymur USB4 host router can run, its pads, clocks, resets,
+GCC control bits, router registers, firmware, DROM, TCSR routing and
+USB4 PHY must be brought up in a fixed order, with fixed delays between
+some of the steps. After system sleep with the router kept powered, a
+shorter warm restart pulses the router control, restores one router
+register and restarts the MCU from its retained RAM.
+
+Add both sequences as tables run by a small sequencer. The platform
+owner supplies the pinctrl, clock, reset, TCSR and PHY steps through
+callbacks; the sequencer does the router register writes, firmware
+upload, DROM write, MCU start and preset command itself. It validates
+its whole input before the first hardware access and records the step
+at which a sequence failed, so the owner can recover.
+
+Only router 0 with the legacy MCU layout, as on the Surface Laptop 8,
+has a startup profile. The order, delays and register values match
+what the platform's Windows driver programs on that laptop.
+
+Assisted-by: Opus 5.5
+Signed-off-by: Jim Martin <jimmartin@gmail.com>
+---
+ drivers/thunderbolt/qcom-usb4-startup.c | 284 ++++++++++++++++++++++++
+ drivers/thunderbolt/qcom-usb4-startup.h | 160 +++++++++++++
+ 2 files changed, 444 insertions(+)
+ create mode 100644 drivers/thunderbolt/qcom-usb4-startup.c
+ create mode 100644 drivers/thunderbolt/qcom-usb4-startup.h
+
+diff --git a/drivers/thunderbolt/qcom-usb4-startup.c b/drivers/thunderbolt/qcom-usb4-startup.c
+new file mode 100644
+index 00000000000..40fa95e0fd9
+--- /dev/null
++++ b/drivers/thunderbolt/qcom-usb4-startup.c
+@@ -0,0 +1,284 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Cold-start and warm-restart sequences of Glymur USB4 host router 0 with the
++ * legacy MCU layout. Only the Surface Laptop 8 profile is defined.
++ */
++
++#include <linux/array_size.h>
++#include <linux/bits.h>
++#include <linux/errno.h>
++
++#include "qcom-usb4-drom.h"
++#include "qcom-usb4-fw.h"
++#include "qcom-usb4-startup.h"
++
++enum start_kind {
++	START_PROVIDER,
++	START_UPDATE,
++	START_DELAY,
++	START_CLEAR_1200C,
++	START_UPLOAD,
++	START_DROM,
++	START_MCU,
++	START_PRESET,
++	START_PCIE,
++	START_RESTORE_81010,
++};
++
++struct start_operation {
++	enum qcom_usb4_start_step step;
++	enum start_kind kind;
++	u32 offset;
++	u32 mask;
++	u32 value;
++};
++
++#define PROVIDER(s) { .step = QCOM_USB4_START_##s, .kind = START_PROVIDER }
++#define UPDATE(s, o, m, v) { QCOM_USB4_START_##s, START_UPDATE, o, m, v }
++#define DELAY(s, us) { QCOM_USB4_START_##s, START_DELAY, 0, 0, us }
++#define SPECIAL(s, k) { .step = QCOM_USB4_START_##s, .kind = k }
++
++static const struct start_operation start_operations[] = {
++	PROVIDER(RX_PAD_PREPARE),
++	PROVIDER(TX_B_PAD_PREPARE),
++	PROVIDER(TX_A_PAD_PREPARE),
++	PROVIDER(RX_CLOCKS_REFERENCE),
++	PROVIDER(USB4_RESET_ASSERT),
++	PROVIDER(COMBO_RESET_ASSERT),
++	PROVIDER(DP_RESET_ASSERT),
++	DELAY(ASSERT_STALL, 1),
++	DELAY(ASSERT_SETTLE, 100),
++	PROVIDER(DP_RESET_DEASSERT),
++	PROVIDER(COMBO_RESET_DEASSERT),
++	PROVIDER(USB4_RESET_DEASSERT),
++	PROVIDER(CLOCK_READY),
++	DELAY(DEASSERT_SETTLE, 100),
++	PROVIDER(RX_CLOCKS_PHY),
++	SPECIAL(ROUTER_1200C_CLEAR, START_CLEAR_1200C),
++	PROVIDER(RX_PAD_ACTIVE),
++	PROVIDER(TX_B_PAD_ACTIVE),
++	PROVIDER(TX_A_PAD_ACTIVE),
++	UPDATE(ROUTER_81000_SET, 0x81000, BIT(0), BIT(0)),
++	PROVIDER(GCC_600C0_BIT3_SET),
++	DELAY(CONTROL_ASSERT_STALL, 1000),
++	DELAY(CONTROL_ASSERT_SETTLE, 100),
++	UPDATE(ROUTER_81018_SET, 0x81018, BIT(0), BIT(0)),
++	PROVIDER(GCC_600C0_BIT3_CLEAR),
++	DELAY(CONTROL_DEASSERT_STALL, 1000),
++	DELAY(CONTROL_DEASSERT_SETTLE, 100),
++	UPDATE(ROUTER_81000_CLEAR, 0x81000, BIT(0), 0),
++	SPECIAL(FIRMWARE_UPLOAD, START_UPLOAD),
++	PROVIDER(SYS_MEMORY_FORCE),
++	/* The board extension (PHYC) step is empty for the supported profile. */
++	SPECIAL(DROM, START_DROM),
++	PROVIDER(TCSR_ROUTE),
++	PROVIDER(PIPE_HWCG_OFF),
++	UPDATE(ROUTER_81004_SET, 0x81004, BIT(0), BIT(0)),
++	UPDATE(TIMER_HIGH, 0x80c8, 0xffff0000, 0x00040000),
++	UPDATE(TIMER_LOW, 0x80c8, 0x0000ffff, 0),
++	UPDATE(TIMER_8148, 0x8148, 0xffffffff, 250000),
++	UPDATE(TIMER_8144, 0x8144, 0xffffffff, 4000),
++	PROVIDER(PHY_COMPOSITE),
++	UPDATE(ADAPTER_BIT23, 0xd000, BIT(23), 0),
++	UPDATE(ADAPTER_BIT22, 0xd000, BIT(22), 0),
++	UPDATE(ADAPTER_BIT21, 0xd000, BIT(21), 0),
++	SPECIAL(MCU, START_MCU),
++	SPECIAL(PRESET, START_PRESET),
++	SPECIAL(PCIE_POLICY, START_PCIE),
++};
++
++/*
++ * Warm restart after system sleep. The router kept its configuration and the
++ * halted MCU its RAM, so no reset, firmware upload or DROM write is repeated.
++ * A partial block reset through the whole GCC 0x600c0 register (0xfffff6bf,
++ * then 0) is left out: the dock stayed connected across sleep without it.
++ */
++static const struct start_operation resume_operations[] = {
++	PROVIDER(RX_CLOCKS_PHY),
++	UPDATE(ROUTER_81000_SET, 0x81000, BIT(0), BIT(0)),
++	PROVIDER(GCC_600C0_BIT3_SET),
++	DELAY(CONTROL_ASSERT_STALL, 1000),
++	DELAY(CONTROL_ASSERT_SETTLE, 100),
++	UPDATE(ROUTER_81018_SET, 0x81018, BIT(0), BIT(0)),
++	PROVIDER(GCC_600C0_BIT3_CLEAR),
++	DELAY(CONTROL_DEASSERT_STALL, 1000),
++	DELAY(CONTROL_DEASSERT_SETTLE, 100),
++	UPDATE(ROUTER_81000_CLEAR, 0x81000, BIT(0), 0),
++	SPECIAL(ROUTER_81010_RESTORE, START_RESTORE_81010),
++	UPDATE(ADAPTER_BIT23, 0xd000, BIT(23), 0),
++	UPDATE(ADAPTER_BIT22, 0xd000, BIT(22), 0),
++	UPDATE(ADAPTER_BIT21, 0xd000, BIT(21), 0),
++	SPECIAL(MCU, START_MCU),
++	SPECIAL(PCIE_POLICY, START_PCIE),
++};
++
++static int start_validate(const struct qcom_usb4_start_config *cfg,
++			  const struct qcom_usb4_start_ops *ops)
++{
++	const struct qcom_usb4_mcu *mcu;
++	u8 drom[QCOM_USB4_DROM_SIZE];
++	u32 command;
++	int ret;
++
++	if (!cfg || !ops || !ops->owner_check || !ops->provider ||
++	    !ops->read_router || !ops->update_router || !ops->delay_us)
++		return -EINVAL;
++	if (cfg->profile != QCOM_USB4_START_SURFACE_A8_PORT0 ||
++	    (cfg->pcie_policy != QCOM_USB4_START_PCIE_SKIP &&
++	     cfg->pcie_policy != QCOM_USB4_START_PCIE_ENABLE))
++		return -EINVAL;
++	if (cfg->preset != 0x4421 || !cfg->command_timeout_us ||
++	    cfg->command_timeout_us > 1000000 || cfg->connection.board_retimer != 1)
++		return -EINVAL;
++	mcu = cfg->mcu;
++	if (!mcu || !mcu->base || (unsigned long)mcu->base % sizeof(u32) ||
++	    mcu->ram_offset != 0x13000 || mcu->control_offset != 0x22000 ||
++	    mcu->shared_offset_reg != 0x22010 || mcu->drom_offset != 0xdf20 ||
++	    mcu->ram_size < 0xdf20 + sizeof(drom) || mcu->ram_size > 0xf000)
++		return -EINVAL;
++	ret = qcom_usb4_typec_connect_command(&cfg->connection, &command);
++	if (ret)
++		return ret;
++	ret = qcom_usb4_drom_build(drom, sizeof(drom), cfg->serial, 0);
++	if (ret)
++		return ret;
++	return qcom_usb4_fw_validate(cfg->firmware, cfg->firmware_size, mcu->ram_size);
++}
++
++static int start_clear_1200c(const struct qcom_usb4_start_ops *ops, void *ctx)
++{
++	u32 value;
++	unsigned int i;
++	int ret;
++
++	ret = ops->read_router(ctx, 0x1200c, &value);
++	if (ret)
++		return ret;
++	for (i = 0; value & BIT(31); i++) {
++		if (i == 11)
++			return -ETIMEDOUT;
++		ret = ops->update_router(ctx, 0x1200c, BIT(31), 0);
++		if (ret)
++			return ret;
++		ops->delay_us(ctx, 1);
++		/* Verify the final state explicitly. */
++		ret = ops->read_router(ctx, 0x1200c, &value);
++		if (ret)
++			return ret;
++	}
++	ops->delay_us(ctx, 10000);
++	return 0;
++}
++
++static int start_execute(const struct start_operation *op,
++			 struct qcom_usb4_start_state *state,
++			 const struct qcom_usb4_start_config *cfg,
++			 const struct qcom_usb4_start_ops *ops, void *ctx)
++{
++	u32 command;
++	int ret;
++
++	switch (op->kind) {
++	case START_PROVIDER:
++		return ops->provider(ctx, op->step, cfg);
++	case START_UPDATE:
++		return ops->update_router(ctx, op->offset, op->mask, op->value);
++	case START_DELAY:
++		ops->delay_us(ctx, op->value);
++		return 0;
++	case START_CLEAR_1200C:
++		return start_clear_1200c(ops, ctx);
++	case START_UPLOAD:
++		return qcom_usb4_mcu_upload(cfg->mcu, cfg->firmware, cfg->firmware_size);
++	case START_DROM:
++		return qcom_usb4_mcu_write_drom(cfg->mcu, cfg->serial, 0);
++	case START_MCU:
++		return qcom_usb4_mcu_start(cfg->mcu, &state->shared_offset);
++	case START_PRESET:
++		ret = qcom_usb4_typec_preset_command(cfg->preset, &command);
++		if (ret)
++			return ret;
++		return qcom_usb4_mcu_command(cfg->mcu, command, cfg->command_timeout_us);
++	case START_PCIE:
++		if (cfg->pcie_policy == QCOM_USB4_START_PCIE_SKIP)
++			return 0;
++		return ops->update_router(ctx, 0x82010, 0xc, 0xc);
++	case START_RESTORE_81010:
++		return ops->update_router(ctx, 0x81010, BIT(0),
++					  state->sleep_81014 & BIT(0));
++	}
++	return -EINVAL;
++}
++
++static int start_run_table(struct qcom_usb4_start_state *state,
++			   const struct start_operation *table, unsigned int count,
++			   const struct qcom_usb4_start_config *cfg,
++			   const struct qcom_usb4_start_ops *ops, void *context)
++{
++	unsigned int i;
++	int ret;
++
++	for (i = 0; i < count; i++) {
++		state->active_step = table[i].step;
++		ret = start_execute(&table[i], state, cfg, ops, context);
++		if (ret) {
++			state->error = ret < 0 ? ret : -EPROTO;
++			state->phase = QCOM_USB4_START_FAILED;
++			return state->error;
++		}
++		state->last_completed_step = state->active_step;
++	}
++	state->active_step = QCOM_USB4_START_NONE;
++	state->phase = QCOM_USB4_START_COMPLETE;
++	return 0;
++}
++
++int qcom_usb4_startup_run(struct qcom_usb4_start_state *state,
++			const struct qcom_usb4_start_config *cfg,
++			const struct qcom_usb4_start_ops *ops, void *context)
++{
++	int ret;
++
++	if (!state)
++		return -EINVAL;
++	if (state->phase != QCOM_USB4_START_NEW)
++		return state->phase == QCOM_USB4_START_RUNNING ? -EBUSY : -EALREADY;
++	state->phase = QCOM_USB4_START_RUNNING;
++	state->active_step = QCOM_USB4_START_VALIDATE;
++	state->last_completed_step = QCOM_USB4_START_NONE;
++	state->shared_offset = 0;
++	state->error = 0;
++	ret = start_validate(cfg, ops);
++	if (ret)
++		goto failed;
++	state->last_completed_step = state->active_step;
++	state->active_step = QCOM_USB4_START_OWNER_CHECK;
++	ret = ops->owner_check(context, cfg);
++	if (ret)
++		goto failed;
++	state->last_completed_step = state->active_step;
++
++	return start_run_table(state, start_operations, ARRAY_SIZE(start_operations),
++			       cfg, ops, context);
++
++failed:
++	state->error = ret < 0 ? ret : -EPROTO;
++	state->phase = QCOM_USB4_START_FAILED;
++	return state->error;
++}
++
++int qcom_usb4_startup_resume(struct qcom_usb4_start_state *state,
++			     const struct qcom_usb4_start_config *cfg,
++			     const struct qcom_usb4_start_ops *ops, void *context)
++{
++	if (!state || !cfg || !cfg->mcu || !ops || !ops->provider ||
++	    !ops->update_router || !ops->delay_us)
++		return -EINVAL;
++	if (state->phase != QCOM_USB4_START_COMPLETE)
++		return -EINVAL;
++	state->phase = QCOM_USB4_START_RUNNING;
++	state->last_completed_step = QCOM_USB4_START_NONE;
++	state->error = 0;
++	return start_run_table(state, resume_operations, ARRAY_SIZE(resume_operations),
++			       cfg, ops, context);
++}
+diff --git a/drivers/thunderbolt/qcom-usb4-startup.h b/drivers/thunderbolt/qcom-usb4-startup.h
+new file mode 100644
+index 00000000000..642f74940cb
+--- /dev/null
++++ b/drivers/thunderbolt/qcom-usb4-startup.h
+@@ -0,0 +1,160 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef QCOM_USB4_STARTUP_H
++#define QCOM_USB4_STARTUP_H
++
++#include "qcom-usb4-mcu.h"
++#include "qcom-usb4-typec.h"
++
++enum qcom_usb4_start_profile {
++	QCOM_USB4_START_PROFILE_UNSET,
++	QCOM_USB4_START_SURFACE_A8_PORT0,
++};
++
++enum qcom_usb4_start_pcie_policy {
++	QCOM_USB4_START_PCIE_UNSET,
++	QCOM_USB4_START_PCIE_SKIP,
++	QCOM_USB4_START_PCIE_ENABLE,
++};
++
++enum qcom_usb4_start_phase {
++	QCOM_USB4_START_NEW,
++	QCOM_USB4_START_RUNNING,
++	QCOM_USB4_START_FAILED,
++	QCOM_USB4_START_COMPLETE,
++};
++
++enum qcom_usb4_start_step {
++	QCOM_USB4_START_NONE,
++	QCOM_USB4_START_VALIDATE,
++	QCOM_USB4_START_OWNER_CHECK,
++	QCOM_USB4_START_RX_PAD_PREPARE,
++	QCOM_USB4_START_TX_B_PAD_PREPARE,
++	QCOM_USB4_START_TX_A_PAD_PREPARE,
++	QCOM_USB4_START_RX_CLOCKS_REFERENCE,
++	QCOM_USB4_START_USB4_RESET_ASSERT,
++	QCOM_USB4_START_COMBO_RESET_ASSERT,
++	QCOM_USB4_START_DP_RESET_ASSERT,
++	QCOM_USB4_START_ASSERT_STALL,
++	QCOM_USB4_START_ASSERT_SETTLE,
++	QCOM_USB4_START_DP_RESET_DEASSERT,
++	QCOM_USB4_START_COMBO_RESET_DEASSERT,
++	QCOM_USB4_START_USB4_RESET_DEASSERT,
++	QCOM_USB4_START_CLOCK_READY,
++	QCOM_USB4_START_DEASSERT_SETTLE,
++	QCOM_USB4_START_RX_CLOCKS_PHY,
++	QCOM_USB4_START_ROUTER_1200C_CLEAR,
++	QCOM_USB4_START_RX_PAD_ACTIVE,
++	QCOM_USB4_START_TX_B_PAD_ACTIVE,
++	QCOM_USB4_START_TX_A_PAD_ACTIVE,
++	QCOM_USB4_START_ROUTER_81000_SET,
++	QCOM_USB4_START_GCC_600C0_BIT3_SET,
++	QCOM_USB4_START_CONTROL_ASSERT_STALL,
++	QCOM_USB4_START_CONTROL_ASSERT_SETTLE,
++	QCOM_USB4_START_ROUTER_81018_SET,
++	QCOM_USB4_START_GCC_600C0_BIT3_CLEAR,
++	QCOM_USB4_START_CONTROL_DEASSERT_STALL,
++	QCOM_USB4_START_CONTROL_DEASSERT_SETTLE,
++	QCOM_USB4_START_ROUTER_81000_CLEAR,
++	QCOM_USB4_START_FIRMWARE_UPLOAD,
++	QCOM_USB4_START_SYS_MEMORY_FORCE,
++	QCOM_USB4_START_DROM,
++	QCOM_USB4_START_TCSR_ROUTE,
++	QCOM_USB4_START_PIPE_HWCG_OFF,
++	QCOM_USB4_START_ROUTER_81004_SET,
++	QCOM_USB4_START_TIMER_HIGH,
++	QCOM_USB4_START_TIMER_LOW,
++	QCOM_USB4_START_TIMER_8148,
++	QCOM_USB4_START_TIMER_8144,
++	QCOM_USB4_START_PHY_COMPOSITE,
++	QCOM_USB4_START_ADAPTER_BIT23,
++	QCOM_USB4_START_ADAPTER_BIT22,
++	QCOM_USB4_START_ADAPTER_BIT21,
++	QCOM_USB4_START_MCU,
++	QCOM_USB4_START_PRESET,
++	QCOM_USB4_START_PCIE_POLICY,
++	QCOM_USB4_START_ROUTER_81010_RESTORE,
++};
++
++struct qcom_usb4_start_config {
++	enum qcom_usb4_start_profile profile;
++	enum qcom_usb4_start_pcie_policy pcie_policy;
++	struct qcom_usb4_mcu *mcu;
++	const u8 *firmware;
++	size_t firmware_size;
++	u32 serial;
++	u32 preset;
++	unsigned int command_timeout_us;
++	struct qcom_usb4_pan_connect connection;
++};
++
++/*
++ * Zero-initialize once for a fresh, owner-established cold-start attempt.
++ * Failure may have partial hardware effects, including in active_step itself.
++ * This state is not a rollback log or proof that firmware/DMA has halted.
++ */
++struct qcom_usb4_start_state {
++	enum qcom_usb4_start_phase phase;
++	enum qcom_usb4_start_step active_step;
++	enum qcom_usb4_start_step last_completed_step;
++	int error;
++	u32 shared_offset;
++	/* Router 0x81014 saved by the owner when the MCU is halted for sleep. */
++	u32 sleep_81014;
++};
++
++/*
++ * Integer callbacks return 0 on completed success or a negative errno.
++ * Positive statuses are rejected. The caller serializes the sleepable operation,
++ * retains immutable inputs, and owns all mappings/providers until recovery.
++ *
++ * owner_check must verify this exact board/image, empty PHYC, powered/exclusive
++ * cold state and inactive shared DP before any effectful callback. Holding the
++ * shared owners' locks is required; merely observing MODE clear is insufficient.
++ * No MCU/DMA/NHI traffic or Type-C command may race this sequence.
++ *
++ * provider implements only the typed provider steps in the source table, using
++ * the owning pinctrl/clock/reset/PHY interfaces. CLOCK_READY needs a finite,
++ * explicit readiness policy. PHY_COMPOSITE must include common PHY setup, then
++ * the separate DP producer/AUX operation, then table/start/calibration. The
++ * existing bare PHY callback does not yet supply that composite operation.
++ * RX clock transitions must establish both selectors, with both gates off
++ * around the switch.
++ *
++ * Router offsets below refer to the expanded router window, never GCC/TLMM.
++ * update_router preserves bits outside mask. delay_us must honor the requested
++ * minimum delay and return only when complete. No provider backend is supplied.
++ */
++struct qcom_usb4_start_ops {
++	int (*owner_check)(void *context, const struct qcom_usb4_start_config *cfg);
++	int (*provider)(void *context, enum qcom_usb4_start_step step,
++			const struct qcom_usb4_start_config *cfg);
++	int (*read_router)(void *context, u32 offset, u32 *value);
++	int (*update_router)(void *context, u32 offset, u32 mask, u32 value);
++	void (*delay_us)(void *context, unsigned int usec);
++};
++
++/*
++ * One attempt only: no automatic restart, rollback, connect command, NHI
++ * registration, event consumer, suspend or shutdown. Success means only this
++ * forward sequence completed. On failure no later step is attempted. The owner
++ * must decide recovery, even when a callback reports failure before completion.
++ * The existing MCU-start helper locally clears RUN/host-ready after a timeout
++ * or bad shared pointer. This is not whole-sequence rollback or physical halt.
++ */
++int qcom_usb4_startup_run(struct qcom_usb4_start_state *state,
++			const struct qcom_usb4_start_config *cfg,
++			const struct qcom_usb4_start_ops *ops, void *context);
++
++/*
++ * Warm restart of a router whose cold start completed and whose MCU the owner
++ * halted for system sleep (after the firmware stop command), with the router
++ * and PHY powered throughout. Restores the RX clocks, pulses the router
++ * control, restores 0x81010 from @state->sleep_81014 and restarts the MCU
++ * from its retained RAM. The owner then re-enables the MCU interrupt and
++ * resumes the link. On failure the owner must stop the router.
++ */
++int qcom_usb4_startup_resume(struct qcom_usb4_start_state *state,
++			     const struct qcom_usb4_start_config *cfg,
++			     const struct qcom_usb4_start_ops *ops, void *context);
++
++#endif
+-- 
+2.56.0
+

@@ -1,0 +1,240 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jim Martin <jimmartin@gmail.com>
+Date: Thu, 8 Oct 2026 13:47:59 -0500
+Subject: [PATCH] drm/msm/dp: handle HPD notifications in a worker
+
+Since the HPD rework, msm_dp_bridge_hpd_notify() runs the plug, IRQ_HPD
+and unplug handling, including DPCD and EDID reads, in the caller's
+context. On USB-C ports that caller is the Type-C alternate mode worker.
+When the port reports HPD and withdraws it again before the sink answers
+(a firmware replay of the last state at boot, for example), the plug
+handler's AUX reads to the departed sink each time out after 32 retries,
+and the withdrawal waits behind them in the same worker. The display and
+everything queued behind the Type-C worker are delayed by tens of
+seconds.
+
+Record the status in hpd_notify() and handle it in a work item. A
+disconnect from the HPD source also disables AUX transfers at once, so
+a handler already waiting on AUX fails fast. The bridge connector calls
+hpd_notify() with detect()'s own result; that echo is recognised and not
+taken as the HPD source reporting the sink gone. detect() answers
+"disconnected" without powering the PHY when the source has withdrawn
+HPD, and both detect() and the plug handler check again after enabling
+transfers, with barriers paired with hpd_notify(), to close the race
+with a concurrent withdrawal. The worker sends a hotplug event only when
+the plugged state or sink count changed, since the notifier's own event
+may have been handled before the worker ran. The work uses the DRM
+objects, so it is enabled only while the display is bound, and unbind
+disables and drains it before releasing them.
+
+Fixes: 5043357e75ba ("drm/msm/dp: rework HPD handling")
+Assisted-by: Opus 5.5
+Signed-off-by: Jim Martin <jimmartin@gmail.com>
+---
+ drivers/gpu/drm/msm/dp/dp_display.c | 106 ++++++++++++++++++++++++++--
+ 1 file changed, 100 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/gpu/drm/msm/dp/dp_display.c b/drivers/gpu/drm/msm/dp/dp_display.c
+index 1433ee307f9..84b5f6d0b4a 100644
+--- a/drivers/gpu/drm/msm/dp/dp_display.c
++++ b/drivers/gpu/drm/msm/dp/dp_display.c
+@@ -12,6 +12,7 @@
+ #include <linux/phy/phy.h>
+ #include <linux/delay.h>
+ #include <linux/string_choices.h>
++#include <drm/drm_probe_helper.h>
+ #include <drm/display/drm_dp_aux_bus.h>
+ #include <drm/display/drm_hdmi_audio_helper.h>
+ #include <drm/drm_edid.h>
+@@ -57,6 +58,17 @@ struct msm_dp_display_private {
+ 	struct mutex plugged_lock;
+ 	bool plugged;
+ 
++	/*
++	 * Latest status from hpd_notify(), handled by hpd_work. A Type-C port
++	 * can report HPD and withdraw it again before the sink ever answers
++	 * AUX; the notifier must neither block on those transfers nor have a
++	 * disconnect wait behind them.
++	 */
++	struct work_struct hpd_work;
++	enum drm_connector_status hpd_status;	/* from the HPD source */
++	enum drm_connector_status work_status;	/* to apply, also detect's */
++	struct task_struct *detect_task;	/* detect() awaiting its echo */
++
+ 	struct drm_device *drm_dev;
+ 
+ 	struct drm_dp_aux *aux;
+@@ -203,6 +215,8 @@ void msm_dp_display_signal_audio_complete(struct msm_dp *msm_dp_display)
+ 	complete_all(&dp->audio_comp);
+ }
+ 
++static void msm_dp_hpd_work(struct work_struct *work);
++
+ static int msm_dp_display_bind(struct device *dev, struct device *master,
+ 			   void *data)
+ {
+@@ -222,6 +236,8 @@ static int msm_dp_display_bind(struct device *dev, struct device *master,
+ 		goto end;
+ 	}
+ 
++	enable_work(&dp->hpd_work);
++
+ 	return 0;
+ end:
+ 	return rc;
+@@ -233,6 +249,9 @@ static void msm_dp_display_unbind(struct device *dev, struct device *master,
+ 	struct msm_dp_display_private *dp = dev_get_dp_display_private(dev);
+ 	struct msm_drm_private *priv = dev_get_drvdata(master);
+ 
++	/* No HPD work may run on the objects released below. */
++	disable_work_sync(&dp->hpd_work);
++
+ 	of_dp_aux_depopulate_bus(dp->aux);
+ 
+ 	msm_dp_aux_unregister(dp->aux);
+@@ -405,6 +424,12 @@ static int msm_dp_display_handle_irq_hpd(struct msm_dp_display_private *dp)
+ 	return 0;
+ }
+ 
++/* The HPD source reported the sink gone. */
++static bool msm_dp_display_hpd_gone(struct msm_dp_display_private *dp)
++{
++	return READ_ONCE(dp->hpd_status) == connector_status_disconnected;
++}
++
+ static int msm_dp_hpd_plug_handle(struct msm_dp_display_private *dp)
+ {
+ 	int ret;
+@@ -429,6 +454,10 @@ static int msm_dp_hpd_plug_handle(struct msm_dp_display_private *dp)
+ 	}
+ 
+ 	msm_dp_aux_enable_xfers(dp->aux, true);
++	/* Pairs with the barrier in msm_dp_bridge_hpd_notify(). */
++	smp_mb();
++	if (msm_dp_display_hpd_gone(dp))
++		msm_dp_aux_enable_xfers(dp->aux, false);
+ 
+ 	ret = msm_dp_display_process_hpd_high(dp);
+ 
+@@ -918,6 +947,17 @@ enum drm_connector_status msm_dp_bridge_detect(struct drm_bridge *bridge,
+ 
+ 	priv = container_of(dp, struct msm_dp_display_private, msm_dp_display);
+ 
++	/*
++	 * The bridge connector passes this result to hpd_notify() right after
++	 * detect() returns; mark that call so it is not taken for the HPD
++	 * source reporting the sink gone.
++	 */
++	WRITE_ONCE(priv->detect_task, current);
++
++	/* No AUX transfer can reach a sink whose HPD was withdrawn. */
++	if (msm_dp_display_hpd_gone(priv))
++		return status;
++
+ 	guard(mutex)(&priv->plugged_lock);
+ 	ret = pm_runtime_resume_and_get(&dp->pdev->dev);
+ 	if (ret) {
+@@ -933,6 +973,12 @@ enum drm_connector_status msm_dp_bridge_detect(struct drm_bridge *bridge,
+ 	phy_deinit = ret;
+ 
+ 	msm_dp_aux_enable_xfers(priv->aux, true);
++	/* Pairs with the barrier in msm_dp_bridge_hpd_notify(). */
++	smp_mb();
++	if (msm_dp_display_hpd_gone(priv)) {
++		msm_dp_aux_enable_xfers(priv->aux, false);
++		goto end;
++	}
+ 
+ 	ret = msm_dp_aux_is_link_connected(priv->aux);
+ 	DRM_DEBUG_DP("aux link status: %x\n", ret);
+@@ -1240,6 +1286,11 @@ static int msm_dp_display_probe(struct platform_device *pdev)
+ 	dp->hpd_isr_status = 0;
+ 
+ 	mutex_init(&dp->plugged_lock);
++	INIT_WORK(&dp->hpd_work, msm_dp_hpd_work);
++	/* It uses the DRM objects, so it may only run while bound. */
++	disable_work(&dp->hpd_work);
++	dp->hpd_status = connector_status_unknown;
++	dp->work_status = connector_status_unknown;
+ 
+ 	rc = msm_dp_display_get_io(dp);
+ 	if (rc)
+@@ -1571,14 +1622,15 @@ void msm_dp_bridge_hpd_disable(struct drm_bridge *bridge)
+ 	pm_runtime_put_sync(&msm_dp_display->pdev->dev);
+ }
+ 
+-void msm_dp_bridge_hpd_notify(struct drm_bridge *bridge,
+-			      struct drm_connector *connector,
+-			      enum drm_connector_status status)
++static void msm_dp_hpd_work(struct work_struct *work)
+ {
+-	struct msm_dp_bridge *msm_dp_bridge = to_dp_bridge(bridge);
+-	struct msm_dp *msm_dp_display = msm_dp_bridge->msm_dp_display;
+-	struct msm_dp_display_private *dp = container_of(msm_dp_display, struct msm_dp_display_private, msm_dp_display);
++	struct msm_dp_display_private *dp =
++		container_of(work, struct msm_dp_display_private, hpd_work);
++	struct msm_dp *msm_dp_display = &dp->msm_dp_display;
++	enum drm_connector_status status = READ_ONCE(dp->work_status);
+ 	u32 hpd_link_status = 0;
++	bool was_plugged;
++	int sink_count;
+ 
+ 	if (pm_runtime_resume_and_get(&msm_dp_display->pdev->dev)) {
+ 		DRM_ERROR("failed to pm_runtime_resume\n");
+@@ -1586,6 +1638,8 @@ void msm_dp_bridge_hpd_notify(struct drm_bridge *bridge,
+ 	}
+ 
+ 	hpd_link_status = msm_dp_aux_is_link_connected(dp->aux);
++	was_plugged = READ_ONCE(dp->plugged);
++	sink_count = dp->link->sink_count;
+ 
+ 	drm_dbg_dp(dp->drm_dev, "type=%d link hpd_link_status=0x%x, status=%d\n",
+ 		   msm_dp_display->connector_type, hpd_link_status, status);
+@@ -1604,4 +1658,44 @@ void msm_dp_bridge_hpd_notify(struct drm_bridge *bridge,
+ 	}
+ 
+ 	pm_runtime_put_sync(&msm_dp_display->pdev->dev);
++
++	/*
++	 * The notifier's hotplug event may have been probed before this ran;
++	 * report the change again. Unchanged results stay quiet, as detect()
++	 * notifies too.
++	 */
++	if (READ_ONCE(dp->plugged) != was_plugged || dp->link->sink_count != sink_count)
++		drm_kms_helper_hotplug_event(dp->drm_dev);
++}
++
++void msm_dp_bridge_hpd_notify(struct drm_bridge *bridge,
++			      struct drm_connector *connector,
++			      enum drm_connector_status status)
++{
++	struct msm_dp_bridge *msm_dp_bridge = to_dp_bridge(bridge);
++	struct msm_dp *msm_dp_display = msm_dp_bridge->msm_dp_display;
++	struct msm_dp_display_private *dp =
++		container_of(msm_dp_display, struct msm_dp_display_private, msm_dp_display);
++
++	/*
++	 * Record the status first, then stop transfers to a sink that went
++	 * away: an HPD handler already waiting on AUX fails fast instead of
++	 * timing out, and the notifier (e.g. the Type-C altmode worker) never
++	 * waits for AUX itself.
++	 */
++	if (READ_ONCE(dp->detect_task) == current) {
++		WRITE_ONCE(dp->detect_task, NULL);
++	} else {
++		WRITE_ONCE(dp->hpd_status, status);
++		if (status != connector_status_connected) {
++			/*
++			 * Pairs with the barriers in msm_dp_hpd_plug_handle() and
++			 * msm_dp_bridge_detect().
++			 */
++			smp_mb();
++			msm_dp_aux_enable_xfers(dp->aux, false);
++		}
++	}
++	WRITE_ONCE(dp->work_status, status);
++	queue_work(system_long_wq, &dp->hpd_work);
+ }
+-- 
+2.56.0
+
