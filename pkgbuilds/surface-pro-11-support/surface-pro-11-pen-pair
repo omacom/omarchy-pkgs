@@ -1,0 +1,253 @@
+#!/usr/bin/python3 -I
+
+# Pair a Surface Slim Pen over Bluetooth by hand: you put the pen into pairing
+# mode (hold its top button about 7 seconds, until the light blinks), this
+# finds it, pairs it, trusts it and shows its battery. The same path Windows
+# offers in Bluetooth settings.
+#
+# Pairing is Just Works: the pen has no display and
+# no input, so there is nothing to confirm. Omarchy keeps the adapter
+# non-pairable; it is pairable only while this runs.
+#
+# The pen reconnects on a button click only to a host that gave it an identity
+# key (IRK and identity address) when bonding, as Windows does. Linux hands one
+# out only with LE privacy on, and privacy left on stops the Flex Keyboard from
+# pairing and reconnecting: it advertises to the host's public address. So
+# privacy is on just for the pairing. Afterwards the host connects from its
+# public address again, and the pen has a real IRK and that identity address,
+# the bond Windows leaves it with.
+
+import queue
+import re
+import signal
+import subprocess
+import sys
+import threading
+import time
+
+WAIT = 90            # seconds to look for a pen in pairing mode
+PAIR_WAIT = 45       # seconds for the pairing itself
+PEN = re.compile(r'Device ([0-9A-F]{2}(?::[0-9A-F]{2}){5}) (.*Slim Pen.*)')
+ANSI = re.compile(r'\x1b\[[0-9;]*[A-Za-z]|\r')
+
+
+def say(msg):
+    print(f'\033[1m{msg}\033[0m', flush=True)
+
+
+def run(*cmd):
+    try:
+        return subprocess.run(cmd, stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                              timeout=20).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return ''
+
+
+class Bluetoothctl:
+    """One interactive bluetoothctl, read line by line from a thread."""
+
+    def __init__(self):
+        self.p = subprocess.Popen(['bluetoothctl'], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                  stderr=subprocess.STDOUT, text=True, bufsize=1)
+        self.lines = queue.Queue()
+        threading.Thread(target=self._read, daemon=True).start()
+
+    def _read(self):
+        for line in self.p.stdout:
+            line = ANSI.sub('', line)
+            # The prompt comes glued to the next line when input is a pipe.
+            line = re.sub(r'^(\[[^\]]*\]# ?)+', '', line).strip()
+            if line:
+                self.lines.put(line)
+
+    def send(self, cmd):
+        try:
+            self.p.stdin.write(cmd + '\n')
+            self.p.stdin.flush()
+        except (OSError, ValueError):
+            pass
+
+    def next_line(self, timeout):
+        try:
+            return self.lines.get(timeout=timeout)
+        except queue.Empty:
+            return None
+
+    def close(self):
+        self.send('scan off')
+        self.send('quit')
+        try:
+            self.p.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            self.p.kill()
+
+
+def forget_pens():
+    for line in run('bluetoothctl', 'devices').splitlines():
+        m = PEN.search(line)
+        if m:
+            run('bluetoothctl', 'remove', m.group(1))
+
+
+def battery(addr):
+    for _ in range(10):
+        m = re.search(r'Battery Percentage: 0x[0-9a-f]+ \((\d+)\)', run('bluetoothctl', 'info', addr))
+        if m:
+            return int(m.group(1))
+        time.sleep(1)
+    return None
+
+
+def privacy_on():
+    m = re.search(r'current settings: (.*)', run('btmgmt', 'info'))
+    return bool(m) and 'privacy' in m.group(1).split()
+
+
+def set_privacy(on):
+    """Turn LE privacy on or off; the kernel takes it only with the radio off."""
+    for args in (('power', 'off'), ('privacy', 'on' if on else 'off'), ('power', 'on')):
+        try:
+            # sudo asks on the terminal itself, so its output can be captured.
+            subprocess.run(['sudo', 'btmgmt', *args], stdin=subprocess.DEVNULL,
+                           capture_output=True, timeout=60)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    for _ in range(10):
+        if 'Powered: yes' in run('bluetoothctl', 'show'):
+            break
+        time.sleep(0.5)
+    return privacy_on() == on
+
+
+def main():
+    say('Pair a Surface Slim Pen')
+    print()
+    show = run('bluetoothctl', 'show')
+    if 'Powered: yes' not in show:
+        run('bluetoothctl', 'power', 'on')
+        show = run('bluetoothctl', 'show')
+        if 'Powered: yes' not in show:
+            say('Bluetooth is off and could not be turned on.')
+            return 1
+    pairable = 'Pairable: yes' in show
+    # A pen remembered from before is forgotten first, so what turns up now is
+    # the pen in your hand, and a dead old bond never gets in the way.
+    forget_pens()
+
+    privacy = privacy_on()
+    if not privacy:
+        print('Bluetooth privacy goes on while pairing, which needs your password.')
+        print('Other Bluetooth devices disconnect for a moment, then reconnect.')
+        print()
+        if subprocess.run(['sudo', '-v']).returncode != 0:
+            say('Not paired: no password given.')
+            return 1
+    try:
+        if not privacy and not set_privacy(True):
+            say('Bluetooth privacy could not be turned on.')
+            return 1
+        return pair(pairable)
+    finally:
+        if not privacy:
+            print('Turning Bluetooth privacy back off...')
+            if not set_privacy(False):
+                say('Bluetooth privacy is still on. Restart Bluetooth to turn it off:')
+                print('  sudo systemctl restart bluetooth')
+
+
+def find_pen(ctl, deadline):
+    ctl.send('scan le')
+    shown = -1
+    found = None, None
+    while time.monotonic() < deadline:
+        line = ctl.next_line(0.5)
+        if line:
+            m = PEN.search(line)
+            if m and ('[NEW]' in line or '[CHG]' in line):
+                found = m.group(1), m.group(2).strip()
+                break
+        left = int(deadline - time.monotonic())
+        if left != shown:
+            print(f'\r  Looking for the pen... {left:2d} s left ', end='', flush=True)
+            shown = left
+    print('\r' + ' ' * 40 + '\r', end='')
+    ctl.send('scan off')
+    return found
+
+
+def try_pair(ctl, addr):
+    """Pair with addr; None on success, else why it failed."""
+    ctl.send(f'pair {addr}')
+    start = time.monotonic()
+    while time.monotonic() - start < PAIR_WAIT:
+        line = ctl.next_line(0.5)
+        if not line:
+            continue
+        if '(yes/no)' in line:
+            ctl.send('yes')
+        elif 'Pairing successful' in line:
+            return None
+        elif 'Failed to pair' in line or 'AuthenticationFailed' in line or 'AuthenticationCanceled' in line:
+            return line.split(':', 1)[-1].strip() or line
+    return 'the pen did not answer'
+
+
+def pair(pairable):
+    print("Hold the pen's top button for about 7 seconds, until its light blinks.")
+    print()
+    ctl = Bluetoothctl()
+    reason = None
+    try:
+        if not pairable:
+            run('bluetoothctl', 'pairable', 'on')
+        ctl.send('agent NoInputNoOutput')
+        ctl.send('default-agent')
+        # The pen shows up as soon as the button wakes it, which can be before
+        # it is in pairing mode, and then it refuses to pair. A refusal goes
+        # back to looking until WAIT runs out.
+        deadline = time.monotonic() + WAIT
+        while True:
+            addr, name = find_pen(ctl, deadline)
+            if not addr:
+                break
+            print(f'Found {name} ({addr}), pairing...')
+            time.sleep(1)
+            reason = try_pair(ctl, addr)
+            if reason is None:
+                break
+            run('bluetoothctl', 'remove', addr)
+            print(f'  Not paired yet ({reason}), trying again...')
+            time.sleep(2)
+            while ctl.next_line(0) is not None:
+                pass
+        if not addr:
+            if reason:
+                say(f'Pairing failed: {reason}.')
+                print('Put the pen into pairing mode again (hold the top button until it blinks) and retry.')
+            else:
+                say('No pen found.')
+                print('Hold the top button longer, until the light blinks, then run surface-pro-11-pen-pair again.')
+                print('A pen that is paired with another computer nearby may have connected there instead.')
+            return 1
+        run('bluetoothctl', 'trust', addr)
+    finally:
+        ctl.close()
+        if not pairable:
+            run('bluetoothctl', 'pairable', 'off')
+
+    level = battery(addr)
+    say(f'Paired {name}.')
+    if level is not None:
+        print(f'Battery {level} %.')
+    print('It connects on its own when you pick it up or click its button.')
+    return 0
+
+
+if __name__ == '__main__':
+    # Closing the terminal still turns privacy back off.
+    for sig in (signal.SIGHUP, signal.SIGTERM):
+        signal.signal(sig, lambda *_: sys.exit(1))
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)
