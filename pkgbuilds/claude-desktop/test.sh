@@ -10,6 +10,13 @@ fail() {
 }
 
 package_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+launcher_checksum=$(grep '^sha256sums=' "$package_dir/PKGBUILD" | cut -d"'" -f2)
+[[ "$launcher_checksum" =~ ^[[:xdigit:]]{64}$ ]] ||
+  fail "the PKGBUILD declares the launcher checksum"
+printf '%s  %s\n' "$launcher_checksum" "$package_dir/claude-desktop-launcher.sh" |
+  sha256sum --check || fail "the launcher matches the PKGBUILD checksum"
+echo "ok - the launcher matches the PKGBUILD checksum"
+
 scratch=$(mktemp -d)
 trap 'rm -rf "$scratch"' EXIT
 
