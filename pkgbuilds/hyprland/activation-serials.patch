@@ -1,0 +1,119 @@
+diff --git a/src/managers/SeatManager.cpp b/src/managers/SeatManager.cpp
+index 2f93c42..d2ba3d9 100644
+--- a/src/managers/SeatManager.cpp
++++ b/src/managers/SeatManager.cpp
+@@ -96,6 +96,29 @@ bool CSeatManager::serialValid(SP<CWLSeatResource> seatResource, uint32_t serial
+     return false;
+ }
+ 
++bool CSeatManager::serialAfterKeyboardLeave(SP<CWLSeatResource> seatResource, uint32_t serial) {
++    if (!seatResource)
++        return false;
++
++    auto container = containerForResource(seatResource);
++
++    ASSERT(container);
++
++    // serials wrap, so compare the signed distance
++    return container->keyboardLeaveSerial == 0 || sc<int32_t>(serial - container->keyboardLeaveSerial) > 0;
++}
++
++void CSeatManager::onKeyboardLeave(SP<CWLSeatResource> seatResource, uint32_t serial) {
++    if (!seatResource)
++        return;
++
++    auto container = containerForResource(seatResource);
++
++    ASSERT(container);
++
++    container->keyboardLeaveSerial = serial;
++}
++
+ void CSeatManager::recordPointerButtonSerial(SP<CWLSeatResource> seatResource, uint32_t serial, SP<CWLSurfaceResource> surface, uint32_t button) {
+     if (!seatResource || !surface || !serial)
+         return;
+diff --git a/src/managers/SeatManager.hpp b/src/managers/SeatManager.hpp
+index 578315a..273a5f5 100644
+--- a/src/managers/SeatManager.hpp
++++ b/src/managers/SeatManager.hpp
+@@ -77,6 +77,9 @@ class CSeatManager {
+     uint32_t nextSerial(SP<CWLSeatResource> seatResource, bool enter = false);
+     // pops the serial if it was valid, meaning it is consumed.
+     bool                serialValid(SP<CWLSeatResource> seatResource, uint32_t serial, bool erase = true);
++    // whether the serial was sent after the client last lost keyboard focus.
++    bool                serialAfterKeyboardLeave(SP<CWLSeatResource> seatResource, uint32_t serial);
++    void                onKeyboardLeave(SP<CWLSeatResource> seatResource, uint32_t serial);
+     void                recordPointerButtonSerial(SP<CWLSeatResource> seatResource, uint32_t serial, SP<CWLSurfaceResource> surface, uint32_t button);
+     void                clearPointerButtonSerials(SP<CWLSeatResource> seatResource, SP<CWLSurfaceResource> surface, uint32_t button);
+     bool                pointerButtonSerialValid(SP<CWLSeatResource> seatResource, uint32_t serial, SP<CWLSurfaceResource> surface, bool erase = true);
+@@ -142,6 +145,7 @@ class CSeatManager {
+ 
+         WP<CWLSeatResource>               resource;
+         uint32_t                          enterSerial = 0; // remember this forever
++        uint32_t                          keyboardLeaveSerial = 0;
+         std::vector<uint32_t>             serials;         // old -> new
+         std::vector<SPointerButtonSerial> pointerButtonSerials;
+ 
+diff --git a/src/protocols/XDGActivation.cpp b/src/protocols/XDGActivation.cpp
+index 01ddb66..88cc7d2 100644
+--- a/src/protocols/XDGActivation.cpp
++++ b/src/protocols/XDGActivation.cpp
+@@ -1,4 +1,5 @@
+ #include "XDGActivation.hpp"
++#include "../managers/SeatManager.hpp"
+ #include "../managers/TokenManager.hpp"
+ #include "../Compositor.hpp"
+ #include "core/Compositor.hpp"
+@@ -16,14 +17,36 @@ CXDGActivationToken::CXDGActivationToken(SP<CXdgActivationTokenV1> resource_) :
+     m_resource->setSetAppId([this](CXdgActivationTokenV1* r, const char* appid) { m_appID = appid; });
+ 
+     m_resource->setCommit([this](CXdgActivationTokenV1* r) {
++        // An empty token tells the client its request was refused.
++        auto reject = [this] { m_resource->sendDone(""); };
++
+         // TODO: should we send a protocol error of already_used here
+         // if it was used? the protocol spec doesn't say _when_ it should be sent...
+         if UNLIKELY (m_committed) {
+-            LOGM(Log::WARN, "possible protocol error, two commits from one token. Ignoring.");
++            LOGM(Log::WARN, "possible protocol error, two commits from one token, rejecting");
++            reject();
+             return;
+         }
+ 
+         m_committed = true;
++
++        const auto SEAT = g_pSeatManager->seatResourceForClient(m_resource->client());
++
++        // Backport of hyprwm/Hyprland#16427: a token needs a serial of input the client got.
++        if UNLIKELY (!m_serial || !g_pSeatManager->serialValid(SEAT, m_serial)) {
++            LOGM(Log::WARN, "invalid serial {} for activation token, rejecting", m_serial);
++            reject();
++            return;
++        }
++
++        // Input the client got before it lost keyboard focus is not a request from the user
++        // now: a browser handed a URL in the background reuses it.
++        if UNLIKELY (!g_pSeatManager->serialAfterKeyboardLeave(SEAT, m_serial)) {
++            LOGM(Log::WARN, "serial {} for activation token predates the client losing focus, rejecting", m_serial);
++            reject();
++            return;
++        }
++
+         // send done with a new token
+         m_token = g_pTokenManager->registerNewToken({}, std::chrono::months{12});
+ 
+diff --git a/src/protocols/core/Seat.cpp b/src/protocols/core/Seat.cpp
+index e37cb76..13cbbeb 100644
+--- a/src/protocols/core/Seat.cpp
++++ b/src/protocols/core/Seat.cpp
+@@ -413,7 +413,9 @@ void CWLKeyboardResource::sendLeave() {
+     if (!(PROTO::seat->m_currentCaps & eHIDCapabilityType::HID_INPUT_CAPABILITY_KEYBOARD))
+         return;
+ 
+-    m_resource->sendLeave(g_pSeatManager->nextSerial(m_owner.lock()), m_currentSurface->getResource().get());
++    const auto SERIAL = g_pSeatManager->nextSerial(m_owner.lock());
++    g_pSeatManager->onKeyboardLeave(m_owner.lock(), SERIAL);
++    m_resource->sendLeave(SERIAL, m_currentSurface->getResource().get());
+     m_currentSurface.reset();
+     m_listeners.destroySurface.reset();
+ }
