@@ -40,6 +40,25 @@ for pkgdir in "$PKGBUILDS_DIR"/*/; do
       esac
     done <<<"$sources"
   done
+
+  # A recipe that fetches git itself, as the dev pair does in prepare()
+  # because makepkg cannot clone shallowly, must fetch the full commit id it
+  # pins in _commit, not a branch.
+  fetches=$(grep -E '^[[:space:]]*git( -C [^ ]+)? fetch ' "$pkgdir/PKGBUILD" || true)
+  if [[ -n $fetches ]]; then
+    checked=$((checked + 1))
+    commit=$(cd "$pkgdir" && env -u OMARCHY_SRC bash -c 'source ./PKGBUILD >/dev/null 2>&1; printf "%s" "${_commit:-}"' 2>/dev/null)
+    if [[ ! $commit =~ ^[0-9a-f]{40}$ ]]; then
+      echo "FAIL: $package: fetches git itself, but _commit is not a full commit id: ${commit:-unset}"
+      failures=$((failures + 1))
+    fi
+    while IFS= read -r fetch; do
+      if [[ $fetch != *'"$_commit"' && $fetch != *'"${_commit}"' ]]; then
+        echo "FAIL: $package: git fetch does not fetch \$_commit: ${fetch#"${fetch%%[![:space:]]*}"}"
+        failures=$((failures + 1))
+      fi
+    done <<<"$fetches"
+  fi
 done
 
 if ((failures)); then
