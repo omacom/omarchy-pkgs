@@ -161,6 +161,18 @@ esac
 STUB
 cat >"$bin/btmgmt" <<'STUB'
 #!/bin/bash
+if [[ $1 == info ]]; then
+  settings='powered ssp br/edr le secure-conn ll-privacy'
+  # privacy holds "on", or how many more checks see it on before it goes off.
+  if [[ -e $BT_STATE/privacy ]]; then
+    left=$(<"$BT_STATE/privacy")
+    if [[ $left == on ]]; then settings+=' privacy'
+    elif (( left > 0 )); then echo $((left - 1)) >"$BT_STATE/privacy"; settings+=' privacy'
+    fi
+  fi
+  printf 'hci0:\tPrimary controller\n\tcurrent settings: %s \n' "$settings"
+  exit 0
+fi
 echo "btmgmt $*" >>"$BT_STATE/log"
 STUB
 cat >"$bin/logger" <<'STUB'
@@ -218,6 +230,23 @@ flex_reset; flex_attach; flex_bond; : >"$scratch/bt/connectable"
 flex denali autopair
 ! flex_did "pair --no-detach" || fail "a bond that connects on request is kept"
 
+# While a pen is pairing, privacy is on and the keyboard cannot connect.
+flex_reset; flex_attach; flex_bond; echo on >"$scratch/bt/privacy"
+flex denali autopair
+! flex_did "remove $keyboard" && ! flex_did "pair --no-detach" && ! flex_did "btmgmt power off" ||
+  fail "a bond is kept, and the radio left alone, while a pen is pairing"
+
+# Once the pairing ends the keyboard may no longer advertise; that is no
+# evidence against the bond.
+flex_reset; flex_attach; flex_bond; echo 2 >"$scratch/bt/privacy"
+flex denali autopair
+! flex_did "remove $keyboard" && ! flex_did "pair --no-detach" && ! flex_did "btmgmt power off" ||
+  fail "a bond that does not connect right after a pen pairing is kept"
+
+flex_reset; flex_attach; echo 2 >"$scratch/bt/privacy"
+flex denali autopair
+flex_did "pair --no-detach" || fail "a keyboard with no bond is paired once a pen pairing ends"
+
 flex_reset; mkdir -p "$scratch/hid/0019:045E:0C8B.0002"
 flex denali autopair
 ! flex_did "pair --no-detach" || fail "without the kernel's pairing channel nothing is paired"
@@ -235,12 +264,24 @@ flex_reset; flex_bond
 flex denali reconnect
 [[ -e $scratch/run/flex-needs-repair ]] || fail "a detached keyboard that never connects is marked for re-pairing"
 
+flex_reset; flex_bond; echo on >"$scratch/bt/privacy"
+flex denali reconnect
+! flex_did "connect $keyboard" && [[ ! -e $scratch/run/flex-needs-repair ]] ||
+  fail "a keyboard detached while a pen is pairing is not marked for re-pairing"
+
+flex_reset; flex_bond; echo 2 >"$scratch/bt/privacy"
+flex denali reconnect
+flex_did "connect $keyboard" && [[ ! -e $scratch/run/flex-needs-repair ]] ||
+  fail "a keyboard detached during a pen pairing is connected afterwards, and not marked if it stays away"
+
 flex_reset; flex_attach; flex_bond
 flex denali reconnect
 ! flex_did "connect $keyboard" || fail "an attached keyboard is not connected over Bluetooth"
 
-python -c 'import ast, sys; ast.parse(open(sys.argv[1]).read())' "$package_dir/surface-pro-11-flex-pair" ||
-  fail "the pairing tool is valid Python"
+for tool in surface-pro-11-flex-pair surface-pro-11-pen-pair; do
+  python -c 'import ast, sys; ast.parse(open(sys.argv[1]).read())' "$package_dir/$tool" ||
+    fail "$tool is valid Python"
+done
 for unit in surface-pro-11-flex-autopair surface-pro-11-flex-reconnect; do
   grep -qx 'ConditionFirmware=device-tree-compatible(microsoft,denali-oled)' "$package_dir/$unit.service" ||
     fail "$unit runs only on the Surface Pro 11 OLED"
