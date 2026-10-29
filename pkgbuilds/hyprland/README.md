@@ -9,3 +9,7 @@ Remove `sync: false` and `software-renderer.patch` in the same change once the s
 ## Output and VRR fixes
 
 `wl-output-global-grace.patch` keeps a removed `wl_output` global for five seconds before destroying it, as wlroots does. Without it, an output that comes and goes within a roundtrip, such as a dock's monitor flapping while its tunnel comes up, disconnects every client that has not bound it yet with "global wl_output (N) is unavailable". `monitor-rule-vrr.patch` makes a config reload apply a monitor rule's `vrr`; without it, changing only `vrr` is ignored until the next session. Neither is upstream yet. Rebase both with `--fuzz=0` on a version bump, and drop each once the selected release carries the fix.
+
+## Resize relayout backport
+
+`monitor-resize-relayout.patch` is hyprwm/Hyprland [ab2d313b](https://github.com/hyprwm/Hyprland/commit/ab2d313b551f004878ada2bbb30c67bb674822f5) (#15842), unchanged. When a backend resizes a monitor on its own, such as the window of a Hyprland nested in another compositor being fullscreened or resized, 0.56.2 applies the new size but never re-arranges the monitors, so tiled windows and layers keep their old geometry. The fix schedules the arrange after the backend's state change and lets the arrange lay out every monitor's layers. It is on Hyprland's main branch but in no release yet; drop it once the selected release includes it.
