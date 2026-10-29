@@ -101,8 +101,8 @@ rm "$efivars/MacAddressEmulationAddress-test"
 [[ -z $(efivars="$scratch/no-efivars" wifi_address '' 00:03:7f:12:7f:94 0x1002) ]] ||
   fail "a machine without efivarfs is left alone"
 
-grep -q 'ACTION=="add".*DEVTYPE}=="wlan".*DRIVERS=="ath12k_pci|ath12k_wifi7_pci".*RUN+="/usr/lib/surface-snapdragon-addresses/surface-wifi-address %k"' \
-  <(tr -d '\\\n' <"$package_dir/60-surface-wifi-address.rules") ||
-  fail "udev sets each ath12k Wi-Fi address while adding the interface"
+grep -q 'ACTION=="add".*DEVTYPE}=="wlan".*DRIVERS=="ath12k_pci|ath12k_wifi7_pci".*RUN+="/usr/lib/surface-snapdragon-addresses/surface-wifi-address $name"' \
+  <(tr -d '\\\n' <"$package_dir/81-surface-wifi-address.rules") ||
+  fail "udev sets each ath12k Wi-Fi address under its name after renaming, while adding the interface"
 
 echo "ok - surface-snapdragon-addresses derives addresses only on Microsoft machines with the variable"
