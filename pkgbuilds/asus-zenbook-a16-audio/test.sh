@@ -28,6 +28,15 @@ tplg="$root/usr/lib/firmware/qcom/glymur/GLYMUR-ASUS-Zenbook-A16-UX3607OA-tplg.b
 [[ $(readlink -f "$tplg") == "$root/usr/lib/firmware/qcom/glymur/GLYMUR-CRD-tplg.bin" ]] ||
   fail "the topology links to the CRD topology"
 
+# The fixture above cannot notice linux-firmware-qcom renaming or dropping the
+# CRD topology, so where that package is installed, check the link against the
+# files it really ships.
+if pacman -Qq linux-firmware-qcom &>/dev/null; then
+  target=$(readlink "$pkgdir/usr/lib/firmware/qcom/glymur/GLYMUR-ASUS-Zenbook-A16-UX3607OA-tplg.bin")
+  pacman -Qlq linux-firmware-qcom | grep -qxF "/usr/lib/firmware/qcom/glymur/$target" ||
+    fail "linux-firmware-qcom ships the topology the link names ($target)"
+fi
+
 # The UCM profile restates the CRD profile and sets the WSA digital volumes on
 # every boot.
 ucm="$pkgdir/usr/share/alsa/ucm2/conf.d/glymur/ASUSTeKCOMPUTERINC.-ZenbookA16UX3607OA-1.0-UX3607OA.conf"
