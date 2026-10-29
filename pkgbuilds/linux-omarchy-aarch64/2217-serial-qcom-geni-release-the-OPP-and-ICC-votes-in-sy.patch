@@ -1,0 +1,133 @@
+From cf18ac82f945ee144d1efb5ad48a999fdda3066a Mon Sep 17 00:00:00 2001
+From: Brandon Williams <turbine.bmw@gmail.com>
+Date: Thu, 22 Oct 2026 18:36:35 -0400
+Subject: [PATCH] serial: qcom-geni: release the OPP and ICC votes in system
+ sleep instead of force-suspending
+
+Since commit d0cd9c8d0fd5 ("serial: qcom-geni: add force suspend/resume
+to system sleep callbacks") an open geni UART is power-collapsed for
+system sleep: pm_runtime_force_suspend() turns the serial engine's
+clocks and interconnect vote off in the normal suspend phase and they
+stay off until pm_runtime_force_resume() in the normal resume phase.
+
+On the Surface Pro 11 (X1E80100) the Surface Aggregator EC hangs off
+such a UART (ttyHS0, b88000, 4 MHz, hardware flow control). On 7.3 a
+suspend that closely follows a resume can leave the EC link dead: the
+D0-entry notification and every later SAM request time out with
+-ETIMEDOUT, the battery and AC resume callbacks block in sequential
+timeouts, and the machine looks hard-locked (it panics in
+dpm_watchdog_handler() with CONFIG_DPM_WATCHDOG). The first 7.3 builds
+hung within one to three "close lid, open lid, suspend again within
+30 s" cycles; later builds without this patch hung far less often (once
+in about sixteen suspends on one, never in forty on two others with
+extra logging), so it is a timing window, not a fixed sequence. 7.2
+never showed it.
+
+Simply dropping the forced suspend avoids the hang but keeps the CX
+rail from collapsing, because the baud-rate OPP vote then stays in the
+RPMh sleep set (0 % CX residency measured over a 2 h sleep).
+
+Release only the votes (OPP rate 0, interconnect bandwidth off) in the
+system suspend callback and restore them on resume, keeping the engine
+clocked and its pins in their default state. Like
+pm_runtime_force_suspend()/pm_runtime_force_resume(), disable runtime PM
+across the transition and leave a closed, runtime-suspended port alone:
+its votes are already released, and restoring them on resume would leave
+it holding an interconnect vote while it stays runtime suspended.
+Disabling runtime PM before the check also keeps a dedicated wake IRQ
+from runtime-resuming a closed port before the wake IRQs are armed,
+which would leave the port holding its votes for the whole sleep.
+
+Why the clocked engine avoids the hang is not established. The port
+uses hardware flow control, so the serial core does not drive RFR
+itself, and RX is cancelled on both paths. Setting UPSTAT_AUTOCTS, so
+that the core cannot latch a deasserted CTS at resume, did not prevent
+the hang. What this patch restores is that the engine stays clocked
+through the transition, as on 7.2, where device_prepare() holds the
+runtime PM reference that would otherwise let it gate.
+
+Measured on the Surface Pro 11: no link loss in 9/9 trigger cycles and
+none since in daily use, CX/AOSS/DDR residency 99.5 % over a 1.8 h
+sleep at ~0.2 W, the same as the forced path and as 7.2. On a Lenovo
+Yoga Slim 7x (no EC on a geni UART): Bluetooth works after resume, ten
+suspends each 10 s after the previous resume all resumed, and CX, AOSS
+and DDR were collapsed for 1192 s of a 1205 s sleep.
+
+Fixes: d0cd9c8d0fd5 ("serial: qcom-geni: add force suspend/resume to system sleep callbacks")
+Signed-off-by: Brandon Williams <turbine.bmw@gmail.com>
+Assisted-by: Claude:claude-opus-5-5
+[ryan: disable runtime PM before the status check, reword the code
+ comment to what is established]
+Signed-off-by: Ryan Hughes <ryan@heyoodle.com>
+---
+ drivers/tty/serial/qcom_geni_serial.c | 41 ++++++++++++++++++++++++---
+ 1 file changed, 37 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/tty/serial/qcom_geni_serial.c b/drivers/tty/serial/qcom_geni_serial.c
+index a851b8f0e..7c809369e 100644
+--- a/drivers/tty/serial/qcom_geni_serial.c
++++ b/drivers/tty/serial/qcom_geni_serial.c
+@@ -2107,23 +2107,56 @@ static int qcom_geni_serial_suspend(struct device *dev)
+ 
+ 	/*
+ 	 * When no_console_suspend is set the console must remain active
+-	 * across system sleep, so skip the force suspend path.
++	 * across system sleep, so skip the vote release.
+ 	 */
+ 	if (!console_suspend_enabled && uart_console(uport))
+ 		return 0;
+ 
+-	return pm_runtime_force_suspend(dev);
++	/*
++	 * Disable runtime PM before checking the status, as
++	 * pm_runtime_force_suspend() did. Otherwise a dedicated wake IRQ could
++	 * runtime-resume a closed port after the check, before the wake IRQs
++	 * are armed, and the port would hold its votes for the whole sleep.
++	 */
++	pm_runtime_disable(dev);
++
++	/* A closed port is runtime suspended and has released its votes. */
++	if (pm_runtime_status_suspended(dev))
++		return 0;
++
++	/*
++	 * The serial core cannot runtime-suspend the port here (the PM core
++	 * holds a runtime PM reference on every device for the whole system
++	 * sleep transition), so the baud-rate OPP vote and the interconnect
++	 * bandwidth vote would stay in RPMh's sleep set and keep the CX rail
++	 * from collapsing. Release the votes, but keep the serial engine
++	 * clocked and its pins in the default state: on the Surface Pro 11,
++	 * power-collapsing the engine with pm_runtime_force_suspend() can
++	 * leave the link to the Surface Aggregator EC dead after resume.
++	 */
++	if (port->se.has_opp)
++		dev_pm_opp_set_rate(dev, 0);
++	ret = geni_icc_disable(&port->se);
++	if (ret)
++		pm_runtime_enable(dev);
++	return ret;
+ }
+ 
+ static int qcom_geni_serial_resume(struct device *dev)
+ {
+-	int ret;
++	int ret = 0;
+ 	struct qcom_geni_serial_port *port = dev_get_drvdata(dev);
+ 	struct uart_port *uport = &port->uport;
+ 	struct qcom_geni_private_data *private_data = uport->private_data;
+ 
+ 	if (console_suspend_enabled || !uart_console(uport)) {
+-		ret = pm_runtime_force_resume(dev);
++		/* Restore the votes only if suspend released them. */
++		if (!pm_runtime_status_suspended(dev)) {
++			ret = geni_icc_enable(&port->se);
++			if (!ret && port->se.has_opp && port->clk_rate)
++				ret = dev_pm_opp_set_rate(dev, port->clk_rate);
++		}
++		pm_runtime_enable(dev);
+ 		if (ret)
+ 			return ret;
+ 	}
+-- 
+2.56.0
+
