@@ -632,3 +632,62 @@ printf '%s 0 test\n%s 0 test\n' "$cdsp" "$cdsp_dtb" >"$cdsp_stage/manifest"
   [[ ! -e $board_updates/$soccp && ! -e $board_updates/$cdsp && ! -e $board_updates/$cdsp_dtb ]]
   echo "ok - while Windows is read for other firmware, listed names are not installed"
 )
+
+# Windows keeps an older driver package beside the one it uses, and neither
+# file of the pair is installed yet: both come from the package whose INF
+# Windows ranks first (DriverVer date, then version), never one from each.
+(
+  newest="$scratch/newest"
+  newest_dt="$newest/device-tree"
+  newest_store="$newest/DriverStore"
+  newest_fw="$newest/firmware"
+  path=qcom/glymur/vendor/board
+  mkdir -p "$newest_dt/remoteproc@2" "$newest_fw" \
+    "$newest_store/qcnspmcdm.inf_arm64_old" "$newest_store/qcnspmcdm.inf_arm64_new"
+  printf '%s\0%s\0' "$path/qccdsp.mbn" "$path/cdsp_dtbs.elf" >"$newest_dt/remoteproc@2/firmware-name"
+  inf() { printf '\xff\xfe'; printf '[Version]\r\nDriverVer = %s\r\n' "$2" | iconv -f UTF-8 -t UTF-16LE; }
+  inf x '01/27/2026,30.0.220.11010' >"$newest_store/qcnspmcdm.inf_arm64_old/qcnspmcdm.inf"
+  inf x '05/21/2026,30.0.225.10000' >"$newest_store/qcnspmcdm.inf_arm64_new/qcnspmcdm.inf"
+  for v in old new; do
+    printf '%s-cdsp' "$v" >"$newest_store/qcnspmcdm.inf_arm64_$v/qccdsp.mbn"
+    printf '%s-dtb' "$v" >"$newest_store/qcnspmcdm.inf_arm64_$v/cdsp_dtbs.elf"
+  done
+  # The older package is the newer file on disk, as after a restore.
+  touch -t 203001010000 "$newest_store/qcnspmcdm.inf_arm64_old/"*
+
+  run_newest() {
+    QCOM_FW_DT_ROOT="$newest_dt" QCOM_FW_FIRMWARE_ROOT="$newest_fw" \
+      QCOM_FW_ROOT="$newest/root" QCOM_FW_TEST_EUID=0 PATH="$test_bin:$PATH" \
+      bash "$extractor" "$@"
+  }
+
+  run_newest --stage "$newest/stage" -d "$newest_store"
+  [[ $(<"$newest/stage/$path/qccdsp.mbn") == new-cdsp && $(<"$newest/stage/$path/cdsp_dtbs.elf") == new-dtb ]]
+  run_newest --install --no-rebuild -d "$newest_store"
+  [[ $(<"$newest_fw/updates/$path/qccdsp.mbn") == new-cdsp && $(<"$newest_fw/updates/$path/cdsp_dtbs.elf") == new-dtb ]]
+  echo "ok - with nothing installed, a pair comes whole from the package Windows ranks first"
+
+  # Once one file of the pair is installed, its companion decides, as before:
+  # an installed file matching no package refuses the other.
+  rm "$newest_fw/updates/$path/cdsp_dtbs.elf"
+  printf 'own-cdsp' >"$newest_fw/updates/$path/qccdsp.mbn"
+  run_newest --install --no-rebuild -d "$newest_store" 2>"$newest/warnings" || true
+  [[ ! -e $newest_fw/updates/$path/cdsp_dtbs.elf ]]
+  grep -Fq "refusing ambiguous cdsp_dtbs.elf" "$newest/warnings"
+  echo "ok - an installed companion still decides, and a mismatch still refuses"
+
+  # Same DriverVer with different files, or an unreadable INF: refused.
+  rm -r "$newest_fw/updates"
+  inf x '05/21/2026,30.0.225.10000' >"$newest_store/qcnspmcdm.inf_arm64_old/qcnspmcdm.inf"
+  run_newest --stage "$newest/tie" -d "$newest_store" 2>/dev/null
+  [[ ! -e $newest/tie/$path/qccdsp.mbn && ! -e $newest/tie/$path/cdsp_dtbs.elf ]]
+  printf '[Version]\nDriverVer = soon\n' >"$newest_store/qcnspmcdm.inf_arm64_old/qcnspmcdm.inf"
+  run_newest --stage "$newest/unreadable" -d "$newest_store" 2>/dev/null
+  [[ ! -e $newest/unreadable/$path/qccdsp.mbn ]]
+  # A package missing half the pair is passed over (plain ASCII INF here).
+  printf '[Version]\nDriverVer=12/31/2026,31.0.0.0\n' >"$newest_store/qcnspmcdm.inf_arm64_old/qcnspmcdm.inf"
+  rm "$newest_store/qcnspmcdm.inf_arm64_old/cdsp_dtbs.elf"
+  run_newest --stage "$newest/half" -d "$newest_store"
+  [[ $(<"$newest/half/$path/qccdsp.mbn") == new-cdsp ]]
+  echo "ok - equal or unreadable versions refuse, and an incomplete package is passed over"
+)
