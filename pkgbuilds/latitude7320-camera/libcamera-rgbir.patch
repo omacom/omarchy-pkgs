@@ -1,0 +1,1265 @@
+diff --git i/include/libcamera/internal/camera_lens.h w/include/libcamera/internal/camera_lens.h
+index f347c5e..f63bcfa 100644
+--- i/include/libcamera/internal/camera_lens.h
++++ w/include/libcamera/internal/camera_lens.h
+@@ -27,6 +27,8 @@ public:
+ 	~CameraLens();
+ 
+ 	int init();
++	int open();
++	void close();
+ 	int setFocusPosition(int32_t position);
+ 
+ 	const std::string &model() const { return model_; }
+diff --git i/include/libcamera/internal/software_isp/swisp_stats.h w/include/libcamera/internal/software_isp/swisp_stats.h
+index d9d0d9b..a20e814 100644
+--- i/include/libcamera/internal/software_isp/swisp_stats.h
++++ w/include/libcamera/internal/software_isp/swisp_stats.h
+@@ -29,6 +29,9 @@ struct SwIspStats {
+ 	bool valid;
+ 	/**
+ 	 * \brief Sums of colour channels of all the sampled pixels
++	 *
++	 * Scaled to 8 bits per sample regardless of the input bit depth, so
++	 * that they can be compared against an 8-bit black level.
+ 	 */
+ 	RGB<uint64_t> sum_;
+ 	/**
+diff --git i/src/gstreamer/gstlibcamerasrc.cpp w/src/gstreamer/gstlibcamerasrc.cpp
+index a7241e9..b246b2c 100644
+--- i/src/gstreamer/gstlibcamerasrc.cpp
++++ w/src/gstreamer/gstlibcamerasrc.cpp
+@@ -908,6 +908,9 @@ gst_libcamera_src_close(GstLibcameraSrc *self)
+ 
+ 	GST_DEBUG_OBJECT(self, "Releasing resources");
+ 
++	/* The camera can outlive this source while another source holds the manager. */
++	state->cam_->requestCompleted.disconnect(state);
++
+ 	state->config_.reset();
+ 
+ 	ret = state->cam_->release();
+diff --git i/src/ipa/libipa/camera_sensor_helper.cpp w/src/ipa/libipa/camera_sensor_helper.cpp
+index e3e3e53..e809b49 100644
+--- i/src/ipa/libipa/camera_sensor_helper.cpp
++++ w/src/ipa/libipa/camera_sensor_helper.cpp
+@@ -733,6 +733,18 @@ public:
+ };
+ REGISTER_CAMERA_SENSOR_HELPER("ov5675", CameraSensorHelperOv5675)
+ 
++class CameraSensorHelperOv8856 : public CameraSensorHelper
++{
++public:
++	CameraSensorHelperOv8856()
++	{
++		/* OV8856 analogue gain register: 128 represents unity gain. */
++		gain_ = AnalogueGainLinear{ 1, 0, 0, 128 };
++	}
++};
++REGISTER_CAMERA_SENSOR_HELPER("ov8856", CameraSensorHelperOv8856)
++
++
+ class CameraSensorHelperOv5693 : public CameraSensorHelper
+ {
+ public:
+diff --git i/src/ipa/simple/algorithms/agc.cpp w/src/ipa/simple/algorithms/agc.cpp
+index 2f7e040..6247d47 100644
+--- i/src/ipa/simple/algorithms/agc.cpp
++++ w/src/ipa/simple/algorithms/agc.cpp
+@@ -8,6 +8,9 @@
+ #include "agc.h"
+ 
+ #include <stdint.h>
++#include <cstdlib>
++#include <cmath>
++#include <libcamera/base/utils.h>
+ 
+ #include <libcamera/base/log.h>
+ 
+@@ -43,6 +46,11 @@ Agc::Agc()
+ 
+ void Agc::updateExposure(IPAContext &context, IPAFrameContext &frameContext, double exposureMSV)
+ {
++	static const float rgbIrExposureTarget = []() {
++		const char *value = utils::secure_getenv("RGBIR_EXPOSURE_TARGET");
++		return value ? std::clamp(static_cast<float>(atof(value)), 0.5f, 4.0f)
++			     : kExposureOptimal;
++	}();
+ 	/*
+ 	 * kExpDenominator of 10 gives ~10% increment/decrement;
+ 	 * kExpDenominator of 5 - about ~20%
+@@ -51,10 +59,27 @@ void Agc::updateExposure(IPAContext &context, IPAFrameContext &frameContext, dou
+ 	static constexpr uint8_t kExpNumeratorUp = kExpDenominator + 1;
+ 	static constexpr uint8_t kExpNumeratorDown = kExpDenominator - 1;
+ 
++	/* Some RGB-IR modules lose chromatic response at high analogue gain.
++	 * Allow a measured safe ceiling; unset leaves the sensor range intact. */
++	static const float gainLimit = []() {
++		const char *value = utils::secure_getenv("RGBIR_ANALOGUE_GAIN_MAX");
++		if (!value)
++			return 0.0f;
++		char *end;
++		const float limit = std::strtof(value, &end);
++		return end != value && *end == '\0' && std::isfinite(limit) && limit > 0
++			? limit : 0.0f;
++	}();
++	const float exposureTarget = context.rgbIrSensor ? rgbIrExposureTarget : kExposureOptimal;
++	const double gainMax = context.rgbIrSensor && gainLimit > 0
++		? std::clamp((double)gainLimit, context.configuration.agc.againMin,
++			     context.configuration.agc.againMax)
++		: context.configuration.agc.againMax;
++
+ 	int32_t &exposure = frameContext.sensor.exposure;
+ 	double &again = frameContext.sensor.gain;
+ 
+-	if (exposureMSV < kExposureOptimal - kExposureSatisfactory) {
++	if (exposureMSV < exposureTarget - kExposureSatisfactory) {
+ 		if (exposure < context.configuration.agc.exposureMax) {
+ 			int32_t next = exposure * kExpNumeratorUp / kExpDenominator;
+ 			if (next - exposure < 1)
+@@ -70,7 +95,7 @@ void Agc::updateExposure(IPAContext &context, IPAFrameContext &frameContext, dou
+ 		}
+ 	}
+ 
+-	if (exposureMSV > kExposureOptimal + kExposureSatisfactory) {
++	if (exposureMSV > exposureTarget + kExposureSatisfactory) {
+ 		if (again > context.configuration.agc.again10) {
+ 			double next = again * kExpNumeratorDown / kExpDenominator;
+ 			if (again - next < context.configuration.agc.againMinStep)
+@@ -89,7 +114,7 @@ void Agc::updateExposure(IPAContext &context, IPAFrameContext &frameContext, dou
+ 	exposure = std::clamp(exposure, context.configuration.agc.exposureMin,
+ 			      context.configuration.agc.exposureMax);
+ 	again = std::clamp(again, context.configuration.agc.againMin,
+-			   context.configuration.agc.againMax);
++			   gainMax);
+ 
+ 	context.activeState.agc.exposure = exposure;
+ 	context.activeState.agc.again = again;
+diff --git i/src/ipa/simple/algorithms/awb.cpp w/src/ipa/simple/algorithms/awb.cpp
+index 6fdaaca..9a4786a 100644
+--- i/src/ipa/simple/algorithms/awb.cpp
++++ w/src/ipa/simple/algorithms/awb.cpp
+@@ -8,9 +8,12 @@
+ #include "awb.h"
+ 
+ #include <numeric>
++#include <cmath>
++#include <cstdlib>
+ #include <stdint.h>
+ 
+ #include <libcamera/base/log.h>
++#include <libcamera/base/utils.h>
+ 
+ #include <libcamera/control_ids.h>
+ 
+@@ -86,16 +89,32 @@ void Awb::process(IPAContext &context,
+ 	const RGB<uint64_t> sum = stats->sum_.max(offset + minValid) - offset;
+ 
+ 	/*
+-	 * Calculate red and blue gains for AWB.
+-	 * Clamp max gain at 4.0, this also avoids 0 division.
++	 * Calculate red and blue gains for AWB. Guard against division by
++	 * zero, but do not impose a maximum: a hardcoded ceiling leaves
++	 * sensors with a weak red response permanently short of neutral.
+ 	 */
+ 	auto &gains = context.activeState.awb.gains;
+ 	gains = { {
+-		sum.r() <= sum.g() / 4 ? 4.0f : static_cast<float>(sum.g()) / sum.r(),
++		static_cast<float>(sum.g()) / std::max<uint64_t>(sum.r(), 1),
+ 		1.0,
+-		sum.b() <= sum.g() / 4 ? 4.0f : static_cast<float>(sum.g()) / sum.b(),
++		static_cast<float>(sum.g()) / std::max<uint64_t>(sum.b(), 1),
+ 	} };
+ 
++	/* Optional gains measured from a neutral target in the current light. */
++	static const auto calibratedGain = [](const char *name) {
++		const char *value = utils::secure_getenv(name);
++		if (!value)
++			return 0.0f;
++		char *end;
++		const float gain = std::strtof(value, &end);
++		return end != value && *end == '\0' && std::isfinite(gain) &&
++		       gain >= 0.25f && gain <= 8.0f ? gain : 0.0f;
++	};
++	static const float redGain = calibratedGain("RGBIR_WB_RED");
++	static const float blueGain = calibratedGain("RGBIR_WB_BLUE");
++	if (context.rgbIrSensor && redGain && blueGain)
++		gains = { { redGain, 1.0f, blueGain } };
++
+ 	RGB<double> rgbGains{ { 1 / gains.r(), 1 / gains.g(), 1 / gains.b() } };
+ 	context.activeState.awb.temperatureK = estimateCCT(rgbGains);
+ 	metadata.set(controls::ColourTemperature, context.activeState.awb.temperatureK);
+diff --git i/src/ipa/simple/ipa_context.h w/src/ipa/simple/ipa_context.h
+index 34f7403..674e6c6 100644
+--- i/src/ipa/simple/ipa_context.h
++++ w/src/ipa/simple/ipa_context.h
+@@ -93,6 +93,7 @@ struct IPAContext {
+ 	FCQueue<IPAFrameContext> frameContexts;
+ 	ControlInfoMap::Map ctrlMap;
+ 	bool ccmEnabled = false;
++	bool rgbIrSensor = false;
+ };
+ 
+ } /* namespace ipa::soft */
+diff --git i/src/ipa/simple/soft_simple.cpp w/src/ipa/simple/soft_simple.cpp
+index 6bef597..5ad0ea0 100644
+--- i/src/ipa/simple/soft_simple.cpp
++++ w/src/ipa/simple/soft_simple.cpp
+@@ -107,6 +107,8 @@ int IPASoftSimple::init(const IPASettings &settings,
+ 	}
+ 
+ 	context_.sensorInfo = sensorInfo;
++	context_.rgbIrSensor = settings.sensorModel == "ov5675";
++	LOG(IPASoft, Info) << "Sensor processing model=" << settings.sensorModel << " rgbir=" << context_.rgbIrSensor;
+ 
+ 	/* Load the tuning data file */
+ 	File file(settings.configurationFile);
+diff --git i/src/libcamera/camera_lens.cpp w/src/libcamera/camera_lens.cpp
+index ccc2a6a..9cfc82a 100644
+--- i/src/libcamera/camera_lens.cpp
++++ w/src/libcamera/camera_lens.cpp
+@@ -76,6 +76,17 @@ int CameraLens::init()
+ 	return 0;
+ }
+ 
++/* Keep lens power tied to capture in pipeline handlers that opt in. */
++int CameraLens::open()
++{
++	return subdev_->isOpen() ? 0 : subdev_->open();
++}
++
++void CameraLens::close()
++{
++	subdev_->close();
++}
++
+ /**
+  * \brief This function sets the focal point of the lens to a specific position.
+  * \param[in] position The focal point of the lens
+diff --git i/src/libcamera/pipeline/simple/simple.cpp w/src/libcamera/pipeline/simple/simple.cpp
+index 4a0b9f5..896d8d7 100644
+--- i/src/libcamera/pipeline/simple/simple.cpp
++++ w/src/libcamera/pipeline/simple/simple.cpp
+@@ -34,6 +34,7 @@
+ 
+ #include "libcamera/internal/camera.h"
+ #include "libcamera/internal/camera_manager.h"
++#include "libcamera/internal/camera_lens.h"
+ #include "libcamera/internal/camera_sensor.h"
+ #include "libcamera/internal/camera_sensor_properties.h"
+ #include "libcamera/internal/converter.h"
+@@ -565,6 +566,10 @@ SimpleCameraData::SimpleCameraData(SimplePipelineHandler *pipe,
+ 	if (!sensor_)
+ 		return;
+ 
++	/* Enumerating a lens must not keep an unused sensor powered. */
++	if (CameraLens *lens = sensor_->focusLens())
++		lens->close();
++
+ 	const CameraSensorProperties::SensorDelays &delays = sensor_->sensorDelays();
+ 	std::unordered_map<uint32_t, DelayedControls::ControlParams> params = {
+ 		{ V4L2_CID_ANALOGUE_GAIN, { delays.gainDelay, false } },
+@@ -1650,6 +1655,14 @@ int SimplePipelineHandler::start(Camera *camera, [[maybe_unused]] const ControlL
+ 		return ret;
+ 	}
+ 
++	if (CameraLens *lens = data->sensor_->focusLens()) {
++		ret = lens->open();
++		if (ret < 0) {
++			stop(camera);
++			return ret;
++		}
++	}
++
+ 	video->bufferReady.connect(data, &SimpleCameraData::imageBufferReady);
+ 
+ 	data->delayedCtrls_->reset();
+@@ -1713,6 +1726,9 @@ void SimplePipelineHandler::stopDevice(Camera *camera)
+ 	video->streamOff();
+ 	video->releaseBuffers();
+ 
++	if (CameraLens *lens = data->sensor_->focusLens())
++		lens->close();
++
+ 	video->bufferReady.disconnect(data, &SimpleCameraData::imageBufferReady);
+ 
+ 	data->frameInfo_.clear();
+diff --git i/src/libcamera/sensor/camera_sensor_properties.cpp w/src/libcamera/sensor/camera_sensor_properties.cpp
+index b217363..7b558bd 100644
+--- i/src/libcamera/sensor/camera_sensor_properties.cpp
++++ w/src/libcamera/sensor/camera_sensor_properties.cpp
+@@ -402,7 +402,12 @@ const CameraSensorProperties *CameraSensorProperties::get(const std::string &sen
+ 				{ controls::draft::TestPatternModeOff, 0 },
+ 				{ controls::draft::TestPatternModeColorBars, 1 },
+ 			},
+-			.sensorDelays = { },
++			.sensorDelays = {
++				.exposureDelay = 2,
++				.gainDelay = 2,
++				.vblankDelay = 2,
++				.hblankDelay = 2,
++			},
+ 		} },
+ 		{ "ov5693", {
+ 			.unitCellSize = { 1400, 1400 },
+diff --git i/src/libcamera/software_isp/debayer_cpu.cpp w/src/libcamera/software_isp/debayer_cpu.cpp
+index af7af0a..9d68086 100644
+--- i/src/libcamera/software_isp/debayer_cpu.cpp
++++ w/src/libcamera/software_isp/debayer_cpu.cpp
+@@ -9,9 +9,16 @@
+  * CPU based debayering class
+  */
+ 
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++
+ #include "debayer_cpu.h"
+ 
+ #include <algorithm>
++#include <chrono>
++#include <thread>
++#include <cmath>
+ #include <stdlib.h>
+ #include <sys/ioctl.h>
+ #include <time.h>
+@@ -19,6 +26,8 @@
+ 
+ #include <linux/dma-buf.h>
+ 
++#include <libcamera/base/utils.h>
++
+ #include <libcamera/formats.h>
+ 
+ #include "libcamera/internal/bayer_format.h"
+@@ -68,14 +77,43 @@ DebayerCpu::~DebayerCpu() = default;
+ #define GAMMA(value) \
+ 	*dst++ = gammaLut_[std::clamp(value, 0, static_cast<int>(gammaLut_.size()) - 1)]
+ 
+-#define STORE_PIXEL(b_, g_, r_)                         \
++#define STORE_PIXEL(bInput, gInput, rInput)                         \
++	{ \
++	const unsigned int b_ = (bInput) * lookupScale_; \
++	const unsigned int g_ = (gInput) * lookupScale_; \
++	const unsigned int r_ = (rInput) * lookupScale_; \
+ 	if constexpr (ccmEnabled) {                     \
+ 		const CcmColumn &blue = blueCcm_[b_];   \
+ 		const CcmColumn &green = greenCcm_[g_]; \
+ 		const CcmColumn &red = redCcm_[r_];     \
+-		GAMMA(blue.b + green.b + red.b);        \
+-		GAMMA(blue.g + green.g + red.g);        \
+-		GAMMA(blue.r + green.r + red.r);        \
++		if (rolloffKnee_ > 0.0f) {              \
++			/* Fade toward the white-balanced \
++			 * (no CCM) value as the pixel's  \
++			 * MAX raw channel nears        \
++			 * saturation, so a clipped     \
++			 * highlight degrades to white  \
++			 * instead of magenta. All three\
++			 * columns fade together - keyed\
++			 * on the max, not each channel \
++			 * - so no cyan ring. See      \
++			 * updateLookupTables().        \
++			 */                              \
++			const int m = std::max({ (b_), (g_), (r_) }); \
++			const float full = kRGBLookupSize - 1; \
++			const float t = (float)m <= rolloffKnee_ ? 0.0f : \
++				((float)m - rolloffKnee_) / (full - rolloffKnee_); \
++			const float d = 1.0f - t;           \
++			const float wbB = rolloffGainB_ * (b_); \
++			const float wbG = rolloffGainG_ * (g_); \
++			const float wbR = rolloffGainR_ * (r_); \
++			GAMMA(static_cast<int>(std::lround((blue.b + green.b + red.b) * d + wbB * t))); \
++			GAMMA(static_cast<int>(std::lround((blue.g + green.g + red.g) * d + wbG * t))); \
++			GAMMA(static_cast<int>(std::lround((blue.r + green.r + red.r) * d + wbR * t))); \
++		} else {                                \
++			GAMMA(blue.b + green.b + red.b);\
++			GAMMA(blue.g + green.g + red.g);\
++			GAMMA(blue.r + green.r + red.r);\
++		}                                       \
+ 	} else {                                        \
+ 		*dst++ = blue_[b_];                     \
+ 		*dst++ = green_[g_];                    \
+@@ -83,7 +121,8 @@ DebayerCpu::~DebayerCpu() = default;
+ 	}                                               \
+ 	if constexpr (addAlphaByte)                     \
+ 		*dst++ = 255;                           \
+-	x++;
++	x++; \
++	}
+ 
+ /*
+  * RGR
+@@ -158,8 +197,8 @@ void DebayerCpu::debayer10_BGBG_BGR888(uint8_t *dst, const uint8_t *src[])
+ 
+ 	for (int x = 0; x < (int)window_.width;) {
+ 		/* divide values by 4 for 10 -> 8 bpp value */
+-		BGGR_BGR888(1, 1, 4)
+-		GBRG_BGR888(1, 1, 4)
++		BGGR_BGR888(1, 1, 1)
++		GBRG_BGR888(1, 1, 1)
+ 	}
+ }
+ 
+@@ -170,8 +209,8 @@ void DebayerCpu::debayer10_GRGR_BGR888(uint8_t *dst, const uint8_t *src[])
+ 
+ 	for (int x = 0; x < (int)window_.width;) {
+ 		/* divide values by 4 for 10 -> 8 bpp value */
+-		GRBG_BGR888(1, 1, 4)
+-		RGGB_BGR888(1, 1, 4)
++		GRBG_BGR888(1, 1, 1)
++		RGGB_BGR888(1, 1, 1)
+ 	}
+ }
+ 
+@@ -182,8 +221,8 @@ void DebayerCpu::debayer12_BGBG_BGR888(uint8_t *dst, const uint8_t *src[])
+ 
+ 	for (int x = 0; x < (int)window_.width;) {
+ 		/* divide values by 16 for 12 -> 8 bpp value */
+-		BGGR_BGR888(1, 1, 16)
+-		GBRG_BGR888(1, 1, 16)
++		BGGR_BGR888(1, 1, 4)
++		GBRG_BGR888(1, 1, 4)
+ 	}
+ }
+ 
+@@ -194,8 +233,8 @@ void DebayerCpu::debayer12_GRGR_BGR888(uint8_t *dst, const uint8_t *src[])
+ 
+ 	for (int x = 0; x < (int)window_.width;) {
+ 		/* divide values by 16 for 12 -> 8 bpp value */
+-		GRBG_BGR888(1, 1, 16)
+-		RGGB_BGR888(1, 1, 16)
++		GRBG_BGR888(1, 1, 4)
++		RGGB_BGR888(1, 1, 4)
+ 	}
+ }
+ 
+@@ -498,6 +537,74 @@ int DebayerCpu::configure(const StreamConfiguration &inputCfg,
+ 	}
+ 
+ 	inputConfig_.stride = inputCfg.stride;
++	const BayerFormat lookupFormat = BayerFormat::fromPixelFormat(inputCfg.pixelFormat);
++	lookupScale_ = lookupFormat.bitDepth >= 10 &&
++		lookupFormat.packing == BayerFormat::Packing::None ? 1 : 4;
++
++
++	/*
++	 * Optional RGB-IR pre-pass. This sensor's mosaic is 4x4 with one pixel
++	 * in four infrared; read as 2x2 Bayer the "blue" channel is pure IR
++	 * and "red" interleaves real red with real blue. Convert to a same-size
++	 * Bayer image first so everything below is unchanged.
++	 *
++	 * Gated on an environment variable because there is no way to describe
++	 * an RGB-IR sensor in the V4L2 ABI yet, so libcamera cannot know.
++	 */
++	rgbIr_.reset();
++	if (utils::secure_getenv("LIBCAMERA_RGBIR") &&
++	    (!utils::secure_getenv("RGBIR_FRONT_ONLY") ||
++	     BayerFormat::fromPixelFormat(inputCfg.pixelFormat).order == BayerFormat::GBRG)) {
++		BayerFormat bayer = BayerFormat::fromPixelFormat(inputCfg.pixelFormat);
++		rgbIrOrder_ = bayer.order == BayerFormat::GBRG
++				    ? RgbIrToBayer::Order::GBRG
++				    : RgbIrToBayer::Order::GRBG;
++		/*
++		 * Override, to settle empirically which order the debayer
++		 * actually wants. The pre-pass output was verified correct when
++		 * decoded as GBRG offline, yet the pipeline renders red as blue,
++		 * so the two disagree about the convention.
++		 */
++		const char *ord = utils::secure_getenv("RGBIR_ORDER");
++		if (ord && !strcmp(ord, "grbg"))
++			rgbIrOrder_ = RgbIrToBayer::Order::GRBG;
++		else if (ord && !strcmp(ord, "gbrg"))
++			rgbIrOrder_ = RgbIrToBayer::Order::GBRG;
++		rgbIrInputSize_ = inputCfg.size;
++		rgbIrSrcStride_ = inputCfg.stride;
++		using Ch = RgbIrToBayer::Channel;
++		static const Ch pattern[16] = {
++			Ch::Green, Ch::Infrared, Ch::Green, Ch::Infrared,
++			Ch::Red,   Ch::Green,    Ch::Blue,  Ch::Green,
++			Ch::Green, Ch::Infrared, Ch::Green, Ch::Infrared,
++			Ch::Blue,  Ch::Green,    Ch::Red,   Ch::Green,
++		};
++		rgbIr_ = std::make_unique<RgbIrToBayer>(pattern, 64, 10);
++		/*
++		 * Infrared subtraction, tunable while it is being judged by eye.
++		 * Sahan ranked IR-2.0 the most colour-accurate and IR-1.0 the
++		 * cleaner compromise on this hardware.
++		 */
++		const char *irs = utils::secure_getenv("RGBIR_IRSUB");
++		if (irs)
++			rgbIr_->setIrSubtract(atof(irs));
++
++		/*
++		 * The tuned coefficient is only right while IR is well exposed,
++		 * and IR is the first channel here to run out of photons. Let it
++		 * shrink toward what is actually measurable; see setIrAdaptive().
++		 * On by default - a fixed coefficient in a dark room was the
++		 * largest single source of grain on this hardware.
++		 */
++		const char *ira = utils::secure_getenv("RGBIR_IRSUB_ADAPT");
++		rgbIr_->setIrAdaptive(!ira || atoi(ira) != 0);
++		rgbIrScratch_.resize(static_cast<size_t>(inputCfg.size.height) *
++				     inputCfg.stride / 2);
++		LOG(Debayer, Info)
++			<< "RGB-IR pre-pass enabled, " << inputCfg.size
++			<< ", emitting "
++			<< (rgbIrOrder_ == RgbIrToBayer::Order::GBRG ? "GBRG" : "GRBG");
++	}
+ 
+ 	if (outputCfgs.size() != 1) {
+ 		LOG(Debayer, Error)
+@@ -542,6 +649,55 @@ int DebayerCpu::configure(const StreamConfiguration &inputCfg,
+ 	window_.width = outputCfg.size.width;
+ 	window_.height = outputCfg.size.height;
+ 
++	/*
++	 * The RGB-IR pre-pass emits a Bayer image at HALF the input dimensions.
++	 * That is not a compromise: a 4x4 RGB-IR cell holds exactly two red and
++	 * two blue pixels, which is what a 2x2 Bayer cell at half resolution
++	 * needs, so no chroma is discarded. Everything below therefore works on
++	 * half-size geometry - the window has to be rebased onto it, and the
++	 * stride halved, or the debayer walks the wrong rows.
++	 *
++	 * Doing the reduction here rather than downstream is what makes it
++	 * cheap: the debayer, the scaler and the format conversion all then
++	 * handle a quarter of the pixels.
++	 */
++	if (rgbIr_) {
++		const unsigned int halfW = inputCfg.size.width / 2;
++		const unsigned int halfH = inputCfg.size.height / 2;
++		if (outputCfg.size.width > halfW || outputCfg.size.height > halfH) {
++			LOG(Debayer, Error)
++				<< "RGB-IR pre-pass gives " << halfW << "x" << halfH
++				<< ", too small for the requested "
++				<< outputCfg.size;
++			return -EINVAL;
++		}
++		window_.x = ((halfW - outputCfg.size.width) / 2) &
++			    ~(inputConfig_.patternSize.width - 1);
++		window_.y = ((halfH - outputCfg.size.height) / 2) &
++			    ~(inputConfig_.patternSize.height - 1);
++		rgbIrHalfStride_ = inputCfg.stride / 2;
++		inputConfig_.stride = rgbIrHalfStride_;
++		/*
++		 * Only the window is ever read, so only convert that band. Here
++		 * that is 720 of 972 rows: 26% of the conversion, and of the
++		 * denoise below, was being spent on rows the debayer discards.
++		 * Two rows of margin because the debayer interpolates across
++		 * neighbours at the window edge.
++		 */
++		const int margin = 2;
++		rgbIrRow0_ = window_.y > margin ? window_.y - margin : 0;
++		rgbIrRow1_ = std::min(halfH, window_.y + window_.height + margin);
++		rgbIrHalfHeight_ = halfH;
++		rgbIr_->setActiveRows(rgbIrRow0_, rgbIrRow1_);
++		LOG(Debayer, Info)
++			<< "RGB-IR half-size output " << halfW << "x" << halfH
++			<< ", window " << window_.x << "," << window_.y
++			<< " " << window_.width << "x" << window_.height
++			<< ", converting rows " << rgbIrRow0_ << ".." << rgbIrRow1_
++			<< " (" << (100 * (rgbIrRow1_ - rgbIrRow0_) / halfH)
++			<< "% of the frame)";
++	}
++
+ 	/*
+ 	 * Set the stats window to the whole processed window. Its coordinates are
+ 	 * relative to the debayered area since debayering passes only the part of
+@@ -753,8 +909,13 @@ void DebayerCpu::process4(uint32_t frame, const uint8_t *src, uint8_t *dst)
+ void DebayerCpu::updateGammaTable(DebayerParams &params)
+ {
+ 	const RGB<float> blackLevel = params.blackLevel;
+-	/* Take let's say the green channel black level */
+-	const unsigned int blackIndex = blackLevel[1] * gammaTable_.size();
++	/* Take let's say the green channel black level. With a CCM the matrix is
++	 * already applied to black-level-subtracted data (see updateLookupTables),
++	 * so the pedestal must not be crushed here as well - that would
++	 * double-subtract and clip the shadows. The black floor is only needed for
++	 * the plain-gains path, which feeds the raw pedestal straight into gamma. */
++	const unsigned int blackIndex = ccmEnabled_ ? 0 :
++					blackLevel[1] * gammaTable_.size();
+ 	const float gamma = params.gamma;
+ 	const float contrastExp = params.contrastExp;
+ 
+@@ -795,6 +956,41 @@ void DebayerCpu::updateLookupTables(DebayerParams &params)
+ 	const unsigned int gammaTableSize = gammaTable_.size();
+ 	const double div = static_cast<double>(kRGBLookupSize) / gammaTableSize;
+ 	if (ccmEnabled_) {
++		/*
++		 * Max-channel CCM highlight rolloff, applied per pixel in
++		 * STORE_PIXEL. A colour matrix is fitted on unclipped patches and
++		 * says nothing about what happens when an input clips - but the
++		 * arithmetic carries on regardless. With a strong matrix, once the
++		 * sensor's most sensitive channel (green) clips while white balance
++		 * pins red and blue at maximum, the green row's negative
++		 * coefficients drive green DOWN and the highlight turns MAGENTA.
++		 * Observed on this hardware with Intel's matrices, whose green
++		 * off-diagonals reach -0.8.
++		 *
++		 * Near saturation the whole matrix is faded toward the
++		 * white-balanced (no CCM) value, so a clipped highlight degrades
++		 * to white instead of magenta. The fade is keyed on the pixel's
++		 * MAX raw channel so all three columns fade together; keying per
++		 * channel fades them at different times and put a CYAN RING around
++		 * every bright source. That is not separable, so it lives in
++		 * STORE_PIXEL, not in these per-channel tables.
++		 *
++		 * RGBIR_CCM_HIGHLIGHT sets the knee as a fraction of full scale;
++		 * 0 disables the rolloff and restores the plain matrix.
++		 */
++		static const float kneeFrac = []() {
++			const char *e = utils::secure_getenv("RGBIR_CCM_HIGHLIGHT");
++			const float v = e ? atof(e) : 0.85f;
++			return v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
++		}();
++		rolloffKnee_ = kneeFrac * (kRGBLookupSize - 1);
++		/* White-balance gains for the three output bytes (B, G, R), matching
++		 * the R/B swap the plain-gains path uses so the fade target equals
++		 * that path's linear value. */
++		rolloffGainB_ = swapRedBlueGains_ ? params.gains.r() : params.gains.b();
++		rolloffGainG_ = params.gains.g();
++		rolloffGainR_ = swapRedBlueGains_ ? params.gains.b() : params.gains.r();
++
+ 		if (gammaUpdateNeeded ||
+ 		    matrixChanged(params.combinedMatrix, params_.combinedMatrix)) {
+ 			auto &red = swapRedBlueGains_ ? blueCcm_ : redCcm_;
+@@ -803,16 +999,33 @@ void DebayerCpu::updateLookupTables(DebayerParams &params)
+ 			const unsigned int redIndex = swapRedBlueGains_ ? 2 : 0;
+ 			const unsigned int greenIndex = 1;
+ 			const unsigned int blueIndex = swapRedBlueGains_ ? 0 : 2;
++
++			/*
++			 * The matrix must act on black-level-subtracted data, not on
++			 * the raw pedestal. The sensor's ~64-count pedestal, amplified
++			 * by the white-balance gains and the matrix's negative
++			 * off-diagonals, lifts red and blue above the gamma black
++			 * floor while green stays under it - magenta shadows. Subtract
++			 * the black level in LUT units (blackLevel is a 0..1 fraction
++			 * of full scale).
++			 */
++			const double blackR = params.blackLevel[redIndex] * kRGBLookupSize;
++			const double blackG = params.blackLevel[greenIndex] * kRGBLookupSize;
++			const double blackB = params.blackLevel[blueIndex] * kRGBLookupSize;
++			const double scale = 1.0 / (1.0 - params.blackLevel[greenIndex]);
+ 			for (unsigned int i = 0; i < kRGBLookupSize; i++) {
+-				red[i].r = std::round(i * params.combinedMatrix[redIndex][0]);
+-				red[i].g = std::round(i * params.combinedMatrix[greenIndex][0]);
+-				red[i].b = std::round(i * params.combinedMatrix[blueIndex][0]);
+-				green[i].r = std::round(i * params.combinedMatrix[redIndex][1]);
+-				green[i].g = std::round(i * params.combinedMatrix[greenIndex][1]);
+-				green[i].b = std::round(i * params.combinedMatrix[blueIndex][1]);
+-				blue[i].r = std::round(i * params.combinedMatrix[redIndex][2]);
+-				blue[i].g = std::round(i * params.combinedMatrix[greenIndex][2]);
+-				blue[i].b = std::round(i * params.combinedMatrix[blueIndex][2]);
++				const double r = (i - blackR) * scale;
++				const double g = (i - blackG) * scale;
++				const double b = (i - blackB) * scale;
++				red[i].r = std::round(r * params.combinedMatrix[redIndex][0]);
++				red[i].g = std::round(r * params.combinedMatrix[greenIndex][0]);
++				red[i].b = std::round(r * params.combinedMatrix[blueIndex][0]);
++				green[i].r = std::round(g * params.combinedMatrix[redIndex][1]);
++				green[i].g = std::round(g * params.combinedMatrix[greenIndex][1]);
++				green[i].b = std::round(g * params.combinedMatrix[blueIndex][1]);
++				blue[i].r = std::round(b * params.combinedMatrix[redIndex][2]);
++				blue[i].g = std::round(b * params.combinedMatrix[greenIndex][2]);
++				blue[i].b = std::round(b * params.combinedMatrix[blueIndex][2]);
+ 				gammaLut_[i] = gammaTable_[i / div];
+ 			}
+ 		}
+@@ -825,9 +1038,23 @@ void DebayerCpu::updateLookupTables(DebayerParams &params)
+ 			for (unsigned int i = 0; i < kRGBLookupSize; i++) {
+ 				/* Apply gamma after gain! */
+ 				const RGB<float> lutGains = (gains * i / div).min(gammaTableSize - 1);
+-				red[i] = gammaTable_[static_cast<unsigned int>(lutGains.r())];
+-				green[i] = gammaTable_[static_cast<unsigned int>(lutGains.g())];
+-				blue[i] = gammaTable_[static_cast<unsigned int>(lutGains.b())];
++				/*
++				 * min() bounds this above but NOT below. A
++				 * negative, NaN or infinite gain casts to a huge
++				 * unsigned and indexes out of bounds, aborting
++				 * the process - which is what crashed v4l2-relayd
++				 * here with SIGABRT and an std::array assertion.
++				 */
++				auto gammaIndex = [gammaTableSize](float v) -> unsigned int {
++					if (!(v >= 0.0f))	/* also catches NaN */
++						return 0;
++					if (v > gammaTableSize - 1)
++						return gammaTableSize - 1;
++					return static_cast<unsigned int>(v);
++				};
++				red[i] = gammaTable_[gammaIndex(lutGains.r())];
++				green[i] = gammaTable_[gammaIndex(lutGains.g())];
++				blue[i] = gammaTable_[gammaIndex(lutGains.b())];
+ 			}
+ 		}
+ 	}
+@@ -842,14 +1069,106 @@ void DebayerCpu::updateLookupTables(DebayerParams &params)
+ 	params_ = params;
+ }
+ 
++/*
++ * Per-stage timing, behind RGBIR_TIMING.
++ *
++ * libcamera's own Benchmark times only the debayer loop, which on this
++ * pipeline is a minority of the work - the RGB-IR pre-pass runs before it and
++ * is not counted. Reading that number as the frame cost understates it by
++ * about half, which has misled this project more than once. These timers cover
++ * every stage between one frame arriving and the next.
++ */
++namespace {
++
++class StageTimer
++{
++public:
++	void add(unsigned int stage, double ms) { sum_[stage] += ms; }
++	/*
++	 * Called on entry, so it measures the whole frame period - including
++	 * whatever happens outside the stages below. The gap between the two is
++	 * the point of reporting both.
++	 */
++	void enter()
++	{
++		const auto now = std::chrono::steady_clock::now();
++		if (frames_)
++			period_ += std::chrono::duration<double, std::milli>(now - last_).count();
++		last_ = now;
++	}
++	void frame()
++	{
++		if (++frames_ < kReport)
++			return;
++		const double work = sum_[0] + sum_[1] + sum_[2];
++		LOG(Debayer, Info)
++			<< "timing over " << frames_ << " frames, ms/frame:"
++			<< " prepass " << sum_[0] / frames_
++			<< ", denoise " << sum_[1] / frames_
++			<< ", debayer+stats " << sum_[2] / frames_
++			<< ", other " << (period_ - work) / (frames_ - 1)
++			<< ", frame period " << period_ / (frames_ - 1);
++		frames_ = 0;
++		period_ = 0.0;
++		sum_[0] = sum_[1] = sum_[2] = 0.0;
++	}
++
++private:
++	static constexpr unsigned int kReport = 60;
++	double sum_[3] = { 0.0, 0.0, 0.0 };
++	double period_ = 0.0;
++	std::chrono::steady_clock::time_point last_;
++	unsigned int frames_ = 0;
++};
++
++StageTimer stageTimer;
++
++bool timingEnabled()
++{
++	static const bool on = utils::secure_getenv("RGBIR_TIMING") != nullptr;
++	return on;
++}
++
++class ScopedStage
++{
++public:
++	ScopedStage(unsigned int stage)
++		: stage_(stage), on_(timingEnabled())
++	{
++		if (on_)
++			t0_ = std::chrono::steady_clock::now();
++	}
++	~ScopedStage()
++	{
++		if (!on_)
++			return;
++		const auto dt = std::chrono::steady_clock::now() - t0_;
++		stageTimer.add(stage_, std::chrono::duration<double, std::milli>(dt).count());
++	}
++
++private:
++	unsigned int stage_;
++	bool on_;
++	std::chrono::steady_clock::time_point t0_;
++};
++
++} /* namespace */
++
+ void DebayerCpu::process(uint32_t frame, FrameBuffer *input, FrameBuffer *output, DebayerParams params)
+ {
+ 	bench_.startFrame();
++	if (timingEnabled())
++		stageTimer.enter();
+ 
+ 	std::vector<DmaSyncer> dmaSyncers;
+ 
+ 	dmaSyncBegin(dmaSyncers, input, output);
+ 
++	if (frame == 60)
++		LOG(Debayer, Info) << "ISP diagnostic rgbir=" << bool(rgbIr_)
++			<< " ccm=" << ccmEnabled_ << " contrast=" << params.contrastExp
++			<< " gamma=" << params.gamma << " black=" << params.blackLevel
++			<< " gains=" << params.gains << " matrix=" << params.combinedMatrix;
+ 	updateLookupTables(params);
+ 
+ 	/* Copy metadata from the input buffer */
+@@ -868,10 +1187,275 @@ void DebayerCpu::process(uint32_t frame, FrameBuffer *input, FrameBuffer *output
+ 
+ 	stats_->startFrame(frame);
+ 
+-	if (inputConfig_.patternSize.height == 2)
+-		process2(frame, in.planes()[0].data(), out.planes()[0].data());
+-	else
+-		process4(frame, in.planes()[0].data(), out.planes()[0].data());
++	const uint8_t *srcData = in.planes()[0].data();
++	if (rgbIr_) {
++		/*
++		 * RGBIR_SHARPNESS trades green resolution against noise.
++		 *
++		 * convert() averages all eight greens in the 4x4 cell into one
++		 * value and writes it to both green slots of the output quad, so
++		 * luma is flat across the cell. convertSharp() can instead give
++		 * each slot its own 2x2 quadrant mean. That is real detail - at
++		 * output-Nyquist the averaging cancels the signal completely -
++		 * but two samples average less noise than eight, so it is a trade
++		 * and not a free win. Measured on a real frame: 1.0 gives 1.49x
++		 * the vertical detail and 1.43x the noise, leaving detail-to-noise
++		 * flat at ~2.1 throughout. Which end looks better is a judgement
++		 * about the scene, so it is a knob.
++		 *
++		 * 0.0 is bit-for-bit the old behaviour, and is the default so this
++		 * changes nothing until it is asked for.
++		 */
++		static const float sharpness = []() {
++			const char *e = utils::secure_getenv("RGBIR_SHARPNESS");
++			return e ? (float)atof(e) : 0.0f;
++		}();
++		/*
++		 * Lens shading. Intel ships measured per-channel gain tables for
++		 * this exact module in its .aiqb tuning; tools/extract-lens-shading.py
++		 * pulls record 100/28 out into the flat file this reads. Their
++		 * corner gain agrees with a flat field captured here to within
++		 * 8%, from two entirely independent sources.
++		 *
++		 * Only G, R and B are applied. The IR plane needs up to 16x at
++		 * the edge, and since IR is subtracted from the colour channels
++		 * before this point, applying it would multiply IR's noise into
++		 * R, G and B exactly where they are already weakest. Leaving IR
++		 * uncorrected slightly under-subtracts it at the edges, which is
++		 * the harmless direction to be wrong in.
++		 */
++		if (!shadingLoaded_) {
++			shadingLoaded_ = true;
++			const char *path = utils::secure_getenv("RGBIR_SHADING");
++			if (path) {
++				FILE *f = fopen(path, "rb");
++				if (f) {
++					uint16_t hdr[4];
++					if (fread(hdr, 2, 4, f) == 4 && hdr[3] == 4 &&
++					    hdr[0] && hdr[1]) {
++						const size_t n = (size_t)hdr[0] * hdr[1];
++						shadingData_.resize(n * 4);
++						if (fread(shadingData_.data(), 2, n * 4, f) == n * 4) {
++							shadingMap_.width = hdr[0];
++							shadingMap_.height = hdr[1];
++							shadingMap_.one = hdr[2];
++							for (unsigned int c = 0; c < 4; c++)
++								shadingMap_.gains[c] = shadingData_.data() + c * n;
++							/* IR is deliberately not applied - see above. */
++							shadingMap_.gains[RgbIrToBayer::Infrared] = nullptr;
++							shadingValid_ = true;
++							LOG(Debayer, Info)
++								<< "lens shading " << hdr[0] << "x" << hdr[1]
++								<< " loaded from " << path;
++						}
++					}
++					fclose(f);
++				}
++				if (!shadingValid_)
++					LOG(Debayer, Warning)
++						<< "lens shading not loaded from " << path;
++			}
++		}
++
++		/*
++		 * Chroma carries most of the visible noise: measured on a flat
++		 * patch of the finished pipeline, luma sd 5.64 but Cr 10.03. Red
++		 * occupies 2 of the 16 mosaic positions and the colour matrix then
++		 * amplifies that row 1.90x. Smoothing red and blue across
++		 * neighbouring cells is nearly free in perceptual terms - one
++		 * chroma value already covers a 4x4 block of sensor pixels - and
++		 * leaves green, which carries the detail, untouched. Measured in
++		 * the Bayer plane: R sd 13.22 -> 7.06 at radius 1, with green
++		 * unchanged at 13.45.
++		 */
++		static const int chromaBlur = []() {
++			const char *e = utils::secure_getenv("RGBIR_CHROMA_BLUR");
++			return e ? atoi(e) : 1;
++		}();
++		rgbIr_->setChromaBlur(chromaBlur < 0 ? 0 : chromaBlur);
++		rgbIr_->setSharpness(sharpness);
++		/*
++		 * Split the pre-pass across cores. It is the largest single
++		 * cost in the frame - 27.8 ms of a 48.8 ms period measured here
++		 * - and the whole ISP runs on one thread, so the other cores sit
++		 * idle while it works.
++		 *
++		 * Default to the physical core count, not hardware_concurrency().
++		 * The pass is limited by memory bandwidth as much as by
++		 * arithmetic and two SMT siblings share one set of load/store
++		 * units, so the extra logical CPUs buy little; measured here,
++		 * see RGBIR_THREADS in the README.
++		 */
++		static const unsigned int threads = []() {
++			const char *e = utils::secure_getenv("RGBIR_THREADS");
++			if (e)
++				return (unsigned int)std::max(1, atoi(e));
++			const unsigned int hw = std::thread::hardware_concurrency();
++			return hw > 2 ? hw / 2 : 1;
++		}();
++		rgbIr_->setThreads(threads);
++		const float irBefore = rgbIr_->effectiveIrSubtract();
++		int ret;
++		{
++			ScopedStage stagePrepass(0);
++			ret = rgbIr_->convertSharp(srcData,
++						   rgbIrInputSize_.width,
++						   rgbIrInputSize_.height,
++						   rgbIrSrcStride_,
++						   rgbIrScratch_.data(),
++						   rgbIrHalfStride_,
++						   rgbIrOrder_,
++						   shadingValid_ ? &shadingMap_ : nullptr);
++		}
++		/*
++		 * Report the adaptive coefficient only when it has actually
++		 * moved, so a steady scene stays quiet and a lighting change is
++		 * visible in the log without a per-frame stream.
++		 */
++		if (std::fabs(rgbIr_->effectiveIrSubtract() - irLoggedIrSub_) > 0.15f) {
++			irLoggedIrSub_ = rgbIr_->effectiveIrSubtract();
++			LOG(Debayer, Info)
++				<< "RGB-IR subtract now " << irLoggedIrSub_
++				<< " (was " << irBefore << ")";
++		}
++
++		if (ret == 0) {
++			/*
++			 * Temporal denoise on the converted mosaic. This sensor
++			 * is noise limited - trading green resolution against
++			 * noise leaves detail-to-noise flat - so the only real
++			 * gain comes from using more photons, and the previous
++			 * frame is the cheapest source of those. Measured on a
++			 * captured sequence: 2.0x less temporal noise at the
++			 * default, up to 3.8x if pushed, against a residual of
++			 * ~3 counts after 100 ms on a scene cut.
++			 *
++			 * RGBIR_DENOISE is the still-area weight: lower
++			 * denoises harder, 1.0 disables entirely.
++			 */
++			static const float dnAlpha = []() {
++				const char *e = utils::secure_getenv("RGBIR_DENOISE");
++				return e ? (float)atof(e) : 0.25f;
++			}();
++			static const int dnThr = []() {
++				const char *e = utils::secure_getenv("RGBIR_DENOISE_THR");
++				return e ? atoi(e) : 40;
++			}();
++			if (dnAlpha < 1.0f) {
++				ScopedStage stageDenoise(1);
++				denoise_.configure(dnAlpha, (uint16_t)dnThr);
++				/*
++				 * Without the geometry the motion decision falls back
++				 * to runs of consecutive samples - horizontal strips a
++				 * fifth of a row wide - and a moving edge leaves seams
++				 * across it that look like interlacing combing.
++				 */
++				denoise_.setGeometry(rgbIrHalfStride_ / 2,
++						     rgbIrRow1_ - rgbIrRow0_);
++				/* Same band as the conversion - the rest is stale
++				 * data that nothing reads. */
++				const size_t pitch = rgbIrHalfStride_ / 2;
++				const size_t off = (size_t)rgbIrRow0_ * pitch;
++				const size_t cnt = (size_t)(rgbIrRow1_ - rgbIrRow0_) * pitch;
++				/*
++				 * Shading runs before this and multiplies the
++				 * corners - noise included - by up to 3.5x, which
++				 * put every corner tile over the motion threshold
++				 * and left it undenoised. Hand the filter the same
++				 * map so it can divide that back out.
++				 */
++				const bool banded = off + cnt <= rgbIrScratch_.size();
++				denoise_.setGainMap(shadingValid_
++						    ? shadingMap_.gains[RgbIrToBayer::Green]
++						    : nullptr,
++						    shadingMap_.width, shadingMap_.height,
++						    shadingMap_.one, pitch,
++						    rgbIrHalfHeight_,
++						    banded ? rgbIrRow0_ : 0);
++				if (banded)
++					denoise_.apply(rgbIrScratch_.data() + off, cnt);
++				else
++					denoise_.apply(rgbIrScratch_.data(),
++						       rgbIrScratch_.size());
++			}
++			srcData = reinterpret_cast<const uint8_t *>(rgbIrScratch_.data());
++			/*
++			 * Dump a LATE frame, not the first. AGC and AWB take
++			 * hundreds of frames to converge on this pipeline, so
++			 * frame 0 is badly exposed and white-balanced - judging
++			 * colour from it compares a settled reference against an
++			 * unsettled capture.
++			 */
++			/*
++			 * Decisive test: overwrite the converted buffer with a
++			 * known GBRG pattern (strong R, mid G, zero B). If the
++			 * output is not obviously red, the debayer is not
++			 * reading this buffer at all and every colour
++			 * comparison so far has been measuring something else.
++			 */
++			if (utils::secure_getenv("RGBIR_TESTPAT")) {
++				uint16_t *d0 = rgbIrScratch_.data();
++				const unsigned int pitch = inputConfig_.stride / 2;
++				for (unsigned int y = 0; y < rgbIrInputSize_.height; y++) {
++					uint16_t *row = d0 + y * pitch;
++					/*
++					 * SPATIAL pattern: red on the left half,
++					 * blue on the right. A uniform colour is
++					 * useless here - grey-world AWB simply
++					 * normalises it away and the output looks
++					 * neutral whether or not the buffer is used.
++					 */
++					const unsigned int half = rgbIrInputSize_.width / 2;
++					for (unsigned int x = 0; x < rgbIrInputSize_.width; x += 2) {
++						const bool left = x < half;
++						if (y % 2 == 0) {
++							row[x] = 300;                      /* G */
++							row[x + 1] = left ? 64 : 900;      /* B */
++						} else {
++							row[x] = left ? 900 : 64;          /* R */
++							row[x + 1] = 300;                  /* G */
++						}
++					}
++				}
++			}
++			static unsigned int frameNo = 0;
++			const char *dp = utils::secure_getenv("RGBIR_DUMP");
++			const char *dn = utils::secure_getenv("RGBIR_DUMP_FRAME");
++			unsigned int want = dn ? (unsigned int)atoi(dn) : 150;
++			if (dp && frameNo++ == want) {
++				const char *rawPath = utils::secure_getenv("RGBIR_RAW_DUMP");
++				if (rawPath) {
++					FILE *rawFile = fopen(rawPath, "wb");
++					if (rawFile) {
++						fwrite(in.planes()[0].data(), 1,
++						       rgbIrSrcStride_ * rgbIrInputSize_.height, rawFile);
++						fclose(rawFile);
++					}
++				}
++				FILE *f = fopen(dp, "wb");
++				if (f) {
++					fwrite(rgbIrScratch_.data(), 2,
++					       rgbIrScratch_.size(), f);
++					fclose(f);
++					LOG(Debayer, Info) << "RGB-IR dumped "
++						<< rgbIrScratch_.size() * 2
++						<< " bytes to " << dp;
++				}
++			}
++		}
++		else
++			LOG(Debayer, Error) << "RGB-IR conversion failed: " << ret;
++	}
++
++	{
++		ScopedStage stageDebayer(2);
++		if (inputConfig_.patternSize.height == 2)
++			process2(frame, srcData, out.planes()[0].data());
++		else
++			process4(frame, srcData, out.planes()[0].data());
++	}
++	if (timingEnabled())
++		stageTimer.frame();
+ 
+ 	metadata.planes()[0].bytesused = out.planes()[0].size();
+ 
+diff --git i/src/libcamera/software_isp/debayer_cpu.h w/src/libcamera/software_isp/debayer_cpu.h
+index b5cbb5b..85b5813 100644
+--- i/src/libcamera/software_isp/debayer_cpu.h
++++ w/src/libcamera/software_isp/debayer_cpu.h
+@@ -23,6 +23,8 @@
+ #include "libcamera/internal/software_isp/swstats_cpu.h"
+ 
+ #include "debayer.h"
++#include "rgbir_to_bayer.h"
++#include "temporal_denoise.h"
+ 
+ namespace libcamera {
+ 
+@@ -116,13 +118,14 @@ private:
+ 	/* Max. supported Bayer pattern height is 4, debayering this requires 5 lines */
+ 	static constexpr unsigned int kMaxLineBuffers = 5;
+ 
+-	static constexpr unsigned int kRGBLookupSize = 256;
++	static constexpr unsigned int kRGBLookupSize = 1024;
+ 	static constexpr unsigned int kGammaLookupSize = 1024;
+ 	struct CcmColumn {
+ 		int16_t r;
+ 		int16_t g;
+ 		int16_t b;
+ 	};
++	unsigned int lookupScale_ = 4;
+ 	using LookupTable = std::array<uint8_t, kRGBLookupSize>;
+ 	using CcmLookupTable = std::array<CcmColumn, kRGBLookupSize>;
+ 	LookupTable red_;
+@@ -135,12 +138,44 @@ private:
+ 	LookupTable gammaLut_;
+ 	bool ccmEnabled_;
+ 	DebayerParams params_;
++	/*
++	 * Max-channel CCM highlight rolloff. Near saturation the colour matrix
++	 * is faded toward the white-balanced (no CCM) value so a clipped
++	 * highlight stays white instead of going magenta. Keyed on the pixel's
++	 * MAX raw channel in STORE_PIXEL; see updateLookupTables(). The knee is
++	 * a raw LUT level (0-255); 0 disables the rolloff.
++	 */
++	float rolloffKnee_ = 0.0f;
++	/* White-balance gains for the three STORE_PIXEL output bytes (B, G, R). */
++	float rolloffGainB_ = 1.0f;
++	float rolloffGainG_ = 1.0f;
++	float rolloffGainR_ = 1.0f;
+ 
+ 	debayerFn debayer0_;
+ 	debayerFn debayer1_;
+ 	debayerFn debayer2_;
+ 	debayerFn debayer3_;
+ 	Rectangle window_;
++	/* RGB-IR pre-pass, enabled by LIBCAMERA_RGBIR. */
++	std::unique_ptr<RgbIrToBayer> rgbIr_;
++	TemporalDenoise denoise_;
++	unsigned int rgbIrRow0_ = 0;
++	unsigned int rgbIrRow1_ = 0;
++	/* Lens shading gains loaded from disk, and the map that points into them. */
++	std::vector<uint16_t> shadingData_;
++	RgbIrToBayer::ShadingMap shadingMap_ = {};
++	bool shadingLoaded_ = false;
++	bool shadingValid_ = false;
++	std::vector<uint16_t> rgbIrScratch_;
++	/* Last adaptive IR coefficient reported, so the log only marks changes. */
++	float irLoggedIrSub_ = -1.0f;
++	/* Full height of the half-size mosaic, for mapping the shading map. */
++	unsigned int rgbIrHalfHeight_ = 0;
++	Size rgbIrInputSize_;
++	RgbIrToBayer::Order rgbIrOrder_ = RgbIrToBayer::Order::GRBG;
++	/* Source stride is the sensor's; the pre-pass output is half of it. */
++	unsigned int rgbIrSrcStride_ = 0;
++	unsigned int rgbIrHalfStride_ = 0;
+ 	std::unique_ptr<SwStatsCpu> stats_;
+ 	std::vector<uint8_t> lineBuffers_[kMaxLineBuffers];
+ 	unsigned int lineBufferLength_;
+diff --git i/src/libcamera/software_isp/meson.build w/src/libcamera/software_isp/meson.build
+index c61ac7d..eaba464 100644
+--- i/src/libcamera/software_isp/meson.build
++++ w/src/libcamera/software_isp/meson.build
+@@ -12,6 +12,8 @@ libcamera_internal_sources += files([
+     'benchmark.cpp',
+     'debayer.cpp',
+     'debayer_cpu.cpp',
++    'rgbir_to_bayer.cpp',
++    'temporal_denoise.cpp',
+     'software_isp.cpp',
+     'swstats_cpu.cpp',
+ ])
+diff --git i/src/libcamera/software_isp/swstats_cpu.cpp w/src/libcamera/software_isp/swstats_cpu.cpp
+index 5c3011a..9be95f0 100644
+--- i/src/libcamera/software_isp/swstats_cpu.cpp
++++ w/src/libcamera/software_isp/swstats_cpu.cpp
+@@ -12,6 +12,7 @@
+ #include "libcamera/internal/software_isp/swstats_cpu.h"
+ 
+ #include <libcamera/base/log.h>
++#include <libcamera/base/utils.h>
+ 
+ #include <libcamera/stream.h>
+ 
+@@ -184,10 +185,19 @@ static constexpr unsigned int kBlueYMul = 29; /* 0.114 * 256 */
+ 	yVal += b * kBlueYMul;             \
+ 	stats_.yHistogram[yVal * SwIspStats::kYHistogramSize / (256 * 256 * (div))]++;
+ 
+-#define SWSTATS_FINISH_LINE_STATS() \
+-	stats_.sum_.r() += sumR;    \
+-	stats_.sum_.g() += sumG;    \
+-	stats_.sum_.b() += sumB;
++/*
++ * Scale the sums down to 8 bits, the same way the histogram above already
++ * scales Y. Their only consumer is the grey-world AWB, which subtracts a black
++ * level taken from IPAContext - and that level is 8 bit by construction
++ * (blc.cpp stores the tuning file's 16-bit value >> 8). Accumulating 10- or
++ * 12-bit samples here left the two in different units, so the AWB subtracted
++ * 16 where it meant 64, under-corrected red and blue, and left a green cast on
++ * any sensor whose native balance is green dominant.
++ */
++#define SWSTATS_FINISH_LINE_STATS(div)  \
++	stats_.sum_.r() += sumR / (div);\
++	stats_.sum_.g() += sumG / (div);\
++	stats_.sum_.b() += sumB / (div);
+ 
+ void SwStatsCpu::statsBGGR8Line0(const uint8_t *src[])
+ {
+@@ -211,11 +221,12 @@ void SwStatsCpu::statsBGGR8Line0(const uint8_t *src[])
+ 		SWSTATS_ACCUMULATE_LINE_STATS(1)
+ 	}
+ 
+-	SWSTATS_FINISH_LINE_STATS()
++	SWSTATS_FINISH_LINE_STATS(1)
+ }
+ 
+ void SwStatsCpu::statsBGGR10Line0(const uint8_t *src[])
+ {
++	static const bool rgbir = utils::secure_getenv("LIBCAMERA_RGBIR") != nullptr;
+ 	const uint16_t *src0 = (const uint16_t *)src[1] + window_.x;
+ 	const uint16_t *src1 = (const uint16_t *)src[2] + window_.x;
+ 
+@@ -235,9 +246,17 @@ void SwStatsCpu::statsBGGR10Line0(const uint8_t *src[])
+ 
+ 		/* divide Y by 4 for 10 -> 8 bpp value */
+ 		SWSTATS_ACCUMULATE_LINE_STATS(4)
++		/* Clipped RGB-IR samples cannot inform white balance. Keep their
++		 * histogram entries for exposure, but contribute only the 64-count
++		 * pedestal restored by the RGB-IR pre-pass to the colour sums. */
++		if (rgbir && std::max({ r, g, b }) >= 960) {
++			sumR = sumR - r + 64;
++			sumG = sumG - g + 64;
++			sumB = sumB - b + 64;
++		}
+ 	}
+ 
+-	SWSTATS_FINISH_LINE_STATS()
++	SWSTATS_FINISH_LINE_STATS(4)
+ }
+ 
+ void SwStatsCpu::statsBGGR12Line0(const uint8_t *src[])
+@@ -263,7 +282,7 @@ void SwStatsCpu::statsBGGR12Line0(const uint8_t *src[])
+ 		SWSTATS_ACCUMULATE_LINE_STATS(16)
+ 	}
+ 
+-	SWSTATS_FINISH_LINE_STATS()
++	SWSTATS_FINISH_LINE_STATS(16)
+ }
+ 
+ void SwStatsCpu::statsBGGR10PLine0(const uint8_t *src[])
+@@ -289,7 +308,7 @@ void SwStatsCpu::statsBGGR10PLine0(const uint8_t *src[])
+ 		SWSTATS_ACCUMULATE_LINE_STATS(1)
+ 	}
+ 
+-	SWSTATS_FINISH_LINE_STATS()
++	SWSTATS_FINISH_LINE_STATS(1)
+ }
+ 
+ void SwStatsCpu::statsGBRG10PLine0(const uint8_t *src[])
+@@ -315,7 +334,7 @@ void SwStatsCpu::statsGBRG10PLine0(const uint8_t *src[])
+ 		SWSTATS_ACCUMULATE_LINE_STATS(1)
+ 	}
+ 
+-	SWSTATS_FINISH_LINE_STATS()
++	SWSTATS_FINISH_LINE_STATS(1)
+ }
+ 
+ /**
