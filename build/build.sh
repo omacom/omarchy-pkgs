@@ -239,16 +239,23 @@ get_local_version() {
 # package_version_is_published for a plan read from the public channel: its
 # retained archives are only reachable there, so a version the database no
 # longer indexes (master's stable pin once edge indexes the next RC) would
-# otherwise read as unpublished and be rebuilt.
+# otherwise read as unpublished and be rebuilt. The four candidate names are
+# asked in parallel: a HEAD is never cached at the edge, so each answer takes
+# about 160 ms, and a version that needs building misses all four.
 remote_version_is_published() {
   local package="$1" version="$2" target ext
+  local -a requests=()
   [[ -n "$PUBLISHED_REPO_SERVER" ]] || return 1
   for target in "$ARCH" any; do
     for ext in zst xz; do
-      curl -fsSI -o /dev/null "$PUBLISHED_REPO_SERVER/$package-$version-$target.pkg.tar.$ext" && return 0
+      requests+=(-o /dev/null "$PUBLISHED_REPO_SERVER/$package-$version-$target.pkg.tar.$ext")
     done
   done
-  return 1
+  # What `curl -f` accepted when the names were tried in turn: the transfer
+  # itself succeeded, and the status is below 400. All four are awaited, so
+  # each gets a time limit: one name that never answers must not hold up an
+  # archive another name already found.
+  curl -sI --parallel --max-time 10 -w '%{exitcode} %{http_code}\n' "${requests[@]}" | awk '$1 == 0 && $2 >= 200 && $2 < 400 { found = 1 } END { exit !found }'
 }
 
 # Check if package should be built for current architecture

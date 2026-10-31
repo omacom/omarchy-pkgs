@@ -51,7 +51,8 @@ runners, with a read-only token and no registry publication.
 
 The compatibility tag contains the architecture, mirror, and a hash of the
 entire `build/` context, including executable bits and symlink targets but
-excluding checkout timestamps and ownership. This deliberately invalidates
+excluding checkout timestamps, ownership and the other permission bits a
+checkout's umask decides. This deliberately invalidates
 images when mounted build scripts change too. `v1` identifies the image build
 contract; change it if the invocation or compatibility rules change. Each
 successful refresh also gets a run-specific tag for diagnosis and rollback.
@@ -79,4 +80,6 @@ refreshes preserve that package visibility.
 `publish.yml`, `promote.yml`, `release-rc.yml` and `unpublish.yml` pull the
 compatible image to sign and update databases, and build it on the runner when
 no image carries the key yet (a change to `build/` publishes before its image
-refresh has finished). Package build jobs still build their own image on the runner.
+refresh has finished). Package build jobs in `build-pr.yml` pull it the same
+way, for their own architecture, and build it only when no image carries the
+key.
