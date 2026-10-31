@@ -43,3 +43,27 @@ bash -e -c "source '$ROOT/helpers/artifact-helpers.sh'; pack_packages '$T/built'
 mkdir -p "$T/empty"
 if pack_packages "$T/empty" "$T/x.tar" 2>/dev/null; then fail "packing an empty build dir should fail"; else pass "empty build dir refused"; fi
 if unpack_packages "$T/empty" "$T/out3" 2>/dev/null; then fail "an empty artifact should fail"; else pass "empty artifact refused"; fi
+
+# An artifact may be reused across unrelated commits, but never across a
+# change to the tools that built or qualified it. Use a tiny repository so the
+# test checks the helper's actual Git-object boundary, not a copied formula.
+keyrepo="$T/keyrepo"
+mkdir -p "$keyrepo/bin" "$keyrepo/helpers" "$keyrepo/build" "$keyrepo/.github/workflows"
+for file in build build-matrix builder-image check-fast-ring; do echo "$file" > "$keyrepo/bin/$file"; done
+echo helper > "$keyrepo/helpers/tool.sh"
+echo image > "$keyrepo/build/Dockerfile"
+echo workflow > "$keyrepo/.github/workflows/build-pr.yml"
+git -C "$keyrepo" init -q
+git -C "$keyrepo" add .
+git -C "$keyrepo" -c user.name=Fixture -c user.email=fixture@example.test commit -qm initial
+key_before=$(build_contract_key "$keyrepo")
+echo documentation > "$keyrepo/README.md"
+git -C "$keyrepo" add README.md
+git -C "$keyrepo" -c user.name=Fixture -c user.email=fixture@example.test commit -qm docs
+[[ $(build_contract_key "$keyrepo") == "$key_before" ]] \
+  && pass "unrelated commits keep the artifact build key" || fail "unrelated commit invalidated artifact"
+echo changed >> "$keyrepo/bin/check-fast-ring"
+git -C "$keyrepo" add bin/check-fast-ring
+git -C "$keyrepo" -c user.name=Fixture -c user.email=fixture@example.test commit -qm tooling
+[[ $(build_contract_key "$keyrepo") != "$key_before" ]] \
+  && pass "build contract changes invalidate the artifact" || fail "tooling change reused artifact"

@@ -9,6 +9,19 @@
 # Both functions run under the workflow's `bash -e`: nothing in them may
 # return non-zero except the final failure.
 
+# build_contract_key [repo]: bind a package artifact to the base-branch tools
+# that produced and qualified it. A package tree alone is not enough: after a
+# build or check fix, bytes made under the previous contract must be rebuilt.
+# Keep this narrower than the whole commit so unrelated changes retain reuse.
+build_contract_key() {
+  local root=${1:-.} objects
+  objects=$(git -C "$root" rev-parse \
+    HEAD:bin/build HEAD:bin/build-matrix HEAD:bin/builder-image \
+    HEAD:bin/check-fast-ring HEAD:helpers HEAD:build \
+    HEAD:.github/workflows/build-pr.yml) || return
+  printf 'v1-%s\n' "$(printf '%s\n' "$objects" | sha256sum | cut -d' ' -f1)"
+}
+
 # package_files <dir>: the *.pkg.tar.zst directly in <dir>, one per line.
 # Signatures and the scratch database next to them are not packages.
 package_files() {
