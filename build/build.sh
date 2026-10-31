@@ -26,6 +26,27 @@ DEFER_RUNTIME_DEPS=${DEFER_RUNTIME_DEPS:-false}
 
 source "$HELPERS_DIR/package-metadata.sh"
 
+# bin/build runs this in the builder image as its unprivileged builder user,
+# which reaches root through sudo. A MicroVM boots an image as root with
+# no_new_privs set, where the setuid sudo refuses to run: there root steps run
+# directly, and makepkg, which refuses root, and the keyring it verifies
+# sources against belong to builder.
+if (( EUID == 0 )); then
+  as_root() { "$@"; }
+  as_builder() { runuser -u builder -- "$@"; }
+else
+  as_root() { sudo "$@"; }
+  as_builder() { "$@"; }
+fi
+
+# makepkg as builder, in the package directory it must be able to write.
+run_makepkg() {
+  if (( EUID == 0 )); then
+    chown -R builder:builder . || return 1
+  fi
+  as_builder env PACMAN="${PACMAN:-pacman}" makepkg "$@"
+}
+
 # Where the channel's published database is read from for planning: a local
 # copy when one is mounted (the build-plan test uses one), otherwise the public
 # channel, whose URL then also serves as pacman's dependency repository.
@@ -83,13 +104,13 @@ if [[ "$DRY_RUN" != true ]]; then
     exit 1
   fi
   # Import GPG keys
-  /build/import-gpg-keys.sh || exit 1
+  as_builder /build/import-gpg-keys.sh || exit 1
 
   mkdir -p "$BUILD_OUTPUT_DIR" "$FINAL_OUTPUT_DIR"
 
   # The image drops pacman's private signing key. Keyring upgrades need a
   # container-local key to sign newly trusted keys.
-  sudo pacman-key --init || exit 1
+  as_root pacman-key --init || exit 1
 
   # Bring the container up to date before any makedepends are installed. The
   # image is layer-cached, so its glibc drifts behind the mirror while makepkg
@@ -97,7 +118,7 @@ if [[ "$DRY_RUN" != true ]]; then
   # that breaks the new packages (imagemagick wanting GLIBC_2.44, etc).
   # Done before the Omarchy repos are added so only core/extra participate.
   echo "==> Updating build container packages..."
-  sudo pacman -Syu --noconfirm || exit 1
+  as_root pacman -Syu --noconfirm || exit 1
 
   # Configure Omarchy repositories for dependency resolution
   echo "==> Configuring Omarchy repositories for dependency resolution..."
@@ -106,7 +127,7 @@ if [[ "$DRY_RUN" != true ]]; then
   # order is pacman's priority order, so this must precede the official repos;
   # otherwise pacman can select an older official package with the same name.
   # Packages in build-output are unsigned, so use SigLevel = Never.
-  sudo sed -i "/^\[core\]$/i [omarchy-build]\nSigLevel = Never\nServer = file://$BUILD_OUTPUT_DIR\n" /etc/pacman.conf
+  as_root sed -i "/^\[core\]$/i [omarchy-build]\nSigLevel = Never\nServer = file://$BUILD_OUTPUT_DIR\n" /etc/pacman.conf
   echo "  -> omarchy-build (priority 1): $BUILD_OUTPUT_DIR"
 
   # Initialize empty build database if it doesn't exist
@@ -139,7 +160,7 @@ if [[ "$DRY_RUN" != true ]]; then
     # filename. Never let the shared download cache substitute older bytes
     # for the staged artifacts described by this run's database.
     for staged in "${staged_packages[@]}"; do
-      sudo rm -f "/var/cache/pacman/pkg/$staged" "/var/cache/pacman/pkg/$staged.sig" || exit 1
+      as_root rm -f "/var/cache/pacman/pkg/$staged" "/var/cache/pacman/pkg/$staged.sig" || exit 1
     done
   fi
   touch "$BUILD_PLAN_DIR/repository-initialized" || exit 1
@@ -148,15 +169,15 @@ if [[ "$DRY_RUN" != true ]]; then
   # is trusted as-is; the public channel is verified against the omarchy
   # keyring the image already carries.
   if [[ -f "$FINAL_OUTPUT_DIR/omarchy.db.tar.zst" ]] || [[ -f "$FINAL_OUTPUT_DIR/omarchy.db" ]]; then
-    sudo sed -i "/^\[core\]$/i [omarchy]\nSigLevel = Optional TrustAll\nServer = file://$FINAL_OUTPUT_DIR\n" /etc/pacman.conf
+    as_root sed -i "/^\[core\]$/i [omarchy]\nSigLevel = Optional TrustAll\nServer = file://$FINAL_OUTPUT_DIR\n" /etc/pacman.conf
     echo "  -> omarchy (priority 2): $FINAL_OUTPUT_DIR"
   elif [[ -n "$PUBLISHED_REPO_SERVER" ]]; then
-    sudo sed -i "/^\[core\]$/i [omarchy]\nSigLevel = Required DatabaseOptional\nServer = $PUBLISHED_REPO_SERVER\n" /etc/pacman.conf
+    as_root sed -i "/^\[core\]$/i [omarchy]\nSigLevel = Required DatabaseOptional\nServer = $PUBLISHED_REPO_SERVER\n" /etc/pacman.conf
     echo "  -> omarchy (priority 2): $PUBLISHED_REPO_SERVER"
   fi
 
   # Sync pacman database
-  sudo pacman -Sy || exit 1
+  as_root pacman -Sy || exit 1
 fi
 
 echo "==> Package Builder"
@@ -284,9 +305,9 @@ refresh_vcs_pkgver_preserving_local_pkgrel() {
 
   echo "    Refreshing VCS pkgver before build (preserving local pkgrel=$original_pkgrel)..."
   if [[ -x /usr/local/bin/pacman-for-makepkg ]]; then
-    PACMAN=/usr/local/bin/pacman-for-makepkg makepkg --nobuild --nodeps --skipinteg --skippgpcheck --noprepare --noconfirm
+    PACMAN=/usr/local/bin/pacman-for-makepkg run_makepkg --nobuild --nodeps --skipinteg --skippgpcheck --noprepare --noconfirm
   else
-    makepkg --nobuild --nodeps --skipinteg --skippgpcheck --noprepare --noconfirm
+    run_makepkg --nobuild --nodeps --skipinteg --skippgpcheck --noprepare --noconfirm
   fi
 
   if [[ $? -ne 0 ]]; then
@@ -328,8 +349,44 @@ install_deferred_build_dependencies() {
 
   if (( ${#build_deps[@]} )); then
     echo "    Installing build-only dependencies for $pkg..."
-    sudo pacman -S --needed --noconfirm -- "${build_deps[@]}"
+    as_root pacman -S --needed --noconfirm -- "${build_deps[@]}"
   fi
+}
+
+# makepkg -s installs a recipe's missing depends, makedepends and, when it will
+# run check(), checkdepends with sudo, which a root run cannot hand to the
+# builder user. Install them here as root first, found the way makepkg finds
+# them (pacman -T), so makepkg -s has nothing left to install. Whether check()
+# runs is makepkg's own decision (CHECKFUNC), made here with its own functions
+# and the configuration it will read as builder.
+install_missing_dependencies_as_root() {
+  local pkg="$1"
+  local -a deps=() missing=()
+
+  mapfile -t deps < <(
+    as_builder env CARCH="$ARCH" bash -c '
+      library=${MAKEPKG_LIBRARY:-/usr/share/makepkg}
+      source "$library/util/config.sh"
+      source "$library/util/option.sh"
+      load_makepkg_config
+      source PKGBUILD
+      kinds=(depends makedepends)
+      if declare -f check >/dev/null && ! check_buildenv check n; then
+        kinds+=(checkdepends)
+      fi
+      for kind in "${kinds[@]}"; do
+        generic="${kind}[@]"
+        specific="${kind}_${CARCH}[@]"
+        printf "%s\n" "${!generic}" "${!specific}"
+      done
+    ' | awk 'NF && !seen[$0]++'
+  )
+  (( ${#deps[@]} )) || return 0
+  mapfile -t missing < <(pacman -T -- "${deps[@]}")
+  (( ${#missing[@]} )) || return 0
+
+  echo "    Installing missing dependencies for $pkg..."
+  /usr/local/bin/pacman-for-makepkg -S --asdeps --needed --noconfirm -- "${missing[@]}"
 }
 
 # Build a package
@@ -352,7 +409,7 @@ build_package() {
     done < "$BUILD_PLAN_DIR/dependencies"
     if (( ${#built_deps[@]} )); then
       echo "    Installing freshly built dependencies for $pkg..."
-      sudo /usr/local/bin/pacman-for-makepkg -S --needed --noconfirm -- "${built_deps[@]}" || return 1
+      as_root /usr/local/bin/pacman-for-makepkg -S --needed --noconfirm -- "${built_deps[@]}" || return 1
     fi
   fi
 
@@ -387,14 +444,14 @@ build_package() {
   if [[ -n "$pgp_keys" ]]; then
     echo "    Importing PGP keys from validpgpkeys..."
     for key in $pgp_keys; do
-      gpg --receive-keys "$key" 2>/dev/null && echo "      Received $key" || echo "      Failed to receive $key"
+      as_builder gpg --receive-keys "$key" 2>/dev/null && echo "      Received $key" || echo "      Failed to receive $key"
     done
   fi
   if [[ -d "keys/pgp" ]]; then
     echo "    Importing package-specific PGP keys..."
     for keyfile in keys/pgp/*.asc; do
       if [[ -f "$keyfile" ]]; then
-        gpg --import "$keyfile" 2>/dev/null && echo "      Imported $(basename "$keyfile")" || echo "      Failed to import $(basename "$keyfile")"
+        as_builder gpg --import "$keyfile" 2>/dev/null && echo "      Imported $(basename "$keyfile")" || echo "      Failed to import $(basename "$keyfile")"
       fi
     done
   fi
@@ -412,9 +469,11 @@ build_package() {
       return 1
     }
     makepkg_flags=(-cf --noconfirm --nodeps)
+  elif (( EUID == 0 )); then
+    install_missing_dependencies_as_root "$pkg" || return 1
   fi
 
-  if PACMAN=/usr/local/bin/pacman-for-makepkg makepkg "${makepkg_flags[@]}"; then
+  if PACMAN=/usr/local/bin/pacman-for-makepkg run_makepkg "${makepkg_flags[@]}"; then
     # Ensure output directory exists
     mkdir -p "$BUILD_OUTPUT_DIR"
 
@@ -422,7 +481,7 @@ build_package() {
     # another pacman package as a source (schist-bin does); a *.pkg.tar.* glob
     # would mistake that source archive for one of our freshly built packages.
     local -a package_files=()
-    mapfile -t package_files < <(makepkg --packagelist)
+    mapfile -t package_files < <(run_makepkg --packagelist)
 
     if [[ ${#package_files[@]} -eq 0 ]]; then
       echo "    Makepkg produced no package files for $pkg"
