@@ -535,8 +535,15 @@ with the `cadence` input (default: `six-hourly`). The historical PR branch
 prefixes remain unchanged so existing PRs keep receiving updates. The separate
 `track-branches.yml` workflow has been retired.
 
-- **A red PR holds back only its own package.** Fix it on `master` or on the
-  PR. The next run updates the PR if upstream moves again, and closes it once
+- **A red PR holds back only its own package.** Fix it on `master`: a run
+  that refreshes the PR rebuilds its branch from `master` and drops commits
+  pushed to the PR. A PR whose own build failed is refreshed only when
+  upstream moves again, or when `master` changes the package or anything
+  outside `pkgbuilds/`; otherwise it keeps its finished checks and the run's
+  report links it as failing. Re-run its failed jobs to retry it as it stands.
+  A PR that failed `self-tests` or `build-isolation`, which read the whole
+  tree, is refreshed every run, and the report says its last checks failed.
+  A run closes the PR once
   it conflicts with `master`. Packages pinned from the same upstream branch
   (`omarchy-dev` and `omarchy-settings-dev`) share a PR, because they move in
   lockstep.
