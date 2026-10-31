@@ -107,7 +107,7 @@ Patches 1101–1104 are for the ASUS ProArt P14 (H7407BA) keyboard, 0B05:4B42: a
 
 Since `7.2.8-4` this is also the kernel for the Snapdragon X laptops. Their drivers were already on in the config. Four things were missing.
 
-The laptops get no device tree from their firmware, so the package builds the Windows-on-ARM families' trees (`x1*`, `hamoa*`, `glymur*`, `sc8280xp*`) and installs them under `/boot/dtbs/linux-omarchy-n1x/qcom`. They sit under the package's name so that no file is shared with Arch Linux ARM's `linux-aarch64`, which keeps its own in `/boot/dtbs`. Omarchy's Snapdragon setup lists them for the UKI.
+The laptops get no device tree from their firmware, so the package builds the Windows-on-ARM families' trees (`x1*`, `hamoa*`, `glymur*`, `sc8280xp*`) and installs them under `/usr/lib/dtbs/linux-omarchy/qcom`. They sit under the package's name so that no file is shared with Arch Linux ARM's `linux-aarch64`, which keeps its own in `/boot/dtbs`. Omarchy's Snapdragon setup lists them for the UKI, which is the only thing that reads them, so since `7.3-8` they stay off the ESP: its FAT mount shows every directory as 700, and pacman warned about each one on every upgrade. The package's install scriptlet points an existing list in `/etc/kernel/uki.conf` at the new place before the UKI is rebuilt.
 
 `2000` is "media: iris: reset AHB bridge before enabling HW mode" (cc330f558996, in the media tree for 7.4). This config builds the Iris video decoder, and without the fix its firmware can assert when a video starts after the decoder has been idle. It was reported and tested on the Yoga Slim 7x.
 
