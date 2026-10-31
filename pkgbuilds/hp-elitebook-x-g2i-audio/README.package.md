@@ -62,16 +62,33 @@ card first, the Speaker device is skipped and the whole HiFi profile comes up
 unavailable — no sinks, no sources — on a random subset of boots.
 
 `wait-tas2783-controls` runs as WirePlumber's `ExecStartPre` and waits, bounded
-at 12 s, for the `tas2783-1 Speaker Volume` kcontrol. It returns at once when
-the control is already there and never blocks login.
+at 20 s, for every amp to settle. It does not wait on a kcontrol appearing and
+a fixed sleep: all four controls are created when the components probe, but
+each amp then applies its factory calibration in turn, about a second apart,
+and an amp is not ready until its own pass is done. While one is still
+initialising its register cache is synced over anything written, so the wait
+writes the trim the UCM sequence will write anyway and requires all four amps
+to hold it on two consecutive passes. It returns in about a second on a settled
+card and never blocks login.
 
 That narrows the window without closing it, so
 `hp-elitebook-x-g2i-audio-recover.service` runs once per session afterwards and
-checks two faults. The second one is the reason it exists: the card can sit on a
-perfectly healthy `HiFi` profile while the PipeWire graph does not reach the
-speakers, so a profile-only check reports success on a silent machine. It logs a
-graph snapshot on every run, healthy or not, and only restarts the shell when it
-actually repaired something.
+checks three faults. The last two are the reason it exists, because both look
+healthy from above:
+
+- the card can sit on a perfectly healthy `HiFi` profile while the PipeWire
+  graph does not reach the speakers, so a profile-only check reports success on
+  a silent machine;
+- the UCM Speaker sequence can be abandoned part-way, leaving the output
+  switches off and the per-amp trim at hardware maximum, while the profile is
+  `HiFi`, the graph is fully linked and every level reads plausible. Observed
+  on 7.2.8-11: kcontrols at 9.6 s, calibration finishing at 10.8, 11.9, 13.0
+  and 14.0 s, and WirePlumber enumerating at 13.6 s. The repair is gated on the
+  `Headphone Jack` kcontrol, because with headphones plugged in UCM switches
+  the Speaker device off on purpose and the controls read exactly the same.
+
+It logs a graph snapshot on every run, healthy or not, and only restarts the
+shell when it actually repaired something.
 
 ## Upstream status
 
