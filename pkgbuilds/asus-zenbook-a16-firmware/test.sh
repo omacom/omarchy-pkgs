@@ -26,6 +26,7 @@ for f in Subsystem/qcsubsys_ext_adsp8480/qcadsp8480.mbn Subsystem/qcsubsys_ext_a
   echo "$f" > "$bsp/$f"
 done
 cp "$package_dir/asus,zenbook-a16-ux3607oa.list" "$srcdir/"
+echo usb4-router > "$srcdir/usb4-router-legacy.bin"
 
 pkgdir="$scratch/pkg"
 (cd "$srcdir" && package)
@@ -35,12 +36,15 @@ fw="$pkgdir/usr/lib/firmware"
 for f in qcadsp8480.mbn adsp_dtbs.elf qccdsp8480.mbn cdsp_dtbs.elf; do
   [[ -f $fw/qcom/glymur/ASUSTeK/UX3607OA/$f ]] || fail "installs $f where the device tree asks for it"
 done
+[[ $(<"$fw/qcom/glymur/ASUSTeK/UX3607OA/usb4-router-legacy.bin") == usb4-router ]] ||
+  fail "installs the USB4 router image where the device tree asks for it"
 [[ $(<"$fw/ath12k/QCC2072/hw1.0/board.bin") == WIFI_BT/qcwlancol8480/bdwlan_qcc2072_1p0_ncm820A.elf ]] ||
   fail "installs the NCM820A board data as ath12k's board.bin"
 
 list="$pkgdir/usr/share/qcom-firmware-extract/provided.d/asus,zenbook-a16-ux3607oa.list"
 [[ -f $list ]] || fail "tells qcom-firmware-extract which firmware the board does not need from Windows"
-for f in qcadsp8480.mbn adsp_dtbs.elf qccdsp8480.mbn cdsp_dtbs.elf soccp.mbn soccp_dtb.mbn; do
+for f in qcadsp8480.mbn adsp_dtbs.elf qccdsp8480.mbn cdsp_dtbs.elf soccp.mbn soccp_dtb.mbn \
+  usb4-router-legacy.bin; do
   grep -qx "qcom/glymur/ASUSTeK/UX3607OA/$f" "$list" || fail "lists $f as provided"
 done
 
