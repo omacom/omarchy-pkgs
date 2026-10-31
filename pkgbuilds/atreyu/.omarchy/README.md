@@ -1,0 +1,23 @@
+# atreyu
+
+Installs the prebuilt Atreyu runtime files from the `v{pkgver}` GitHub tag archive into `/usr/share/omarchy/plugins/omarchy.atreyu/` (the directory name is the plugin id the shell scans for, not the package name), plus `LICENSE` and `THIRD_PARTY_NOTICES.md` under `/usr/share/licenses/atreyu/`. No install hook: Omarchy restarts the shell after `omarchy update`, and nothing here may write into a user home.
+
+`package()` selects the runtime files explicitly and copies the curated `components`, `assets`, `runtime/licenses`, `browser-companion/dist` and `browser-companion/native-host` directories. Source, tests, documentation and release tooling stay out. The build rejects a manifest with the wrong plugin id, version or entry points, missing required files, and absent or empty runtime directories. New runtime paths outside this selection require a recipe update; sync only moves versions and checksums. Directories are 0755, ordinary files are 0644, and only the eight directly invoked commands are 0755.
+
+`options=('!strip' '!debug')` is load-bearing. `runtime/dist/atreyu-broker` and `runtime/dist/adapters/codex-acp` are static x86-64 ELF stubs with no section headers whose JavaScript payload sits after the code (see upstream `runtime/launcher/embedded-node-launcher.mjs`); they `execve("/usr/bin/env", "node", ...)`, so strip would corrupt them and there are no debug symbols to split.
+
+Dependencies, cited as `file: tool` in the upstream tree:
+
+- `cua-driver-bin>=0.27.0` and `cua-hyprland-plugin>=0.26.1`: `runtime/system-dependencies.txt`; `runtime/bin/atreyu-broker` checks them with `pacman -T` and refuses to start without them. The Hyprland module must match the installed compositor build; follow its package compatibility verifier and upstream desktop-input setup. Installing the packages does not load the module or enable input, and Atreyu must not change the user's Hyprland configuration on first launch.
+- `nodejs>=22`: `runtime/launcher/embedded-node-launcher.mjs: node` (both launchers), `package.json: engines.node >=22`.
+- `omarchy`: `*.qml: import qs.Commons / qs.Ui`; `scripts/install-hotkeys.sh`, `scripts/manage-voice-escape.sh: omarchy-shell`; `runtime/src/tools/desktop.ts`, `web-handoff.ts`, `pi-harness.ts: omarchy`; owns `/usr/share/omarchy`.
+- `quickshell`: `*.qml: import Quickshell{,.Io,.Wayland,.Hyprland,.Services.Mpris}`.
+- `hyprland`: `scripts/manage-voice-escape.sh: hyprctl` (required), `runtime/src/tools/desktop.ts`, `context-attachments.ts`, `herdr.ts: hyprctl`.
+- `jq`: `scripts/manage-voice-escape.sh: jq` (required), `scripts/install-browser-companion.sh: jq`.
+- `util-linux`: `scripts/install-hotkeys.sh: flock` (required).
+- `imagemagick`: `runtime/src/images.ts: magick` (every stored image is normalized through it, so image handling fails outright without it).
+- Optional, one feature each and probed before use: `grim` (`runtime/src/context-attachments.ts: grim`, screen capture), `wl-clipboard` (`runtime/src/broker.ts`, `tools/web-handoff.ts: wl-copy`, Copy action), `xdg-utils` (`runtime/src/broker.ts: xdg-open`, links), `uwsm` + `gtk3` (`runtime/src/tools/desktop.ts: uwsm-app -- gtk-launch`, app_open tool). All four ship in the Omarchy base install anyway; they are optdepends so `depends` states what the plugin needs to load, matching upstream `docs/delivery.md`. Also optional: `voxtype` (`runtime/src/dictation.ts`, `voxtype-vocabulary.ts`), `herdr` (`runtime/src/herdr.ts`), `tesseract` (`context-attachments.ts`), `libpulse` (`audio-devices.ts: pactl`), `pipewire-audio` (`tts.ts: pw-play`; the `pw-metadata` in `audio-devices.ts` is in `pipewire`, already an `omarchy` dependency), `ffmpeg` (`tts.ts`, metering only), `espeak-ng` (Kokoro TTS per upstream README), `openai-codex`/`opencode` (`providers.ts` ACP harnesses), `lua` (`scripts/install-hotkeys.sh: luac`, optional syntax check). Each is probed with `resolveExecutable` or `command -v` and degrades with a message when absent.
+
+Release tracking: `bin/sync-upstream` follows `omacom/atreyu` through `upstream.watch.github`, which reads published GitHub Releases, excludes drafts and prereleases, and matches exactly `vX.Y.Z`. A newer release updates `pkgver`, resets `pkgrel` to 1, downloads `archive/refs/tags/v{pkgver}.tar.gz` and updates `sha256sums`. `min_release_age: 24h` holds a fresh release for a day; `release_ring: fast` builds it to edge, rc and stable.
+
+The first release's archive digest must be entered by hand because the watch updates only newer versions. Keep this recipe in draft until upstream publishes its first Release and the placeholder checksum is replaced; tags alone are not visible to the watch.
