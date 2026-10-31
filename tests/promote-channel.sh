@@ -18,7 +18,7 @@ BIN="$T/root/bin"
 mkdir -p "$BIN"
 cp -r "$ROOT/helpers" "$T/root/"
 cp -r "$ROOT/release" "$T/root/"
-cp "$ROOT/bin/promote-channel" "$ROOT/bin/publish-artifact" "$ROOT/bin/check-mac-set" "$BIN/"
+cp "$ROOT/bin/promote-channel" "$ROOT/bin/publish-artifact" "$ROOT/bin/check-mac-set" "$ROOT/bin/recipe-index" "$BIN/"
 PKGBUILDS_DIR="$T/root/pkgbuilds"
 recipe() { # recipe <dir> <metadata json> [pkgbase] [arch]
   mkdir -p "$PKGBUILDS_DIR/$1/.omarchy"
@@ -34,6 +34,13 @@ recipe ahead '{"source": "local"}'
 recipe big '{"source": "local"}'
 # Built for x86_64 once; the recipe has since dropped it.
 recipe dropped '{"source": "local"}' "" aarch64
+# A recipe with a side effect at its top level shows whether promotion reads
+# recipes; it reads the index only.
+recipe marker '{"source": "local"}'
+echo ": > '$T/marker-read'" >> "$PKGBUILDS_DIR/marker/PKGBUILD"
+
+"$BIN/recipe-index" > "$T/index"
+rm -f "$T/marker-read"
 
 # minimal real packages via makepkg; a second name makes a split package
 mkpkg() { # mkpkg <base> <pkgrel> [second pkgname]
@@ -62,7 +69,7 @@ pub() { # pub <mirror> <files...>
   local mirror=$1; shift
   "$BIN/publish-artifact" --remote "$REMOTE" --mirror "$mirror" --arch x86_64 "$@" >"$T/out" 2>&1 || { cat "$T/out"; exit 1; }
 }
-promote() { "$BIN/promote-channel" --remote "$REMOTE" --from edge --to rc --arch x86_64 --record "$T/record" "$@" >"$T/out" 2>&1; }
+promote() { "$BIN/promote-channel" --remote "$REMOTE" --recipe-index "$T/index" --from edge --to rc --arch x86_64 --record "$T/record" "$@" >"$T/out" 2>&1; }
 entries() { tar -tf "$REMOTE/$1/x86_64/omarchy.db.tar.zst" | grep '/$' | tr -d / | sort | tr '\n' ' '; }
 plan_action() { jq -r --arg n "$1" 'select(.type=="plan" and .name==$n) | .action' "$T/record" | tail -1; }
 pass() { echo "PASS: $1"; }
@@ -71,7 +78,7 @@ fail() { echo "FAIL: $1"; cat "$T/out"; exit 1; }
 # rc: what stable users have now. edge: newer builds of most of it.
 pub rc $(mkpkg alpha 1) $(mkpkg fast 1) $(mkpkg pinned 1) $(mkpkg ahead 3)
 pub edge $(mkpkg alpha 2) $(mkpkg split 1 split-extra) $(mkpkg fast 2) $(mkpkg pinned 2) \
-  $(mkpkg ahead 2) $(mkpkg big 1) $(mkpkg dropped 1)
+  $(mkpkg ahead 2) $(mkpkg big 1) $(mkpkg dropped 1) $(mkpkg marker 1)
 rc_before=$(entries rc)
 
 : > "$T/record"
@@ -81,8 +88,23 @@ promote --dry-run && [[ "$(entries rc)" == "$rc_before" ]] \
 
 : > "$T/record"
 promote || fail "promotion failed"
-[[ "$(entries rc)" == "ahead-1.0-3 alpha-1.0-2 big-1.0-1 fast-1.0-1 pinned-1.0-1 split-1.0-1 split-extra-1.0-1 " ]] \
+[[ "$(entries rc)" == "ahead-1.0-3 alpha-1.0-2 big-1.0-1 fast-1.0-1 marker-1.0-1 pinned-1.0-1 split-1.0-1 split-extra-1.0-1 " ]] \
   && pass "newer and missing packages reach rc; nothing else changes" || fail "rc entries: $(entries rc)"
+
+[[ ! -e "$T/marker-read" ]] && pass "promotion reads the index, not the recipes" || fail "promotion read pkgbuilds/marker"
+
+
+printf 'x86_64\talpha\tbig\tno\n' >> "$T/index"
+if promote --dry-run; then fail "two recipes naming one pkgbase should refuse"; else
+  grep -q 'Two recipes build alpha for x86_64' "$T/out" && pass "two recipes naming one pkgbase are refused" || fail "duplicate reason"
+fi
+"$BIN/recipe-index" > "$T/index"
+printf 'x86_64\t$(touch x)\talpha\tyes\n' >> "$T/index"
+if promote --dry-run; then fail "a malformed index line should refuse"; else
+  grep -q 'Not a recipe index line' "$T/out" && pass "a malformed index line is refused" || fail "malformed index reason"
+fi
+"$BIN/recipe-index" > "$T/index"
+rm -f "$T/marker-read"
 
 [[ $(plan_action fast) == hold && $(plan_action pinned) == hold && $(plan_action ahead) == hold ]] \
   && jq -e 'select(.name=="pinned") | .reason | test("pinned")' "$T/record" >/dev/null \
@@ -107,16 +129,17 @@ pub edge $(mkpkg alpha 3) $(mkpkg split 2 split-extra) $(mkpkg big 2)
 promote --batch-bytes 1 || fail "batched promotion failed"
 jq -e -s '[.[] | select(.type=="slot")] | length == 3 and all(.status == "published")' "$T/record" >/dev/null \
   && jq -e -s '[.[] | select(.type=="slot") | .packages | select(index("split-1.0-2-x86_64"))] | length == 1 and (.[0] | index("split-extra-1.0-2-x86_64"))' "$T/record" >/dev/null \
-  && [[ "$(entries rc)" == "ahead-1.0-3 alpha-1.0-3 big-1.0-2 fast-1.0-1 pinned-1.0-1 split-1.0-2 split-extra-1.0-2 " ]] \
+  && [[ "$(entries rc)" == "ahead-1.0-3 alpha-1.0-3 big-1.0-2 fast-1.0-1 marker-1.0-1 pinned-1.0-1 split-1.0-2 split-extra-1.0-2 " ]] \
   && pass "small batches publish base by base and keep split packages together" || fail "batches: $(cat "$T/record")"
 
 # A named pkgbase limits the run to it.
 pub edge $(mkpkg alpha 4) $(mkpkg big 3)
 : > "$T/record"
-promote alpha && [[ "$(entries rc)" == "ahead-1.0-3 alpha-1.0-4 big-1.0-2 fast-1.0-1 pinned-1.0-1 split-1.0-2 split-extra-1.0-2 " ]] \
+promote alpha && [[ "$(entries rc)" == "ahead-1.0-3 alpha-1.0-4 big-1.0-2 fast-1.0-1 marker-1.0-1 pinned-1.0-1 split-1.0-2 split-extra-1.0-2 " ]] \
   && pass "naming a pkgbase promotes only that one" || fail "named promotion: $(entries rc)"
 if promote nosuch; then fail "an unknown pkgbase should refuse"; else grep -q 'not a pkgbase in edge/x86_64 or a recipe' "$T/out" && pass "an unknown pkgbase is refused" || fail "unknown pkgbase reason"; fi
 recipe elsewhere '{"source": "local"}'
+"$BIN/recipe-index" > "$T/index"
 promote elsewhere && grep -q 'not in edge/x86_64; skipping' "$T/out" \
   && pass "a recipe this architecture has not published is skipped, not refused" || fail "other-arch recipe"
 
@@ -131,20 +154,20 @@ if promote big; then fail "a corrupt source file should refuse"; else
 fi
 cp "$T/good" "$f"
 
-if "$BIN/promote-channel" --remote "$REMOTE" --from edge --to stable --arch x86_64 >"$T/out" 2>&1; then
+if "$BIN/promote-channel" --remote "$REMOTE" --recipe-index "$T/index" --from edge --to stable --arch x86_64 >"$T/out" 2>&1; then
   fail "edge -> stable should refuse"
 else grep -q 'refusing edge -> stable' "$T/out" && pass "channels only move one step forward" || fail "direction reason"; fi
 
 # rc -> stable: pinned packages move there (stable gets the release pair by
 # promotion); fast-ring ones are published at merge.
 : > "$T/record"
-"$BIN/promote-channel" --remote "$REMOTE" --from rc --to stable --arch x86_64 --record "$T/record" >"$T/out" 2>&1 || fail "rc -> stable"
+"$BIN/promote-channel" --remote "$REMOTE" --recipe-index "$T/index" --from rc --to stable --arch x86_64 --record "$T/record" >"$T/out" 2>&1 || fail "rc -> stable"
 [[ $(plan_action pinned) == promote && $(plan_action fast) == hold ]] && [[ "$(entries stable)" == *"pinned-1.0-1 "* ]] \
   && pass "rc -> stable carries the pinned pair and holds the fast ring" || fail "stable promotion: $(entries stable)"
 
 # --fast-ring: rc and stable catch up with edge for fast-ring packages only,
 # from edge directly.
-fastring() { "$BIN/promote-channel" --remote "$REMOTE" --fast-ring --from edge --arch x86_64 --record "$T/record" "$@" >"$T/out" 2>&1; }
+fastring() { "$BIN/promote-channel" --remote "$REMOTE" --recipe-index "$T/index" --fast-ring --from edge --arch x86_64 --record "$T/record" "$@" >"$T/out" 2>&1; }
 : > "$T/record"
 fastring --to rc || fail "fast-ring sync to rc"
 [[ $(plan_action fast) == promote && $(plan_action alpha) == hold ]] && [[ "$(entries rc)" == *"fast-1.0-2 "* ]] \
@@ -156,6 +179,6 @@ fastring --to stable && [[ "$(entries stable)" == *"fast-1.0-2 "* ]] && [[ $(pla
   && pass "--fast-ring goes from edge straight to stable" || fail "fast-ring stable: $(entries stable)"
 : > "$T/record"
 fastring --to rc && [[ $(plan_action fast) == current ]] && pass "--fast-ring is a no-op once the channels agree" || fail "fast-ring rerun"
-if "$BIN/promote-channel" --remote "$REMOTE" --fast-ring --from rc --to stable --arch x86_64 >"$T/out" 2>&1; then
+if "$BIN/promote-channel" --remote "$REMOTE" --recipe-index "$T/index" --fast-ring --from rc --to stable --arch x86_64 >"$T/out" 2>&1; then
   fail "--fast-ring from rc should refuse"
 else grep -q 'fast ring follows edge' "$T/out" && pass "--fast-ring only follows edge" || fail "fast-ring direction reason"; fi

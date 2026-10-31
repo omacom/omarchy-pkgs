@@ -52,6 +52,8 @@ recipe arm-ahead '{"source": "local"}' aarch64
 # names non-Mac packages while edge's Mac stack is ahead of rc.
 recipe linux-aurora '{"source": "local"}' aarch64
 recipe omarchy-mac '{"source": "local"}' aarch64
+# Only this checkout's tooling reads recipes through an index.
+"$T/after/bin/recipe-index" > "$T/after.index"
 
 export GNUPGHOME="$T/g"; mkdir -m700 "$GNUPGHOME"
 gpg --batch --quiet --passphrase '' --quick-gen-key 'Test <t@t>' ed25519 sign 0 2>/dev/null
@@ -109,10 +111,11 @@ run_side() { # run_side <before|after>
     "$bin/publish-artifact" --remote "$remote" --mirror "$mirror" --arch "$arch" "$@" >"$T/$side.log" 2>&1 || { cat "$T/$side.log"; fail "$side: fixture publish"; }
   }
   step() { # step <label> <promote-channel args...>
-    local label=$1 code=0 to arch
+    local label=$1 code=0 to arch index=()
     shift
+    [[ $side == before ]] || index=(--recipe-index "$T/after.index")
     : > "$T/$side.record"
-    "$bin/promote-channel" --remote "$remote" --record "$T/$side.record" "$@" >"$T/$side.log" 2>&1 || code=$?
+    "$bin/promote-channel" --remote "$remote" "${index[@]}" --record "$T/$side.record" "$@" >"$T/$side.log" 2>&1 || code=$?
     to=$(sed -n 's/.*--to \([a-z]*\).*/\1/p' <<<" $* ") arch=$(sed -n 's/.*--arch \([a-z0-9_]*\).*/\1/p' <<<" $* ")
     jq -c 'select(.type == "mac-set")' "$T/$side.record" >> "$T/$side.macset"
     {

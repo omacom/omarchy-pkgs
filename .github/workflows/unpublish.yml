@@ -22,7 +22,32 @@ on:
         default: "edge rc stable"
 
 jobs:
+  # Planning reads the recipes; it happens here, in a job of its own. Its
+  # plan is a JSON object of RETIRE_<CHANNEL>_<ARCH> lists.
+  plan:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      retire: ${{ steps.plan.outputs.retire }}
+    steps:
+      - uses: actions/checkout@v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Plan what no recipe publishes
+        id: plan
+        env:
+          PACKAGES: ${{ github.event.inputs.packages }}
+          CHANNELS: ${{ github.event.inputs.channels }}
+        run: |
+          set -euo pipefail
+          bin/unpublish-plan --channels "$CHANNELS" $PACKAGES > plan.env
+          cat plan.env
+          echo "retire=$(jq -Rnc '[inputs | capture("^(?<k>RETIRE_[A-Z0-9_]+)=(?<v>.*)$") | {(.k): .v}] | add // {}' < plan.env)" >> "$GITHUB_OUTPUT"
+
   unpublish:
+    needs: plan
     runs-on: ubuntu-latest
     environment: publish
     timeout-minutes: 15
@@ -33,20 +58,15 @@ jobs:
       cancel-in-progress: false
       queue: max
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4.4.0
         with:
           persist-credentials: false
 
-      - name: Plan what no recipe publishes
-        env:
-          PACKAGES: ${{ github.event.inputs.packages }}
-          CHANNELS: ${{ github.event.inputs.channels }}
-        run: |
-          set -euo pipefail
-          bin/unpublish-plan --channels "$CHANNELS" $PACKAGES >>"$GITHUB_ENV"
-
+      # Only what the dispatch named, from the channels it named.
       - name: Unpublish
         env:
+          RETIRE: ${{ needs.plan.outputs.retire }}
+          PACKAGES: ${{ github.event.inputs.packages }}
           CHANNELS: ${{ github.event.inputs.channels }}
           RCLONE_CONFIG_R2_TYPE: s3
           RCLONE_CONFIG_R2_PROVIDER: Cloudflare
@@ -57,21 +77,27 @@ jobs:
           OMARCHY_PUBLISH_PREFIX: ${{ vars.OMARCHY_PUBLISH_PREFIX }}
         run: |
           set -euo pipefail
-          # repo-remove and bsdtar are Arch tools: run in the tested builder
-          # image, as the publish job does.
-          builder=ghcr.io/omacom/omarchy-pkg-builder:$(bin/builder-image key --arch x86_64 --mirror edge)
-          # A change to build/ runs before builder-images.yml has published an
-          # image under its new key; build that image here instead.
-          docker pull --quiet "$builder" || docker buildx build --load -t "$builder" --build-arg MIRROR=edge build
+          # repo-remove and bsdtar are Arch tools: run in the publisher image
+          # (ci/publisher.Dockerfile: Arch packages only), as the publish job
+          # does.
+          docker build --quiet -t omarchy-publisher -f ci/publisher.Dockerfile ci
           for mirror in $CHANNELS; do
+            [[ $mirror == edge || $mirror == rc || $mirror == stable ]] || { echo "::error::Unknown channel: $mirror"; exit 1; }
             for arch in x86_64 aarch64; do
-              var=RETIRE_${mirror^^}_${arch^^}
-              [[ -n ${!var} ]] || continue
+              retire=()
+              for p in $(jq -r --arg k "RETIRE_${mirror^^}_${arch^^}" '.[$k] // ""' <<<"$RETIRE"); do
+                if [[ ! $p =~ ^[a-z0-9][a-z0-9@._+-]*$ || " $PACKAGES " != *" $p "* ]]; then
+                  echo "::error::The plan names $p for $mirror/$arch, which this run was not asked to unpublish"
+                  exit 1
+                fi
+                retire+=("$p")
+              done
+              (( ${#retire[@]} )) || continue
               docker run --rm \
                 -e OMARCHY_PUBLISH_PREFIX \
                 -e RCLONE_CONFIG_R2_TYPE -e RCLONE_CONFIG_R2_PROVIDER -e RCLONE_CONFIG_R2_ENDPOINT -e RCLONE_CONFIG_R2_NO_CHECK_BUCKET \
                 -e RCLONE_CONFIG_R2_ACCESS_KEY_ID -e RCLONE_CONFIG_R2_SECRET_ACCESS_KEY \
-                -v "$PWD:/w:ro" -w /w "$builder" \
-                bin/unpublish-packages --remote R2:omarchy-pkgs --mirror "$mirror" --arch "$arch" ${!var}
+                -v "$PWD:/w:ro" -w /w omarchy-publisher \
+                bin/unpublish-packages --remote R2:omarchy-pkgs --mirror "$mirror" --arch "$arch" "${retire[@]}"
             done
           done
