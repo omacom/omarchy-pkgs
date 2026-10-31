@@ -1,0 +1,859 @@
+#!/bin/bash
+# Build DKMS modules against kernel headers the way a machine does on an
+# update: install the headers, then `dkms build` each module source tree for
+# each kernel. A kernel that renames or drops something an out-of-tree module
+# uses fails here instead of on users' machines (linux-omarchy 7.2.8-9 renamed
+# battery_hook_register, and the TUXEDO modules stopped building).
+#
+# Only what changes is checked: a kernel/module pair builds when either side is
+# a package in --local (a pull request's fresh build) or a package whose
+# version differs from --since's (a promotion). With neither, everything is.
+# --packages narrows that to the named packages or pkgbases.
+#
+# Some DKMS packages Omarchy installs come from Arch's own repositories, not
+# from this one (ci/dkms-packages marks them repo=<name>). They are read from
+# the channel's Arch mirror, the snapshot that channel's machines install
+# from. They never move with this repository, so they are checked whenever a
+# kernel changes; --from-repos checks only them, against every kernel. The
+# daily CI run (dkms-check.yml) checks every pair on edge that has not built
+# at its versions before, which catches Arch updating one of them.
+#
+# Usage:
+#   bin/check-dkms plan --arch <arch> --files-db <omarchy.files>
+#                       [--local <dir>] [--since-db <omarchy.files>]
+#                       [--repo-files-db <repo>=<repo.files> ...] [--from-repos]
+#       Print the kernels, the DKMS packages and the pairs a run would build.
+#   bin/check-dkms matrix --arch <arch> [--channel <channel> | --files-db <omarchy.files>]
+#                         [the options of run or plan] [--save-local <dir>] [--all]
+#       Print the run's legs as a JSON array for a CI matrix, [] for none: one
+#       {"arch", "kernel": "<pkgbase> <version>", "module": "<name> <version>"}
+#       per kernel and DKMS package it builds. Runs on the host (curl and
+#       bsdtar). --save-local copies --local's kernels and DKMS packages, all
+#       the legs need, into <dir>. --all keeps every pair of the channel, not
+#       only those that touch --local's packages, which stand in for theirs.
+#   bin/check-dkms run --arch <arch> --channel <channel> [--local <dir>] [--since <channel>]
+#                      [--packages "<name|pkgbase> ..."] [--from-repos]
+#                      [--kernel "<name|pkgbase> [version]"] [--module "<name> [version]"]
+#                      [--results <dir>] [--all]
+#       Run the check, as root, in a disposable Arch (x86_64) or Arch Linux ARM
+#       (aarch64) system: it installs packages. --kernel and --module keep only
+#       the pairs of one leg, at the versions the leg names.
+#       --results <dir> keeps each pair's verdict in <dir>/pairs.tsv.
+#   bin/check-dkms container <same options as run> [--result <file>]
+#       Run it in a throwaway container of the right image (needs Docker).
+#       --result writes the outcome as JSON: {"arch", "kernel", "module",
+#       "outcome": passed|excluded|known-broken|fixed|failed|error, "detail"}.
+#       Exits 0 for passed, excluded and known-broken.
+#   bin/check-dkms report --legs <legs.json> --results <dir> [--plan <job result>]
+#                         [--url <run>] [--note <text>] [--channel <channel>]
+#       The verdict of a CI run, from its matrix legs and the --result files
+#       in <dir>: {"conclusion", "title", "summary"} as JSON. A leg without a
+#       result failed, and a plan that did not succeed fails the run.
+#   bin/check-dkms judge --arch <arch> < <raw results>
+#       Judge run's raw results ("<kernel> <kver> <package> <tree> <built|
+#       excluded|failed> <note>" per line) against ci/dkms-packages: a
+#       known-broken package that fails is expected, one that builds fails.
+#       Prints each pair with its verdict and text; exits 1 on a failure.
+#   bin/check-dkms toolchain <kernel build tree>...
+#       Print the packages a DKMS build needs beyond base-devel for these
+#       kernels: "clang llvm lld" when one was built with clang, else nothing.
+set -euo pipefail
+
+ROOT=$(realpath "${BASH_SOURCE[0]%/*}/..")
+REGISTRY=${OMARCHY_DKMS_REGISTRY:-$ROOT/ci/dkms-packages}
+PKGS_BASE=${OMARCHY_PKGS_BASE:-https://pkgs.omarchy.org}
+X86_64_IMAGE=${OMARCHY_DKMS_X86_64_IMAGE:-ghcr.io/archlinux/archlinux:base-devel}
+AARCH64_IMAGE=${OMARCHY_DKMS_AARCH64_IMAGE:-ghcr.io/menci/archlinuxarm@sha256:3e1074c407fc1a57c2a2117af6920c96a7cc906fa6f1f2da8a4a7fd3aa2c2f4e}
+
+die() { echo "check-dkms: $*" >&2; exit 2; }
+usage() { sed -n '/^# Usage:/,/^set -euo/p' "$0" | sed '$d; s/^# \{0,1\}//' >&2; exit 2; }
+
+# A kernel built with clang (linux-aurora) needs its modules built with clang:
+# DKMS reads CONFIG_CC_IS_CLANG from the build tree and passes LLVM=1 to make,
+# which runs clang, ld.lld and the llvm-* tools from PATH.
+toolchain() {
+  local tree
+  for tree in "$@"; do
+    if grep -qx 'CONFIG_CC_IS_CLANG=y' "$tree/.config" 2>/dev/null; then
+      echo "clang llvm lld"
+      return
+    fi
+  done
+}
+
+mode=${1:-}
+[[ -n $mode ]] || usage
+shift
+if [[ $mode == toolchain ]]; then
+  (($#)) || usage
+  toolchain "$@"
+  exit 0
+fi
+arch="" channel="" files_db="" local_dir="" since="" since_db="" only="" from_repos=0
+pair_kernel="" pair_module="" save_local="" results_dir="" all_pairs=0
+result_file="" legs_file="" plan_result="" run_url="" note=""
+repo_dbs=()
+while (($#)); do
+  case $1 in
+    --arch) arch=${2:?--arch needs a value}; shift 2 ;;
+    --channel) channel=${2:?--channel needs a value}; shift 2 ;;
+    --files-db) files_db=${2:?--files-db needs a value}; shift 2 ;;
+    --local) local_dir=${2:?--local needs a value}; shift 2 ;;
+    --since) since=${2:?--since needs a value}; shift 2 ;;
+    --since-db) since_db=${2:?--since-db needs a value}; shift 2 ;;
+    --packages) only=${2-}; shift 2 ;;
+    --repo-files-db) repo_dbs+=("${2:?--repo-files-db needs <repo>=<file>}"); shift 2 ;;
+    --from-repos) from_repos=1; shift ;;
+    --kernel) pair_kernel=${2:?--kernel needs a value}; shift 2 ;;
+    --module) pair_module=${2:?--module needs a value}; shift 2 ;;
+    --save-local) save_local=${2:?--save-local needs a value}; shift 2 ;;
+    --results) results_dir=${2:?--results needs a directory}; shift 2 ;;
+    --all) all_pairs=1; shift ;;
+    --result) result_file=${2:?--result needs a file}; shift 2 ;;
+    --legs) legs_file=${2:?--legs needs a file}; shift 2 ;;
+    --plan) plan_result=${2-}; shift 2 ;;
+    --url) run_url=${2-}; shift 2 ;;
+    --note) note=${2-}; shift 2 ;;
+    *) usage ;;
+  esac
+done
+
+# A CI run's verdict, for its summary and the pull request's single check.
+# Leg names and details come from package metadata a pull request controls,
+# so they are reduced to plain text before they reach the markdown.
+report() {
+  [[ -f $legs_file ]] || die "report needs --legs <file>"
+  [[ -d $results_dir ]] || die "report needs --results <dir>"
+  local leg_results=()
+  shopt -s nullglob
+  leg_results=("$results_dir"/*.json)
+  shopt -u nullglob
+  jq -n --slurpfile legs "$legs_file" --slurpfile results <(cat /dev/null "${leg_results[@]}") \
+    --arg plan "$plan_result" --arg url "$run_url" --arg note "$note" --arg channel "$channel" '
+    def clean: tostring | gsub("[[:cntrl:]|<>`*\\[\\]\\\\]"; " ") | .[0:400];
+    # In a code span, so a name cannot mention anyone or become a link.
+    def code: clean | if . == "" then "" else "`" + . + "`" end;
+    def rank: {failed: 0, error: 0, missing: 0, fixed: 1, "known-broken": 2, passed: 3, excluded: 4}[.] // 0;
+    def word: {failed: "failed", error: "error", missing: "no result", fixed: "builds now",
+      "known-broken": "known broken", passed: "passed", excluded: "excluded"}[.] // (. | clean);
+    ($legs[0] // []) as $all
+    | ($all | map(. as $leg
+        | ([$results[] | select(.arch == $leg.arch and .kernel == $leg.kernel and .module == $leg.module)] | first) as $r
+        | $leg + {outcome: ($r.outcome // "missing"), detail: (if $r == null then "the leg left no result" else ($r.detail // "") end)})) as $rows
+    | ($rows | length) as $m
+    | ([$rows[] | select(.outcome == "passed" or .outcome == "excluded")] | length) as $n
+    | ([$rows[] | select(.outcome == "known-broken")] | length) as $k
+    | ($m - $n - $k) as $f
+    | (if $url == "" then "" else "[Open the run, with every leg](\($url))" end) as $link
+    | (if $channel == "" then "" else " on \($channel | clean)" end) as $where
+    | if $plan != "" and $plan != "success" then
+        {conclusion: "failure", title: "The DKMS plan did not finish",
+         summary: "The plan ended as \($plan | clean), so nothing was checked. \($link)"}
+      elif $m == 0 then
+        {conclusion: "success", title: "Nothing to check",
+         summary: ((if $note == "" then "Nothing to build" + $where else ($note | clean) end) + ". " + $link)}
+      else
+        ("\($n)/\($m) passed" + (if $k > 0 then ", \($k) known broken" else "" end)
+          + (if $f > 0 then ", \($f) failed" else "" end)) as $title
+        | {conclusion: (if $f == 0 then "success" else "failure" end), title: $title,
+           summary: ([
+             "**\($title)**" + $where + "." + (if $note == "" then "" else " " + ($note | clean) + "." end),
+             "", $link, "",
+             "| Result | Arch | Kernel | Module | Detail |", "|---|---|---|---|---|"]
+             + ($rows | sort_by((.outcome | rank), .arch, .kernel, .module)
+                | map("| \(.outcome | word) | \(.arch | clean) | \(.kernel | code) | \(.module | code) | \(.detail | code) |"))
+             | join("\n"))}
+      end'
+}
+if [[ $mode == report ]]; then
+  report
+  exit 0
+fi
+
+case $arch in x86_64 | aarch64) ;; *) die "--arch must be x86_64 or aarch64" ;; esac
+# run, and matrix without --files-db, download the channel's databases and the
+# repo= packages' from its mirror; plan only reads the files it is given.
+download=0
+[[ $mode != run && ($mode != matrix || -n $files_db) ]] || download=1
+REPO_CHANNEL=""
+((!download)) || REPO_CHANNEL=$channel
+if [[ -n $local_dir ]]; then
+  [[ -d $local_dir ]] || die "--local $local_dir is not a directory"
+fi
+
+# The registry's entries for this architecture, one line each:
+#   <package> <kernels=, or -> <repo=, or -> <known-broken= reason, or ->
+# A reason is quoted and may hold spaces, so it is taken out of the line
+# before the fields are read. A field the registry does not know is an error:
+# a misspelt mark must not silently stop applying.
+read_registry() {
+  awk -v a="$arch" '
+    /^[[:space:]]*(#|$)/ { next }
+    {
+      why = "-"
+      if (match($0, /known-broken="[^"]*"/)) {
+        why = substr($0, RSTART + 14, RLENGTH - 15)
+        $0 = substr($0, 1, RSTART - 1) " " substr($0, RSTART + RLENGTH)
+        if (why == "") { print "check-dkms: " FILENAME ":" FNR ": known-broken needs a reason" > "/dev/stderr"; bad = 1 }
+      }
+      ok = 0; k = "-"; r = "-"
+      for (i = 2; i <= NF; i++) {
+        if ($i == "x86_64" || $i == "aarch64") { if ($i == a) ok = 1 }
+        else if ($i ~ /^kernels=./) k = substr($i, 9)
+        else if ($i ~ /^repo=./) r = substr($i, 6)
+        else { print "check-dkms: " FILENAME ":" FNR ": unknown field " $i > "/dev/stderr"; bad = 1 }
+      }
+      if (ok) print $1 "\t" k "\t" r "\t" why
+    }
+    END { exit bad }' "$REGISTRY"
+}
+ENTRIES=$(read_registry) || die "$REGISTRY has errors"
+# The DKMS packages ci/dkms-packages lists for this architecture, and the
+# kernels each is limited to ("<package> <headers>,..."; none means every one,
+# and "!<headers>" every one but those).
+LISTED=$(cut -f1 <<<"$ENTRIES" | sed '/^$/d')
+SCOPES=$(awk -F'\t' '$2 != "-" { print $1 "\t" $2 }' <<<"$ENTRIES")
+is_listed() { grep -qxF -- "$1" <<<"$LISTED"; }
+# The listed packages that come from an Arch repository: "<package> <repo>".
+REPOS=$(awk -F'\t' '$3 != "-" { print $1 "\t" $3 }' <<<"$ENTRIES")
+from_repo() { awk -F'\t' -v n="$1" '$1 == n { f = 1 } END { exit !f }' <<<"$REPOS"; }
+# The listed packages known not to build, with the reason: "<package> <why>".
+# The check expects them to fail, and fails when one builds, so the mark
+# comes off as soon as it is wrong.
+BROKEN=$(awk -F'\t' '$4 != "-" { print $1 "\t" $4 }' <<<"$ENTRIES")
+
+# Raw results on stdin ("<kernel> <kver> <package> <tree> <built|excluded|
+# failed> <note>") to verdicts: the same fields with the outcome replaced by
+# built, excluded, failed, known-broken or fixed, and the note by the text a
+# person reads. Exits 1 when a pair failed or a known-broken one built.
+judge() {
+  awk -F'\t' -v OFS='\t' '
+    FNR == 1 { file++ }
+    file == 1 { if ($1 != "") why[$1] = $2; next }
+    $1 == "" { next }
+    {
+      verdict = $5
+      if ($5 == "built") text = "built"
+      else if ($5 == "excluded") text = "excluded (BUILD_EXCLUSIVE)"
+      else if ($5 == "failed") text = "FAILED"
+      else { print "check-dkms: unknown outcome " $5 " for " $3 > "/dev/stderr"; exit 2 }
+      if ($3 in why) {
+        if ($5 == "failed") { verdict = "known-broken"; text = "known broken: " why[$3] }
+        else if ($5 == "built") { verdict = "fixed"; text = "FAILED: builds now; remove its known-broken mark from ci/dkms-packages (" why[$3] ")" }
+      }
+      if (verdict == "failed" || verdict == "fixed") failed = 1
+      if ($6 != "" && $6 != "-") text = text " (" $6 ")"
+      print $1, $2, $3, $4, verdict, text
+    }
+    END { exit failed }' <(printf '%s\n' "$BROKEN") -
+}
+# The repo= packages this plan really takes from Arch: those this repository
+# does not build itself. Set by plan_for; empty when none were needed.
+ARCH_SOURCED=""
+
+# Where a channel's machines get Arch packages: each channel has its own
+# snapshot on both architectures (default/pacman/mirrorlist-* in
+# omacom/omarchy), the same mirrors build/Dockerfile builds against.
+# Printed as pacman Server lines: $repo and $arch stay literal.
+# shellcheck disable=SC2016
+mirror_server() {
+  case $arch:$1 in
+    x86_64:edge) echo 'https://mirror.omarchy.org/$repo/os/$arch' ;;
+    x86_64:rc) echo 'https://rc-mirror.omarchy.org/$repo/os/$arch' ;;
+    x86_64:stable) echo 'https://stable-mirror.omarchy.org/$repo/os/$arch' ;;
+    aarch64:edge) echo 'https://arm-mirror.omarchy.org/$arch/$repo' ;;
+    aarch64:rc) echo 'https://arm-rc-mirror.omarchy.org/$arch/$repo' ;;
+    aarch64:stable) echo 'https://arm-stable-mirror.omarchy.org/$arch/$repo' ;;
+    *) die "no Arch mirror is known for channel $1 on $arch" ;;
+  esac
+}
+# The URL of an Arch repository's directory for a channel.
+repo_url() { # repo_url <channel> <repo>
+  local server
+  server=$(mirror_server "$1")
+  server=${server//\$repo/$2}
+  echo "${server//\$arch/$arch}"
+}
+
+# A package's role from its file list on stdin: "kernel <kver>" for headers
+# with a build tree, "dkms <tree>[,<tree>]" for DKMS sources, else "other".
+# A transitional headers package that ships no tree is "other".
+classify() {
+  awk '
+    /^usr\/lib\/modules\/[^\/]+\/build\/Makefile$/ { split($0, p, "/"); kver = p[4] }
+    /^usr\/src\/[^\/]+\/dkms.conf$/ { split($0, p, "/"); trees = trees (trees == "" ? "" : ",") p[3] }
+    END { if (kver != "") print "kernel\t" kver; else if (trees != "") print "dkms\t" trees; else print "other\t-" }'
+}
+
+# Every package of a files database, one line each:
+#   <kind> <name> <version> <file> <sha256> <kver|trees|-> <pkgbase>
+read_db() {
+  local db=$1 dir
+  dir=$(mktemp -d)
+  bsdtar -xf "$db" -C "$dir" || { rm -rf "$dir"; die "cannot read $db"; }
+  read_entries "$dir" "$db" "" || { rm -rf "$dir"; exit 2; }
+  rm -rf "$dir"
+}
+
+read_entries() { # read_entries <unpacked db> <db, for errors> <file prefix>
+  local dir=$1 db=$2 prefix=$3 entry name version file sha base role
+  for entry in "$dir"/*/; do
+    [[ -f $entry/desc ]] || continue
+    [[ -f $entry/files ]] || { echo "check-dkms: $db is not a files database (no file lists)" >&2; return 1; }
+    name=$(awk '$0 == "%NAME%" { getline; print; exit }' "$entry/desc")
+    version=$(awk '$0 == "%VERSION%" { getline; print; exit }' "$entry/desc")
+    file=$(awk '$0 == "%FILENAME%" { getline; print; exit }' "$entry/desc")
+    sha=$(awk '$0 == "%SHA256SUM%" { getline; print; exit }' "$entry/desc")
+    base=$(awk '$0 == "%BASE%" { getline; print; exit }' "$entry/desc")
+    role=$(classify <"$entry/files")
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "${role%%$'\t'*}" "$name" "$version" "$prefix$file" "$sha" "${role#*$'\t'}" "${base:-$name}"
+  done
+}
+
+# The repo= packages, read from their Arch repositories' files databases
+# (<repo>=<file> pairs). Only their own entries are unpacked: a repository
+# holds thousands. A listed package missing from its repository, or one that
+# ships no DKMS tree there, is an error. With a channel, file names become URLs
+# on that channel's mirror, so fetch downloads them from there.
+read_repos() { # read_repos <channel or ""> <repo>=<file>...
+  local channel=$1 spec repo db dir name line prefix out="" patterns=() names=()
+  shift
+  for spec in "$@"; do
+    repo=${spec%%=*} db=${spec#*=}
+    mapfile -t names < <(awk -F'\t' -v r="$repo" '$2 == r { print $1 }' <<<"$REPOS")
+    ((${#names[@]})) || continue
+    [[ -f $db ]] || die "no files database for repository $repo ($db)"
+    patterns=()
+    for name in "${names[@]}"; do patterns+=("$name-[0-9]*"); done
+    dir=$(mktemp -d)
+    # bsdtar complains about a pattern that matches nothing; checked below.
+    bsdtar -xf "$db" -C "$dir" "${patterns[@]}" 2>/dev/null || true
+    prefix=""
+    [[ -z $channel ]] || prefix="$(repo_url "$channel" "$repo")/"
+    line=$(read_entries "$dir" "$db" "$prefix") || { rm -rf "$dir"; exit 2; }
+    rm -rf "$dir"
+    for name in "${names[@]}"; do
+      awk -F'\t' -v n="$name" '$1 == "dkms" && $2 == n { f = 1 } END { exit !f }' <<<"$line" ||
+        die "$name is listed as coming from $repo, but $repo has no DKMS package of that name"
+    done
+    out+=$(awk -F'\t' 'FNR == 1 { file++ } file == 1 { w[$0] = 1; next } ($2 in w)' \
+      <(printf '%s\n' "${names[@]}") <(printf '%s\n' "$line"))$'\n'
+  done
+  while IFS=$'\t' read -r name repo; do
+    [[ -n $name ]] || continue
+    grep -q "^dkms"$'\t'"$name"$'\t' <<<"$out" || die "no files database given for $name's repository, $repo"
+  done <<<"$REPOS"
+  printf '%s' "$out" | sed '/^$/d'
+}
+
+# The same lines for the packages in --local built for this architecture.
+read_local() {
+  local pkg info name version parch base list role found=0
+  for pkg in "$local_dir"/*.pkg.tar.*; do
+    [[ -f $pkg && $pkg != *.sig ]] || continue
+    # Its path goes into tab-separated lines and logs: a name with a tab or
+    # "##[" in it is refused, and not repeated.
+    [[ ${pkg##*/} =~ ^[A-Za-z0-9@_+][A-Za-z0-9@._+:~-]*\.pkg\.tar\.[a-z0-9]+$ ]] ||
+      die "--local holds a package file whose name makepkg would not produce"
+    info=$(bsdtar -xOf "$pkg" .PKGINFO) || die "cannot read $pkg"
+    name=$(awk -F' = ' '$1 == "pkgname" { print $2; exit }' <<<"$info")
+    version=$(awk -F' = ' '$1 == "pkgver" { print $2; exit }' <<<"$info")
+    parch=$(awk -F' = ' '$1 == "arch" { print $2; exit }' <<<"$info")
+    base=$(awk -F' = ' '$1 == "pkgbase" { print $2; exit }' <<<"$info")
+    [[ -n $name && -n $version ]] || die "$pkg has no pkgname or pkgver"
+    # A pull request built these, so their names reach logs, job outputs and
+    # the check's markdown: only what makepkg itself allows.
+    [[ $name =~ ^[A-Za-z0-9@_+][A-Za-z0-9@._+-]*$ && ${base:-$name} =~ ^[A-Za-z0-9@_+][A-Za-z0-9@._+-]*$ ]] ||
+      die "${pkg##*/} has a package name makepkg would not allow"
+    [[ $version =~ ^[A-Za-z0-9._+~:-]+$ ]] || die "${pkg##*/} has a version makepkg would not allow"
+    [[ $parch == "$arch" || $parch == any ]] || continue
+    list=$(bsdtar -tf "$pkg") || die "cannot list $pkg"
+    role=$(classify <<<"$list")
+    [[ ${role#*$'\t'} =~ ^[A-Za-z0-9@._+~,-]+$ ]] || die "${pkg##*/} ships a kernel or DKMS tree with a name makepkg would not allow"
+    printf '%s\t%s\t%s\t%s\t-\t%s\t%s\n' "${role%%$'\t'*}" "$name" "$version" "$pkg" "${role#*$'\t'}" "${base:-$name}"
+    found=1
+  done
+  # matrix asks about each architecture; one with nothing built has no legs.
+  ((found || all_pairs)) || [[ $mode == matrix ]] || die "--local $local_dir holds no package for $arch"
+}
+
+# The packages a check runs over: the channel's, with --local's in place of
+# the published ones of the same name. A local package that no longer ships
+# the headers tree or dkms.conf its published one did is an error: the
+# published one must not quietly stand in for it.
+compose() {
+  local published=$1 fresh=$2 kind name pkind
+  while IFS=$'\t' read -r kind name _; do
+    [[ -n $name ]] || continue
+    pkind=$(awk -F'\t' -v n="$name" '$2 == n { print $1; exit }' <<<"$published")
+    if [[ -n $pkind && $pkind != other && $kind != "$pkind" ]]; then
+      die "the local $name is a '$kind' package, but the published one is '$pkind'"
+    fi
+  done <<<"$fresh"
+  {
+    [[ -z $fresh ]] || printf '%s\n' "$fresh"
+    awk -F'\t' 'FNR == 1 { file++ } file == 1 { if ($2 != "") seen[$2] = 1; next } $2 != "" && !($2 in seen)' \
+      <(printf '%s\n' "$fresh") <(printf '%s\n' "$published")
+  } | awk -F'\t' '$1 == "kernel" || $1 == "dkms"' | sort -t$'\t' -k1,1 -k2,2
+}
+
+# The names a check is about: --local's, or those whose version differs from
+# --since's (missing there counts), or with neither option every one.
+changed_names() {
+  local names
+  names=$(changed_unfiltered "$@")
+  if ((from_repos)); then
+    names=$ARCH_SOURCED
+  fi
+  if [[ -n $only ]]; then
+    # Keep a name when it, or its pkgbase, is one of --packages.
+    awk -F'\t' -v only=" $only " 'FNR == 1 { file++ } file == 1 { if ($1 != "") keep[$1] = 1; next }
+      ($2 in keep) && (index(only, " " $2 " ") || index(only, " " $7 " ")) { print $2 }' \
+      <(printf '%s\n' "$names") <(printf '%s\n' "$1")
+  else
+    printf '%s\n' "$names"
+  fi
+}
+
+changed_unfiltered() {
+  local packages=$1 fresh=$2 previous=$3
+  if ((all_pairs)); then
+    cut -f2 <<<"$packages"
+  elif [[ -n $fresh ]]; then
+    cut -f2 <<<"$fresh"
+  elif [[ -n $previous ]]; then
+    # A package taken from Arch does not move with a promotion: it pairs
+    # through kernels. This repository's own copy of a repo= name does move.
+    awk -F'\t' 'FNR == 1 { file++ } file == 1 { if ($0 != "") r[$0] = 1; next }
+      file == 2 { v[$2] = $3; next } $2 != "" && v[$2] != $3 && !($2 in r) { print $2 }' \
+      <(printf '%s\n' "$ARCH_SOURCED") <(printf '%s\n' "$previous") <(printf '%s\n' "$packages")
+  else
+    cut -f2 <<<"$packages"
+  fi
+}
+
+# Every published DKMS package must be in the registry; a listed one that this
+# channel does not publish is only noted.
+check_registry() {
+  local packages=$1 status=0 kind name
+  while IFS=$'\t' read -r kind name _; do
+    [[ $kind == dkms ]] || continue
+    if ! is_listed "$name"; then
+      echo "check-dkms: $name ships a DKMS module for $arch but is not in ci/dkms-packages" >&2
+      status=1
+    fi
+  done <<<"$packages"
+  while IFS= read -r name; do
+    [[ -n $name ]] || continue
+    from_repo "$name" && continue
+    awk -F'\t' -v n="$name" '$1 == "dkms" && $2 == n { f = 1 } END { exit !f }' <<<"$packages" ||
+      echo "check-dkms: note: $name is listed for $arch but not published here" >&2
+  done <<<"$LISTED"
+  return "$status"
+}
+
+# The kernel/module pairs to build: "<kernel name> <kver> <dkms name> <tree>".
+pairs() {
+  local packages=$1 changed=$2
+  awk -F'\t' '
+    FNR == 1 { file++ }
+    # kernels= names the headers a module builds against, or with a leading
+    # "!" the ones it never does; with only exclusions, every other kernel.
+    function builds_against(module, kernel,   n, s, x, listed, hit) {
+      if (!(module in scope)) return 1
+      n = split(scope[module], s, ",")
+      for (x = 1; x <= n; x++) {
+        if (substr(s[x], 1, 1) == "!") {
+          if (substr(s[x], 2) == kernel) return 0
+        } else {
+          listed = 1
+          if (s[x] == kernel) hit = 1
+        }
+      }
+      return !listed || hit
+    }
+    file == 1 { if ($1 != "") scope[$1] = $2; next }
+    file == 2 { if ($1 != "") c[$1] = 1; next }
+    $1 == "kernel" { kn[++k] = $2; kv[k] = $6; next }
+    $1 == "dkms" { dn[++d] = $2; dt[d] = $6 }
+    END {
+      for (i = 1; i <= d; i++) {
+        n = split(dt[i], t, ",")
+        for (j = 1; j <= k; j++)
+          if (((dn[i] in c) || (kn[j] in c)) && builds_against(dn[i], kn[j]))
+            for (x = 1; x <= n; x++) print kn[j] "\t" kv[j] "\t" dn[i] "\t" t[x]
+      }
+    }' <(printf '%s\n' "$SCOPES") <(printf '%s\n' "$changed") <(printf '%s\n' "$packages")
+}
+
+plan_for() { # plan_for <channel db> [since db]: sets PACKAGES, CHANGED, PAIRS
+  local fresh="" previous="" published repos="" ours
+  PACKAGES="" CHANGED="" PAIRS=""
+  if [[ -n $local_dir ]]; then
+    fresh=$(read_local)
+    # Only matrix gets here with nothing built for this architecture.
+    [[ -n $fresh ]] || ((all_pairs)) || return 0
+  fi
+  [[ -z ${2:-} ]] || previous=$(read_db "$2")
+  published=$(read_db "$1")
+  if [[ -n $REPOS ]] && repos_needed "$published" "$fresh" "$previous"; then
+    load_repo_dbs
+    repos=$(read_repos "$REPO_CHANNEL" "${repo_dbs[@]}")
+    # This repository's own copy, published or fresh, is what pacman installs.
+    ours=$(printf '%s\n%s\n' "$published" "$fresh" | awk -F'\t' '$1 == "dkms" { print $2 }')
+    repos=$(awk -F'\t' 'FNR == 1 { file++ } file == 1 { if ($0 != "") o[$0] = 1; next }
+      ($2 in o) { print "check-dkms: note: " $2 " is built here too; the Arch copy is not checked (drop its repo= from ci/dkms-packages)" > "/dev/stderr"; next } { print }' \
+      <(printf '%s\n' "$ours") <(printf '%s\n' "$repos"))
+    ARCH_SOURCED=$(awk -F'\t' '$1 == "dkms" { print $2 }' <<<"$repos")
+  fi
+  PACKAGES=$(compose "$(printf '%s\n%s\n' "$published" "$repos" | sed '/^$/d')" "$fresh")
+  # Listed DKMS packages, and every fresh one: a pull request that adds a new
+  # recipe is checked before it publishes, even though master's registry does
+  # not list it yet.
+  PACKAGES=$(awk -F'\t' 'FNR == 1 { file++ }
+    file == 1 { if ($0 != "") ok[$0] = 1; next }
+    file == 2 { if ($1 == "dkms") ok[$2] = 1; next }
+    $1 == "kernel" || ($1 == "dkms" && ($2 in ok))' \
+    <(printf '%s\n' "$LISTED") <(printf '%s\n' "$fresh") <(printf '%s\n' "$PACKAGES"))
+  if [[ -n $fresh ]]; then
+    awk -F'\t' -v L="$LISTED" 'BEGIN { n = split(L, l, "\n"); for (i = 1; i <= n; i++) ok[l[i]] = 1 }
+      $1 == "dkms" && !($2 in ok) { print "check-dkms: note: " $2 " is not in ci/dkms-packages yet; checking it against every kernel" > "/dev/stderr" }' <<<"$fresh"
+  fi
+  CHANGED=$(changed_names "$PACKAGES" "$fresh" "$previous")
+  PAIRS=$(pairs "$PACKAGES" "$CHANGED")
+  # One leg of a matrix: the pairs of one kernel (headers name or pkgbase) and
+  # one DKMS package, at the versions the leg names, if it names them. A leg
+  # the plan no longer has means the channel moved after the matrix was made:
+  # fail, so the run is redone, not passed.
+  if [[ -n $pair_kernel || -n $pair_module ]]; then
+    PAIRS=$(awk -F'\t' -v k="$pair_kernel" -v m="$pair_module" 'FNR == 1 {
+        file++
+        split(k, kk, " "); split(m, mm, " ")
+      }
+      file == 1 { base[$2] = $7; ver[$2] = $3; next }
+      $1 != "" && (kk[1] == "" || $1 == kk[1] || base[$1] == kk[1]) && (kk[2] == "" || ver[$1] == kk[2]) &&
+        (mm[1] == "" || $3 == mm[1]) && (mm[2] == "" || ver[$3] == mm[2])' \
+      <(printf '%s\n' "$PACKAGES") <(printf '%s\n' "$PAIRS"))
+    [[ -n $PAIRS ]] || die "this plan has no pair${pair_kernel:+ for kernel $pair_kernel}${pair_module:+ and module $pair_module}; the channel moved since the matrix was made, so run it again"
+  fi
+}
+
+# The plan's legs as a JSON array: one per kernel (by pkgbase) and DKMS
+# package, each named with its version.
+legs() {
+  awk -F'\t' -v a="$arch" 'FNR == 1 { file++ }
+    file == 1 { base[$2] = $7; ver[$2] = $3; next }
+    $1 != "" && !seen[$1 "\t" $3]++ {
+      printf "%s{\"arch\":\"%s\",\"kernel\":\"%s %s\",\"module\":\"%s %s\"}", (n++ ? "," : "["), a, base[$1], ver[$1], $3, ver[$3]
+    }
+    END { print (n ? "]" : "[]") }' <(printf '%s\n' "$PACKAGES") <(printf '%s\n' "$PAIRS")
+}
+
+# The channel's files database, and --since's, into $work.
+download_channel() {
+  curl -fsSL --retry 3 -o "$work/channel.files" "$PKGS_BASE/$channel/$arch/omarchy.files" || die "cannot download $channel/$arch/omarchy.files"
+  files_db=$work/channel.files
+  if [[ -n $since ]]; then
+    curl -fsSL --retry 3 -o "$work/since.files" "$PKGS_BASE/$since/$arch/omarchy.files" || die "cannot download $since/$arch/omarchy.files"
+    since_db=$work/since.files
+  fi
+}
+
+# repo= packages can only pair with a kernel. They are needed when every
+# package is checked, with --from-repos, or when a kernel changes: a fresh one,
+# or one whose version differs from --since's.
+repos_needed() { # repos_needed <published> <fresh> <previous>
+  ((from_repos || all_pairs)) && return 0
+  [[ -n $2 || -n $3 ]] || return 0
+  if [[ -n $2 ]]; then
+    awk -F'\t' '$1 == "kernel" { f = 1 } END { exit !f }' <<<"$2"
+    return
+  fi
+  awk -F'\t' 'FNR == 1 { file++ } file == 1 { v[$2] = $3; next }
+    $1 == "kernel" && v[$2] != $3 { f = 1 } END { exit !f }' <(printf '%s\n' "$3") <(printf '%s\n' "$1")
+}
+
+# plan reads the repo files databases it was given; run downloads them.
+load_repo_dbs() {
+  ((download)) || return 0
+  local repo
+  while IFS= read -r repo; do
+    [[ -n $repo ]] || continue
+    curl -fsSL --retry 3 -o "$work/$repo.files" "$(repo_url "$channel" "$repo")/$repo.files" ||
+      die "cannot download $repo.files from the $channel mirror"
+    repo_dbs+=("$repo=$work/$repo.files")
+  done < <(cut -f2 <<<"$REPOS" | sort -u)
+}
+
+# A leg's outcome, from run's exit status and its verdicts: the worst pair
+# decides it. The status must agree with the verdicts, and a run that stopped
+# (any other status, or no verdicts) is an error, never a pass.
+leg_result() { # leg_result <status> <pairs.tsv>
+  local status=$1 pairs=$2
+  [[ -f $pairs ]] || pairs=/dev/null
+  jq -n --arg arch "$arch" --arg kernel "$pair_kernel" --arg module "$pair_module" \
+    --argjson status "$status" --rawfile pairs "$pairs" '
+    def rank: {failed: 5, fixed: 4, "known-broken": 3, built: 2, excluded: 1}[.] // 0;
+    # The container wrote these rows: plain text only, and nothing else.
+    def plain: gsub("[^A-Za-z0-9 ._+~,;:()=/@#\u0027-]"; " ") | .[0:400];
+    ($pairs | split("\n") | map(select(length > 0) | split("\t"))) as $rows
+    | ($rows | map({tree: (.[3] // "" | plain), verdict: (.[4] // ""), text: (.[5] // "" | plain), fields: length})) as $p
+    | (if ($p | length) == 0 then "" else ($p | max_by(.verdict | rank) | .verdict) end) as $worst
+    | (if ($status != 0 and $status != 1) or ($p | length) == 0 then
+         {outcome: "error", detail: "the check stopped before it built anything (exit status \($status))"}
+       elif any($p[]; .fields != 6 or (.verdict | rank) == 0) then
+         {outcome: "error", detail: "the verdicts are malformed"}
+       elif ($status == 1) != ($worst == "failed" or $worst == "fixed") then
+         {outcome: "error", detail: "exit status \($status) disagrees with the verdicts"}
+       else
+         {outcome: (if $worst == "built" then "passed" else $worst end),
+          detail: (if ($p | length) == 1 then (if $p[0].text == "built" then "" else $p[0].text end)
+                   else ($p | map("\(.tree): \(.text)") | join("; ")) end)}
+       end)
+    | {arch: $arch, kernel: $kernel, module: $module} + .'
+}
+
+print_plan() {
+  awk -F'\t' '{ print $1 "\t" $2 "\t" $3 "\t" $6 }' <<<"$PACKAGES"
+  if [[ -n $PAIRS ]]; then
+    awk -F'\t' '{ print "pair\t" $1 " " $2 "\t" $3 " " $4 }' <<<"$PAIRS"
+  else
+    echo "nothing to check"
+  fi
+}
+
+case $mode in
+  matrix)
+    # The legs a CI run fans out into, each built by run --kernel --module.
+    # A build with nothing for this architecture has none; nothing to download.
+    # Read on a line of its own: a package that cannot be read or trusted
+    # stops here, never reads as an empty build.
+    local_rows=""
+    if [[ -n $local_dir ]]; then
+      local_rows=$(read_local)
+    fi
+    if [[ -n $local_dir && -z $local_rows ]] && ((!all_pairs)); then
+      echo "$arch: this build has nothing for $arch" >&2
+      echo '[]'
+      exit 0
+    fi
+    if ((download)); then
+      [[ -n $channel ]] || die "matrix needs --channel or --files-db"
+      work=$(mktemp -d)
+      trap 'rm -rf "$work"' EXIT
+      download_channel
+    fi
+    [[ -z $since_db || -f $since_db ]] || die "--since-db $since_db is not a file"
+    check_registry "$(read_db "$files_db")" || exit 1
+    plan_for "$files_db" "$since_db"
+    if [[ -n $PAIRS ]]; then
+      print_plan >&2
+    else
+      echo "$arch: nothing to check" >&2
+    fi
+    if [[ -n $save_local ]]; then
+      [[ -n $local_dir ]] || die "--save-local needs --local"
+      mkdir -p "$save_local"
+      while IFS=$'\t' read -r kind _ _ file _; do
+        [[ $kind == kernel || $kind == dkms ]] || continue
+        cp -- "$file" "$save_local/" || die "cannot copy ${file##*/} to $save_local"
+      done <<<"$local_rows"
+    fi
+    legs
+    ;;
+
+  plan)
+    [[ -f $files_db ]] || die "plan needs --files-db"
+    [[ -z $since_db || -f $since_db ]] || die "--since-db $since_db is not a file"
+    all=$(read_db "$files_db")
+    status=0
+    check_registry "$all" || status=1
+    plan_for "$files_db" "$since_db"
+    print_plan
+    exit "$status"
+    ;;
+
+  container)
+    [[ -n $channel ]] || die "container needs --channel"
+    image=$X86_64_IMAGE
+    [[ $arch == x86_64 ]] || image=$AARCH64_IMAGE
+    mounts=(-v "$ROOT:/src:ro")
+    args=(run --arch "$arch" --channel "$channel")
+    [[ -z $since ]] || args+=(--since "$since")
+    [[ -z $only ]] || args+=(--packages "$only")
+    ((!from_repos)) || args+=(--from-repos)
+    ((!all_pairs)) || args+=(--all)
+    [[ -z $pair_kernel ]] || args+=(--kernel "$pair_kernel")
+    [[ -z $pair_module ]] || args+=(--module "$pair_module")
+    if [[ -n $local_dir ]]; then
+      mounts+=(-v "$(realpath "$local_dir"):/local:ro")
+      args+=(--local /local)
+    fi
+    # run writes each pair's verdict here; the outcome is decided out here.
+    results=$(mktemp -d)
+    trap 'rm -rf "$results"' EXIT
+    mounts+=(-v "$results:/results")
+    args+=(--results /results)
+    if [[ -n ${GITHUB_STEP_SUMMARY:-} ]]; then
+      mounts+=(-v "$GITHUB_STEP_SUMMARY:/summary.md")
+      args=(env GITHUB_STEP_SUMMARY=/summary.md bash /src/bin/check-dkms "${args[@]}")
+    else
+      args=(bash /src/bin/check-dkms "${args[@]}")
+    fi
+    # The container runs a pull request's code: its kernel's and modules'
+    # Makefiles. Nothing they print may act as a workflow command on the
+    # runner (::add-mask::, ::set-output::, ::error::).
+    stop=""
+    if [[ -n ${GITHUB_ACTIONS:-} ]]; then
+      stop=$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')
+      echo "::stop-commands::$stop"
+    fi
+    status=0
+    docker run --rm "${mounts[@]}" "$image" "${args[@]}" || status=$?
+    outcome=$(leg_result "$status" "$results/pairs.tsv") || die "cannot summarise the leg"
+    # Still inside stop-commands: the detail is the container's text.
+    echo "==> $(jq -r '"\(.outcome)\(if .detail == "" then "" else ": " + .detail end)"' <<<"$outcome")"
+    [[ -z $stop ]] || echo "::$stop::"
+    if [[ -n $result_file ]]; then
+      printf '%s\n' "$outcome" >"$result_file" || die "cannot write $result_file"
+    fi
+    case $(jq -r .outcome <<<"$outcome") in
+      passed | excluded | known-broken) exit 0 ;;
+      *) exit 1 ;;
+    esac
+    ;;
+
+  run)
+    [[ -n $channel ]] || die "run needs --channel"
+    ((EUID == 0)) || die "run installs packages; run it as root in a disposable system"
+    work=$(mktemp -d)
+    download_channel
+    check_registry "$(read_db "$files_db")" || exit 1
+    plan_for "$files_db" "$since_db"
+    echo "==> $channel/$arch${since:+, changes since $since}${local_dir:+, with $local_dir}${pair_kernel:+, kernel $pair_kernel}${pair_module:+, module $pair_module}:"
+    print_plan | column -t -s $'\t'
+    if [[ -z $PAIRS ]]; then
+      echo "### DKMS on $channel/$arch: nothing to check" | tee -a "${GITHUB_STEP_SUMMARY:-/dev/null}"
+      exit 0
+    fi
+
+    # The Arch packages the channel's machines build with: its own mirror
+    # snapshot (mirror_server). pacman 7 cannot sandbox its downloads on a
+    # kernel without Landlock, which CI runners can be.
+    echo "Server = $(mirror_server "$channel")" >/etc/pacman.d/mirrorlist
+    if [[ $arch == aarch64 ]]; then
+      pacman-key --init >/dev/null 2>&1
+      pacman-key --populate archlinuxarm >/dev/null 2>&1
+    fi
+    if ! grep -qw landlock /sys/kernel/security/lsm 2>/dev/null && ! grep -q '^DisableSandbox' /etc/pacman.conf; then
+      sed -i '/^\[options\]/a DisableSandboxFilesystem\nDisableSandboxSyscalls' /etc/pacman.conf
+    fi
+    pacman -Syu --noconfirm --needed dkms base-devel bc cpio pahole libarchive curl >/dev/null
+
+    # Sets FETCHED to a verified local copy of a package line's file.
+    fetch() {
+      local file=$1 sha=$2
+      if [[ $sha == - ]]; then
+        FETCHED=$file
+        return 0
+      fi
+      # repo= packages carry their mirror URL; this repository's, a file name.
+      local url=$PKGS_BASE/$channel/$arch/$file
+      [[ $file != https://* ]] || url=$file
+      FETCHED=$work/${file##*/}
+      curl -fsSL --retry 3 -o "$FETCHED" "$url" || die "cannot download $url"
+      echo "$sha  $FETCHED" | sha256sum -c --quiet - || die "$file does not match its database's SHA-256"
+    }
+    line_of() { awk -F'\t' -v n="$1" '$2 == n' <<<"$PACKAGES"; }
+
+    for name in $(cut -f1 <<<"$PAIRS" | sort -u); do
+      IFS=$'\t' read -r _ _ _ file sha kver _ <<<"$(line_of "$name")"
+      fetch "$file" "$sha"
+      echo "==> Installing $name ($kver)"
+      pacman -U --noconfirm --needed "$FETCHED" >/dev/null || die "cannot install $name"
+    done
+    # A kernel built with clang needs clang, lld and the llvm tools on PATH.
+    # Its headers package should depend on them; when it does not, a machine
+    # without them cannot build any module for that kernel, so say so.
+    llvm_kernels=() llvm_note=""
+    for kver in $(cut -f2 <<<"$PAIRS" | sort -u); do
+      [[ -z $(toolchain "/usr/lib/modules/$kver/build") ]] || llvm_kernels+=("$kver")
+    done
+    if ((${#llvm_kernels[@]})); then
+      missing=()
+      for tool in clang ld.lld llvm-ar llvm-nm llvm-objcopy; do
+        command -v "$tool" >/dev/null || missing+=("$tool")
+      done
+      if ((${#missing[@]})); then
+        echo "==> ${llvm_kernels[*]}: built with clang; installing clang, llvm and lld (missing: ${missing[*]})"
+        pacman -S --noconfirm --needed clang llvm lld >/dev/null || die "cannot install clang, llvm and lld"
+        llvm_note="the kernel's headers do not depend on clang, llvm and lld; the check installed them"
+      fi
+      echo "==> $(clang --version | head -n 1), for ${llvm_kernels[*]}"
+    fi
+    # DKMS packages are unpacked, not installed: pacman would run DKMS's own
+    # hook and build them against every kernel. The whole package, not just
+    # /usr/src: broadcom-wl's build links a blob from /usr/lib/broadcom-wl-dkms.
+    for name in $(cut -f3 <<<"$PAIRS" | sort -u); do
+      IFS=$'\t' read -r _ _ _ file sha _ <<<"$(line_of "$name")"
+      fetch "$file" "$sha"
+      bsdtar -xpf "$FETCHED" -C / --exclude .PKGINFO --exclude .BUILDINFO --exclude .MTREE \
+        --exclude .INSTALL --exclude .CHANGELOG || die "cannot unpack $name"
+    done
+
+    raw=""
+    while IFS=$'\t' read -r kname kver dname tree; do
+      # The module and version the way Arch's DKMS hook reads them: the source
+      # directory's name, split at its last dash.
+      module=${tree%-*} version=${tree##*-}
+      dkms add -m "$module" -v "$version" >/dev/null 2>&1 || true
+      echo "==> $dname: $module/$version against $kver"
+      status=0
+      timeout 3600 dkms build --force -m "$module" -v "$version" -k "$kver" >"$work/build.log" 2>&1 || status=$?
+      case $status in
+        0) result=built ;;
+        77) result=excluded ;;
+        *)
+          result=failed
+          tail -n 40 "$work/build.log" || true
+          log=/var/lib/dkms/$module/$version/build/make.log
+          if [[ -f $log ]]; then
+            # The compiler's errors, then the end of the log: a link or
+            # modpost failure names no "error" until make gives up.
+            echo "--- $log (errors)"
+            grep -m 20 -iE 'error|undefined|no rule|fatal' "$log" || true
+            echo "--- $log (end)"
+            tail -n 25 "$log" || true
+          fi
+          ;;
+      esac
+      note=-
+      if [[ -n $llvm_note && " ${llvm_kernels[*]} " == *" $kver "* ]]; then
+        note=$llvm_note
+      fi
+      echo "    $result"
+      raw+=$(printf '%s\t%s\t%s\t%s\t%s\t%s' "$kname" "$kver" "$dname" "$tree" "$result" "$note")$'\n'
+    done <<<"$PAIRS"
+
+    failed=0
+    judged=$(judge <<<"$raw") || failed=$?
+    ((failed < 2)) || die "cannot judge the results"
+    if [[ -n $results_dir ]]; then
+      printf '%s\n' "$judged" >"$results_dir/pairs.tsv" || die "cannot write $results_dir/pairs.tsv"
+    fi
+    {
+      echo "### DKMS on $channel/$arch${since:+, changes since $since}${local_dir:+, with this build}"
+      echo
+      echo "| Package | Module | Kernel | Result |"
+      echo "|---|---|---|---|"
+      awk -F'\t' '{ m = $4; sub(/-[^-]*$/, "", m); v = substr($4, length(m) + 2); print "| " $3 " | " m " " v " | " $1 " " $2 " | " $6 " |" }' <<<"$judged"
+    } | tee -a "${GITHUB_STEP_SUMMARY:-/dev/null}"
+    exit "$failed"
+    ;;
+
+  judge)
+    judge
+    ;;
+
+  *) usage ;;
+esac

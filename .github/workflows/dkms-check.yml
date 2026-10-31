@@ -1,0 +1,253 @@
+name: DKMS check
+
+# Builds DKMS modules against kernel headers (dkms-matrix.yml, bin/check-dkms):
+#   - after every pull request build ("Build changed packages"), on what the
+#     build would publish: a new kernel against every module, Arch's included,
+#     and a new module against every kernel. The pull request gets one check,
+#     "DKMS check: 41/45 passed", whose summary has a row per kernel and module
+#     and links this run, where every leg is its own job;
+#   - daily, on every pair on edge that has not built at its versions yet:
+#     Arch updates the DKMS packages Omarchy installs from it (ci/dkms-packages
+#     repo=) on its own schedule;
+#   - by hand, for a whole channel or what differs from another one:
+#       gh workflow run dkms-check.yml -R omacom/omarchy-pkgs -f channel=stable
+#       gh workflow run dkms-check.yml -R omacom/omarchy-pkgs -f channel=edge -f since=rc
+#   - by hand for a pull request, the same path as after its build:
+#       gh workflow run dkms-check.yml -R omacom/omarchy-pkgs -f pr=1250
+#     From a branch (--ref) it runs that branch's check, which is how a change
+#     to the check itself is proven before it merges; -f all=true checks every
+#     pair on the channel with the pull request's packages in place.
+# promote.yml calls dkms-matrix.yml itself, on what a promotion moves.
+#
+# Why workflow_run and not the pull request's own workflow: every job of a
+# pull_request run is a check on the pull request, about 45 of them for a
+# kernel. This run's jobs attach to master's head instead, and the pull
+# request gets the one check this workflow writes through the Checks API.
+#
+# workflow_run runs master's copy of this file with a token that could write,
+# so: the only jobs that may write (checks: write, to open and close that one
+# check) never check out the repository or download anything; they pass the
+# event's commit and run ids and the matrix's verdict to the API through jq,
+# as data. The matrix itself is read-only and runs master's tooling; the pull
+# request's build is data until a leg unpacks it in a throwaway container.
+
+on:
+  workflow_run:
+    workflows: [Build changed packages]
+    types: [completed]
+  schedule:
+    - cron: "37 5 * * *"
+  workflow_dispatch:
+    inputs:
+      channel:
+        description: Channel whose kernels and DKMS packages to check
+        type: choice
+        options: [edge, rc, stable]
+        default: edge
+      since:
+        description: "Only what differs from this channel (empty: everything)"
+        required: false
+        default: ""
+      from_repos:
+        description: Only the DKMS packages from Arch's repositories, against every kernel
+        type: boolean
+        default: false
+      pr:
+        description: "A pull request: check what its newest green build ships, and report it there as one check"
+        required: false
+        default: ""
+      head_sha:
+        description: "The commit whose build to check (default: the pull request's head)"
+        required: false
+        default: ""
+      all:
+        description: With pr or head_sha, every pair on the channel, the build's packages in place
+        type: boolean
+        default: false
+
+permissions: {}
+
+# One run per commit at a time: a newer build of the same commit (a label
+# starts one) replaces the check in flight, which closes as cancelled. Keyed by
+# commit, so a build of an older commit that finishes late, or one this
+# workflow ignores (failed, cancelled, not a pull request's), never cancels the
+# check of the pull request's head.
+concurrency:
+  group: >-
+    dkms-check-${{ github.event_name == 'workflow_run'
+      && (github.event.workflow_run.event == 'pull_request' && github.event.workflow_run.conclusion == 'success'
+        && github.event.workflow_run.path == '.github/workflows/build-pr.yml'
+        && format('sha-{0}', github.event.workflow_run.head_sha) || format('ignored-{0}', github.run_id))
+      || ((inputs.pr || inputs.head_sha) && format('pr-{0}-{1}', inputs.pr, inputs.head_sha))
+      || format('{0}-{1}-{2}-{3}', github.event_name, github.ref, inputs.channel || 'edge', inputs.since || 'all') }}
+  cancel-in-progress: ${{ (github.event_name == 'workflow_run' || inputs.pr || inputs.head_sha) && true || false }}
+
+jobs:
+  # A pull request's build: which commit and run, and the check, opened as in
+  # progress so the pull request shows it while the legs build. A commit the
+  # pull request has moved past gets no check. The build's dkms-request is
+  # only as good as the build-pr.yml that wrote it, and a fork's pull request
+  # runs its own copy: a build from a fork whose build-pr.yml differs from
+  # its merge base's is refused, never checked. Any API error fails this job
+  # before a check opens, so it fails closed.
+  target:
+    name: open the check
+    if: >-
+      (github.event_name == 'workflow_run' && github.event.workflow_run.event == 'pull_request'
+        && github.event.workflow_run.conclusion == 'success'
+        && github.event.workflow_run.path == '.github/workflows/build-pr.yml')
+      || (github.event_name == 'workflow_dispatch' && (inputs.pr != '' || inputs.head_sha != ''))
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      checks: write
+      actions: read
+      pull-requests: read
+    outputs:
+      head_sha: ${{ steps.open.outputs.head_sha }}
+      build_run: ${{ steps.open.outputs.build_run }}
+      check_run: ${{ steps.open.outputs.check_run }}
+      refused: ${{ steps.open.outputs.refused }}
+    steps:
+      # No checkout: nothing from the repository, let alone a pull request,
+      # runs next to this token.
+      - name: Find the build and open its check
+        id: open
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_SHA: ${{ github.event.workflow_run.head_sha }}
+          EVENT_RUN: ${{ github.event.workflow_run.id }}
+          HEAD_OWNER: ${{ github.event.workflow_run.head_repository.owner.login }}
+          HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          PR: ${{ inputs.pr }}
+          SHA: ${{ inputs.head_sha }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          pr=$PR refused=""
+          if [[ -n $EVENT_RUN ]]; then
+            sha=$EVENT_SHA run=$EVENT_RUN
+            # The event names no pull request for a fork's; find it by its
+            # head. One that has moved on to a newer commit gets no check.
+            pr=$(gh api -X GET "repos/$GITHUB_REPOSITORY/pulls" -f state=open -f head="$HEAD_OWNER:$HEAD_BRANCH" |
+              jq -r --arg sha "$sha" '[.[] | select(.head.sha == $sha)][0].number // empty')
+            if [[ -z $pr ]]; then
+              echo "no open pull request has $sha as its head; nothing to check"
+              exit 0
+            fi
+          else
+            sha=$SHA
+            if [[ -n $PR ]]; then
+              if [[ ! $PR =~ ^[0-9]+$ ]]; then
+                echo "::error::pr must be a pull request number"
+                exit 1
+              fi
+              [[ -n $sha ]] || sha=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR" --jq .head.sha)
+            fi
+            if [[ ! $sha =~ ^[0-9a-f]{40}$ ]]; then
+              echo "::error::head_sha must be a full commit hash"
+              exit 1
+            fi
+            # The newest green pull request build of that commit.
+            run=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/build-pr.yml/runs?head_sha=$sha&event=pull_request&status=success&per_page=1" \
+              --jq '.workflow_runs[0].id // empty')
+            if [[ -z $run ]]; then
+              echo "::error::$sha has no green pull request build to check"
+              exit 1
+            fi
+          fi
+          # A fork's pull request builds with its own build-pr.yml, which
+          # writes the dkms-request this check reads. Whether this build's
+          # copy is the base's comes from the build run itself, in every mode.
+          build=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run")
+          if [[ $(jq -r '.head_sha' <<<"$build") != "$sha" || $(jq -r '.path' <<<"$build") != .github/workflows/build-pr.yml ]]; then
+            echo "::error::run $run is not the pull request build of $sha"
+            exit 1
+          fi
+          # build-pr.yml's blob at a commit, "missing" where it has none (a
+          # fork that branched before it existed); any other error stops here.
+          blob() {
+            local out
+            if out=$(gh api "repos/$GITHUB_REPOSITORY/contents/.github/workflows/build-pr.yml?ref=$1" --jq .sha 2>&1); then
+              echo "$out"
+            elif [[ $out == *"(HTTP 404)"* ]]; then
+              echo missing
+            else
+              echo "::error::cannot read build-pr.yml at $1" >&2
+              return 1
+            fi
+          }
+          if [[ $(jq -r '.head_repository.full_name // ""' <<<"$build") != "$GITHUB_REPOSITORY" ]]; then
+            base=$(gh api "repos/$GITHUB_REPOSITORY/compare/${DEFAULT_BRANCH}...$sha" --jq .merge_base_commit.sha)
+            ours=$(blob "$base")
+            theirs=$(blob "$sha")
+            if [[ ! $ours =~ ^([0-9a-f]{40}|missing)$ || $theirs != "$ours" ]]; then
+              refused="Not checked: this build comes from a fork whose .github/workflows/build-pr.yml differs from its merge base's, and that file writes what this check reads. Land the workflow change in a pull request of its own first."
+            fi
+          fi
+          check=$(jq -n --arg sha "$sha" --arg url "$URL" '{
+              name: "DKMS check", head_sha: $sha, status: "in_progress", details_url: $url,
+              output: {title: "Building DKMS modules against kernel headers", summary: "[Open the run, with every leg](\($url))"}
+            }' | gh api -X POST "repos/$GITHUB_REPOSITORY/check-runs" --input - --jq .id)
+          echo "check run $check on $sha, for build run $run${pr:+ of pull request #$pr}"
+          {
+            echo "head_sha=$sha"
+            echo "build_run=$run"
+            echo "check_run=$check"
+            echo "refused=$refused"
+          } >>"$GITHUB_OUTPUT"
+
+  dkms:
+    name: DKMS
+    needs: target
+    # After a build only for a pull request's open check; daily and by hand
+    # always.
+    if: >-
+      !cancelled() && ((needs.target.result == 'success' && needs.target.outputs.check_run != '' && needs.target.outputs.refused == '')
+        || (github.event_name != 'workflow_run' && needs.target.result == 'skipped'))
+    permissions:
+      contents: read
+      actions: read
+    uses: ./.github/workflows/dkms-matrix.yml
+    with:
+      channel: ${{ inputs.channel || 'edge' }}
+      since: ${{ inputs.since || '' }}
+      from_repos: ${{ inputs.from_repos == true }}
+      all: ${{ inputs.all == true }}
+      build_run: ${{ needs.target.outputs.build_run || '' }}
+      head_sha: ${{ needs.target.outputs.head_sha || '' }}
+
+  # Closes the check with the matrix's verdict. A matrix that stopped before
+  # its summary fails the check (or cancels it), never passes it.
+  report:
+    name: close the check
+    needs: [target, dkms]
+    if: always() && needs.target.result == 'success' && needs.target.outputs.check_run != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      checks: write
+    steps:
+      - name: Close the check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CHECK: ${{ needs.target.outputs.check_run }}
+          REFUSED: ${{ needs.target.outputs.refused }}
+          RESULT: ${{ needs.dkms.result }}
+          CONCLUSION: ${{ needs.dkms.outputs.conclusion }}
+          TITLE: ${{ needs.dkms.outputs.title }}
+          SUMMARY: ${{ needs.dkms.outputs.summary }}
+          URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          if [[ -n $REFUSED ]]; then
+            CONCLUSION=failure TITLE="Not checked" SUMMARY=$REFUSED
+          elif [[ $RESULT == cancelled ]]; then
+            CONCLUSION=cancelled TITLE="Cancelled" SUMMARY="A newer build's check replaced this one. [Open the run]($URL)"
+          elif [[ $CONCLUSION != success && $CONCLUSION != failure ]]; then
+            CONCLUSION=failure TITLE="The DKMS check did not finish ($RESULT)" SUMMARY="[Open the run]($URL)"
+          fi
+          jq -n --arg c "$CONCLUSION" --arg t "$TITLE" --arg s "$SUMMARY" --arg url "$URL" \
+            '{status: "completed", conclusion: $c, details_url: $url, output: {title: $t, summary: $s}}' |
+            gh api -X PATCH "repos/$GITHUB_REPOSITORY/check-runs/$CHECK" --input - --jq '"\(.conclusion): \(.output.title) \(.html_url)"'
