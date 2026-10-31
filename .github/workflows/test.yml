@@ -23,6 +23,53 @@ jobs:
           TEST_BUILDER_IMAGE: omarchy-build-isolation-test
         run: tests/build-isolation.sh
 
+  # namcap reads one PKGBUILD at a time, so this lints the recipes a PR
+  # changes and fails on errors that are new against the base branch: the tree
+  # already carries 23, and nobody touching omarchy-nvim should inherit them.
+  # The split-makedepends rule is printed but never gates: it fires on any
+  # split package whose parts depend on each other (19 of the 23).
+  recipes:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Fail on namcap errors the base branch did not have
+        run: |
+          set -euo pipefail
+          base="${{ github.event.pull_request.base.sha }}"
+          if [[ -z "$base" ]]; then echo "not a pull request: nothing to compare"; exit 0; fi
+          mapfile -t dirs < <(git diff --name-only "$base"...HEAD -- 'pkgbuilds/*/PKGBUILD' | xargs -r -n1 dirname | sort -u)
+          (( ${#dirs[@]} )) || { echo "no recipe changed"; exit 0; }
+          base_tree=$(mktemp -d); trap 'rm -rf "$base_tree"' EXIT
+          for d in "${dirs[@]}"; do
+            mkdir -p "$base_tree/$d"
+            git show "$base:$d/PKGBUILD" >"$base_tree/$d/PKGBUILD" 2>/dev/null || rm -rf "$base_tree/$d"
+          done
+          docker run --rm -e DIRS="${dirs[*]}" -v "$PWD:/w:ro" -v "$base_tree:/base:ro" -w /w \
+            ghcr.io/archlinux/archlinux:base-devel bash -lc '
+              pacman -Sy --noconfirm namcap >/dev/null
+              gate=" E: "
+              skip="Split PKGBUILD needs additional makedepends"
+              status=0
+              for d in $DIRS; do
+                now=$(namcap -i "$d/PKGBUILD" 2>&1; true)
+                printf "%s\n" "$now" | grep -E " (E|W): " | sed "s#^#$d #" || true
+                was=""
+                [[ -f /base/$d/PKGBUILD ]] && was=$(namcap -i "/base/$d/PKGBUILD" 2>&1; true)
+                new=$(comm -23 <(printf "%s\n" "$now" | grep "$gate" | grep -v "$skip" | sort) \
+                                 <(printf "%s\n" "$was" | grep "$gate" | grep -v "$skip" | sort) || true)
+                if [[ -n "$new" ]]; then
+                  printf "%s\n" "$new" | sed "s#^#::error file=$d/PKGBUILD::#"
+                  status=1
+                fi
+              done
+              exit $status'
+
   self-tests:
     runs-on: ubuntu-latest
 
@@ -78,6 +125,7 @@ jobs:
               ./tests/passwordless-package-files.sh
               ./tests/pinned-sources.sh
               ./tests/package-metadata.sh
+              ./tests/pkgname-unique.sh
               ./tests/unpublish-plan.sh
               ./tests/fast-ring-check.sh
               ./tests/controller.sh
