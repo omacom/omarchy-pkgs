@@ -96,6 +96,25 @@ if one of them fails to update, the run restores the others and reports the grou
 targeted sync includes the other packages watching that branch, so requesting
 only `omarchy-dev` also updates `omarchy-settings-dev`.
 
+A package marked `"auto_merge": true` whose feed dates its releases
+(`github`, `npm`, `pypi`, `git_branch`) must say how long a new release is
+held, because it is checked hourly and its update merges itself once the
+build is green, with nobody reading the release:
+
+- `"min_release_age": "24h"` for someone else's project, so a bad or
+  compromised release can be withdrawn upstream before it reaches anyone. On
+  a `github` feed the newest release at least a day old ships, and a newer
+  one waits its own day; with `latest_only`, the update waits until the
+  newest release is a day old. `npm` and `pypi` name only their current
+  release, so there too the update waits until that one is a day old.
+- `"min_release_age": "0"` for Omacom's own projects, to ship at once.
+
+`tests/release-hold.sh` rejects such a package that sets neither. The other
+feeds (`git_tags`, `debian`, `json`, `regex`, `redirect`, `archive`) and
+hooks carry no release date of their own. A hold on one of them fails the
+sync unless the declaration supplies a `published_at`, since the age cannot
+be established otherwise.
+
 ### Enable unattended branch updates
 
 The builder controller box dispatches both groups on systemd timers
