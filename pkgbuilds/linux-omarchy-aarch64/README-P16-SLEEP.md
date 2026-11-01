@@ -47,13 +47,15 @@ claimed. Its SHA-256 is
 
 ## Evidence and limits
 
-A hardware experiment on the P16/BIOS 303 measured 0.497 Wh over 1181.737 s,
-approximately **1.514 W**, including suspend/resume transitions, with the first
-three patches and a temporary LPS0 timing module. That
-measurement belongs to the experimental kernel/module combination. It does
-not establish a hardware result for a newly integrated in-tree LPS0 patch
-or this package build. Validate the final package on hardware before making
-that claim. A boot message or successful resume alone does not prove low power.
+The final five-patch implementation was built as `7.3.0-8-omarchy-n1x-pr1958-1` and physically tested on H7607BA BIOS 303. It boots with no activation argument, no external LPS0 module, and automatic OSI/genpd admission of all 20 CPUs. The in-tree LPS0 driver advertises functions `0x3f8`. NVIDIA 615.78.08, Wi-Fi and the SD reader work after boot.
+
+Two five-second platform PM tests passed, followed by three manual lid cycles with estimated suspended times of 380.317, 152.117 and 1221.047 seconds. The first was confirmed to wake solely on lid open; the logs for the other cycles show resume at lid opening. GPU, Wi-Fi and SD recovered, with no blocking kernel warnings/errors in these captures. An earlier external-module trial had an intermittent Wi-Fi scan failure, which is not claimed fixed generally.
+
+The long integrated-kernel battery test reported 92.296 Wh before and 91.847 Wh immediately after resume: **0.449 Wh over 1225.775 seconds = 1.319 W**, including suspend/resume transitions and approximately 4.728 seconds of awake overhead. AC was disconnected in every captured sample, the gauge was confirmed decreasing below full charge, and neither endpoint snapshot crossed suspend. The following 0.209 Wh consumed while awake during settling is excluded. This validates the integrated implementation on this machine, not physical DRIPS residency or other models/BIOS revisions; gauge update timing and a single long measurement limit precision.
+
+For reference, the earlier three-patch kernel plus temporary LPS0 module measured 0.497 Wh over 1181.737 seconds, about1.514 W including transitions. These are separate trials, not a controlled percentage comparison. No private-layout module is required by this package.
+
+The first local test boot reached emergency mode because the test kernel was installed manually and `linux-modules-cleanup.service` removed its unowned module directory before it was selected. Restoring the modules and registering their directory ownership fixed that packaging mistake without changing the kernel, UKI or PR patches. This is distinct from the package's normal pacman-owned installation.
 
 The function tests exercise actual extracted C code with mock providers,
 `-Werror`, AddressSanitizer and UndefinedBehaviorSanitizer: firmware rejection,
