@@ -238,9 +238,14 @@ approval hold, and arms auto-merge. A push to an `auto/sync-*` or
 `auto/track-branches-*` branch does not cancel the PR's build in flight: the new
 build waits, then reuses every artifact the finished one uploaded.
 
-A red PR stays open for a maintainer and holds back only its own package. A
-later run updates it if upstream moves again, and closes it once it conflicts
-with `master`. A run started by hand with `packages` updates the same
+A red PR stays open for a maintainer and holds back only its own package, and
+a later run closes it once it conflicts with `master`. When only the package's
+own build failed, a later run updates the PR if upstream moves again or
+`master` changes the package or anything outside `pkgbuilds/`; otherwise it
+leaves the PR's branch and finished checks alone instead of rebuilding the
+same proposal, and its report shows the PR as failing rather than pending. A
+PR that failed `self-tests` or `build-isolation`, which read the whole tree, is
+updated every run, and the report says its last checks failed. A run started by hand with `packages` updates the same
 per-package PRs a scheduled run would.
 
 ## Declarative providers and hooks

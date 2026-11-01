@@ -20,7 +20,9 @@ function readResults(path) {
 
 function updateFailure(result) {
   if (result.apply !== 'success') return 'Could not apply the package update';
-  if (result.pr !== 'success') return 'Could not push or update the PR';
+  // "unchanged": the open PR already had this update, so nothing was pushed
+  // and its checks are the ones that finished on its last push.
+  if (!['success', 'unchanged'].includes(result.pr)) return 'Could not push or update the PR';
   if (!['success', 'skipped'].includes(result.merge)) return 'Could not enable auto-merge';
   return '';
 }
@@ -82,7 +84,7 @@ module.exports = async function summarize({ github, context, core, groups,
     problems.push(`Could not read package results: ${error.message}`);
   }
 
-  const updates = { passing: 0, failing: 0, unknown: 0 };
+  const updates = { passing: 0, unchanged: 0, failing: 0, unknown: 0 };
   const checks = { passing: 0, failing: 0, pending: 0, unknown: 0 };
   const rows = [];
   for (const group of groups) {
@@ -93,6 +95,7 @@ module.exports = async function summarize({ github, context, core, groups,
       updates.unknown++;
       problems.push(`${group.packages}: ${failure}`);
     } else if (failure) updates.failing++;
+    else if (result.pr === 'unchanged') updates.unchanged++;
     else updates.passing++;
 
     let pr;
@@ -103,7 +106,8 @@ module.exports = async function summarize({ github, context, core, groups,
     }
     if (pr.warning) core.warning(`${group.packages}: PR checks unavailable: ${pr.warning}`);
     if (pr.checks in checks) checks[pr.checks]++;
-    rows.push({ ...group, ...pr, failure });
+    rows.push({ ...group, ...pr, failure, unchanged: result?.pr === 'unchanged',
+      previous: result?.previous });
   }
 
   const succeeded = problems.length === 0;
@@ -112,6 +116,7 @@ module.exports = async function summarize({ github, context, core, groups,
   if (cadence) content.push(`Package group: ${escape(cadence)}.`);
   if (groups.length) {
     content.push(`PR updates: ${updates.passing} passing, ${updates.failing} failing` +
+      (updates.unchanged ? `, ${updates.unchanged} unchanged` : '') +
       (updates.unknown ? `, ${updates.unknown} unknown` : '') + '.');
     content.push(`PR checks at notification time: ${checks.passing} passing, ${checks.failing} failing, ${checks.pending} pending` +
       (checks.unknown ? `, ${checks.unknown} unknown` : '') + '.');
@@ -122,6 +127,11 @@ module.exports = async function summarize({ github, context, core, groups,
     const reasons = [];
     if (row.failure) reasons.push(row.failure);
     if (row.checks === 'failing') reasons.push('PR checks failing');
+    // A refreshed PR's new checks have only just started; say that its
+    // last ones failed, or a PR that fails every run reads as pending.
+    if (row.checks === 'pending' && row.previous === 'failing' && !row.unchanged) {
+      reasons.push('PR checks failed before this push, running again');
+    }
     if (row.checks === 'unknown') reasons.push('PR checks unavailable');
     if (!reasons.length) continue;
     const target = row.url ? link(row.url, `${row.packages} #${row.number}`) :
@@ -134,7 +144,7 @@ module.exports = async function summarize({ github, context, core, groups,
   core.setOutput('content', html);
   const table = rows.length ? '<table><tr><th>Package / PR</th><th>PR update</th><th>PR checks</th></tr>' +
     rows.map(row => `<tr><td>${row.url ? link(row.url, `${row.packages} #${row.number}`) : escape(row.packages)}</td>` +
-      `<td>${escape(row.failure || 'Passing')}</td><td>${escape(row.checks)}</td></tr>`).join('') + '</table>' : '';
+      `<td>${escape(row.failure || (row.unchanged ? 'Unchanged' : 'Passing'))}</td><td>${escape(row.checks)}</td></tr>`).join('') + '</table>' : '';
   await core.summary.addRaw(html + table).write();
   // Missing reports and orchestration errors remain failures. Individual PR
   // update/check failures are actionable summary data, not a failed sync.
