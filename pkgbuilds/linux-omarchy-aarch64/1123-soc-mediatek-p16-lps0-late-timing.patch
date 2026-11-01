@@ -1,0 +1,208 @@
+diff --git a/drivers/acpi/processor_idle.c b/drivers/acpi/processor_idle.c
+--- a/drivers/acpi/processor_idle.c
++++ b/drivers/acpi/processor_idle.c
+@@ -183,6 +183,16 @@
+ static u64 acpi_lpi_rebuild_generation;
+ static DEFINE_SPINLOCK(acpi_lpi_rebuild_request_lock);
+ 
++#if IS_BUILTIN(CONFIG_ACPI_PROCESSOR)
++bool acpi_processor_n1x_s2idle_active(void)
++{
++	/* The firmware gate is cached before coordinated mode is published. */
++	return READ_ONCE(n1x_coordinated_gate_allowed) &&
++		READ_ONCE(acpi_lpi_lifecycle) == ACPI_LPI_COORDINATED &&
++		READ_ONCE(acpi_lpi_system_sleep);
++}
++#endif
++
+ static void acpi_lpi_rebuild_workfn(struct work_struct *work);
+ static DECLARE_DELAYED_WORK(acpi_lpi_rebuild_work,
+ 			   acpi_lpi_rebuild_workfn);
+@@ -1099,6 +1109,10 @@
+ 
+ static bool acpi_lpi_can_coordinate(void)
+ {
++	/* Keep this downstream port opt-in even on other OSI-capable systems. */
++	if (!n1x_coordinated_allowed())
++		return false;
++
+ 	/* The arm64 FFH hooks are intentionally not linked to processor.ko. */
+ 	return IS_BUILTIN(CONFIG_ACPI_PROCESSOR) &&
+ 	       osc_os_lpi_support_confirmed &&
+diff --git a/include/acpi/processor.h b/include/acpi/processor.h
+--- a/include/acpi/processor.h
++++ b/include/acpi/processor.h
+@@ -504,6 +504,15 @@
+ int acpi_processor_ffh_lpi_prepare_state(struct acpi_lpi_state *lpi);
+ #endif /* CONFIG_ACPI_PROCESSOR_IDLE */
+ 
++#if IS_BUILTIN(CONFIG_ACPI_PROCESSOR) && defined(CONFIG_ACPI_PROCESSOR_IDLE)
++bool acpi_processor_n1x_s2idle_active(void);
++#else
++static inline bool acpi_processor_n1x_s2idle_active(void)
++{
++	return false;
++}
++#endif
++
+ /* in processor_thermal.c */
+ int acpi_processor_thermal_init(struct acpi_processor *pr,
+ 				struct acpi_device *device);
+diff --git a/drivers/soc/mediatek/power_wrap/power_wrap_lps0.c b/drivers/soc/mediatek/power_wrap/power_wrap_lps0.c
+--- a/drivers/soc/mediatek/power_wrap/power_wrap_lps0.c
++++ b/drivers/soc/mediatek/power_wrap/power_wrap_lps0.c
+@@ -6,7 +6,10 @@
+ #include <linux/acpi.h>
+ #include <linux/bits.h>
+ #include <linux/device.h>
++#include <linux/delay.h>
+ #include <linux/pm.h>
++#include <linux/suspend.h>
++#include <acpi/processor.h>
+ 
+ #include "power_wrap.h"
+ 
+@@ -29,6 +32,9 @@
+ 	bool screen_off;
+ 	bool ms_entered;
+ 	bool lps0_entered;
++	bool display_pending;
++	bool late_cycle;
++	bool attempted;
+ };
+ 
+ static int pwrap_lps0_dsm(struct pwrap_lps0 *lps0, unsigned int function)
+@@ -84,11 +90,114 @@
+ 	pwrap_lps0_restore(lps0);
+ }
+ 
++/* Retain each attempted notification until its matching exit succeeds. */
++static int pwrap_lps0_restore_late(struct pwrap_lps0 *lps0)
++{
++	int ret = 0;
++
++	if (lps0->lps0_entered) {
++		if (pwrap_lps0_dsm(lps0, PWRAP_LPS0_EXIT))
++			ret = -EIO;
++		else
++			lps0->lps0_entered = false;
++	}
++	if (lps0->display_pending) {
++		if (pwrap_lps0_dsm(lps0, PWRAP_LPS0_DISPLAY_ON))
++			ret = -EIO;
++		else
++			lps0->display_pending = false;
++	}
++	if (lps0->ms_entered) {
++		if (pwrap_lps0_dsm(lps0, PWRAP_LPS0_MS_EXIT))
++			ret = -EIO;
++		else
++			lps0->ms_entered = false;
++	}
++	if (lps0->screen_off) {
++		if (pwrap_lps0_dsm(lps0, PWRAP_LPS0_SCREEN_ON))
++			ret = -EIO;
++		else
++			lps0->screen_off = false;
++	}
++	if (!ret)
++		lps0->attempted = false;
++	return ret;
++}
++
++static int pwrap_lps0_suspend_late(struct device *dev)
++{
++	struct pwrap_driver_data *priv = dev_get_drvdata(dev);
++	struct pwrap_lps0 *lps0 = priv->lps0;
++	int ret;
++
++	if (!lps0)
++		return 0;
++	/* Do not start another cycle while a previous exit remains unacknowledged. */
++	if (lps0->attempted) {
++		ret = pwrap_lps0_restore_late(lps0);
++		if (ret)
++			return ret;
++	}
++	if (priv->plid != PWRAP_PLID_MT8901 ||
++	    pm_suspend_target_state != PM_SUSPEND_TO_IDLE ||
++	    lps0->functions != 0x3f8 || !acpi_processor_n1x_s2idle_active())
++		return 0;
++
++	lps0->late_cycle = true;
++	lps0->attempted = true;
++	/* AML may change state even if evaluating an entry method fails. */
++	lps0->screen_off = true;
++	lps0->display_pending = true;
++	ret = pwrap_lps0_dsm(lps0, PWRAP_LPS0_SCREEN_OFF);
++	if (ret)
++		goto restore;
++	lps0->ms_entered = true;
++	ret = pwrap_lps0_dsm(lps0, PWRAP_LPS0_MS_ENTRY);
++	if (ret)
++		goto restore;
++	lps0->lps0_entered = true;
++	ret = pwrap_lps0_dsm(lps0, PWRAP_LPS0_ENTRY);
++	if (ret)
++		goto restore;
++
++	/* Dispatch the delayed EC event before suspend_device_irqs(). */
++	msleep(3000);
++	return 0;
++
++restore:
++	/* A failed late callback does not receive resume_early(). */
++	if (pwrap_lps0_restore_late(lps0))
++		dev_warn(dev, "LPS0 late prepare unwind incomplete\n");
++	return ret;
++}
++
++static int pwrap_lps0_resume_early(struct device *dev)
++{
++	struct pwrap_driver_data *priv = dev_get_drvdata(dev);
++	struct pwrap_lps0 *lps0 = priv->lps0;
++
++	if (lps0 && lps0->late_cycle && lps0->attempted)
++		return pwrap_lps0_restore_late(lps0);
++	return 0;
++}
++
++static void pwrap_lps0_complete(struct device *dev)
++{
++	struct pwrap_driver_data *priv = dev_get_drvdata(dev);
++	struct pwrap_lps0 *lps0 = priv->lps0;
++
++	if (!lps0)
++		return;
++	if (lps0->attempted && pwrap_lps0_restore_late(lps0))
++		dev_err(dev, "LPS0 late restore incomplete; pending exits retained\n");
++	lps0->late_cycle = false;
++}
++
+ static int pwrap_lps0_suspend_noirq(struct device *dev)
+ {
+ 	struct pwrap_driver_data *priv = dev_get_drvdata(dev);
+ 
+-	if (priv->lps0)
++	if (priv->lps0 && !priv->lps0->late_cycle)
+ 		pwrap_lps0_prepare(priv->lps0);
+ 	return 0;
+ }
+@@ -97,13 +206,16 @@
+ {
+ 	struct pwrap_driver_data *priv = dev_get_drvdata(dev);
+ 
+-	if (priv->lps0)
++	if (priv->lps0 && !priv->lps0->late_cycle)
+ 		pwrap_lps0_restore(priv->lps0);
+ 	return 0;
+ }
+ 
+ /* The PM core also calls resume_noirq() when a later suspend step fails. */
+ const struct dev_pm_ops pwrap_lps0_pm_ops = {
++	.suspend_late = pwrap_lps0_suspend_late,
++	.resume_early = pwrap_lps0_resume_early,
++	.complete = pwrap_lps0_complete,
+ 	.suspend_noirq = pwrap_lps0_suspend_noirq,
+ 	.resume_noirq = pwrap_lps0_resume_noirq,
+ };
