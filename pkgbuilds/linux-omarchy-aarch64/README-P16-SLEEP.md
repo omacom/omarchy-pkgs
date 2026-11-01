@@ -1,25 +1,14 @@
 # ProArt P16 suspend-to-idle candidate
 
-This package adds an opt-in coordinated CPU idle path for the ASUS ProArt
-P16 H7607BA with NVIDIA N1x, BIOS 303. It does not add a kernel command-line
-option to the boot loader. The private P16 hierarchy and LPS0 timing policy
-require the admission gate below.
+This package activates coordinated suspend-to-idle automatically on ASUS ProArt P16 systems with NVIDIA N1x, identified by the ASUS DMI vendor, the ProArt P16 product family and the NVDA6210 ACPI platform device. It does not require an enable parameter, a particular product-code suffix, a BIOS release number or a whole-DSDT hash. A ProArt P16 without N1x does not match.
 
-## Enable and disable
+## Automatic Activation And Disable Override
 
-Add `acpi.n1x_coordinated_s2idle=1` to a test boot entry's kernel command line
-and boot that entry. Select `s2idle` for the test. Keep a working kernel entry
-available. Remove the option and reboot to disable this candidate; no runtime
-mode-switch command is provided.
+Boot the updated kernel normally and use `s2idle`. To disable this correction for troubleshooting, add `acpi.n1x_coordinated_s2idle=0` to the kernel command line and reboot. The legacy `=1` value is accepted but cannot force activation on unrelated hardware. An invalid value disables the correction and logs a warning. Keep a working kernel entry available during validation.
 
-The option alone does not admit a machine. The gate requires the exact ASUS
-model and BIOS, NVDA6210, a raw DSDT of 73551 bytes with SHA-256
-`5eced75d1b24c7fbd069aa9240695147848bbfca56cce76ab7f4a6a0eba9849f`,
-the firmware OSLPI acknowledgement and cached PSCI OSI capability. Each of
-the 20 CPUs must have the validated four-level hierarchy, three parents and
-seven complete compositions before coordinated mode is published. Changed
-firmware or an incomplete hierarchy is rejected. Ordinary idle retains the
-prepared leaf path; shared-domain selection requires actual suspend-to-idle.
+Hardware matching establishes eligibility. Actual activation still requires the firmware OSLPI acknowledgement and cached PSCI OSI capability. Each of the 20 CPUs must have the validated four-level hierarchy, three parents and seven complete compositions before coordinated mode is published. The raw LPI state shape, registers, LevelIDs, context-loss semantics and topology are checked; incompatible firmware is refused regardless of BIOS version. Ordinary idle retains the prepared leaf path, and shared-domain selection requires actual suspend-to-idle.
+
+Only H7607BA BIOS 303 has been physically tested so far. Removing the version and hash pins does not establish hardware validation of other firmware revisions.
 
 ## Patch order and provenance
 
@@ -27,12 +16,13 @@ The recipe retains its existing N1x prerequisites and then applies:
 
 1. `1120`: defer pciehp event processing across system resume.
 2. `1121`: bounded PCI identity retry for the P16 soldered SD reader.
-3. `1122`: coordinated hierarchy port with the P16 suspend-only policy.
+3. `1122`: coordinated hierarchy port with the original P16 suspend-only policy.
 4. `1123`: in-tree LPS0 late suspend/early resume timing, gated on the admitted
    coordinated P16 entering s2idle, MT8901 platform ID 2, and the expected
    `0x3f8` DSM function mask.
    Entry notifications run before IRQ suspension, with a three-second delay
    for the EC event; failed entries are unwound and pending exits retained.
+5. `1124`: automatic ASUS ProArt P16/N1x family detection, replacing the original explicit-enable, BIOS-release and DSDT-hash restrictions while retaining firmware compatibility checks and a disable override.
 
 The generic PCI event deferral in `1120` is Cole Leavitt's submitted
 [linux-pci patch 1/2](https://patchwork.ozlabs.org/project/linux-pci/patch/20261018163910.132231-1-cole@unwrap.rs/)
@@ -80,7 +70,7 @@ Run the source/checksum and configuration checks without a build:
 bash test.sh
 ```
 
-Run all eleven compiled function tests against a kernel tree after this
+Run the compiled function tests against a kernel tree after this
 recipe's complete patch series has been applied:
 
 ```sh

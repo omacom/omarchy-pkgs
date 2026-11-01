@@ -11,5 +11,9 @@ if [[ -z $kernel_source ]]; then
 fi
 for test in "$package_dir"/test_*.py; do
   [[ $test = */test_package.py ]] && continue
-  python "$test" "$kernel_source"
+  if [[ $test = */test_gate.py ]]; then
+    python "$test" --processor-source "$kernel_source/drivers/acpi/processor_idle.c" --pci-source "$kernel_source/drivers/pci/hotplug/pciehp_core.c"
+  else
+    python "$test" "$kernel_source"
+  fi
 done

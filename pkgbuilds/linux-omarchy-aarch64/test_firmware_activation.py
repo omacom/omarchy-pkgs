@@ -18,59 +18,41 @@ def function(name):
 prefix=r'''
 #include <assert.h>
 #include <stdbool.h>
-#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 #define IS_BUILTIN(x) ((x) == 1)
 #define CONFIG_ACPI_PROCESSOR 1
-#define SHA256_DIGEST_SIZE 32
 #define __init
 #define DMI_SYS_VENDOR 1
 #define DMI_PRODUCT_NAME 2
-#define DMI_BIOS_VERSION 3
-#define ACPI_SIG_DSDT "DSDT"
-#define ACPI_FAILURE(x) ((x)!=0)
-#define pr_info(...) do {} while(0)
+#define pr_info(...) do {} while (0)
+#define pr_warn(...) do {} while (0)
 #define mutex_lock(x) ((void)(x))
 #define mutex_unlock(x) ((void)(x))
-typedef uint8_t u8;
-struct acpi_table_header{unsigned int length;};
-static bool n1x_coordinated_requested,n1x_coordinated_gate_checked,n1x_coordinated_gate_allowed;
+static bool n1x_coordinated_requested,n1x_coordinated_disabled;
+static bool n1x_coordinated_gate_checked,n1x_coordinated_gate_allowed;
 static int n1x_coordinated_gate_lock;
-static bool good_vendor=true,good_model=true,good_bios=true,pep=true,good_hash=true,table_present=true;
-static int gets,puts_count,hashes;
+static bool good_vendor=true,n1x=true;
+static const char *product="ProArt P16 H7607BA";
 static bool osc_os_lpi_support_confirmed,osi_supported;
 static bool acpi_processor_ffh_lpi_hierarchy_supported(void){return osi_supported;}
-static struct acpi_table_header table={.length=73551};
-static int dmi_match(int field,const char *expected){(void)expected;return field==1?good_vendor:field==2?good_model:good_bios;}
-static int acpi_dev_present(const char *hid,const char *uid,int rev){(void)hid;(void)uid;(void)rev;return pep;}
-static int acpi_get_table(const char *signature,int instance,struct acpi_table_header **out){(void)signature;(void)instance;gets++;*out=&table;return table_present?0:1;}
-static void acpi_put_table(struct acpi_table_header *out){assert(out==&table);puts_count++;}
-static void sha256(const u8 *data,size_t len,u8 *out){
- static const u8 digest[32]={0x5e,0xce,0xd7,0x5d,0x1b,0x24,0xc7,0xfb,0xd0,0x69,0xaa,0x92,0x40,0x69,0x51,0x47,0x84,0x8b,0xbf,0xca,0x56,0xcc,0xe7,0x6a,0xb7,0xf4,0xa6,0xa0,0xeb,0xa9,0x84,0x9f};
- assert(data==(const u8 *)&table && len==73551);hashes++;memcpy(out,digest,32);if(!good_hash)out[0]^=1;
-}
-static void reset(void){n1x_coordinated_requested=false;n1x_coordinated_gate_checked=false;n1x_coordinated_gate_allowed=false;good_vendor=good_model=good_bios=pep=good_hash=table_present=true;table.length=73551;gets=puts_count=hashes=0;}
+static bool dmi_match(int field,const char *value){assert(field==DMI_SYS_VENDOR);assert(!strcmp(value,"ASUS"));return good_vendor;}
+static const char *dmi_get_system_info(int field){assert(field==DMI_PRODUCT_NAME);return product;}
+static bool acpi_dev_present(const char *hid,const char *uid,int rev){(void)uid;(void)rev;assert(!strcmp(hid,"NVDA6210"));return n1x;}
+static void reset(void){n1x_coordinated_requested=false;n1x_coordinated_disabled=false;n1x_coordinated_gate_checked=false;n1x_coordinated_gate_allowed=false;good_vendor=true;n1x=true;product="ProArt P16 H7607BA";}
 '''
 main=r'''
 int main(void){
- reset();n1x_coordinated_setup(NULL);assert(!n1x_coordinated_allowed() && gets==0);
- reset();n1x_coordinated_setup("0");assert(!n1x_coordinated_allowed() && gets==0);
- reset();n1x_coordinated_setup("true");assert(!n1x_coordinated_allowed() && gets==0);
- reset();n1x_coordinated_setup("1");assert(n1x_coordinated_allowed() && gets==1 && puts_count==1 && hashes==1);assert(n1x_coordinated_allowed() && gets==1);
- for(int bad=0;bad<7;bad++){
-  reset();n1x_coordinated_setup("1");
-  if(bad==0)good_vendor=false;if(bad==1)good_model=false;if(bad==2)good_bios=false;if(bad==3)pep=false;if(bad==4)good_hash=false;if(bad==5)table_present=false;if(bad==6)table.length++;
-  assert(!n1x_coordinated_allowed());if(bad<4)assert(gets==0);if(bad==4)assert(hashes==1 && puts_count==1);if(bad==5)assert(puts_count==0);if(bad==6)assert(hashes==0 && puts_count==1);
+ for(int disable=0;disable<2;disable++)for(int dmi=0;dmi<2;dmi++)for(int ack=0;ack<2;ack++)for(int osi=0;osi<2;osi++){
+  reset();if(disable)n1x_coordinated_setup("0");good_vendor=dmi;osc_os_lpi_support_confirmed=ack;osi_supported=osi;
+  assert(acpi_lpi_can_coordinate()==(!disable && dmi && ack && osi));
  }
- for(int opt=0;opt<2;opt++)for(int dmi=0;dmi<2;dmi++)for(int ack=0;ack<2;ack++)for(int osi=0;osi<2;osi++){
-  reset();n1x_coordinated_requested=opt;good_model=dmi;osc_os_lpi_support_confirmed=ack;osi_supported=osi;
-  assert(acpi_lpi_can_coordinate()==(opt && dmi && ack && osi));
- }
- puts("PASS actual firmware gate and activation: 16 opt-in/DMI/OSC/OSI combinations; explicit opt-in, DMI/model/BIOS/PEP/hash/table length and cache/refcount negative paths");return 0;
+ reset();n1x_coordinated_setup("1");n1x=false;osc_os_lpi_support_confirmed=osi_supported=true;
+ assert(!acpi_lpi_can_coordinate());
+ puts("PASS actual automatic admission/activation: disable/DMI/OSC/OSI matrix; explicit1 cannot force non-N1X");return 0;
 }
 '''
 with tempfile.TemporaryDirectory(prefix='n1x-lpi-gate-') as td:
- c=Path(td)/'gate.c';exe=Path(td)/'test';c.write_text(prefix+'\n'+function('n1x_coordinated_setup')+'\n'+function('n1x_coordinated_allowed')+'\n'+function('acpi_lpi_can_coordinate')+'\n'+main)
+ c=Path(td)/'gate.c';exe=Path(td)/'test';c.write_text(prefix+'\n'+function('n1x_coordinated_setup')+'\n'+function('n1x_p16_hardware_matches')+'\n'+function('n1x_coordinated_allowed')+'\n'+function('acpi_lpi_can_coordinate')+'\n'+main)
  subprocess.run(['cc','-std=gnu11','-Wall','-Wextra','-Werror','-Wno-misleading-indentation','-fsanitize=address,undefined','-g',str(c),'-o',str(exe)],check=True)
  subprocess.run([str(exe)],check=True)
