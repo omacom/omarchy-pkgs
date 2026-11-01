@@ -1,0 +1,163 @@
+diff --git a/alacritty/src/daemon.rs b/alacritty/src/daemon.rs
+index 7760767..805f041 100644
+--- a/alacritty/src/daemon.rs
++++ b/alacritty/src/daemon.rs
+@@ -59,6 +59,7 @@ pub fn spawn_daemon<I, S>(
+     args: I,
+     master_fd: RawFd,
+     shell_pid: u32,
++    activation_token: Option<&str>,
+ ) -> io::Result<()>
+ where
+     I: IntoIterator<Item = S> + Copy,
+@@ -67,6 +68,11 @@ where
+     let mut command = Command::new(program);
+     command.args(args).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+ 
++    // Lets the launched program raise its window for the input that launched it.
++    if let Some(token) = activation_token {
++        command.env("XDG_ACTIVATION_TOKEN", token);
++    }
++
+     let working_directory = foreground_process_path(master_fd, shell_pid)
+         .ok()
+         .and_then(|path| CString::new(path.into_os_string().into_vec()).ok());
+diff --git a/alacritty/src/display/window.rs b/alacritty/src/display/window.rs
+index 4e5ccca..4f99e00 100644
+--- a/alacritty/src/display/window.rs
++++ b/alacritty/src/display/window.rs
+@@ -1,9 +1,11 @@
+ #[cfg(not(any(target_os = "macos", windows)))]
+ use winit::platform::startup_notify::{
+-    self, EventLoopExtStartupNotify, WindowAttributesExtStartupNotify,
++    self, EventLoopExtStartupNotify, WindowAttributesExtStartupNotify, WindowExtStartupNotify,
+ };
+ #[cfg(not(any(target_os = "macos", windows)))]
+ use winit::window::ActivationToken;
++#[cfg(not(any(target_os = "macos", windows)))]
++use winit::event_loop::AsyncRequestSerial;
+ 
+ #[cfg(all(not(feature = "x11"), not(any(target_os = "macos", windows))))]
+ use winit::platform::wayland::WindowAttributesExtWayland;
+@@ -122,6 +124,10 @@ pub struct Window {
+     current_mouse_cursor: CursorIcon,
+     mouse_visible: bool,
+     ime_inhibitor: ImeInhibitor,
++
++    /// Programs waiting for the activation token requested to launch them.
++    #[cfg(not(any(target_os = "macos", windows)))]
++    pending_launches: Vec<(AsyncRequestSerial, String, Vec<String>)>,
+ }
+ 
+ impl Window {
+@@ -214,9 +220,35 @@ impl Window {
+             window,
+             is_x11,
+             ime_inhibitor: Default::default(),
++            #[cfg(not(any(target_os = "macos", windows)))]
++            pending_launches: Vec::new(),
+         })
+     }
+ 
++    /// Request an activation token to launch a program with, so the program can raise its
++    /// window for the input that launched it. Returns `false` if no token can be requested.
++    #[cfg(not(any(target_os = "macos", windows)))]
++    pub fn request_launch_token(&mut self, program: &str, args: Vec<String>) -> bool {
++        match self.window.request_activation_token() {
++            Ok(serial) => {
++                self.pending_launches.push((serial, program.to_owned(), args));
++                true
++            },
++            Err(_) => false,
++        }
++    }
++
++    /// Take the program waiting for the activation token with this serial.
++    #[cfg(not(any(target_os = "macos", windows)))]
++    pub fn take_pending_launch(
++        &mut self,
++        serial: AsyncRequestSerial,
++    ) -> Option<(String, Vec<String>)> {
++        let index = self.pending_launches.iter().position(|(pending, ..)| *pending == serial)?;
++        let (_, program, args) = self.pending_launches.remove(index);
++        Some((program, args))
++    }
++
+     #[inline]
+     pub fn raw_window_handle(&self) -> RawWindowHandle {
+         self.window.window_handle().unwrap().as_raw()
+diff --git a/alacritty/src/event.rs b/alacritty/src/event.rs
+index 46ecdad..945f391 100644
+--- a/alacritty/src/event.rs
++++ b/alacritty/src/event.rs
+@@ -210,7 +210,6 @@ impl Processor {
+         matches!(
+             event,
+             WindowEvent::KeyboardInput { is_synthetic: true, .. }
+-                | WindowEvent::ActivationTokenDone { .. }
+                 | WindowEvent::DoubleTapGesture { .. }
+                 | WindowEvent::TouchpadPressure { .. }
+                 | WindowEvent::RotationGesture { .. }
+@@ -908,7 +907,7 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
+         S: AsRef<OsStr>,
+     {
+         #[cfg(not(windows))]
+-        let result = spawn_daemon(program, args, self.master_fd, self.shell_pid);
++        let result = spawn_daemon(program, args, self.master_fd, self.shell_pid, None);
+         #[cfg(windows)]
+         let result = spawn_daemon(program, args);
+ 
+@@ -1247,7 +1246,16 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
+             HintAction::Command(command) => {
+                 let mut args = command.args().to_vec();
+                 args.push(text.into());
+-                self.spawn_daemon(command.program(), &args);
++
++                // Launch once the activation token arrives, so the program can raise its window.
++                #[cfg(not(any(target_os = "macos", windows)))]
++                let pending = self.display.window.request_launch_token(command.program(), args.clone());
++                #[cfg(any(target_os = "macos", windows))]
++                let pending = false;
++
++                if !pending {
++                    self.spawn_daemon(command.program(), &args);
++                }
+             },
+             // Copy the text to the clipboard.
+             HintAction::Action(HintInternalAction::Copy) => {
+@@ -1500,6 +1508,16 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
+ }
+ 
+ impl<'a, N: Notify + 'a, T: EventListener> ActionContext<'a, N, T> {
++    /// Launch a program that was waiting for an activation token.
++    #[cfg(not(any(target_os = "macos", windows)))]
++    fn spawn_with_activation_token(&self, program: &str, args: &[String], token: &str) {
++        let token = (!token.is_empty()).then_some(token);
++        match spawn_daemon(program, args, self.master_fd, self.shell_pid, token) {
++            Ok(_) => debug!("Launched {program} with args {args:?}"),
++            Err(err) => warn!("Unable to launch {program} with args {args:?}: {err}"),
++        }
++    }
++
+     fn update_search(&mut self) {
+         let regex = match self.search_state.regex() {
+             Some(regex) => regex,
+@@ -2041,8 +2059,17 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
+                             *self.ctx.dirty = true;
+                         },
+                     },
++                    WindowEvent::ActivationTokenDone { serial, token } => {
++                        #[cfg(not(any(target_os = "macos", windows)))]
++                        if let Some((program, args)) =
++                            self.ctx.display.window.take_pending_launch(serial)
++                        {
++                            self.ctx.spawn_with_activation_token(&program, &args, &token.into_raw());
++                        }
++                        #[cfg(any(target_os = "macos", windows))]
++                        let _ = (serial, token);
++                    },
+                     WindowEvent::KeyboardInput { is_synthetic: true, .. }
+-                    | WindowEvent::ActivationTokenDone { .. }
+                     | WindowEvent::DoubleTapGesture { .. }
+                     | WindowEvent::TouchpadPressure { .. }
+                     | WindowEvent::RotationGesture { .. }
