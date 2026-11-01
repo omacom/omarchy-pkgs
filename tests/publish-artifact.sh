@@ -80,8 +80,47 @@ if pub "$C1"; then fail "aarch64 package into x86_64 should refuse"; else grep -
 cp "$B1" "$T/renamed-1.0-1-x86_64.pkg.tar.zst"
 if pub "$T/renamed-1.0-1-x86_64.pkg.tar.zst"; then fail "filename/PKGINFO mismatch should refuse"; else grep -q 'does not match PKGINFO' "$T/out" && pass "filename must match PKGINFO" || fail "mismatch reason"; fi
 
+# A .PKGINFO makepkg would not write never reaches gpg or repo-add. Each
+# fixture is beta 1.0-2 as makepkg built it with one thing changed in its
+# .PKGINFO or its archive.
+B2=$(mkpkg beta 2 x86_64)
+crafted() { # crafted <label> <sed script for .PKGINFO> [second .PKGINFO]
+  local d="$T/crafted-$1" out="$T/crafted-$1/beta-1.0-2-x86_64.pkg.tar.zst"
+  mkdir -p "$d/pkg" "$d/extra"
+  bsdtar -xf "$B2" -C "$d/pkg"
+  sed -i "$2" "$d/pkg/.PKGINFO"
+  ( cd "$d/pkg"
+    if [[ -n ${3:-} ]]; then
+      printf '%s\n' "$3" > "$d/extra/.PKGINFO"
+      bsdtar --zstd -cf "$out" .PKGINFO usr -C "$d/extra" .PKGINFO
+    else
+      bsdtar --zstd -cf "$out" .PKGINFO usr
+    fi )
+  echo "$out"
+}
+refused() { # refused <description> <package>
+  local before; before=$(entries)
+  if pub "$2"; then fail "$1 should be refused"; fi
+  grep -q 'not one makepkg writes' "$T/out" && [[ "$(entries)" == "$before" && ! -e "$REMOTE/edge/x86_64/${2##*/}" ]] \
+    && pass "refused before signing: $1" || fail "$1: wrong reason or the channel changed"
+}
+[[ $(bsdtar -xOf "$(crafted plain '')" .PKGINFO) == "$(bsdtar -xOf "$B2" .PKGINFO)" ]] || fail "fixture: crafted packages are not beta as built"
+refused "a key that is not a bare word" \
+  "$(crafted subscript "\$a _groups[\$(touch\${IFS}$T/repo-add-ran)] = x")"
+[[ ! -e "$T/repo-add-ran" ]] && pass "a refused package never reaches repo-add" || fail "repo-add read a refused package"
+refused "a value with a second ' = '" "$(crafted equals 's/^pkgname = beta$/pkgname = beta = alpha/')"
+refused "pkgname twice" "$(crafted twice '$a pkgname = alpha')"
+refused "a key makepkg does not write" "$(crafted unknown '$a PATH = /tmp')"
+refused "a NUL byte" "$(crafted nul 's/^pkgname = beta$/pkgname = be\x00ta/')"
+refused "a tab" "$(crafted tab 's/^pkgname = beta$/pkgname = beta\tx/')"
+refused "a second .PKGINFO member" "$(crafted second '' 'pkgbase = alpha')"
+refused "an empty value in a repeated key" "$(crafted empty '$a license = ')"
+refused "a value that reads like a database field" "$(crafted fieldlike '$a license = %NAME%')"
+refused "no pkgbase" "$(crafted nobase '/^pkgbase = /d')"
+pub "$B2" && [[ "$(entries)" == *"beta-1.0-2/ "* ]] && pass "the same package as makepkg built it publishes" || fail "beta 1.0-2"
+
 A3=$(mkpkg alpha 3 any); D1=$(mkpkg delta 1 any)
-pub "$A1" "$A3" "$D1" && [[ "$(entries)" == "alpha-1.0-3/ beta-1.0-1/ delta-1.0-1/ " ]] \
+pub "$A1" "$A3" "$D1" && [[ "$(entries)" == "alpha-1.0-3/ beta-1.0-2/ delta-1.0-1/ " ]] \
   && pass "newer and new packages publish, the rest are dropped" || fail "mixed publish"
 
 # db must verify: pacman can read it and each package's signature checks

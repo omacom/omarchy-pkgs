@@ -55,3 +55,9 @@ while read -r package arch runner; do
 done < <(jq -r '.include[] | "\(.package) \(.arch) \(.runner)"' <<<"$matrix")
 [[ $(jq -r '.include[] | select(.package == "linux-aurora") | .runner' <<<"$matrix") == "$KERNEL_ARM" ]] || fail "linux-aurora in the matrix: $matrix"
 pass "bin/build-matrix puts the runner on every entry"
+
+# Publishing reads no recipe, so the matrix carries what the recipe builds,
+# which is not always the directory's name.
+[[ $("$ROOT/bin/build-matrix" yaru-icon-theme | jq -r '[.include[].pkgbase] | unique | join(" ")') == yaru ]] \
+  || fail "pkgbase of yaru-icon-theme: $("$ROOT/bin/build-matrix" yaru-icon-theme)"
+pass "bin/build-matrix puts the pkgbase on every entry"

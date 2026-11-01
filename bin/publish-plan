@@ -1,0 +1,64 @@
+#!/bin/bash
+# Turn the matrix the changes job hands publish.yml into the plan the
+# publish job works from, one line per entry:
+#
+#   package arch channels publish_arches pkgbase decision
+#
+# with channels and publish_arches comma-separated. Reads the matrix JSON
+# ({"include":[...]}, bin/build-matrix's shape plus a "decision" per entry)
+# on stdin.
+#
+# Everything the publish job needs to know about a package comes from this
+# plan and from the built files themselves. Every field is checked against
+# the fixed set of values it may take, and anything else stops the publish:
+#   package, pkgbase  a package name (PACKAGE_NAME_RE)
+#   arch              one of VALID_ARCHES
+#   channels          one or more of VALID_MIRRORS
+#   publish_arches    one or more of VALID_ARCHES
+#   decision          reuse (a build artifact exists), rebuild (this run's
+#                     rebuild job builds it) or published (the channel already
+#                     serves this tree's version: nothing to do)
+set -euo pipefail
+BUILD_ROOT=$(realpath "${BASH_SOURCE[0]%/*}/..")
+source "$BUILD_ROOT/helpers/paths.sh"
+
+fail() { echo "publish-plan: $*" >&2; exit 1; }
+
+# A list of words, each one of the allowed ones, at least one, no repeats.
+words_in() { # words_in <field> <value> <allowed...>
+  local field=$1 value=$2 word; shift 2
+  local -A seen=()
+  [[ $value =~ ^[a-z0-9_]+( [a-z0-9_]+)*$ ]] || fail "$field is not a list of words: $value"
+  for word in $value; do
+    [[ " $* " == *" $word "* ]] || fail "$field has $word, not one of: $*"
+    [[ -z ${seen[$word]:-} ]] || fail "$field names $word twice"
+    seen[$word]=1
+  done
+}
+
+entries=$(jq -c '
+  if type == "object" and (.include | type) == "array" then .include[]
+  else error("not a matrix: no include list") end
+  | if type == "object"
+      and ([.package, .pkgbase, .arch, .channels, .publish_arches, .decision] | all(type == "string"))
+    then [.package, .pkgbase, .arch, .channels, .publish_arches, .decision]
+    else error("an entry lacks a field or has a non-string one: \(tojson)") end') \
+  || fail "the matrix is not valid"
+
+while IFS= read -r entry; do
+  [[ -n $entry ]] || continue
+  { read -r package; read -r pkgbase; read -r arch; read -r channels; read -r publish_arches; read -r decision; } \
+    < <(jq -r '.[]' <<<"$entry")
+  # A value with a newline would have split into extra lines above.
+  [[ $(jq -r '[.[] | test("\n")] | any' <<<"$entry") == false ]] || fail "a field holds a newline: $entry"
+  [[ $package =~ $PACKAGE_NAME_RE ]] || fail "not a package name: $package"
+  [[ $pkgbase =~ $PACKAGE_NAME_RE ]] || fail "not a pkgbase: $pkgbase"
+  validate_arch "$arch" || fail "$package: not an architecture: $arch"
+  words_in "$package channels" "$channels" $VALID_MIRRORS
+  words_in "$package publish_arches" "$publish_arches" $VALID_ARCHES
+  case $decision in
+  reuse | rebuild | published) ;;
+  *) fail "$package: not a decision: $decision" ;;
+  esac
+  echo "$package $arch ${channels// /,} ${publish_arches// /,} $pkgbase $decision"
+done <<<"$entries"

@@ -42,6 +42,11 @@ reference_arch() {
   ci_arches | head -1
 }
 
+# A package directory or pkgbase name, as anything that signs or publishes
+# accepts one: Arch's pkgname characters, lowercase, not starting with a
+# punctuation character.
+PACKAGE_NAME_RE='^[a-z0-9][a-z0-9@._+-]*$'
+
 # Valid package channels, in pipeline order: packages move edge -> rc -> stable
 VALID_MIRRORS="edge rc stable"
 
