@@ -43,3 +43,39 @@ bash -e -c "source '$ROOT/helpers/artifact-helpers.sh'; pack_packages '$T/built'
 mkdir -p "$T/empty"
 if pack_packages "$T/empty" "$T/x.tar" 2>/dev/null; then fail "packing an empty build dir should fail"; else pass "empty build dir refused"; fi
 if unpack_packages "$T/empty" "$T/out3" 2>/dev/null; then fail "an empty artifact should fail"; else pass "empty artifact refused"; fi
+
+# ---- plan_slots: one pkgbase, one set of filenames, per architecture --------
+mkdir -p "$T/slots/edge/x86_64"
+for f in kernel-1-1-x86_64 kernel-headers-1-1-x86_64 stub-2-1-x86_64; do
+  echo "$f" > "$T/slots/edge/x86_64/$f.pkg.tar.zst"
+done
+{
+  echo "$T/slots/edge/x86_64/kernel-1-1-x86_64.pkg.tar.zst kernel"
+  echo "$T/slots/edge/x86_64/kernel-headers-1-1-x86_64.pkg.tar.zst kernel"
+  echo "$T/slots/edge/x86_64/stub-2-1-x86_64.pkg.tar.zst stub"
+} > "$T/map"
+
+# A split package's files and a standalone package both reach edge; only the
+# split one ships to rc.
+out=$(printf 'kernel kernel x86_64 edge,rc x86_64\nstub stub x86_64 edge x86_64\n' | plan_slots "$T/map" "$T/slots/edge" /dev/null)
+[[ $(grep -c . <<<"$out") == 2 ]] && pass "plan_slots: one line per channel and architecture" || fail "slot lines: $out"
+[[ $(awk '$1=="edge" && $2=="x86_64" {print NF-2}' <<<"$out") == 3 ]] && pass "plan_slots: edge takes every file" || fail "edge files: $out"
+[[ $(awk '$1=="rc" && $2=="x86_64" {print NF-2}' <<<"$out") == 2 ]] && pass "plan_slots: rc takes only the package that ships there" || fail "rc files: $out"
+
+# Two recipes that declare one pkgbase publish one filename twice; whichever
+# artifact was collected last would silently replace the other (#1878).
+out=$(printf 'linux-omarchy kernel x86_64 edge x86_64\nlinux-omarchy-bore kernel x86_64 edge x86_64\n' \
+  | plan_slots "$T/map" "$T/slots/edge" /dev/null 2>&1) \
+  && fail "two recipes sharing a pkgbase were accepted"
+[[ $out == *"linux-omarchy-bore (x86_64) and linux-omarchy both build pkgbase kernel"* ]] \
+  && pass "plan_slots: a pkgbase built by two recipes is refused" || fail "refusal: $out"
+
+# An entry that collects no file would publish nothing and read as success.
+out=$(printf 'ghost ghost x86_64 edge x86_64\n' | plan_slots "$T/map" "$T/slots/edge" /dev/null 2>&1) \
+  && fail "a plan entry with no files was accepted"
+[[ $out == *"no package file has pkgbase ghost"* ]] && pass "plan_slots: an entry with no files is refused" || fail "no-file refusal: $out"
+
+# Unless its source is already published: then there is nothing to collect.
+echo "ghost x86_64" > "$T/skip"
+out=$(printf 'ghost ghost x86_64 edge x86_64\n' | plan_slots "$T/map" "$T/slots/edge" "$T/skip" 2>&1) \
+  && [[ -z $out ]] && pass "plan_slots: an already-published entry may have no files" || fail "already-published: ${out:-accepted with output}"
