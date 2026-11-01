@@ -28,7 +28,7 @@ files=(
   default/applications/mimeapps.list
   default/bashrc
   default/environment.d/10-omarchy-fcitx.conf
-  default/fontconfig/conf.avail/50-omarchy.conf
+  default/fontconfig/conf.avail/51-omarchy.conf
   default/fonts/omarchy/omarchy.ttf
   default/libalpm/hooks/05-omarchy-passwordless-revoke.hook
   default/hypr/toggles/flags.lua
