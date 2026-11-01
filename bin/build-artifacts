@@ -1,0 +1,167 @@
+#!/bin/bash
+# The packages a pull request build ships, into <dest>: the artifacts that
+# run built, and the ones its plan reused from an earlier run (build-pr.yml
+# skips a package whose exact tree already has an artifact). A matrix entry
+# with no artifact in the run built nothing because edge already holds its
+# version, so nothing new ships for it. A reused artifact that cannot be
+# found, or any download or extraction error, fails: the DKMS check must see
+# everything that would publish.
+#
+# The build records what it planned in its dkms-request artifact (\A and \z,
+# not ^ and $, which in jq would let a trailing newline through):
+#   {"trusted": bool, "matrix": {"include": [{"package", "arch"}, ...]},
+#    "reused": ["<package>-<arch>-<tree hash>", ...]}
+# A pull request's run wrote it, so it is data: checked against a strict
+# shape before any of it names a path or a URL. An untrusted build built
+# nothing, so it ships nothing.
+#
+# A reused artifact was made by another run, and any run can upload an
+# artifact under any name: a fork's pull request with its own workflow could
+# upload one named for another pull request's package tree. So a reused
+# artifact counts only when its run is this repository's build-pr.yml, and a
+# fork's run only when its build-pr.yml is its merge base's: the rule
+# dkms-check.yml applies to the build it checks. The newest such artifact
+# wins; none fails.
+#
+# Usage: bin/build-artifacts <dest> <run id> <head sha>
+#   Needs gh (GH_TOKEN), bsdtar and GITHUB_REPOSITORY, in a checkout that has
+#   <head sha>. DEFAULT_BRANCH names the branch forks are compared with (by
+#   default the repository's).
+set -euo pipefail
+
+die() { echo "build-artifacts: $*" >&2; exit 2; }
+(($# == 3)) || die "usage: bin/build-artifacts <dest> <run id> <head sha>"
+dest=$1 run=$2 head=$3
+repo=${GITHUB_REPOSITORY:?build-artifacts needs GITHUB_REPOSITORY}
+[[ $run =~ ^[0-9]+$ ]] || die "run id $run is not a number"
+mkdir -p "$dest"
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+
+# Each artifact unpacks into a fresh directory and must yield packages; every
+# file is then copied with its own error check.
+fetch() { # fetch <artifact id> <label>
+  local id=$1 label=$2 f n=0
+  gh api "repos/$repo/actions/artifacts/$id/zip" >"$work/$label.zip" || die "cannot download artifact $label"
+  mkdir -p "$work/$label" "$work/$label.out"
+  bsdtar -xf "$work/$label.zip" -C "$work/$label" || die "cannot unzip artifact $label"
+  if [[ -f $work/$label/packages.tar ]]; then
+    tar -xf "$work/$label/packages.tar" -C "$work/$label.out" || die "cannot unpack artifact $label"
+  else
+    for f in "$work/$label"/*.pkg.tar.zst; do
+      [[ -e $f || -L $f ]] || continue
+      [[ ${f##*/} =~ ^[A-Za-z0-9@_+][A-Za-z0-9@._+:~-]*\.pkg\.tar\.zst$ ]] ||
+        die "artifact $label holds a file whose name makepkg would not produce"
+      [[ -f $f && ! -L $f ]] || die "artifact $label holds ${f##*/}, which is not a regular file"
+      cp -- "$f" "$work/$label.out/" || die "cannot copy ${f##*/} from artifact $label"
+    done
+  fi
+  for f in "$work/$label.out"/*.pkg.tar.*; do
+    [[ $f != *.sig && (-e $f || -L $f) ]] || continue
+    # The name goes into logs and tab-separated plans: makepkg's names only,
+    # and an odd one is not repeated.
+    [[ ${f##*/} =~ ^[A-Za-z0-9@_+][A-Za-z0-9@._+:~-]*\.pkg\.tar\.[a-z0-9]+$ ]] ||
+      die "artifact $label holds a file whose name makepkg would not produce"
+    # A link would copy whatever it points at on this runner.
+    [[ -f $f && ! -L $f ]] || die "artifact $label holds ${f##*/}, which is not a regular file"
+    cp -- "$f" "$dest/" || die "cannot copy ${f##*/} from artifact $label"
+    n=$((n + 1))
+  done
+  ((n)) || die "artifact $label holds no package"
+  echo "$label: $n package(s)"
+}
+
+# build-pr.yml's blob at a commit, "missing" where it has none (a fork that
+# branched before it existed); any other error stops the collection.
+blob() {
+  local out
+  if out=$(gh api "repos/$repo/contents/.github/workflows/build-pr.yml?ref=$1" --jq .sha 2>&1); then
+    echo "$out"
+  elif [[ $out == *"(HTTP 404)"* ]]; then
+    echo missing
+  else
+    die "cannot read build-pr.yml at $1"
+  fi
+}
+
+# Whether a run may vouch for an artifact (see the top).
+declare -A vouches=()
+trusted_run() { # trusted_run <run id>
+  local id=$1 info head_repo head_sha base ours theirs
+  [[ $id =~ ^[0-9]+$ ]] || return 1
+  [[ -z ${vouches[$id]:-} ]] || return "${vouches[$id]}"
+  info=$(gh api "repos/$repo/actions/runs/$id") || die "cannot read run $id"
+  vouches[$id]=1
+  [[ $(jq -r .path <<<"$info") == .github/workflows/build-pr.yml ]] || return 1
+  [[ $(jq -r .event <<<"$info") =~ ^(pull_request|workflow_dispatch)$ ]] || return 1
+  head_repo=$(jq -r '.head_repository.full_name // ""' <<<"$info")
+  head_sha=$(jq -r '.head_sha // ""' <<<"$info")
+  if [[ $head_repo != "$repo" ]]; then
+    [[ $head_sha =~ ^[0-9a-f]{40}$ ]] || return 1
+    default=${DEFAULT_BRANCH:-$(gh api "repos/$repo" --jq .default_branch)} || die "cannot read the default branch"
+    base=$(gh api "repos/$repo/compare/$default...$head_sha" --jq .merge_base_commit.sha) ||
+      die "cannot find the merge base of run $id's commit"
+    ours=$(blob "$base") || exit 2
+    theirs=$(blob "$head_sha") || exit 2
+    [[ $ours =~ ^([0-9a-f]{40}|missing)$ && $theirs == "$ours" ]] || return 1
+  fi
+  vouches[$id]=0
+}
+
+# This run's artifacts, by name.
+mine=$(gh api --paginate "repos/$repo/actions/runs/$run/artifacts" --jq '.artifacts[] | select(.expired | not) | "\(.name)\t\(.id)"') ||
+  die "cannot list run $run's artifacts"
+
+id=$(awk -F'\t' '$1 == "dkms-request" { print $2; exit }' <<<"$mine")
+[[ -n $id ]] || die "run $run has no dkms-request artifact; it is not a pull request build this check can read"
+gh api "repos/$repo/actions/artifacts/$id/zip" >"$work/request.zip" || die "cannot download run $run's dkms-request"
+mkdir -p "$work/request"
+bsdtar -xf "$work/request.zip" -C "$work/request" || die "cannot unzip run $run's dkms-request"
+request=$work/request/dkms-request.json
+jq -e '
+  (.trusted | type) == "boolean"
+  and (.matrix.include | type) == "array"
+  and all(.matrix.include[]; (.package | type) == "string" and (.package | test("\\A[A-Za-z0-9@_+][A-Za-z0-9@._+-]*\\z"))
+    and (.arch == "x86_64" or .arch == "aarch64"))
+  and (.reused | type) == "array"
+  and all(.reused[]; type == "string" and test("\\A[A-Za-z0-9@_+][A-Za-z0-9@._+-]*-(x86_64|aarch64)-[0-9a-f]{40}\\z"))' \
+  "$request" >/dev/null 2>&1 || die "run $run's dkms-request is malformed"
+if [[ $(jq -r .trusted "$request") != true ]]; then
+  echo "run $run: the build was not approved, so it built nothing"
+  exit 0
+fi
+matrix=$(jq -c .matrix "$request")
+reused=$(jq -c .reused "$request")
+
+while IFS=$'\t' read -r package arch; do
+  [[ -n $package ]] || continue
+  tree=$(git rev-parse -q --verify "$head:pkgbuilds/$package") || die "no pkgbuilds/$package at $head"
+  label=$package-$arch-$tree
+  id=$(awk -F'\t' -v l="$label" '$1 == l { print $2; exit }' <<<"$mine")
+  if [[ -z $id ]]; then
+    echo "$label: nothing built (edge already holds this version)"
+    continue
+  fi
+  fetch "$id" "$label"
+done < <(jq -r '.include[] | "\(.package)\t\(.arch)"' <<<"$matrix")
+
+while IFS= read -r label; do
+  [[ -n $label ]] || continue
+  # Every page, newest first across them: untrusted uploads in front must
+  # not hide a trusted one behind.
+  candidates=$(gh api --paginate "repos/$repo/actions/artifacts?name=$label&per_page=100" \
+    --jq '.artifacts[] | select(.expired | not) | "\(.created_at)\t\(.id)\t\(.workflow_run.id // "")"') ||
+    die "cannot look up artifact $label"
+  candidates=$(sort -r <<<"$candidates" | cut -f2-)
+  [[ -n $candidates ]] || die "the plan reused artifact $label, which no longer exists; rerun the build"
+  id=""
+  while IFS=$'\t' read -r artifact producer; do
+    if trusted_run "$producer"; then
+      id=$artifact
+      break
+    fi
+    echo "$label: artifact $artifact skipped: run $producer cannot vouch for it"
+  done <<<"$candidates"
+  [[ -n $id ]] || die "no artifact $label comes from a build this check trusts; rerun the build"
+  fetch "$id" "$label"
+done < <(jq -r '.[]' <<<"$reused")
