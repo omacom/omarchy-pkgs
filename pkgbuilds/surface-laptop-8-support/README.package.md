@@ -1,6 +1,6 @@
 # surface-laptop-8-support
 
-Hardware support for the 13.8-inch Microsoft Surface Laptop 8 with Snapdragon X2 Elite (`microsoft,surface-laptop8`) that no upstream package carries yet. `linux-omarchy` carries the laptop's kernel patches and device tree from 7.3-4.
+Hardware support for the 13.8-inch Microsoft Surface Laptop 8 with Snapdragon X2 Elite (`microsoft,surface-laptop-8-13p8`) that no upstream package carries yet. `linux-omarchy` carries the laptop's kernel patches and device tree from 7.3-4.
 
 The package contains no Microsoft or Qualcomm DSP firmware; `qcom-firmware-extract` copies that from the machine's own Windows installation.
 
