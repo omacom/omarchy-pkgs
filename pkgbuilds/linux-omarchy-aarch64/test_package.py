@@ -33,6 +33,6 @@ config = (package / 'config.aarch64').read_text().splitlines()
 for option in ['ACPI_PROCESSOR', 'ACPI_PROCESSOR_IDLE', 'PM_GENERIC_DOMAINS', 'CPU_IDLE', 'ARM_PSCI_FW', 'CRYPTO_LIB_SHA256']:
     assert f'CONFIG_{option}=y' in config, option
 sources = arrays[0]
-ordered = [name for name in sources if name.startswith(('1120-', '1121-', '1122-', '1123-', '1124-'))]
-assert len(ordered) == 5 and ordered == sorted(ordered)
+ordered = [name for name in sources if name.startswith(('1120-', '1121-', '1122-', '1123-', '1124-', '1125-'))]
+assert len(ordered) == 6 and ordered == sorted(ordered)
 print(f'PASS package sources/checksums: {checked} local files; coordinated suspend config prerequisites')

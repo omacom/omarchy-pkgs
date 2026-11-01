@@ -45,9 +45,11 @@ a consolidated port, not an upstream-signed patch, and no new sign-offs are
 claimed. Its SHA-256 is
 `8a2319ae87519a94298e5e086c0b5ce2729fda8d6496728147e475033d60d8ae`.
 
+6. `1125`: preserve Ryan Hughes' existing DRIPS latency adjustment for non-coordinated N1x states, including fallback when coordination is refused. Coordinated composite latencies are unchanged.
+
 ## Evidence and limits
 
-The final five-patch implementation was built as `7.3.0-8-omarchy-n1x-pr1958-1` and physically tested on H7607BA BIOS 303. It boots with no activation argument, no external LPS0 module, and automatic OSI/genpd admission of all 20 CPUs. The in-tree LPS0 driver advertises functions `0x3f8`. NVIDIA 615.78.08, Wi-Fi and the SD reader work after boot.
+The five-patch implementation before the fallback-only follow-up was built as `7.3.0-8-omarchy-n1x-pr1958-1` and physically tested on H7607BA BIOS 303. It boots with no activation argument, no external LPS0 module, and automatic OSI/genpd admission of all 20 CPUs. The in-tree LPS0 driver advertises functions `0x3f8`. NVIDIA 615.78.08, Wi-Fi and the SD reader work after boot.
 
 Two five-second platform PM tests passed, followed by three manual lid cycles with estimated suspended times of 380.317, 152.117 and 1221.047 seconds. The first was confirmed to wake solely on lid open; the logs for the other cycles show resume at lid opening. GPU, Wi-Fi and SD recovered, with no blocking kernel warnings/errors in these captures. An earlier external-module trial had an intermittent Wi-Fi scan failure, which is not claimed fixed generally.
 
