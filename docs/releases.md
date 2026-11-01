@@ -13,7 +13,7 @@ and starts the two workflows that build and move packages:
 
 Both run on the bucket inside the same lock as merges, and each records who
 started it and what it published, in its run summary and in the
-[publish log](../README.md#read-the-publish-log).
+[publish log](operations.md#read-the-publish-log).
 
 `bin/omarchy-release` is the front door. A release train has three human
 moments, each one command — and bare `omarchy-release` observes reality
@@ -95,7 +95,7 @@ as `omarchy-4.5.0rc1.iso`), or with `--arch aarch64` for aarch64 (uploaded as
 Run **Promote channel** (`.github/workflows/promote.yml`) from the Actions
 tab. It works on the bucket directly, both architectures, inside the same
 lock as merges, and records who ran it and what moved; see
-[Promote a channel](../README.md#promote-a-channel) for what it holds back.
+[Promote a channel](operations.md#promote-a-channel) for what it holds back.
 
 Carry what has landed on edge into rc, so RC testing runs against the
 package set stable users will get:
