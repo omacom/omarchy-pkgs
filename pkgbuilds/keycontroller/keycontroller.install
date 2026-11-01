@@ -1,0 +1,72 @@
+post_install() {
+  # Replacing the old ssh-keys package runs its pre_remove hook, which stops
+  # the managed services. Restore only persistent, explicitly enabled users;
+  # discovering a loaded unit is not authorization to enable a new instance.
+  local directory=/etc/systemd/system/multi-user.target.wants
+  local link unit state mode uid result=0
+  local -a restore=()
+  if ! systemctl daemon-reload; then
+    echo 'KeyController: systemd reload failed; services were not restored.' >&2
+    return 1
+  fi
+  # list-unit-files does not enumerate enabled template instances reliably.
+  # The helper's persistent WantedBy link is the actual installation record.
+  if [[ ! -e $directory && ! -L $directory ]]; then
+    return 0
+  fi
+  mode=$(/usr/bin/stat -c '%a' -- "$directory") || return 1
+  if [[ -L $directory || ! -d $directory || $(/usr/bin/stat -c '%u' -- "$directory") != 0 || ! $mode =~ ^[0-7]{3,4}$ ]] || (( (8#$mode & 0022) != 0 )); then
+    echo 'KeyController: unsafe persistent enablement directory; services were not restored.' >&2
+    return 1
+  fi
+  # Validate the whole set before starting anything. Only root-owned symlinks
+  # to our exact packaged template and canonical desktop UIDs are accepted.
+  for link in "$directory"/ssh-keysd@*.service; do
+    [[ -e $link || -L $link ]] || continue
+    unit=${link##*/}
+    if [[ ! $unit =~ ^ssh-keysd@([1-9][0-9]{3,9})\.service$ ]]; then
+      echo 'KeyController: unexpected enabled-helper name; services were not restored.' >&2
+      return 1
+    fi
+    uid=${BASH_REMATCH[1]}
+    if (( uid < 1000 || uid > 4294967294 )); then
+      echo 'KeyController: invalid enabled-helper UID; services were not restored.' >&2
+      return 1
+    fi
+    if [[ ! -L $link || $(/usr/bin/stat -c '%u' -- "$link") != 0 || $(/usr/bin/readlink -- "$link") != /usr/lib/systemd/system/ssh-keysd@.service ]]; then
+      echo 'KeyController: unexpected enabled-helper link; services were not restored.' >&2
+      return 1
+    fi
+    if ! state=$(LC_ALL=C systemctl is-enabled "$unit") || [[ $state != enabled ]]; then
+      echo "KeyController: could not confirm persistent enablement of $unit; services were not restored." >&2
+      return 1
+    fi
+    restore+=("$unit")
+  done
+  for unit in "${restore[@]}"; do
+    if ! systemctl start "$unit"; then
+      echo "KeyController: could not restore $unit; inspect its systemd status." >&2
+      result=1
+    fi
+  done
+  return "$result"
+}
+
+post_upgrade() {
+  # A running daemon must not spawn its deleted executable after an upgrade.
+  # Restarting also makes every upgraded instance recover with an empty agent.
+  systemctl daemon-reload || return 1
+  systemctl try-restart 'ssh-keysd@*.service'
+}
+
+pre_remove() {
+  # Stop the sleep lifecycle first; its normal ExecStop may resume helpers.
+  # The coordinator then stops every managed helper/agent/socket and never
+  # restarts them. Pacman owns the sleep.target.requires link and removes it.
+  systemctl stop ssh-keys-sleep.service
+  /usr/lib/ssh-keys/sleep-coordinator remove
+}
+
+post_remove() {
+  systemctl daemon-reload
+}
