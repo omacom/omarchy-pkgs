@@ -180,7 +180,9 @@ entry scoped omarchy-ane-dkms 0.4.9-1 usr/src/omarchy-ane-0.4.9/dkms.conf
 entry scoped xpadneo-dkms 0.10.4-1 usr/src/hid-xpadneo-v0.10.4/dkms.conf
 channel scoped
 printf '%s\n' 'omarchy-ane-dkms aarch64 kernels=linux-aurora-headers' 'xpadneo-dkms x86_64 aarch64' >"$tmp/registry"
-plan=$("$ROOT/bin/check-dkms" plan --arch aarch64 --files-db "$tmp/scoped.files" 2>/dev/null)
+# These three take every kernel: they are about kernels=, not about which
+# kernels the check is for.
+plan=$(OMARCHY_DKMS_KERNELS='*' "$ROOT/bin/check-dkms" plan --arch aarch64 --files-db "$tmp/scoped.files" 2>/dev/null)
 grep -qP '^pair\tlinux-aurora-headers 7.1.12-2-ARCH\tomarchy-ane-dkms ' <<<"$plan" &&
   ! grep -qP '^pair\tlinux-omarchy-headers \S+\tomarchy-ane-dkms ' <<<"$plan" &&
   [[ $(grep -c $'^pair\t.*xpadneo-dkms' <<<"$plan") == 2 ]] &&
@@ -194,7 +196,7 @@ channel scoped
 nvidia_kernels() { awk -F'\t' '$1 == "pair" && $3 ~ /^nvidia-open-dkms / { split($2, k, " "); print k[1] }' | sort | tr '\n' ' '; }
 printf '%s\n' 'omarchy-ane-dkms aarch64 kernels=linux-aurora-headers' 'xpadneo-dkms x86_64 aarch64' \
   'nvidia-open-dkms aarch64 kernels=!linux-aurora-headers' 'v4l2loopback-dkms aarch64' >"$tmp/registry"
-plan=$("$ROOT/bin/check-dkms" plan --arch aarch64 --files-db "$tmp/scoped.files" 2>"$tmp/stderr") || fail "exclude plan: $(cat "$tmp/stderr")"
+plan=$(OMARCHY_DKMS_KERNELS='*' "$ROOT/bin/check-dkms" plan --arch aarch64 --files-db "$tmp/scoped.files" 2>"$tmp/stderr") || fail "exclude plan: $(cat "$tmp/stderr")"
 nvidia=$(nvidia_kernels <<<"$plan")
 [[ $nvidia == "linux-n1x-headers linux-omarchy-headers " ]] && [[ $(grep -c $'^pair\t.*xpadneo-dkms' <<<"$plan") == 3 ]] &&
   pass "a module that excludes a kernel builds against every other one" || fail "exclude: $nvidia / $plan"
@@ -203,11 +205,21 @@ nvidia=$(nvidia_kernels <<<"$plan")
 mkdir -p "$tmp/extra-arm/v4l2loopback-dkms-0.15.4-2"
 cp "$tmp/scoped/v4l2loopback-dkms-0.15.4-2"/* "$tmp/extra-arm/v4l2loopback-dkms-0.15.4-2/"
 bsdtar -czf "$tmp/extra-arm.files" -C "$tmp/extra-arm" .
-plan=$(OMARCHY_DKMS_REGISTRY="$ROOT/ci/dkms-packages" "$ROOT/bin/check-dkms" plan --arch aarch64 --files-db "$tmp/scoped.files" \
+plan=$(OMARCHY_DKMS_KERNELS='*' OMARCHY_DKMS_REGISTRY="$ROOT/ci/dkms-packages" "$ROOT/bin/check-dkms" plan --arch aarch64 --files-db "$tmp/scoped.files" \
   --repo-files-db "extra=$tmp/extra-arm.files" 2>"$tmp/stderr") || fail "registry plan: $(cat "$tmp/stderr")"
 nvidia=$(nvidia_kernels <<<"$plan")
 [[ $nvidia == "linux-n1x-headers linux-omarchy-headers " ]] &&
   pass "ci/dkms-packages builds aarch64 nvidia-open-dkms against every kernel but linux-aurora" || fail "registry nvidia: $nvidia"
+
+# By default the check builds against Omarchy's own kernels only, and names
+# the others it leaves out.
+plan=$("$ROOT/bin/check-dkms" plan --arch aarch64 --files-db "$tmp/scoped.files" 2>"$tmp/stderr") || fail "default kernels: $(cat "$tmp/stderr")"
+! grep -qE '^(kernel|pair)'$'\t''linux-(aurora|n1x)-headers' <<<"$plan" &&
+  [[ $(nvidia_kernels <<<"$plan") == "linux-omarchy-headers " ]] &&
+  ! grep -q 'omarchy-ane-dkms ' <<<"$(grep '^pair' <<<"$plan")" &&
+  grep -q 'linux-aurora-headers (linux-aurora-headers) is not a kernel this check builds against (linux-omarchy\*); left out' "$tmp/stderr" &&
+  grep -q 'linux-n1x-headers (linux-n1x-headers) is not a kernel this check builds against' "$tmp/stderr" &&
+  pass "only linux-omarchy* kernels are built against, and the others are named" || fail "default kernels: $plan $(cat "$tmp/stderr")"
 printf '%s\n' 'tuxedo-drivers-nocompatcheck-dkms x86_64' 'intel-ipu7-camera x86_64' >"$tmp/registry"
 
 # repo= packages come from an Arch repository's files database. They pair
