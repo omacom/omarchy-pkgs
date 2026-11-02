@@ -49,6 +49,8 @@ claimed. Its SHA-256 is
 
 ## Evidence and limits
 
+The recipe is based on the current `7.3-9` package and proposes `7.3-10`, retaining the upstream P14 BIOS 303 keyboard and Copilot-key changes. The physical measurements below belong to the earlier isolated test build; the updated package revision has not been physically retested.
+
 The five-patch implementation before the fallback-only follow-up was built as `7.3.0-8-omarchy-n1x-pr1958-1` and physically tested on H7607BA BIOS 303. It boots with no activation argument, no external LPS0 module, and automatic OSI/genpd admission of all 20 CPUs. The in-tree LPS0 driver advertises functions `0x3f8`. NVIDIA 615.78.08, Wi-Fi and the SD reader work after boot.
 
 Two five-second platform PM tests passed, followed by three manual lid cycles with estimated suspended times of 380.317, 152.117 and 1221.047 seconds. The first was confirmed to wake solely on lid open; the logs for the other cycles show resume at lid opening. GPU, Wi-Fi and SD recovered, with no blocking kernel warnings/errors in these captures. An earlier external-module trial had an intermittent Wi-Fi scan failure, which is not claimed fixed generally.
