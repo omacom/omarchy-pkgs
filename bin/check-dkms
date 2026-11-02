@@ -6,9 +6,11 @@
 # battery_hook_register, and the TUXEDO modules stopped building).
 #
 # Only what changes is checked: a kernel/module pair builds when either side is
-# a package in --local (a pull request's fresh build) or a package whose
-# version differs from --since's (a promotion). With neither, everything is.
-# --packages narrows that to the named packages or pkgbases.
+# a package in --local (a pull request's fresh build) or one that moves in from
+# --from (a promotion into the channel). The pairs are the ones the channel's
+# machines will have: the channel's own packages, with the fresh or moving ones
+# in place of theirs. With neither option, everything is checked. --packages
+# narrows it to the named packages or pkgbases; in a promotion, only they move.
 #
 # Some DKMS packages Omarchy installs come from Arch's own repositories, not
 # from this one (ci/dkms-packages marks them repo=<name>). They are read from
@@ -20,7 +22,7 @@
 #
 # Usage:
 #   bin/check-dkms plan --arch <arch> --files-db <omarchy.files>
-#                       [--local <dir>] [--since-db <omarchy.files>]
+#                       [--local <dir> | --from-db <omarchy.files>]
 #                       [--repo-files-db <repo>=<repo.files> ...] [--from-repos]
 #       Print the kernels, the DKMS packages and the pairs a run would build.
 #   bin/check-dkms matrix --arch <arch> [--channel <channel> | --files-db <omarchy.files>]
@@ -31,7 +33,7 @@
 #       bsdtar). --save-local copies --local's kernels and DKMS packages, all
 #       the legs need, into <dir>. --all keeps every pair of the channel, not
 #       only those that touch --local's packages, which stand in for theirs.
-#   bin/check-dkms run --arch <arch> --channel <channel> [--local <dir>] [--since <channel>]
+#   bin/check-dkms run --arch <arch> --channel <channel> [--local <dir> | --from <channel>]
 #                      [--packages "<name|pkgbase> ..."] [--from-repos]
 #                      [--kernel "<name|pkgbase> [version]"] [--module "<name> [version]"]
 #                      [--results <dir>] [--all]
@@ -89,7 +91,7 @@ if [[ $mode == toolchain ]]; then
   toolchain "$@"
   exit 0
 fi
-arch="" channel="" files_db="" local_dir="" since="" since_db="" only="" from_repos=0
+arch="" channel="" files_db="" local_dir="" from="" from_db="" only="" from_repos=0
 pair_kernel="" pair_module="" save_local="" results_dir="" all_pairs=0
 result_file="" legs_file="" plan_result="" run_url="" note=""
 repo_dbs=()
@@ -99,8 +101,8 @@ while (($#)); do
     --channel) channel=${2:?--channel needs a value}; shift 2 ;;
     --files-db) files_db=${2:?--files-db needs a value}; shift 2 ;;
     --local) local_dir=${2:?--local needs a value}; shift 2 ;;
-    --since) since=${2:?--since needs a value}; shift 2 ;;
-    --since-db) since_db=${2:?--since-db needs a value}; shift 2 ;;
+    --from) from=${2:?--from needs a channel}; shift 2 ;;
+    --from-db) from_db=${2:?--from-db needs a value}; shift 2 ;;
     --packages) only=${2-}; shift 2 ;;
     --repo-files-db) repo_dbs+=("${2:?--repo-files-db needs <repo>=<file>}"); shift 2 ;;
     --from-repos) from_repos=1; shift ;;
@@ -179,6 +181,7 @@ REPO_CHANNEL=""
 ((!download)) || REPO_CHANNEL=$channel
 if [[ -n $local_dir ]]; then
   [[ -d $local_dir ]] || die "--local $local_dir is not a directory"
+  [[ -z $from && -z $from_db ]] || die "--local and --from are two different checks; give one"
 fi
 
 # The registry's entries for this architecture, one line each:
@@ -250,6 +253,8 @@ judge() {
 # The repo= packages this plan really takes from Arch: those this repository
 # does not build itself. Set by plan_for; empty when none were needed.
 ARCH_SOURCED=""
+# Where the packages that move in from --from are downloaded: set with it.
+FROM_PREFIX=""
 
 # Where a channel's machines get Arch packages: each channel has its own
 # snapshot on both architectures (default/pacman/mirrorlist-* in
@@ -287,11 +292,11 @@ classify() {
 
 # Every package of a files database, one line each:
 #   <kind> <name> <version> <file> <sha256> <kver|trees|-> <pkgbase>
-read_db() {
-  local db=$1 dir
+read_db() { # read_db <db> [prefix for its file names]
+  local db=$1 prefix=${2:-} dir
   dir=$(mktemp -d)
   bsdtar -xf "$db" -C "$dir" || { rm -rf "$dir"; die "cannot read $db"; }
-  read_entries "$dir" "$db" "" || { rm -rf "$dir"; exit 2; }
+  read_entries "$dir" "$db" "$prefix" || { rm -rf "$dir"; exit 2; }
   rm -rf "$dir"
 }
 
@@ -377,8 +382,19 @@ read_local() {
   ((found || all_pairs)) || [[ $mode == matrix ]] || die "--local $local_dir holds no package for $arch"
 }
 
-# The packages a check runs over: the channel's, with --local's in place of
-# the published ones of the same name. A local package that no longer ships
+# What a promotion moves into the channel: --from's packages at a version the
+# channel does not have (missing here counts), narrowed by --packages. A
+# fast-ring package is at the same version everywhere, so it never shows here;
+# a pinned one would be checked as if it moved, which only adds pairs.
+moving() { # moving <published> <--from's packages>
+  awk -F'\t' -v only=" $only " 'FNR == 1 { file++ }
+    file == 1 { if ($2 != "") v[$2] = $3; next }
+    $2 != "" && v[$2] != $3 && (only == "  " || index(only, " " $2 " ") || index(only, " " $7 " "))' \
+    <(printf '%s\n' "$1") <(printf '%s\n' "$2")
+}
+
+# The packages a check runs over: the channel's, with --local's (or what
+# moves in from --from) in place of the published ones of the same name. A local package that no longer ships
 # the headers tree or dkms.conf its published one did is an error: the
 # published one must not quietly stand in for it.
 compose() {
@@ -397,8 +413,8 @@ compose() {
   } | awk -F'\t' '$1 == "kernel" || $1 == "dkms"' | sort -t$'\t' -k1,1 -k2,2
 }
 
-# The names a check is about: --local's, or those whose version differs from
-# --since's (missing there counts), or with neither option every one.
+# The names a check is about: --local's, or those that move in from --from, or
+# with neither option every one.
 changed_names() {
   local names
   names=$(changed_unfiltered "$@")
@@ -416,17 +432,11 @@ changed_names() {
 }
 
 changed_unfiltered() {
-  local packages=$1 fresh=$2 previous=$3
-  if ((all_pairs)); then
-    cut -f2 <<<"$packages"
-  elif [[ -n $fresh ]]; then
+  local packages=$1 fresh=$2
+  # A package taken from Arch never moves: it pairs through kernels. This
+  # repository's own copy of a repo= name is in its database, so it does.
+  if ((!all_pairs)) && [[ -n $fresh ]]; then
     cut -f2 <<<"$fresh"
-  elif [[ -n $previous ]]; then
-    # A package taken from Arch does not move with a promotion: it pairs
-    # through kernels. This repository's own copy of a repo= name does move.
-    awk -F'\t' 'FNR == 1 { file++ } file == 1 { if ($0 != "") r[$0] = 1; next }
-      file == 2 { v[$2] = $3; next } $2 != "" && v[$2] != $3 && !($2 in r) { print $2 }' \
-      <(printf '%s\n' "$ARCH_SOURCED") <(printf '%s\n' "$previous") <(printf '%s\n' "$packages")
   else
     cut -f2 <<<"$packages"
   fi
@@ -486,17 +496,20 @@ pairs() {
     }' <(printf '%s\n' "$SCOPES") <(printf '%s\n' "$changed") <(printf '%s\n' "$packages")
 }
 
-plan_for() { # plan_for <channel db> [since db]: sets PACKAGES, CHANGED, PAIRS
-  local fresh="" previous="" published repos="" ours
+plan_for() { # plan_for <channel db> [--from's db]: sets PACKAGES, CHANGED, PAIRS
+  local fresh="" published repos="" ours
   PACKAGES="" CHANGED="" PAIRS=""
+  published=$(read_db "$1")
   if [[ -n $local_dir ]]; then
     fresh=$(read_local)
     # Only matrix gets here with nothing built for this architecture.
     [[ -n $fresh ]] || ((all_pairs)) || return 0
+  elif [[ -n ${2:-} ]]; then
+    fresh=$(moving "$published" "$(read_db "$2" "$FROM_PREFIX")")
+    # A promotion that moves nothing checks nothing, unless asked for more.
+    [[ -n $fresh ]] || ((all_pairs || from_repos)) || return 0
   fi
-  [[ -z ${2:-} ]] || previous=$(read_db "$2")
-  published=$(read_db "$1")
-  if [[ -n $REPOS ]] && repos_needed "$published" "$fresh" "$previous"; then
+  if [[ -n $REPOS ]] && repos_needed "$published" "$fresh"; then
     load_repo_dbs
     repos=$(read_repos "$REPO_CHANNEL" "${repo_dbs[@]}")
     # This repository's own copy, published or fresh, is what pacman installs.
@@ -519,7 +532,7 @@ plan_for() { # plan_for <channel db> [since db]: sets PACKAGES, CHANGED, PAIRS
     awk -F'\t' -v L="$LISTED" 'BEGIN { n = split(L, l, "\n"); for (i = 1; i <= n; i++) ok[l[i]] = 1 }
       $1 == "dkms" && !($2 in ok) { print "check-dkms: note: " $2 " is not in ci/dkms-packages yet; checking it against every kernel" > "/dev/stderr" }' <<<"$fresh"
   fi
-  CHANGED=$(changed_names "$PACKAGES" "$fresh" "$previous")
+  CHANGED=$(changed_names "$PACKAGES" "$fresh")
   PAIRS=$(pairs "$PACKAGES" "$CHANGED")
   # One leg of a matrix: the pairs of one kernel (headers name or pkgbase) and
   # one DKMS package, at the versions the leg names, if it names them. A leg
@@ -549,28 +562,25 @@ legs() {
     END { print (n ? "]" : "[]") }' <(printf '%s\n' "$PACKAGES") <(printf '%s\n' "$PAIRS")
 }
 
-# The channel's files database, and --since's, into $work.
+# The channel's files database, and --from's, into $work. What moves is
+# downloaded from --from's channel, so its file names become URLs there.
 download_channel() {
   curl -fsSL --retry 3 -o "$work/channel.files" "$PKGS_BASE/$channel/$arch/omarchy.files" || die "cannot download $channel/$arch/omarchy.files"
   files_db=$work/channel.files
-  if [[ -n $since ]]; then
-    curl -fsSL --retry 3 -o "$work/since.files" "$PKGS_BASE/$since/$arch/omarchy.files" || die "cannot download $since/$arch/omarchy.files"
-    since_db=$work/since.files
+  if [[ -n $from ]]; then
+    [[ $from != "$channel" ]] || die "--from names the channel itself"
+    curl -fsSL --retry 3 -o "$work/from.files" "$PKGS_BASE/$from/$arch/omarchy.files" || die "cannot download $from/$arch/omarchy.files"
+    from_db=$work/from.files
+    FROM_PREFIX=$PKGS_BASE/$from/$arch/
   fi
 }
 
 # repo= packages can only pair with a kernel. They are needed when every
-# package is checked, with --from-repos, or when a kernel changes: a fresh one,
-# or one whose version differs from --since's.
-repos_needed() { # repos_needed <published> <fresh> <previous>
+# package is checked, with --from-repos, or when a kernel is fresh or moves.
+repos_needed() { # repos_needed <published> <fresh or moving>
   ((from_repos || all_pairs)) && return 0
-  [[ -n $2 || -n $3 ]] || return 0
-  if [[ -n $2 ]]; then
-    awk -F'\t' '$1 == "kernel" { f = 1 } END { exit !f }' <<<"$2"
-    return
-  fi
-  awk -F'\t' 'FNR == 1 { file++ } file == 1 { v[$2] = $3; next }
-    $1 == "kernel" && v[$2] != $3 { f = 1 } END { exit !f }' <(printf '%s\n' "$3") <(printf '%s\n' "$1")
+  [[ -n $2 ]] || return 0
+  awk -F'\t' '$1 == "kernel" { f = 1 } END { exit !f }' <<<"$2"
 }
 
 # plan reads the repo files databases it was given; run downloads them.
@@ -643,9 +653,9 @@ case $mode in
       trap 'rm -rf "$work"' EXIT
       download_channel
     fi
-    [[ -z $since_db || -f $since_db ]] || die "--since-db $since_db is not a file"
+    [[ -z $from_db || -f $from_db ]] || die "--from-db $from_db is not a file"
     check_registry "$(read_db "$files_db")" || exit 1
-    plan_for "$files_db" "$since_db"
+    plan_for "$files_db" "$from_db"
     if [[ -n $PAIRS ]]; then
       print_plan >&2
     else
@@ -664,11 +674,11 @@ case $mode in
 
   plan)
     [[ -f $files_db ]] || die "plan needs --files-db"
-    [[ -z $since_db || -f $since_db ]] || die "--since-db $since_db is not a file"
+    [[ -z $from_db || -f $from_db ]] || die "--from-db $from_db is not a file"
     all=$(read_db "$files_db")
     status=0
     check_registry "$all" || status=1
-    plan_for "$files_db" "$since_db"
+    plan_for "$files_db" "$from_db"
     print_plan
     exit "$status"
     ;;
@@ -679,7 +689,7 @@ case $mode in
     [[ $arch == x86_64 ]] || image=$AARCH64_IMAGE
     mounts=(-v "$ROOT:/src:ro")
     args=(run --arch "$arch" --channel "$channel")
-    [[ -z $since ]] || args+=(--since "$since")
+    [[ -z $from ]] || args+=(--from "$from")
     [[ -z $only ]] || args+=(--packages "$only")
     ((!from_repos)) || args+=(--from-repos)
     ((!all_pairs)) || args+=(--all)
@@ -729,8 +739,8 @@ case $mode in
     work=$(mktemp -d)
     download_channel
     check_registry "$(read_db "$files_db")" || exit 1
-    plan_for "$files_db" "$since_db"
-    echo "==> $channel/$arch${since:+, changes since $since}${local_dir:+, with $local_dir}${pair_kernel:+, kernel $pair_kernel}${pair_module:+, module $pair_module}:"
+    plan_for "$files_db" "$from_db"
+    echo "==> $channel/$arch${from:+, with what moves in from $from}${local_dir:+, with $local_dir}${pair_kernel:+, kernel $pair_kernel}${pair_module:+, module $pair_module}:"
     print_plan | column -t -s $'\t'
     if [[ -z $PAIRS ]]; then
       echo "### DKMS on $channel/$arch: nothing to check" | tee -a "${GITHUB_STEP_SUMMARY:-/dev/null}"
@@ -757,9 +767,10 @@ case $mode in
         FETCHED=$file
         return 0
       fi
-      # repo= packages carry their mirror URL; this repository's, a file name.
+      # repo= packages, and what moves in from --from, carry their URL; the
+      # channel's own, a file name.
       local url=$PKGS_BASE/$channel/$arch/$file
-      [[ $file != https://* ]] || url=$file
+      [[ $file != *://* ]] || url=$file
       FETCHED=$work/${file##*/}
       curl -fsSL --retry 3 -o "$FETCHED" "$url" || die "cannot download $url"
       echo "$sha  $FETCHED" | sha256sum -c --quiet - || die "$file does not match its database's SHA-256"
@@ -842,7 +853,7 @@ case $mode in
       printf '%s\n' "$judged" >"$results_dir/pairs.tsv" || die "cannot write $results_dir/pairs.tsv"
     fi
     {
-      echo "### DKMS on $channel/$arch${since:+, changes since $since}${local_dir:+, with this build}"
+      echo "### DKMS on $channel/$arch${from:+, with what moves in from $from}${local_dir:+, with this build}"
       echo
       echo "| Package | Module | Kernel | Result |"
       echo "|---|---|---|---|"

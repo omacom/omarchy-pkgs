@@ -40,6 +40,8 @@ channel rc
 printf '%s\n' '# test registry' 'tuxedo-drivers-nocompatcheck-dkms x86_64' 'intel-ipu7-camera x86_64' 'xpadneo-dkms x86_64 aarch64' >"$tmp/registry"
 export OMARCHY_DKMS_REGISTRY="$tmp/registry"
 check() { "$ROOT/bin/check-dkms" plan --arch x86_64 --files-db "$tmp/edge.files" "$@" 2>"$tmp/stderr"; }
+# promote <target> <source> [options]: the plan for a promotion into target.
+promote() { "$ROOT/bin/check-dkms" plan --arch x86_64 --files-db "$tmp/$1.files" --from-db "$tmp/$2.files" "${@:3}" 2>"$tmp/stderr"; }
 
 plan=$(check) || fail "a database whose DKMS packages are all listed plans cleanly: $(cat "$tmp/stderr")"
 grep -qP '^kernel\tlinux-omarchy-headers\t7.2.8-9\t7.2.8-9-omarchy$' <<<"$plan" &&
@@ -53,13 +55,50 @@ grep -qP '^dkms\tintel-ipu7-camera\t1.0.6-3\tipu7-drivers-1.0.6,vision-drivers-1
 grep -q 'xpadneo-dkms is listed for x86_64 but not published here' "$tmp/stderr" &&
   pass "a listed package the channel does not publish is only noted" || fail "note: $(cat "$tmp/stderr")"
 
-# A promotion checks the pairs that touch a version the target lacks.
-plan=$(check --since-db "$tmp/rc.files")
+# A promotion checks the pairs that touch a version the target lacks, on the
+# target as the promotion leaves it.
+plan=$(promote rc edge)
 [[ $(grep -c '^pair' <<<"$plan") == 3 ]] && grep -q 'linux-omarchy-headers 7.2.8-9-omarchy' <<<"$plan" &&
-  pass "a new kernel is checked against every module" || fail "new kernel: $plan"
-plan=$("$ROOT/bin/check-dkms" plan --arch x86_64 --files-db "$tmp/edge.files" --since-db "$tmp/edge.files" 2>/dev/null)
+  ! grep -q '7.2.8-8-omarchy' <<<"$plan" &&
+  pass "a new kernel is checked against every module, in place of the target's" || fail "new kernel: $plan"
+plan=$(promote edge edge)
 grep -qx 'nothing to check' <<<"$plan" && ! grep -q '^pair' <<<"$plan" &&
   pass "a promotion that moves no kernel or module checks nothing" || fail "unchanged: $plan"
+
+# A kernel promoted on its own meets the modules the target keeps, not the
+# source's newer ones: stable's machines keep their xpadneo when only
+# linux-omarchy moves from rc.
+entry target linux-omarchy-headers 7.2.8-13 usr/lib/modules/7.2.8-13-omarchy/build/Makefile
+entry target xpadneo-dkms 0.10.4-1 usr/src/hid-xpadneo-v0.10.4/dkms.conf
+entry source linux-omarchy-headers 7.3-3 usr/lib/modules/7.3.0-3-omarchy/build/Makefile
+entry source xpadneo-dkms 0.10.5-1 usr/src/hid-xpadneo-v0.10.5/dkms.conf
+channel target
+channel source
+printf '%s\n' 'xpadneo-dkms x86_64' >"$tmp/registry"
+plan=$(promote target source --packages linux-omarchy-headers) || fail "a narrowed promotion plans: $(cat "$tmp/stderr")"
+[[ $(grep -c '^pair' <<<"$plan") == 1 ]] &&
+  grep -qP '^pair\tlinux-omarchy-headers 7.3.0-3-omarchy\txpadneo-dkms hid-xpadneo-v0.10.4$' <<<"$plan" &&
+  pass "a kernel promoted alone is built against the target's module" || fail "kernel alone: $plan"
+plan=$(promote target source --packages xpadneo-dkms)
+[[ $(grep -c '^pair' <<<"$plan") == 1 ]] &&
+  grep -qP '^pair\tlinux-omarchy-headers 7.2.8-13-omarchy\txpadneo-dkms hid-xpadneo-v0.10.5$' <<<"$plan" &&
+  pass "a module promoted alone is built against the target's kernel" || fail "module alone: $plan"
+plan=$(promote target source)
+[[ $(grep -c '^pair' <<<"$plan") == 1 ]] &&
+  grep -qP '^pair\tlinux-omarchy-headers 7.3.0-3-omarchy\txpadneo-dkms hid-xpadneo-v0.10.5$' <<<"$plan" &&
+  pass "a kernel and a module promoted together are built against each other" || fail "both: $plan"
+legs=$("$ROOT/bin/check-dkms" matrix --arch x86_64 --files-db "$tmp/target.files" --from-db "$tmp/source.files" \
+  --packages linux-omarchy-headers 2>/dev/null)
+[[ $legs == '[{"arch":"x86_64","kernel":"linux-omarchy-headers 7.3-3","module":"xpadneo-dkms 0.10.4-1"}]' ]] &&
+  pass "a promotion's legs name the moving kernel and the target's module" || fail "promotion legs: $legs"
+mkdir -p "$tmp/empty-local"
+if "$ROOT/bin/check-dkms" plan --arch x86_64 --files-db "$tmp/target.files" --from-db "$tmp/source.files" \
+  --local "$tmp/empty-local" >/dev/null 2>"$tmp/stderr"; then
+  fail "--local and --from together must be refused"
+fi
+grep -q -- '--local and --from are two different checks' "$tmp/stderr" &&
+  pass "--local and --from together are refused" || fail "local and from: $(cat "$tmp/stderr")"
+printf '%s\n' '# test registry' 'tuxedo-drivers-nocompatcheck-dkms x86_64' 'intel-ipu7-camera x86_64' 'xpadneo-dkms x86_64 aarch64' >"$tmp/registry"
 
 printf '%s\n' 'intel-ipu7-camera x86_64' >"$tmp/registry"
 if check >/dev/null; then
@@ -176,10 +215,10 @@ grep -qP '^dkms\tv4l2loopback-dkms\t0.15.4-2\tv4l2loopback-0.15.4$' <<<"$plan" &
   pass "a repo= package is read from its repository and checked against every kernel" || fail "repo: $plan"
 ! grep -q 'v4l2loopback-dkms is listed for x86_64 but not published here' "$tmp/stderr" &&
   pass "a repo= package is not reported as missing from this repository" || fail "repo note: $(cat "$tmp/stderr")"
-plan=$(check "${repo[@]}" --since-db "$tmp/edge.files")
+plan=$(promote edge edge "${repo[@]}")
 grep -qx 'nothing to check' <<<"$plan" &&
   pass "a promotion that moves no kernel does not check repo= packages" || fail "repo unchanged: $plan"
-plan=$(check "${repo[@]}" --since-db "$tmp/rc.files")
+plan=$(promote rc edge "${repo[@]}")
 grep -qP '^pair\tlinux-omarchy-headers 7.2.8-9-omarchy\tv4l2loopback-dkms ' <<<"$plan" &&
   pass "a promotion that moves a kernel checks it against repo= packages" || fail "repo kernel: $plan"
 plan=$(check "${repo[@]}" --local "$tmp/local-kernel")
@@ -205,9 +244,9 @@ plan=$(check "${repo[@]}" --local "$tmp/local-own")
 grep -qP '^dkms\tv4l2loopback-dkms\t0.15.5-1\t' <<<"$plan" && [[ $(grep -c $'^dkms\tv4l2loopback-dkms' <<<"$plan") == 1 ]] &&
   grep -q 'v4l2loopback-dkms is built here too' "$tmp/stderr" &&
   pass "this repository's own copy of a repo= package is the one checked" || fail "own copy: $plan $(cat "$tmp/stderr")"
-plan=$(check "${repo[@]}" --since-db "$tmp/edge.files" --from-repos)
+plan=$(promote edge edge "${repo[@]}" --from-repos)
 [[ $(grep -c '^pair' <<<"$plan") == 1 ]] && grep -qP '^pair\tlinux-omarchy-headers 7.2.8-9-omarchy\tv4l2loopback-dkms ' <<<"$plan" &&
-  pass "--from-repos checks repo= packages even alongside --since" || fail "from-repos since: $plan"
+  pass "--from-repos checks repo= packages even in a promotion that moves nothing" || fail "from-repos from: $plan"
 
 # This repository's own copy of a repo= name moves with promotions like any
 # other package.
@@ -218,7 +257,7 @@ entry own-old v4l2loopback-dkms 0.15.4-1 usr/src/v4l2loopback-0.15.4/dkms.conf
 entry own-new v4l2loopback-dkms 0.15.5-1 usr/src/v4l2loopback-0.15.5/dkms.conf
 channel own-old
 channel own-new
-plan=$("$ROOT/bin/check-dkms" plan --arch x86_64 --files-db "$tmp/own-new.files" --since-db "$tmp/own-old.files" "${repo[@]}" 2>/dev/null)
+plan=$(promote own-old own-new "${repo[@]}")
 grep -qP '^pair\tlinux-omarchy-headers 7.2.8-9-omarchy\tv4l2loopback-dkms v4l2loopback-0.15.5$' <<<"$plan" &&
   pass "a promotion that moves this repository's copy of a repo= name checks it" || fail "own copy promoted: $plan"
 printf '%s\n' 'tuxedo-drivers-nocompatcheck-dkms x86_64' 'intel-ipu7-camera x86_64' >"$tmp/registry"
