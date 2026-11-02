@@ -397,13 +397,15 @@ printf '%s\n' 'tuxedo-drivers-nocompatcheck-dkms x86_64' 'intel-ipu7-camera x86_
 
 # container: the leg's outcome is decided out here, from run's exit status
 # and the verdicts it leaves in /results. docker is a stub that writes
-# $FAKE_PAIRS there, prints a workflow command, and exits $FAKE_STATUS.
+# $FAKE_PAIRS there, prints a workflow command, and exits $FAKE_STATUS. It
+# writes the environment it was given to $FAKE_ENV.
 mkdir -p "$tmp/dockerbin"
 cat >"$tmp/dockerbin/docker" <<'DOCKER'
 #!/bin/bash
 results=""
 while (($#)); do
   if [[ $1 == -v && $2 == *:/results ]]; then results=${2%:/results}; fi
+  if [[ $1 == -e ]]; then echo "$2" >>"${FAKE_ENV:-/dev/null}"; fi
   shift
 done
 [[ -z ${FAKE_PAIRS:-} ]] || cp "$FAKE_PAIRS" "$results/pairs.tsv"
@@ -460,6 +462,12 @@ PATH="$tmp/dockerbin:$PATH" FAKE_STATUS=0 FAKE_PAIRS="$tmp/pairs.tsv" "$ROOT/bin
   --kernel "linux-omarchy 7.2.8-9" --module "intel-ipu7-camera 1.0.6-3" --result "$tmp/result.json" >/dev/null 2>&1 || true
 jq -e '.detail | test("[\\[<>]") | not' "$tmp/result.json" >/dev/null &&
   pass "the container's text reaches the result as plain text" || fail "plain: $(cat "$tmp/result.json")"
+: >"$tmp/env"
+PATH="$tmp/dockerbin:$PATH" FAKE_STATUS=0 FAKE_PAIRS="$tmp/pairs.tsv" FAKE_ENV="$tmp/env" OMARCHY_DKMS_KERNELS='*' \
+  OMARCHY_PKGS_BASE=https://pkgs.example.invalid "$ROOT/bin/check-dkms" container --arch x86_64 --channel edge \
+  --kernel "linux-omarchy 7.2.8-9" --module "intel-ipu7-camera 1.0.6-3" --result "$tmp/result.json" >/dev/null 2>&1 || true
+grep -qxF 'OMARCHY_DKMS_KERNELS=*' "$tmp/env" && grep -qxF 'OMARCHY_PKGS_BASE=https://pkgs.example.invalid' "$tmp/env" &&
+  pass "the container plans with the kernels and package base set out here" || fail "container env: $(cat "$tmp/env")"
 
 # report: one verdict for a run, from its legs and their results.
 mkdir -p "$tmp/report"
