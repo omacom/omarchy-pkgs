@@ -735,3 +735,86 @@ printf '%s 0 test\n%s 0 test\n' "$cdsp" "$cdsp_dtb" >"$cdsp_stage/manifest"
   grep -Fq "$rt/fw/$path/qcdxkmsuc8380.mbn.xz" "$rt/root/etc/mkinitcpio.conf.d/qcom-firmware.conf"
   echo "ok - --retire removes unchanged copies once packages ship their whole node, and the zap shader entry follows"
 )
+
+# Retire never splits a node: a changed or unrecorded companion, a name an
+# incomplete node still uses, a board's provided.d entry, a symlinked updates
+# directory and a kernel whose decompressors are unknown all keep the copies.
+(
+  rs="$scratch/retire-safety"
+  p=qcom/x1e80100/TEST/board
+  # fresh NODE:NAME,NAME ...
+  fresh() {
+    local spec name
+    rm -rf "$rs"
+    mkdir -p "$rs/fw/$p" "$rs/fw/updates/$p" "$rs/root/var/lib/omarchy/qcom-firmware"
+    for spec in "$@"; do
+      mkdir -p "$rs/dt/${spec%%:*}"
+      for name in ${spec#*:}; do
+        printf '%s\0' "$p/$name" >>"$rs/dt/${spec%%:*}/firmware-name"
+      done
+    done
+  }
+  copied() {
+    printf 'windows-%s' "$1" >"$rs/fw/updates/$p/$1"
+    printf '%s %s /windows/%s 2026-01-01T00:00:00Z\n' "$p/$1" \
+      "$(sha256sum <"$rs/fw/updates/$p/$1" | cut -d' ' -f1)" "$1" >>"$rs/root/var/lib/omarchy/qcom-firmware/manifest"
+  }
+  packaged() { printf 'packaged-%s' "$1" >"$rs/fw/$p/$1"; }
+  retire() {
+    QCOM_FW_DT_ROOT="$rs/dt" \
+      QCOM_FW_FIRMWARE_ROOT="$rs/fw" \
+      QCOM_FW_ROOT="$rs/root" \
+      QCOM_FW_PROVIDED_DIR="$rs/provided" \
+      QCOM_FW_TEST_EUID=0 \
+      PATH="$test_bin:$PATH" \
+      bash "$extractor" --retire --no-rebuild >/dev/null 2>&1
+  }
+  kept() {
+    local name
+    for name; do
+      [[ -f $rs/fw/updates/$p/$name ]] || { echo "not ok - $name was retired from a node that keeps its copies" >&2; exit 1; }
+    done
+  }
+
+  fresh "remoteproc@0:a.mbn b.elf"; copied a.mbn; copied b.elf; packaged a.mbn; packaged b.elf
+  retire
+  [[ ! -e $rs/fw/updates/$p/a.mbn && ! -e $rs/fw/updates/$p/b.elf ]]
+
+  fresh "remoteproc@0:a.mbn b.elf"; copied a.mbn; copied b.elf; packaged a.mbn; packaged b.elf
+  printf 'edited' >"$rs/fw/updates/$p/b.elf"
+  retire; kept a.mbn b.elf
+
+  fresh "remoteproc@0:a.mbn b.elf"; copied a.mbn; packaged a.mbn; packaged b.elf
+  printf 'unrecorded' >"$rs/fw/updates/$p/b.elf"
+  retire; kept a.mbn b.elf
+
+  fresh "remoteproc@0:a.mbn" "remoteproc@1:a.mbn b.elf"; copied a.mbn; copied b.elf; packaged a.mbn
+  retire; kept a.mbn b.elf
+
+  fresh "remoteproc@0:a.mbn"; copied a.mbn; packaged a.mbn
+  printf 'test,board\0' >"$rs/dt/compatible"
+  mkdir -p "$rs/provided"
+  printf '%s\n' "$p/a.mbn" >"$rs/provided/test,board.list"
+  retire; kept a.mbn
+
+  fresh "remoteproc@0:a.mbn"; copied a.mbn; printf 'packaged' | zstd -q >"$rs/fw/$p/a.mbn.zst"
+  QCOM_FW_KERNEL_CONFIG="$rs/no-config" retire; kept a.mbn
+
+  # updates/qcom leads into the packaged tree: the packaged file stays.
+  fresh "remoteproc@0:a.mbn"; packaged a.mbn
+  rm -r "$rs/fw/updates/qcom"
+  ln -s ../qcom "$rs/fw/updates/qcom"
+  printf '%s %s /windows/a 2026-01-01T00:00:00Z\n' "$p/a.mbn" \
+    "$(sha256sum <"$rs/fw/$p/a.mbn" | cut -d' ' -f1)" >"$rs/root/var/lib/omarchy/qcom-firmware/manifest"
+  retire
+  [[ -f $rs/fw/$p/a.mbn ]]
+
+  # Without a manifest, the zap shader's entry still follows a format change.
+  fresh "gpu@0/zap-shader:zap.mbn"
+  printf 'zap' | xz -c >"$rs/fw/$p/zap.mbn.xz"
+  mkdir -p "$rs/root/etc/mkinitcpio.conf.d"
+  printf 'FILES+=(%s)\n' "$rs/fw/$p/zap.mbn.zst" >"$rs/root/etc/mkinitcpio.conf.d/qcom-firmware.conf"
+  retire
+  grep -Fq "$rs/fw/$p/zap.mbn.xz" "$rs/root/etc/mkinitcpio.conf.d/qcom-firmware.conf"
+  echo "ok - --retire keeps a node's copies unless all of them can go, and repairs the zap shader entry without a manifest"
+)
