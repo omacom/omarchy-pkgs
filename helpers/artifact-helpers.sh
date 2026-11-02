@@ -28,17 +28,19 @@ pack_packages() {
 }
 
 # unpack_packages <artifact dir> <dest>: the packages an unzipped artifact
-# carried, into <dest>. Packed artifacts hold packages.tar; artifacts from
-# builds before packing hold the bare files. The bare form can go once
-# those artifacts have expired (7-day retention).
+# carried in its packages.tar, into <dest>. The tar is a build's output, so
+# it is checked before anything is extracted: plain files only (no links,
+# directories or devices), each at the top level, named as a package, once.
 unpack_packages() {
-  local src=$1 dest=$2 files=()
-  mkdir -p "$dest"
-  if [[ -f "$src/packages.tar" ]]; then
-    tar -xf "$src/packages.tar" -C "$dest"
-    return 0
+  local src=$1 dest=$2 tarball=$1/packages.tar types names
+  [[ -f $tarball && ! -L $tarball ]] || { echo "unpack_packages: no packages.tar in $src" >&2; return 1; }
+  types=$(tar -tvf "$tarball" | cut -c1 | sort -u) || { echo "unpack_packages: unreadable $tarball" >&2; return 1; }
+  names=$(tar -tf "$tarball")
+  if [[ -z $names || $types != "-" ]] || grep -qvE '^[a-zA-Z0-9@_+][a-zA-Z0-9@._+:~-]*\.pkg\.tar\.zst$' <<<"$names" \
+    || [[ -n $(sort <<<"$names" | uniq -d) ]]; then
+    echo "unpack_packages: $tarball holds something other than package files" >&2
+    return 1
   fi
-  mapfile -t files < <(package_files "$src")
-  (( ${#files[@]} )) || { echo "unpack_packages: nothing to unpack in $src" >&2; return 1; }
-  cp -- "${files[@]}" "$dest/"
+  mkdir -p "$dest"
+  tar -xf "$tarball" -C "$dest" --no-same-owner
 }

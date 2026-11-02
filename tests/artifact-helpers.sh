@@ -26,10 +26,23 @@ unpack_packages "$T/artifact" "$T/out" || fail "unpack"
 [[ "$(ls "$T/out" | sort | tr '\n' ' ')" == "$PLAIN $EPOCH " && "$(cat "$T/out/$EPOCH")" == epoch ]] \
   && pass "epoch filename and bytes survive the round trip" || fail "round trip: $(ls "$T/out" | tr '\n' ' ')"
 
-# An artifact uploaded before packing existed: bare package files.
-mkdir -p "$T/old" "$T/out2"; cp "$T/built"/*.pkg.tar.zst "$T/old/"
-unpack_packages "$T/old" "$T/out2" && [[ "$(ls "$T/out2" | sort | tr '\n' ' ')" == "$PLAIN $EPOCH " ]] \
-  && pass "a bare pre-packing artifact still unpacks" || fail "bare artifact"
+# A packages.tar holding anything but top-level package files is refused
+# before anything is extracted.
+bad() { # bad <description> <tar arguments...>
+  local d="$T/bad-$RANDOM"; mkdir -p "$d/in" "$d/out"
+  ( cd "$T/built" && tar -cf "$d/in/packages.tar" "${@:2}" )
+  if unpack_packages "$d/in" "$d/out" 2>/dev/null; then fail "$1 should be refused"; fi
+  [[ -z $(ls -A "$d/out") ]] && pass "refused, nothing extracted: $1" || fail "$1: extracted $(ls -A "$d/out")"
+}
+ln -s /etc/passwd "$T/built/link-1.0-1-x86_64.pkg.tar.zst"
+bad "a symlink named as a package" "$PLAIN" link-1.0-1-x86_64.pkg.tar.zst
+rm "$T/built/link-1.0-1-x86_64.pkg.tar.zst"
+mkdir -p "$T/built/sub"; cp "$T/built/$PLAIN" "$T/built/sub/"
+bad "a package in a subdirectory" "$PLAIN" "sub/$PLAIN"
+bad "a file that is no package" "$PLAIN" omarchy.db.tar.zst
+bad "a package twice" "$PLAIN" "$PLAIN"
+mkdir -p "$T/old"; cp "$T/built/$PLAIN" "$T/old/"
+if unpack_packages "$T/old" "$T/out2" 2>/dev/null; then fail "bare files without packages.tar should be refused"; else pass "an artifact without packages.tar is refused"; fi
 
 # The workflows call these bare under `bash -e`, so any non-zero status
 # inside them ends the step. (The first version used `shopt -p nullglob`,

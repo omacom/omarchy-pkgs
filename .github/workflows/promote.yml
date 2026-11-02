@@ -43,7 +43,31 @@ on:
         default: false
 
 jobs:
+  # The recipe index: the pkgbase each package directory builds and whether
+  # it still builds for each architecture. The promote job reads this index
+  # rather than the recipes.
+  index:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4.4.0
+        with:
+          persist-credentials: false
+      - name: Index the recipes
+        run: |
+          set -euo pipefail
+          bin/recipe-index > recipe-index.tsv
+          echo "$(wc -l < recipe-index.tsv) recipe index lines"
+      - uses: actions/upload-artifact@v4.6.2
+        with:
+          name: recipe-index
+          path: recipe-index.tsv
+          if-no-files-found: error
+          retention-days: 7
+
   promote:
+    needs: index
     runs-on: ubuntu-latest
     environment: publish
     # A first promotion into a sparse channel moves gigabytes.
@@ -56,9 +80,15 @@ jobs:
       cancel-in-progress: false
       queue: max
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4.4.0
         with:
           persist-credentials: false
+
+      # This run's index job's output, nothing older.
+      - uses: actions/download-artifact@v4.3.0
+        with:
+          name: recipe-index
+          path: ${{ runner.temp }}/recipe-index
 
       - name: Check inputs
         id: inputs
@@ -94,18 +124,12 @@ jobs:
           OMARCHY_PUBLISH_PREFIX: ${{ vars.OMARCHY_PUBLISH_PREFIX }}
         run: |
           set -euo pipefail
-          # repo-add, gpg, bsdtar and vercmp are Arch tools: run in the tested
-          # builder image, as the publish job does.
-          builder=ghcr.io/omacom/omarchy-pkg-builder:$(bin/builder-image key --arch x86_64 --mirror edge)
-          # A change to build/ runs before builder-images.yml has published an
-          # image under its new key; build that image here instead.
-          docker pull --quiet "$builder" || docker buildx build --load -t "$builder" --build-arg MIRROR=edge build
+          # repo-add, gpg, bsdtar and vercmp are Arch tools: run in the
+          # publisher image (ci/publisher.Dockerfile: Arch packages only), as
+          # the publish job does.
+          docker build --quiet -t omarchy-publisher -f ci/publisher.Dockerfile ci
           mkdir -p "$RUNNER_TEMP/promote"
           : > "$RUNNER_TEMP/promote/record.jsonl"
-          # The builder image runs as its own unprivileged user, which does
-          # not own the runner's files; let it append to the record.
-          chmod 0777 "$RUNNER_TEMP/promote"
-          chmod 0666 "$RUNNER_TEMP/promote/record.jsonl"
           flags=()
           [[ $DRY_RUN == true ]] && flags+=(--dry-run)
           run() { # run <arch> <record> [flags...]
@@ -114,9 +138,9 @@ jobs:
               -e GPG_PRIVATE_KEY -e GPG_PASSPHRASE -e OMARCHY_PUBLISH_PREFIX \
               -e RCLONE_CONFIG_R2_TYPE -e RCLONE_CONFIG_R2_PROVIDER -e RCLONE_CONFIG_R2_ENDPOINT -e RCLONE_CONFIG_R2_NO_CHECK_BUCKET \
               -e RCLONE_CONFIG_R2_ACCESS_KEY_ID -e RCLONE_CONFIG_R2_SECRET_ACCESS_KEY \
-              -v "$PWD:/w:ro" -v "$RUNNER_TEMP/promote:/out" -w /w "$builder" \
+              -v "$PWD:/w:ro" -v "$RUNNER_TEMP/promote:/out" -v "$RUNNER_TEMP/recipe-index:/index:ro" -w /w omarchy-publisher \
               bin/promote-channel --remote R2:omarchy-pkgs --from "$FROM" --to "$TO" --arch "$arch" \
-                --record "/out/$record" "$@" $PACKAGES
+                --recipe-index /index/recipe-index.tsv --record "/out/$record" "$@" $PACKAGES
           }
           # Plan and check every architecture before either publishes: a
           # refusal on one leaves both channels as they were. The lock is
@@ -209,7 +233,7 @@ jobs:
 
       - name: Keep the record
         if: always() && steps.inputs.outcome == 'success'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v4.6.2
         with:
           name: promote-record-${{ github.run_id }}
           path: promote-record.json

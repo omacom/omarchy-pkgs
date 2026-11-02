@@ -1,0 +1,66 @@
+#!/bin/bash
+# Find the build artifact a workflow reuses for one package on one
+# architecture.
+#
+#   build-artifact <package> <arch>
+#       for publish.yml: the tree master holds for the package now
+#   build-artifact --pr <head repo> <head branch> <head sha> <package> <arch>
+#       for build-pr.yml: the tree the pull request's head holds
+#
+# Prints "<archive download url> <run id>" for the newest unexpired artifact
+# named <package>-<arch>-<tree hash> from a run that matches, or nothing.
+#
+# An artifact is matched by the run that produced it, not by its name alone.
+# For publish.yml that run is one of:
+#   - this run (GITHUB_RUN_ID), whose rebuild job built it;
+#   - publish.yml on master, a merge's own rebuild;
+#   - build-pr.yml at the head commit of the merged pull request that brought
+#     this tree to master: the commit that was reviewed and merged.
+# For a pull request, it is an earlier build-pr.yml run of the same branch:
+# a push that changes one package of fifty rebuilds one.
+# Anything else is built again: at merge from master, or in the PR's run.
+#
+# Needs GH_TOKEN and GITHUB_REPOSITORY; publish.yml's form also needs
+# GITHUB_SHA (the master commit being published) and GITHUB_RUN_ID. Reads git
+# for the tree hash.
+set -euo pipefail
+BUILD_ROOT=$(realpath "${BASH_SOURCE[0]%/*}/..")
+source "$BUILD_ROOT/helpers/paths.sh"
+
+pr_repo="" pr_branch=""
+if [[ ${1:-} == --pr ]]; then
+  pr_repo=${2:?head repository} pr_branch=${3:?head branch} tree=${4:?head commit}
+  shift 4
+else
+  tree=$GITHUB_SHA
+fi
+package=${1:?package}; arch=${2:?arch}
+[[ $package =~ $PACKAGE_NAME_RE ]] || { echo "build-artifact: not a package name: $package" >&2; exit 1; }
+require_valid_arch "$arch"
+repo=$GITHUB_REPOSITORY
+label="$package-$arch-$(git rev-parse "$tree:pkgbuilds/$package")"
+
+# -f encodes the name: a + in it would otherwise read as a space.
+artifacts=$(gh api -X GET --paginate "repos/$repo/actions/artifacts" -f name="$label" -f per_page=100 \
+  --jq '.artifacts[] | select(.expired | not)' | jq -sc .)
+[[ $artifacts != "[]" ]] || exit 0
+
+# The head commit of the merged pull request(s) that last changed this
+# package's tree.
+heads='[]'
+if [[ -z $pr_repo ]]; then
+  last=$(gh api -X GET "repos/$repo/commits" -f sha="$GITHUB_SHA" -f path="pkgbuilds/$package" -f per_page=1 --jq '.[0].sha // empty')
+  if [[ -n $last ]]; then
+    heads=$(gh api "repos/$repo/commits/$last/pulls" \
+      | jq -c --arg repo "$repo" '[.[] | select(.merged_at != null and .base.repo.full_name == $repo) | .head.sha]')
+  fi
+fi
+
+runs='[]'
+for id in $(jq -r '[.[].workflow_run.id] | unique | .[]' <<<"$artifacts"); do
+  runs=$(jq -c --argjson run "$(gh api "repos/$repo/actions/runs/$id" --jq '{id, path, event, head_sha, head_branch, head_repository: .head_repository.full_name}')" '. + [$run]' <<<"$runs")
+done
+
+jq -nr --argjson artifacts "$artifacts" --argjson runs "$runs" --argjson heads "$heads" \
+  --arg repo "$repo" --arg run_id "${GITHUB_RUN_ID:-}" --arg pr_repo "$pr_repo" --arg pr_branch "$pr_branch" \
+  -f "$BUILD_ROOT/helpers/build-artifact.jq"

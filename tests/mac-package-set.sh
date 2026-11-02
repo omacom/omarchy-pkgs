@@ -18,7 +18,7 @@ unset GNUPGHOME
 BIN="$T/root/bin"
 mkdir -p "$BIN" "$T/root/release"
 cp -r "$ROOT/helpers" "$T/root/"
-cp "$ROOT/bin/promote-channel" "$ROOT/bin/publish-artifact" "$ROOT/bin/check-mac-set" "$BIN/"
+cp "$ROOT/bin/promote-channel" "$ROOT/bin/publish-artifact" "$ROOT/bin/check-mac-set" "$ROOT/bin/recipe-index" "$BIN/"
 PKGBUILDS_DIR="$T/root/pkgbuilds"
 recipe() { # recipe <dir> <metadata json> <arch...>
   local dir=$1 meta=$2; shift 2
@@ -40,6 +40,7 @@ mac-boot 1.0-1
 mac-audio 1.0-1
 mac-new none
 EOF
+"$BIN/recipe-index" > "$T/index"
 
 # minimal real packages via makepkg; +name is a provides, anything else a
 # depends; <name>@<pkgbase> builds it under another pkgbase
@@ -73,7 +74,7 @@ pub() { # pub <mirror> <arch> <files...>
 promote() { # promote <from> <to> <arch> [flags and pkgbases...]
   local from=$1 to=$2 arch=$3; shift 3
   : > "$T/record"
-  "$BIN/promote-channel" --remote "$REMOTE" --from "$from" --to "$to" --arch "$arch" --record "$T/record" "$@" >"$T/out" 2>&1
+  "$BIN/promote-channel" --remote "$REMOTE" --recipe-index "$T/index" --from "$from" --to "$to" --arch "$arch" --record "$T/record" "$@" >"$T/out" 2>&1
 }
 entries() { tar -tf "$REMOTE/$1/$2/omarchy.db.tar.zst" | grep '/$' | tr -d / | sort | tr '\n' ' '; }
 mac_result() { jq -r 'select(.type=="mac-set") | .result' "$T/record" | tail -1; }
@@ -156,16 +157,16 @@ promote edge rc aarch64 --fast-ring --dry-run || true
   && pass "a fast-ring promotion that breaks the closure is refused" || fail "fast-ring promotion"
 
 : > "$T/record"
-if "$BIN/check-mac-set" --remote "$REMOTE" --channel rc --arch aarch64 --record "$T/record" --add "$FAST2" >"$T/out" 2>&1; then
+if "$BIN/check-mac-set" --recipe-index "$T/index" --remote "$REMOTE" --channel rc --arch aarch64 --record "$T/record" --add "$FAST2" >"$T/out" 2>&1; then
   fail "a fast-ring publish breaking the closure should refuse"
 fi
 [[ $(mac_result) == refused && "$(names)" == "mac-boot " ]] \
   && pass "the fast-ring publish at merge refuses the same break" || fail "fast-ring publish"
 : > "$T/record"
-"$BIN/check-mac-set" --remote "$REMOTE" --channel rc --arch aarch64 --record "$T/record" --add $(mkpkg alpha 4 aarch64) >"$T/out" 2>&1 \
+"$BIN/check-mac-set" --recipe-index "$T/index" --remote "$REMOTE" --channel rc --arch aarch64 --record "$T/record" --add $(mkpkg alpha 4 aarch64) >"$T/out" 2>&1 \
   && [[ $(mac_result) == untouched ]] && pass "a fast-ring publish with no Mac change passes untouched" || fail "fast-ring untouched"
 : > "$T/record"
-"$BIN/check-mac-set" --remote "$REMOTE" --channel rc --arch aarch64 --record "$T/record" --add $(mkpkg fast-tool 3 aarch64 +tool-api=1) >"$T/out" 2>&1 \
+"$BIN/check-mac-set" --recipe-index "$T/index" --remote "$REMOTE" --channel rc --arch aarch64 --record "$T/record" --add $(mkpkg fast-tool 3 aarch64 +tool-api=1) >"$T/out" 2>&1 \
   && [[ $(mac_result) == pass ]] && pass "a fast-ring publish that keeps the closure resolving passes" || fail "fast-ring pass"
 
 # The merge publish checks every rc and stable slot before any publishes, as
@@ -174,7 +175,7 @@ X86_ALPHA=$(mkpkg alpha 7 x86_64)
 printf 'rc x86_64 %s\nrc aarch64 %s\n' "$X86_ALPHA" "$FAST2" > "$T/slots"
 x86_before=$(entries rc x86_64) arm_before=$(entries rc aarch64)
 : > "$T/record"
-if "$BIN/check-mac-set" --remote "$REMOTE" --slots "$T/slots" --record "$T/record" >"$T/out" 2>&1; then
+if "$BIN/check-mac-set" --recipe-index "$T/index" --remote "$REMOTE" --slots "$T/slots" --record "$T/record" >"$T/out" 2>&1; then
   pub rc x86_64 "$X86_ALPHA"; pub rc aarch64 "$FAST2"
   fail "a publish with one refused slot should refuse"
 fi
@@ -182,14 +183,14 @@ fi
   && [[ "$(entries rc x86_64)" == "$x86_before" && "$(entries rc aarch64)" == "$arm_before" ]] \
   && pass "a merge publish is checked slot by slot before anything publishes; one refusal publishes nothing" || fail "slots: $(cat "$T/record")"
 printf 'rc x86_64 %s\n' "$X86_ALPHA" > "$T/slots"
-"$BIN/check-mac-set" --remote "$REMOTE" --slots "$T/slots" >"$T/out" 2>&1 \
+"$BIN/check-mac-set" --recipe-index "$T/index" --remote "$REMOTE" --slots "$T/slots" >"$T/out" 2>&1 \
   && pass "a merge publish whose slots all pass is cleared" || fail "slots pass"
 
 # --- a pkgbase renamed away from the Mac set ------------------------------------
 # mac-audio rebuilt under a pkgbase the inventory does not list is still a
 # Mac package: the old pkgbase classifies it.
 : > "$T/record"
-if "$BIN/check-mac-set" --remote "$REMOTE" --channel rc --arch aarch64 --record "$T/record" \
+if "$BIN/check-mac-set" --recipe-index "$T/index" --remote "$REMOTE" --channel rc --arch aarch64 --record "$T/record" \
   --add $(mkpkg mac-audio@audio-renamed 2 aarch64) >"$T/out" 2>&1; then
   fail "a Mac package moving to an unlisted pkgbase should refuse"
 fi
@@ -201,7 +202,7 @@ fi
 # --- the inventory itself ------------------------------------------------------
 cp "$T/root/release/mac-inventory.txt" "$T/inventory"
 echo "mac-kernel 1.0-1" >> "$T/root/release/mac-inventory.txt"
-if "$BIN/check-mac-set" --channel rc --arch aarch64 --before "$REMOTE/rc/aarch64/omarchy.db.tar.zst" \
+if "$BIN/check-mac-set" --recipe-index "$T/index" --channel rc --arch aarch64 --before "$REMOTE/rc/aarch64/omarchy.db.tar.zst" \
   --after "$REMOTE/rc/aarch64/omarchy.db.tar.zst" >"$T/out" 2>&1; then
   fail "an inventory listing a pkgbase twice should be refused"
 else
@@ -210,14 +211,14 @@ fi
 cp "$T/inventory" "$T/root/release/mac-inventory.txt"
 echo "mac-ghost 1.0-1" >> "$T/root/release/mac-inventory.txt"
 : > "$T/record"
-if "$BIN/check-mac-set" --remote "$REMOTE" --channel rc --arch aarch64 --record "$T/record" \
+if "$BIN/check-mac-set" --recipe-index "$T/index" --remote "$REMOTE" --channel rc --arch aarch64 --record "$T/record" \
   --add $(mkpkg mac-kernel 3 aarch64 'mac-boot>=1.0') >"$T/out" 2>&1; then
   fail "an inventory pkgbase no recipe builds should refuse"
 fi
 [[ $(mac_result) == refused ]] && says 'the inventory lists mac-ghost, but no recipe on this checkout builds that pkgbase' \
   && pass "an inventory pkgbase no recipe builds is named, with a verdict recorded" || fail "missing recipe"
 cp "$T/inventory" "$T/root/release/mac-inventory.txt"
-if "$BIN/check-mac-set" --remote "$T/nowhere" --channel rc --arch aarch64 --add "$FAST2" >"$T/out" 2>&1; then
+if "$BIN/check-mac-set" --recipe-index "$T/index" --remote "$T/nowhere" --channel rc --arch aarch64 --add "$FAST2" >"$T/out" 2>&1; then
   fail "an unreadable channel should not pass"
 else
   [[ $? == 2 ]] && grep -q 'Cannot list' "$T/out" && pass "an unreadable channel fails closed instead of reading as empty" || fail "unreadable remote"

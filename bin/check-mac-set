@@ -6,7 +6,7 @@
 #   check-mac-set --channel <rc|stable> --arch <arch> --before <db|dir> --add <pkg file...>
 #   check-mac-set --channel <rc|stable> --arch <arch> --remote <remote> --add <pkg file...>
 #   check-mac-set --remote <remote> --slots FILE
-#     [--inventory FILE] [--record FILE]
+#     --recipe-index FILE [--inventory FILE] [--record FILE]
 #
 # The channel's database before the write and as the write would leave it
 # come as package databases (omarchy.db.tar.zst, or the directory it unpacks
@@ -23,7 +23,9 @@
 # A write that moves a Mac package passes only when the channel's whole Mac
 # set would then be the inventory's: every Mac pkgbase it serves at exactly
 # the listed version, none listed as `none`, and none missing that a recipe
-# on this checkout builds for the architecture.
+# on this checkout builds for the architecture. Which recipe builds a
+# pkgbase, and whether it builds for the architecture, comes from the
+# recipe index (--recipe-index, written by bin/recipe-index).
 #
 # A write that touches the closure passes only when every dependency in it
 # still resolves in the channel: a dependency some package in the channel
@@ -44,11 +46,14 @@ BUILD_ROOT=$(realpath "${BASH_SOURCE[0]%/*}/..")
 source "$BUILD_ROOT/helpers/message-helpers.sh"
 source "$BUILD_ROOT/helpers/paths.sh"
 source "$BUILD_ROOT/helpers/package-metadata.sh"
+source "$BUILD_ROOT/helpers/repo-db.sh"
+source "$BUILD_ROOT/helpers/pkginfo.sh"
+source "$BUILD_ROOT/helpers/recipe-index.sh"
 
 INVENTORY=$BUILD_ROOT/release/mac-inventory.txt
 PREFIX=${OMARCHY_PUBLISH_PREFIX:-}
 RECORD=/dev/null
-BEFORE="" AFTER="" REMOTE="" ADD=() ADDING=false SLOTS=""
+BEFORE="" AFTER="" REMOTE="" ADD=() ADDING=false SLOTS="" RECIPE_INDEX=""
 while [[ $# -gt 0 ]]; do
   case $1 in
   --channel) CHANNEL=$2; require_valid_mirror "$CHANNEL"; shift 2 ;;
@@ -59,13 +64,15 @@ while [[ $# -gt 0 ]]; do
   --inventory) INVENTORY=$2; shift 2 ;;
   --record) RECORD=$2; shift 2 ;;
   --slots) SLOTS=$2; shift 2 ;;
+  --recipe-index) RECIPE_INDEX=$2; shift 2 ;;
   --add) ADDING=true; shift ;;
-  -h|--help) sed -n '2,41p' "$0"; exit 0 ;;
+  -h|--help) sed -n '2,43p' "$0"; exit 0 ;;
   -*) print_error "Unknown option: $1"; exit 2 ;;
   *) [[ $ADDING == true ]] || { print_error "Unexpected argument: $1"; exit 2; }; ADD+=("$1"); shift ;;
   esac
 done
 usage() { print_error "$1"; exit 2; }
+[[ -n $RECIPE_INDEX ]] || usage "--recipe-index is required"
 if [[ -n $SLOTS ]]; then
   [[ -n $REMOTE && -f $SLOTS ]] || usage "--slots needs --remote and a slots file"
   status=0
@@ -73,7 +80,7 @@ if [[ -n $SLOTS ]]; then
     [[ -n $channel ]] || continue
     # shellcheck disable=SC2086 # one file name per word
     "$0" --remote "$REMOTE" --channel "$channel" --arch "$arch" --inventory "$INVENTORY" \
-      --record "$RECORD" --add $files || { code=$?; (( code > status )) && status=$code; }
+      --recipe-index "$RECIPE_INDEX" --record "$RECORD" --add $files || { code=$?; (( code > status )) && status=$code; }
   done < "$SLOTS"
   exit "$status"
 fi
@@ -84,6 +91,7 @@ fi
 [[ -z $AFTER || $ADDING == false ]] || usage "--after and --add are alternatives"
 [[ -z $REMOTE || $ADDING == true ]] || usage "--remote reads the database a publish adds to; it needs --add"
 [[ -f $INVENTORY ]] || usage "No Mac inventory at $INVENTORY"
+recipe_index_load "$RECIPE_INDEX" "$ARCH" || exit 2
 
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
@@ -120,21 +128,13 @@ fi
 unpack "$BEFORE" "$WORK/before"
 
 # One line per package: name|version|base|depends|provides, the lists
-# space-separated. Not tabs: read would merge an empty field into the next.
+# space-separated (helpers/repo-db.sh reads the entries). Not tabs: read
+# would merge an empty field into the next.
 entries() { # entries <dir>
-  find "$1" -name desc -print0 | xargs -0r awk '
-    function flush() { if (name != "") print name "|" ver "|" base "|" deps "|" provs; name = ver = base = deps = provs = ""; section = "" }
-    FNR == 1 { flush() }
-    /^%[A-Z0-9]+%$/ { section = $0; next }
-    /^$/ { section = ""; next }
-    section == "%NAME%" { name = $0 }
-    section == "%VERSION%" { ver = $0 }
-    section == "%BASE%" { base = $0 }
-    section == "%DEPENDS%" { deps = deps (deps == "" ? "" : " ") $0 }
-    section == "%PROVIDES%" { provs = provs (provs == "" ? "" : " ") $0 }
-    END { flush() }' | awk -F'|' '$3 == "" { $3 = $1 } 1' OFS='|' | sort
+  repo_db_fields "$1" NAME VERSION BASE DEPENDS PROVIDES \
+    | awk -F'\t' '{ if ($3 == "") $3 = $1; $1 = $1 } 1' OFS='|' | sort
 }
-entries "$WORK/before" > "$WORK/before.tsv"
+entries "$WORK/before" > "$WORK/before.tsv" || usage "Cannot read $CHANNEL/$ARCH as it is"
 
 if [[ $ADDING == true ]]; then
   # As publish-artifact would leave it: each file replaces its name's entry
@@ -143,11 +143,13 @@ if [[ $ADDING == true ]]; then
   cp "$WORK/before.tsv" "$WORK/after.tsv"
   for f in "${ADD[@]}"; do
     [[ -f $f ]] || usage "Not a package file: $f"
-    bsdtar -xOf "$f" .PKGINFO | awk -F' = ' '
+    # Read as publish-artifact and repo-add read it (helpers/pkginfo.sh).
+    fields=$(pkginfo_fields "$f") || usage "Not a package makepkg writes: $f"
+    awk -F'\t' '
       $1 == "pkgname" { name = $2 } $1 == "pkgver" { ver = $2 } $1 == "pkgbase" { base = $2 }
       $1 == "depend" { deps = deps (deps == "" ? "" : " ") $2 }
       $1 == "provides" { provs = provs (provs == "" ? "" : " ") $2 }
-      END { print name "|" ver "|" (base == "" ? name : base) "|" deps "|" provs }' > "$WORK/new.tsv"
+      END { print name "|" ver "|" (base == "" ? name : base) "|" deps "|" provs }' <<<"$fields" > "$WORK/new.tsv"
     IFS='|' read -r name ver _ < "$WORK/new.tsv"
     have=$(awk -F'|' -v n="$name" '$1 == n { print $2 }' "$WORK/after.tsv")
     [[ -n $have ]] && (( $(vercmp "$ver" "$have") <= 0 )) && continue
@@ -156,7 +158,7 @@ if [[ $ADDING == true ]]; then
   done
 else
   unpack "$AFTER" "$WORK/after"
-  entries "$WORK/after" > "$WORK/after.tsv"
+  entries "$WORK/after" > "$WORK/after.tsv" || usage "Cannot read $CHANNEL/$ARCH as the write would leave it"
 fi
 
 # --- what moves --------------------------------------------------------------
@@ -264,14 +266,7 @@ fi
 problem() { printf '%s\t%s\n' "$1" "$2" >> "$WORK/problems"; }
 
 recipe_for() { # recipe_for <pkgbase>: the recipe on this checkout that builds it
-  local dir
-  if [[ -d $PKGBUILDS_DIR/$1 ]] && [[ $(package_pkgbase "$PKGBUILDS_DIR/$1" "$ARCH") == "$1" ]]; then
-    echo "$PKGBUILDS_DIR/$1"; return
-  fi
-  while IFS= read -r dir; do
-    [[ $(package_pkgbase "$dir" "$ARCH") == "$1" ]] && { echo "$dir"; return; }
-  done < <(package_dirs)
-  return 0
+  echo "${RECIPE[$1]:-}"
 }
 
 if (( ${#moved_mac[@]} )); then
@@ -298,7 +293,7 @@ if (( ${#moved_mac[@]} )); then
       continue
     fi
     [[ $want != none && -z ${SEEN_BASE[$base]:-} ]] || continue
-    package_supports_arch "$recipe" "$ARCH" || continue
+    [[ ${BUILDS[$base]} == yes ]] || continue
     problem "$base" "the qualified Mac set has $base $want; $CHANNEL/$ARCH would not have it"
   done
 fi
