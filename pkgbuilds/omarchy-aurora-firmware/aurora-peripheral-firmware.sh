@@ -19,6 +19,9 @@ if grep -aq 'apple,j700' "$compatible"; then
     echo 'Aurora: ALS calibration missing; Neo AOP probe deferred' >&2
   fi
   radio_ready=true
+  # Only the world policy gates the radios: the driver falls back to it for
+  # any country without its own policy file, so a missing US.bin (or any
+  # other country) must not keep Wi-Fi, and with it Bluetooth, down.
   for name in \
     mediatek/mt7932/IZUBA_WIFI_MT7932_patch_mcu_1_2_hdr.bin \
     mediatek/mt7932/IZUBA_W7932_2.bin \
@@ -28,7 +31,7 @@ if grep -aq 'apple,j700' "$compatible"; then
     mediatek/MT7932B1_OS_TypeB_0.1.133.0_260128190103.bin \
     mediatek/MT7932_PTB_IzubaA_0.1.0.0_20251021141303.ptx \
     mediatek/j700-mt7932-btcal.bin mediatek/j700-mt7932-bdaddr.bin \
-    mediatek/mt7932/policy/US.bin mediatek/mt7932/policy/world-XZ.bin; do
+    mediatek/mt7932/policy/world-XZ.bin; do
     if ! has_firmware "$name"; then
       echo "Aurora: required firmware is missing: $name; peripheral probe deferred" >&2
       radio_ready=false
@@ -37,10 +40,15 @@ if grep -aq 'apple,j700' "$compatible"; then
 fi
 
 if "$neo"; then
-  if "$radio_ready"; then "$modprobe_command" mt7932-fullmac; fi
+  if "$radio_ready"; then
+    "$modprobe_command" mt7932-fullmac
+    # Only the root firmware unit opts in. The initrd keeps Bluetooth out so
+    # its Wi-Fi module dependency cannot probe before firmware extraction.
+    if [ "${AURORA_ADMIT_BLUETOOTH:-0}" = 1 ]; then
+      "$modprobe_command" mt7932_bt_pcie
+    fi
+  fi
 else
   # Preserve ordinary non-Neo admission even if vendor extraction failed.
   "$modprobe_command" aop
 fi
-# Bluetooth is deliberately admitted later by its existing gated PCI service,
-# after root firmware extraction. It is not necessary to unlock the root disk.

@@ -36,6 +36,7 @@ Path(os.environ["TEST_OUTPUT"]).write_text(json.dumps({
     "ignore": os.environ.get("HERMES_DESKTOP_IGNORE_EXISTING"),
     "root": os.environ.get("HERMES_DESKTOP_HERMES_ROOT"),
     "inherited": [name for name in ("ELECTRON_RUN_AS_NODE", "PYTHONPATH", "PYTHONHOME") if name in os.environ],
+    "app": Path(sys.argv[0]).parent.name,
 }))
 ''')
     executable.chmod(0o755)
@@ -96,12 +97,14 @@ def with_hermes_node_path(env=None):
                      a11y=None, ignore=None):
         subprocess.run(launch + list(args), env={**env, **(overrides or {})}, cwd=home, check=True)
         result = json.loads(output.read_text())
+        app = result.pop("app")
         assert result == {"args": ["--disable-setuid-sandbox", *expected_args],
                           "home": str(home / ".hermes"), "store": store, "gpu": gpu,
                           "ozone": ozone, "cwd": str(home), "a11y": a11y, "ignore": ignore, "root": None,
                           "inherited": []}, result
         assert not forbidden_output.exists(), "launcher invoked the Omarchy installer or sudo"
         output.unlink()
+        return app
 
     wayland = {"WAYLAND_DISPLAY": "wayland-1"}
     check_launch(overrides=wayland, expected_args=["--ozone-platform=wayland"])
@@ -212,6 +215,25 @@ def load_config():
     return json.loads(path.read_text()) if path.exists() else {}
 """)
     shutil.move(root / "legacy-venv", runtime / "venv")
+
+    # electron-builder names the ARM app linux-arm64-unpacked. An ARM runtime
+    # seeded under the x86_64 name holds both once `hermes update` rebuilds it,
+    # and the launcher opens the newer, as Hermes does.
+    arm = runtime / "apps/desktop/release/linux-arm64-unpacked"
+    shutil.copytree(native, arm)
+    later = executable.stat().st_mtime + 60
+    os.utime(arm / "Hermes", (later, later))
+    app = check_launch(overrides=wayland, expected_args=["--ozone-platform=wayland"])
+    assert app == "linux-arm64-unpacked", app
+    os.utime(executable, (later + 60, later + 60))
+    app = check_launch(overrides=wayland, expected_args=["--ozone-platform=wayland"])
+    assert app == "linux-unpacked", app
+    seeded = root / "seeded-native"
+    native.rename(seeded)
+    app = check_launch(overrides=wayland, expected_args=["--ozone-platform=wayland"])
+    assert app == "linux-arm64-unpacked", app
+    seeded.rename(native)
+    shutil.rmtree(arm)
 
     def check_namespace_failure():
         for code in ("1", "127"):

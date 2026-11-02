@@ -1,0 +1,106 @@
+#!/bin/bash
+# Tell omacom/omarchy-mac-installer that a publish changed the edge channel
+# for aarch64, so it can decide whether to build a new Mac image.
+#
+#   mac-installer-dispatch [--dry-run] RECORD
+#
+# RECORD is the publish job's publish-record.json. Only packages the record
+# shows as published into edge/aarch64 are sent (debug packages left out),
+# even when a later slot failed;
+# a publish that touched no edge/aarch64 slot (x86_64-only, rc/stable only,
+# a failed slot) sends nothing, and so does a proof run into a scratch
+# prefix. The installer, not this script, decides which packages matter to
+# its image.
+#
+# Sends a repository_dispatch (event_type edge-mac-changed) whose
+# client_payload is:
+#   {schema: 1, channel: "edge", arch: "aarch64",
+#    packages: [{name, version}], database_sha256 (if it could be read),
+#    source: {repository, commit, run}}
+#
+# Opt-in: without MAC_INSTALLER_DISPATCH_TOKEN it prints a notice and exits
+# 0. A failed dispatch is a warning, never a failure: the packages are
+# already published, and the installer can always be built by hand.
+# --dry-run prints the payload instead of sending it, and needs no token.
+set -euo pipefail
+
+REPOSITORY=omacom/omarchy-mac-installer
+EVENT_TYPE=edge-mac-changed
+DB_URL=https://pkgs.omarchy.org/edge/aarch64/omarchy.db
+DRY_RUN=false
+RECORD=""
+while [[ $# -gt 0 ]]; do
+  case $1 in
+  --dry-run) DRY_RUN=true; shift ;;
+  -h|--help) sed -n '2,24p' "$0"; exit 0 ;;
+  -*) echo "Unknown option: $1" >&2; exit 64 ;;
+  *) [[ -z $RECORD ]] || { echo "One record only" >&2; exit 64; }; RECORD=$1; shift ;;
+  esac
+done
+[[ -n $RECORD ]] || { echo "Usage: mac-installer-dispatch [--dry-run] RECORD" >&2; exit 64; }
+
+notice() { echo "::notice title=Mac installer dispatch::$1"; }
+warning() { echo "::warning title=Mac installer dispatch::$1"; }
+
+if ! jq -e 'type == "object" and (.slots | type == "array")' "$RECORD" >/dev/null 2>&1; then
+  warning "$RECORD is not a publish record; nothing sent"
+  exit 0
+fi
+
+target=$(jq -r '.target // ""' "$RECORD")
+if [[ $target != live ]]; then
+  notice "publish target is ${target:-unknown}, not the live channels; nothing sent"
+  exit 0
+fi
+
+# File names, without .pkg.tar.zst, are <name>-<pkgver>-<pkgrel>-<arch>; a
+# pkgver may carry an epoch (1:2.0) but never a dash.
+packages=$(jq -c '
+  [.slots[] | select(.mirror == "edge" and .arch == "aarch64" and .status == "published") | .packages[]
+   | capture("^(?<name>.+)-(?<version>[^-]+-[^-]+)-(?<arch>[^-]+)$")
+   | select(.name | endswith("-debug") | not)
+   | {name, version}]
+  | unique_by(.name)' "$RECORD")
+if [[ $(jq length <<<"$packages") == 0 ]]; then
+  notice "nothing was published into edge/aarch64; nothing sent"
+  exit 0
+fi
+
+if [[ $DRY_RUN != true && -z ${MAC_INSTALLER_DISPATCH_TOKEN:-} ]]; then
+  notice "MAC_INSTALLER_DISPATCH_TOKEN is not set; not notifying $REPOSITORY"
+  exit 0
+fi
+
+# The database this publish just wrote: the publish job holds the publish
+# lock, so nothing else has written edge/aarch64 since. The query string and
+# no-cache header get past the CDN's copy (see build/build.sh). Leave it out
+# rather than guess when it cannot be read.
+database_sha256=$(curl -fsSL --proto '=https' --max-time 60 -H 'Cache-Control: no-cache' "$DB_URL?$(date +%s)" |
+  sha256sum | cut -d' ' -f1) || database_sha256=""
+[[ $database_sha256 =~ ^[0-9a-f]{64}$ && $database_sha256 != e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855 ]] \
+  || database_sha256=""
+
+payload=$(jq -nc --argjson packages "$packages" --arg db "$database_sha256" \
+  --arg repository "${GITHUB_REPOSITORY:-}" --arg commit "${GITHUB_SHA:-}" \
+  --arg run "${GITHUB_SERVER_URL:-https://github.com}/${GITHUB_REPOSITORY:-}/actions/runs/${GITHUB_RUN_ID:-}" \
+  '{schema: 1, channel: "edge", arch: "aarch64", packages: $packages}
+   + (if $db == "" then {} else {database_sha256: $db} end)
+   + {source: {repository: $repository, commit: $commit, run: $run}}')
+
+if [[ $DRY_RUN == true ]]; then
+  jq . <<<"$payload"
+  exit 0
+fi
+
+body=$(jq -nc --arg event "$EVENT_TYPE" --argjson payload "$payload" '{event_type: $event, client_payload: $payload}')
+# The token goes to curl on stdin (printf is a Bash builtin), never on a
+# command line.
+status=$(printf 'header = "Authorization: Bearer %s"\n' "$MAC_INSTALLER_DISPATCH_TOKEN" |
+  curl -sS --proto '=https' --max-time 60 --retry 2 -o /dev/null -w '%{http_code}' --config - \
+    -X POST -H "Accept: application/vnd.github+json" -H "X-GitHub-Api-Version: 2022-11-28" \
+    --data "$body" "https://api.github.com/repos/$REPOSITORY/dispatches") || status=000
+if [[ $status == 204 ]]; then
+  echo "==> Notified $REPOSITORY ($EVENT_TYPE): $(jq -r '[.[] | .name + " " + .version] | join(", ")' <<<"$packages")"
+else
+  warning "dispatch to $REPOSITORY failed (HTTP $status); start its Mac image build by hand if this publish matters to it"
+fi

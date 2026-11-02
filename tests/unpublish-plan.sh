@@ -13,7 +13,6 @@ recipe() { # recipe <name> <arches> [package.json]
   printf 'pkgname=%s\npkgver=1\npkgrel=1\narch=(%s)\n' "$1" "$2" > "$T/pkgbuilds/$1/PKGBUILD"
   echo "${3:-"{\"source\": \"local\"}"}" > "$T/pkgbuilds/$1/.omarchy/package.json"
 }
-recipe edge-only "x86_64 aarch64" '{"source": "local", "channels": ["edge"]}'
 recipe everywhere "x86_64 aarch64"
 recipe arm-only "aarch64"
 recipe icon-theme "any"
@@ -21,12 +20,6 @@ sed -i 's/^pkgname=icon-theme$/pkgbase=icons\npkgname=(icons-light icons-dark)/'
 
 plan() { OMARCHY_PKGBUILDS="$T/pkgbuilds" "$ROOT/bin/unpublish-plan" "$@" 2>"$T/err"; }
 line() { grep "^$1=" <<<"$out" | cut -d= -f2-; }
-
-out=$(plan --channels "edge rc stable" edge-only) || fail "edge-only refused: $(cat "$T/err")"
-[[ $(line RETIRE_STABLE_X86_64) == edge-only && $(line RETIRE_RC_AARCH64) == edge-only ]] &&
-  pass "an edge-only package is retired from rc and stable" || fail "edge-only plan: $out"
-[[ -z $(line RETIRE_EDGE_X86_64) && -z $(line RETIRE_EDGE_AARCH64) ]] &&
-  pass "and kept on edge, where its recipe publishes it" || fail "edge-only retired from edge: $out"
 
 out=$(plan --channels "stable" arm-only gone) || fail "arm-only refused: $(cat "$T/err")"
 [[ $(line RETIRE_STABLE_X86_64) == "arm-only gone" && $(line RETIRE_STABLE_AARCH64) == gone ]] &&
@@ -37,8 +30,8 @@ plan --channels "edge rc stable" everywhere >/dev/null && fail "a package publis
 grep -q "still published to every channel" "$T/err" && pass "a package still published everywhere asked for is refused" || fail "message: $(cat "$T/err")"
 plan --channels "edge rc stable" icons >/dev/null && fail "a pkgbase built under another directory name was retired: $(cat "$T/err")"
 pass "a pkgbase is matched to the recipe that builds it, whatever its directory is called"
-plan --channels "edge" edge-only >/dev/null && fail "edge-only on edge was not refused"
-pass "an edge-only package asked only for edge is refused"
+plan --channels "rc" everywhere >/dev/null && fail "a package was retired from rc although its recipe publishes it there by promotion"
+pass "a package with a recipe is refused for rc too, which promotion fills from edge"
 plan --channels "stable beta" gone >/dev/null && fail "an unknown channel was accepted"
 pass "an unknown channel is refused"
 plan --channels "stable" 'bad name' >/dev/null && fail "a bad package name was accepted"

@@ -1,8 +1,8 @@
 #!/bin/bash
 # Every package's .omarchy/package.json passes validate_package_metadata,
-# and a fast-ring package that declares rebuild_on is refused: the fast ring
+# a fast-ring package that declares rebuild_on is refused (the fast ring
 # ships one edge build to every channel, so nothing rebuilds it when a
-# dependency moves.
+# dependency moves), and so is the retired channels key.
 set -euo pipefail
 ROOT=$(realpath "${BASH_SOURCE[0]%/*}/..")
 source "$ROOT/helpers/package-metadata.sh"
@@ -24,3 +24,10 @@ out=$(validate_package_metadata "$T/fast-rebuild" 2>&1) && fail "fast ring with 
 mkdir -p "$T/slow-rebuild/.omarchy"
 echo '{"source": "local", "rebuild_on": ["qt6-base"]}' > "$T/slow-rebuild/.omarchy/package.json"
 validate_package_metadata "$T/slow-rebuild" >/dev/null && pass "rebuild_on off the fast ring is fine" || fail "rebuild_on alone refused"
+
+# The release ring is the only say a package has in where it publishes; a
+# leftover channels list would look like a restriction and enforce nothing.
+mkdir -p "$T/channels/.omarchy"
+echo '{"source": "local", "channels": ["edge"]}' > "$T/channels/.omarchy/package.json"
+out=$(validate_package_metadata "$T/channels" 2>&1) && fail "a channels key was accepted"
+[[ $out == *"channels is gone"* ]] && pass "a channels key is refused" || fail "unexpected message: $out"

@@ -1,0 +1,136 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jim Martin <jimmartin@gmail.com>
+Date: Thu, 8 Oct 2026 13:47:30 -0500
+Subject: [PATCH] usb: dwc3: keep a USB4-tunnelled host port across system
+ sleep
+
+When system sleep is entered with a USB4 device attached, the USB4 host
+router can keep its link and the USB3 tunnel to the controller's
+SuperSpeed port up, so the devices behind it stay connected. The dwc3
+core undoes that in two ways.
+
+First, a host-mode controller that may not wake the system is shut down
+in dwc3_suspend_common() and fully initialized again on resume, which
+drops the tunnelled port and every device behind it. Keep the core and
+its PHYs initialized for a system suspend while the port's CIO_EN bit is
+set, as for a wakeup-capable controller. Runtime suspend, and
+controllers that need a full reinit, are unchanged.
+
+Second, nothing orders the xHCI after the router on resume, so the xHCI
+can resume and find its tunnelled port gone before the router has
+restored the tunnel. Link the xHCI as a consumer of the platform device
+named by "usb4-host-interface", so the PM core resumes the router first.
+The link is removed with the xHCI.
+
+Both only apply to controllers with a "usb4-host-interface" reference.
+
+Assisted-by: Opus 5.5
+Signed-off-by: Jim Martin <jimmartin@gmail.com>
+---
+ drivers/usb/dwc3/core.c | 16 ++++++++++++++--
+ drivers/usb/dwc3/core.h |  3 +++
+ drivers/usb/dwc3/host.c | 18 ++++++++++++++++++
+ 3 files changed, 35 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/usb/dwc3/core.c b/drivers/usb/dwc3/core.c
+index e781aa1c2dd..dcfb59420f3 100644
+--- a/drivers/usb/dwc3/core.c
++++ b/drivers/usb/dwc3/core.c
+@@ -16,6 +16,7 @@
+ #include <linux/spinlock.h>
+ #include <linux/platform_device.h>
+ #include <linux/pm_runtime.h>
++#include <linux/suspend.h>
+ #include <linux/interrupt.h>
+ #include <linux/ioport.h>
+ #include <linux/io.h>
+@@ -2578,8 +2579,18 @@ static int dwc3_suspend_common(struct dwc3 *dwc, pm_message_t msg)
+ 		dwc3_core_exit(dwc);
+ 		break;
+ 	case DWC3_GCTL_PRTCAP_HOST:
++		/*
++		 * A port in USB4 tunnel (CIO) mode stays connected across
++		 * suspend through the host router: keep the core and its PHYs
++		 * initialized so the xHCI ports keep their state.
++		 */
++		dwc->keep_core_for_tunnel = !PMSG_IS_AUTO(msg) &&
++			pm_suspend_target_state != PM_SUSPEND_ON &&
++			device_property_present(dwc->dev, "usb4-host-interface") &&
++			(dwc3_readl(dwc, DWC3_CIOCTRL(0)) & DWC3_CIOCTRL_CIO_EN);
+ 		if (!PMSG_IS_AUTO(msg) &&
+-		    (!device_may_wakeup(dwc->dev) || dwc->needs_full_reinit)) {
++		    ((!device_may_wakeup(dwc->dev) && !dwc->keep_core_for_tunnel) ||
++		     dwc->needs_full_reinit)) {
+ 			dwc3_core_exit(dwc);
+ 			break;
+ 		}
+@@ -2643,7 +2654,8 @@ static int dwc3_resume_common(struct dwc3 *dwc, pm_message_t msg)
+ 		break;
+ 	case DWC3_GCTL_PRTCAP_HOST:
+ 		if (!PMSG_IS_AUTO(msg) &&
+-		    (!device_may_wakeup(dwc->dev) || dwc->needs_full_reinit)) {
++		    ((!device_may_wakeup(dwc->dev) && !dwc->keep_core_for_tunnel) ||
++		     dwc->needs_full_reinit)) {
+ 			ret = dwc3_core_init_for_resume(dwc);
+ 			if (ret)
+ 				return ret;
+diff --git a/drivers/usb/dwc3/core.h b/drivers/usb/dwc3/core.h
+index a8d8f4c93d8..6779ca27b9b 100644
+--- a/drivers/usb/dwc3/core.h
++++ b/drivers/usb/dwc3/core.h
+@@ -1140,6 +1140,8 @@ struct dwc3_glue_ops {
+  * @usb2_gadget_lpm_disable: set to disable usb2 lpm for gadget
+  * @needs_full_reinit: set to indicate the core may lose power and need full
+  *			initialization during system pm
++ * @keep_core_for_tunnel: set during system suspend while a SuperSpeed port is
++ *			tunnelled over USB4, to keep the core initialized
+  * @disable_scramble_quirk: set if we enable the disable scramble quirk
+  * @u2exit_lfps_quirk: set if we enable u2exit lfps quirk
+  * @u2ss_inp3_quirk: set if we enable P3 OK for U2/SS Inactive quirk
+@@ -1408,6 +1410,7 @@ struct dwc3 {
+ 	unsigned		usb2_lpm_disable:1;
+ 	unsigned		usb2_gadget_lpm_disable:1;
+ 	unsigned		needs_full_reinit:1;
++	unsigned		keep_core_for_tunnel:1;
+ 
+ 	unsigned		disable_scramble_quirk:1;
+ 	unsigned		u2exit_lfps_quirk:1;
+diff --git a/drivers/usb/dwc3/host.c b/drivers/usb/dwc3/host.c
+index 693be048b93..db9e6fd6c72 100644
+--- a/drivers/usb/dwc3/host.c
++++ b/drivers/usb/dwc3/host.c
+@@ -9,6 +9,7 @@
+ 
+ #include <linux/irq.h>
+ #include <linux/of.h>
++#include <linux/of_platform.h>
+ #include <linux/platform_device.h>
+ #include <linux/usb.h>
+ #include <linux/usb/hcd.h>
+@@ -241,6 +242,23 @@ int dwc3_host_init(struct dwc3 *dwc)
+ 		goto err;
+ 	}
+ 
++	/*
++	 * System sleep: the USB4 host router restores the tunnels to this
++	 * controller's ports, so it must resume before the xHCI does.
++	 */
++	if (device_property_present(dwc->dev, "usb4-host-interface")) {
++		struct device_node *np = of_parse_phandle(dwc->dev->of_node,
++							  "usb4-host-interface", 0);
++		struct platform_device *router = np ? of_find_device_by_node(np) : NULL;
++
++		of_node_put(np);
++		if (router) {
++			if (!device_link_add(&xhci->dev, &router->dev, DL_FLAG_STATELESS))
++				dev_warn(dwc->dev, "USB4 router device link failed\n");
++			put_device(&router->dev);
++		}
++	}
++
+ 	if (dwc->sys_wakeup) {
+ 		/* Restore wakeup setting if switched from device */
+ 		device_wakeup_enable(dwc->sysdev);
+-- 
+2.56.0
+

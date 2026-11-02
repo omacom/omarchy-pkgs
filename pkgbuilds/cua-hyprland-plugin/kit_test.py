@@ -45,14 +45,24 @@ class KitTests(unittest.TestCase):
         self.assertTrue((self.srcdir / "cua-hyprland-plugin-0.33.2-c82d32e3e1adbc6578a148962002ddf6e3e8a15a"
                          / "SOURCE-PROVENANCE.json").is_file())
 
+    def test_moved_abi_version_is_admitted(self):
+        payload = kit.read_kit(ARCHIVE, CHECKSUM)
+        verify = kit.load_verifier(self.root / "profile_verify.py", payload["profile_verify.py"])
+        self.profile["runtime"]["packages"]["wayland"] = "1.26.0-2"
+        data = self.write_profile(self.profile).read_bytes()
+        derived, _ = kit.derive(payload, data, verify)
+        self.assertEqual(derived["PROFILE.json"], data)
+        self.assertIn(b"'wayland=1.26.0-2'", derived["PKGBUILD"])
+
     def test_profile_changes_beyond_scope_refuse(self):
         changes = {
             "an extra runtime pin": lambda p: p["runtime"]["packages"].update(mesa="1:26.2.4-1"),
             "a dropped runtime pin": lambda p: p["runtime"]["packages"].pop("libxkbcommon"),
-            "a changed runtime version": lambda p: p["runtime"]["packages"].update(wayland="1.26.0-2"),
+            "a rebuilt compositor": lambda p: p["hyprland"].update(package_version="0.56.2-5"),
             "a changed compositor hash": lambda p: p["hyprland"].update(sha256="0" * 64),
             "a changed header hash": lambda p: p["hyprland"].update(headers_sha256="0" * 64),
             "a changed compiler hash": lambda p: p["compiler"].update(sha256="0" * 64),
+            "a changed libstdc++ hash": lambda p: p["runtime"].update(sha256="0" * 64),
             "a changed source": lambda p: p["source"].update(archive_sha256="0" * 64),
         }
         for label, change in changes.items():

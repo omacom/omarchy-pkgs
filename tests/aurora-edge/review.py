@@ -32,21 +32,24 @@ class KernelRecipeTests(unittest.TestCase):
     def test_shared_config_keeps_existing_machine_behaviour(self):
         package = ROOT / 'pkgbuilds/linux-aurora'
         recipe = (package / 'PKGBUILD').read_text()
-        self.assertIn('cp ../config build/base/.config', recipe)
-        self.assertIn("grep -qx 'CONFIG_RUST=y'", recipe)
+        helper = (package / 'configure.sh').read_text()
+        self.assertIn('source ../configure.sh', recipe)
+        self.assertIn('configure_kernel "$PWD/.." "$PWD/build/base"', recipe)
+        self.assertIn('cp "$config_dir/config" "$output_dir/.config"', helper)
+        self.assertIn("grep -qx 'CONFIG_RUST=y'", helper)
+        gate = (ROOT / 'tests/aurora-edge/configure.py').read_text()
+        self.assertIn('source "$1/configure.sh"', gate)
+        self.assertIn('configure_kernel "$2" "$3" "$4"', gate)
+        self.assertIn('resolve_kernel_config "$2" "$3" "$4"', gate)
+        self.assertIn('resolve_kernel_config "$config_dir" "$output_dir" "${3:-}" || return', helper)
         self.assertNotIn('j700.config', recipe)
         self.assertNotIn('j700-device-parity.config', recipe)
         original = (package / 'config').read_text()
-        fragment = (package / 'neo.config').read_text()
         for setting in ['CONFIG_USB4=m', 'CONFIG_DEBUG_INFO_BTF=y', 'CONFIG_KEXEC_FILE=y',
                         'CONFIG_RELR=y', 'CONFIG_RUST=y']:
             self.assertIn(setting, original)
-        for line in fragment.splitlines():
-            if line.startswith('CONFIG_'):
-                name = line.split('=', 1)[0]
-                self.assertNotIn('\n' + name + '=', original, 'Neo fragment overrides shared setting')
-                self.assertNotIn('# ' + name + ' is not set', original, 'Neo fragment flips shared disabled setting')
-        self.assertIn('CONFIG_MT7932_FULLMAC=m', fragment)
+        self.assertFalse((package / 'common.config').exists())
+        self.assertFalse((package / 'neo.config').exists())
 
     def test_generated_release_keeps_boot_bundle_suffix(self):
         recipe = ROOT / 'pkgbuilds/linux-aurora/PKGBUILD'
@@ -57,29 +60,24 @@ class KernelRecipeTests(unittest.TestCase):
                 self.assertEqual(result.returncode, expected, result.stderr)
         self.assertIn('_check_kernelrelease "$(<build/base/version)"', recipe.read_text())
 
-    def test_shared_capabilities_are_explicit_and_separate_from_neo_drivers(self):
+    def test_platform_choices_come_from_the_pinned_kernel(self):
         package = ROOT / 'pkgbuilds/linux-aurora'
-        common = (package / 'common.config').read_text()
-        expected = {'CONFIG_SERIAL_APPLE_DOCKCHANNEL', 'CONFIG_SERIAL_APPLE_DOCKCHANNEL_EARLYCON',
-                    'CONFIG_SYSFB_SIMPLEFB', 'CONFIG_DMABUF_HEAPS', 'CONFIG_DMABUF_HEAPS_SYSTEM',
-                    'CONFIG_UDMABUF', 'CONFIG_THERMAL_NETLINK', 'CONFIG_NVME_HWMON', 'CONFIG_TRUSTED_KEYS',
-                    'CONFIG_APPLE_SEP'}
-        self.assertEqual({line.split('=', 1)[0] for line in common.splitlines()
-                          if line.startswith('CONFIG_')}, expected)
         recipe = (package / 'PKGBUILD').read_text()
-        self.assertIn('../common.config ../neo.config', recipe)
-        self.assertIn('python3 ../validate-config.py ../common.config build/base/.config', recipe)
+        helper = (package / 'configure.sh').read_text()
+        self.assertNotIn('common.config', recipe)
+        self.assertNotIn('neo.config', recipe)
+        self.assertIn('fragments=(arch/arm64/configs/asahi.config)', helper)
+        self.assertIn('python3 "$config_dir/validate-config.py" arch/arm64/configs/asahi.config', helper)
+        self.assertFalse(any(line.startswith('CONFIG_') for line in helper.splitlines()))
 
     def test_trusted_keys_cannot_downgrade_the_builtin_sep_driver(self):
         package = ROOT / 'pkgbuilds/linux-aurora'
         spec = importlib.util.spec_from_file_location('sep_config_check', package / 'validate-config.py')
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
-        fragment = package / 'common.config'
-        requested = module.values(fragment)
-        self.assertEqual(requested['CONFIG_TRUSTED_KEYS'], 'y')
-        self.assertEqual(requested['CONFIG_APPLE_SEP'], 'y')
         with tempfile.TemporaryDirectory() as temporary:
+            fragment = Path(temporary) / 'asahi.config'
+            fragment.write_text('CONFIG_TRUSTED_KEYS=y\nCONFIG_APPLE_SEP=y\n')
             resolved = Path(temporary) / 'config'
             resolved.write_text(fragment.read_text())
             module.validate(fragment, resolved)
@@ -96,12 +94,31 @@ class KernelRecipeTests(unittest.TestCase):
         spec.loader.exec_module(module)
         with tempfile.TemporaryDirectory() as temporary:
             resolved = Path(temporary) / 'config'
-            fragment = validator.with_name('neo.config')
+            fragment = Path(temporary) / 'asahi.config'
+            fragment.write_text('CONFIG_SND_SOC_APPLE_T8140_AOP_AUDIO=m\n')
             resolved.write_text(fragment.read_text())
             module.validate(fragment, resolved)
             resolved.write_text(fragment.read_text().replace(
                 'CONFIG_SND_SOC_APPLE_T8140_AOP_AUDIO=m', '# CONFIG_SND_SOC_APPLE_T8140_AOP_AUDIO is not set'))
             with self.assertRaisesRegex(ValueError, 'CONFIG_SND_SOC_APPLE_T8140_AOP_AUDIO'):
+                module.validate(fragment, resolved)
+
+    def test_inactive_parent_can_omit_a_requested_disabled_symbol(self):
+        validator = ROOT / 'pkgbuilds/linux-aurora/validate-config.py'
+        spec = importlib.util.spec_from_file_location('disabled_config_check', validator)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        with tempfile.TemporaryDirectory() as temporary:
+            fragment = Path(temporary) / 'asahi.config'
+            fragment.write_text('# CONFIG_TRUSTED_KEYS_TPM is not set\nCONFIG_VIDEO_APPLE_ISP=m\n')
+            resolved = Path(temporary) / 'config'
+            resolved.write_text('CONFIG_VIDEO_APPLE_ISP=m\n')
+            module.validate(fragment, resolved)
+            resolved.write_text('CONFIG_TRUSTED_KEYS_TPM=y\nCONFIG_VIDEO_APPLE_ISP=m\n')
+            with self.assertRaisesRegex(ValueError, 'CONFIG_TRUSTED_KEYS_TPM'):
+                module.validate(fragment, resolved)
+            resolved.write_text('')
+            with self.assertRaisesRegex(ValueError, 'CONFIG_VIDEO_APPLE_ISP'):
                 module.validate(fragment, resolved)
 
     def test_headers_require_resolver_only_when_btf_enabled(self):
@@ -129,19 +146,158 @@ _package-headers
 
 class MesaRecipeTests(unittest.TestCase):
     def test_cpu_tests_fail_the_package_and_runtime_abi_is_checked(self):
+        # Only libgallium may link LLVM, exactly one libLLVM.so.<major>.<minor>,
+        # and it must be executable so makepkg versions the 'libLLVM.so' depend
+        # from it; it must link LLVM, or llvmpipe is missing. SPIRV-Tools stays
+        # out everywhere.
         recipe = ROOT / 'pkgbuilds/mesa-aurora/PKGBUILD'
-        for test_status, runtime, reader_status, expected in [
-            (0, '', 0, 0), (1, '', 0, 1), (0, 'libLLVM.so.23', 0, 1),
-            (0, 'libSPIRV-Tools.so', 0, 1), (0, '', 1, 1)]:
-            with self.subTest(tests=test_status, runtime=runtime, reader=reader_status), tempfile.TemporaryDirectory() as temporary:
+        llvm23, llvm24 = 'libLLVM.so.23.1', 'libLLVM.so.24.1'
+        for test_status, gallium, other, reader_status, executable, expected in [
+            (0, llvm23, '', 0, True, 0),
+            (0, llvm24, '', 0, True, 0),
+            (1, llvm23, '', 0, True, 1),
+            (0, llvm23, '', 1, True, 1),
+            (0, llvm23, '', 0, False, 1),
+            (0, '', '', 0, True, 1),
+            (0, f'{llvm23} {llvm24}', '', 0, True, 1),
+            (0, llvm23, llvm23, 0, True, 1),
+            (0, llvm23, 'libSPIRV-Tools.so', 0, True, 1)]:
+            with self.subTest(tests=test_status, gallium=gallium, other=other, reader=reader_status, executable=executable), tempfile.TemporaryDirectory() as temporary:
                 root = Path(temporary)
                 stage = root / 'mesa-stage'
                 stage.mkdir()
-                (stage / 'driver.so').write_bytes(b'fixture')
-                result = shell('source "$1"\nsrcdir="$2"\nmeson() { printf \'%s\\n\' "$*"; return "$TEST_STATUS"; }\nreadelf() { [[ -z $RUNTIME ]] || echo "NEEDED $RUNTIME"; return "$READER_STATUS"; }\ncheck\n', recipe, root, env=dict(os.environ, TEST_STATUS=str(test_status),
-                          RUNTIME=runtime, READER_STATUS=str(reader_status)))
+                gallium_file = stage / 'libgallium-26.3.0-devel.so'
+                gallium_file.write_bytes(b'fixture')
+                gallium_file.chmod(0o755 if executable else 0o644)
+                other_file = stage / 'libvulkan_asahi.so'
+                other_file.write_bytes(b'fixture')
+                other_file.chmod(0o755)
+                result = shell('source "$1"\nsrcdir="$2"\nmeson() { printf \'%s\\n\' "$*"; return "$TEST_STATUS"; }\n'
+                               'readelf() { local needed=$OTHER; [[ ${2##*/} == libgallium-* ]] && needed=$GALLIUM; '
+                               'for lib in $needed; do echo " 0x1 (NEEDED) Shared library: [$lib]"; done; return "$READER_STATUS"; }\ncheck\n',
+                               recipe, root, env=dict(os.environ, TEST_STATUS=str(test_status),
+                               GALLIUM=gallium, OTHER=other, READER_STATUS=str(reader_status)))
                 self.assertEqual(result.returncode, expected, result.stderr)
                 self.assertIn('test -C build --print-errorlogs', result.stdout)
+
+
+
+class M1n1RecipeTests(unittest.TestCase):
+    def test_stage_roles_artwork_and_installer_compatibility(self):
+        recipe = ROOT / 'pkgbuilds/m1n1-aurora/PKGBUILD'
+        record = json.loads(recipe.with_name('build-qualification.json').read_text())
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / 'm1n1'
+            (source / 'data').mkdir(parents=True)
+            (source / '3rdparty_licenses').mkdir()
+            (source / 'LICENSE').write_text('fixture notice')
+            (source / '3rdparty_licenses/fixture').write_text('fixture notice')
+            for size in (48, 128, 256):
+                (root / f'bootlogo_{size}.bin').write_bytes(recipe.with_name(f'bootlogo_{size}.bin').read_bytes())
+            for name in ('build-qualification.json', 'validate-qualification.py'):
+                (root / name).write_bytes(recipe.with_name(name).read_bytes())
+            result = shell(r'''set -euo pipefail
+source "$1"
+srcdir="$2"
+pkgdir="$2/package"
+git() { [[ "$*" == "-C $srcdir/m1n1 rev-parse HEAD" ]] || return 91; printf '%s\n' "$TEST_PIN"; }
+rustup() { [[ "$*" == 'toolchain install 1.89.0 --profile minimal --target aarch64-unknown-none-softfloat' ]] || return 92; }
+make() {
+  [[ "$PWD" == "$srcdir/m1n1" ]] || return 93
+  if [[ "$*" == clean ]]; then rm -rf build; return; fi
+  [[ " $* " == *' RELEASE=1 '* && " $* " == *' CHAINLOADING=1 '* && " $* " == *' USE_CLANG=1 '* && " $* " == *' EXTRA_CFLAGS=-Os '* ]] || return 94
+  [[ "$RUSTUP_TOOLCHAIN" == '1.89.0' ]] || return 95
+  for size in 48 128 256; do cmp "$srcdir/bootlogo_$size.bin" "data/bootlogo_$size.bin"; done
+  mkdir build
+  local role=stage1
+  [[ " $* " != *' ESP_STAGE2=1 '* ]] || role=stage2
+  printf '%s-raw' "$role" > build/m1n1.bin
+  printf '%s-macho' "$role" > build/m1n1.macho
+}
+prepare
+build
+package
+''', recipe, root, env=dict(os.environ, TEST_PIN=record['source_commit']))
+            self.assertEqual(result.returncode, 0, result.stderr)
+            package = root / 'package'
+            expected = {
+                'usr/lib/asahi-boot/m1n1.bin': 'stage2-raw',
+                'usr/share/m1n1-aurora/stage1/m1n1-raw.bin': 'stage1-raw',
+                'usr/share/m1n1-aurora/stage1/m1n1.macho': 'stage1-macho',
+                'usr/share/aura/stage1/aura-raw.bin': 'stage1-raw',
+                'usr/share/aura/stage1/aura.macho': 'stage1-macho',
+            }
+            for name, value in expected.items():
+                self.assertEqual((package / name).read_text(), value)
+                self.assertFalse((package / name).is_symlink())
+            self.assertEqual((package / 'usr/lib/m1n1-neo/m1n1.bin').resolve(), package / 'usr/lib/asahi-boot/m1n1.bin')
+            self.assertFalse((package / 'boot').exists())
+            self.assertFalse((package / 'usr/share/libalpm/hooks').exists())
+            self.assertIs(json.loads((package / 'usr/share/doc/m1n1-aurora/build-qualification.json').read_text())['hardware_tested'], False)
+
+    def test_prepare_refuses_a_different_source_pin(self):
+        recipe = ROOT / 'pkgbuilds/m1n1-aurora/PKGBUILD'
+        pin = json.loads(recipe.with_name('build-qualification.json').read_text())['source_commit']
+        for actual in (pin, '0' * 40):
+            with self.subTest(pin_matches=actual == pin), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                data = root / 'm1n1/data'
+                data.mkdir(parents=True)
+                for size in (48, 128, 256):
+                    (root / f'bootlogo_{size}.bin').write_bytes(b'new-logo')
+                    (data / f'bootlogo_{size}.bin').write_bytes(b'original-logo')
+                result = shell(r'''set -e
+source "$1"
+srcdir="$2"
+git() { printf '%s\n' "$ACTUAL_PIN"; }
+rustup() { printf 'toolchain touched' > "$srcdir/toolchain"; }
+prepare
+''', recipe, root, env=dict(os.environ, ACTUAL_PIN=actual))
+                if actual == pin:
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertTrue((root / 'toolchain').is_file())
+                else:
+                    self.assertEqual(result.returncode, 1, result.stderr)
+                    self.assertFalse((root / 'toolchain').exists())
+                for size in (48, 128, 256):
+                    self.assertEqual((data / f'bootlogo_{size}.bin').read_bytes(),
+                                     b'new-logo' if actual == pin else b'original-logo')
+
+    def test_canonical_candidate_cannot_claim_hardware_qualification(self):
+        path = ROOT / 'pkgbuilds/m1n1-aurora/validate-qualification.py'
+        spec = importlib.util.spec_from_file_location('m1n1_qualification', path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        record = json.loads(path.with_name('build-qualification.json').read_text())
+        module.validate(record, record['source_commit'], require_hardware=False)
+        with self.assertRaisesRegex(ValueError, 'not hardware-qualified'):
+            module.validate(record, record['source_commit'])
+
+
+    def test_promotion_requires_each_legacy_boot_pair(self):
+        path = ROOT / 'pkgbuilds/m1n1-aurora/validate-qualification.py'
+        spec = importlib.util.spec_from_file_location('m1n1_promotion_qualification', path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        record = json.loads(path.with_name('build-qualification.json').read_text())
+        gates = ['native_build', 'matched_stage1_stage2_boot', 'repair', 'upgrade',
+                 'legacy_stage1_omacom_stage2_m1_cold_boot',
+                 'legacy_stage1_omacom_stage2_m2_cold_boot',
+                 'aura_stage1_omacom_stage2_m1_cold_boot',
+                 'aura_stage1_omacom_stage2_m2_cold_boot',
+                 'aura_stage1_omacom_stage2_m3_cold_boot',
+                 'aura_stage1_omacom_stage2_neo_cold_boot']
+        record['hardware_tested'] = True
+        record['evidence'] = {gate: {'passed': True, 'report': 'synthetic test fixture only'}
+                              for gate in gates}
+        module.validate(record, record['source_commit'])
+        for gate in gates:
+            with self.subTest(missing=gate):
+                partial = dict(record, evidence={k: v for k, v in record['evidence'].items() if k != gate})
+                with self.assertRaisesRegex(ValueError, gate):
+                    module.validate(partial, record['source_commit'])
+
 
 
 class QualificationTests(unittest.TestCase):
@@ -200,7 +356,7 @@ class FirmwareTests(unittest.TestCase):
             code = script.read_text().replace('/usr/bin/set-wireless-regdom', str(root / 'no-host-helper'))
             result = subprocess.run(['bash', '-c', code], text=True, capture_output=True, timeout=9,
                 env=dict(os.environ, PATH=str(root) + ':' + os.environ['PATH'], FIXTURE=str(root),
-                         AURORA_REGDOM_POLICY_DIR=str(root / 'policy')))
+                         AURORA_FIRMWARE_ROOT=str(root / 'firmware')))
             self.assertNotEqual(result.returncode, 0, 'systemd must restart a dead event stream')
             self.assertEqual((root / 'calls').read_text().splitlines(), ['fallback'])
             self.assertEqual((root / 'country').read_text().strip(), '00')
@@ -232,7 +388,7 @@ esac
             process = subprocess.Popen(['bash', '-c', code], text=True, stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE, start_new_session=True,
                 env=dict(os.environ, PATH=str(root) + ':' + os.environ['PATH'], FIXTURE=str(root),
-                         AURORA_REGDOM_POLICY_DIR=str(root / 'policy')))
+                         AURORA_FIRMWARE_ROOT=str(root / 'firmware')))
             try:
                 stdout, stderr = process.communicate(timeout=8)
             except subprocess.TimeoutExpired:
@@ -257,7 +413,7 @@ fall_back
 current=JP; fall_back
 [[ $calls == 2 && $SECONDS -ge 60 ]] || exit 11
 # A supported hint arriving during the delay must not be overwritten.
-touch "$policy/US.bin"
+mkdir -p "$firmware/mediatek/mt7932/policy"; touch "$firmware/mediatek/mt7932/policy/US.bin"
 sleep() { SECONDS=$((SECONDS+$1)); current=US; }
 current=PL; fall_back
 [[ $calls == 2 && $current == US ]] || exit 12
@@ -265,9 +421,29 @@ current=00; fall_back
 [[ $calls == 2 ]] || exit 13
 '''
         with tempfile.TemporaryDirectory() as temporary:
-            result = shell(code, env=dict(os.environ, AURORA_REGDOM_POLICY_DIR=temporary))
+            result = shell(code, env=dict(os.environ, AURORA_FIRMWARE_ROOT=temporary))
         self.assertEqual(result.returncode, 0, result.stderr)
 
+
+    def test_a_policy_extracted_into_vendor_firmware_keeps_its_country(self):
+        path = ROOT / 'pkgbuilds/omarchy-aurora-firmware/aurora-regdom-fallback'
+        # vendorfw puts per-machine files under vendor/, which the kernel's
+        # firmware loader searches first; a US policy there must keep US.
+        setup = path.read_text().split('\n# An initramfs')[0]
+        code = setup + '''
+calls=0; current=US
+sleep() { SECONDS=$((SECONDS+$1)); }
+iw() { if [[ $1 == reg && $2 == get ]]; then echo "country $current:"; else calls=$((calls+1)); current=00; fi; }
+mkdir -p "$firmware/vendor/mediatek/mt7932/policy"
+touch "$firmware/vendor/mediatek/mt7932/policy/US.bin"
+fall_back
+[[ $calls == 0 && $current == US ]] || exit 20
+current=PL; fall_back
+[[ $calls == 1 && $current == 00 ]] || exit 21
+'''
+        with tempfile.TemporaryDirectory() as temporary:
+            result = shell(code, env=dict(os.environ, AURORA_FIRMWARE_ROOT=temporary))
+        self.assertEqual(result.returncode, 0, result.stderr)
 
 if __name__ == '__main__':
     unittest.main()

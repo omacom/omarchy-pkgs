@@ -1,0 +1,111 @@
+#!/usr/bin/python3 -I
+
+# Put the attached Flex Keyboard's touchpad back in precision-touchpad mode
+# after resume.
+#
+# The touchpad sometimes comes back from deep sleep in mouse mode (HID Input
+# Mode 0). libinput then only gets relative motion, so two-finger scroll,
+# two-finger right click and palm rejection stop until the keyboard is
+# reattached. hid-multitouch sends the mode and the touchpad's surface and
+# button switches again in its resume callback, but those requests can be lost
+# on the Surface Aggregator, so read both after resume and, if needed, send
+# them the way hid-multitouch does: Input Mode = 3, both switches on.
+
+import fcntl
+import os
+import subprocess
+import sys
+import time
+
+COMPATIBLE = os.environ.get('SP11_TOUCHPAD_COMPATIBLE', '/proc/device-tree/compatible')
+HID = os.environ.get('SP11_TOUCHPAD_HID', '/sys/bus/hid/devices')
+DEV = os.environ.get('SP11_TOUCHPAD_DEV', '/dev')
+SETTLE = float(os.environ.get('SP11_TOUCHPAD_SETTLE', '3'))
+TRIES = int(os.environ.get('SP11_TOUCHPAD_TRIES', '3'))
+# The touchpad on the Surface Aggregator bus. Over Bluetooth the keyboard keeps
+# its mode, and BlueZ cuts the reply to a mode read short anyway.
+TOUCHPAD = '0019:045E:0C8D.'
+
+# The touchpad's Device Configuration collection: Input Mode in feature report
+# 0x84 (one byte), Surface Switch and Button Switch in bits 0 and 1 of feature
+# report 0x85. A touchpad whose descriptor lacks it is left alone.
+CONFIG = bytes.fromhex(
+    '050d090ea1018584 0922a1020952 1500250a75089501b102c0'
+    '0922a1008585 09570958750195022501b102 9506b103c0c0')
+INPUT_MODE, SWITCHES = 0x84, 0x85
+PTP, BOTH = 3, 0x03
+
+
+def ioc(nr, size):
+    return (3 << 30) | (size << 16) | (ord('H') << 8) | nr
+
+
+def get_feature(fd, rid):
+    buf = bytearray([rid, 0])
+    if fcntl.ioctl(fd, ioc(0x07, len(buf)), buf) != len(buf):
+        raise OSError(f'short reply to feature report 0x{rid:02x}')
+    return buf
+
+
+def set_feature(fd, rid, value):
+    fcntl.ioctl(fd, ioc(0x06, 2), bytearray([rid, value]))
+
+
+def check(dev):
+    """Restore touchpad mode on one HID device; return what was done, or None."""
+    path = os.path.join(HID, dev)
+    if os.path.basename(os.path.realpath(os.path.join(path, 'driver'))) != 'hid-multitouch':
+        return None
+    with open(os.path.join(path, 'report_descriptor'), 'rb') as f:
+        if CONFIG not in f.read():
+            return None
+    fd = os.open(os.path.join(DEV, os.listdir(os.path.join(path, 'hidraw'))[0]), os.O_RDWR)
+    try:
+        mode = get_feature(fd, INPUT_MODE)[1]
+        switches = get_feature(fd, SWITCHES)[1]
+        if mode == PTP and switches & BOTH == BOTH:
+            return None
+        set_feature(fd, INPUT_MODE, PTP)
+        set_feature(fd, SWITCHES, switches | BOTH)
+        return f'resumed in input mode {mode} with switches 0x{switches:02x}, restored touchpad mode'
+    finally:
+        os.close(fd)
+
+
+def on_surface_pro_11():
+    try:
+        return 'microsoft,denali-oled' in open(COMPATIBLE, 'rb').read().decode(errors='replace').split('\0')
+    except OSError:
+        return False
+
+
+def main():
+    if not on_surface_pro_11():
+        return
+    if sys.argv[1:2] == ['post']:
+        # systemd-sleep waits for every hook before it reports the resume, so
+        # wait for the keyboard in a job of its own.
+        subprocess.run(['systemd-run', '--quiet', '--no-block', '--collect',
+                        '--unit=surface-pro-11-touchpad-mode', os.path.abspath(__file__), 'check'])
+        return
+    if sys.argv[1:2] != ['check']:
+        return
+    time.sleep(SETTLE)
+    for dev in sorted(os.listdir(HID)):
+        if not dev.startswith(TOUCHPAD):
+            continue
+        for attempt in range(1, TRIES + 1):
+            try:
+                done = check(dev)
+            except (OSError, IndexError) as e:
+                if attempt < TRIES:
+                    time.sleep(1)
+                    continue
+                done = f'gave up: {e!r}'
+            if done:
+                print(f'surface-pro-11-touchpad-mode: {dev} {done}')
+            break
+
+
+if __name__ == '__main__':
+    main()

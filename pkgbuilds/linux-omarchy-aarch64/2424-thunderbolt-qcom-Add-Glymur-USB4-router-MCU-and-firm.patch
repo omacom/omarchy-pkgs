@@ -1,0 +1,932 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jim Martin <jimmartin@gmail.com>
+Date: Thu, 8 Oct 2026 15:51:01 -0500
+Subject: [PATCH] thunderbolt: qcom: Add Glymur USB4 router MCU and firmware
+ helpers
+
+The USB4 host router of Qualcomm Glymur SoCs has a microcontroller (MCU)
+that runs firmware loaded by the host. The host uploads the firmware
+image and a router DROM into MCU RAM, starts the MCU and then passes
+Type-C link changes to it through a command mailbox. The MCU reports
+events through a ring in its shared memory.
+
+Add helpers for these steps, without platform ownership of power,
+clocks or resets:
+- firmware image validation and upload (records of offset, word count
+  and words, validated as a whole before the first write);
+- the router DROM, with a UID derived from the SoC serial number;
+- MCU layout setup for the legacy and v2 register layouts, upload, DROM
+  write, start with its ready handshake, stop and mailbox commands;
+- the MCU event ring decoder;
+- encoders for the Type-C connect (USB4 and TBT3), preset and disconnect
+  mailbox commands, from the enter_usb_data and typec_thunderbolt_data
+  that the Type-C mux receives.
+
+The register layout, firmware image format, upload and start handshake,
+DROM contents, event ring format and command encodings match what the
+platform's Windows driver uses on the Surface Laptop 8. The helpers are
+built with the host router driver, which adds the Kconfig entry.
+
+Assisted-by: Opus 5.5
+Signed-off-by: Jim Martin <jimmartin@gmail.com>
+---
+ drivers/thunderbolt/qcom-usb4-drom.c   |  51 ++++++
+ drivers/thunderbolt/qcom-usb4-drom.h   |  18 ++
+ drivers/thunderbolt/qcom-usb4-events.c |  55 ++++++
+ drivers/thunderbolt/qcom-usb4-events.h |  42 +++++
+ drivers/thunderbolt/qcom-usb4-fw.c     |  87 ++++++++++
+ drivers/thunderbolt/qcom-usb4-fw.h     |  20 +++
+ drivers/thunderbolt/qcom-usb4-mcu.c    | 228 +++++++++++++++++++++++++
+ drivers/thunderbolt/qcom-usb4-mcu.h    |  79 +++++++++
+ drivers/thunderbolt/qcom-usb4-typec.c  | 165 ++++++++++++++++++
+ drivers/thunderbolt/qcom-usb4-typec.h  |  70 ++++++++
+ 10 files changed, 815 insertions(+)
+ create mode 100644 drivers/thunderbolt/qcom-usb4-drom.c
+ create mode 100644 drivers/thunderbolt/qcom-usb4-drom.h
+ create mode 100644 drivers/thunderbolt/qcom-usb4-events.c
+ create mode 100644 drivers/thunderbolt/qcom-usb4-events.h
+ create mode 100644 drivers/thunderbolt/qcom-usb4-fw.c
+ create mode 100644 drivers/thunderbolt/qcom-usb4-fw.h
+ create mode 100644 drivers/thunderbolt/qcom-usb4-mcu.c
+ create mode 100644 drivers/thunderbolt/qcom-usb4-mcu.h
+ create mode 100644 drivers/thunderbolt/qcom-usb4-typec.c
+ create mode 100644 drivers/thunderbolt/qcom-usb4-typec.h
+
+diff --git a/drivers/thunderbolt/qcom-usb4-drom.c b/drivers/thunderbolt/qcom-usb4-drom.c
+new file mode 100644
+index 00000000000..1b9b470465a
+--- /dev/null
++++ b/drivers/thunderbolt/qcom-usb4-drom.c
+@@ -0,0 +1,51 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/* DROM of the Qualcomm Glymur USB4 host router. */
++#include <linux/crc32.h>
++#include <linux/errno.h>
++#include <linux/string.h>
++#include <linux/unaligned.h>
++
++#include "qcom-usb4-drom.h"
++
++/* Revision/length, legacy IDs, adapter entries and product description. */
++static const u8 qcom_usb4_drom_data[QCOM_USB4_DROM_SIZE - 13] = {
++	0x01, 0x67, 0x00, 0x28, 0x03, 0x00, 0x00, 0x00, 0x00, 0x05, 0x86, 0x00,
++	0x00, 0x00, 0x05, 0x87, 0x00, 0x00, 0x00, 0x1e, 0x01, 0x51, 0x75, 0x61,
++	0x6c, 0x63, 0x6f, 0x6d, 0x6d, 0x20, 0x54, 0x65, 0x63, 0x68, 0x6e, 0x6f,
++	0x6c, 0x6f, 0x67, 0x69, 0x65, 0x73, 0x2c, 0x20, 0x49, 0x6e, 0x63, 0x2e,
++	0x00, 0x11, 0x02, 0x53, 0x6e, 0x61, 0x70, 0x64, 0x72, 0x61, 0x67, 0x6f,
++	0x6e, 0x20, 0x30, 0x31, 0x42, 0x00, 0x0f, 0x09, 0x10, 0x04, 0xc6, 0x05,
++	0x38, 0x09, 0x00, 0x00, 0xeb, 0x34, 0x00, 0x00, 0x00, 0x08, 0x82, 0x80,
++	0x03, 0x00, 0x00, 0x00, 0x00, 0x08, 0x83, 0x90, 0x02, 0x00, 0x00, 0x00,
++	0x00, 0x03, 0x84, 0x00, 0x03, 0x08, 0x06,
++};
++
++static u8 qcom_usb4_uid_crc(const u8 *data)
++{
++	u8 crc = 0xff;
++	unsigned int i, bit;
++
++	for (i = 0; i < 8; i++) {
++		crc ^= data[i];
++		for (bit = 0; bit < 8; bit++)
++			crc = (crc << 1) ^ ((crc & 0x80) ? 0x07 : 0);
++	}
++	return crc;
++}
++
++int qcom_usb4_drom_build(u8 *data, size_t size, u32 serial, u8 router)
++{
++	u64 uid;
++	u32 crc;
++
++	if (!data || size < QCOM_USB4_DROM_SIZE || router > 2)
++		return -EINVAL;
++
++	uid = (0x5c6ULL << 48) | ((u64)serial << 4) | router;
++	put_unaligned_le64(uid, data + 1);
++	data[0] = qcom_usb4_uid_crc(data + 1);
++	memcpy(data + 13, qcom_usb4_drom_data, sizeof(qcom_usb4_drom_data));
++	crc = ~crc32c(~0U, data + 13, sizeof(qcom_usb4_drom_data));
++	put_unaligned_le32(crc, data + 9);
++	return 0;
++}
+diff --git a/drivers/thunderbolt/qcom-usb4-drom.h b/drivers/thunderbolt/qcom-usb4-drom.h
+new file mode 100644
+index 00000000000..97cc1ec11b3
+--- /dev/null
++++ b/drivers/thunderbolt/qcom-usb4-drom.h
+@@ -0,0 +1,18 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef QCOM_USB4_DROM_H
++#define QCOM_USB4_DROM_H
++
++#include <linux/types.h>
++
++#define QCOM_USB4_DROM_SIZE 116
++
++/*
++ * Build the router DROM in the format the Glymur router firmware uses.
++ * serial must come from validated SoC information, not a guessed board ID.
++ * router is the hardware router index (0..2). This helper does not determine
++ * whether the descriptor's adapter topology applies to another chip.
++ * On error, data is unchanged. No hardware access is performed.
++ */
++int qcom_usb4_drom_build(u8 *data, size_t size, u32 serial, u8 router);
++
++#endif
+diff --git a/drivers/thunderbolt/qcom-usb4-events.c b/drivers/thunderbolt/qcom-usb4-events.c
+new file mode 100644
+index 00000000000..1dcb575d13a
+--- /dev/null
++++ b/drivers/thunderbolt/qcom-usb4-events.c
+@@ -0,0 +1,55 @@
++// SPDX-License-Identifier: GPL-2.0-only
++#include <linux/errno.h>
++#include <linux/unaligned.h>
++
++#include "qcom-usb4-events.h"
++
++#define QCOM_USB4_EVENTS_HEADER_SIZE 16
++
++int qcom_usb4_events_decode(const u8 *snapshot, size_t size, u32 consumer,
++			    struct qcom_usb4_events *events)
++{
++	struct qcom_usb4_events decoded = {};
++	u32 layout, tail, head, i, j;
++
++	if (!snapshot || !events || size < QCOM_USB4_EVENTS_HEADER_SIZE)
++		return -EINVAL;
++
++	layout = get_unaligned_le32(snapshot);
++	decoded.capacity = layout & 0xffff;
++	decoded.stride = layout >> 16;
++	decoded.producer = get_unaligned_le32(snapshot + 4);
++	if (!decoded.capacity || !decoded.stride ||
++	    consumer >= decoded.capacity || decoded.producer >= decoded.capacity)
++		return -EINVAL;
++
++	/* Validate the entire ring, not just the unread portion; no size overflow. */
++	if (decoded.capacity > (size - QCOM_USB4_EVENTS_HEADER_SIZE) / decoded.stride)
++		return -EINVAL;
++
++	decoded.consumer = consumer;
++	decoded.auxiliary = get_unaligned_le32(snapshot + 8);
++	decoded.reserved = get_unaligned_le32(snapshot + 12);
++	if (decoded.producer >= consumer) {
++		tail = decoded.producer - consumer;
++		head = 0;
++	} else {
++		tail = decoded.capacity - consumer;
++		head = decoded.producer;
++	}
++	decoded.pending_modulo = tail + head;
++	decoded.spans[0].count = tail;
++	decoded.spans[1].count = head;
++	if (tail)
++		decoded.spans[0].data = snapshot + QCOM_USB4_EVENTS_HEADER_SIZE +
++			(size_t)consumer * decoded.stride;
++	if (head)
++		decoded.spans[1].data = snapshot + QCOM_USB4_EVENTS_HEADER_SIZE;
++	for (i = 0; i < 2; i++)
++		for (j = 0; j < decoded.spans[i].count; j++)
++			if (decoded.spans[i].data[(size_t)j * decoded.stride] == 4)
++				decoded.type4_records++;
++
++	*events = decoded;
++	return 0;
++}
+diff --git a/drivers/thunderbolt/qcom-usb4-events.h b/drivers/thunderbolt/qcom-usb4-events.h
+new file mode 100644
+index 00000000000..5f1f6c4c67f
+--- /dev/null
++++ b/drivers/thunderbolt/qcom-usb4-events.h
+@@ -0,0 +1,42 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef QCOM_USB4_EVENTS_H
++#define QCOM_USB4_EVENTS_H
++
++#include <linux/types.h>
++
++struct qcom_usb4_event_span {
++	const u8 *data;
++	u32 count;
++};
++
++struct qcom_usb4_events {
++	u32 capacity;
++	u32 stride;
++	u32 producer;
++	u32 consumer;
++	u32 pending_modulo;
++	u32 auxiliary;
++	u32 reserved;
++	u32 type4_records;
++	/* Unread records in order: tail, then head. Empty spans have NULL data. */
++	struct qcom_usb4_event_span spans[2];
++};
++
++/*
++ * Decode the MCU event ring format from a stable, ordinary-memory copy.
++ * snapshot must remain immutable and alive while the returned spans are used;
++ * it must not overlap events. This does not capture live shared RAM or MMIO.
++ * size is the accessible snapshot length. On error, events is unchanged.
++ *
++ * A caller must separately establish coherent publication and no producer
++ * overwrite. Every modulo count can conceal complete laps, including zero.
++ * producer is the next private cursor only after the caller consumes the
++ * spans; this helper neither updates a cursor nor writes a shared reader.
++ * auxiliary and reserved have unknown semantics and are left uninterpreted.
++ * Type 4 signals completion of a stop command, but supplies no proven freshness
++ * token or MCU/DMA halt guarantee. type4_records is only a record count.
++ */
++int qcom_usb4_events_decode(const u8 *snapshot, size_t size, u32 consumer,
++			    struct qcom_usb4_events *events);
++
++#endif
+diff --git a/drivers/thunderbolt/qcom-usb4-fw.c b/drivers/thunderbolt/qcom-usb4-fw.c
+new file mode 100644
+index 00000000000..0a012ad23c4
+--- /dev/null
++++ b/drivers/thunderbolt/qcom-usb4-fw.c
+@@ -0,0 +1,87 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Qualcomm USB4 MCU firmware record decoding.
++ *
++ * Each record is a little-endian u32 byte offset, a little-endian u32 word
++ * count, then that many little-endian u32 words. Records continue to EOF.
++ * There is no file header, signature, or checksum field.
++ *
++ * This helper does not select firmware, reset the MCU, or access hardware.
++ * The caller must select the correct image, establish the actual RAM size,
++ * hold the MCU in the required loading state, and implement ordered writes.
++ */
++
++#include <linux/errno.h>
++#include <linux/unaligned.h>
++
++#include "qcom-usb4-fw.h"
++
++int qcom_usb4_fw_validate(const u8 *data, size_t size, size_t ram_size)
++{
++	size_t pos = 0;
++
++	if (!data || !size)
++		return -EINVAL;
++
++	while (pos < size) {
++		size_t bytes;
++		u32 offset, words;
++
++		if (size - pos < 8)
++			return -EINVAL;
++
++		offset = get_unaligned_le32(data + pos);
++		words = get_unaligned_le32(data + pos + 4);
++		pos += 8;
++
++		/* Bound multiplication and record traversal before doing either. */
++		if (words > (size - pos) / sizeof(u32))
++			return -EINVAL;
++		bytes = (size_t)words * sizeof(u32);
++
++		if (offset % sizeof(u32))
++			return -EINVAL;
++
++		/* Prevent the 32-bit destination arithmetic used by the transport. */
++		if (bytes > (u32)-1 - offset)
++			return -EOVERFLOW;
++
++		if (offset > ram_size || bytes > ram_size - offset)
++			return -EFBIG;
++
++		pos += bytes;
++	}
++
++	return 0;
++}
++
++int qcom_usb4_fw_upload(const u8 *data, size_t size, size_t ram_size,
++		       qcom_usb4_fw_write_word_t write_word, void *context)
++{
++	size_t pos = 0;
++	int ret;
++
++	if (!write_word)
++		return -EINVAL;
++
++	/* A bad later record must not leave a partially uploaded image. */
++	ret = qcom_usb4_fw_validate(data, size, ram_size);
++	if (ret)
++		return ret;
++
++	while (pos < size) {
++		u32 offset = get_unaligned_le32(data + pos);
++		u32 words = get_unaligned_le32(data + pos + 4);
++
++		pos += 8;
++		while (words--) {
++			ret = write_word(context, offset, get_unaligned_le32(data + pos));
++			if (ret)
++				return ret;
++			offset += sizeof(u32);
++			pos += sizeof(u32);
++		}
++	}
++
++	return 0;
++}
+diff --git a/drivers/thunderbolt/qcom-usb4-fw.h b/drivers/thunderbolt/qcom-usb4-fw.h
+new file mode 100644
+index 00000000000..d0775f9eb45
+--- /dev/null
++++ b/drivers/thunderbolt/qcom-usb4-fw.h
+@@ -0,0 +1,20 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef QCOM_USB4_FW_H
++#define QCOM_USB4_FW_H
++
++#include <linux/types.h>
++
++/*
++ * Offsets are relative to MCU RAM, not to the router's MMIO resource.
++ * The callback returns zero on success or a negative errno on failure.
++ * Keep the image bytes unchanged throughout upload, including callbacks.
++ * Transport failure stops further writes but may leave a partial image;
++ * the caller must keep the MCU stopped and perform its recovery sequence.
++ */
++typedef int (*qcom_usb4_fw_write_word_t)(void *context, u32 offset, u32 value);
++
++int qcom_usb4_fw_validate(const u8 *data, size_t size, size_t ram_size);
++int qcom_usb4_fw_upload(const u8 *data, size_t size, size_t ram_size,
++		       qcom_usb4_fw_write_word_t write_word, void *context);
++
++#endif
+diff --git a/drivers/thunderbolt/qcom-usb4-mcu.c b/drivers/thunderbolt/qcom-usb4-mcu.c
+new file mode 100644
+index 00000000000..9deaf93ed0c
+--- /dev/null
++++ b/drivers/thunderbolt/qcom-usb4-mcu.c
+@@ -0,0 +1,228 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/* Qualcomm USB4 router MCU: firmware upload, run/ready handshake, mailbox. */
++
++#include <linux/bits.h>
++#include <linux/errno.h>
++#include <linux/iopoll.h>
++#include <linux/unaligned.h>
++
++#include "qcom-usb4-drom.h"
++#include "qcom-usb4-fw.h"
++#include "qcom-usb4-mcu.h"
++
++#define QCOM_USB4_MCU_STATUS		0x18
++#define QCOM_USB4_MCU_HOST_CONTROL	0x8018
++#define QCOM_USB4_MCU_UID_HIGH		0x801c
++#define QCOM_USB4_MCU_UID_LOW		0x8020
++#define QCOM_USB4_MCU_READY		BIT(24)
++#define QCOM_USB4_MCU_RUN			BIT(0)
++#define QCOM_USB4_MCU_SHARED_MIN_SIZE	12
++#define QCOM_USB4_MCU_COMMAND_RELATIVE	0xc
++#define QCOM_USB4_MCU_MAX_COMMAND_TIMEOUT_US	1000000
++
++int qcom_usb4_mcu_init(struct qcom_usb4_mcu *mcu, void __iomem *base,
++		       size_t mapping_size, size_t ram_size,
++		       enum qcom_usb4_mcu_layout layout)
++{
++	u32 ram, control, shared;
++
++	if (!mcu)
++		return -EINVAL;
++	*mcu = (struct qcom_usb4_mcu) { 0 };
++	if (!base || (unsigned long)base % sizeof(u32) ||
++	    ram_size < QCOM_USB4_MCU_SHARED_MIN_SIZE)
++		return -EINVAL;
++
++	switch (layout) {
++	case QCOM_USB4_MCU_LEGACY:
++		ram = 0x13000;
++		control = 0x22000;
++		shared = 0x22010;
++		break;
++	case QCOM_USB4_MCU_V2:
++		ram = 0x1e000;
++		control = 0x14000;
++		shared = 0x14010;
++		break;
++	default:
++		return -EINVAL;
++	}
++
++	/* The shared register is the highest control register accessed here. */
++	if (mapping_size < shared + sizeof(u32) || ram > mapping_size ||
++	    ram_size > mapping_size - ram ||
++	    (ram <= control && ram_size > control - ram))
++		return -EINVAL;
++
++	mcu->base = base;
++	mcu->ram_size = ram_size;
++	mcu->ram_offset = ram;
++	mcu->control_offset = control;
++	mcu->shared_offset_reg = shared;
++	mcu->drom_offset = layout == QCOM_USB4_MCU_V2 ? 0xff20 : 0xdf20;
++	return 0;
++}
++
++static int qcom_usb4_mcu_write_word(void *context, u32 offset, u32 value)
++{
++	struct qcom_usb4_mcu *mcu = context;
++
++	writel(value, mcu->base + mcu->ram_offset + offset);
++	return 0;
++}
++
++static int qcom_usb4_mcu_prepare_drom(struct qcom_usb4_mcu *mcu, u8 *drom,
++				      u32 serial, u8 router)
++{
++	if (!mcu || !mcu->base)
++		return -EINVAL;
++	if (mcu->drom_offset > mcu->ram_size ||
++	    mcu->ram_size - mcu->drom_offset < QCOM_USB4_DROM_SIZE)
++		return -EFBIG;
++	return qcom_usb4_drom_build(drom, QCOM_USB4_DROM_SIZE, serial, router);
++}
++
++int qcom_usb4_mcu_upload(struct qcom_usb4_mcu *mcu, const u8 *data, size_t size)
++{
++	int ret;
++
++	if (!mcu || !mcu->base)
++		return -EINVAL;
++	ret = qcom_usb4_fw_validate(data, size, mcu->ram_size);
++	if (ret)
++		return ret;
++	if (readl(mcu->base + mcu->control_offset) & QCOM_USB4_MCU_RUN)
++		return -EBUSY;
++
++	/* Clear the control register before copying any records. */
++	writel(0, mcu->base + mcu->control_offset);
++	ret = qcom_usb4_fw_upload(data, size, mcu->ram_size,
++				 qcom_usb4_mcu_write_word, mcu);
++	if (!ret)
++		/* Flush writes before an intervening provider operation. */
++		readl(mcu->base + mcu->control_offset);
++	return ret;
++}
++
++static void qcom_usb4_mcu_store_drom(struct qcom_usb4_mcu *mcu, const u8 *drom)
++{
++	unsigned int i;
++
++	writel(get_unaligned_le32(drom + 5), mcu->base + QCOM_USB4_MCU_UID_HIGH);
++	writel(get_unaligned_le32(drom + 1), mcu->base + QCOM_USB4_MCU_UID_LOW);
++	for (i = 0; i < QCOM_USB4_DROM_SIZE; i += sizeof(u32))
++		qcom_usb4_mcu_write_word(mcu, mcu->drom_offset + i,
++					 get_unaligned_le32(drom + i));
++	readl(mcu->base + mcu->control_offset);
++}
++
++int qcom_usb4_mcu_write_drom(struct qcom_usb4_mcu *mcu, u32 serial, u8 router)
++{
++	u8 drom[QCOM_USB4_DROM_SIZE];
++	int ret;
++
++	ret = qcom_usb4_mcu_prepare_drom(mcu, drom, serial, router);
++	if (ret)
++		return ret;
++	if (readl(mcu->base + mcu->control_offset) & QCOM_USB4_MCU_RUN)
++		return -EBUSY;
++	qcom_usb4_mcu_store_drom(mcu, drom);
++	return 0;
++}
++
++int qcom_usb4_mcu_load(struct qcom_usb4_mcu *mcu, const u8 *data, size_t size,
++		       u32 serial, u8 router)
++{
++	u8 drom[QCOM_USB4_DROM_SIZE];
++	int ret;
++
++	/* Validate the descriptor before upload can modify any hardware. */
++	ret = qcom_usb4_mcu_prepare_drom(mcu, drom, serial, router);
++	if (ret)
++		return ret;
++	ret = qcom_usb4_mcu_upload(mcu, data, size);
++	if (ret)
++		return ret;
++	qcom_usb4_mcu_store_drom(mcu, drom);
++	return 0;
++}
++
++static void qcom_usb4_mcu_update(struct qcom_usb4_mcu *mcu, u32 offset,
++				u32 mask, u32 value)
++{
++	u32 reg = readl(mcu->base + offset);
++
++	writel((reg & ~mask) | (value & mask), mcu->base + offset);
++}
++
++void qcom_usb4_mcu_stop(struct qcom_usb4_mcu *mcu)
++{
++	if (!mcu || !mcu->base)
++		return;
++
++	qcom_usb4_mcu_update(mcu, mcu->control_offset, QCOM_USB4_MCU_RUN, 0);
++	qcom_usb4_mcu_update(mcu, QCOM_USB4_MCU_HOST_CONTROL,
++			     QCOM_USB4_MCU_READY, 0);
++	/* Complete posted writes before the caller releases power or clocks. */
++	readl(mcu->base + QCOM_USB4_MCU_HOST_CONTROL);
++}
++
++int qcom_usb4_mcu_start(struct qcom_usb4_mcu *mcu, u32 *shared_offset)
++{
++	u32 status, offset;
++	int ret;
++
++	if (!shared_offset)
++		return -EINVAL;
++	*shared_offset = 0;
++	if (!mcu || !mcu->base)
++		return -EINVAL;
++	if (readl(mcu->base + mcu->control_offset) & QCOM_USB4_MCU_RUN)
++		return -EBUSY;
++
++	qcom_usb4_mcu_update(mcu, QCOM_USB4_MCU_HOST_CONTROL,
++			     QCOM_USB4_MCU_READY, 0);
++	qcom_usb4_mcu_update(mcu, mcu->control_offset,
++			     QCOM_USB4_MCU_RUN, QCOM_USB4_MCU_RUN);
++	ret = readl_poll_timeout(mcu->base + QCOM_USB4_MCU_STATUS, status,
++				 status & QCOM_USB4_MCU_READY, 5000, 1000000);
++	if (ret)
++		goto stop;
++
++	offset = readl(mcu->base + mcu->shared_offset_reg);
++	if (offset % sizeof(u32) ||
++	    offset > mcu->ram_size - QCOM_USB4_MCU_SHARED_MIN_SIZE) {
++		ret = -EPROTO;
++		goto stop;
++	}
++
++	*shared_offset = offset;
++	return 0;
++
++stop:
++	qcom_usb4_mcu_stop(mcu);
++	return ret;
++}
++
++int qcom_usb4_mcu_command(struct qcom_usb4_mcu *mcu, u32 command,
++			 unsigned int timeout_us)
++{
++	void __iomem *mailbox;
++	u32 value;
++
++	if (!mcu || !mcu->base || !command || !timeout_us ||
++	    timeout_us > QCOM_USB4_MCU_MAX_COMMAND_TIMEOUT_US)
++		return -EINVAL;
++	if (!(readl(mcu->base + mcu->control_offset) & QCOM_USB4_MCU_RUN))
++		return -EHOSTDOWN;
++	if (!(readl(mcu->base + QCOM_USB4_MCU_STATUS) & QCOM_USB4_MCU_READY))
++		return -EAGAIN;
++
++	/* Both layouts place the mailbox before the validated shared register. */
++	mailbox = mcu->base + mcu->control_offset + QCOM_USB4_MCU_COMMAND_RELATIVE;
++	if (readl(mailbox))
++		return -EBUSY;
++
++	writel(command, mailbox);
++	return readl_poll_timeout(mailbox, value, !value, 1, timeout_us);
++}
+diff --git a/drivers/thunderbolt/qcom-usb4-mcu.h b/drivers/thunderbolt/qcom-usb4-mcu.h
+new file mode 100644
+index 00000000000..ad48cd34c3b
+--- /dev/null
++++ b/drivers/thunderbolt/qcom-usb4-mcu.h
+@@ -0,0 +1,79 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef QCOM_USB4_MCU_H
++#define QCOM_USB4_MCU_H
++
++#include <linux/io.h>
++#include <linux/types.h>
++
++enum qcom_usb4_mcu_layout {
++	QCOM_USB4_MCU_LEGACY,
++	QCOM_USB4_MCU_V2,
++};
++
++struct qcom_usb4_mcu {
++	void __iomem *base;
++	size_t ram_size;
++	u32 ram_offset;
++	u32 control_offset;
++	u32 shared_offset_reg;
++	u32 drom_offset;
++};
++
++/*
++ * The caller must verify the router variant and usable RAM size, own the
++ * mapping, serialize all operations, and maintain power/clocks throughout.
++ * The register mapping base must be aligned to four bytes.
++ * Initializing this helper does not touch hardware. It is not a power/reset
++ * sequence or a platform driver. Do not modify the fields after initialization.
++ */
++int qcom_usb4_mcu_init(struct qcom_usb4_mcu *mcu, void __iomem *base,
++		       size_t mapping_size, size_t ram_size,
++		       enum qcom_usb4_mcu_layout layout);
++
++/*
++ * Separate stopped-state operations for platform sequencing. Upload validates
++ * the entire image before zeroing control and writing firmware; it does not
++ * write UID/DROM or start the MCU. A control readback follows successful
++ * upload before returning. The owner can then perform the required
++ * provider memory-force and board-extension steps before writing UID/DROM.
++ * Both operations reject running firmware without writes. DROM input/bounds
++ * validation happens before any MMIO. Neither operation establishes power,
++ * image identity, physical halt or successful completion of the other step.
++ * Keep exclusive ownership across the entire sequence, including provider work.
++ */
++int qcom_usb4_mcu_upload(struct qcom_usb4_mcu *mcu, const u8 *data, size_t size);
++int qcom_usb4_mcu_write_drom(struct qcom_usb4_mcu *mcu, u32 serial, u8 router);
++
++/*
++ * Upload a caller-selected immutable image and generated DROM while stopped.
++ * serial and router must be validated hardware identity, as for the DROM
++ * builder. Malformed input or running firmware causes no hardware writes.
++ * This convenience operation provides no intervening provider step. The Glymur
++ * startup sequence requires upload and write_drom separately, with memory
++ * force and the board extension between them. This does not select an image
++ * or establish the board's power/reset state.
++ */
++int qcom_usb4_mcu_load(struct qcom_usb4_mcu *mcu, const u8 *data, size_t size,
++		       u32 serial, u8 router);
++
++/*
++ * Start requires a fully uploaded firmware image and DROM. Already running
++ * firmware is rejected without modifying hardware. On failure after starting,
++ * stop the MCU and leave shared_offset zero. Success validates only the first
++ * 12 shared bytes; further accesses require their own bounds checks.
++ */
++int qcom_usb4_mcu_start(struct qcom_usb4_mcu *mcu, u32 *shared_offset);
++void qcom_usb4_mcu_stop(struct qcom_usb4_mcu *mcu);
++
++/*
++ * Send a caller-validated, nonzero command to running, ready firmware.
++ * Requires sleepable context and exclusive command/lifecycle ownership.
++ * timeout_us must be in 1..1000000; it is caller policy, not a discovered
++ * hardware limit. Success means only that firmware cleared the mailbox.
++ * On timeout the command may still be executing: do not retry blindly. This
++ * helper neither clears a pending command nor resets/stops firmware.
++ */
++int qcom_usb4_mcu_command(struct qcom_usb4_mcu *mcu, u32 command,
++			 unsigned int timeout_us);
++
++#endif
+diff --git a/drivers/thunderbolt/qcom-usb4-typec.c b/drivers/thunderbolt/qcom-usb4-typec.c
+new file mode 100644
+index 00000000000..18c8cd82ec7
+--- /dev/null
++++ b/drivers/thunderbolt/qcom-usb4-typec.c
+@@ -0,0 +1,165 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Encoders for the Type-C commands of the Qualcomm USB4 router MCU mailbox.
++ * Command completion, power sequencing and link readiness belong to callers;
++ * encoding a word does not establish that the MCU can accept it.
++ */
++#include <linux/errno.h>
++#include <linux/usb/pd.h>
++
++#include "qcom-usb4-typec.h"
++
++int qcom_usb4_typec_connect_command(const struct qcom_usb4_pan_connect *pan,
++				   u32 *command)
++{
++	u32 cable_class;
++
++	if (!pan || !command)
++		return -EINVAL;
++	if (pan->mode > QCOM_USB4_TUNNEL_USB4 ||
++	    pan->orientation > QCOM_USB4_PAN_REVERSE ||
++	    pan->rounded > 1 || pan->board_retimer > 1)
++		return -EINVAL;
++	if (pan->cable_type > QCOM_USB4_PAN_RETIMER || pan->cable_speed > 1)
++		return -EOPNOTSUPP;
++
++	cable_class = 0;
++	if (pan->cable_type == QCOM_USB4_PAN_RETIMER) {
++		cable_class = 1;
++		if (pan->mode == QCOM_USB4_TUNNEL_TBT && !pan->rounded)
++			cable_class = 3;
++	}
++
++	*command = 1U | (u32)pan->mode << 8 | (u32)pan->orientation << 9 |
++		   (u32)pan->board_retimer << 10 | cable_class << 11 |
++		   (u32)pan->cable_speed << 13;
++	return 0;
++}
++
++int qcom_usb4_typec_usb4_command(const struct enter_usb_data *data,
++				enum typec_orientation orientation,
++				u8 board_retimer, u32 *command)
++{
++	struct qcom_usb4_pan_connect pan = {
++		.mode = QCOM_USB4_TUNNEL_USB4,
++		.board_retimer = board_retimer,
++	};
++	u32 speed;
++
++	if (!data || !command)
++		return -EINVAL;
++	if (((data->eudo & EUDO_USB_MODE_MASK) >> EUDO_USB_MODE_SHIFT) !=
++	    EUDO_USB_MODE_USB4)
++		return -EINVAL;
++	if (data->active_link_training)
++		return -EOPNOTSUPP;
++
++	switch (orientation) {
++	case TYPEC_ORIENTATION_NORMAL:
++		pan.orientation = QCOM_USB4_PAN_NORMAL;
++		break;
++	case TYPEC_ORIENTATION_REVERSE:
++		pan.orientation = QCOM_USB4_PAN_REVERSE;
++		break;
++	default:
++		return -EINVAL;
++	}
++
++	speed = (data->eudo & EUDO_CABLE_SPEED_MASK) >> EUDO_CABLE_SPEED_SHIFT;
++	switch (speed) {
++	case EUDO_CABLE_SPEED_USB4_GEN2:
++		pan.cable_speed = 0;
++		break;
++	case EUDO_CABLE_SPEED_USB4_GEN3:
++		pan.cable_speed = 1;
++		break;
++	default:
++		return -EOPNOTSUPP;
++	}
++	pan.cable_type = (data->eudo & EUDO_CABLE_TYPE_MASK) >> EUDO_CABLE_TYPE_SHIFT;
++
++	return qcom_usb4_typec_connect_command(&pan, command);
++}
++
++int qcom_usb4_typec_tbt_command(const struct typec_thunderbolt_data *data,
++			      enum typec_orientation orientation,
++			      u8 board_retimer, u32 *command)
++{
++	struct qcom_usb4_pan_connect pan = {
++		.mode = QCOM_USB4_TUNNEL_TBT,
++		.board_retimer = board_retimer,
++	};
++	u32 cable, enter, speed, rounded;
++	bool active, retimer;
++
++	if (!data || !command)
++		return -EINVAL;
++	cable = data->cable_mode;
++	enter = data->enter_vdo;
++	if (!(data->device_mode & TBT_MODE) || !(cable & TBT_MODE) ||
++	    !(enter & TBT_MODE))
++		return -EINVAL;
++	if (TBT_ADAPTER(data->device_mode) != TBT_ADAPTER_TBT3)
++		return -EOPNOTSUPP;
++	if ((cable | enter) & (TBT_CABLE_OPTICAL | TBT_CABLE_LINK_TRAINING))
++		return -EOPNOTSUPP;
++
++	active = !!(cable & TBT_CABLE_ACTIVE_PASSIVE);
++	retimer = !!(cable & TBT_CABLE_RETIMER);
++	if (active != !!(enter & TBT_ENTER_MODE_ACTIVE_CABLE) ||
++	    retimer != !!(enter & TBT_CABLE_RETIMER) || (!active && retimer))
++		return -EINVAL;
++	/* Redriver or old GLINK active-only data must not become a retimer. */
++	if (active && !retimer)
++		return -EOPNOTSUPP;
++	pan.cable_type = retimer ? QCOM_USB4_PAN_RETIMER : QCOM_USB4_PAN_PASSIVE;
++
++	speed = TBT_CABLE_SPEED(cable);
++	if (speed != TBT_CABLE_SPEED(enter))
++		return -EINVAL;
++	switch (speed) {
++	case TBT_CABLE_USB3_PASSIVE:
++		pan.cable_speed = 0;
++		break;
++	case TBT_CABLE_10_AND_20GBPS:
++		pan.cable_speed = 1;
++		break;
++	default:
++		return -EOPNOTSUPP;
++	}
++	rounded = TBT_CABLE_ROUNDED_SUPPORT(cable);
++	if (rounded != TBT_CABLE_ROUNDED_SUPPORT(enter))
++		return -EINVAL;
++	if (rounded > 1)
++		return -EOPNOTSUPP;
++	pan.rounded = rounded;
++
++	switch (orientation) {
++	case TYPEC_ORIENTATION_NORMAL:
++		pan.orientation = QCOM_USB4_PAN_NORMAL;
++		break;
++	case TYPEC_ORIENTATION_REVERSE:
++		pan.orientation = QCOM_USB4_PAN_REVERSE;
++		break;
++	default:
++		return -EINVAL;
++	}
++
++	return qcom_usb4_typec_connect_command(&pan, command);
++}
++
++int qcom_usb4_typec_preset_command(u32 preset, u32 *command)
++{
++	if (!command || preset > 0xffff)
++		return -EINVAL;
++	*command = 2U | preset << 8;
++	return 0;
++}
++
++int qcom_usb4_typec_disconnect_command(u32 *command)
++{
++	if (!command)
++		return -EINVAL;
++	*command = 6;
++	return 0;
++}
+diff --git a/drivers/thunderbolt/qcom-usb4-typec.h b/drivers/thunderbolt/qcom-usb4-typec.h
+new file mode 100644
+index 00000000000..9a7531d8eb1
+--- /dev/null
++++ b/drivers/thunderbolt/qcom-usb4-typec.h
+@@ -0,0 +1,70 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef QCOM_USB4_TYPEC_H
++#define QCOM_USB4_TYPEC_H
++
++#include <linux/types.h>
++#include <linux/usb/typec.h>
++#include <linux/usb/typec_tbt.h>
++
++enum qcom_usb4_tunnel_mode {
++	QCOM_USB4_TUNNEL_TBT = 0,
++	QCOM_USB4_TUNNEL_USB4 = 1,
++};
++
++/* PAN wire values, deliberately distinct from enum typec_orientation. */
++enum qcom_usb4_pan_orientation {
++	QCOM_USB4_PAN_NORMAL = 0,
++	QCOM_USB4_PAN_REVERSE = 1,
++};
++
++enum qcom_usb4_pan_cable_type {
++	QCOM_USB4_PAN_PASSIVE = 0,
++	QCOM_USB4_PAN_RETIMER = 1,
++};
++
++/*
++ * Validated PAN fields for a port with a PS8830 board retimer.
++ * cable_speed is the PAN value 0/1: USB4 Gen2/Gen3 respectively;
++ * TBT maps these to TBT_CABLE_USB3_PASSIVE/TBT_CABLE_10_AND_20GBPS.
++ * rounded and board_retimer must be 0/1. The latter describes the board,
++ * never the cable. Determine it from verified board configuration.
++ * Do not truncate raw fields before calling: unavailable mode/orientation,
++ * unsupported cable types and higher cable speeds must remain distinguishable.
++ */
++struct qcom_usb4_pan_connect {
++	u8 mode;
++	u8 orientation;
++	u8 cable_type;
++	u8 cable_speed;
++	u8 rounded;
++	u8 board_retimer;
++};
++
++/* All helpers leave *command unchanged on error. They perform no hardware I/O. */
++int qcom_usb4_typec_connect_command(const struct qcom_usb4_pan_connect *pan,
++				   u32 *command);
++
++/*
++ * Adapter for TYPEC_MODE_USB4's enter_usb_data, not a mux callback.
++ * Caller must establish the payload's mode/type before passing it here.
++ * Gen4, redriver, optical and active-link-training cases are unsupported.
++ */
++int qcom_usb4_typec_usb4_command(const struct enter_usb_data *data,
++				enum typec_orientation orientation,
++				u8 board_retimer, u32 *command);
++
++/*
++ * Adapter for a verified TBT modal payload. Requires standard cable-type and
++ * Enter Mode flags, including TBT_CABLE_RETIMER for a retimer cable. The older
++ * GLINK producer omits this flag; its ambiguous active payload is rejected.
++ * Optical/redriver cables, link training and unsupported rates are rejected.
++ */
++int qcom_usb4_typec_tbt_command(const struct typec_thunderbolt_data *data,
++			      enum typec_orientation orientation,
++			      u8 board_retimer, u32 *command);
++
++/* Only packs a verified 16-bit PMSK/preset; does not choose or apply a preset. */
++int qcom_usb4_typec_preset_command(u32 preset, u32 *command);
++int qcom_usb4_typec_disconnect_command(u32 *command);
++
++#endif
+-- 
+2.56.0
+

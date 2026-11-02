@@ -1,0 +1,57 @@
+#!/bin/bash
+# Reconnect the Flex Keyboard over Bluetooth when it is detached.
+#
+# The keyboard advertises ADV_DIRECT_IND at its bonded host's *public* identity.
+# bluetoothd's background auto-connect did not pick this up on this system, but
+# an explicit connect (which puts the controller in the initiator state) does.
+# This just issues that connect, with retries, when the wired KIP endpoints go.
+#
+# If every retry fails, the stored bond is very likely stale (e.g. Windows
+# re-keyed the keyboard on a dual boot): the keyboard is right here and
+# advertising, yet will not accept our key. We record that in a marker so
+# surface-pro-11-flex-autopair re-pairs on the next attach. A successful connect clears it.
+set -u
+compatible=${SP11_FLEX_COMPATIBLE:-/proc/device-tree/compatible}
+hid_devices=${SP11_FLEX_HID_DEVICES:-/sys/bus/hid/devices}
+address_file=${SP11_FLEX_ADDRESS_FILE:-/var/lib/surface-pro-11-support/flex-keyboard-address}
+run_dir=${SP11_FLEX_RUN_DIR:-/run/surface-pro-11-support}
+marker=$run_dir/flex-needs-repair
+
+[[ -r $compatible ]] && tr '\0' '\n' <"$compatible" | grep -qx 'microsoft,denali-oled' || exit 0
+mkdir -p "$run_dir"
+
+# Waits are skipped in the package tests.
+nap(){ [[ -n ${SP11_FLEX_NO_SLEEP:-} ]] || sleep "$1"; }
+
+KBD="${1:-}"
+[ -n "$KBD" ] || KBD=$(cat "$address_file" 2>/dev/null || true)
+[ -n "$KBD" ] || exit 0
+
+# Already connected? nothing to do.
+bluetoothctl info "$KBD" 2>/dev/null | grep -q 'Connected: yes' && { rm -f "$marker"; exit 0; }
+
+for n in $(seq 1 10); do
+    # Still attached over the wire? then we are not wanted.
+    ls "$hid_devices" 2>/dev/null | grep -q '045E:0C8B' && exit 0
+    timeout 25 bluetoothctl connect "$KBD" >/dev/null 2>&1
+    if bluetoothctl info "$KBD" 2>/dev/null | grep -q 'Connected: yes'; then
+        logger -t surface-pro-11-flex-reconnect "connected $KBD over Bluetooth"
+        rm -f "$marker"
+        exit 0
+    fi
+    # Half-way with nothing: a wedged in-flight LE connect in the kernel makes
+    # every connect a silent "busy" until the controller is reset. Reset once.
+    if [ "$n" = 5 ]; then
+        logger -t surface-pro-11-flex-reconnect "no connection after $n tries; power-cycling the controller once"
+        btmgmt power off >/dev/null 2>&1; nap 2; btmgmt power on >/dev/null 2>&1; nap 4
+    fi
+    nap 3
+done
+# Exhausted retries with the keyboard detached: flag a likely-stale bond so the
+# next attach re-pairs. Only if it is still detached (not a race with re-attach).
+if ! ls "$hid_devices" 2>/dev/null | grep -q '045E:0C8B'; then
+    : > "$marker" 2>/dev/null || true
+    logger -t surface-pro-11-flex-reconnect "failed to connect $KBD after retries; flagged for re-pair on next attach"
+else
+    logger -t surface-pro-11-flex-reconnect "failed to connect $KBD after retries (re-attached during attempt)"
+fi

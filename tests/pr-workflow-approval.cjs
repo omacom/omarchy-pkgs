@@ -368,12 +368,11 @@ test('scoped branch names reject anything that is not a package name', () => {
 // PAT: a GITHUB_TOKEN push would wait for build approval, and a GITHUB_TOKEN
 // merge would not start publish.yml.
 test('every bot lane opens its PRs per package through package-prs.yml', () => {
-  for (const [file, prefix] of [['sync-upstream.yml', 'auto/sync-upstream'],
-    ['sync-rebuilds.yml', 'auto/sync-rebuilds'], ['track-branches.yml', 'auto/track-branches']]) {
+  for (const file of ['sync-upstream.yml', 'sync-rebuilds.yml']) {
     const text = readFileSync(join(__dirname, '../.github/workflows', file), 'utf8');
-    assert.match(text, new RegExp(`package-pr-groups\\.sh ${prefix.replace('/', '\\/')} "\\$RUNNER_TEMP\/pins\\.patch"`), file);
+    assert.match(text, /package-pr-groups\.sh (?:"\$PREFIX"|auto\/sync-rebuilds) "\$RUNNER_TEMP\/pins\.patch"/, file);
     assert.match(text, /uses: \.\/\.github\/workflows\/package-prs\.yml/, file);
-    assert.match(text, new RegExp(`prefix: ${prefix.replace('/', '\\/')}\n`), file);
+    assert.match(text, /prefix: (?:\$\{\{ needs.sync.outputs.prefix \}\}|auto\/sync-rebuilds)\n/, file);
     assert.match(text, /PKGS_BOT_TOKEN: \$\{\{ secrets\.PKGS_BOT_TOKEN \}\}/, file);
     assert.doesNotMatch(text, /create-pull-request|build-approved|\n  approve:\n/, file);
     assert.doesNotMatch(text, /^ +(contents|pull-requests|actions): write$/m, file);
@@ -400,7 +399,7 @@ test('package PRs split per package and keep branch siblings together', () => {
       writeFileSync(join(pkg, 'PKGBUILD'), `pkgname=${name}\npkgver=1\npkgrel=1\n`);
       writeFileSync(join(pkg, '.omarchy/package.json'), JSON.stringify({ upstream: { watch } }));
     };
-    const branch = { git_branch: 'https://github.com/basecamp/omarchy.git', branch: 'quattro' };
+    const branch = { git_branch: 'https://github.com/omacom/omarchy.git', branch: 'quattro' };
     write('omarchy-dev', branch);
     write('omarchy-settings-dev', branch);
     write('omasnap-git', { git_branch: 'https://github.com/omacom/omasnap.git', branch: 'main' });
