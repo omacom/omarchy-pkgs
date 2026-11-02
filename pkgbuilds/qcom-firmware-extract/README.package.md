@@ -19,8 +19,11 @@ only those on internal disks. A DSP device-tree image the device tree calls
 `*_dtb.mbn` is also found under its Windows name, `*_dtbs.elf`, when the exact
 name is missing. If Windows carries several variants and linux-firmware has a
 companion image from the same device-tree node, the sibling image's hash
-selects the compatible variant. Identical duplicates are accepted; differing
-variants without a unique companion match are skipped. The result is
+selects the compatible variant. When no file of the node is installed yet,
+as on a first install after Windows updated a driver and kept the older
+package, every file of the node comes from the one driver package whose INF
+`DriverVer` Windows ranks first (date, then version). Identical duplicates are
+accepted; other differing variants are skipped. The result is
 installed under `/usr/lib/firmware/updates/<name>`. The GPU zap shader is
 added to the initramfs through `/etc/mkinitcpio.conf.d/qcom-firmware.conf`;
 the DSP images are loaded from the root filesystem. What was installed, from

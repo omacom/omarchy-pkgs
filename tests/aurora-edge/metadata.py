@@ -118,10 +118,17 @@ class EdgeMetadataTests(unittest.TestCase):
             for package in srcinfo(name).values():
                 self.assertEqual(package['groups'], ['omarchy-platform-apple-silicon'])
 
-    def test_mesa_follows_neither_llvm_nor_spirv_tools(self):
-        for package in srcinfo('mesa-aurora').values():
-            for dependency in ['llvm-libs', 'spirv-tools']:
-                self.assertNotIn(dependency, package['depends'])
+    def test_mesa_follows_llvm_by_soname_and_never_spirv_tools(self):
+        # llvmpipe links the system LLVM. mesa-aurora depends on 'libLLVM.so',
+        # which makepkg versions from libgallium's NEEDED soname, so an LLVM
+        # major bump blocks the upgrade instead of breaking libgallium.
+        packages = srcinfo('mesa-aurora')
+        for package in packages.values():
+            self.assertNotIn('spirv-tools', package['depends'])
+            self.assertNotIn('llvm-libs', package['depends'])
+        self.assertEqual([d for d in packages['mesa-aurora']['depends'] if d.startswith('libLLVM')],
+                         ['libLLVM.so'])
+        self.assertFalse([d for d in packages['vulkan-aurora']['depends'] if d.startswith('libLLVM')])
 
     def test_mesa_epoch_and_existing_neo_versions_upgrade(self):
         installed = {'mesa-aurora': '1:26.3.0_devel-932.a0bcbcb28528',
