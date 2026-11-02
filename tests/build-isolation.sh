@@ -164,20 +164,29 @@ printf 'PASS: deferred pair mode works across isolated containers\n'
 fixture scratch ''
 cat >> "$TEST_ROOT/pkgbuilds/scratch/PKGBUILD" <<'EOF'
 check() {
-  # The exact size: the mount bin/build makes, not a tmpfs the host happens
-  # to provide under a bind mount.
-  [[ $(stat -f -c %T /tmp) == tmpfs ]]
-  (( $(df -B1G --output=size /tmp | tail -1) == 16 ))
+  # The filesystem type and superblock options of a tmpfs mounted at $1 in
+  # its own right. A bind mount of a host directory that happens to sit on
+  # tmpfs has that directory, not /, as its root, so it prints nothing.
+  own_mount() {
+    awk -v target="$1" '$4 == "/" && $5 == target { sub(/.* - /, ""); print }' /proc/self/mountinfo
+  }
+  [[ $(own_mount /tmp) == "tmpfs "*"size=16777216k"* ]]
   printf '#!/bin/sh\nexit 0\n' > /tmp/omarchy-exec-probe
   chmod +x /tmp/omarchy-exec-probe
   /tmp/omarchy-exec-probe
+  # The source tree moves to memory only where a kernel tree fits.
+  if (( $(awk '/^MemTotal:/ { print $2 }' /proc/meminfo) >= 56 * 1024 * 1024 )); then
+    [[ $(own_mount /src) == "tmpfs "*"size=41943040k"* ]]
+  else
+    [[ $(own_mount /src) != tmpfs\ * ]]
+  fi
 }
 EOF
 run_build scratch > "$TEST_ROOT/scratch.log" 2>&1 || {
   cat "$TEST_ROOT/scratch.log"
   exit 1
 }
-printf 'PASS: /tmp is an executable tmpfs in the build container\n'
+printf 'PASS: /tmp, and /src on large hosts, are executable tmpfs mounts\n'
 
 fixture excluded ''
 other_arch=aarch64
