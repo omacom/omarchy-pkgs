@@ -91,6 +91,14 @@ legs=$("$ROOT/bin/check-dkms" matrix --arch x86_64 --files-db "$tmp/target.files
   --packages linux-omarchy-headers 2>/dev/null)
 [[ $legs == '[{"arch":"x86_64","kernel":"linux-omarchy-headers 7.3-3","module":"xpadneo-dkms 0.10.4-1"}]' ]] &&
   pass "a promotion's legs name the moving kernel and the target's module" || fail "promotion legs: $legs"
+mkdir -p "$tmp/nofiles/linux-omarchy-headers-7.3-3"
+printf '%%NAME%%\nlinux-omarchy-headers\n\n%%VERSION%%\n7.3-3\n' >"$tmp/nofiles/linux-omarchy-headers-7.3-3/desc"
+channel nofiles
+if promote target nofiles >/dev/null; then
+  fail "a source database that cannot be read must fail the promotion's plan"
+fi
+grep -q 'nofiles.files is not a files database' "$tmp/stderr" &&
+  pass "a source database that cannot be read fails the plan, never checks nothing" || fail "unreadable source: $(cat "$tmp/stderr")"
 mkdir -p "$tmp/empty-local"
 if "$ROOT/bin/check-dkms" plan --arch x86_64 --files-db "$tmp/target.files" --from-db "$tmp/source.files" \
   --local "$tmp/empty-local" >/dev/null 2>"$tmp/stderr"; then
