@@ -203,6 +203,8 @@ Outside the board files they touch `glymur.dtsi` on every X2 laptop, and `pmic_g
 
 `1110` restores the keyboard backlight and the Fn-lock state on `reset_resume`. i2c-hid resumes its devices only through that callback (`i2c_hid_core_resume()` ends in `hid_driver_reset_resume()`), and hid-asus restored the backlight level (upstream) and the Fn-lock state (`1102`) only in `resume`, which i2c-hid never calls: on the 0B05:4B42, the backlight that `1104` turns off for sleep stayed off. The ProArt P14 (N1x) and the Zenbook A16 have the same keyboard, so it runs there too.
 
+`2181` adds the machine to QSEECOM's allowlist, as upstream does for the other X1 laptops whose firmware has the UEFI secure application, so Linux reads and writes EFI variables through it. Without it efivarfs is empty: `efibootmgr` cannot list or change boot entries, and the RTC cannot find the offset the firmware keeps there, so the clock is wrong at every boot until the network sets it.
+
 ## Config
 
 `config.aarch64` started from NVIDIA's `arm64-nvidia` annotations for the 1021.21 tree, went through `olddefconfig` on 7.2.5, and then had `linux-omarchy`'s behavioral choices applied (preemption, LSM list, zswap and zram defaults, THP, built-in Btrfs, schedutil, I/O schedulers, binder off, no Canonical trusted keys). It sets `linux-omarchy`'s BORE scheduler options too: `SCHED_BORE=y`, `MIN_BASE_SLICE_NS=2000000` and `MQ_IOSCHED_ADIOS=m`.
