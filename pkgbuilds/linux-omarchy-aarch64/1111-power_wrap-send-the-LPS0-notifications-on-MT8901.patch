@@ -1,0 +1,300 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Kaushal Rajeev Butala <kbutala@nvidia.com>
+Date: Mon, 19 Oct 2026 11:06:22 +0530
+Subject: [PATCH] NVIDIA: SAUCE: soc: mediatek: power_wrap: fix lid wake on
+ MT8901
+
+Opening the lid fails to resume affected MT8901-based systems from
+s2idle or PSCI SYSTEM_SUSPEND. The lid event reaches Linux only after
+another wake source, such as the power button, resumes the system.
+
+Firmware exposes a platform-agnostic LPS0 _DSM and uses its
+notifications to configure the EC sleep state. Linux invokes these
+methods only from the x86 ACPI s2idle path, leaving the arm64 suspend
+path without the notifications needed for EC lid wake.
+
+Although the LPS0 _DSM is defined for S0 idle, deliberately invoke it
+around PSCI SYSTEM_SUSPEND as well: the EC on affected MT8901 systems
+needs these notifications to arm lid wake. Firmware tables from both
+reviewed OEMs expose the interface and advertise the same functions.
+
+Send the notifications from the power_wrap device's suspend_noirq and
+resume_noirq callbacks. This moves the calls into the device noirq
+phases, closer to the x86 LPS0 timing, after userspace is frozen and
+before it is thawed. Preserve the notification ordering used by x86.
+
+Keep notification failures non-fatal so an AML evaluation error cannot
+prevent the system from sleeping. Unwind attempted entry notifications
+on failure and let the PM core balance successful entry if a later
+suspend step aborts.
+
+Require the screen-off/on pair and use the other notifications only
+when advertised, with entry/exit functions paired. Log unsupported
+platform IDs and missing required functions to aid platform bring-up.
+
+With this change, affected systems resume on lid open from both deep
+sleep and s2idle. Negative testing also covers:
+
+1. Injecting a later device noirq failure with a temporary test driver
+   to verify correct unwinding of EC notifications in both modes.
+2. Injecting _DSM evaluation failures in a host-side mocked harness
+   to verify that notification failures do not abort suspend.
+
+Signed-off-by: Kaushal Rajeev Butala <kbutala@nvidia.com>
+---
+ drivers/soc/mediatek/power_wrap/Makefile      |   1 +
+ .../soc/mediatek/power_wrap/inc/power_wrap.h  |  15 ++
+ drivers/soc/mediatek/power_wrap/power_wrap.c  |   8 +-
+ .../soc/mediatek/power_wrap/power_wrap_lps0.c | 156 ++++++++++++++++++
+ 4 files changed, 179 insertions(+), 1 deletion(-)
+ create mode 100644 drivers/soc/mediatek/power_wrap/power_wrap_lps0.c
+
+diff --git a/drivers/soc/mediatek/power_wrap/Makefile b/drivers/soc/mediatek/power_wrap/Makefile
+index 0765daf22..9a4c0f687 100644
+--- a/drivers/soc/mediatek/power_wrap/Makefile
++++ b/drivers/soc/mediatek/power_wrap/Makefile
+@@ -5,6 +5,7 @@ obj-y += power_wrap_drv.o
+ power_wrap_drv-y += power_wrap.o
+ power_wrap_drv-y += power_wrap_sysfs.o
+ power_wrap_drv-y += acpiutil.o
++power_wrap_drv-$(CONFIG_SUSPEND) += power_wrap_lps0.o
+ 
+ ccflags-y += -Wall
+ ccflags-y += -I$(src)/inc
+diff --git a/drivers/soc/mediatek/power_wrap/inc/power_wrap.h b/drivers/soc/mediatek/power_wrap/inc/power_wrap.h
+index a2b64a4c7..b8afddff8 100644
+--- a/drivers/soc/mediatek/power_wrap/inc/power_wrap.h
++++ b/drivers/soc/mediatek/power_wrap/inc/power_wrap.h
+@@ -12,6 +12,8 @@
+ #include <linux/soc/mediatek/mtk-pwrap.h>
+ 
+ #define PWRAP_MAX_COMP_NUM 20
++/* Platform id returned by the PLID method for MT8901. */
++#define PWRAP_PLID_MT8901 0x2
+ /* Number of scalar constraint fields before the comp_states array */
+ #define PWRAP_IDLE_CONSTRAINT_SCALARS  3
+ 
+@@ -91,6 +93,8 @@ struct mtk_pwrap_device {
+ 	unsigned int dev_id;
+ };
+ 
++struct pwrap_lps0;
++
+ /* Driver private data */
+ struct pwrap_driver_data {
+ 	struct device *dev;
+@@ -99,8 +103,19 @@ struct pwrap_driver_data {
+ 	struct acpi_buffer acpi_path;
+ 	/* Platform id from the PLID method, 0 when unavailable */
+ 	unsigned long long plid;
++	struct pwrap_lps0 *lps0;
+ };
+ 
++#ifdef CONFIG_SUSPEND
++extern const struct dev_pm_ops pwrap_lps0_pm_ops;
++int pwrap_lps0_init(struct pwrap_driver_data *priv);
++#else
++static inline int pwrap_lps0_init(struct pwrap_driver_data *priv)
++{
++	return 0;
++}
++#endif
++
+ /* Create the sysfs debug/test nodes (non-fatal; group is devm-managed) */
+ int pwrap_create_sys_files(struct platform_device *pdev);
+ 
+diff --git a/drivers/soc/mediatek/power_wrap/power_wrap.c b/drivers/soc/mediatek/power_wrap/power_wrap.c
+index b1342be15..e17b20640 100644
+--- a/drivers/soc/mediatek/power_wrap/power_wrap.c
++++ b/drivers/soc/mediatek/power_wrap/power_wrap.c
+@@ -63,7 +63,6 @@ static struct pwrap_dev_ctrl dev_ctrl;
+  * Windows maps it directly via MmMapIoSpaceEx(), so the Linux equivalent is
+  * ioremap(0x12FC00, 4) + writel(0x1).
+  */
+-#define PWRAP_PLID_MT8901		0x2	/* SOC_MT8901 */
+ #define PWRAP_DVFSRC_FLAG_ADDR	0x12FC00
+ #define PWRAP_DVFSRC_FLAG_LEN	0x4
+ #define PWRAP_DVFSRC_FLAG_VAL	0x1
+@@ -970,6 +969,10 @@ static int mtk_pwrap_probe(struct platform_device *pdev)
+ 	/* Release the USB4 resources once xHCI has bound (see the hook note). */
+ 	pwrap_usb4_arm_release(dev);
+ 
++	ret = pwrap_lps0_init(priv);
++	if (ret)
++		dev_warn(dev, "failed to initialize sleep notifications: %d\n", ret);
++
+ 	return 0;
+ }
+ 
+@@ -984,6 +987,9 @@ MODULE_DEVICE_TABLE(acpi, mtk_pwrap_acpi_ids);
+ static struct platform_driver mtk_pwrap_driver = {
+ 	.driver = {
+ 		.name = "mtk_pwrap",
++#ifdef CONFIG_SUSPEND
++		.pm = &pwrap_lps0_pm_ops,
++#endif
+ #ifdef CONFIG_ACPI
+ 		.acpi_match_table = mtk_pwrap_acpi_ids,
+ #endif /* CONFIG_ACPI */
+diff --git a/drivers/soc/mediatek/power_wrap/power_wrap_lps0.c b/drivers/soc/mediatek/power_wrap/power_wrap_lps0.c
+new file mode 100644
+index 000000000..46c41c7a8
+--- /dev/null
++++ b/drivers/soc/mediatek/power_wrap/power_wrap_lps0.c
+@@ -0,0 +1,156 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++ */
++
++#include <linux/acpi.h>
++#include <linux/bits.h>
++#include <linux/device.h>
++#include <linux/pm.h>
++
++#include "power_wrap.h"
++
++static const guid_t pwrap_lps0_guid = GUID_INIT(0x11e00d56, 0xce64, 0x47ce,
++					     0x83, 0x7b, 0x1f, 0x89, 0x8f, 0x9a, 0xa4, 0x61);
++
++enum pwrap_lps0_function {
++	PWRAP_LPS0_SCREEN_OFF = 3,
++	PWRAP_LPS0_SCREEN_ON = 4,
++	PWRAP_LPS0_ENTRY = 5,
++	PWRAP_LPS0_EXIT = 6,
++	PWRAP_LPS0_MS_ENTRY = 7,
++	PWRAP_LPS0_MS_EXIT = 8,
++	PWRAP_LPS0_DISPLAY_ON = 9,
++};
++
++struct pwrap_lps0 {
++	struct device *dev;
++	u64 functions;
++	bool screen_off;
++	bool ms_entered;
++	bool lps0_entered;
++};
++
++static int pwrap_lps0_dsm(struct pwrap_lps0 *lps0, unsigned int function)
++{
++	union acpi_object *obj;
++
++	obj = acpi_evaluate_dsm(ACPI_HANDLE(lps0->dev), &pwrap_lps0_guid,
++				0, function, NULL);
++	/* acpi_evaluate_dsm() already reports AML evaluation failures. */
++	if (!obj)
++		return -EIO;
++	ACPI_FREE(obj);
++	return 0;
++}
++
++static void pwrap_lps0_restore(struct pwrap_lps0 *lps0)
++{
++	/* Keep the Microsoft LPS0 exit ordering used by ACPI on x86. */
++	if (lps0->lps0_entered)
++		pwrap_lps0_dsm(lps0, PWRAP_LPS0_EXIT);
++	if (lps0->screen_off &&
++	    (lps0->functions & BIT_ULL(PWRAP_LPS0_DISPLAY_ON)))
++		pwrap_lps0_dsm(lps0, PWRAP_LPS0_DISPLAY_ON);
++	if (lps0->ms_entered)
++		pwrap_lps0_dsm(lps0, PWRAP_LPS0_MS_EXIT);
++	if (lps0->screen_off)
++		pwrap_lps0_dsm(lps0, PWRAP_LPS0_SCREEN_ON);
++	lps0->lps0_entered = false;
++	lps0->ms_entered = false;
++	lps0->screen_off = false;
++}
++
++static void pwrap_lps0_prepare(struct pwrap_lps0 *lps0)
++{
++	/* AML may have side effects even when evaluating the method fails. */
++	lps0->screen_off = true;
++	if (pwrap_lps0_dsm(lps0, PWRAP_LPS0_SCREEN_OFF))
++		goto restore;
++	if (lps0->functions & BIT_ULL(PWRAP_LPS0_MS_ENTRY)) {
++		lps0->ms_entered = true;
++		if (pwrap_lps0_dsm(lps0, PWRAP_LPS0_MS_ENTRY))
++			goto restore;
++	}
++	if (lps0->functions & BIT_ULL(PWRAP_LPS0_ENTRY)) {
++		lps0->lps0_entered = true;
++		if (pwrap_lps0_dsm(lps0, PWRAP_LPS0_ENTRY))
++			goto restore;
++	}
++	return;
++
++restore:
++	/* Restore attempted notifications, but do not veto system suspend. */
++	pwrap_lps0_restore(lps0);
++}
++
++static int pwrap_lps0_suspend_noirq(struct device *dev)
++{
++	struct pwrap_driver_data *priv = dev_get_drvdata(dev);
++
++	if (priv->lps0)
++		pwrap_lps0_prepare(priv->lps0);
++	return 0;
++}
++
++static int pwrap_lps0_resume_noirq(struct device *dev)
++{
++	struct pwrap_driver_data *priv = dev_get_drvdata(dev);
++
++	if (priv->lps0)
++		pwrap_lps0_restore(priv->lps0);
++	return 0;
++}
++
++/* The PM core also calls resume_noirq() when a later suspend step fails. */
++const struct dev_pm_ops pwrap_lps0_pm_ops = {
++	.suspend_noirq = pwrap_lps0_suspend_noirq,
++	.resume_noirq = pwrap_lps0_resume_noirq,
++};
++
++int pwrap_lps0_init(struct pwrap_driver_data *priv)
++{
++	struct device *dev = priv->dev;
++	struct pwrap_lps0 *lps0;
++	u64 functions = BIT_ULL(PWRAP_LPS0_SCREEN_OFF) | BIT_ULL(PWRAP_LPS0_SCREEN_ON);
++	u64 lps0_pair = BIT_ULL(PWRAP_LPS0_ENTRY) | BIT_ULL(PWRAP_LPS0_EXIT);
++	u64 ms_pair = BIT_ULL(PWRAP_LPS0_MS_ENTRY) | BIT_ULL(PWRAP_LPS0_MS_EXIT);
++
++	/*
++	 * MT8901 firmware uses these notifications to arm EC lid wake for
++	 * both s2idle and PSCI SYSTEM_SUSPEND. The normal LPS0 caller is x86
++	 * only, so the EC otherwise delivers the lid event after another
++	 * source has already resumed Linux. Use the device noirq callbacks
++	 * to keep these notifications close to the sleep transition, after
++	 * userspace is frozen and before CPUs go offline. The FF-A bridge
++	 * uses synchronous requests and has no system-sleep callbacks that
++	 * disable the transport during device suspend.
++	 */
++	if (priv->plid != PWRAP_PLID_MT8901) {
++		dev_info(dev, "LPS0 EC sleep notifications skipped for platform id %#llx\n",
++			 priv->plid);
++		return 0;
++	}
++	if (!acpi_check_dsm(ACPI_HANDLE(dev), &pwrap_lps0_guid, 0, functions)) {
++		dev_info(dev, "LPS0 EC sleep notifications disabled: screen off/on functions unavailable\n");
++		return 0;
++	}
++	/* Other notifications are optional, but entry/exit must be paired. */
++	if (acpi_check_dsm(ACPI_HANDLE(dev), &pwrap_lps0_guid, 0, lps0_pair))
++		functions |= lps0_pair;
++	if (acpi_check_dsm(ACPI_HANDLE(dev), &pwrap_lps0_guid, 0, ms_pair))
++		functions |= ms_pair;
++	if (acpi_check_dsm(ACPI_HANDLE(dev), &pwrap_lps0_guid, 0,
++			   BIT_ULL(PWRAP_LPS0_DISPLAY_ON)))
++		functions |= BIT_ULL(PWRAP_LPS0_DISPLAY_ON);
++
++	lps0 = devm_kzalloc(dev, sizeof(*lps0), GFP_KERNEL);
++	if (!lps0)
++		return -ENOMEM;
++	lps0->dev = dev;
++	lps0->functions = functions;
++	priv->lps0 = lps0;
++	dev_info(dev, "LPS0 EC sleep notifications enabled (functions %#llx)\n",
++		 functions);
++	return 0;
++}

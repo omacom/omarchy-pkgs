@@ -1,0 +1,730 @@
+From 3001c25a8392d01e3c1e1a7041ebef017cdc9f8c Mon Sep 17 00:00:00 2001
+From: Bharat Dintakurti <bdintakurti@nvidia.com>
+Date: Thu, 17 Sep 2026 14:15:43 -0700
+Subject: [PATCH] drivers: add NVIDIA RTX Spark power profiles
+
+Add an RTX Spark-specific cppc_cpufreq backend using the numeric EPP interface. Select EPP values per core type and update the CPUFreq governor for each profile and AC/battery state.
+
+Reapply the selected settings after resume and gate the backend on the SMBIOS Type 4 processor version.
+---
+ src/meson.build                   |   5 +-
+ src/power-profiles-daemon.c       |   3 +
+ src/ppd-driver-nvidia-rtx-spark.c | 462 ++++++++++++++++++++++++++++++
+ src/ppd-driver-nvidia-rtx-spark.h |  15 +
+ tests/integration_test.py         | 142 +++++++++
+ 5 files changed, 626 insertions(+), 1 deletion(-)
+ create mode 100644 src/ppd-driver-nvidia-rtx-spark.c
+ create mode 100644 src/ppd-driver-nvidia-rtx-spark.h
+
+diff --git a/src/meson.build b/src/meson.build
+index 0056466..713312c 100644
+--- a/src/meson.build
++++ b/src/meson.build
+@@ -1,3 +1,5 @@
++# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++
+ deps = [
+   gio_dep,
+   gio_unix_dep,
+@@ -93,6 +95,7 @@ sources += [
+   'ppd-action-amdgpu-dpm.c',
+   'ppd-driver-intel-pstate.c',
+   'ppd-driver-amd-pstate.c',
++  'ppd-driver-nvidia-rtx-spark.c',
+   'ppd-driver-platform-profile.c',
+   'ppd-driver-placeholder.c',
+   'ppd-driver-fake.c',
+@@ -153,4 +156,4 @@ if argparse_manpage.found()
+   ))
+ endif
+ 
+-subdir('completions')
+\ No newline at end of file
++subdir('completions')
+diff --git a/src/power-profiles-daemon.c b/src/power-profiles-daemon.c
+index 01aac72..ec6e9f8 100644
+--- a/src/power-profiles-daemon.c
++++ b/src/power-profiles-daemon.c
+@@ -1,6 +1,7 @@
+ /*
+  * Copyright (c) 2014-2016, 2020-2021 Bastien Nocera <hadess@hadess.net>
+  * Copyright (c) 2021 David Redondo <kde@david-redondo.de>
++ * Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+  *
+  * This program is free software; you can redistribute it and/or modify it
+  * under the terms of the GNU General Public License version 3 as published by
+@@ -143,6 +144,7 @@ static void upower_battery_set_power_changed_reason (PpdApp *, PpdPowerChangedRe
+ #include "ppd-driver-platform-profile.h"
+ #include "ppd-driver-intel-pstate.h"
+ #include "ppd-driver-amd-pstate.h"
++#include "ppd-driver-nvidia-rtx-spark.h"
+ #include "ppd-driver-fake.h"
+ 
+ typedef GType (*GTypeGetFunc) (void);
+@@ -151,6 +153,7 @@ static GTypeGetFunc objects[] = {
+   /* Hardware specific profile drivers */
+   ppd_driver_fake_get_type,
+   ppd_driver_platform_profile_get_type,
++  ppd_driver_nvidia_rtx_spark_get_type,
+   ppd_driver_intel_pstate_get_type,
+   ppd_driver_amd_pstate_get_type,
+ 
+diff --git a/src/ppd-driver-nvidia-rtx-spark.c b/src/ppd-driver-nvidia-rtx-spark.c
+new file mode 100644
+index 0000000..d1a3512
+--- /dev/null
++++ b/src/ppd-driver-nvidia-rtx-spark.c
+@@ -0,0 +1,462 @@
++/*
++ * Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License version 3 as published by
++ * the Free Software Foundation.
++ *
++ */
++
++#define G_LOG_DOMAIN "CpuDriver"
++
++#include <string.h>
++
++#include "ppd-utils.h"
++#include "ppd-driver-nvidia-rtx-spark.h"
++
++#define DMI_ENTRY_DIR "/sys/firmware/dmi/entries/"
++#define DMI_PROCESSOR_INFORMATION_TYPE 4
++#define DMI_PROCESSOR_VERSION_OFFSET 0x10
++#define RTX_SPARK_PROCESSOR_VERSION_PREFIX "NVIDIA RTX Spark"
++#define CPUFREQ_POLICY_DIR "/sys/devices/system/cpu/cpufreq/"
++#define CPPC_CPUFREQ_DRIVER "cppc_cpufreq"
++#define RTX_SPARK_PERFORMANCE_CORE_MIN_MAX_KHZ 3000000
++
++#define RTX_SPARK_EFFICIENCY_EPP_PERFORMANCE "5"
++#define RTX_SPARK_EFFICIENCY_EPP_BALANCED "76"
++#define RTX_SPARK_EFFICIENCY_EPP_POWER_SAVER "76"
++
++#define RTX_SPARK_PERFORMANCE_EPP_PERFORMANCE "5"
++#define RTX_SPARK_PERFORMANCE_EPP_BALANCED "114"
++#define RTX_SPARK_PERFORMANCE_EPP_POWER_SAVER "153"
++
++struct _PpdDriverNvidiaRtxSpark
++{
++  PpdDriverCpu  parent_instance;
++
++  PpdProfile activated_profile;
++  GPtrArray *efficiency_epp_devices; /* Array of paths */
++  GPtrArray *performance_epp_devices; /* Array of paths */
++  GPtrArray *governor_devices; /* Array of paths */
++  gboolean on_battery;
++};
++
++G_DEFINE_TYPE (PpdDriverNvidiaRtxSpark, ppd_driver_nvidia_rtx_spark, PPD_TYPE_DRIVER_CPU)
++
++static gboolean ppd_driver_nvidia_rtx_spark_activate_profile (PpdDriver                  *driver,
++                                                              PpdProfile                  profile,
++                                                              PpdProfileActivationReason  reason,
++                                                              GError                    **error);
++
++static GObject*
++ppd_driver_nvidia_rtx_spark_constructor (GType                  type,
++                                         guint                  n_construct_params,
++                                         GObjectConstructParam *construct_params)
++{
++  GObject *object;
++
++  object = G_OBJECT_CLASS (ppd_driver_nvidia_rtx_spark_parent_class)->constructor (type,
++                                                                                    n_construct_params,
++                                                                                    construct_params);
++  g_object_set (object,
++                "driver-name", "nvidia_rtx_spark",
++                "profiles", PPD_PROFILE_PERFORMANCE | PPD_PROFILE_BALANCED | PPD_PROFILE_POWER_SAVER,
++                NULL);
++
++  return object;
++}
++
++static gboolean
++dmi_processor_is_nvidia_rtx_spark (const guint8 *raw,
++                                   gsize         raw_len)
++{
++  const guint8 *string;
++  const guint8 *end;
++  const guint8 *nul;
++  guint8 formatted_len;
++  guint8 string_index;
++
++  if (raw_len <= DMI_PROCESSOR_VERSION_OFFSET ||
++      raw[0] != DMI_PROCESSOR_INFORMATION_TYPE)
++    return FALSE;
++
++  formatted_len = raw[1];
++  if (formatted_len <= DMI_PROCESSOR_VERSION_OFFSET ||
++      formatted_len >= raw_len)
++    return FALSE;
++
++  string_index = raw[DMI_PROCESSOR_VERSION_OFFSET];
++  if (string_index == 0)
++    return FALSE;
++
++  string = raw + formatted_len;
++  end = raw + raw_len;
++  for (guint i = 1; i < string_index; i++) {
++    nul = memchr (string, '\0', end - string);
++    if (!nul || nul == string)
++      return FALSE;
++    string = nul + 1;
++  }
++
++  nul = memchr (string, '\0', end - string);
++  if (!nul || nul == string)
++    return FALSE;
++
++  return g_str_has_prefix ((const char *) string,
++                           RTX_SPARK_PROCESSOR_VERSION_PREFIX);
++}
++
++static gboolean
++is_nvidia_rtx_spark (void)
++{
++  g_autoptr(GDir) dir = NULL;
++  g_autofree char *entry_dir = NULL;
++  const char *dirname;
++
++  entry_dir = ppd_utils_get_sysfs_path (DMI_ENTRY_DIR);
++  dir = g_dir_open (entry_dir, 0, NULL);
++  if (!dir)
++    return FALSE;
++
++  while ((dirname = g_dir_read_name (dir)) != NULL) {
++    g_autofree char *raw_path = NULL;
++    g_autofree char *raw = NULL;
++    gsize raw_len;
++
++    if (!g_str_has_prefix (dirname, "4-"))
++      continue;
++
++    raw_path = g_build_filename (entry_dir, dirname, "raw", NULL);
++    if (!g_file_get_contents (raw_path, &raw, &raw_len, NULL))
++      continue;
++
++    if (dmi_processor_is_nvidia_rtx_spark ((const guint8 *) raw, raw_len))
++      return TRUE;
++  }
++
++  return FALSE;
++}
++
++static gboolean
++available_governors_has (const char *available,
++                         const char *governor)
++{
++  g_auto(GStrv) governors = NULL;
++
++  governors = g_strsplit_set (available, " \n\t", -1);
++  return g_strv_contains ((const char * const *) governors, governor);
++}
++
++static gboolean
++available_governors_valid (const char *available)
++{
++  return available_governors_has (available, "performance") &&
++         available_governors_has (available, "schedutil");
++}
++
++static PpdProbeResult
++probe_nvidia_rtx_spark (PpdDriverNvidiaRtxSpark *self)
++{
++  g_autoptr(GDir) dir = NULL;
++  g_autofree char *policy_dir = NULL;
++  const char *dirname;
++
++  policy_dir = ppd_utils_get_sysfs_path (CPUFREQ_POLICY_DIR);
++  dir = g_dir_open (policy_dir, 0, NULL);
++  if (!dir) {
++    g_debug ("Could not open %s", policy_dir);
++    return PPD_PROBE_RESULT_FAIL;
++  }
++
++  while ((dirname = g_dir_read_name (dir)) != NULL) {
++    g_autofree char *base = NULL;
++    g_autofree char *driver_path = NULL;
++    g_autofree char *driver = NULL;
++    g_autofree char *epp = NULL;
++    g_autofree char *governor = NULL;
++    g_autofree char *available_governors_path = NULL;
++    g_autofree char *available_governors = NULL;
++    g_autofree char *current = NULL;
++    g_autofree char *current_governor = NULL;
++    g_autofree char *max_freq_path = NULL;
++    g_autofree char *max_freq = NULL;
++    char *end = NULL;
++    guint64 max_freq_khz;
++    gboolean is_performance_core;
++    GPtrArray **epp_devices;
++    g_autoptr(GError) error = NULL;
++
++    base = g_build_filename (policy_dir,
++                             dirname,
++                             NULL);
++
++    driver_path = g_build_filename (base,
++                                    "scaling_driver",
++                                    NULL);
++    if (!g_file_get_contents (driver_path, &driver, NULL, NULL))
++      continue;
++    driver = g_strchomp (driver);
++    if (g_strcmp0 (driver, CPPC_CPUFREQ_DRIVER) != 0)
++      continue;
++
++    epp = g_build_filename (base,
++                            "energy_performance_preference_val",
++                            NULL);
++    if (!g_file_test (epp, G_FILE_TEST_EXISTS))
++      continue;
++
++    governor = g_build_filename (base,
++                                 "scaling_governor",
++                                 NULL);
++    if (!g_file_test (governor, G_FILE_TEST_EXISTS))
++      continue;
++
++    max_freq_path = g_build_filename (base,
++                                      "cpuinfo_max_freq",
++                                      NULL);
++    if (!g_file_get_contents (max_freq_path, &max_freq, NULL, NULL)) {
++      g_debug ("CPPC policy %s does not expose cpuinfo_max_freq", dirname);
++      continue;
++    }
++    max_freq = g_strchomp (max_freq);
++    max_freq_khz = g_ascii_strtoull (max_freq, &end, 10);
++    if (end == max_freq || *end != '\0') {
++      g_debug ("CPPC policy %s exposes invalid cpuinfo_max_freq '%s'", dirname, max_freq);
++      continue;
++    }
++    is_performance_core = max_freq_khz >= RTX_SPARK_PERFORMANCE_CORE_MIN_MAX_KHZ;
++
++    available_governors_path = g_build_filename (base,
++                                                 "scaling_available_governors",
++                                                 NULL);
++    if (!g_file_get_contents (available_governors_path, &available_governors, NULL, NULL) ||
++        !available_governors_valid (available_governors)) {
++      g_debug ("CPPC policy %s does not expose expected governors", dirname);
++      continue;
++    }
++
++    if (!g_file_get_contents (epp, &current, NULL, NULL))
++      continue;
++    current = g_strchomp (current);
++    if (!ppd_utils_write (epp, current, &error)) {
++      g_debug ("Could not validate CPPC EPP writes for %s: %s", dirname, error->message);
++      continue;
++    }
++
++    if (!g_file_get_contents (governor, &current_governor, NULL, NULL))
++      continue;
++    current_governor = g_strchomp (current_governor);
++    if (!ppd_utils_write (governor, current_governor, &error)) {
++      g_debug ("Could not validate CPUFreq governor writes for %s: %s", dirname, error->message);
++      continue;
++    }
++
++    epp_devices = is_performance_core ?
++                  &self->performance_epp_devices :
++                  &self->efficiency_epp_devices;
++    if (!*epp_devices)
++      *epp_devices = g_ptr_array_new_with_free_func (g_free);
++    if (!self->governor_devices)
++      self->governor_devices = g_ptr_array_new_with_free_func (g_free);
++
++    g_ptr_array_add (*epp_devices, g_steal_pointer (&epp));
++    g_ptr_array_add (self->governor_devices, g_steal_pointer (&governor));
++  }
++
++  if (((self->efficiency_epp_devices &&
++        self->efficiency_epp_devices->len) ||
++       (self->performance_epp_devices &&
++        self->performance_epp_devices->len)) &&
++      self->governor_devices &&
++      self->governor_devices->len)
++    return PPD_PROBE_RESULT_SUCCESS;
++
++  return PPD_PROBE_RESULT_FAIL;
++}
++
++static PpdProbeResult
++ppd_driver_nvidia_rtx_spark_probe (PpdDriver  *driver)
++{
++  PpdDriverNvidiaRtxSpark *self = PPD_DRIVER_NVIDIA_RTX_SPARK (driver);
++  PpdProbeResult ret;
++
++  if (!is_nvidia_rtx_spark ())
++    return PPD_PROBE_RESULT_FAIL;
++
++  ret = probe_nvidia_rtx_spark (self);
++
++  g_debug ("%s NVIDIA RTX Spark CPPC cpufreq settings",
++           ret == PPD_PROBE_RESULT_SUCCESS ? "Found" : "Didn't find");
++  return ret;
++}
++
++static const char *
++profile_to_epp (PpdProfile profile,
++                gboolean   performance_core)
++{
++  switch (profile) {
++  case PPD_PROFILE_POWER_SAVER:
++    return performance_core ?
++           RTX_SPARK_PERFORMANCE_EPP_POWER_SAVER :
++           RTX_SPARK_EFFICIENCY_EPP_POWER_SAVER;
++  case PPD_PROFILE_BALANCED:
++    return performance_core ?
++           RTX_SPARK_PERFORMANCE_EPP_BALANCED :
++           RTX_SPARK_EFFICIENCY_EPP_BALANCED;
++  case PPD_PROFILE_PERFORMANCE:
++    return performance_core ?
++           RTX_SPARK_PERFORMANCE_EPP_PERFORMANCE :
++           RTX_SPARK_EFFICIENCY_EPP_PERFORMANCE;
++  }
++
++  g_return_val_if_reached (NULL);
++}
++
++static const char *
++profile_to_governor (PpdProfile profile,
++                     gboolean   on_battery)
++{
++  switch (profile) {
++  case PPD_PROFILE_POWER_SAVER:
++    return "schedutil";
++  case PPD_PROFILE_BALANCED:
++    return on_battery ? "schedutil" : "performance";
++  case PPD_PROFILE_PERFORMANCE:
++    return "performance";
++  }
++
++  g_return_val_if_reached (NULL);
++}
++
++static gboolean
++apply_profile_to_devices (PpdDriver   *driver,
++                          PpdProfile   profile,
++                          GError     **error)
++{
++  PpdDriverNvidiaRtxSpark *self = PPD_DRIVER_NVIDIA_RTX_SPARK (driver);
++  const char *governor;
++
++  if (profile == PPD_PROFILE_UNSET)
++    return TRUE;
++
++  g_return_val_if_fail (self->efficiency_epp_devices != NULL ||
++                        self->performance_epp_devices != NULL, FALSE);
++  g_return_val_if_fail (self->governor_devices != NULL, FALSE);
++  g_return_val_if_fail (self->governor_devices->len != 0, FALSE);
++
++  if (self->efficiency_epp_devices &&
++      !ppd_utils_write_files (self->efficiency_epp_devices,
++                              profile_to_epp (profile, FALSE),
++                              error))
++      return FALSE;
++
++  if (self->performance_epp_devices &&
++      !ppd_utils_write_files (self->performance_epp_devices,
++                              profile_to_epp (profile, TRUE),
++                              error))
++      return FALSE;
++
++  governor = profile_to_governor (profile, self->on_battery);
++  if (!ppd_utils_write_files (self->governor_devices, governor, error))
++    return FALSE;
++
++  return TRUE;
++}
++
++static gboolean
++ppd_driver_nvidia_rtx_spark_activate_profile (PpdDriver                  *driver,
++                                              PpdProfile                  profile,
++                                              PpdProfileActivationReason  reason,
++                                              GError                    **error)
++{
++  PpdDriverNvidiaRtxSpark *self = PPD_DRIVER_NVIDIA_RTX_SPARK (driver);
++  gboolean ret;
++
++  ret = apply_profile_to_devices (driver, profile, error);
++  if (!ret && self->activated_profile != PPD_PROFILE_UNSET) {
++    g_autoptr(GError) local_error = NULL;
++
++    if (!apply_profile_to_devices (driver, self->activated_profile, &local_error))
++      g_warning ("Failed to restore previous CPPC cpufreq profile: %s", local_error->message);
++    return ret;
++  }
++
++  if (ret)
++    self->activated_profile = profile;
++
++  return ret;
++}
++
++static gboolean
++ppd_driver_nvidia_rtx_spark_power_changed (PpdDriver             *driver,
++                                           PpdPowerChangedReason  reason,
++                                           GError               **error)
++{
++  PpdDriverNvidiaRtxSpark *self = PPD_DRIVER_NVIDIA_RTX_SPARK (driver);
++
++  switch (reason) {
++  case PPD_POWER_CHANGED_REASON_UNKNOWN:
++  case PPD_POWER_CHANGED_REASON_AC:
++    self->on_battery = FALSE;
++    break;
++  case PPD_POWER_CHANGED_REASON_BATTERY:
++    self->on_battery = TRUE;
++    break;
++  default:
++    g_return_val_if_reached (FALSE);
++  }
++
++  return apply_profile_to_devices (driver,
++                                   self->activated_profile,
++                                   error);
++}
++
++static gboolean
++ppd_driver_nvidia_rtx_spark_prepare_for_sleep (PpdDriver  *driver,
++                                               gboolean    start,
++                                               GError    **error)
++{
++  PpdDriverNvidiaRtxSpark *self = PPD_DRIVER_NVIDIA_RTX_SPARK (driver);
++
++  if (start)
++    return TRUE;
++
++  return ppd_driver_nvidia_rtx_spark_activate_profile (driver,
++                                                       self->activated_profile,
++                                                       PPD_PROFILE_ACTIVATION_REASON_RESUME,
++                                                       error);
++}
++
++static void
++ppd_driver_nvidia_rtx_spark_finalize (GObject *object)
++{
++  PpdDriverNvidiaRtxSpark *driver;
++
++  driver = PPD_DRIVER_NVIDIA_RTX_SPARK (object);
++  g_clear_pointer (&driver->efficiency_epp_devices, g_ptr_array_unref);
++  g_clear_pointer (&driver->performance_epp_devices, g_ptr_array_unref);
++  g_clear_pointer (&driver->governor_devices, g_ptr_array_unref);
++  G_OBJECT_CLASS (ppd_driver_nvidia_rtx_spark_parent_class)->finalize (object);
++}
++
++static void
++ppd_driver_nvidia_rtx_spark_class_init (PpdDriverNvidiaRtxSparkClass *klass)
++{
++  GObjectClass *object_class;
++  PpdDriverClass *driver_class;
++
++  object_class = G_OBJECT_CLASS (klass);
++  object_class->constructor = ppd_driver_nvidia_rtx_spark_constructor;
++  object_class->finalize = ppd_driver_nvidia_rtx_spark_finalize;
++
++  driver_class = PPD_DRIVER_CLASS (klass);
++  driver_class->probe = ppd_driver_nvidia_rtx_spark_probe;
++  driver_class->activate_profile = ppd_driver_nvidia_rtx_spark_activate_profile;
++  driver_class->prepare_to_sleep = ppd_driver_nvidia_rtx_spark_prepare_for_sleep;
++  driver_class->power_changed = ppd_driver_nvidia_rtx_spark_power_changed;
++}
++
++static void
++ppd_driver_nvidia_rtx_spark_init (PpdDriverNvidiaRtxSpark *self)
++{
++}
+diff --git a/src/ppd-driver-nvidia-rtx-spark.h b/src/ppd-driver-nvidia-rtx-spark.h
+new file mode 100644
+index 0000000..fd2e1f3
+--- /dev/null
++++ b/src/ppd-driver-nvidia-rtx-spark.h
+@@ -0,0 +1,15 @@
++/*
++ * Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License version 3 as published by
++ * the Free Software Foundation.
++ *
++ */
++
++#pragma once
++
++#include "ppd-driver-cpu.h"
++
++#define PPD_TYPE_DRIVER_NVIDIA_RTX_SPARK (ppd_driver_nvidia_rtx_spark_get_type ())
++G_DECLARE_FINAL_TYPE (PpdDriverNvidiaRtxSpark, ppd_driver_nvidia_rtx_spark, PPD, DRIVER_NVIDIA_RTX_SPARK, PpdDriverCpu)
+diff --git a/tests/integration_test.py b/tests/integration_test.py
+index d836886..9c4e069 100644
+--- a/tests/integration_test.py
++++ b/tests/integration_test.py
+@@ -8,6 +8,7 @@
+ # Copyright: (C) 2011 Martin Pitt <martin.pitt@ubuntu.com>
+ # (C) 2020 Bastien Nocera <hadess@hadess.net>
+ # (C) 2021 David Redondo <kde@david-redondo.de>
++# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ #
+ # This program is free software; you can redistribute it and/or modify
+ # it under the terms of the GNU General Public License as published by
+@@ -358,6 +359,53 @@ class Tests(dbusmock.DBusTestCase):
+             os.path.join(proc_dir, "cpuinfo"), "vendor_id	: AuthenticAMD\n"
+         )
+ 
++    def create_nvidia_rtx_spark(
++        self,
++        processor_version="NVIDIA RTX Spark N1X (6144-core GPU, 20-core CPU)",
++    ):
++        dmi_dir = os.path.join(
++            self.testbed.get_root_dir(), "sys/firmware/dmi/entries/4-0/"
++        )
++        os.makedirs(dmi_dir)
++        type4 = bytearray(0x11)
++        type4[0] = 4
++        type4[1] = len(type4)
++        type4[0x04] = 1
++        type4[0x07] = 2
++        type4[0x10] = 3
++        type4.extend(
++            b"CPU 0\0NVIDIA\0" + processor_version.encode("utf-8") + b"\0\0"
++        )
++        self.write_file_contents(os.path.join(dmi_dir, "raw"), bytes(type4))
++
++        policy_root = os.path.join(
++            self.testbed.get_root_dir(), "sys/devices/system/cpu/cpufreq/"
++        )
++        policies = {}
++        for policy, max_freq in (("policy0", "2000000"), ("policy4", "4004000")):
++            policy_dir = os.path.join(policy_root, policy)
++            os.makedirs(policy_dir)
++            self.write_file_contents(
++                os.path.join(policy_dir, "scaling_driver"), "cppc_cpufreq\n"
++            )
++            self.write_file_contents(
++                os.path.join(policy_dir, "cpuinfo_max_freq"), max_freq + "\n"
++            )
++            self.write_file_contents(
++                os.path.join(policy_dir, "energy_performance_preference_val"),
++                "0\n",
++            )
++            self.write_file_contents(
++                os.path.join(policy_dir, "scaling_available_governors"),
++                "performance schedutil\n",
++            )
++            self.write_file_contents(
++                os.path.join(policy_dir, "scaling_governor"), "schedutil\n"
++            )
++            policies[policy] = policy_dir
++
++        return policies
++
+     def create_empty_platform_profile(self):
+         acpi_dir = os.path.join(self.testbed.get_root_dir(), "sys/firmware/acpi/")
+         os.makedirs(acpi_dir)
+@@ -675,6 +723,100 @@ class Tests(dbusmock.DBusTestCase):
+         self.set_dbus_property("ActiveProfile", GLib.Variant.new_string("power-saver"))
+         self.assertEqual(self.get_dbus_property("ActiveProfile"), "power-saver")
+ 
++    def test_nvidia_rtx_spark(self):
++        """NVIDIA RTX Spark EPP, governor and power-source handling"""
++
++        policies = self.create_nvidia_rtx_spark()
++        _, upowerd_obj, _ = self.start_dbus_template(
++            "upower",
++            {"DaemonVersion": "0.99", "OnBattery": False},
++        )
++        _, logind_obj, _ = self.start_dbus_template("logind", {})
++
++        efficiency_epp = os.path.join(
++            policies["policy0"], "energy_performance_preference_val"
++        )
++        performance_epp = os.path.join(
++            policies["policy4"], "energy_performance_preference_val"
++        )
++        efficiency_governor = os.path.join(
++            policies["policy0"], "scaling_governor"
++        )
++        performance_governor = os.path.join(
++            policies["policy4"], "scaling_governor"
++        )
++
++        self.start_daemon()
++
++        profiles = self.get_dbus_property("Profiles")
++        self.assertEqual(len(profiles), 3)
++        self.assertEqual(profiles[0]["CpuDriver"], "nvidia_rtx_spark")
++        self.assertEqual(self.get_dbus_property("ActiveProfile"), "balanced")
++        self.assert_file_eventually_contains(efficiency_epp, "76")
++        self.assert_file_eventually_contains(performance_epp, "114")
++        self.assert_file_eventually_contains(efficiency_governor, "performance")
++        self.assert_file_eventually_contains(performance_governor, "performance")
++
++        self.set_dbus_property("ActiveProfile", GLib.Variant.new_string("performance"))
++        self.assertEqual(self.get_dbus_property("ActiveProfile"), "performance")
++        self.assert_file_eventually_contains(efficiency_epp, "5")
++        self.assert_file_eventually_contains(performance_epp, "5")
++        self.assert_file_eventually_contains(efficiency_governor, "performance")
++        self.assert_file_eventually_contains(performance_governor, "performance")
++
++        self.set_dbus_property("ActiveProfile", GLib.Variant.new_string("balanced"))
++        self.assertEqual(self.get_dbus_property("ActiveProfile"), "balanced")
++        self.assert_file_eventually_contains(efficiency_epp, "76")
++        self.assert_file_eventually_contains(performance_epp, "114")
++        self.assert_file_eventually_contains(efficiency_governor, "performance")
++        self.assert_file_eventually_contains(performance_governor, "performance")
++
++        upowerd_obj.Set("org.freedesktop.UPower", "OnBattery", True)
++        self.assert_file_eventually_contains(efficiency_governor, "schedutil")
++        self.assert_file_eventually_contains(performance_governor, "schedutil")
++
++        self.set_dbus_property(
++            "ActiveProfile", GLib.Variant.new_string("power-saver")
++        )
++        self.assert_file_eventually_contains(efficiency_epp, "76")
++        self.assert_file_eventually_contains(performance_epp, "153")
++        self.assert_file_eventually_contains(efficiency_governor, "schedutil")
++        self.assert_file_eventually_contains(performance_governor, "schedutil")
++
++        self.write_file_contents(efficiency_epp, "0\n")
++        self.write_file_contents(performance_epp, "0\n")
++        self.write_file_contents(efficiency_governor, "performance\n")
++        self.write_file_contents(performance_governor, "performance\n")
++        logind_obj.EmitSignal(
++            "org.freedesktop.login1.Manager", "PrepareForSleep", "b", [True]
++        )
++        logind_obj.EmitSignal(
++            "org.freedesktop.login1.Manager", "PrepareForSleep", "b", [False]
++        )
++        self.assert_file_eventually_contains(efficiency_epp, "76")
++        self.assert_file_eventually_contains(performance_epp, "153")
++        self.assert_file_eventually_contains(efficiency_governor, "schedutil")
++        self.assert_file_eventually_contains(performance_governor, "schedutil")
++
++    def test_nvidia_rtx_spark_processor_gate(self):
++        """The RTX Spark values are not applied to other CPPC systems"""
++
++        policies = self.create_nvidia_rtx_spark(processor_version="Other CPU")
++        self.start_daemon()
++
++        profiles = self.get_dbus_property("Profiles")
++        self.assertEqual(len(profiles), 2)
++        self.assertEqual(self.get_dbus_property("ActiveProfile"), "balanced")
++        self.assert_file_eventually_contains(
++            os.path.join(
++                policies["policy0"], "energy_performance_preference_val"
++            ),
++            "0\n",
++        )
++        self.assert_file_eventually_contains(
++            os.path.join(policies["policy4"], "scaling_governor"), "schedutil\n"
++        )
++
+     def test_intel_pstate(self):
+         """Intel P-State driver (no UPower)"""
+ 
+-- 
+2.56.0
+

@@ -1,0 +1,202 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jim Martin <jimmartin@gmail.com>
+Date: Thu, 8 Oct 2026 18:59:08 -0500
+Subject: [PATCH] drm/msm/dp: use MAX_LINK_RATE when the best eDP table rate is
+ unusable
+
+When the best SUPPORTED_LINK_RATES entry of an eDP 1.4 sink within the
+limits is an intermediate rate, msm now trains at the best table rate
+that the source can drive, even when the sink's MAX_LINK_RATE allows a
+higher standard rate through LINK_BW_SET. eDP 1.4b lets the source
+select any standard rate up to a valid MAX_LINK_RATE through
+LINK_BW_SET, table or not, and amdgpu takes the higher of the two rates
+for eDP sinks.
+
+In that case, use whichever of the table and MAX_LINK_RATE reaches the
+higher rate, preferring LINK_BW_SET. When the table's best rate is one
+the source drives, keep training at that rate, as before, and select it
+through LINK_BW_SET when MAX_LINK_RATE covers it and through
+LINK_RATE_SET when it does not, as for a MAX_LINK_RATE of 0. This
+replaces the check of the value found in LINK_BW_SET, which made the
+register depend on whether the boot firmware had trained the sink.
+
+A sink with a valid MAX_LINK_RATE can now be set up through
+LINK_RATE_SET while a rate left by the boot firmware is in LINK_BW_SET,
+and per eDP 1.5 such a sink ignores LINK_RATE_SET. Clear LINK_BW_SET
+first in that case only. 0 is a reserved LINK_BW_SET value, and i915
+stopped writing it in commit e6861d8264cd ("drm/i915/edp: don't write to
+DP_LINK_BW_SET when using rate select") because a panel ignored
+LINK_RATE_SET after the write.
+
+The Sharp LQ138P1JX61 panel of the Microsoft Surface Laptop 8 lists 1.62
+to 3.24 Gbps in its table and reports 5.4 Gbps in MAX_LINK_RATE. Its
+2304x1536 mode needs 5.4 Gbps on four lanes for 10 bits per colour; at
+2.7 Gbps it gets 6. msm now selects 5.4 Gbps through LINK_BW_SET for
+this panel, the setting the platform firmware leaves.
+
+Compared with before this change, sinks whose best table rate within
+the limits is a standard rate keep that rate. They are set up through
+LINK_RATE_SET when it is above MAX_LINK_RATE, and through LINK_BW_SET
+when MAX_LINK_RATE covers it, whatever LINK_BW_SET held.
+
+Assisted-by: Opus 5.5
+Signed-off-by: Jim Martin <jimmartin@gmail.com>
+---
+ drivers/gpu/drm/msm/dp/dp_ctrl.c  | 21 ++++++++++++--
+ drivers/gpu/drm/msm/dp/dp_panel.c | 46 +++++++++++++++++++++----------
+ 2 files changed, 50 insertions(+), 17 deletions(-)
+
+diff --git a/drivers/gpu/drm/msm/dp/dp_ctrl.c b/drivers/gpu/drm/msm/dp/dp_ctrl.c
+index 9345ddeeff2..360e15f6f43 100644
+--- a/drivers/gpu/drm/msm/dp/dp_ctrl.c
++++ b/drivers/gpu/drm/msm/dp/dp_ctrl.c
+@@ -172,7 +172,8 @@ static inline void msm_dp_write_link(struct msm_dp_ctrl_private *ctrl,
+ }
+ 
+ static int msm_dp_aux_link_configure(struct drm_dp_aux *aux,
+-					struct msm_dp_link_info *link)
++				     const u8 dpcd[DP_RECEIVER_CAP_SIZE],
++				     struct msm_dp_link_info *link)
+ {
+ 	u8 lane_count, bw_code;
+ 	int err;
+@@ -187,6 +188,22 @@ static int msm_dp_aux_link_configure(struct drm_dp_aux *aux,
+ 		return err;
+ 
+ 	if (link->use_rate_set) {
++		/*
++		 * A sink with a valid MAX_LINK_RATE ignores LINK_RATE_SET while
++		 * a rate selected through LINK_BW_SET is in place (eDP 1.5),
++		 * and the boot firmware may have left one there. Clear it, but
++		 * do not write LINK_BW_SET otherwise: 0 is a reserved value
++		 * there, and writing it made at least one panel ignore
++		 * LINK_RATE_SET.
++		 */
++		if (drm_dp_max_link_rate(dpcd)) {
++			err = drm_dp_dpcd_read_byte(aux, DP_LINK_BW_SET, &bw_code);
++			if (!err && bw_code)
++				err = drm_dp_dpcd_write_byte(aux, DP_LINK_BW_SET, 0);
++			if (err)
++				return err;
++		}
++
+ 		DRM_DEBUG_DP("using LINK_RATE_SET: 0x%02x", link->rate_set);
+ 		err = drm_dp_dpcd_writeb(aux, DP_LINK_RATE_SET, link->rate_set);
+ 	} else {
+@@ -1655,7 +1672,7 @@ static int msm_dp_ctrl_link_train(struct msm_dp_ctrl_private *ctrl,
+ 	link_info.use_rate_set = ctrl->link->link_params.use_rate_set;
+ 	link_info.capabilities = DP_LINK_CAP_ENHANCED_FRAMING;
+ 
+-	msm_dp_aux_link_configure(ctrl->aux, &link_info);
++	msm_dp_aux_link_configure(ctrl->aux, dpcd, &link_info);
+ 
+ 	if (drm_dp_max_downspread(dpcd))
+ 		encoding[0] |= DP_SPREAD_AMP_0_5;
+diff --git a/drivers/gpu/drm/msm/dp/dp_panel.c b/drivers/gpu/drm/msm/dp/dp_panel.c
+index 5adc151ba17..53b97d93fc4 100644
+--- a/drivers/gpu/drm/msm/dp/dp_panel.c
++++ b/drivers/gpu/drm/msm/dp/dp_panel.c
+@@ -103,16 +103,19 @@ static bool msm_dp_panel_is_source_rate(const struct msm_dp_link *link, u32 rate
+  * entries the source can use, stored in ascending order with their table
+  * index, or a negative error code. Entries the source cannot drive, such
+  * as the eDP intermediate rates, are skipped rather than taken as the end
+- * of the table.
++ * of the table. *best is the table's highest rate within the board and
++ * LTTPR limits, whether the source can drive it or not.
+  */
+ static int msm_dp_panel_read_rate_table(struct msm_dp_panel_private *panel,
+ 					u32 max_lttpr_rate, unsigned int *rates,
+-					u8 *rate_sets)
++					u8 *rate_sets, u32 *best)
+ {
+ 	__le16 table[DP_MAX_SUPPORTED_RATES];
+ 	int i, j, n = 0;
+ 	int rc;
+ 
++	*best = 0;
++
+ 	rc = drm_dp_dpcd_read_data(panel->aux, DP_SUPPORTED_LINK_RATES,
+ 				   table, sizeof(table));
+ 	if (rc)
+@@ -136,6 +139,9 @@ static int msm_dp_panel_read_rate_table(struct msm_dp_panel_private *panel,
+ 		if (max_lttpr_rate && rate > max_lttpr_rate)
+ 			continue;
+ 
++		if (rate <= panel->link->max_dp_link_rate && rate > *best)
++			*best = rate;
++
+ 		if (!msm_dp_panel_is_source_rate(panel->link, rate))
+ 			continue;
+ 
+@@ -153,8 +159,16 @@ static int msm_dp_panel_read_rate_table(struct msm_dp_panel_private *panel,
+ 
+ /*
+  * Find the link rates that the sink and the source share, and the register
+- * that selects them: the usable entries of an eDP 1.4 sink's rate table if
+- * there are any, otherwise the standard rates up to MAX_LINK_RATE.
++ * that selects them.
++ *
++ * A sink accepts the standard rates up to its MAX_LINK_RATE through
++ * LINK_BW_SET. An eDP 1.4 sink also lists its rates, intermediate ones
++ * included, in SUPPORTED_LINK_RATES, and accepts the index of one of them
++ * in LINK_RATE_SET. If the table's best rate within the limits is one the
++ * source drives, keep that rate, and select it through LINK_BW_SET when
++ * MAX_LINK_RATE covers it. Otherwise eDP 1.4b still lets the source use
++ * LINK_BW_SET up to a valid MAX_LINK_RATE, so take whichever of the two
++ * reaches the higher rate, preferring LINK_BW_SET.
+  */
+ static int msm_dp_panel_read_link_rates(struct msm_dp_panel_private *panel)
+ {
+@@ -168,8 +182,7 @@ static int msm_dp_panel_read_link_rates(struct msm_dp_panel_private *panel)
+ 	unsigned int table_rates[DP_MAX_SUPPORTED_RATES];
+ 	u8 table_sets[DP_MAX_SUPPORTED_RATES];
+ 	unsigned int i, n_bw = 0, n_table = 0;
+-	u32 max_rate, max_lttpr_rate;
+-	u8 bw_set = 0;
++	u32 max_rate, max_lttpr_rate, table_best = 0;
+ 	int rc;
+ 
+ 	max_lttpr_rate = drm_dp_lttpr_max_link_rate(link->lttpr_common_caps);
+@@ -198,27 +211,30 @@ static int msm_dp_panel_read_link_rates(struct msm_dp_panel_private *panel)
+ 
+ 		if (edp_rev >= DP_EDP_14) {
+ 			rc = msm_dp_panel_read_rate_table(panel, max_lttpr_rate,
+-							  table_rates, table_sets);
++							  table_rates, table_sets,
++							  &table_best);
+ 			if (rc < 0)
+ 				return rc;
+ 
+ 			n_table = rc;
+-
+-			rc = drm_dp_dpcd_read_byte(panel->aux, DP_LINK_BW_SET, &bw_set);
+-			if (rc)
+-				return rc;
+ 		}
+ 	}
+ 
+-	if (n_table) {
++	/* The table's best rate is one the source drives: go no higher */
++	if (n_table && table_rates[n_table - 1] == table_best) {
++		while (n_bw && bw_rates[n_bw - 1] > table_best)
++			n_bw--;
++	}
++
++	link_info->use_rate_set = n_table &&
++		(!n_bw || table_rates[n_table - 1] > bw_rates[n_bw - 1]);
++
++	if (link_info->use_rate_set) {
+ 		for (i = 0; i < n_table; i++) {
+ 			link_info->supported_rates[i] = table_rates[i];
+ 			link_info->supported_rate_sets[i] = table_sets[i];
+ 		}
+ 		link_info->num_supported_rates = n_table;
+-
+-		/* Only use LINK_RATE_SET if LINK_BW_SET hasn't already been written to */
+-		link_info->use_rate_set = !bw_set;
+ 	} else {
+ 		for (i = 0; i < n_bw; i++)
+ 			link_info->supported_rates[i] = bw_rates[i];
+-- 
+2.56.0
+

@@ -1,0 +1,363 @@
+--- a/crypto/af_alg.c
++++ b/crypto/af_alg.c
+@@ -8,6 +8,7 @@
+  */
+ 
+ #include <linux/atomic.h>
++#include <linux/capability.h>
+ #include <crypto/if_alg.h>
+ #include <linux/crypto.h>
+ #include <linux/init.h>
+@@ -22,10 +23,28 @@
+ #include <linux/sched/signal.h>
+ #include <linux/security.h>
+ #include <linux/string.h>
++#include <linux/sysctl.h>
++#include <linux/user_namespace.h>
+ #include <keys/user-type.h>
+ #include <keys/trusted-type.h>
+ #include <keys/encrypted-type.h>
+ 
++static int af_alg_restrict = 1;
++
++static const struct ctl_table af_alg_table[] = {
++	{
++		.procname       = "af_alg_restrict",
++		.data           = &af_alg_restrict,
++		.maxlen         = sizeof(int),
++		.mode           = 0644,
++		.proc_handler   = proc_dointvec_minmax,
++		.extra1		= SYSCTL_ZERO,
++		.extra2		= SYSCTL_TWO,
++	},
++};
++
++static struct ctl_table_header *af_alg_header;
++
+ struct alg_type_list {
+ 	const struct af_alg_type *type;
+ 	struct list_head list;
+@@ -110,6 +129,43 @@
+ }
+ EXPORT_SYMBOL_GPL(af_alg_unregister_type);
+ 
++static bool af_alg_capable(void)
++{
++	return ns_capable_noaudit(&init_user_ns, CAP_NET_ADMIN) ||
++	       capable(CAP_SYS_ADMIN);
++}
++
++int af_alg_check_restriction(const char *name,
++			     const struct af_alg_allowlist_entry allowlist[])
++{
++	int level = READ_ONCE(af_alg_restrict);
++
++	if (level == 0)
++		return 0;
++	if (level == 1) {
++		for (const struct af_alg_allowlist_entry *ent = allowlist;
++		     ent->name; ent++) {
++			if (strcmp(name, ent->name) == 0) {
++				if ((ent->flags & AF_ALG_UNPRIVILEGED) ||
++				    af_alg_capable())
++					return 0;
++				/* List contains at most one entry per name. */
++				break;
++			}
++		}
++	}
++	/*
++	 * Use -ENOENT (the error code for "algorithm not found") instead of
++	 * -EACCES or -EPERM, for the highest chance of correctly triggering
++	 * fallback code paths in userspace programs.
++	 *
++	 * Don't log a warning, since it would be noisy.  iwd tries to bind a
++	 * bunch of algorithms that it never uses.
++	 */
++	return -ENOENT;
++}
++EXPORT_SYMBOL_GPL(af_alg_check_restriction);
++
+ static void alg_do_release(const struct af_alg_type *type, void *private)
+ {
+ 	if (!type)
+@@ -506,6 +562,9 @@
+ 	struct sock *sk;
+ 	int err;
+ 
++	if (READ_ONCE(af_alg_restrict) == 2)
++		return -EAFNOSUPPORT;
++
+ 	if (sock->type != SOCK_SEQPACKET)
+ 		return -ESOCKTNOSUPPORT;
+ 	if (protocol != 0)
+@@ -1222,27 +1281,32 @@
+ 
+ static int __init af_alg_init(void)
+ {
+-	int err = proto_register(&alg_proto, 0);
++	int err;
++
++	af_alg_header = register_sysctl("crypto", af_alg_table);
+ 
++	err = proto_register(&alg_proto, 0);
+ 	if (err)
+-		goto out;
++		goto out_unregister_sysctl;
+ 
+ 	err = sock_register(&alg_family);
+-	if (err != 0)
++	if (err)
+ 		goto out_unregister_proto;
+ 
+-out:
+-	return err;
++	return 0;
+ 
+ out_unregister_proto:
+ 	proto_unregister(&alg_proto);
+-	goto out;
++out_unregister_sysctl:
++	unregister_sysctl_table(af_alg_header);
++	return err;
+ }
+ 
+ static void __exit af_alg_exit(void)
+ {
+ 	sock_unregister(PF_ALG);
+ 	proto_unregister(&alg_proto);
++	unregister_sysctl_table(af_alg_header);
+ }
+ 
+ module_init(af_alg_init);
+--- a/crypto/algif_aead.c
++++ b/crypto/algif_aead.c
+@@ -34,6 +34,11 @@
+ #include <linux/net.h>
+ #include <net/sock.h>
+ 
++static const struct af_alg_allowlist_entry aead_allowlist[] = {
++	{ "ccm(aes)" }, /* bluez */
++	{},
++};
++
+ static inline bool aead_sufficient_data(struct sock *sk)
+ {
+ 	struct alg_sock *ask = alg_sk(sk);
+@@ -344,6 +349,12 @@
+ 
+ static void *aead_bind(const char *name)
+ {
++	int err;
++
++	err = af_alg_check_restriction(name, aead_allowlist);
++	if (err)
++		return ERR_PTR(err);
++
+ 	return crypto_alloc_aead(name, 0, AF_ALG_CRYPTOAPI_MASK);
+ }
+ 
+--- a/crypto/algif_hash.c
++++ b/crypto/algif_hash.c
+@@ -16,6 +16,24 @@
+ #include <linux/net.h>
+ #include <net/sock.h>
+ 
++static const struct af_alg_allowlist_entry hash_allowlist[] = {
++	{ "cmac(aes)" }, /* iwd, bluez */
++	{ "hmac(md5)" }, /* iwd */
++	{ "hmac(sha1)" }, /* iwd */
++	{ "hmac(sha224)" }, /* iwd */
++	{ "hmac(sha256)" }, /* iwd */
++	{ "hmac(sha384)" }, /* iwd */
++	{ "hmac(sha512)" }, /* iwd, sha512hmac */
++	{ "md4" }, /* iwd */
++	{ "md5" }, /* iwd */
++	{ "sha1", AF_ALG_UNPRIVILEGED }, /* iwd, iproute2 < 7.0 */
++	{ "sha224" }, /* iwd */
++	{ "sha256" }, /* iwd */
++	{ "sha384" }, /* iwd */
++	{ "sha512" }, /* iwd */
++	{},
++};
++
+ struct hash_ctx {
+ 	struct af_alg_sgl sgl;
+ 
+@@ -382,6 +400,12 @@
+ 
+ static void *hash_bind(const char *name)
+ {
++	int err;
++
++	err = af_alg_check_restriction(name, hash_allowlist);
++	if (err)
++		return ERR_PTR(err);
++
+ 	return crypto_alloc_ahash(name, 0, AF_ALG_CRYPTOAPI_MASK);
+ }
+ 
+--- a/crypto/algif_rng.c
++++ b/crypto/algif_rng.c
+@@ -50,6 +50,10 @@
+ MODULE_AUTHOR("Stephan Mueller <smueller@chronox.de>");
+ MODULE_DESCRIPTION("User-space interface for random number generators");
+ 
++static const struct af_alg_allowlist_entry rng_allowlist[] = {
++	{},
++};
++
+ struct rng_ctx {
+ #define MAXSIZE 128
+ 	unsigned int len;
+@@ -201,6 +205,11 @@
+ {
+ 	struct rng_parent_ctx *pctx;
+ 	struct crypto_rng *rng;
++	int err;
++
++	err = af_alg_check_restriction(name, rng_allowlist);
++	if (err)
++		return ERR_PTR(err);
+ 
+ 	pctx = kzalloc_obj(*pctx);
+ 	if (!pctx)
+--- a/crypto/algif_skcipher.c
++++ b/crypto/algif_skcipher.c
+@@ -35,6 +35,24 @@
+ #include <linux/string.h>
+ #include <net/sock.h>
+ 
++static const struct af_alg_allowlist_entry skcipher_allowlist[] = {
++	{ "adiantum(xchacha12,aes)", AF_ALG_UNPRIVILEGED }, /* cryptsetup */
++	{ "adiantum(xchacha20,aes)", AF_ALG_UNPRIVILEGED }, /* cryptsetup */
++	{ "cbc(aes)" }, /* iwd */
++	{ "cbc(des)" }, /* iwd */
++	{ "cbc(des3_ede)" }, /* iwd */
++	{ "cbc(paes)" }, /* caam and others */
++	{ "ctr(aes)" }, /* iwd */
++	{ "ecb(aes)" }, /* iwd, bluez */
++	{ "ecb(des)" }, /* iwd */
++	{ "hctr2(aes)", AF_ALG_UNPRIVILEGED }, /* cryptsetup */
++	{ "xts(aes)", AF_ALG_UNPRIVILEGED }, /* cryptsetup benchmark */
++	{ "xts(camellia)", AF_ALG_UNPRIVILEGED }, /* cryptsetup */
++	{ "xts(serpent)", AF_ALG_UNPRIVILEGED }, /* cryptsetup */
++	{ "xts(twofish)", AF_ALG_UNPRIVILEGED }, /* cryptsetup */
++	{},
++};
++
+ static int skcipher_sendmsg(struct socket *sock, struct msghdr *msg,
+ 			    size_t size)
+ {
+@@ -311,6 +329,11 @@
+ static void *skcipher_bind(const char *name)
+ {
+ 	u32 mask = AF_ALG_CRYPTOAPI_MASK;
++	int err;
++
++	err = af_alg_check_restriction(name, skcipher_allowlist);
++	if (err)
++		return ERR_PTR(err);
+ 
+ 	if (strcmp(name, "cbc(paes)") == 0)
+ 		mask = 0;
+--- a/include/crypto/if_alg.h
++++ b/include/crypto/if_alg.h
+@@ -8,6 +8,7 @@
+ #ifndef _CRYPTO_IF_ALG_H
+ #define _CRYPTO_IF_ALG_H
+ 
++#include <linux/bits.h>
+ #include <linux/compiler.h>
+ #include <linux/completion.h>
+ #include <linux/if_alg.h>
+@@ -121,7 +122,7 @@
+  * @iv:			IV for cipher operation
+  * @state:		Existing state for continuing operation
+  * @aead_assoclen:	Length of AAD for AEAD cipher operations
+- * @completion:		Work queue for synchronous operation
++ * @wait:		For waiting for completion of async crypto ops
+  * @used:		TX bytes sent to kernel. This variable is used to
+  *			ensure that user space cannot cause the kernel
+  *			to allocate too much memory in sendmsg operation.
+@@ -161,9 +162,20 @@
+ 	unsigned int inflight;
+ };
+ 
++/* Flags for af_alg_allowlist_entry::flags: */
++#define AF_ALG_UNPRIVILEGED BIT(0) /* Unprivileged use is allowed */
++
++struct af_alg_allowlist_entry {
++	const char *name;
++	u32 flags;
++};
++
+ int af_alg_register_type(const struct af_alg_type *type);
+ int af_alg_unregister_type(const struct af_alg_type *type);
+ 
++int af_alg_check_restriction(const char *name,
++			     const struct af_alg_allowlist_entry allowlist[]);
++
+ int af_alg_release(struct socket *sock);
+ void af_alg_release_parent(struct sock *sk);
+ int af_alg_accept(struct sock *sk, struct socket *newsock,
+@@ -177,10 +189,11 @@
+ }
+ 
+ /**
+- * Size of available buffer for sending data from user space to kernel.
++ * af_alg_sndbuf - Size of available buffer for sending data from user space to kernel.
+  *
+- * @sk socket of connection to user space
+- * @return number of bytes still available
++ * @sk: socket of connection to user space
++ *
++ * Returns: number of bytes still available
+  */
+ static inline int af_alg_sndbuf(struct sock *sk)
+ {
+@@ -192,10 +205,11 @@
+ }
+ 
+ /**
+- * Can the send buffer still be written to?
++ * af_alg_writable - Can the send buffer still be written to?
++ *
++ * @sk: socket of connection to user space
+  *
+- * @sk socket of connection to user space
+- * @return true => writable, false => not writable
++ * Returns: true => writable, false => not writable
+  */
+ static inline bool af_alg_writable(struct sock *sk)
+ {
+@@ -203,10 +217,11 @@
+ }
+ 
+ /**
+- * Size of available buffer used by kernel for the RX user space operation.
++ * af_alg_rcvbuf - Size of available buffer used by kernel for the RX user space operation.
+  *
+- * @sk socket of connection to user space
+- * @return number of bytes still available
++ * @sk: socket of connection to user space
++ *
++ * Returns: number of bytes still available
+  */
+ static inline int af_alg_rcvbuf(struct sock *sk)
+ {
+@@ -218,10 +233,11 @@
+ }
+ 
+ /**
+- * Can the RX buffer still be written to?
++ * af_alg_readable - Can the RX buffer still be read from?
++ *
++ * @sk: socket of connection to user space
+  *
+- * @sk socket of connection to user space
+- * @return true => writable, false => not writable
++ * Returns: true => readable, false => not readable
+  */
+ static inline bool af_alg_readable(struct sock *sk)
+ {

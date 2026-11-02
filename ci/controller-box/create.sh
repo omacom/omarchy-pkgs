@@ -18,7 +18,7 @@ SSH_KEYS=${SSH_KEYS:-[]}
 # Public keys authorized for root: the operators' GitHub keys, fetched at
 # creation so the box never depends on an ssh_key API scope. Override with
 # ADMIN_GITHUB_USERS.
-ADMIN_GITHUB_USERS=${ADMIN_GITHUB_USERS:-ryanrhughes dhh}
+ADMIN_GITHUB_USERS=${ADMIN_GITHUB_USERS:-ryanrhughes dhh emirb}
 ssh_keys_json=$(for u in $ADMIN_GITHUB_USERS; do curl -fsS "https://github.com/$u.keys"; done | jq -R . | jq -sc .)
 [[ $(jq length <<<"$ssh_keys_json") -gt 0 ]] || { echo "no ssh keys fetched for $ADMIN_GITHUB_USERS" >&2; exit 1; }
 

@@ -1,0 +1,79 @@
+#!/bin/bash
+# The MT7932 radio takes its regulatory policy from
+# mediatek/mt7932/policy/<country>.bin, wherever the kernel's firmware loader
+# finds it, and stays blocked for a country without one. Whenever the
+# regulatory domain lands on such a country, switch to the world domain, whose
+# policy is world-XZ.bin, so the radio comes up with the most restrictive rules
+# instead of not at all.
+firmware=${AURORA_FIRMWARE_ROOT:-/usr/lib/firmware}
+last_fallback=-60
+minimum_interval=60
+
+# The loader's own order: an extracted vendor file (vendorfw), then updates, then
+# a packaged one.
+has_policy() {
+  local root
+  for root in "$firmware/vendor" "$firmware/updates" "$firmware"; do
+    [[ ! -e $root/mediatek/mt7932/policy/$1.bin ]] || return 0
+  done
+  return 1
+}
+
+fall_back() {
+  local country
+  country=$(iw reg get | awk '$1 == "country" { sub(":", "", $2); print $2; exit }')
+  [[ $country =~ ^[A-Z]{2}$ ]] && ! has_policy "$country" || return 0
+  [[ $country != 00 ]] || return 0
+  local remaining=$((minimum_interval - SECONDS + last_fallback))
+  if (( remaining > 0 )); then
+    # Defer instead of dropping the hint: otherwise the radio can stay blocked
+    # forever when no later event arrives. A supported hint during the wait wins.
+    sleep "$remaining"
+    country=$(iw reg get | awk '$1 == "country" { sub(":", "", $2); print $2; exit }')
+    [[ $country =~ ^[A-Z]{2}$ && $country != 00 ]] && ! has_policy "$country" || return 0
+  fi
+  last_fallback=$SECONDS
+  echo "No MT7932 policy for $country; using the world regulatory domain"
+  iw reg set 00
+}
+
+# An initramfs built before it carried regulatory.db left cfg80211 without
+# one, and a country set then reaches the driver but not the global domain,
+# so nothing above would see it. Load the database from the root filesystem
+# and set the configured country again, now for real.
+# Start the event source before changing the domain. Keep fallback state in this
+# process, not a pipeline subshell. Periodic readback also closes the nl80211
+# subscription-registration gap (starting a process alone does not prove ready).
+coproc REG_EVENTS { exec iw event; }
+watcher=$REG_EVENTS_PID
+exec {events}<&"${REG_EVENTS[0]}"
+trap 'kill "$watcher" 2>/dev/null || true' EXIT
+
+iw reg reload
+[[ ! -x /usr/bin/set-wireless-regdom ]] || /usr/bin/set-wireless-regdom
+fall_back
+next_reconcile=$((SECONDS + 5))
+while kill -0 "$watcher" 2>/dev/null; do
+  # Unrelated events must not reset the readback deadline: a busy stream can
+  # otherwise hide the missed country hint indefinitely.
+  if (( SECONDS >= next_reconcile )); then
+    fall_back
+    next_reconcile=$((SECONDS + 5))
+  fi
+  remaining=$((next_reconcile - SECONDS))
+  (( remaining > 0 )) || continue
+  if IFS= read -r -t "$remaining" -u "$events" line; then
+    [[ $line != *"regulatory domain change"* ]] || fall_back
+  else
+    status=$?
+    if (( status <= 128 )); then
+      break
+    fi
+  fi
+done
+wait "$watcher"
+status=$?
+trap - EXIT
+# A dead event stream must be restarted even when iw exited successfully.
+(( status != 0 )) || status=1
+exit "$status"

@@ -1,0 +1,117 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jim Martin <jimmartin@gmail.com>
+Date: Thu, 8 Oct 2026 13:40:56 -0500
+Subject: [PATCH] platform/surface: platform_profile: Handle an EC that reports
+ profile 0
+
+The EC on the Surface Laptop 8 accepts every performance profile the
+driver writes, but its TMP get-profile reply always carries profile 0,
+whatever was written. 0 is not a valid profile, so every read of the
+platform profile fails with "invalid performance profile: 0" and
+-EINVAL, and userspace cannot see which profile is active.
+
+Work around this. Remember the profile last written successfully, and
+report it when the EC returns 0. A failed fan profile write now returns
+before the profile is recorded, so a later read does not report a
+profile change that failed. At probe, if the EC reports 0, write
+balanced, so that the remembered profile matches what the EC was told
+rather than whatever the firmware left behind. If the probe read or
+write fails, a read that gets 0 from the EC reports balanced until a
+later write succeeds; a failed probe write is logged.
+
+This applies only to the Surface Laptop 8 ("microsoft,surface-laptop8").
+On other Surface devices a profile 0 from the EC is still reported as an
+error, and probe neither reads nor writes the profile.
+
+This is a workaround, not an understanding of the EC. It can be removed
+once the EC's behaviour is known, for example a request or field that
+reports the active profile on these devices.
+
+Assisted-by: Opus 5.5
+Signed-off-by: Jim Martin <jimmartin@gmail.com>
+---
+ .../surface/surface_platform_profile.c        | 31 ++++++++++++++++++-
+ 1 file changed, 30 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/platform/surface/surface_platform_profile.c b/drivers/platform/surface/surface_platform_profile.c
+index 0e479e35e66..f581a76f138 100644
+--- a/drivers/platform/surface/surface_platform_profile.c
++++ b/drivers/platform/surface/surface_platform_profile.c
+@@ -9,6 +9,7 @@
+ #include <linux/unaligned.h>
+ #include <linux/kernel.h>
+ #include <linux/module.h>
++#include <linux/of.h>
+ #include <linux/platform_profile.h>
+ #include <linux/types.h>
+ 
+@@ -42,6 +43,8 @@ struct ssam_platform_profile_device {
+ 	struct ssam_device *sdev;
+ 	struct device *ppdev;
+ 	bool has_fan;
++	bool ec_reports_zero;
++	enum platform_profile_option last_set;
+ };
+ 
+ SSAM_DEFINE_SYNC_REQUEST_CL_R(__ssam_tmp_profile_get, struct ssam_tmp_profile_info, {
+@@ -167,6 +170,15 @@ static int ssam_platform_profile_get(struct device *dev,
+ 	if (status)
+ 		return status;
+ 
++	/*
++	 * The Surface Laptop 8 accepts a profile but always reports 0. Report
++	 * the profile last set by this driver there.
++	 */
++	if (tp == 0 && tpd->ec_reports_zero) {
++		*profile = tpd->last_set;
++		return 0;
++	}
++
+ 	status = convert_ssam_tmp_to_profile(tpd->sdev, tp);
+ 	if (status < 0)
+ 		return status;
+@@ -196,9 +208,12 @@ static int ssam_platform_profile_set(struct device *dev,
+ 		if (tp < 0)
+ 			return tp;
+ 		tp = ssam_fan_profile_set(tpd->sdev, tp);
++		if (tp < 0)
++			return tp;
+ 	}
+ 
+-	return tp;
++	tpd->last_set = profile;
++	return 0;
+ }
+ 
+ static int ssam_platform_profile_probe(void *drvdata, unsigned long *choices)
+@@ -220,6 +235,8 @@ static const struct platform_profile_ops ssam_platform_profile_ops = {
+ static int surface_platform_profile_probe(struct ssam_device *sdev)
+ {
+ 	struct ssam_platform_profile_device *tpd;
++	enum ssam_tmp_profile tp;
++	int status;
+ 
+ 	tpd = devm_kzalloc(&sdev->dev, sizeof(*tpd), GFP_KERNEL);
+ 	if (!tpd)
+@@ -229,6 +246,18 @@ static int surface_platform_profile_probe(struct ssam_device *sdev)
+ 	ssam_device_set_drvdata(sdev, tpd);
+ 
+ 	tpd->has_fan = device_property_read_bool(&sdev->dev, "has_fan");
++	tpd->ec_reports_zero = of_machine_is_compatible("microsoft,surface-laptop8");
++
++	/*
++	 * If the EC does not report its profile, start from a known one:
++	 * balanced, which is also what reads report until the next change.
++	 */
++	if (tpd->ec_reports_zero && !ssam_tmp_profile_get(sdev, &tp) && tp == 0) {
++		status = ssam_platform_profile_set(&sdev->dev, PLATFORM_PROFILE_BALANCED);
++		if (status)
++			dev_warn(&sdev->dev, "failed to set the initial profile: %d\n", status);
++	}
++	tpd->last_set = PLATFORM_PROFILE_BALANCED;
+ 
+ 	tpd->ppdev = devm_platform_profile_register(&sdev->dev, "Surface Platform Profile",
+ 						    tpd, &ssam_platform_profile_ops);
+-- 
+2.56.0
+
