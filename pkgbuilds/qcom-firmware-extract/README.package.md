@@ -87,8 +87,20 @@ BitLocker volumes cannot be read; turn BitLocker off in Windows first.
 ## Retirement
 
 When linux-firmware ships a machine's vendor directory, the tool copies nothing
-and still configures its GPU firmware for early display. When every supported
-machine is covered, drop the package and prune the `/usr/lib/firmware/updates`
-entries listed in the manifest.
+and still configures its GPU firmware for early display.
+
+Copies from Windows load before packaged firmware, so once linux-firmware ships
+a file that was copied, the copy would keep loading. The pacman hook
+`80-qcom-firmware-retire.hook` runs `qcom-firmware-extract --retire` whenever
+packaged Qualcomm firmware is installed or upgraded, before mkinitcpio's own
+hook rebuilds the boot image, and when this package is installed or upgraded. It removes a copy only when packages ship every
+file of its device-tree node, since a DSP image and its device-tree image have
+to come from the same release: while linux-firmware ships part of a node, the
+copies keep the node on Windows' release. A copy is removed only if the
+manifest records it and its SHA-256 still matches; a changed copy is kept with
+a warning. The GPU zap shader's initramfs entry follows to the packaged file.
+
+When every supported machine is covered, drop the package; by then `--retire`
+has removed every copy the manifest recorded.
 
 Derived from Canonical's `qcom-firmware-extract` (GPL-2+).

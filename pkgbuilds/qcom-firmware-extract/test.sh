@@ -691,3 +691,47 @@ printf '%s 0 test\n%s 0 test\n' "$cdsp" "$cdsp_dtb" >"$cdsp_stage/manifest"
   [[ $(<"$newest/half/$path/qccdsp.mbn") == new-cdsp ]]
   echo "ok - equal or unreadable versions refuse, and an incomplete package is passed over"
 )
+
+# Retire: copies from Windows load before packaged firmware, so once packages
+# ship every file of a device-tree node, its copies step aside and the
+# packaged set loads instead of a mix of releases.
+(
+  rt="$scratch/retire"
+  path=qcom/x1e80100/LENOVO/83ED
+  set_kernel_config CONFIG_FW_LOADER_COMPRESS_ZSTD=y CONFIG_FW_LOADER_COMPRESS_XZ=y
+  mkdir -p "$rt/dt/remoteproc@0" "$rt/dt/remoteproc@1" "$rt/dt/gpu@0/zap-shader" "$rt/fw/$path" \
+    "$rt/store/cdsp" "$rt/store/adsp" "$rt/store/gpu"
+  printf '%s\0%s\0' "$path/qccdsp8380.mbn" "$path/cdsp_dtbs.elf" >"$rt/dt/remoteproc@0/firmware-name"
+  printf '%s\0' "$path/qcadsp8380.mbn" >"$rt/dt/remoteproc@1/firmware-name"
+  printf '%s\0' "$path/qcdxkmsuc8380.mbn" >"$rt/dt/gpu@0/zap-shader/firmware-name"
+  # Packages ship the CDSP image but not its device-tree image.
+  printf 'old-cdsp' >"$rt/fw/$path/qccdsp8380.mbn"
+  printf 'windows-dtb' >"$rt/store/cdsp/cdsp_dtbs.elf"
+  printf 'windows-adsp' >"$rt/store/adsp/qcadsp8380.mbn"
+  printf 'windows-zap' >"$rt/store/gpu/qcdxkmsuc8380.mbn"
+  run_retire() {
+    QCOM_FW_DT_ROOT="$rt/dt" \
+      QCOM_FW_FIRMWARE_ROOT="$rt/fw" \
+      QCOM_FW_ROOT="$rt/root" \
+      QCOM_FW_TEST_EUID=0 \
+      PATH="$test_bin:$PATH" \
+      bash "$extractor" "$@"
+  }
+  run_retire --install --no-rebuild -d "$rt/store" >/dev/null
+  run_retire --retire --no-rebuild >/dev/null
+  [[ $(<"$rt/fw/updates/$path/cdsp_dtbs.elf") == windows-dtb ]]
+
+  # Packages catch up; the ADSP copy was changed by hand since.
+  printf 'new-cdsp' >"$rt/fw/$path/qccdsp8380.mbn"
+  printf 'packaged-dtb' >"$rt/fw/$path/cdsp_dtbs.elf"
+  printf 'packaged-adsp' >"$rt/fw/$path/qcadsp8380.mbn"
+  printf 'packaged-zap' | xz -c >"$rt/fw/$path/qcdxkmsuc8380.mbn.xz"
+  printf 'edited' >"$rt/fw/updates/$path/qcadsp8380.mbn"
+  run_retire --retire --no-rebuild >/dev/null 2>"$rt/err"
+  [[ ! -e $rt/fw/updates/$path/cdsp_dtbs.elf && ! -e $rt/fw/updates/$path/qcdxkmsuc8380.mbn ]]
+  [[ $(<"$rt/fw/updates/$path/qcadsp8380.mbn") == edited ]]
+  grep -Fq "keeping $rt/fw/updates/$path/qcadsp8380.mbn" "$rt/err"
+  [[ $(cut -d' ' -f1 "$rt/root/var/lib/omarchy/qcom-firmware/manifest") == "$path/qcadsp8380.mbn" ]]
+  grep -Fq "$rt/fw/$path/qcdxkmsuc8380.mbn.xz" "$rt/root/etc/mkinitcpio.conf.d/qcom-firmware.conf"
+  echo "ok - --retire removes unchanged copies once packages ship their whole node, and the zap shader entry follows"
+)
