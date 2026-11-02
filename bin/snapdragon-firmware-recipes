@@ -1,0 +1,262 @@
+#!/usr/bin/env python3
+# Write a recipe per Snapdragon machine from arewearmyet's firmware table: each recipe downloads
+# the OEM's own Windows driver package at build time, unpacks it without running it, installs the
+# firmware files the machine's device tree asks for and checks each against its SHA-256.
+#
+# Usage: bin/snapdragon-firmware-recipes [--table FILE] [recipe ...]
+# The table defaults to https://arewearmyet.com/firmware-sources.json. Recipes are written under
+# pkgbuilds/; naming some limits the run to them.
+import argparse, json, os, re, sys, textwrap, urllib.request
+
+ROOT = os.path.realpath(os.path.join(os.path.dirname(__file__), ".."))
+parser = argparse.ArgumentParser()
+parser.add_argument("--table", default="https://arewearmyet.com/firmware-sources.json")
+parser.add_argument("recipes", nargs="*")
+args = parser.parse_args()
+if re.match(r"https?://", args.table):
+    request = urllib.request.Request(args.table, headers={"User-Agent": "omarchy-pkgs snapdragon-firmware-recipes"})
+    with urllib.request.urlopen(request) as response:
+        table = json.load(response)
+else:
+    table = json.load(open(args.table))
+out = os.path.join(ROOT, "pkgbuilds")
+
+MAINTAINER = "Birk Skyum <birk.skyum@pm.me>"
+TABLE_URL = "https://arewearmyet.com/firmware-sources.json"
+
+# Recipe name -> the machines it is for, and the firmware folders their device trees load from.
+# Left out: glymur/ASUSTeK/UX3607OA, which asus-zenbook-a16-firmware ships, and
+# x1e80100/LENOVO/21N1, whose ThinkPad T14s Gen 6 set linux-firmware already ships.
+RECIPES = {
+    "acer-swift-14-go-pro-ai-firmware": ("Acer Swift 14 Go Pro AI", ["qcom/x1e80100/ACER/SFA14-11"]),
+    "asus-vivobook-s15-firmware": ("ASUS Vivobook S 15", ["qcom/x1e80100/ASUSTeK/vivobook-s15"]),
+    "asus-zenbook-a14-firmware": ("ASUS Zenbook A14 and Zenbook 14 (2026)", ["qcom/x1e80100/ASUSTeK/zenbook-a14", "qcom/x1p42100/ASUSTeK/zenbook-a14"]),
+    "asus-zenbook-a14-x2-firmware": ("ASUS Zenbook A14 (X2)", ["qcom/glymur/ASUSTeK/UX3407NA"]),
+    "dell-inspiron-14-5441-firmware": ("Dell Inspiron 14 5441", ["qcom/x1e80100/dell/inspiron-14-plus-5441"]),
+    "dell-inspiron-14-plus-7441-firmware": ("Dell Inspiron 14 Plus 7441", ["qcom/x1e80100/dell/inspiron-14-plus-7441"]),
+    "dell-latitude-7455-firmware": ("Dell Latitude 7455", ["qcom/x1e80100/dell/latitude-7455"]),
+    "dell-xps-13-9345-firmware": ("Dell XPS 13 9345", ["qcom/x1e80100/dell/xps13-9345"]),
+    "honor-magicbook-art-14-firmware": ("Honor MagicBook Art 14", ["qcom/x1e80100/HONOR/MRO-XXX"]),
+    "hp-elitebook-6-g1q-firmware": ("HP EliteBook 6 G1q", ["qcom/x1p42100/hp/elitebook-6-g1q"]),
+    "hp-elitebook-ultra-g1q-firmware": ("HP EliteBook Ultra G1q", ["qcom/x1e80100/hp/elitebook-ultra-g1q"]),
+    "hp-elitebook-x-g2q-firmware": ("HP EliteBook X G2q", ["qcom/glymur/hp/elitebook-x-g2q"]),
+    "hp-omnibook-ultra-14-firmware": ("HP OmniBook Ultra 14", ["qcom/glymur/hp/omnibook-ultra-14-kg0xxx"]),
+    "hp-omnibook-x14-firmware": ("HP OmniBook X 14", ["qcom/x1e80100/hp/omnibook-x14", "qcom/x1p42100/hp/omnibook-x14"]),
+    "hp-omnibook-x16-firmware": ("HP OmniBook X 16 (2026)", ["qcom/glymur/hp/omnibook-x16"]),
+    "lenovo-ideacentre-mini-x-firmware": ("Lenovo IdeaCentre Mini x", ["qcom/x1e80100/LENOVO/91B6"]),
+    "lenovo-thinkpad-t14s-gen7-firmware": ("Lenovo ThinkPad T14s Gen 7", ["qcom/glymur/LENOVO/22A8"]),
+    "medion-sprchrgd-14-s1-firmware": ("Medion SPRCHRGD 14 S1", ["qcom/x1e80100/Medion/sprchrgd-14-s1"]),
+    "microsoft-surface-laptop-7-firmware": ("Microsoft Surface Laptop 7", ["qcom/x1e80100/microsoft/Romulus", "qcom/x1e80100/microsoft"]),
+    "microsoft-surface-laptop-8-firmware": ("Microsoft Surface Laptop 8", ["qcom/glymur/microsoft/mahua"]),
+    "microsoft-surface-pro-11-firmware": ("Microsoft Surface Pro 11th Edition", ["qcom/x1e80100/microsoft/Denali", "qcom/x1e80100/microsoft"]),
+    "microsoft-surface-pro-12in-firmware": ("Microsoft Surface Pro 12-inch", ["qcom/x1p42100/Microsoft/Surface12"]),
+    "samsung-galaxy-book4-edge-firmware": ("Samsung Galaxy Book4 Edge", ["qcom/x1e80100/SAMSUNG/galaxy-book4-edge"]),
+}
+# Both Surfaces load the same GPU zap shader from qcom/x1e80100/microsoft.
+CONFLICTS = {
+    "microsoft-surface-laptop-7-firmware": ["microsoft-surface-pro-11-firmware"],
+    "microsoft-surface-pro-11-firmware": ["microsoft-surface-laptop-7-firmware"],
+}
+# Device-tree compatibles for the provided.d list of firmware the board's boot firmware loads.
+COMPATIBLE = {"hp-elitebook-x-g2q-firmware": "hp,elitebook-x-g2q"}
+
+folders = {f["path"]: f for f in table["folders"]}
+packages = {p["id"]: p for p in table["packages"]}
+
+
+def resolve(path, name, depth=0):
+    """The table's entry for a file, following linux-firmware style links between folders."""
+    folder = folders[path]
+    for f in folder.get("files", []):
+        if f["name"] == name:
+            return f
+    for link in folder.get("links", []):
+        if link["name"] == name and depth < 4:
+            target = os.path.normpath(os.path.join(path, link["target"]))
+            return resolve(os.path.dirname(target), os.path.basename(target), depth + 1)
+    raise KeyError(f"{path}/{name}")
+
+
+def unpack_kind(pkg):
+    path = pkg["url"].split("?")[0].lower()
+    if path.endswith(".msi"):
+        return "msi"
+    if path.endswith(".exe") and pkg["maker"] == "Lenovo":
+        return "inno"
+    if path.endswith(".exe") and pkg["maker"] == "ASUS":
+        return "7z-appended"
+    return "7z"
+
+
+def ext(pkg):
+    m = re.search(r"(\.[A-Za-z0-9]+)$", pkg["url"].split("?")[0])
+    return m.group(1).lower() if m else ".bin"
+
+
+def q(s):
+    return "'" + s.replace("'", "'\"'\"'") + "'"
+
+
+def human_list(items):
+    return items[0] if len(items) == 1 else ", ".join(items[:-1]) + " and " + items[-1]
+
+
+# What the files run on, named the way the comment and description say it.
+def contents(dests):
+    base = [os.path.basename(d) for d in dests]
+    parts = []
+    if any(b.startswith(("qcadsp", "adsp", "battmgr")) for b in base):
+        parts.append("audio DSP")
+    if any(b.startswith(("qccdsp", "cdsp")) for b in base):
+        parts.append("compute DSP")
+    if any(b.startswith("qcdxkmsuc") for b in base):
+        parts.append("GPU")
+    if any(b.startswith("qcvss") for b in base):
+        parts.append("video")
+    return human_list(parts)
+
+
+def comment(text):
+    return ["# " + line for line in textwrap.wrap(text, 96, break_on_hyphens=False)]
+
+
+def recipe(name, who, paths):
+    wanted, provided = [], []
+    for path in paths:
+        folder = folders[path]
+        for n in [f["name"] for f in folder.get("files", [])] + [l["name"] for l in folder.get("links", [])]:
+            if re.fullmatch(r"soccp(_dtb)?\.mbn", n):
+                # The board's boot firmware starts the SoC control processor before Linux.
+                provided.append(f"{path}/{n}")
+                continue
+            entry = resolve(path, n)
+            if not entry.get("from"):
+                raise SystemExit(f"{name}: {path}/{n} is in no OEM download")
+            wanted.append({"dest": f"{path}/{n}", "sha256": entry["sha256"], "from": entry["from"]})
+
+    # The fewest OEM downloads that hold every file: the one with the most of the rest first,
+    # the smaller on a tie.
+    remaining, chosen = list(range(len(wanted))), []
+    while remaining:
+        counts = {}
+        for i in remaining:
+            for s in wanted[i]["from"]:
+                counts[s["package"]] = counts.get(s["package"], 0) + 1
+        best = min(counts, key=lambda p: (-counts[p], packages[p]["size"], p))
+        chosen.append(best)
+        for i in list(remaining):
+            src = next((s for s in wanted[i]["from"] if s["package"] == best), None)
+            if src:
+                wanted[i]["src"] = (best, src["member"])
+                remaining.remove(i)
+
+    for w in wanted:
+        if "!xz@" in w["src"][1]:
+            raise SystemExit(f"{name}: {w['dest']} is an XZ stream; the generator does not unpack those")
+
+    makers = sorted({packages[p]["maker"] for p in chosen})
+    kinds = {p: unpack_kind(packages[p]) for p in chosen}
+    makedepends = ["7zip"] + (["innoextract"] if "inno" in kinds.values() else []) + (["msitools"] if "msi" in kinds.values() else [])
+    local = {p: f"{p}{ext(packages[p])}" for p in chosen}
+    version = max(packages[p]["fetched"] for p in chosen).replace("-", "")
+    page = next((packages[p].get("page") for p in chosen if packages[p].get("page")), None) or packages[chosen[0]]["url"].split("?")[0]
+
+    what = contents([w["dest"] for w in wanted])
+    L = [f"# Maintainer: {MAINTAINER}", "#"]
+    L += comment(
+        f"{what[0].upper() + what[1:]} firmware for the {who}. The firmware only runs if it is signed for this "
+        f"board by {human_list(makers)}, so linux-firmware cannot carry it until the OEM submits it. The OEM ships it "
+        "in its Windows driver download, which this recipe unpacks without running. The files are installed "
+        "unmodified, under the names the device tree requests, and checked against the SHA-256 each was matched to.")
+    if provided:
+        L += ["#"] + comment(
+            "The board's own firmware starts the SoC control processor before Linux, so its images are not "
+            "installed, and provided.d tells qcom-firmware-extract not to look for them.")
+    L += ["#"] + comment(f"Generated from {TABLE_URL} by bin/snapdragon-firmware-recipes; change the table, not this file.") + [""]
+    L += [
+        f"pkgname={name}",
+        f"pkgver={version}",
+        "pkgrel=1",
+        f"pkgdesc={q(what[0].upper() + what[1:] + ' firmware for the ' + who)}",
+        "arch=('aarch64')",
+        f"url={q(page)}",
+        "license=('LicenseRef-proprietary')",
+        "provides=(" + " ".join(q("qcom-firmware-" + p.removeprefix("qcom/").replace("/", "-").lower()) for p in paths) + ")",
+    ]
+    if name in CONFLICTS:
+        L.append("conflicts=(" + " ".join(q(c) for c in CONFLICTS[name]) + ")")
+    L += [
+        "makedepends=(" + " ".join(q(d) for d in makedepends) + ")",
+        "options=('!strip' '!debug')",
+    ]
+    if any(packages[p]["maker"] == "Dell" for p in chosen):
+        L += [
+            "# dl.dell.com turns away clients that do not name a browser.",
+            "DLAGENTS=('https::/usr/bin/curl -qgb \"\" -A Mozilla/5.0 -fLC - --retry 3 --retry-delay 3 -o %o %u')",
+        ]
+    L.append("source=(")
+    for p in chosen:
+        L.append(f'  "{local[p]}::{packages[p]["url"]}"')
+    L.append(")")
+    if provided:
+        L.append(f"source+=({q(COMPATIBLE[name] + '.list')})")
+    L.append("noextract=(" + " ".join(q(local[p]) for p in chosen) + ")")
+    L.append("sha256sums=(" + " ".join(q(packages[p]["sha256"]) for p in chosen) + ")")
+    if provided:
+        L.append("sha256sums+=('SKIP')")
+    L += [
+        "",
+        "# Unpack an OEM download the way it is packed: MSIs with msiextract, Lenovo's installers with",
+        "# innoextract, ASUS's installers from the 7-Zip archive appended to them, the rest with 7z.",
+        "_unpack() {",
+        "  local file=$1 dir=$2 kind=$3 offset",
+        '  rm -rf "$dir"',
+        '  mkdir -p "$dir"',
+        "  case $kind in",
+        '    msi) msiextract -C "$dir" "$file" >/dev/null ;;',
+        '    inno) innoextract -s -d "$dir" "$file" ;;',
+        "    7z-appended)",
+        "      offset=$(LC_ALL=C grep -obUaP '7z\\xBC\\xAF\\x27\\x1C' \"$file\" | head -1 | cut -d: -f1)",
+        '      [[ -n $offset ]] || { echo "no 7z archive in $file" >&2; return 1; }',
+        '      tail -c +$((offset + 1)) "$file" >"$dir.7z"',
+        '      7z x -y -o"$dir" "$dir.7z" >/dev/null',
+        "      ;;",
+        '    *) 7z x -y -o"$dir" "$file" >/dev/null ;;',
+        "  esac",
+        "}",
+        "",
+        "prepare() {",
+    ]
+    for p in chosen:
+        L.append(f"  _unpack {q(local[p])} {q(p)} {kinds[p]}")
+    nested = sorted({(w["src"][0], "!/".join(w["src"][1].split("!/")[:i])) for w in wanted for i in range(1, len(w["src"][1].split("!/")))}, key=lambda t: (t[0], t[1].count("!/")))
+    for p, inner in nested:
+        disk = inner.replace("!/", "__x/")
+        L.append(f"  _unpack {q(p + '/' + disk)} {q(p + '/' + disk + '__x')} 7z")
+    L += ["}", "", "package() {", '  local fw="$pkgdir/usr/lib/firmware"']
+    for w in sorted(wanted, key=lambda w: w["dest"]):
+        p, member = w["src"]
+        L.append(f"  install -Dm644 {q(p + '/' + member.replace('!/', '__x/'))} \"$fw/{w['dest']}\"")
+    L += ["", "  # The bytes each file was matched to in the OEM's download.", "  (", '    cd "$fw"', "    sha256sum -c --quiet <<'SUMS'"]
+    for w in sorted(wanted, key=lambda w: w["dest"]):
+        L.append(f"{w['sha256']}  {w['dest']}")
+    L += ["SUMS", "  )"]
+    if provided:
+        L += ["", f'  install -Dm644 -t "$pkgdir/usr/share/qcom-firmware-extract/provided.d" {q(COMPATIBLE[name] + ".list")}']
+    L += ["}", ""]
+
+    d = os.path.join(out, name)
+    os.makedirs(os.path.join(d, ".omarchy"), exist_ok=True)
+    open(os.path.join(d, "PKGBUILD"), "w").write("\n".join(L))
+    open(os.path.join(d, ".omarchy", "package.json"), "w").write('{\n  "source": "local"\n}\n')
+    if provided:
+        open(os.path.join(d, COMPATIBLE[name] + ".list"), "w").write(
+            "# The board's own firmware starts the SoC control processor before Linux.\n" + "\n".join(provided) + "\n")
+    return {"name": name, "files": len(wanted), "sources": [(p, packages[p]["size"]) for p in chosen], "provided": provided}
+
+
+for name, (who, paths) in RECIPES.items():
+    if args.recipes and name not in args.recipes:
+        continue
+    r = recipe(name, who, paths)
+    print(f'{r["name"]:40} {r["files"]:3} files from ' + ", ".join(f"{p} ({s // 1000000} MB)" for p, s in r["sources"]) + (f'  provided: {len(r["provided"])}' if r["provided"] else ""))
