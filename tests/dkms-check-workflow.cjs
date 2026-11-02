@@ -60,6 +60,21 @@ test('the matrix only reads, and holds no secret', () => {
   }
 });
 
+test('a promotion stops when the channels moved after its DKMS check', () => {
+  const matrix = read('dkms-matrix.yml');
+  assert.match(matrix, /^      legs:\n.*\n        value: \$\{\{ jobs\.plan\.outputs\.legs \}\}$/m, 'the matrix hands its legs to the caller');
+  const promote = jobs(read('promote.yml')).promote;
+  assert.match(promote, /^    needs: dkms$/m);
+  assert.match(promote, /group: publish/, 'the comparison runs under the publish lock');
+  const compare = promote.indexOf('name: Check that the channels still hold what the DKMS check built');
+  const publish = promote.indexOf('name: Promote');
+  assert.ok(compare > 0 && compare < publish, 'the comparison comes before the promotion');
+  assert.match(promote, /CHECKED: \$\{\{ needs\.dkms\.outputs\.legs \}\}/);
+  assert.match(promote, /bin\/check-dkms matrix --arch x86_64 "\$\{args\[@\]\}"/);
+  assert.match(promote, /bin\/check-dkms matrix --arch aarch64 "\$\{args\[@\]\}"/);
+  assert.match(promote, /if \[\[ \$now != "\$built" \]\]; then/);
+});
+
 test('a pull request build records what the DKMS check reads', () => {
   const build = read('build-pr.yml');
   const changes = jobs(build).changes;
