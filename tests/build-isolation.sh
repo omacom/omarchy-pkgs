@@ -158,6 +158,27 @@ OMARCHY_DEFER_RUNTIME_DEPS=true run_build omarchy-dev omarchy-settings-dev > "$T
 compgen -G "$TEST_ROOT/build-output/edge/$TEST_ARCH/omarchy-dev-1-1-*.pkg.tar.zst" >/dev/null
 printf 'PASS: deferred pair mode works across isolated containers\n'
 
+# Compilers write their temporaries to /tmp, so it lives in memory rather
+# than on the builder's disk, and configure scripts must still be able to run
+# the test programs they build there.
+fixture scratch ''
+cat >> "$TEST_ROOT/pkgbuilds/scratch/PKGBUILD" <<'EOF'
+check() {
+  # The exact size: the mount bin/build makes, not a tmpfs the host happens
+  # to provide under a bind mount.
+  [[ $(stat -f -c %T /tmp) == tmpfs ]]
+  (( $(df -B1G --output=size /tmp | tail -1) == 16 ))
+  printf '#!/bin/sh\nexit 0\n' > /tmp/omarchy-exec-probe
+  chmod +x /tmp/omarchy-exec-probe
+  /tmp/omarchy-exec-probe
+}
+EOF
+run_build scratch > "$TEST_ROOT/scratch.log" 2>&1 || {
+  cat "$TEST_ROOT/scratch.log"
+  exit 1
+}
+printf 'PASS: /tmp is an executable tmpfs in the build container\n'
+
 fixture excluded ''
 other_arch=aarch64
 [[ $TEST_ARCH == aarch64 ]] && other_arch=x86_64
