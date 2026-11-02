@@ -98,7 +98,8 @@ only once packages ship every file the node names (a name a board lists in
 node back). They go only if every copy in the node is one the manifest records,
 unchanged since, a plain file in `/usr/lib/firmware/updates` itself, and not
 listed in `provided.d`; otherwise the node keeps all of its copies, with a
-warning. A name several nodes use goes only when all of them can. Without the
+warning. Nodes that share a name are tied: when one keeps its copies, every
+node linked to it through shared names keeps them too. Without the
 kernel's configuration only an uncompressed packaged file counts. The manifest
 stops recording a copy before it is removed, and the GPU zap shader's initramfs
 entry follows to the packaged file.

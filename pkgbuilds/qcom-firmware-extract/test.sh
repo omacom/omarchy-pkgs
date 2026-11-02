@@ -791,6 +791,12 @@ printf '%s 0 test\n%s 0 test\n' "$cdsp" "$cdsp_dtb" >"$cdsp_stage/manifest"
   fresh "remoteproc@0:a.mbn" "remoteproc@1:a.mbn b.elf"; copied a.mbn; copied b.elf; packaged a.mbn
   retire; kept a.mbn b.elf
 
+  # c.elf is not packaged, so the second node keeps a.mbn, and the first node,
+  # tied to it through a.mbn, keeps b.elf with it.
+  fresh "remoteproc@0:a.mbn b.elf" "remoteproc@1:a.mbn c.elf"; copied a.mbn; copied b.elf; copied c.elf
+  packaged a.mbn; packaged b.elf
+  retire; kept a.mbn b.elf c.elf
+
   fresh "remoteproc@0:a.mbn"; copied a.mbn; packaged a.mbn
   printf 'test,board\0' >"$rs/dt/compatible"
   mkdir -p "$rs/provided"
