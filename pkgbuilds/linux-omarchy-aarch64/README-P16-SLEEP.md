@@ -90,7 +90,7 @@ reports the compiled tests as skipped when no prepared tree is supplied.
 
 ## Current recipe compatibility
 
-The PR is refreshed on the official 7.3-12 recipe and uses pkgrel 14 so its
+The PR is refreshed on the official 7.3-12 recipe and uses pkgrel 15 so its
 packaging change is shipped. It retains upstream's separate kernel, headers and
 NVIDIA open-module split, driver version and seven NVIDIA patches unchanged.
 The six P16 sleep patches are byte-identical to those in the locally built and
