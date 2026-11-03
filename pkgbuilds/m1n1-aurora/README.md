@@ -1,10 +1,15 @@
 # m1n1-aurora
 
 Build the canonical Aurora bootloader package from an immutable omacom/m1n1
-commit. The current candidate is 7ea16980c6dabc1aa0c59e140cbf1f457a579bad
-(merged source PRs #6, #7, #8, #10, #12, #13, #14 and #15, plus omacom/m1n1#18: the
-M3 Airs and M3 Pros hand the display and GPU over by default), with Clang/lld, Rust 1.89.0 and
-`-Os`. The package's existing 48/128/256 artwork is unchanged. The former USB4
+commit. The current candidate is bc79acc434e612ffcb95bfc7cb2fd7543afac5f2
+(merged source PRs #6, #7, #8, #10, #12, #13, #14, #15, #17, #18 and #19: on
+the 16-inch M3 Max with the 40-core GPU, J516C, m1n1 requests its existing display and GPU
+handoffs by default, subject to the existing checks), with Clang/lld, Rust 1.89.0 and
+`-Os`. Native J516C graphics also need the kernel's automatic J516C display request and
+display-before-GPU gate (omacom/linux-aurora#246) and the kernel's J516C board data; those
+are outside this package. The merge also includes #17's T6030 external-display
+dependency fix: a display handoff requests its required memory handoff. The
+package's existing 48/128/256 artwork is unchanged. The former USB4
 alias patch is already in the source; the APFS preboot UUID handoff proposed in
 omarchy-pkgs #1485 is also present upstream, so neither needs a local patch.
 
@@ -50,6 +55,11 @@ its first `pacman -Syu` (`--noconfirm` accepts the default-yes replacement).
 This source and provider change also requires explicit maintainer approval.
 
 ## Qualification
+
+The #19 merge pin includes #17; this exact combined package has not yet been
+natively built or booted. The earlier #19 package was cold-booted by its J516C
+owner, and #17 was separately boot-tested on an M3 Pro. Those results do not
+replace qualification of this merge pin.
 
 Edge is the qualification channel. `package()` uses `--build-only`, so merging
 this PR allows the normal build/publish workflow to publish an edge candidate;
