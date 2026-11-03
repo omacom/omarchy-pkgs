@@ -195,11 +195,23 @@ The patches by other authors carry their sign-offs, except `2367`, and Jim Marti
 
 Outside the board files they touch `glymur.dtsi` on every X2 laptop, and `pmic_glink`, `pcie-qcom`, `pci-pwrctrl-pwrseq` and EFI variable locking more widely. The A16's own DSP firmware and Wi-Fi board data are in `asus-zenbook-a16-firmware`.
 
+### Acer Aspire 14 AI and 16 AI
+
+`2510`-`2512` bring up the Acer Aspire 14 AI (A14-11M) and Aspire 16 AI (A16-11M), on the Snapdragon X X1-26-100 (`acer,aspire-a14-11m`, `acer,aspire-a16-11m`). The trees are written from the ACPI tables in the two laptops' hardware reports.
+
+- `2510` adds the two compatibles to the binding.
+- `2511` adds them to the QSEECOM allowlist, for the EFI variables an install needs to write its boot entry.
+- `2512` adds the trees, one dtsi for both sizes and a .dts each with the model, compatible and firmware paths, which the `x1*` rule builds and installs. Audio and the cameras are left out.
+
+systemd's list of hardware IDs doesn't have these laptops, so the package installs their entries under `/usr/lib/systemd/boot/hwids/aa64/linux-omarchy/`. ukify reads that directory with its subdirectories, so the installer image's live UKI and the installed system's UKI both pick the tree on these laptops by themselves. Each entry lists CHIDs 3 to 10 from the laptop's report, except 7, which is only the maker and an all-zero SKU, the same on both laptops and on other Acer models.
+
+The trees build with `W=1` and `CHECK_DTBS=y` on this recipe. The one schema warning, on the camera clock controller's power domains, comes with the recipe's camera nodes, and the Zenbook A14's tree gets it too. The Aspire 16 AI booted the tree from Ubuntu's live USB on a 7.0 kernel, with the panel, keyboard, NVMe, all four USB ports, battery and Bluetooth working. The Aspire 14 AI hasn't been tried, and neither laptop has run with QSEECOM yet. The DSP and GPU firmware come from Windows through `qcom-firmware-extract`. Wi-Fi also needs board data, which linux-firmware doesn't have for the module's subsystem ID (`1a3b:6580`).
+
 ### Acer Swift 14 AI and Swift Go 14, Dell Latitude 5455 and HP EliteBook 6 G1q
 
-`2510`-`2532` add four X1 laptops whose trees are not in 7.3. Each has its firmware in an omarchy-pkgs package and its hardware IDs in systemd 262, so the image picks its tree by itself.
+`2513`-`2532` add four X1 laptops whose trees are not in 7.3. Each has its firmware in an omarchy-pkgs package and its hardware IDs in systemd 262, so the image picks its tree by itself.
 
-- `2510`-`2513` are the Acer Swift 14 AI (SF14-11, X1P-64-100, `acer,swift-sf14-11`) and Swift Go 14 (SFG14-01, X1P-42-100, `acer,swift-go14-01`), which come from Ubuntu's kernel. `2510` is Tobias Heider's trees, `2511` Timo Aaltonen's include fix and `2512` Tobias Heider's move of the PCIe PERST and wake GPIOs to the port nodes. `2513` sets `dr_mode` on the USB controllers themselves, since 7.3 merged their DWC3 child nodes into them. As in Ubuntu, the trees list `lenovo,thinkpad-t14s` after their own compatible, which gets them EFI variables through QSEECOM.
+- `2513`-`2516` are the Acer Swift 14 AI (SF14-11, X1P-64-100, `acer,swift-sf14-11`) and Swift Go 14 (SFG14-01, X1P-42-100, `acer,swift-go14-01`), which come from Ubuntu's kernel. `2513` is Tobias Heider's trees, `2514` Timo Aaltonen's include fix and `2515` Tobias Heider's move of the PCIe PERST and wake GPIOs to the port nodes. `2516` sets `dr_mode` on the USB controllers themselves, since 7.3 merged their DWC3 child nodes into them. As in Ubuntu, the trees list `lenovo,thinkpad-t14s` after their own compatible, which gets them EFI variables through QSEECOM.
 - `2520`-`2522` are Juerg Haefliger's HP EliteBook 6 G1q series (X1P-42-100, `hp,elitebook-6-g1q`), v1 as posted to linux-arm-msm on 2026-10-13, with its binding and QSEECOM entry.
 - `2530`-`2532` are the Dell Latitude 5455 (X1P-64-100, `dell,latitude-5455`), the Latitude 7455's board in 7.3 (`x1-dell-thena.dtsi`) with its own PWM backlight, DisplayPort audio and firmware paths. `2530` is Ethan Ramsey's tree from his repository, `2531` reaches the panel through `mdss_dp3` because this tree has no `dp3_panel` label, and `2532` puts the laptop on the QSEECOM allowlist beside the 7455.
 
