@@ -32,7 +32,14 @@ for sources, sha, b2 in (arrays[:3], arrays[3:]):
 config = (package / 'config.aarch64').read_text().splitlines()
 for option in ['ACPI_PROCESSOR', 'ACPI_PROCESSOR_IDLE', 'PM_GENERIC_DOMAINS', 'CPU_IDLE', 'ARM_PSCI_FW', 'CRYPTO_LIB_SHA256']:
     assert f'CONFIG_{option}=y' in config, option
+for option in ('ACPI_WMI', 'ASUS_WMI', 'ASUS_NB_WMI', 'SPI_HID_ACPI'):
+    assert f'CONFIG_{option}=m' in config, option
+for option in ('ASUS_ARMOURY', 'ASUS_WMI_DEPRECATED_ATTRS'):
+    assert f'# CONFIG_{option} is not set' in config, option
 sources = arrays[0]
 ordered = [name for name in sources if name.startswith(('1120-', '1121-', '1122-', '1123-', '1124-', '1125-'))]
 assert len(ordered) == 6 and ordered == sorted(ordered)
+platform = [name for name in sources if name.startswith(('9100-', '9101-', '9102-'))]
+assert len(platform) == 3 and platform == sorted(platform)
+assert not any('p16-platform-support' in name for name in sources)
 print(f'PASS package sources/checksums: {checked} local files; coordinated suspend config prerequisites')

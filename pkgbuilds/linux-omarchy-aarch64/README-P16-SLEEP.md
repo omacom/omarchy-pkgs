@@ -90,11 +90,12 @@ reports the compiled tests as skipped when no prepared tree is supplied.
 
 ## Current recipe compatibility
 
-The PR is refreshed on the official 7.3-12 recipe and uses pkgrel 13 so its
+The PR is refreshed on the official 7.3-12 recipe and uses pkgrel 14 so its
 packaging change is shipped. It retains upstream's separate kernel, headers and
 NVIDIA open-module split, driver version and seven NVIDIA patches unchanged.
 The six P16 sleep patches are byte-identical to those in the locally built and
 booted Staticduo P16 7.3-12.1 candidate. That local candidate also includes
-separate ASUS platform changes; those are not part of this sleep PR. Its successful
-build/boot and the extracted-function tests do not establish new physical
+ASUS platform changes. That kernel portion is now included in this package PR
+(see README-P16-PLATFORM.md); userspace battery integration remains excluded.
+Its successful build/boot and the extracted-function tests do not establish new physical
 suspend measurements for this refreshed official recipe.
