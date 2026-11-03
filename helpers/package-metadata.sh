@@ -10,8 +10,6 @@
 #   { "source": "local", "skip_build": true }
 #   { "source": "local", "rebuild_on": ["qt6-base"] }
 #   { "source": "local", "upstream": { "watch": { "github": "owner/repo", "pattern": "v(?P<version>[0-9.]+)" } } }
-#   { "source": "local", "channels": ["edge"] }
-#   { "source": "local", "channels": ["edge", "rc", "stable"] }
 #   { "source": "local", "min_release_age": "24h" }
 #   { "source": "local", "auto_merge": true, "upstream": { "watch": { "git_branch": "...", "branch": "main" } } }
 #   { "source": "local", "upstream": { "github": "owner/repo", "checksums": "SHASUMS256.txt", "assets": { "x86_64": ["name-{tag}-x64.tar.xz"] } } }
@@ -167,9 +165,19 @@ package_pkgbuild_var() {
   ' _ "$var")
 }
 
+# The pkgbase a recipe builds, as makepkg names it: pkgbase, else the first
+# pkgname. Usually the directory's name, but not always
+# (pkgbuilds/yaru-icon-theme builds pkgbase yaru).
+package_pkgbase() {
+  local pkgdir="$1" base
+  base=$(package_pkgbuild_var "$pkgdir" pkgbase "${2:-}" 2>/dev/null || true)
+  [[ -n "$base" ]] || base=$(package_pkgbuild_var "$pkgdir" pkgname "${2:-}" 2>/dev/null || true)
+  echo "${base:-${pkgdir##*/}}"
+}
+
 # The architectures declared by a PKGBUILD. Set CARCH while reading it so a
 # conditional arch=() assignment is evaluated for the architecture we are
-# actually checking, even when the repository host is a different one.
+# actually checking, even when the machine running the check is a different one.
 package_arches() {
   local pkgdir="$1"
   local arch="${2:-${ARCH:-x86_64}}"
@@ -193,8 +201,8 @@ package_supports_arch() {
 }
 
 # The channel DB indexes only its newest version, but older published archives
-# remain immutable. Both the scheduler and build planner must skip an existing
-# filename even when the checkout differs from the version currently indexed.
+# remain immutable. The build planner must skip an existing filename even when
+# the checkout differs from the version currently indexed.
 package_version_is_published() {
   local repo_dir="$1" package="$2" version="$3" target="$4" path
   for path in "$repo_dir/$package-$version-$target.pkg.tar."* \
@@ -204,33 +212,11 @@ package_version_is_published() {
   return 1
 }
 
-# Channel membership: where a package may be published. Packages without a
-# `channels` key are members of every channel (they flow edge -> rc -> stable).
-package_has_channels() {
-  local pkgdir="$1" metadata
-  metadata=$(metadata_file_for_dir "$pkgdir")
-  [[ -f "$metadata" ]] || return 1
-  jq -e 'has("channels")' "$metadata" >/dev/null
-}
-
-package_channels() {
-  local pkgdir="$1" metadata
-  metadata=$(metadata_file_for_dir "$pkgdir")
-  [[ -f "$metadata" ]] || return 0
-  jq -r '(.channels // [])[]' "$metadata"
-}
-
-package_in_channel() {
-  local pkgdir="$1" channel="$2"
-  package_has_channels "$pkgdir" || return 0
-  package_channels "$pkgdir" | grep -qx "$channel"
-}
-
-# A pinned package's version is set per release by the orchestrator on the rc
-# branch, not by whatever the current checkout happens to say. Only a build
-# running from that branch's worktree (OMARCHY_RC_PINS=1) may build it for rc;
-# otherwise master's shipped pins would try to overwrite an in-flight RC with
-# an older version.
+# A pinned package's version is set per release by bin/omarchy-release on the
+# rc branch, not by whatever the current checkout happens to say. Only the
+# release-candidate build (release-rc.yml, which sets OMARCHY_RC_PINS=1 after
+# taking the rc branch's pins) may build it for rc; otherwise master's shipped
+# pins would try to overwrite an in-flight RC with an older version.
 package_is_pinned() {
   local pkgdir="$1" metadata
   metadata=$(metadata_file_for_dir "$pkgdir")
@@ -245,12 +231,8 @@ package_builds_for_mirror() {
   package_has_pkgbuild "$pkgdir" || return 1
   package_has_metadata "$pkgdir" || return 1
 
-  # An explicit `channels` key is the outer bound on where a package may be
-  # built at all.
-  if package_has_channels "$pkgdir" && ! package_in_channel "$pkgdir" "$mirror"; then
-    return 1
-  fi
-
+  # Every package publishes to edge. The fast ring also publishes to rc and
+  # stable at merge; everything else reaches them through bin/promote-channel.
   case "$mirror" in
     edge)
       return 0
@@ -273,13 +255,12 @@ package_builds_for_mirror() {
   esac
 }
 
-# Whether `bin/repo advance` may carry this package into the given channel:
-# a member of that channel that is not built there natively. Native builds are
-# authoritative — advancing over them could pair a published filename with
-# different bytes, which the R2 cache would never recover from.
+# Whether bin/promote-channel may carry this package into the given channel:
+# any package not built there natively. Native builds are authoritative —
+# advancing over them could pair a published filename with different bytes,
+# which the R2 cache would never recover from.
 package_moves_to_channel() {
   local pkgdir="$1" channel="$2"
-  package_in_channel "$pkgdir" "$channel" || return 1
   # Pinned packages build natively in rc from the release pin. That the
   # advancing environment lacks OMARCHY_RC_PINS (so *it* may not build them)
   # does not make the edge copy movable over the pin's artifact — edge's
@@ -298,13 +279,6 @@ package_dirs() {
   done
 }
 
-packages_for_aur_sync() {
-  package_dirs | while IFS= read -r pkgdir; do
-    if package_sync_enabled "$pkgdir"; then
-      basename "$pkgdir"
-    fi
-  done
-}
 
 package_has_upstream_hook() {
   local pkgdir="$1"
@@ -328,14 +302,10 @@ packages_for_upstream_sync() {
   done
 }
 
-# Upstream updates travel in one of two lanes. The reviewed lane is the
-# 6-hourly sync PR a maintainer reads before merging. A package that marks
-# "auto_merge": true rides the unattended lane instead: its bump PR is opened
-# and auto-merged by the branch tracker as soon as CI is green, which is how a
-# package that follows a moving branch (omarchy-dev, omasnap-git) gets rebuilt
-# without anyone clicking, and how trusted release feeds (browsers, large
-# vendors, Omacom's own projects) ship without waiting for review. The lanes are disjoint so a branch tip can never
-# hold up a reviewed vendor release, or the other way round.
+# Upstream updates travel in two disjoint package groups. "auto_merge": true
+# selects the hourly group; the rest are checked every six hours. Both open
+# PRs and auto-merge them when CI passes. The historical CLI lane names stay
+# compatible, but "reviewed" no longer implies a manual merge.
 package_auto_merge() {
   local pkgdir="$1" metadata
   metadata=$(metadata_file_for_dir "$pkgdir")
@@ -373,23 +343,7 @@ package_has_rebuild_triggers() {
   [[ -n "$(package_rebuild_triggers "$pkgdir")" ]]
 }
 
-packages_for_rebuild_sync() {
-  package_dirs | while IFS= read -r pkgdir; do
-    if package_has_rebuild_triggers "$pkgdir"; then
-      basename "$pkgdir"
-    fi
-  done
-}
 
-packages_for_mirror() {
-  local mirror="$1"
-
-  package_dirs | while IFS= read -r pkgdir; do
-    if package_builds_for_mirror "$pkgdir" "$mirror"; then
-      basename "$pkgdir"
-    fi
-  done
-}
 
 packages_for_unscoped_build() {
   local mirror="$1"
@@ -525,14 +479,10 @@ validate_package_metadata() {
     return 1
   fi
 
-  if ! jq -e '
-    if has("channels") | not then true
-    else .channels | type == "array" and length > 0
-      and all(. == "edge" or . == "rc" or . == "stable")
-      and (unique | length) == length
-    end
-  ' "$metadata" >/dev/null; then
-    echo "invalid channels for $(basename "$pkgdir"): must be a non-empty array of unique edge/rc/stable values"
+  # The release ring alone decides where a package publishes. A stale
+  # `channels` key would read as a restriction nothing enforces.
+  if jq -e 'has("channels")' "$metadata" >/dev/null; then
+    echo "invalid channels for $(basename "$pkgdir"): channels is gone; every package publishes to edge and moves on by promotion, or set \"release_ring\": \"fast\""
     return 1
   fi
 
@@ -626,6 +576,15 @@ validate_package_metadata() {
     return 1
   fi
 
+  # The fast ring ships one edge build to every channel at once, so nothing
+  # rebuilds it when a channel moves under it: a package that needs those
+  # rebuilds reaches rc and stable with the release instead. The rest of the
+  # rule is checked on the built package (helpers/fast-ring-check.sh).
+  if package_is_fast_ring "$pkgdir" && jq -e '(.rebuild_on // []) | length > 0' "$metadata" >/dev/null; then
+    echo "invalid release_ring for $(basename "$pkgdir"): a package with rebuild_on cannot be on the fast ring"
+    return 1
+  fi
+
   if ! jq -e '
     def version_map:
       type == "object" and (to_entries | all(.value | type == "string" and length > 0));
@@ -651,4 +610,25 @@ validate_package_metadata() {
     echo "invalid rebuilt_against for $(basename "$pkgdir"): records a package that rebuild_on does not name"
     return 1
   fi
+}
+
+# The runner an entry builds on, as the JSON list runs-on takes. x86_64 builds
+# on the droplet pool. aarch64 builds natively on GitHub's arm64 runner (4
+# vCPU), except a kernel: there the compile is 95 of 105 minutes, so it goes
+# to Namespace's Apple-backed runner (Linux on Apple Silicon, 12 vCPU), where
+# the whole job takes 24. Its cores are the fast ones: the 32-core AmpereOne
+# runner took 66. A kernel is a package named linux-*; the firmware and pkgbase
+# shim packages share the prefix and build in seconds, so they stay put.
+package_runner() {
+  local name="$1" arch="$2"
+
+  if [[ $arch != aarch64 ]]; then
+    echo '["self-hosted","omarchy-builder"]'
+    return
+  fi
+  case "$name" in
+  linux-firmware-* | linux-*-shim) echo '["ubuntu-24.04-arm"]' ;;
+  linux-*) echo '["namespace-profile-arm64-linux-apple-12x32"]' ;;
+  *) echo '["ubuntu-24.04-arm"]' ;;
+  esac
 }

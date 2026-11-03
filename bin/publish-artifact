@@ -5,8 +5,11 @@
 #   publish-artifact --mirror <edge|rc|stable> --arch <arch> <pkg files...>
 #
 # What it does, in order:
-#   1. pull the channel's current database from the remote
-#   2. refuse if any package filename already exists on the remote
+#   1. pull the channel's current database from the remote and drop every
+#      package the channel already serves at that version or newer: a channel
+#      only ever moves forward
+#   2. refuse if any remaining filename already exists on the remote with
+#      different bytes
 #   3. sign each package (GPG_PRIVATE_KEY / GPG_PASSPHRASE)
 #   4. repo-add the packages into the pulled database (replaces the entry
 #      for that name; nothing else in the channel is touched)
@@ -32,7 +35,7 @@ while [[ $# -gt 0 ]]; do
   --mirror) MIRROR=$2; require_valid_mirror "$MIRROR"; shift 2 ;;
   --arch) ARCH=$2; require_valid_arch "$ARCH"; shift 2 ;;
   --remote) REMOTE=$2; shift 2 ;;
-  -h|--help) sed -n '2,22p' "$0"; exit 0 ;;
+  -h|--help) sed -n '2,24p' "$0"; exit 0 ;;
   -*) print_error "Unknown option: $1"; exit 1 ;;
   *) FILES+=("$1"); shift ;;
   esac
@@ -67,12 +70,39 @@ else
   print_warning "No database at $DEST — creating a new one"
 fi
 
+# A channel only moves forward. Whatever it already serves at this version or
+# newer is left alone: a stale artifact (built before the channel moved on), a
+# re-run of a slot that already landed, an RC carried into an edge that is
+# ahead of it.
+if [[ -f "$WORK/repo/omarchy.db.tar.zst" ]]; then
+  served=$(tar -xO --zstd -f "$WORK/repo/omarchy.db.tar.zst" --wildcards '*/desc' 2>/dev/null | awk '
+    $0 == "%NAME%"    { getline; name = $0; next }
+    $0 == "%VERSION%" { getline; print name, $0 }')
+  keep=()
+  for f in "${FILES[@]}"; do
+    name=$(bsdtar -xOf "$f" .PKGINFO | awk -F' = ' '$1=="pkgname"{print $2}')
+    ver=$(bsdtar -xOf "$f" .PKGINFO | awk -F' = ' '$1=="pkgver"{print $2}')
+    have=$(awk -v n="$name" '$1 == n {print $2; exit}' <<<"$served")
+    if [[ -n "$have" ]] && (( $(vercmp "$ver" "$have") <= 0 )); then
+      print_info "$MIRROR already serves $name $have, skipping $(basename "$f")"
+    else
+      keep+=("$f")
+    fi
+  done
+  if (( ${#keep[@]} == 0 )); then
+    print_success "Nothing newer than what $DEST serves; nothing published"
+    exit 0
+  fi
+  FILES=("${keep[@]}")
+fi
+
 # --- 2. same-name collisions ----------------------------------------------
-# A filename must mean one set of bytes across every channel. The same file
-# reaching a channel that already holds it (a fast-ring publish after edge,
-# a re-run, a later promotion) is fine: it is skipped on upload and only the
-# database entry is added. Different bytes under a name the channel already
-# has is the one thing this must never do.
+# A filename must mean one set of bytes across every channel. What reaches
+# here is newer than anything the channel serves, so a file it already holds
+# is one whose database entry never landed or was lost (a run that failed
+# after uploading, a concurrent publish). The same bytes are fine: the upload
+# is skipped and only the database entry is added. Different bytes under a
+# name the channel already has is the one thing this must never do.
 for f in "${FILES[@]}"; do
   b=$(basename "$f")
   grep -qxF "$b" <<<"$listing" || continue

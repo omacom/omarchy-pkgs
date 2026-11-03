@@ -4,7 +4,7 @@ This aarch64-only split recipe provides qemu-user-static and qemu-user-static-bi
 
 ## Updates
 
-Updates are reviewed pins, not automatic. To move to a new Debian 13 revision, update `_debver`, `pkgver` (Debian epoch.upstream.revision), `_snapshot` (the snapshot.debian.org SHA1 of the ARM64 `qemu-user` archive) and `sha256sums_aarch64` together, and confirm both Debian ordering and `vercmp` advance. A one-time Arch epoch of 1 moves away from the previous upstream-only version.
+Updates are reviewed pins, not automatic. The binaries are fully static, so the pin can come from any Debian release that builds them for arm64: QEMU 11.1.2 comes from Debian testing, because its Debian 13 backport has not built. To move to a new revision, update `_debver`, `pkgver` (Debian epoch.upstream.revision), `_snapshot` (the snapshot.debian.org SHA1 of the ARM64 `qemu-user` archive) and `sha256sums_aarch64` together, and confirm both Debian ordering and `vercmp` advance. A one-time Arch epoch of 1 moves away from the previous upstream-only version.
 
 ## binfmt rules
 

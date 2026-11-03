@@ -1,84 +1,143 @@
 #!/bin/bash
-# Cursor publishes Grok Bot from its own Debian repository, one index per
-# architecture. Each index carries the version and the SHA256, so an update
-# is two small HTTP requests instead of downloading the debs, and the pool
-# URL is keyed by version. bin/sync-upstream can rewrite pkgver and the
-# checksums; it cannot rewrite a commit id embedded in the old
-# downloads.cursor.com/grokbot/stable/<commit>/ URL.
+# Cursor's apt index lags the Linux build the app updates from. The sand
+# update feed is that build: each architecture names a version and a commit,
+# and the .deb (not the AppImage the feed links) is published at
+# downloads.cursor.com/grokbot/stable/<commit>/. The feed digest is the
+# AppImage, so a newer release is hashed from the debs. A run that is already
+# current does not download them.
+#
+# bin/sync-upstream rewrites pkgver and the deb checksums. It does not rewrite
+# _commit, which the source URL depends on, so this hook writes that assignment
+# and only when the version is actually newer.
 set -euo pipefail
 
-BASE_URL="https://downloads.cursor.com/aptrepo"
-declare -A DEB_ARCHES=([x86_64]=amd64 [aarch64]=arm64)
+declare -A FEED_ARCH=([x86_64]=x64 [aarch64]=arm64)
+declare -A DEB_ARCH=([x86_64]=amd64 [aarch64]=arm64)
+ARCHES=(x86_64 aarch64)
 
-# Print "<version> <sha256>" for the newest grok-bot stanza. Newest is
-# vercmp's opinion, which is the one bin/sync-upstream and pacman both use;
-# sort -V disagrees with it over versions like 1.0a. The winner's Filename
-# must be the versioned pool path the PKGBUILD downloads from.
-newest_release() {
-  local index="$1" debarch="$2"
-  local version sha256 filename best_version="" best_sha256="" best_filename=""
-
-  while read -r version sha256 filename; do
-    [[ -n "$version" && -n "$sha256" ]] || continue
-    if [[ -z "$best_version" ]] || [[ "$(vercmp "$version" "$best_version")" -gt 0 ]]; then
-      best_version="$version"
-      best_sha256="$sha256"
-      best_filename="$filename"
-    fi
-  done < <(awk '
-    { sub(/\r$/, "") }
-    /^Package:/ { package = $2 }
-    /^Version:/ { version = $2 }
-    /^SHA256:/  { sha256 = $2 }
-    /^Filename:/ { filename = $2 }
-    /^$/ {
-      if (package == "grok-bot" && version && sha256) print version, sha256, filename
-      package = version = sha256 = filename = ""
-    }
-    END {
-      if (package == "grok-bot" && version && sha256) print version, sha256, filename
-    }
-  ' <<<"$index")
-
-  [[ -n "$best_version" ]] || return 1
-
-  local expected="pool/grok-bot/g/gr/grok-bot_${best_version}_${debarch}.deb"
-  if [[ "$best_filename" != "$expected" ]]; then
-    echo "Unexpected Grok Bot $best_version $debarch Filename: '${best_filename}' (expected $expected)" >&2
-    return 1
-  fi
-
-  echo "$best_version $best_sha256"
+curl_https() {
+  curl --proto '=https' --proto-redir '=https' -fsSL \
+    --connect-timeout 20 --retry 2 --retry-all-errors "$@"
 }
 
+parse_feed() {
+  jq -er '
+    (.version | strings) as $version
+    | (.url | strings) as $url
+    | ($url | capture("grokbot/stable/(?<commit>[0-9a-f]{40})/").commit) as $commit
+    | if ($version | test("\\A[0-9]+\\.[0-9]+\\.[0-9]+\\z")) then
+        "\($version) \($commit)"
+      else
+        error("version is not x.y.z")
+      end
+  '
+}
+
+read_assignment() {
+  local name="$1" value
+  value=$(grep -m1 -E "^${name}=" PKGBUILD | cut -d= -f2- | tr -d "\"'")
+  [[ -n "$value" ]] || {
+    echo "PKGBUILD has no ${name} assignment" >&2
+    return 1
+  }
+  printf '%s' "$value"
+}
+
+current_pkgver=$(read_assignment pkgver)
+current_commit=$(read_assignment _commit)
+
 versions=()
-declare -A checksums=()
-
-for arch in "${!DEB_ARCHES[@]}"; do
-  index=$(curl -fsSL "$BASE_URL/dists/grok-bot/main/binary-${DEB_ARCHES[$arch]}/Packages")
-
-  read -r version sha256 <<<"$(newest_release "$index" "${DEB_ARCHES[$arch]}")"
-  if [[ -z "${version:-}" || -z "${sha256:-}" ]]; then
-    echo "No usable Grok Bot release found for $arch" >&2
+commits=()
+for arch in "${ARCHES[@]}"; do
+  json=$(curl_https --max-time 60 \
+    "https://api2.cursor.sh/updates/api/update/linux-${FEED_ARCH[$arch]}/sand/0.0.0/00000000-0000-0000-0000-000000000000/stable")
+  if ! parsed=$(parse_feed <<<"$json"); then
+    echo "Grok Bot ${arch} feed did not name a version and commit" >&2
     exit 1
   fi
-
+  read -r version commit <<<"$parsed"
   versions+=("$version")
-  checksums[$arch]="$sha256"
+  commits+=("$commit")
 done
 
-# A release can land one architecture at a time. Wait until both agree so one
-# pkgver always describes both artifacts.
-for version in "${versions[@]}"; do
-  if [[ "$version" != "${versions[0]}" ]]; then
-    echo "Upstream architectures are mid-release (${versions[*]}); skipping" >&2
-    echo '{}'
-    exit 0
+if [[ "${versions[0]}" != "${versions[1]}" || "${commits[0]}" != "${commits[1]}" ]]; then
+  echo "Upstream architectures are mid-release (x86_64 ${versions[0]} ${commits[0]}, aarch64 ${versions[1]} ${commits[1]}); skipping" >&2
+  echo '{}'
+  exit 0
+fi
+
+version="${versions[0]}"
+commit="${commits[0]}"
+
+emit() {
+  jq -n \
+    --arg pkgver "$version" \
+    --arg x86_64 "$1" \
+    --arg aarch64 "$2" \
+    '{pkgver: $pkgver, sha256sums: {x86_64: [$x86_64], aarch64: [$aarch64]}}'
+}
+
+# The debs the feed's commit serves, and their checksums, into checksums[].
+tmpdir=$(mktemp -d)
+trap 'rm -rf "$tmpdir"' EXIT
+declare -A checksums=()
+fetch_debs() {
+  local arch deb url
+  for arch in "${ARCHES[@]}"; do
+    deb="grok-bot_${version}_${DEB_ARCH[$arch]}.deb"
+    url="https://downloads.cursor.com/grokbot/stable/${commit}/linux/${FEED_ARCH[$arch]}/${deb}"
+    curl_https --max-time 300 -o "$tmpdir/$deb" "$url"
+    checksums[$arch]=$(sha256sum "$tmpdir/$deb" | awk '{print $1}')
+    [[ "${checksums[$arch]}" =~ ^[0-9a-f]{64}$ ]] || {
+      echo "Bad checksum for Grok Bot ${arch}" >&2
+      exit 1
+    }
+  done
+}
+
+# Point the recipe's _commit, which the source URL depends on, at the feed's.
+write_commit() {
+  python3 - "$commit" <<'PY'
+import pathlib, sys
+commit = sys.argv[1]
+path = pathlib.Path("PKGBUILD")
+lines = path.read_text().splitlines(keepends=True)
+found = 0
+out = []
+for line in lines:
+    if line.startswith("_commit="):
+        found += 1
+        newline = "\n" if line.endswith("\n") else ""
+        out.append(f"_commit={commit}{newline}")
+    else:
+        out.append(line)
+if found != 1:
+    raise SystemExit(f"expected one _commit= assignment, found {found}")
+path.write_text("".join(out))
+PY
+}
+
+# Not an upgrade. sync-upstream ignores the checksums unless the version is newer.
+if [[ "$(vercmp "$version" "$current_pkgver")" -le 0 ]]; then
+  eval "$(bash -c 'source ./PKGBUILD >/dev/null; printf "deb_x86_64=%q\ndeb_aarch64=%q\n" "${sha256sums_x86_64[0]}" "${sha256sums_aarch64[0]}"')"
+  if [[ "$version" == "$current_pkgver" && "$commit" != "$current_commit" ]]; then
+    # The same version under a new commit. Cursor moves a build to a new path
+    # and removes the old one, so the recipe has to follow; but only when the
+    # debs are the same bytes, since a changed build under an old version
+    # needs a person and a pkgrel.
+    fetch_debs
+    if [[ "${checksums[x86_64]}" != "$deb_x86_64" || "${checksums[aarch64]}" != "$deb_aarch64" ]]; then
+      echo "Grok Bot ${version} was republished at ${commit} with different debs (recipe has ${current_commit}); refusing to keep the old ones" >&2
+      exit 1
+    fi
+    echo "Grok Bot ${version} moved to ${commit} with the same debs; following it" >&2
+    write_commit
   fi
-done
+  emit "$deb_x86_64" "$deb_aarch64"
+  exit 0
+fi
 
-jq -n \
-  --arg pkgver "${versions[0]}" \
-  --arg x86_64 "${checksums[x86_64]}" \
-  --arg aarch64 "${checksums[aarch64]}" \
-  '{pkgver: $pkgver, sha256sums: {x86_64: [$x86_64], aarch64: [$aarch64]}}'
+fetch_debs
+write_commit
+
+emit "${checksums[x86_64]}" "${checksums[aarch64]}"

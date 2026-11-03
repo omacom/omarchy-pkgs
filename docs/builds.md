@@ -18,7 +18,7 @@ PR's packages do not see each other's fresh builds; they resolve from `edge`.
 4. Blocks consumers of a failed prerequisite while continuing independent
    builds.
 
-Example: If `aether` depends on `hyprshade`, `hyprshade` is built first.
+Example: `steam` on aarch64 depends on `gtk2`, so `gtk2` is built first.
 
 Isolation also lets the release and dev Omarchy pairs build in the same run:
 Flea can install `omarchy` without preventing `omarchy-dev` from installing
@@ -76,5 +76,7 @@ The workflow checks anonymous registry access before advancing the compatible
 tag, so fork PRs will not be directed to an image they cannot pull. Subsequent
 refreshes preserve that package visibility.
 
-`publish.yml` and `unpublish.yml` pull the compatible image to sign and update
-databases. Package build jobs still build their own image on the runner.
+`publish.yml`, `promote.yml`, `release-rc.yml` and `unpublish.yml` pull the
+compatible image to sign and update databases, and build it on the runner when
+no image carries the key yet (a change to `build/` publishes before its image
+refresh has finished). Package build jobs still build their own image on the runner.

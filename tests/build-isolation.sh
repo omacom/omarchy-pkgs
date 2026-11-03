@@ -35,7 +35,7 @@ chmod +x "$TEST_ROOT/engine/$CONTAINER_ENGINE"
 export TEST_ENGINE TEST_BUILDER_IMAGE
 export PATH="$TEST_ROOT/engine:$PATH"
 export OMARCHY_SKIP_BUILDER_IMAGE=1
-unset OMARCHY_REPO_ROOT OMARCHY_RC_PINS OMARCHY_DEFER_RUNTIME_DEPS OMARCHY_KEEP_BUILD_WORKSPACE
+unset OMARCHY_RC_PINS OMARCHY_DEFER_RUNTIME_DEPS OMARCHY_KEEP_BUILD_WORKSPACE
 
 fixture() {
   local name=$1 metadata=$2
@@ -159,7 +159,9 @@ compgen -G "$TEST_ROOT/build-output/edge/$TEST_ARCH/omarchy-dev-1-1-*.pkg.tar.zs
 printf 'PASS: deferred pair mode works across isolated containers\n'
 
 fixture excluded ''
-printf '{"source":"local","channels":["stable"]}\n' > "$TEST_ROOT/pkgbuilds/excluded/.omarchy/package.json"
+other_arch=aarch64
+[[ $TEST_ARCH == aarch64 ]] && other_arch=x86_64
+sed -i "s/^arch=.*/arch=('$other_arch')/" "$TEST_ROOT/pkgbuilds/excluded/PKGBUILD"
 run_build excluded > "$TEST_ROOT/empty.log" 2>&1 || { cat "$TEST_ROOT/empty.log"; exit 1; }
 grep -q 'Total packages: 0' "$TEST_ROOT/empty.log"
 if grep -q 'in a fresh container' "$TEST_ROOT/empty.log"; then

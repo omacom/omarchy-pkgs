@@ -29,8 +29,8 @@ The AUR PKGBUILD only supports x86_64.
 ## Testing
 
 ```bash
-bin/sync-aur 1password-beta
-bin/repo build --arch aarch64 --package 1password-beta
+bin/sync-upstream 1password-beta
+bin/build --arch aarch64 --package 1password-beta
 ```
 
 The aarch64 build should download from:
