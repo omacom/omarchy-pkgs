@@ -21,3 +21,10 @@ Run `sudo bash tests/p16-audio-install-user-units.sh` from the repository root.
 The four regression cases use temporary directories and the unprivileged nobody
 account: offline setup, online reload, a hostile systemd symlink, and preserving
 custom global rules. No real audio service or user configuration is changed.
+
+
+Uninstall runs the same helper in `--remove` mode before package files disappear.
+It removes only the matching per-user hiding rule and its own service link,
+including for an offline account. Customized rules/links remain untouched and
+cleanup is idempotent. The installer regression suite now covers seven cases,
+including uninstall and hostile symlinks; all home operations run as the account.

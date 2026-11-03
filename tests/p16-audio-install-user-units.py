@@ -35,6 +35,7 @@ class InstallerTests(unittest.TestCase):
         self.service = self.root / 'p16-audio-jack.service'
         self.service.touch()
         self.legacy = self.root / 'global.conf'
+        self.legacy.parent.mkdir(parents=True, exist_ok=True)
         self.runtime = self.root / 'runtime'
         self.runtime.mkdir()
         self.log = self.root / 'systemctl.log'
@@ -50,20 +51,35 @@ class InstallerTests(unittest.TestCase):
         self.helper = self.root / 'install-user-config'
         self.helper.write_bytes((PACKAGE / 'install-user-config').read_bytes())
         self.helper.chmod(0o755)
+        self.runtime_root = self.root / 'runtime'
+        self.logged_out_installer = self.root / 'installer-logged-out'
         source = (PACKAGE / 'install-user-units').read_text()
         for name, path in {'dmi_root': self.dmi, 'acpi_root': self.acpi,
                            'config_source': self.config, 'service_source': self.service,
                            'config_installer': self.helper, 'legacy_config': self.legacy,
-                           'runtime_root': self.runtime}.items():
+                           'runtime_root': self.runtime_root}.items():
             import re
             source, count = re.subn(r'^readonly ' + name + r'=.*$',
                                     lambda m: 'readonly ' + name + '=' + shlex.quote(str(path)),
                                     source, flags=re.M)
             self.assertEqual(count, 1, name)
+        source = source.replace(
+            'readonly config_source=' + shlex.quote(str(self.config)),
+            'config_source=' + shlex.quote(str(self.config)))
+        source = source.replace(
+            'readonly service_source=' + shlex.quote(str(self.service)),
+            'service_source=' + shlex.quote(str(self.service)))
+        source = source.replace(
+            'readonly config_installer=' + shlex.quote(str(self.helper)),
+            'config_installer=' + shlex.quote(str(self.helper)))
         source = source.replace('systemctl --user', shlex.quote(str(systemctl)) + ' --user')
         self.installer = self.root / 'installer'
         self.installer.write_text(source)
         self.installer.chmod(0o755)
+        self.logged_out_installer.write_text(source.replace(
+            'readonly runtime_root=' + shlex.quote(str(self.runtime_root)),
+            'readonly runtime_root=' + shlex.quote(str(self.root / 'no-runtime'))))
+        self.logged_out_installer.chmod(0o755)
         self.env = os.environ | {'PATH': str(self.bindir) + ':/usr/bin:/bin',
                                  'SUDO_UID': str(self.account.pw_uid)}
 
@@ -72,6 +88,9 @@ class InstallerTests(unittest.TestCase):
 
     def run_installer(self):
         return subprocess.run([str(self.installer)], env=self.env, text=True, capture_output=True)
+
+    def run_logged_out(self):
+        return subprocess.run([str(self.logged_out_installer)], env=self.env, text=True, capture_output=True)
 
     def test_offline_user_gets_graph_and_scoped_rules(self):
         self.legacy.write_bytes(self.config.read_bytes())
@@ -117,6 +136,57 @@ class InstallerTests(unittest.TestCase):
         result = self.run_installer()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.legacy.read_text(), 'administrator custom rules\n')
+
+    def test_uninstall_removes_only_exact_user_rules_and_own_service_link_offline(self):
+        offline = self.run_logged_out()
+        self.assertEqual(offline.returncode, 0, offline.stderr)
+        rules = self.home / '.config/wireplumber/wireplumber.conf.d/80-p16-internal-sinks.conf'
+        link = self.home / '.config/systemd/user/pipewire.service.wants/p16-audio-jack.service'
+        self.assertTrue(rules.is_file())
+        self.assertTrue(link.is_symlink())
+
+        uninstall = subprocess.run([str(self.installer), '--remove'], env=self.env,
+                                   text=True, capture_output=True)
+        self.assertEqual(uninstall.returncode, 0, uninstall.stderr)
+        self.assertFalse(rules.exists())
+        self.assertFalse(link.exists())
+        self.assertFalse(self.legacy.exists())
+        self.assertFalse((self.other / '.config').exists())
+
+        again = subprocess.run([str(self.installer), '--remove'], env=self.env,
+                               text=True, capture_output=True)
+        self.assertEqual(again.returncode, 0, again.stderr)
+
+    def test_uninstall_preserves_custom_user_rules_and_similar_link(self):
+        config_dir = self.home / '.config/wireplumber/wireplumber.conf.d'
+        config_dir.mkdir(parents=True)
+        custom = config_dir / '80-p16-internal-sinks.conf'
+        custom.write_text('customized user rule\n')
+        wants = self.home / '.config/systemd/user/pipewire.service.wants'
+        wants.mkdir(parents=True)
+        other_link = wants / 'p16-audio-jack.service'
+        other_link.symlink_to('/usr/lib/systemd/user/custom-audio.service')
+
+        uninstall = subprocess.run([str(self.installer), '--remove'], env=self.env,
+                                   text=True, capture_output=True)
+        self.assertEqual(uninstall.returncode, 0, uninstall.stderr)
+        self.assertEqual(custom.read_text(), 'customized user rule\n')
+        self.assertEqual(os.readlink(other_link), '/usr/lib/systemd/user/custom-audio.service')
+
+    def test_uninstall_symlinked_config_path_cannot_touch_protected_file(self):
+        protected = self.root / 'protected-rules'
+        protected.mkdir()
+        sentinel = protected / 'custom.conf'
+        sentinel.write_text('protected admin content\n')
+        config_dir = self.home / '.config/wireplumber/wireplumber.conf.d'
+        config_dir.mkdir(parents=True)
+        (config_dir / '80-p16-internal-sinks.conf').symlink_to(sentinel)
+
+        uninstall = subprocess.run([str(self.installer), '--remove'], env=self.env,
+                                   text=True, capture_output=True)
+        self.assertEqual(uninstall.returncode, 0, uninstall.stderr)
+        self.assertEqual(sentinel.read_text(), 'protected admin content\n')
+        self.assertTrue((config_dir / '80-p16-internal-sinks.conf').is_symlink())
 
 
 if __name__ == '__main__':
