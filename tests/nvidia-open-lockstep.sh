@@ -11,7 +11,7 @@ REPO_ROOT=$(realpath "${BASH_SOURCE[0]%/*}/..")
 PKGBUILDS=${1:-"$REPO_ROOT/pkgbuilds"}
 DKMS="$PKGBUILDS/nvidia-open-dkms"
 ARM_KERNEL="$PKGBUILDS/linux-omarchy-aarch64"
-KERNELS=(linux-omarchy linux-omarchy-eevdf linux-omarchy-muqss linux-omarchy-aarch64)
+KERNELS=(linux-omarchy linux-omarchy-aarch64)
 DRIVER=(nvidia-utils nvidia-open-dkms lib32-nvidia-utils)
 
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
