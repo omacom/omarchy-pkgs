@@ -1,38 +1,45 @@
 #!/bin/bash
 set -euo pipefail
 
-# linux-omarchy-aarch64 builds linux-omarchy-nvidia-open from the same driver
-# and patches nvidia-open-dkms ships, pinned to nvidia-utils. Updating one
-# NVIDIA recipe without the kernel's copy would ship prebuilt modules that no
-# longer match nvidia-utils, or that miss a fix the DKMS package carries.
+# Every linux-omarchy recipe builds its $kernel-nvidia-open modules from the
+# driver nvidia-open-dkms ships, pinned to nvidia-utils, which
+# lib32-nvidia-utils pins too. A driver update that misses one of them ships
+# modules that no longer match nvidia-utils, a userspace pacman cannot
+# install, or ARM modules without a fix the DKMS package carries.
 
 REPO_ROOT=$(realpath "${BASH_SOURCE[0]%/*}/..")
 PKGBUILDS=${1:-"$REPO_ROOT/pkgbuilds"}
-KERNEL="$PKGBUILDS/linux-omarchy-aarch64"
 DKMS="$PKGBUILDS/nvidia-open-dkms"
-UTILS="$PKGBUILDS/nvidia-utils"
+ARM_KERNEL="$PKGBUILDS/linux-omarchy-aarch64"
+KERNELS=(linux-omarchy linux-omarchy-eevdf linux-omarchy-muqss linux-omarchy-aarch64)
+DRIVER=(nvidia-utils nvidia-open-dkms lib32-nvidia-utils)
 
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
 
 # Sourcing reads the recipes' variables without running any of their functions.
 recipe() {
-  (CARCH=aarch64; source "$1/PKGBUILD"; eval "$2")
+  (CARCH=$1; source "$2/PKGBUILD"; eval "$3")
 }
 
-kernel_nvidia=$(recipe "$KERNEL" 'echo "$_nvidiaver"')
-dkms_version=$(recipe "$DKMS" 'echo "$pkgver"')
-utils_version=$(recipe "$UTILS" 'echo "$pkgver"')
+version=$(recipe x86_64 "$PKGBUILDS/nvidia-utils" 'echo "$pkgver"')
 
-[[ $kernel_nvidia == "$dkms_version" ]] || fail "linux-omarchy-aarch64 builds NVIDIA $kernel_nvidia, nvidia-open-dkms is $dkms_version"
-[[ $kernel_nvidia == "$utils_version" ]] || fail "linux-omarchy-aarch64 builds NVIDIA $kernel_nvidia, nvidia-utils is $utils_version"
+for package in "${DRIVER[@]}"; do
+  found=$(recipe x86_64 "$PKGBUILDS/$package" 'echo "$pkgver"')
+  [[ $found == "$version" ]] || fail "$package is NVIDIA $found, nvidia-utils is $version"
+done
 
-mapfile -t kernel_sources < <(recipe "$KERNEL" 'printf "%s\n" "${source[@]##*/}"')
-mapfile -t dkms_patches < <(recipe "$DKMS" 'printf "%s\n" "${source[@]##*/}"' | grep '\.patch$')
+for kernel in "${KERNELS[@]}"; do
+  found=$(recipe x86_64 "$PKGBUILDS/$kernel" 'echo "$_nvidiaver"')
+  [[ $found == "$version" ]] || fail "$kernel builds NVIDIA ${found:-nothing}, nvidia-utils is $version"
+done
+
+mapfile -t kernel_sources < <(recipe aarch64 "$ARM_KERNEL" 'printf "%s\n" "${source[@]##*/}"')
+mapfile -t dkms_patches < <(recipe aarch64 "$DKMS" 'printf "%s\n" "${source_aarch64[@]##*/}"' | grep '\.patch$')
 
 for patch in "${dkms_patches[@]}"; do
   copy="nvidia-$patch"
   printf '%s\n' "${kernel_sources[@]}" | grep -qxF "$copy" || fail "linux-omarchy-aarch64 does not build with $copy"
-  cmp -s "$DKMS/$patch" "$KERNEL/$copy" || fail "$KERNEL/$copy differs from nvidia-open-dkms's $patch"
+  cmp -s "$DKMS/$patch" "$ARM_KERNEL/$copy" || fail "$ARM_KERNEL/$copy differs from nvidia-open-dkms's $patch"
 done
 
 for source in "${kernel_sources[@]}"; do
@@ -40,4 +47,4 @@ for source in "${kernel_sources[@]}"; do
   printf '%s\n' "${dkms_patches[@]}" | grep -qxF "${source#nvidia-}" || fail "linux-omarchy-aarch64 carries $source, which nvidia-open-dkms dropped"
 done
 
-echo "linux-omarchy-nvidia-open matches nvidia-open-dkms and nvidia-utils $kernel_nvidia (${#dkms_patches[@]} patches)"
+echo "NVIDIA $version in ${#DRIVER[@]} driver recipes and ${#KERNELS[@]} kernels, ${#dkms_patches[@]} ARM patches in step"

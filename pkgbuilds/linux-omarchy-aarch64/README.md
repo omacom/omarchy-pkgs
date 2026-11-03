@@ -223,7 +223,7 @@ Outside the board files they only add two entries to the QSEECOM allowlist. The 
 
 The modules are signed with the key this build generates for the kernel's own modules and then throws away, so the kernel trusts them through its built-in keyring, with no MOK key to enroll.
 
-They're built from the driver and patches `nvidia-open-dkms` ships: `_nvidiaver` is its version, and its patches are copied here with an `nvidia-` prefix, which `prepare()` keeps out of the kernel tree and applies to NVIDIA's. Update all three together with `nvidia-utils`, and bump this recipe's `pkgrel`; `tests/nvidia-open-lockstep.sh` fails when the copies drift.
+They're built from the driver and patches `nvidia-open-dkms` ships: `_nvidiaver` is its version, and its patches are copied here with an `nvidia-` prefix, which `prepare()` keeps out of the kernel tree and applies to NVIDIA's. Update them with the rest of the NVIDIA driver (`nvidia-utils`'s README lists every recipe a driver update changes, the x86_64 kernels included), and bump this recipe's `pkgrel`; `tests/nvidia-open-lockstep.sh` fails when they drift.
 
 ## Config
 
