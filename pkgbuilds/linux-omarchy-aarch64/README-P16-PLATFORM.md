@@ -74,3 +74,20 @@ current evidence does not demonstrate usable SPI sensors or input devices.
 Battery cutoff behavior, fan controls, other BIOS revisions, and other ASUS
 models remain unverified. The family match is an eligibility check, not a claim
 that every eligible firmware has been validated.
+
+## Capability-aware initialization follow-up
+
+Patch 9103 keeps the ROG Ally MCU restoration callback behind the same
+x86/suspend availability as its ACPI registration API. The P16's independent
+coordinated LPS0 path is unchanged. It also avoids installing/removing an
+i8042 filter when that controller is not reachable, and tests each optional
+fan curve against its corresponding CPU/GPU/middle fan capability.
+
+The reported curve error `0x00110032` refers to the middle fan. CPU and GPU
+RPM and eight-point curves are readable on the tested machine; no custom
+fan writes or thermal-response validation are claimed. The new harness
+compiles the actual functions for x86, ARM64 and no-suspend configurations,
+checks i8042 reachability and verifies independent fan detection. The ASUS
+module also compiles against packaged Linux 7.3 headers with `W=1`.
+A boot with this follow-up remains pending; SPI sensor availability is
+still under investigation.
