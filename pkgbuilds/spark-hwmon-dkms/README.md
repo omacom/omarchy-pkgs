@@ -30,8 +30,14 @@ its own discovery and offset checks.
 
 ## Validation and limits
 
-The package's `check()` runs the production helper tests and compiles the DKMS
-source against installed kernel headers in temporary DKMS directories. Set
+The package's `check()` runs a userspace C fixture against the production
+firmware-schema and MMIO validation helpers. It simulates the ACPI and MMIO API
+responses to cover malformed packages, duplicate or missing required keys, bad
+PLID, invalid limit tuples and temperature bounds. The fixture checks that a
+valid contract maps only the expected window and that the P16 helper performs
+no MMIO writes; it does not emulate hardware or the kernel's ACPI/resource
+subsystems. The check also compiles the DKMS source against installed kernel
+headers in temporary DKMS directories. Set
 `SPBM_KERNEL_BUILD=/usr/lib/modules/<release>/build` to select specific headers.
 Building a source package does not load the module or change the running system.
 
