@@ -26,5 +26,10 @@ custom global rules. No real audio service or user configuration is changed.
 Uninstall runs the same helper in `--remove` mode before package files disappear.
 It removes only the matching per-user hiding rule and its own service link,
 including for an offline account. Customized rules/links remain untouched and
-cleanup is idempotent. The installer regression suite now covers seven cases,
+cleanup is idempotent. The installer regression suite covers nine cases,
 including uninstall and hostile symlinks; all home operations run as the account.
+
+When uninstall removes its matching hiding rule in an active user session, it
+tries to restart the already-running WirePlumber service after deleting that
+rule, so the physical outputs are recreated with their normal media classes.
+Offline accounts and preserved custom rules do not trigger that restart.

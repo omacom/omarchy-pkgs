@@ -46,7 +46,11 @@ class InstallerTests(unittest.TestCase):
         getent.write_text('#!/bin/sh\nprintf "%s\\n" ' + shlex.quote(entry) + '\n')
         getent.chmod(0o755)
         systemctl = self.bindir / 'systemctl'
-        systemctl.write_text('#!/bin/sh\nprintf "%s\\n" "$*" >> ' + shlex.quote(str(self.log)) + '\n')
+        rules = self.home / '.config/wireplumber/wireplumber.conf.d/80-p16-internal-sinks.conf'
+        systemctl.write_text('#!/bin/sh\n'
+            'if [ "$*" = "--user try-restart wireplumber.service" ]; then\n'
+            '  test ! -e ' + shlex.quote(str(rules)) + ' || exit 42\n'
+            'fi\nprintf "%s\\n" "$*" >> ' + shlex.quote(str(self.log)) + '\n')
         systemctl.chmod(0o755)
         self.helper = self.root / 'install-user-config'
         self.helper.write_bytes((PACKAGE / 'install-user-config').read_bytes())
@@ -104,6 +108,7 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual(link.lstat().st_uid, self.account.pw_uid)
         self.assertFalse(self.legacy.exists())
         self.assertFalse((self.other / '.config').exists())
+        self.assertNotIn('try-restart', self.log.read_text())
         self.assertEqual(self.log.read_text(), '')
 
     def test_online_user_gets_rules_and_reload(self):
@@ -172,6 +177,34 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual(uninstall.returncode, 0, uninstall.stderr)
         self.assertEqual(custom.read_text(), 'customized user rule\n')
         self.assertEqual(os.readlink(other_link), '/usr/lib/systemd/user/custom-audio.service')
+
+    def test_online_uninstall_restarts_monitor_after_rule_removal(self):
+        directory = self.runtime / str(self.account.pw_uid)
+        directory.mkdir()
+        with socket.socket(socket.AF_UNIX) as bus:
+            bus.bind(str(directory / 'bus'))
+            self.assertEqual(self.run_installer().returncode, 0)
+            self.log.write_text('')
+            result = subprocess.run([str(self.installer), '--remove'], env=self.env,
+                                    text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self.log.read_text().splitlines()
+        self.assertEqual(calls[-1], '--user try-restart wireplumber.service')
+        self.assertTrue(calls[0].startswith('--user disable --now'))
+
+    def test_online_uninstall_does_not_restart_for_custom_rule(self):
+        self.assertEqual(self.run_installer().returncode, 0)
+        rules = self.home / '.config/wireplumber/wireplumber.conf.d/80-p16-internal-sinks.conf'
+        rules.write_text('customized user rule\n')
+        directory = self.runtime / str(self.account.pw_uid)
+        directory.mkdir()
+        with socket.socket(socket.AF_UNIX) as bus:
+            bus.bind(str(directory / 'bus'))
+            result = subprocess.run([str(self.installer), '--remove'], env=self.env,
+                                    text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn('try-restart', self.log.read_text())
+        self.assertEqual(rules.read_text(), 'customized user rule\n')
 
     def test_uninstall_symlinked_config_path_cannot_touch_protected_file(self):
         protected = self.root / 'protected-rules'
