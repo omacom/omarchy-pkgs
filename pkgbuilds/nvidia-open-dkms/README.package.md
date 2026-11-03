@@ -57,6 +57,9 @@ on that path. Keep it until NVIDIA merges the fix.
 
 Requires `[omarchy]` before `[extra]` and matching `nvidia-utils=615.78.08`.
 Update both NVIDIA packages together; automatic version tracking is disabled.
+`linux-omarchy-aarch64` builds the same driver and patches into the prebuilt
+`linux-omarchy-nvidia-open`: update its `_nvidiaver` and `nvidia-` patch copies
+in the same change (`tests/nvidia-open-lockstep.sh` checks them).
 
 Remove this recipe and the published package/database entry once a fixed
 Arch Linux ARM driver is validated. A stale package in the earlier repository
