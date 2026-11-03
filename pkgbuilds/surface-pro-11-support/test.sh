@@ -163,6 +163,18 @@ cat >"$bin/btmgmt" <<'STUB'
 #!/bin/bash
 if [[ $1 == info ]]; then
   settings='powered ssp br/edr le secure-conn ll-privacy'
+  # privacy-later holds "<checks before privacy comes on> <privacy value then>".
+  if [[ -e $BT_STATE/privacy-later ]]; then
+    read -r after hold <"$BT_STATE/privacy-later"
+    if (( after > 0 )); then echo "$((after - 1)) $hold" >"$BT_STATE/privacy-later"
+    else rm -f "$BT_STATE/privacy-later"; echo "$hold" >"$BT_STATE/privacy"
+    fi
+  fi
+  # privacy-cycle counts checks; every third of the first 200 sees privacy on.
+  if [[ -e $BT_STATE/privacy-cycle ]]; then
+    c=$(( $(<"$BT_STATE/privacy-cycle") + 1 )); echo "$c" >"$BT_STATE/privacy-cycle"
+    (( c <= 200 && c % 3 == 0 )) && settings+=' privacy'
+  fi
   # privacy holds "on", or how many more checks see it on before it goes off.
   if [[ -e $BT_STATE/privacy ]]; then
     left=$(<"$BT_STATE/privacy")
@@ -273,6 +285,29 @@ flex_reset; flex_bond; echo 2 >"$scratch/bt/privacy"
 flex denali reconnect
 flex_did "connect $keyboard" && [[ ! -e $scratch/run/flex-needs-repair ]] ||
   fail "a keyboard detached during a pen pairing is connected afterwards, and not marked if it stays away"
+
+# A pen pairing that begins between tries is waited out, then the tries resume.
+flex_reset; flex_bond; : >"$scratch/bt/connectable"; echo "2 2" >"$scratch/bt/privacy-later"
+flex denali reconnect
+flex_did "connect $keyboard" ||
+  fail "a pen pairing that starts while the keyboard reconnects does not end the reconnect"
+
+flex_reset; flex_bond; echo "2 2" >"$scratch/bt/privacy-later"
+flex denali reconnect
+flex_did "connect $keyboard" && ! flex_did "btmgmt power off" && [[ ! -e $scratch/run/flex-needs-repair ]] ||
+  fail "a keyboard that stays away after a pen pairing mid-reconnect is retried, with the radio left alone, and not marked"
+
+# A pen pairing that begins during the fifth try, just before the controller
+# reset, is not cut off by it.
+flex_reset; flex_bond; echo "7 on" >"$scratch/bt/privacy-later"
+flex denali reconnect
+! flex_did "btmgmt power off" || fail "the controller is not reset while a pen is pairing"
+
+# Pen pairings that keep coming do not keep the job running.
+flex_reset; flex_bond; echo 0 >"$scratch/bt/privacy-cycle"
+flex denali reconnect
+(( $(grep -c "^connect $keyboard" "$scratch/bt/log") <= 40 )) ||
+  fail "a reconnect gives up after a few pen pairings in a row"
 
 flex_reset; flex_attach; flex_bond
 flex denali reconnect
