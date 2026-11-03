@@ -14,9 +14,9 @@ class PackageTests(unittest.TestCase):
         text = (ROOT / 'dkms.conf').read_text()
         pattern = re.search(r'^BUILD_EXCLUSIVE_KERNEL="([^"]+)"$', text, re.M).group(1)
         for release in ('7.3.0-12-omarchy', '7.4.0-1-omarchy',
-                        '7.3.0-12.1-staticduo-p16', '8.0.0-2-staticduo-p16'):
+                        '7.5.0-2-omarchy', '8.0.0-2-omarchy'):
             self.assertIsNotNone(re.fullmatch(pattern, release), release)
-        for release in ('7.3.0-12-staticduo-p16-experimental', '7.4.0-1-arch',
+        for release in ('7.3.0-12-custom', '7.4.0-1-arch',
                         '7.3.0-8-omarchy-n1x-pr1958-1', '7.3.0-12-omarchy-debug'):
             self.assertIsNone(re.fullmatch(pattern, release), release)
 
