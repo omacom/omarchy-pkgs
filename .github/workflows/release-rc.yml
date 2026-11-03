@@ -1,0 +1,291 @@
+name: Build release candidate
+
+# Builds the omarchy + omarchy-settings pair pinned on the rc branch,
+# publishes it to the rc channel, then carries the same files into edge.
+# bin/omarchy-release starts it after cutting pins (`rc`, and `ship` for the
+# final), or run it from the Actions tab to re-publish the current pins.
+#
+# Edge takes rc's exact files (one filename, one set of bytes) and only when
+# they are newer than what edge serves: a patch train's RC must not take edge
+# back from a newer train's. A re-run whose pins rc already serves builds
+# nothing but still fills edge.
+#
+# The rc branch is master at the time of the cut plus the pin commit
+# (bin/omarchy-release cut_pins). Only the two recipes are taken from it:
+# everything that runs on the runner is master's, so a fix to the tooling
+# reaches an RC already pinned. OMARCHY_RC_PINS lets bin/build build the pinned
+# pair for rc (package_builds_for_mirror); nothing else sets it.
+#
+# Both halves build in one bin/build call per architecture: omarchy depends on
+# omarchy-settings=<pkgver>, and only a single run installs the fresh settings
+# package before building omarchy. A run whose pins rc already serves builds
+# and publishes nothing.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    # The runners package_runner names for these packages.
+    runs-on: ${{ matrix.arch == 'aarch64' && 'ubuntu-24.04-arm' || fromJSON('["self-hosted","omarchy-builder"]') }}
+    timeout-minutes: 180
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: true
+      matrix:
+        arch: [x86_64, aarch64]
+    outputs:
+      rc_commit: ${{ steps.pins.outputs.rc_commit }}
+      pkgver: ${{ steps.pins.outputs.pkgver }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Take the pins from the rc branch
+        id: pins
+        run: |
+          set -euo pipefail
+          git fetch --no-tags --depth=1 origin rc
+          git checkout FETCH_HEAD -- pkgbuilds/omarchy pkgbuilds/omarchy-settings
+          pkgver=$(grep -m1 '^pkgver=' pkgbuilds/omarchy/PKGBUILD | cut -d= -f2)
+          echo "rc_commit=$(git rev-parse FETCH_HEAD)" >> "$GITHUB_OUTPUT"
+          echo "pkgver=$pkgver" >> "$GITHUB_OUTPUT"
+          echo "tooling: $(git rev-parse --short HEAD) (master)  pins: $(git rev-parse --short FETCH_HEAD) (rc), omarchy $pkgver"
+      - name: Build omarchy-settings and omarchy (${{ matrix.arch }})
+        id: build
+        env:
+          CONTAINER_ENGINE: docker
+          OMARCHY_RC_PINS: "1"
+        run: |
+          set -euo pipefail
+          plan=$(bin/build --dry-run --mirror rc --arch "${{ matrix.arch }}" --package omarchy-settings omarchy 2>&1 | grep -E '^==> Plan complete' || true)
+          if [[ -n "$plan" && -z "$(sed -E 's/.*would build: *//' <<<"$plan" | tr -d '[:space:]')" ]]; then
+            echo "==> rc/${{ matrix.arch }} already serves omarchy ${{ steps.pins.outputs.pkgver }}, nothing to build"
+            echo "built=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          bin/build --mirror rc --arch "${{ matrix.arch }}" --package omarchy-settings omarchy
+          echo "built=true" >> "$GITHUB_OUTPUT"
+      # The upload action rejects ':' in a path; the files ride inside
+      # packages.tar (helpers/artifact-helpers.sh), as in build-pr.yml.
+      - name: Pack artifact
+        if: steps.build.outputs.built == 'true'
+        run: |
+          source helpers/artifact-helpers.sh
+          pack_packages build-output/rc/${{ matrix.arch }} packages.tar
+          tar -tvf packages.tar
+      - name: Upload artifact
+        if: steps.build.outputs.built == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-rc-${{ matrix.arch }}-${{ github.run_id }}
+          path: packages.tar
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: publish
+    timeout-minutes: 30
+    # The publish job's group: one writer per channel database at a time.
+    # queue: max, as there: a waiting job is queued, not replaced.
+    concurrency:
+      group: publish
+      cancel-in-progress: false
+      queue: max
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      # An architecture whose pins rc already serves uploaded nothing.
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-rc-*-${{ github.run_id }}
+          path: artifacts
+      - name: Collect the builds
+        run: |
+          set -euo pipefail
+          source helpers/artifact-helpers.sh
+          for arch in x86_64 aarch64; do
+            mkdir -p "build-output/rc/$arch"
+            if [[ -d "artifacts/release-rc-$arch-${{ github.run_id }}" ]]; then
+              unpack_packages "artifacts/release-rc-$arch-${{ github.run_id }}" "build-output/rc/$arch"
+            else
+              echo "==> $arch: no build (rc already serves these pins)"
+            fi
+          done
+          ls -1 build-output/rc/*/*.pkg.tar.zst 2>/dev/null || true
+
+      - name: Publish to rc
+        id: publish
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+          RCLONE_CONFIG_R2_TYPE: s3
+          RCLONE_CONFIG_R2_PROVIDER: Cloudflare
+          RCLONE_CONFIG_R2_NO_CHECK_BUCKET: "true"
+          RCLONE_CONFIG_R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          RCLONE_CONFIG_R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          RCLONE_CONFIG_R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          OMARCHY_PUBLISH_PREFIX: ${{ vars.OMARCHY_PUBLISH_PREFIX }}
+        run: |
+          set -euo pipefail
+          : > slots.jsonl
+          if ! compgen -G "build-output/rc/*/*.pkg.tar.zst" >/dev/null; then
+            echo "Nothing to publish: rc already serves these pins on every architecture."
+            exit 0
+          fi
+          # repo-add, gpg and bsdtar are Arch tools: run in the tested builder
+          # image, as the publish job does. A change to build/ runs before
+          # builder-images.yml has published an image under its new key;
+          # build that image here instead.
+          builder=ghcr.io/omacom/omarchy-pkg-builder:$(bin/builder-image key --arch x86_64 --mirror edge)
+          docker pull --quiet "$builder" || docker buildx build --load -t "$builder" --build-arg MIRROR=edge build
+          for arch in x86_64 aarch64; do
+            files=$(ls build-output/rc/"$arch"/*.pkg.tar.zst 2>/dev/null | tr '\n' ' ' || true)
+            [[ -n "$files" ]] || continue
+            echo "==> rc/$arch: $files"
+            if docker run --rm \
+              -e GPG_PRIVATE_KEY -e GPG_PASSPHRASE -e OMARCHY_PUBLISH_PREFIX \
+              -e RCLONE_CONFIG_R2_TYPE -e RCLONE_CONFIG_R2_PROVIDER -e RCLONE_CONFIG_R2_ENDPOINT -e RCLONE_CONFIG_R2_NO_CHECK_BUCKET \
+              -e RCLONE_CONFIG_R2_ACCESS_KEY_ID -e RCLONE_CONFIG_R2_SECRET_ACCESS_KEY \
+              -v "$PWD:/w:ro" -w /w "$builder" \
+              bin/publish-artifact --remote R2:omarchy-pkgs --mirror rc --arch "$arch" $files; then
+              status=published
+            else
+              status=failed
+            fi
+            jq -nc --arg a "$arch" --arg st "$status" --arg files "$files" \
+              '{mirror:"rc", arch:$a, status:$st, packages:[$files | split(" ") | .[] | select(length>0) | sub(".*/";"") | sub("\\.pkg\\.tar\\.zst$";"")]}' >> slots.jsonl
+            # x86_64 first; a failure leaves aarch64 on the previous pins.
+            [[ $status == published ]] || exit 1
+          done
+
+      - name: Carry the pins into edge
+        id: edge
+        env:
+          PKGVER: ${{ needs.build.outputs.pkgver }}
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+          RCLONE_CONFIG_R2_TYPE: s3
+          RCLONE_CONFIG_R2_PROVIDER: Cloudflare
+          RCLONE_CONFIG_R2_NO_CHECK_BUCKET: "true"
+          RCLONE_CONFIG_R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          RCLONE_CONFIG_R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          RCLONE_CONFIG_R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          OMARCHY_PUBLISH_PREFIX: ${{ vars.OMARCHY_PUBLISH_PREFIX }}
+        run: |
+          set -euo pipefail
+          builder=ghcr.io/omacom/omarchy-pkg-builder:$(bin/builder-image key --arch x86_64 --mirror edge)
+          docker image inspect "$builder" >/dev/null 2>&1 || docker pull --quiet "$builder" || docker buildx build --load -t "$builder" --build-arg MIRROR=edge build
+          for arch in x86_64 aarch64; do
+            # The builder image runs as its own user, not the runner's.
+            mkdir -p "edge-carry/$arch" && chmod 777 "edge-carry/$arch"
+            # The pair's filenames come from rc's database, so edge gets the
+            # very files rc serves, not whatever else shares the version.
+            if docker run --rm \
+              -e ARCH="$arch" -e PKGVER \
+              -e GPG_PRIVATE_KEY -e GPG_PASSPHRASE -e OMARCHY_PUBLISH_PREFIX \
+              -e RCLONE_CONFIG_R2_TYPE -e RCLONE_CONFIG_R2_PROVIDER -e RCLONE_CONFIG_R2_ENDPOINT -e RCLONE_CONFIG_R2_NO_CHECK_BUCKET \
+              -e RCLONE_CONFIG_R2_ACCESS_KEY_ID -e RCLONE_CONFIG_R2_SECRET_ACCESS_KEY \
+              -v "$PWD:/w:ro" -v "$PWD/edge-carry/$arch:/carry" -w /w "$builder" bash -c '
+                set -euo pipefail
+                rc="R2:omarchy-pkgs/${OMARCHY_PUBLISH_PREFIX:+$OMARCHY_PUBLISH_PREFIX/}rc/$ARCH"
+                rclone copy "$rc/omarchy.db.tar.zst" /carry/db --s3-no-head
+                files=$(tar -xO --zstd -f /carry/db/omarchy.db.tar.zst --wildcards "*/desc" | awk -v want="$PKGVER" "
+                  \$0 == \"%FILENAME%\" { getline; file = \$0; next }
+                  \$0 == \"%NAME%\"     { getline; name = \$0; next }
+                  \$0 == \"%VERSION%\"  { getline; v = \$0; sub(/-[^-]*\$/, \"\", v)
+                                           if ((name == \"omarchy\" || name == \"omarchy-settings\") && v == want) print file }")
+                if [[ $(wc -w <<<"$files") -ne 2 ]]; then
+                  echo "rc/$ARCH does not serve the omarchy $PKGVER pair (found: ${files:-nothing})"
+                  exit 1
+                fi
+                for f in $files; do rclone copy "$rc/$f" /carry --s3-no-head; done
+                bin/publish-artifact --remote R2:omarchy-pkgs --mirror edge --arch "$ARCH" $(printf "/carry/%s " $files)
+              ' 2>&1 | tee "edge-carry/$arch.log"; then
+              status=published
+            else
+              status=failed
+            fi
+            echo "==> edge/$arch: $status"
+            # Nothing newer than edge serves moves nothing; no slot to record.
+            if [[ $status == failed ]] || ! grep -q 'nothing published' "edge-carry/$arch.log"; then
+              jq -nc --arg a "$arch" --arg st "$status" --arg files "$(ls edge-carry/$arch/*.pkg.tar.zst 2>/dev/null | tr '\n' ' ')" \
+                '{mirror:"edge", arch:$a, status:$st, packages:[$files | split(" ") | .[] | select(length>0) | sub(".*/";"") | sub("\\.pkg\\.tar\\.zst$";"")]}' >> slots.jsonl
+            fi
+            [[ $status == published ]] || exit 1
+          done
+
+      - name: Write the record
+        if: always()
+        env:
+          OUTCOME: ${{ steps.publish.outcome == 'success' && steps.edge.outcome || steps.publish.outcome }}
+          ACTOR: ${{ github.triggering_actor }}
+          PKGVER: ${{ needs.build.outputs.pkgver }}
+          RC_COMMIT: ${{ needs.build.outputs.rc_commit }}
+          OMARCHY_PUBLISH_PREFIX: ${{ vars.OMARCHY_PUBLISH_PREFIX }}
+        run: |
+          set -euo pipefail
+          touch slots.jsonl
+          # sources: [] stands in for the field publish runs fill, so the
+          # publish log's queries read every kind of line.
+          jq -s --arg sha "${{ github.sha }}" --arg run "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            --arg prefix "${OMARCHY_PUBLISH_PREFIX:-}" --arg event "${{ github.event_name }}" \
+            --arg actor "$ACTOR" --arg pkgver "$PKGVER" --arg rc_commit "$RC_COMMIT" --arg outcome "$OUTCOME" '
+            {time: (now|todate), kind: "release-rc", pkgver: $pkgver, rc_commit: $rc_commit, actor: $actor,
+             commit: $sha, run: $run, event: $event,
+             target: (if $prefix == "" then "live" else $prefix end),
+             result: (if $outcome == "success" then "success" else "failed" end),
+             sources: [], slots: .}' slots.jsonl > release-record.json
+          cat release-record.json
+          jq -r '
+            "### Release candidate " + (if .result != "success" then "FAILED" elif (.slots | length) == 0 then "already published" else "published" end)
+              + ": omarchy `" + .pkgver + "` → `rc`" + (if any(.slots[]; .mirror == "edge") then " + `edge`" else "" end) + " on **" + .target + "**" + (if .target != "live" then " (proof prefix, not live)" else "" end),
+            "",
+            "Run by @" + .actor + ", pins from rc " + .rc_commit[0:7] + ", tooling from " + .commit[0:7] + ".",
+            "",
+            (if (.slots | length) > 0 then
+              (.slots[] | "- `" + .mirror + "/" + .arch + "`: " + (if .status == "published" then "" else "**" + .status + "** " end)
+                + ([.packages[] | select(test("-debug-") | not)] | join(", ")))
+            else "_Nothing to publish: rc already serves these pins._" end)
+          ' release-record.json >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Keep the record
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-record-${{ github.run_id }}
+          path: release-record.json
+          retention-days: 90
+
+      # The carry into edge changes the runtime pair the Mac image installs:
+      # tell omarchy-mac-installer, as the publish job does. Opt-in through
+      # MAC_INSTALLER_DISPATCH_TOKEN in the publish environment; never fails
+      # the release.
+      - name: Notify omarchy-mac-installer
+        if: ${{ !cancelled() && github.ref == 'refs/heads/master' && hashFiles('release-record.json') != '' }}
+        continue-on-error: true
+        env:
+          MAC_INSTALLER_DISPATCH_TOKEN: ${{ secrets.MAC_INSTALLER_DISPATCH_TOKEN }}
+        run: bin/mac-installer-dispatch release-record.json
+
+      - name: Append to the publish log in the bucket
+        if: always() && hashFiles('release-record.json') != ''
+        env:
+          RCLONE_CONFIG_R2_TYPE: s3
+          RCLONE_CONFIG_R2_PROVIDER: Cloudflare
+          RCLONE_CONFIG_R2_NO_CHECK_BUCKET: "true"
+          RCLONE_CONFIG_R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          RCLONE_CONFIG_R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          RCLONE_CONFIG_R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+        run: |
+          # A run that published nothing changed nothing; its summary keeps it.
+          [[ $(jq '.slots | length' release-record.json) -gt 0 ]] || exit 0
+          curl -fsSL https://downloads.rclone.org/rclone-current-linux-amd64.zip -o rclone.zip && unzip -jq rclone.zip '*/rclone' && chmod +x rclone
+          ./rclone copy R2:omarchy-pkgs/publish-log.jsonl . --s3-no-head 2>/dev/null || : > publish-log.jsonl
+          jq -c . release-record.json >> publish-log.jsonl
+          ./rclone copyto publish-log.jsonl R2:omarchy-pkgs/publish-log.jsonl --s3-no-head
+          echo "log now has $(wc -l < publish-log.jsonl) entries"

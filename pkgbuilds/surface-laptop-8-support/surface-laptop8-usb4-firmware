@@ -1,0 +1,221 @@
+#!/usr/bin/python3 -I
+"""Install the Surface Laptop 8's USB4 router firmware from Windows.
+
+The USB4 host router's firmware is only shipped inside Qualcomm's Windows USB4
+filter driver, QcUsb4Filter8480.sys. This finds that driver in the machine's
+Windows driver store (internal NTFS partitions, mounted read-only), or in a
+directory or file given on the command line, and copies out the one router
+image tested on this laptop: a run of MCU load records whose SHA-256 is pinned
+below. Nothing else is ever installed, so a driver without that exact image
+leaves USB4 off. The image is the same in Microsoft's, HP's and ASUS's driver
+packages.
+
+The router driver requests the image once, at probe in the initramfs, so the
+boot images are rebuilt afterwards (unless --no-rebuild); thunderbolt_qcom
+declares the file, so mkinitcpio adds it to the initramfs.
+
+Usage: surface-laptop8-usb4-firmware [--no-rebuild] [-d DIR | FILE]
+"""
+
+import argparse
+import hashlib
+import os
+import struct
+import subprocess
+import sys
+import tempfile
+
+FIRMWARE = 'qcom/glymur/surface-laptop8/usb4-router-legacy.bin'
+DRIVER = 'qcusb4filter8480.sys'
+PACKAGE_PREFIX = 'qcusb4filter8480.inf_'
+DRIVER_STORE = ('Windows', 'System32', 'DriverStore', 'FileRepository')
+# Router 0, legacy MCU layout, current silicon: the image the Windows driver
+# selects on this laptop, tested with the router driver (5 October 2026, and
+# on linux-omarchy 7.3-2 and 7.3-4).
+IMAGE_SHA256 = '0f2eb991490ce26b7d3932f2af44987f61e033f5b689e5bf7642f457a13cbb1d'
+IMAGE_SIZE = 39152
+MCU_MEMORY = 0x100000
+
+
+def log(message):
+    print(f'surface-laptop8-usb4-firmware: {message}', file=sys.stderr)
+
+
+def records_fill(data, start, size):
+    """True if data[start:start+size] is exactly a run of (address, word
+    count, words) load records starting at MCU address 0."""
+    pos, end, loaded = start, start + size, 0
+    while pos < end:
+        if end - pos < 8:
+            return False
+        address, count = struct.unpack_from('<II', data, pos)
+        if pos == start and address != 0:
+            return False
+        if count == 0 or address % 4 or address < loaded or address + 4 * count > MCU_MEMORY:
+            return False
+        loaded = address + 4 * count
+        pos += 8 + 4 * count
+    return pos == end
+
+
+def find_image(data, sha256=IMAGE_SHA256, size=IMAGE_SIZE):
+    """The tested image inside a driver file, or None."""
+    for start in range(0, len(data) - size + 1, 4):
+        if data[start:start + 4] != b'\0\0\0\0' or not records_fill(data, start, size):
+            continue
+        image = data[start:start + size]
+        if hashlib.sha256(image).hexdigest() == sha256:
+            return image
+    return None
+
+
+def drivers_in(directory):
+    """Every QcUsb4Filter8480.sys under directory."""
+    found = []
+    for parent, dirs, files in os.walk(directory):
+        dirs.sort()
+        for name in sorted(files):
+            if name.lower() == DRIVER:
+                found.append(os.path.join(parent, name))
+    return found
+
+
+def windows_driver_stores(mounts, root):
+    """Mount each internal NTFS partition read-only; return the driver
+    stores found. Mount points are appended to mounts for cleanup."""
+    listing = subprocess.run(['lsblk', '-rpno', 'PATH,RM,HOTPLUG,FSTYPE,TRAN'],
+                             capture_output=True, text=True, check=False).stdout
+    stores, bitlocker = [], []
+    for line in listing.splitlines():
+        fields = line.split()
+        if len(fields) < 4 or fields[3] not in ('ntfs', 'BitLocker'):
+            continue
+        device, removable, hotplug = fields[:3]
+        transport = fields[4] if len(fields) > 4 else ''
+        if removable != '0' or hotplug != '0' or transport == 'usb':
+            continue
+        if fields[3] == 'BitLocker':
+            bitlocker.append(device)
+            continue
+        mountpoint = tempfile.mkdtemp(prefix='surface-laptop8-usb4.', dir=os.path.join(root, 'run'))
+        result = subprocess.run(['mount', '-t', 'ntfs3', '-o', 'ro,nosuid,nodev,noexec',
+                                 device, mountpoint], capture_output=True, check=False)
+        if result.returncode != 0:
+            log(f'could not mount {device} read-only; skipping it')
+            os.rmdir(mountpoint)
+            continue
+        mounts.append(mountpoint)
+        store = os.path.join(mountpoint, *DRIVER_STORE)
+        if os.path.isdir(store):
+            log(f'Windows driver store found on {device}')
+            stores.append(store)
+    if bitlocker:
+        log(f'BitLocker volume(s) skipped: {" ".join(bitlocker)}; '
+            'turn BitLocker off in Windows to let the firmware be read')
+    return stores
+
+
+def store_drivers(store):
+    found = []
+    for entry in sorted(os.listdir(store)):
+        if entry.lower().startswith(PACKAGE_PREFIX):
+            found += drivers_in(os.path.join(store, entry))
+    return found
+
+
+def unmount(mounts):
+    for mountpoint in mounts:
+        subprocess.run(['umount', mountpoint], check=False)
+        try:
+            os.rmdir(mountpoint)
+        except OSError:
+            pass
+
+
+def install(image, root):
+    target = os.path.join(root, 'usr/lib/firmware/updates', FIRMWARE)
+    os.makedirs(os.path.dirname(target), exist_ok=True)
+    temporary = target + '.new'
+    with open(temporary, 'wb') as output:
+        output.write(image)
+    os.chmod(temporary, 0o644)
+    os.replace(temporary, target)
+    return target
+
+
+def installed(root):
+    target = os.path.join(root, 'usr/lib/firmware/updates', FIRMWARE)
+    try:
+        with open(target, 'rb') as existing:
+            return hashlib.sha256(existing.read()).hexdigest() == IMAGE_SHA256
+    except OSError:
+        return False
+
+
+def rebuild():
+    for command in (['limine-update'], ['mkinitcpio', '-P']):
+        try:
+            subprocess.run(command, check=True)
+            return True
+        except FileNotFoundError:
+            continue
+        except subprocess.CalledProcessError:
+            log(f'{command[0]} failed; rebuild the boot images before rebooting')
+            return False
+    log('no limine-update or mkinitcpio; rebuild the boot images before rebooting')
+    return False
+
+
+def main(argv):
+    parser = argparse.ArgumentParser(description=__doc__.split('\n\n')[0])
+    parser.add_argument('-d', dest='directory', help='search this directory tree instead of Windows')
+    parser.add_argument('file', nargs='?', help='a QcUsb4Filter8480.sys to read')
+    parser.add_argument('--no-rebuild', action='store_true', help='do not rebuild the boot images')
+    args = parser.parse_args(argv)
+    root = os.environ.get('SURFACE_LAPTOP8_ROOT', '/')
+
+    if os.geteuid() != 0 and root == '/':
+        log('must run as root')
+        return 1
+
+    if installed(root):
+        log(f'{FIRMWARE} is already installed')
+    else:
+        mounts = []
+        try:
+            if args.file:
+                drivers = [args.file]
+            elif args.directory:
+                drivers = drivers_in(args.directory)
+            else:
+                drivers = [d for store in windows_driver_stores(mounts, root) for d in store_drivers(store)]
+            if not drivers:
+                log(f'{DRIVER} not found; USB4 stays off')
+                return 2
+            image = None
+            for driver in drivers:
+                with open(driver, 'rb') as source:
+                    image = find_image(source.read())
+                if image:
+                    log(f'tested router image found in {driver}')
+                    break
+                log(f'no tested router image in {driver}')
+            if not image:
+                log('USB4 stays off')
+                return 2
+            log(f'installed {install(image, root)}')
+        finally:
+            unmount(mounts)
+
+    # Rebuilt even when the image was already there, so rerunning recovers
+    # from a rebuild that failed.
+    if args.no_rebuild:
+        return 0
+    if not rebuild():
+        return 1
+    log('reboot to start the USB4 router')
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv[1:]))

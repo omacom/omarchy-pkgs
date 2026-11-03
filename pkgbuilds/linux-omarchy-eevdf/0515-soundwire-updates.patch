@@ -1,0 +1,351 @@
+diff --git a/drivers/soundwire/bus.c b/drivers/soundwire/bus.c
+--- a/drivers/soundwire/bus.c
++++ b/drivers/soundwire/bus.c
+@@ -816,8 +816,11 @@ bool is_clock_scaling_supported_by_slave(struct sdw_slave *slave)
+ 	/*
+ 	 * Dynamic scaling is a defined by SDCA. However, some devices expose the class ID but
+ 	 * can't support dynamic scaling. We might need a quirk to handle such devices.
++	 * The clock base and scale registers themselves are SoundWire 1.2, so a device
++	 * may implement them without setting the class field; the driver says so with
++	 * clock_reg_supported.
+ 	 */
+-	return slave->id.class_id;
++	return slave->id.class_id || slave->prop.clock_reg_supported;
+ }
+ EXPORT_SYMBOL(is_clock_scaling_supported_by_slave);
+ 
+@@ -1384,7 +1387,7 @@ static int sdw_slave_set_frequency(struct sdw_slave *slave)
+ 	 * DisCo property to discover support for the scaling registers
+ 	 * from platform firmware.
+ 	 */
+-	if (!slave->id.class_id && !slave->prop.clock_reg_supported)
++	if (!is_clock_scaling_supported_by_slave(slave))
+ 		return 0;
+ 
+ 	scale_index = sdw_slave_get_scale_index(slave, &base);
+diff --git a/drivers/soundwire/cadence_master.c b/drivers/soundwire/cadence_master.c
+--- a/drivers/soundwire/cadence_master.c
++++ b/drivers/soundwire/cadence_master.c
+@@ -2141,6 +2141,7 @@ EXPORT_SYMBOL(sdw_cdns_bpt_find_bandwidth);
+ int sdw_cdns_bpt_find_buffer_sizes(int command, /* 0: write, 1: read */
+ 				   int row, int col, unsigned int data_bytes,
+ 				   unsigned int requested_bytes_per_frame,
++				   unsigned int bra_block_alignment,
+ 				   unsigned int *data_per_frame, unsigned int *pdi0_buffer_size,
+ 				   unsigned int *pdi1_buffer_size, unsigned int *num_frames)
+ {
+@@ -2165,6 +2166,16 @@ int sdw_cdns_bpt_find_buffer_sizes(int command, /* 0: write, 1: read */
+ 	if (requested_bytes_per_frame < actual_bpt_bytes)
+ 		actual_bpt_bytes = requested_bytes_per_frame;
+ 
++	if (bra_block_alignment) {
++		/* align to a multiple of bra_block_alignment */
++		if (actual_bpt_bytes < bra_block_alignment) {
++			pr_err("effective bytes per frame %u is smaller than block alignment %u\n",
++			       actual_bpt_bytes, bra_block_alignment);
++			return -EINVAL;
++		}
++		actual_bpt_bytes -= (actual_bpt_bytes % bra_block_alignment);
++	}
++
+ 	*data_per_frame = actual_bpt_bytes;
+ 
+ 	if (data_bytes < actual_bpt_bytes)
+diff --git a/drivers/soundwire/cadence_master.h b/drivers/soundwire/cadence_master.h
+--- a/drivers/soundwire/cadence_master.h
++++ b/drivers/soundwire/cadence_master.h
+@@ -218,6 +218,7 @@ int sdw_cdns_bpt_find_bandwidth(int command, /* 0: write, 1: read */
+ int sdw_cdns_bpt_find_buffer_sizes(int command, /* 0: write, 1: read */
+ 				   int row, int col, unsigned int data_bytes,
+ 				   unsigned int requested_bytes_per_frame,
++				   unsigned int bra_block_alignment,
+ 				   unsigned int *data_per_frame, unsigned int *pdi0_buffer_size,
+ 				   unsigned int *pdi1_buffer_size, unsigned int *num_frames);
+ 
+diff --git a/drivers/soundwire/dmi-quirks.c b/drivers/soundwire/dmi-quirks.c
+--- a/drivers/soundwire/dmi-quirks.c
++++ b/drivers/soundwire/dmi-quirks.c
+@@ -15,6 +15,14 @@ struct adr_remap {
+ 	u64 remapped_adr;
+ };
+ 
++static const struct adr_remap global_ghost_adr[] = {
++	{
++		0x000000D010010500ull,
++		0x0000000000000000ull
++	},
++	{}
++};
++
+ /*
+  * Some TigerLake devices based on an initial Intel BIOS do not expose
+  * the correct _ADR in the DSDT.
+@@ -178,6 +186,20 @@ static const struct dmi_system_id adr_remap_quirk_table[] = {
+ 		.driver_data = (void *)hp_omen_16,
+ 	},
+ 	/* PTL devices */
++	{
++		.matches = {
++			DMI_MATCH(DMI_SYS_VENDOR, "ASUS"),
++			DMI_MATCH(DMI_BOARD_NAME, "B9406CAA"),
++		},
++		.driver_data = (void *)ghost_realtek,
++	},
++	{
++		.matches = {
++			DMI_MATCH(DMI_SYS_VENDOR, "ASUS"),
++			DMI_MATCH(DMI_BOARD_NAME, "GX651AR"),
++		},
++		.driver_data = (void *)ghost_realtek,
++	},
+ 	{
+ 		.matches = {
+ 			DMI_MATCH(DMI_SYS_VENDOR, "ASUS"),
+@@ -185,6 +207,13 @@ static const struct dmi_system_id adr_remap_quirk_table[] = {
+ 		},
+ 		.driver_data = (void *)ghost_realtek,
+ 	},
++	{
++		.matches = {
++			DMI_MATCH(DMI_SYS_VENDOR, "ASUS"),
++			DMI_MATCH(DMI_BOARD_NAME, "UX8407AA"),
++		},
++		.driver_data = (void *)ghost_realtek,
++	},
+ 	{
+ 		.matches = {
+ 			DMI_MATCH(DMI_SYS_VENDOR, "LENOVO"),
+@@ -212,6 +241,7 @@ static const struct dmi_system_id adr_remap_quirk_table[] = {
+ u64 sdw_dmi_override_adr(struct sdw_bus *bus, u64 addr)
+ {
+ 	const struct dmi_system_id *dmi_id;
++	int i;
+ 
+ 	/* check if any address remap quirk applies */
+ 	dmi_id = dmi_first_match(adr_remap_quirk_table);
+@@ -223,10 +253,20 @@ u64 sdw_dmi_override_adr(struct sdw_bus *bus, u64 addr)
+ 				dev_dbg(bus->dev, "remapped _ADR 0x%llx as 0x%llx\n",
+ 					addr, map->remapped_adr);
+ 				addr = map->remapped_adr;
+-				break;
++				goto out;
+ 			}
+ 		}
+ 	}
+ 
++	/* remap the ghost ADRs */
++	for (i = 0; i < ARRAY_SIZE(global_ghost_adr); i++) {
++		if (global_ghost_adr[i].adr == addr) {
++			dev_dbg(bus->dev, "remapped _ADR 0x%llx as 0x%llx\n",
++				addr, global_ghost_adr[i].remapped_adr);
++			addr = global_ghost_adr[i].remapped_adr;
++			break;
++		}
++	}
++out:
+ 	return addr;
+ }
+diff --git a/drivers/soundwire/intel_ace2x.c b/drivers/soundwire/intel_ace2x.c
+--- a/drivers/soundwire/intel_ace2x.c
++++ b/drivers/soundwire/intel_ace2x.c
+@@ -57,6 +57,7 @@ static int intel_ace2x_bpt_open_stream(struct sdw_intel *sdw, struct sdw_slave *
+ 	struct sdw_port_config *pconfig;
+ 	unsigned int pdi0_buf_size_pre_frame;
+ 	unsigned int pdi1_buf_size_pre_frame;
++	unsigned int max_data_per_frame;
+ 	unsigned int pdi0_buffer_size_;
+ 	unsigned int pdi1_buffer_size_;
+ 	unsigned int pdi0_buffer_size;
+@@ -168,11 +169,25 @@ static int intel_ace2x_bpt_open_stream(struct sdw_intel *sdw, struct sdw_slave *
+ 	pdi0_buffer_size = 0;
+ 	pdi1_buffer_size = 0;
+ 	num_frames = 0;
++
++	if (slave->prop.bra_max_data_per_frame) {
++		max_data_per_frame = slave->prop.bra_max_data_per_frame;
++		if (max_data_per_frame > SDW_BRA_MAX_BYTES_PER_FRAME) {
++			dev_warn(&slave->dev,
++				 "BRA max_data_per_frame %u exceeds limit %u, clamping\n",
++				 max_data_per_frame, SDW_BRA_MAX_BYTES_PER_FRAME);
++			max_data_per_frame = SDW_BRA_MAX_BYTES_PER_FRAME;
++		}
++	} else {
++		max_data_per_frame = SDW_BRA_MAX_BYTES_PER_FRAME;
++	}
++
+ 	/* Add up pdi buffer size and frame numbers of each BPT sections */
+ 	for (i = 0; i < msg->sections; i++) {
+ 		ret = sdw_cdns_bpt_find_buffer_sizes(command, cdns->bus.params.row,
+ 						     cdns->bus.params.col,
+-						     msg->sec[i].len, SDW_BPT_MSG_MAX_BYTES,
++						     msg->sec[i].len, max_data_per_frame,
++						     slave->prop.bra_block_alignment,
+ 						     &data_per_frame, &pdi0_buffer_size_,
+ 						     &pdi1_buffer_size_, &num_frames_);
+ 		if (ret < 0)
+@@ -196,7 +211,8 @@ static int intel_ace2x_bpt_open_stream(struct sdw_intel *sdw, struct sdw_slave *
+ 		/* Get buffer size of a full frame */
+ 		ret = sdw_cdns_bpt_find_buffer_sizes(command, cdns->bus.params.row,
+ 						     cdns->bus.params.col,
+-						     data_per_frame, SDW_BPT_MSG_MAX_BYTES,
++						     data_per_frame, max_data_per_frame,
++						     slave->prop.bra_block_alignment,
+ 						     &data_per_frame, &pdi0_buf_size_pre_frame,
+ 						     &pdi1_buf_size_pre_frame, &fake_num_frames);
+ 		if (ret < 0)
+diff --git a/drivers/soundwire/intel_auxdevice.c b/drivers/soundwire/intel_auxdevice.c
+--- a/drivers/soundwire/intel_auxdevice.c
++++ b/drivers/soundwire/intel_auxdevice.c
+@@ -54,6 +54,7 @@ static struct wake_capable_part wake_capable_list[] = {
+ 	{0x01fa, 0x2A30},
+ 	{0x01fa, 0x2A3B},
+ 	{0x01fa, 0x4243},
++	{0x01fa, 0x4244},
+ 	{0x01fa, 0x4245},
+ 	{0x01fa, 0x4249},
+ 	{0x01fa, 0x4747},
+diff --git a/drivers/soundwire/mipi_disco.c b/drivers/soundwire/mipi_disco.c
+--- a/drivers/soundwire/mipi_disco.c
++++ b/drivers/soundwire/mipi_disco.c
+@@ -470,6 +470,12 @@ int sdw_slave_read_prop(struct sdw_slave *slave)
+ 	device_property_read_u32(dev, "mipi-sdw-sdca-interrupt-register-list",
+ 				 &prop->sdca_interrupt_register_list);
+ 
++	device_property_read_u32(dev, "mipi-sdw-bra-mode-block-alignment",
++				 &prop->bra_block_alignment);
++
++	device_property_read_u32(dev, "mipi-sdw-bra-mode-max-data-per-frame",
++				 &prop->bra_max_data_per_frame);
++
+ 	prop->commit_register_supported = mipi_device_property_read_bool(dev,
+ 			"mipi-sdw-commit-register-supported");
+ 
+diff --git a/drivers/soundwire/qcom.c b/drivers/soundwire/qcom.c
+--- a/drivers/soundwire/qcom.c
++++ b/drivers/soundwire/qcom.c
+@@ -134,7 +134,6 @@
+ #define TIMEOUT_MS						100
+ #define QCOM_SWRM_MAX_RD_LEN					0x1
+ #define DEFAULT_CLK_FREQ					9600000
+-#define SWRM_MAX_DAIS						0xF
+ #define SWR_INVALID_PARAM					0xFF
+ #define SWR_HSTOP_MAX_VAL					0xF
+ #define SWR_HSTART_MIN_VAL					0x0
+@@ -215,7 +214,7 @@ struct qcom_swrm_ctrl {
+ 	u8 wcmd_id;
+ 	/* Port numbers are 1 - 14 */
+ 	struct qcom_swrm_port_config *pconfig;
+-	struct sdw_stream_runtime *sruntime[SWRM_MAX_DAIS];
++	struct sdw_stream_runtime **sruntime;
+ 	enum sdw_slave_status status[SDW_MAX_DEVICES + 1];
+ 	int (*reg_read)(struct qcom_swrm_ctrl *ctrl, int reg, u32 *val);
+ 	int (*reg_write)(struct qcom_swrm_ctrl *ctrl, int reg, int val);
+@@ -976,6 +975,20 @@ static enum sdw_command_response qcom_swrm_xfer_msg(struct sdw_bus *bus,
+ 	struct qcom_swrm_ctrl *ctrl = to_qcom_sdw(bus);
+ 	int ret, i, len;
+ 
++	if (msg->page) {
++		ret = qcom_swrm_cmd_fifo_wr_cmd(ctrl, msg->addr_page1,
++						msg->dev_num,
++						SDW_SCP_ADDRPAGE1);
++		if (ret)
++			return ret;
++
++		ret = qcom_swrm_cmd_fifo_wr_cmd(ctrl, msg->addr_page2,
++						msg->dev_num,
++						SDW_SCP_ADDRPAGE2);
++		if (ret)
++			return ret;
++	}
++
+ 	if (msg->flags == SDW_MSG_FLAG_READ) {
+ 		for (i = 0; i < msg->len;) {
+ 			len = min(msg->len - i, QCOM_SWRM_MAX_RD_LEN);
+@@ -1384,6 +1397,10 @@ static int qcom_swrm_register_dais(struct qcom_swrm_ctrl *ctrl)
+ 	struct device *dev = ctrl->dev;
+ 	int i;
+ 
++	ctrl->sruntime = devm_kcalloc(dev, num_dais, sizeof(*ctrl->sruntime), GFP_KERNEL);
++	if (!ctrl->sruntime)
++		return -ENOMEM;
++
+ 	/* PDM dais are only tested for now */
+ 	dais = devm_kcalloc(dev, num_dais, sizeof(*dais), GFP_KERNEL);
+ 	if (!dais)
+@@ -1616,6 +1633,7 @@ static int qcom_swrm_probe(struct platform_device *pdev)
+ 
+ 	prop = &ctrl->bus.prop;
+ 	prop->max_clk_freq = DEFAULT_CLK_FREQ;
++	prop->mclk_freq = DEFAULT_CLK_FREQ;
+ 	prop->num_clk_gears = 0;
+ 	prop->num_clk_freq = MAX_FREQ_NUM;
+ 	prop->clk_freq = &qcom_swrm_freq_tbl[0];
+diff --git a/drivers/soundwire/stream.c b/drivers/soundwire/stream.c
+--- a/drivers/soundwire/stream.c
++++ b/drivers/soundwire/stream.c
+@@ -1060,14 +1060,23 @@ static int sdw_slave_port_config(struct sdw_slave *slave,
+ 
+ 	i = 0;
+ 	list_for_each_entry(p_rt, &s_rt->port_list, port_node) {
+-		/*
+-		 * TODO: Check valid port range as defined by DisCo/
+-		 * slave
+-		 */
+ 		if (!is_bpt_stream) {
+ 			ret = sdw_slave_port_is_valid_range(&slave->dev, port_config[i].num);
+ 			if (ret < 0)
+ 				return ret;
++
++			/*
++			 * A port in the generic valid range may still be unsupported by
++			 * the Slave or unavailable for the requested stream direction.
++			 */
++			if (!sdw_get_slave_dpn_prop(slave, s_rt->direction,
++						    port_config[i].num)) {
++				dev_err(&slave->dev,
++					"port %u not supported for %s\n",
++					port_config[i].num,
++					s_rt->direction == SDW_DATA_DIR_TX ? "TX" : "RX");
++				return -EINVAL;
++			}
+ 		} else if (port_config[i].num) {
+ 			return -EINVAL;
+ 		}
+diff --git a/include/linux/soundwire/sdw.h b/include/linux/soundwire/sdw.h
+--- a/include/linux/soundwire/sdw.h
++++ b/include/linux/soundwire/sdw.h
+@@ -365,6 +365,10 @@ struct sdw_dpn_prop {
+  * @commit_register_supported: is PCP_Commit register supported
+  * @scp_int1_mask: SCP_INT1_MASK desired settings
+  * @lane_maps: Lane mapping for the slave, only valid if lane_control_support is set
++ * @bra_block_alignment: If non-zero the length of data in a BRA frame must be
++ *			 a multiple of this number of bytes.
++ * @bra_max_data_per_frame: If non-zero the maximum data payload size (in bytes per
++ *			    frame excluding header, CRC, and footer) for this BRA Mode
+  * @clock_reg_supported: the Peripheral implements the clock base and scale
+  * registers introduced with the SoundWire 1.2 specification. SDCA devices
+  * do not need to set this boolean property as the registers are required.
+@@ -395,6 +399,8 @@ struct sdw_slave_prop {
+ 	u8 commit_register_supported;
+ 	u8 scp_int1_mask;
+ 	u8 lane_maps[SDW_MAX_LANES];
++	u32 bra_block_alignment;
++	u32 bra_max_data_per_frame;
+ 	bool clock_reg_supported;
+ 	bool use_domain_irq;
+ };
+@@ -837,6 +843,14 @@ struct sdw_defer {
+  */
+ #define SDW_BPT_MSG_MAX_BYTES  (1024 * 1024)
+ 
++/*
++ * According to mipi SoundWire DisCo Specification_v2-1,
++ * this maximum value shall not exceed 470.
++ * Note that the largest number of bytes accessible by a single BRA operation is limited to 470
++ * bytes when using lane 0, but goes up to 502 bytes when using one of the optional extra lanes.
++ */
++#define SDW_BRA_MAX_BYTES_PER_FRAME  470
++
+ struct sdw_bpt_msg;
+ 
+ /**

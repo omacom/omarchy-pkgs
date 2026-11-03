@@ -1,0 +1,136 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yongxing Mou <yongxing.mou@oss.qualcomm.com>
+Date: Mon, 3 Aug 2026 16:43:08 +0800
+Subject: [PATCH] drm/bridge: aux-hpd-bridge: replay last HPD status on
+ hpd_enable
+
+If a downstream consumer (e.g. drm_bridge_connector attached by the
+msm/dp driver) registers its HPD callback after an upstream driver
+has already reported a HPD event through drm_aux_hpd_bridge_notify(),
+the notification is dropped because bridge->hpd_cb is still NULL.
+This can affect any user of drm_aux_hpd_bridge_notify() whose
+downstream consumer arms HPD only after upstream events have started.
+
+The race has been observed on Qualcomm X1E-based laptops during boot,
+when pmic_glink_altmode reports the initial USB-C DP connection state
+before the DP driver has finished probing and enabled HPD handling on
+the bridge. The consumer then never observes the initial connected
+state and the external display remains dark.
+
+Cache the last HPD status reported through drm_aux_hpd_bridge_notify()
+and replay it when HPD is enabled by the downstream consumer.
+
+The replay is deferred to a work item so that the replayed HPD
+notification is delivered outside drm_bridge_hpd_enable()'s call
+context.
+
+This follows the same pattern as display-connector, which also defers
+an initial HPD notification from .hpd_enable(), but reuses the cached
+status since aux-hpd-bridge cannot re-detect sink presence on its own.
+
+Fixes: e560518a6c2e ("drm/bridge: implement generic DP HPD bridge")
+Signed-off-by: Yongxing Mou <yongxing.mou@oss.qualcomm.com>
+Link: https://lore.kernel.org/r/20260803-drm-usbdp-preboot-v1-1-2539b362be00@oss.qualcomm.com
+---
+ drivers/gpu/drm/bridge/aux-hpd-bridge.c | 53 ++++++++++++++++++++++++-
+ 1 file changed, 52 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/bridge/aux-hpd-bridge.c b/drivers/gpu/drm/bridge/aux-hpd-bridge.c
+index a2e525aa578..bb81aabf58d 100644
+--- a/drivers/gpu/drm/bridge/aux-hpd-bridge.c
++++ b/drivers/gpu/drm/bridge/aux-hpd-bridge.c
+@@ -8,6 +8,7 @@
+ #include <linux/export.h>
+ #include <linux/module.h>
+ #include <linux/of.h>
++#include <linux/workqueue.h>
+ 
+ #include <drm/drm_atomic_helper.h>
+ #include <drm/drm_bridge.h>
+@@ -18,6 +19,17 @@ static DEFINE_IDA(drm_aux_hpd_bridge_ida);
+ struct drm_aux_hpd_bridge_data {
+ 	struct drm_bridge bridge;
+ 	struct device *dev;
++
++	/*
++	 * Last HPD status pushed through drm_aux_hpd_bridge_notify().
++	 * Replayed from .hpd_enable so that consumers registering their
++	 * callback after the initial notification are caught up.
++	 *
++	 * Accessed lockless from the notify path (writer) and hpd_work
++	 * (reader) - use WRITE_ONCE()/READ_ONCE().
++	 */
++	enum drm_connector_status last_status;
++	struct work_struct hpd_work;
+ };
+ 
+ static void drm_aux_hpd_bridge_release(struct device *dev)
+@@ -154,6 +166,8 @@ void drm_aux_hpd_bridge_notify(struct device *dev, enum drm_connector_status sta
+ 	if (!data)
+ 		return;
+ 
++	WRITE_ONCE(data->last_status, status);
++
+ 	drm_bridge_hpd_notify(&data->bridge, status);
+ }
+ EXPORT_SYMBOL_GPL(drm_aux_hpd_bridge_notify);
+@@ -165,11 +179,45 @@ static int drm_aux_hpd_bridge_attach(struct drm_bridge *bridge,
+ 	return flags & DRM_BRIDGE_ATTACH_NO_CONNECTOR ? 0 : -EINVAL;
+ }
+ 
++static void drm_aux_hpd_bridge_hpd_work(struct work_struct *work)
++{
++	struct drm_aux_hpd_bridge_data *data =
++		container_of(work, struct drm_aux_hpd_bridge_data, hpd_work);
++	enum drm_connector_status status = READ_ONCE(data->last_status);
++
++	if (status == connector_status_unknown)
++		return;
++
++	drm_bridge_hpd_notify(&data->bridge, status);
++}
++
++/*
++ * Deferred to a work item so that the replayed HPD notification is
++ * delivered outside drm_bridge_hpd_enable()'s call context.
++ */
++static void drm_aux_hpd_bridge_hpd_enable(struct drm_bridge *bridge)
++{
++	struct drm_aux_hpd_bridge_data *data =
++		container_of(bridge, struct drm_aux_hpd_bridge_data, bridge);
++
++	schedule_work(&data->hpd_work);
++}
++
++static void drm_aux_hpd_bridge_hpd_disable(struct drm_bridge *bridge)
++{
++	struct drm_aux_hpd_bridge_data *data =
++		container_of(bridge, struct drm_aux_hpd_bridge_data, bridge);
++
++	cancel_work_sync(&data->hpd_work);
++}
++
+ static const struct drm_bridge_funcs drm_aux_hpd_bridge_funcs = {
+ 	.atomic_create_state = drm_atomic_helper_bridge_create_state,
+ 	.atomic_destroy_state = drm_atomic_helper_bridge_destroy_state,
+ 	.atomic_duplicate_state = drm_atomic_helper_bridge_duplicate_state,
+-	.attach	= drm_aux_hpd_bridge_attach,
++	.attach	     = drm_aux_hpd_bridge_attach,
++	.hpd_enable  = drm_aux_hpd_bridge_hpd_enable,
++	.hpd_disable = drm_aux_hpd_bridge_hpd_disable,
+ };
+ 
+ static int drm_aux_hpd_bridge_probe(struct auxiliary_device *auxdev,
+@@ -192,6 +240,9 @@ static int drm_aux_hpd_bridge_probe(struct auxiliary_device *auxdev,
+ 	data->bridge.interlace_allowed = true;
+ 	data->bridge.ycbcr_420_allowed = true;
+ 
++	data->last_status = connector_status_unknown;
++	INIT_WORK(&data->hpd_work, drm_aux_hpd_bridge_hpd_work);
++
+ 	auxiliary_set_drvdata(auxdev, data);
+ 
+ 	return devm_drm_bridge_add(data->dev, &data->bridge);
+-- 
+2.56.0
+

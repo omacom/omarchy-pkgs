@@ -1,45 +1,99 @@
-name: Sync Upstream Releases
+name: Sync Upstream
+run-name: Sync upstream (${{ inputs.cadence || 'six-hourly' }})
 
+# One updater for releases and branch tips. Packages marked "auto_merge":
+# true are checked hourly; the rest every six hours. Each package keeps its
+# existing auto/track-branches-* or auto/sync-upstream-* PR, opened by
+# package-prs.yml: the PR builds on the droplets, auto-merge lands it when
+# `result` is green, and the merge publishes. A package that fails to build
+# stays an open red PR for a maintainer without holding back any other; the
+# next run updates it if upstream moves again. `min_release_age` still
+# quarantines fresh releases before they are proposed.
+#
+# The PRs and auto-merge use the PAT in PKGS_BOT_TOKEN, so their pushes
+# build without an approval hold and their merges start publish.yml.
+
+# The controller box dispatches both cadences on its own timers
+# (ci/dispatch.sh): GitHub's schedule ran them hours late, or not at all.
 on:
-  schedule:
-    # Every 6 hours, off the hour to dodge the scheduling backlog at :00
-    - cron: '20 */6 * * *'
   workflow_dispatch:
     inputs:
+      cadence:
+        description: 'Which package group to update'
+        type: choice
+        options:
+          - six-hourly
+          - hourly
+        default: six-hourly
       packages:
-        description: 'Specific packages to update (space-separated, leave empty for all)'
+        description: 'Specific packages in that group (space-separated, leave empty for all)'
         required: false
         default: ''
+
+# Serialize each package group independently. Keep the old concurrency keys
+# so a tracker run already queued at migration cannot race the new workflow.
+concurrency:
+  group: ${{ inputs.cadence == 'hourly' && 'track-branches' || 'sync-upstream' }}
+  cancel-in-progress: false
 
 jobs:
   sync:
     runs-on: ubuntu-latest
     permissions:
-      contents: write
-      pull-requests: write
+      contents: read
+    outputs:
+      groups: ${{ steps.groups.outputs.groups }}
+      prefix: ${{ steps.scope.outputs.prefix }}
+      cadence: ${{ steps.scope.outputs.cadence }}
 
     steps:
+      - name: Require the bot token
+        env:
+          PKGS_BOT_TOKEN: ${{ secrets.PKGS_BOT_TOKEN }}
+        run: |
+          if [[ -z "$PKGS_BOT_TOKEN" ]]; then
+            echo "::error::Set PKGS_BOT_TOKEN to a PAT with Contents: write and Pull requests: write on this repository, owned by an account trusted to trigger builds."
+            exit 1
+          fi
+
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           persist-credentials: false
 
+      - name: Select the package group
+        id: scope
+        env:
+          CADENCE: ${{ inputs.cadence || 'six-hourly' }}
+        run: |
+          case "$CADENCE" in
+            hourly) lane=auto-merge; prefix=auto/track-branches ;;
+            six-hourly) lane=reviewed; prefix=auto/sync-upstream ;;
+            *) echo "::error::Unknown update cadence: $CADENCE"; exit 1 ;;
+          esac
+          echo "lane=$lane" >> "$GITHUB_OUTPUT"
+          echo "prefix=$prefix" >> "$GITHUB_OUTPUT"
+          echo "cadence=$CADENCE" >> "$GITHUB_OUTPUT"
+
       # Runs in an Arch container for vercmp: whether a release is an upgrade has
       # to be decided by the same comparator pacman will use on users' machines.
-      - name: Update packages from upstream release feeds
+      - name: Update packages from upstream releases and branches
+        id: sync
         run: |
           docker run --rm \
             -e PACKAGES="$PACKAGES" \
+            -e SYNC_LANE="$SYNC_LANE" \
+            -e UPSTREAM_GITHUB_TOKEN="$UPSTREAM_GITHUB_TOKEN" \
             -e HOST_UID="$(id -u)" \
             -e HOST_GID="$(id -g)" \
             -v "$PWD/bin:/workspace/bin:ro" \
             -v "$PWD/helpers:/workspace/helpers:ro" \
             -v "$PWD/pkgbuilds:/workspace/pkgbuilds" \
             -w /workspace \
-            archlinux:base-devel bash -lc '
+            ghcr.io/archlinux/archlinux:base-devel bash -lc '
               set -euo pipefail
 
-              pacman -Syu --noconfirm git jq
+              pacman -Syu --noconfirm git jq python libarchive
 
               groupadd -g "$HOST_GID" runner
               useradd -m -u "$HOST_UID" -g "$HOST_GID" runner
@@ -47,49 +101,110 @@ jobs:
 
               if [[ -n "${PACKAGES:-}" ]]; then
                 read -r -a package_args <<< "$PACKAGES"
-                runuser -u runner -- ./bin/sync-upstream "${package_args[@]}"
+                runuser -u runner -- ./bin/sync-upstream --lane "$SYNC_LANE" "${package_args[@]}"
               else
-                runuser -u runner -- ./bin/sync-upstream
+                runuser -u runner -- ./bin/sync-upstream --lane "$SYNC_LANE"
               fi
             '
         env:
           PACKAGES: ${{ github.event.inputs.packages }}
+          SYNC_LANE: ${{ steps.scope.outputs.lane }}
+          UPSTREAM_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Check for changes
-        id: changes
+      # Failed feeds leave their recipes untouched; completed updates still
+      # get their PRs. The failed sync step keeps the workflow red and notifies.
+      - name: Group the updates into PRs
+        if: ${{ !cancelled() && steps.sync.outcome != 'skipped' }}
+        id: groups
+        env:
+          PREFIX: ${{ steps.scope.outputs.prefix }}
         run: |
-          if [ -z "$(git status --porcelain)" ]; then
-            echo "has_changes=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "has_changes=true" >> "$GITHUB_OUTPUT"
-          fi
+          groups=$(.github/scripts/package-pr-groups.sh "$PREFIX" "$RUNNER_TEMP/pins.patch")
+          echo "groups=$groups" >> "$GITHUB_OUTPUT"
 
-      - name: Create Pull Request
-        if: steps.changes.outputs.has_changes == 'true'
-        uses: peter-evans/create-pull-request@v7
+      - name: Hand the updates to the PR jobs
+        if: ${{ !cancelled() && steps.groups.outputs.groups != '' && steps.groups.outputs.groups != '[]' }}
+        uses: actions/upload-artifact@v4
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          commit-message: 'chore: sync upstream releases'
-          title: 'chore: sync upstream releases'
-          body: |
-            Automated update of packages that track an upstream vendor release
-            feed rather than the AUR.
+          name: package-pins
+          path: ${{ runner.temp }}/pins.patch
+          retention-days: 1
 
-            Each package reports its newest release through
-            `.omarchy/upstream.sh`.
-          branch: auto/sync-upstream
-          delete-branch: true
-          labels: automated
-          reviewers: ryanrhughes
+  prs:
+    needs: sync
+    if: ${{ !cancelled() && needs.sync.outputs.groups != '' }}
+    permissions:
+      contents: read
+    uses: ./.github/workflows/package-prs.yml
+    with:
+      groups: ${{ needs.sync.outputs.groups }}
+      prefix: ${{ needs.sync.outputs.prefix }}
+      title: Sync upstream (${{ needs.sync.outputs.cadence }})
+      report-package-failures: true
+      body: |
+        Automated update of a package that tracks an upstream vendor release
+        feed or branch tip rather than the AUR.
 
-      - name: Notify Basecamp on failure
-        if: failure() && env.BASECAMP_CHATBOT_URL != ''
+        Release watches and providers are declared in `.omarchy/package.json`;
+        exceptional feeds use `.omarchy/upstream.sh`. This PR auto-merges once
+        the build checks pass. A failing build leaves it open for a maintainer
+        without holding back any other package.
+    secrets:
+      PKGS_BOT_TOKEN: ${{ secrets.PKGS_BOT_TOKEN }}
+
+  notify:
+    needs: [sync, prs]
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+      pull-requests: read
+      checks: read
+      statuses: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Fetch package results
+        if: ${{ needs.sync.outputs.groups != '' && needs.sync.outputs.groups != '[]' }}
+        # Still produce an actionable summary if a runner or artifact failed.
+        # The summary checks that every expected package result is present.
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          pattern: package-pr-result-*
+          path: ${{ runner.temp }}/package-pr-results
+          merge-multiple: true
+
+      - name: Summarize the sync and PR results
+        id: summary
+        uses: actions/github-script@v7
+        env:
+          GROUPS_JSON: ${{ needs.sync.outputs.groups }}
+          SYNC_RESULT: ${{ needs.sync.result }}
+          PRS_RESULT: ${{ needs.prs.result }}
+          CADENCE: ${{ needs.sync.outputs.cadence }}
+        with:
+          script: |
+            const summarize = require('./.github/scripts/sync-upstream-summary.cjs');
+            await summarize({ github, context, core,
+              groups: JSON.parse(process.env.GROUPS_JSON || '[]'),
+              syncResult: process.env.SYNC_RESULT,
+              prsResult: process.env.PRS_RESULT,
+              cadence: process.env.CADENCE,
+              resultsPath: `${process.env.RUNNER_TEMP}/package-pr-results`,
+            });
+
+      - name: Notify Basecamp of the sync results
+        if: ${{ !cancelled() && steps.summary.outputs.content != '' && env.BASECAMP_CHATBOT_URL != '' }}
         env:
           BASECAMP_CHATBOT_URL: ${{ secrets.BASECAMP_CHATBOT_URL }}
+          CONTENT: ${{ steps.summary.outputs.content }}
         run: |
-          curl -s -o /dev/null \
+          curl --fail-with-body --silent --show-error -o /dev/null \
             -H "Content-Type: application/json" \
-            -d "$(jq -n --arg content \
-              "🔴 <strong>Upstream sync failed</strong><br><a href=\"${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\">View run</a>" \
-              '{content: $content}')" \
+            -d "$(jq -n --arg content "$CONTENT" '{content: $content}')" \
             "$BASECAMP_CHATBOT_URL"

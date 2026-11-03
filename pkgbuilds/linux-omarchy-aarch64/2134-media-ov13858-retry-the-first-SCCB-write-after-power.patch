@@ -1,0 +1,83 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Brandon Williams <turbine.bmw@gmail.com>
+Date: Sat, 25 Jul 2026 10:52:59 -0400
+Subject: [PATCH] media: ov13858: retry the first SCCB write after power-up
+
+On the Surface Pro 11 (X1E80100, Denali) the rear OV13858 intermittently
+fails to start streaming. The first SCCB transaction after the sensor
+powers up returns -EIO, preceded by a CCI queue timeout:
+
+  i2c-qcom-cci ac15000.cci: master 1 queue 0 timeout
+  ov13858 3-0010: ov13858_start_streaming failed to set powerup registers
+
+The failure only occurs when another camera on the same SoC was active
+shortly beforehand, and never when the rear sensor is used on its own.
+Measured over 120 rear opens with the sensor exercised immediately after
+a front or IR session, it reproduces on 26% of opens.
+
+The condition is transient and has already cleared by the time the
+failed transfer returns. Retrying this one write is sufficient:
+
+  no retry     31 capture failures / 120 opens   0.26
+  one retry     0 capture failures / 100 opens   0.00
+
+with 39 retries observed to succeed on the second attempt across those
+100 opens. A zero delay before the retry is enough; adding 1 ms or 20 ms
+made no difference.
+
+Enlarging the power-up timing does not help, which rules out a settle
+time problem: separately varying the post-regulator settle (1 ms to
+20 ms), the reset-release-to-SCCB delay (10 ms to 50 ms), the power-off
+reset hold (1 ms to 20 ms) and a forced minimum off time (0 to 50 ms)
+all left the rate inside the 0.20-0.45 noise band.
+
+Scope the retry to the software reset register only. It is the first
+transaction after power-up, the only one observed to fail, and it is
+idempotent. Later writes in the sequence are not, and are left alone.
+
+Why the first transaction errors when another camera is powered is not
+yet explained; this makes the sensor tolerate it.
+
+Co-authored-by: Claude Opus 5 (1M context) <noreply@anthropic.com>
+Signed-off-by: Brandon Williams <turbine.bmw@gmail.com>
+---
+ drivers/media/i2c/ov13858.c | 24 +++++++++++++++++++++++-
+ 1 file changed, 23 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/media/i2c/ov13858.c b/drivers/media/i2c/ov13858.c
+index 09d58e8b1c7f..b324d9a27fc5 100644
+--- a/drivers/media/i2c/ov13858.c
++++ b/drivers/media/i2c/ov13858.c
+@@ -1413,9 +1413,31 @@ static int ov13858_start_streaming(struct ov13858 *ov13858)
+ 	const struct ov13858_reg_list *reg_list;
+ 	int ret, link_freq_index;
+ 
+-	/* Get out of from software reset */
++	/*
++	 * Get out of from software reset.
++	 *
++	 * The first SCCB transaction after the sensor powers up can fail when
++	 * another camera on the same SoC is powered at the same time: the CCI
++	 * master logs a queue timeout and the transfer returns -EIO. The
++	 * condition is transient and clears by the time the failed transfer
++	 * returns, so retry once.
++	 *
++	 * Scoped deliberately to this one register. It is the first
++	 * transaction after power-up and the only one observed to fail, and
++	 * the write is idempotent -- it asserts the sensor's software reset,
++	 * which is already the state it is in. Later writes in this sequence
++	 * are not idempotent and must not be retried blindly.
++	 */
+ 	ret = ov13858_write_reg(ov13858, OV13858_REG_SOFTWARE_RST,
+ 				OV13858_REG_VALUE_08BIT, OV13858_SOFTWARE_RST);
++	if (ret) {
++		dev_dbg(ov13858->dev,
++			"software reset write failed (%d), retrying once\n",
++			ret);
++		ret = ov13858_write_reg(ov13858, OV13858_REG_SOFTWARE_RST,
++					OV13858_REG_VALUE_08BIT,
++					OV13858_SOFTWARE_RST);
++	}
+ 	if (ret) {
+ 		dev_err(ov13858->dev, "%s failed to set powerup registers\n",
+ 			__func__);

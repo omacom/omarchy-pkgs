@@ -1,0 +1,80 @@
+#!/bin/bash
+# Retire packages from one channel of the remote repository.
+#
+#   unpublish-packages --mirror <edge|rc|stable> --arch <arch> <pkgbase...>
+#
+# The counterpart of publish-artifact, with the same steps:
+#   1. pull the channel's current database from the remote
+#   2. find every entry built from the named pkgbases (so a package's split
+#      outputs and -debug go with it)
+#   3. repo-remove them
+#   4. upload the database
+#
+# Package files stay in the bucket. Published filenames are immutable and the
+# R2 cache cannot recover from a rewrite; an unreferenced file costs nothing
+# and pacman never sees it. Naming a package the channel does not hold is not
+# an error, so a re-run is harmless.
+#
+# The remote is an rclone remote (REMOTE, default the production one);
+# OMARCHY_PUBLISH_PREFIX can point a proof run at a scratch prefix.
+set -euo pipefail
+BUILD_ROOT=$(realpath "${BASH_SOURCE[0]%/*}/..")
+source "$BUILD_ROOT/helpers/message-helpers.sh"
+source "$BUILD_ROOT/helpers/paths.sh"
+
+REMOTE=${REMOTE:-pkgs.omarchy.org:omarchy-pkgs}
+PREFIX=${OMARCHY_PUBLISH_PREFIX:-}
+BASES=()
+while [[ $# -gt 0 ]]; do
+  case $1 in
+  --mirror) MIRROR=$2; require_valid_mirror "$MIRROR"; shift 2 ;;
+  --arch) ARCH=$2; require_valid_arch "$ARCH"; shift 2 ;;
+  --remote) REMOTE=$2; shift 2 ;;
+  -h|--help) sed -n '2,19p' "$0"; exit 0 ;;
+  -*) print_error "Unknown option: $1"; exit 1 ;;
+  *) BASES+=("$1"); shift ;;
+  esac
+done
+(( ${#BASES[@]} )) || { print_error "No packages given"; exit 1; }
+
+DEST="$REMOTE/${PREFIX:+$PREFIX/}$MIRROR/$ARCH"
+WORK=$(mktemp -d)
+trap 'rm -rf "$WORK"' EXIT
+print_header "Unpublish from $DEST"
+
+# --- 1. pull the current database -----------------------------------------
+mkdir -p "$WORK/repo"
+listing=$(rclone lsf "$DEST/" --s3-no-head 2>/dev/null || true)
+if ! grep -q '^omarchy.db.tar.zst$' <<<"$listing"; then
+  print_info "No database at $DEST; nothing to remove"
+  exit 0
+fi
+rclone copy "$DEST/omarchy.db.tar.zst" "$WORK/repo" --s3-no-head
+rclone copy "$DEST/omarchy.files.tar.zst" "$WORK/repo" --s3-no-head 2>/dev/null || true
+before=$(tar -tf "$WORK/repo/omarchy.db.tar.zst" | grep -c '/$')
+print_info "Pulled current database ($before entries)"
+
+# --- 2. entries built from the named pkgbases -----------------------------
+names=$(bsdtar -xOf "$WORK/repo/omarchy.db.tar.zst" --include '*/desc' |
+  awk -v bases=" ${BASES[*]} " '
+    /^%NAME%$/ { getline name }
+    /^%BASE%$/ { getline base; if (index(bases, " " base " ")) print name }')
+if [[ -z "$names" ]]; then
+  print_info "None of ${BASES[*]} is in $MIRROR/$ARCH; nothing to remove"
+  exit 0
+fi
+mapfile -t NAMES <<<"$names"
+for n in "${NAMES[@]}"; do print_step "removing $n"; done
+
+# --- 3. repo-remove ---------------------------------------------------------
+( cd "$WORK/repo" && repo-remove --quiet omarchy.db.tar.zst "${NAMES[@]}" )
+ln -sf omarchy.db.tar.zst "$WORK/repo/omarchy.db"
+ln -sf omarchy.files.tar.zst "$WORK/repo/omarchy.files"
+after=$(tar -tf "$WORK/repo/omarchy.db.tar.zst" | grep -c '/$')
+(( before - after == ${#NAMES[@]} )) || {
+  print_error "Expected to remove ${#NAMES[@]} entries, removed $((before - after))"; exit 1; }
+print_info "Database now has $after entries"
+
+# --- 4. upload the database -------------------------------------------------
+rclone copy "$WORK/repo" "$DEST" --s3-no-head --checksum --copy-links --filter '+ omarchy.db*' --filter '+ omarchy.files*' --filter '- *'
+print_success "Removed ${#NAMES[@]} package(s) from $DEST"

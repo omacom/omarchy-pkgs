@@ -1,0 +1,150 @@
+#!/bin/bash
+# Invoked only by the package's Remove/PreTransaction ALPM hook.
+set -eu
+
+# systemd's configuration parser throws the whitespace around an assignment away
+# (parse_line() runs both halves through strstrip()), so a drop-in written as
+#   ExecStart = /home/alice/build/omawake daemon
+# picks the executable just as surely as the unspaced form does.
+readonly execstart_assignment='^[[:space:]]*ExecStart[[:space:]]*='
+
+owned_unit() {
+  local commands
+  [[ -f $1 && ! -L $1 ]] || return 1
+  # Only a unit in the very shape the application generates is ever deleted;
+  # anything else, however it is spaced, stays somebody's own file.
+  commands=$(grep '^ExecStart=' "$1") || return 1
+  [[ $commands != *$'\n'* ]] || return 1
+  grep -Eq "^ExecStart=\"?/usr/bin/$2\"?([[:space:]]|$)" <<< "$commands"
+}
+
+# Decode systemd's shell_maybe_quote() output, including cescape_char() escapes.
+# Never evaluate manager-controlled values as shell syntax.
+unquote_manager_value() {
+  local text=$1 decoded= character octal
+  if [[ $text != '$'* ]]; then
+    unquoted_value=$text
+    return 0
+  fi
+  [[ $text == \$\'*\' ]] || return 1
+  text=${text:2:${#text}-3}
+  while [[ -n $text ]]; do
+    if [[ ${text:0:1} != \\ ]]; then
+      decoded+=${text:0:1}
+      text=${text:1}
+      continue
+    fi
+    case ${text:1:1} in
+      \\ | "'") decoded+=${text:1:1} ;;
+      a | b | f | n | r | t | v)
+        printf -v character '%b' "\\${text:1:1}"
+        decoded+=$character
+        ;;
+      [0-3])
+        octal=${text:1:3}
+        [[ $octal =~ ^[0-3][0-7]{2}$ && $octal != 000 ]] || return 1
+        printf -v character '%b' "\\0$octal"
+        decoded+=$character
+        text=${text:4}
+        continue
+        ;;
+      *) return 1 ;;
+    esac
+    text=${text:2}
+  done
+  unquoted_value=$decoded
+}
+
+remove_for_user() {
+  local app=$1 user_home=$2 runtime=$3 config="$2/.config" unit="$1.service"
+  local online=false effective path target manager_environment load_state
+  if [[ -S $runtime/bus || -S $runtime/systemd/private ]]; then
+    online=true
+    # Do not evaluate shell syntax from a user manager's environment.
+    manager_environment=$(systemctl --user show-environment) || return 1
+    while IFS= read -r line; do
+      case $line in
+        XDG_CONFIG_HOME=*)
+          if ! unquote_manager_value "${line#XDG_CONFIG_HOME=}"; then
+            echo ":: Cannot tell which directory $user_home's manager reads $unit from; removal aborted." >&2
+            return 1
+          fi
+          # An XDG_CONFIG_HOME that is not an absolute path is no setting at all:
+          # the manager itself falls back to the home's .config directory then.
+          if [[ $unquoted_value == /* ]]; then config=$unquoted_value; fi
+          ;;
+      esac
+    done <<< "$manager_environment"
+    effective=$(systemctl --user show "$unit" --property=ExecStart --value) || return 1
+    if [[ -n $effective && $effective != *"path=/usr/bin/$app ;"* ]]; then
+      echo ":: Preserving $unit for $user_home: it uses another executable."
+      return 0
+    fi
+  fi
+  path="$config/systemd/user/$unit"
+  if ! $online && grep -qs "$execstart_assignment" "$path.d/"*.conf; then
+    echo ":: Preserving offline service with an executable override: $path."
+    return 0
+  fi
+  if [[ -e $path || -L $path ]]; then
+    if ! owned_unit "$path" "$app"; then
+      echo ":: Preserving custom or masked unit $path."
+      return 0
+    fi
+  fi
+  if $online; then
+    # Stop first, and fail the package transaction if stopping fails.
+    load_state=$(systemctl --user show "$unit" --property=LoadState --value) || return 1
+    if [[ $load_state != not-found ]]; then
+      systemctl --user stop "$unit" || return 1
+      # A unit that had failed stays failed once it is stopped, which is the one
+      # state systemd will reset. For every other state it answers that the unit
+      # is not loaded and exits non-zero, so the reset is asked for only where it
+      # applies: a healthy unit leaving the transaction never aborts a removal.
+      if [[ $(systemctl --user show "$unit" --property=ActiveState --value) == failed ]]; then
+        systemctl --user reset-failed "$unit" || return 1
+      fi
+      # Disabling also removes enablement links outside the normal target.
+      systemctl --user disable "$unit" || return 1
+    fi
+  fi
+  # Offline users have no bus. Remove only exact enablement links for this unit.
+  # All filesystem operations run as the owning user, never as pacman's root.
+  for target in "$config/systemd/user/"*.wants/"$unit" "$config/systemd/user/"*.requires/"$unit"; do
+    [[ -L $target ]] || continue
+    case $(realpath -m -- "$target") in
+      "$path"|"/usr/lib/systemd/user/$unit") rm -- "$target" ;;
+    esac
+  done
+  if owned_unit "$path" "$app"; then rm -- "$path"; fi
+  if $online; then systemctl --user daemon-reload || return 1; fi
+}
+
+if [[ ${1-} == --user ]]; then
+  shift
+  case ${1-} in omawake|omaspeak) ;; *) exit 2 ;; esac
+  [[ $# == 3 ]] || exit 2
+  remove_for_user "$@"
+  exit
+fi
+
+[[ $# == 1 ]] || exit 2
+case $1 in omawake|omaspeak) ;; *) exit 2 ;; esac
+app=$1
+result=0
+# Include logged-out users as well as active/lingering user managers.
+accounts=$(getent passwd) || exit 1
+while IFS=: read -r account _ user_id _ _ user_home _; do
+  [[ $user_home == /* ]] || continue
+  runtime="/run/user/$user_id"
+  if [[ ! -d $user_home/.config/systemd/user && ! -S $runtime/bus && ! -S $runtime/systemd/private ]]; then
+    continue
+  fi
+  if ! runuser -u "$account" -- env -u XDG_CONFIG_HOME \
+      XDG_RUNTIME_DIR="$runtime" DBUS_SESSION_BUS_ADDRESS="unix:path=$runtime/bus" \
+      "$0" --user "$app" "$user_home" "$runtime"; then
+    echo ":: Could not clean up $app for $account; removal aborted. Stop/remove the user service and retry." >&2
+    result=1
+  fi
+done <<< "$accounts"
+exit "$result"
