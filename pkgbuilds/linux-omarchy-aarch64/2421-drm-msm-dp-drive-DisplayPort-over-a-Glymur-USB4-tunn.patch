@@ -1,0 +1,1514 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jim Martin <jimmartin@gmail.com>
+Date: Thu, 8 Oct 2026 13:54:51 -0500
+Subject: [PATCH] drm/msm/dp: drive DisplayPort over a Glymur USB4 tunnel
+
+On Glymur, DP controller 0 can feed the USB4 host router's DP IN
+adapter instead of the combo PHY. The router then owns the sink: it
+carries AUX, reports HPD, and trains the DP OUT link at the far end of
+the tunnel. The DP controller has no way to work in that arrangement.
+
+Add an experimental interface, include/linux/soc/qcom/usb4-dp.h, through
+which the Qualcomm Glymur USB4 host router driver attaches its tunnel to
+the controller, and use it:
+
+- AUX: while a tunnel is attached, transfers go to the router's AUX
+  channel and the controller's own AUX and HPD blocks are left alone.
+  The tunnel's no_zero_sized setting is used, so segmented (E-DDC) EDID
+  reads keep MOT set between messages. Runtime PM is now taken before
+  the AUX lock for every transfer, including address-only ones.
+- HPD: the router reports HPD through msm_dp_usb4_hpd() and
+  msm_dp_usb4_hpd_sync(), handled in a separate worker so the router's
+  mailbox worker never waits for AUX or a modeset; native HPD
+  notifications are ignored while the tunnel is attached. A synchronous
+  disconnect waits up to one second for the atomic disable, then shuts
+  the PHY down.
+- Link: the link clocks are switched to the tunnel source, the DP IN
+  clock divider follows the link rate, and the USB4 link interface
+  clock is enabled. The producer is held in reset while the router
+  configures and trains the receiver, then the main link starts without
+  a reset pulse. Mode bits, the post-training flag and the second
+  transfer unit bank are set for the producer and restored when the
+  link clocks stop. Native training, its retries and the native FEC
+  setup are skipped; FEC readiness goes through the router, and the
+  producer takes its FEC symbol sequence from registers. Video and idle
+  readiness are polled from MAINLINK_READY, which is all the tunnelled
+  producer reports.
+- Interrupts: link status interrupts are masked while the tunnel's link
+  clocks are off, under a lock shared with the interrupt handler, which
+  now writes back the current mask instead of re-enabling all of them.
+  Stale status is drained each time the link clocks start.
+- Routing: msm_dp_usb4_route() asks the DPU to route the DP stream into
+  the USB4 DP IN adapter.
+
+The register values and sequences match what the platform's Windows
+driver programs on this laptop.
+
+Experimental; exercised only on the Surface Laptop 8 with its USB4 host
+router driver.
+
+Assisted-by: Opus 5.5
+Signed-off-by: Jim Martin <jimmartin@gmail.com>
+---
+ drivers/gpu/drm/msm/dp/dp_aux.c     | 178 ++++++++++-
+ drivers/gpu/drm/msm/dp/dp_aux.h     |  11 +
+ drivers/gpu/drm/msm/dp/dp_ctrl.c    | 445 +++++++++++++++++++++++++++-
+ drivers/gpu/drm/msm/dp/dp_display.c | 293 +++++++++++++++++-
+ include/linux/soc/qcom/usb4-dp.h    |  52 ++++
+ 5 files changed, 958 insertions(+), 21 deletions(-)
+ create mode 100644 include/linux/soc/qcom/usb4-dp.h
+
+diff --git a/drivers/gpu/drm/msm/dp/dp_aux.c b/drivers/gpu/drm/msm/dp/dp_aux.c
+index f39ea58b9f2..3a1ee098c8a 100644
+--- a/drivers/gpu/drm/msm/dp/dp_aux.c
++++ b/drivers/gpu/drm/msm/dp/dp_aux.c
+@@ -6,6 +6,7 @@
+ #include <linux/delay.h>
+ #include <linux/iopoll.h>
+ #include <linux/phy/phy.h>
++#include <linux/soc/qcom/usb4-dp.h>
+ #include <drm/drm_print.h>
+ 
+ #include "dp_reg.h"
+@@ -43,6 +44,11 @@ struct msm_dp_aux_private {
+ 	u32 offset;
+ 	u32 segment;
+ 
++	bool external_connected;
++	bool saved_no_zero_sized;
++	struct drm_dp_aux *external_aux;
++	const struct msm_dp_usb4_ops *usb4_ops;
++	void *usb4_data;
+ 	struct drm_dp_aux msm_dp_aux;
+ };
+ 
+@@ -369,13 +375,29 @@ static ssize_t msm_dp_aux_transfer(struct drm_dp_aux *msm_dp_aux,
+ 
+ 	aux = container_of(msm_dp_aux, struct msm_dp_aux_private, msm_dp_aux);
+ 
++	/* Runtime resume may initialise AUX, so acquire the transfer lock after it. */
++	ret = pm_runtime_resume_and_get(msm_dp_aux->dev);
++	if (ret)
++		return ret;
++
++	/* Preserve this AUX object: panel, link and controller retain its address. */
++	mutex_lock(&aux->mutex);
++	if (aux->external_aux) {
++		if (!aux->enable_xfers || !aux->external_connected)
++			ret = -ENXIO;
++		else
++			ret = aux->external_aux->transfer(aux->external_aux, msg);
++		goto exit;
++	}
++
+ 	aux->native = msg->request & (DP_AUX_NATIVE_WRITE & DP_AUX_NATIVE_READ);
+ 
+ 	/* Ignore address only message */
+ 	if (msg->size == 0 || !msg->buffer) {
+ 		msg->reply = aux->native ?
+ 			DP_AUX_NATIVE_REPLY_ACK : DP_AUX_I2C_REPLY_ACK;
+-		return msg->size;
++		ret = msg->size;
++		goto exit;
+ 	}
+ 
+ 	/* msg sanity check */
+@@ -383,14 +405,10 @@ static ssize_t msm_dp_aux_transfer(struct drm_dp_aux *msm_dp_aux,
+ 	    msg->size > aux_cmd_i2c_max) {
+ 		DRM_ERROR("%s: invalid msg: size(%zu), request(%x)\n",
+ 			__func__, msg->size, msg->request);
+-		return -EINVAL;
++		ret = -EINVAL;
++		goto exit;
+ 	}
+ 
+-	ret = pm_runtime_resume_and_get(msm_dp_aux->dev);
+-	if (ret)
+-		return  ret;
+-
+-	mutex_lock(&aux->mutex);
+ 	if (!aux->initted) {
+ 		ret = -EIO;
+ 		goto exit;
+@@ -529,6 +547,9 @@ bool msm_dp_aux_link_plugged(struct drm_dp_aux *msm_dp_aux)
+ 
+ 	aux = container_of(msm_dp_aux, struct msm_dp_aux_private, msm_dp_aux);
+ 
++	if (READ_ONCE(aux->external_aux))
++		return READ_ONCE(aux->external_connected);
++
+ 	if (msm_dp_aux_is_link_connected(msm_dp_aux))
+ 		return true;
+ 
+@@ -549,8 +570,10 @@ void msm_dp_aux_reconfig(struct drm_dp_aux *msm_dp_aux)
+ 
+ 	aux = container_of(msm_dp_aux, struct msm_dp_aux_private, msm_dp_aux);
+ 
+-	phy_calibrate(aux->phy);
+-	msm_dp_aux_reset(aux);
++	if (!READ_ONCE(aux->external_aux)) {
++		phy_calibrate(aux->phy);
++		msm_dp_aux_reset(aux);
++	}
+ }
+ 
+ void msm_dp_aux_init(struct drm_dp_aux *msm_dp_aux)
+@@ -566,7 +589,8 @@ void msm_dp_aux_init(struct drm_dp_aux *msm_dp_aux)
+ 
+ 	mutex_lock(&aux->mutex);
+ 
+-	msm_dp_aux_enable(aux);
++	if (!aux->external_aux)
++		msm_dp_aux_enable(aux);
+ 	aux->retry_cnt = 0;
+ 	aux->initted = true;
+ 
+@@ -582,7 +606,8 @@ void msm_dp_aux_deinit(struct drm_dp_aux *msm_dp_aux)
+ 	mutex_lock(&aux->mutex);
+ 
+ 	aux->initted = false;
+-	msm_dp_aux_disable(aux);
++	if (!aux->external_aux)
++		msm_dp_aux_disable(aux);
+ 
+ 	mutex_unlock(&aux->mutex);
+ }
+@@ -619,6 +644,9 @@ static int msm_dp_wait_hpd_asserted(struct drm_dp_aux *msm_dp_aux,
+ 
+ 	aux = container_of(msm_dp_aux, struct msm_dp_aux_private, msm_dp_aux);
+ 
++	if (READ_ONCE(aux->external_aux))
++		return READ_ONCE(aux->external_connected) ? 0 : -ENXIO;
++
+ 	ret = pm_runtime_resume_and_get(aux->dev);
+ 	if (ret)
+ 		return ret;
+@@ -635,6 +663,9 @@ void msm_dp_aux_hpd_enable(struct drm_dp_aux *msm_dp_aux)
+ 		container_of(msm_dp_aux, struct msm_dp_aux_private, msm_dp_aux);
+ 	u32 reg;
+ 
++	if (READ_ONCE(aux->external_aux))
++		return;
++
+ 	/* Configure REFTIMER and enable it */
+ 	reg = msm_dp_read_aux(aux, REG_DP_DP_HPD_REFTIMER);
+ 	reg |= DP_DP_HPD_REFTIMER_ENABLE;
+@@ -650,6 +681,9 @@ void msm_dp_aux_hpd_disable(struct drm_dp_aux *msm_dp_aux)
+ 		container_of(msm_dp_aux, struct msm_dp_aux_private, msm_dp_aux);
+ 	u32 reg;
+ 
++	if (READ_ONCE(aux->external_aux))
++		return;
++
+ 	reg = msm_dp_read_aux(aux, REG_DP_DP_HPD_REFTIMER);
+ 	reg &= ~DP_DP_HPD_REFTIMER_ENABLE;
+ 	msm_dp_write_aux(aux, REG_DP_DP_HPD_REFTIMER, reg);
+@@ -663,6 +697,9 @@ void msm_dp_aux_hpd_intr_enable(struct drm_dp_aux *msm_dp_aux)
+ 		container_of(msm_dp_aux, struct msm_dp_aux_private, msm_dp_aux);
+ 	u32 reg;
+ 
++	if (READ_ONCE(aux->external_aux))
++		return;
++
+ 	reg = msm_dp_read_aux(aux, REG_DP_DP_HPD_INT_MASK);
+ 	reg |= DP_DP_HPD_INT_MASK;
+ 	msm_dp_write_aux(aux, REG_DP_DP_HPD_INT_MASK,
+@@ -675,6 +712,9 @@ void msm_dp_aux_hpd_intr_disable(struct drm_dp_aux *msm_dp_aux)
+ 		container_of(msm_dp_aux, struct msm_dp_aux_private, msm_dp_aux);
+ 	u32 reg;
+ 
++	if (READ_ONCE(aux->external_aux))
++		return;
++
+ 	reg = msm_dp_read_aux(aux, REG_DP_DP_HPD_INT_MASK);
+ 	reg &= ~DP_DP_HPD_INT_MASK;
+ 	msm_dp_write_aux(aux, REG_DP_DP_HPD_INT_MASK,
+@@ -687,6 +727,9 @@ u32 msm_dp_aux_get_hpd_intr_status(struct drm_dp_aux *msm_dp_aux)
+ 		container_of(msm_dp_aux, struct msm_dp_aux_private, msm_dp_aux);
+ 	int isr, mask;
+ 
++	if (READ_ONCE(aux->external_aux))
++		return 0;
++
+ 	isr = msm_dp_read_aux(aux, REG_DP_DP_HPD_INT_STATUS);
+ 	msm_dp_write_aux(aux, REG_DP_DP_HPD_INT_ACK,
+ 				 (isr & DP_DP_HPD_INT_MASK));
+@@ -708,6 +751,9 @@ u32 msm_dp_aux_is_link_connected(struct drm_dp_aux *msm_dp_aux)
+ 		container_of(msm_dp_aux, struct msm_dp_aux_private, msm_dp_aux);
+ 	u32 status;
+ 
++	if (READ_ONCE(aux->external_aux))
++		return READ_ONCE(aux->external_connected) ? 2 : 0;
++
+ 	status = msm_dp_read_aux(aux, REG_DP_DP_HPD_INT_STATUS);
+ 	status >>= DP_DP_HPD_STATE_STATUS_BITS_SHIFT;
+ 	status &= DP_DP_HPD_STATE_STATUS_BITS_MASK;
+@@ -763,3 +809,113 @@ void msm_dp_aux_put(struct drm_dp_aux *msm_dp_aux)
+ 
+ 	devm_kfree(aux->dev, aux);
+ }
++
++/* Serialized against both AUX transactions and provider teardown. */
++int msm_dp_aux_usb4_set(struct drm_dp_aux *msm_dp_aux,
++		      struct drm_dp_aux *external,
++		      const struct msm_dp_usb4_ops *ops, void *data)
++{
++	struct msm_dp_aux_private *aux =
++		container_of(msm_dp_aux, struct msm_dp_aux_private, msm_dp_aux);
++	int ret = 0;
++
++	mutex_lock(&aux->mutex);
++	if (external && (aux->is_edp || aux->external_aux || aux->enable_xfers)) {
++		ret = -EBUSY;
++	} else {
++		aux->enable_xfers = false;
++		aux->external_connected = false;
++		if (external) {
++			aux->saved_no_zero_sized = msm_dp_aux->no_zero_sized;
++			msm_dp_aux->no_zero_sized = external->no_zero_sized;
++		} else if (aux->external_aux) {
++			msm_dp_aux->no_zero_sized = aux->saved_no_zero_sized;
++		}
++		aux->usb4_ops = ops;
++		aux->usb4_data = data;
++		WRITE_ONCE(aux->external_aux, external);
++	}
++	mutex_unlock(&aux->mutex);
++	return ret;
++}
++
++bool msm_dp_aux_usb4_attached(struct drm_dp_aux *msm_dp_aux)
++{
++	struct msm_dp_aux_private *aux =
++		container_of(msm_dp_aux, struct msm_dp_aux_private, msm_dp_aux);
++
++	return READ_ONCE(aux->external_aux) != NULL;
++}
++
++int msm_dp_aux_usb4_configure_link(struct drm_dp_aux *msm_dp_aux, u32 rate, u32 lanes)
++{
++	struct msm_dp_aux_private *aux =
++		container_of(msm_dp_aux, struct msm_dp_aux_private, msm_dp_aux);
++	int ret = 0;
++
++	mutex_lock(&aux->mutex);
++	if (aux->external_aux && aux->usb4_ops && aux->usb4_ops->configure_link)
++		ret = aux->usb4_ops->configure_link(aux->usb4_data, rate, lanes);
++	mutex_unlock(&aux->mutex);
++	return ret;
++}
++
++int msm_dp_aux_usb4_train_link(struct drm_dp_aux *msm_dp_aux, u32 rate, u32 lanes)
++{
++	struct msm_dp_aux_private *aux =
++		container_of(msm_dp_aux, struct msm_dp_aux_private, msm_dp_aux);
++	int ret = -ENODEV;
++
++	mutex_lock(&aux->mutex);
++	if (aux->external_aux && aux->usb4_ops && aux->usb4_ops->train_link)
++		ret = aux->usb4_ops->train_link(aux->usb4_data, rate, lanes);
++	mutex_unlock(&aux->mutex);
++	return ret;
++}
++
++bool msm_dp_aux_usb4_fec_supported(struct drm_dp_aux *msm_dp_aux)
++{
++	struct msm_dp_aux_private *aux =
++		container_of(msm_dp_aux, struct msm_dp_aux_private, msm_dp_aux);
++	bool supported;
++
++	mutex_lock(&aux->mutex);
++	supported = aux->external_aux && aux->usb4_ops &&
++		    aux->usb4_ops->set_fec_ready;
++	mutex_unlock(&aux->mutex);
++	return supported;
++}
++
++int msm_dp_aux_usb4_set_fec_ready(struct drm_dp_aux *msm_dp_aux, bool ready)
++{
++	struct msm_dp_aux_private *aux =
++		container_of(msm_dp_aux, struct msm_dp_aux_private, msm_dp_aux);
++	int ret = -EOPNOTSUPP;
++
++	mutex_lock(&aux->mutex);
++	if (aux->external_aux && aux->usb4_ops && aux->usb4_ops->set_fec_ready)
++		ret = aux->usb4_ops->set_fec_ready(aux->usb4_data, ready);
++	mutex_unlock(&aux->mutex);
++	return ret;
++}
++
++void msm_dp_aux_usb4_unconfigure_link(struct drm_dp_aux *msm_dp_aux)
++{
++	struct msm_dp_aux_private *aux =
++		container_of(msm_dp_aux, struct msm_dp_aux_private, msm_dp_aux);
++
++	mutex_lock(&aux->mutex);
++	if (aux->external_aux && aux->usb4_ops && aux->usb4_ops->unconfigure_link)
++		aux->usb4_ops->unconfigure_link(aux->usb4_data);
++	mutex_unlock(&aux->mutex);
++}
++
++void msm_dp_aux_usb4_set_hpd(struct drm_dp_aux *msm_dp_aux, bool connected)
++{
++	struct msm_dp_aux_private *aux =
++		container_of(msm_dp_aux, struct msm_dp_aux_private, msm_dp_aux);
++
++	mutex_lock(&aux->mutex);
++	aux->external_connected = connected;
++	mutex_unlock(&aux->mutex);
++}
+diff --git a/drivers/gpu/drm/msm/dp/dp_aux.h b/drivers/gpu/drm/msm/dp/dp_aux.h
+index 98625c9b9a0..a1ee7cca536 100644
+--- a/drivers/gpu/drm/msm/dp/dp_aux.h
++++ b/drivers/gpu/drm/msm/dp/dp_aux.h
+@@ -24,6 +24,17 @@ u32 msm_dp_aux_get_hpd_intr_status(struct drm_dp_aux *msm_dp_aux);
+ u32 msm_dp_aux_is_link_connected(struct drm_dp_aux *msm_dp_aux);
+ bool msm_dp_aux_link_plugged(struct drm_dp_aux *msm_dp_aux);
+ 
++struct msm_dp_usb4_ops;
++int msm_dp_aux_usb4_set(struct drm_dp_aux *aux, struct drm_dp_aux *external,
++		      const struct msm_dp_usb4_ops *ops, void *data);
++bool msm_dp_aux_usb4_attached(struct drm_dp_aux *aux);
++void msm_dp_aux_usb4_set_hpd(struct drm_dp_aux *aux, bool connected);
++int msm_dp_aux_usb4_configure_link(struct drm_dp_aux *aux, u32 rate, u32 lanes);
++int msm_dp_aux_usb4_train_link(struct drm_dp_aux *aux, u32 rate, u32 lanes);
++bool msm_dp_aux_usb4_fec_supported(struct drm_dp_aux *aux);
++int msm_dp_aux_usb4_set_fec_ready(struct drm_dp_aux *aux, bool ready);
++void msm_dp_aux_usb4_unconfigure_link(struct drm_dp_aux *aux);
++
+ struct phy;
+ struct drm_dp_aux *msm_dp_aux_get(struct device *dev,
+ 			      struct phy *phy,
+diff --git a/drivers/gpu/drm/msm/dp/dp_ctrl.c b/drivers/gpu/drm/msm/dp/dp_ctrl.c
+index 1797138c0f7..a2f29975a18 100644
+--- a/drivers/gpu/drm/msm/dp/dp_ctrl.c
++++ b/drivers/gpu/drm/msm/dp/dp_ctrl.c
+@@ -14,6 +14,7 @@
+ #include <linux/phy/phy-dp.h>
+ #include <linux/pm_opp.h>
+ #include <linux/rational.h>
++#include <linux/spinlock.h>
+ #include <linux/string_choices.h>
+ 
+ #include <drm/display/drm_dp_helper.h>
+@@ -28,6 +29,23 @@
+ #define POLLING_SLEEP_US			1000
+ #define POLLING_TIMEOUT_US			10000
+ 
++/* Glymur: link clock source, 0 for a USB4 tunnel, 1 for the native PHY. */
++#define REG_DP_USB4_CLK_SEL		0x0f8
++#define DP_USB4_CLK_SEL_NATIVE		BIT(0)
++
++/* Glymur: cleared before USB4 training, set once the router clock is in sync. */
++#define REG_DP_USB4_POST_TRAIN		0x072c
++#define DP_USB4_POST_TRAIN_ENABLE	BIT(0)
++
++/* Glymur: second SST transfer unit bank, used by the USB4 producer. */
++#define REG_DP_TU_BANK2			0x07e0
++#define REG_DP_VALID_BOUNDARY_BANK2	0x07e4
++#define REG_DP_VALID_BOUNDARY_2_BANK2	0x07e8
++
++/* Glymur: FEC symbol sequence of the USB4 producer, eight registers. */
++#define REG_DP_USB4_FEC_SEQ(n)		(0x073c + 4 * (n))
++#define DP_CONFIGURATION_CTRL_USB4_FEC	BIT(16)
++
+ #define DP_KHZ_TO_HZ 1000
+ #define IDLE_PATTERN_COMPLETION_TIMEOUT_JIFFIES	(30 * HZ / 1000) /* 30 ms */
+ #define PSR_OPERATION_COMPLETION_TIMEOUT_JIFFIES       (300 * HZ / 1000) /* 300 ms */
+@@ -68,6 +86,14 @@
+ #define DP_CTRL_INTR_READY_FOR_VIDEO     BIT(0)
+ #define DP_CTRL_INTR_IDLE_PATTERN_SENT  BIT(3)
+ 
++/* Main link mode bits the USB4 producer needs set. */
++#define DP_USB4_MAINLINK_MODE_MASK (BIT(3) | BIT(4) | BIT(5) | BIT(30))
++
++static const u32 msm_dp_usb4_fec_seq[] = {
++	0x0100fefd, 0x55555555, 0x55555555, 0x55555555,
++	0xffffff55, 0xffffffff, 0xffffffff, 0x009cffff,
++};
++
+ #define MR_LINK_TRAINING1  0x8
+ #define MR_LINK_SYMBOL_ERM 0x80
+ #define MR_LINK_PRBS7 0x100
+@@ -127,9 +153,27 @@ struct msm_dp_ctrl_private {
+ 	struct clk_bulk_data *link_clks;
+ 
+ 	struct clk *pixel_clk;
++	/* USB4 DisplayPort tunneling: link clock branch feeding the router's DP IN adapter. */
++	struct clk *dpin_clk;
++	struct clk *usb4_link_clk;
++	bool usb4_link_clk_on;
++	bool dpin_clk_on;
++	bool usb4_clk_sel_saved;
++	u32 usb4_clk_sel_native;
++	bool usb4_reset_held;
++	bool usb4_mainlink_saved;
++	u32 usb4_mainlink_original;
++	u32 usb4_scrambler_reset_original;
++	bool usb4_post_train_saved;
++	u32 usb4_post_train_original;
++	bool usb4_tu_bank2_saved;
++	u32 usb4_tu_bank2_original;
++	u32 usb4_boundary_bank2_original;
++	u32 usb4_boundary2_bank2_original;
+ 
+ 	union phy_configure_opts phy_opts;
+ 
++	spinlock_t link_irq_lock;
+ 	struct completion idle_comp;
+ 	struct completion psr_op_comp;
+ 	struct completion video_comp;
+@@ -255,16 +299,32 @@ static u32 msm_dp_ctrl_get_aux_interrupt(struct msm_dp_ctrl_private *ctrl)
+ 
+ }
+ 
++/* Serialize the ISR acknowledgment with link-clock interrupt ownership. */
++static void msm_dp_ctrl_link_irq_mask(struct msm_dp_ctrl_private *ctrl,
++				     u32 mask, bool clear)
++{
++	unsigned long flags;
++
++	spin_lock_irqsave(&ctrl->link_irq_lock, flags);
++	msm_dp_write_ahb(ctrl, REG_DP_INTR_STATUS2,
++			 mask | (clear ? DP_INTERRUPT_STATUS2_ACK : 0));
++	spin_unlock_irqrestore(&ctrl->link_irq_lock, flags);
++}
++
+ static u32 msm_dp_ctrl_get_interrupt(struct msm_dp_ctrl_private *ctrl)
+ {
+-	u32 intr, intr_ack;
++	unsigned long flags;
++	u32 intr, intr_ack, mask;
+ 
++	spin_lock_irqsave(&ctrl->link_irq_lock, flags);
+ 	intr = msm_dp_read_ahb(ctrl, REG_DP_INTR_STATUS2);
++	mask = intr & DP_INTERRUPT_STATUS2_MASK;
+ 	intr &= ~DP_INTERRUPT_STATUS2_MASK;
+ 	intr_ack = (intr & DP_INTERRUPT_STATUS2)
+ 			<< DP_INTERRUPT_STATUS_ACK_SHIFT;
+-	msm_dp_write_ahb(ctrl, REG_DP_INTR_STATUS2,
+-		     intr_ack | DP_INTERRUPT_STATUS2_MASK);
++	/* An in-flight ISR must not re-enable a clock-stopped link. */
++	msm_dp_write_ahb(ctrl, REG_DP_INTR_STATUS2, intr_ack | mask);
++	spin_unlock_irqrestore(&ctrl->link_irq_lock, flags);
+ 
+ 	return intr;
+ }
+@@ -276,8 +336,9 @@ void msm_dp_ctrl_enable_irq(struct msm_dp_ctrl *msm_dp_ctrl)
+ 
+ 	msm_dp_write_ahb(ctrl, REG_DP_INTR_STATUS,
+ 			DP_INTERRUPT_STATUS1_MASK);
+-	msm_dp_write_ahb(ctrl, REG_DP_INTR_STATUS2,
+-			DP_INTERRUPT_STATUS2_MASK);
++	msm_dp_ctrl_link_irq_mask(ctrl,
++		msm_dp_aux_usb4_attached(ctrl->aux) && !ctrl->link_clks_on ?
++		0 : DP_INTERRUPT_STATUS2_MASK, false);
+ }
+ 
+ void msm_dp_ctrl_disable_irq(struct msm_dp_ctrl *msm_dp_ctrl)
+@@ -286,7 +347,7 @@ void msm_dp_ctrl_disable_irq(struct msm_dp_ctrl *msm_dp_ctrl)
+ 		container_of(msm_dp_ctrl, struct msm_dp_ctrl_private, msm_dp_ctrl);
+ 
+ 	msm_dp_write_ahb(ctrl, REG_DP_INTR_STATUS, 0x00);
+-	msm_dp_write_ahb(ctrl, REG_DP_INTR_STATUS2, 0x00);
++	msm_dp_ctrl_link_irq_mask(ctrl, 0, false);
+ }
+ 
+ static u32 msm_dp_ctrl_get_psr_interrupt(struct msm_dp_ctrl_private *ctrl)
+@@ -389,12 +450,32 @@ static bool msm_dp_ctrl_mainlink_ready(struct msm_dp_ctrl_private *ctrl)
+ 	return true;
+ }
+ 
++/* USB4 reports idle in MAINLINK_READY; it does not raise the native IRQ. */
++#define DP_MAINLINK_READY_FOR_IDLE BIT(1)
++
+ void msm_dp_ctrl_push_idle(struct msm_dp_ctrl *msm_dp_ctrl)
+ {
+ 	struct msm_dp_ctrl_private *ctrl;
+ 
+ 	ctrl = container_of(msm_dp_ctrl, struct msm_dp_ctrl_private, msm_dp_ctrl);
+ 
++	if (msm_dp_aux_usb4_attached(ctrl->aux)) {
++		u32 ready;
++		int ret;
++
++		/* The tunneled producer requires a fresh state request. */
++		msm_dp_write_link(ctrl, REG_DP_STATE_CTRL, 0);
++		msm_dp_write_link(ctrl, REG_DP_STATE_CTRL, DP_STATE_CTRL_PUSH_IDLE);
++		ret = readl_poll_timeout(ctrl->link_base + REG_DP_MAINLINK_READY,
++				ready, ready & DP_MAINLINK_READY_FOR_IDLE,
++				100, 30000);
++		if (ret)
++			dev_warn(ctrl->dev, "USB4 idle status timed out: ready=%#x\n", ready);
++		else
++			dev_dbg(ctrl->dev, "USB4 idle status confirmed: ready=%#x\n", ready);
++		return;
++	}
++
+ 	reinit_completion(&ctrl->idle_comp);
+ 	msm_dp_write_link(ctrl, REG_DP_STATE_CTRL, DP_STATE_CTRL_PUSH_IDLE);
+ 
+@@ -473,10 +554,25 @@ static void msm_dp_ctrl_config_ctrl_link(struct msm_dp_ctrl_private *ctrl,
+ static void msm_dp_ctrl_fec_config(struct msm_dp_ctrl_private *ctrl, bool enable)
+ {
+ 	u32 mainlink_ctrl;
++	int i;
+ 
+ 	mainlink_ctrl = msm_dp_read_link(ctrl, REG_DP_MAINLINK_CTRL);
+ 
+-	if (enable)
++	if (enable && msm_dp_aux_usb4_attached(ctrl->aux)) {
++		/*
++		 * The tunnelled producer takes its FEC symbol sequence from
++		 * registers. Preserve the stream's other main link and
++		 * configuration fields.
++		 */
++		for (i = 0; i < ARRAY_SIZE(msm_dp_usb4_fec_seq); i++)
++			msm_dp_write_link(ctrl, REG_DP_USB4_FEC_SEQ(i),
++					  msm_dp_usb4_fec_seq[i]);
++		msm_dp_write_link(ctrl, REG_DP_CONFIGURATION_CTRL,
++			msm_dp_read_link(ctrl, REG_DP_CONFIGURATION_CTRL) |
++			DP_CONFIGURATION_CTRL_USB4_FEC);
++		mainlink_ctrl &= ~DP_MAINLINK_CTRL_FEC_SEQ_MODE;
++		mainlink_ctrl |= DP_MAINLINK_CTRL_FEC_EN;
++	} else if (enable)
+ 		mainlink_ctrl |= DP_MAINLINK_CTRL_FEC_EN |
+ 				 DP_MAINLINK_CTRL_FEC_SEQ_MODE |
+ 				 DP_MAINLINK_FLUSH_MODE_SDE_PERIPH_UPDATE |
+@@ -1385,6 +1481,42 @@ static void msm_dp_ctrl_calc_tu_parameters(struct msm_dp_ctrl_private *ctrl,
+ 	_dp_ctrl_calc_tu(ctrl, &in, tu_table);
+ }
+ 
++/* The USB4 producer reads the second TU bank: give it the same values. */
++static void msm_dp_ctrl_usb4_tu_bank2(struct msm_dp_ctrl_private *ctrl,
++				   u32 tu, u32 boundary, u32 boundary2)
++{
++	if (!msm_dp_aux_usb4_attached(ctrl->aux))
++		return;
++
++	if (!ctrl->usb4_tu_bank2_saved) {
++		ctrl->usb4_tu_bank2_original =
++			msm_dp_read_link(ctrl, REG_DP_TU_BANK2);
++		ctrl->usb4_boundary_bank2_original =
++			msm_dp_read_link(ctrl, REG_DP_VALID_BOUNDARY_BANK2);
++		ctrl->usb4_boundary2_bank2_original =
++			msm_dp_read_link(ctrl, REG_DP_VALID_BOUNDARY_2_BANK2);
++		ctrl->usb4_tu_bank2_saved = true;
++	}
++	msm_dp_write_link(ctrl, REG_DP_VALID_BOUNDARY_BANK2, boundary);
++	msm_dp_write_link(ctrl, REG_DP_VALID_BOUNDARY_2_BANK2, boundary2);
++	msm_dp_write_link(ctrl, REG_DP_TU_BANK2, tu);
++}
++
++static void msm_dp_ctrl_usb4_tu_bank2_restore(struct msm_dp_ctrl_private *ctrl)
++{
++	if (!ctrl->usb4_tu_bank2_saved)
++		return;
++
++	/* Caller has disabled the main link, but still owns the link clocks. */
++	msm_dp_write_link(ctrl, REG_DP_VALID_BOUNDARY_BANK2,
++			  ctrl->usb4_boundary_bank2_original);
++	msm_dp_write_link(ctrl, REG_DP_VALID_BOUNDARY_2_BANK2,
++			  ctrl->usb4_boundary2_bank2_original);
++	msm_dp_write_link(ctrl, REG_DP_TU_BANK2,
++			  ctrl->usb4_tu_bank2_original);
++	ctrl->usb4_tu_bank2_saved = false;
++}
++
+ static void msm_dp_ctrl_setup_tr_unit(struct msm_dp_ctrl_private *ctrl,
+ 				      struct msm_dp_panel *panel)
+ {
+@@ -1412,12 +1544,24 @@ static void msm_dp_ctrl_setup_tr_unit(struct msm_dp_ctrl_private *ctrl,
+ 	msm_dp_write_link(ctrl, REG_DP_VALID_BOUNDARY, valid_boundary);
+ 	msm_dp_write_link(ctrl, REG_DP_TU, msm_dp_tu);
+ 	msm_dp_write_link(ctrl, REG_DP_VALID_BOUNDARY_2, valid_boundary2);
++	msm_dp_ctrl_usb4_tu_bank2(ctrl, msm_dp_tu, valid_boundary, valid_boundary2);
+ }
+ 
+ static int msm_dp_ctrl_wait4video_ready(struct msm_dp_ctrl_private *ctrl)
+ {
+ 	int ret = 0;
+ 
++	if (msm_dp_aux_usb4_attached(ctrl->aux)) {
++		u32 ready;
++
++		/* The USB4 producer reports readiness only in MAINLINK_READY. */
++		ret = readl_poll_timeout(ctrl->link_base + REG_DP_MAINLINK_READY,
++				ready, ready & DP_MAINLINK_READY_FOR_VIDEO, 100, 21000);
++		dev_dbg(ctrl->dev, "USB4 video readiness polled: ret %d ready %#x\n",
++			ret, ready);
++		return ret;
++	}
++
+ 	if (!wait_for_completion_timeout(&ctrl->video_comp,
+ 				WAIT_FOR_VIDEO_READY_TIMEOUT_JIFFIES)) {
+ 		DRM_ERROR("wait4video timedout\n");
+@@ -1648,6 +1792,10 @@ static void msm_dp_ctrl_clear_training_pattern(struct msm_dp_ctrl_private *ctrl,
+ {
+ 	int delay_us;
+ 
++	/* The tunneled receiver is trained by DP OUT, not native AUX writes. */
++	if (msm_dp_aux_usb4_attached(ctrl->aux))
++		return;
++
+ 	msm_dp_ctrl_train_pattern_set(ctrl, DP_TRAINING_PATTERN_DISABLE, dp_phy);
+ 
+ 	delay_us = drm_dp_read_channel_eq_delay(ctrl->aux,
+@@ -1735,6 +1883,96 @@ static int msm_dp_ctrl_link_train_1_2(struct msm_dp_ctrl_private *ctrl,
+ 	return 0;
+ }
+ 
++/* Hold the producer in reset while the USB4 receiver trains and synchronizes. */
++static void msm_dp_ctrl_usb4_reset(struct msm_dp_ctrl_private *ctrl, bool hold)
++{
++	u32 value;
++
++	if (ctrl->usb4_reset_held == hold)
++		return;
++
++	value = msm_dp_read_ahb(ctrl, REG_DP_SW_RESET);
++	if (hold)
++		value |= DP_SW_RESET;
++	else
++		value &= ~DP_SW_RESET;
++	msm_dp_write_ahb(ctrl, REG_DP_SW_RESET, value);
++	ctrl->usb4_reset_held = hold;
++	if (!hold)
++		usleep_range(10000, 11000);
++}
++
++/* Configure only while mainlink is disabled and the producer reset is held. */
++static void msm_dp_ctrl_usb4_mainlink_config(struct msm_dp_ctrl_private *ctrl)
++{
++	u32 value = msm_dp_read_link(ctrl, REG_DP_MAINLINK_CTRL);
++
++	if (!ctrl->usb4_mainlink_saved) {
++		ctrl->usb4_mainlink_original = value & DP_USB4_MAINLINK_MODE_MASK;
++		ctrl->usb4_scrambler_reset_original = msm_dp_read_link(ctrl,
++				REG_DP_HBR2_COMPLIANCE_SCRAMBLER_RESET);
++		ctrl->usb4_mainlink_saved = true;
++	}
++	value |= DP_USB4_MAINLINK_MODE_MASK;
++	msm_dp_write_link(ctrl, REG_DP_MAINLINK_CTRL, value);
++	/* Normal producer operation, not an HBR2 compliance pattern. */
++	msm_dp_write_link(ctrl, REG_DP_HBR2_COMPLIANCE_SCRAMBLER_RESET, 0);
++}
++
++static void msm_dp_ctrl_usb4_mainlink_restore(struct msm_dp_ctrl_private *ctrl)
++{
++	u32 value;
++
++	if (!ctrl->usb4_mainlink_saved)
++		return;
++
++	/* The caller still owns link clocks; do not change mode on an active link. */
++	msm_dp_ctrl_mainlink_disable(ctrl);
++	value = msm_dp_read_link(ctrl, REG_DP_MAINLINK_CTRL);
++	value &= ~DP_USB4_MAINLINK_MODE_MASK;
++	value |= ctrl->usb4_mainlink_original;
++	msm_dp_write_link(ctrl, REG_DP_MAINLINK_CTRL, value);
++	msm_dp_write_link(ctrl, REG_DP_HBR2_COMPLIANCE_SCRAMBLER_RESET,
++			  ctrl->usb4_scrambler_reset_original);
++	ctrl->usb4_mainlink_saved = false;
++}
++
++static void msm_dp_ctrl_usb4_mainlink_start(struct msm_dp_ctrl_private *ctrl)
++{
++	u32 value = msm_dp_read_link(ctrl, REG_DP_MAINLINK_CTRL);
++
++	/* Do not pulse main-link reset after the router synchronized its clock. */
++	value |= DP_MAINLINK_CTRL_ENABLE | DP_MAINLINK_FB_BOUNDARY_SEL;
++	msm_dp_write_link(ctrl, REG_DP_MAINLINK_CTRL, value);
++}
++
++static void msm_dp_ctrl_usb4_post_train(struct msm_dp_ctrl_private *ctrl, bool on)
++{
++	u32 value = msm_dp_read_link(ctrl, REG_DP_USB4_POST_TRAIN);
++
++	if (!ctrl->usb4_post_train_saved) {
++		ctrl->usb4_post_train_original = value & DP_USB4_POST_TRAIN_ENABLE;
++		ctrl->usb4_post_train_saved = true;
++	}
++	value &= ~DP_USB4_POST_TRAIN_ENABLE;
++	if (on)
++		value |= DP_USB4_POST_TRAIN_ENABLE;
++	msm_dp_write_link(ctrl, REG_DP_USB4_POST_TRAIN, value);
++}
++
++static void msm_dp_ctrl_usb4_post_train_restore(struct msm_dp_ctrl_private *ctrl)
++{
++	u32 value;
++
++	if (!ctrl->usb4_post_train_saved)
++		return;
++	value = msm_dp_read_link(ctrl, REG_DP_USB4_POST_TRAIN);
++	value &= ~DP_USB4_POST_TRAIN_ENABLE;
++	value |= ctrl->usb4_post_train_original;
++	msm_dp_write_link(ctrl, REG_DP_USB4_POST_TRAIN, value);
++	ctrl->usb4_post_train_saved = false;
++}
++
+ static int msm_dp_ctrl_link_train(struct msm_dp_ctrl_private *ctrl,
+ 			struct msm_dp_panel *panel,
+ 			int *training_step)
+@@ -1749,6 +1987,40 @@ static int msm_dp_ctrl_link_train(struct msm_dp_ctrl_private *ctrl,
+ 	msm_dp_ctrl_config_ctrl_link(ctrl, panel);
+ 	msm_dp_ctrl_config_ctrl_streams(ctrl, panel);
+ 
++	if (msm_dp_aux_usb4_attached(ctrl->aux)) {
++		/* The tunnelled producer needs a fresh state request. */
++		msm_dp_write_link(ctrl, REG_DP_STATE_CTRL, 0);
++		msm_dp_ctrl_usb4_mainlink_config(ctrl);
++		msm_dp_ctrl_usb4_post_train(ctrl, false);
++
++		/*
++		 * The router trains the tunnel itself, so the native FEC setup
++		 * below does not run. FEC readiness goes through the router;
++		 * without its callback, uncompressed streams go ahead without
++		 * FEC and compressed streams fail here, before training.
++		 */
++		if (panel->msm_dp_mode.dsc_en ||
++		    (panel->fec_capable && msm_dp_aux_usb4_fec_supported(ctrl->aux))) {
++			msm_dp_ctrl_fec_config(ctrl, false);
++			ret = msm_dp_aux_usb4_set_fec_ready(ctrl->aux,
++							    panel->msm_dp_mode.dsc_en);
++			if (ret) {
++				msm_dp_ctrl_usb4_reset(ctrl, false);
++				return ret;
++			}
++		}
++
++		ret = msm_dp_aux_usb4_train_link(ctrl->aux,
++				ctrl->link->link_params.rate,
++				ctrl->link->link_params.num_lanes);
++		msm_dp_ctrl_usb4_reset(ctrl, false);
++		if (!ret) {
++			msm_dp_ctrl_usb4_post_train(ctrl, true);
++			msm_dp_ctrl_usb4_mainlink_start(ctrl);
++		}
++		return ret;
++	}
++
+ 	link_info.num_lanes = ctrl->link->link_params.num_lanes;
+ 	link_info.rate = ctrl->link->link_params.rate;
+ 	link_info.rate_set = ctrl->link->link_params.rate_set;
+@@ -1818,6 +2090,12 @@ static int msm_dp_ctrl_setup_main_link(struct msm_dp_ctrl_private *ctrl,
+ {
+ 	int ret = 0;
+ 
++	if (msm_dp_aux_usb4_attached(ctrl->aux)) {
++		msm_dp_ctrl_mainlink_disable(ctrl);
++		msm_dp_ctrl_usb4_reset(ctrl, true);
++		return msm_dp_ctrl_link_train(ctrl, panel, training_step);
++	}
++
+ 	msm_dp_ctrl_mainlink_enable(ctrl);
+ 
+ 	if (ctrl->link->sink_request & DP_TEST_LINK_PHY_TEST_PATTERN)
+@@ -1878,6 +2156,59 @@ void msm_dp_ctrl_core_clk_disable(struct msm_dp_ctrl *msm_dp_ctrl)
+ 		   str_on_off(ctrl->core_clks_on));
+ }
+ 
++static void msm_dp_ctrl_usb4_clk_sel_restore(struct msm_dp_ctrl_private *ctrl)
++{
++	u32 value;
++
++	if (!ctrl->usb4_clk_sel_saved)
++		return;
++
++	value = msm_dp_read_ahb(ctrl, REG_DP_USB4_CLK_SEL);
++	value = (value & ~DP_USB4_CLK_SEL_NATIVE) | ctrl->usb4_clk_sel_native;
++	msm_dp_write_ahb(ctrl, REG_DP_USB4_CLK_SEL, value);
++	ctrl->usb4_clk_sel_saved = false;
++}
++
++static int msm_dp_ctrl_usb4_dpin_set_rate(struct msm_dp_ctrl_private *ctrl)
++{
++	unsigned long link_rate = (unsigned long)ctrl->link->link_params.rate * 1000;
++	unsigned long dpin_rate;
++	unsigned int div;
++	int ret;
++
++	/* DP-IN consumes wider symbols at HBR2/HBR3. Keep the PHY rate intact. */
++	switch (ctrl->link->link_params.rate) {
++	case 162000:
++	case 270000:
++		div = 1;
++		break;
++	case 540000:
++		div = 2;
++		break;
++	case 810000:
++		div = 4;
++		break;
++	default:
++		return -EINVAL;
++	}
++
++	dpin_rate = link_rate / div;
++	if (clk_get_rate(ctrl->link_clks[0].clk) != link_rate)
++		return -EINVAL;
++
++	ret = clk_set_rate(ctrl->dpin_clk, dpin_rate);
++	if (ret)
++		return ret;
++
++	if (clk_get_rate(ctrl->dpin_clk) != dpin_rate ||
++	    clk_get_rate(ctrl->link_clks[0].clk) != link_rate)
++		return -ERANGE;
++
++	dev_dbg(ctrl->dev, "USB4 DP-IN clock %lu Hz, link %lu Hz, divisor %u\n",
++		dpin_rate, link_rate, div);
++	return 0;
++}
++
+ static int msm_dp_ctrl_link_clk_enable(struct msm_dp_ctrl *msm_dp_ctrl)
+ {
+ 	struct msm_dp_ctrl_private *ctrl;
+@@ -1898,12 +2229,48 @@ static int msm_dp_ctrl_link_clk_enable(struct msm_dp_ctrl *msm_dp_ctrl)
+ 			return ret;
+ 	}
+ 
++	if (msm_dp_aux_usb4_attached(ctrl->aux)) {
++		u32 value;
++
++		msm_dp_ctrl_link_irq_mask(ctrl, 0, false);
++		value = msm_dp_read_ahb(ctrl, REG_DP_USB4_CLK_SEL);
++
++		ctrl->usb4_clk_sel_native = value & DP_USB4_CLK_SEL_NATIVE;
++		ctrl->usb4_clk_sel_saved = true;
++		msm_dp_write_ahb(ctrl, REG_DP_USB4_CLK_SEL,
++				 value & ~DP_USB4_CLK_SEL_NATIVE);
++	}
++
+ 	ret = clk_bulk_prepare_enable(ctrl->num_link_clks, ctrl->link_clks);
+ 	if (ret)
+-		return ret;
++		goto err_sel;
++
++	if (msm_dp_aux_usb4_attached(ctrl->aux)) {
++		if (!ctrl->dpin_clk || !ctrl->usb4_link_clk) {
++			ret = -ENODEV;
++			goto err_link;
++		}
++		ret = msm_dp_ctrl_usb4_dpin_set_rate(ctrl);
++		if (ret)
++			goto err_link;
++		ret = clk_prepare_enable(ctrl->usb4_link_clk);
++		if (ret)
++			goto err_link;
++		ctrl->usb4_link_clk_on = true;
++		ret = clk_prepare_enable(ctrl->dpin_clk);
++		if (ret)
++			goto err_usb4_link;
++		ctrl->dpin_clk_on = true;
++	}
+ 
+ 	ctrl->link_clks_on = true;
+ 
++	/*
++	 * Drain stale link status only while its clocks are running. Also
++	 * restore native IRQs when returning from a USB4 attachment.
++	 */
++	msm_dp_ctrl_link_irq_mask(ctrl, DP_INTERRUPT_STATUS2_MASK, true);
++
+ 	drm_dbg_dp(ctrl->drm_dev, "enable link clocks\n");
+ 	drm_dbg_dp(ctrl->drm_dev, "stream_clks:%s link_clks:%s core_clks:%s\n",
+ 		   str_on_off(ctrl->stream_clks_on),
+@@ -1911,6 +2278,15 @@ static int msm_dp_ctrl_link_clk_enable(struct msm_dp_ctrl *msm_dp_ctrl)
+ 		   str_on_off(ctrl->core_clks_on));
+ 
+ 	return 0;
++
++err_usb4_link:
++	clk_disable_unprepare(ctrl->usb4_link_clk);
++	ctrl->usb4_link_clk_on = false;
++err_link:
++	clk_bulk_disable_unprepare(ctrl->num_link_clks, ctrl->link_clks);
++err_sel:
++	msm_dp_ctrl_usb4_clk_sel_restore(ctrl);
++	return ret;
+ }
+ 
+ static void msm_dp_ctrl_link_clk_disable(struct msm_dp_ctrl *msm_dp_ctrl)
+@@ -1919,8 +2295,32 @@ static void msm_dp_ctrl_link_clk_disable(struct msm_dp_ctrl *msm_dp_ctrl)
+ 
+ 	ctrl = container_of(msm_dp_ctrl, struct msm_dp_ctrl_private, msm_dp_ctrl);
+ 
++	/*
++	 * Restoring native framing can latch video/idle status. Mask it before
++	 * stopping link clocks, while the ISR can still acknowledge it.
++	 */
++	if (msm_dp_aux_usb4_attached(ctrl->aux))
++		msm_dp_ctrl_link_irq_mask(ctrl, 0, false);
++
++	msm_dp_ctrl_usb4_reset(ctrl, false);
++	msm_dp_ctrl_usb4_mainlink_restore(ctrl);
++	msm_dp_ctrl_usb4_tu_bank2_restore(ctrl);
++	msm_dp_ctrl_usb4_post_train_restore(ctrl);
++
++	if (ctrl->dpin_clk_on) {
++		msm_dp_aux_usb4_unconfigure_link(ctrl->aux);
++		clk_disable_unprepare(ctrl->dpin_clk);
++		ctrl->dpin_clk_on = false;
++	}
++
++	if (ctrl->usb4_link_clk_on) {
++		clk_disable_unprepare(ctrl->usb4_link_clk);
++		ctrl->usb4_link_clk_on = false;
++	}
++
+ 	clk_bulk_disable_unprepare(ctrl->num_link_clks, ctrl->link_clks);
+ 
++	msm_dp_ctrl_usb4_clk_sel_restore(ctrl);
+ 	ctrl->link_clks_on = false;
+ 
+ 	drm_dbg_dp(ctrl->drm_dev, "disabled link clocks\n");
+@@ -1960,6 +2360,18 @@ static int msm_dp_ctrl_enable_mainlink_clocks(struct msm_dp_ctrl_private *ctrl,
+ 		goto err_phy;
+ 	}
+ 
++	if (msm_dp_aux_usb4_attached(ctrl->aux)) {
++		msm_dp_ctrl_mainlink_disable(ctrl);
++		msm_dp_ctrl_usb4_reset(ctrl, true);
++		ret = msm_dp_aux_usb4_configure_link(ctrl->aux,
++				ctrl->link->link_params.rate,
++				ctrl->link->link_params.num_lanes);
++		if (ret) {
++			msm_dp_ctrl_link_clk_disable(&ctrl->msm_dp_ctrl);
++			goto err_phy;
++		}
++	}
++
+ 	drm_dbg_dp(ctrl->drm_dev, "link rate=%d\n", ctrl->link->link_params.rate);
+ 	return 0;
+ 
+@@ -2538,6 +2950,9 @@ int msm_dp_ctrl_on_link(struct msm_dp_ctrl *msm_dp_ctrl,
+ 		if (rc == 0) {
+ 			/* training completed successfully */
+ 			break;
++		} else if (msm_dp_aux_usb4_attached(ctrl->aux)) {
++			/* Native voltage/rate retries do not own the tunneled receiver. */
++			break;
+ 		} else if (training_step == DP_TRAINING_1) {
+ 			/* link train_1 failed */
+ 			if (!msm_dp_aux_link_plugged(ctrl->aux))
+@@ -2789,6 +3204,9 @@ int msm_dp_ctrl_on_stream(struct msm_dp_ctrl *msm_dp_ctrl, struct msm_dp_panel *
+ 
+ 	msm_dp_ctrl_setup_tr_unit(ctrl, panel);
+ 
++	/* The tunnelled producer needs a fresh state request. */
++	if (msm_dp_aux_usb4_attached(ctrl->aux))
++		msm_dp_write_link(ctrl, REG_DP_STATE_CTRL, 0);
+ 	msm_dp_write_link(ctrl, REG_DP_STATE_CTRL, DP_STATE_CTRL_SEND_VIDEO);
+ 
+ 	ret = msm_dp_ctrl_wait4video_ready(ctrl);
+@@ -2960,6 +3378,16 @@ static int msm_dp_ctrl_clk_init(struct msm_dp_ctrl *msm_dp_ctrl)
+ 	if (rc)
+ 		return rc;
+ 
++	ctrl->dpin_clk = devm_clk_get_optional(dev, "ctrl_link_dpin");
++	if (IS_ERR(ctrl->dpin_clk))
++		return dev_err_probe(dev, PTR_ERR(ctrl->dpin_clk),
++				     "failed to get ctrl_link_dpin clock\n");
++
++	ctrl->usb4_link_clk = devm_clk_get_optional(dev, "ctrl_usb4_link_iface");
++	if (IS_ERR(ctrl->usb4_link_clk))
++		return dev_err_probe(dev, PTR_ERR(ctrl->usb4_link_clk),
++				     "failed to get ctrl_usb4_link_iface clock\n");
++
+ 	ctrl->pixel_clk = devm_clk_get(dev, "stream_pixel");
+ 	if (IS_ERR(ctrl->pixel_clk))
+ 		return PTR_ERR(ctrl->pixel_clk);
+@@ -2999,6 +3427,7 @@ struct msm_dp_ctrl *msm_dp_ctrl_get(struct device *dev, struct msm_dp_link *link
+ 	if (ret)
+ 		dev_err(dev, "failed to add DP OPP table\n");
+ 
++	spin_lock_init(&ctrl->link_irq_lock);
+ 	init_completion(&ctrl->idle_comp);
+ 	init_completion(&ctrl->psr_op_comp);
+ 	init_completion(&ctrl->video_comp);
+diff --git a/drivers/gpu/drm/msm/dp/dp_display.c b/drivers/gpu/drm/msm/dp/dp_display.c
+index 11049950d29..6c500bcc3ea 100644
+--- a/drivers/gpu/drm/msm/dp/dp_display.c
++++ b/drivers/gpu/drm/msm/dp/dp_display.c
+@@ -12,6 +12,8 @@
+ #include <linux/phy/phy.h>
+ #include <linux/delay.h>
+ #include <linux/string_choices.h>
++#include <linux/wait.h>
++#include <linux/soc/qcom/usb4-dp.h>
+ #include <drm/drm_probe_helper.h>
+ #include <drm/display/drm_dp_aux_bus.h>
+ #include <drm/display/drm_hdmi_audio_helper.h>
+@@ -55,6 +57,15 @@ struct msm_dp_display_private {
+ 	bool link_pm_ref;
+ 	bool audio_supported;
+ 
++	struct mutex usb4_lock;
++	struct mutex usb4_link_lock;
++	struct work_struct usb4_hpd_work;
++	wait_queue_head_t usb4_stop_wait;
++	bool usb4_bound;
++	bool usb4_attached;
++	bool usb4_connected;
++	bool usb4_irq;
++
+ 	struct mutex plugged_lock;
+ 	bool plugged;
+ 
+@@ -223,6 +234,7 @@ void msm_dp_display_signal_audio_complete(struct msm_dp *msm_dp_display)
+ 	complete_all(&dp->audio_comp);
+ }
+ 
++static void msm_dp_usb4_detach_locked(struct device *dev);
+ static void msm_dp_hpd_work(struct work_struct *work);
+ 
+ static int msm_dp_display_bind(struct device *dev, struct device *master,
+@@ -246,6 +258,10 @@ static int msm_dp_display_bind(struct device *dev, struct device *master,
+ 
+ 	enable_work(&dp->hpd_work);
+ 
++	mutex_lock(&dp->usb4_lock);
++	dp->usb4_bound = true;
++	mutex_unlock(&dp->usb4_lock);
++
+ 	return 0;
+ end:
+ 	return rc;
+@@ -257,6 +273,12 @@ static void msm_dp_display_unbind(struct device *dev, struct device *master,
+ 	struct msm_dp_display_private *dp = dev_get_dp_display_private(dev);
+ 	struct msm_drm_private *priv = dev_get_drvdata(master);
+ 
++	/* Stop new attachment/events before draining work using DRM objects. */
++	mutex_lock(&dp->usb4_lock);
++	dp->usb4_bound = false;
++	mutex_unlock(&dp->usb4_lock);
++	msm_dp_usb4_detach_locked(dev);
++
+ 	/* No HPD work may run on the objects released below. */
+ 	disable_work_sync(&dp->hpd_work);
+ 
+@@ -432,10 +454,11 @@ static int msm_dp_display_handle_irq_hpd(struct msm_dp_display_private *dp)
+ 	return 0;
+ }
+ 
+-/* The HPD source reported the sink gone. */
++/* The native sink was reported gone; a USB4 tunnel reports HPD separately. */
+ static bool msm_dp_display_hpd_gone(struct msm_dp_display_private *dp)
+ {
+-	return READ_ONCE(dp->hpd_status) == connector_status_disconnected;
++	return READ_ONCE(dp->hpd_status) == connector_status_disconnected &&
++	       !msm_dp_aux_usb4_attached(dp->aux);
+ }
+ 
+ static int msm_dp_hpd_plug_handle(struct msm_dp_display_private *dp)
+@@ -569,6 +592,203 @@ static int msm_dp_irq_hpd_handle(struct msm_dp_display_private *dp)
+ 	return rc;
+ }
+ 
++/* Apply the HPD state the USB4 router reported for its DP tunnel. */
++static void msm_dp_usb4_hpd_work(struct work_struct *work)
++{
++	struct msm_dp_display_private *dp =
++		container_of(work, struct msm_dp_display_private, usb4_hpd_work);
++	bool connected, irq;
++	int ret = 0;
++
++	mutex_lock(&dp->usb4_lock);
++	if (!dp->usb4_bound || !dp->usb4_attached || !dp->msm_dp_display.connector) {
++		mutex_unlock(&dp->usb4_lock);
++		return;
++	}
++	connected = dp->usb4_connected;
++	irq = dp->usb4_irq;
++	dp->usb4_irq = false;
++	mutex_unlock(&dp->usb4_lock);
++
++	/* Never block the host's mailbox worker behind a modeset or AUX I/O. */
++	msm_dp_aux_usb4_set_hpd(dp->aux, connected);
++	if (connected) {
++		if (!dp->plugged)
++			ret = msm_dp_hpd_plug_handle(dp);
++		else if (irq)
++			ret = msm_dp_irq_hpd_handle(dp);
++	} else {
++		ret = msm_dp_hpd_unplug_handle(dp);
++	}
++	if (ret)
++		dev_err(&dp->msm_dp_display.pdev->dev,
++			"USB4 display event failed: %d\n", ret);
++	if (dp->drm_dev)
++		drm_kms_helper_hotplug_event(dp->drm_dev);
++}
++
++static int msm_dp_usb4_attach_locked(struct device *dev, struct drm_dp_aux *aux,
++		      const struct msm_dp_usb4_ops *ops, void *data)
++{
++	struct msm_dp_display_private *dp;
++	int ret;
++
++	if (!dev || !aux || !aux->transfer || !ops || !ops->configure_link)
++		return -ENODEV;
++	if (!dev_get_drvdata(dev))
++		return -EPROBE_DEFER;
++	dp = dev_get_dp_display_private(dev);
++	if (dp->id != MSM_DP_CONTROLLER_0 || dp->msm_dp_display.is_edp)
++		return -ENODEV;
++	if (!dp->msm_dp_display.connector || !dp->drm_dev || !dp->drm_dev->registered)
++		return -EPROBE_DEFER;
++	mutex_lock(&dp->usb4_lock);
++	if (!dp->usb4_bound || !dp->drm_dev) {
++		ret = -EPROBE_DEFER;
++		goto out;
++	}
++	if (dp->usb4_attached || dp->plugged || dp->link_pm_ref) {
++		ret = -EBUSY;
++		goto out;
++	}
++	ret = msm_dp_aux_usb4_set(dp->aux, aux, ops, data);
++	if (!ret) {
++		dp->usb4_attached = true;
++		dp->usb4_connected = false;
++		dp->usb4_irq = false;
++	}
++out:
++	mutex_unlock(&dp->usb4_lock);
++	return ret;
++}
++
++int msm_dp_usb4_attach(struct device *dev, struct drm_dp_aux *aux,
++		      const struct msm_dp_usb4_ops *ops, void *data)
++{
++	int ret;
++
++	if (!dev)
++		return -ENODEV;
++	device_lock(dev);
++	ret = msm_dp_usb4_attach_locked(dev, aux, ops, data);
++	device_unlock(dev);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(msm_dp_usb4_attach);
++
++static int msm_dp_usb4_hpd_locked(struct device *dev, bool connected, bool irq)
++{
++	struct msm_dp_display_private *dp;
++	int ret = 0;
++
++	if (!dev || !dev_get_drvdata(dev))
++		return -ENODEV;
++	dp = dev_get_dp_display_private(dev);
++	mutex_lock(&dp->usb4_lock);
++	if (!dp->usb4_bound || !dp->usb4_attached) {
++		ret = -ENODEV;
++	} else {
++		dp->usb4_connected = connected;
++		dp->usb4_irq |= irq;
++		schedule_work(&dp->usb4_hpd_work);
++	}
++	mutex_unlock(&dp->usb4_lock);
++	return ret;
++}
++
++int msm_dp_usb4_hpd(struct device *dev, bool connected, bool irq)
++{
++	int ret;
++
++	if (!dev)
++		return -ENODEV;
++	device_lock(dev);
++	ret = msm_dp_usb4_hpd_locked(dev, connected, irq);
++	device_unlock(dev);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(msm_dp_usb4_hpd);
++
++/* Stop reporting HPD before release. DRM owns active-stream teardown. */
++static int msm_dp_usb4_hpd_sync_locked(struct device *dev, bool connected, bool irq)
++{
++	struct msm_dp_display_private *dp;
++	int ret;
++
++	ret = msm_dp_usb4_hpd_locked(dev, connected, irq);
++	if (ret)
++		return ret;
++	dp = dev_get_dp_display_private(dev);
++	flush_work(&dp->usb4_hpd_work);
++	if (!connected) {
++		/* Userspace completes the atomic disable after HPD. Do not report
++		 * release failure just because that commit has not run yet.
++		 */
++		if (!wait_event_timeout(dp->usb4_stop_wait,
++				!READ_ONCE(dp->msm_dp_display.power_on) &&
++				!READ_ONCE(dp->link_pm_ref), msecs_to_jiffies(1000)))
++			return -ETIMEDOUT;
++		mutex_lock(&dp->usb4_link_lock);
++		if (dp->msm_dp_display.power_on || dp->link_pm_ref) {
++			ret = -EBUSY;
++		} else if (dp->phy_initialized) {
++			/* Unplug may already have dropped its runtime-PM reference. */
++			ret = pm_runtime_resume_and_get(dev);
++			if (!ret) {
++				msm_dp_display_host_phy_exit(dp);
++				pm_runtime_put_sync(dev);
++			}
++		}
++		mutex_unlock(&dp->usb4_link_lock);
++	}
++	return ret;
++}
++
++int msm_dp_usb4_hpd_sync(struct device *dev, bool connected, bool irq)
++{
++	int ret;
++
++	if (!dev)
++		return -ENODEV;
++	device_lock(dev);
++	ret = msm_dp_usb4_hpd_sync_locked(dev, connected, irq);
++	device_unlock(dev);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(msm_dp_usb4_hpd_sync);
++
++static void msm_dp_usb4_detach_locked(struct device *dev)
++{
++	struct msm_dp_display_private *dp;
++
++	if (!dev || !dev_get_drvdata(dev))
++		return;
++	dp = dev_get_dp_display_private(dev);
++	mutex_lock(&dp->usb4_lock);
++	dp->usb4_attached = false;
++	mutex_unlock(&dp->usb4_lock);
++	cancel_work_sync(&dp->usb4_hpd_work);
++	mutex_lock(&dp->usb4_lock);
++	if (msm_dp_aux_usb4_attached(dp->aux)) {
++		msm_dp_aux_usb4_set_hpd(dp->aux, false);
++		msm_dp_hpd_unplug_handle(dp);
++		msm_dp_aux_usb4_set(dp->aux, NULL, NULL, NULL);
++		if (dp->usb4_bound && dp->drm_dev)
++			drm_kms_helper_hotplug_event(dp->drm_dev);
++	}
++	mutex_unlock(&dp->usb4_lock);
++}
++
++void msm_dp_usb4_detach(struct device *dev)
++{
++	if (!dev)
++		return;
++	device_lock(dev);
++	msm_dp_usb4_detach_locked(dev);
++	device_unlock(dev);
++}
++EXPORT_SYMBOL_GPL(msm_dp_usb4_detach);
++
+ static void msm_dp_display_deinit_sub_modules(struct msm_dp_display_private *dp)
+ {
+ 	msm_dp_audio_put(dp->audio);
+@@ -726,6 +946,12 @@ static int msm_dp_display_prepare_link(struct msm_dp_display_private *dp)
+ 		return rc;
+ 	}
+ 
++	/* Autonomous USB4 training above already completed receiver training and
++	 * clock synchronization. Native stream preparation would train it again.
++	 */
++	if (msm_dp_aux_usb4_attached(dp->aux))
++		return 0;
++
+ 	return msm_dp_ctrl_prepare_stream_on(dp->ctrl, dp->panel, force_link_train);
+ }
+ 
+@@ -833,6 +1059,11 @@ static bool msm_dp_display_dsc_allowed(const struct msm_dp_display_private *dp,
+ 	if (!dp->dsc_supported || msm_dp_display->is_edp || !dp->panel->dsc_capable)
+ 		return false;
+ 
++	/* Do not advertise DSC on a tunnel without a verified FEC contract. */
++	if (msm_dp_aux_usb4_attached(dp->aux) &&
++	    !msm_dp_aux_usb4_fec_supported(dp->aux))
++		return false;
++
+ 	/* the data throttle assumes the wide bus, two pixels per clock */
+ 	if (!dp->wide_bus_supported ||
+ 	    drm_mode_is_420_only(&msm_dp_display->connector->display_info, mode))
+@@ -1122,6 +1353,12 @@ enum drm_connector_status msm_dp_bridge_detect(struct drm_bridge *bridge,
+ 
+ 	priv = container_of(dp, struct msm_dp_display_private, msm_dp_display);
+ 
++	/* The router owns detection; the HPD worker already acquired sink caps. */
++	if (msm_dp_aux_usb4_attached(priv->aux))
++		return msm_dp_aux_link_plugged(priv->aux) && READ_ONCE(priv->plugged) &&
++			priv->link->sink_count ? connector_status_connected :
++			connector_status_disconnected;
++
+ 	/*
+ 	 * The bridge connector passes this result to hpd_notify() right after
+ 	 * detect() returns; mark that call so it is not taken for the HPD
+@@ -1462,11 +1699,15 @@ static int msm_dp_display_probe(struct platform_device *pdev)
+ 	dp->hpd_isr_status = 0;
+ 
+ 	mutex_init(&dp->plugged_lock);
++	mutex_init(&dp->usb4_lock);
++	mutex_init(&dp->usb4_link_lock);
++	INIT_WORK(&dp->usb4_hpd_work, msm_dp_usb4_hpd_work);
+ 	INIT_WORK(&dp->hpd_work, msm_dp_hpd_work);
+ 	/* It uses the DRM objects, so it may only run while bound. */
+ 	disable_work(&dp->hpd_work);
+ 	dp->hpd_status = connector_status_unknown;
+ 	dp->work_status = connector_status_unknown;
++	init_waitqueue_head(&dp->usb4_stop_wait);
+ 
+ 	rc = msm_dp_display_get_io(dp);
+ 	if (rc)
+@@ -1516,6 +1757,7 @@ static void msm_dp_display_remove(struct platform_device *pdev)
+ {
+ 	struct msm_dp_display_private *dp = dev_get_dp_display_private(&pdev->dev);
+ 
++	msm_dp_usb4_detach_locked(&pdev->dev);
+ 	component_del(&pdev->dev, &msm_dp_display_comp_ops);
+ 	msm_dp_display_deinit_sub_modules(dp);
+ 	platform_set_drvdata(pdev, NULL);
+@@ -1570,6 +1812,40 @@ static const struct dev_pm_ops msm_dp_pm_ops = {
+ 				pm_runtime_force_resume)
+ };
+ 
++static int msm_dp_usb4_route_locked(struct device *dev, unsigned int resource)
++{
++	struct msm_dp_display_private *dp;
++	struct msm_drm_private *priv;
++
++	if (!dev || !dev_get_drvdata(dev) || resource > 3)
++		return -EINVAL;
++	dp = dev_get_dp_display_private(dev);
++	if (dp->id != MSM_DP_CONTROLLER_0 || dp->msm_dp_display.is_edp ||
++	    !READ_ONCE(dp->usb4_bound) || !dp->drm_dev || !dev->parent ||
++	    !of_device_is_compatible(dev->parent->of_node, "qcom,glymur-mdss"))
++		return -ENODEV;
++
++	priv = dp->drm_dev->dev_private;
++	if (!priv || !priv->kms || !priv->kms->funcs->set_usb4_dp_route)
++		return -EOPNOTSUPP;
++
++	/* MDP_TOP routing belongs to DPU and must survive its power collapse. */
++	return priv->kms->funcs->set_usb4_dp_route(priv->kms, resource);
++}
++
++int msm_dp_usb4_route(struct device *dev, unsigned int resource)
++{
++	int ret;
++
++	if (!dev)
++		return -EINVAL;
++	device_lock(dev);
++	ret = msm_dp_usb4_route_locked(dev, resource);
++	device_unlock(dev);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(msm_dp_usb4_route);
++
+ static struct platform_driver msm_dp_display_driver = {
+ 	.probe  = msm_dp_display_probe,
+ 	.remove = msm_dp_display_remove,
+@@ -1693,6 +1969,10 @@ void msm_dp_display_atomic_enable(struct msm_dp *msm_dp_display,
+ 
+ 	dp = container_of(msm_dp_display, struct msm_dp_display_private, msm_dp_display);
+ 
++	guard(mutex)(&dp->usb4_link_lock);
++	if (msm_dp_aux_usb4_attached(dp->aux) && !READ_ONCE(dp->usb4_connected))
++		return;
++
+ 	rc = msm_dp_display_prepare_link(dp);
+ 	if (rc) {
+ 		DRM_ERROR("DP display prepare failed, rc=%d\n", rc);
+@@ -1763,6 +2043,7 @@ void msm_dp_display_atomic_post_disable(struct msm_dp *dp)
+ 	msm_dp_display_disable(msm_dp_display, msm_dp_display->panel);
+ 
+ 	msm_dp_display_unprepare(msm_dp_display);
++	wake_up_all(&msm_dp_display->usb4_stop_wait);
+ }
+ 
+ void msm_dp_bridge_hpd_enable(struct drm_bridge *bridge)
+@@ -1811,6 +2092,10 @@ static void msm_dp_hpd_work(struct work_struct *work)
+ 	bool was_plugged;
+ 	int sink_count;
+ 
++	/* The allocated router is the sole HPD owner while AUX is routed. */
++	if (msm_dp_aux_usb4_attached(dp->aux))
++		return;
++
+ 	if (pm_runtime_resume_and_get(&msm_dp_display->pdev->dev)) {
+ 		DRM_ERROR("failed to pm_runtime_resume\n");
+ 		return;
+@@ -1858,6 +2143,10 @@ void msm_dp_bridge_hpd_notify(struct drm_bridge *bridge,
+ 	struct msm_dp_display_private *dp =
+ 		container_of(msm_dp_display, struct msm_dp_display_private, msm_dp_display);
+ 
++	/* The allocated router is the sole HPD owner while AUX is routed. */
++	if (msm_dp_aux_usb4_attached(dp->aux))
++		return;
++
+ 	/*
+ 	 * Record the status first, then stop transfers to a sink that went
+ 	 * away: an HPD handler already waiting on AUX fails fast instead of
+diff --git a/include/linux/soc/qcom/usb4-dp.h b/include/linux/soc/qcom/usb4-dp.h
+new file mode 100644
+index 00000000000..5773570274c
+--- /dev/null
++++ b/include/linux/soc/qcom/usb4-dp.h
+@@ -0,0 +1,52 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef _QCOM_USB4_DP_H
++#define _QCOM_USB4_DP_H
++
++#include <linux/errno.h>
++#include <linux/kconfig.h>
++#include <linux/types.h>
++
++struct device;
++struct drm_dp_aux;
++
++/*
++ * Experimental interface between the Qualcomm Glymur USB4 host router
++ * driver, which owns a DisplayPort tunnel, and the msm DisplayPort
++ * controller that feeds it. Not a stable interface.
++ *
++ * Callbacks may sleep. They must not re-enter the MSM AUX wrapper.
++ * The caller retains aux, ops and data until detach has returned.
++ * Exported calls acquire the display device lock; callers must not hold it.
++ */
++struct msm_dp_usb4_ops {
++	int (*configure_link)(void *data, unsigned int rate, unsigned int lanes);
++	int (*train_link)(void *data, unsigned int rate, unsigned int lanes);
++	/* Prepare the sink and both tunnel adapters for FEC before training.
++	 * Must write DPCD FEC_READY and complete any required SET_FEC_READY
++	 * acknowledgment. Return an error if this is unsupported or uncertain.
++	 * Runs with the MSM AUX mutex held; must not re-enter its wrapper.
++	 */
++	int (*set_fec_ready)(void *data, bool ready);
++	void (*unconfigure_link)(void *data);
++};
++
++#if IS_REACHABLE(CONFIG_DRM_MSM)
++int msm_dp_usb4_attach(struct device *dev, struct drm_dp_aux *aux,
++		      const struct msm_dp_usb4_ops *ops, void *data);
++void msm_dp_usb4_detach(struct device *dev);
++int msm_dp_usb4_hpd(struct device *dev, bool connected, bool irq);
++/* Returns -EBUSY on disconnect while DRM still owns an active/prepared link. */
++int msm_dp_usb4_hpd_sync(struct device *dev, bool connected, bool irq);
++int msm_dp_usb4_route(struct device *dev, unsigned int resource);
++#else
++static inline int msm_dp_usb4_attach(struct device *dev, struct drm_dp_aux *aux,
++		const struct msm_dp_usb4_ops *ops, void *data) { return -ENODEV; }
++static inline void msm_dp_usb4_detach(struct device *dev) { }
++static inline int msm_dp_usb4_hpd(struct device *dev, bool connected, bool irq)
++{ return -ENODEV; }
++static inline int msm_dp_usb4_hpd_sync(struct device *dev, bool connected, bool irq)
++{ return -ENODEV; }
++static inline int msm_dp_usb4_route(struct device *dev, unsigned int resource)
++{ return -ENODEV; }
++#endif
++#endif
+-- 
+2.56.0
+

@@ -1,0 +1,237 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jim Martin <jimmartin@gmail.com>
+Date: Thu, 8 Oct 2026 13:55:28 -0500
+Subject: [PATCH] phy: qcom: qmp-combo: Keep DP off the USB3 lane block on a
+ shared port
+
+The Glymur USB43DP PHY has no dedicated DP TX blocks: dp_tx and dp_tx2
+alias the two lane blocks that USB3 programs as well. The v8 DP lane
+table writes the interface-select, lane-mode and clock-buffer registers
+of the block it is applied to, and qmp_combo_dp_power_on(),
+qmp_v4_configure_dp_tx(), qmp_combo_configure_dp_swing() and
+qmp_v8_configure_dp_phy() apply DP settings to both blocks. In USB3+DP
+mode one of the blocks carries the live USB3 link: a DP power-on takes
+that block away from the USB3 PCS, DP link training rewrites its drive
+settings, and the USB3 link on the same port drops.
+
+Add a dp_lanes_exclusive flag for PHYs with this layout and, when it is
+set and the PHY runs in USB3+DP mode with fewer than four DP lanes, let
+DP program only the block that carries its own lanes. USB3 sits on
+block A in normal and on block B in reverse orientation, so DP takes
+block B in normal and block A in reverse orientation. In DP-only mode,
+and with four lanes, DP still owns both blocks. Enable the flag for
+Glymur.
+
+Fixes: d10736db98d2 ("phy: qualcomm: qmp-combo: Add DP offsets and settings for Glymur platforms")
+Assisted-by: Opus 5.5
+Signed-off-by: Jim Martin <jimmartin@gmail.com>
+---
+ drivers/phy/qualcomm/phy-qcom-qmp-combo.c | 115 ++++++++++++++++++----
+ 1 file changed, 97 insertions(+), 18 deletions(-)
+
+diff --git a/drivers/phy/qualcomm/phy-qcom-qmp-combo.c b/drivers/phy/qualcomm/phy-qcom-qmp-combo.c
+index 7d108353710..be32e69b641 100644
+--- a/drivers/phy/qualcomm/phy-qcom-qmp-combo.c
++++ b/drivers/phy/qualcomm/phy-qcom-qmp-combo.c
+@@ -2596,6 +2596,13 @@ struct qmp_phy_cfg {
+ 	/* Set if DP mode configuration should ignore TypeC orientation */
+ 	bool dp_mode_ignore_reverse;
+ 
++	/*
++	 * Set when the DP and USB3 lane tables collide on the shared TX lane
++	 * blocks (v8 LALB: interface select, lane mode, clock buffer).  DP then
++	 * programs only the lane block it owns while USB3 shares the port.
++	 */
++	bool dp_lanes_exclusive;
++
+ 	/* USB4 specifics */
+ 	const struct qmp_phy_init_tbl *usb4_serdes_tbl;
+ 	int usb4_serdes_tbl_num;
+@@ -3493,6 +3500,7 @@ static const struct qmp_phy_cfg glymur_usb3dpphy_cfg = {
+ 	.dp_aux_cfg2		= QSERDES_DP_PHY_AUX_CFG2_V8,
+ 	.dp_phy_cfg1		= QSERDES_DP_PHY_CFG1_V8,
+ 	.dp_mode_ignore_reverse	= true,
++	.dp_lanes_exclusive	= true,
+ 
+ 	.regs			= qmp_v8_n3_usb43dpphy_regs_layout,
+ 	.reset_list		= msm8996_usb3phy_reset_l,
+@@ -3501,6 +3509,45 @@ static const struct qmp_phy_cfg glymur_usb3dpphy_cfg = {
+ 	.num_vregs		= ARRAY_SIZE(qmp_phy_vreg_refgen),
+ };
+ 
++/*
++ * Decide which TX lane blocks DP may program.
++ *
++ * Without dedicated DP TX blocks, dp_tx/dp_tx2 alias the lane blocks that
++ * USB3 also programs (qmp_combo_parse_dt()).  On the v8 USB43DP PHY the DP
++ * lane table rewrites the interface-select, lane-mode and clock-buffer
++ * registers of both blocks, which takes the block carrying the live USB3
++ * link away from the USB3 PCS.  With dp_lanes_exclusive set, DP programs
++ * only the block that carries its lanes while USB3 shares the port (USB3DP
++ * mode, DP on two or one lanes).  The block USB3 occupies follows the cable
++ * orientation (block A in normal, block B in reverse orientation), so DP
++ * takes the other one: block B in normal, block A in reverse.  This is
++ * independent of dp_mode_ignore_reverse, which only concerns the DP PCS's
++ * own lane numbering.  In DP-only mode DP owns both blocks.
++ */
++static void qmp_combo_dp_lane_blocks(struct qmp_combo *qmp, bool *use_tx,
++				     bool *use_tx2)
++{
++	const struct qmp_phy_cfg *cfg = qmp->cfg;
++	bool reverse = qmp->orientation == TYPEC_ORIENTATION_REVERSE;
++
++	*use_tx = true;
++	*use_tx2 = true;
++
++	if (!cfg->dp_lanes_exclusive || qmp->dp_tx != qmp->tx)
++		return;
++
++	if (qmp->qmpphy_mode != QMPPHY_MODE_USB3DP)
++		return;
++
++	if (qmp->dp_opts.lanes >= 4)
++		return;
++
++	if (reverse)
++		*use_tx2 = false;
++	else
++		*use_tx = false;
++}
++
+ static int qmp_combo_dp_serdes_init(struct qmp_combo *qmp)
+ {
+ 	const struct qmp_phy_cfg *cfg = qmp->cfg;
+@@ -3588,6 +3635,7 @@ static int qmp_combo_configure_dp_swing(struct qmp_combo *qmp)
+ 	unsigned int v_level = 0, p_level = 0;
+ 	u8 voltage_swing_cfg, pre_emphasis_cfg;
+ 	u8 ln_drv_lvl_cfg = 0;
++	bool use_tx, use_tx2;
+ 	int i;
+ 
+ 	for (i = 0; i < dp_opts->lanes; i++) {
+@@ -3619,10 +3667,16 @@ static int qmp_combo_configure_dp_swing(struct qmp_combo *qmp)
+ 	voltage_swing_cfg |= DP_PHY_TXn_TX_DRV_LVL_MUX_EN;
+ 	pre_emphasis_cfg |= DP_PHY_TXn_TX_EMP_POST1_LVL_MUX_EN;
+ 
+-	writel(voltage_swing_cfg, qmp->dp_tx + cfg->regs[QPHY_TX_TX_DRV_LVL]);
+-	writel(pre_emphasis_cfg, qmp->dp_tx + cfg->regs[QPHY_TX_TX_EMP_POST1_LVL]);
+-	writel(voltage_swing_cfg, qmp->dp_tx2 + cfg->regs[QPHY_TX_TX_DRV_LVL]);
+-	writel(pre_emphasis_cfg, qmp->dp_tx2 + cfg->regs[QPHY_TX_TX_EMP_POST1_LVL]);
++	qmp_combo_dp_lane_blocks(qmp, &use_tx, &use_tx2);
++
++	if (use_tx) {
++		writel(voltage_swing_cfg, qmp->dp_tx + cfg->regs[QPHY_TX_TX_DRV_LVL]);
++		writel(pre_emphasis_cfg, qmp->dp_tx + cfg->regs[QPHY_TX_TX_EMP_POST1_LVL]);
++	}
++	if (use_tx2) {
++		writel(voltage_swing_cfg, qmp->dp_tx2 + cfg->regs[QPHY_TX_TX_DRV_LVL]);
++		writel(pre_emphasis_cfg, qmp->dp_tx2 + cfg->regs[QPHY_TX_TX_EMP_POST1_LVL]);
++	}
+ 
+ 	/* Initial PCS programming is done by configure_dp_clocks(). */
+ 	if (ln_drv_lvl && qmp->dp_powered_on) {
+@@ -3905,13 +3959,20 @@ static void qmp_v8_dp_aux_init(struct qmp_combo *qmp)
+ static void qmp_v4_configure_dp_tx(struct qmp_combo *qmp)
+ {
+ 	const struct qmp_phy_cfg *cfg = qmp->cfg;
++	bool use_tx, use_tx2;
++
++	qmp_combo_dp_lane_blocks(qmp, &use_tx, &use_tx2);
+ 
+ 	/* Program default values before writing proper values */
+-	writel(0x27, qmp->dp_tx + cfg->regs[QPHY_TX_TX_DRV_LVL]);
+-	writel(0x27, qmp->dp_tx2 + cfg->regs[QPHY_TX_TX_DRV_LVL]);
++	if (use_tx)
++		writel(0x27, qmp->dp_tx + cfg->regs[QPHY_TX_TX_DRV_LVL]);
++	if (use_tx2)
++		writel(0x27, qmp->dp_tx2 + cfg->regs[QPHY_TX_TX_DRV_LVL]);
+ 
+-	writel(0x2b, qmp->dp_tx + cfg->regs[QPHY_TX_TX_EMP_POST1_LVL]);
+-	writel(0x2b, qmp->dp_tx2 + cfg->regs[QPHY_TX_TX_EMP_POST1_LVL]);
++	if (use_tx)
++		writel(0x2b, qmp->dp_tx + cfg->regs[QPHY_TX_TX_EMP_POST1_LVL]);
++	if (use_tx2)
++		writel(0x2b, qmp->dp_tx2 + cfg->regs[QPHY_TX_TX_EMP_POST1_LVL]);
+ 
+ 	qmp_combo_configure_dp_swing(qmp);
+ }
+@@ -4085,6 +4146,7 @@ static int qmp_v8_configure_dp_phy(struct qmp_combo *qmp)
+ 	bool reverse = (qmp->orientation == TYPEC_ORIENTATION_REVERSE);
+ 	const struct phy_configure_opts_dp *dp_opts = &qmp->dp_opts;
+ 	u32 bias0_en, drvr0_en, bias1_en, drvr1_en;
++	bool use_tx, use_tx2;
+ 	u32 status;
+ 	int ret;
+ 
+@@ -4092,6 +4154,8 @@ static int qmp_v8_configure_dp_phy(struct qmp_combo *qmp)
+ 	if (ret < 0)
+ 		return ret;
+ 
++	qmp_combo_dp_lane_blocks(qmp, &use_tx, &use_tx2);
++
+ 	if (dp_opts->lanes == 1) {
+ 		bias0_en = reverse ? 0x3e : 0x15;
+ 		bias1_en = reverse ? 0x15 : 0x3e;
+@@ -4109,19 +4173,27 @@ static int qmp_v8_configure_dp_phy(struct qmp_combo *qmp)
+ 		drvr1_en = 0x30;
+ 	}
+ 
+-	writel(0x87, qmp->dp_tx + QSERDES_V8_LALB_CLKBUF_ENABLE);
+-	writel(0x87, qmp->dp_tx2 + QSERDES_V8_LALB_CLKBUF_ENABLE);
+-	writel(drvr0_en, qmp->dp_tx + cfg->regs[QPHY_TX_HIGHZ_DRVR_EN]);
+-	writel(bias0_en, qmp->dp_tx + cfg->regs[QPHY_TX_TRANSCEIVER_BIAS_EN]);
+-	writel(drvr1_en, qmp->dp_tx2 + cfg->regs[QPHY_TX_HIGHZ_DRVR_EN]);
+-	writel(bias1_en, qmp->dp_tx2 + cfg->regs[QPHY_TX_TRANSCEIVER_BIAS_EN]);
++	if (use_tx)
++		writel(0x87, qmp->dp_tx + QSERDES_V8_LALB_CLKBUF_ENABLE);
++	if (use_tx2)
++		writel(0x87, qmp->dp_tx2 + QSERDES_V8_LALB_CLKBUF_ENABLE);
++	if (use_tx) {
++		writel(drvr0_en, qmp->dp_tx + cfg->regs[QPHY_TX_HIGHZ_DRVR_EN]);
++		writel(bias0_en, qmp->dp_tx + cfg->regs[QPHY_TX_TRANSCEIVER_BIAS_EN]);
++	}
++	if (use_tx2) {
++		writel(drvr1_en, qmp->dp_tx2 + cfg->regs[QPHY_TX_HIGHZ_DRVR_EN]);
++		writel(bias1_en, qmp->dp_tx2 + cfg->regs[QPHY_TX_TRANSCEIVER_BIAS_EN]);
++	}
+ 
+ 	writel(0x03, qmp->dp_dp_phy + QSERDES_V8_DP_PHY_TSYNC_OVRD);
+ 	writel(0x23, qmp->dp_dp_phy + QSERDES_V8_DP_PHY_TSYNC_OVRD);
+ 	writel(0x22, qmp->dp_dp_phy + QSERDES_V8_DP_PHY_TSYNC_OVRD);
+ 
+-	writel(0x0a, qmp->dp_tx + QSERDES_V8_LALB_RESET_TSYNC_EN_CTRL);
+-	writel(0x0a, qmp->dp_tx2 + QSERDES_V8_LALB_RESET_TSYNC_EN_CTRL);
++	if (use_tx)
++		writel(0x0a, qmp->dp_tx + QSERDES_V8_LALB_RESET_TSYNC_EN_CTRL);
++	if (use_tx2)
++		writel(0x0a, qmp->dp_tx2 + QSERDES_V8_LALB_RESET_TSYNC_EN_CTRL);
+ 
+ 	writel(0x3e, qmp->dp_dp_phy + QSERDES_V8_DP_PHY_TSYNC_OVRD);
+ 
+@@ -4394,14 +4466,21 @@ static int qmp_combo_dp_power_on(struct phy *phy)
+ 	const struct qmp_phy_cfg *cfg = qmp->cfg;
+ 	void __iomem *tx = qmp->dp_tx;
+ 	void __iomem *tx2 = qmp->dp_tx2;
++	bool use_tx, use_tx2;
+ 	int ret = 0;
+ 
+ 	mutex_lock(&qmp->phy_mutex);
+ 
+ 	qmp_combo_dp_serdes_init(qmp);
+ 
+-	qmp_configure_lane(qmp->dev, tx, cfg->dp_tx_tbl, cfg->dp_tx_tbl_num, 1);
+-	qmp_configure_lane(qmp->dev, tx2, cfg->dp_tx_tbl, cfg->dp_tx_tbl_num, 2);
++	qmp_combo_dp_lane_blocks(qmp, &use_tx, &use_tx2);
++	dev_dbg(qmp->dev, "DP lane blocks: tx=%d tx2=%d lanes=%u mode=%u orientation=%u\n",
++		use_tx, use_tx2, qmp->dp_opts.lanes, qmp->qmpphy_mode, qmp->orientation);
++
++	if (use_tx)
++		qmp_configure_lane(qmp->dev, tx, cfg->dp_tx_tbl, cfg->dp_tx_tbl_num, 1);
++	if (use_tx2)
++		qmp_configure_lane(qmp->dev, tx2, cfg->dp_tx_tbl, cfg->dp_tx_tbl_num, 2);
+ 
+ 	/* Configure special DP tx tunings */
+ 	cfg->configure_dp_tx(qmp);
+-- 
+2.56.0
+

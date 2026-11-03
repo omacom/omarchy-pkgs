@@ -1,8 +1,9 @@
 # The x86_64 builder pool
 
 x86_64 package builds run on DigitalOcean droplets that exist for one job
-each. aarch64 builds run on GitHub's `ubuntu-24.04-arm` runners and need
-nothing here.
+each. aarch64 builds run on GitHub's `ubuntu-24.04-arm` runners, and aarch64
+kernels on Namespace's Apple-backed runners (`package_runner` in
+`helpers/package-metadata.sh`); neither needs anything here.
 
 ## How it works
 
@@ -62,7 +63,7 @@ gh run list -R omacom/omarchy-pkgs --workflow build-pr.yml --status queued
 ```
 
 Only x86_64 jobs use this pool. A queued aarch64 job is waiting on GitHub's
-own runners.
+or Namespace's runners.
 
 ### Change settings
 
@@ -84,12 +85,41 @@ tick, so it is live within a minute. The unit and timer files are copies made
 when the box was created; after changing them, on the box:
 
 ```bash
-cp /opt/omarchy-pkgs/ci/controller-box/omarchy-controller.{service,timer} /etc/systemd/system/
+cp /opt/omarchy-pkgs/ci/controller-box/omarchy-{controller.service,controller.timer,dispatch@.service,dispatch-*.timer} /etc/systemd/system/
 systemctl daemon-reload
+systemctl enable --now omarchy-dispatch-{sync-hourly,sync-six-hourly,sync-rebuilds,builder-images}.timer
 ```
 
 `tests/controller.sh` exercises every controller decision against canned API
 responses. Run it before merging a change.
+
+### Scheduled workflows
+
+The box also keeps the repo's clock. GitHub's `on: schedule` started these
+workflows 3 to 7 hours late and fired an hourly one about once every four
+hours, so they have no cron. A systemd timer per schedule runs
+`ci/dispatch.sh <name>`, which starts the workflow with `workflow_dispatch`
+on `master`.
+
+| Timer | UTC | Starts |
+|---|---|---|
+| `omarchy-dispatch-sync-hourly` | every hour at :35 | `sync-upstream.yml`, `cadence=hourly` |
+| `omarchy-dispatch-sync-six-hourly` | 00:20, 06:20, 12:20, 18:20 | `sync-upstream.yml`, `cadence=six-hourly` |
+| `omarchy-dispatch-sync-rebuilds` | 00:40, 06:40, 12:40, 18:40 | `sync-rebuilds.yml` |
+| `omarchy-dispatch-builder-images` | 04:23 | `builder-images.yml` |
+
+```bash
+systemctl list-timers 'omarchy-dispatch-*'                  # Next and last run
+journalctl -u 'omarchy-dispatch@*' -n 20 --no-pager         # Recent dispatches
+systemctl start omarchy-dispatch@sync-hourly                # Dispatch one now
+```
+
+A failed dispatch leaves the unit failed (`systemctl --failed`) with
+GitHub's response in its journal. A 403 means `GITHUB_TOKEN` lost Actions
+write.
+
+To add or move a schedule, add its name to the `case` in `dispatch.sh` and a
+timer to `controller-box/`, then install the timer as below.
 
 ### Reach a builder
 
@@ -108,8 +138,9 @@ DIGITALOCEAN_TOKEN=<account that pays for builders> GITHUB_TOKEN=<fine-grained P
   REPO=omacom/omarchy-pkgs ci/controller-box/create.sh
 ```
 
-- The GitHub PAT is fine-grained and scoped to this repository: Actions read,
-  Administration read and write (for runner registration tokens).
+- The GitHub PAT is fine-grained and scoped to this repository: Actions read
+  and write (to dispatch the scheduled workflows), Administration read and
+  write (for runner registration tokens).
 - The DigitalOcean token is written into the box's env file, so it is the
   account that pays. It needs ssh_key:read to attach `DO_SSH_KEYS`; without
   it every create is refused with 403.

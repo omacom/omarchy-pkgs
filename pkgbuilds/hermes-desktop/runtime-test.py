@@ -3,6 +3,7 @@ import ast
 import json
 import os
 from pathlib import Path
+import shlex
 import shutil
 import subprocess
 import sys
@@ -35,6 +36,7 @@ Path(os.environ["TEST_OUTPUT"]).write_text(json.dumps({
     "ignore": os.environ.get("HERMES_DESKTOP_IGNORE_EXISTING"),
     "root": os.environ.get("HERMES_DESKTOP_HERMES_ROOT"),
     "inherited": [name for name in ("ELECTRON_RUN_AS_NODE", "PYTHONPATH", "PYTHONHOME") if name in os.environ],
+    "app": Path(sys.argv[0]).parent.name,
 }))
 ''')
     executable.chmod(0o755)
@@ -95,12 +97,14 @@ def with_hermes_node_path(env=None):
                      a11y=None, ignore=None):
         subprocess.run(launch + list(args), env={**env, **(overrides or {})}, cwd=home, check=True)
         result = json.loads(output.read_text())
+        app = result.pop("app")
         assert result == {"args": ["--disable-setuid-sandbox", *expected_args],
                           "home": str(home / ".hermes"), "store": store, "gpu": gpu,
                           "ozone": ozone, "cwd": str(home), "a11y": a11y, "ignore": ignore, "root": None,
                           "inherited": []}, result
         assert not forbidden_output.exists(), "launcher invoked the Omarchy installer or sudo"
         output.unlink()
+        return app
 
     wayland = {"WAYLAND_DISPLAY": "wayland-1"}
     check_launch(overrides=wayland, expected_args=["--ozone-platform=wayland"])
@@ -152,6 +156,84 @@ def _desktop_launch_options():
     check_launch(overrides={**wayland, "HERMES_DESKTOP_DISABLE_GPU": "0"},
                  expected_args=["--ozone-platform=wayland"], gpu="0")
     (module / "main_desktop.py").write_text(helper)
+
+    # Current runtimes have no venv in the checkout. Their multi-line CLI shim
+    # exposes the store interpreter through --print-runtime-command, while the
+    # committed environment carries the dependencies needed to read settings.
+    shutil.move(runtime / "venv", root / "legacy-venv")
+    store_python = home / ".hermes/tools/python/abc/bin/python3"
+    store_python.parent.mkdir(parents=True)
+    store_python.symlink_to(sys.executable)
+    environment = home / ".hermes/installs/abc/environments/def/venv"
+    interpreter = environment / "bin/python"
+    interpreter.parent.mkdir(parents=True)
+    interpreter.symlink_to(sys.executable)
+    (environment / "pyvenv.cfg").write_text(f"home = {Path(sys.executable).parent}\n")
+    site_packages = environment / f"lib/python{sys.version_info.major}.{sys.version_info.minor}/site-packages"
+    site_packages.mkdir(parents=True)
+    (site_packages / "runtime_dependency.py").write_text("available = True\n")
+    (module / "config.py").write_text("""import json, os
+from pathlib import Path
+from runtime_dependency import available
+def load_config():
+    assert available
+    path = Path(os.environ["HERMES_HOME"], "config.yaml")
+    return json.loads(path.read_text()) if path.exists() else {}
+""")
+    pm = runtime / "pm"
+    pm.mkdir()
+    (pm / "__init__.py").touch()
+    (pm / "environments.py").write_text(
+        "from pathlib import Path\n"
+        f"def committed_venv(project_root): return Path({str(environment)!r})\n")
+    command = [str(store_python), "-I", "-c", "import sys"]
+    bootstrap = ("import json, sys\n"
+                 "if sys.argv[1:] == ['--print-runtime-command']:\n"
+                 f"    print(json.dumps({command!r}))\n"
+                 "else:\n"
+                 "    raise SystemExit('unexpected CLI invocation')")
+    shim = runtime / ".hermes/bin/hermes"
+    shim.parent.mkdir(parents=True)
+    shim.write_text(f'#!/bin/sh\nexec {shlex.join([str(store_python), "-I", "-c", bootstrap])} "$@"\n')
+    shim.chmod(0o755)
+    config.write_text(json.dumps({"desktop": {"disable_gpu": True}}))
+    check_launch(overrides=wayland, expected_args=["--ozone-platform=wayland"], gpu="1")
+    # A venv/ left in the checkout, like the one omacom/omarchy#13975's workaround links
+    # to an older generation, lacks the dependency and must not win over the committed one.
+    leftover = runtime / "venv/bin/python"
+    leftover.parent.mkdir(parents=True)
+    leftover.symlink_to(sys.executable)
+    check_launch(overrides=wayland, expected_args=["--ozone-platform=wayland"], gpu="1")
+    shutil.rmtree(runtime / "venv")
+    shutil.rmtree(runtime / ".hermes")
+    shutil.rmtree(pm)
+    config.unlink()
+    (module / "config.py").write_text("""import json, os
+from pathlib import Path
+def load_config():
+    path = Path(os.environ["HERMES_HOME"], "config.yaml")
+    return json.loads(path.read_text()) if path.exists() else {}
+""")
+    shutil.move(root / "legacy-venv", runtime / "venv")
+
+    # electron-builder names the ARM app linux-arm64-unpacked. An ARM runtime
+    # seeded under the x86_64 name holds both once `hermes update` rebuilds it,
+    # and the launcher opens the newer, as Hermes does.
+    arm = runtime / "apps/desktop/release/linux-arm64-unpacked"
+    shutil.copytree(native, arm)
+    later = executable.stat().st_mtime + 60
+    os.utime(arm / "Hermes", (later, later))
+    app = check_launch(overrides=wayland, expected_args=["--ozone-platform=wayland"])
+    assert app == "linux-arm64-unpacked", app
+    os.utime(executable, (later + 60, later + 60))
+    app = check_launch(overrides=wayland, expected_args=["--ozone-platform=wayland"])
+    assert app == "linux-unpacked", app
+    seeded = root / "seeded-native"
+    native.rename(seeded)
+    app = check_launch(overrides=wayland, expected_args=["--ozone-platform=wayland"])
+    assert app == "linux-arm64-unpacked", app
+    seeded.rename(native)
+    shutil.rmtree(arm)
 
     def check_namespace_failure():
         for code in ("1", "127"):

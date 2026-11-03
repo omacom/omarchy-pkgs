@@ -1,0 +1,369 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jim Martin <jimmartin@gmail.com>
+Date: Thu, 8 Oct 2026 13:46:25 -0500
+Subject: [PATCH] drm/msm/dpu: drive one interface from four DSC encoders on
+ DPU 12
+
+A single interface can take at most two layer mixers and two merged DSC
+encoders today, which limits a compressed stream to twice the maximum
+mixer width (5120 pixels on most DPUs). Wider modes, such as 6K
+DisplayPort monitors, are rejected by dpu_crtc_mode_valid().
+
+DPU 9 and later have a DSC "4HS" merge block that combines the output of
+four DSC encoders into one interface: the encoders work as two pairs,
+each compressing half of the picture, and the merged output of a pair is
+padded to 8 bytes and aligned to 16 bytes.
+
+Add a dsc_config_4hsmerge operation for the DSC 1.2 blocks of DPU 9 and
+later, and use it on DPU 12 (Glymur), the only generation where it has
+been tested, when four merged encoders drive one interface:
+- dpu_crtc_get_topology() asks for four mixers and four DSC encoders when
+  a compressed mode on one interface is wider than two mixers, with
+  virtual planes enabled so that planes can be split across the two
+  mixer pairs;
+- dpu_crtc_mode_valid() cannot tell whether a mode will be compressed,
+  so on DPU 12 it accepts any mode up to four mixer widths and
+  checks the clock of modes wider than two mixers against a quarter of
+  the mode clock; the interface driver has to reject such modes when it
+  will not compress them (DisplayPort does so once it supports DSC);
+- dpu_encoder_prep_dsc() programs each pair for half the picture, with
+  a quarter of the slices per encoder and the pair padding and
+  alignment, and dpu_encoder_dsc_pipe_clr() clears the merge again.
+
+With two interfaces (dual DSI in a 4:4:2 topology) each interface keeps
+merging its own pair, so the 4HS merge is only used for a single
+interface. Earlier DPUs keep the two-mixer limit and mode validation.
+
+Assisted-by: Opus 5.5
+Signed-off-by: Jim Martin <jimmartin@gmail.com>
+---
+ drivers/gpu/drm/msm/disp/dpu1/dpu_crtc.c      | 39 +++++++++++--
+ drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.c   | 58 +++++++++++++++++--
+ drivers/gpu/drm/msm/disp/dpu1/dpu_hw_dsc.h    | 19 +++++-
+ .../gpu/drm/msm/disp/dpu1/dpu_hw_dsc_1_2.c    | 32 +++++++++-
+ drivers/gpu/drm/msm/disp/dpu1/dpu_rm.c        |  2 +-
+ 5 files changed, 137 insertions(+), 13 deletions(-)
+
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_crtc.c b/drivers/gpu/drm/msm/disp/dpu1/dpu_crtc.c
+index 471cccd8b7c..44e3c7cae8e 100644
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_crtc.c
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_crtc.c
+@@ -1389,6 +1389,20 @@ static int dpu_crtc_reassign_planes(struct drm_crtc *crtc, struct drm_crtc_state
+ #define MAX_CHANNELS_PER_CRTC PIPES_PER_PLANE
+ #define MAX_HDISPLAY_SPLIT 1080
+ 
++/*
++ * Four mixers feeding one interface need four DSC encoders merged by the
++ * DSC 4HS merge block of DPU 9 and later, and virtual planes to split a
++ * plane across two mixer pairs. Used only from DPU 12 (Glymur), where it
++ * has been tested; earlier generations keep the two-mixer limit.
++ */
++static bool dpu_crtc_quad_dsc_supported(const struct dpu_kms *dpu_kms)
++{
++	return dpu_use_virtual_planes &&
++	       dpu_kms->catalog->mdss_ver->core_major_ver >= 12 &&
++	       dpu_kms->catalog->caps->has_3d_merge &&
++	       dpu_kms->catalog->dsc_count >= 4;
++}
++
+ static struct msm_display_topology dpu_crtc_get_topology(
+ 		struct drm_crtc *crtc,
+ 		struct dpu_kms *dpu_kms,
+@@ -1450,8 +1464,18 @@ static struct msm_display_topology dpu_crtc_get_topology(
+ 		topology.num_lm = min(num_rt_intf, topology.num_lm);
+ 
+ 	if (topology.num_dsc) {
+-		if (num_rt_intf == 1)
+-			topology.num_lm = min(2, dpu_kms->catalog->dsc_count);
++		if (num_rt_intf == 1) {
++			/*
++			 * One interface takes two merged DSC encoders, or
++			 * four merged as two pairs when the mode is wider
++			 * than two mixers (DPU 9+ DSC 4HS merge).
++			 */
++			if (dpu_crtc_quad_dsc_supported(dpu_kms) &&
++			    mode->hdisplay > 2 * dpu_kms->catalog->caps->max_mixer_width)
++				topology.num_lm = 4;
++			else
++				topology.num_lm = min(2, dpu_kms->catalog->dsc_count);
++		}
+ 		topology.num_dsc = topology.num_lm;
+ 	}
+ 
+@@ -1644,7 +1668,10 @@ static enum drm_mode_status dpu_crtc_mode_valid(struct drm_crtc *crtc,
+ 	adjusted_mode_clk = dpu_core_perf_adjusted_mode_clk(mode->clock,
+ 							    dpu_kms->perf.perf_cfg);
+ 
+-	if (dpu_kms->catalog->caps->has_3d_merge)
++	if (dpu_crtc_quad_dsc_supported(dpu_kms) &&
++	    mode->hdisplay > 2 * dpu_kms->catalog->caps->max_mixer_width)
++		adjusted_mode_clk /= 4;
++	else if (dpu_kms->catalog->caps->has_3d_merge)
+ 		adjusted_mode_clk /= 2;
+ 
+ 	/*
+@@ -1655,10 +1682,12 @@ static enum drm_mode_status dpu_crtc_mode_valid(struct drm_crtc *crtc,
+ 		return MODE_CLOCK_HIGH;
+ 
+ 	/*
+-	 * max crtc width is equal to the max mixer width * 2 and max height is 4K
++	 * max crtc width is equal to the max mixer width * 2, or * 4 with the
++	 * four-encoder DSC merge, and max height is 4K
+ 	 */
+ 	return drm_mode_validate_size(mode,
+-				      2 * dpu_kms->catalog->caps->max_mixer_width,
++				      (dpu_crtc_quad_dsc_supported(dpu_kms) ? 4 : 2) *
++				      dpu_kms->catalog->caps->max_mixer_width,
+ 				      4096);
+ }
+ 
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.c b/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.c
+index fada24cdb1a..4924bbeb444 100644
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.c
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.c
+@@ -2075,12 +2075,14 @@ static void dpu_encoder_prep_dsc(struct dpu_encoder_virt *dpu_enc,
+ 	struct dpu_hw_ctl *ctl = enc_master->hw_ctl;
+ 	struct dpu_hw_dsc *hw_dsc[MAX_CHANNELS_PER_ENC];
+ 	struct dpu_hw_pingpong *hw_pp[MAX_CHANNELS_PER_ENC];
++	struct drm_dsc_config dsc_half;
+ 	int this_frame_slices;
+ 	int intf_ip_w, enc_ip_w;
+ 	int dsc_common_mode;
+ 	int pic_width;
+ 	u32 initial_lines;
+-	bool dsc_merge;
++	u32 padding = 0, alignment = 0;
++	bool dsc_merge, dsc_4hs_merge;
+ 	int num_dsc = 0;
+ 	int i;
+ 
+@@ -2097,26 +2099,43 @@ static void dpu_encoder_prep_dsc(struct dpu_encoder_virt *dpu_enc,
+ 	pic_width = dsc->pic_width;
+ 
+ 	dsc_merge = dpu_encoder_use_dsc_merge(enc_master->parent);
++	/*
++	 * Four encoders merged into one interface: two pairs, each
++	 * compressing half the picture. With two interfaces each one merges
++	 * its own pair instead.
++	 */
++	dsc_4hs_merge = dsc_merge && num_dsc == 4 && dpu_enc->num_phys_encs == 1;
+ 
+ 	dsc_common_mode = 0;
+ 	if (num_dsc > 1)
+ 		dsc_common_mode |= DSC_MODE_SPLIT_PANEL;
+ 	if (dsc_merge)
+ 		dsc_common_mode |= DSC_MODE_MULTIPLEX;
++	if (dsc_4hs_merge)
++		dsc_common_mode |= DSC_MODE_4HS_MERGE;
+ 	if (enc_master->intf_mode == INTF_MODE_VIDEO)
+ 		dsc_common_mode |= DSC_MODE_VIDEO;
+ 
+ 	this_frame_slices = pic_width / dsc->slice_width;
+ 	intf_ip_w = this_frame_slices * dsc->slice_width;
+ 
+-	enc_ip_w = intf_ip_w / num_dsc;
++	/*
++	 * Merged encoders share the stream, so each takes half of the
++	 * interface width; the initial line delay follows that split.
++	 */
++	if (dsc_merge)
++		enc_ip_w = intf_ip_w / 2;
++	else
++		enc_ip_w = intf_ip_w / num_dsc;
+ 
+ 	/* Tested only for DisplayPort; DSI panels keep the DSC 1.1 estimate. */
+ 	if (dpu_kms->catalog->mdss_ver->core_major_ver >= 7 &&
+ 	    dpu_enc->disp_info.intf_type == INTF_DP) {
+ 		u32 ss_per_enc = dsc->slice_count;
+ 
+-		if (dsc_merge)
++		if (dsc_4hs_merge)
++			ss_per_enc /= 4;
++		else if (dsc_merge)
+ 			ss_per_enc /= 2;
+ 		initial_lines = dpu_encoder_dsc_1_2_initial_line_calc(dsc, dsc_common_mode,
+ 								      max(ss_per_enc, 1U));
+@@ -2124,9 +2143,37 @@ static void dpu_encoder_prep_dsc(struct dpu_encoder_virt *dpu_enc,
+ 		initial_lines = dpu_encoder_dsc_initial_line_calc(dsc, enc_ip_w);
+ 	}
+ 
+-	for (i = 0; i < num_dsc; i++)
++	if (dsc_4hs_merge) {
++		u32 pair_bytes = 2 * dsc->slice_chunk_size;
++
++		/*
++		 * Each pair operates on half the picture. The merged output
++		 * of a pair is padded to 8 bytes and then aligned to 16.
++		 */
++		dsc_half = *dsc;
++		dsc_half.pic_width = pic_width / 2;
++		dsc = &dsc_half;
++
++		if (pair_bytes % 8)
++			padding = 8 - pair_bytes % 8;
++		if ((pair_bytes + padding) % 16)
++			alignment = 16 - (pair_bytes + padding) % 16;
++	}
++
++	DPU_DEBUG("enc%d: %d dsc mode 0x%x %ux%u slices %u/%u lines %u pad %u align %u\n",
++		  DRMID(&dpu_enc->base), num_dsc, dsc_common_mode,
++		  dsc->pic_width, dsc->pic_height, dsc->slice_count,
++		  dsc->slice_width, initial_lines, padding, alignment);
++
++	for (i = 0; i < num_dsc; i++) {
+ 		dpu_encoder_dsc_pipe_cfg(ctl, hw_dsc[i], hw_pp[i],
+ 					 dsc, dsc_common_mode, initial_lines);
++
++		if (hw_dsc[i]->ops.dsc_config_4hsmerge)
++			hw_dsc[i]->ops.dsc_config_4hsmerge(hw_dsc[i], dsc_4hs_merge,
++							   dsc_common_mode,
++							   padding, alignment);
++	}
+ }
+ 
+ /**
+@@ -2292,6 +2339,9 @@ static void dpu_encoder_dsc_pipe_clr(struct dpu_hw_ctl *ctl,
+ 	if (hw_dsc->ops.dsc_disable)
+ 		hw_dsc->ops.dsc_disable(hw_dsc);
+ 
++	if (hw_dsc->ops.dsc_config_4hsmerge)
++		hw_dsc->ops.dsc_config_4hsmerge(hw_dsc, false, 0, 0, 0);
++
+ 	if (hw_pp->ops.disable_dsc)
+ 		hw_pp->ops.disable_dsc(hw_pp);
+ 
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_dsc.h b/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_dsc.h
+index 39d93b9df05..35d73269d5a 100644
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_dsc.h
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_dsc.h
+@@ -12,6 +12,7 @@
+ #define DSC_MODE_SPLIT_PANEL            BIT(0)
+ #define DSC_MODE_MULTIPLEX              BIT(1)
+ #define DSC_MODE_VIDEO                  BIT(2)
++#define DSC_MODE_4HS_MERGE              BIT(3)
+ 
+ struct dpu_hw_dsc;
+ 
+@@ -38,6 +39,21 @@ struct dpu_hw_dsc_ops {
+ 			   u32 mode,
+ 			   u32 initial_lines);
+ 
++	/**
++	 * @dsc_config_4hsmerge: configure merging four DSC streams into one
++	 * @hw_dsc: Pointer to dsc context
++	 * @enable: Enable four-stream merging, or clear its configuration
++	 * @mode: dsc topology mode, including DSC_MODE_VIDEO for video mode
++	 * @padding: Bytes to pad a pair of DSC slices to an 8-byte boundary
++	 * @alignment: Additional bytes to align the padded pair to 16 bytes
++	 *
++	 * Available on DPU 9.0 and later. The caller must also configure the
++	 * four-encoder topology and each encoder's slice allocation, and clear
++	 * this configuration before reusing the DSC block for another topology.
++	 */
++	void (*dsc_config_4hsmerge)(struct dpu_hw_dsc *hw_dsc, bool enable,
++				    u32 mode, u32 padding, u32 alignment);
++
+ 	/**
+ 	 * @dsc_config_thresh: programs panel thresholds
+ 	 * @hw_dsc: Pointer to dsc context
+@@ -73,7 +89,8 @@ struct dpu_hw_dsc *dpu_hw_dsc_init(struct drm_device *dev,
+ 
+ struct dpu_hw_dsc *dpu_hw_dsc_init_1_2(struct drm_device *dev,
+ 				       const struct dpu_dsc_cfg *cfg,
+-				       void __iomem *addr);
++				       void __iomem *addr,
++				       const struct dpu_mdss_version *mdss_ver);
+ 
+ static inline struct dpu_hw_dsc *to_dpu_hw_dsc(struct dpu_hw_blk *hw)
+ {
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_dsc_1_2.c b/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_dsc_1_2.c
+index b3395e9c34a..a9a254e65a4 100644
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_dsc_1_2.c
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_dsc_1_2.c
+@@ -57,6 +57,8 @@
+ #define DSC_CFG                    0x04
+ #define DSC_DATA_IN_SWAP           0x08
+ #define DSC_CLK_CTRL               0x0C
++#define DSC_4HS_MERGE_EN           0x10
++#define DSC_4HS_MERGE_CFG          0x14
+ 
+ static int _dsc_calc_output_buf_max_addr(struct dpu_hw_dsc *hw_dsc, int num_softslice)
+ {
+@@ -84,6 +86,26 @@ static void dpu_hw_dsc_disable_1_2(struct dpu_hw_dsc *hw_dsc)
+ 	DPU_REG_WRITE(hw, sblk->enc.base + DSC_MAIN_CONF, 0);
+ }
+ 
++static void dpu_hw_dsc_config_4hsmerge(struct dpu_hw_dsc *hw_dsc,
++				       bool enable, u32 mode,
++				       u32 padding, u32 alignment)
++{
++	struct dpu_hw_blk_reg_map *hw = &hw_dsc->hw;
++	u32 ctl_base = hw_dsc->caps->sblk->ctl.base;
++	u32 data = 0, en = 0;
++
++	if (enable) {
++		data = alignment << 12;
++		data |= padding << 8;
++		if (mode & DSC_MODE_VIDEO)
++			data |= BIT(0);
++		en = BIT(0);
++	}
++
++	DPU_REG_WRITE(hw, ctl_base + DSC_4HS_MERGE_CFG, data);
++	DPU_REG_WRITE(hw, ctl_base + DSC_4HS_MERGE_EN, en);
++}
++
+ static void dpu_hw_dsc_config_1_2(struct dpu_hw_dsc *hw_dsc,
+ 				  struct drm_dsc_config *dsc,
+ 				  u32 mode,
+@@ -110,7 +132,9 @@ static void dpu_hw_dsc_config_1_2(struct dpu_hw_dsc *hw_dsc,
+ 		data |= BIT(1);
+ 
+ 	num_active_slice_per_enc = dsc->slice_count;
+-	if (mode & DSC_MODE_MULTIPLEX)
++	if (mode & DSC_MODE_4HS_MERGE)
++		num_active_slice_per_enc = dsc->slice_count / 4;
++	else if (mode & DSC_MODE_MULTIPLEX)
+ 		num_active_slice_per_enc = dsc->slice_count / 2;
+ 
+ 	data |= (num_active_slice_per_enc & 0x3) << 7;
+@@ -373,11 +397,13 @@ static void _setup_dcs_ops_1_2(struct dpu_hw_dsc_ops *ops)
+  * @dev:  Corresponding device for devres management
+  * @cfg:  DSC catalog entry for which driver object is required
+  * @addr: Mapped register io address of MDP
++ * @mdss_ver: MDSS hardware version
+  * Returns: Error code or allocated dpu_hw_dsc context
+  */
+ struct dpu_hw_dsc *dpu_hw_dsc_init_1_2(struct drm_device *dev,
+ 				       const struct dpu_dsc_cfg *cfg,
+-				       void __iomem *addr)
++				       void __iomem *addr,
++				       const struct dpu_mdss_version *mdss_ver)
+ {
+ 	struct dpu_hw_dsc *c;
+ 
+@@ -391,6 +417,8 @@ struct dpu_hw_dsc *dpu_hw_dsc_init_1_2(struct drm_device *dev,
+ 	c->idx = cfg->id;
+ 	c->caps = cfg;
+ 	_setup_dcs_ops_1_2(&c->ops);
++	if (mdss_ver->core_major_ver >= 9)
++		c->ops.dsc_config_4hsmerge = dpu_hw_dsc_config_4hsmerge;
+ 
+ 	return c;
+ }
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_rm.c b/drivers/gpu/drm/msm/disp/dpu1/dpu_rm.c
+index 7e77d88f895..5d2d3922df1 100644
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_rm.c
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_rm.c
+@@ -169,7 +169,7 @@ int dpu_rm_init(struct drm_device *dev,
+ 		const struct dpu_dsc_cfg *dsc = &cat->dsc[i];
+ 
+ 		if (cat->mdss_ver->core_major_ver >= 7)
+-			hw = dpu_hw_dsc_init_1_2(dev, dsc, mmio);
++			hw = dpu_hw_dsc_init_1_2(dev, dsc, mmio, cat->mdss_ver);
+ 		else
+ 			hw = dpu_hw_dsc_init(dev, dsc, mmio, cat->mdss_ver);
+ 
+-- 
+2.56.0
+

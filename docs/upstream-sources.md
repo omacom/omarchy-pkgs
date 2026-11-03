@@ -79,24 +79,27 @@ selects a commit from a merged side branch. This uses Git's committer date, not
 the time a commit was pushed, measured from when the run cloned the branch so
 packages pinned from it agree. `BYPASS_MIN_RELEASE_AGE=1` bypasses the hold.
 
-Packages marked `"auto_merge": true` ride the unattended lane
-(`track-branches.yml`), checked hourly instead of every 6 hours. Every lane
-opens its PRs through `package-prs.yml` and auto-merges them as soon as the
-build checks pass. Each package gets its own
-PR on `auto/track-branches-<package>`, and packages that pin the same branch
-share one, so a package whose build fails holds back only itself. The lane works with every
-provider, not only branch watches, so it also carries release feeds trusted to
-ship without review: the browsers, large vendors' apps, Omacom's own projects,
+Packages marked `"auto_merge": true` use the hourly group in
+`sync-upstream.yml`; other packages are checked every 6 hours. Both groups
+open their PRs through `package-prs.yml` and auto-merge them as soon as the
+build checks pass. Hourly packages keep their PRs on
+`auto/track-branches-<package>`; the others use `auto/sync-upstream-<package>`.
+Packages that pin the same branch share a PR, so a package whose build fails
+holds back only itself and its branch companions. The hourly group works with
+every provider, not only branch watches, so it also carries release feeds worth
+checking frequently: the browsers, large vendors' apps, Omacom's own projects,
 and vendor binaries that hold fresh releases with `min_release_age`. `bin/sync-upstream --lane
-reviewed|auto-merge|all` selects a lane; the scheduled workflows each pass their
-own. Packages that pin the same branch move in lockstep: if one of them fails
-to update, the run restores the others and reports the group as failed. A
+reviewed|auto-merge|all` selects a lane; the shared workflow passes the lane
+for the dispatched `cadence`. These historical names select cadence, not
+whether the PR auto-merges. Packages that pin the same branch move in lockstep:
+if one of them fails to update, the run restores the others and reports the group as failed. A
 targeted sync includes the other packages watching that branch, so requesting
 only `omarchy-dev` also updates `omarchy-settings-dev`.
 
 ### Enable unattended branch updates
 
-The schedule already runs in GitHub Actions; no server cron job is needed.
+The builder controller box dispatches both groups on systemd timers
+(`ci/dispatch.sh`), because GitHub's own schedule ran them hours late.
 It uses a personal access token so its PRs trigger builds and its merges trigger
 publishing without manual approval. No GitHub App is required.
 
@@ -109,10 +112,10 @@ publishing without manual approval. No GitHub App is required.
    save the PAT as `PKGS_BOT_TOKEN`. Update this secret when the token is rotated
    or expires. The built-in Actions `GITHUB_TOKEN` cannot run this unattended chain.
 3. Keep **Allow auto-merge** enabled and require `result`, `self-tests`, and
-   `build-isolation` on `master`; the tracker does not request a protection bypass.
-4. After merging the tracker, run **Track upstream branches** once from Actions
+   `build-isolation` on `master`; the updater does not request a protection bypass.
+4. Run **Sync Upstream** once from Actions with `cadence: hourly`
    to verify that its PR builds, auto-merges, and starts **Publish merged packages**.
-   Subsequent runs happen every two hours.
+   Subsequent runs happen hourly.
 
 Checksums retain their algorithms (SHA256, SHA512, BLAKE2, etc.) and source order.
 Changed git sources are hashed with makepkg's git-archive convention. Unchanged
@@ -160,7 +163,6 @@ in `origin` and has no effect on release selection.
 | `1password-cli` | json | [https://app-updates.agilebits.com/check/1/0/CLI2/en/0](https://app-updates.agilebits.com/check/1/0/CLI2/en/0) |
 | `aether` | github | [omacom/aether](https://github.com/omacom/aether) |
 | `basecamp-cli` | github | [basecamp/basecamp-cli](https://github.com/basecamp/basecamp-cli) |
-| `bun-bin` | github | [oven-sh/bun](https://github.com/oven-sh/bun) |
 | `claude-code` | regex | [https://downloads.claude.ai/claude-code-releases/latest](https://downloads.claude.ai/claude-code-releases/latest) |
 | `cliamp` | github | [bjarneo/cliamp](https://github.com/bjarneo/cliamp) |
 | `crush-bin` | github | [charmbracelet/crush](https://github.com/charmbracelet/crush) |
@@ -170,27 +172,22 @@ in `origin` and has no effect on release selection.
 | `dropbox` | redirect | [https://www.dropbox.com/download?plat=lnx.x86_64](https://www.dropbox.com/download?plat=lnx.x86_64) |
 | `dropbox-cli` | regex | [https://linux.dropbox.com/packages/](https://linux.dropbox.com/packages/) |
 | `heroic-games-launcher-bin` | github | [Heroic-Games-Launcher/HeroicGamesLauncher](https://github.com/Heroic-Games-Launcher/HeroicGamesLauncher) |
-| `hyprshade` | pypi | [hyprshade](https://pypi.org/project/hyprshade/) |
 | `lib32-nvidia-580xx-utils` | regex | [https://download.nvidia.com/XFree86/Linux-x86_64/](https://download.nvidia.com/XFree86/Linux-x86_64/) |
 | `limine-mkinitcpio-hook` | git_tags | [https://gitlab.com/Zesko/limine-entry-tool.git](https://gitlab.com/Zesko/limine-entry-tool.git) |
 | `limine-snapper-sync` | git_tags | [https://gitlab.com/Zesko/limine-snapper-sync.git](https://gitlab.com/Zesko/limine-snapper-sync.git) |
 | `lmstudio-bin` | regex | [https://lmstudio.ai/download](https://lmstudio.ai/download) |
 | `localsend` | github | [localsend/localsend](https://github.com/localsend/localsend) |
-| `localsend-bin` | github | [localsend/localsend](https://github.com/localsend/localsend) |
 | `macbook12-spi-driver-dkms` | git_branch | [https://github.com/marc-git/macbook12-spi-driver.git](https://github.com/marc-git/macbook12-spi-driver.git) |
-| `omarchy-dev`, `omarchy-settings-dev` | git_branch (auto-merge) | [https://github.com/basecamp/omarchy.git](https://github.com/basecamp/omarchy.git) `quattro` |
+| `omarchy-dev`, `omarchy-settings-dev` | git_branch (auto-merge) | [https://github.com/omacom/omarchy.git](https://github.com/omacom/omarchy.git) `quattro` |
 | `omasnap-git` | git_branch (auto-merge) | [https://github.com/omacom/omasnap.git](https://github.com/omacom/omasnap.git) `main` |
-| `makima-bin` | github | [cyber-sushi/makima](https://github.com/cyber-sushi/makima) |
 | `minecraft-launcher` | archive | [https://launcher.mojang.com/download/Minecraft.deb](https://launcher.mojang.com/download/Minecraft.deb) |
 | `nautilus-dropbox` | github | [dropbox/nautilus-dropbox](https://github.com/dropbox/nautilus-dropbox) |
-| `nautilus-open-any-terminal` | git_tags | [https://github.com/Stunkymonkey/nautilus-open-any-terminal.git](https://github.com/Stunkymonkey/nautilus-open-any-terminal.git) |
 | `nordvpn-bin` | debian | [https://repo.nordvpn.com/deb/nordvpn/debian/dists/stable/main/binary-amd64/Packages](https://repo.nordvpn.com/deb/nordvpn/debian/dists/stable/main/binary-amd64/Packages) |
 | `nvidia-580xx-utils` | regex | [https://download.nvidia.com/XFree86/Linux-x86_64/](https://download.nvidia.com/XFree86/Linux-x86_64/) |
 | `omarchy-chromium-bin` | github | [omacom/omarchy-chromium](https://github.com/omacom/omarchy-chromium) |
 | `omarchy-emacs` | git_tags | [https://github.com/scottjones/omarchy-emacs.git](https://github.com/scottjones/omarchy-emacs.git) |
 | `omazed` | git_tags | [https://github.com/aps6/omazed.git](https://github.com/aps6/omazed.git) |
 | `once-bin` | github | [basecamp/once](https://github.com/basecamp/once) |
-| `openai-codex-bin` | github | [openai/codex](https://github.com/openai/codex) |
 | `python-mediapipe` | github | [google-ai-edge/mediapipe](https://github.com/google-ai-edge/mediapipe) |
 | `python-sounddevice` | pypi | [sounddevice](https://pypi.org/project/sounddevice/) |
 | `python-terminaltexteffects` | pypi | [terminaltexteffects](https://pypi.org/project/terminaltexteffects/) |
@@ -216,9 +213,11 @@ in `origin` and has no effect on release selection.
 
 These packages were already excluded from automatic AUR updates. The migration preserves that policy.
 
-`m1n1-aurora` and `uboot-asahi` are deliberate holds: Apple Silicon boot code, pinned by hand like `linux-aurora`, and bumped only after a cold boot on the qualification Macs. `m1n1-aurora` pins an aurora-silicon/m1n1 commit plus a local patch. `uboot-asahi` follows asahi-alarm's recipe and patch set (asahi-alarm/PKGBUILDs), which a tag watch on AsahiLinux/u-boot cannot carry.
+`m1n1-aurora` and `uboot-asahi` are deliberate holds: Apple Silicon boot code, pinned by hand like `linux-aurora`. A bump reaches edge, which the testing team uses as the hardware qualification lane, and is promoted to rc or stable only after a cold boot on the qualification Macs. `m1n1-aurora` pins an omacom/m1n1 commit; its source and package migration are documented in pkgbuilds/m1n1-aurora/README.md. `uboot-asahi` follows asahi-alarm's recipe and patch set (asahi-alarm/PKGBUILDs), which a tag watch on AsahiLinux/u-boot cannot carry.
 
 `cua-driver-bin` is a deliberate hold: Omarchy bumps it by hand, so a Cua release ships only when a maintainer has verified it. It keeps its `.omarchy/upstream.sh` hook and `min_release_age`, so lifting the hold means removing `"sync": false`. `cua-hyprland-plugin` declares no upstream source, so no automation updates it either.
+
+`omarchy-mlx` is a deliberate hold: its wheel's filename carries a per-build stamp (`mlx_omarchy-0.32.4.dev202610050725+5c15fba-…`) that a tag watch cannot derive, so the maintainer repins `_wheel`, the vendor tar, and the checksums together. It keeps its watch, so lifting the hold means removing `"sync": false` once the wheel's name follows the release version.
 
 ## Package-specific boundaries
 
@@ -231,7 +230,7 @@ These packages were already excluded from automatic AUR updates. The migration p
 
 ## How the sync PRs build
 
-`sync-upstream.yml`, `sync-rebuilds.yml` and `track-branches.yml` each run their
+`sync-upstream.yml` (both package groups) and `sync-rebuilds.yml` each run their
 sync once, split the changed recipes into one PR per package with
 `.github/scripts/package-pr-groups.sh`, and hand them to `package-prs.yml`. That
 pushes each PR with the PAT in `PKGS_BOT_TOKEN`, so its builds start without an
@@ -405,6 +404,16 @@ than downloading the artifacts — see `pkgbuilds/openai-codex-desktop/.omarchy/
 which reads OpenAI's Debian package index and never fetches the 750 MB of debs
 it describes. Hooks honoring `min_release_age` receive the window as
 `MIN_RELEASE_AGE_SECONDS` and report `published_at` alongside `pkgver`.
+
+`grok-bot` cannot follow that pattern. Cursor's apt index lags the Linux update
+feed the app itself follows, and the feed's digest is for an AppImage.
+`pkgbuilds/grok-bot/.omarchy/upstream.sh` reads the x64 and arm64 feeds, waits
+until both name the same version and commit, and downloads the two `.deb`s at
+that commit only when the version is newer than the recipe. The hook writes
+`_commit` itself: `bin/sync-upstream` rewrites `pkgver` and the checksum arrays,
+not other recipe variables, and the source URL is
+`downloads.cursor.com/grokbot/stable/<commit>/`. An hourly run that is already
+current does not download the debs.
 
 `bin/sync-upstream self-test` runs offline fixture tests over the release
 selection, quarantine backstop, duration parsing, and manifest validation.
