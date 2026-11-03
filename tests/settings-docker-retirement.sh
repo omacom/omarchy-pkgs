@@ -46,6 +46,8 @@ EOF
       if [[ $podman_source == true ]]; then
         install -Dm755 /dev/null "$stage/usr/lib/systemd/user-environment-generators/60-omarchy-podman"
       fi
+      # The current settings scriptlet certifies its temporary-grant cleanup.
+      install -Dm644 /dev/null "$stage/etc/tmpfiles.d/omarchy-nopasswd-sudo.conf"
       cp "$ROOT/pkgbuilds/$name/$name.install" "$stage/.INSTALL"
       # Exercise the actual entry points and retirement function. The unrelated
       # os-release/CUPS/skel defaults have no payload in these small fixtures.
@@ -80,6 +82,19 @@ package_fixture docker 1
 package_fixture podman-docker 1
 package_fixture docker-git 1
 for variant in omarchy-settings omarchy-settings-dev; do
+  (
+    source "$ROOT/pkgbuilds/$variant/$variant.install"
+    for failing in none grants overrides retirement; do
+      calls=()
+      _passwordless_package_transition() { calls+=(grants); [[ $failing != "grants" ]]; }
+      _etc_overrides_apply() { calls+=(overrides); [[ $failing != "overrides" ]]; }
+      _docker_defaults_retire() { calls+=(retirement); [[ $failing != "retirement" ]]; }
+      if post_install >/dev/null 2>&1; then status=0; else status=$?; fi
+      [[ ${calls[*]} == "grants overrides retirement" ]]
+      if [[ $failing == "none" ]]; then (( status == 0 )); else (( status != 0 )); fi
+    done
+  )
+  printf 'ok - %s retains privilege cleanup, overrides and retirement failures\n' "$variant"
   package_fixture "$variant" 1 false
   package_fixture "$variant" 2 true
   package_fixture "$variant" 3 true
@@ -91,6 +106,15 @@ for variant in omarchy-settings omarchy-settings-dev; do
   install_fixture "$variant" 2
   assert_pending
   printf 'ok - %s upgrade preserves custom and stock Docker config while migration is pending\n' "$variant"
+  (
+    source "$ROOT/pkgbuilds/$variant/$variant.install"
+    pacman() { printf 'podman-docker\n'; }
+    mv() { return 1; }
+    rm() { echo 'unexpected retirement after a failed backup' >&2; exit 91; }
+    if _docker_defaults_retire; then exit 92; fi
+  )
+  assert_pending
+  printf 'ok - %s stops retirement after a failed custom-config backup\n' "$variant"
   install_fixture podman-docker 1
   [[ $(pacman -Qq docker) == podman-docker ]]
   install_fixture "$variant" 3

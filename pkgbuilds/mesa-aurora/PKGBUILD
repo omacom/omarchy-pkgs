@@ -1,0 +1,128 @@
+pkgbase=mesa-aurora
+pkgname=('mesa-aurora' 'vulkan-aurora')
+epoch=1
+# Development versions sort by real UTC date, full reachable commit count,
+# then source hash. Hash-only same-day repins can downgrade existing packages.
+pkgver=26.3.0_devel.20261031.231483.a1969111475
+pkgrel=1
+pkgdesc='Aurora Asahi Gallium, Zink and Honeykrisp'
+arch=('aarch64')
+groups=('omarchy-platform-apple-silicon')
+url='https://github.com/omacom/mesa'
+license=('MIT')
+# integration/aurora after omacom/mesa#20: memory-scope flushes for G17P host-read
+# and aliased-memory barriers, on top of the omacom/mesa#19 sync.
+# Full-history `git rev-list --count` for this pin is 231483 (not first-parent).
+# omacom/mesa#20 was checked on the Neo through a private driver, not this package's
+# build or hardware qualification.
+_commit=a19691114759e2c0507f3502cf6166ef2c6e2e33
+_src=mesa-omacom
+# Matched to the DRM UAPI in omacom/linux-aurora integration/aurora.
+# The drivers never link SPIRV-Tools, which Arch Linux ARM moves without a
+# versioned soname. Asahi needs LLVM only to precompile its CL shaders, so a
+# first build makes those compilers and the packaged one uses them. llvmpipe, the
+# fallback renderer for a Mac without a working GPU, links the system LLVM, like
+# Arch's own mesa: one LLVM per process. mesa-aurora depends on 'libLLVM.so',
+# which makepkg turns into the exact soname libgallium links (today libLLVM.so=23.1-64),
+# so an LLVM major bump blocks the upgrade until this package is rebuilt for it,
+# rather than leaving libgallium without its LLVM.
+makedepends=('git' 'meson' 'ninja' 'python-mako' 'python-yaml' 'python-packaging' 'rust'
+             'rust-bindgen' 'clang' 'llvm' 'libclc' 'spirv-llvm-translator' 'spirv-tools'
+             'cbindgen' 'glslang' 'libdrm' 'expat' 'libglvnd'
+             'libx11' 'libxcb' 'libxext' 'libxfixes' 'libxrandr' 'libxshmfence' 'libxxf86vm'
+             'wayland' 'wayland-protocols' 'vulkan-headers' 'vulkan-icd-loader' 'libdisplay-info'
+             'lm_sensors' 'zlib' 'zstd' 'xcb-util-keysyms')
+# Use a distinct VCS cache name when changing repository origin. Existing
+# makepkg caches named mesa belong to Aurora and reject a different URL.
+source=("$_src::git+$url.git#commit=$_commit")
+sha256sums=('SKIP')
+options=('!debug')
+_options=(-Dplatforms=x11,wayland
+  -Dgallium-drivers=asahi,zink,softpipe,llvmpipe -Dvulkan-drivers=asahi
+  -Degl=enabled -Dgbm=enabled -Dglx=dri -Dgles1=enabled -Dgles2=enabled
+  -Dglvnd=enabled -Dvideo-codecs=all -Dvulkan-layers=
+  -Dexpat=enabled -Dzstd=enabled -Dlmsensors=enabled -Dlibunwind=disabled -Dvalgrind=disabled)
+# arch-meson's flags without --auto-features enabled, which would require
+# features this driver set cannot have, such as the VA front end.
+_meson() {
+  meson setup --prefix /usr --libexecdir lib --sbindir bin --buildtype plain \
+    --wrap-mode nodownload -Db_pie=true -Db_ndebug=true -Dpython.bytecompile=1 "$@"
+}
+build() {
+  # The bootstrap builds only three shader tools; the driver build runs tests.
+  _meson "$_src" tools "${_options[@]}" -Dllvm=enabled -Dbuild-tests=false
+  ninja -C tools -j "${OMARCHY_BUILD_JOBS:-10}" \
+    src/compiler/clc/mesa_clc src/compiler/spirv/vtn_bindgen2 src/asahi/clc/asahi_clc
+  printf '%s\n' '[binaries]' \
+    "mesa_clc = '$srcdir/tools/src/compiler/clc/mesa_clc'" \
+    "vtn_bindgen2 = '$srcdir/tools/src/compiler/spirv/vtn_bindgen2'" \
+    "asahi_clc = '$srcdir/tools/src/asahi/clc/asahi_clc'" > tools.ini
+
+  _meson "$_src" build "${_options[@]}" --native-file tools.ini \
+    -Dllvm=enabled -Dshared-llvm=enabled -Dspirv-tools=disabled \
+    -Dmesa-clc=system -Dprecomp-compiler=system \
+    -Dbuild-tests=true
+  meson compile -C build -j "${OMARCHY_BUILD_JOBS:-10}"
+  DESTDIR="$srcdir/mesa-stage" meson install -C build --no-rebuild
+}
+check() {
+  meson test -C build --print-errorlogs \
+    --num-processes "${OMARCHY_BUILD_JOBS:-10}" || return 1
+  # Only the Gallium megadriver, for llvmpipe, links LLVM, and exactly one LLVM.
+  # makepkg versions the 'libLLVM.so' depend only from executable files that
+  # link it, so libgallium must be one. Nothing packaged links SPIRV-Tools.
+  [[ -d $srcdir/mesa-stage ]] || return 1
+  local binary dependencies llvm llvmpipe=0
+  while IFS= read -r -d '' binary; do
+    dependencies=$(LC_ALL=C readelf -d "$binary") || return 1
+    if grep -Eq 'NEEDED.*libSPIRV-Tools' <<<"$dependencies"; then
+      echo "Unexpected compiler runtime dependency: $binary" >&2
+      return 1
+    fi
+    llvm=$(sed -nE 's/.*NEEDED.*\[(libLLVM[^]]*)\].*/\1/p' <<<"$dependencies")
+    [[ -n $llvm ]] || continue
+    if [[ $(basename "$binary") != libgallium-*.so ]]; then
+      echo "Only libgallium may link LLVM: $binary" >&2
+      return 1
+    fi
+    if ! [[ $llvm =~ ^libLLVM\.so\.[0-9]+\.[0-9]+$ ]]; then
+      echo "libgallium must link exactly one libLLVM.so.<major>.<minor>: $binary" >&2
+      return 1
+    fi
+    if [[ ! -x $binary ]]; then
+      echo "makepkg would not version the libLLVM.so depend from $binary" >&2
+      return 1
+    fi
+    llvmpipe=1
+  done < <(find "$srcdir/mesa-stage" -name '*.so*' -type f -print0)
+  if (( ! llvmpipe )); then
+    echo "libgallium does not link LLVM, so llvmpipe is missing" >&2
+    return 1
+  fi
+}
+
+package_mesa-aurora() {
+  pkgdesc='Aurora native Asahi Gallium and Zink OpenGL drivers'
+  depends=('expat' 'glibc' 'gcc-libs' 'libdrm' 'libglvnd' 'libx11' 'libxcb' 'libxext'
+           'libxshmfence' 'libxxf86vm' 'libLLVM.so' 'lm_sensors' 'wayland' 'zlib' 'zstd'
+           'vulkan-mesa-implicit-layers')
+  provides=("mesa=$epoch:$pkgver" 'mesa-libgl' 'opengl-driver' 'libgbm.so')
+  conflicts=('mesa')
+  cp -a "$srcdir/mesa-stage/usr" "$pkgdir/"
+  rm "$pkgdir/usr/lib/libvulkan_asahi.so"
+  rm "$pkgdir"/usr/share/vulkan/icd.d/*asahi*.json
+  rmdir "$pkgdir/usr/share/vulkan/icd.d" "$pkgdir/usr/share/vulkan" 2>/dev/null || true
+
+}
+package_vulkan-aurora() {
+  pkgdesc='Aurora Honeykrisp Vulkan driver'
+  depends=('expat' 'glibc' 'gcc-libs' 'libdrm' 'libdisplay-info' 'libx11' 'libxcb'
+           'libxshmfence' 'systemd-libs' 'vulkan-icd-loader' 'wayland'
+           'xcb-util-keysyms' 'zlib' 'zstd')
+  provides=("vulkan-asahi=$epoch:$pkgver" "vulkan-asahi-aurora=$epoch:$pkgver" 'vulkan-driver')
+  conflicts=('vulkan-asahi' 'vulkan-asahi-aurora')
+  replaces=('vulkan-asahi-aurora')
+  install -Dm755 "$srcdir/mesa-stage/usr/lib/libvulkan_asahi.so" "$pkgdir/usr/lib/libvulkan_asahi.so"
+  install -d "$pkgdir/usr/share/vulkan/icd.d"
+  cp -a "$srcdir"/mesa-stage/usr/share/vulkan/icd.d/*asahi*.json "$pkgdir/usr/share/vulkan/icd.d/"
+}

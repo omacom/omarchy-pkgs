@@ -1,0 +1,203 @@
+diff --git c/src/core/generation.cpp i/src/core/generation.cpp
+index ad5dca2..878abbc 100644
+--- c/src/core/generation.cpp
++++ i/src/core/generation.cpp
+@@ -38,7 +38,7 @@ static QHash<const QQmlEngine*, EngineGeneration*> g_generations; // NOLINT
+ EngineGeneration::EngineGeneration(const QDir& rootPath, QmlScanner scanner)
+     : rootPath(rootPath)
+     , scanner(std::move(scanner))
+-    , urlInterceptor(this->rootPath)
++    , urlInterceptor(this->rootPath, this->scanner)
+     , interceptNetFactory(this->rootPath, this->scanner.fileIntercepts)
+     , engine(new QQmlEngine()) {
+ 	g_generations.insert(this->engine, this);
+diff --git c/src/core/qsintercept.cpp i/src/core/qsintercept.cpp
+index 6687681..8f14178 100644
+--- c/src/core/qsintercept.cpp
++++ i/src/core/qsintercept.cpp
+@@ -2,6 +2,7 @@
+ #include <cstring>
+ 
+ #include <qdir.h>
++#include <qfileinfo.h>
+ #include <qhash.h>
+ #include <qiodevice.h>
+ #include <qlogging.h>
+@@ -16,6 +17,7 @@
+ #include <qurl.h>
+ 
+ #include "logcat.hpp"
++#include "scan.hpp"
+ 
+ QS_LOGGING_CATEGORY(logQsIntercept, "quickshell.interceptor", QtWarningMsg);
+ 
+@@ -24,6 +26,13 @@ QUrl QsUrlInterceptor::intercept(
+     QQmlAbstractUrlInterceptor::DataType type
+ ) {
+ 	auto url = originalUrl;
++	if (this->scanner.omarchyLoadPatch && type == QQmlAbstractUrlInterceptor::DataType::QmlFile
++	    && url.isLocalFile())
++	{
++		auto path = QFileInfo(url.toLocalFile()).absoluteFilePath();
++		this->scanner.scanDir(QFileInfo(path).dir());
++		if (this->scanner.fileIntercepts.contains(path)) url.setScheme("qs");
++	}
+ 
+ 	if (url.scheme() == "root") {
+ 		url.setScheme("qs");
+diff --git c/src/core/qsintercept.hpp i/src/core/qsintercept.hpp
+index c3d8b55..ccfd651 100644
+--- c/src/core/qsintercept.hpp
++++ i/src/core/qsintercept.hpp
+@@ -14,14 +14,19 @@
+ 
+ QS_DECLARE_LOGGING_CATEGORY(logQsIntercept);
+ 
++class QmlScanner;
++
+ class QsUrlInterceptor: public QQmlAbstractUrlInterceptor {
+ public:
+-	explicit QsUrlInterceptor(const QDir& configRoot): configRoot(configRoot) {}
++	QsUrlInterceptor(const QDir& configRoot, QmlScanner& scanner)
++	    : configRoot(configRoot)
++	    , scanner(scanner) {}
+ 
+ 	QUrl intercept(const QUrl& originalUrl, QQmlAbstractUrlInterceptor::DataType type) override;
+ 
+ private:
+ 	QDir configRoot;
++	QmlScanner& scanner;
+ };
+ 
+ class QsInterceptDataReply: public QNetworkReply {
+diff --git c/src/core/scan.cpp i/src/core/scan.cpp
+index 9f33302..de443ba 100644
+--- c/src/core/scan.cpp
++++ i/src/core/scan.cpp
+@@ -14,6 +14,7 @@
+ #include <qlogging.h>
+ #include <qloggingcategory.h>
+ #include <qpair.h>
++#include <qregularexpression.h>
+ #include <qstring.h>
+ #include <qtextstream.h>
+ 
+@@ -22,6 +23,12 @@
+ 
+ QS_LOGGING_CATEGORY(logQmlScanner, "quickshell.qmlscanner", QtWarningMsg);
+ 
++namespace {
++const auto unversionedQtQuickImport = QRegularExpression(
++    QStringLiteral(R"(^([ \t]*import[ \t]+QtQuick)(?=[ \t]*(?:as[ \t]|;|//|/\*|$)))")
++);
++} // namespace
++
+ bool QmlScanner::readAndHashFile(const QString& path, QByteArray& data) {
+ 	auto file = QFile(path);
+ 	if (!file.open(QFile::ReadOnly)) return false;
+@@ -65,13 +72,19 @@ void QmlScanner::scanDir(const QDir& dir) {
+ 			) << "Found qmldir file, qmldir synthesization will be disabled for directory"
+ 			  << path;
+ 			seenQmldir = true;
+-		} else if (name.at(0).isUpper() && name.endsWith(".qml")) {
+-			auto& entry = entries.emplaceBack();
++		} else if (name.endsWith(".qml") && (this->omarchyLoadPatch || name.at(0).isUpper())) {
++			if (name.at(0).isUpper()) {
++				auto& entry = entries.emplaceBack();
+ 
+-			if (this->scanQmlFile(dir.filePath(name), entry.singleton, entry.internal)) {
+-				entry.name = name;
++				if (this->scanQmlFile(dir.filePath(name), entry.singleton, entry.internal)) {
++					entry.name = name;
++				} else {
++					entries.pop_back();
++				}
+ 			} else {
+-				entries.pop_back();
++				bool singleton = false;
++				bool internal = false;
++				this->scanQmlFile(dir.filePath(name), singleton, internal);
+ 			}
+ 		} else if (name.at(0).isUpper() && name.endsWith(".qml.json")) {
+ 			if (this->scanQmlJson(dir.filePath(name))) {
+@@ -121,9 +134,10 @@ void QmlScanner::scanDir(const QDir& dir) {
+ 		qCDebug(logQmlScanner) << "Synthesized qmldir for" << path << qPrintable("\n" + qmldir);
+ 		this->fileIntercepts.insert(QDir(path).filePath("qmldir"), qmldir);
+ 	}
++
+ }
+ 
+-bool QmlScanner::scanQmlFile(const QString& path, bool& singleton, bool& internal) {
++bool QmlScanner::scanQmlFile(const QString& path, bool& singleton, bool& internal, bool isRoot) {
+ 	if (this->scannedFiles.contains(path)) return false;
+ 	this->scannedFiles.push_back(path);
+ 
+@@ -159,6 +173,9 @@ bool QmlScanner::scanQmlFile(const QString& path, bool& singleton, bool& interna
+ 		if (!sourceMasked && inHeader) {
+ 			if (!singleton && line == "pragma Singleton") {
+ 				singleton = true;
++			} else if (isRoot && line == "//@ pragma OmarchyLoadPatch") {
++				// Qt 6.12 added a QtQuick Color singleton which shadows Omarchy's Color singleton.
++				this->omarchyLoadPatch = true;
+ 			} else if (line.startsWith("import")) {
+ 				// we don't care about "import qs" as we always load the root folder
+ 				if (auto importCursor = line.indexOf(" qs."); importCursor != -1) {
+@@ -226,6 +243,15 @@ bool QmlScanner::scanQmlFile(const QString& path, bool& singleton, bool& interna
+ 			}
+ 		}
+ 
++		if (!sourceMasked && this->omarchyLoadPatch) {
++			auto patchedLine =
++			    QString(rawLine).replace(unversionedQtQuickImport, QStringLiteral("\\1 6.11"));
++			if (patchedLine != rawLine) {
++				rawLine = patchedLine;
++				isOverridden = true;
++			}
++		}
++
+ 		if (!hideMask && sourceMasked) overrideText.append("// MASKED: " % rawLine % '\n');
+ 		else overrideText.append(rawLine % '\n');
+ 
+@@ -285,7 +311,7 @@ bool QmlScanner::scanQmlFile(const QString& path, bool& singleton, bool& interna
+ void QmlScanner::scanQmlRoot(const QString& path) {
+ 	bool singleton = false;
+ 	bool internal = false;
+-	this->scanQmlFile(path, singleton, internal);
++	this->scanQmlFile(path, singleton, internal, true);
+ }
+ 
+ bool QmlScanner::scanQmlJson(const QString& path) {
+diff --git c/src/core/scan.hpp i/src/core/scan.hpp
+index 7d807e1..932c0b0 100644
+--- c/src/core/scan.hpp
++++ i/src/core/scan.hpp
+@@ -25,6 +25,7 @@ public:
+ 	QVector<QString> scannedFiles;
+ 	QHash<QString, QByteArray> fileHashes;
+ 	QHash<QString, QString> fileIntercepts;
++	bool omarchyLoadPatch = false;
+ 
+ 	struct ScanError {
+ 		QString file;
+@@ -40,7 +41,7 @@ public:
+ private:
+ 	QDir rootPath;
+ 
+-	bool scanQmlFile(const QString& path, bool& singleton, bool& internal);
++	bool scanQmlFile(const QString& path, bool& singleton, bool& internal, bool isRoot = false);
+ 	bool scanQmlJson(const QString& path);
+ 	[[nodiscard]] static QPair<QString, QString> jsonToQml(const QJsonValue& value, int indent = 0);
+ 
+diff --git c/src/launch/launch.cpp i/src/launch/launch.cpp
+index 1edd60c..f2542ae 100644
+--- c/src/launch/launch.cpp
++++ i/src/launch/launch.cpp
+@@ -124,6 +124,8 @@ int launch(const LaunchArgs& args, char** argv) {
+ 				pragmas.stateDir = pragma.sliced(9).trimmed();
+ 			} else if (pragma.startsWith("CacheDir ")) {
+ 				pragmas.cacheDir = pragma.sliced(9).trimmed();
++			} else if (pragma == "OmarchyLoadPatch") {
++				// Applied later by the QML scanner.
+ 			} else {
+ 				qWarning() << "Unrecognized pragma" << pragma;
+ 			}

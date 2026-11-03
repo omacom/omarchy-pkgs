@@ -1,0 +1,108 @@
+name: Auto-merge approved package PRs
+
+# A package PR trusted to build is trusted to ship: once its builds are
+# green it should merge and publish without a maintainer pressing the
+# button. This enables GitHub's auto-merge on such PRs; branch protection
+# still holds the merge until `result`, `self-tests` and `build-isolation`
+# pass, and a red build stays an open PR. .github/scripts/auto-merge-pr.cjs
+# has the rule.
+#
+# Auto-merge is enabled with the PAT in PKGS_BOT_TOKEN: a merge made with the
+# built-in GITHUB_TOKEN does not start publish.yml.
+#
+# pull_request_target runs this default-branch code with secrets; the PR's
+# code is never checked out here.
+on:
+  pull_request_target:
+    types: [opened, reopened, synchronize, ready_for_review, labeled, unlabeled]
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: 'PR number to evaluate'
+        required: true
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: auto-merge-pr-${{ github.event.pull_request.number || github.event.inputs.pr }}
+  cancel-in-progress: true
+
+jobs:
+  auto-merge:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+
+      - name: Find the PR's author
+        id: pr
+        uses: actions/github-script@v7
+        env:
+          NUMBER: ${{ github.event.pull_request.number || github.event.inputs.pr }}
+        with:
+          script: |
+            const { data: pr } = await github.rest.pulls.get({
+              ...context.repo, pull_number: Number(process.env.NUMBER),
+            });
+            core.setOutput('number', String(pr.number));
+            core.setOutput('author', pr.user.login);
+
+      - id: vouch
+        uses: mitchellh/vouch/action/check-user@f23dbb5e745334f97414ec70463ce7301071a661 # v1
+        with:
+          user: ${{ steps.pr.outputs.author }}
+          allow-fail: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Decide
+        id: decide
+        uses: actions/github-script@v7
+        env:
+          NUMBER: ${{ steps.pr.outputs.number }}
+          VOUCH_STATUS: ${{ steps.vouch.outputs.status }}
+        with:
+          script: |
+            const autoMerge = require('./.github/scripts/auto-merge-pr.cjs');
+            await autoMerge({ github, context, core,
+              number: Number(process.env.NUMBER), vouchStatus: process.env.VOUCH_STATUS });
+
+      - name: Enable auto-merge
+        if: steps.decide.outputs.enable == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.PKGS_BOT_TOKEN }}
+          PR: ${{ steps.pr.outputs.number }}
+          HEAD_SHA: ${{ steps.decide.outputs.head_sha }}
+        run: |
+          if [[ -z "$GH_TOKEN" ]]; then
+            echo "::error::Set PKGS_BOT_TOKEN; a GITHUB_TOKEN merge would not publish."
+            exit 1
+          fi
+          # Idempotent: enabling twice errors. Bot lanes enable their own.
+          if [[ "$(gh pr view "$PR" -R "$GITHUB_REPOSITORY" --json autoMergeRequest --jq '.autoMergeRequest != null')" == true ]]; then
+            echo "auto-merge already enabled on #$PR"
+            exit 0
+          fi
+          # --match-head-commit: never arm a merge for a commit newer than
+          # the one just judged.
+          gh pr merge --auto --squash --match-head-commit "$HEAD_SHA" "$PR" -R "$GITHUB_REPOSITORY"
+
+      # Removing build-approved withdraws the approval, so withdraw the
+      # auto-merge it armed too. Only on that event: auto-merge a maintainer
+      # enabled by hand on any other PR is theirs to keep.
+      - name: Withdraw auto-merge
+        if: >-
+          steps.decide.outputs.enable == 'false' &&
+          github.event.action == 'unlabeled' && github.event.label.name == 'build-approved'
+        env:
+          GH_TOKEN: ${{ secrets.PKGS_BOT_TOKEN }}
+          PR: ${{ steps.pr.outputs.number }}
+        run: |
+          if [[ "$(gh pr view "$PR" -R "$GITHUB_REPOSITORY" --json autoMergeRequest --jq '.autoMergeRequest != null')" == true ]]; then
+            gh pr merge --disable-auto "$PR" -R "$GITHUB_REPOSITORY"
+          fi
