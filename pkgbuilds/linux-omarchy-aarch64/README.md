@@ -8,13 +8,17 @@ The `pkgrel` counts N1x revisions of this package and starts again at 1 when the
 
 [`UPGRADING-7.3.md`](UPGRADING-7.3.md) has notes for the move to 7.3: what each N1x patch needs there, what upstream already has, and how to verify the result.
 
-## DGX Spark
+## GB10 desktops
 
 `1099` leaves the firmware DVFSRC flag unchanged on the NVIDIA DGX Spark.
 The N1x probe-time SYSRAM write triggers idle resets on that machine even
-though it reports the same PLID. The exception matches the exact DMI vendor
-and product; BestPerf and the rest of power_wrap remain enabled. Other GB10
-products have not been tested, and the firmware reset mechanism is still
+though it reports the same PLID. `1114` replaces its exact DMI match with the
+test `1112` already uses: the flag is written only when the N1x laptops'
+MediaTek I2C controllers (NVDA0200) are present. Every GB10 desktop is
+therefore covered: the DGX Spark, the ASUS Ascent GX10 and the other OEM
+boxes. With the write, an ASUS Ascent GX10 reset or reported kernel memory
+corruption within 13-36 minutes at idle in 7 of 7 boots. BestPerf and the
+rest of power_wrap remain enabled, and the firmware reset mechanism is still
 unknown.
 
 ## N1x patches
@@ -272,3 +276,5 @@ The Surface Pro 11 patches (`2100` and up), built in an Arch Linux ARM environme
 `19`'s patches, as `7.2.8-17`, on the same Surface Pro 11 (2026-10-19), with the package's own device tree in its UKI: gcc, the interconnects and the other providers reach `sync_state()` on their own at boot, the GPU binds with its GMU, and the ADSP takes the Modern Standby message on the way into and out of suspend. In a 10.6-minute deep suspend on battery, CX, AOSS and DDR were asleep 99.9% of the time with five exits, and the battery gauge read about 0.25 W, within its 10 mWh steps of the 0.23 W that an earlier one-hour run of `2170`-`2177` measured; with none of them asleep it was 0.75 W. Resume by the power key with the display, NVMe drive, Wi-Fi, Bluetooth and audio back, and no kernel warnings. Not booted on another X1 laptop or an N1x; on the N1x the root-port change finds no Qualcomm controller.
 
 The trees of `2510`-`2532` build against this recipe's patches on 7.3 (2026-11-03, their dtbs with `config.aarch64`), without dtc warnings. None of the four laptops has booted this kernel yet.
+
+`1114`, as `7.3-6`, built natively on an ASUS Ascent GX10 (GB10, BIOS GX10DGX.0106.2026.0707.0731) with `nvidia-open-dkms` 615.78.08 (2026-10-29): the driver logs "DVFSRC: not an N1x laptop, leaving firmware policy unchanged" and still writes BestPerf, with all four LPI states enabled. On `7.3-3`, with the write, the machine reset at idle or reported list and page corruption within 13-36 minutes in 7 of 7 boots. With power_wrap kept from probing it ran 12 h 41 min clean, and on 7.3-6 it has since run five days, idle and under GPU load, without a reset or a kernel warning.
