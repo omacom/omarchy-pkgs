@@ -20,7 +20,7 @@ check() {
   [[ $got == "$want" ]] || fail "$name on $arch builds on $got, expected $want"
 }
 
-for kernel in linux-omarchy-n1x linux-n1x linux-aurora linux-omarchy; do
+for kernel in linux-omarchy-aarch64 linux-aurora linux-omarchy; do
   check "$KERNEL_ARM" "$kernel" aarch64
 done
 pass "an aarch64 kernel builds on the Apple-backed runner at Namespace"
