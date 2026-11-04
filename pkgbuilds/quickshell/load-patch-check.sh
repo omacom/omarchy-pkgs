@@ -25,13 +25,19 @@ import QtQuick
 QtObject { readonly property string origin: "config" }
 QML
 
-printf '.pragma library\nvar tag = Math.random().toFixed(4)\n' >"$work/ext/Lib.js"
+# Every importer registers with the library. One shared instance counts all
+# six; with two, neither count reaches six.
+cat >"$work/ext/Lib.js" <<'JS'
+.pragma library
+var importers = 0
+function register() { return ++importers }
+JS
 for entry in A B; do
   cat >"$work/ext/$entry.qml" <<QML
 import QtQuick
 import "Lib.js" as Lib
 Item {
-  Component.onCompleted: console.log("check-tag $entry", Lib.tag)
+  Component.onCompleted: console.log("check-import $entry", Lib.register())
   T1 { who: "$entry.T1" }
   T2 { who: "$entry.T2" }
 }
@@ -41,7 +47,7 @@ for type in T1 T2; do
   cat >"$work/ext/$type.qml" <<'QML'
 import QtQuick
 import "Lib.js" as Lib
-Item { property string who; Component.onCompleted: console.log("check-tag", who, Lib.tag) }
+Item { property string who; Component.onCompleted: console.log("check-import", who, Lib.register()) }
 QML
 done
 
@@ -57,9 +63,18 @@ ShellRoot {
 }
 QML
 
-QT_QPA_PLATFORM=offscreen timeout 20 "$qs" -p "$work/cfg" --no-color >"$work/log" 2>&1 || true
+rc=0
+QT_QPA_PLATFORM=offscreen timeout 20 "$qs" -p "$work/cfg" --no-color >"$work/log" 2>&1 || rc=$?
 
 fail=0
+if (( rc == 124 )); then
+  echo "FAIL: quickshell did not quit within 20 seconds"
+  fail=1
+elif (( rc )); then
+  echo "FAIL: quickshell exited with status $rc"
+  fail=1
+fi
+
 color=$(sed -n 's/.*check-color //p' "$work/log")
 if [[ $color == config ]]; then
   echo "ok: the config's Color singleton wins over QtQuick's"
@@ -68,13 +83,13 @@ else
   fail=1
 fi
 
-tags=$(sed -n 's/.*check-tag .* \([0-9.]*\)$/\1/p' "$work/log")
-count=$(grep -c . <<<"$tags" || true)
-distinct=$(sort -u <<<"$tags" | grep -c . || true)
-if [[ $count == 6 && $distinct == 1 ]]; then
+counts=$(sed -n 's/.*check-import .* \([0-9]*\)$/\1/p' "$work/log")
+importers=$(grep -c . <<<"$counts" || true)
+highest=$(sort -n <<<"$counts" | tail -n 1)
+if [[ $importers == 6 && $highest == 6 ]]; then
   echo "ok: one .pragma library instance across 6 importers"
 else
-  echo "FAIL: $count importers saw $distinct .pragma library instances (want 6 and 1)"
+  echo "FAIL: $importers importers ran and the library counted at most ${highest:-0} (want 6 and 6)"
   fail=1
 fi
 
