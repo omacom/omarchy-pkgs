@@ -256,7 +256,7 @@ The trees build with `W=1` and no warnings on this recipe. `CHECK_DTBS=y` report
 - `2620` and `2621` are Qiang Yu's commits from 7.4-rc1, `7a147b572a22` and `f4526f9ee314`. They give `glymur.dtsi` the Gen5x8 PHY that PCIe3a and PCIe3b share, and the PCIe3a controller, and give Mahua its own PCIe3b PHY. Linux 7.3 already has the PHY's driver, `phy-qcom-qmp-pcie-multiphy`, so the config now builds it as a module, like the other QMP PCIe PHY. The new nodes are disabled: every Glymur and Mahua tree this package already ships gains only disabled nodes, and none of their nodes changes status.
 - `2630`-`2632` are Jason Pettit's v2, reviewed by Konrad Dybcio and Abel Vesa, with its binding and QSEECOM allowlist entry. Their lines in 7.3's binding, dtb Makefile and allowlist sit next to their neighbours here. The rest is as posted.
 
-The tree builds with `W=1` and no warnings, and `CHECK_DTBS=y` gives it only the two ADSP warnings every Glymur tree here has. Its hardware IDs are not collected yet, so systemd-stub can't pick it until an owner shares them. HP's firmware is in `hp-omnibook-ultra-14-firmware`.
+The tree builds with `W=1` and no warnings, and `CHECK_DTBS=y` gives it only the two ADSP warnings every Glymur tree here has. systemd and stubble don't list the laptop yet, so the package installs `glymur-hp-omnibook-ultra-kg0xxx.json` with the 14 hardware IDs from an owner's hardware report, recomputed here from its SMBIOS table. Seven of them include the owner's SKU; the rest match any 14-kg0xxx. HP's firmware is in `hp-omnibook-ultra-14-firmware`.
 
 ## NVIDIA modules
 
