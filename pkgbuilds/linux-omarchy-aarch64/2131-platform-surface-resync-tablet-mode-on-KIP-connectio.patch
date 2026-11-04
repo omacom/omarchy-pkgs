@@ -1,0 +1,136 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Brandon Williams <turbine.bmw@gmail.com>
+Date: Tue, 21 Jul 2026 22:50:26 -0400
+Subject: [PATCH] platform/surface: resync tablet mode on KIP connection
+
+The KIP hub connection event can arrive and re-enumerate the keyboard
+and touchpad even when the separate cover-state notification is lost. In
+that case the tablet-mode switch retains a stale disconnected state and
+userspace suppresses the attached touchpad.
+
+Observe KIP connection changes and schedule a controller-backed state
+query after two seconds. Keep the hub as the primary event handler and
+share the delayed serialized update path with the resume correction.
+
+Signed-off-by: Brandon Williams <turbine.bmw@gmail.com>
+---
+ .../surface/surface_aggregator_tabletsw.c     | 46 +++++++++++++------
+ 1 file changed, 31 insertions(+), 15 deletions(-)
+
+diff --git a/drivers/platform/surface/surface_aggregator_tabletsw.c b/drivers/platform/surface/surface_aggregator_tabletsw.c
+index ca499a360373..d4604eb8aeda 100644
+--- a/drivers/platform/surface/surface_aggregator_tabletsw.c
++++ b/drivers/platform/surface/surface_aggregator_tabletsw.c
+@@ -38,7 +38,7 @@ struct ssam_tablet_sw {
+ 
+ 	struct ssam_tablet_sw_state state;
+ 	struct work_struct update_work;
+-	struct delayed_work resume_update_work;
++	struct delayed_work delayed_update_work;
+ 	struct input_dev *mode_switch;
+ 
+ 	struct ssam_tablet_sw_ops ops;
+@@ -106,11 +106,11 @@ static void ssam_tablet_sw_update_workfn(struct work_struct *work)
+ 	input_sync(sw->mode_switch);
+ }
+ 
+-static void ssam_tablet_sw_resume_update_workfn(struct work_struct *work)
++static void ssam_tablet_sw_delayed_update_workfn(struct work_struct *work)
+ {
+ 	struct ssam_tablet_sw *sw = container_of(to_delayed_work(work),
+ 						  struct ssam_tablet_sw,
+-						  resume_update_work);
++						  delayed_update_work);
+ 
+ 	/* Serialize the delayed re-query through the normal update work. */
+ 	schedule_work(&sw->update_work);
+@@ -120,7 +120,7 @@ static int __maybe_unused ssam_tablet_sw_suspend(struct device *dev)
+ {
+ 	struct ssam_tablet_sw *sw = dev_get_drvdata(dev);
+ 
+-	cancel_delayed_work_sync(&sw->resume_update_work);
++	cancel_delayed_work_sync(&sw->delayed_update_work);
+ 	return 0;
+ }
+ 
+@@ -134,7 +134,7 @@ static int __maybe_unused ssam_tablet_sw_resume(struct device *dev)
+ 	 * retain the early state if the corresponding notification is missed.
+ 	 */
+ 	schedule_work(&sw->update_work);
+-	mod_delayed_work(system_wq, &sw->resume_update_work, msecs_to_jiffies(2000));
++	mod_delayed_work(system_wq, &sw->delayed_update_work, msecs_to_jiffies(2000));
+ 	return 0;
+ }
+ 
+@@ -164,7 +164,7 @@ static int ssam_tablet_sw_probe(struct ssam_device *sdev)
+ 	sw->ops.state_is_tablet_mode = desc->ops.state_is_tablet_mode;
+ 
+ 	INIT_WORK(&sw->update_work, ssam_tablet_sw_update_workfn);
+-	INIT_DELAYED_WORK(&sw->resume_update_work, ssam_tablet_sw_resume_update_workfn);
++	INIT_DELAYED_WORK(&sw->delayed_update_work, ssam_tablet_sw_delayed_update_workfn);
+ 
+ 	ssam_device_set_drvdata(sdev, sw);
+ 
+@@ -213,7 +213,7 @@ static int ssam_tablet_sw_probe(struct ssam_device *sdev)
+ 
+ err:
+ 	ssam_device_notifier_unregister(sdev, &sw->notif);
+-	cancel_delayed_work_sync(&sw->resume_update_work);
++	cancel_delayed_work_sync(&sw->delayed_update_work);
+ 	cancel_work_sync(&sw->update_work);
+ 	return status;
+ }
+@@ -225,7 +225,7 @@ static void ssam_tablet_sw_remove(struct ssam_device *sdev)
+ 	sysfs_remove_group(&sdev->dev.kobj, &ssam_tablet_sw_group);
+ 
+ 	ssam_device_notifier_unregister(sdev, &sw->notif);
+-	cancel_delayed_work_sync(&sw->resume_update_work);
++	cancel_delayed_work_sync(&sw->delayed_update_work);
+ 	cancel_work_sync(&sw->update_work);
+ }
+ 
+@@ -233,6 +233,7 @@ static void ssam_tablet_sw_remove(struct ssam_device *sdev)
+ /* -- SSAM KIP tablet switch implementation. -------------------------------- */
+ 
+ #define SSAM_EVENT_KIP_CID_COVER_STATE_CHANGED	0x1d
++#define SSAM_EVENT_KIP_CID_CONNECTION_CHANGED	0x2c
+ 
+ enum ssam_kip_cover_state {
+ 	SSAM_KIP_COVER_STATE_DISCONNECTED  = 0x01,
+@@ -318,14 +319,29 @@ static u32 ssam_kip_sw_notif(struct ssam_event_notifier *nf, const struct ssam_e
+ {
+ 	struct ssam_tablet_sw *sw = container_of(nf, struct ssam_tablet_sw, notif);
+ 
+-	if (event->command_id != SSAM_EVENT_KIP_CID_COVER_STATE_CHANGED)
++	switch (event->command_id) {
++	case SSAM_EVENT_KIP_CID_COVER_STATE_CHANGED:
++		if (event->length < 1)
++			dev_warn(&sw->sdev->dev, "unexpected payload size: %u\n",
++				 event->length);
++
++		schedule_work(&sw->update_work);
++		return SSAM_NOTIF_HANDLED;
++
++	case SSAM_EVENT_KIP_CID_CONNECTION_CHANGED:
++		/*
++		 * Cover-state notifications can be lost while the KIP devices are
++		 * being re-enumerated. Re-query once the controller and devices have
++		 * had time to settle so that the input switch cannot remain stale.
++		 * The subsystem hub remains the primary handler for this event.
++		 */
++		mod_delayed_work(system_wq, &sw->delayed_update_work,
++				 msecs_to_jiffies(2000));
++		return 0;
++
++	default:
+ 		return 0;	/* Return "unhandled". */
+-
+-	if (event->length < 1)
+-		dev_warn(&sw->sdev->dev, "unexpected payload size: %u\n", event->length);
+-
+-	schedule_work(&sw->update_work);
+-	return SSAM_NOTIF_HANDLED;
++	}
+ }
+ 
+ static const struct ssam_tablet_sw_desc ssam_kip_sw_desc = {

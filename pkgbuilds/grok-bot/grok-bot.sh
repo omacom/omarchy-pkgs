@@ -9,7 +9,14 @@ if [[ -f $XDG_CONFIG_HOME/grok-bot-flags.conf ]]; then
 	GROK_BOT_USER_FLAGS="$(sed 's/#.*//' "$XDG_CONFIG_HOME/grok-bot-flags.conf" | tr '\n' ' ')"
 fi
 
-exec "/opt/Grok Bot/sand" \
+# 0.24.0 renamed the binary sand -> grok-bot.
+if [[ -x "/opt/Grok Bot/grok-bot" ]]; then
+	GROK_BOT_BIN="/opt/Grok Bot/grok-bot"
+else
+	GROK_BOT_BIN="/opt/Grok Bot/sand"
+fi
+
+exec "$GROK_BOT_BIN" \
 	--ozone-platform=wayland \
 	--enable-features=UseOzonePlatform,WaylandWindowDecorations \
 	--enable-wayland-ime \

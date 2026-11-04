@@ -1,0 +1,335 @@
+#!/bin/bash
+# Check a write into a channel against the qualified Mac package set, for one
+# architecture.
+#
+#   check-mac-set --channel <rc|stable> --arch <arch> --before <db|dir> --after <db|dir>
+#   check-mac-set --channel <rc|stable> --arch <arch> --before <db|dir> --add <pkg file...>
+#   check-mac-set --channel <rc|stable> --arch <arch> --remote <remote> --add <pkg file...>
+#   check-mac-set --remote <remote> --slots FILE
+#     [--inventory FILE] [--record FILE]
+#
+# The channel's database before the write and as the write would leave it
+# come as package databases (omarchy.db.tar.zst, or the directory it unpacks
+# to), or as the package files a publish adds to the channel's current
+# database (--add; --remote pulls that database, as publish-artifact does).
+#
+# The Mac set is every pkgbase release/mac-inventory.txt lists; a package is
+# a Mac package when its pkgbase before or after the write is one. The write
+# touches the set when it moves a Mac package, or a package in the Mac set's
+# shared dependency closure: what the Mac packages depend on, by name or
+# provides, that this channel serves, and what that depends on in turn. A
+# write that touches neither passes without further checks.
+#
+# A write that moves a Mac package passes only when the channel's whole Mac
+# set would then be the inventory's: every Mac pkgbase it serves at exactly
+# the listed version, none listed as `none`, and none missing that a recipe
+# on this checkout builds for the architecture.
+#
+# A write that touches the closure passes only when every dependency in it
+# still resolves in the channel: a dependency some package in the channel
+# provides must be satisfied, version included, by one of them, and one the
+# channel provided before must still be provided after. Dependencies the
+# channel never provides come from the Arch base and are not checked here.
+#
+# --slots checks a whole publish at once: one "<channel> <arch> <pkg file...>"
+# line per slot, each as --remote --add would, every slot even after a
+# refusal so all of them are named. It passes only when every slot does.
+#
+# Exit status: 0 passes (or touches nothing), 1 refuses and names every
+# offending package, 2 on a usage error. --record appends one JSON line:
+# {"type":"mac-set", arch, channel, result: "untouched"|"pass"|"refused",
+#  moved: [Mac pkgbases moved], problems: [{package, problem}]}.
+set -euo pipefail
+BUILD_ROOT=$(realpath "${BASH_SOURCE[0]%/*}/..")
+source "$BUILD_ROOT/helpers/message-helpers.sh"
+source "$BUILD_ROOT/helpers/paths.sh"
+source "$BUILD_ROOT/helpers/package-metadata.sh"
+
+INVENTORY=$BUILD_ROOT/release/mac-inventory.txt
+PREFIX=${OMARCHY_PUBLISH_PREFIX:-}
+RECORD=/dev/null
+BEFORE="" AFTER="" REMOTE="" ADD=() ADDING=false SLOTS=""
+while [[ $# -gt 0 ]]; do
+  case $1 in
+  --channel) CHANNEL=$2; require_valid_mirror "$CHANNEL"; shift 2 ;;
+  --arch) ARCH=$2; require_valid_arch "$ARCH"; shift 2 ;;
+  --before) BEFORE=$2; shift 2 ;;
+  --after) AFTER=$2; shift 2 ;;
+  --remote) REMOTE=$2; shift 2 ;;
+  --inventory) INVENTORY=$2; shift 2 ;;
+  --record) RECORD=$2; shift 2 ;;
+  --slots) SLOTS=$2; shift 2 ;;
+  --add) ADDING=true; shift ;;
+  -h|--help) sed -n '2,41p' "$0"; exit 0 ;;
+  -*) print_error "Unknown option: $1"; exit 2 ;;
+  *) [[ $ADDING == true ]] || { print_error "Unexpected argument: $1"; exit 2; }; ADD+=("$1"); shift ;;
+  esac
+done
+usage() { print_error "$1"; exit 2; }
+if [[ -n $SLOTS ]]; then
+  [[ -n $REMOTE && -f $SLOTS ]] || usage "--slots needs --remote and a slots file"
+  status=0
+  while read -r channel arch files; do
+    [[ -n $channel ]] || continue
+    # shellcheck disable=SC2086 # one file name per word
+    "$0" --remote "$REMOTE" --channel "$channel" --arch "$arch" --inventory "$INVENTORY" \
+      --record "$RECORD" --add $files || { code=$?; (( code > status )) && status=$code; }
+  done < "$SLOTS"
+  exit "$status"
+fi
+[[ -n ${CHANNEL:-} && -n ${ARCH:-} ]] || usage "--channel and --arch are required"
+[[ -n $BEFORE || -n $REMOTE ]] || usage "--before or --remote is required"
+[[ -z $BEFORE || -z $REMOTE ]] || usage "--before and --remote are alternatives"
+[[ -n $AFTER || $ADDING == true ]] || usage "--after or --add is required"
+[[ -z $AFTER || $ADDING == false ]] || usage "--after and --add are alternatives"
+[[ -z $REMOTE || $ADDING == true ]] || usage "--remote reads the database a publish adds to; it needs --add"
+[[ -f $INVENTORY ]] || usage "No Mac inventory at $INVENTORY"
+
+WORK=$(mktemp -d)
+trap 'rm -rf "$WORK"' EXIT
+
+# --- the inventory ------------------------------------------------------------
+declare -A WANT=()
+while read -r base version extra; do
+  [[ -z $base || $base == \#* ]] && continue
+  [[ -n $version && -z ${extra:-} ]] || usage "$INVENTORY: want '<pkgbase> <version|none>', got '$base ${version:-} ${extra:-}'"
+  [[ -z ${WANT[$base]:-} ]] || usage "$INVENTORY lists $base twice"
+  WANT[$base]=$version
+done < "$INVENTORY"
+
+# --- the channel before and after ---------------------------------------------
+unpack() { # unpack <db|dir|""> <dir>: a database's entries as <dir>/<name-version>/desc
+  mkdir -p "$2"
+  if [[ -d $1 ]]; then
+    cp -R "$1/." "$2/"
+  elif [[ -f $1 ]]; then
+    bsdtar -xf "$1" -C "$2" --include '*/desc'
+  elif [[ -n $1 ]]; then
+    usage "No database at $1"
+  fi
+}
+if [[ -n $REMOTE ]]; then
+  dir="$REMOTE/${PREFIX:+$PREFIX/}$CHANNEL/$ARCH"
+  # An unreadable channel is not an empty one: it would hide the Mac set.
+  listing=$(rclone lsf "$dir/" --s3-no-head) || usage "Cannot list $dir"
+  if grep -qx 'omarchy.db.tar.zst' <<<"$listing"; then
+    rclone copyto "$dir/omarchy.db.tar.zst" "$WORK/before.db.tar.zst" --s3-no-head
+    BEFORE=$WORK/before.db.tar.zst
+  fi
+fi
+unpack "$BEFORE" "$WORK/before"
+
+# One line per package: name|version|base|depends|provides, the lists
+# space-separated. Not tabs: read would merge an empty field into the next.
+entries() { # entries <dir>
+  find "$1" -name desc -print0 | xargs -0r awk '
+    function flush() { if (name != "") print name "|" ver "|" base "|" deps "|" provs; name = ver = base = deps = provs = ""; section = "" }
+    FNR == 1 { flush() }
+    /^%[A-Z0-9]+%$/ { section = $0; next }
+    /^$/ { section = ""; next }
+    section == "%NAME%" { name = $0 }
+    section == "%VERSION%" { ver = $0 }
+    section == "%BASE%" { base = $0 }
+    section == "%DEPENDS%" { deps = deps (deps == "" ? "" : " ") $0 }
+    section == "%PROVIDES%" { provs = provs (provs == "" ? "" : " ") $0 }
+    END { flush() }' | awk -F'|' '$3 == "" { $3 = $1 } 1' OFS='|' | sort
+}
+entries "$WORK/before" > "$WORK/before.tsv"
+
+if [[ $ADDING == true ]]; then
+  # As publish-artifact would leave it: each file replaces its name's entry
+  # unless the channel already serves that name at this version or newer.
+  (( ${#ADD[@]} )) || usage "--add needs package files"
+  cp "$WORK/before.tsv" "$WORK/after.tsv"
+  for f in "${ADD[@]}"; do
+    [[ -f $f ]] || usage "Not a package file: $f"
+    bsdtar -xOf "$f" .PKGINFO | awk -F' = ' '
+      $1 == "pkgname" { name = $2 } $1 == "pkgver" { ver = $2 } $1 == "pkgbase" { base = $2 }
+      $1 == "depend" { deps = deps (deps == "" ? "" : " ") $2 }
+      $1 == "provides" { provs = provs (provs == "" ? "" : " ") $2 }
+      END { print name "|" ver "|" (base == "" ? name : base) "|" deps "|" provs }' > "$WORK/new.tsv"
+    IFS='|' read -r name ver _ < "$WORK/new.tsv"
+    have=$(awk -F'|' -v n="$name" '$1 == n { print $2 }' "$WORK/after.tsv")
+    [[ -n $have ]] && (( $(vercmp "$ver" "$have") <= 0 )) && continue
+    awk -F'|' -v n="$name" '$1 != n' "$WORK/after.tsv" | cat - "$WORK/new.tsv" | sort > "$WORK/after.tmp"
+    mv "$WORK/after.tmp" "$WORK/after.tsv"
+  done
+else
+  unpack "$AFTER" "$WORK/after"
+  entries "$WORK/after" > "$WORK/after.tsv"
+fi
+
+# --- what moves --------------------------------------------------------------
+declare -A B_VER=() A_VER=() A_BASE=() A_DEPS=() B_DEPS=() MOVED=()
+while IFS='|' read -r name ver base deps _; do B_VER[$name]=$ver; B_DEPS[$name]=$deps; done < "$WORK/before.tsv"
+while IFS='|' read -r name ver base deps _; do
+  A_VER[$name]=$ver A_BASE[$name]=$base A_DEPS[$name]=$deps
+  [[ ${B_VER[$name]:-} == "$ver" ]] || MOVED[$name]=1
+done < "$WORK/after.tsv"
+
+# --- the closure ---------------------------------------------------------------
+# Who in a view provides what: "<name>\t<version or empty>" per provider.
+declare -A A_PROV=() B_PROV=()
+index() { # index <tsv> <array name>
+  local -n idx=$2
+  local name ver base deps provs p
+  while IFS='|' read -r name ver base deps provs; do
+    idx[$name]+="$name"$'\t'"$ver"$'\n'
+    for p in $provs; do
+      if [[ $p == *=* ]]; then idx[${p%%=*}]+="$name"$'\t'"${p#*=}"$'\n'
+      else idx[$p]+="$name"$'\t'$'\n'
+      fi
+    done
+  done < "$1"
+}
+index "$WORK/before.tsv" B_PROV
+index "$WORK/after.tsv" A_PROV
+
+split_dep() { # split_dep <dep>: prints "name op version" (op and version may be empty)
+  if [[ $1 =~ ^([^<>=]+)(>=|<=|=|<|>)(.+)$ ]]; then
+    echo "${BASH_REMATCH[1]} ${BASH_REMATCH[2]} ${BASH_REMATCH[3]}"
+  else
+    echo "$1"
+  fi
+}
+satisfies() { # satisfies <provided version or ""> <op> <version>: as pacman decides
+  local have=$1 op=$2 want=$3 c
+  [[ -z $op ]] && return 0
+  [[ -n $have ]] || return 1
+  c=$(vercmp "$have" "$want")
+  case $op in
+  '>=') (( c >= 0 )) ;; '<=') (( c <= 0 )) ;; '=') (( c == 0 )) ;; '>') (( c > 0 )) ;; '<') (( c < 0 )) ;;
+  esac
+}
+
+# closure <view: A|B>: the names reachable from the view's Mac packages.
+closure() {
+  local -n vers=${1}_VER prov=${1}_PROV deps=${1}_DEPS
+  local -A seen=()
+  local queue=() name dep dname p
+  for name in "${!vers[@]}"; do
+    [[ -n ${WANT[$(base_of "$1" "$name")]:-} ]] && queue+=("$name")
+  done
+  while (( ${#queue[@]} )); do
+    name=${queue[0]}; queue=("${queue[@]:1}")
+    [[ -z ${seen[$name]:-} ]] || continue
+    seen[$name]=1
+    echo "$name"
+    for dep in ${deps[$name]:-}; do
+      read -r dname _ <<<"$(split_dep "$dep")"
+      while IFS=$'\t' read -r p _; do
+        [[ -n $p && -z ${seen[$p]:-} ]] && queue+=("$p")
+      done <<<"${prov[$dname]:-}"
+    done
+  done
+}
+declare -A B_BASE=()
+while IFS='|' read -r name _ base _; do B_BASE[$name]=$base; done < "$WORK/before.tsv"
+base_of() { if [[ $1 == A ]]; then echo "${A_BASE[$2]}"; else echo "${B_BASE[$2]}"; fi; }
+
+declare -A IN_CLOSURE=()
+while read -r name; do [[ -n $name ]] && IN_CLOSURE[$name]=1; done < <(closure A; closure B)
+
+# A package is a Mac package when its pkgbase before or after the write is
+# one: a rebuild under a new pkgbase must not carry it out of the Mac set.
+moved_mac=() touched=false
+declare -A LEFT_MAC=()
+for name in "${!MOVED[@]}"; do
+  base=${A_BASE[$name]} old=${B_BASE[$name]:-}
+  for b in "$base" "$old"; do
+    [[ -n $b && -n ${WANT[$b]:-} ]] || continue
+    [[ " ${moved_mac[*]} " == *" $b "* ]] || moved_mac+=("$b")
+    touched=true
+  done
+  [[ -n ${IN_CLOSURE[$name]:-} ]] && touched=true
+  [[ -n $old && -n ${WANT[$old]:-} && -z ${WANT[$base]:-} ]] && LEFT_MAC[$name]="$old $base"
+done
+mapfile -t moved_mac < <(printf '%s\n' "${moved_mac[@]}" | sed '/^$/d' | sort)
+
+finish() { # finish <result> [problems file]
+  jq -nc --arg arch "$ARCH" --arg channel "$CHANNEL" --arg result "$1" --rawfile p "${2:-/dev/null}" \
+    '{type:"mac-set", arch:$arch, channel:$channel, result:$result, moved:$ARGS.positional,
+      problems: ($p | split("\n") | map(select(length > 0) | split("\t") | {package: .[0], problem: .[1]}))}' \
+    --args "${moved_mac[@]}" >> "$RECORD"
+}
+
+if [[ $touched == false ]]; then
+  print_info "Mac package set: $CHANNEL/$ARCH moves no Mac package and nothing the Mac set depends on"
+  finish untouched
+  exit 0
+fi
+
+# --- the checks ---------------------------------------------------------------
+: > "$WORK/problems"
+problem() { printf '%s\t%s\n' "$1" "$2" >> "$WORK/problems"; }
+
+recipe_for() { # recipe_for <pkgbase>: the recipe on this checkout that builds it
+  local dir
+  if [[ -d $PKGBUILDS_DIR/$1 ]] && [[ $(package_pkgbase "$PKGBUILDS_DIR/$1" "$ARCH") == "$1" ]]; then
+    echo "$PKGBUILDS_DIR/$1"; return
+  fi
+  while IFS= read -r dir; do
+    [[ $(package_pkgbase "$dir" "$ARCH") == "$1" ]] && { echo "$dir"; return; }
+  done < <(package_dirs)
+  return 0
+}
+
+if (( ${#moved_mac[@]} )); then
+  for name in "${!LEFT_MAC[@]}"; do
+    read -r old base <<<"${LEFT_MAC[$name]}"
+    problem "$name" "$name would move from Mac pkgbase $old to $base, which the inventory does not list"
+  done
+  declare -A SEEN_BASE=()
+  while IFS='|' read -r name ver base _; do
+    [[ -n ${WANT[$base]:-} ]] || continue
+    SEEN_BASE[$base]=1
+    want=${WANT[$base]}
+    if [[ $want == none ]]; then
+      problem "$name" "$name $ver is a Mac package with no qualified version (the inventory lists $base as none)"
+    elif [[ $ver != "$want" ]]; then
+      problem "$name" "$name would be $ver in $CHANNEL; the qualified Mac set has $base $want"
+    fi
+  done < "$WORK/after.tsv"
+  for base in $(printf '%s\n' "${!WANT[@]}" | sort); do
+    want=${WANT[$base]}
+    recipe=$(recipe_for "$base")
+    if [[ -z $recipe ]]; then
+      problem "$base" "the inventory lists $base, but no recipe on this checkout builds that pkgbase"
+      continue
+    fi
+    [[ $want != none && -z ${SEEN_BASE[$base]:-} ]] || continue
+    package_supports_arch "$recipe" "$ARCH" || continue
+    problem "$base" "the qualified Mac set has $base $want; $CHANNEL/$ARCH would not have it"
+  done
+fi
+
+for name in $(printf '%s\n' "${!IN_CLOSURE[@]}" | sort); do
+  [[ -n ${A_VER[$name]:-} ]] || continue
+  for dep in ${A_DEPS[$name]:-}; do
+    read -r dname op want <<<"$(split_dep "$dep")"
+    providers=${A_PROV[$dname]:-}
+    if [[ -z $providers ]]; then
+      [[ -n ${B_PROV[$dname]:-} ]] && problem "$name" "$name needs $dep; $CHANNEL provided $dname before, and would not after"
+      continue
+    fi
+    ok=false
+    while IFS=$'\t' read -r p pver; do
+      [[ -n $p ]] || continue
+      satisfies "$pver" "${op:-}" "${want:-}" && { ok=true; break; }
+    done <<<"$providers"
+    [[ $ok == true ]] && continue
+    offered=$(awk -F'\t' -v d="$dname" 'NF && $1 != "" {
+      printf "%s%s", (n++ ? ", " : ""), ($1 == d ? $1 " " $2 : d ($2 == "" ? "" : "=" $2) " (from " $1 ")") }' <<<"$providers")
+    problem "$name" "$name needs $dep; $CHANNEL would offer only $offered"
+  done
+done
+
+if [[ -s $WORK/problems ]]; then
+  print_error "Refusing: $CHANNEL/$ARCH would not hold the qualified Mac set ($(basename "$INVENTORY")) with a resolving dependency closure"
+  sort -u "$WORK/problems" | while IFS=$'\t' read -r _ text; do print_step "$text"; done
+  sort -u "$WORK/problems" > "$WORK/problems.sorted"
+  finish refused "$WORK/problems.sorted"
+  exit 1
+fi
+print_success "Mac package set: $CHANNEL/$ARCH holds the qualified set${moved_mac[*]:+ (moving ${moved_mac[*]})} and its dependency closure resolves"
+finish pass

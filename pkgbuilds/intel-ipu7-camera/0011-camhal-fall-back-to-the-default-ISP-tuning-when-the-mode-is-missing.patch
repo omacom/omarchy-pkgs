@@ -1,0 +1,91 @@
+From 5ba99a9f2cda77035dd99cacf8d98d3a0293768f Mon Sep 17 00:00:00 2001
+From: Spencer Bull <spencer@omarchy.org>
+Date: Tue, 29 Sep 2026 08:27:30 -0500
+Subject: [PATCH] PipeLine: fall back to the default ISP tuning when the mode
+ is missing
+
+The static graph tags its nodes with an ISP tuning mode, and PipeLine
+asks CCA to load the matching ISP container from the tuning file. When
+the file has no container for that mode, updateTuning() fails and the
+HAL carries on with the graph's mode anyway. The generic AIC then looks
+up tunings for a mode it does not have, finds none, and every ISP kernel
+it tunes (noise reduction, TNR, sharpening, ...) runs on library
+defaults.
+
+The OV08X40 PTL tuning (OV08X40_KAFE799_PTL.aiqb) ships DFLT, LMOD 1 and
+LMOD 2, while its graph (OV08X40_KAFE799.IPU75XA.bin) tags the 1080p
+video pipe with mode 4: gaic_find_all_tunings(60001, 4) returns nothing
+and temporal noise reduction never engages. Measured on a Dell XPS 16
+DA16260 at ISO 402: frame-to-frame noise on a flat wall drops from 9.2
+to 1.9 once the default tuning is applied.
+
+On failure, load the default (DFLT) ISP tuning and configure the CB
+stages with mode 0, which is how the generic AIC indexes it. Tunings
+that carry the requested mode are unchanged.
+---
+ src/core/processingUnit/PipeLine.cpp | 23 +++++++++++++++++++++--
+ src/core/processingUnit/PipeLine.h   |  3 +++
+ 2 files changed, 24 insertions(+), 2 deletions(-)
+
+diff --git a/src/core/processingUnit/PipeLine.cpp b/src/core/processingUnit/PipeLine.cpp
+index afd82f7..eebff11 100644
+--- a/src/core/processingUnit/PipeLine.cpp
++++ b/src/core/processingUnit/PipeLine.cpp
+@@ -53,6 +53,7 @@ void PipeLine::deinit() {
+ }
+ 
+ void PipeLine::updateIspTuningMode(TuningMode tuningMode) {
++    mUseDefaultIspTuning = false;
+     if (!PlatformData::supportUpdateTuning(mCameraId)) {
+         return;
+     }
+@@ -74,8 +75,22 @@ void PipeLine::updateIspTuningMode(TuningMode tuningMode) {
+     CheckAndLogError(!intelCca, VOID_VALUE, "Failed to get IntelCca");
+ 
+     ia_err iaErr = intelCca->updateTuning(cca::CCA_LARD_ISP, lardParam, tmpNvm, mStreamId);
+-    CheckAndLogError(iaErr != ia_err_none, VOID_VALUE, "Failed to update tuning %u",
+-                     ispTuningMode);
++    if (iaErr != ia_err_none) {
++        // The graph asks for an ISP tuning mode the tuning file does not carry (the
++        // OV08X40 PTL tuning ships DFLT, LMOD 1 and LMOD 2 while its graph asks for 4).
++        // Without a fallback the generic AIC finds no tunings for the mode, and every
++        // ISP kernel it tunes (noise reduction, TNR, sharpening, ...) runs on library
++        // defaults. Load the default ISP tuning and look it up as mode 0 instead.
++        LOGW("No ISP tuning for mode %u, falling back to the default tuning", ispTuningMode);
++        lardParam.isp_mode_index = IA_MKN_CHTOUL('D', 'F', 'L', 'T');
++        iaErr = intelCca->updateTuning(cca::CCA_LARD_ISP, lardParam, tmpNvm, mStreamId);
++        if (iaErr != ia_err_none) {
++            // The default ISP tuning loaded at init is still in place.
++            LOGW("Failed to reload the default ISP tuning (%d)", iaErr);
++        }
++        mUseDefaultIspTuning = true;
++        return;
++    }
+ 
+     LOG1("Update isp tuning mode %u, streamId %d", ispTuningMode, mStreamId);
+ }
+@@ -292,6 +307,10 @@ status_t PipeLine::configurePipeStages() {
+         CheckAndLogError(!pNode, UNKNOWN_ERROR, "No PSys node for psys contextId %d",
+                          unit.psysContextId);
+ 
++        if (mUseDefaultIspTuning) {
++            unit.node->nodeKernels.operationMode = 0;
++        }
++
+         std::unordered_map<uint8_t, TerminalConfig> terminalConfig;
+         ret = unit.ipuStage->configure(unit.node->nodeKernels,
+                                        const_cast<const GraphLink**>(links), numLinks,
+diff --git a/src/core/processingUnit/PipeLine.h b/src/core/processingUnit/PipeLine.h
+index 0f881f0..a72756d 100644
+--- a/src/core/processingUnit/PipeLine.h
++++ b/src/core/processingUnit/PipeLine.h
+@@ -134,6 +134,9 @@ class PipeLine {
+     std::map<uuid, TerminalInfo> mTerminalsDesc;
+ 
+     TuningMode mTuningMode;
++    // The tuning has no ISP container for the graph's tuning mode, so the default
++    // (DFLT) ISP tuning is loaded and looked up as mode 0.
++    bool mUseDefaultIspTuning = false;
+ 
+     PSysDevice* mPSysDevice;
+     PSysGraph mPSysGraph;

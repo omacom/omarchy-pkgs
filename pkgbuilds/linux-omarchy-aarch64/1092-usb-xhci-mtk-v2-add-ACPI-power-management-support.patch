@@ -1,0 +1,2123 @@
+From d054faf0712ea2dfeb26952839d3751230cbb26a Mon Sep 17 00:00:00 2001
+From: Bharat Dintakurti <bdintakurti@nvidia.com>
+Date: Wed, 12 Aug 2026 09:31:24 -0700
+Subject: [PATCH 3/6] NVIDIA: SAUCE: usb: xhci-mtk-v2: add ACPI power
+ management support
+
+BugLink: https://bugs.launchpad.net/bugs/2167884
+
+Add the MediaTek xHCI platform glue for ACPI-described controllers.
+Parse the IPPC, MAC and PHY resources, configure the USB PHYs, and
+coordinate controller D0/D3 transitions through Power Wrap. Add support
+for the platform's dedicated wake interrupt.
+
+Integrate the platform sequence with probe, remove and system suspend.
+Propagate IPPC and Power Wrap failures, unwind locally prepared hardware
+on probe and suspend failures, and avoid MMIO recovery until firmware has
+confirmed D0. Follow the platform power-on ordering by disabling IPPC bus
+and PHY clock gating before releasing host power-down during initialization
+and low-power exit.
+
+Keep runtime PM disabled until Power Wrap can report an authoritative
+state after a failed transition, and reject MediaTek runtime PM callbacks.
+Keep confirmed D0 after system-resume errors. If platform D0 exit fails,
+mark both HCDs inaccessible; if controller restore or failed-suspend
+rollback fails after D0, keep accessibility accurate while marking the host
+dead before later IRQ, hub, unlink, remove, or shutdown paths can access
+registers.
+
+Quiesce Debug Capability work and tear down its software state without
+MMIO when hardware is inaccessible. Suppress stale clear-TT doorbells
+during failed-host teardown.
+
+Validate the required PHY type before acquiring controller resources,
+return standard timeout errors, and avoid hardware teardown when D0 is not
+confirmed.
+
+Co-developed-by: Chunfeng Yun <chunfeng.yun@mediatek.com>
+Signed-off-by: Chunfeng Yun <chunfeng.yun@mediatek.com>
+Signed-off-by: Bharat Dintakurti <bdintakurti@nvidia.com>
+Acked-by: Emily Soto <emilys@nvidia.com>
+Acked-by: Jamie Nguyen <jamien@nvidia.com>
+Acked-by: Carol L Soto <csoto@nvidia.com>
+Signed-off-by: Brad Figg <bfigg@nvidia.com>
+[rh: backported to 7.2.5; xhci_dbc_remove() keeps 7.2's enable_mutex around both stop paths]
+---
+ drivers/usb/host/Kconfig         |   11 +
+ drivers/usb/host/Makefile        |    5 +
+ drivers/usb/host/xhci-dbgcap.c   |   62 +-
+ drivers/usb/host/xhci-dbgcap.h   |   12 +-
+ drivers/usb/host/xhci-dbgtty.c   |    4 +-
+ drivers/usb/host/xhci-ext-caps.h |    4 +
+ drivers/usb/host/xhci-hub.c      |   11 +
+ drivers/usb/host/xhci-mem.c      |    2 +-
+ drivers/usb/host/xhci-mtk-v2.c   | 1019 ++++++++++++++++++++++++++++++
+ drivers/usb/host/xhci-mtk-v2.h   |   85 +++
+ drivers/usb/host/xhci-plat.c     |  207 +++++-
+ drivers/usb/host/xhci-plat.h     |   13 +
+ drivers/usb/host/xhci-ring.c     |   37 +-
+ drivers/usb/host/xhci.c          |   78 ++-
+ 14 files changed, 1490 insertions(+), 60 deletions(-)
+ create mode 100644 drivers/usb/host/xhci-mtk-v2.c
+ create mode 100644 drivers/usb/host/xhci-mtk-v2.h
+
+diff --git a/drivers/usb/host/Kconfig b/drivers/usb/host/Kconfig
+index b3b1ec6..7a80311 100644
+--- a/drivers/usb/host/Kconfig
++++ b/drivers/usb/host/Kconfig
+@@ -83,6 +83,17 @@ config USB_XHCI_MTK
+ 	  found in MediaTek SoCs.
+ 	  If unsure, say N.
+ 
++config USB_XHCI_MTK_V2
++	tristate "xHCI support for MediaTek MT8901 SoC"
++	depends on ACPI
++	depends on MTK_POWER_WRAP
++	depends on ARM64 || COMPILE_TEST
++	select USB_XHCI_PLATFORM
++	default y
++	help
++	  Say 'Y' to enable the support for the xHCI host controller
++	  for the MT8901 SoC.
++
+ config USB_XHCI_MVEBU
+ 	tristate "xHCI support for Marvell Armada 375/38x/37xx"
+ 	select USB_XHCI_PLATFORM
+diff --git a/drivers/usb/host/Makefile b/drivers/usb/host/Makefile
+index 174580c..27e2873 100644
+--- a/drivers/usb/host/Makefile
++++ b/drivers/usb/host/Makefile
+@@ -22,6 +22,11 @@ endif
+ xhci-mtk-hcd-y := xhci-mtk.o xhci-mtk-sch.o
+ 
+ xhci-plat-hcd-y := xhci-plat.o
++
++ifneq ($(CONFIG_USB_XHCI_MTK_V2), )
++	xhci-plat-hcd-y		+= xhci-mtk-v2.o
++endif
++
+ ifneq ($(CONFIG_USB_XHCI_MVEBU), )
+ 	xhci-plat-hcd-y		+= xhci-mvebu.o
+ endif
+diff --git a/drivers/usb/host/xhci-dbgcap.c b/drivers/usb/host/xhci-dbgcap.c
+index 48ee6a4..b91584a 100644
+--- a/drivers/usb/host/xhci-dbgcap.c
++++ b/drivers/usb/host/xhci-dbgcap.c
+@@ -773,6 +773,43 @@ static void xhci_dbc_stop(struct xhci_dbc *dbc)
+ 		pm_runtime_put(dbc->dev);
+ }
+ 
++/*
++ * Tear down DbC software state after the platform has made xHCI registers
++ * inaccessible.  Mark the state disabled before draining asynchronous work so
++ * neither the worker nor a request completion can issue another MMIO access.
++ */
++static void xhci_dbc_stop_no_hw(struct xhci_dbc *dbc)
++{
++	enum dbc_state state;
++	unsigned long flags;
++
++	spin_lock_irqsave(&dbc->lock, flags);
++	state = dbc->state;
++	dbc->state = DS_DISABLED;
++	spin_unlock_irqrestore(&dbc->lock, flags);
++
++	/* Stop the worker and prevent request completions from requeueing it. */
++	disable_delayed_work_sync(&dbc->event_work);
++
++	if (state == DS_DISABLED)
++		return;
++
++	if (state == DS_CONFIGURED) {
++		spin_lock_irqsave(&dbc->lock, flags);
++		xhci_dbc_flush_requests(dbc);
++		spin_unlock_irqrestore(&dbc->lock, flags);
++
++		if (dbc->driver->disconnect)
++			dbc->driver->disconnect(dbc);
++	}
++
++	xhci_dbc_mem_cleanup(dbc);
++
++	/* DS_INITIALIZED is left behind only after a failed start already put. */
++	if (state >= DS_ENABLED)
++		pm_runtime_put_noidle(dbc->dev);
++}
++
+ static void
+ handle_ep_halt_changes(struct xhci_dbc *dbc, struct dbc_ep *dep, bool halted)
+ {
+@@ -1554,17 +1591,25 @@ err:
+ }
+ 
+ /* undo what xhci_alloc_dbc() did */
+-void xhci_dbc_remove(struct xhci_dbc *dbc)
++void xhci_dbc_remove(struct xhci_dbc *dbc, bool hw_accessible)
+ {
+ 	if (!dbc)
+ 		return;
+-	/* stop hw, stop wq and call dbc->ops->stop() */
+-	mutex_lock(&dbc->enable_mutex);
+-	xhci_dbc_stop(dbc);
+-	mutex_unlock(&dbc->enable_mutex);
+-	/* remove sysfs files */
++
++	/* Prevent a concurrent sysfs write from restarting DbC during removal. */
+ 	sysfs_remove_groups(&dbc->dev->kobj, dbc_dev_groups);
+ 
++	/* stop hw when possible, then stop work and call dbc->ops->stop() */
++	mutex_lock(&dbc->enable_mutex);
++	if (hw_accessible) {
++		/* Removal is final; prevent callbacks from requeueing the worker. */
++		disable_delayed_work_sync(&dbc->event_work);
++		xhci_dbc_stop(dbc);
++	} else {
++		xhci_dbc_stop_no_hw(dbc);
++	}
++	mutex_unlock(&dbc->enable_mutex);
++
+ 	kfree(dbc);
+ }
+ 
+@@ -1593,18 +1638,19 @@ int xhci_create_dbc_dev(struct xhci_hcd *xhci)
+ 	return ret;
+ }
+ 
+-void xhci_remove_dbc_dev(struct xhci_hcd *xhci)
++void xhci_remove_dbc_dev(struct xhci_hcd *xhci, bool hw_accessible)
+ {
+ 	unsigned long		flags;
+ 
+ 	if (!xhci->dbc)
+ 		return;
+ 
+-	xhci_dbc_tty_remove(xhci->dbc);
++	xhci_dbc_tty_remove(xhci->dbc, hw_accessible);
+ 	spin_lock_irqsave(&xhci->lock, flags);
+ 	xhci->dbc = NULL;
+ 	spin_unlock_irqrestore(&xhci->lock, flags);
+ }
++EXPORT_SYMBOL_GPL(xhci_remove_dbc_dev);
+ 
+ #ifdef CONFIG_PM
+ int xhci_dbc_suspend(struct xhci_hcd *xhci)
+diff --git a/drivers/usb/host/xhci-dbgcap.h b/drivers/usb/host/xhci-dbgcap.h
+index 5b18efb..2f05066 100644
+--- a/drivers/usb/host/xhci-dbgcap.h
++++ b/drivers/usb/host/xhci-dbgcap.h
+@@ -230,16 +230,17 @@ static inline struct dbc_ep *get_out_ep(struct xhci_dbc *dbc)
+ 
+ #ifdef CONFIG_USB_XHCI_DBGCAP
+ int xhci_create_dbc_dev(struct xhci_hcd *xhci);
+-void xhci_remove_dbc_dev(struct xhci_hcd *xhci);
++void xhci_remove_dbc_dev(struct xhci_hcd *xhci, bool hw_accessible);
+ int xhci_dbc_init(void);
+ void xhci_dbc_exit(void);
+ int dbc_tty_init(void);
+ void dbc_tty_exit(void);
+-int xhci_dbc_tty_probe(struct device *dev, void __iomem *res, struct xhci_hcd *xhci);
+-void xhci_dbc_tty_remove(struct xhci_dbc *dbc);
++int xhci_dbc_tty_probe(struct device *dev, void __iomem *res,
++		       struct xhci_hcd *xhci);
++void xhci_dbc_tty_remove(struct xhci_dbc *dbc, bool hw_accessible);
+ struct xhci_dbc *xhci_alloc_dbc(struct device *dev, void __iomem *res,
+ 				 const struct dbc_driver *driver);
+-void xhci_dbc_remove(struct xhci_dbc *dbc);
++void xhci_dbc_remove(struct xhci_dbc *dbc, bool hw_accessible);
+ struct dbc_request *dbc_alloc_request(struct xhci_dbc *dbc,
+ 				      unsigned int direction,
+ 				      gfp_t flags);
+@@ -255,7 +256,8 @@ static inline int xhci_create_dbc_dev(struct xhci_hcd *xhci)
+ 	return 0;
+ }
+ 
+-static inline void xhci_remove_dbc_dev(struct xhci_hcd *xhci)
++static inline void xhci_remove_dbc_dev(struct xhci_hcd *xhci,
++				       bool hw_accessible)
+ {
+ }
+ static inline int xhci_dbc_init(void)
+diff --git a/drivers/usb/host/xhci-dbgtty.c b/drivers/usb/host/xhci-dbgtty.c
+index 7e44e62..db8d00b 100644
+--- a/drivers/usb/host/xhci-dbgtty.c
++++ b/drivers/usb/host/xhci-dbgtty.c
+@@ -611,11 +611,11 @@ out2:
+  * undo what probe did, assume dbc is stopped already.
+  * we also assume tty_unregister_device() is called before this
+  */
+-void xhci_dbc_tty_remove(struct xhci_dbc *dbc)
++void xhci_dbc_tty_remove(struct xhci_dbc *dbc, bool hw_accessible)
+ {
+ 	struct dbc_port         *port = dbc_to_port(dbc);
+ 
+-	xhci_dbc_remove(dbc);
++	xhci_dbc_remove(dbc, hw_accessible);
+ 	kfree(port);
+ }
+ 
+diff --git a/drivers/usb/host/xhci-ext-caps.h b/drivers/usb/host/xhci-ext-caps.h
+index 67ecf73..1c3d6df 100644
+--- a/drivers/usb/host/xhci-ext-caps.h
++++ b/drivers/usb/host/xhci-ext-caps.h
+@@ -8,6 +8,9 @@
+  * Some code borrowed from the Linux EHCI driver.
+  */
+ 
++#ifndef __XHCI_EXT_CAPS_H
++#define __XHCI_EXT_CAPS_H
++
+ /* HC should halt within 16 ms, but use 32 ms as some hosts take longer */
+ #define XHCI_MAX_HALT_USEC	(32 * 1000)
+ /* HC not running - set to 1 when run/stop bit is cleared. */
+@@ -155,3 +158,4 @@ static inline int xhci_find_next_ext_cap(void __iomem *base, u32 start, int id)
+ 
+ 	return 0;
+ }
++#endif /* __XHCI_EXT_CAPS_H */
+diff --git a/drivers/usb/host/xhci-hub.c b/drivers/usb/host/xhci-hub.c
+index c2c2b74..174d9b7 100644
+--- a/drivers/usb/host/xhci-hub.c
++++ b/drivers/usb/host/xhci-hub.c
+@@ -1203,6 +1203,12 @@ int xhci_hub_control(struct usb_hcd *hcd, u16 typeReq, u16 wValue,
+ 	bus_state = &rhub->bus_state;
+ 
+ 	spin_lock_irqsave(&xhci->lock, flags);
++	if (unlikely(!HCD_HW_ACCESSIBLE(hcd) ||
++		     xhci->xhc_state & XHCI_STATE_DYING)) {
++		spin_unlock_irqrestore(&xhci->lock, flags);
++		return -ESHUTDOWN;
++	}
++
+ 	switch (typeReq) {
+ 	case GetHubStatus:
+ 		/* No power source, over-current reported per port */
+@@ -1646,6 +1652,11 @@ int xhci_hub_status_data(struct usb_hcd *hcd, char *buf)
+ 	 * a non-zero value even if there are no status changes.
+ 	 */
+ 	spin_lock_irqsave(&xhci->lock, flags);
++	if (unlikely(!HCD_HW_ACCESSIBLE(hcd) ||
++		     xhci->xhc_state & XHCI_STATE_DYING)) {
++		spin_unlock_irqrestore(&xhci->lock, flags);
++		return 0;
++	}
+ 
+ 	status = bus_state->resuming_ports;
+ 
+diff --git a/drivers/usb/host/xhci-mem.c b/drivers/usb/host/xhci-mem.c
+index a5e7f36..fe2d3e2 100644
+--- a/drivers/usb/host/xhci-mem.c
++++ b/drivers/usb/host/xhci-mem.c
+@@ -1834,7 +1834,7 @@ xhci_remove_interrupter(struct xhci_hcd *xhci, struct xhci_interrupter *ir)
+ 	 * low or high 32 bits of ERSTBA immediately causes the controller to
+ 	 * dereference the partially cleared 64 bit address, causing IOMMU error.
+ 	 */
+-	if (ir->ir_set) {
++	if (ir->ir_set && HCD_HW_ACCESSIBLE(xhci_to_hcd(xhci))) {
+ 		tmp = readl(&ir->ir_set->erst_size);
+ 		tmp &= ~ERST_SIZE_MASK;
+ 		writel(tmp, &ir->ir_set->erst_size);
+diff --git a/drivers/usb/host/xhci-mtk-v2.c b/drivers/usb/host/xhci-mtk-v2.c
+new file mode 100644
+index 0000000..779e471
+--- /dev/null
++++ b/drivers/usb/host/xhci-mtk-v2.c
+@@ -0,0 +1,1019 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Copyright (c) 2026 MediaTek Inc.
++ *
++ * Author: Chunfeng Yun <chunfeng.yun@mediatek.com>
++ */
++
++#include <linux/errno.h>
++#include <linux/io.h>
++#include <linux/of.h>
++#include <linux/platform_device.h>
++#include <linux/soc/mediatek/mtk-pwrap.h>
++
++#include <linux/usb.h>
++#include <linux/usb/hcd.h>
++
++#include "xhci.h"
++#include "xhci-plat.h"
++#include "xhci-mtk-v2.h"
++
++/* IPPC (IP Port Control) registers */
++#define IPPC_IP_PW_CTRL0			0x00
++#define CTRL0_IP_SW_RST				BIT(0)
++
++#define IPPC_IP_PW_CTRL1			0x04
++#define CTRL1_IP_HOST_PDN			BIT(0)
++
++#define IPPC_IP_PW_CTRL2			0x08
++/* U3D_SSUSB_IP_PW_CTRL2 */
++#define CTRL2_IP_DEV_PDN			BIT(0)
++
++#define IPPC_IP_PW_STS1				0x10
++#define STS1_SYSPLL_STABLE			BIT(0)
++#define STS1_REF_RST				BIT(8)
++#define STS1_SYS125_RST				BIT(10)
++#define STS1_XHCI_RST				BIT(11)
++#define STS1_U3_MAC_RST				BIT(16)
++#define U3_MAC3_CSR_PLL_STB			(STS1_SYSPLL_STABLE | STS1_U3_MAC_RST)
++#define U3_MAC2_CSR_PLL_STB			(STS1_SYSPLL_STABLE | STS1_SYS125_RST)
++#define STS1_IP_SLEEP				BIT(30)
++
++#define IPPC_IP_XHCI_CAP			0x24
++#define CAP_U3_PORT_NUM(p)			((p) & 0xff)
++#define CAP_U2_PORT_NUM(p)			(((p) >> 8) & 0xff)
++
++#define IPPC_U3_CTRL_P0				0x30
++#define CTRL_U3_PORT_DIS			BIT(0)
++#define CTRL_U3_PORT_PDN			BIT(1)
++#define CTRL_U3_PORT_HOST_SEL			BIT(2)
++#define CTRL_U3_PORT_SS_GEN2			BIT(9)
++#define CTRL_U3_PORT_SS_2LANE			BIT(10)
++
++#define IPPC_U2_CTRL_P0				0x50
++#define IPPC_U2_CTRL_P1				0x58
++#define CTRL_U2_PORT_DIS			BIT(0)
++#define CTRL_U2_PORT_PDN			BIT(1)
++#define CTRL_U2_PORT_HOST_SEL			BIT(2)
++
++#define IPPC_CSR_CK_CTRL			0x88
++#define CK_CSR_BUS_CK_GATE_EN			BIT(0)
++#define CK_PHY_BUS_CK_GATE_EN			BIT(1)
++
++/* Test Bank */
++#define XHCI_VTIO_TEST_BASE			0
++
++#define TEST_HSRAM_DBGCTL			(XHCI_VTIO_TEST_BASE + 0x00)
++#define THDC_SRAM_DBG_EN			BIT(0)
++#define THDC_SRAM_DBG_WP			BIT(1)
++
++#define TEST_HSRAM_DBGMODE			(XHCI_VTIO_TEST_BASE + 0x04)
++#define THDM_SRAM_DM_EP_SLOT			BIT(3)
++
++#define TEST_HSRAM_DBGSEL			(XHCI_VTIO_TEST_BASE + 0x08)
++#define THDS_SRAM_DS_EP_SLOT			BIT(3)
++
++#define TEST_HSRAM_DBGADR			(XHCI_VTIO_TEST_BASE + 0x0C)
++#define THDA_SRAM_DWSEL_MSK			GENMASK(2, 0)
++#define THDA_SRAM_DWSEL_VAL(x)			((x) & THDA_SRAM_DWSEL_MSK)
++#define THDA_DWSEL_32B_TO_64B			1
++#define THDA_SRAM_ADDR_MSK			GENMASK(16, 3)
++#define THDA_SRAM_ADDR_VAL(x)			(((x) << 3) & THDA_SRAM_ADDR_MSK)
++
++#define TEST_HSRAM_DBGDR			(XHCI_VTIO_TEST_BASE + 0x10)
++
++#define TEST_XACT3_CFG				(XHCI_VTIO_TEST_BASE + 0x48)
++#define TXC_TX_TMOUT_MSK			GENMASK(7, 0)
++#define TXC_TX_TMOUT_VAL(x)			((x) & TXC_TX_TMOUT_MSK)
++#define TXC_TX_TMOUT_VAL_DFT			0x40
++
++#define TEST_HSCH_CFG1				(XHCI_VTIO_TEST_BASE + 0x60)
++#define THC1_PORT_IDLE_WITH_ISO			BIT(0)
++#define THC1_BURST_TD_OFF			BIT(2)
++#define THC1_OUT_NUMP_REF			BIT(4)
++#define THC1_SCH3_INT_PING_TD_CHK		BIT(12)
++#define THC1_PORT_IDLE_WITH_INT			BIT(13)
++
++#define TEST_CMD_CFG				(XHCI_VTIO_TEST_BASE + 0x64)
++#define TCC_PARAM_ERR_CHK_DIS			BIT(0)
++
++#define TEST_EP_CFG				(XHCI_VTIO_TEST_BASE + 0x68)
++#define TEC_STOP_EP_OPT				BIT(2)
++
++#define TEST_TRBQ_CFG				(XHCI_VTIO_TEST_BASE + 0x70)
++#define TTC_TRB_ERR_CHK_DIS			BIT(0)
++
++#define TEST_RST_CTRL0				(XHCI_VTIO_TEST_BASE + 0xB0)
++#define TRC_HCRST_RXDETECT_EN			BIT(7)
++
++#define TEST_SCH_CFG5				(XHCI_VTIO_TEST_BASE + 0x114)
++#define TSC5_OH_FS_INT_IN_MSK			GENMASK(7, 0)
++#define TSC5_OH_FS_INT_IN_VAL(x)		((x) & TSC5_OH_FS_INT_IN_MSK)
++#define TSC5_OH_FS_INT_OUT_MSK			GENMASK(15, 8)
++#define TSC5_OH_FS_INT_OUT_VAL(x)		(((x) << 8) & TSC5_OH_FS_INT_OUT_MSK)
++#define TSC5_OH_FS_INT_DFT				0xA
++#define TSC5_OH_FS_ISO_IN_MSK			GENMASK(23, 16)
++#define TSC5_OH_FS_ISO_IN_VAL(x)		(((x) << 16) & TSC5_OH_FS_ISO_IN_MSK)
++#define TSC5_OH_FS_ISO_OUT_MSK			GENMASK(31, 24)
++#define TSC5_OH_FS_ISO_OUT_VAL(x)		(((x) << 24) & TSC5_OH_FS_ISO_OUT_MSK)
++#define TSC5_OH_FS_ISO_DFT			0x8
++
++#define TEST_SCH_CFG6				(XHCI_VTIO_TEST_BASE + 0x118)
++#define TSC6_OH_LS_INT_IN_MSK			GENMASK(7, 0)
++#define TSC6_OH_LS_INT_IN_VAL(x)		((x) & TSC6_OH_LS_INT_IN_MSK)
++#define TSC6_OH_LS_INT_OUT_MSK			GENMASK(15, 8)
++#define TSC6_OH_LS_INT_OUT_VAL(x)		(((x) << 8) & TSC6_OH_LS_INT_OUT_MSK)
++#define TSC6_OH_LS_INT_DFT			0xA
++
++#define IPPC_U3_CTRL(p)				(IPPC_U3_CTRL_P0 + ((p) << 3))
++#define IPPC_U2_CTRL(p)				(IPPC_U2_CTRL_P0 + ((p) << 3))
++
++#define SPHY_U3_BASE_OFFSET			0x3000
++#define SPHY_PORT_BANKS_SIZE			0x4000
++
++/* S-PHY sub-banks offset base address */
++/* u2 phy banks */
++#define SPHY_U2_MISC				0x000
++#define SPHY_U2_FREQ				0x100
++#define SPHY_U2_COM				0x300
++
++/* u3/pcie phy banks */
++#define SPHY_U3_DIG_GLB				0x000
++#define SPHY_U3_PHYA_GLB			0x100
++/* u3 phy banks, ln0/1 */
++#define SPHY_LN0_OFFSET				0x400
++#define SPHY_LN_BANKS_SIZE			0x600
++/* ln0/1 banks */
++#define SPHY_LN_DIG_TOP				0x000
++#define SPHY_LN_DIG_TX0				0x100
++#define SPHY_LN_DIG_RX0				0x200
++#define SPHY_LN_DIG_DAIF			0x300
++#define SPHY_LN_PHYA				0x400
++#define SPHY_LN_FEDIG				0x500
++
++#define U2P_MISC_REG1				(SPHY_U2_MISC + 0x04)
++#define MR1_RG_EFUSE_AUTO_LOAD_DIS		BIT(6)
++
++#define U2P_USBPHYACR0				(SPHY_U2_COM + 0x000)
++#define PA0_RG_U2_INTR_EN			BIT(5)
++
++#define U2P_USBPHYACR2				(SPHY_U2_COM + 0x008)
++#define PA2_RG_U2_CLKREF_REV1_MSK		GENMASK(15, 8)
++#define PA2_RG_U2_CLKREF_REV1_VAL(x)		((0xff & (x)) << 8)
++#define PA2_RG_U2_CLKREF_DFT			PA2_RG_U2_CLKREF_REV1_VAL(0x32)
++
++#define U2P_USBPHYACR5				(SPHY_U2_COM + 0x014)
++#define PA5_RG_U2_HSTX_SRCTRL_MSK		GENMASK(14, 12)
++#define PA5_RG_U2_HSTX_SRCTRL_VAL(x)		((0x7 & (x)) << 12)
++#define PA5_RG_U2_DE_EMPHASIS_MSK		GENMASK(9, 8)
++#define PA5_RG_U2_DE_EMPHASIS(x)		((0x3 & (x)) << 8)
++
++#define U2P_USBPHYACR6				(SPHY_U2_COM + 0x018)
++#define PA6_RG_U2_BC11_SW_EN			BIT(23)
++#define PA6_RG_U2_OTG_VBUSCMP_EN		BIT(20)
++#define PA6_RG_U2_DISCTH_MSK			GENMASK(7, 4)
++#define PA6_RG_U2_DISCTH_VAL(x)			((0xf & (x)) << 4)
++#define PA6_RG_U2_SQTH_MSK			GENMASK(3, 0)
++#define PA6_RG_U2_SQTH_VAL(x)			(0xf & (x))
++
++#define U2P_U2PHYACR4				(SPHY_U2_COM + 0x020)
++#define P2C_RG_U2_GPIO_CTL			BIT(9)
++#define P2C_RG_U2_GPIO_MODE			BIT(8)
++#define P2C_U2_GPIO_CTR_MSK			(P2C_RG_U2_GPIO_CTL | P2C_RG_U2_GPIO_MODE)
++
++#define U2P_U2PHYACR5				(SPHY_U2_COM + 0x050)
++#define PA5_RG_LDO_VREF_SEL_MSK			GENMASK(2, 0)
++#define PA5_RG_LDO_VREF_SEL_VAL(x)		((0x7 & (x)) << 0)
++#define PA5_RG_LDO_VREF_SEL_VAL_MAX		(0x7)
++#define PA5_RG_TERM_CAL_P_MSK			GENMASK(19, 16)
++#define PA5_RG_TERM_CAL_P_VAL(x)		((0xF & (x)) << 16)
++#define PA5_RG_HSTX_LDO_OUT_SEL_MSK		GENMASK(29, 28)
++#define PA5_RG_HSTX_LDO_OUT_SEL_VAL(x)		((0x3 & (x)) << 28)
++
++#define U2P_U2PHYDTM0				(SPHY_U2_COM + 0x068)
++#define P2C_FORCE_UART_EN			BIT(26)
++#define P2C_FORCE_DATAIN			BIT(23)
++#define P2C_FORCE_DM_PULLDOWN			BIT(21)
++#define P2C_FORCE_DP_PULLDOWN			BIT(20)
++#define P2C_FORCE_XCVRSEL			BIT(19)
++#define P2C_FORCE_SUSPENDM			BIT(18)
++#define P2C_FORCE_TERMSEL			BIT(17)
++#define P2C_RG_DATAIN_MSK			GENMASK(13, 10)
++#define P2C_RG_DATAIN_VAL(x)			((0xf & (x)) << 10)
++#define P2C_RG_DMPULLDOWN			BIT(7)
++#define P2C_RG_DPPULLDOWN			BIT(6)
++#define P2C_RG_XCVRSEL_MSK			GENMASK(5, 4)
++#define P2C_RG_XCVRSEL_VAL(x)			((0x3 & (x)) << 4)
++#define P2C_RG_SUSPENDM				BIT(3)
++#define P2C_RG_TERMSEL				BIT(2)
++#define P2C_DTM0_PART_MSK	  \
++		(P2C_FORCE_DATAIN | P2C_FORCE_DM_PULLDOWN |	\
++		 P2C_FORCE_DP_PULLDOWN | P2C_FORCE_XCVRSEL |	\
++		 P2C_FORCE_TERMSEL | P2C_RG_DMPULLDOWN |	\
++		 P2C_RG_DPPULLDOWN | P2C_RG_TERMSEL)
++
++#define U2P_U2PHYDTM1				(SPHY_U2_COM + 0x06C)
++#define P2C_RG_UART_EN				BIT(16)
++#define P2C_FORCE_IDDIG				BIT(9)
++#define P2C_RG_VBUSVALID			BIT(5)
++#define P2C_RG_SESSEND				BIT(4)
++#define P2C_RG_AVALID				BIT(2)
++#define P2C_RG_IDDIG				BIT(1)
++
++/*	u3 phy bit fileds */
++#define U3P_DIG_GLB_38				(SPHY_U3_DIG_GLB + 0x38)
++#define P3D_TX_DET_P3_TRACK_OPTION		BIT(14)
++
++#define U3P_DIG_GLB_60				(SPHY_U3_DIG_GLB + 0x60)
++#define P3D_CKM_GATED_BIAS_DIS			BIT(13)
++#define P3D_CKM_XTAL_CK_DETECT_DIS		BIT(14)
++
++#define U3P_DIG_LN_RX_34			(SPHY_LN_DIG_RX0 + 0x34)
++#define P3LR_RXLFPS_G1_FWAKE_TH			GENMASK(7, 0)
++#define P3LR_RXLFPS_G1_FWAKE_TH_VAL(x)		((0xFF & (x)) << 0)
++#define P3LR_RXLFPS_G2_FWAKE_TH			GENMASK(15, 8)
++#define P3LR_RXLFPS_G2_FWAKE_TH_VAL(x)		((0xFF & (x)) << 8)
++#define P3LR_RXLFPS_FILTER_VAL_DFT		0x46
++#define P3LR_RXLFPS_FWAKE_SYS_TH		GENMASK(23, 16)
++#define P3LR_RXLFPS_FWAKE_SYS_TH_VAL(x)	((0xFF & (x)) << 16)
++#define P3LR_RXLFPS_FWAKE_SYS_TH_DFT		0xB9
++
++#define U3P_FEDIG_RG_29				(SPHY_LN_FEDIG + 0x74)
++#define P3FE_LN_RX_DFE_AUTO_OFF_EN		BIT(30)
++
++/* SPHY3-only LN0 SI tuning (N1A P4U3 P0/P1) */
++#define U3P_DIG_LN_RX_70			(SPHY_LN_DIG_RX0 + 0x70)
++#define P3LR_PPATH_DVN_G2_LTD0_MSK		GENMASK(7, 0)
++#define P3LR_PPATH_DVN_G2_LTD0_VAL		(0x28 << 0)
++#define P3LR_PPATH_DVN_G2_LTD1_MSK		GENMASK(15, 8)
++#define P3LR_PPATH_DVN_G2_LTD1_VAL		(0x58 << 8)
++
++#define U3P_DIG_LN_RX_7C			(SPHY_LN_DIG_RX0 + 0x7C)
++#define P3LR_STB_GAIN_G2_LTD0_MSK		GENMASK(15, 14)
++#define P3LR_STB_GAIN_G2_LTD0_VAL		(0x2 << 14)
++
++#define U3P_DIG_LN_DAIF_44			(SPHY_LN_DIG_DAIF + 0x44)
++#define P3LD_G2_CDR_IIR_GAIN_MSK		GENMASK(15, 13)
++#define P3LD_G2_CDR_IIR_GAIN_VAL		(0x2 << 13)
++
++#define U3P_DIG_LN_DAIF_58			(SPHY_LN_DIG_DAIF + 0x58)
++#define P3LD_G2_RX_CDR_FASTP_GAIN_MSK		GENMASK(31, 28)
++#define P3LD_G2_RX_CDR_FASTP_GAIN_VAL		(0xF << 28)
++
++#define U3P_DIG_LN_DAIF_60			(SPHY_LN_DIG_DAIF + 0x60)
++#define P3LD_G2_RX_LF_CTLE_CSEL_MSK		GENMASK(23, 21)
++#define P3LD_G2_RX_LF_CTLE_CSEL_VAL		(0x1 << 21)
++#define P3LD_G2_RX_LF_CTLE_RSEL_MSK		GENMASK(31, 28)
++#define P3LD_G2_RX_LF_CTLE_RSEL_VAL		(0x3 << 28)
++
++#define U3P_PHYA_LN_0C				(SPHY_LN_PHYA + 0x0C)
++#define P3L_RX_FE_RESERVE_MSK			GENMASK(23, 22)
++#define P3L_RX_FE_RESERVE_VAL			(0x0 << 22)
++
++// sw macros
++#define U3_CLK_WAIT_MS			10
++#define MS_TO_US			1000
++#define WAIT_UNIT_US			10
++#define TEST_HSRAM_ARRAY_SIZE		32
++
++static inline void usb_write(void __iomem *base, u32 offset, u32 val)
++{
++	writel(val, base + offset);
++}
++
++static inline u32 usb_read(void __iomem *base, u32 offset)
++{
++	return readl(base + offset);
++}
++
++static inline void usb_clr_bits(void __iomem *base, u32 offset, u32 bits)
++{
++	u32 tmp;
++
++	tmp = readl(base + offset);
++	tmp &= ~bits;
++	writel(tmp, base + offset);
++}
++
++static inline void usb_set_bits(void __iomem *base, u32 offset, u32 bits)
++{
++	u32 tmp;
++
++	tmp = readl(base + offset);
++	tmp |= bits;
++	writel(tmp, base + offset);
++}
++
++static inline void usb_update_bits(void __iomem *base, u32 offset, u32 mask, u32 bits)
++{
++	u32 tmp;
++
++	tmp = readl(base + offset);
++	tmp &= ~mask;
++	tmp |= bits;
++	writel(tmp, base + offset);
++}
++
++static inline int
++usb_read_poll_timeout(void __iomem *base, u32 offset, u32 check_val, int timeout_ms)
++{
++	int times = timeout_ms * MS_TO_US / WAIT_UNIT_US;
++	u32 val;
++
++	do {
++		val = usb_read(base, offset);
++		if (check_val == (val & check_val))
++			break;
++
++		udelay(WAIT_UNIT_US);
++	} while (--times > 0);
++
++	return times > 0 ? 0 : -ETIMEDOUT;
++}
++
++static void sphy_u2_init(struct mtk_usb_phy *phy)
++{
++	void __iomem *pbase = phy->port_base;
++
++	// switch to USB function, and enable usb pll
++	usb_clr_bits(pbase, U2P_U2PHYDTM0, P2C_FORCE_UART_EN | P2C_FORCE_SUSPENDM);
++
++	usb_clr_bits(pbase, U2P_U2PHYDTM1, P2C_RG_UART_EN);
++
++	usb_set_bits(pbase, U2P_USBPHYACR0, PA0_RG_U2_INTR_EN);
++
++	usb_clr_bits(pbase, U2P_U2PHYACR4, P2C_U2_GPIO_CTR_MSK);
++
++	// DP/DM BC1.1 path Disable
++	usb_clr_bits(pbase, U2P_USBPHYACR6, PA6_RG_U2_BC11_SW_EN);
++
++	//usb_update_bits(pbase, U2P_USBPHYACR6, PA6_RG_U2_SQTH_MSK, PA6_RG_U2_SQTH_VAL(2));
++
++	// set HS slew rate
++	//usb_update_bits(pbase, U2P_USBPHYACR5,
++	//		PA5_RG_U2_HSTX_SRCTRL_MSK, PA5_RG_U2_HSTX_SRCTRL_VAL(4));
++
++	// set de-emphasis (from sphy3/4)
++	usb_update_bits(pbase, U2P_USBPHYACR5, PA5_RG_U2_DE_EMPHASIS_MSK, PA5_RG_U2_DE_EMPHASIS(1));
++	// set LDO output follow de-emphasis  (from sphy3/4)
++	usb_update_bits(pbase, U2P_U2PHYACR5, PA5_RG_HSTX_LDO_OUT_SEL_MSK,
++			PA5_RG_HSTX_LDO_OUT_SEL_VAL(1));
++
++	usb_clr_bits(pbase, U2P_U2PHYDTM0, P2C_DTM0_PART_MSK);
++
++	usb_update_bits(pbase, U2P_USBPHYACR2, PA2_RG_U2_CLKREF_REV1_MSK, PA2_RG_U2_CLKREF_DFT);
++
++	/* OTG Enable */
++	usb_set_bits(pbase, U2P_USBPHYACR6, PA6_RG_U2_OTG_VBUSCMP_EN);
++
++	usb_set_bits(pbase, U2P_U2PHYDTM1, P2C_RG_VBUSVALID | P2C_RG_AVALID);
++
++	usb_clr_bits(pbase, U2P_U2PHYDTM1, P2C_RG_SESSEND);
++
++	pr_debug(" %s (%u)\n", __func__, phy->pid);
++}
++
++static void sphy_u2_exit(struct mtk_usb_phy *phy)
++{
++	/* OTG Enable */
++	usb_clr_bits(phy->port_base, U2P_USBPHYACR6, PA6_RG_U2_OTG_VBUSCMP_EN);
++
++	usb_clr_bits(phy->port_base, U2P_U2PHYDTM1, P2C_RG_VBUSVALID | P2C_RG_AVALID);
++
++	usb_set_bits(phy->port_base, U2P_U2PHYDTM1, P2C_RG_SESSEND);
++
++	pr_debug(" %s (%u)\n", __func__, phy->pid);
++}
++
++static void sphy_u2_param_tune(struct mtk_usb_phy *phy)
++{
++	void __iomem *pbase = phy->port_base;
++
++	pr_debug(" %s (%u)\n", __func__, phy->pid);
++
++	if (phy->u2p_disconnect_threshold) {
++		usb_update_bits(pbase, U2P_USBPHYACR6, PA6_RG_U2_DISCTH_MSK,
++				PA6_RG_U2_DISCTH_VAL(phy->u2p_disconnect_threshold));
++	}
++
++	if (phy->u2p_eye_rising_deemphasis) {
++		// set de-emphasis (from sphy3/4)
++		usb_update_bits(pbase, U2P_USBPHYACR5, PA5_RG_U2_DE_EMPHASIS_MSK,
++				PA5_RG_U2_DE_EMPHASIS(phy->u2p_eye_rising_deemphasis));
++	}
++
++	if (phy->u2p_eye_rising_txldoout) {
++		// it's better to set LDO-out as de-emphasis  (from sphy3/4)
++		usb_update_bits(pbase, U2P_U2PHYACR5, PA5_RG_HSTX_LDO_OUT_SEL_MSK,
++				PA5_RG_HSTX_LDO_OUT_SEL_VAL(phy->u2p_eye_rising_txldoout));
++	}
++
++	if (phy->u2p_eye_swing_vref) {
++		// disable efuse auto-load first
++		usb_set_bits(pbase, U2P_MISC_REG1, MR1_RG_EFUSE_AUTO_LOAD_DIS);
++		usb_update_bits(pbase, U2P_U2PHYACR5, PA5_RG_LDO_VREF_SEL_MSK,
++				PA5_RG_LDO_VREF_SEL_VAL(phy->u2p_eye_swing_vref));
++		// shall update Term only when Verf is max 7
++		if (phy->u2p_eye_swing_term &&
++			(phy->u2p_eye_swing_vref == PA5_RG_LDO_VREF_SEL_VAL_MAX)) {
++			usb_update_bits(pbase, U2P_U2PHYACR5, PA5_RG_TERM_CAL_P_MSK,
++					PA5_RG_TERM_CAL_P_VAL(phy->u2p_eye_swing_term));
++		}
++	}
++}
++
++static void sphy3_u3_lane0_init(struct mtk_usb_phy *phy)
++{
++	void __iomem *lane_base = phy->port_base + phy->u3p_offset + SPHY_LN0_OFFSET;
++
++	pr_debug("sphy3: %s\n", __func__);
++
++	usb_update_bits(lane_base, U3P_DIG_LN_RX_70,
++			P3LR_PPATH_DVN_G2_LTD0_MSK | P3LR_PPATH_DVN_G2_LTD1_MSK,
++			P3LR_PPATH_DVN_G2_LTD0_VAL | P3LR_PPATH_DVN_G2_LTD1_VAL);
++	usb_update_bits(lane_base, U3P_DIG_LN_RX_7C,
++			P3LR_STB_GAIN_G2_LTD0_MSK,
++			P3LR_STB_GAIN_G2_LTD0_VAL);
++	usb_update_bits(lane_base, U3P_DIG_LN_DAIF_44,
++			P3LD_G2_CDR_IIR_GAIN_MSK,
++			P3LD_G2_CDR_IIR_GAIN_VAL);
++	usb_update_bits(lane_base, U3P_DIG_LN_DAIF_58,
++			P3LD_G2_RX_CDR_FASTP_GAIN_MSK,
++			P3LD_G2_RX_CDR_FASTP_GAIN_VAL);
++	usb_update_bits(lane_base, U3P_DIG_LN_DAIF_60,
++			P3LD_G2_RX_LF_CTLE_CSEL_MSK | P3LD_G2_RX_LF_CTLE_RSEL_MSK,
++			P3LD_G2_RX_LF_CTLE_CSEL_VAL | P3LD_G2_RX_LF_CTLE_RSEL_VAL);
++	usb_clr_bits(lane_base, U3P_PHYA_LN_0C, P3L_RX_FE_RESERVE_MSK);
++}
++
++static void sphy4_u3_lane_init(struct mtk_usb_phy *phy, u32 lane_num)
++{
++	void __iomem *lane_base;
++
++	pr_debug(" %s (%u)\n", __func__, lane_num);
++
++	lane_base = phy->port_base + phy->u3p_offset + SPHY_LN0_OFFSET;
++	if (lane_num != 0)
++		lane_base = lane_base + SPHY_LN_BANKS_SIZE;
++
++	usb_update_bits(lane_base, U3P_DIG_LN_RX_34,
++			P3LR_RXLFPS_G1_FWAKE_TH | P3LR_RXLFPS_G2_FWAKE_TH |
++			P3LR_RXLFPS_FWAKE_SYS_TH,
++			(P3LR_RXLFPS_G1_FWAKE_TH_VAL(P3LR_RXLFPS_FILTER_VAL_DFT) |
++			 P3LR_RXLFPS_G2_FWAKE_TH_VAL(P3LR_RXLFPS_FILTER_VAL_DFT) |
++			 P3LR_RXLFPS_FWAKE_SYS_TH_VAL(P3LR_RXLFPS_FWAKE_SYS_TH_DFT)));
++
++	// disable DFE auto off function
++	usb_clr_bits(lane_base, U3P_FEDIG_RG_29, P3FE_LN_RX_DFE_AUTO_OFF_EN);
++}
++
++static void sphy_u3_init(struct mtk_usb_phy *phy)
++{
++	void __iomem *pbase = phy->port_base + phy->u3p_offset;
++
++	pr_debug(" %s (%u)\n", __func__, phy->pid);
++
++	if (phy->hw_type == PHY_HWIP_SPHY3) {
++		usb_set_bits(pbase, U3P_DIG_GLB_60, P3D_CKM_XTAL_CK_DETECT_DIS);
++		usb_clr_bits(pbase, U3P_DIG_GLB_60, P3D_CKM_GATED_BIAS_DIS);
++		sphy3_u3_lane0_init(phy);
++	} else if (phy->hw_type == PHY_HWIP_SPHY4) {
++		// Apply detection option in P3 and backs to sleep
++		usb_set_bits(pbase, U3P_DIG_GLB_38, P3D_TX_DET_P3_TRACK_OPTION);
++
++		sphy4_u3_lane_init(phy, 0);
++		sphy4_u3_lane_init(phy, 1);
++	}
++}
++
++static void sphy_u3_exit(struct mtk_usb_phy *phy)
++{}
++
++static int sphy_power_on(struct usb3_sphy *sphy)
++{
++	struct mtk_usb_phy *phy;
++	int i;
++
++	if (!sphy)
++		return 0;
++
++	for (i = 0; i < sphy->phy_cnt; i++) {
++		phy = &sphy->phys[i];
++
++		sphy_u2_init(phy);
++		sphy_u2_param_tune(phy);
++
++		if (phy->type == PHY_TYPE_USB3)
++			sphy_u3_init(phy);
++	}
++
++	pr_debug(" %s\n", __func__);
++	return 0;
++}
++
++static int sphy_power_off(struct usb3_sphy *sphy)
++{
++	struct mtk_usb_phy *phy;
++	int i;
++
++	if (!sphy)
++		return 0;
++
++	for (i = 0; i < sphy->phy_cnt; i++) {
++		phy = &sphy->phys[i];
++
++		sphy_u2_exit(phy);
++
++		if (phy->type == PHY_TYPE_USB3)
++			sphy_u3_exit(phy);
++	}
++
++	pr_debug(" %s\n", __func__);
++	return 0;
++}
++
++static void usb3_ippc_disable(struct xhci_plat_priv *priv)
++{
++	void __iomem *ibase = priv->ippc_base;
++	u32 i;
++
++	dev_dbg(priv->dev, " %s\n", __func__);
++
++	// power down and disable u3 ports
++	for (i = 0; i < priv->u3port_cnt; i++) {
++		if (BIT(i) & priv->u3port_disable_mask)
++			continue;
++
++		usb_set_bits(ibase, IPPC_U3_CTRL(i), CTRL_U3_PORT_PDN | CTRL_U3_PORT_DIS);
++	}
++
++	// power down and disable all u2 ports
++	for (i = 0; i < priv->u2port_cnt; i++)
++		usb_set_bits(ibase, IPPC_U2_CTRL(i), CTRL_U2_PORT_PDN | CTRL_U2_PORT_DIS);
++
++	// power down host ip
++	usb_set_bits(ibase, IPPC_IP_PW_CTRL1, CTRL1_IP_HOST_PDN);
++}
++
++static int usb3_ippc_enable(struct xhci_plat_priv *priv)
++{
++	void __iomem *ibase = priv->ippc_base;
++	u32 check_val;
++	u32 u3port_dis_cnt = 0;
++	u32 i;
++	int status;
++
++	dev_dbg(priv->dev, " %s\n", __func__);
++
++	// disable ck gate
++	usb_clr_bits(ibase, IPPC_CSR_CK_CTRL, CK_CSR_BUS_CK_GATE_EN | CK_PHY_BUS_CK_GATE_EN);
++
++	// power on host ip
++	usb_clr_bits(ibase, IPPC_IP_PW_CTRL1, CTRL1_IP_HOST_PDN);
++
++	// power on and enable u3 ports
++	for (i = 0; i < priv->u3port_cnt; i++) {
++		if (BIT(i) & priv->u3port_disable_mask) {
++			usb_set_bits(ibase, IPPC_U3_CTRL(i), CTRL_U3_PORT_PDN | CTRL_U3_PORT_DIS);
++			u3port_dis_cnt++;
++			continue;
++		}
++
++		usb_update_bits(ibase, IPPC_U3_CTRL(i),
++				CTRL_U3_PORT_PDN | CTRL_U3_PORT_DIS | CTRL_U3_PORT_HOST_SEL,
++				CTRL_U3_PORT_HOST_SEL);
++	}
++
++	// power on and enable all u2 ports
++	for (i = 0; i < priv->u2port_cnt; i++) {
++		usb_update_bits(ibase, IPPC_U2_CTRL(i),
++				CTRL_U2_PORT_PDN | CTRL_U2_PORT_DIS | CTRL_U2_PORT_HOST_SEL,
++				CTRL_U2_PORT_HOST_SEL);
++	}
++
++	//
++	// wait for clocks to be stable, and clock domains reset to
++	// be inactive after power on and enable ports
++	//
++	check_val = STS1_SYSPLL_STABLE | STS1_REF_RST | STS1_SYS125_RST | STS1_XHCI_RST;
++	if (priv->u3port_cnt > u3port_dis_cnt)
++		check_val |= STS1_U3_MAC_RST;
++
++	status = usb_read_poll_timeout(ibase, IPPC_IP_PW_STS1, check_val, U3_CLK_WAIT_MS);
++	if (status)
++		dev_warn(priv->dev, " xHCI wait clocks timeout\n");
++
++	return status;
++}
++
++static int usb3_ippc_enter_lps(struct xhci_plat_priv *priv)
++{
++	void __iomem *ibase = priv->ippc_base;
++	u32 i;
++	int status;
++
++	// power down u3 ports
++	for (i = 0; i < priv->u3port_cnt; i++) {
++		if (BIT(i) & priv->u3port_disable_mask)
++			continue;
++
++		usb_set_bits(ibase, IPPC_U3_CTRL(i), CTRL_U3_PORT_PDN);
++	}
++
++	// power down all u2 ports
++	for (i = 0; i < priv->u2port_cnt; i++)
++		usb_set_bits(ibase, IPPC_U2_CTRL(i), CTRL_U2_PORT_PDN);
++
++	// power down host ip
++	usb_set_bits(ibase, IPPC_IP_PW_CTRL1, CTRL1_IP_HOST_PDN);
++
++	status = usb_read_poll_timeout(ibase, IPPC_IP_PW_STS1, STS1_IP_SLEEP, 10);
++	if (status)
++		dev_err(priv->dev, " xHCI sleep failed\n");
++
++	dev_info(priv->dev, " ip-sleep %d\n",
++		!!(usb_read(ibase, IPPC_IP_PW_STS1) & STS1_IP_SLEEP));
++
++	return status;
++}
++
++static int usb3_ippc_exit_lps(struct xhci_plat_priv *priv)
++{
++	void __iomem *ibase = priv->ippc_base;
++	u32 i;
++	int status;
++
++	dev_info(priv->dev, " ip-sleep %d\n",
++		!!(usb_read(ibase, IPPC_IP_PW_STS1) & STS1_IP_SLEEP));
++
++	// clear reset
++	usb_clr_bits(ibase, IPPC_IP_PW_CTRL0, CTRL0_IP_SW_RST);
++
++	// disable ck gate
++	usb_clr_bits(ibase, IPPC_CSR_CK_CTRL, CK_CSR_BUS_CK_GATE_EN | CK_PHY_BUS_CK_GATE_EN);
++
++	// power on host ip
++	usb_clr_bits(ibase, IPPC_IP_PW_CTRL1, CTRL1_IP_HOST_PDN);
++
++	// power on u3 ports
++	for (i = 0; i < priv->u3port_cnt; i++) {
++		if (BIT(i) & priv->u3port_disable_mask) {
++			usb_set_bits(ibase, IPPC_U3_CTRL(i), CTRL_U3_PORT_PDN | CTRL_U3_PORT_DIS);
++			continue;
++		}
++
++		usb_update_bits(ibase, IPPC_U3_CTRL(i),
++				CTRL_U3_PORT_PDN | CTRL_U3_PORT_DIS | CTRL_U3_PORT_HOST_SEL,
++				CTRL_U3_PORT_HOST_SEL);
++	}
++
++	// power on all u2 ports
++	for (i = 0; i < priv->u2port_cnt; i++) {
++		usb_update_bits(ibase, IPPC_U2_CTRL(i),
++				CTRL_U2_PORT_PDN | CTRL_U2_PORT_DIS | CTRL_U2_PORT_HOST_SEL,
++				CTRL_U2_PORT_HOST_SEL);
++	}
++
++	status = usb_read_poll_timeout(ibase, IPPC_IP_PW_STS1,
++				       STS1_SYSPLL_STABLE | STS1_XHCI_RST, U3_CLK_WAIT_MS);
++	if (status)
++		dev_err(priv->dev, " xHCI wait clocks timeout\n");
++
++	return status;
++}
++
++static void usb3_ippc_get_port_cnt(struct xhci_plat_priv *priv)
++{
++	u32 cap;
++
++	cap = usb_read(priv->ippc_base, IPPC_IP_XHCI_CAP);
++	priv->u2port_cnt = CAP_U2_PORT_NUM(cap);
++	priv->u3port_cnt = CAP_U3_PORT_NUM(cap);
++
++	dev_dbg(priv->dev, " xHCI - u2 ports:%u, u3 ports:%u\n",
++		priv->u2port_cnt, priv->u3port_cnt);
++}
++
++static void usb3_ip_reset(struct xhci_plat_priv *priv)
++{
++	// Todo: peri top reset?
++
++	// reset whole ip
++	usb_set_bits(priv->ippc_base, IPPC_IP_PW_CTRL0, CTRL0_IP_SW_RST);
++	udelay(1);
++	usb_clr_bits(priv->ippc_base, IPPC_IP_PW_CTRL0, CTRL0_IP_SW_RST);
++
++	// power down device ip, otherwise ip-sleep will fail
++	usb_set_bits(priv->ippc_base, IPPC_IP_PW_CTRL2, CTRL2_IP_DEV_PDN);
++}
++
++static void usb3_hsram_init(struct xhci_plat_priv *priv)
++{
++	void __iomem *embase = priv->ext_mac_base;
++	int i;
++
++	usb_write(embase, TEST_HSRAM_DBGCTL, THDC_SRAM_DBG_EN);
++	usb_write(embase, TEST_HSRAM_DBGMODE, THDM_SRAM_DM_EP_SLOT);
++	usb_write(embase, TEST_HSRAM_DBGSEL, THDS_SRAM_DS_EP_SLOT);
++
++	for (i = 0; i < TEST_HSRAM_ARRAY_SIZE; i++) {
++		usb_write(embase, TEST_HSRAM_DBGADR,
++			  THDA_SRAM_ADDR_VAL(i) | THDA_SRAM_DWSEL_VAL(THDA_DWSEL_32B_TO_64B));
++		usb_write(embase, TEST_HSRAM_DBGDR, 0);
++	}
++
++	// restore default value
++	usb_write(embase, TEST_HSRAM_DBGCTL, THDC_SRAM_DBG_WP);
++	usb_write(embase, TEST_HSRAM_DBGMODE, 0);
++	usb_write(embase, TEST_HSRAM_DBGSEL, 0);
++}
++
++static void usb3_mac_ext_init(struct xhci_plat_priv *priv)
++{
++	void __iomem *embase = priv->ext_mac_base;
++
++	// workaround:
++	// SSUSB INTR EP not resume link after doorbell issue, can't enter u1/u2
++	// when isoc is active;
++	usb_set_bits(embase, TEST_HSCH_CFG1, THC1_PORT_IDLE_WITH_ISO);
++	usb_set_bits(embase, TEST_HSCH_CFG1, THC1_PORT_IDLE_WITH_INT);
++	// SSUSB ISO ACK missing due to unexpected PING reject issue
++	// don't check TD status, just resume anyway
++	usb_clr_bits(embase, TEST_HSCH_CFG1, THC1_SCH3_INT_PING_TD_CHK);
++	// isoc miss service error when run multi ep stress test(bulk/intr/isoc)
++	usb_set_bits(embase, TEST_HSCH_CFG1, THC1_BURST_TD_OFF | THC1_OUT_NUMP_REF);
++	// decrease LS/FS default BW overhead
++	usb_update_bits(embase, TEST_SCH_CFG6,
++			(TSC6_OH_LS_INT_IN_MSK | TSC6_OH_LS_INT_OUT_MSK),
++			(TSC6_OH_LS_INT_IN_VAL(TSC6_OH_LS_INT_DFT) |
++			 TSC6_OH_LS_INT_OUT_VAL(TSC6_OH_LS_INT_DFT)));
++	usb_update_bits(embase, TEST_SCH_CFG5,
++			(TSC5_OH_FS_INT_IN_MSK | TSC5_OH_FS_INT_OUT_MSK),
++			(TSC5_OH_FS_INT_IN_VAL(TSC5_OH_FS_INT_DFT) |
++			 TSC5_OH_FS_INT_OUT_VAL(TSC5_OH_FS_INT_DFT)));
++	usb_update_bits(embase, TEST_SCH_CFG5,
++			(TSC5_OH_FS_ISO_IN_MSK | TSC5_OH_FS_ISO_OUT_MSK),
++			(TSC5_OH_FS_ISO_IN_VAL(TSC5_OH_FS_ISO_DFT) |
++			 TSC5_OH_FS_ISO_OUT_VAL(TSC5_OH_FS_ISO_DFT)));
++
++	// fix Gen2 SSD UASP Read performance low issue
++	usb_update_bits(embase, TEST_XACT3_CFG, TXC_TX_TMOUT_MSK,
++			TXC_TX_TMOUT_VAL(TXC_TX_TMOUT_VAL_DFT));
++
++	// WA for xhcicv test
++	usb_set_bits(embase, TEST_CMD_CFG, TCC_PARAM_ERR_CHK_DIS);
++	usb_clr_bits(embase, TEST_RST_CTRL0, TRC_HCRST_RXDETECT_EN);
++	usb_set_bits(embase, TEST_EP_CFG, TEC_STOP_EP_OPT);
++	usb_set_bits(embase, TEST_TRBQ_CFG, TTC_TRB_ERR_CHK_DIS);
++
++	usb3_hsram_init(priv);
++}
++
++static int xhci_mtk_restore_local(struct xhci_plat_priv *priv)
++{
++	int ret;
++
++	sphy_power_on(&priv->sphy);
++
++	usb3_ippc_get_port_cnt(priv);
++
++	ret = usb3_ippc_exit_lps(priv);
++	if (ret)
++		return ret;
++
++	usb3_mac_ext_init(priv);
++
++	return 0;
++}
++
++int xhci_mtk_exit_lps(struct xhci_hcd *xhci)
++{
++	struct xhci_plat_priv *priv = xhci_to_priv(xhci);
++	int ret;
++
++	dev_dbg(priv->dev, " %s\n", __func__);
++
++	ret = mtk_pwrap_dev_resume(priv->pwrap_cfg, 0);
++	if (ret) {
++		dev_err(priv->dev, "pwrap resume failed (%d)\n", ret);
++		return ret;
++	}
++
++	return xhci_mtk_restore_local(priv);
++}
++
++int xhci_mtk_enter_lps(struct xhci_hcd *xhci)
++{
++	struct xhci_plat_priv *priv = xhci_to_priv(xhci);
++	int ret, rollback_ret;
++
++	ret = usb3_ippc_enter_lps(priv);
++	if (ret)
++		goto restore_local;
++
++	sphy_power_off(&priv->sphy);
++
++	ret = mtk_pwrap_dev_suspend(priv->pwrap_cfg, 0);
++	if (!ret)
++		return 0;
++
++	dev_err(priv->dev, "pwrap suspend failed (%d)\n", ret);
++
++	/*
++	 * A failed Power Wrap request may still have reached firmware. Confirm
++	 * D0 before accessing local USB registers during rollback.
++	 */
++	rollback_ret = mtk_pwrap_dev_resume(priv->pwrap_cfg, 0);
++	if (rollback_ret) {
++		dev_err(priv->dev, "pwrap suspend rollback failed (%d)\n",
++			rollback_ret);
++		/* Let the normal resume callback retry D0 before touching MMIO. */
++		return 0;
++	}
++
++restore_local:
++	rollback_ret = xhci_mtk_restore_local(priv);
++	if (rollback_ret) {
++		dev_err(priv->dev, "failed to restore local hardware (%d)\n",
++			rollback_ret);
++		/* Keep PM bookkeeping suspended for a later recovery attempt. */
++		return 0;
++	}
++
++	return ret;
++}
++
++int xhci_mtk_prepare_hw(struct xhci_hcd *xhci)
++{
++	struct xhci_plat_priv *priv = xhci_to_priv(xhci);
++	int ret;
++
++	dev_dbg(priv->dev, " %s\n", __func__);
++
++	// power up
++	priv->pwrap_cfg = mtk_pwrap_dev_probe((char *)priv->acpi_path.pointer);
++	if (!priv->pwrap_cfg) {
++		dev_err(priv->dev, "Not find power wrap config data\n");
++		return -EINVAL;
++	}
++
++	sphy_power_on(&priv->sphy);
++
++	usb3_ip_reset(priv);
++
++	usb3_ippc_get_port_cnt(priv);
++
++	ret = usb3_ippc_enable(priv);
++	if (ret) {
++		xhci_mtk_release_hw(xhci, true);
++		return ret;
++	}
++
++	usb3_mac_ext_init(priv);
++
++	return 0;
++}
++
++void xhci_mtk_release_hw(struct xhci_hcd *xhci, bool hw_accessible)
++{
++	struct xhci_plat_priv *priv = xhci_to_priv(xhci);
++
++	/* Avoid IPPC and PHY accesses when the power state is unconfirmed. */
++	if (hw_accessible) {
++		usb3_ippc_disable(priv);
++		sphy_power_off(&priv->sphy);
++	}
++
++	mtk_pwrap_dev_remove(priv->pwrap_cfg);
++	priv->pwrap_cfg = NULL;
++}
++
++int xhci_mtk_get_resources(struct platform_device *pdev, struct xhci_hcd *xhci)
++{
++	struct xhci_plat_priv *priv = xhci_to_priv(xhci);
++	struct device *dev = &pdev->dev;
++	struct acpi_device *adev = ACPI_COMPANION(dev);
++	acpi_status status;
++	void __iomem *phy_base;
++	struct usb3_sphy *sphy;
++	struct mtk_usb_phy *phy;
++	u32 phy_type = 0;
++	u32 eye_swing[2] = {0, };
++	u32 disth = 0;
++	u32 deemph = 0;
++	u32 txldo = 0;
++	int ret;
++
++	if (!adev)
++		return dev_err_probe(dev, -ENODEV, "missing ACPI companion\n");
++
++	// required
++	ret = device_property_read_u32(dev, "mtk-phy-type", &phy_type);
++	if (ret)
++		return dev_err_probe(dev, ret, "missing mtk-phy-type\n");
++	if (phy_type != PHY_HWIP_SPHY3 && phy_type != PHY_HWIP_SPHY4)
++		return dev_err_probe(dev, -EINVAL,
++				     "unsupported mtk-phy-type: %u\n", phy_type);
++	dev_info(dev, "mtk-phy-type: %x\n", phy_type);
++
++	priv->ext_mac_base = devm_platform_ioremap_resource(pdev, 1);
++	if (IS_ERR(priv->ext_mac_base)) {
++		ret = PTR_ERR(priv->ext_mac_base);
++		goto err_ext_mac;
++	}
++
++	priv->ippc_base = devm_platform_ioremap_resource(pdev, 2);
++	if (IS_ERR(priv->ippc_base)) {
++		ret = PTR_ERR(priv->ippc_base);
++		goto err_ippc;
++	}
++
++	phy_base = devm_platform_ioremap_resource(pdev, 3);
++	if (IS_ERR(phy_base)) {
++		ret = PTR_ERR(phy_base);
++		goto err_phy;
++	}
++
++	priv->dev = dev;
++	priv->acpi_path.length = ACPI_ALLOCATE_BUFFER;
++	priv->acpi_path.pointer = NULL;
++	status = acpi_get_name(adev->handle, ACPI_FULL_PATHNAME, &priv->acpi_path);
++	if (ACPI_FAILURE(status)) {
++		dev_err(&pdev->dev, "Failed to get ACPI device path\n");
++		return -EINVAL;
++	}
++
++	ret = acpi_dev_uid_to_integer(adev, &priv->uid);
++	if (ret)
++		dev_err(&pdev->dev, "error: no _UID found\n");
++	else
++		dev_info(&pdev->dev, "find acpi _UID: %x\n", (int)priv->uid);
++
++	// optional
++	device_property_read_u32(dev, "mtk-u3port-disable-mask", &priv->u3port_disable_mask);
++	dev_info(&pdev->dev, "mtk-u3port-disable-mask: %x\n", priv->u3port_disable_mask);
++
++	// optional
++	device_property_read_u32(dev, "mtk-u2phy-discth", &disth);
++	dev_info(&pdev->dev, "mtk-u2phy-discth: %x\n", disth);
++
++	// optional
++	device_property_read_u32(dev, "mtk-u2phy-de-emphasis", &deemph);
++	dev_info(&pdev->dev, "mtk-u2phy-de-emphasis: %x\n", deemph);
++
++	// optional
++	device_property_read_u32(dev, "mtk-u2phy-tx-ldo-out", &txldo);
++	dev_info(&pdev->dev, "mtk-u2phy-tx-ldo-out: %x\n", txldo);
++
++	/*
++	 * get u2phy eye swing adjust, optional
++	 * Note: tune Term only when Vref is max 7, otherwise Term is ignored
++	 */
++	device_property_read_u32_array(dev, "mtk-u2phy-eye-swing", eye_swing, 2);
++	dev_info(dev, "eye swing: val[0]=0x%x, val[1]=0x%x\n", eye_swing[0], eye_swing[1]);
++
++	sphy = &priv->sphy;
++	sphy->phy_cnt = 1; // by default
++	phy = &sphy->phys[0];
++	phy->port_base = phy_base;
++	phy->hw_type = phy_type;
++	phy->pid = PHY_ID_U3_P0;
++	phy->type = PHY_TYPE_USB3;
++	phy->u3p_offset = SPHY_U3_BASE_OFFSET;
++	phy->u2p_eye_swing_vref = eye_swing[0];
++	phy->u2p_eye_swing_term = eye_swing[1];
++	phy->u2p_eye_rising_deemphasis = deemph;
++	phy->u2p_eye_rising_txldoout = txldo;
++	phy->u2p_disconnect_threshold = disth;
++
++	// p4u3 port-1 has the 2nd u2 port
++	if (priv->uid == 0x5) {
++		sphy->phy_cnt = 2;
++		phy = &sphy->phys[1];
++		phy->port_base = phy_base + SPHY_PORT_BANKS_SIZE;
++		phy->hw_type = phy_type;
++		phy->pid = PHY_ID_U2_P1;
++		phy->type = PHY_TYPE_USB2;
++		phy->u2p_eye_swing_vref = eye_swing[0];
++		phy->u2p_eye_swing_term = eye_swing[1];
++		phy->u2p_eye_rising_deemphasis = deemph;
++		phy->u2p_eye_rising_txldoout = txldo;
++		phy->u2p_disconnect_threshold = disth;
++	}
++
++	return 0;
++
++err_ext_mac:
++err_ippc:
++err_phy:
++	return ret;
++}
++
++void xhci_mtk_free_resources(struct platform_device *pdev, struct xhci_hcd *xhci)
++{
++	struct xhci_plat_priv *priv = xhci_to_priv(xhci);
++
++	ACPI_FREE(priv->acpi_path.pointer);
++	priv->acpi_path.pointer = NULL;
++	priv->acpi_path.length = 0;
++}
+diff --git a/drivers/usb/host/xhci-mtk-v2.h b/drivers/usb/host/xhci-mtk-v2.h
+new file mode 100644
+index 0000000..74cd4ab
+--- /dev/null
++++ b/drivers/usb/host/xhci-mtk-v2.h
+@@ -0,0 +1,85 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * Copyright (c) 2026 MediaTek Inc.
++ *
++ * Author: Chunfeng Yun <chunfeng.yun@mediatek.com>
++ */
++
++#ifndef __LINUX_XHCI_MTK_V2_H
++#define __LINUX_XHCI_MTK_V2_H
++
++#include <dt-bindings/phy/phy.h>
++#include <linux/acpi.h>
++
++#include "xhci.h"
++
++enum phy_hwip_type {
++	PHY_HWIP_SPHY3 = 3,
++	PHY_HWIP_SPHY4,
++};
++
++enum usb_phy_id {
++	PHY_ID_U3_P0 = 0,
++	PHY_ID_U2_P1,
++	PHY_ID_U2_P2,
++	PHY_ID_U2_P3,
++};
++
++struct mtk_usb_phy {
++	void __iomem *port_base;
++	u32 u3p_offset;	// when support u3
++	u32 pid;
++	u32 type;
++	enum phy_hwip_type hw_type;
++	u32  u2p_disconnect_threshold;
++	u32  u2p_eye_swing_vref;
++	u32  u2p_eye_swing_term;
++	u32  u2p_eye_rising_deemphasis;
++	u32  u2p_eye_rising_txldoout;
++};
++
++struct usb3_sphy {
++	int phy_cnt;	 // total number of hw port, 'u2 + u3' pair or u2 only
++	struct mtk_usb_phy phys[4];
++};
++
++#if IS_ENABLED(CONFIG_USB_XHCI_MTK_V2)
++int xhci_mtk_exit_lps(struct xhci_hcd *xhci);
++int xhci_mtk_enter_lps(struct xhci_hcd *xhci);
++int xhci_mtk_prepare_hw(struct xhci_hcd *xhci);
++void xhci_mtk_release_hw(struct xhci_hcd *xhci, bool hw_accessible);
++int xhci_mtk_get_resources(struct platform_device *pdev, struct xhci_hcd *xhci);
++void xhci_mtk_free_resources(struct platform_device *pdev, struct xhci_hcd *xhci);
++
++#else
++
++static inline int xhci_mtk_exit_lps(struct xhci_hcd *xhci)
++{
++	return 0;
++}
++
++static inline int xhci_mtk_enter_lps(struct xhci_hcd *xhci)
++{
++	return 0;
++}
++
++static inline int xhci_mtk_prepare_hw(struct xhci_hcd *xhci)
++{
++	return 0;
++}
++
++static inline void xhci_mtk_release_hw(struct xhci_hcd *xhci,
++				       bool hw_accessible)
++{}
++
++static inline int xhci_mtk_get_resources(struct platform_device *pdev, struct xhci_hcd *xhci)
++{
++	return 0;
++}
++
++static inline void xhci_mtk_free_resources(struct platform_device *pdev, struct xhci_hcd *xhci)
++{}
++
++#endif
++
++#endif /* __LINUX_XHCI_MTK_V2_H */
+diff --git a/drivers/usb/host/xhci-plat.c b/drivers/usb/host/xhci-plat.c
+index 771836a..07a5388 100644
+--- a/drivers/usb/host/xhci-plat.c
++++ b/drivers/usb/host/xhci-plat.c
+@@ -15,6 +15,7 @@
+ #include <linux/of.h>
+ #include <linux/of_device.h>
+ #include <linux/platform_device.h>
++#include <linux/pm_wakeirq.h>
+ #include <linux/usb/phy.h>
+ #include <linux/slab.h>
+ #include <linux/acpi.h>
+@@ -23,8 +24,10 @@
+ #include <linux/usb/xhci-sideband.h>
+ 
+ #include "xhci.h"
++#include "xhci-dbgcap.h"
+ #include "xhci-plat.h"
+ #include "xhci-mvebu.h"
++#include "xhci-mtk-v2.h"
+ 
+ static struct hc_driver __read_mostly xhci_plat_hc_driver;
+ 
+@@ -97,7 +100,6 @@ static int xhci_plat_setup(struct usb_hcd *hcd)
+ {
+ 	int ret;
+ 
+-
+ 	ret = xhci_priv_init_quirk(hcd);
+ 	if (ret)
+ 		return ret;
+@@ -164,6 +166,8 @@ int xhci_plat_probe(struct platform_device *pdev, struct device *sysdev, const s
+ 	int			irq;
+ 	struct xhci_plat_priv	*priv = NULL;
+ 	const struct of_device_id *of_match;
++	bool mtk_hw_prepared = false;
++	int wakeup_irq = -1;
+ 
+ 	if (usb_disabled())
+ 		return -ENODEV;
+@@ -246,6 +250,26 @@ int xhci_plat_probe(struct platform_device *pdev, struct device *sysdev, const s
+ 		*priv = *priv_match;
+ 	}
+ 
++	if (priv && priv->is_mtk_v2) {
++
++		wakeup_irq = platform_get_irq_optional(pdev, 1);
++		if (wakeup_irq == -EPROBE_DEFER) {
++			ret = wakeup_irq;
++			goto disable_clk;
++		}
++
++		ret = xhci_mtk_get_resources(pdev, xhci);
++		if (ret)
++			goto disable_clk;
++
++		ret = xhci_mtk_prepare_hw(xhci);
++		if (ret) {
++			goto free_rscs;
++		}
++
++		mtk_hw_prepared = true;
++	}
++
+ 	device_set_wakeup_capable(&pdev->dev, true);
+ 
+ 	xhci->main_hcd = hcd;
+@@ -296,12 +320,12 @@ int xhci_plat_probe(struct platform_device *pdev, struct device *sysdev, const s
+ 		if (IS_ERR(hcd->usb_phy)) {
+ 			ret = PTR_ERR(hcd->usb_phy);
+ 			if (ret == -EPROBE_DEFER)
+-				goto disable_clk;
++				goto free_rscs;
+ 			hcd->usb_phy = NULL;
+ 		} else {
+ 			ret = usb_phy_init(hcd->usb_phy);
+ 			if (ret)
+-				goto disable_clk;
++				goto free_rscs;
+ 		}
+ 	}
+ 
+@@ -355,6 +379,15 @@ int xhci_plat_probe(struct platform_device *pdev, struct device *sysdev, const s
+ 			goto put_usb3_hcd;
+ 	}
+ 
++	if (wakeup_irq > 0) {
++		ret = dev_pm_set_dedicated_wake_irq_reverse(&pdev->dev, wakeup_irq);
++		if (ret) {
++			dev_err(&pdev->dev, "set wakeup irq %d failed\n", wakeup_irq);
++			goto dealloc_usb3_hcd;
++		}
++		dev_info(&pdev->dev, "wakeup irq %d\n", wakeup_irq);
++	}
++
+ 	device_enable_async_suspend(&pdev->dev);
+ 	pm_runtime_put_noidle(&pdev->dev);
+ 
+@@ -363,9 +396,20 @@ int xhci_plat_probe(struct platform_device *pdev, struct device *sysdev, const s
+ 	 * runtime pm using power/control in sysfs.
+ 	 */
+ 	pm_runtime_forbid(&pdev->dev);
++	if (priv && priv->is_mtk_v2) {
++		/*
++		 * Runtime PM is unsupported until Power Wrap can report an
++		 * authoritative final state after a transition failure. Keep
++		 * system sleep enabled, but prevent userspace from enabling the
++		 * unsafe runtime suspend path through power/control.
++		 */
++		pm_runtime_disable(&pdev->dev);
++	}
+ 
+ 	return 0;
+ 
++dealloc_usb3_hcd:
++	usb_remove_hcd(xhci->shared_hcd);
+ 
+ put_usb3_hcd:
+ 	usb_put_hcd(xhci->shared_hcd);
+@@ -376,6 +420,12 @@ dealloc_usb2_hcd:
+ disable_usb_phy:
+ 	usb_phy_shutdown(hcd->usb_phy);
+ 
++free_rscs:
++	if (mtk_hw_prepared)
++		xhci_mtk_release_hw(xhci, true);
++	if (priv && priv->is_mtk_v2)
++		xhci_mtk_free_resources(pdev, xhci);
++
+ disable_clk:
+ 	clk_disable_unprepare(xhci->clk);
+ 
+@@ -427,14 +477,46 @@ static int xhci_generic_plat_probe(struct platform_device *pdev)
+ 			return ret;
+ 	}
+ 
+-	if (pdev->dev.of_node)
+-		priv_match = of_device_get_match_data(&pdev->dev);
+-	else
++	priv_match = device_get_match_data(&pdev->dev);
++	if (!priv_match)
+ 		priv_match = dev_get_platdata(&pdev->dev);
+ 
+ 	return xhci_plat_probe(pdev, sysdev, priv_match);
+ }
+ 
++static void xhci_plat_hc_died(struct xhci_hcd *xhci, bool hw_accessible)
++{
++	struct usb_hcd *hcd = xhci_to_hcd(xhci);
++
++	/*
++	 * Make the host dead and update accessibility under the same lock.  This
++	 * keeps unlink and timeout paths from touching registers while an IRQ
++	 * which passed usb_hcd_irq()'s accessibility check is synchronized.
++	 */
++	spin_lock_irq(&xhci->lock);
++	if (hw_accessible) {
++		set_bit(HCD_FLAG_HW_ACCESSIBLE, &hcd->flags);
++		if (xhci->shared_hcd)
++			set_bit(HCD_FLAG_HW_ACCESSIBLE,
++				&xhci->shared_hcd->flags);
++	} else {
++		clear_bit(HCD_FLAG_HW_ACCESSIBLE, &hcd->flags);
++		if (xhci->shared_hcd)
++			clear_bit(HCD_FLAG_HW_ACCESSIBLE,
++				  &xhci->shared_hcd->flags);
++	}
++	xhci_hc_died(xhci);
++	spin_unlock_irq(&xhci->lock);
++
++	if (hcd->irq > 0)
++		synchronize_irq(hcd->irq);
++
++	/* A dead host must not leave DbC work or register sysfs files live. */
++	mutex_lock(&xhci->mutex);
++	xhci_remove_dbc_dev(xhci, hw_accessible);
++	mutex_unlock(&xhci->mutex);
++}
++
+ void xhci_plat_remove(struct platform_device *dev)
+ {
+ 	struct usb_hcd	*hcd = platform_get_drvdata(dev);
+@@ -442,28 +524,59 @@ void xhci_plat_remove(struct platform_device *dev)
+ 	struct clk *clk = xhci->clk;
+ 	struct clk *reg_clk = xhci->reg_clk;
+ 	struct usb_hcd *shared_hcd = xhci->shared_hcd;
++	struct xhci_plat_priv *priv = hcd_to_xhci_priv(hcd);
++	bool mtk_hw_accessible = true;
++	bool mtk_host_suspended = false;
++	int ret;
+ 
+ 	xhci->xhc_state |= XHCI_STATE_REMOVING;
+ 	pm_runtime_get_sync(&dev->dev);
++	if (priv->is_mtk_v2) {
++		mtk_hw_accessible = HCD_HW_ACCESSIBLE(hcd);
++		if (!mtk_hw_accessible) {
++			mtk_host_suspended = true;
++			ret = xhci_mtk_exit_lps(xhci);
++			if (ret) {
++				dev_warn(&dev->dev,
++					 "failed to recover D0 for removal (%d)\n",
++					 ret);
++			} else {
++				mtk_hw_accessible = true;
++			}
++		}
++		if (mtk_host_suspended)
++			xhci_plat_hc_died(xhci, mtk_hw_accessible);
++	}
++
++	if (priv->is_mtk_v2)
++		dev_pm_clear_wake_irq(&dev->dev);
+ 
+ 	if (shared_hcd) {
+ 		usb_remove_hcd(shared_hcd);
+ 		xhci->shared_hcd = NULL;
+ 	}
+ 
+-	usb_phy_shutdown(hcd->usb_phy);
++	if (!priv->is_mtk_v2 || mtk_hw_accessible)
++		usb_phy_shutdown(hcd->usb_phy);
+ 
+ 	usb_remove_hcd(hcd);
+ 
+ 	if (shared_hcd)
+ 		usb_put_hcd(shared_hcd);
+ 
++	if (priv->is_mtk_v2) {
++		xhci_mtk_release_hw(xhci, mtk_hw_accessible);
++		xhci_mtk_free_resources(dev, xhci);
++	}
++
+ 	clk_disable_unprepare(clk);
+ 	clk_disable_unprepare(reg_clk);
+ 	reset_control_assert(xhci->reset);
++
+ 	usb_put_hcd(hcd);
+ 
+-	pm_runtime_disable(&dev->dev);
++	if (pm_runtime_enabled(&dev->dev))
++		pm_runtime_disable(&dev->dev);
+ 	pm_runtime_put_noidle(&dev->dev);
+ 	pm_runtime_set_suspended(&dev->dev);
+ }
+@@ -473,10 +586,16 @@ static int xhci_plat_suspend_common(struct device *dev)
+ {
+ 	struct usb_hcd	*hcd = dev_get_drvdata(dev);
+ 	struct xhci_hcd	*xhci = hcd_to_xhci(hcd);
+-	int ret;
++	struct xhci_plat_priv *priv = hcd_to_xhci_priv(hcd);
++	int ret, rollback_ret;
+ 
+-	if (pm_runtime_suspended(dev))
+-		pm_runtime_resume(dev);
++	if (pm_runtime_suspended(dev)) {
++		ret = pm_runtime_resume(dev);
++		if (ret < 0)
++			return ret;
++	}
++	if (priv->is_mtk_v2 && !HCD_HW_ACCESSIBLE(hcd))
++		return -ESHUTDOWN;
+ 
+ 	ret = xhci_priv_suspend_quirk(hcd);
+ 	if (ret)
+@@ -489,6 +608,19 @@ static int xhci_plat_suspend_common(struct device *dev)
+ 	if (ret)
+ 		return ret;
+ 
++	if (priv->is_mtk_v2) {
++		ret = xhci_mtk_enter_lps(xhci);
++		if (ret) {
++			rollback_ret = xhci_resume(xhci, false, false);
++			if (rollback_ret) {
++				xhci_plat_hc_died(xhci, true);
++				dev_err(dev, "failed to roll back xHCI suspend (%d)\n",
++					rollback_ret);
++			}
++			return ret;
++		}
++	}
++
+ 	if (!device_may_wakeup(dev) && (xhci->quirks & XHCI_SUSPEND_RESUME_CLKS)) {
+ 		clk_disable_unprepare(xhci->clk);
+ 		clk_disable_unprepare(xhci->reg_clk);
+@@ -535,24 +667,45 @@ static int xhci_plat_resume_common(struct device *dev, bool power_lost)
+ 		}
+ 	}
+ 
++	if (priv->is_mtk_v2) {
++		ret = xhci_mtk_exit_lps(xhci);
++		if (ret)
++			goto hc_inaccessible;
++	}
++
++	/*
++	 * System PM clears its suspended bookkeeping before invoking this
++	 * callback and does not restore it on error.  Once the platform low-power
++	 * exit succeeds, do not re-enter low power on later errors because
++	 * subsequent callbacks may access the host registers.
++	 */
+ 	ret = xhci_priv_resume_quirk(hcd);
+ 	if (ret)
+ 		goto disable_clks;
+ 
+ 	ret = xhci_resume(xhci, power_lost || priv->power_lost, false);
+-	if (ret)
++	if (ret) {
++		if (priv->is_mtk_v2)
++			xhci_plat_hc_died(xhci, true);
+ 		goto disable_clks;
++	}
+ 
+ 	ret = xhci_priv_post_resume_quirk(hcd);
+ 	if (ret)
+ 		goto disable_clks;
+ 
+-	pm_runtime_disable(dev);
+-	pm_runtime_set_active(dev);
+-	pm_runtime_enable(dev);
++	if (priv->is_mtk_v2) {
++		pm_runtime_set_active(dev);
++	} else {
++		pm_runtime_disable(dev);
++		pm_runtime_set_active(dev);
++		pm_runtime_enable(dev);
++	}
+ 
+ 	return 0;
+ 
++hc_inaccessible:
++	xhci_plat_hc_died(xhci, false);
+ disable_clks:
+ 	if (!device_may_wakeup(dev) && (xhci->quirks & XHCI_SUSPEND_RESUME_CLKS)) {
+ 		clk_disable_unprepare(xhci->clk);
+@@ -590,19 +743,31 @@ static int __maybe_unused xhci_plat_runtime_suspend(struct device *dev)
+ {
+ 	struct usb_hcd  *hcd = dev_get_drvdata(dev);
+ 	struct xhci_hcd *xhci = hcd_to_xhci(hcd);
++	struct xhci_plat_priv *priv = hcd_to_xhci_priv(hcd);
+ 	int ret;
+ 
++	if (priv->is_mtk_v2)
++		return -EOPNOTSUPP;
++
+ 	ret = xhci_priv_suspend_quirk(hcd);
+ 	if (ret)
+ 		return ret;
+ 
+-	return xhci_suspend(xhci, true);
++	ret = xhci_suspend(xhci, true);
++	if (ret)
++		return ret;
++
++	return 0;
+ }
+ 
+ static int __maybe_unused xhci_plat_runtime_resume(struct device *dev)
+ {
+ 	struct usb_hcd  *hcd = dev_get_drvdata(dev);
+ 	struct xhci_hcd *xhci = hcd_to_xhci(hcd);
++	struct xhci_plat_priv *priv = hcd_to_xhci_priv(hcd);
++
++	if (priv->is_mtk_v2)
++		return -EOPNOTSUPP;
+ 
+ 	return xhci_resume(xhci, false, true);
+ }
+@@ -622,9 +787,19 @@ const struct dev_pm_ops xhci_plat_pm_ops = {
+ EXPORT_SYMBOL_GPL(xhci_plat_pm_ops);
+ 
+ #ifdef CONFIG_ACPI
++#if IS_ENABLED(CONFIG_USB_XHCI_MTK_V2)
++static const struct xhci_plat_priv xhci_plat_mtk_v2 = {
++	.is_mtk_v2 = 1,
++};
++#endif
++
+ static const struct acpi_device_id usb_xhci_acpi_match[] = {
+ 	/* XHCI-compliant USB Controller */
+ 	{ "PNP0D10", },
++#if IS_ENABLED(CONFIG_USB_XHCI_MTK_V2)
++	{ "NVDA8000", (kernel_ulong_t)&xhci_plat_mtk_v2, },
++	{ "NVDA8001", (kernel_ulong_t)&xhci_plat_mtk_v2, },
++#endif
+ 	{ "PNP0D15", },
+ 	{ }
+ };
+diff --git a/drivers/usb/host/xhci-plat.h b/drivers/usb/host/xhci-plat.h
+index 00751d8..b04308c 100644
+--- a/drivers/usb/host/xhci-plat.h
++++ b/drivers/usb/host/xhci-plat.h
+@@ -8,6 +8,8 @@
+ #ifndef _XHCI_PLAT_H
+ #define _XHCI_PLAT_H
+ 
++#include "xhci-mtk-v2.h"
++
+ struct device;
+ struct platform_device;
+ struct usb_hcd;
+@@ -17,11 +19,22 @@ struct xhci_plat_priv {
+ 	unsigned long long quirks;
+ 	bool power_lost;
+ 	unsigned sideband_at_suspend:1;
++	unsigned is_mtk_v2:1;
+ 	void (*plat_start)(struct usb_hcd *);
+ 	int (*init_quirk)(struct usb_hcd *);
+ 	int (*suspend_quirk)(struct usb_hcd *);
+ 	int (*resume_quirk)(struct usb_hcd *);
+ 	int (*post_resume_quirk)(struct usb_hcd *);
++	struct device *dev;
++	void __iomem *ippc_base;
++	void __iomem *ext_mac_base;
++	void *pwrap_cfg;                /* power wrap scmi configuration */
++	struct acpi_buffer acpi_path;   /* ACPI name */
++	struct usb3_sphy sphy;
++	u64 uid;
++	u32 u2port_cnt;
++	u32 u3port_cnt;
++	u32 u3port_disable_mask;
+ };
+ 
+ #define hcd_to_xhci_priv(h) ((struct xhci_plat_priv *)hcd_to_xhci(h)->priv)
+diff --git a/drivers/usb/host/xhci-ring.c b/drivers/usb/host/xhci-ring.c
+index 8908f5c..09d180f 100644
+--- a/drivers/usb/host/xhci-ring.c
++++ b/drivers/usb/host/xhci-ring.c
+@@ -1391,8 +1391,8 @@ static void xhci_kill_endpoint_urbs(struct xhci_hcd *xhci,
+  * URBs need to be given back as usb core might be waiting with device locks
+  * held for the URBs to finish during device disconnect, blocking host remove.
+  *
+- * Call with xhci->lock held.
+- * lock is relased and re-acquired while giving back urb.
++ * Call with xhci->lock held. xHCI uses HCD_BH, so URB completion
++ * callbacks are deferred and the lock remains held while they are queued.
+  */
+ void xhci_hc_died(struct xhci_hcd *xhci)
+ {
+@@ -1421,6 +1421,7 @@ void xhci_hc_died(struct xhci_hcd *xhci)
+ 	if (notify)
+ 		usb_hc_died(xhci_to_hcd(xhci));
+ }
++EXPORT_SYMBOL_GPL(xhci_hc_died);
+ 
+ /*
+  * When we get a completion for a Set Transfer Ring Dequeue Pointer command,
+@@ -3028,11 +3029,13 @@ static int xhci_handle_event_trb(struct xhci_hcd *xhci, struct xhci_interrupter
+ 		else
+ 			xhci_warn(xhci, "ERROR unknown event type %d\n", trb_type);
+ 	}
+-	/* Any of the above functions may drop and re-acquire the lock, so check
+-	 * to make sure a watchdog timer didn't mark the host as non-responsive.
++	/*
++	 * Any of the above functions may drop and re-acquire the lock.  Stop if
++	 * suspend or failed recovery made the controller inaccessible meanwhile.
+ 	 */
+-	if (xhci->xhc_state & XHCI_STATE_DYING) {
+-		xhci_dbg(xhci, "xHCI host dying, returning from event handler.\n");
++	if (!HCD_HW_ACCESSIBLE(xhci_to_hcd(xhci)) ||
++	    xhci->xhc_state & XHCI_STATE_DYING) {
++		xhci_dbg(xhci, "xHCI host inaccessible, returning from event handler.\n");
+ 		return -ENODEV;
+ 	}
+ 
+@@ -3099,6 +3102,9 @@ static int xhci_handle_events(struct xhci_hcd *xhci, struct xhci_interrupter *ir
+ 	int err = 0;
+ 	u64 temp;
+ 
++	if (!HCD_HW_ACCESSIBLE(xhci_to_hcd(xhci)))
++		return -ENODEV;
++
+ 	xhci_clear_interrupt_pending(ir);
+ 
+ 	/* Event ring hasn't been allocated yet. */
+@@ -3111,7 +3117,7 @@ static int xhci_handle_events(struct xhci_hcd *xhci, struct xhci_interrupter *ir
+ 	    xhci->xhc_state & XHCI_STATE_HALTED) {
+ 		xhci_dbg(xhci, "xHCI dying, ignoring interrupt. Shouldn't IRQs be disabled?\n");
+ 
+-		/* Clear the event handler busy flag (RW1C) */
++		/* Clear the event handler busy flag (RW1C). */
+ 		temp = xhci_read_64(xhci, &ir->ir_set->erst_dequeue);
+ 		xhci_write_64(xhci, temp | ERST_EHB, &ir->ir_set->erst_dequeue);
+ 		return -ENODEV;
+@@ -3121,6 +3127,15 @@ static int xhci_handle_events(struct xhci_hcd *xhci, struct xhci_interrupter *ir
+ 	while (unhandled_event_trb(ir->event_ring)) {
+ 		if (!skip_events)
+ 			err = xhci_handle_event_trb(xhci, ir, ir->event_ring->dequeue);
++		if (err) {
++			/*
++			 * The event was consumed before the controller became
++			 * inaccessible. Advance only the software dequeue pointer;
++			 * updating ERDP below would access unavailable hardware.
++			 */
++			inc_deq(xhci, ir->event_ring);
++			return err;
++		}
+ 
+ 		/*
+ 		 * If half a segment of events have been handled in one go then
+@@ -3138,8 +3153,6 @@ static int xhci_handle_events(struct xhci_hcd *xhci, struct xhci_interrupter *ir
+ 		/* Update SW event ring dequeue pointer */
+ 		inc_deq(xhci, ir->event_ring);
+ 
+-		if (err)
+-			break;
+ 	}
+ 
+ 	xhci_update_erst_dequeue(xhci, ir, true);
+@@ -3190,6 +3203,12 @@ irqreturn_t xhci_irq(struct usb_hcd *hcd)
+ 	u32 status;
+ 
+ 	spin_lock(&xhci->lock);
++	/* Recheck after taking the lock to close the accessibility TOCTOU. */
++	if (unlikely(HCD_DEAD(hcd) || !HCD_HW_ACCESSIBLE(hcd))) {
++		ret = IRQ_NONE;
++		goto out;
++	}
++
+ 	/* Check if the xHC generated the interrupt, or the irq is shared */
+ 	status = readl(&xhci->op_regs->status);
+ 	if (status == ~(u32)0) {
+diff --git a/drivers/usb/host/xhci.c b/drivers/usb/host/xhci.c
+index 181d4f0..50cbd74 100644
+--- a/drivers/usb/host/xhci.c
++++ b/drivers/usb/host/xhci.c
+@@ -690,7 +690,11 @@ void xhci_stop(struct usb_hcd *hcd)
+ {
+ 	u32 temp;
+ 	struct xhci_hcd *xhci = hcd_to_xhci(hcd);
+-	struct xhci_interrupter *ir = xhci->interrupters[0];
++	struct xhci_interrupter *ir = NULL;
++	bool hw_accessible;
++
++	if (xhci->interrupters)
++		ir = xhci->interrupters[0];
+ 
+ 	mutex_lock(&xhci->mutex);
+ 
+@@ -700,13 +704,18 @@ void xhci_stop(struct usb_hcd *hcd)
+ 		return;
+ 	}
+ 
+-	xhci_remove_dbc_dev(xhci);
++	hw_accessible = HCD_HW_ACCESSIBLE(hcd);
++
++	/* A failed platform resume can leave only software teardown possible. */
++	xhci_remove_dbc_dev(xhci, hw_accessible);
+ 
+ 	spin_lock_irq(&xhci->lock);
+ 	xhci->xhc_state |= XHCI_STATE_HALTED;
+ 	xhci->cmd_ring_state = CMD_RING_STATE_STOPPED;
+-	xhci_halt(xhci);
+-	xhci_reset(xhci, XHCI_RESET_SHORT_USEC);
++	if (hw_accessible) {
++		xhci_halt(xhci);
++		xhci_reset(xhci, XHCI_RESET_SHORT_USEC);
++	}
+ 	spin_unlock_irq(&xhci->lock);
+ 
+ 	/* Deleting Compliance Mode Recovery Timer */
+@@ -721,18 +730,22 @@ void xhci_stop(struct usb_hcd *hcd)
+ 	if (xhci->quirks & XHCI_AMD_PLL_FIX)
+ 		usb_amd_dev_put();
+ 
+-	xhci_dbg_trace(xhci, trace_xhci_dbg_init,
+-			"// Disabling event ring interrupts");
+-	temp = readl(&xhci->op_regs->status);
+-	writel((temp & ~0x1fff) | STS_EINT, &xhci->op_regs->status);
+-	xhci_disable_interrupter(xhci, ir);
++	if (hw_accessible) {
++		xhci_dbg_trace(xhci, trace_xhci_dbg_init,
++			       "// Disabling event ring interrupts");
++		temp = readl(&xhci->op_regs->status);
++		writel((temp & ~0x1fff) | STS_EINT, &xhci->op_regs->status);
++		if (ir)
++			xhci_disable_interrupter(xhci, ir);
++	}
+ 
+ 	xhci_dbg_trace(xhci, trace_xhci_dbg_init, "cleaning up memory");
+ 	xhci_mem_cleanup(xhci);
+ 	xhci_debugfs_exit(xhci);
+-	xhci_dbg_trace(xhci, trace_xhci_dbg_init,
+-			"xhci_stop completed - status = %x",
+-			readl(&xhci->op_regs->status));
++	if (hw_accessible)
++		xhci_dbg_trace(xhci, trace_xhci_dbg_init,
++			       "%s completed - status = %x", __func__,
++			       readl(&xhci->op_regs->status));
+ 	mutex_unlock(&xhci->mutex);
+ }
+ EXPORT_SYMBOL_GPL(xhci_stop);
+@@ -749,8 +762,9 @@ EXPORT_SYMBOL_GPL(xhci_stop);
+ void xhci_shutdown(struct usb_hcd *hcd)
+ {
+ 	struct xhci_hcd *xhci = hcd_to_xhci(hcd);
++	bool hw_accessible = HCD_HW_ACCESSIBLE(hcd);
+ 
+-	if (xhci->quirks & XHCI_SPURIOUS_REBOOT)
++	if (hw_accessible && (xhci->quirks & XHCI_SPURIOUS_REBOOT))
+ 		usb_disable_xhci_ports(to_pci_dev(hcd->self.sysdev));
+ 
+ 	/* Don't poll the roothubs after shutdown. */
+@@ -764,6 +778,11 @@ void xhci_shutdown(struct usb_hcd *hcd)
+ 		timer_delete_sync(&xhci->shared_hcd->rh_timer);
+ 	}
+ 
++	if (!hw_accessible) {
++		xhci_dbg(xhci, "skip shutdown of inaccessible hardware\n");
++		return;
++	}
++
+ 	spin_lock_irq(&xhci->lock);
+ 	xhci_halt(xhci);
+ 
+@@ -1786,9 +1805,13 @@ static int xhci_urb_dequeue(struct usb_hcd *hcd, struct urb *urb, int status)
+ 	if (!ep || !ep_ring)
+ 		goto err_giveback;
+ 
++	/* Failed platform recovery marks the host dead and drains its URBs. */
++	if (xhci->xhc_state & XHCI_STATE_DYING)
++		goto done;
++
+ 	/* If xHC is dead take it down and return ALL URBs in xhci_hc_died() */
+ 	temp = readl(&xhci->op_regs->status);
+-	if (temp == ~(u32)0 || xhci->xhc_state & XHCI_STATE_DYING) {
++	if (temp == ~(u32)0) {
+ 		xhci_hc_died(xhci);
+ 		goto done;
+ 	}
+@@ -4158,10 +4181,15 @@ int xhci_disable_slot(struct xhci_hcd *xhci, u32 slot_id)
+ 	xhci_debugfs_remove_slot(xhci, slot_id);
+ 
+ 	spin_lock_irqsave(&xhci->lock, flags);
+-	/* Don't disable the slot if the host controller is dead. */
++	/* Don't disable the slot if the host is inaccessible or dead. */
++	if (!HCD_HW_ACCESSIBLE(xhci_to_hcd(xhci)) ||
++	    xhci->xhc_state & (XHCI_STATE_DYING | XHCI_STATE_HALTED)) {
++		spin_unlock_irqrestore(&xhci->lock, flags);
++		xhci_free_command(xhci, command);
++		return -ENODEV;
++	}
+ 	state = readl(&xhci->op_regs->status);
+-	if (state == 0xffffffff || (xhci->xhc_state & XHCI_STATE_DYING) ||
+-			(xhci->xhc_state & XHCI_STATE_HALTED)) {
++	if (state == 0xffffffff) {
+ 		spin_unlock_irqrestore(&xhci->lock, flags);
+ 		xhci_free_command(xhci, command);
+ 		return -ENODEV;
+@@ -4673,6 +4701,9 @@ static int xhci_set_usb2_hardware_lpm(struct usb_hcd *hcd,
+ 	int		hird, exit_latency;
+ 	int		ret;
+ 
++	if (!HCD_HW_ACCESSIBLE(hcd))
++		return -ESHUTDOWN;
++
+ 	if (xhci->quirks & XHCI_HW_LPM_DISABLE)
+ 		return -EPERM;
+ 
+@@ -5579,6 +5610,7 @@ static void xhci_clear_tt_buffer_complete(struct usb_hcd *hcd,
+ {
+ 	struct xhci_hcd *xhci;
+ 	struct usb_device *udev;
++	struct xhci_virt_device *vdev;
+ 	unsigned int slot_id;
+ 	unsigned int ep_index;
+ 	unsigned long flags;
+@@ -5589,9 +5621,17 @@ static void xhci_clear_tt_buffer_complete(struct usb_hcd *hcd,
+ 	udev = (struct usb_device *)ep->hcpriv;
+ 	slot_id = udev->slot_id;
+ 	ep_index = xhci_get_endpoint_index(&ep->desc);
++	vdev = xhci->devs[slot_id];
+ 
+-	xhci->devs[slot_id]->eps[ep_index].ep_state &= ~EP_CLEARING_TT;
+-	xhci_ring_doorbell_for_active_rings(xhci, slot_id, ep_index);
++	if (!vdev)
++		goto out;
++
++	vdev->eps[ep_index].ep_state &= ~EP_CLEARING_TT;
++	if (HCD_HW_ACCESSIBLE(hcd) &&
++	    !(xhci->xhc_state & XHCI_STATE_DYING))
++		xhci_ring_doorbell_for_active_rings(xhci, slot_id, ep_index);
++
++out:
+ 	spin_unlock_irqrestore(&xhci->lock, flags);
+ }
+ 
+-- 
+2.56.0
+

@@ -1,0 +1,96 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Brandon Williams <turbine.bmw@gmail.com>
+Date: Tue, 21 Jul 2026 21:24:19 -0400
+Subject: [PATCH] platform/surface: recheck tablet mode after resume
+
+Some Surface devices can report an early stale posture during resume and
+then miss the correction notification, leaving SW_TABLET_MODE asserted
+after the controller has settled.
+
+Keep the immediate query and schedule one delayed re-query after two
+seconds. Route the delayed request through the existing update work so
+state queries and input events remain serialized.
+
+Signed-off-by: Brandon Williams <turbine.bmw@gmail.com>
+---
+ .../surface/surface_aggregator_tabletsw.c     | 32 ++++++++++++++++++-
+ 1 file changed, 31 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/platform/surface/surface_aggregator_tabletsw.c b/drivers/platform/surface/surface_aggregator_tabletsw.c
+index 13031c329553..ca499a360373 100644
+--- a/drivers/platform/surface/surface_aggregator_tabletsw.c
++++ b/drivers/platform/surface/surface_aggregator_tabletsw.c
+@@ -38,6 +38,7 @@ struct ssam_tablet_sw {
+ 
+ 	struct ssam_tablet_sw_state state;
+ 	struct work_struct update_work;
++	struct delayed_work resume_update_work;
+ 	struct input_dev *mode_switch;
+ 
+ 	struct ssam_tablet_sw_ops ops;
+@@ -105,14 +106,40 @@ static void ssam_tablet_sw_update_workfn(struct work_struct *work)
+ 	input_sync(sw->mode_switch);
+ }
+ 
++static void ssam_tablet_sw_resume_update_workfn(struct work_struct *work)
++{
++	struct ssam_tablet_sw *sw = container_of(to_delayed_work(work),
++						  struct ssam_tablet_sw,
++						  resume_update_work);
++
++	/* Serialize the delayed re-query through the normal update work. */
++	schedule_work(&sw->update_work);
++}
++
++static int __maybe_unused ssam_tablet_sw_suspend(struct device *dev)
++{
++	struct ssam_tablet_sw *sw = dev_get_drvdata(dev);
++
++	cancel_delayed_work_sync(&sw->resume_update_work);
++	return 0;
++}
++
+ static int __maybe_unused ssam_tablet_sw_resume(struct device *dev)
+ {
+ 	struct ssam_tablet_sw *sw = dev_get_drvdata(dev);
+ 
++	/*
++	 * Query immediately, then re-query after the controller has had time to
++	 * report its settled post-resume posture. Some devices can otherwise
++	 * retain the early state if the corresponding notification is missed.
++	 */
+ 	schedule_work(&sw->update_work);
++	mod_delayed_work(system_wq, &sw->resume_update_work, msecs_to_jiffies(2000));
+ 	return 0;
+ }
+-static SIMPLE_DEV_PM_OPS(ssam_tablet_sw_pm_ops, NULL, ssam_tablet_sw_resume);
++
++static SIMPLE_DEV_PM_OPS(ssam_tablet_sw_pm_ops, ssam_tablet_sw_suspend,
++			 ssam_tablet_sw_resume);
+ 
+ static int ssam_tablet_sw_probe(struct ssam_device *sdev)
+ {
+@@ -137,6 +164,7 @@ static int ssam_tablet_sw_probe(struct ssam_device *sdev)
+ 	sw->ops.state_is_tablet_mode = desc->ops.state_is_tablet_mode;
+ 
+ 	INIT_WORK(&sw->update_work, ssam_tablet_sw_update_workfn);
++	INIT_DELAYED_WORK(&sw->resume_update_work, ssam_tablet_sw_resume_update_workfn);
+ 
+ 	ssam_device_set_drvdata(sdev, sw);
+ 
+@@ -185,6 +213,7 @@ static int ssam_tablet_sw_probe(struct ssam_device *sdev)
+ 
+ err:
+ 	ssam_device_notifier_unregister(sdev, &sw->notif);
++	cancel_delayed_work_sync(&sw->resume_update_work);
+ 	cancel_work_sync(&sw->update_work);
+ 	return status;
+ }
+@@ -196,6 +225,7 @@ static void ssam_tablet_sw_remove(struct ssam_device *sdev)
+ 	sysfs_remove_group(&sdev->dev.kobj, &ssam_tablet_sw_group);
+ 
+ 	ssam_device_notifier_unregister(sdev, &sw->notif);
++	cancel_delayed_work_sync(&sw->resume_update_work);
+ 	cancel_work_sync(&sw->update_work);
+ }
+ 
