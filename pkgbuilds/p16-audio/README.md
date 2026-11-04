@@ -15,7 +15,9 @@ normal physical outputs. Both online and offline account setup write home files
 only after dropping privileges with runuser. A user-controlled home symlink
 cannot redirect root writes. The previous global rule is retired only if its
 regular-file content exactly matches this package's generated rules; customized
-administrator rules are preserved.
+administrator rules are preserved. On upgrades, a matching generated per-user
+rule is accepted as package-owned; an edited file or symlink at that path is
+retained rather than overwritten.
 
 Run `sudo bash tests/p16-audio-install-user-units.sh` from the repository root.
 The four regression cases use temporary directories and the unprivileged nobody
@@ -33,3 +35,15 @@ When uninstall removes its matching hiding rule in an active user session, it
 tries to restart the already-running WirePlumber service after deleting that
 rule, so the physical outputs are recreated with their normal media classes.
 Offline accounts and preserved custom rules do not trigger that restart.
+
+## Speaker host restart recovery
+
+Both speaker capture sinks start muted. The policy tracks their PulseAudio
+indices and restores saved volume/mute when either is recreated, before any
+new state is saved. Partial graph snapshots never overwrite the saved file.
+Normal changes on the complete restored graph continue to persist, and
+Bluetooth/HDMI defaults are not changed during recovery.
+
+`check()` runs the nine mocked jack/state regression cases; a separate isolated
+PipeWire/Pulse server test also recovered exact volume/mute after host restart.
+These checks do not replace physical wired-headphone or acoustic validation.

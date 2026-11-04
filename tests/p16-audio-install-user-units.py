@@ -142,6 +142,49 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.legacy.read_text(), 'administrator custom rules\n')
 
+    def test_upgrade_preserves_customized_user_rules(self):
+        config_dir = self.home / '.config/wireplumber/wireplumber.conf.d'
+        config_dir.mkdir(parents=True)
+        os.chown(self.home / '.config', self.account.pw_uid, self.account.pw_gid)
+        os.chown(config_dir.parent, self.account.pw_uid, self.account.pw_gid)
+        os.chown(config_dir, self.account.pw_uid, self.account.pw_gid)
+        rules = config_dir / '80-p16-internal-sinks.conf'
+        rules.write_text('user-edited rules\n')
+        os.chown(rules, self.account.pw_uid, self.account.pw_gid)
+
+        result = self.run_installer()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(rules.read_text(), 'user-edited rules\n')
+
+    def test_install_preserves_symlink_and_protected_target(self):
+        protected = self.root / 'protected-rules.conf'
+        protected.write_text('user configuration\n')
+        os.chown(protected, self.account.pw_uid, self.account.pw_gid)
+        config_dir = self.home / '.config/wireplumber/wireplumber.conf.d'
+        config_dir.mkdir(parents=True)
+        os.chown(self.home / '.config', self.account.pw_uid, self.account.pw_gid)
+        os.chown(config_dir.parent, self.account.pw_uid, self.account.pw_gid)
+        os.chown(config_dir, self.account.pw_uid, self.account.pw_gid)
+        rules = config_dir / '80-p16-internal-sinks.conf'
+        rules.symlink_to(protected)
+
+        result = self.run_installer()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(rules.is_symlink())
+        self.assertEqual(rules.resolve(), protected)
+        self.assertEqual(protected.read_text(), 'user configuration\n')
+
+    def test_install_updates_identical_owned_rules_idempotently(self):
+        first = self.run_installer()
+        self.assertEqual(first.returncode, 0, first.stderr)
+        rules = self.home / '.config/wireplumber/wireplumber.conf.d/80-p16-internal-sinks.conf'
+        expected = self.config.read_bytes()
+        self.assertEqual(rules.read_bytes(), expected)
+
+        second = self.run_installer()
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertEqual(rules.read_bytes(), expected)
+
     def test_uninstall_removes_only_exact_user_rules_and_own_service_link_offline(self):
         offline = self.run_logged_out()
         self.assertEqual(offline.returncode, 0, offline.stderr)
