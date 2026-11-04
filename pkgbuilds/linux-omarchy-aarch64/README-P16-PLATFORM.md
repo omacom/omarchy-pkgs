@@ -91,3 +91,25 @@ checks i8042 reachability and verifies independent fan detection. The ASUS
 module also compiles against packaged Linux 7.3 headers with `W=1`.
 A boot with this follow-up remains pending; SPI sensor availability is
 still under investigation.
+
+## SPI-HID ACPI reset follow-up
+
+Patch 9104 invokes `_RST` on the namespace handle already held in the ACPI
+configuration. The previous `device_reset(&adev->dev)` looked for a physical
+ACPI companion on the namespace object's embedded device and skipped AML.
+A boot trace showed reset-control lookup returning `-ENOENT` with no nested
+ACPI evaluation, and no sensor interrupts or bus transfers.
+
+The production callback regression requires `_RST` to run on the saved handle
+and checks success plus firmware-error reporting. The complete native ARM64
+kernel build and the existing function harnesses passed. On H7607BA BIOS303,
+a boot with this patch shows successful `_RST`, the first GPIO190 interrupt,
+a SPI HID sensor hub and an ambient-light IIO device. A physical cover and
+phone-light test changed the desktop sensor reading from 0 to about2175 lux
+and back to ambient. Absolute calibration is not established.
+
+A user-operated s2idle cycle of about57 seconds completed; after resume the
+light sensor still reported13 lux, SPI error/timeout counters remained zero,
+and NVIDIA plus audio services remained active. This is one functional cycle,
+not a new sleep-power measurement or repeated-cycle qualification. No GNOME
+battery policy, custom fan policy or desktop settings are included.
