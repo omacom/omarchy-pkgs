@@ -121,6 +121,13 @@ board2 "$qcc/board-2.bin" "$e15a=NCM820A-DATA" "$e14f=E14F-DATA"
 "$tool" >/dev/null
 [[ $(<"$copy") == SOMEONE-ELSE ]] || fail "does not remove a board.bin it did not install"
 rm "$copy"
+# Not even one that holds the same record.
+board2 "$qcc/board-2.bin" "$e15a=NCM820A-DATA"
+printf 'NCM820A-DATA' >"$copy"
+"$tool" >/dev/null
+"$tool" --remove >/dev/null
+[[ $(<"$copy") == NCM820A-DATA ]] || fail "does not take over a board.bin it did not install that holds the same record"
+rm "$copy"
 echo "ok - never touches a board.bin it did not install"
 
 # --check changes nothing, and --remove removes every copy.
