@@ -31,12 +31,14 @@ pkgdir="$scratch/pkg"
 (cd "$srcdir" && package)
 
 fw="$pkgdir/usr/lib/firmware"
-# The names glymur-asus-zenbook-a16-ux3607oa.dts gives the ADSP and CDSP.
+# The names glymur-asus-zenbook-a16-ux3607oa.dts gives the ADSP and CDSP, compressed with xz so a
+# copy linux-firmware ships under the same name is the one the kernel loads.
 for f in qcadsp8480.mbn adsp_dtbs.elf qccdsp8480.mbn cdsp_dtbs.elf; do
-  [[ -f $fw/qcom/glymur/ASUSTeK/UX3607OA/$f ]] || fail "installs $f where the device tree asks for it"
+  [[ $(xz -dc "$fw/qcom/glymur/ASUSTeK/UX3607OA/$f.xz") == */$f ]] || fail "installs $f.xz where the device tree asks for $f"
 done
-[[ $(<"$fw/ath12k/QCC2072/hw1.0/board.bin") == WIFI_BT/qcwlancol8480/bdwlan_qcc2072_1p0_ncm820A.elf ]] ||
+[[ $(xz -dc "$fw/ath12k/QCC2072/hw1.0/board.bin.xz") == WIFI_BT/qcwlancol8480/bdwlan_qcc2072_1p0_ncm820A.elf ]] ||
   fail "installs the NCM820A board data as ath12k's board.bin"
+[[ -z $(find "$fw" -type f ! -name '*.xz') ]] || fail "installs no firmware path linux-firmware could also ship"
 
 list="$pkgdir/usr/share/qcom-firmware-extract/provided.d/asus,zenbook-a16-ux3607oa.list"
 [[ -f $list ]] || fail "tells qcom-firmware-extract which firmware the board does not need from Windows"
