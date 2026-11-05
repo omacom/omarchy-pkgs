@@ -1,0 +1,209 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jim Martin <jimmartin@gmail.com>
+Date: Thu, 8 Oct 2026 13:55:30 -0500
+Subject: [PATCH] phy: qcom: qmp-combo: Apply the Type-C mode requested during
+ USB4
+
+While the USB4 PHY is initialised the Type-C mux callback returns
+without doing anything, so that the USB4 router alone decides when the
+PHY leaves USB4 mode. A Type-C mode set in that period is lost: when the
+partner enters DisplayPort alternate mode or falls back to USB3 while
+the router still holds the PHY, the request is not repeated after the
+router releases it, and the port stays unconfigured until the cable is
+plugged again.
+
+The USB4 mode entry has two more problems:
+
+- qmp_combo_reconfigure_phy() powers the USB PHY on in the new mode if
+  the USB3 controller holds the PHY, and qmp_combo_usb4_init() then
+  powers it on again, so the USB4 sequence runs twice on entry;
+- when the USB4 power-on fails, qmp_combo_usb4_init() releases its
+  reference but leaves the PHY in USB4 mode, so the remaining USB3 and
+  DP users are left without their configuration.
+
+Record the last native mode the mux asks for while USB4 owns the PHY
+and switch to it when the USB4 PHY is released, or just record it if
+nothing else uses the PHY. As in the mux callback, the switch is
+skipped, not deferred, while the DP PHY is still powered on (a DP tunnel
+not yet torn down); the port is then configured only by the next Type-C
+mux event. Skip the USB power-on in qmp_combo_reconfigure_phy() until
+the USB4 PHY is initialised, and restore the previous mode when the
+USB4 entry fails.
+
+Fixes: 89563a152973 ("phy: qualcomm: qmp-combo: Add preliminary USB4 support")
+Assisted-by: Opus 5.5
+Signed-off-by: Jim Martin <jimmartin@gmail.com>
+---
+ drivers/phy/qualcomm/phy-qcom-qmp-combo.c | 97 ++++++++++++++++-------
+ 1 file changed, 68 insertions(+), 29 deletions(-)
+
+diff --git a/drivers/phy/qualcomm/phy-qcom-qmp-combo.c b/drivers/phy/qualcomm/phy-qcom-qmp-combo.c
+index be5e149f1da..b9473f005c6 100644
+--- a/drivers/phy/qualcomm/phy-qcom-qmp-combo.c
++++ b/drivers/phy/qualcomm/phy-qcom-qmp-combo.c
+@@ -2688,6 +2688,9 @@ struct qmp_combo {
+ 	struct phy *usb4_phy;
+ 	enum tbt_phy_submode usb4_phy_submode;
+ 	unsigned int usb4_init_count;
++	/* Last native Type-C mode requested while USB4 owned the PHY */
++	enum qmpphy_mode typec_mode;
++	bool typec_mode_pending;
+ 	bool com_powered_on;
+ 	u32 usb4_rx_eq;
+ 
+@@ -4854,8 +4857,10 @@ static int qmp_combo_reconfigure_phy(struct qmp_combo *qmp, enum qmpphy_mode new
+ 	if (ret)
+ 		return ret;
+ 
++	/* First USB4 initialization is performed once by usb4_init(). */
+ 	if ((qmp->usb_init_count || qmp->usb4_init_count) &&
+-	    new_mode != QMPPHY_MODE_DP_ONLY) {
++	    new_mode != QMPPHY_MODE_DP_ONLY &&
++	    (new_mode != QMPPHY_MODE_USB4 || qmp->usb4_init_count)) {
+ 		/*
+ 		 * Keep the common block up: DP may still hold it, and none of
+ 		 * the DP operations checks that it is powered.
+@@ -4875,9 +4880,11 @@ static int qmp_combo_reconfigure_phy(struct qmp_combo *qmp, enum qmpphy_mode new
+ static int qmp_combo_usb4_init(struct phy *phy)
+ {
+ 	struct qmp_combo *qmp = phy_get_drvdata(phy);
+-	int ret;
++	enum qmpphy_mode old_mode;
++	int restore_ret, ret;
+ 
+ 	guard(mutex)(&qmp->phy_mutex);
++	old_mode = qmp->qmpphy_mode;
+ 
+ 	if (qmp->cfg->configure_usb4_phy && qmp->usb4_rx_eq > 0xff)
+ 		return dev_err_probe(qmp->dev, -EINVAL,
+@@ -4902,18 +4909,12 @@ static int qmp_combo_usb4_init(struct phy *phy)
+ 
+ 	/* USB4 mode takes precedence to USB3(+DP), force reconfigure the PHY */
+ 	ret = qmp_combo_reconfigure_phy(qmp, QMPPHY_MODE_USB4);
+-	if (ret) {
+-		clk_disable_unprepare(qmp->p2rr2p_pipe_clk);
+-		qmp_combo_com_exit(qmp, false);
+-		return ret;
+-	}
++	if (ret)
++		goto err_restore;
+ 
+ 	ret = qmp_combo_usb_power_on(phy);
+-	if (ret) {
+-		clk_disable_unprepare(qmp->p2rr2p_pipe_clk);
+-		qmp_combo_com_exit(qmp, false);
+-		return ret;
+-	}
++	if (ret)
++		goto err_restore;
+ 
+ 	/*
+ 	 * Due to the SoC design, the PHY only has a single valid consumer and
+@@ -4923,6 +4924,18 @@ static int qmp_combo_usb4_init(struct phy *phy)
+ 	WARN_ON(qmp->usb4_init_count++);
+ 
+ 	return 0;
++
++err_restore:
++	qmp_combo_com_exit(qmp, false);
++	if (qmp->init_count) {
++		restore_ret = qmp_combo_reconfigure_phy(qmp, old_mode);
++		if (restore_ret)
++			dev_err(qmp->dev, "failed to restore native PHY: %d\n", restore_ret);
++	} else {
++		qmp->qmpphy_mode = old_mode;
++	}
++	clk_disable_unprepare(qmp->p2rr2p_pipe_clk);
++	return ret;
+ }
+ 
+ static int qmp_combo_usb4_exit(struct phy *phy)
+@@ -4941,13 +4954,35 @@ static int qmp_combo_usb4_exit(struct phy *phy)
+ 		return ret;
+ 
+ 	/*
+-	 * Mark the USB4 PHY uninitialized and wait for a mux_set event to determine the correct
+-	 * setting. This will always be possible because USB4 requires Type-C.
++	 * Mark the USB4 PHY uninitialized. If the partner asked for a native mode while
++	 * USB4 owned the PHY, e.g. DisplayPort alternate mode, switch to it now unless
++	 * the DP PHY is still powered: that request will not be repeated. Otherwise wait
++	 * for a mux_set event to determine the correct setting. This will always be
++	 * possible because USB4 requires Type-C.
+ 	 */
+ 	qmp->usb4_init_count--;
+ 
+ 	clk_disable_unprepare(qmp->p2rr2p_pipe_clk);
+ 
++	if (!qmp->typec_mode_pending)
++		return 0;
++	qmp->typec_mode_pending = false;
++
++	if (!qmp->init_count) {
++		qmp->qmpphy_mode = qmp->typec_mode;
++		return 0;
++	}
++
++	if (qmp->dp_powered_on) {
++		dev_dbg(qmp->dev, "usb4_exit: DP PHY is still in use, delaying switch\n");
++		return 0;
++	}
++
++	ret = qmp_combo_reconfigure_phy(qmp, qmp->typec_mode);
++	if (ret)
++		dev_err(qmp->dev, "failed to restore Type-C mode %d: %d\n",
++			qmp->typec_mode, ret);
++
+ 	return 0;
+ }
+ 
+@@ -5481,21 +5516,6 @@ static int qmp_combo_typec_mux_set(struct typec_mux_dev *mux, struct typec_mux_s
+ 	else
+ 		svid = 0;
+ 
+-	/*
+-	 * The USB4 router driver must excercise fine-grained control over the timing of
+-	 * USB4 QMPPHY mode entry/exit, which is difficult to otherwise ensure within Linux's
+-	 * Type-C framework if the PHY acts as a self-decisive mode mux in parallel.
+-	 *
+-	 * Keep the hardware in QMPPHY_MODE_USB4 at all times between .init and .exit of the
+-	 * (Linux) USB4 PHY and wait for the router driver to turn it off at its discretion.
+-	 * Once that happens, fall back to the usual USB3/DP/Combo mode logic.
+-	 *
+-	 * After the QMPPHY has been turned off through phy_exit(usb4_phy), the next mux_set
+-	 * will initialize it in the right mode.
+-	 */
+-	if (qmp->usb4_init_count)
+-		return 0;
+-
+ 	/*
+ 	 * Explicitly ignore TBT/USB4 mode requests that may come if the USB4 PHY hasn't been
+ 	 * initialized, either due to the USB4 drivers being disabled or due to this PHY instance
+@@ -5526,6 +5546,25 @@ static int qmp_combo_typec_mux_set(struct typec_mux_dev *mux, struct typec_mux_s
+ 		new_mode = QMPPHY_MODE_USB3_ONLY;
+ 	}
+ 
++	/*
++	 * The USB4 router driver must excercise fine-grained control over the timing of
++	 * USB4 QMPPHY mode entry/exit, which is difficult to otherwise ensure within Linux's
++	 * Type-C framework if the PHY acts as a self-decisive mode mux in parallel.
++	 *
++	 * Keep the hardware in QMPPHY_MODE_USB4 at all times between .init and .exit of the
++	 * (Linux) USB4 PHY and wait for the router driver to turn it off at its discretion.
++	 * Once that happens, fall back to the usual USB3/DP/Combo mode logic.
++	 *
++	 * After the QMPPHY has been turned off through phy_exit(usb4_phy), it is
++	 * reconfigured for the last native mode requested in the meantime.
++	 */
++	if (qmp->usb4_init_count) {
++		qmp->typec_mode = new_mode;
++		qmp->typec_mode_pending = true;
++		return 0;
++	}
++	qmp->typec_mode_pending = false;
++
+ 	if (new_mode == qmp->qmpphy_mode && qmp->com_powered_on) {
+ 		dev_dbg(qmp->dev, "typec_mux_set: same qmpphy mode, bail out\n");
+ 		return 0;
+-- 
+2.56.0
+

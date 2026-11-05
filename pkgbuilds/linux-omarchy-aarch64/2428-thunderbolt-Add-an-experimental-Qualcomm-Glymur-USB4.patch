@@ -1,0 +1,1837 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jim Martin <jimmartin@gmail.com>
+Date: Thu, 8 Oct 2026 15:51:03 -0500
+Subject: [PATCH] thunderbolt: Add an experimental Qualcomm Glymur USB4 host
+ router driver
+
+Qualcomm Glymur SoCs have USB4 host routers that are platform devices,
+not PCI devices. Their host interface (NHI) works with the common
+Thunderbolt/USB4 core once the router has been started: firmware upload
+and MCU start, the line-interrupt host interface, Type-C mailbox
+commands for each link change, and the DisplayPort IN adapter for the
+msm DisplayPort controller.
+
+Add a platform driver, USB4_QCOM, built into thunderbolt.ko, that ties
+these parts together for "qcom,glymur-usb4" routers:
+- It registers a Type-C orientation switch and mode mux, so the
+  alternate-mode driver passes USB4 and TBT3 entries and exits to it,
+  and turns them into connect and disconnect mailbox commands.
+- It sets the PHY up for USB4 or Thunderbolt 3 to match the partner,
+  restarting a router still running in the other mode first.
+- The router shares its PHY lanes with native USB and DisplayPort
+  alternate mode. It is therefore cold-started only when a USB4 or
+  Thunderbolt partner enters, and stopped once the partner and its
+  DisplayPort tunnel are gone; it is powered (runtime PM, interconnect
+  votes and clocks) only while it runs. The block reset is released
+  before power-off, because the power domain cannot be switched on
+  again while it is held.
+- While it runs, the router keeps the combo PHY powered and the xHCI of
+  the controller whose ports it tunnels runtime-active, and the display
+  state is saved before the router releases DisplayPort and restored
+  after the tunnel returns.
+- Across system suspend with a partner connected, the connection
+  manager puts the routers to sleep, the firmware is stopped and the MCU
+  halted with its RAM retained; on resume the MCU is warm-started and
+  the link resumed, so the tunnels and devices behind them survive. A
+  partner that left during sleep is handled as an unplug. Hibernation,
+  and suspend without a connected partner, stop the router like an
+  unplug.
+
+Limitations: only router 0 has a startup profile; the board retimer,
+the preset and the DisplayPort controller are fixed to those of the
+Surface Laptop 8; router runtime suspend is not implemented; the
+"qcom,glymur-usb4" binding is not documented yet; Thunderbolt 3
+partners have not been tested. The router firmware image is named by
+the device tree's firmware-name property.
+
+The Type-C core must be built in: its port mapper already calls into
+thunderbolt.ko, so with both as modules each would depend on the other.
+
+The startup and sleep sequences match what the platform's Windows
+driver programs on the Surface Laptop 8, the only machine on which this
+driver has been tested.
+
+Assisted-by: Opus 5.5
+Signed-off-by: Jim Martin <jimmartin@gmail.com>
+---
+ drivers/thunderbolt/Kconfig          |   24 +
+ drivers/thunderbolt/Makefile         |    4 +
+ drivers/thunderbolt/qcom-usb4-host.c | 1721 ++++++++++++++++++++++++++
+ 3 files changed, 1749 insertions(+)
+ create mode 100644 drivers/thunderbolt/qcom-usb4-host.c
+
+diff --git a/drivers/thunderbolt/Kconfig b/drivers/thunderbolt/Kconfig
+index eb500f013f7..ffa567c7e58 100644
+--- a/drivers/thunderbolt/Kconfig
++++ b/drivers/thunderbolt/Kconfig
+@@ -86,4 +86,28 @@ config USB4_STREAM
+ 	  To compile this driver a module, choose M here. The module will be
+ 	  called thunderbolt_stream.
+ 
++config USB4_QCOM
++	bool "Qualcomm Glymur USB4 host router (experimental)"
++	depends on OF && PINCTRL && MFD_SYSCON
++	depends on ARCH_QCOM || COMPILE_TEST
++	depends on QCOM_SMEM=y || QCOM_SMEM=USB4
++	depends on CLK_GLYMUR_GCC=y || CLK_GLYMUR_GCC=USB4
++	depends on DRM_MSM=y || DRM_MSM=USB4
++	depends on TYPEC=y
++	select DRM_DISPLAY_HELPER
++	help
++	  Platform driver for the USB4 host router of Qualcomm Glymur
++	  (Snapdragon X2) SoCs: router firmware upload, MCU startup, the
++	  line-interrupt NHI adapter, Type-C mailbox commands and
++	  DisplayPort tunnelling from the msm DisplayPort controller.
++	  Requires the board's router firmware image under /lib/firmware.
++
++	  Experimental. Only the first router is supported, its board values
++	  (retimer, preset) are those of the Surface Laptop 8, and it has
++	  been tested only on that machine.
++
++	  The Type-C core must be built in: its port mapper calls into
++	  thunderbolt.ko, so with both as modules each would depend on the
++	  other.
++
+ endif # USB4
+diff --git a/drivers/thunderbolt/Makefile b/drivers/thunderbolt/Makefile
+index 9aee28769cb..ffc3c358cb0 100644
+--- a/drivers/thunderbolt/Makefile
++++ b/drivers/thunderbolt/Makefile
+@@ -19,3 +19,7 @@ obj-$(CONFIG_USB4_DMA_TEST) += thunderbolt_dma_test.o
+ 
+ thunderbolt_stream-${CONFIG_USB4_STREAM} += stream.o
+ obj-$(CONFIG_USB4_STREAM) += thunderbolt_stream.o
++
++thunderbolt-$(CONFIG_USB4_QCOM) += qcom-usb4-fw.o qcom-usb4-drom.o qcom-usb4-mcu.o \
++	qcom-usb4-typec.o qcom-usb4-irq.o qcom-usb4-nhi.o qcom-usb4-startup.o \
++	qcom-usb4-events.o qcom-usb4-host.o qcom-usb4-dp.o qcom-usb4-dp-link.o
+diff --git a/drivers/thunderbolt/qcom-usb4-host.c b/drivers/thunderbolt/qcom-usb4-host.c
+new file mode 100644
+index 00000000000..69ad6de975b
+--- /dev/null
++++ b/drivers/thunderbolt/qcom-usb4-host.c
+@@ -0,0 +1,1721 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Qualcomm Glymur USB4 host router platform frontend.
++ *
++ * Experimental. Only router 0 has a startup profile, tested only on the
++ * Surface Laptop 8. The driver connects the cold-start sequence, the MCU
++ * firmware/mailbox helpers and the line-interrupt NHI adapter to the common
++ * Thunderbolt/USB4 core, and takes Type-C tunnelling requests from the
++ * platform's alternate-mode driver.
++ *
++ * Hardware startup failures keep the device bound so the Type-C mode switch
++ * stays registered (the alternate-mode driver depends on it) and the state
++ * is inspectable; the router is simply not brought up.
++ */
++
++#include <linux/bitfield.h>
++#include <linux/clk.h>
++#include <linux/completion.h>
++#include <linux/delay.h>
++#include <linux/dma-mapping.h>
++#include <linux/firmware.h>
++#include <linux/interconnect.h>
++#include <linux/interrupt.h>
++#include <linux/io.h>
++#include <linux/mfd/syscon.h>
++#include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/of.h>
++#include <linux/of_platform.h>
++#include <linux/phy/phy.h>
++#include <linux/pinctrl/consumer.h>
++#include <linux/platform_device.h>
++#include <linux/pm_runtime.h>
++#include <linux/suspend.h>
++#include <linux/regmap.h>
++#include <linux/reset.h>
++#include <linux/slab.h>
++#include <linux/soc/qcom/glymur-usb4.h>
++#include <linux/soc/qcom/smem.h>
++#include <linux/soc/qcom/socinfo.h>
++#include <linux/usb/typec.h>
++#include <linux/usb/typec_mux.h>
++#include <linux/usb/typec_tbt.h>
++#include <linux/workqueue.h>
++
++#include "nhi.h"
++#include "tb.h"
++#include "nhi_regs.h"
++#include "qcom-usb4-events.h"
++#include "qcom-usb4-dp.h"
++#include "qcom-usb4-mcu.h"
++#include "qcom-usb4-nhi.h"
++#include "qcom-usb4-startup.h"
++#include "qcom-usb4-typec.h"
++
++#define QCOM_USB4_ROUTER_SIZE		0x100000
++#define QCOM_USB4_NHI_OFFSET		0x3f000
++#define QCOM_USB4_MCU_RAM_OFFSET	0x13000
++#define QCOM_USB4_MCU_RAM_SIZE		0xf000
++#define QCOM_USB4_MCU_IRQ_ACK		0x22018
++#define QCOM_USB4_MCU_IRQ_ENABLE	0x2201c
++#define QCOM_USB4_ROUTER_STOP_FLAG	0x81018
++#define QCOM_USB4_TCSR_ROUTE		0xb004
++#define QCOM_USB4_MCU_STOP_COMMAND	4
++#define QCOM_USB4_MCU_RESUME_COMMAND	5
++/* Router state saved before the MCU is halted for sleep. */
++#define QCOM_USB4_ROUTER_SLEEP_SAVE	0x81014
++#define QCOM_USB4_WAKE_STATUS		0x20a4
++#define QCOM_USB4_LANE0_STATUS		0x2050
++#define QCOM_USB4_LANE_STATE		GENMASK(29, 26)
++#define QCOM_USB4_LANE_STATE_ACTIVE	2
++#define QCOM_USB4_LINK_RESUME_TIMEOUT_MS	5000
++#define QCOM_USB4_STOP_TIMEOUT_MS	200
++#define QCOM_USB4_COMMAND_TIMEOUT_US	10000
++#define QCOM_USB4_SURFACE_PRESET	0x4421
++#define QCOM_USB4_SYS_READY_TIMEOUT_US	100000
++/*
++ * After a USB4 partner leaves, wait this long (and until DRM has released the
++ * DisplayPort tunnel) before stopping the router, so an immediate replug just
++ * reconnects.
++ */
++#define QCOM_USB4_IDLE_STOP_MS		500
++/* Bound for the DisplayPort tunnel release before system sleep. */
++#define QCOM_USB4_SLEEP_STOP_MS		5000
++#define QCOM_USB4_MAX_ROUTERS		3
++
++/* Verified board facts: PS8830 board retimer on every Surface Laptop 8 port. */
++#define QCOM_USB4_SURFACE_BOARD_RETIMER	1
++
++#define QCOM_USB4_DDR_PEAK_BW		MBps_to_icc(5000)
++#define QCOM_USB4_APPS_PEAK_BW		MBps_to_icc(40)
++
++enum qcom_usb4_pin_state {
++	QCOM_USB4_PIN_RX_PREPARE,
++	QCOM_USB4_PIN_TXB_PREPARE,
++	QCOM_USB4_PIN_TXA_PREPARE,
++	QCOM_USB4_PIN_RX_ACTIVE,
++	QCOM_USB4_PIN_TXB_ACTIVE,
++	QCOM_USB4_PIN_TXA_ACTIVE,
++	QCOM_USB4_PIN_COUNT,
++};
++
++static const char *const qcom_usb4_pin_names[QCOM_USB4_PIN_COUNT] = {
++	[QCOM_USB4_PIN_RX_PREPARE] = "rx-prepare",
++	[QCOM_USB4_PIN_TXB_PREPARE] = "txb-prepare",
++	[QCOM_USB4_PIN_TXA_PREPARE] = "txa-prepare",
++	[QCOM_USB4_PIN_RX_ACTIVE] = "rx-active",
++	[QCOM_USB4_PIN_TXB_ACTIVE] = "txb-active",
++	[QCOM_USB4_PIN_TXA_ACTIVE] = "txa-active",
++};
++
++enum qcom_usb4_link_request {
++	QCOM_USB4_LINK_NONE,
++	QCOM_USB4_LINK_CONNECT,
++	QCOM_USB4_LINK_DISCONNECT,
++};
++
++struct qcom_usb4_host {
++	struct device *dev;
++	unsigned int port;
++	void __iomem *router;
++
++	struct qcom_usb4_nhi qnhi;
++	struct qcom_usb4_mcu mcu;
++	struct qcom_usb4_start_state start_state;
++	struct qcom_usb4_dp *dp;
++
++	struct clk_bulk_data *clks;
++	bool *clk_enabled;
++	int num_clks;
++	struct reset_control *router_reset;
++	struct reset_control *phy_reset;
++	struct reset_control *dp_reset;
++	struct pinctrl *pinctrl;
++	struct pinctrl_state *pins[QCOM_USB4_PIN_COUNT];
++	struct regmap *tcsr;
++	struct phy *phy;
++	struct icc_path *icc_ddr;
++	struct icc_path *icc_apps;
++	const struct firmware *fw;
++	u32 serial;
++	int nhi_irq;
++	int mcu_irq;
++
++	struct typec_switch_dev *sw;
++	struct typec_mux_dev *mux;
++
++	/* Serializes link requests, mailbox commands and lifecycle changes. */
++	struct mutex lock;
++	enum typec_orientation orientation;
++	enum qcom_usb4_link_request pending;
++	u32 pending_command;
++	/* PHY submode the pending connection needs, and the running router's. */
++	enum tbt_phy_submode pending_submode;
++	enum tbt_phy_submode phy_submode;
++	bool connected;
++	/* Command of the current connection, repeated after system sleep. */
++	u32 connect_command;
++
++	bool started;
++	/*
++	 * The router and native partners (USB, DisplayPort alternate mode)
++	 * share the port's PHY lanes, and a partner trains its link the moment
++	 * it is plugged in. The router therefore runs only for a USB4 or
++	 * Thunderbolt partner: it is cold-started on entry and stopped once
++	 * the partner and its DisplayPort tunnel are gone. @released means
++	 * ready but stopped.
++	 */
++	bool released;
++	bool removing;
++	/*
++	 * System sleep. A connected router is kept (@kept): the connection
++	 * manager puts the routers to sleep, then the MCU is halted with its
++	 * state retained and its power domain held on; on resume the MCU is
++	 * warm-started and the link resumed, so the tunnels and the devices
++	 * behind them survive. @sleep_failed asks for a full restart instead.
++	 * Any other running router is stopped like an unplugged partner and a
++	 * connection restored like a new plug afterwards. @suspending blocks
++	 * starts in between.
++	 */
++	bool suspending;
++	bool resume_connect;
++	bool kept;
++	bool mcu_halted;
++	bool sleep_failed;
++	struct notifier_block pm_nb;
++	bool pm_nb_registered;
++	/*
++	 * The controller whose ports this router tunnels, and its xHCI, held
++	 * runtime-active while the router runs (see qcom_usb4_host_hold_xhci()).
++	 */
++	struct device *tunnel_ctrl;
++	struct device *xhci;
++	struct notifier_block bus_nb;
++	struct mutex lifecycle_lock;
++	struct delayed_work lifecycle_work;
++	bool nhi_probed;
++	bool phy_initialized;
++	bool phy_powered;
++	bool mcu_irq_enabled;
++	/* Runtime PM reference, interconnect votes and clocks while running. */
++	bool powered;
++
++	struct completion stop_event;
++	u32 event_consumer;
++};
++
++static struct qcom_usb4_host *qcom_usb4_hosts[QCOM_USB4_MAX_ROUTERS];
++static DEFINE_MUTEX(qcom_usb4_hosts_lock);
++
++static struct qcom_usb4_host *qcom_usb4_host_from_dev(struct device *dev)
++{
++	struct qcom_usb4_host *host = NULL;
++	unsigned int i;
++
++	mutex_lock(&qcom_usb4_hosts_lock);
++	for (i = 0; i < QCOM_USB4_MAX_ROUTERS; i++) {
++		if (qcom_usb4_hosts[i] && qcom_usb4_hosts[i]->dev == dev) {
++			host = qcom_usb4_hosts[i];
++			break;
++		}
++	}
++	mutex_unlock(&qcom_usb4_hosts_lock);
++	return host;
++}
++
++static struct qcom_usb4_host *qcom_usb4_host_from_nhi(struct tb_nhi *nhi)
++{
++	struct qcom_usb4_nhi *qnhi = container_of(nhi, struct qcom_usb4_nhi, nhi);
++
++	return container_of(qnhi, struct qcom_usb4_host, qnhi);
++}
++
++/* Router window access for the startup sequencer. */
++
++static int qcom_usb4_host_read_router(void *ctx, u32 offset, u32 *value)
++{
++	struct qcom_usb4_host *host = ctx;
++
++	if (offset % sizeof(u32) || offset > QCOM_USB4_ROUTER_SIZE - sizeof(u32))
++		return -EINVAL;
++	*value = readl(host->router + offset);
++	return 0;
++}
++
++static int qcom_usb4_host_update_router(void *ctx, u32 offset, u32 mask, u32 value)
++{
++	struct qcom_usb4_host *host = ctx;
++	u32 reg;
++
++	if (offset % sizeof(u32) || offset > QCOM_USB4_ROUTER_SIZE - sizeof(u32))
++		return -EINVAL;
++	reg = readl(host->router + offset);
++	writel((reg & ~mask) | (value & mask), host->router + offset);
++	return 0;
++}
++
++static void qcom_usb4_host_delay_us(void *ctx, unsigned int usec)
++{
++	if (usec < 20)
++		udelay(usec);
++	else
++		usleep_range(usec, usec + usec / 10 + 10);
++}
++
++static int qcom_usb4_host_owner_check(void *ctx, const struct qcom_usb4_start_config *cfg)
++{
++	struct qcom_usb4_host *host = ctx;
++
++	if (!host->fw || cfg->firmware != host->fw->data)
++		return -EINVAL;
++	if (host->phy_initialized || host->started)
++		return -EBUSY;
++	/* Cold start only: a running MCU means a prior owner left it active. */
++	if (readl(host->router + host->mcu.control_offset) & BIT(0))
++		return -EBUSY;
++	return 0;
++}
++
++static int qcom_usb4_host_select_pins(struct qcom_usb4_host *host,
++				      enum qcom_usb4_pin_state state)
++{
++	return pinctrl_select_state(host->pinctrl, host->pins[state]);
++}
++
++static int qcom_usb4_host_provider(void *ctx, enum qcom_usb4_start_step step,
++				   const struct qcom_usb4_start_config *cfg)
++{
++	struct qcom_usb4_host *host = ctx;
++	int ret;
++
++	switch (step) {
++	case QCOM_USB4_START_RX_PAD_PREPARE:
++		return qcom_usb4_host_select_pins(host, QCOM_USB4_PIN_RX_PREPARE);
++	case QCOM_USB4_START_TX_B_PAD_PREPARE:
++		return qcom_usb4_host_select_pins(host, QCOM_USB4_PIN_TXB_PREPARE);
++	case QCOM_USB4_START_TX_A_PAD_PREPARE:
++		return qcom_usb4_host_select_pins(host, QCOM_USB4_PIN_TXA_PREPARE);
++	case QCOM_USB4_START_RX_CLOCKS_REFERENCE:
++		return glymur_gcc_usb4_rx_select(host->port, false);
++	case QCOM_USB4_START_USB4_RESET_ASSERT:
++		return reset_control_assert(host->router_reset);
++	case QCOM_USB4_START_COMBO_RESET_ASSERT:
++		return reset_control_assert(host->phy_reset);
++	case QCOM_USB4_START_DP_RESET_ASSERT:
++		/*
++		 * Cold start: the DP reset could only be skipped while a DP
++		 * tunnel clock is active, which cannot be the case before the
++		 * first startup on this owner.
++		 */
++		return reset_control_assert(host->dp_reset);
++	case QCOM_USB4_START_DP_RESET_DEASSERT:
++		return reset_control_deassert(host->dp_reset);
++	case QCOM_USB4_START_COMBO_RESET_DEASSERT:
++		return reset_control_deassert(host->phy_reset);
++	case QCOM_USB4_START_USB4_RESET_DEASSERT:
++		return reset_control_deassert(host->router_reset);
++	case QCOM_USB4_START_CLOCK_READY:
++		/*
++		 * Wait a bounded time for the SYS branch to report running, but
++		 * do not fail the cold start on a timeout; log it instead.
++		 */
++		ret = glymur_gcc_usb4_sys_ready(host->port, QCOM_USB4_SYS_READY_TIMEOUT_US);
++		if (ret == -ETIMEDOUT) {
++			dev_warn(host->dev, "SYS clock not reported running after reset\n");
++			return 0;
++		}
++		return ret;
++	case QCOM_USB4_START_RX_CLOCKS_PHY:
++		return glymur_gcc_usb4_rx_select(host->port, true);
++	case QCOM_USB4_START_RX_PAD_ACTIVE:
++		return qcom_usb4_host_select_pins(host, QCOM_USB4_PIN_RX_ACTIVE);
++	case QCOM_USB4_START_TX_B_PAD_ACTIVE:
++		return qcom_usb4_host_select_pins(host, QCOM_USB4_PIN_TXB_ACTIVE);
++	case QCOM_USB4_START_TX_A_PAD_ACTIVE:
++		return qcom_usb4_host_select_pins(host, QCOM_USB4_PIN_TXA_ACTIVE);
++	case QCOM_USB4_START_GCC_600C0_BIT3_SET:
++		return glymur_gcc_usb4_ctrl_bit(host->port, true);
++	case QCOM_USB4_START_GCC_600C0_BIT3_CLEAR:
++		return glymur_gcc_usb4_ctrl_bit(host->port, false);
++	case QCOM_USB4_START_SYS_MEMORY_FORCE:
++		return glymur_gcc_usb4_sys_force_mem(host->port, true);
++	case QCOM_USB4_START_TCSR_ROUTE:
++		return regmap_update_bits(host->tcsr, QCOM_USB4_TCSR_ROUTE,
++					  BIT(host->port), BIT(host->port));
++	case QCOM_USB4_START_PIPE_HWCG_OFF:
++		return glymur_gcc_usb4_pipe_hwcg(host->port, false);
++	case QCOM_USB4_START_PHY_COMPOSITE:
++		ret = phy_set_mode_ext(host->phy, PHY_MODE_TBT, host->pending_submode);
++		if (ret)
++			return ret;
++		host->phy_submode = host->pending_submode;
++		ret = phy_init(host->phy);
++		if (ret)
++			return ret;
++		host->phy_initialized = true;
++		/*
++		 * Keep the PHY runtime-active while the router uses it. The
++		 * DWC3 controller sharing it drops its own reference when it
++		 * runtime-suspends, and a suspended PHY clamps the USB4 lanes
++		 * and gates their clocks, dropping the link.
++		 */
++		ret = phy_power_on(host->phy);
++		if (ret)
++			return ret;
++		host->phy_powered = true;
++		return 0;
++	default:
++		return -EINVAL;
++	}
++}
++
++static const struct qcom_usb4_start_ops qcom_usb4_host_start_ops = {
++	.owner_check = qcom_usb4_host_owner_check,
++	.provider = qcom_usb4_host_provider,
++	.read_router = qcom_usb4_host_read_router,
++	.update_router = qcom_usb4_host_update_router,
++	.delay_us = qcom_usb4_host_delay_us,
++};
++
++/* MCU event notification interrupt (third router interrupt). */
++
++static irqreturn_t qcom_usb4_host_mcu_irq(int irq, void *data)
++{
++	struct qcom_usb4_host *host = data;
++	struct qcom_usb4_events events;
++	void __iomem *shared;
++	u32 layout, capacity, stride, producer, aux;
++	size_t need, avail;
++	unsigned int i, j;
++	u8 *snapshot;
++	int ret;
++
++	if (!READ_ONCE(host->mcu_irq_enabled))
++		return IRQ_HANDLED;
++
++	shared = host->router + QCOM_USB4_MCU_RAM_OFFSET + host->start_state.shared_offset;
++	producer = readl(shared + 4);
++	aux = readl(shared + 8);
++	/* Read the producer state, then acknowledge, then drain. */
++	writel(1, host->router + QCOM_USB4_MCU_IRQ_ACK);
++
++	layout = readl(shared);
++	capacity = layout & 0xffff;
++	stride = layout >> 16;
++	avail = QCOM_USB4_MCU_RAM_SIZE - host->start_state.shared_offset;
++	if (!capacity || !stride || capacity > (avail - 16) / stride) {
++		dev_warn_ratelimited(host->dev, "MCU event ring geometry invalid: %#x\n", layout);
++		return IRQ_HANDLED;
++	}
++	need = 16 + (size_t)capacity * stride;
++	snapshot = kmalloc(need, GFP_KERNEL);
++	if (!snapshot)
++		return IRQ_HANDLED;
++	memcpy_fromio(snapshot, shared, need);
++
++	ret = qcom_usb4_events_decode(snapshot, need, host->event_consumer, &events);
++	if (ret) {
++		dev_warn_ratelimited(host->dev,
++				     "MCU event decode failed (%d): producer %u aux %u consumer %u\n",
++				     ret, producer, aux, host->event_consumer);
++		goto out;
++	}
++
++	for (i = 0; i < 2; i++) {
++		for (j = 0; j < events.spans[i].count; j++) {
++			const u8 *rec = events.spans[i].data + (size_t)j * stride;
++
++			if (rec[0] == 1 && stride > 2)
++				dev_dbg(host->dev, "MCU event type 1: %c %.*s\n", rec[1],
++					(int)stride - 2, rec + 2);
++			else
++				dev_dbg(host->dev, "MCU event type %u: %*ph\n", rec[0],
++					(int)min_t(u32, stride, 16), rec);
++		}
++	}
++	host->event_consumer = events.producer;
++	if (events.type4_records)
++		complete(&host->stop_event);
++out:
++	kfree(snapshot);
++	return IRQ_HANDLED;
++}
++
++/* Type-C link requests from the platform alternate-mode driver. */
++
++static int qcom_usb4_host_send_command(struct qcom_usb4_host *host, u32 command,
++				       const char *what)
++{
++	int ret;
++
++	ret = qcom_usb4_mcu_command(&host->mcu, command, QCOM_USB4_COMMAND_TIMEOUT_US);
++	if (ret)
++		dev_err(host->dev, "%s command %#010x failed: %d\n", what, command, ret);
++	else
++		dev_dbg(host->dev, "%s command %#010x acknowledged\n", what, command);
++	return ret;
++}
++
++static void qcom_usb4_host_apply_link(struct qcom_usb4_host *host)
++{
++	lockdep_assert_held(&host->lock);
++
++	/* A halted MCU takes no commands: keep the request until it resumes. */
++	if (!host->started || host->mcu_halted)
++		return;
++
++	switch (host->pending) {
++	case QCOM_USB4_LINK_CONNECT:
++		/* The PHY runs the other mode: the lifecycle work restarts the router. */
++		if (host->phy_submode != host->pending_submode) {
++			if (!host->removing)
++				mod_delayed_work(system_long_wq, &host->lifecycle_work, 0);
++			return;
++		}
++		if (!qcom_usb4_host_send_command(host, host->pending_command, "connect")) {
++			host->connected = true;
++			host->connect_command = host->pending_command;
++		}
++		break;
++	case QCOM_USB4_LINK_DISCONNECT:
++		if (host->connected &&
++		    !qcom_usb4_host_send_command(host, host->pending_command, "disconnect"))
++			host->connected = false;
++		break;
++	default:
++		break;
++	}
++	qcom_usb4_dp_set_connected(host->dp, host->connected);
++	host->pending = QCOM_USB4_LINK_NONE;
++}
++
++static int qcom_usb4_host_switch_set(struct typec_switch_dev *sw,
++				     enum typec_orientation orientation)
++{
++	struct qcom_usb4_host *host = typec_switch_get_drvdata(sw);
++
++	mutex_lock(&host->lock);
++	host->orientation = orientation;
++	mutex_unlock(&host->lock);
++	return 0;
++}
++
++static int qcom_usb4_host_mux_set(struct typec_mux_dev *mux, struct typec_mux_state *state)
++{
++	struct qcom_usb4_host *host = typec_mux_get_drvdata(mux);
++	enum qcom_usb4_link_request request = QCOM_USB4_LINK_DISCONNECT;
++	enum tbt_phy_submode submode = PHY_SUBMODE_USB4;
++	u32 command;
++	int ret;
++
++	mutex_lock(&host->lock);
++	if (state->mode == TYPEC_STATE_USB && !state->alt) {
++		/*
++		 * The UCSI driver also sets the plain USB state on the port when
++		 * a partner registers; that is not a firmware mux change. Only the
++		 * alternate-mode driver's safe state or a DP alternate mode ends
++		 * a tunnel, so leave an established connection alone here.
++		 */
++		dev_dbg(host->dev, "Type-C USB state, connection %s\n",
++			host->connected ? "kept" : "absent");
++		mutex_unlock(&host->lock);
++		return 0;
++	}
++	if (!state->alt && state->mode == TYPEC_MODE_USB4 && state->data) {
++		ret = qcom_usb4_typec_usb4_command(state->data, host->orientation,
++						   QCOM_USB4_SURFACE_BOARD_RETIMER, &command);
++		request = QCOM_USB4_LINK_CONNECT;
++	} else if (state->alt && state->alt->svid == USB_TYPEC_TBT_SID && state->data) {
++		ret = qcom_usb4_typec_tbt_command(state->data, host->orientation,
++						  QCOM_USB4_SURFACE_BOARD_RETIMER, &command);
++		request = QCOM_USB4_LINK_CONNECT;
++		submode = PHY_SUBMODE_TBT3;
++	} else {
++		ret = qcom_usb4_typec_disconnect_command(&command);
++	}
++	if (ret) {
++		const struct enter_usb_data *eudo = state->data;
++
++		dev_warn(host->dev,
++			 "unsupported Type-C request (mode %lu, orientation %d, svid %#x, eudo %#x): %d\n",
++			 state->mode, host->orientation, state->alt ? state->alt->svid : 0,
++			 (!state->alt && state->data) ? eudo->eudo : 0, ret);
++		mutex_unlock(&host->lock);
++		return 0;
++	}
++	dev_dbg(host->dev, "Type-C request: mode %lu orientation %d -> %s %#010x%s\n",
++		state->mode, host->orientation,
++		request == QCOM_USB4_LINK_CONNECT ? "connect" : "disconnect",
++		command, host->started ? "" : " (deferred until router startup)");
++	host->pending = request;
++	host->pending_command = command;
++	if (request == QCOM_USB4_LINK_CONNECT)
++		host->pending_submode = submode;
++	qcom_usb4_host_apply_link(host);
++	if (!host->removing) {
++		if (request == QCOM_USB4_LINK_CONNECT && host->released)
++			mod_delayed_work(system_long_wq, &host->lifecycle_work, 0);
++		else if (request == QCOM_USB4_LINK_DISCONNECT && host->started)
++			mod_delayed_work(system_long_wq, &host->lifecycle_work,
++					 msecs_to_jiffies(QCOM_USB4_IDLE_STOP_MS));
++	}
++	mutex_unlock(&host->lock);
++	return 0;
++}
++
++static void qcom_usb4_host_typec_unregister(void *data)
++{
++	struct qcom_usb4_host *host = data;
++
++	typec_mux_unregister(host->mux);
++	typec_switch_unregister(host->sw);
++}
++
++static int qcom_usb4_host_typec_register(struct qcom_usb4_host *host)
++{
++	struct typec_switch_desc sw_desc = {
++		.fwnode = dev_fwnode(host->dev),
++		.set = qcom_usb4_host_switch_set,
++		.drvdata = host,
++	};
++	struct typec_mux_desc mux_desc = {
++		.fwnode = dev_fwnode(host->dev),
++		.set = qcom_usb4_host_mux_set,
++		.drvdata = host,
++	};
++
++	host->sw = typec_switch_register(host->dev, &sw_desc);
++	if (IS_ERR(host->sw))
++		return dev_err_probe(host->dev, PTR_ERR(host->sw),
++				     "failed to register orientation switch\n");
++	host->mux = typec_mux_register(host->dev, &mux_desc);
++	if (IS_ERR(host->mux)) {
++		typec_switch_unregister(host->sw);
++		return dev_err_probe(host->dev, PTR_ERR(host->mux),
++				     "failed to register mode switch\n");
++	}
++	return devm_add_action_or_reset(host->dev, qcom_usb4_host_typec_unregister, host);
++}
++
++/*
++ * While the router runs, keep the xHCI of the controller whose ports it
++ * tunnels runtime-active. A runtime-suspended xHCI is halted, and nothing
++ * else would wake it for a tunnelled port: the controller's wakeup
++ * interrupts watch its native USB2 lines and SuperSpeed PHY, not the USB4
++ * tunnels, so a suspended xHCI would not see the dock's USB3 ports come up.
++ * The xHCI comes and goes with the controller's USB role, possibly after
++ * the router has started, so a bus notifier tracks it.
++ */
++static int qcom_usb4_host_match_xhci(struct device *dev, const void *data)
++{
++	return dev->driver && !strcmp(dev->driver->name, "xhci-hcd");
++}
++
++static void qcom_usb4_host_hold_xhci(struct qcom_usb4_host *host)
++{
++	struct device *xhci;
++	int ret;
++
++	lockdep_assert_held(&host->lock);
++
++	if (host->xhci || !host->tunnel_ctrl || !host->started)
++		return;
++	xhci = device_find_child(host->tunnel_ctrl, NULL, qcom_usb4_host_match_xhci);
++	if (!xhci)
++		return;
++	ret = pm_runtime_get_sync(xhci);
++	if (ret < 0)
++		dev_warn(host->dev, "%s runtime resume failed: %d\n", dev_name(xhci), ret);
++	host->xhci = xhci;
++}
++
++static void qcom_usb4_host_release_xhci(struct qcom_usb4_host *host)
++{
++	lockdep_assert_held(&host->lock);
++
++	if (!host->xhci)
++		return;
++	pm_runtime_put(host->xhci);
++	put_device(host->xhci);
++	host->xhci = NULL;
++}
++
++static int qcom_usb4_host_bus_notify(struct notifier_block *nb, unsigned long action,
++				     void *data)
++{
++	struct qcom_usb4_host *host = container_of(nb, struct qcom_usb4_host, bus_nb);
++	struct device *dev = data;
++
++	if (dev->parent != host->tunnel_ctrl)
++		return NOTIFY_DONE;
++	mutex_lock(&host->lock);
++	switch (action) {
++	case BUS_NOTIFY_BOUND_DRIVER:
++		qcom_usb4_host_hold_xhci(host);
++		break;
++	/*
++	 * The lookup can find an xHCI still probing or being unbound; drop it
++	 * however its binding ends so the next xHCI is held.
++	 */
++	case BUS_NOTIFY_UNBIND_DRIVER:
++	case BUS_NOTIFY_UNBOUND_DRIVER:
++	case BUS_NOTIFY_DRIVER_NOT_BOUND:
++		if (dev == host->xhci)
++			qcom_usb4_host_release_xhci(host);
++		break;
++	}
++	mutex_unlock(&host->lock);
++	return NOTIFY_DONE;
++}
++
++/* Hardware shutdown, in the normal stop order. */
++
++static void qcom_usb4_host_stop_hardware(struct qcom_usb4_host *host)
++{
++	int ret;
++
++	qcom_usb4_dp_stop(host->dp);
++	mutex_lock(&host->lock);
++	/* An MCU halted for sleep that did not warm-start cannot take commands. */
++	if (host->start_state.phase == QCOM_USB4_START_COMPLETE && !host->mcu_halted) {
++		qcom_usb4_host_update_router(host, QCOM_USB4_ROUTER_STOP_FLAG, BIT(0), 0);
++		reinit_completion(&host->stop_event);
++		ret = qcom_usb4_mcu_command(&host->mcu, QCOM_USB4_MCU_STOP_COMMAND,
++					    QCOM_USB4_COMMAND_TIMEOUT_US);
++		if (ret)
++			dev_warn(host->dev, "MCU stop command failed: %d\n", ret);
++		else if (host->mcu_irq_enabled &&
++			 !wait_for_completion_timeout(&host->stop_event,
++						      msecs_to_jiffies(QCOM_USB4_STOP_TIMEOUT_MS)))
++			dev_warn(host->dev, "no MCU stop event within %u ms\n",
++				 QCOM_USB4_STOP_TIMEOUT_MS);
++		qcom_usb4_mcu_stop(&host->mcu);
++	}
++	if (host->mcu_irq_enabled) {
++		qcom_usb4_host_update_router(host, QCOM_USB4_MCU_IRQ_ENABLE, BIT(0), 0);
++		WRITE_ONCE(host->mcu_irq_enabled, false);
++		/* A handler past its check may still read MCU RAM: let it finish. */
++		synchronize_irq(host->mcu_irq);
++	}
++	if (host->phy_powered) {
++		ret = phy_power_off(host->phy);
++		if (ret)
++			dev_warn(host->dev, "USB4 PHY power off failed: %d\n", ret);
++		host->phy_powered = false;
++	}
++	if (host->phy_initialized) {
++		ret = phy_exit(host->phy);
++		if (ret)
++			dev_warn(host->dev, "USB4 PHY exit failed: %d\n", ret);
++		host->phy_initialized = false;
++	}
++	if (host->start_state.phase != QCOM_USB4_START_NEW) {
++		glymur_gcc_usb4_rx_select(host->port, false);
++		regmap_update_bits(host->tcsr, QCOM_USB4_TCSR_ROUTE, BIT(host->port), 0);
++		/*
++		 * Hold the router block in reset once it is stopped: a wedged
++		 * firmware otherwise keeps the block busy, the clocks cannot be
++		 * gated ("status stuck at on") and the next start finds them
++		 * stuck off. The startup sequencer asserts and releases the
++		 * resets itself, so leaving it asserted here is safe.
++		 */
++		ret = reset_control_assert(host->router_reset);
++		if (ret)
++			dev_warn(host->dev, "router reset assert at stop failed: %d\n", ret);
++	}
++	/* Nothing is left running; a repeated stop has nothing to undo. */
++	if (host->start_state.phase == QCOM_USB4_START_COMPLETE)
++		host->start_state.phase = QCOM_USB4_START_NEW;
++	host->mcu_halted = false;
++	host->started = false;
++	host->connected = false;
++	qcom_usb4_host_release_xhci(host);
++	mutex_unlock(&host->lock);
++}
++
++static void qcom_usb4_host_nhi_shutdown(struct tb_nhi *nhi)
++{
++	struct qcom_usb4_host *host = qcom_usb4_host_from_nhi(nhi);
++
++	qcom_usb4_nhi_shutdown(nhi);
++	qcom_usb4_host_stop_hardware(host);
++}
++
++static int qcom_usb4_host_runtime_suspend(struct tb_nhi *nhi)
++{
++	/* No validated router runtime suspend sequence yet: stay active. */
++	return -EBUSY;
++}
++
++/* A kept router that failed to sleep or resume is restarted after resume. */
++static bool qcom_usb4_host_nhi_present(struct tb_nhi *nhi)
++{
++	return !READ_ONCE(qcom_usb4_host_from_nhi(nhi)->sleep_failed);
++}
++
++static const struct tb_nhi_ops qcom_usb4_host_nhi_ops = {
++	.init_interrupts = qcom_usb4_nhi_init_interrupts,
++	.request_ring_irq = qcom_usb4_nhi_request_ring_irq,
++	.release_ring_irq = qcom_usb4_nhi_release_ring_irq,
++	.ring_interrupt_mask = qcom_usb4_nhi_ring_interrupt_mask,
++	.disable_interrupts = qcom_usb4_nhi_disable_interrupts,
++	.runtime_suspend = qcom_usb4_host_runtime_suspend,
++	.shutdown = qcom_usb4_host_nhi_shutdown,
++	.is_present = qcom_usb4_host_nhi_present,
++};
++
++/* Resources. */
++
++static int qcom_usb4_host_get_serial(struct qcom_usb4_host *host)
++{
++	struct socinfo *info;
++	size_t size;
++
++	info = qcom_smem_get(QCOM_SMEM_HOST_ANY, SMEM_HW_SW_BUILD_ID, &size);
++	if (IS_ERR(info))
++		return dev_err_probe(host->dev, PTR_ERR(info), "SoC info unavailable\n");
++	if (offsetofend(struct socinfo, serial_num) > size)
++		return dev_err_probe(host->dev, -ENODEV, "SoC info lacks a serial number\n");
++	host->serial = le32_to_cpu(info->serial_num);
++	if (!host->serial)
++		return dev_err_probe(host->dev, -ENODEV, "SoC serial number is zero\n");
++	return 0;
++}
++
++static int qcom_usb4_host_get_resources(struct qcom_usb4_host *host)
++{
++	struct platform_device *pdev = to_platform_device(host->dev);
++	struct device *dev = host->dev;
++	struct resource *res;
++	unsigned int i;
++	int ret;
++
++	host->router = devm_platform_get_and_ioremap_resource(pdev, 0, &res);
++	if (IS_ERR(host->router))
++		return PTR_ERR(host->router);
++	if (resource_size(res) < QCOM_USB4_ROUTER_SIZE)
++		return dev_err_probe(dev, -EINVAL, "router window smaller than %#x\n",
++				     QCOM_USB4_ROUTER_SIZE);
++
++	host->nhi_irq = platform_get_irq_byname(pdev, "nhi");
++	if (host->nhi_irq < 0)
++		return host->nhi_irq;
++	host->mcu_irq = platform_get_irq_byname(pdev, "mcu");
++	if (host->mcu_irq < 0)
++		return host->mcu_irq;
++
++	host->num_clks = devm_clk_bulk_get_all(dev, &host->clks);
++	if (host->num_clks <= 0)
++		return dev_err_probe(dev, host->num_clks ?: -ENOENT, "no clocks\n");
++	host->clk_enabled = devm_kcalloc(dev, host->num_clks, sizeof(bool), GFP_KERNEL);
++	if (!host->clk_enabled)
++		return -ENOMEM;
++
++	host->router_reset = devm_reset_control_get_exclusive(dev, "router");
++	if (IS_ERR(host->router_reset))
++		return dev_err_probe(dev, PTR_ERR(host->router_reset), "router reset\n");
++	host->phy_reset = devm_reset_control_get_exclusive(dev, "phy");
++	if (IS_ERR(host->phy_reset))
++		return dev_err_probe(dev, PTR_ERR(host->phy_reset), "phy reset\n");
++	host->dp_reset = devm_reset_control_get_exclusive(dev, "dp");
++	if (IS_ERR(host->dp_reset))
++		return dev_err_probe(dev, PTR_ERR(host->dp_reset), "dp reset\n");
++
++	host->pinctrl = devm_pinctrl_get(dev);
++	if (IS_ERR(host->pinctrl))
++		return dev_err_probe(dev, PTR_ERR(host->pinctrl), "pinctrl\n");
++	for (i = 0; i < QCOM_USB4_PIN_COUNT; i++) {
++		host->pins[i] = pinctrl_lookup_state(host->pinctrl, qcom_usb4_pin_names[i]);
++		if (IS_ERR(host->pins[i]))
++			return dev_err_probe(dev, PTR_ERR(host->pins[i]),
++					     "pinctrl state %s\n", qcom_usb4_pin_names[i]);
++	}
++
++	host->tcsr = syscon_regmap_lookup_by_phandle(dev->of_node, "qcom,tcsr");
++	if (IS_ERR(host->tcsr))
++		return dev_err_probe(dev, PTR_ERR(host->tcsr), "TCSR syscon\n");
++
++	host->phy = devm_phy_get(dev, "usb4");
++	if (IS_ERR(host->phy))
++		return dev_err_probe(dev, PTR_ERR(host->phy), "USB4 PHY\n");
++
++	host->icc_ddr = devm_of_icc_get(dev, "usb4-ddr");
++	if (IS_ERR(host->icc_ddr))
++		return dev_err_probe(dev, PTR_ERR(host->icc_ddr), "usb4-ddr interconnect\n");
++	host->icc_apps = devm_of_icc_get(dev, "apps-usb4");
++	if (IS_ERR(host->icc_apps))
++		return dev_err_probe(dev, PTR_ERR(host->icc_apps), "apps-usb4 interconnect\n");
++
++	ret = qcom_usb4_host_get_serial(host);
++	if (ret)
++		return ret;
++
++	ret = qcom_usb4_mcu_init(&host->mcu, host->router, QCOM_USB4_ROUTER_SIZE,
++				 QCOM_USB4_MCU_RAM_SIZE, QCOM_USB4_MCU_LEGACY);
++	if (ret)
++		return dev_err_probe(dev, ret, "MCU layout\n");
++
++	return dma_set_mask_and_coherent(dev, DMA_BIT_MASK(40));
++}
++
++static void qcom_usb4_host_clocks_disable(struct qcom_usb4_host *host)
++{
++	int i;
++
++	for (i = host->num_clks - 1; i >= 0; i--) {
++		if (host->clk_enabled[i]) {
++			clk_disable_unprepare(host->clks[i].clk);
++			host->clk_enabled[i] = false;
++		}
++	}
++}
++
++static void qcom_usb4_host_clocks_enable(struct qcom_usb4_host *host)
++{
++	int i, ret;
++
++	for (i = 0; i < host->num_clks; i++) {
++		ret = clk_prepare_enable(host->clks[i].clk);
++		if (ret)
++			dev_warn(host->dev, "clock %s enable failed: %d\n",
++				 host->clks[i].id ?: "?", ret);
++		else
++			host->clk_enabled[i] = true;
++	}
++}
++
++/*
++ * The router is powered only while it runs, so its power domain can be
++ * switched off with no USB4 partner. A router kept across system sleep stays
++ * powered.
++ */
++static int qcom_usb4_host_power_on(struct qcom_usb4_host *host)
++{
++	int ret;
++
++	if (host->powered)
++		return 0;
++	ret = pm_runtime_resume_and_get(host->dev);
++	if (ret < 0) {
++		dev_err(host->dev, "power on failed: %d\n", ret);
++		return ret;
++	}
++	ret = icc_set_bw(host->icc_ddr, 0, QCOM_USB4_DDR_PEAK_BW);
++	if (ret)
++		dev_warn(host->dev, "usb4-ddr bandwidth vote failed: %d\n", ret);
++	ret = icc_set_bw(host->icc_apps, 0, QCOM_USB4_APPS_PEAK_BW);
++	if (ret)
++		dev_warn(host->dev, "apps-usb4 bandwidth vote failed: %d\n", ret);
++	qcom_usb4_host_clocks_enable(host);
++	host->powered = true;
++	return 0;
++}
++
++static void qcom_usb4_host_power_off(struct qcom_usb4_host *host)
++{
++	int ret;
++
++	if (!host->powered)
++		return;
++	qcom_usb4_host_clocks_disable(host);
++	icc_set_bw(host->icc_apps, 0, 0);
++	icc_set_bw(host->icc_ddr, 0, 0);
++	/*
++	 * The stop holds the router block reset (GCC_USB4_0_BCR). The domain
++	 * cannot be switched on again while that reset is asserted ("status
++	 * stuck at 'off'"), whether by our next start or by genpd at system
++	 * resume, so release it before the domain goes off. The domain loses
++	 * the block's state anyway and the startup sequencer resets it again.
++	 */
++	ret = reset_control_deassert(host->router_reset);
++	if (ret)
++		dev_warn(host->dev, "router reset release at power off failed: %d\n", ret);
++	pm_runtime_put_sync(host->dev);
++	host->powered = false;
++}
++
++static void qcom_usb4_host_start_config(struct qcom_usb4_host *host,
++					struct qcom_usb4_start_config *cfg)
++{
++	*cfg = (struct qcom_usb4_start_config) {
++		.profile = QCOM_USB4_START_SURFACE_A8_PORT0,
++		.pcie_policy = QCOM_USB4_START_PCIE_ENABLE,
++		.mcu = &host->mcu,
++		.firmware = host->fw->data,
++		.firmware_size = host->fw->size,
++		.serial = host->serial,
++		.preset = QCOM_USB4_SURFACE_PRESET,
++		.command_timeout_us = QCOM_USB4_COMMAND_TIMEOUT_US,
++		.connection = {
++			.mode = QCOM_USB4_TUNNEL_USB4,
++			.orientation = QCOM_USB4_PAN_NORMAL,
++			.cable_type = QCOM_USB4_PAN_PASSIVE,
++			.cable_speed = 0,
++			.rounded = 0,
++			.board_retimer = QCOM_USB4_SURFACE_BOARD_RETIMER,
++		},
++	};
++}
++
++static int qcom_usb4_host_start(struct qcom_usb4_host *host)
++{
++	struct qcom_usb4_start_config cfg;
++	int ret;
++
++	qcom_usb4_host_start_config(host, &cfg);
++	memset(&host->start_state, 0, sizeof(host->start_state));
++	ret = qcom_usb4_startup_run(&host->start_state, &cfg, &qcom_usb4_host_start_ops, host);
++	if (ret) {
++		dev_err(host->dev,
++			"router startup failed at step %d (last completed %d): %d\n",
++			host->start_state.active_step, host->start_state.last_completed_step,
++			ret);
++		return ret;
++	}
++	dev_dbg(host->dev, "router firmware running, shared memory at %#x\n",
++		host->start_state.shared_offset);
++	return 0;
++}
++
++static int qcom_usb4_host_probe_nhi(struct qcom_usb4_host *host)
++{
++	struct tb_nhi *nhi = &host->qnhi.nhi;
++	enum qcom_usb4_irq_width width;
++	unsigned int paths;
++	u32 caps;
++	int ret;
++
++	nhi->dev = host->dev;
++	nhi->iobase = host->router + QCOM_USB4_NHI_OFFSET;
++	nhi->ops = &qcom_usb4_host_nhi_ops;
++
++	caps = readl(nhi->iobase + REG_CAPS);
++	paths = caps & 0x3ff;
++	width = paths <= 10 ? QCOM_USB4_IRQ_32 : QCOM_USB4_IRQ_NATIVE_64;
++	dev_dbg(host->dev, "NHI capabilities %#010x: %u paths, version %lu\n",
++		caps, paths, FIELD_GET(REG_CAPS_VERSION_MASK, caps));
++
++	ret = qcom_usb4_nhi_prepare(&host->qnhi, QCOM_USB4_ROUTER_SIZE - QCOM_USB4_NHI_OFFSET,
++				    paths, width, host->nhi_irq);
++	if (ret)
++		return dev_err_probe(host->dev, ret, "NHI adapter preparation\n");
++
++	/* nhi_probe() drops one runtime reference; balance it here. */
++	pm_runtime_get_noresume(host->dev);
++	ret = nhi_probe(nhi);
++	if (ret) {
++		pm_runtime_put_noidle(host->dev);
++		return ret;
++	}
++	/* No validated router runtime suspend sequence: keep the device active. */
++	pm_runtime_forbid(host->dev);
++	host->nhi_probed = true;
++	return 0;
++}
++
++/*
++ * Port ownership. Stopping the router hands the PHY back to the native Type-C
++ * mux (phy_exit(usb4) restores the mode last requested there) and releases
++ * the lanes' TCSR routing. It is the teardown path without the final clock,
++ * power and firmware release. Starting it again repeats the probe-time cold
++ * start and NHI probe.
++ */
++static void qcom_usb4_host_stop_all(struct qcom_usb4_host *host)
++{
++	if (host->nhi_probed) {
++		/* Domain removal ends in our NHI shutdown, which stops the hardware. */
++		nhi_remove(&host->qnhi.nhi);
++		host->nhi_probed = false;
++		pm_runtime_put_noidle(host->dev);
++		/* Undo the pm_runtime_forbid() of qcom_usb4_host_probe_nhi(). */
++		pm_runtime_allow(host->dev);
++	} else {
++		qcom_usb4_host_stop_hardware(host);
++	}
++	qcom_usb4_host_power_off(host);
++}
++
++static void qcom_usb4_host_release(struct qcom_usb4_host *host)
++{
++	dev_dbg(host->dev, "%s: stopping USB4 host router %u\n",
++		host->suspending ? "system sleep" : "no USB4 partner", host->port);
++	qcom_usb4_host_stop_all(host);
++	host->released = true;
++}
++
++static int qcom_usb4_host_acquire(struct qcom_usb4_host *host)
++{
++	int ret;
++
++	dev_dbg(host->dev, "USB4 partner: starting USB4 host router %u\n", host->port);
++	ret = qcom_usb4_nhi_reset(&host->qnhi);
++	if (ret)
++		return ret;
++	ret = qcom_usb4_host_power_on(host);
++	if (ret)
++		return ret;
++	ret = qcom_usb4_host_start(host);
++	if (ret)
++		goto err_stop;
++
++	host->event_consumer = 0;
++	WRITE_ONCE(host->mcu_irq_enabled, true);
++	qcom_usb4_host_update_router(host, QCOM_USB4_MCU_IRQ_ENABLE, BIT(0), BIT(0));
++	qcom_usb4_dp_restart(host->dp);
++
++	ret = qcom_usb4_host_probe_nhi(host);
++	if (ret) {
++		dev_err(host->dev, "NHI probe failed: %d\n", ret);
++		/* nhi_probe() already ran our shutdown on its failure path. */
++		goto err_stop;
++	}
++
++	mutex_lock(&host->lock);
++	host->released = false;
++	host->started = true;
++	qcom_usb4_host_hold_xhci(host);
++	qcom_usb4_host_apply_link(host);
++	mutex_unlock(&host->lock);
++	dev_dbg(host->dev, "USB4 host router %u up\n", host->port);
++	return 0;
++
++err_stop:
++	qcom_usb4_host_stop_hardware(host);
++	qcom_usb4_host_power_off(host);
++	dev_err(host->dev, "USB4 host router %u not started (%d)\n", host->port, ret);
++	return ret;
++}
++
++static void qcom_usb4_host_lifecycle_work(struct work_struct *work)
++{
++	struct qcom_usb4_host *host = container_of(to_delayed_work(work),
++						   struct qcom_usb4_host, lifecycle_work);
++	bool release, acquire;
++
++	mutex_lock(&host->lifecycle_lock);
++	for (;;) {
++		mutex_lock(&host->lock);
++		/* A router kept for system sleep is released only after resume. */
++		release = !host->removing && !host->kept && host->started && !host->connected;
++		/* DRM stops the tunnel's producer first; the router must outlive it. */
++		if (release && qcom_usb4_dp_active(host->dp)) {
++			dev_dbg(host->dev, "DisplayPort tunnel still active; delaying stop\n");
++			mod_delayed_work(system_long_wq, &host->lifecycle_work,
++					 msecs_to_jiffies(QCOM_USB4_IDLE_STOP_MS));
++			release = false;
++		}
++		acquire = !host->removing && !host->suspending && host->released &&
++			  host->pending == QCOM_USB4_LINK_CONNECT;
++		/* Stop sending commands before the hardware goes away. */
++		if (release)
++			host->started = false;
++		mutex_unlock(&host->lock);
++
++		if (release)
++			qcom_usb4_host_release(host);
++		else if (!acquire || qcom_usb4_host_acquire(host))
++			break;
++	}
++	mutex_unlock(&host->lifecycle_lock);
++}
++
++/*
++ * Save and atomically stop modesetting before the USB4 provider sleeps or
++ * disconnects. The compositor may already be frozen by the sleep service.
++ * Restoring the saved state is deferred until PM_POST_SUSPEND, after provider
++ * reprobes are allowed again and its DisplayPort tunnel is ready.
++ */
++static int qcom_usb4_host_sleep_prepare(struct qcom_usb4_host *host, bool keep)
++{
++	unsigned long deadline;
++	u32 command;
++	bool started;
++	int ret;
++
++	/* Let a start in progress finish first, and block starts until resume. */
++	mutex_lock(&host->lifecycle_lock);
++	mutex_lock(&host->lock);
++	host->suspending = true;
++	host->resume_connect = host->connected || host->pending == QCOM_USB4_LINK_CONNECT;
++	started = host->started;
++	mutex_unlock(&host->lock);
++
++	ret = started ? qcom_usb4_dp_sleep_prepare(host->dp) : 0;
++	if (ret) {
++		dev_err(host->dev, "USB4 sleep display shutdown failed: %d\n", ret);
++		mutex_unlock(&host->lifecycle_lock);
++		return ret;
++	}
++	mutex_lock(&host->lock);
++	/* Suspend keeps a connected router: the PM callbacks put it to sleep. */
++	if (keep && started && host->connected && !host->removing && host->nhi_probed) {
++		host->kept = true;
++		mutex_unlock(&host->lock);
++		mutex_unlock(&host->lifecycle_lock);
++		return 0;
++	}
++	if (host->connected && !qcom_usb4_typec_disconnect_command(&command)) {
++		host->pending = QCOM_USB4_LINK_DISCONNECT;
++		host->pending_command = command;
++		qcom_usb4_host_apply_link(host);
++	}
++	if (started && !host->removing)
++		mod_delayed_work(system_long_wq, &host->lifecycle_work, 0);
++	mutex_unlock(&host->lock);
++	mutex_unlock(&host->lifecycle_lock);
++
++	deadline = jiffies + msecs_to_jiffies(QCOM_USB4_SLEEP_STOP_MS);
++	while (started) {
++		flush_delayed_work(&host->lifecycle_work);
++		mutex_lock(&host->lock);
++		started = host->started;
++		mutex_unlock(&host->lock);
++		if (!started)
++			break;
++		if (time_after(jiffies, deadline)) {
++			dev_err(host->dev, "USB4 host router %u did not stop; refusing system sleep\n",
++				host->port);
++			return -EBUSY;
++		}
++		msleep(50);
++	}
++	return 0;
++}
++
++static void qcom_usb4_host_sleep_complete(struct qcom_usb4_host *host)
++{
++	bool acquire, connected;
++	int ret;
++
++	mutex_lock(&host->lifecycle_lock);
++	mutex_lock(&host->lock);
++	if (host->kept && !host->sleep_failed) {
++		host->kept = false;
++		host->suspending = false;
++		host->resume_connect = false;
++		/* A Type-C change during sleep; tells the display side the state. */
++		qcom_usb4_host_apply_link(host);
++		connected = host->started && host->connected && !host->removing;
++		mutex_unlock(&host->lock);
++		ret = qcom_usb4_dp_resume_discover(host->dp);
++		if (ret)
++			dev_warn(host->dev, "USB4 sleep DisplayPort rediscovery failed: %d\n", ret);
++		ret = qcom_usb4_dp_sleep_complete(host->dp, connected);
++		if (ret)
++			dev_err(host->dev, "USB4 sleep display restore failed: %d\n", ret);
++		/* Let the lifecycle react to anything that changed during sleep. */
++		mod_delayed_work(system_long_wq, &host->lifecycle_work, 0);
++		mutex_unlock(&host->lifecycle_lock);
++		return;
++	}
++	if (host->kept) {
++		/* The kept router did not sleep or resume: restart it. */
++		dev_warn(host->dev, "USB4 host router %u did not resume; restarting it\n",
++			 host->port);
++		host->started = false;
++		host->kept = false;
++		mutex_unlock(&host->lock);
++		/* The domain may be suspended: tear it down without traffic. */
++		host->qnhi.nhi.going_away = true;
++		qcom_usb4_host_release(host);
++		mutex_lock(&host->lock);
++		host->sleep_failed = false;
++	}
++	host->suspending = false;
++	/* No Type-C event during sleep: reconnect the partner we detached. */
++	if (host->resume_connect && host->pending == QCOM_USB4_LINK_NONE &&
++	    host->connect_command && !host->connected) {
++		host->pending = QCOM_USB4_LINK_CONNECT;
++		host->pending_command = host->connect_command;
++	}
++	host->resume_connect = false;
++	acquire = !host->removing && host->released &&
++		  host->pending == QCOM_USB4_LINK_CONNECT;
++	/* A failed prepare may leave the router running. Reapply a pending
++	 * connection before restoring modesetting, rather than waiting forever
++	 * for the released-only acquisition path.
++	 */
++	if (!host->removing && host->started &&
++	    host->pending == QCOM_USB4_LINK_CONNECT)
++		qcom_usb4_host_apply_link(host);
++	mutex_unlock(&host->lock);
++
++	/* Synchronous restart: return to the sleep service only after restoring
++	 * the saved display state, before it thaws the desktop session.
++	 */
++	if (acquire) {
++		ret = qcom_usb4_host_acquire(host);
++		if (ret)
++			dev_err(host->dev, "USB4 sleep router restart failed: %d\n", ret);
++	}
++	mutex_lock(&host->lock);
++	connected = host->started && host->connected && !host->removing;
++	mutex_unlock(&host->lock);
++	ret = qcom_usb4_dp_sleep_complete(host->dp, connected);
++	if (ret)
++		dev_err(host->dev, "USB4 sleep display restore failed: %d\n", ret);
++	mutex_unlock(&host->lifecycle_lock);
++}
++
++static int qcom_usb4_host_pm_notify(struct notifier_block *nb, unsigned long action,
++				    void *data)
++{
++	struct qcom_usb4_host *host = container_of(nb, struct qcom_usb4_host, pm_nb);
++	int ret;
++
++	switch (action) {
++	case PM_SUSPEND_PREPARE:
++	case PM_HIBERNATION_PREPARE:
++	case PM_RESTORE_PREPARE:
++		ret = qcom_usb4_host_sleep_prepare(host, action == PM_SUSPEND_PREPARE);
++		if (ret) {
++			/* The robust notifier chain unwinds earlier callbacks, not
++			 * this failing callback. Undo our own preparation here.
++			 */
++			qcom_usb4_host_sleep_complete(host);
++			return notifier_from_errno(ret);
++		}
++		break;
++	case PM_POST_SUSPEND:
++	case PM_POST_HIBERNATION:
++	case PM_POST_RESTORE:
++		qcom_usb4_host_sleep_complete(host);
++		break;
++	}
++	return NOTIFY_DONE;
++}
++
++/*
++ * Standby, after the connection manager has put the routers to sleep:
++ * stop the firmware, halt the MCU with its RAM retained and park the RX
++ * clocks on the reference. The PHY clamps its USB4 outputs in its own suspend
++ * callback, which runs after this one.
++ */
++static int qcom_usb4_host_halt(struct qcom_usb4_host *host)
++{
++	u32 save;
++	int ret;
++
++	mutex_lock(&host->lock);
++	reinit_completion(&host->stop_event);
++	ret = qcom_usb4_mcu_command(&host->mcu, QCOM_USB4_MCU_STOP_COMMAND,
++				    QCOM_USB4_COMMAND_TIMEOUT_US);
++	if (ret) {
++		dev_err(host->dev, "MCU stop command for sleep failed: %d\n", ret);
++		goto out;
++	}
++	if (!wait_for_completion_timeout(&host->stop_event,
++					 msecs_to_jiffies(QCOM_USB4_STOP_TIMEOUT_MS)))
++		dev_warn(host->dev, "no MCU stop event within %u ms\n",
++			 QCOM_USB4_STOP_TIMEOUT_MS);
++	ret = qcom_usb4_host_read_router(host, QCOM_USB4_ROUTER_SLEEP_SAVE, &save);
++	if (ret)
++		goto out;
++	host->start_state.sleep_81014 = save;
++	qcom_usb4_host_update_router(host, QCOM_USB4_MCU_IRQ_ENABLE, BIT(0), 0);
++	WRITE_ONCE(host->mcu_irq_enabled, false);
++	synchronize_irq(host->mcu_irq);
++	qcom_usb4_host_update_router(host, QCOM_USB4_ROUTER_STOP_FLAG, BIT(0), 0);
++	qcom_usb4_mcu_stop(&host->mcu);
++	host->mcu_halted = true;
++	ret = glymur_gcc_usb4_rx_select(host->port, false);
++out:
++	mutex_unlock(&host->lock);
++	return ret;
++}
++
++/*
++ * Resume policy: the wake status selects the resume command's type.
++ * Type 2 is followed by the connection's connect command; types 0 and 3 by a
++ * wait for the lane to become active. Returns false if the partner left
++ * during sleep.
++ */
++static bool qcom_usb4_host_link_resumed(struct qcom_usb4_host *host, unsigned int type)
++{
++	unsigned long timeout;
++	u32 lane;
++
++	if (type == 1)
++		return false;
++	if (type == 2)
++		return !qcom_usb4_mcu_command(&host->mcu, host->connect_command,
++					      QCOM_USB4_COMMAND_TIMEOUT_US);
++	timeout = jiffies + msecs_to_jiffies(QCOM_USB4_LINK_RESUME_TIMEOUT_MS);
++	for (;;) {
++		if (qcom_usb4_host_read_router(host, QCOM_USB4_LANE0_STATUS, &lane))
++			return false;
++		if (FIELD_GET(QCOM_USB4_LANE_STATE, lane) == QCOM_USB4_LANE_STATE_ACTIVE)
++			return true;
++		if (time_after(jiffies, timeout))
++			return false;
++		msleep(20);
++	}
++}
++
++/*
++ * Resume the link after the warm restart. A partner that left during sleep
++ * (a Type-C disconnect meanwhile, a disconnect wake, or a lane that does not
++ * come back) is disconnected here, so the connection manager resumes with
++ * the port empty and the stop follows as for an unplug.
++ */
++static int qcom_usb4_host_resume_link(struct qcom_usb4_host *host)
++{
++	unsigned int type;
++	u32 status, command;
++	int ret;
++
++	ret = qcom_usb4_host_read_router(host, QCOM_USB4_WAKE_STATUS, &status);
++	if (ret)
++		return ret;
++	if (status & BIT(17))
++		type = 1;
++	else if (status & BIT(16))
++		type = 2;
++	else if (status & (BIT(18) | BIT(19)))
++		type = 0;
++	else
++		type = 3;
++	ret = qcom_usb4_mcu_command(&host->mcu, QCOM_USB4_MCU_RESUME_COMMAND | type << 8,
++				    QCOM_USB4_COMMAND_TIMEOUT_US);
++	if (ret)
++		return ret;
++	if (host->pending != QCOM_USB4_LINK_DISCONNECT &&
++	    qcom_usb4_host_link_resumed(host, type))
++		return 0;
++
++	dev_dbg(host->dev, "USB4 partner left during sleep (wake type %u)\n", type);
++	ret = qcom_usb4_typec_disconnect_command(&command);
++	if (!ret)
++		ret = qcom_usb4_mcu_command(&host->mcu, command, QCOM_USB4_COMMAND_TIMEOUT_US);
++	host->connected = false;
++	if (host->pending == QCOM_USB4_LINK_DISCONNECT)
++		host->pending = QCOM_USB4_LINK_NONE;
++	/* The display side learns of it after resume, in sleep_complete. */
++	return ret;
++}
++
++/* Resume: warm-start the halted MCU, then resume the link. */
++static int qcom_usb4_host_warm_start(struct qcom_usb4_host *host)
++{
++	struct qcom_usb4_start_config cfg;
++	int ret;
++
++	qcom_usb4_host_start_config(host, &cfg);
++	mutex_lock(&host->lock);
++	ret = qcom_usb4_startup_resume(&host->start_state, &cfg,
++				       &qcom_usb4_host_start_ops, host);
++	if (ret) {
++		dev_err(host->dev, "router warm restart failed at step %d: %d\n",
++			host->start_state.active_step, ret);
++		goto out;
++	}
++	host->mcu_halted = false;
++	WRITE_ONCE(host->mcu_irq_enabled, true);
++	qcom_usb4_host_update_router(host, QCOM_USB4_MCU_IRQ_ENABLE, BIT(0), BIT(0));
++	ret = qcom_usb4_host_resume_link(host);
++	if (ret)
++		dev_err(host->dev, "router link resume failed: %d\n", ret);
++out:
++	mutex_unlock(&host->lock);
++	return ret;
++}
++
++/*
++ * The router and PHY power domains stay on while their devices are on the
++ * wakeup path; the halted router keeps its configuration there. Ordering
++ * against the tunnelled ports' controller and xHCI comes from device links.
++ */
++static int qcom_usb4_host_suspend(struct device *dev)
++{
++	struct qcom_usb4_host *host = qcom_usb4_host_from_dev(dev);
++	int ret;
++
++	if (!host || !host->kept)
++		return 0;
++	mutex_lock(&host->lock);
++	if (!host->started || !host->nhi_probed)
++		host->sleep_failed = true;
++	mutex_unlock(&host->lock);
++	if (host->sleep_failed)
++		return 0;
++	ret = nhi_pm_ops.suspend_noirq(dev);
++	if (!ret)
++		ret = qcom_usb4_host_halt(host);
++	if (ret) {
++		host->sleep_failed = true;
++		return ret;
++	}
++	device_set_awake_path(dev);
++	if (host->phy->dev.parent)
++		device_set_awake_path(host->phy->dev.parent);
++	return 0;
++}
++
++static int qcom_usb4_host_resume(struct device *dev)
++{
++	struct qcom_usb4_host *host = qcom_usb4_host_from_dev(dev);
++	int ret;
++
++	if (!host || !host->kept || host->sleep_failed)
++		return 0;
++	if (qcom_usb4_host_warm_start(host))
++		host->sleep_failed = true;
++	/* After a failure the core skips the domain (is_present). */
++	ret = nhi_pm_ops.resume_noirq(dev);
++	if (ret)
++		host->sleep_failed = true;
++	return ret;
++}
++
++/* Suspend only: hibernation stops the router in the PM notifier. */
++static const struct dev_pm_ops qcom_usb4_host_pm_ops = {
++	.suspend = pm_sleep_ptr(qcom_usb4_host_suspend),
++	.resume = pm_sleep_ptr(qcom_usb4_host_resume),
++};
++
++static void qcom_usb4_host_unlink(void *link)
++{
++	device_link_del(link);
++}
++
++static void qcom_usb4_host_put_ctrl(void *dev)
++{
++	put_device(dev);
++}
++
++static void qcom_usb4_host_bus_unregister(void *nb)
++{
++	bus_unregister_notifier(&platform_bus_type, nb);
++}
++
++/*
++ * The controller whose ports the router tunnels must resume first: the tunnel
++ * restore at router resume goes through its powered core.
++ */
++static int qcom_usb4_host_link_controller(struct qcom_usb4_host *host)
++{
++	struct device_link *link;
++	struct device_node *np;
++	int ret = 0;
++
++	for_each_node_with_property(np, "usb4-host-interface") {
++		struct device_node *router = of_parse_phandle(np, "usb4-host-interface", 0);
++		struct platform_device *usb;
++
++		of_node_put(router);
++		if (router != host->dev->of_node)
++			continue;
++		usb = of_find_device_by_node(np);
++		if (!usb)
++			continue;
++		link = device_link_add(host->dev, &usb->dev, DL_FLAG_STATELESS);
++		if (!link)
++			dev_warn(host->dev, "device link to %s failed\n", dev_name(&usb->dev));
++		else
++			ret = devm_add_action_or_reset(host->dev, qcom_usb4_host_unlink, link);
++		if (link && !ret && !host->tunnel_ctrl) {
++			ret = devm_add_action_or_reset(host->dev, qcom_usb4_host_put_ctrl,
++						       &usb->dev);
++			if (!ret)
++				host->tunnel_ctrl = &usb->dev;
++		} else {
++			put_device(&usb->dev);
++		}
++		if (ret) {
++			of_node_put(np);
++			return ret;
++		}
++	}
++	if (!host->tunnel_ctrl)
++		return 0;
++	host->bus_nb.notifier_call = qcom_usb4_host_bus_notify;
++	ret = bus_register_notifier(&platform_bus_type, &host->bus_nb);
++	if (ret)
++		return ret;
++	return devm_add_action_or_reset(host->dev, qcom_usb4_host_bus_unregister,
++					&host->bus_nb);
++}
++
++static int qcom_usb4_host_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct qcom_usb4_host *host;
++	const char *fw_name;
++	unsigned int i;
++	int ret;
++
++	host = devm_kzalloc(dev, sizeof(*host), GFP_KERNEL);
++	if (!host)
++		return -ENOMEM;
++	host->dev = dev;
++	mutex_init(&host->lock);
++	mutex_init(&host->lifecycle_lock);
++	INIT_DELAYED_WORK(&host->lifecycle_work, qcom_usb4_host_lifecycle_work);
++	host->pending_submode = PHY_SUBMODE_USB4;
++	host->phy_submode = PHY_SUBMODE_USB4;
++	init_completion(&host->stop_event);
++	host->orientation = TYPEC_ORIENTATION_NONE;
++
++	ret = of_property_read_u32(dev->of_node, "qcom,router-index", &host->port);
++	if (ret && ret != -EINVAL)
++		return ret;
++	if (host->port != 0)
++		return dev_err_probe(dev, -EINVAL,
++				     "only router 0 has a verified startup profile\n");
++
++	ret = of_property_read_string(dev->of_node, "firmware-name", &fw_name);
++	if (ret)
++		return dev_err_probe(dev, ret, "firmware-name\n");
++
++	ret = qcom_usb4_host_get_resources(host);
++	if (ret)
++		return ret;
++	ret = qcom_usb4_host_link_controller(host);
++	if (ret)
++		return ret;
++	host->dp = qcom_usb4_dp_create(dev, host->router);
++	if (IS_ERR(host->dp))
++		return PTR_ERR(host->dp);
++
++	mutex_lock(&qcom_usb4_hosts_lock);
++	for (i = 0; i < QCOM_USB4_MAX_ROUTERS; i++) {
++		if (!qcom_usb4_hosts[i]) {
++			qcom_usb4_hosts[i] = host;
++			break;
++		}
++	}
++	mutex_unlock(&qcom_usb4_hosts_lock);
++	if (i == QCOM_USB4_MAX_ROUTERS)
++		return -EBUSY;
++
++	/* Register early so the alternate-mode driver can bind regardless. */
++	ret = qcom_usb4_host_typec_register(host);
++	if (ret)
++		goto err_unlist;
++
++	/*
++	 * genpd switched the domain on and applied the required-opps vote when
++	 * it attached the device, so start active: the runtime suspend that
++	 * follows probe releases both until the first start
++	 * (qcom_usb4_host_power_on()).
++	 */
++	ret = pm_runtime_set_active(dev);
++	if (ret)
++		goto err_unlist;
++	ret = devm_pm_runtime_enable(dev);
++	if (ret)
++		goto err_unlist;
++
++	ret = request_firmware(&host->fw, fw_name, dev);
++	if (ret) {
++		dev_err(dev, "router firmware %s unavailable: %d\n", fw_name, ret);
++		goto out_stopped;
++	}
++	dev_dbg(dev, "router firmware %s: %zu bytes, SoC serial %#x\n", fw_name,
++		host->fw->size, host->serial);
++
++	ret = devm_request_threaded_irq(dev, host->mcu_irq, NULL, qcom_usb4_host_mcu_irq,
++					IRQF_ONESHOT, "qcom-usb4-mcu", host);
++	if (ret) {
++		dev_err(dev, "MCU interrupt request failed: %d\n", ret);
++		goto out_stopped;
++	}
++
++	host->pm_nb.notifier_call = qcom_usb4_host_pm_notify;
++	ret = register_pm_notifier(&host->pm_nb);
++	if (ret) {
++		dev_err(dev, "PM notifier registration failed: %d\n", ret);
++		goto out_stopped;
++	}
++	host->pm_nb_registered = true;
++
++	/* The router starts on the first USB4 or Thunderbolt entry. */
++	mutex_lock(&host->lock);
++	host->released = true;
++	if (host->pending == QCOM_USB4_LINK_CONNECT)
++		mod_delayed_work(system_long_wq, &host->lifecycle_work, 0);
++	mutex_unlock(&host->lock);
++
++	dev_dbg(dev, "USB4 host router %u ready\n", host->port);
++	return 0;
++
++out_stopped:
++	/* Keep the device bound and inspectable; the router stays down. */
++	qcom_usb4_host_stop_hardware(host);
++	dev_err(dev, "USB4 host router %u not started (%d)\n", host->port, ret);
++	return 0;
++
++err_unlist:
++	mutex_lock(&qcom_usb4_hosts_lock);
++	qcom_usb4_hosts[i] = NULL;
++	mutex_unlock(&qcom_usb4_hosts_lock);
++	return ret;
++}
++
++static void qcom_usb4_host_teardown(struct qcom_usb4_host *host)
++{
++	unsigned int i;
++
++	if (host->pm_nb_registered) {
++		unregister_pm_notifier(&host->pm_nb);
++		host->pm_nb_registered = false;
++	}
++	mutex_lock(&host->lock);
++	host->removing = true;
++	mutex_unlock(&host->lock);
++	cancel_delayed_work_sync(&host->lifecycle_work);
++	mutex_lock(&host->lifecycle_lock);
++	qcom_usb4_host_stop_all(host);
++	if (host->fw) {
++		release_firmware(host->fw);
++		host->fw = NULL;
++	}
++	mutex_unlock(&host->lifecycle_lock);
++	mutex_lock(&qcom_usb4_hosts_lock);
++	for (i = 0; i < QCOM_USB4_MAX_ROUTERS; i++)
++		if (qcom_usb4_hosts[i] == host)
++			qcom_usb4_hosts[i] = NULL;
++	mutex_unlock(&qcom_usb4_hosts_lock);
++}
++
++static void qcom_usb4_host_remove(struct platform_device *pdev)
++{
++	struct qcom_usb4_host *host = qcom_usb4_host_from_dev(&pdev->dev);
++
++	if (host)
++		qcom_usb4_host_teardown(host);
++}
++
++static void qcom_usb4_host_shutdown(struct platform_device *pdev)
++{
++	struct qcom_usb4_host *host = qcom_usb4_host_from_dev(&pdev->dev);
++
++	if (host)
++		qcom_usb4_host_teardown(host);
++}
++
++static const struct of_device_id qcom_usb4_host_of_match[] = {
++	{ .compatible = "qcom,glymur-usb4" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, qcom_usb4_host_of_match);
++/* Router image named by the Surface Laptop 8 device tree, for initramfs tools. */
++MODULE_FIRMWARE("qcom/glymur/surface-laptop8/usb4-router-legacy.bin");
++
++struct platform_driver qcom_usb4_host_driver = {
++	.probe = qcom_usb4_host_probe,
++	.remove = qcom_usb4_host_remove,
++	.shutdown = qcom_usb4_host_shutdown,
++	.driver = {
++		.name = "qcom-usb4-host",
++		.of_match_table = qcom_usb4_host_of_match,
++		.pm = &qcom_usb4_host_pm_ops,
++		/*
++		 * The Type-C consumers keep this device's switch and mux for the
++		 * life of the port and have no way to drop them on unbind.
++		 */
++		.suppress_bind_attrs = true,
++		/* Type-C requests may arrive before startup; do not probe asynchronously. */
++	},
++};
+-- 
+2.56.0
+

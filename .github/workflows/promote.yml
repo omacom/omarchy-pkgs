@@ -14,6 +14,13 @@ name: Promote channel
 # database, and published with bin/publish-artifact, so a filename keeps one
 # set of bytes in every channel.
 #
+# Inside the same lock, bin/check-mac-set holds what the plan would leave in
+# the destination to the qualified Mac set (release/mac-inventory.txt) and
+# its shared dependency closure, and refuses the run when it does not hold.
+# Every architecture is checked before any publishes, so a refusal leaves
+# both as they were. The step summary shows the result for any run that
+# moves a Mac package or something the Mac set depends on.
+#
 # Every run writes its plan to the step summary and keeps the full record as
 # an artifact. A run that publishes appends it to the publish log
 # (https://pkgs.omarchy.org/publish-log.jsonl) with "kind": "promote".
@@ -101,17 +108,35 @@ jobs:
           chmod 0666 "$RUNNER_TEMP/promote/record.jsonl"
           flags=()
           [[ $DRY_RUN == true ]] && flags+=(--dry-run)
-          # One architecture after the other; a failure stops before the next
-          # one, so a channel never moves for one architecture alone without
-          # the record saying so.
-          for arch in x86_64 aarch64; do
+          run() { # run <arch> <record> [flags...]
+            local arch=$1 record=$2; shift 2
             docker run --rm \
               -e GPG_PRIVATE_KEY -e GPG_PASSPHRASE -e OMARCHY_PUBLISH_PREFIX \
               -e RCLONE_CONFIG_R2_TYPE -e RCLONE_CONFIG_R2_PROVIDER -e RCLONE_CONFIG_R2_ENDPOINT -e RCLONE_CONFIG_R2_NO_CHECK_BUCKET \
               -e RCLONE_CONFIG_R2_ACCESS_KEY_ID -e RCLONE_CONFIG_R2_SECRET_ACCESS_KEY \
               -v "$PWD:/w:ro" -v "$RUNNER_TEMP/promote:/out" -w /w "$builder" \
               bin/promote-channel --remote R2:omarchy-pkgs --from "$FROM" --to "$TO" --arch "$arch" \
-                --record /out/record.jsonl "${flags[@]}" $PACKAGES
+                --record "/out/$record" "$@" $PACKAGES
+          }
+          # Plan and check every architecture before either publishes: a
+          # refusal on one leaves both channels as they were. The lock is
+          # held throughout, so the plans below are these plans.
+          if [[ $DRY_RUN != true ]]; then
+            : > "$RUNNER_TEMP/promote/preflight.jsonl"
+            chmod 0666 "$RUNNER_TEMP/promote/preflight.jsonl"
+            for arch in x86_64 aarch64; do
+              if ! run "$arch" preflight.jsonl --dry-run; then
+                # The refused plan, so the record shows what would have moved.
+                cat "$RUNNER_TEMP/promote/preflight.jsonl" >> "$RUNNER_TEMP/promote/record.jsonl"
+                exit 1
+              fi
+            done
+          fi
+          # One architecture after the other; a failure stops before the next
+          # one, so a channel never moves for one architecture alone without
+          # the record saying so.
+          for arch in x86_64 aarch64; do
+            run "$arch" record.jsonl "${flags[@]}"
           done
 
       - name: Write the record
@@ -140,6 +165,7 @@ jobs:
              result: (if $outcome == "success" then "success" else "failed" end),
              sources: [],
              plan: [.[] | select(.type == "plan") | del(.type)],
+             mac_set: [.[] | select(.type == "mac-set") | del(.type)],
              slots: [.[] | select(.type == "slot") | del(.type)]}' \
             "$RUNNER_TEMP/promote/record.jsonl" > promote-record.json
           jq '{kind, from, to, actor, dry_run, result, slots: (.slots | length)}' promote-record.json
@@ -169,6 +195,11 @@ jobs:
                 (.[] | select(.action == "hold") | "| " + .name + " | " + (.to_version // "—") + " | " + .from_version + " | " + .reason + " |"),
                 "", "</details>", ""
               else empty end)),
+            (.mac_set[] | select(.result != "untouched") |
+              "#### Mac package set, " + .arch + ": " + (if .result == "pass" then "matches release/mac-inventory.txt" else "**refused**: nothing was published" end),
+              "",
+              (.problems[] | "- " + .problem),
+              ""),
             (if (.slots | length) > 0 then
               "#### Publishes", "",
               (.slots[] | "- `" + .mirror + "/" + .arch + "`: " + (if .status == "published" then "" else "**" + .status + "** " end)

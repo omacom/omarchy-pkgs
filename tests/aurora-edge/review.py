@@ -146,19 +146,158 @@ _package-headers
 
 class MesaRecipeTests(unittest.TestCase):
     def test_cpu_tests_fail_the_package_and_runtime_abi_is_checked(self):
+        # Only libgallium may link LLVM, exactly one libLLVM.so.<major>.<minor>,
+        # and it must be executable so makepkg versions the 'libLLVM.so' depend
+        # from it; it must link LLVM, or llvmpipe is missing. SPIRV-Tools stays
+        # out everywhere.
         recipe = ROOT / 'pkgbuilds/mesa-aurora/PKGBUILD'
-        for test_status, runtime, reader_status, expected in [
-            (0, '', 0, 0), (1, '', 0, 1), (0, 'libLLVM.so.23', 0, 1),
-            (0, 'libSPIRV-Tools.so', 0, 1), (0, '', 1, 1)]:
-            with self.subTest(tests=test_status, runtime=runtime, reader=reader_status), tempfile.TemporaryDirectory() as temporary:
+        llvm23, llvm24 = 'libLLVM.so.23.1', 'libLLVM.so.24.1'
+        for test_status, gallium, other, reader_status, executable, expected in [
+            (0, llvm23, '', 0, True, 0),
+            (0, llvm24, '', 0, True, 0),
+            (1, llvm23, '', 0, True, 1),
+            (0, llvm23, '', 1, True, 1),
+            (0, llvm23, '', 0, False, 1),
+            (0, '', '', 0, True, 1),
+            (0, f'{llvm23} {llvm24}', '', 0, True, 1),
+            (0, llvm23, llvm23, 0, True, 1),
+            (0, llvm23, 'libSPIRV-Tools.so', 0, True, 1)]:
+            with self.subTest(tests=test_status, gallium=gallium, other=other, reader=reader_status, executable=executable), tempfile.TemporaryDirectory() as temporary:
                 root = Path(temporary)
                 stage = root / 'mesa-stage'
                 stage.mkdir()
-                (stage / 'driver.so').write_bytes(b'fixture')
-                result = shell('source "$1"\nsrcdir="$2"\nmeson() { printf \'%s\\n\' "$*"; return "$TEST_STATUS"; }\nreadelf() { [[ -z $RUNTIME ]] || echo "NEEDED $RUNTIME"; return "$READER_STATUS"; }\ncheck\n', recipe, root, env=dict(os.environ, TEST_STATUS=str(test_status),
-                          RUNTIME=runtime, READER_STATUS=str(reader_status)))
+                gallium_file = stage / 'libgallium-26.3.0-devel.so'
+                gallium_file.write_bytes(b'fixture')
+                gallium_file.chmod(0o755 if executable else 0o644)
+                other_file = stage / 'libvulkan_asahi.so'
+                other_file.write_bytes(b'fixture')
+                other_file.chmod(0o755)
+                result = shell('source "$1"\nsrcdir="$2"\nmeson() { printf \'%s\\n\' "$*"; return "$TEST_STATUS"; }\n'
+                               'readelf() { local needed=$OTHER; [[ ${2##*/} == libgallium-* ]] && needed=$GALLIUM; '
+                               'for lib in $needed; do echo " 0x1 (NEEDED) Shared library: [$lib]"; done; return "$READER_STATUS"; }\ncheck\n',
+                               recipe, root, env=dict(os.environ, TEST_STATUS=str(test_status),
+                               GALLIUM=gallium, OTHER=other, READER_STATUS=str(reader_status)))
                 self.assertEqual(result.returncode, expected, result.stderr)
                 self.assertIn('test -C build --print-errorlogs', result.stdout)
+
+
+
+class M1n1RecipeTests(unittest.TestCase):
+    def test_stage_roles_artwork_and_installer_compatibility(self):
+        recipe = ROOT / 'pkgbuilds/m1n1-aurora/PKGBUILD'
+        record = json.loads(recipe.with_name('build-qualification.json').read_text())
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / 'm1n1'
+            (source / 'data').mkdir(parents=True)
+            (source / '3rdparty_licenses').mkdir()
+            (source / 'LICENSE').write_text('fixture notice')
+            (source / '3rdparty_licenses/fixture').write_text('fixture notice')
+            for size in (48, 128, 256):
+                (root / f'bootlogo_{size}.bin').write_bytes(recipe.with_name(f'bootlogo_{size}.bin').read_bytes())
+            for name in ('build-qualification.json', 'validate-qualification.py'):
+                (root / name).write_bytes(recipe.with_name(name).read_bytes())
+            result = shell(r'''set -euo pipefail
+source "$1"
+srcdir="$2"
+pkgdir="$2/package"
+git() { [[ "$*" == "-C $srcdir/m1n1 rev-parse HEAD" ]] || return 91; printf '%s\n' "$TEST_PIN"; }
+rustup() { [[ "$*" == 'toolchain install 1.89.0 --profile minimal --target aarch64-unknown-none-softfloat' ]] || return 92; }
+make() {
+  [[ "$PWD" == "$srcdir/m1n1" ]] || return 93
+  if [[ "$*" == clean ]]; then rm -rf build; return; fi
+  [[ " $* " == *' RELEASE=1 '* && " $* " == *' CHAINLOADING=1 '* && " $* " == *' USE_CLANG=1 '* && " $* " == *' EXTRA_CFLAGS=-Os '* ]] || return 94
+  [[ "$RUSTUP_TOOLCHAIN" == '1.89.0' ]] || return 95
+  for size in 48 128 256; do cmp "$srcdir/bootlogo_$size.bin" "data/bootlogo_$size.bin"; done
+  mkdir build
+  local role=stage1
+  [[ " $* " != *' ESP_STAGE2=1 '* ]] || role=stage2
+  printf '%s-raw' "$role" > build/m1n1.bin
+  printf '%s-macho' "$role" > build/m1n1.macho
+}
+prepare
+build
+package
+''', recipe, root, env=dict(os.environ, TEST_PIN=record['source_commit']))
+            self.assertEqual(result.returncode, 0, result.stderr)
+            package = root / 'package'
+            expected = {
+                'usr/lib/asahi-boot/m1n1.bin': 'stage2-raw',
+                'usr/share/m1n1-aurora/stage1/m1n1-raw.bin': 'stage1-raw',
+                'usr/share/m1n1-aurora/stage1/m1n1.macho': 'stage1-macho',
+                'usr/share/aura/stage1/aura-raw.bin': 'stage1-raw',
+                'usr/share/aura/stage1/aura.macho': 'stage1-macho',
+            }
+            for name, value in expected.items():
+                self.assertEqual((package / name).read_text(), value)
+                self.assertFalse((package / name).is_symlink())
+            self.assertEqual((package / 'usr/lib/m1n1-neo/m1n1.bin').resolve(), package / 'usr/lib/asahi-boot/m1n1.bin')
+            self.assertFalse((package / 'boot').exists())
+            self.assertFalse((package / 'usr/share/libalpm/hooks').exists())
+            self.assertIs(json.loads((package / 'usr/share/doc/m1n1-aurora/build-qualification.json').read_text())['hardware_tested'], False)
+
+    def test_prepare_refuses_a_different_source_pin(self):
+        recipe = ROOT / 'pkgbuilds/m1n1-aurora/PKGBUILD'
+        pin = json.loads(recipe.with_name('build-qualification.json').read_text())['source_commit']
+        for actual in (pin, '0' * 40):
+            with self.subTest(pin_matches=actual == pin), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                data = root / 'm1n1/data'
+                data.mkdir(parents=True)
+                for size in (48, 128, 256):
+                    (root / f'bootlogo_{size}.bin').write_bytes(b'new-logo')
+                    (data / f'bootlogo_{size}.bin').write_bytes(b'original-logo')
+                result = shell(r'''set -e
+source "$1"
+srcdir="$2"
+git() { printf '%s\n' "$ACTUAL_PIN"; }
+rustup() { printf 'toolchain touched' > "$srcdir/toolchain"; }
+prepare
+''', recipe, root, env=dict(os.environ, ACTUAL_PIN=actual))
+                if actual == pin:
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertTrue((root / 'toolchain').is_file())
+                else:
+                    self.assertEqual(result.returncode, 1, result.stderr)
+                    self.assertFalse((root / 'toolchain').exists())
+                for size in (48, 128, 256):
+                    self.assertEqual((data / f'bootlogo_{size}.bin').read_bytes(),
+                                     b'new-logo' if actual == pin else b'original-logo')
+
+    def test_canonical_candidate_cannot_claim_hardware_qualification(self):
+        path = ROOT / 'pkgbuilds/m1n1-aurora/validate-qualification.py'
+        spec = importlib.util.spec_from_file_location('m1n1_qualification', path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        record = json.loads(path.with_name('build-qualification.json').read_text())
+        module.validate(record, record['source_commit'], require_hardware=False)
+        with self.assertRaisesRegex(ValueError, 'not hardware-qualified'):
+            module.validate(record, record['source_commit'])
+
+
+    def test_promotion_requires_each_legacy_boot_pair(self):
+        path = ROOT / 'pkgbuilds/m1n1-aurora/validate-qualification.py'
+        spec = importlib.util.spec_from_file_location('m1n1_promotion_qualification', path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        record = json.loads(path.with_name('build-qualification.json').read_text())
+        gates = ['native_build', 'matched_stage1_stage2_boot', 'repair', 'upgrade',
+                 'legacy_stage1_omacom_stage2_m1_cold_boot',
+                 'legacy_stage1_omacom_stage2_m2_cold_boot',
+                 'aura_stage1_omacom_stage2_m1_cold_boot',
+                 'aura_stage1_omacom_stage2_m2_cold_boot',
+                 'aura_stage1_omacom_stage2_m3_cold_boot',
+                 'aura_stage1_omacom_stage2_neo_cold_boot']
+        record['hardware_tested'] = True
+        record['evidence'] = {gate: {'passed': True, 'report': 'synthetic test fixture only'}
+                              for gate in gates}
+        module.validate(record, record['source_commit'])
+        for gate in gates:
+            with self.subTest(missing=gate):
+                partial = dict(record, evidence={k: v for k, v in record['evidence'].items() if k != gate})
+                with self.assertRaisesRegex(ValueError, gate):
+                    module.validate(partial, record['source_commit'])
+
 
 
 class QualificationTests(unittest.TestCase):

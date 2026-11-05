@@ -1,0 +1,248 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jim Martin <jimmartin@gmail.com>
+Date: Thu, 8 Oct 2026 13:45:46 -0500
+Subject: [PATCH] drm/msm/dp: report PHY configure and power-on errors
+
+The DP controller ignores the results of phy_init(), phy_configure() and
+phy_power_on(), and of enabling the core clocks before the link clocks.
+When the PHY refuses a link rate or fails to power on, link training then
+runs against an unconfigured PHY and fails later with an unrelated error,
+or the stream is enabled on a link that never came up.
+
+Return these errors to the callers. msm_dp_ctrl_phy_init() now returns
+the phy_init() result and msm_dp_display_host_phy_init() returns 1, 0 or
+a negative error code, so the plug handler, detect(), link preparation
+and the eDP runtime resume can stop and undo their own setup. The plug
+handler initialises the PHY before it enables AUX transfers, so a failed
+initialisation never leaves transfers enabled.
+
+msm_dp_ctrl_enable_mainlink_clocks() powers the PHY off again when the
+link clocks fail to start. Because a failed reinitialisation during link
+training leaves the link clocks and the PHY off,
+msm_dp_ctrl_deinitialize_mainlink() now returns early in that state
+instead of disabling them a second time. When the display enable step
+fails, atomic_enable no longer goes on to the post-enable step.
+
+Assisted-by: Opus 5.5
+Signed-off-by: Jim Martin <jimmartin@gmail.com>
+---
+ drivers/gpu/drm/msm/dp/dp_ctrl.c    | 34 ++++++++++++++++-----
+ drivers/gpu/drm/msm/dp/dp_ctrl.h    |  2 +-
+ drivers/gpu/drm/msm/dp/dp_display.c | 47 +++++++++++++++++++++--------
+ 3 files changed, 63 insertions(+), 20 deletions(-)
+
+diff --git a/drivers/gpu/drm/msm/dp/dp_ctrl.c b/drivers/gpu/drm/msm/dp/dp_ctrl.c
+index 53ce53ddb58..83b890d5bbf 100644
+--- a/drivers/gpu/drm/msm/dp/dp_ctrl.c
++++ b/drivers/gpu/drm/msm/dp/dp_ctrl.c
+@@ -1789,7 +1789,9 @@ static int msm_dp_ctrl_link_clk_enable(struct msm_dp_ctrl *msm_dp_ctrl)
+ 	if (!ctrl->core_clks_on) {
+ 		drm_dbg_dp(ctrl->drm_dev, "Enable core clks before link clks\n");
+ 
+-		msm_dp_ctrl_core_clk_enable(msm_dp_ctrl);
++		ret = msm_dp_ctrl_core_clk_enable(msm_dp_ctrl);
++		if (ret)
++			return ret;
+ 	}
+ 
+ 	ret = clk_bulk_prepare_enable(ctrl->num_link_clks, ctrl->link_clks);
+@@ -1827,7 +1829,7 @@ static void msm_dp_ctrl_link_clk_disable(struct msm_dp_ctrl *msm_dp_ctrl)
+ static int msm_dp_ctrl_enable_mainlink_clocks(struct msm_dp_ctrl_private *ctrl,
+ 					      struct msm_dp_panel *panel)
+ {
+-	int ret = 0;
++	int ret;
+ 	struct phy *phy = ctrl->phy;
+ 	const u8 *dpcd = panel->dpcd;
+ 
+@@ -1835,16 +1837,30 @@ static int msm_dp_ctrl_enable_mainlink_clocks(struct msm_dp_ctrl_private *ctrl,
+ 	ctrl->phy_opts.dp.link_rate = ctrl->link->link_params.rate / 100;
+ 	ctrl->phy_opts.dp.ssc = drm_dp_max_downspread(dpcd);
+ 
+-	phy_configure(phy, &ctrl->phy_opts);
+-	phy_power_on(phy);
++	ret = phy_configure(phy, &ctrl->phy_opts);
++	if (ret) {
++		DRM_ERROR("Unable to configure phy for %u kHz / %u lanes. ret=%d\n",
++			  ctrl->phy_opts.dp.link_rate * 100, ctrl->phy_opts.dp.lanes, ret);
++		return ret;
++	}
++	ret = phy_power_on(phy);
++	if (ret) {
++		DRM_ERROR("Unable to power on phy. ret=%d\n", ret);
++		return ret;
++	}
+ 
+ 	dev_pm_opp_set_rate(ctrl->dev, ctrl->link->link_params.rate * 1000);
+ 	ret = msm_dp_ctrl_link_clk_enable(&ctrl->msm_dp_ctrl);
+-	if (ret)
++	if (ret) {
+ 		DRM_ERROR("Unable to start link clocks. ret=%d\n", ret);
++		goto err_phy;
++	}
+ 
+ 	drm_dbg_dp(ctrl->drm_dev, "link rate=%d\n", ctrl->link->link_params.rate);
++	return 0;
+ 
++err_phy:
++	phy_power_off(phy);
+ 	return ret;
+ }
+ 
+@@ -1964,7 +1980,7 @@ static void msm_dp_ctrl_phy_reset(struct msm_dp_ctrl_private *ctrl)
+ 	msm_dp_write_ahb(ctrl, REG_DP_PHY_CTRL, 0x0);
+ }
+ 
+-void msm_dp_ctrl_phy_init(struct msm_dp_ctrl *msm_dp_ctrl)
++int msm_dp_ctrl_phy_init(struct msm_dp_ctrl *msm_dp_ctrl)
+ {
+ 	struct msm_dp_ctrl_private *ctrl;
+ 	struct phy *phy;
+@@ -1973,7 +1989,7 @@ void msm_dp_ctrl_phy_init(struct msm_dp_ctrl *msm_dp_ctrl)
+ 	phy = ctrl->phy;
+ 
+ 	msm_dp_ctrl_phy_reset(ctrl);
+-	phy_init(phy);
++	return phy_init(phy);
+ }
+ 
+ void msm_dp_ctrl_phy_exit(struct msm_dp_ctrl *msm_dp_ctrl)
+@@ -2025,6 +2041,10 @@ static int msm_dp_ctrl_deinitialize_mainlink(struct msm_dp_ctrl_private *ctrl,
+ 
+ 	phy = ctrl->phy;
+ 
++	/* Reinitialization may have failed after disabling clocks and PHY. */
++	if (!ctrl->link_clks_on)
++		return 0;
++
+ 	msm_dp_ctrl_mainlink_disable(ctrl);
+ 
+ 	msm_dp_ctrl_reset(&ctrl->msm_dp_ctrl, panel);
+diff --git a/drivers/gpu/drm/msm/dp/dp_ctrl.h b/drivers/gpu/drm/msm/dp/dp_ctrl.h
+index 5902cf7e746..42c5f847cb0 100644
+--- a/drivers/gpu/drm/msm/dp/dp_ctrl.h
++++ b/drivers/gpu/drm/msm/dp/dp_ctrl.h
+@@ -39,7 +39,7 @@ struct msm_dp_ctrl *msm_dp_ctrl_get(struct device *dev,
+ 
+ void msm_dp_ctrl_reset(struct msm_dp_ctrl *msm_dp_ctrl,
+ 		       struct msm_dp_panel *panel);
+-void msm_dp_ctrl_phy_init(struct msm_dp_ctrl *msm_dp_ctrl);
++int msm_dp_ctrl_phy_init(struct msm_dp_ctrl *msm_dp_ctrl);
+ void msm_dp_ctrl_phy_exit(struct msm_dp_ctrl *msm_dp_ctrl);
+ void msm_dp_ctrl_irq_phy_exit(struct msm_dp_ctrl *msm_dp_ctrl);
+ 
+diff --git a/drivers/gpu/drm/msm/dp/dp_display.c b/drivers/gpu/drm/msm/dp/dp_display.c
+index ec7c91b3911..1433ee307f9 100644
+--- a/drivers/gpu/drm/msm/dp/dp_display.c
++++ b/drivers/gpu/drm/msm/dp/dp_display.c
+@@ -323,22 +323,26 @@ static int msm_dp_display_process_hpd_high(struct msm_dp_display_private *dp)
+  *
+  * Prepare DP PHY for the AUX transactions to succeed.
+  *
+- * Returns: true if this call has initliazed the PHY and false if the PHY has
+- * already been setup beforehand.
++ * Returns: 1 if this call initialized the PHY, 0 if already initialized, or
++ * a negative error code if initialization failed.
+  */
+-static bool msm_dp_display_host_phy_init(struct msm_dp_display_private *dp)
++static int msm_dp_display_host_phy_init(struct msm_dp_display_private *dp)
+ {
++	int ret;
++
+ 	drm_dbg_dp(dp->drm_dev, "type=%d core_init=%d phy_init=%d\n",
+ 		dp->msm_dp_display.connector_type, dp->core_initialized,
+ 		dp->phy_initialized);
+ 
+ 	if (!dp->phy_initialized) {
+-		msm_dp_ctrl_phy_init(dp->ctrl);
++		ret = msm_dp_ctrl_phy_init(dp->ctrl);
++		if (ret)
++			return ret;
+ 		dp->phy_initialized = true;
+-		return true;
++		return 1;
+ 	}
+ 
+-	return false;
++	return 0;
+ }
+ 
+ static void msm_dp_display_host_phy_exit(struct msm_dp_display_private *dp)
+@@ -418,9 +422,13 @@ static int msm_dp_hpd_plug_handle(struct msm_dp_display_private *dp)
+ 		return ret;
+ 	}
+ 
+-	msm_dp_aux_enable_xfers(dp->aux, true);
++	ret = msm_dp_display_host_phy_init(dp);
++	if (ret < 0) {
++		pm_runtime_put_sync(&pdev->dev);
++		return ret;
++	}
+ 
+-	msm_dp_display_host_phy_init(dp);
++	msm_dp_aux_enable_xfers(dp->aux, true);
+ 
+ 	ret = msm_dp_display_process_hpd_high(dp);
+ 
+@@ -644,7 +652,9 @@ static int msm_dp_display_prepare_link(struct msm_dp_display_private *dp)
+ 		return -ENOTCONN;
+ 
+ 	if (!msm_dp_display->power_on) {
+-		msm_dp_display_host_phy_init(dp);
++		rc = msm_dp_display_host_phy_init(dp);
++		if (rc < 0)
++			return rc;
+ 		force_link_train = true;
+ 	}
+ 
+@@ -915,7 +925,12 @@ enum drm_connector_status msm_dp_bridge_detect(struct drm_bridge *bridge,
+ 		return status;
+ 	}
+ 
+-	phy_deinit = msm_dp_display_host_phy_init(priv);
++	ret = msm_dp_display_host_phy_init(priv);
++	if (ret < 0) {
++		pm_runtime_put_sync(&dp->pdev->dev);
++		return status;
++	}
++	phy_deinit = ret;
+ 
+ 	msm_dp_aux_enable_xfers(priv->aux, true);
+ 
+@@ -1297,6 +1312,7 @@ static int msm_dp_pm_runtime_suspend(struct device *dev)
+ static int msm_dp_pm_runtime_resume(struct device *dev)
+ {
+ 	struct msm_dp_display_private *dp = dev_get_dp_display_private(dev);
++	int ret;
+ 
+ 	/*
+ 	 * for eDP, host cotroller, HPD block and PHY are enabled here
+@@ -1309,7 +1325,12 @@ static int msm_dp_pm_runtime_resume(struct device *dev)
+ 	msm_dp_display_host_init(dp);
+ 	if (dp->msm_dp_display.is_edp) {
+ 		msm_dp_aux_hpd_enable(dp->aux);
+-		msm_dp_display_host_phy_init(dp);
++		ret = msm_dp_display_host_phy_init(dp);
++		if (ret < 0) {
++			msm_dp_aux_hpd_disable(dp->aux);
++			msm_dp_display_host_deinit(dp);
++			return ret;
++		}
+ 	}
+ 
+ 	enable_irq(dp->irq);
+@@ -1450,8 +1471,10 @@ void msm_dp_display_atomic_enable(struct msm_dp *msm_dp_display,
+ 	}
+ 
+ 	rc = msm_dp_display_enable(dp, dp->panel);
+-	if (rc)
++	if (rc) {
+ 		DRM_ERROR("DP display enable failed, rc=%d\n", rc);
++		return;
++	}
+ 
+ 	rc = msm_dp_display_post_enable(msm_dp_display);
+ 	if (rc) {
+-- 
+2.56.0
+

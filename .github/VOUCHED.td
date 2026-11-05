@@ -22,6 +22,7 @@ github:dhh
 github:DjDeveloperr
 github:f-trycua
 github:HANCORE-linux
+github:jacob-vincent-mink
 github:jdvmi00
 github:kwilczynski
 github:malik-na

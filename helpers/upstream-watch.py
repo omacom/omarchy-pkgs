@@ -55,7 +55,9 @@ class Fetcher:
         dest = self.cache / hashlib.sha256(url.encode()).hexdigest()
         if not dest.exists():
             scratch = dest.with_suffix(f".{os.getpid()}.tmp")
-            command = ["curl", "--proto", "=https", "--proto-redir", "=https", "-fsSL",
+            # HTTP/1.1: HTTP/2 stream resets from GitHub and vendor servers
+            # fail the fetch outright, and --retry does not cover them.
+            command = ["curl", "--http1.1", "--proto", "=https", "--proto-redir", "=https", "-fsSL",
                        "--connect-timeout", "20", "--max-time", "300", "--retry", "2", "-o", str(scratch), url]
             # Credentials only go to GitHub's API, never to release assets or vendors.
             token = os.environ.get("UPSTREAM_GITHUB_TOKEN")

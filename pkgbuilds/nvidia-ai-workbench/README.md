@@ -3,6 +3,8 @@
 This package repackages NVIDIA's pinned arm64 Debian release of AI Workbench
 for the DGX Spark and adds small adapters so it runs on Arch Linux ARM. It is a
 temporary compatibility layer until NVIDIA supports the platform directly.
+It is an optional install that nothing in Omarchy installs or sets up, and its
+setup runs only on NVIDIA GB10 systems.
 
 ## Why the adapters exist
 
@@ -27,6 +29,9 @@ without changing the host:
 Installing the package grants nothing. On first launch a terminal explains the
 access needed and asks for confirmation and your password. It then:
 
+- registers NVIDIA's runtime in `/etc/docker/daemon.json` with
+  `nvidia-ctk runtime configure --runtime=docker`, restarting Docker if it is
+  running without that runtime;
 - adds your account to the `docker` group, which is equivalent to root access;
 - installs `/etc/sudoers.d/nvwb-spark-<username>`, allowing only:
 
@@ -44,7 +49,8 @@ run `nvwb-spark-setup` as your user.
 
 Removing the package does not undo setup. The sudoers rule, docker group
 membership, the enabled service link and the links in `~/.nvwb/bin` stay
-behind. To revoke access, run these before removing the package:
+behind, as does the NVIDIA runtime entry in Docker's configuration, which other
+GPU containers can use. To revoke access, run these before removing the package:
 
 ```sh
 sudo systemctl disable --now nvwb-spark@<username>.service

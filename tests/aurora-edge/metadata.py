@@ -9,7 +9,7 @@ import subprocess
 import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
-NAMES = ['linux-aurora', 'mesa-aurora', 'aura', 'uboot-aurora', 'aurora-bless',
+NAMES = ['linux-aurora', 'mesa-aurora', 'aura', 'm1n1-aurora', 'uboot-aurora', 'aurora-bless',
          'speakerguardd', 'aurora-audio', 'alsa-ucm-conf-aurora', 'omarchy-aurora-firmware']
 
 
@@ -36,8 +36,10 @@ class EdgeMetadataTests(unittest.TestCase):
     def test_runtime_only_dependencies_remain_in_packages_not_build_environments(self):
         expected = {
             'aura': ['asahi-scripts>=20260127.1', 'uboot-aurora'],
+            'm1n1-aurora': ['asahi-scripts>=20260127.1', 'uboot-asahi'],
             'aurora-audio': ['alsa-ucm-conf-aurora', 'pipewire-audio', 'wireplumber',
-                             'bankstown', 'lsp-plugins-lv2', 'speakersafetyd', 'speakerguardd'],
+                             'bankstown', 'lsp-plugins-lv2', 'triforce-lv2>=0.2.0',
+                             'speakersafetyd', 'speakerguardd'],
             'omarchy-aurora-firmware': ['bash', 'iw', 'kmod', 'omarchy-mac-boot',
                                        'wireless-regdb', 'linux-aurora>=7.1.12.aurora5'],
         }
@@ -116,10 +118,17 @@ class EdgeMetadataTests(unittest.TestCase):
             for package in srcinfo(name).values():
                 self.assertEqual(package['groups'], ['omarchy-platform-apple-silicon'])
 
-    def test_mesa_follows_neither_llvm_nor_spirv_tools(self):
-        for package in srcinfo('mesa-aurora').values():
-            for dependency in ['llvm-libs', 'spirv-tools']:
-                self.assertNotIn(dependency, package['depends'])
+    def test_mesa_follows_llvm_by_soname_and_never_spirv_tools(self):
+        # llvmpipe links the system LLVM. mesa-aurora depends on 'libLLVM.so',
+        # which makepkg versions from libgallium's NEEDED soname, so an LLVM
+        # major bump blocks the upgrade instead of breaking libgallium.
+        packages = srcinfo('mesa-aurora')
+        for package in packages.values():
+            self.assertNotIn('spirv-tools', package['depends'])
+            self.assertNotIn('llvm-libs', package['depends'])
+        self.assertEqual([d for d in packages['mesa-aurora']['depends'] if d.startswith('libLLVM')],
+                         ['libLLVM.so'])
+        self.assertFalse([d for d in packages['vulkan-aurora']['depends'] if d.startswith('libLLVM')])
 
     def test_mesa_epoch_and_existing_neo_versions_upgrade(self):
         installed = {'mesa-aurora': '1:26.3.0_devel-932.a0bcbcb28528',
@@ -134,6 +143,28 @@ class EdgeMetadataTests(unittest.TestCase):
             self.assertGreater(int(subprocess.check_output(['vercmp', new, old], text=True)), 0)
         self.assertEqual(srcinfo('mesa-aurora')['mesa-aurora']['epoch'], ['1'])
         self.assertNotIn('epoch', srcinfo('linux-aurora')['linux-aurora'])
+
+    def test_omacom_loader_migrates_only_downstream_providers(self):
+        package = srcinfo('m1n1-aurora')['m1n1-aurora']
+        self.assertEqual(package['replaces'], ['aura', 'm1n1-neo'])
+        self.assertEqual(package['conflicts'], ['m1n1', 'aura', 'm1n1-neo'])
+        self.assertNotIn('install', package)
+        version = package['pkgver'][0]
+        self.assertGreater(int(subprocess.check_output(['vercmp', version, '1.6.1.aurora1'], text=True)), 0)
+        self.assertGreaterEqual(int(subprocess.check_output(['vercmp', version, '1.6.1.aurora19'], text=True)), 0)
+        self.assertIn('m1n1=' + version, package['provides'])
+        self.assertEqual(package['url'], ['https://github.com/omacom/m1n1'])
+        # Upgrading must not force a U-Boot swap: either installed provider satisfies it.
+        self.assertIn('uboot-asahi', package['depends'])
+        self.assertNotIn('uboot-aurora', package['depends'])
+        uboot = srcinfo('uboot-aurora')['uboot-aurora']
+        self.assertTrue(any(p.startswith('uboot-asahi=') for p in uboot['provides']))
+        record = json.loads((ROOT / 'pkgbuilds/m1n1-aurora/build-qualification.json').read_text())
+        self.assertIn('m1n1::git+https://github.com/omacom/m1n1.git#commit=' + record['source_commit'], package['source'])
+        self.assertEqual(len(package['source']), len(package['sha256sums']))
+        for source, digest in zip(package['source'], package['sha256sums']):
+            if '://' not in source:
+                self.assertEqual(hashlib.sha256((ROOT / 'pkgbuilds/m1n1-aurora' / source).read_bytes()).hexdigest(), digest)
 
     def test_aura_independent_version_satisfies_legacy_kernel_dependency(self):
         package = srcinfo('aura')['aura']

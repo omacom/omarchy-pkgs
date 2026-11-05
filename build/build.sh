@@ -25,6 +25,7 @@ SRC_DIR=${SRC_DIR:-/src}
 DEFER_RUNTIME_DEPS=${DEFER_RUNTIME_DEPS:-false}
 
 source "$HELPERS_DIR/package-metadata.sh"
+source "$HELPERS_DIR/package-owners.sh"
 
 # Where the channel's published database is read from for planning: a local
 # copy when one is mounted (the build-plan test uses one), otherwise the public
@@ -444,6 +445,10 @@ build_package() {
         echo "    Expected package file was not produced: $pkg_file"
         return 1
       fi
+
+      # pacman installs the owners a package records, so a package with a
+      # file a local user would own never leaves the build.
+      check_package_owners "$pkg_file" || return 1
 
       cp "$pkg_file" "$BUILD_OUTPUT_DIR/" || return 1
       new_pkgs+=("$pkg_file")
