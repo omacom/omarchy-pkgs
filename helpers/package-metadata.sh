@@ -613,12 +613,10 @@ validate_package_metadata() {
 }
 
 # The runner an entry builds on, as the JSON list runs-on takes. x86_64 builds
-# on the droplet pool. aarch64 builds natively on GitHub's arm64 runner (4
-# vCPU), except a kernel: there the compile is 95 of 105 minutes, so it goes
-# to Namespace's Apple-backed runner (Linux on Apple Silicon, 12 vCPU), where
-# the whole job takes 24. Its cores are the fast ones: the 32-core AmpereOne
-# runner took 66. A kernel is a package named linux-*; the firmware and pkgbase
-# shim packages share the prefix and build in seconds, so they stay put.
+# on the droplet pool. aarch64 builds on Namespace's Apple-backed runner (Linux
+# on Apple Silicon, 12 vCPU): a kernel takes 24 minutes there against 105 on
+# GitHub's 4 vCPU arm64 runner, and other packages take a quarter to a half of
+# the time. Its cores are the fast ones: the 32-core AmpereOne runner took 66.
 package_runner() {
   local name="$1" arch="$2"
 
@@ -626,9 +624,5 @@ package_runner() {
     echo '["self-hosted","omarchy-builder"]'
     return
   fi
-  case "$name" in
-  linux-firmware-* | linux-*-shim) echo '["ubuntu-24.04-arm"]' ;;
-  linux-*) echo '["namespace-profile-arm64-linux-apple-12x32"]' ;;
-  *) echo '["ubuntu-24.04-arm"]' ;;
-  esac
+  echo '["namespace-profile-arm64-linux-apple-12x32"]'
 }
