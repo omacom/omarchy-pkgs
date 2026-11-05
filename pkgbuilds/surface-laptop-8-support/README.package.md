@@ -2,7 +2,7 @@
 
 Hardware support for the 13.8-inch Microsoft Surface Laptop 8 with Snapdragon X2 Elite (`microsoft,surface-laptop-8-13p8`) that no upstream package carries yet. `linux-omarchy` carries the laptop's kernel patches and device tree from 7.3-4.
 
-The package contains no Microsoft or Qualcomm DSP firmware; `qcom-firmware-extract` copies that from the machine's own Windows installation.
+The DSP firmware comes from the `microsoft-surface-laptop-8-firmware` dependency, which installs Microsoft's signed ADSP and CDSP images from Microsoft's driver download in `qcom/glymur/microsoft/mahua/`, the folder Qualcomm's posted tree names. `linux-omarchy` loads them from there from 7.3-17, with or without Windows on the disk.
 
 ## Contents
 
@@ -21,7 +21,6 @@ The package contains no Microsoft or Qualcomm DSP firmware; `qcom-firmware-extra
 
 - **USB4 with BitLocker on**: the Windows partition cannot be read; turn BitLocker off in Windows and run `surface-laptop8-usb4-firmware` again.
 - **USB4 after a full-disk install**: with Windows erased there is no driver to copy the router firmware from; `surface-laptop8-usb4-firmware FILE` takes a saved copy of `QcUsb4Filter8480.sys`.
-- **Compute DSP (CDSP)**: `qcom-firmware-extract` 1-5 refuses the CDSP pair when Windows keeps more than one version of its driver package, as it does after a driver update.
 
 ## Retirement
 
