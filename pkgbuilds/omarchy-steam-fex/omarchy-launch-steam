@@ -35,7 +35,67 @@ launch_fex_steam() {
   local launcher="$1"
   shift
 
-  exec muvm -- FEXBash -c 'exec "$@"' omarchy-steam "$launcher" "$@"
+  local -a vm_args=()
+  local variable scale
+
+  # muvm deliberately forwards only selected environment variables. Steam's
+  # desktop UI uses its own scale override; GTK variables alone are insufficient.
+  for variable in GDK_SCALE GDK_DPI_SCALE XDG_CONFIG_HOME FEX_APP_CONFIG_LOCATION; do
+    if [[ -n ${!variable:-} ]]; then
+      vm_args+=(-e "$variable=${!variable}")
+    fi
+  done
+  scale=${STEAM_FORCE_DESKTOPUI_SCALING:-}
+  if [[ -z $scale ]]; then
+    scale=$(desktop_scale)
+  fi
+  if [[ -n $scale ]]; then
+    vm_args+=(-e "STEAM_FORCE_DESKTOPUI_SCALING=$scale")
+  fi
+
+  # Session-bus forwarding requires muvm's --session-bus support. Keep older
+  # installations usable when their distribution's build lacks the bridge.
+  if [[ -n ${DBUS_SESSION_BUS_ADDRESS:-} || -S ${XDG_RUNTIME_DIR:-/nonexistent}/bus ]]; then
+    if [[ $(muvm --help) == *--session-bus* ]]; then
+      vm_args+=(--session-bus)
+    else
+      printf 'Steam: this muvm lacks --session-bus support; the tray icon will be unavailable.\n' >&2
+    fi
+  fi
+
+  exec muvm "${vm_args[@]}" -- FEXBash -c 'exec "$@"' omarchy-steam "$launcher" "$@"
+}
+
+desktop_scale() {
+  python3 - <<'PY'
+import json
+import math
+import os
+import subprocess
+
+def valid_scale(value):
+    try:
+        value = float(value)
+        return format(value, 'g') if math.isfinite(value) and value > 0 else None
+    except (TypeError, ValueError):
+        return None
+
+# Use the output where Steam is being launched, including fractional scales.
+# GDK_SCALE is the fallback for desktops without Hyprland or an available IPC.
+scale = None
+try:
+    result = subprocess.run(['hyprctl', 'monitors', '-j'], capture_output=True,
+                            text=True, timeout=2, check=True)
+    monitors = json.loads(result.stdout)
+    focused = next((m for m in monitors if m.get('focused')), None)
+    if focused is not None:
+        scale = valid_scale(focused.get('scale'))
+except (OSError, subprocess.SubprocessError, ValueError, TypeError, AttributeError):
+    pass
+scale = scale or valid_scale(os.environ.get('GDK_SCALE'))
+if scale:
+    print(scale)
+PY
 }
 
 patch_steam_ui() {
@@ -78,9 +138,98 @@ for path in sorted(steamui.glob("chunk~*.js")):
 PY
 }
 
+prepare_steamwebhelper() {
+  python3 - <<'PY'
+import json
+import os
+from pathlib import Path
+import shutil
+import sys
+import tempfile
+
+# FEX represents multiple arguments as repeated scalar JSON keys, not an array.
+# Keep those keys when updating an existing per-application profile.
+class Object(list):
+    pass
+
+def encode(value):
+    if isinstance(value, Object):
+        return '{' + ','.join(json.dumps(k) + ':' + encode(v) for k, v in value) + '}'
+    if isinstance(value, list):
+        return '[' + ','.join(encode(v) for v in value) + ']'
+    return json.dumps(value)
+
+try:
+    home = Path.home()
+    override = os.environ.get('FEX_APP_CONFIG_LOCATION')
+    if override:
+        directory = Path(override)
+        if not directory.is_absolute():
+            raise ValueError('relative FEX_APP_CONFIG_LOCATION needs manual profile setup')
+    elif (home / '.fex-emu').exists():
+        directory = home / '.fex-emu'
+    else:
+        directory = Path(os.environ.get('XDG_CONFIG_HOME') or home / '.config') / 'fex-emu'
+    path = directory / 'AppConfig/steamwebhelper.json'
+    if path.is_symlink():
+        raise ValueError('profile is a user-managed symlink')
+    exists = path.exists()
+    if exists:
+        profile = json.loads(path.read_text(), object_pairs_hook=Object)
+    else:
+        # Retain the stock steamwebhelper profile's GL thunk workaround.
+        profile = Object([('ThunksDB', Object([('GL', 0)]))])
+    if not isinstance(profile, Object):
+        raise ValueError('profile must be a JSON object')
+    configs = [v for k, v in profile if k == 'Config']
+    if not configs:
+        config = Object()
+        profile.append(('Config', config))
+    elif len(configs) == 1 and isinstance(configs[0], Object):
+        config = configs[0]
+    else:
+        raise ValueError('profile must have a single Config object')
+
+    arguments = [(i, v) for i, (k, v) in enumerate(config) if k == 'AdditionalArguments']
+    if any(not isinstance(v, str) for _, v in arguments):
+        raise ValueError('AdditionalArguments must use scalar strings')
+    js_flags = [(i, v) for i, v in arguments if v.startswith('--js-flags=')]
+    if any('--no-jitless' in v.split('=', 1)[1].split() for _, v in js_flags):
+        raise ValueError('profile explicitly disables jitless mode')
+    if js_flags:
+        # Chromium uses the last --js-flags value; preserve its other V8 flags.
+        index, value = js_flags[-1]
+        if '--jitless' in value.split('=', 1)[1].split():
+            sys.exit(0)
+        config[index] = ('AdditionalArguments', value + ' --jitless')
+    else:
+        config.append(('AdditionalArguments', '--js-flags=--jitless'))
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    backup = path.with_name(path.name + '.omarchy-bak')
+    if exists and not backup.exists() and not backup.is_symlink():
+        shutil.copy2(path, backup)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode='w', dir=path.parent, delete=False) as output:
+            temporary = Path(output.name)
+            output.write(encode(profile) + '\n')
+        if exists:
+            temporary.chmod(path.stat().st_mode & 0o777)
+        temporary.replace(path)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+except (OSError, ValueError) as error:
+    print(f'Steam: cannot prepare FEX steamwebhelper profile: {error}. '
+          'Enable --js-flags=--jitless there to avoid renderer restarts.', file=sys.stderr)
+PY
+}
+
 prepare_asahi() {
   [[ $(uname -m) == aarch64 ]] || return 0
   write_steam_desktop
+  prepare_steamwebhelper
   patch_steam_ui
 }
 
@@ -93,7 +242,7 @@ if [[ $(uname -m) == aarch64 ]] && command -v muvm >/dev/null && command -v FEXB
   launcher="$HOME/.local/share/fex-steam/steam-launcher/bin_steam.sh"
 
   if [[ -f $launcher ]]; then
-    steam_args=(-cef-force-occlusion)
+    steam_args=(-cef-force-occlusion -system-composer)
     if steam_client_ready; then
       # Steam's verifier replaces our patched UI chunk on every launch.
       # Keep update/bootstrap checks enabled while preserving that patch.
@@ -101,6 +250,7 @@ if [[ $(uname -m) == aarch64 ]] && command -v muvm >/dev/null && command -v FEXB
       prepare_asahi
     else
       write_steam_desktop
+      prepare_steamwebhelper
     fi
 
     launch_fex_steam "$launcher" "${steam_args[@]}" "$@"
