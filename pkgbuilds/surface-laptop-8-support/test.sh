@@ -232,9 +232,12 @@ PY
 python - "$package_dir/glymur-microsoft-surface-laptop8.json" <<'PY' || fail "the hardware-ID file maps to the Surface Laptop 8 device tree"
 import json, sys
 data = json.load(open(sys.argv[1]))
-assert data["type"] == "devicetree" and data["compatible"] == "microsoft,surface-laptop8", data
+assert data["type"] == "devicetree" and data["compatible"] == "microsoft,surface-laptop-8-13p8", data
 assert data["hwids"], data
 PY
+# qcom-firmware-extract looks the list up by the running board's name.
+grep -qF '/provided.d/microsoft,surface-laptop-8-13p8.list"' "$package_dir/PKGBUILD" ||
+  fail "the firmware list is installed under the board name the hardware-ID file selects"
 grep -q '^MatchDMIModalias=dmi:\*svnMicrosoftCorporation:pnSurfaceLaptop13.8in8thEdSnapdragon:\*$' \
   "$package_dir/99-surface-laptop8.quirks" || fail "the touchpad quirk matches only this model"
 grep -q '^MemorySleepMode=s2idle$' "$package_dir/60-surface-laptop8-sleep.conf" || fail "sleep uses s2idle"
