@@ -18,16 +18,28 @@ Changed from the MR head while rebasing:
 - 0c5e, 0c7c and 0c90 leave the unsupported allowlist with 0c00 and
   0c4c, and data/autosuspend.hwdb is regenerated with
   fprint-list-udev-hwdb.
+- A failed delete of an already enrolled finger ends the enroll with
+  an error. The MR jumps to ENROLL_WIPE_SENSOR there, which erases
+  every print on the sensor, for all users; that state is removed.
+- Error paths fixed from review: a fatal enroll response no longer
+  falls through to another enroll; failed commit and clear-storage
+  complete the action once instead of twice; a failed USB send clears
+  in_flight_cmd so close() does not abort; retry errors are handed to
+  the report functions with g_steal_pointer and verify retries use
+  FPI_MATCH_ERROR; an identify/verify retry ends the action, since
+  libfprint accepts one report per action; an unknown finger on
+  identify/verify is a no-match instead of DATA_NOT_FOUND, and on
+  enroll a retry as the MR's comment intends; the user id terminator
+  is in allocated space outside the returned length.
+
 ---
  data/autosuspend.hwdb                 |   14 +-
- libfprint/drivers/elanmoc2/elanmoc2.c | 1197 +++++++++++++++++++++++++
- libfprint/drivers/elanmoc2/elanmoc2.h |  195 ++++
+ libfprint/drivers/elanmoc2/elanmoc2.c | 1197 +++++++++++++++++++++++++++++++++
+ libfprint/drivers/elanmoc2/elanmoc2.h |  194 ++++++
  libfprint/fprint-list-udev-hwdb.c     |    5 -
  libfprint/meson.build                 |    1 +
  meson.build                           |    1 +
- 6 files changed, 1403 insertions(+), 10 deletions(-)
- create mode 100644 libfprint/drivers/elanmoc2/elanmoc2.c
- create mode 100644 libfprint/drivers/elanmoc2/elanmoc2.h
+ 6 files changed, 1402 insertions(+), 10 deletions(-)
 
 diff --git a/data/autosuspend.hwdb b/data/autosuspend.hwdb
 index 104ce5e6..edd59140 100644
@@ -75,7 +87,7 @@ index 104ce5e6..edd59140 100644
  usb:v04F3p2706*
 diff --git a/libfprint/drivers/elanmoc2/elanmoc2.c b/libfprint/drivers/elanmoc2/elanmoc2.c
 new file mode 100644
-index 00000000..29afd776
+index 00000000..85b00f93
 --- /dev/null
 +++ b/libfprint/drivers/elanmoc2/elanmoc2.c
 @@ -0,0 +1,1197 @@
@@ -166,6 +178,7 @@ index 00000000..29afd776
 +
 +  if (error)
 +    {
++      self->in_flight_cmd = NULL;
 +      fpi_ssm_mark_failed (g_steal_pointer (&self->ssm),
 +                           g_steal_pointer (&error));
 +      return;
@@ -313,21 +326,18 @@ index 00000000..29afd776
 +elanmoc2_get_user_id_string (FpiDeviceElanMoC2 *self,
 +                             GBytes            *finger_info_response)
 +{
-+  GByteArray *user_id = g_byte_array_new ();
-+
 +  guint offset = self->dev_type == ELANMOC2_DEV_0C5E ? 3 : 2;
 +  guint max_len = MIN (elanmoc2_get_user_id_max_length (self),
 +                       g_bytes_get_size (finger_info_response) - offset);
 +
-+  g_byte_array_set_size (user_id, max_len);
-+
 +  /* The string must be copied since the input data is not guaranteed to be
 +   * null-terminated */
++  guint8 *user_id = g_malloc0 (max_len + 1);
 +  const guint8 *data = g_bytes_get_data (finger_info_response, NULL);
-+  memcpy (user_id->data, &data[offset], max_len);
-+  user_id->data[max_len] = '\0';
 +
-+  return g_byte_array_free_to_bytes (user_id);
++  memcpy (user_id, &data[offset], max_len);
++
++  return g_bytes_new_take (user_id, max_len);
 +}
 +
 +static FpPrint *
@@ -581,12 +591,13 @@ index 00000000..29afd776
 +            }
 +          fp_info ("Identify: no match");
 +        }
-+      fpi_device_identify_report (device, NULL, print, *error);
++      fpi_device_identify_report (device, NULL, print,
++                                  g_steal_pointer (error));
 +      return TRUE;
 +    }
 +  else
 +    {
-+      FpiMatchResult result = FPI_MATCH_FAIL;
++      FpiMatchResult result = *error != NULL ? FPI_MATCH_ERROR : FPI_MATCH_FAIL;
 +      if (print != NULL)
 +        {
 +          FpPrint *to_match = NULL;
@@ -604,7 +615,8 @@ index 00000000..29afd776
 +              print = NULL;
 +            }
 +        }
-+      fpi_device_verify_report (device, result, print, *error);
++      fpi_device_verify_report (device, result, print,
++                                g_steal_pointer (error));
 +      return result != FPI_MATCH_FAIL;
 +    }
 +}
@@ -680,6 +692,17 @@ index 00000000..29afd776
 +    case IDENTIFY_GET_FINGER_INFO: {
 +        g_assert_nonnull (buffer_in);
 +        fpi_device_report_finger_status (device, FP_FINGER_STATUS_PRESENT);
++
++        g_assert (data_in_len >= 2);
++        if (data_in[1] == ELANMOC2_RESP_NOT_ENROLLED)
++          {
++            fp_info ("Identify: finger not enrolled on the sensor");
++            elanmoc2_identify_verify_report (device, NULL, &error);
++            elanmoc2_identify_verify_complete (device, NULL);
++            fpi_ssm_mark_completed (g_steal_pointer (&self->ssm));
++            break;
++          }
++
 +        gboolean can_retry = FALSE;
 +        error = elanmoc2_get_finger_error (buffer_in, &can_retry);
 +        if (error != NULL)
@@ -688,7 +711,8 @@ index 00000000..29afd776
 +            if (can_retry)
 +              {
 +                elanmoc2_identify_verify_report (device, NULL, &error);
-+                fpi_ssm_jump_to_state (ssm, IDENTIFY_IDENTIFY);
++                elanmoc2_identify_verify_complete (device, NULL);
++                fpi_ssm_mark_completed (g_steal_pointer (&self->ssm));
 +              }
 +            else
 +              {
@@ -938,9 +962,14 @@ index 00000000..29afd776
 +
 +        if (data_in[1] != 0)
 +          {
-+            fp_info ("Failed to delete finger %d, wiping sensor",
-+                     self->print_index);
-+            fpi_ssm_jump_to_state (ssm, ENROLL_WIPE_SENSOR);
++            fp_info ("Failed to delete finger %d (code %d)",
++                     self->print_index, data_in[1]);
++            error = fpi_device_error_new_msg (FP_DEVICE_ERROR_GENERAL,
++                                              "Could not remove the existing "
++                                              "print of this finger");
++            fpi_device_enroll_complete (device, NULL,
++                                        g_steal_pointer (&error));
++            fpi_ssm_mark_completed (g_steal_pointer (&self->ssm));
 +          }
 +        else
 +          {
@@ -951,23 +980,6 @@ index 00000000..29afd776
 +                                        NULL);
 +            fpi_ssm_jump_to_state (ssm, ENROLL_ENROLL);
 +          }
-+        break;
-+      }
-+
-+    case ENROLL_WIPE_SENSOR: {
-+        g_autoptr(GByteArray) buffer_out =
-+          elanmoc2_prepare_cmd (self, &cmd_wipe_sensor);
-+        if (buffer_out == NULL)
-+          {
-+            fpi_ssm_next_state (ssm);
-+            break;
-+          }
-+        elanmoc2_cmd_transceive (device, &cmd_wipe_sensor, buffer_out);
-+        self->enrolled_num = 0;
-+        self->print_index = 0;
-+        fp_info (
-+          "Wipe sensor command sent - next operation will take a while");
-+        fpi_ssm_next_state (ssm);
 +        break;
 +      }
 +
@@ -1025,7 +1037,7 @@ index 00000000..29afd776
 +                     * "enroll" */
 +                    error->domain = FP_DEVICE_RETRY;
 +                    error->code = FP_DEVICE_RETRY_TOO_SHORT;
-+                    can_retry = FALSE;
++                    can_retry = TRUE;
 +                  }
 +                if (can_retry)
 +                  {
@@ -1037,6 +1049,7 @@ index 00000000..29afd776
 +                    fpi_device_enroll_complete (device, NULL,
 +                                                g_steal_pointer (&error));
 +                    fpi_ssm_mark_completed (g_steal_pointer (&self->ssm));
++                    break;
 +                  }
 +              }
 +            else
@@ -1115,9 +1128,9 @@ index 00000000..29afd776
 +            error = fpi_device_error_new_msg (FP_DEVICE_ERROR_GENERAL,
 +                                              "Failed to store fingerprint for "
 +                                              "unknown reasons");
-+            fpi_device_enroll_complete (device, NULL, error);
-+            fpi_ssm_mark_failed (g_steal_pointer (&self->ssm),
-+                                 g_steal_pointer (&error));
++            fpi_device_enroll_complete (device, NULL,
++                                        g_steal_pointer (&error));
++            fpi_ssm_mark_completed (g_steal_pointer (&self->ssm));
 +          }
 +        else
 +          {
@@ -1210,10 +1223,9 @@ index 00000000..29afd776
 +            error = fpi_device_error_new_msg (FP_DEVICE_ERROR_GENERAL,
 +                                              "Sensor erase requested but "
 +                                              "storage is not empty");
-+            fpi_device_clear_storage_complete (device, error);
-+            fpi_ssm_mark_failed (g_steal_pointer (&self->ssm),
-+                                 g_steal_pointer (&error));
-+            break;
++            fpi_device_clear_storage_complete (device,
++                                               g_steal_pointer (&error));
++            fpi_ssm_mark_completed (g_steal_pointer (&self->ssm));
 +          }
 +        break;
 +      }
@@ -1278,10 +1290,10 @@ index 00000000..29afd776
 +}
 diff --git a/libfprint/drivers/elanmoc2/elanmoc2.h b/libfprint/drivers/elanmoc2/elanmoc2.h
 new file mode 100644
-index 00000000..2a99089d
+index 00000000..5894a274
 --- /dev/null
 +++ b/libfprint/drivers/elanmoc2/elanmoc2.h
-@@ -0,0 +1,195 @@
+@@ -0,0 +1,194 @@
 +/*
 + * Driver for ELAN Match-On-Chip sensors
 + * Copyright (C) 2021-2023 Davide Depau <davide@depau.eu>
@@ -1462,7 +1474,6 @@ index 00000000..2a99089d
 +  ENROLL_GET_ENROLLED_FINGER_INFO,
 +  ENROLL_ATTEMPT_DELETE,
 +  ENROLL_CHECK_DELETED,
-+  ENROLL_WIPE_SENSOR,
 +  ENROLL_ENROLL,
 +  ENROLL_CHECK_ENROLLED,
 +  ENROLL_LATE_REENROLL_CHECK,
