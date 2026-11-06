@@ -9,7 +9,7 @@ The package contains no Microsoft or Qualcomm DSP firmware; `qcom-firmware-extra
 - **Wi-Fi board data** (`ath12k/WCN7850/hw2.0/board.bin`): the tablet's WCN7850 reports generic identifiers (subsystem `17cb:1107`, board-id 255) that match no record in linux-firmware's `board-2.bin`, so Wi-Fi fails to load board data. The build extracts one record, unmodified, from the installed `linux-firmware-atheros` and checks its size and SHA-256. That record (`subsystem-device=3378`) is Qualcomm's own reference-design board, not Surface calibration: it carries RF and regulatory tables for a different antenna design. It brings Wi-Fi up until the Surface Pro 11's own board data reaches linux-firmware.
 - **Audio**
   - The AudioReach topology (`qcom/x1e80100/X1E80100-Microsoft-Surface-Pro-11-tplg.bin`), built from `X1E80100-Microsoft-Surface-Pro-11.m4` against pinned `linux-msm/audioreach-topology` source and checked against the SHA-256 of the binary validated on the device.
-  - ALSA UCM routing for speakers and microphones, derived from alsa-ucm-conf's Surface Pro 12in profile and linked from `conf.d/x1e80100/` by card name and by DMI identity. It sets a fixed hardware ceiling and leaves volume to software attenuation.
+  - ALSA UCM routing for speakers and microphones, derived from alsa-ucm-conf's Surface Pro 12in profile, kept in `Qualcomm/surface-pro-11/` and linked from `conf.d/x1e80100/` by card name and by DMI identity. It sets a fixed hardware ceiling and leaves volume to software attenuation.
 - **Cameras**: a WirePlumber rule that hides the monochrome infrared sensor from camera pickers, so apps see only the front and back cameras (provided by libcamera through `pipewire-libcamera`). It also gives libcamera's software ISP the measured black level of the front camera (IMX681). With the linear gain control in `linux-omarchy`'s IMX681 driver, that lets stock libcamera drive the front camera.
 - **Battery**: after resume, a sleep hook writes the currently set charge thresholds back to the battery manager, which can lose them across suspend. It never chooses a limit: UPower or Omarchy's power settings do. With no limit set, it does nothing. The kernel driver restores the thresholds itself when the battery-manager service restarts.
 - **Wi-Fi and Bluetooth addresses**: come from the `surface-snapdragon-addresses` dependency, which the Surface Laptop 8 shares.
@@ -25,7 +25,7 @@ Every service and sleep hook checks for the `microsoft,denali-oled` device tree 
 ## Retirement
 
 - Board data: drop once linux-firmware carries a Surface Pro 11 entry, selected by a `qcom,calibration-variant` in the Denali device tree.
-- Topology and UCM: drop once audioreach-topology and alsa-ucm-conf ship Surface Pro 11 profiles. alsa-ucm-conf shipping `MICROSOFT-Surface-Pro-11.conf` would conflict with this package's file, so drop the UCM here first.
+- Topology and UCM: drop once audioreach-topology and alsa-ucm-conf ship Surface Pro 11 profiles that match this one. alsa-ucm-conf's master ships its own `Qualcomm/x1e80100/MICROSOFT-Surface-Pro-11.conf` without this tuning, so this package keeps its files in its own folder.
 - Touchpad hook: drop once the kernel keeps the attached touchpad in touchpad mode across resume.
 - Touchpad quirk: drop once libinput carries an entry for the Flex Keyboard over Bluetooth.
 

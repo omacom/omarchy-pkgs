@@ -53,7 +53,7 @@ source "$package_dir/PKGBUILD"
   fail "the package is tagged Qualcomm-only for aarch64"
 grep -q "^_audioreach_commit=d7a5e9d80ad18a7a6844eeb32cacbdeea0e7e677$" "$package_dir/PKGBUILD" ||
   fail "the topology builds from pinned AudioReach source"
-grep -q 'File "/Qualcomm/x1e80100/Surface11-HiFi.conf"' "$package_dir/MICROSOFT-Surface-Pro-11.conf" ||
+grep -q 'File "/Qualcomm/surface-pro-11/Surface11-HiFi.conf"' "$package_dir/MICROSOFT-Surface-Pro-11.conf" ||
   fail "the card profile points at the shipped HiFi verb"
 
 grep -Fq 'api.libcamera.path = "/base/soc@0/cci@ac15000/i2c-bus@0/camera@60"' "$package_dir/50-surface-pro-11-cameras.conf" ||
