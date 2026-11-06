@@ -291,7 +291,7 @@ The trees build with `W=1` and no warnings. `CHECK_DTBS=y` gives them the two wa
 
 ### HP OmniBook 5 16 (2026)
 
-`2710`-`2713` add the HP OmniBook 5 16-bf1xxx (X2P-64-100 on the Mahua SoC, `hp,omnibook-5-16-bf1xxx`), whose tree is carried outside Linux and not posted to linux-arm-msm yet.
+`2710`-`2713` add the HP OmniBook 5 16-bf1xxx (`hp,omnibook-5-16-bf1xxx`), on the Mahua SoC, which HP sells with the X2 Elite X2E-84-100, as in its owner's unit, and the X2 Plus X2P-64-100, whose tree is carried outside Linux and not posted to linux-arm-msm yet.
 
 - `2711` is Rahul Pon's daily device tree as his linux-hp-omnibook-5-glymur repository has it at `ca32454d2ae6`, which has no sign-off. He boots it on his own kernel, Qualcomm's qcom-next with his patches, with the panel, input, GPU, Wi-Fi, Bluetooth, battery and USB working.
 - `2712` drops the tree's CoreSight overrides, which name nodes only qcom-next's `glymur.dtsi` has, and leaves the GPU off, as the ThinkPad T14s Gen 7's and the OmniBook X16's trees do. This kernel doesn't support the Mahua's Adreno X2-85, and msm binds the GPU into the display's DRM device, so a GPU that never probes would keep the panel down too.
