@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -31,14 +32,20 @@ import json, os
 from pathlib import Path
 import shutil, sys
 name = Path(sys.argv[0]).name
+if name == 'muvm' and sys.argv[1:] == ['--help']:
+    print('--session-bus' if os.environ.get('TEST_MUVM_SESSION_BUS', '1') == '1' else 'Usage: muvm')
+    sys.exit(0)
+if name == 'hyprctl':
+    print(os.environ.get('TEST_MONITORS', '[]'))
+    sys.exit(int(os.environ.get('TEST_HYPR_EXIT', '0')))
 if name == 'uname':
     print(os.environ.get('TEST_ARCH', 'aarch64'))
     sys.exit(0)
 with open(os.environ['TEST_CALLS'], 'a') as log:
     log.write(json.dumps([name, *sys.argv[1:]]) + '\\n')
 if name == 'muvm':
-    assert sys.argv[1:3] == ['--', 'FEXBash']
-    os.execv(shutil.which('FEXBash'), sys.argv[2:])
+    start = sys.argv.index('--') + 1
+    os.execv(shutil.which('FEXBash'), sys.argv[start:])
 if name == 'FEXBash':
     os.execv('/bin/bash', ['/bin/bash', *sys.argv[1:]])
 sys.exit(int(os.environ.get('TEST_EXIT', '0')))
@@ -57,9 +64,12 @@ class SteamLauncherTests(unittest.TestCase):
         self.calls_path = self.root / 'calls.jsonl'
         self.env = dict(os.environ, HOME=str(self.user_home), PATH=str(self.tools),
                         TEST_CALLS=str(self.calls_path), TEST_ARCH='aarch64', TEST_EXIT='0')
+        for key in ['GDK_SCALE', 'GDK_DPI_SCALE', 'STEAM_FORCE_DESKTOPUI_SCALING',
+                    'DBUS_SESSION_BUS_ADDRESS', 'XDG_RUNTIME_DIR']:
+            self.env.pop(key, None)
         for name in ['mkdir', 'cat', 'python3']:
             (self.tools / name).symlink_to(shutil.which(name))
-        for name in ['uname', 'muvm', 'FEXBash', 'steam']:
+        for name in ['uname', 'muvm', 'FEXBash', 'steam', 'hyprctl']:
             self.mock(self.tools / name)
         self.fex_launcher = self.user_home / '.local/share/fex-steam/steam-launcher/bin_steam.sh'
         self.mock(self.fex_launcher)
@@ -75,6 +85,7 @@ class SteamLauncherTests(unittest.TestCase):
     def run_launcher(self, *args, expected=0):
         result = subprocess.run(['/bin/bash', str(LAUNCHER), *args], env=self.env,
                                 capture_output=True, text=True, timeout=10)
+        self.last_result = result
         self.assertEqual(result.returncode, expected, result.stderr)
         return [json.loads(line) for line in self.calls_path.read_text().splitlines()] if self.calls_path.exists() else []
 
@@ -95,10 +106,10 @@ class SteamLauncherTests(unittest.TestCase):
         self.assertIn('\nExec=omarchy-launch-steam %U\n', text)
         self.assertIn('x-scheme-handler/steam;x-scheme-handler/steamlink;', text)
 
-    def assert_fex(self, calls, flags, user_args):
+    def assert_fex(self, calls, flags, user_args, vm_args=()):
         args = [str(self.fex_launcher), *flags, *user_args]
         self.assertEqual(calls, [
-            ['muvm', '--', 'FEXBash', '-c', 'exec "$@"', 'omarchy-steam', *args],
+            ['muvm', *vm_args, '--', 'FEXBash', '-c', 'exec "$@"', 'omarchy-steam', *args],
             ['FEXBash', '-c', 'exec "$@"', 'omarchy-steam', *args],
             ['bin_steam.sh', *flags, *user_args],
         ])
@@ -228,6 +239,67 @@ class SteamLauncherTests(unittest.TestCase):
     def test_fex_exit_status_is_preserved(self):
         self.env['TEST_EXIT'] = '29'
         self.assert_fex(self.run_launcher(expected=29), ['-cef-force-occlusion'], [])
+
+    def test_focused_monitor_scale_is_forwarded_without_rounding(self):
+        self.env['GDK_SCALE'] = '2'
+        self.env['GDK_DPI_SCALE'] = '0.9'
+        self.env['TEST_MONITORS'] = json.dumps([
+            {'focused': False, 'scale': 1}, {'focused': True, 'scale': 1.75},
+        ])
+        self.assert_fex(self.run_launcher(), ['-cef-force-occlusion'], [], [
+            '-e', 'GDK_SCALE=2', '-e', 'GDK_DPI_SCALE=0.9',
+            '-e', 'STEAM_FORCE_DESKTOPUI_SCALING=1.75',
+        ])
+
+    def test_explicit_steam_scale_is_preserved(self):
+        self.env['STEAM_FORCE_DESKTOPUI_SCALING'] = '1.25'
+        self.env['TEST_MONITORS'] = '[{"focused": true, "scale": 2}]'
+        self.assert_fex(self.run_launcher(), ['-cef-force-occlusion'], [], [
+            '-e', 'STEAM_FORCE_DESKTOPUI_SCALING=1.25',
+        ])
+
+    def test_scale_falls_back_to_gdk_when_monitor_query_is_unavailable(self):
+        self.env['GDK_SCALE'] = '2'
+        for value in ['[]', 'null', '{bad json', '[{"focused":true,"scale":0}]',
+                      '[{"focused":true,"scale":"NaN"}]']:
+            with self.subTest(monitors=value):
+                self.env['TEST_MONITORS'] = value
+                self.assert_fex(self.run_launcher(), ['-cef-force-occlusion'], [], [
+                    '-e', 'GDK_SCALE=2', '-e', 'STEAM_FORCE_DESKTOPUI_SCALING=2',
+                ])
+                self.calls_path.unlink()
+
+    def test_missing_hyprctl_falls_back_to_gdk(self):
+        (self.tools / 'hyprctl').unlink()
+        self.env['GDK_SCALE'] = '2'
+        self.assert_fex(self.run_launcher(), ['-cef-force-occlusion'], [], [
+            '-e', 'GDK_SCALE=2', '-e', 'STEAM_FORCE_DESKTOPUI_SCALING=2',
+        ])
+
+    def test_unknown_scale_is_left_to_steam(self):
+        self.env['TEST_MONITORS'] = '[{"focused":true,"scale":-1}]'
+        self.assert_fex(self.run_launcher(), ['-cef-force-occlusion'], [])
+
+    def test_host_session_bus_enables_muvm_bridge(self):
+        self.env['DBUS_SESSION_BUS_ADDRESS'] = 'unix:path=/run/user/1000/bus'
+        args = ['steam://open/main', 'argument with spaces']
+        self.assert_fex(self.run_launcher(*args), ['-cef-force-occlusion'], args,
+                        ['--session-bus'])
+
+    def test_older_muvm_still_launches_without_session_bus_flag(self):
+        self.env['DBUS_SESSION_BUS_ADDRESS'] = 'unix:path=/run/user/1000/bus'
+        self.env['TEST_MUVM_SESSION_BUS'] = '0'
+        self.assert_fex(self.run_launcher(), ['-cef-force-occlusion'], [])
+        self.assertIn('tray icon will be unavailable', self.last_result.stderr)
+
+    def test_runtime_bus_is_used_when_session_bus_variable_is_unset(self):
+        runtime = self.root / 'runtime'
+        runtime.mkdir()
+        with socket.socket(socket.AF_UNIX) as bus:
+            bus.bind(str(runtime / 'bus'))
+            self.env['XDG_RUNTIME_DIR'] = str(runtime)
+            self.assert_fex(self.run_launcher(), ['-cef-force-occlusion'], [],
+                            ['--session-bus'])
 
 
 if __name__ == '__main__':
