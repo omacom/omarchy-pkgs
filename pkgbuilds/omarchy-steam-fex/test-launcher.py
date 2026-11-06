@@ -103,6 +103,21 @@ class SteamLauncherTests(unittest.TestCase):
         binary.parent.mkdir(parents=True, exist_ok=True)
         binary.touch()
 
+    def host_bus(self, name='bus', *, listen=True):
+        runtime = self.root / 'runtime'
+        runtime.mkdir(exist_ok=True)
+        path = runtime / name
+        bus = socket.socket(socket.AF_UNIX)
+        self.addCleanup(bus.close)
+        try:
+            bus.bind(str(path))
+        except PermissionError as error:
+            self.skipTest(f'local Unix sockets are restricted: {error}')
+        if listen:
+            bus.listen(16)
+        self.env['XDG_RUNTIME_DIR'] = str(runtime)
+        return bus, path
+
     def assert_desktop(self):
         text = self.desktop.read_text()
         self.assertIn('\nExec=omarchy-launch-steam %U\n', text)
@@ -349,7 +364,8 @@ class SteamLauncherTests(unittest.TestCase):
         self.assert_fex(self.run_launcher(), ['-cef-force-occlusion', '-system-composer'], [])
 
     def test_host_session_bus_enables_muvm_bridge(self):
-        self.env['DBUS_SESSION_BUS_ADDRESS'] = 'unix:path=/run/user/1000/bus'
+        _, path = self.host_bus()
+        self.env['DBUS_SESSION_BUS_ADDRESS'] = f'unix:path={path}'
         args = ['steam://open/main', 'argument with spaces']
         self.assert_fex(self.run_launcher(*args), ['-cef-force-occlusion', '-system-composer'], args,
                         ['--session-bus'])
@@ -360,14 +376,89 @@ class SteamLauncherTests(unittest.TestCase):
         self.assert_fex(self.run_launcher(), ['-cef-force-occlusion', '-system-composer'], [])
         self.assertIn('tray icon will be unavailable', self.last_result.stderr)
 
+    def test_unsupported_bus_addresses_launch_without_the_bridge(self):
+        self.env['XDG_RUNTIME_DIR'] = str(self.root)
+        for address in ['unix:abstract=/tmp/dbus-example',
+                        'tcp:host=localhost,port=1234',
+                        'unix:path=/tmp/bus;unix:path=/tmp/other',
+                        'unix:path=relative/bus', 'unix:path=',
+                        'unix:path=/tmp/%XX', 'unix:path=/tmp/%0',
+                        'unix:path=/tmp/%00bus', 'unix:path=/tmp/bus,broken',
+                        'unix:path=/tmp/bus,path=/tmp/other',
+                        'unix:path=/tmp/bus,abstract=/tmp/other']:
+            with self.subTest(address=address):
+                self.calls_path.unlink(missing_ok=True)
+                self.env['DBUS_SESSION_BUS_ADDRESS'] = address
+                args = ['steam://open/main', 'argument with spaces']
+                self.assert_fex(self.run_launcher(*args),
+                                ['-cef-force-occlusion', '-system-composer'], args)
+                self.assertIn('starting without tray integration', self.last_result.stderr)
+
+    def test_missing_runtime_directory_launches_without_the_bridge(self):
+        self.env['DBUS_SESSION_BUS_ADDRESS'] = 'unix:path=/tmp/bus'
+        for runtime in [None, '', 'relative/runtime', str(self.root / 'missing')]:
+            with self.subTest(runtime=runtime):
+                self.calls_path.unlink(missing_ok=True)
+                if runtime is None:
+                    self.env.pop('XDG_RUNTIME_DIR', None)
+                else:
+                    self.env['XDG_RUNTIME_DIR'] = runtime
+                self.assert_fex(self.run_launcher(),
+                                ['-cef-force-occlusion', '-system-composer'], [])
+                self.assertIn('starting without tray integration', self.last_result.stderr)
+
+    def test_unreachable_bus_launches_without_the_bridge(self):
+        self.env['XDG_RUNTIME_DIR'] = str(self.root)
+        self.env['DBUS_SESSION_BUS_ADDRESS'] = f'unix:path={self.root}/missing-bus'
+        self.assert_fex(self.run_launcher(), ['-cef-force-occlusion', '-system-composer'], [])
+        self.assertIn('starting without tray integration', self.last_result.stderr)
+
     def test_runtime_bus_is_used_when_session_bus_variable_is_unset(self):
-        runtime = self.root / 'runtime'
-        runtime.mkdir()
-        with socket.socket(socket.AF_UNIX) as bus:
-            bus.bind(str(runtime / 'bus'))
-            self.env['XDG_RUNTIME_DIR'] = str(runtime)
-            self.assert_fex(self.run_launcher(), ['-cef-force-occlusion', '-system-composer'], [],
-                            ['--session-bus'])
+        self.host_bus()
+        for address in [None, '']:
+            with self.subTest(address=address):
+                self.calls_path.unlink(missing_ok=True)
+                if address is None:
+                    self.env.pop('DBUS_SESSION_BUS_ADDRESS', None)
+                else:
+                    self.env['DBUS_SESSION_BUS_ADDRESS'] = address
+                self.assert_fex(self.run_launcher(), ['-cef-force-occlusion', '-system-composer'], [],
+                                ['--session-bus'])
+
+    def test_escaped_bus_paths_and_guid_enable_the_bridge(self):
+        _, path = self.host_bus('bus with space,%')
+        encoded = str(path).replace('%', '%25').replace(' ', '%20').replace(',', '%2C')
+        self.env['DBUS_SESSION_BUS_ADDRESS'] = f'unix:path={encoded},guid=abc'
+        self.assert_fex(self.run_launcher(), ['-cef-force-occlusion', '-system-composer'], [],
+                        ['--session-bus'])
+
+    def test_unlistening_bus_socket_launches_without_the_bridge(self):
+        _, path = self.host_bus(listen=False)
+        self.env['DBUS_SESSION_BUS_ADDRESS'] = f'unix:path={path}'
+        self.assert_fex(self.run_launcher(), ['-cef-force-occlusion', '-system-composer'], [])
+        self.assertIn('starting without tray integration', self.last_result.stderr)
+
+    def test_full_bus_queue_does_not_block_launch(self):
+        _, path = self.host_bus()
+        self.env['DBUS_SESSION_BUS_ADDRESS'] = f'unix:path={path}'
+        for _ in range(32):
+            client = socket.socket(socket.AF_UNIX)
+            self.addCleanup(client.close)
+            client.setblocking(False)
+            try:
+                client.connect(str(path))
+            except BlockingIOError:
+                break
+        else:
+            self.fail('could not fill the bus listen queue')
+        self.assert_fex(self.run_launcher(), ['-cef-force-occlusion', '-system-composer'], [])
+        self.assertIn('starting without tray integration', self.last_result.stderr)
+
+    def test_unsupported_explicit_bus_does_not_use_a_different_runtime_bus(self):
+        self.host_bus()
+        self.env['DBUS_SESSION_BUS_ADDRESS'] = 'unix:abstract=/tmp/dbus-example'
+        self.assert_fex(self.run_launcher(), ['-cef-force-occlusion', '-system-composer'], [])
+        self.assertIn('starting without tray integration', self.last_result.stderr)
 
 
 if __name__ == '__main__':

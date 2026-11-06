@@ -32,11 +32,17 @@ including fractional scales. It falls back to `GDK_SCALE` when monitor informati
 is unavailable. An explicit `STEAM_FORCE_DESKTOPUI_SCALING` takes precedence.
 These values are resolved at launch; restart Steam after changing desktop scale.
 
-When a host session bus is available, the launcher enables muvm's optional
+When a supported host session bus is reachable, the launcher enables muvm's optional
 `--session-bus` bridge so Steam can register its tray icon with the host bar.
 This requires a muvm build with session-bus forwarding support and grants the
 guest access to the host user's session services. Older builds still launch
 Steam and print a diagnostic explaining why its tray icon is unavailable.
+The bridge requires an existing absolute `XDG_RUNTIME_DIR` and a single absolute
+`unix:path` address. Escaped paths and a `guid` field are supported. When the
+address is unset or empty, it checks `$XDG_RUNTIME_DIR/bus`. Unsupported addresses
+(including abstract sockets and address lists), missing runtime directories and
+unreachable sockets produce a diagnostic and launch Steam without the bridge.
+The socket check is nonblocking, so a full listen queue cannot stall the launcher.
 Restart an existing VM after upgrading muvm to enable the bridge.
 
 `omarchy-launch-steam --prepare` creates the current user's desktop override with `Exec=omarchy-launch-steam %U` if it is missing, and applies the same UI patch. Existing overrides and symlinks are preserved on preparation and launch. If an existing override uses a different command, edit its `Exec` entry to use `omarchy-launch-steam %U` when you want this launcher. Each matching chunk is backed up as `.omarchy-bak` before its first patch; existing backups are preserved. The regex matches the original network initialization block, so a patched block is not changed again. An unrelated connected-state assignment elsewhere in the chunk does not suppress the fix. The regex depends on Valve's client code and may need updating when that code changes.
