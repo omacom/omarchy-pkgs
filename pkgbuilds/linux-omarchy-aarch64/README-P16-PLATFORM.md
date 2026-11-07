@@ -113,3 +113,35 @@ light sensor still reported13 lux, SPI error/timeout counters remained zero,
 and NVIDIA plus audio services remained active. This is one functional cycle,
 not a new sleep-power measurement or repeated-cycle qualification. No GNOME
 battery policy, custom fan policy or desktop settings are included.
+
+## MT7925 MLO membership follow-up
+
+Patch 9105 is the unmodified upstream commit
+`dd3f17ef69ed6d0085cd94a15b9dec227b4ebfb1`, authored by Andrei Rusu de Castro:
+`wifi: mt76: mt7925: keep MLD membership consistent during link add`.
+Both station updates sent while adding a secondary link now include the same
+published and pending links. Publication still happens after successful setup;
+the firmware record retains its capacity bound and primary-first order.
+
+`test_mld.py` extracts the actual function and firmware structure from the
+prepared kernel tree and compiles a native harness with ASan/UBSan and
+`-Werror`. The previous implementation fails with member counts 1/2; the fixed
+implementation passes pending/published membership, missing station/BSS,
+duplicate prevention, record capacity and initial-primary cases. Both real
+add-time ASSOC callers must pass the same pending link. `check()` runs this
+test alongside the existing sleep and platform tests.
+
+The patch was fully built and booted on H7607BA BIOS303 in an isolated Linux
+7.3 test kernel using the same Omarchy 7.3-26 base and P16 patch set. Active
+MLO links at 5975 and 5500 MHz carried a 120-second simultaneous ping test:
+240/240 replies each from gateway, LAN host and Internet through VPN, with
+mean latencies 10.6/10.9/15.0 ms and isolated peaks near 274 ms. A subsequent
+180-second operator walk received 360/360 gateway, 359/360 LAN and 360/360
+Internet replies, means 5.3/6.5/9.8 ms, and a maximum near 107 ms. No
+reconnections occurred in these intervals; the walk retained the same AP and
+therefore does not validate inter-AP roaming. Initial supplicant scan/link/key
+warnings remain, and suspend/resume with this Wi-Fi change is untested.
+
+No frequency band, BSSID, VPN or roaming configuration is changed by this
+kernel patch. These observations support the narrow backport; they do not
+establish that every MT7925 connectivity issue is resolved.

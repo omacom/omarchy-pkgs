@@ -39,7 +39,8 @@ for option in ('ASUS_ARMOURY', 'ASUS_WMI_DEPRECATED_ATTRS'):
 sources = arrays[0]
 ordered = [name for name in sources if name.startswith(('1120-', '1121-', '1122-', '1123-', '1124-', '1125-'))]
 assert len(ordered) == 6 and ordered == sorted(ordered)
-platform = [name for name in sources if name.startswith(('9100-', '9101-', '9102-', '9103-', '9104-'))]
-assert len(platform) == 5 and platform == sorted(platform)
+platform = [name for name in sources if name.startswith(('9100-', '9101-', '9102-', '9103-', '9104-', '9105-'))]
+assert len(platform) == 6 and platform == sorted(platform)
+assert '9105-mt7925-mld-membership.patch' in sources and 'test_mld.py' in sources
 assert not any('p16-platform-support' in name for name in sources)
 print(f'PASS package sources/checksums: {checked} local files; coordinated suspend config prerequisites')
