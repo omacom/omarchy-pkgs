@@ -133,6 +133,51 @@ jobs:
               { echo "Reused existing build artifacts (${#reused[@]}):"; printf -- '- %s\n' "${reused[@]}"; } >> "$GITHUB_STEP_SUMMARY"
             fi
           fi
+          # A package whose version edge already holds has nothing to build,
+          # yet 21 of 48 builder jobs on 2026-10-28 started a droplet only to
+          # find that out. Plan here, on this hosted runner: the dry run reads
+          # the published channel and starts no container. If an architecture
+          # cannot be planned, all of its entries stay; the build job checks
+          # again before it builds.
+          declare -A planned=()
+          for arch in $(jq -r '[.include[].arch] | unique | .[]' <<<"$matrix"); do
+            mapfile -t packages < <(jq -r --arg arch "$arch" '.include[] | select(.arch == $arch) | .package' <<<"$matrix")
+            # Naming the engine skips the docker info probe that sourcing
+            # bin/build's helpers otherwise runs: 376 ms, for no container.
+            plan=$(CONTAINER_ENGINE=docker bin/build --dry-run --mirror edge --arch "$arch" --package "${packages[@]}" 2>&1 | grep -E '^==> Plan complete' || true)
+            if [[ -n "$plan" ]]; then
+              planned[$arch]=" $(sed -E 's/.*would build: *//' <<<"$plan") "
+            else
+              echo "::warning::Could not plan the $arch builds; every $arch package goes to a builder"
+              planned[$arch]=" ${packages[*]} "
+            fi
+          done
+          recipe_lines() { grep -vE '^[[:space:]]*(#|$)' || true; }
+          kept=(); held=(); declare -A flagged=()
+          while read -r entry; do
+            package=$(jq -r .package <<<"$entry"); arch=$(jq -r .arch <<<"$entry")
+            if [[ ${planned[$arch]} == *" $package "* ]]; then
+              kept+=("$entry")
+            else
+              held+=("$package ($arch)")
+              # Arch bumps pkgrel only when the built package changes, which is
+              # the reviewer's call. When the recipe itself changed (comments
+              # and blank lines aside), flag it on the PKGBUILD without failing.
+              recipe="pkgbuilds/$package/PKGBUILD"
+              [[ -z ${flagged[$package]:-} ]] || continue
+              flagged[$package]=1
+              if ! cmp -s <(git show "HEAD:$recipe" 2>/dev/null | recipe_lines) <(recipe_lines < "$recipe"); then
+                note="PKGBUILD changed, but edge already holds this version of $package, so the change will not ship until pkgver or pkgrel changes. Bump pkgrel if it affects the built package."
+                echo "::warning file=$recipe,title=Change will not ship::$note"
+                echo "$note" >> "$GITHUB_STEP_SUMMARY"
+              fi
+            fi
+          done < <(jq -c '.include[]' <<<"$matrix")
+          matrix=$(printf '%s\n' "${kept[@]}" | jq -sc '{include: .}')
+          if (( ${#held[@]} )); then
+            printf '==> edge already holds this version, nothing to build: %s\n' "${held[@]}"
+            { echo "Already on edge, not built (${#held[@]}):"; printf -- '- %s\n' "${held[@]}"; } >> "$GITHUB_STEP_SUMMARY"
+          fi
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
           echo "planned=$(jq '.include | length' <<<"$matrix")" >> "$GITHUB_OUTPUT"
           jq -r '.include[] | "\(.package) \(.arch) -> \(.channels)"' <<<"$matrix"
@@ -225,6 +270,8 @@ jobs:
       # version, so the planner builds nothing and there is nothing to pack.
       # The same check publish.yml's rebuild job makes; without it the pack
       # step failed on the empty output and the required result went red.
+      # The changes job drops these before a builder starts; this catches a
+      # plan it could not make.
       - name: Build ${{ matrix.package }} (${{ matrix.arch }}, ships to ${{ matrix.channels }})
         id: build
         env:
@@ -248,6 +295,18 @@ jobs:
               echo "$note" >> "$GITHUB_STEP_SUMMARY"
             fi
             exit 0
+          fi
+          # builder-images.yml publishes the tested image for exactly these
+          # build inputs under their key; building it here instead cost every
+          # package job about 130 s. Build only when no image carries the key:
+          # a change to build/ reaches PR builds before its refresh finishes.
+          published="ghcr.io/omacom/omarchy-pkg-builder:$(bin/builder-image key --arch "${{ matrix.arch }}" --mirror edge)"
+          if docker pull --quiet "$published"; then
+            docker tag "$published" "omarchy-pkg-builder:latest-${{ matrix.arch }}-edge"
+            export OMARCHY_SKIP_BUILDER_IMAGE=1
+            echo "==> Builder image: pulled $published"
+          else
+            echo "==> Builder image: none published for this key, building it"
           fi
           bin/build --mirror edge --arch "${{ matrix.arch }}" --package "${{ matrix.package }}"
           echo "built=true" >> "$GITHUB_OUTPUT"
