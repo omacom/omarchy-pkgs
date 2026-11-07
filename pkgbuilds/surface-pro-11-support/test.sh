@@ -161,6 +161,30 @@ esac
 STUB
 cat >"$bin/btmgmt" <<'STUB'
 #!/bin/bash
+if [[ $1 == info ]]; then
+  settings='powered ssp br/edr le secure-conn ll-privacy'
+  # privacy-later holds "<checks before privacy comes on> <privacy value then>".
+  if [[ -e $BT_STATE/privacy-later ]]; then
+    read -r after hold <"$BT_STATE/privacy-later"
+    if (( after > 0 )); then echo "$((after - 1)) $hold" >"$BT_STATE/privacy-later"
+    else rm -f "$BT_STATE/privacy-later"; echo "$hold" >"$BT_STATE/privacy"
+    fi
+  fi
+  # privacy-cycle counts checks; every third of the first 200 sees privacy on.
+  if [[ -e $BT_STATE/privacy-cycle ]]; then
+    c=$(( $(<"$BT_STATE/privacy-cycle") + 1 )); echo "$c" >"$BT_STATE/privacy-cycle"
+    (( c <= 200 && c % 3 == 0 )) && settings+=' privacy'
+  fi
+  # privacy holds "on", or how many more checks see it on before it goes off.
+  if [[ -e $BT_STATE/privacy ]]; then
+    left=$(<"$BT_STATE/privacy")
+    if [[ $left == on ]]; then settings+=' privacy'
+    elif (( left > 0 )); then echo $((left - 1)) >"$BT_STATE/privacy"; settings+=' privacy'
+    fi
+  fi
+  printf 'hci0:\tPrimary controller\n\tcurrent settings: %s \n' "$settings"
+  exit 0
+fi
 echo "btmgmt $*" >>"$BT_STATE/log"
 STUB
 cat >"$bin/logger" <<'STUB'
@@ -218,6 +242,23 @@ flex_reset; flex_attach; flex_bond; : >"$scratch/bt/connectable"
 flex denali autopair
 ! flex_did "pair --no-detach" || fail "a bond that connects on request is kept"
 
+# While a pen is pairing, privacy is on and the keyboard cannot connect.
+flex_reset; flex_attach; flex_bond; echo on >"$scratch/bt/privacy"
+flex denali autopair
+! flex_did "remove $keyboard" && ! flex_did "pair --no-detach" && ! flex_did "btmgmt power off" ||
+  fail "a bond is kept, and the radio left alone, while a pen is pairing"
+
+# Once the pairing ends the keyboard may no longer advertise; that is no
+# evidence against the bond.
+flex_reset; flex_attach; flex_bond; echo 2 >"$scratch/bt/privacy"
+flex denali autopair
+! flex_did "remove $keyboard" && ! flex_did "pair --no-detach" && ! flex_did "btmgmt power off" ||
+  fail "a bond that does not connect right after a pen pairing is kept"
+
+flex_reset; flex_attach; echo 2 >"$scratch/bt/privacy"
+flex denali autopair
+flex_did "pair --no-detach" || fail "a keyboard with no bond is paired once a pen pairing ends"
+
 flex_reset; mkdir -p "$scratch/hid/0019:045E:0C8B.0002"
 flex denali autopair
 ! flex_did "pair --no-detach" || fail "without the kernel's pairing channel nothing is paired"
@@ -235,12 +276,125 @@ flex_reset; flex_bond
 flex denali reconnect
 [[ -e $scratch/run/flex-needs-repair ]] || fail "a detached keyboard that never connects is marked for re-pairing"
 
+flex_reset; flex_bond; echo on >"$scratch/bt/privacy"
+flex denali reconnect
+! flex_did "connect $keyboard" && [[ ! -e $scratch/run/flex-needs-repair ]] ||
+  fail "a keyboard detached while a pen is pairing is not marked for re-pairing"
+
+flex_reset; flex_bond; echo 2 >"$scratch/bt/privacy"
+flex denali reconnect
+flex_did "connect $keyboard" && [[ ! -e $scratch/run/flex-needs-repair ]] ||
+  fail "a keyboard detached during a pen pairing is connected afterwards, and not marked if it stays away"
+
+# A pen pairing that begins between tries is waited out, then the tries resume.
+flex_reset; flex_bond; : >"$scratch/bt/connectable"; echo "2 2" >"$scratch/bt/privacy-later"
+flex denali reconnect
+flex_did "connect $keyboard" ||
+  fail "a pen pairing that starts while the keyboard reconnects does not end the reconnect"
+
+flex_reset; flex_bond; echo "2 2" >"$scratch/bt/privacy-later"
+flex denali reconnect
+flex_did "connect $keyboard" && ! flex_did "btmgmt power off" && [[ ! -e $scratch/run/flex-needs-repair ]] ||
+  fail "a keyboard that stays away after a pen pairing mid-reconnect is retried, with the radio left alone, and not marked"
+
+# A pen pairing that begins during the fifth try, just before the controller
+# reset, is not cut off by it.
+flex_reset; flex_bond; echo "7 on" >"$scratch/bt/privacy-later"
+flex denali reconnect
+! flex_did "btmgmt power off" || fail "the controller is not reset while a pen is pairing"
+
+# Pen pairings that keep coming do not keep the job running.
+flex_reset; flex_bond; echo 0 >"$scratch/bt/privacy-cycle"
+flex denali reconnect
+(( $(grep -c "^connect $keyboard" "$scratch/bt/log") <= 40 )) ||
+  fail "a reconnect gives up after a few pen pairings in a row"
+
 flex_reset; flex_attach; flex_bond
 flex denali reconnect
 ! flex_did "connect $keyboard" || fail "an attached keyboard is not connected over Bluetooth"
 
-python -c 'import ast, sys; ast.parse(open(sys.argv[1]).read())' "$package_dir/surface-pro-11-flex-pair" ||
-  fail "the pairing tool is valid Python"
+# Pen pairing. The stub bluetoothctl acts like BlueZ: a pen paired before
+# advertises only as changes to its device (no name), a pen that is not shows
+# up as a new device, and a pen still bonded refuses to pair again.
+penbin=$scratch/penbin; pen_state=$scratch/pen; mkdir -p "$penbin"
+pen=AA:BB:CC:DD:EE:01
+cat >"$penbin/bluetoothctl" <<'STUB'
+#!/bin/bash
+s=$PEN_STATE; pen=AA:BB:CC:DD:EE:01
+if (( $# )); then
+  echo "$*" >>"$s/log"
+  case $1 in
+    show) printf 'Controller X\n\tPowered: yes\n\tPairable: no\n' ;;
+    devices) [[ -e $s/bonded ]] && echo "Device $pen Surface Slim Pen 2" ;;
+    info) if [[ -e $s/bonded ]]; then printf '\tPaired: yes\n\tBonded: yes\n\tBattery Percentage: 0x55 (85)\n'
+          else printf '\tPaired: no\n'; fi ;;
+    remove) rm -f "$s/bonded" ;;
+  esac
+  exit 0
+fi
+while read -r cmd arg; do
+  case "$cmd $arg" in
+    'scan le')
+      [[ -e $s/battery-only ]] && echo "[CHG] Device $pen Battery Percentage: 0x55 (85)"
+      if [[ -e $s/advertising ]]; then
+        if [[ -e $s/bonded ]]; then echo "[CHG] Device $pen RSSI: 0xffffffc4 (-60)"
+        else echo "[NEW] Device $pen Surface Slim Pen 2"; fi
+      fi ;;
+    "pair $pen")
+      echo "pair" >>"$s/log"
+      if [[ -e $s/bonded ]]; then echo "Failed to pair: org.bluez.Error.AlreadyExists"
+      else touch "$s/bonded"; echo "Pairing successful"; fi ;;
+    'quit ') exit 0 ;;
+  esac
+done
+STUB
+printf '#!/bin/bash\n[[ $1 == info ]] && printf "hci0:\\tPrimary controller\\n\\tcurrent settings: powered le privacy \\n"\nexit 0\n' >"$penbin/btmgmt"
+printf '#!/bin/bash\nexit 0\n' >"$penbin/sudo"
+chmod +x "$penbin"/*
+cat >"$scratch/pen-pair.py" <<'EOF'
+import importlib.machinery, importlib.util, sys
+sys.dont_write_bytecode = True
+loader = importlib.machinery.SourceFileLoader('pen_pair', sys.argv[1])
+spec = importlib.util.spec_from_loader('pen_pair', loader)
+pen_pair = importlib.util.module_from_spec(spec)
+loader.exec_module(pen_pair)
+pen_pair.WAIT = 6
+sys.exit(pen_pair.main())
+EOF
+pen_reset() { rm -rf "$pen_state"; mkdir -p "$pen_state"; : >"$pen_state/log"; }
+# pen_pair ANSWERS: run the script, answering its prompts with ANSWERS.
+pen_pair() {
+  PATH="$penbin:$PATH" PEN_STATE=$pen_state python3 "$scratch/pen-pair.py" \
+    "$package_dir/surface-pro-11-pen-pair" <<<"$1" >/dev/null 2>&1
+}
+pen_removed() { grep -qx "remove $pen" "$pen_state/log"; }
+
+pen_reset; touch "$pen_state/bonded" "$pen_state/advertising"
+! pen_pair n || fail "declining the pen found ends without pairing"
+[[ -e $pen_state/bonded ]] && ! pen_removed || fail "a declined pen keeps its bond"
+
+pen_reset; touch "$pen_state/bonded"
+! pen_pair "" || fail "no pen found is a failure"
+[[ -e $pen_state/bonded ]] && ! pen_removed || fail "a run that finds no pen keeps the paired pen"
+
+pen_reset; touch "$pen_state/bonded" "$pen_state/battery-only"
+! pen_pair y || fail "a connected pen's battery report is not a pen in pairing mode"
+[[ -e $pen_state/bonded ]] || fail "a connected pen that is not in pairing mode keeps its bond"
+
+pen_reset; touch "$pen_state/bonded" "$pen_state/advertising"
+pen_pair y || fail "a pen paired before pairs again once approved"
+pen_removed && grep -qx pair "$pen_state/log" && grep -qx "trust $pen" "$pen_state/log" ||
+  fail "an approved pen loses its old bond, then pairs and is trusted"
+(( $(grep -cx pair "$pen_state/log") == 1 )) || fail "the old bond goes before the pairing, not after a refusal"
+
+pen_reset; touch "$pen_state/advertising"
+pen_pair y || fail "a new pen pairs once approved"
+! pen_removed || fail "pairing a new pen removes nothing"
+
+for tool in surface-pro-11-flex-pair surface-pro-11-pen-pair; do
+  python -c 'import ast, sys; ast.parse(open(sys.argv[1]).read())' "$package_dir/$tool" ||
+    fail "$tool is valid Python"
+done
 for unit in surface-pro-11-flex-autopair surface-pro-11-flex-reconnect; do
   grep -qx 'ConditionFirmware=device-tree-compatible(microsoft,denali-oled)' "$package_dir/$unit.service" ||
     fail "$unit runs only on the Surface Pro 11 OLED"
