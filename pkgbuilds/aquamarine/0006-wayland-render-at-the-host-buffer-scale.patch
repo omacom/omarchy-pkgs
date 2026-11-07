@@ -1,0 +1,150 @@
+From 670169dd5220a9a5f060a0f47941c65ddf4ea2b1 Mon Sep 17 00:00:00 2001
+From: jgoyvaerts <1125884+jgoyvaerts@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 17:13:10 -0300
+Subject: [PATCH] wayland: render at the host's buffer scale
+
+The output took the host's configure size, which is in surface-local
+coordinates, as its pixel size, and attached its buffers at scale 1. On a
+HiDPI host a nested compositor therefore rendered at a fraction of the
+window's pixels and the host upscaled it: blurry.
+
+- Follow wl_surface.preferred_buffer_scale (wl_compositor v6): the mode is
+  the configured size times the scale, and buffers are attached with
+  set_buffer_scale. A buffer that is not a multiple of the scale (a custom
+  mode) goes out at scale 1 rather than as a protocol error.
+- The pointer's surface-local coordinates are divided by the buffer size
+  over the scale.
+- The host sends the preferred scale only once the surface is mapped. Seed
+  the scale from the host's wl_output scales (v3, released right after
+  startup), so the first mode already has the right size and a consumer's
+  scale rule never sees a 1x size first.
+---
+ include/aquamarine/backend/Wayland.hpp |  7 ++++-
+ src/backend/Wayland.cpp                | 38 ++++++++++++++++++++++++--
+ 2 files changed, 41 insertions(+), 4 deletions(-)
+
+diff --git a/include/aquamarine/backend/Wayland.hpp b/include/aquamarine/backend/Wayland.hpp
+index 7e6636f..68b8d89 100644
+--- a/include/aquamarine/backend/Wayland.hpp
++++ b/include/aquamarine/backend/Wayland.hpp
+@@ -92,7 +92,8 @@ namespace Aquamarine {
+             Hyprutils::Memory::CSharedPointer<CCWlCallback>  frameCallback;
+             Hyprutils::Math::Vector2D                        surfaceSize;
+             Hyprutils::Math::Vector2D                        pendingSize;
+-            bool                                             announced = false;
++            int32_t                                          bufferScale = 1;
++            bool                                             announced   = false;
+         } waylandState;
+ 
+         friend class CWaylandBackend;
+@@ -185,6 +186,10 @@ namespace Aquamarine {
+             Hyprutils::Memory::CSharedPointer<CCWlCompositor>             compositor;
+             Hyprutils::Memory::CSharedPointer<CCZwpLinuxDmabufV1>         dmabuf;
+             Hyprutils::Memory::CSharedPointer<CCZwpLinuxDmabufFeedbackV1> dmabufFeedback;
++            std::vector<Hyprutils::Memory::CSharedPointer<CCWlOutput>>    hostOutputs;
++
++            // the largest scale of the host's outputs, a new output's first guess before wl_surface.preferred_buffer_scale
++            int32_t hostScale = 1;
+ 
+             // control
+             bool dmabufFailed = false;
+diff --git a/src/backend/Wayland.cpp b/src/backend/Wayland.cpp
+index 6af7b93..5cde059 100644
+--- a/src/backend/Wayland.cpp
++++ b/src/backend/Wayland.cpp
+@@ -67,6 +67,7 @@ Aquamarine::CWaylandBackend::~CWaylandBackend() {
+     pointers.clear();
+     idleCallbacks.clear();
+ 
++    waylandState.hostOutputs.clear();
+     waylandState.dmabufFeedback.reset();
+     waylandState.dmabuf.reset();
+     waylandState.shm.reset();
+@@ -127,6 +128,12 @@ bool Aquamarine::CWaylandBackend::start() {
+         } else if (NAME == "wl_compositor") {
+             TRACE(backend->log(AQ_LOG_TRACE, std::format("  > binding to global: {} (version {}) with id {}", name, 6, id)));
+             waylandState.compositor = makeShared<CCWlCompositor>((wl_proxy*)wl_registry_bind((wl_registry*)waylandState.registry->resource(), id, &wl_compositor_interface, 6));
++        } else if (NAME == "wl_output" && version >= 3) {
++            // v2 has the scale event, v3 the release request our wrapper sends on destruction
++            TRACE(backend->log(AQ_LOG_TRACE, std::format("  > binding to global: {} (version {}) with id {}", name, 3, id)));
++            auto output = makeShared<CCWlOutput>((wl_proxy*)wl_registry_bind((wl_registry*)waylandState.registry->resource(), id, &wl_output_interface, 3));
++            output->setScale([this](CCWlOutput* r, int32_t scale) { waylandState.hostScale = std::max(waylandState.hostScale, scale); });
++            waylandState.hostOutputs.emplace_back(output);
+         } else if (NAME == "wl_shm") {
+             TRACE(backend->log(AQ_LOG_TRACE, std::format("  > binding to global: {} (version {}) with id {}", name, 1, id)));
+             waylandState.shm = makeShared<CCWlShm>((wl_proxy*)wl_registry_bind((wl_registry*)waylandState.registry->resource(), id, &wl_shm_interface, 1));
+@@ -143,6 +150,9 @@ bool Aquamarine::CWaylandBackend::start() {
+     waylandState.registry->setGlobalRemove([this](CCWlRegistry* r, uint32_t id) { backend->log(AQ_LOG_DEBUG, std::format("Global {} removed", id)); });
+ 
+     wl_display_roundtrip(waylandState.display);
++    // the bound wl_outputs send their scale now, nothing else needs them
++    wl_display_roundtrip(waylandState.display);
++    waylandState.hostOutputs.clear();
+ 
+     if (!waylandState.xdg || !waylandState.compositor || !waylandState.seat || !waylandState.dmabuf || waylandState.dmabufFailed || !waylandState.shm) {
+         backend->log(AQ_LOG_ERROR, "Wayland backend cannot start: Missing protocols");
+@@ -515,13 +525,28 @@ Aquamarine::CWaylandOutput::CWaylandOutput(const std::string& name_, Hyprutils::
+         sched.frameReady.emit();
+     });
+ 
+-    waylandState.surface = makeShared<CCWlSurface>(backend->waylandState.compositor->sendCreateSurface());
++    waylandState.surface     = makeShared<CCWlSurface>(backend->waylandState.compositor->sendCreateSurface());
++    waylandState.bufferScale = backend->waylandState.hostScale;
+ 
+     if (!waylandState.surface->resource()) {
+         backend->backend->log(AQ_LOG_ERROR, std::format("Output {} failed: no surface given. Errno: {}", name, errno));
+         return;
+     }
+ 
++    // Render at the host's scale (wl_surface v6), otherwise a HiDPI host upscales the output and it looks blurry.
++    waylandState.surface->setPreferredBufferScale([this](CCWlSurface* r, int32_t scale) {
++        backend->backend->log(AQ_LOG_DEBUG, std::format("Output {}: preferred buffer scale {}", name, scale));
++        if (scale < 1 || scale == waylandState.bufferScale)
++            return;
++
++        waylandState.bufferScale = scale;
++        if (modes.empty())
++            return;
++
++        modes.front()->pixelSize = waylandState.pendingSize * scale;
++        applyConfigure();
++    });
++
+     waylandState.xdgSurface = makeShared<CCXdgSurface>(backend->waylandState.xdg->sendGetXdgSurface(waylandState.surface->resource()));
+ 
+     if (!waylandState.xdgSurface->resource()) {
+@@ -536,7 +561,8 @@ Aquamarine::CWaylandOutput::CWaylandOutput(const std::string& name_, Hyprutils::
+         // Retain the acknowledged size for consumers that attach their listeners later.
+         if (modes.empty())
+             modes.emplace_back(makeShared<SOutputMode>(SOutputMode{.refreshRate = 60000, .preferred = true}));
+-        modes.front()->pixelSize = waylandState.pendingSize;
++        // The configured size is in surface-local coordinates, the mode is in buffer pixels.
++        modes.front()->pixelSize = waylandState.pendingSize * waylandState.bufferScale;
+         applyConfigure();
+     });
+ 
+@@ -703,6 +729,11 @@ bool Aquamarine::CWaylandOutput::commit() {
+ 
+     wlBuffer->pendingRelease = true;
+ 
++    // A buffer that isn't a multiple of the scale (e.g. a custom mode) would be a protocol error, send it unscaled.
++    const auto SIZE  = STATE.buffer->size;
++    const auto SCALE = ((int)SIZE.x % waylandState.bufferScale == 0 && (int)SIZE.y % waylandState.bufferScale == 0) ? waylandState.bufferScale : 1;
++
++    waylandState.surface->sendSetBufferScale(SCALE);
+     waylandState.surface->sendAttach(wlBuffer->waylandState.buffer.get(), 0, 0);
+     waylandState.surface->sendDamageBuffer(0, 0, INT32_MAX, INT32_MAX);
+ 
+@@ -722,7 +753,8 @@ bool Aquamarine::CWaylandOutput::commit() {
+     }
+ 
+     waylandState.surface->sendCommit();
+-    waylandState.surfaceSize = STATE.buffer->size;
++    // Surface-local size, pointer coordinates are relative to it.
++    waylandState.surfaceSize = SIZE / SCALE;
+ 
+     // Flush immediately: commit() runs from the consumer's render path, outside
+     // dispatchEvents() (which flushes only at its top). Without this the buffer commit and
+-- 
+2.56.0
+
