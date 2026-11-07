@@ -18,24 +18,12 @@ source "$package_dir/PKGBUILD"
 pkgdir="$scratch/pkg"
 (cd "$package_dir" && package)
 
-# The topology name must resolve to the CRD topology it stands in for.
-root="$scratch/root"
-mkdir -p "$root/usr/lib/firmware/qcom/glymur"
-touch "$root/usr/lib/firmware/qcom/glymur/GLYMUR-CRD-tplg.bin"
-cp -a "$pkgdir/usr" "$root/"
-
-tplg="$root/usr/lib/firmware/qcom/glymur/GLYMUR-ASUS-Zenbook-A16-UX3607OA-tplg.bin"
-[[ $(readlink -f "$tplg") == "$root/usr/lib/firmware/qcom/glymur/GLYMUR-CRD-tplg.bin" ]] ||
-  fail "the topology links to the CRD topology"
-
-# The fixture above cannot notice linux-firmware-qcom renaming or dropping the
-# CRD topology, so where that package is installed, check the link against the
-# files it really ships.
-if pacman -Qq linux-firmware-qcom &>/dev/null; then
-  target=$(readlink "$pkgdir/usr/lib/firmware/qcom/glymur/GLYMUR-ASUS-Zenbook-A16-UX3607OA-tplg.bin")
-  pacman -Qlq linux-firmware-qcom | grep -qxF "/usr/lib/firmware/qcom/glymur/$target" ||
-    fail "linux-firmware-qcom ships the topology the link names ($target)"
-fi
+# linux-firmware-qcom ships the board's topology since 20261019-1.1, so this
+# package must not: a file of its own at that path would conflict with it.
+[[ ! -e $pkgdir/usr/lib/firmware && ! -L $pkgdir/usr/lib/firmware ]] ||
+  fail "the package leaves the firmware to linux-firmware-qcom"
+[[ " ${depends[*]} " == *" linux-firmware-qcom>=20261019-1.1 "* ]] ||
+  fail "the package needs the linux-firmware-qcom that ships the topology"
 
 # The UCM profile restates the CRD profile and sets the WSA digital volumes on
 # every boot.
