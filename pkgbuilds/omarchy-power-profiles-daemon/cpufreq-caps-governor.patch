@@ -1,0 +1,319 @@
+From 6d6c439b66efcc9328f2aad6611d0f68843d8f43 Mon Sep 17 00:00:00 2001
+From: David Heinemeier Hansson <david@hey.com>
+Date: Sat, 7 Nov 2026 22:22:01 +0100
+Subject: [PATCH] cpufreq: Use the performance governor in performance on
+ Snapdragon X
+
+The caps method tells the profiles apart by capping scaling_max_freq,
+and left the governor at schedutil in every profile. schedutil raises
+the frequency only as a task's tracked utilisation grows, over tens of
+milliseconds, so bursty work such as a web browser runs most of its
+bursts at low clocks even with no cap at all. On a Snapdragon X2 Elite
+(ASUS Zenbook A16, X2E-88-100) on AC in performance, Speedometer 3.1
+scored 26.5 +/- 4.1 under schedutil and 45.3 +/- 2.6 under the
+performance governor, against 48 on Windows on the same machine. Pinning
+the browser to the prime cores under schedutil only reached 30.1, and
+Google's own Chrome build scored 28.2, so neither core placement nor the
+browser build accounts for the gap.
+
+With the caps method on scmi and qcom-cpufreq-hw, switch each policy to
+the performance governor in performance and back to schedutil in
+balanced and power-saver, in the same pass that writes the caps, so new
+and returning policies and resume are covered the same way. A policy
+that doesn't offer both governors keeps its own. A failure to switch is
+reported but doesn't fail the profile change, since the caps still tell
+the profiles apart. When the daemon stops, the governor is set back to
+schedutil along with lifting the caps, so the CPUs aren't left at full
+clock.
+
+Apple Silicon machines that fall back to the caps method keep their
+governor, as this was only measured on Snapdragon X.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ README.md                 | 14 +++++--
+ src/ppd-driver-cpufreq.c  | 73 ++++++++++++++++++++++++++++++++--
+ tests/integration_test.py | 82 ++++++++++++++++++++++++++++++++++++++-
+ 3 files changed, 161 insertions(+), 8 deletions(-)
+
+diff --git a/README.md b/README.md
+index 8816992..4fe28c0 100644
+--- a/README.md
++++ b/README.md
+@@ -287,10 +287,16 @@ scmi
+ scmi
+ ```
+ 
+-The scaling governor and the minimum frequency are not changed. The caps are
+-re-applied after resume. When the daemon stops, they are lifted to the
+-hardware maximum, so another tool's lower `scaling_max_freq` is not preserved
+-(see [Conflicts](#conflicts)).
++The scaling governor follows the profile: `performance` in "performance", and
++`schedutil` in "balanced" and "power-saver", on policies that offer both.
++`schedutil` raises the frequency only as a task's tracked utilisation grows,
++over tens of milliseconds, so bursty work such as a web browser runs most of
++its bursts at low clocks: on a Snapdragon X2 Elite, Speedometer 3.1 scored 26.5
++under `schedutil` and 45.3 under `performance`. The minimum frequency is not
++changed. The caps and the governor are re-applied after resume. When the
++daemon stops, the caps are lifted to the hardware maximum and the governor is
++set back to `schedutil`, so another tool's lower `scaling_max_freq` or other
++governor is not preserved (see [Conflicts](#conflicts)).
+ 
+ A cluster whose CPUs are all offline is skipped, even at startup. When it comes
+ back online, or a new policy appears, it keeps the cap it last had until the
+diff --git a/src/ppd-driver-cpufreq.c b/src/ppd-driver-cpufreq.c
+index f9eb4f1..2c0e92b 100644
+--- a/src/ppd-driver-cpufreq.c
++++ b/src/ppd-driver-cpufreq.c
+@@ -23,12 +23,19 @@
+  *   caps maximum performance per power mode. Used where boost is off by
+  *   default or absent, so it can't tell the profiles apart. The boost switch
+  *   is left alone: performance, which is uncapped, allows the boost
+- *   frequencies, so whether they are used stays up to the switch.
++ *   frequencies, so whether they are used stays up to the switch. Their
++ *   governor follows the profile too: performance in performance, and
++ *   schedutil otherwise. schedutil raises the frequency only as a task's
++ *   tracked utilisation grows, over tens of milliseconds, so bursty work such
++ *   as a browser's runs most of its bursts at low clocks: Speedometer 3.1
++ *   scored 26.5 under schedutil and 45.3 under performance on a Snapdragon X2
++ *   Elite (Zenbook A16), against 48 on Windows.
+  *
+  * An apple-cpufreq machine whose frequency table has no boost frequencies,
+  * such as the M3 Max, has a boost switch the kernel refuses to turn on, or
+  * none, so it uses the caps method instead. Only power-saver is capped there, which
+- * keeps the boost method's split: balanced and performance run uncapped.
++ * keeps the boost method's split: balanced and performance run uncapped. Its
++ * governor is left alone.
+  *
+  * It is only used when every cpufreq policy runs one of the scaling drivers
+  * in the table below. Any other system keeps its current driver.
+@@ -59,6 +66,9 @@
+ #define BALANCED_PERCENT           75
+ #define UNCAPPED_PERCENT           100
+ 
++#define PERFORMANCE_GOVERNOR       "performance"
++#define DEFAULT_GOVERNOR           "schedutil"
++
+ typedef enum {
+   CPUFREQ_METHOD_NONE,
+   CPUFREQ_METHOD_BOOST,
+@@ -91,6 +101,7 @@ struct _PpdDriverCpufreq
+   PpdProfile activated_profile;
+   CpufreqMethod method;
+   guint balanced_percent; /* with the caps method */
++  gboolean switch_governor; /* with the caps method, on Snapdragon X */
+   char *boost_path;
+   GPtrArray *policies; /* of Policy, with the caps method */
+ };
+@@ -423,6 +434,7 @@ ppd_driver_cpufreq_probe (PpdDriver *driver)
+     break;
+   case CPUFREQ_METHOD_CAPS:
+     cpufreq->balanced_percent = BALANCED_PERCENT;
++    cpufreq->switch_governor = TRUE;
+     ret = probe_caps (cpufreq, policy_dirs);
+     break;
+   }
+@@ -505,6 +517,56 @@ write_cap (Policy   *policy,
+   return FALSE;
+ }
+ 
++static const char *
++profile_to_governor (PpdProfile profile)
++{
++  switch (profile) {
++  case PPD_PROFILE_POWER_SAVER:
++  case PPD_PROFILE_BALANCED:
++    return DEFAULT_GOVERNOR;
++  case PPD_PROFILE_PERFORMANCE:
++    return PERFORMANCE_GOVERNOR;
++  }
++
++  g_return_val_if_reached (DEFAULT_GOVERNOR);
++}
++
++/* Switches the policy's governor where it offers both governors the
++ * profiles use. A failure is reported but doesn't fail the profile change:
++ * the cap, which was written, is what tells the profiles apart. */
++static void
++write_governor (Policy     *policy,
++                const char *governor)
++{
++  g_autofree char *available = NULL;
++  g_autofree char *current = NULL;
++  g_autofree char *path = NULL;
++  g_auto(GStrv) governors = NULL;
++  g_autoptr(GError) error = NULL;
++
++  available = read_attr (policy->dir, "scaling_available_governors");
++  if (!available) {
++    g_debug ("%s lists no governors", policy->dir);
++    return;
++  }
++  governors = g_strsplit_set (available, " \n\t", -1);
++  if (!g_strv_contains ((const char * const *) governors, PERFORMANCE_GOVERNOR) ||
++      !g_strv_contains ((const char * const *) governors, DEFAULT_GOVERNOR)) {
++    g_debug ("%s does not offer the %s and %s governors", policy->dir,
++             PERFORMANCE_GOVERNOR, DEFAULT_GOVERNOR);
++    return;
++  }
++
++  current = read_attr (policy->dir, "scaling_governor");
++  if (g_strcmp0 (current, governor) == 0)
++    return;
++
++  path = g_build_filename (policy->dir, "scaling_governor", NULL);
++  if (!ppd_utils_write (path, governor, &error))
++    g_warning ("Could not switch %s to the %s governor: %s", policy->dir, governor,
++               error ? error->message : "unknown error");
++}
++
+ static gboolean
+ has_policy (PpdDriverCpufreq *cpufreq,
+             const char       *dir)
+@@ -592,6 +654,8 @@ apply_caps (PpdDriverCpufreq  *cpufreq,
+       i++;
+       continue;
+     }
++    if (cpufreq->switch_governor)
++      write_governor (policy, profile_to_governor (profile));
+     written++;
+     i++;
+   }
+@@ -676,7 +740,8 @@ ppd_driver_cpufreq_prepare_for_sleep (PpdDriver  *driver,
+   return TRUE;
+ }
+ 
+-/* A cap left behind would slow the machine down until reboot */
++/* A cap left behind would slow the machine down until reboot, and the
++ * performance governor would keep the CPUs at full clock */
+ static void
+ ppd_driver_cpufreq_dispose (GObject *object)
+ {
+@@ -690,6 +755,8 @@ ppd_driver_cpufreq_dispose (GObject *object)
+       Policy *policy = g_ptr_array_index (cpufreq->policies, i);
+       g_autoptr(GError) error = NULL;
+ 
++      if (cpufreq->switch_governor)
++        write_governor (policy, DEFAULT_GOVERNOR);
+       if (write_cap (policy, policy->top_freq, &error))
+         continue;
+       /* The kernel keeps an offline policy's limit until it is written again */
+diff --git a/tests/integration_test.py b/tests/integration_test.py
+index f3ccdba..fd59e72 100644
+--- a/tests/integration_test.py
++++ b/tests/integration_test.py
+@@ -1679,7 +1679,14 @@ class Tests(dbusmock.DBusTestCase):
+     )
+ 
+     def create_cpufreq_policy(
+-        self, name, driver, freqs, epp=False, boost_freqs=None, cpuinfo_max=None
++        self,
++        name,
++        driver,
++        freqs,
++        epp=False,
++        boost_freqs=None,
++        cpuinfo_max=None,
++        governors=None,
+     ):
+         policy = os.path.join(
+             self.testbed.get_root_dir(), "sys/devices/system/cpu/cpufreq", name
+@@ -1702,8 +1709,18 @@ class Tests(dbusmock.DBusTestCase):
+             self.write_file_contents(
+                 os.path.join(policy, "energy_performance_preference"), "default\n"
+             )
++        if governors:
++            self.write_file_contents(
++                os.path.join(policy, "scaling_available_governors"), governors + "\n"
++            )
++            self.write_file_contents(
++                os.path.join(policy, "scaling_governor"), "schedutil\n"
++            )
+         return os.path.join(policy, "scaling_max_freq")
+ 
++    def cpufreq_governor_path(self, max_freq_path):
++        return os.path.join(os.path.dirname(max_freq_path), "scaling_governor")
++
+     M3_MAX_P_FREQS = (
+         "1092000 1356000 1596000 1884000 2172000 2424000 2616000 2808000 "
+         "2988000 3144000 3288000 3420000 3516000 3576000 3624000 3708000 "
+@@ -1764,6 +1781,22 @@ class Tests(dbusmock.DBusTestCase):
+         self.assertEqual(self.read_file_contents(boost), b"0\n")
+         self.assertFalse(self.have_text_in_log("Failed to activate"))
+ 
++    def test_cpufreq_apple_without_boost_keeps_governor(self):
++        """Apple Silicon on the caps method keeps its governor"""
++        max0, max1, _ = self.create_apple_without_boost()
++        gov0 = self.cpufreq_governor_path(max0)
++        self.write_file_contents(
++            os.path.join(os.path.dirname(max0), "scaling_available_governors"),
++            "performance schedutil\n",
++        )
++        self.write_file_contents(gov0, "schedutil\n")
++
++        self.start_daemon()
++        self.set_dbus_property("ActiveProfile", GLib.Variant.new_string("performance"))
++        self.assert_file_eventually_contains(gov0, "schedutil\n", keep_checking=200)
++        self.stop_daemon()
++        self.assertEqual(self.read_file_contents(gov0), b"schedutil\n")
++
+     def test_cpufreq_apple_without_boost_lifted_on_exit(self):
+         """Stopping in power-saver lifts the cap on Apple Silicon too"""
+         max0, max1, _ = self.create_apple_without_boost()
+@@ -2060,6 +2093,53 @@ class Tests(dbusmock.DBusTestCase):
+         self.assertEqual(self.read_file_contents(max0), b"4012800")
+         self.assertEqual(self.read_file_contents(boost), b"0\n")
+ 
++    def test_cpufreq_caps_governor(self):
++        """Performance switches the governor to performance, the others to
++        schedutil, and stopping sets schedutil back"""
++        governors = "conservative ondemand userspace powersave performance schedutil"
++        max0 = self.create_cpufreq_policy(
++            "policy0", "scmi", self.X1E_FREQS, governors=governors
++        )
++        max4 = self.create_cpufreq_policy(
++            "policy4", "scmi", self.X1E_FREQS, governors=governors
++        )
++        gov0 = self.cpufreq_governor_path(max0)
++        gov4 = self.cpufreq_governor_path(max4)
++
++        self.start_daemon()
++        self.assertEqual(self.get_dbus_property("ActiveProfile"), "balanced")
++        self.assert_file_eventually_contains(max0, "2515200")
++        self.assertEqual(self.read_file_contents(gov0), b"schedutil\n")
++
++        self.set_dbus_property("ActiveProfile", GLib.Variant.new_string("performance"))
++        self.assert_file_eventually_contains(gov0, "performance")
++        self.assert_file_eventually_contains(gov4, "performance")
++        self.assert_file_eventually_contains(max0, "3417600")
++
++        self.set_dbus_property("ActiveProfile", GLib.Variant.new_string("power-saver"))
++        self.assert_file_eventually_contains(gov0, "schedutil")
++        self.assert_file_eventually_contains(gov4, "schedutil")
++        self.assert_file_eventually_contains(max0, "1920000")
++
++        self.set_dbus_property("ActiveProfile", GLib.Variant.new_string("performance"))
++        self.assert_file_eventually_contains(gov0, "performance")
++        self.stop_daemon()
++        self.assertEqual(self.read_file_contents(gov0), b"schedutil")
++        self.assertEqual(self.read_file_contents(gov4), b"schedutil")
++
++    def test_cpufreq_caps_governor_unavailable(self):
++        """A policy without both governors keeps its own"""
++        max0 = self.create_cpufreq_policy(
++            "policy0", "scmi", self.X1E_FREQS, governors="ondemand schedutil"
++        )
++        gov0 = self.cpufreq_governor_path(max0)
++
++        self.start_daemon()
++        self.set_dbus_property("ActiveProfile", GLib.Variant.new_string("performance"))
++        self.assert_file_eventually_contains(max0, "3417600")
++        self.assertEqual(self.read_file_contents(gov0), b"schedutil\n")
++        self.assertFalse(self.have_text_in_log("Could not switch"))
++
+     def test_cpufreq_caps_unwritable_policy(self):
+         """A policy that can't be written is reported and the others are capped"""
+         max0 = self.create_cpufreq_policy("policy0", "scmi", self.X1E_FREQS)
+-- 
+2.56.0
+
