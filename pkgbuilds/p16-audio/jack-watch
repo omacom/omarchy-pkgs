@@ -1,0 +1,177 @@
+#!/usr/bin/python
+"""Maintain the P16 speaker graph and switch it on physical jack events."""
+import json
+import os
+from pathlib import Path
+import selectors
+import subprocess
+import time
+
+CARD = 'mt8901soundwire'
+CONTROL = 'iface=CARD,name=Headphone Jack'
+STATE = Path(os.environ.get('XDG_STATE_HOME', str(Path.home() / '.local/state'))) / 'p16-audio/state.json'
+SPEAKERS = {'p16_two_way', 'p16_dolby_speakers'}
+RAW = ['alsa_output.platform-mtk_sdw_mc.HiFi__Speaker__sink',
+       'alsa_output.platform-mtk_sdw_mc.HiFi__Headphones__sink']
+
+
+def run(*args, check=True):
+    return subprocess.run(args, check=check, text=True, capture_output=True, timeout=15).stdout
+
+
+def supported():
+    return (Path('/sys/class/dmi/id/product_name').read_text().strip() == 'ProArt P16 H7607BA'
+            and Path('/sys/class/dmi/id/board_name').read_text().strip() == 'H7607BA'
+            and Path('/sys/bus/acpi/devices/NVDA6210:00').exists())
+
+
+def jack_present():
+    return 'values=on' in run('amixer', '-c', CARD, 'cget', CONTROL)
+
+
+def list_sinks():
+    return json.loads(run('pactl', '--format=json', 'list', 'sinks'))
+
+
+def set_alsa(name, value):
+    run('amixer', '-c', CARD, 'cset', 'name=' + name, value)
+
+
+def load_state():
+    try:
+        return json.loads(STATE.read_text())
+    except (FileNotFoundError, ValueError):
+        return {'volume': {}, 'mute': False, 'dolby': True}
+
+
+def save_state():
+    sinks = list_sinks()
+    sink = next((s for s in sinks if s['name'] == 'p16_two_way'), None)
+    if sink is None:
+        return
+    data = load_state()
+    data.update(volume={n: int(c['value']) for n, c in sink['volume'].items()}, mute=sink['mute'])
+    dolby = next((s for s in sinks if s['name'] == 'p16_dolby_speakers'), None)
+    if dolby is not None:
+        data['dolby_volume'] = [int(c['value']) for c in dolby['volume'].values()]
+        data['dolby_mute'] = dolby['mute']
+    current = run('pactl', 'get-default-sink').strip()
+    if current in SPEAKERS:
+        data['dolby'] = current == 'p16_dolby_speakers'
+    STATE.parent.mkdir(parents=True, exist_ok=True)
+    encoded = json.dumps(data) + '\n'
+    if not STATE.exists() or STATE.read_text() != encoded:
+        temporary = STATE.with_suffix('.tmp')
+        temporary.write_text(encoded)
+        temporary.replace(STATE)
+
+
+def wait_sink(name):
+    deadline = time.monotonic() + 12
+    while time.monotonic() < deadline:
+        if any(s['name'] == name for s in list_sinks()):
+            return
+        time.sleep(.1)
+    raise RuntimeError('Missing audio sink: ' + name)
+
+
+def restore_speaker_state(saved, targets):
+    # New filter nodes start muted; restore both volumes before unmuting either.
+    for target in targets.values():
+        run('pactl', 'set-sink-mute', str(target), '1')
+    for name, target in targets.items():
+        volume = saved.get('dolby_volume') if name == 'p16_dolby_speakers' else list(saved['volume'].values())
+        if volume:
+            run('pactl', 'set-sink-volume', str(target), *map(str, volume))
+    for name, target in targets.items():
+        mute = saved.get('dolby_mute', False) if name == 'p16_dolby_speakers' else saved['mute']
+        run('pactl', 'set-sink-mute', str(target), str(int(mute)))
+
+
+def reconcile_speakers(known):
+    current = {sink['name']: sink['index'] for sink in list_sinks() if sink['name'] in SPEAKERS}
+    recreated = {name: index for name, index in current.items() if known.get(name) != index}
+    if recreated:
+        restore_speaker_state(load_state(), recreated)
+    # Never replace persisted state with defaults from a partial/recreated graph.
+    elif current.keys() == SPEAKERS:
+        save_state()
+    known.clear()
+    known.update(current)
+
+
+def switch(mode):
+    if mode not in ('speakers', 'headphones'):
+        raise ValueError(mode)
+    old_default = run('pactl', 'get-default-sink', check=False).strip()
+    ours = old_default in SPEAKERS | {'p16_headphones', 'omarchy_speaker_tuning'} or old_default in RAW
+    saved = load_state()
+    if mode == 'headphones':
+        save_state()
+        run('pactl', 'set-sink-mute', 'p16_two_way', '1', check=False)
+        for name in ('cs42l43 Speaker Digital Switch', 'Speaker Switch', 'AMP1 Speaker Switch', 'AMP2 Speaker Switch'):
+            set_alsa(name, 'off,off' if name.startswith('cs42') else 'off')
+    other = 'headphones' if mode == 'speakers' else 'speakers'
+    run('systemctl', '--user', 'stop', f'p16-audio-host@{other}.service', check=False)
+    run('systemctl', '--user', 'start', f'p16-audio-host@{mode}.service')
+    target = 'p16_headphones' if mode == 'headphones' else ('p16_dolby_speakers' if saved['dolby'] else 'p16_two_way')
+    wait_sink(target)
+    if mode == 'speakers':
+        wait_sink('p16_two_way')
+        wait_sink('p16_dolby_speakers')
+        restore_speaker_state(saved, {name: name for name in sorted(SPEAKERS)})
+        for name in ('Speaker Switch', 'AMP1 Speaker Switch', 'AMP2 Speaker Switch', 'Headphone Switch'):
+            set_alsa(name, 'on')
+        for side, source in [('L', 'DP5RX1'), ('R', 'DP5RX2')]:
+            set_alsa(f'cs42l43 Speaker {side} Input 1', source)
+            set_alsa(f'cs42l43 Speaker {side} Input 1 Volume', '32')
+        set_alsa('cs42l43 Speaker Digital Volume', '100,100')
+        set_alsa('cs42l43 Speaker Digital Switch', 'on,on')
+    set_alsa('Headphone Switch', 'on')
+    set_alsa('cs42l43 Headphone Digital Volume', '229,229')
+    # Hardware endpoints stay at unity; desktop volume belongs to virtual sinks.
+    for node in json.loads(run('pw-dump')):
+        props = node.get('info', {}).get('props', {})
+        if props.get('node.name') in RAW:
+            run('wpctl', 'set-volume', str(node['id']), '1.0')
+            run('wpctl', 'set-mute', str(node['id']), '0')
+    if ours:
+        run('pactl', 'set-default-sink', target)
+
+
+def main():
+    if not supported():
+        return
+    run('amixer', '-c', CARD, 'controls')
+    mode = 'headphones' if jack_present() else 'speakers'
+    switch(mode)
+    known_speakers = {sink['name']: sink['index'] for sink in list_sinks() if sink['name'] in SPEAKERS}
+    processes = [subprocess.Popen(args, stdout=subprocess.PIPE, text=True, bufsize=1)
+                 for args in (['stdbuf', '-oL', 'alsactl', 'monitor', 'hw:' + CARD],
+                              ['stdbuf', '-oL', 'pactl', 'subscribe'])]
+    selector = selectors.DefaultSelector()
+    for process in processes:
+        selector.register(process.stdout, selectors.EVENT_READ, process)
+    try:
+        while True:
+            for key, _ in selector.select():
+                line = key.fileobj.readline()
+                if not line:
+                    raise RuntimeError('Audio event monitor exited')
+                if key.data is processes[0] and 'Headphone Jack' in line:
+                    next_mode = 'headphones' if jack_present() else 'speakers'
+                    if next_mode != mode:
+                        switch(next_mode)
+                        mode = next_mode
+                        known_speakers.clear()
+                elif key.data is processes[1] and (' on sink #' in line or ' on server ' in line):
+                    if mode == 'speakers':
+                        reconcile_speakers(known_speakers)
+    finally:
+        for process in processes:
+            process.terminate()
+            process.wait(timeout=3)
+
+
+if __name__ == '__main__':
+    main()
