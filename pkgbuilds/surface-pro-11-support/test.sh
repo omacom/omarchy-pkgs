@@ -316,9 +316,10 @@ flex denali reconnect
 # Pen pairing. The stub bluetoothctl acts like BlueZ: a pen paired before
 # advertises only as changes to its device (no name), a pen that is not shows
 # up as a new device, and a pen still bonded refuses to pair again. With
-# prompts, another device connects and asks to pair while the pen pairs, then
-# the pen asks; each answer is logged. The stub btmgmt keeps LE privacy's
-# state, and the log records it at the pairing.
+# prompts, other devices ask to pair, confirm a passkey and use a service while
+# the pen pairs, and each answer is logged; the pen's own pairing asks nothing,
+# as BlueZ accepts a Just Works pairing that `pair` started. The stub btmgmt
+# keeps LE privacy's state, and the log records it at the pairing.
 penbin=$scratch/penbin; pen_state=$scratch/pen; mkdir -p "$penbin"
 pen=AA:BB:CC:DD:EE:01
 cat >"$penbin/bluetoothctl" <<'STUB'
@@ -349,13 +350,11 @@ while read -r cmd arg; do
       echo "Attempting to pair with $pen"
       if [[ -e $s/prompts ]]; then
         echo "[NEW] Device 11:22:33:44:55:66 11-22-33-44-55-66"
-        echo "Request authorization"
-        echo "[agent] Accept pairing (yes/no):"
-        read -r answer; echo "other answered $answer" >>"$s/log"
+        for prompt in "Accept pairing" "Confirm passkey 123456" "Authorize service 00001812-0000-1000-8000-00805f9b34fb"; do
+          echo "[agent] $prompt (yes/no):"
+          read -r answer; echo "answered $answer" >>"$s/log"
+        done
         echo "[CHG] Device $pen Connected: yes"
-        echo "Request confirmation"
-        echo "[agent] Confirm passkey 000000 (yes/no):"
-        read -r answer; echo "pen answered $answer" >>"$s/log"
       fi
       if [[ -e $s/bonded ]]; then echo "Failed to pair: org.bluez.Error.AlreadyExists"
       else touch "$s/bonded"; echo "Pairing successful"; fi ;;
@@ -423,9 +422,9 @@ grep -qx "pair privacy=on" "$pen_state/log" && privacy_restored ||
   fail "the pen pairs with privacy on, and privacy is off again afterwards"
 
 pen_reset; touch "$pen_state/advertising" "$pen_state/prompts"
-pen_pair y || fail "a new pen pairs when it asks for confirmation"
-grep -qx "other answered no" "$pen_state/log" && grep -qx "pen answered yes" "$pen_state/log" ||
-  fail "only the approved pen's pairing prompt is answered yes"
+pen_pair y || fail "a new pen pairs while other devices ask to pair"
+(( $(grep -cx "answered no" "$pen_state/log") == 3 )) && ! grep -q "answered yes" "$pen_state/log" ||
+  fail "every agent prompt is turned down while the pen pairs"
 privacy_restored || fail "privacy is off again after a pairing with prompts"
 
 pen_reset; echo on >"$pen_state/privacy"; touch "$pen_state/advertising"
