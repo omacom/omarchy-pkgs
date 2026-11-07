@@ -18,10 +18,12 @@ source "$package_dir/PKGBUILD"
 pkgdir="$scratch/pkg"
 (cd "$package_dir" && package)
 
-ucm="$pkgdir/usr/share/alsa/ucm2/conf.d/x1e80100/ASUSTeKCOMPUTERINC.-Zenbook14UX3480QA-1.0-UX3480QA.conf"
-[[ -f $ucm ]] || fail "the profile is named after the card's long name"
-grep -qxF 'Include.t14s.File "/Qualcomm/x1e80100/LENOVO-T14s.conf"' "$ucm" ||
-  fail "the profile includes the T14s profile"
+for model in UX3480QA UX3480QAB; do
+  ucm="$pkgdir/usr/share/alsa/ucm2/conf.d/x1e80100/ASUSTeKCOMPUTERINC.-Zenbook14$model-1.0-$model.conf"
+  [[ -f $ucm ]] || fail "the $model profile is named after the card's long name"
+  grep -qxF 'Include.t14s.File "/Qualcomm/x1e80100/LENOVO-T14s.conf"' "$ucm" ||
+    fail "the $model profile includes the T14s profile"
+done
 
 # Where alsa-ucm-conf is installed, check that the profile it names still
 # exists and still drives two speakers.

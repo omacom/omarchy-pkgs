@@ -19,6 +19,7 @@ and PipeWire offers no speakers, microphones or headset.
 The board has the A14's audio layout: two WSA884x speakers, two DMICs on the VA macro, a WCD938x headset jack and three DP/HDMI outputs. This package installs a profile for the card's long name that includes the ThinkPad T14s profile, the one alsa-ucm-conf gives the A14:
 
 - `/usr/share/alsa/ucm2/conf.d/x1e80100/ASUSTeKCOMPUTERINC.-Zenbook14UX3480QA-1.0-UX3480QA.conf` → `Qualcomm/x1e80100/LENOVO-T14s.conf` (alsa-ucm-conf)
+- `/usr/share/alsa/ucm2/conf.d/x1e80100/ASUSTeKCOMPUTERINC.-Zenbook14UX3480QAB-1.0-UX3480QAB.conf`, the same profile for the UX3480QAB, whose product and board names end in B
 
 UCM looks up `conf.d/<driver>/<long name>.conf` before the driver's own profile. The kernel builds the long name from DMI (`board_vendor-product_name-product_version-board_name`, stripped of spaces).
 
