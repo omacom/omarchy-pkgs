@@ -315,7 +315,10 @@ flex denali reconnect
 
 # Pen pairing. The stub bluetoothctl acts like BlueZ: a pen paired before
 # advertises only as changes to its device (no name), a pen that is not shows
-# up as a new device, and a pen still bonded refuses to pair again.
+# up as a new device, and a pen still bonded refuses to pair again. With
+# prompts, another device connects and asks to pair while the pen pairs, then
+# the pen asks; each answer is logged. The stub btmgmt keeps LE privacy's
+# state, and the log records it at the pairing.
 penbin=$scratch/penbin; pen_state=$scratch/pen; mkdir -p "$penbin"
 pen=AA:BB:CC:DD:EE:01
 cat >"$penbin/bluetoothctl" <<'STUB'
@@ -342,14 +345,35 @@ while read -r cmd arg; do
       fi ;;
     "pair $pen")
       echo "pair" >>"$s/log"
+      echo "pair privacy=$([[ -e $s/privacy ]] && echo on || echo off)" >>"$s/log"
+      echo "Attempting to pair with $pen"
+      if [[ -e $s/prompts ]]; then
+        echo "[NEW] Device 11:22:33:44:55:66 11-22-33-44-55-66"
+        echo "Request authorization"
+        echo "[agent] Accept pairing (yes/no):"
+        read -r answer; echo "other answered $answer" >>"$s/log"
+        echo "[CHG] Device $pen Connected: yes"
+        echo "Request confirmation"
+        echo "[agent] Confirm passkey 000000 (yes/no):"
+        read -r answer; echo "pen answered $answer" >>"$s/log"
+      fi
       if [[ -e $s/bonded ]]; then echo "Failed to pair: org.bluez.Error.AlreadyExists"
       else touch "$s/bonded"; echo "Pairing successful"; fi ;;
     'quit ') exit 0 ;;
   esac
 done
 STUB
-printf '#!/bin/bash\n[[ $1 == info ]] && printf "hci0:\\tPrimary controller\\n\\tcurrent settings: powered le privacy \\n"\nexit 0\n' >"$penbin/btmgmt"
-printf '#!/bin/bash\nexit 0\n' >"$penbin/sudo"
+cat >"$penbin/btmgmt" <<'STUB'
+#!/bin/bash
+s=$PEN_STATE
+case $1 in
+  info) printf 'hci0:\tPrimary controller\n\tcurrent settings: powered le%s \n' "$([[ -e $s/privacy ]] && echo ' privacy')" ;;
+  privacy) echo "btmgmt privacy $2" >>"$s/log"
+           if [[ $2 == on ]]; then touch "$s/privacy"; else rm -f "$s/privacy"; fi ;;
+esac
+exit 0
+STUB
+printf '#!/bin/bash\n[[ $1 == -v ]] && exit 0\nexec "$@"\n' >"$penbin/sudo"
 chmod +x "$penbin"/*
 cat >"$scratch/pen-pair.py" <<'EOF'
 import importlib.machinery, importlib.util, sys
@@ -368,14 +392,19 @@ pen_pair() {
     "$package_dir/surface-pro-11-pen-pair" <<<"$1" >/dev/null 2>&1
 }
 pen_removed() { grep -qx "remove $pen" "$pen_state/log"; }
+# Privacy starts off; every run turns it back off, however it ends.
+privacy_restored() { [[ ! -e $pen_state/privacy ]]; }
 
 pen_reset; touch "$pen_state/bonded" "$pen_state/advertising"
 ! pen_pair n || fail "declining the pen found ends without pairing"
 [[ -e $pen_state/bonded ]] && ! pen_removed || fail "a declined pen keeps its bond"
+grep -qx "btmgmt privacy on" "$pen_state/log" && privacy_restored ||
+  fail "privacy goes on for the search and off again after a declined pen"
 
 pen_reset; touch "$pen_state/bonded"
 ! pen_pair "" || fail "no pen found is a failure"
 [[ -e $pen_state/bonded ]] && ! pen_removed || fail "a run that finds no pen keeps the paired pen"
+privacy_restored || fail "privacy is off again after a run that finds no pen"
 
 pen_reset; touch "$pen_state/bonded" "$pen_state/battery-only"
 ! pen_pair y || fail "a connected pen's battery report is not a pen in pairing mode"
@@ -390,6 +419,19 @@ pen_removed && grep -qx pair "$pen_state/log" && grep -qx "trust $pen" "$pen_sta
 pen_reset; touch "$pen_state/advertising"
 pen_pair y || fail "a new pen pairs once approved"
 ! pen_removed || fail "pairing a new pen removes nothing"
+grep -qx "pair privacy=on" "$pen_state/log" && privacy_restored ||
+  fail "the pen pairs with privacy on, and privacy is off again afterwards"
+
+pen_reset; touch "$pen_state/advertising" "$pen_state/prompts"
+pen_pair y || fail "a new pen pairs when it asks for confirmation"
+grep -qx "other answered no" "$pen_state/log" && grep -qx "pen answered yes" "$pen_state/log" ||
+  fail "only the approved pen's pairing prompt is answered yes"
+privacy_restored || fail "privacy is off again after a pairing with prompts"
+
+pen_reset; echo on >"$pen_state/privacy"; touch "$pen_state/advertising"
+pen_pair y || fail "a new pen pairs while privacy is already on"
+[[ -e $pen_state/privacy ]] && ! grep -q "btmgmt privacy" "$pen_state/log" ||
+  fail "privacy that was on before stays on, untouched"
 
 for tool in surface-pro-11-flex-pair surface-pro-11-pen-pair; do
   python -c 'import ast, sys; ast.parse(open(sys.argv[1]).read())' "$package_dir/$tool" ||
