@@ -43,6 +43,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.list.outputs.matrix }}
+      runners: ${{ steps.list.outputs.runners }}
       count: ${{ steps.gate.outputs.count }}
       trusted: ${{ steps.gate.outputs.trusted }}
       vouch_status: ${{ steps.vouch.outputs.status }}
@@ -133,8 +134,18 @@ jobs:
               { echo "Reused existing build artifacts (${#reused[@]}):"; printf -- '- %s\n' "${reused[@]}"; } >> "$GITHUB_STEP_SUMMARY"
             fi
           fi
-          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
-          echo "planned=$(jq '.include | length' <<<"$matrix")" >> "$GITHUB_OUTPUT"
+          # The runner of each entry moves to a map: GitHub names a matrix job
+          # after its values, and a runner list in every check name helps
+          # nobody. A base whose build-matrix predates runners has none.
+          runners=$(jq -c 'reduce (.include[] | select((.runner // "") != "")) as $e ({}; .[$e.package][$e.arch] = ($e.runner | fromjson))' <<<"$matrix")
+          matrix=$(jq -c '{include: [.include[] | del(.runner)]}' <<<"$matrix")
+          {
+            echo "matrix=$matrix"
+            echo "runners=$runners"
+            # The DKMS check needs every package that would publish, reused ones too.
+            echo "reused=$(printf '%s\n' "${reused[@]:-}" | jq -Rsc 'split("\n") | map(select(length > 0))')"
+            echo "planned=$(jq '.include | length' <<<"$matrix")"
+          } >> "$GITHUB_OUTPUT"
           jq -r '.include[] | "\(.package) \(.arch) -> \(.channels)"' <<<"$matrix"
           # A PR whose diff against its base is empty changes nothing: its
           # content already landed some other way (a sync PR beat it, or a
@@ -175,6 +186,28 @@ jobs:
             fi
           fi
 
+      # What this build ships, for the DKMS check (dkms-check.yml). It runs
+      # after this run completes, from master's copy, and reads this as data:
+      # whether the build ran, its matrix, and the artifacts it reused.
+      - name: Record what the DKMS check reads
+        if: github.event_name == 'pull_request'
+        env:
+          MATRIX: ${{ steps.list.outputs.matrix }}
+          REUSED: ${{ steps.list.outputs.reused }}
+          TRUSTED: ${{ steps.gate.outputs.trusted }}
+        run: |
+          jq -n --argjson matrix "$MATRIX" --argjson reused "$REUSED" --arg trusted "$TRUSTED" \
+            '{trusted: ($trusted == "true"), matrix: $matrix, reused: $reused}' >dkms-request.json
+          cat dkms-request.json
+      - if: github.event_name == 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: dkms-request
+          path: dkms-request.json
+          if-no-files-found: error
+          retention-days: 7
+          overwrite: true
+
   build:
     needs: changes
     if: needs.changes.outputs.count != '0'
@@ -184,12 +217,14 @@ jobs:
     # build it natively in 11 minutes, and linux-aurora in 30 (72 under QEMU).
     # An aarch64 kernel goes to Namespace's Apple-backed runner instead:
     # linux-omarchy-n1x took 1h45m on the 4 vCPU, and takes 24 minutes there. bin/build-matrix names the runner for each
-    # entry (package_runner); a base branch whose build-matrix predates that
-    # gives none, and gets the runners named here.
-    # The name GitHub made from the matrix before it carried the runner, so
-    # the checks on a pull request keep the names they had.
-    name: build (${{ matrix.package }}, ${{ matrix.arch }}, ${{ matrix.channels }}, ${{ matrix.publish_arches }})
-    runs-on: ${{ matrix.runner && fromJSON(matrix.runner) || (matrix.arch == 'aarch64' && 'ubuntu-24.04-arm' || fromJSON('["self-hosted","omarchy-builder"]')) }}
+    # entry (package_runner), and the changes job moves it to the runners
+    # map; a base branch whose build-matrix predates that gives none, and gets
+    # the runners named here.
+    # No name: GitHub's own, "build (package, arch, channels, publish_arches)",
+    # is the one these checks always had, and a build that is skipped shows as
+    # plain "build". A name with matrix expressions shows them unevaluated
+    # then, because GitHub evaluates nothing for a skipped job.
+    runs-on: ${{ fromJSON(needs.changes.outputs.runners || '{}')[matrix.package][matrix.arch] || (matrix.arch == 'aarch64' && 'ubuntu-24.04-arm' || fromJSON('["self-hosted","omarchy-builder"]')) }}
     timeout-minutes: 180
     strategy:
       fail-fast: false
