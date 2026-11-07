@@ -1,0 +1,104 @@
+#!/bin/bash
+# Fail when publishing packages would leave a dependency unmet on a channel
+# they ship to, the way Arch's hyprland 0.57.0 left omarchy-hyprland-titlebars
+# (hyprland=0.56.2) unmet on edge on 2026-10-28 and stopped every update.
+#
+# Usage: bin/check-publish [--remote <rclone remote>] --channels "<channel>..." --arches "<arch>..." <package file>...
+#
+# With --remote it reads each channel's database where bin/publish-artifact
+# writes it, OMARCHY_PUBLISH_PREFIX included, so a proof run is checked
+# against its scratch channel. Without it, the live copy on pkgs.omarchy.org.
+#
+# For each channel and architecture it runs bin/check-dependencies twice on
+# the live databases, as they are and with the packages added, and fails on
+# any unmet dependency only the second run has. Packages a channel already
+# cannot install do not fail a publish that leaves them as they were.
+# Needs bsdtar, repo-add and vercmp: run it in the builder image.
+set -euo pipefail
+BUILD_ROOT=$(realpath "${BASH_SOURCE[0]%/*}/..")
+
+channels="" arches="" remote=""
+while [[ $# -gt 0 && $1 == --* ]]; do
+  case $1 in
+    --channels) channels=${2:?Missing channels}; shift 2 ;;
+    --arches) arches=${2:?Missing architectures}; shift 2 ;;
+    --remote) remote=${2:?Missing remote}; shift 2 ;;
+    *) echo "Unknown option: $1" >&2; exit 2 ;;
+  esac
+done
+[[ -n $channels && -n $arches ]] && (( $# )) || {
+  echo "usage: ${0##*/} --channels \"<channel>...\" --arches \"<arch>...\" <package file>..." >&2
+  exit 2
+}
+
+# The Arch databases each channel's machines use, in pacman.conf order, as in
+# build/Dockerfile.
+arch_dbs() { # arch_dbs <channel> <arch>
+  local host repo
+  case "$2:$1" in
+    x86_64:edge) host=mirror.omarchy.org ;;
+    x86_64:rc|x86_64:stable) host=$1-mirror.omarchy.org ;;
+    aarch64:edge) host=arm-mirror.omarchy.org ;;
+    aarch64:rc|aarch64:stable) host=arm-$1-mirror.omarchy.org ;;
+    *) echo "unknown channel $1 for $2" >&2; return 2 ;;
+  esac
+  if [[ $2 == x86_64 ]]; then
+    for repo in core extra multilib; do echo "https://$host/$repo/os/$2/$repo.db"; done
+  else
+    for repo in core extra alarm aur; do echo "https://$host/$2/$repo/$repo.db"; done
+  fi
+}
+
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+failed=()
+for arch in $arches; do
+  for channel in $channels; do
+    dir="$work/$channel-$arch"
+    mkdir -p "$dir"
+    if [[ -n $remote ]]; then
+      prefix=${OMARCHY_PUBLISH_PREFIX:-}
+      rclone copyto "$remote/${prefix:+$prefix/}$channel/$arch/omarchy.db.tar.zst" "$dir/now.db.tar.zst" --s3-no-head 2>/dev/null || true
+      # A new scratch channel has no database yet; the publish creates one.
+      [[ -s $dir/now.db.tar.zst ]] || bsdtar -cf "$dir/now.db.tar.zst" --zstd -T /dev/null
+    else
+      curl -fsSL --retry 3 "https://pkgs.omarchy.org/$channel/$arch/omarchy.db" -o "$dir/now.db.tar.zst"
+    fi
+    dbs=()
+    while read -r url; do
+      curl -fsSL --retry 3 "$url" -o "$dir/${url##*/}"
+      dbs+=("$dir/${url##*/}")
+    done < <(arch_dbs "$channel" "$arch")
+    # The same download on both sides, so a publish in between cannot show up.
+    cp "$dir/now.db.tar.zst" "$dir/with.db.tar.zst"
+    # Only what bin/publish-artifact would publish: a file newer than the
+    # channel's copy of the same name.
+    served=$(bsdtar -xOf "$dir/now.db.tar.zst" '*/desc' | awk '/^%NAME%$/ { getline; n = $0 } /^%VERSION%$/ { getline; print n, $0 }')
+    ships=()
+    for file in "$@"; do
+      read -r name version < <(bsdtar -xOf "$file" .PKGINFO | awk -F' = ' '$1 == "pkgname" { n = $2 } $1 == "pkgver" { v = $2 } END { print n, v }')
+      have=$(awk -v n="$name" '$1 == n { print $2; exit }' <<<"$served")
+      if [[ -z $have ]] || (( $(vercmp "$version" "$have") > 0 )); then ships+=("$file"); fi
+    done
+    if (( ${#ships[@]} == 0 )); then
+      echo "$channel ($arch): already serves these versions, nothing to check"
+      continue
+    fi
+    repo-add -q "$dir/with.db.tar.zst" "${ships[@]}" >/dev/null
+    "$BUILD_ROOT/bin/check-dependencies" "$dir/now.db.tar.zst" "${dbs[@]}" > "$dir/before"
+    "$BUILD_ROOT/bin/check-dependencies" "$dir/with.db.tar.zst" "${dbs[@]}" > "$dir/after"
+    new=$(comm -13 "$dir/before" "$dir/after")
+    if [[ -n $new ]]; then
+      echo "Publishing ${ships[*]##*/} leaves these unmet on $channel ($arch):"
+      awk -F'\t' '{ printf "  %s needs %s\n", $1, $2 }' <<<"$new"
+      failed+=("$channel/$arch")
+    else
+      echo "$channel ($arch): no new unmet dependencies ($(wc -l < "$dir/before") already unmet)"
+    fi
+  done
+done
+
+if (( ${#failed[@]} )); then
+  echo "Dependencies break on ${failed[*]}. Rebuild or re-pin those packages in the same change, or publish them first." >&2
+  exit 1
+fi
