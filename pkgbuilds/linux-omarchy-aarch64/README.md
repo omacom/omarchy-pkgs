@@ -125,6 +125,8 @@ The laptops get no device tree from their firmware, so the package builds the Wi
 
 `ARM_SCMI_CPUFREQ` and `ARM_SCMI_PERF_DOMAIN` are built in since `7.2.8-5`. The X1 and X2 CPUs scale through SCMI's performance protocol, and neither module carries an alias, so as modules nothing loaded them: the laptops booted with no cpufreq policies and ran at whatever clock the firmware left. Arch Linux ARM's kernel builds both in. The N1x scales through ACPI CPPC and is unaffected.
 
+FAT mounts as on x86_64's `linux-omarchy` since `7.3-23`. `FAT_DEFAULT_IOCHARSET` is `ascii`, `FAT_DEFAULT_UTF8` is on and `NLS_ASCII` is built in. The N1x config kept the kernel's own default, `iso8859-1` without UTF-8, so FAT file names came out as Latin-1 bytes unless a mount asked for `utf8`. mkinitcpio adds only `nls_ascii` and `nls_cp437` for FAT, so no initramfs could mount FAT either: the live image stopped in a shell when booted from a stick with the ISO copied onto FAT32 ("IO charset iso8859-1 not found").
+
 Two differences from Arch Linux ARM's kernel matter on these laptops. Omarchy's Snapdragon setup handles both, so the config stays as the N1x needs it.
 
 - The X1 pin control, interconnect, PMIC and bus drivers are modules here and built in there. mkinitcpio's hooks only pick storage, input and display drivers, so the setup names them for the initramfs.
@@ -330,6 +332,12 @@ On 7.2.8 it went through `olddefconfig` again and took the architecture-independ
 On 7.3 it went through `olddefconfig` once more, with four modules set by hand. `QCOM_SPMI_ADC5_GEN3` is new to the config because 7.3's `hamoa-pmics.dtsi` wires the X1 PMICs' temperature alarms to the PMK8550's ADC5 Gen3, and without it they stay in deferred probe. `HW_RANDOM_QCOM` is 7.3's name for `CRYPTO_DEV_QCOM_RNG`, which `olddefconfig` would otherwise turn off. `AMD_SBTSI` keeps `SENSORS_SBTSI`, which now depends on it. 7.3 marks the Qualcomm crypto engine (`CRYPTO_DEV_QCE`) as broken on Qualcomm SoCs, so it is gone. New symbols keep their defaults.
 
 `FB_NVIDIA` is off since 7.3-3. `nvidiafb` matches every NVIDIA display controller, the N1x GPU included, and Omarchy had to blacklist it.
+
+Since `7.3-24` it also takes three of `linux-omarchy`'s choices that the NVIDIA settings had left at Ubuntu's values:
+
+- `EFI_VARS_PSTORE_DEFAULT_DISABLE` is on. systemd loads `efi_pstore` at boot, and on the Snapdragon laptops the UEFI variables are writable through the firmware's `uefisecapp`, so with it off an oops or panic wrote the kernel log into the firmware's variable store. `efi_pstore.pstore_disable=0` turns it back on.
+- `RCU_LAZY_DEFAULT_OFF` is off, so RCU batches callbacks while the system is idle, as on x86_64.
+- `MODULE_COMPRESS_ALL` is on, so `modules_install` compresses the modules with the `ZSTD_CLEVEL=19` the recipe already sets. Without it they shipped uncompressed: 731 MB for 7.3-4.
 
 The Surface Laptop 8 patches add `USB4_QCOM`, built as the `thunderbolt_qcom` module, and `QCOM_SCMI_GENERIC_EXT`, `DEVFREQ_GOV_REMOTE` and `SCMI_QCOM_MEMLAT_DEVFREQ`, built in as on that laptop's own package, and the config builds the Glymur GPU clock controller (`CLK_GLYMUR_GPUCC`), which the X2's GPU needs, and its video clock controller (`CLK_GLYMUR_VIDEOCC`), which `glymur.dtsi` describes, as modules.
 
