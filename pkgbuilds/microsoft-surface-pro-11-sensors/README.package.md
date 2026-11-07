@@ -1,4 +1,4 @@
-# surface-pro-11-sensors
+# microsoft-surface-pro-11-sensors
 
 Ambient light for the Microsoft Surface Pro 11 with Snapdragon X Elite. The AMS TCS3430 colour sensor is run by the Qualcomm sensor core on the ADSP, which needs its configuration served from the host before it reports anything:
 

@@ -283,4 +283,4 @@ for compatible in microsoft,surface-laptop-8-13p8 microsoft,surface-laptop-8-15;
     fail "the board list is installed for $compatible"
 done
 
-echo "ok - surface-laptop-8-support"
+echo "ok - microsoft-surface-laptop-8-support"

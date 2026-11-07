@@ -526,4 +526,4 @@ grep -q '^AttrEventCode=-BTN_RIGHT$' "$package_dir/50-surface-pro-11-flex-keyboa
 grep -q 'usr/share/libinput/50-surface-pro-11-flex-keyboard.quirks' "$package_dir/PKGBUILD" ||
   fail "the touchpad quirk is installed where libinput reads quirks"
 
-echo "ok - surface-pro-11-support verifies its hardware setup"
+echo "ok - microsoft-surface-pro-11-support verifies its hardware setup"

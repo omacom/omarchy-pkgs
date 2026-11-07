@@ -105,4 +105,4 @@ grep -q 'ACTION=="add".*DEVTYPE}=="wlan".*DRIVERS=="ath12k_pci|ath12k_wifi7_pci"
   <(tr -d '\\\n' <"$package_dir/81-surface-wifi-address.rules") ||
   fail "udev sets each ath12k Wi-Fi address under its name after renaming, while adding the interface"
 
-echo "ok - surface-snapdragon-addresses derives addresses only on Microsoft machines with the variable"
+echo "ok - microsoft-surface-snapdragon-addresses derives addresses only on Microsoft machines with the variable"
