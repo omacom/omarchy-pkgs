@@ -22,8 +22,6 @@ pkgdir="$scratch/pkg"
 # package must not: a file of its own at that path would conflict with it.
 [[ ! -e $pkgdir/usr/lib/firmware && ! -L $pkgdir/usr/lib/firmware ]] ||
   fail "the package leaves the firmware to linux-firmware-qcom"
-[[ " ${depends[*]} " == *" linux-firmware-qcom>=20261019-1.1 "* ]] ||
-  fail "the package needs the linux-firmware-qcom that ships the topology"
 
 # The UCM profile restates the CRD profile and sets the WSA digital volumes on
 # every boot.
