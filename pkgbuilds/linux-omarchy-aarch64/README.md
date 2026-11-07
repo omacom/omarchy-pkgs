@@ -125,6 +125,16 @@ The laptops get no device tree from their firmware, so the package builds the Wi
 
 `2217` keeps an open geni UART clocked across system sleep and releases only its baud-rate OPP vote and interconnect vote, instead of the force suspend 7.3 added (d0cd9c8d0fd5). On the Surface Pro 11 the Surface Aggregator EC sits on such a UART, and with the force suspend a suspend that closely follows a resume could leave the EC link dead: every SAM request timed out and the machine hung in resume. Dropping the force suspend alone avoids that but keeps CX from collapsing, because the OPP vote stays in the sleep set. Why keeping the engine clocked avoids the hang is not established. The change is in the generic driver, so it changes the sleep path of every open geni UART, Bluetooth on the X1 laptops included; closed, runtime-suspended ports are left alone, as before. Runtime PM stays off across the transition, as it did with the force suspend, so a wake interrupt can't bring a closed port back up partway through suspend and leave it holding its votes for the whole sleep.
 
+`2218` and `2219` let a laptop's device tree turn on QSEECOM, through which Linux reads and writes the UEFI variables: `efibootmgr`'s boot entries and the RTC offset the firmware keeps there. `qcom_scm` uses QSEECOM only on the machines in its allowlist, so every laptop added here also needed a driver patch, and with it a kernel rebuild. A tree can now say instead that its firmware runs the UEFI secure application:
+
+```
+&scm {
+	qcom,uefisecapp;
+};
+```
+
+`2218` adds the boolean to the SCM binding, so `CHECK_DTBS` accepts it, and `2219` allows QSEECOM where it is set, as for the machines on the allowlist. Laptops added from now on use it instead of an allowlist patch. The allowlist entries already carried here stay.
+
 `ARM_SCMI_CPUFREQ` and `ARM_SCMI_PERF_DOMAIN` are built in since `7.2.8-5`. The X1 and X2 CPUs scale through SCMI's performance protocol, and neither module carries an alias, so as modules nothing loaded them: the laptops booted with no cpufreq policies and ran at whatever clock the firmware left. Arch Linux ARM's kernel builds both in. The N1x scales through ACPI CPPC and is unaffected.
 
 FAT mounts as on x86_64's `linux-omarchy` since `7.3-23`. `FAT_DEFAULT_IOCHARSET` is `ascii`, `FAT_DEFAULT_UTF8` is on and `NLS_ASCII` is built in. The N1x config kept the kernel's own default, `iso8859-1` without UTF-8, so FAT file names came out as Latin-1 bytes unless a mount asked for `utf8`. mkinitcpio adds only `nls_ascii` and `nls_cp437` for FAT, so no initramfs could mount FAT either: the live image stopped in a shell when booted from a stick with the ISO copied onto FAT32 ("IO charset iso8859-1 not found").
