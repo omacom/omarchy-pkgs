@@ -313,6 +313,83 @@ flex_reset; flex_attach; flex_bond
 flex denali reconnect
 ! flex_did "connect $keyboard" || fail "an attached keyboard is not connected over Bluetooth"
 
+# Pen pairing. The stub bluetoothctl acts like BlueZ: a pen paired before
+# advertises only as changes to its device (no name), a pen that is not shows
+# up as a new device, and a pen still bonded refuses to pair again.
+penbin=$scratch/penbin; pen_state=$scratch/pen; mkdir -p "$penbin"
+pen=AA:BB:CC:DD:EE:01
+cat >"$penbin/bluetoothctl" <<'STUB'
+#!/bin/bash
+s=$PEN_STATE; pen=AA:BB:CC:DD:EE:01
+if (( $# )); then
+  echo "$*" >>"$s/log"
+  case $1 in
+    show) printf 'Controller X\n\tPowered: yes\n\tPairable: no\n' ;;
+    devices) [[ -e $s/bonded ]] && echo "Device $pen Surface Slim Pen 2" ;;
+    info) if [[ -e $s/bonded ]]; then printf '\tPaired: yes\n\tBonded: yes\n\tBattery Percentage: 0x55 (85)\n'
+          else printf '\tPaired: no\n'; fi ;;
+    remove) rm -f "$s/bonded" ;;
+  esac
+  exit 0
+fi
+while read -r cmd arg; do
+  case "$cmd $arg" in
+    'scan le')
+      [[ -e $s/battery-only ]] && echo "[CHG] Device $pen Battery Percentage: 0x55 (85)"
+      if [[ -e $s/advertising ]]; then
+        if [[ -e $s/bonded ]]; then echo "[CHG] Device $pen RSSI: 0xffffffc4 (-60)"
+        else echo "[NEW] Device $pen Surface Slim Pen 2"; fi
+      fi ;;
+    "pair $pen")
+      echo "pair" >>"$s/log"
+      if [[ -e $s/bonded ]]; then echo "Failed to pair: org.bluez.Error.AlreadyExists"
+      else touch "$s/bonded"; echo "Pairing successful"; fi ;;
+    'quit ') exit 0 ;;
+  esac
+done
+STUB
+printf '#!/bin/bash\n[[ $1 == info ]] && printf "hci0:\\tPrimary controller\\n\\tcurrent settings: powered le privacy \\n"\nexit 0\n' >"$penbin/btmgmt"
+printf '#!/bin/bash\nexit 0\n' >"$penbin/sudo"
+chmod +x "$penbin"/*
+cat >"$scratch/pen-pair.py" <<'EOF'
+import importlib.machinery, importlib.util, sys
+loader = importlib.machinery.SourceFileLoader('pen_pair', sys.argv[1])
+spec = importlib.util.spec_from_loader('pen_pair', loader)
+pen_pair = importlib.util.module_from_spec(spec)
+loader.exec_module(pen_pair)
+pen_pair.WAIT = 6
+sys.exit(pen_pair.main())
+EOF
+pen_reset() { rm -rf "$pen_state"; mkdir -p "$pen_state"; : >"$pen_state/log"; }
+# pen_pair ANSWERS: run the script, answering its prompts with ANSWERS.
+pen_pair() {
+  PATH="$penbin:$PATH" PEN_STATE=$pen_state python3 "$scratch/pen-pair.py" \
+    "$package_dir/surface-pro-11-pen-pair" <<<"$1" >/dev/null 2>&1
+}
+pen_removed() { grep -qx "remove $pen" "$pen_state/log"; }
+
+pen_reset; touch "$pen_state/bonded" "$pen_state/advertising"
+! pen_pair n || fail "declining the pen found ends without pairing"
+[[ -e $pen_state/bonded ]] && ! pen_removed || fail "a declined pen keeps its bond"
+
+pen_reset; touch "$pen_state/bonded"
+! pen_pair "" || fail "no pen found is a failure"
+[[ -e $pen_state/bonded ]] && ! pen_removed || fail "a run that finds no pen keeps the paired pen"
+
+pen_reset; touch "$pen_state/bonded" "$pen_state/battery-only"
+! pen_pair y || fail "a connected pen's battery report is not a pen in pairing mode"
+[[ -e $pen_state/bonded ]] || fail "a connected pen that is not in pairing mode keeps its bond"
+
+pen_reset; touch "$pen_state/bonded" "$pen_state/advertising"
+pen_pair y || fail "a pen paired before pairs again once approved"
+pen_removed && grep -qx pair "$pen_state/log" && grep -qx "trust $pen" "$pen_state/log" ||
+  fail "an approved pen loses its old bond, then pairs and is trusted"
+(( $(grep -cx pair "$pen_state/log") == 1 )) || fail "the old bond goes before the pairing, not after a refusal"
+
+pen_reset; touch "$pen_state/advertising"
+pen_pair y || fail "a new pen pairs once approved"
+! pen_removed || fail "pairing a new pen removes nothing"
+
 for tool in surface-pro-11-flex-pair surface-pro-11-pen-pair; do
   python -c 'import ast, sys; ast.parse(open(sys.argv[1]).read())' "$package_dir/$tool" ||
     fail "$tool is valid Python"
