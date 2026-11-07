@@ -226,3 +226,25 @@ for recipe in omarchy-settings omarchy-settings-dev; do
     fail 'x86_64 gains only the new source files from a runtime-profile source' "$(cat "$scratch/added")"
   echo "PASS: $recipe: a runtime-profile source ships the full set on aarch64"
 done
+
+# New services must be discoverable by systemd, not only in the source archive.
+optional_units=(omarchy-gpd-pocket-4-rotate)
+for unit in "${optional_units[@]}"; do
+  printf 'fixture for %s\n' "$unit" >"$scratch/profile/default/systemd/user/$unit.service"
+done
+camera_dropin=default/systemd/user/wireplumber.service.d/10-omarchy-camera-access.conf
+mkdir -p "$scratch/profile/$(dirname "$camera_dropin")"
+printf '[Unit]\nAfter=omarchy-camera-access.service\n' >"$scratch/profile/$camera_dropin"
+for recipe in omarchy-settings omarchy-settings-dev; do
+  for architecture in x86_64 aarch64; do
+    output=services-$recipe-$architecture
+    package_as "$recipe" "$scratch/profile" "$architecture" "$output" checkout
+    for unit in "${optional_units[@]}"; do
+      cmp "$scratch/profile/default/systemd/user/$unit.service" "$scratch/$output/usr/lib/systemd/user/$unit.service" ||
+        fail "$recipe installs $unit unchanged for $architecture"
+    done
+    cmp "$scratch/profile/$camera_dropin" "$scratch/$output/usr/lib/systemd/user/wireplumber.service.d/10-omarchy-camera-access.conf" ||
+      fail "$recipe preserves the camera drop-in alongside rotation for $architecture"
+  done
+  echo "PASS: $recipe installs the rotation user unit on both architectures"
+done
