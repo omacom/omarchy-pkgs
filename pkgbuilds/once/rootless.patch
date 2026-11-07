@@ -1,0 +1,362 @@
+diff --git a/internal/docker/application.go b/internal/docker/application.go
+index 448ef90..aa5d5ed 100644
+--- a/internal/docker/application.go
++++ b/internal/docker/application.go
+@@ -8,6 +8,7 @@ import (
+ 	"io"
+ 	"log/slog"
+ 	"net/http"
++	"os"
+ 	"strconv"
+ 	"strings"
+ 	"time"
+@@ -352,6 +353,9 @@ func (a *Application) deployWithVolume(ctx context.Context, vol *ApplicationVolu
+ 		LogConfig:     ContainerLogConfig(),
+ 		Mounts:        a.volumeMounts(vol),
+ 	}
++	if os.Getenv("ONCE_ROOTLESS") == "1" {
++		hostConfig.Sysctls = map[string]string{"net.ipv4.ip_unprivileged_port_start": "0"}
++	}
+ 	hostConfig.Resources = container.Resources{
+ 		Memory:   int64(a.Settings.Resources.MemoryMB) * 1024 * 1024,
+ 		NanoCPUs: int64(a.Settings.Resources.CPUs) * 1e9,
+diff --git a/internal/docker/application_backup.go b/internal/docker/application_backup.go
+index f3c9f7d..b263b9e 100644
+--- a/internal/docker/application_backup.go
++++ b/internal/docker/application_backup.go
+@@ -264,8 +264,9 @@ func (a *Application) populateVolume(ctx context.Context, vol *ApplicationVolume
+ 		pw.CloseWithError(streamVolumeDataEntries(backup, pw))
+ 	}()
+ 
+-	// Extracting at the root places the data/ entries in the volume mount.
+-	if _, err := a.namespace.client.CopyToContainer(ctx, resp.ID, client.CopyToContainerOptions{DestinationPath: "/", Content: pr}); err != nil {
++	// Target the mount itself: Podman does not route root-directory archive
++	// extraction into the named volumes of a container that has not started.
++	if _, err := a.namespace.client.CopyToContainer(ctx, resp.ID, client.CopyToContainerOptions{DestinationPath: "/" + BackupDataDir, Content: pr}); err != nil {
+ 		return fmt.Errorf("copying data to volume: %w", err)
+ 	}
+ 
+@@ -416,9 +417,25 @@ func streamVolumeDataEntries(backup io.Reader, w io.Writer) error {
+ 	defer gr.Close()
+ 
+ 	tw := tar.NewWriter(w)
++	var archiveErr error
+ 	err = copyTarEntries(gr, tw, func(header *tar.Header) bool {
+-		return header.Name == BackupDataDir || strings.HasPrefix(header.Name, BackupDataDir+"/")
++		if archiveErr != nil {
++			return false
++		}
++		if header.Name == backupAppSettingsEntry || header.Name == backupVolSettingsEntry {
++			return false
++		}
++		if _, pathErr := archiveVolumePath(header.Name, BackupDataDir, BackupDataDir); pathErr != nil || strings.HasPrefix(header.Name, "/") {
++			archiveErr = fmt.Errorf("%w: unexpected data path %q", ErrInvalidBackup, header.Name)
++			return false
++		}
++		header.Name, archiveErr = archiveVolumePath(header.Name, BackupDataDir, ".")
++		if archiveErr == nil && header.Typeflag == tar.TypeLink {
++			header.Linkname, archiveErr = archiveVolumePath(header.Linkname, BackupDataDir, ".")
++		}
++		return archiveErr == nil
+ 	})
++	err = errors.Join(err, archiveErr)
+ 	if err != nil {
+ 		return err
+ 	}
+@@ -426,14 +443,44 @@ func streamVolumeDataEntries(backup io.Reader, w io.Writer) error {
+ }
+ 
+ func copyTarEntriesWithPrefix(src io.Reader, dst *tar.Writer, oldPrefix, newPrefix string) error {
+-	return copyTarEntries(src, dst, func(header *tar.Header) bool {
+-		if header.Name == oldPrefix {
+-			header.Name = newPrefix
+-		} else if strings.HasPrefix(header.Name, oldPrefix+"/") {
+-			header.Name = newPrefix + strings.TrimPrefix(header.Name, oldPrefix)
++	var rewriteErr error
++	err := copyTarEntries(src, dst, func(header *tar.Header) bool {
++		if rewriteErr != nil {
++			return false
++		}
++		header.Name, rewriteErr = archiveVolumePath(header.Name, oldPrefix, newPrefix)
++		if rewriteErr == nil && header.Typeflag == tar.TypeLink {
++			header.Linkname, rewriteErr = archiveVolumePath(header.Linkname, oldPrefix, newPrefix)
+ 		}
+-		return true
++		return rewriteErr == nil
+ 	})
++	return errors.Join(err, rewriteErr)
++}
++
++// Docker includes the requested directory in archive names; Podman uses paths
++// rooted at that directory. Normalize only engine output, never an untrusted
++// backup during restore, and reject traversal or an unexpected relative root.
++func archiveVolumePath(name, oldPrefix, newPrefix string) (string, error) {
++	for _, component := range strings.Split(name, "/") {
++		if component == ".." {
++			return "", fmt.Errorf("unsafe volume archive path %q", name)
++		}
++	}
++	name = strings.TrimSuffix(name, "/")
++	var relative string
++	if strings.HasPrefix(name, "/") || name == "" {
++		relative = strings.TrimLeft(name, "/")
++	} else if name == oldPrefix {
++		relative = ""
++	} else if strings.HasPrefix(name, oldPrefix+"/") {
++		relative = strings.TrimPrefix(name, oldPrefix+"/")
++	} else {
++		return "", fmt.Errorf("unexpected volume archive path %q", name)
++	}
++	if relative == "" {
++		return newPrefix, nil
++	}
++	return newPrefix + "/" + relative, nil
+ }
+ 
+ func copyTarEntries(src io.Reader, dst *tar.Writer, keep func(*tar.Header) bool) error {
+diff --git a/internal/docker/container.go b/internal/docker/container.go
+index a4f1ca1..272632f 100644
+--- a/internal/docker/container.go
++++ b/internal/docker/container.go
+@@ -9,6 +9,7 @@ import (
+ 	"os/signal"
+ 	"sync"
+ 	"syscall"
++	"time"
+ 
+ 	"github.com/charmbracelet/x/term"
+ 	"github.com/moby/moby/api/pkg/stdcopy"
+@@ -148,11 +149,24 @@ func startExec(ctx context.Context, c *client.Client, containerName string, opts
+ }
+ 
+ func inspectExecExitCode(ctx context.Context, c *client.Client, execID string) (int, error) {
+-	inspect, err := c.ExecInspect(ctx, execID, client.ExecInspectOptions{})
+-	if err != nil {
+-		return 0, fmt.Errorf("inspecting exec: %w", err)
++	// Podman may close the attach stream before exec state has been updated.
++	// Running=true with ExitCode=0 is not a successful command result.
++	ctx, cancel := context.WithTimeout(ctx, 150*time.Second)
++	defer cancel()
++	for {
++		inspect, err := c.ExecInspect(ctx, execID, client.ExecInspectOptions{})
++		if err != nil {
++			return 0, fmt.Errorf("inspecting exec: %w", err)
++		}
++		if !inspect.Running {
++			return inspect.ExitCode, nil
++		}
++		select {
++		case <-ctx.Done():
++			return 0, ctx.Err()
++		case <-time.After(20 * time.Millisecond):
++		}
+ 	}
+-	return inspect.ExitCode, nil
+ }
+ 
+ func copyExecOutput(r io.Reader, tty bool) error {
+diff --git a/internal/docker/proxy.go b/internal/docker/proxy.go
+index e42663e..2cd8582 100644
+--- a/internal/docker/proxy.go
++++ b/internal/docker/proxy.go
+@@ -9,6 +9,7 @@ import (
+ 	"io"
+ 	"log/slog"
+ 	"net/netip"
++	"os"
+ 	"strings"
+ 
+ 	"github.com/containerd/errdefs"
+@@ -72,9 +73,15 @@ func NewProxy(ns *Namespace) *Proxy {
+ func (p *Proxy) Boot(ctx context.Context, settings ProxySettings) error {
+ 	if settings.HTTPPort == 0 {
+ 		settings.HTTPPort = DefaultHTTPPort
++		if os.Getenv("ONCE_ROOTLESS") == "1" {
++			settings.HTTPPort = 8080
++		}
+ 	}
+ 	if settings.HTTPSPort == 0 {
+ 		settings.HTTPSPort = DefaultHTTPSPort
++		if os.Getenv("ONCE_ROOTLESS") == "1" {
++			settings.HTTPSPort = 8443
++		}
+ 	}
+ 	if settings.MetricsPort == 0 {
+ 		settings.MetricsPort = DefaultMetricsPort
+@@ -95,6 +102,12 @@ func (p *Proxy) Boot(ctx context.Context, settings ProxySettings) error {
+ 	defer reader.Close()
+ 	_, _ = io.Copy(io.Discard, reader)
+ 
++	bindIP := netip.Addr{}
++	sysctls := map[string]string{}
++	if os.Getenv("ONCE_ROOTLESS") == "1" {
++		bindIP = netip.MustParseAddr("127.0.0.1")
++		sysctls["net.ipv4.ip_unprivileged_port_start"] = "0"
++	}
+ 	name := p.containerName()
+ 	httpPortTCP := network.MustParsePort("80/tcp")
+ 	httpsPortTCP := network.MustParsePort("443/tcp")
+@@ -115,9 +128,10 @@ func (p *Proxy) Boot(ctx context.Context, settings ProxySettings) error {
+ 			},
+ 		},
+ 		HostConfig: &container.HostConfig{
++			Sysctls: sysctls,
+ 			PortBindings: network.PortMap{
+-				httpPortTCP:    []network.PortBinding{{HostPort: fmt.Sprintf("%d", settings.HTTPPort)}},
+-				httpsPortTCP:   []network.PortBinding{{HostPort: fmt.Sprintf("%d", settings.HTTPSPort)}},
++				httpPortTCP:    []network.PortBinding{{HostIP: bindIP, HostPort: fmt.Sprintf("%d", settings.HTTPPort)}},
++				httpsPortTCP:   []network.PortBinding{{HostIP: bindIP, HostPort: fmt.Sprintf("%d", settings.HTTPSPort)}},
+ 				metricsPortTCP: []network.PortBinding{{HostIP: netip.MustParseAddr("127.0.0.1"), HostPort: fmt.Sprintf("%d", settings.MetricsPort)}},
+ 			},
+ 			RestartPolicy: container.RestartPolicy{Name: container.RestartPolicyAlways},
+@@ -194,6 +208,11 @@ func (p *Proxy) containerName() string {
+ // Private
+ 
+ func (p *Proxy) ensureRunning(ctx context.Context, info container.InspectResponse) error {
++	if os.Getenv("ONCE_ROOTLESS") == "1" {
++		if err := validateRootlessProxy(info.HostConfig); err != nil {
++			return err
++		}
++	}
+ 	if !info.State.Running {
+ 		if _, err := p.namespace.client.ContainerStart(ctx, info.ID, client.ContainerStartOptions{}); err != nil {
+ 			if isPortConflict(err) {
+diff --git a/internal/docker/rootless.go b/internal/docker/rootless.go
+new file mode 100644
+--- /dev/null
++++ b/internal/docker/rootless.go
+@@ -0,0 +1,28 @@
++package docker
++
++import (
++	"fmt"
++	"strconv"
++
++	"github.com/moby/moby/api/types/container"
++)
++
++func validateRootlessProxy(host *container.HostConfig) error {
++	if host == nil || host.Privileged || host.NetworkMode.IsHost() || len(host.PortBindings) != 3 {
++		return fmt.Errorf("existing proxy is not configured for rootless local access; migrate it explicitly")
++	}
++	for port, bindings := range host.PortBindings {
++		if port.String() != "80/tcp" && port.String() != "443/tcp" && port.String() != "1318/tcp" {
++			return fmt.Errorf("unexpected proxy port %s", port)
++		}
++		if len(bindings) != 1 {
++			return fmt.Errorf("unexpected proxy bindings")
++		}
++		binding := bindings[0]
++		number, err := strconv.Atoi(binding.HostPort)
++		if err != nil || number < 1024 || number > 65535 || !binding.HostIP.IsLoopback() {
++			return fmt.Errorf("existing proxy must bind only loopback and unprivileged ports")
++		}
++	}
++	return nil
++}
+diff --git a/internal/docker/rootless_test.go b/internal/docker/rootless_test.go
+new file mode 100644
+--- /dev/null
++++ b/internal/docker/rootless_test.go
+@@ -0,0 +1,101 @@
++package docker
++
++import (
++	"archive/tar"
++	"bytes"
++	"compress/gzip"
++	"context"
++	"github.com/moby/moby/client"
++	"net/http"
++	"net/http/httptest"
++	"net/netip"
++	"testing"
++
++	"github.com/moby/moby/api/types/container"
++	"github.com/moby/moby/api/types/network"
++	"github.com/stretchr/testify/require"
++)
++
++func TestPodmanBackupPathsSurviveRestore(t *testing.T) {
++	var source, backup, restored bytes.Buffer
++	writer := tar.NewWriter(&source)
++	require.NoError(t, writeTarEntry(writer, "/db/production.sqlite3", []byte("book content")))
++	require.NoError(t, writer.WriteHeader(&tar.Header{Name: "/db/hardlink", Typeflag: tar.TypeLink, Linkname: "/db/production.sqlite3"}))
++	require.NoError(t, writer.Close())
++	output := tar.NewWriter(&backup)
++	require.NoError(t, copyTarEntriesWithPrefix(&source, output, "storage", "data"))
++	require.NoError(t, output.Close())
++	reader := tar.NewReader(&backup)
++	header, err := reader.Next()
++	require.NoError(t, err)
++	require.Equal(t, "data/db/production.sqlite3", header.Name)
++	_, err = restored.ReadFrom(reader)
++	require.NoError(t, err)
++	require.Equal(t, "book content", restored.String())
++	header, err = reader.Next()
++	require.NoError(t, err)
++	require.Equal(t, "data/db/hardlink", header.Name)
++	require.Equal(t, "data/db/production.sqlite3", header.Linkname)
++}
++
++func TestRejectUnsafeVolumeArchivePaths(t *testing.T) {
++	for _, name := range []string{"storage/../outside", "/../outside", "storage/a/../../outside", "unexpected/file"} {
++		_, err := archiveVolumePath(name, "storage", "data")
++		require.Error(t, err)
++	}
++}
++
++func TestRootlessProxyRejectsPublicAndPrivilegedBindings(t *testing.T) {
++	host := &container.HostConfig{PortBindings: network.PortMap{}}
++	for _, port := range []string{"80/tcp", "443/tcp", "1318/tcp"} {
++		host.PortBindings[network.MustParsePort(port)] = []network.PortBinding{{HostIP: netip.MustParseAddr("127.0.0.1"), HostPort: "8080"}}
++	}
++	require.NoError(t, validateRootlessProxy(host))
++	host.PortBindings[network.MustParsePort("80/tcp")] = []network.PortBinding{{HostPort: "8080"}}
++	require.Error(t, validateRootlessProxy(host))
++	host.PortBindings[network.MustParsePort("80/tcp")] = []network.PortBinding{{HostIP: netip.MustParseAddr("127.0.0.1"), HostPort: "80"}}
++	require.Error(t, validateRootlessProxy(host))
++}
++
++func TestRestoreArchiveTargetsVolumeAndRejectsOldPodmanPaths(t *testing.T) {
++	for _, name := range []string{"data/db/production.sqlite3", "/db/production.sqlite3"} {
++		var backup, output bytes.Buffer
++		compressed := gzip.NewWriter(&backup)
++		writer := tar.NewWriter(compressed)
++		require.NoError(t, writeTarEntry(writer, name, []byte("book content")))
++		// A later valid file must not erase an earlier validation error.
++		require.NoError(t, writeTarEntry(writer, "data/later", []byte("later")))
++		require.NoError(t, writer.Close())
++		require.NoError(t, compressed.Close())
++		err := streamVolumeDataEntries(&backup, &output)
++		if name[0] == '/' {
++			require.ErrorIs(t, err, ErrInvalidBackup)
++		} else {
++			require.NoError(t, err)
++			header, err := tar.NewReader(&output).Next()
++			require.NoError(t, err)
++			require.Equal(t, "./db/production.sqlite3", header.Name)
++		}
++	}
++}
++
++func TestExecWaitsForFinalExitStatus(t *testing.T) {
++	calls := 0
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		w.Header().Set("Content-Type", "application/json")
++		calls++
++		if calls == 1 {
++			w.Write([]byte(`{"Running":true,"ExitCode":0}`))
++		} else {
++			w.Write([]byte(`{"Running":false,"ExitCode":7}`))
++		}
++	}))
++	defer server.Close()
++	c, err := client.New(client.WithHost(server.URL), client.WithAPIVersion("1.44"))
++	require.NoError(t, err)
++	defer c.Close()
++	code, err := inspectExecExitCode(context.Background(), c, "exec-id")
++	require.NoError(t, err)
++	require.Equal(t, 7, code)
++	require.Equal(t, 2, calls)
++}
