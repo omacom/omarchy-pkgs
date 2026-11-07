@@ -30,6 +30,10 @@ import time
 WAIT = 90            # seconds to look for a pen in pairing mode
 PAIR_WAIT = 45       # seconds for the pairing itself
 PEN = re.compile(r'Device ([0-9A-F]{2}(?::[0-9A-F]{2}){5}) (.*Slim Pen.*)')
+# Advertising data only: a pen that is connected also reports battery and
+# connection changes, which say nothing about pairing mode.
+ADV = re.compile(r'\[CHG\] Device ([0-9A-F]{2}(?::[0-9A-F]{2}){5}) '
+                 r'(RSSI|TxPower|ManufacturerData|ServiceData|AdvertisingFlags)')
 ANSI = re.compile(r'\x1b\[[0-9;]*[A-Za-z]|\r')
 
 
@@ -84,11 +88,17 @@ class Bluetoothctl:
             self.p.kill()
 
 
-def forget_pens():
+def known_pens():
+    pens = {}
     for line in run('bluetoothctl', 'devices').splitlines():
         m = PEN.search(line)
         if m:
-            run('bluetoothctl', 'remove', m.group(1))
+            pens[m.group(1)] = m.group(2).strip()
+    return pens
+
+
+def bonded(addr):
+    return re.search(r'^\s*(Paired|Bonded): yes$', run('bluetoothctl', 'info', addr), re.M) is not None
 
 
 def battery(addr):
@@ -132,9 +142,8 @@ def main():
             say('Bluetooth is off and could not be turned on.')
             return 1
     pairable = 'Pairable: yes' in show
-    # A pen remembered from before is forgotten first, so what turns up now is
-    # the pen in your hand, and a dead old bond never gets in the way.
-    forget_pens()
+    # Pens paired before keep their bonds; only the pen you approve loses its
+    # old one, in pair(), so a cancelled or failed run leaves them working.
 
     privacy = privacy_on()
     if not privacy:
@@ -157,7 +166,9 @@ def main():
                 print('  sudo systemctl restart bluetooth')
 
 
-def find_pen(ctl, deadline, skip):
+def find_pen(ctl, deadline, skip, known):
+    """A pen that advertises: new, or one paired before (known), which shows
+    up only as changes to its advertising data, without its name."""
     ctl.send('scan le')
     shown = -1
     found = None, None
@@ -165,8 +176,14 @@ def find_pen(ctl, deadline, skip):
         line = ctl.next_line(0.5)
         if line:
             m = PEN.search(line)
-            if m and m.group(1) not in skip and ('[NEW]' in line or '[CHG]' in line):
-                found = m.group(1), m.group(2).strip()
+            if m and ('[NEW]' in line or '[CHG]' in line):
+                addr, name = m.group(1), m.group(2).strip()
+            else:
+                m = ADV.search(line)
+                addr = m.group(1) if m else None
+                name = known.get(addr)
+            if name and addr not in skip:
+                found = addr, name
                 break
         left = int(deadline - time.monotonic())
         if left != shown:
@@ -218,8 +235,9 @@ def pair(pairable):
         # A pen turned down is ignored for the rest of the search.
         deadline = time.monotonic() + WAIT
         approved, declined = set(), set()
+        known = known_pens()
         while True:
-            addr, name = find_pen(ctl, deadline, declined)
+            addr, name = find_pen(ctl, deadline, declined, known)
             if not addr:
                 break
             if addr not in approved:
@@ -228,6 +246,14 @@ def pair(pairable):
                     print('  Not paired. Still looking...')
                     continue
                 approved.add(addr)
+                # A pen still bonded from before refuses a new pairing, and its
+                # old bond may be dead (the pen forgot this host). Drop it now
+                # that you chose this pen, and find the pen again as a new
+                # device, the way a refused pairing does below.
+                if bonded(addr):
+                    run('bluetoothctl', 'remove', addr)
+                    known.pop(addr, None)
+                    continue
             print('Pairing...')
             time.sleep(1)
             reason = try_pair(ctl, addr)
