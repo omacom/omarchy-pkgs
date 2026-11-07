@@ -1,0 +1,787 @@
+#!/usr/bin/python3
+# SPDX-License-Identifier: GPL-2.0-only
+"""hm1092-relay: publish the Himax HM1092 IR sensor as an 8-bit grayscale
+v4l2loopback device, lighting its flood LED only while someone is watching.
+
+Derived from hm1092-relay in https://github.com/meros/hm1092-linux
+(GPL-2.0-only), reworked for the IR module Dell fits behind the Intel IPU7:
+the illuminator is the LED class device the in-tree INT3472 driver registers,
+the media graph is found by entity name at start, and V4L2 is driven through
+ctypes so numpy is the only dependency beyond the standard library.
+
+Why a relay: the sensor delivers SGRBG10 (10-bit mono samples in a
+Bayer-labelled container) on a root-only IPU ISYS capture node that needs the
+media graph linked first. Howdy wants an ordinary V4L2 device with 8-bit frames.
+
+Trust model: this process holds the loopback's OUTPUT side for its whole life so
+no other producer can inject frames, and it lights the invisible IR flood LED
+only while a consumer is attached, bounded by a per-burst cap and a duty budget.
+Every wait is a select() with a deadline, so a stalled sensor cannot park the
+process in the kernel with the LED lit.
+"""
+
+import ctypes
+import fcntl
+import math
+import mmap
+import os
+import re
+import select
+import signal
+import socket
+import subprocess
+import sys
+import time
+
+# ---------------------------------------------------------------------------
+# V4L2 through ctypes. Layouts and ioctl numbers are x86_64 as compiled from
+# linux/videodev2.h; test-hm1092-relay.py pins the struct sizes.
+
+VIDIOC_G_FMT = 0xC0D05604
+VIDIOC_S_FMT = 0xC0D05605
+VIDIOC_REQBUFS = 0xC0145608
+VIDIOC_QUERYBUF = 0xC0585609
+VIDIOC_QBUF = 0xC058560F
+VIDIOC_DQBUF = 0xC0585611
+VIDIOC_STREAMON = 0x40045612
+VIDIOC_STREAMOFF = 0x40045613
+VIDIOC_SUBSCRIBE_EVENT = 0x4020565A
+VIDIOC_UNSUBSCRIBE_EVENT = 0x4020565B
+VIDIOC_DQEVENT = 0x80885659
+
+BUF_TYPE_CAPTURE = 1
+BUF_TYPE_OUTPUT = 2
+MEMORY_MMAP = 1
+FIELD_NONE = 1
+PIX_FMT_SGRBG10 = 0x30314142  # 'BA10'
+PIX_FMT_GREY = 0x59455247  # 'GREY'
+
+# v4l2loopback posts this on the producer fd whenever the consumer count
+# changes: V4L2_EVENT_PRIVATE_START (0x08000000) + 0x08E00001.
+EVENT_CLIENT_USAGE = 0x10E00001
+
+u8, u32, u64, i64 = ctypes.c_uint8, ctypes.c_uint32, ctypes.c_uint64, ctypes.c_int64
+
+
+class PixFormat(ctypes.Structure):
+    _fields_ = [
+        ("width", u32), ("height", u32), ("pixelformat", u32), ("field", u32),
+        ("bytesperline", u32), ("sizeimage", u32), ("colorspace", u32),
+        ("priv", u32), ("flags", u32), ("ycbcr_enc", u32),
+        ("quantization", u32), ("xfer_func", u32),
+    ]
+
+
+class FormatUnion(ctypes.Union):
+    _fields_ = [("pix", PixFormat), ("raw", u8 * 200)]
+
+
+class Format(ctypes.Structure):
+    # The kernel union holds 8-byte members, so fmt sits at offset 8.
+    _fields_ = [("type", u32), ("_pad", u32), ("fmt", FormatUnion)]
+
+
+class RequestBuffers(ctypes.Structure):
+    _fields_ = [
+        ("count", u32), ("type", u32), ("memory", u32), ("capabilities", u32),
+        ("flags", u8), ("reserved", u8 * 3),
+    ]
+
+
+class Buffer(ctypes.Structure):
+    _fields_ = [
+        ("index", u32), ("type", u32), ("bytesused", u32), ("flags", u32),
+        ("field", u32), ("_pad0", u32), ("tv_sec", i64), ("tv_usec", i64),
+        ("timecode", u8 * 16), ("sequence", u32), ("memory", u32),
+        ("m", u64), ("length", u32), ("reserved2", u32), ("request_fd", u32),
+        ("_pad1", u32),
+    ]
+
+
+class EventSubscription(ctypes.Structure):
+    _fields_ = [("type", u32), ("id", u32), ("flags", u32), ("reserved", u32 * 5)]
+
+
+class Event(ctypes.Structure):
+    _fields_ = [
+        ("type", u32), ("_pad0", u32), ("u", u8 * 64), ("pending", u32),
+        ("sequence", u32), ("ts_sec", i64), ("ts_nsec", i64), ("id", u32),
+        ("reserved", u32 * 8), ("_pad1", u32),
+    ]
+
+
+def ioctl(fd, request, arg):
+    fcntl.ioctl(fd, request, arg)
+
+
+def event_consumer_count(event):
+    """v4l2loopback's client-usage payload: a u32 consumer count."""
+    return int.from_bytes(bytes(event.u)[:4], "little")
+
+
+# ---------------------------------------------------------------------------
+# Configuration: the systemd EnvironmentFile /etc/hm1092-ir-camera.conf.
+
+
+def env_str(name, default):
+    value = os.environ.get(name, "")
+    return value if value != "" else default
+
+
+def env_int(name, default):
+    return int(env_str(name, str(default)), 0)
+
+
+def env_float(name, default):
+    return float(env_str(name, str(default)))
+
+
+def env_bool(name, default):
+    return env_str(name, "1" if default else "0").strip().lower() in ("1", "true", "yes", "on")
+
+
+class Config:
+    def __init__(self, env=None):
+        if env is not None:
+            saved, os.environ = dict(os.environ), dict(env)
+        try:
+            self.card_label = env_str("CARD_LABEL", "HM1092 IR Camera")
+            self.width = env_int("WIDTH", 648)
+            self.height = env_int("HEIGHT", 368)
+            self.video_nr = env_int("VIDEO_NR", 51)
+            self.rotate180 = env_bool("ROTATE180", False)
+            self.fixed_scale = env_bool("FIXED_SCALE", False)
+            self.ir_led = env_str("IR_LED", "")
+            self.max_burst_s = env_int("MAX_ILLUMINATION_MS", 8000) / 1000.0
+            self.duty_window_s = env_float("DUTY_WINDOW_S", 60.0)
+            self.duty_fraction = env_float("DUTY_FRACTION", 0.5)
+            self.mbus_code = env_str("MBUS_CODE", "SGRBG10_1X10")
+            self.sensor = env_str("SENSOR_ENTITY", "hm1092")
+            # Test seams only; the shipped unit never sets them.
+            self.sys_root = env_str("HM1092_SYS_ROOT", "/sys")
+            self.dev_root = env_str("HM1092_DEV_ROOT", "/dev")
+        finally:
+            if env is not None:
+                os.environ = saved
+
+
+def log(msg):
+    print(f"hm1092-relay: {msg}", flush=True)
+
+
+def sd_notify(state):
+    addr = os.environ.get("NOTIFY_SOCKET")
+    if not addr:
+        return
+    if addr.startswith("@"):
+        addr = "\0" + addr[1:]
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as sk:
+            sk.connect(addr)
+            sk.sendall(state.encode())
+    except OSError:
+        pass
+
+
+def run(argv, **kw):
+    return subprocess.run(argv, capture_output=True, text=True, check=False, **kw)
+
+
+# ---------------------------------------------------------------------------
+# The media graph. Node numbers, subdev numbers and the CSI-2 port the sensor
+# hangs off all differ between machines and boots, so everything is resolved
+# from `media-ctl -p` by entity name, never hardcoded.
+
+ENTITY_RE = re.compile(r"^- entity \d+: (.+?) \(\d+ pads?, \d+ links?", re.M)
+NODE_RE = re.compile(r"device node name (\S+)")
+LINK_RE = re.compile(r'-> "([^"]+)":(\d+)')
+
+
+class Graph:
+    def __init__(self, mdev, topology, sensor_pattern="hm1092"):
+        self.mdev = mdev
+        self.topology = topology
+        self.blocks = {}
+        matches = list(ENTITY_RE.finditer(topology))
+        for i, m in enumerate(matches):
+            end = matches[i + 1].start() if i + 1 < len(matches) else len(topology)
+            self.blocks[m.group(1)] = topology[m.start():end]
+        self.sensor = self._entity(rf"^{sensor_pattern}\b")
+        self.sensor_subdev = self._node(self.sensor)
+        self.csi = self._link_target(self.sensor, r"csi2")
+        self.capture = self._link_target(self.csi, r"capture")
+        self.capture_node = self._node(self.capture)
+
+    def _entity(self, pattern):
+        for name in self.blocks:
+            if re.search(pattern, name, re.I):
+                return name
+        return None
+
+    def _node(self, entity):
+        if not entity:
+            return None
+        m = NODE_RE.search(self.blocks[entity])
+        return m.group(1) if m else None
+
+    def _link_target(self, entity, pattern):
+        if not entity:
+            return None
+        for target, _pad in LINK_RE.findall(self.blocks[entity]):
+            if re.search(pattern, target, re.I):
+                return target
+        return None
+
+    @property
+    def complete(self):
+        return bool(self.sensor and self.csi and self.capture and self.capture_node)
+
+    def configure_commands(self, width, height, code):
+        fmt = f"[fmt:{code}/{width}x{height}]"
+        return [
+            ["media-ctl", "-d", self.mdev, "-l", f'"{self.csi}":1 -> "{self.capture}":0 [1]'],
+            ["media-ctl", "-d", self.mdev, "-V", f'"{self.sensor}":0 {fmt}'],
+            ["media-ctl", "-d", self.mdev, "-V", f'"{self.csi}":0 {fmt}'],
+            ["media-ctl", "-d", self.mdev, "-V", f'"{self.csi}":1 {fmt}'],
+        ]
+
+    def configure(self, width, height, code, runner=run):
+        for argv in self.configure_commands(width, height, code):
+            result = runner(argv)
+            if result.returncode != 0:
+                raise RuntimeError(f"{' '.join(argv)}: {result.stderr.strip() or result.stdout.strip()}")
+
+    @classmethod
+    def discover(cls, dev_root="/dev", sensor_pattern="hm1092", runner=run):
+        """The first media device whose graph has the sensor."""
+        found = None
+        for mdev in sorted(f for f in os.listdir(dev_root) if re.fullmatch(r"media\d+", f)):
+            path = os.path.join(dev_root, mdev)
+            result = runner(["media-ctl", "-d", path, "-p"])
+            if result.returncode != 0:
+                continue
+            graph = cls(path, result.stdout, sensor_pattern)
+            if graph.sensor:
+                return graph
+            found = found or graph
+        return found
+
+
+# ---------------------------------------------------------------------------
+# The loopback sink.
+
+
+def find_video_by_name(name, sys_root="/sys", dev_root="/dev"):
+    class_dir = os.path.join(sys_root, "class", "video4linux")
+    if not os.path.isdir(class_dir):
+        return None
+    for entry in sorted(os.listdir(class_dir)):
+        try:
+            with open(os.path.join(class_dir, entry, "name")) as f:
+                if f.read().strip() == name:
+                    return os.path.join(dev_root, entry)
+        except OSError:
+            continue
+    return None
+
+
+def ensure_loopback(cfg, runner=run, sleep=time.sleep):
+    """Find the loopback named cfg.card_label, creating it when missing.
+
+    The RGB stack creates its own loopback through module options, so a second
+    device has to come from v4l2loopback's control interface. The preferred
+    number is tried first; a taken number falls back to the next free one.
+    """
+    path = find_video_by_name(cfg.card_label, cfg.sys_root, cfg.dev_root)
+    if path:
+        return path
+    base = ["v4l2loopback-ctl", "add", "-n", cfg.card_label, "-x", "1", "-o", "10"]
+    attempts = [base + [os.path.join(cfg.dev_root, f"video{cfg.video_nr}")], base]
+    for argv in attempts:
+        result = runner(argv)
+        if result.returncode == 0:
+            break
+        log(f"{' '.join(argv)} failed: {result.stderr.strip() or result.stdout.strip()}")
+    else:
+        raise RuntimeError("cannot create the loopback device")
+    for _ in range(20):
+        path = find_video_by_name(cfg.card_label, cfg.sys_root, cfg.dev_root)
+        if path and os.path.exists(path):
+            return path
+        sleep(0.1)
+    raise RuntimeError(f"the loopback {cfg.card_label!r} did not appear")
+
+
+class Loopback:
+    def __init__(self, path, width, height):
+        self.path = path
+        self.width, self.height = width, height
+        self.fd = os.open(path, os.O_RDWR | os.O_CLOEXEC)
+        fmt = Format(type=BUF_TYPE_OUTPUT)
+        fmt.fmt.pix.width = width
+        fmt.fmt.pix.height = height
+        fmt.fmt.pix.pixelformat = PIX_FMT_GREY
+        fmt.fmt.pix.field = FIELD_NONE
+        fmt.fmt.pix.bytesperline = width
+        fmt.fmt.pix.sizeimage = width * height
+        ioctl(self.fd, VIDIOC_S_FMT, fmt)
+        sub = EventSubscription(type=EVENT_CLIENT_USAGE)
+        ioctl(self.fd, VIDIOC_SUBSCRIBE_EVENT, sub)
+
+    def fileno(self):
+        return self.fd
+
+    def write(self, frame):
+        os.write(self.fd, frame)
+
+    def pending_events(self):
+        """Consumer counts posted since the last call, oldest first."""
+        counts = []
+        while select.select([], [], [self.fd], 0)[2]:
+            event = Event()
+            try:
+                ioctl(self.fd, VIDIOC_DQEVENT, event)
+            except OSError:
+                break
+            if event.type == EVENT_CLIENT_USAGE:
+                counts.append(event_consumer_count(event))
+        return counts
+
+    def close(self):
+        try:
+            ioctl(self.fd, VIDIOC_UNSUBSCRIBE_EVENT, EventSubscription(type=EVENT_CLIENT_USAGE))
+        except OSError:
+            pass
+        os.close(self.fd)
+
+
+# ---------------------------------------------------------------------------
+# The ISYS capture source.
+
+
+class Capture:
+    def __init__(self, path, width, height, nbuf=4):
+        self.fd = os.open(path, os.O_RDWR | os.O_NONBLOCK | os.O_CLOEXEC)
+        self.maps = []
+        try:
+            fmt = Format(type=BUF_TYPE_CAPTURE)
+            fmt.fmt.pix.width = width
+            fmt.fmt.pix.height = height
+            fmt.fmt.pix.pixelformat = PIX_FMT_SGRBG10
+            fmt.fmt.pix.field = FIELD_NONE
+            ioctl(self.fd, VIDIOC_S_FMT, fmt)
+            ioctl(self.fd, VIDIOC_G_FMT, fmt)
+            pix = fmt.fmt.pix
+            if (pix.width, pix.height, pix.pixelformat) != (width, height, PIX_FMT_SGRBG10):
+                raise RuntimeError(
+                    f"{path} negotiated {pix.width}x{pix.height} {pix.pixelformat:#x}, "
+                    f"not {width}x{height} SGRBG10")
+            # Not width*2: the IPU pads each line and appends a spare one.
+            self.stride = pix.bytesperline
+            req = RequestBuffers(count=nbuf, type=BUF_TYPE_CAPTURE, memory=MEMORY_MMAP)
+            ioctl(self.fd, VIDIOC_REQBUFS, req)
+            for i in range(req.count):
+                buf = Buffer(index=i, type=BUF_TYPE_CAPTURE, memory=MEMORY_MMAP)
+                ioctl(self.fd, VIDIOC_QUERYBUF, buf)
+                self.maps.append(mmap.mmap(self.fd, buf.length, mmap.MAP_SHARED,
+                                           mmap.PROT_READ, offset=buf.m))
+                ioctl(self.fd, VIDIOC_QBUF, buf)
+            ioctl(self.fd, VIDIOC_STREAMON, ctypes.c_int(BUF_TYPE_CAPTURE))
+        except Exception:
+            self.close(streaming=False)
+            raise
+
+    def fileno(self):
+        return self.fd
+
+    def read(self):
+        """One dequeued frame as bytes, or None when nothing is ready."""
+        buf = Buffer(type=BUF_TYPE_CAPTURE, memory=MEMORY_MMAP)
+        try:
+            ioctl(self.fd, VIDIOC_DQBUF, buf)
+        except BlockingIOError:
+            return None
+        data = bytes(self.maps[buf.index][:buf.bytesused])
+        ioctl(self.fd, VIDIOC_QBUF, buf)
+        return data
+
+    def close(self, streaming=True):
+        if streaming:
+            try:
+                ioctl(self.fd, VIDIOC_STREAMOFF, ctypes.c_int(BUF_TYPE_CAPTURE))
+            except OSError:
+                pass
+        for m in self.maps:
+            m.close()
+        self.maps = []
+        os.close(self.fd)
+
+
+# ---------------------------------------------------------------------------
+# The IR flood LED. Near-infrared is invisible, so nothing warns a person
+# looking into a stuck-on emitter; every path that lights it has a path that
+# darkens it, and the budget bounds the damage when one of those paths is
+# missed. systemd's ExecStopPost and the sleep hook cover SIGKILL.
+
+
+def boottime():
+    """Suspend-inclusive clock, so a burst spanning s0ix is not undercounted."""
+    return time.clock_gettime(time.CLOCK_BOOTTIME)
+
+
+def find_flood_led(sys_root="/sys"):
+    leds_dir = os.path.join(sys_root, "class", "leds")
+    if not os.path.isdir(leds_dir):
+        return None
+    for entry in sorted(os.listdir(leds_dir)):
+        if "ir_flood_led" in entry:
+            return os.path.join(leds_dir, entry)
+    return None
+
+
+class FloodLed:
+    """A burst is one consumer's light: it starts when the LED first lights for
+    that consumer and ends max_burst_s later, or when the consumer leaves. Once
+    it ends, the LED stays dark until end_session(). Dropping and rebuilding a
+    stalled source inside a burst does not start a new one."""
+
+    def __init__(self, led_dir, max_burst_s=8.0, duty_window_s=60.0, duty_fraction=0.5,
+                 clock=boottime, log=log):
+        if not 0 < max_burst_s < math.inf:
+            raise ValueError(f"MAX_ILLUMINATION_MS must be a positive duration, not {max_burst_s * 1000:g}")
+        if not 0 < duty_window_s < math.inf:
+            raise ValueError(f"DUTY_WINDOW_S must be a positive duration, not {duty_window_s:g}")
+        if not 0 < duty_fraction <= 1:
+            raise ValueError(f"DUTY_FRACTION must lie in (0, 1], not {duty_fraction:g}")
+        self.path = os.path.join(led_dir, "brightness")
+        self.max_burst_s = max_burst_s
+        self.duty_window_s = duty_window_s
+        self.duty_budget_s = duty_window_s * duty_fraction
+        self.clock = clock
+        self.log = log
+        self.on = False
+        self.burst_start = None
+        self.session_start = None
+        self.held_dark = None
+        self.history = []
+
+    def _write(self, value):
+        fd = os.open(self.path, os.O_WRONLY | os.O_TRUNC | os.O_CLOEXEC)
+        try:
+            os.write(fd, value)
+        finally:
+            os.close(fd)
+
+    def spent(self, t):
+        cutoff = t - self.duty_window_s
+        self.history = [(s, e) for (s, e) in self.history if e > cutoff]
+        spent = sum(e - max(s, cutoff) for (s, e) in self.history)
+        if self.burst_start is not None:
+            spent += t - max(self.burst_start, cutoff)
+        return spent
+
+    def budget_exhausted(self, t=None):
+        t = self.clock() if t is None else t
+        return self.spent(t) >= self.duty_budget_s
+
+    def refusal(self, t):
+        """Why the LED must stay dark at t, or None when it may light."""
+        if self.session_start is not None and t - self.session_start >= self.max_burst_s:
+            return f"the {self.max_burst_s:g} s burst is used up until the consumer leaves"
+        if self.budget_exhausted(t):
+            return f"{self.duty_budget_s:g} s of light in {self.duty_window_s:g} s are used up"
+        return None
+
+    def _hold_dark(self, reason):
+        if self.on:
+            self.set(False)
+        if reason != self.held_dark:
+            self.held_dark = reason
+            self.log(f"illuminator held dark: {reason}")
+        return False
+
+    def assert_on(self):
+        """Light the LED unconditionally; the write is cheap and the LED may
+        have been reset behind our back. False when the burst or budget
+        forbids it."""
+        t = self.clock()
+        reason = self.refusal(t)
+        if reason:
+            return self._hold_dark(reason)
+        self._write(b"1")
+        self.held_dark = None
+        if self.session_start is None:
+            self.session_start = t
+        if not self.on:
+            self.on = True
+            self.burst_start = t
+            self.log("illuminator on")
+        return True
+
+    def set(self, on):
+        if on:
+            return self.assert_on()
+        try:
+            self._write(b"0")
+        except OSError as e:
+            self.log(f"illuminator off failed: {e}")
+        if self.on:
+            t = self.clock()
+            if self.burst_start is not None:
+                self.history.append((self.burst_start, t))
+            self.burst_start = None
+            self.on = False
+            self.log("illuminator off")
+        return False
+
+    def tick(self):
+        """Called every pass while streaming. False once this burst or the
+        rolling budget is used up; the LED is already off by then."""
+        reason = self.refusal(self.clock())
+        return self._hold_dark(reason) if reason else True
+
+    def end_session(self):
+        self.set(False)
+        self.session_start = None
+        self.held_dark = None
+
+    def close(self):
+        self.set(False)
+
+
+# ---------------------------------------------------------------------------
+# 10-bit mono in 16-bit containers to GRAY8. numpy is imported lazily so the
+# probe mode and the unit tests of everything else work without it.
+
+SENSOR_MAX = 1023
+
+
+def as_u16(buf, w, h, stride):
+    import numpy as np
+    row_samples = stride // 2
+    raw = np.frombuffer(buf, dtype="<u2", count=row_samples * h)
+    return raw.reshape(h, row_samples)[:, :w]
+
+
+def to_gray8(buf, w, h, stride, scale, rotate180):
+    """Mono sensor, so the Bayer label is nominal and no demosaic is wanted:
+    dropping to 8 bits is the whole conversion. `scale` maps the used range
+    onto 0-255; None is the plain shift, which leaves torch-lit frames dim."""
+    import numpy as np
+    raw = as_u16(buf, w, h, stride)
+    if rotate180:
+        raw = raw[::-1, ::-1]
+    if scale is None:
+        return (raw >> 2).astype(np.uint8)
+    return np.clip(raw.astype(np.float32) * scale, 0, 255).astype(np.uint8)
+
+
+def compute_scale(raw_u16, target_p99=235.0):
+    """Scale from the 99th percentile of the unsaturated samples, so hot
+    pixels cannot crush the image and a saturated region (a window, a specular
+    return) cannot squeeze the face into the bottom of the range."""
+    import numpy as np
+    usable = raw_u16[raw_u16 < SENSOR_MAX]
+    if usable.size < raw_u16.size // 100:
+        usable = raw_u16
+    p99 = float(np.percentile(usable, 99))
+    if p99 < 1.0:
+        return None
+    return target_p99 / p99
+
+
+def scale_due(frames):
+    """Skip the first frames while the exposure loop settles after the LED
+    lights, track closely while it does, then slow down so per-frame rescaling
+    does not pump the image."""
+    if frames < 3:
+        return False
+    if frames < 13:
+        return True
+    return frames % 30 == 0
+
+
+# ---------------------------------------------------------------------------
+
+TICK_S = 0.2
+STALL_TICKS = 3
+
+
+def probe(cfg):
+    graph = Graph.discover(cfg.dev_root, cfg.sensor)
+    sink = find_video_by_name(cfg.card_label, cfg.sys_root, cfg.dev_root)
+    led = cfg.ir_led or find_flood_led(cfg.sys_root)
+    print(f"media device : {graph.mdev if graph else 'none with a camera graph'}")
+    print(f"sensor       : {graph.sensor if graph and graph.sensor else 'not in the graph'}"
+          + (f"  ({graph.sensor_subdev})" if graph and graph.sensor_subdev else ""))
+    print(f"csi2         : {graph.csi if graph and graph.csi else 'unresolved'}")
+    print(f"capture      : {graph.capture if graph and graph.capture else 'unresolved'}"
+          + (f"  ({graph.capture_node})" if graph and graph.capture_node else ""))
+    print(f"loopback     : {sink or 'not created yet'}  ({cfg.card_label})")
+    print(f"flood led    : {led or 'none'}")
+    return 0 if graph and graph.complete and led else 1
+
+
+def main(argv=None):
+    argv = sys.argv[1:] if argv is None else argv
+    cfg = Config()
+    if argv == ["--probe"]:
+        return probe(cfg)
+    if argv:
+        print("Usage: hm1092-relay [--probe]   (settings come from the environment)", file=sys.stderr)
+        return 2
+
+    led_dir = cfg.ir_led or find_flood_led(cfg.sys_root)
+    if not led_dir:
+        log("no IR flood LED found; frames would be too dark to match")
+        return 1
+    try:
+        lamp = FloodLed(led_dir, cfg.max_burst_s, cfg.duty_window_s, cfg.duty_fraction)
+    except ValueError as e:
+        log(f"refusing to drive the IR flood LED: {e}")
+        return 1
+    lamp.set(False)
+
+    graph = Graph.discover(cfg.dev_root, cfg.sensor)
+    if not graph or not graph.complete:
+        log("the media graph has no complete hm1092 -> csi2 -> capture path; is the driver bound?")
+        return 1
+    graph.configure(cfg.width, cfg.height, cfg.mbus_code)
+    log(f"source {graph.capture_node}: {graph.sensor} -> {graph.csi} -> {graph.capture}")
+
+    sink_path = ensure_loopback(cfg)
+    sink = Loopback(sink_path, cfg.width, cfg.height)
+    black = b"\x00" * (cfg.width * cfg.height)
+    # v4l2loopback advertises CAPTURE only once a producer has written, and
+    # with exclusive_caps a consumer cannot open before that; prime it.
+    sink.write(black)
+    log(f"publishing {cfg.width}x{cfg.height} GREY on {sink_path} as {cfg.card_label!r}")
+    sd_notify("READY=1")
+
+    wake_r, wake_w = os.pipe2(os.O_NONBLOCK | os.O_CLOEXEC)
+    signal.set_wakeup_fd(wake_w)
+    stop = False
+
+    def on_signal(_sig, _frame):
+        nonlocal stop
+        stop = True
+
+    signal.signal(signal.SIGTERM, on_signal)
+    signal.signal(signal.SIGINT, on_signal)
+
+    def drain_wakeups():
+        try:
+            os.read(wake_r, 64)
+        except BlockingIOError:
+            pass
+
+    consumers = 0
+    source = None
+    scale = None
+    frames = 0
+    empty_ticks = 0
+
+    def close_source(reason):
+        nonlocal source, scale, frames, empty_ticks
+        # Darken first: that write cannot block, closing V4L2 handles can.
+        lamp.set(False)
+        if source is not None:
+            try:
+                source.close()
+            except Exception:  # noqa: BLE001 - teardown is best effort
+                pass
+        source = None
+        scale = None
+        frames = 0
+        empty_ticks = 0
+        if reason:
+            log(reason)
+
+    try:
+        while not stop:
+            for count in sink.pending_events():
+                if count != consumers:
+                    consumers = count
+                    log(f"consumers: {consumers}")
+                    if consumers == 0:
+                        lamp.end_session()
+
+            if consumers > 0 and source is None:
+                if not lamp.assert_on():
+                    # A consumer blocks in DQBUF until a frame arrives; keep
+                    # it moving so its own timeout ends the session.
+                    try:
+                        sink.write(black)
+                    except OSError:
+                        pass
+                    select.select([sink, wake_r], [], [sink], TICK_S)
+                    drain_wakeups()
+                    continue
+                try:
+                    source = Capture(graph.capture_node, cfg.width, cfg.height)
+                    log(f"streaming, stride {source.stride} bytes for {cfg.width} px")
+                except Exception as e:  # noqa: BLE001 - report and back off
+                    close_source(f"cannot stream from {graph.capture_node}: {e}")
+                    select.select([sink, wake_r], [], [sink], 1.0)
+                    drain_wakeups()
+                    continue
+
+            if consumers == 0 and source is not None:
+                close_source("idle")
+                try:
+                    sink.write(black)
+                except OSError:
+                    pass
+
+            if source is None:
+                select.select([sink, wake_r], [], [sink], None if not stop else 0)
+                drain_wakeups()
+                continue
+
+            if frames and frames % 30 == 0:
+                lamp.assert_on()
+            if not lamp.tick():
+                close_source("dropping the source while the illuminator is held dark")
+                try:
+                    sink.write(black)
+                except OSError:
+                    pass
+                continue
+
+            readable, _, _ = select.select([source, wake_r], [], [sink], TICK_S)
+            drain_wakeups()
+            if stop:
+                break
+            if source not in readable:
+                empty_ticks += 1
+                if empty_ticks >= STALL_TICKS:
+                    close_source(f"source stalled for {STALL_TICKS} ticks, rebuilding")
+                continue
+            empty_ticks = 0
+
+            try:
+                buf = source.read()
+            except OSError as e:
+                close_source(f"source read failed: {e}, rebuilding")
+                continue
+            if buf is None or len(buf) < source.stride * cfg.height:
+                continue
+            if not cfg.fixed_scale and scale_due(frames):
+                scale = compute_scale(as_u16(buf, cfg.width, cfg.height, source.stride))
+            sink.write(to_gray8(buf, cfg.width, cfg.height, source.stride,
+                                None if cfg.fixed_scale else scale, cfg.rotate180))
+            frames += 1
+    finally:
+        sd_notify("STOPPING=1")
+        close_source(None)
+        lamp.close()
+        sink.close()
+        signal.set_wakeup_fd(-1)
+        os.close(wake_w)
+        os.close(wake_r)
+        log("stopped")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
