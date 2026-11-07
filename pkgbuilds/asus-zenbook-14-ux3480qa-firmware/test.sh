@@ -24,12 +24,17 @@ dir=qcom/x1p42100/ASUSTeK/zenbook-14-ux3480qa
 # Stand in for the unpacked board support package. The fixture's bytes cannot
 # match the real firmware's sums, so stub sha256sum and check what it is given.
 srcdir="$scratch/src"
-bsp="$srcdir/bsp/QualcommBSP"
+bsp="$srcdir/asus-socpackage-50883/QualcommBSP"
 files=(
   Subsystem/qcsubsys_ext_adsp8380/qcadsp8380.mbn
   Subsystem/qcsubsys_ext_adsp8380/adsp_dtbs.elf
+  Subsystem/qcsubsys_ext_adsp8380/adspr.jsn
+  Subsystem/qcsubsys_ext_adsp8380/adsps.jsn
+  Subsystem/qcsubsys_ext_adsp8380/adspua.jsn
+  Subsystem/qcsubsys_ext_adsp8380/battmgr.jsn
   NPU/qcnspmcdm_ext_cdsp8380/qccdsp8380.mbn
   NPU/qcnspmcdm_ext_cdsp8380/cdsp_dtbs.elf
+  NPU/qcnspmcdm_ext_cdsp8380/cdspr.jsn
   GFX/qcdx8380/qcdxkmsucpurwa.mbn
   GFX/qcdx8380/qcvss8380.mbn
 )
@@ -43,12 +48,14 @@ pkgdir="$scratch/pkg"
 (cd "$srcdir" && package)
 
 # The names x1p42100-asus-zenbook-14-ux3480qa.dts gives the ADSP, CDSP, GPU zap
-# shader and Iris.
+# shader and Iris, and the DSP services beside them, compressed with xz so a copy
+# linux-firmware ships under the same name is the one the kernel loads.
 for f in "${files[@]}"; do
-  [[ $(<"$pkgdir/usr/lib/firmware/$dir/${f##*/}") == "$f" ]] ||
-    fail "installs ${f##*/} unmodified where the device tree asks for it"
-  grep -qE "^[0-9a-f]{64}  ${f##*/}\$" "$scratch/sums" || fail "checks ${f##*/} against its sha256"
+  [[ $(xz -dc "$pkgdir/usr/lib/firmware/$dir/${f##*/}.xz") == "$f" ]] ||
+    fail "installs ${f##*/}.xz unmodified where the device tree asks for ${f##*/}"
+  grep -qE "^[0-9a-f]{64}  $dir/${f##*/}\$" "$scratch/sums" || fail "checks ${f##*/} against its sha256"
 done
 [[ $(find "$pkgdir" -type f | wc -l) -eq ${#files[@]} ]] || fail "installs nothing else"
+[[ -z $(find "$pkgdir" -type f ! -name '*.xz') ]] || fail "installs no path linux-firmware could also ship"
 
 echo "ok - asus-zenbook-14-ux3480qa-firmware"
