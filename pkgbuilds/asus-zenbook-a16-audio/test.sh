@@ -16,12 +16,17 @@ source "$package_dir/PKGBUILD"
   fail "the package is tagged Qualcomm-only for aarch64"
 
 pkgdir="$scratch/pkg"
-(cd "$package_dir" && package)
+(cd "$package_dir" && package_asus-zenbook-a16-audio)
 
 # linux-firmware-qcom ships the board's topology since 20261019-1.1, so this
 # package must not: a file of its own at that path would conflict with it.
 [[ ! -e $pkgdir/usr/lib/firmware && ! -L $pkgdir/usr/lib/firmware ]] ||
   fail "the package leaves the firmware to linux-firmware-qcom"
+# The build installs the unversioned dependency; the built package must ask for
+# the linux-firmware-qcom that ships the topology.
+built_depends=$(cd "$package_dir" && package_asus-zenbook-a16-audio >/dev/null 2>&1; printf '%s\n' "${depends[@]}")
+grep -qxF 'linux-firmware-qcom>=20261019-1.1' <<<"$built_depends" ||
+  fail "the built package needs the linux-firmware-qcom that ships the topology"
 
 # The UCM profile restates the CRD profile and sets the WSA digital volumes on
 # every boot.
