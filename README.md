@@ -145,8 +145,8 @@ To ship a change: open a PR, wait for green, merge. Nothing else is needed.
 
 1. **Build.** `build-pr.yml` builds every package directory the PR touches,
    once, against `edge`. x86_64 builds on an ephemeral DigitalOcean droplet
-   (runner label `omarchy-builder`), aarch64 on GitHub's `ubuntu-24.04-arm`
-   (aarch64 kernels on Namespace; see [the runner table](#where-a-package-is-published)).
+   (runner label `omarchy-builder`), aarch64 on Namespace's Apple-backed runner
+   (see [the runner table](#where-a-package-is-published)).
    Each build is kept as a workflow artifact for 7 days, named
    `<package>-<arch>-<git tree hash of the package directory>`.
 2. **Merge.** Branch protection requires `result`, `self-tests` and
@@ -190,8 +190,7 @@ It also decides where each build runs (`package_runner` in
 | Build | Runner |
 |---|---|
 | x86_64 | the droplet pool |
-| aarch64 | GitHub's `ubuntu-24.04-arm` (4 vCPU) |
-| aarch64 kernel (`linux-*`) | `namespace-profile-arm64-linux-apple-12x32` (Linux on Apple Silicon, 12 vCPU) |
+| aarch64 | `namespace-profile-arm64-linux-apple-12x32` (Linux on Apple Silicon, 12 vCPU) |
 
 A build that has to be repeated at merge runs on the same runner.
 
