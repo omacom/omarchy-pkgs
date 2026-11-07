@@ -235,11 +235,52 @@ data = json.load(open(sys.argv[1]))
 assert data["type"] == "devicetree" and data["compatible"] == "microsoft,surface-laptop-8-13p8", data
 assert data["hwids"], data
 PY
-# qcom-firmware-extract looks the list up by the running board's name.
-grep -qF '/provided.d/microsoft,surface-laptop-8-13p8.list"' "$package_dir/PKGBUILD" ||
-  fail "the firmware list is installed under the board name the hardware-ID file selects"
 grep -q '^MatchDMIModalias=dmi:\*svnMicrosoftCorporation:pnSurfaceLaptop13.8in8thEdSnapdragon:\*$' \
   "$package_dir/99-surface-laptop8.quirks" || fail "the touchpad quirk matches only this model"
 grep -q '^MemorySleepMode=s2idle$' "$package_dir/60-surface-laptop8-sleep.conf" || fail "sleep uses s2idle"
+
+# package() on stand-ins for what the build makes and the licences it takes
+# from installed packages: each size's card long name links to the shipped
+# profile, and qcom-firmware-extract finds the board list by each size's board
+# name.
+srcdir="$scratch/src"
+pkgdir="$scratch/pkg"
+mkdir -p "$srcdir/audioreach-topology" "$scratch/licenses"
+for f in GLYMUR-Microsoft-Surface-Laptop-8.conf HiFi.conf WSAInit.conf SpeakerSeq.conf \
+  glymur-microsoft-surface-laptop8.json qcom-firmware-extract-provided.list surface-laptop8-usb4-firmware \
+  60-surface-laptop8-usb-runtime-pm.rules 60-surface-laptop8-sleep.conf 99-surface-laptop8.quirks \
+  README.package.md LICENSE; do
+  cp "$package_dir/$f" "$srcdir/"
+done
+printf 'board' >"$srcdir/board.bin"
+printf 'topology' >"$srcdir/GLYMUR-Microsoft-Surface-Laptop-8-tplg.bin"
+printf 'licence' >"$srcdir/audioreach-topology/LICENSE.BSD-3-Clause"
+install() {
+  local arg
+  local -a args=()
+  for arg; do
+    if [[ $arg == /usr/share/licenses/* ]]; then
+      printf 'licence' >"$scratch/licenses/${arg##*/}"
+      arg="$scratch/licenses/${arg##*/}"
+    fi
+    args+=("$arg")
+  done
+  command install "${args[@]}"
+}
+(cd "$srcdir" && package) || fail "package() installs the package"
+unset -f install
+
+ucm="$pkgdir/usr/share/alsa/ucm2"
+profile=$(readlink -f "$ucm/Qualcomm/surface-laptop8/GLYMUR-Microsoft-Surface-Laptop-8.conf")
+for name in MicrosoftCorporation-SurfaceLaptop13.8in8thEdSnapdragon-124I00137T000M000000 \
+  MicrosoftCorporation-SurfaceLaptop15in8thEdSnapdragon-124I00137T000M0000000F; do
+  link="$ucm/conf.d/glymur/$name.conf"
+  [[ -L $link && $(readlink -f "$link") == "$profile" ]] || fail "the card profile is linked for $name"
+done
+for compatible in microsoft,surface-laptop-8-13p8 microsoft,surface-laptop-8-15; do
+  cmp -s "$pkgdir/usr/share/qcom-firmware-extract/provided.d/$compatible.list" \
+    "$package_dir/qcom-firmware-extract-provided.list" ||
+    fail "the board list is installed for $compatible"
+done
 
 echo "ok - surface-laptop-8-support"
