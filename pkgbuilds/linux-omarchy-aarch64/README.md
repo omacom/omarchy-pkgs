@@ -317,12 +317,13 @@ Qualcomm builds the topologies linux-firmware ships for the three laptops from t
 
 ### ASUS ProArt PZ13
 
-`2730`-`2733` add the ASUS ProArt PZ13 (HT5306QA, X1P-42-100 on the Purwa SoC, `asus,proart-pz13-ht5306qa`), a 13" tablet with a detachable USB keyboard cover, whose tree is carried outside Linux and not posted to linux-arm-msm yet.
+`2730`-`2734` add the ASUS ProArt PZ13 (HT5306QA, X1P-42-100 on the Purwa SoC, `asus,proart-pz13-ht5306qa`), a 13" tablet with a detachable USB keyboard cover, whose tree is carried outside Linux and not posted to linux-arm-msm yet.
 
 - `2732` is Alex Grucza's tree as his asus-proart-pz13-linux repository has it at `71c27d312a0e`, under its BSD-3-Clause licence, without the front, rear and IR camera nodes, their pin states and the front camera's DVDD regulator. Those need the X1P42100 CAMSS series and sensor driver changes this kernel doesn't carry. He runs the tree on jglathe's 7.2.5 Ubuntu kernel with the display, GPU, Wi-Fi, Bluetooth, both USB-C ports with DisplayPort, touchscreen and pen, keyboard cover, battery, suspend, speakers and microphones working.
+- `2734` is his driver for the tablet's embedded controller (`EC_ASUS_PROART_PZ13`, a module). The controller runs the fan on a temperature the OS reports to it and can't measure the SoC itself, so without the driver the fan never starts: the SoC reached 72 degrees under load with the fan off, and its thermal zones have no passive trip. The driver reports the hottest CPU and GPU zone once a second, sets the controller's full-speed bit from 85 degrees and clears it below 75, and shows the fan and the controller's sensors in hwmon.
 - `2731` and `2733` are his entries for the panel, a Samsung ATNA33AA08, in the `samsung,atna33xc20` binding, and for the tablet in the QSEECOM allowlist, which the UEFI variables and the RTC need. `2730` adds the compatible to the board binding.
 
-On this kernel sound doesn't work yet: the card asks for `X1P42100-ASUS-ProArt-PZ13-tplg.bin`, which Alex builds from his own topology source and linux-firmware doesn't have. His embedded controller driver, which reports the SoC temperature for the fan curve, isn't carried either, so the fan follows the controller's own curve.
+The sound card asks for `X1P42100-ASUS-ProArt-PZ13-tplg.bin`, the Surface Pro 12in topology under the tablet's name, which `asus-proart-pz13-audio` installs. Its UCM profile is in this repository's `alsa-ucm-conf`. Sound on monitors needs Alex's DisplayPort fixes in msm and a topology with DisplayPort graphs, which aren't carried.
 
 systemd doesn't list the tablet, so the package installs `x1p42100-asus-proart-pz13.json`, the four hardware IDs proposed in ubuntu/stubble#104, from the manufacturer, family, product name and BIOS in the owner's SMBIOS tables. Its firmware is in `asus-proart-pz13-firmware`.
 
