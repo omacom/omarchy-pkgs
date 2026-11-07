@@ -64,6 +64,14 @@ for name in WSAInit.conf SpeakerSeq.conf; do
     fail "the profile includes the shipped $name"
 done
 
+# Both sizes: the card profile is linked under each card's DMI long name, and
+# the board list is installed under each board's compatible.
+for name in MicrosoftCorporation-SurfaceLaptop13.8in8thEdSnapdragon-124I00137T000M000000 \
+  MicrosoftCorporation-SurfaceLaptop15in8thEdSnapdragon-124I00137T000M0000000F \
+  microsoft,surface-laptop-8-13p8 microsoft,surface-laptop-8-15; do
+  grep -qF "$name" "$package_dir/PKGBUILD" || fail "the package installs the profile link or board list for $name"
+done
+
 # The board list holds what the boot firmware starts and the router image this
 # package copies itself, so the extractor still copies the ADSP and CDSP from
 # Windows (Omarchy's DSP check looks for the ADSP in --list-missing).
@@ -236,8 +244,9 @@ assert data["type"] == "devicetree" and data["compatible"] == "microsoft,surface
 assert data["hwids"], data
 PY
 # qcom-firmware-extract looks the list up by the running board's name.
-grep -qF '/provided.d/microsoft,surface-laptop-8-13p8.list"' "$package_dir/PKGBUILD" ||
-  fail "the firmware list is installed under the board name the hardware-ID file selects"
+grep -qF '/provided.d/$compatible.list"' "$package_dir/PKGBUILD" &&
+  grep -qx '  for compatible in microsoft,surface-laptop-8-13p8 microsoft,surface-laptop-8-15; do' "$package_dir/PKGBUILD" ||
+  fail "the firmware list is installed under each size's board name"
 grep -q '^MatchDMIModalias=dmi:\*svnMicrosoftCorporation:pnSurfaceLaptop13.8in8thEdSnapdragon:\*$' \
   "$package_dir/99-surface-laptop8.quirks" || fail "the touchpad quirk matches only this model"
 grep -q '^MemorySleepMode=s2idle$' "$package_dir/60-surface-laptop8-sleep.conf" || fail "sleep uses s2idle"
