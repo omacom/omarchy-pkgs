@@ -1,4 +1,4 @@
-# surface-snapdragon-addresses
+# microsoft-surface-snapdragon-addresses
 
 Wi-Fi and Bluetooth addresses for Snapdragon Microsoft Surface devices. Neither the Surface Pro 11 nor the Surface Laptop 8 gets a usable address from Linux on its own. Both keep one base address in the `MacAddressEmulationAddress` UEFI variable and lay the others out the same way around it, as Windows' registry shows on each:
 
