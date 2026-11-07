@@ -1,0 +1,153 @@
+diff --git a/drivers/acpi/processor_idle.c b/drivers/acpi/processor_idle.c
+--- a/drivers/acpi/processor_idle.c
++++ b/drivers/acpi/processor_idle.c
+@@ -33,7 +33,6 @@
+ #include <linux/workqueue.h>
+ #include <acpi/processor.h>
+ #include <linux/context_tracking.h>
+-#include <crypto/sha2.h>
+ 
+ #include "internal.h"
+ 
+@@ -50,52 +49,52 @@
+ 
+ #define ACPI_IDLE_STATE_START	(IS_ENABLED(CONFIG_ARCH_HAS_CPU_RELAX) ? 1 : 0)
+ 
++/* Cached platform admission, never an unrestricted command-line request. */
+ static bool n1x_coordinated_requested;
++static bool n1x_coordinated_disabled;
+ static DEFINE_MUTEX(n1x_coordinated_gate_lock);
+ static bool n1x_coordinated_gate_checked;
+ static bool n1x_coordinated_gate_allowed;
+ 
+ static int __init n1x_coordinated_setup(char *value)
+ {
+-	if (value && !strcmp(value, "1"))
+-		n1x_coordinated_requested = true;
++	if (value && !strcmp(value, "1")) {
++		n1x_coordinated_disabled = false;
++	} else {
++		n1x_coordinated_disabled = true;
++		if (!value || strcmp(value, "0"))
++			pr_warn("invalid acpi.n1x_coordinated_s2idle value; disabled\n");
++	}
+ 	return 1;
+ }
+ __setup("acpi.n1x_coordinated_s2idle=", n1x_coordinated_setup);
+ 
++static bool n1x_p16_hardware_matches(void)
++{
++	const char *product = dmi_get_system_info(DMI_PRODUCT_NAME);
++	static const char model[] = "ProArt P16";
++
++	/* Require a model boundary so that ProArt P160 is not admitted. */
++	return dmi_match(DMI_SYS_VENDOR, "ASUS") && product &&
++	       !strncmp(product, model, sizeof(model) - 1) &&
++	       (!product[sizeof(model) - 1] || product[sizeof(model) - 1] == ' ') &&
++	       acpi_dev_present("NVDA6210", NULL, -1);
++}
++
+ static bool n1x_coordinated_allowed(void)
+ {
+-	static const u8 expected[SHA256_DIGEST_SIZE] = {
+-		0x5e, 0xce, 0xd7, 0x5d, 0x1b, 0x24, 0xc7, 0xfb,
+-		0xd0, 0x69, 0xaa, 0x92, 0x40, 0x69, 0x51, 0x47,
+-		0x84, 0x8b, 0xbf, 0xca, 0x56, 0xcc, 0xe7, 0x6a,
+-		0xb7, 0xf4, 0xa6, 0xa0, 0xeb, 0xa9, 0x84, 0x9f,
+-	};
+-	struct acpi_table_header *table;
+-	u8 digest[SHA256_DIGEST_SIZE];
+ 	bool allowed;
+ 
+-	if (!n1x_coordinated_requested)
++	if (n1x_coordinated_disabled)
+ 		return false;
+ 	mutex_lock(&n1x_coordinated_gate_lock);
+ 	if (n1x_coordinated_gate_checked)
+ 		goto out;
+ 	n1x_coordinated_gate_checked = true;
+-	if (!dmi_match(DMI_SYS_VENDOR, "ASUS") ||
+-	    !dmi_match(DMI_PRODUCT_NAME, "ProArt P16 H7607BA") ||
+-	    !dmi_match(DMI_BIOS_VERSION, "H7607BA.303") ||
+-	    !acpi_dev_present("NVDA6210", NULL, -1))
+-		goto report;
+-	if (ACPI_FAILURE(acpi_get_table(ACPI_SIG_DSDT, 0, &table)))
+-		goto report;
+-	if (table->length == 73551) {
+-		sha256((const u8 *)table, table->length, digest);
+-		n1x_coordinated_gate_allowed = !memcmp(digest, expected, sizeof(digest));
+-	}
+-	acpi_put_table(table);
+-report:
+-	pr_info("P16 suspend-only LPI firmware gate %s\n",
+-		n1x_coordinated_gate_allowed ? "matched" : "refused");
++	n1x_coordinated_gate_allowed = n1x_p16_hardware_matches();
++	n1x_coordinated_requested = n1x_coordinated_gate_allowed;
++	if (n1x_coordinated_gate_allowed)
++		pr_info("P16 suspend-only LPI platform matched; validating firmware hierarchy\n");
+ out:
+ 	allowed = n1x_coordinated_gate_allowed;
+ 	mutex_unlock(&n1x_coordinated_gate_lock);
+@@ -1109,7 +1108,7 @@
+ 
+ static bool acpi_lpi_can_coordinate(void)
+ {
+-	/* Keep this downstream port opt-in even on other OSI-capable systems. */
++	/* Restrict this downstream port to the P16/N1X platform. */
+ 	if (!n1x_coordinated_allowed())
+ 		return false;
+ 
+@@ -3850,8 +3849,8 @@
+ 	 * If a cpuidle driver is already registered, there is no need to
+ 	 * evaluate _CST or attempt to register the ACPI idle driver.
+ 	 */
+-	if (n1x_coordinated_requested)
+-		pr_info_once("P16 coordinated request: OSLPI_ack=%u cached_PSCI_OSI=%u firmware_gate=%u\n",
++	if (n1x_coordinated_allowed())
++		pr_info_once("P16 coordinated automatic admission: OSLPI_ack=%u cached_PSCI_OSI=%u platform_gate=%u\n",
+ 			     osc_os_lpi_support_confirmed,
+ 			     acpi_processor_ffh_lpi_hierarchy_supported(),
+ 			     n1x_coordinated_allowed());
+diff --git a/drivers/pci/hotplug/pciehp_core.c b/drivers/pci/hotplug/pciehp_core.c
+--- a/drivers/pci/hotplug/pciehp_core.c
++++ b/drivers/pci/hotplug/pciehp_core.c
+@@ -20,6 +20,7 @@
+ #define pr_fmt(fmt) "pciehp: " fmt
+ #define dev_fmt pr_fmt
+ 
++#include <linux/acpi.h>
+ #include <linux/bitfield.h>
+ #include <linux/delay.h>
+ #include <linux/dmi.h>
+@@ -287,7 +288,19 @@
+ 	return 0;
+ }
+ 
+-/* Experiment: this soldered reader can initially return all ones on resume. */
++static bool pciehp_p16_n1x_matches(void)
++{
++	const char *product = dmi_get_system_info(DMI_PRODUCT_NAME);
++	static const char model[] = "ProArt P16";
++
++	/* Require a model boundary so that ProArt P160 is not admitted. */
++	return dmi_match(DMI_SYS_VENDOR, "ASUS") && product &&
++	       !strncmp(product, model, sizeof(model) - 1) &&
++	       (!product[sizeof(model) - 1] || product[sizeof(model) - 1] == ' ') &&
++	       acpi_dev_present("NVDA6210", NULL, -1);
++}
++
++/* This soldered reader can initially return all ones on resume. */
+ static bool pciehp_p16_resume_replaced(struct controller *ctrl)
+ {
+ 	struct pci_dev *port = ctrl->pcie->port;
+@@ -299,9 +312,7 @@
+ 
+ 	if (pci_dev_is_disconnected(port))
+ 		return false;
+-	if (!dmi_match(DMI_SYS_VENDOR, "ASUS") ||
+-	    !dmi_match(DMI_PRODUCT_NAME, "ProArt P16 H7607BA") ||
+-	    !dmi_match(DMI_BIOS_VERSION, "H7607BA.303") ||
++	if (!pciehp_p16_n1x_matches() ||
+ 	    port->vendor != 0x10de || port->device != 0x22d0 ||
+ 	    pci_domain_nr(port->bus) != 6 || port->bus->number != 0 ||
+ 	    port->devfn != PCI_DEVFN(0, 0))
