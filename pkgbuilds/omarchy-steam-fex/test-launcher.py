@@ -26,6 +26,15 @@ ORIGINAL = (
     't||(this.m_bIsAwaitingInitialNetworkState=!1);after();'
 )
 
+CEF_FLAGS = ['-cef-force-occlusion', '-cef-disable-gpu', '-cef-disable-gpu-compositing']
+
+# The same block as bundled in sp.js by current clients (build 1792618285),
+# where the minifier picked different local names.
+CURRENT = (
+    ORIGINAL.replace('const t=', 'const He=').replace('t&&', 'He&&').replace('t||', 'He||')
+    .replace('e=>this.m_proxyInfo=e', 'Ke=>this.m_proxyInfo=Ke').replace('Ab.cd', 'x.Dp')
+)
+
 MOCK = '''
 import json, os
 from pathlib import Path
@@ -135,6 +144,25 @@ class SteamLauncherTests(unittest.TestCase):
         self.assertIn('(0,New.api)', path.read_text())
         self.assertEqual(path.with_suffix('.js.omarchy-bak').read_text(), ORIGINAL)
 
+    def test_prepare_patches_current_sp_bundle_with_renamed_locals(self):
+        path = self.chunk(CURRENT, 'sp.js')
+        self.run_launcher('--prepare')
+        patched = path.read_text()
+        self.assertTrue(patched.startswith('before();'))
+        self.assertTrue(patched.endswith(';after();'))
+        self.assertIn('const He=(0,x.Dp)("System.Network.RegisterForDeviceChanges")&&!!', patched)
+        self.assertIn('try{He&&SteamClient', patched)
+        self.assertIn('.then(Ke=>this.m_proxyInfo=Ke)', patched)
+        self.assertEqual(patched.count('catch(e){}'), 3)
+        self.assertIn('this.m_bIsAwaitingInitialNetworkState=!1,this.m_bIsConnectedToANetwork=!0', patched)
+        self.assertEqual(path.with_suffix('.js.omarchy-bak').read_text(), CURRENT)
+
+    def test_mismatched_local_names_are_not_patched(self):
+        content = CURRENT.replace('He||', 'Zz||')
+        path = self.chunk(content, 'sp.js')
+        self.run_launcher('--prepare')
+        self.assertEqual(path.read_text(), content)
+
     def test_unmatched_code_and_other_filenames_are_untouched(self):
         for name, content in [('chunk~changed.js', 'otherNetworkCode();'), ('other.js', ORIGINAL)]:
             path = self.chunk(content, name)
@@ -190,20 +218,20 @@ class SteamLauncherTests(unittest.TestCase):
     def test_initial_launch_keeps_bootstrap_enabled_and_preserves_arguments(self):
         args = ['steam://rungameid/123', 'argument with spaces', '$(touch unwanted)', '']
         calls = self.run_launcher(*args)
-        self.assert_fex(calls, ['-cef-force-occlusion'], args)
+        self.assert_fex(calls, [*CEF_FLAGS], args)
         self.assert_desktop()
         self.assertFalse(self.steam_root.exists())
 
     def test_ui_directory_alone_does_not_disable_bootstrap(self):
         path = self.chunk()
-        self.assert_fex(self.run_launcher(), ['-cef-force-occlusion'], [])
+        self.assert_fex(self.run_launcher(), [*CEF_FLAGS], [])
         self.assertEqual(path.read_text(), ORIGINAL)
 
     def test_ready_launch_patches_and_keeps_update_checks_enabled(self):
         path = self.chunk()
         self.client_ready()
         args = ['steam://open/main']
-        self.assert_fex(self.run_launcher(*args), ['-cef-force-occlusion', '-noverifyfiles'], args)
+        self.assert_fex(self.run_launcher(*args), [*CEF_FLAGS, '-noverifyfiles'], args)
         self.assertIn('m_bIsConnectedToANetwork=!0', path.read_text())
         self.assert_desktop()
 
@@ -227,7 +255,7 @@ class SteamLauncherTests(unittest.TestCase):
 
     def test_fex_exit_status_is_preserved(self):
         self.env['TEST_EXIT'] = '29'
-        self.assert_fex(self.run_launcher(expected=29), ['-cef-force-occlusion'], [])
+        self.assert_fex(self.run_launcher(expected=29), [*CEF_FLAGS], [])
 
 
 if __name__ == '__main__':
