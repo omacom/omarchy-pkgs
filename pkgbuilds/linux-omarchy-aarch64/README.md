@@ -125,6 +125,8 @@ The laptops get no device tree from their firmware, so the package builds the Wi
 
 `ARM_SCMI_CPUFREQ` and `ARM_SCMI_PERF_DOMAIN` are built in since `7.2.8-5`. The X1 and X2 CPUs scale through SCMI's performance protocol, and neither module carries an alias, so as modules nothing loaded them: the laptops booted with no cpufreq policies and ran at whatever clock the firmware left. Arch Linux ARM's kernel builds both in. The N1x scales through ACPI CPPC and is unaffected.
 
+FAT mounts as on x86_64's `linux-omarchy` since `7.3-23`. `FAT_DEFAULT_IOCHARSET` is `ascii`, `FAT_DEFAULT_UTF8` is on and `NLS_ASCII` is built in. The N1x config kept the kernel's own default, `iso8859-1` without UTF-8, so FAT file names came out as Latin-1 bytes unless a mount asked for `utf8`. mkinitcpio adds only `nls_ascii` and `nls_cp437` for FAT, so no initramfs could mount FAT either: the live image stopped in a shell when booted from a stick with the ISO copied onto FAT32 ("IO charset iso8859-1 not found").
+
 Two differences from Arch Linux ARM's kernel matter on these laptops. Omarchy's Snapdragon setup handles both, so the config stays as the N1x needs it.
 
 - The X1 pin control, interconnect, PMIC and bus drivers are modules here and built in there. mkinitcpio's hooks only pick storage, input and display drivers, so the setup names them for the initramfs.
