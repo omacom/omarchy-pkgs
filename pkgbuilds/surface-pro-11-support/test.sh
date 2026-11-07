@@ -353,6 +353,7 @@ printf '#!/bin/bash\nexit 0\n' >"$penbin/sudo"
 chmod +x "$penbin"/*
 cat >"$scratch/pen-pair.py" <<'EOF'
 import importlib.machinery, importlib.util, sys
+sys.dont_write_bytecode = True
 loader = importlib.machinery.SourceFileLoader('pen_pair', sys.argv[1])
 spec = importlib.util.spec_from_loader('pen_pair', loader)
 pen_pair = importlib.util.module_from_spec(spec)
