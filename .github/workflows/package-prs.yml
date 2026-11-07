@@ -84,9 +84,84 @@ jobs:
           echo "title=$title" >> "$GITHUB_OUTPUT"
           echo "- $title" >> "$GITHUB_STEP_SUMMARY"
 
+      # The push below rebuilds the PR branch from master. When the open PR
+      # already carries this recipe and master's tooling, that push only
+      # repeats a build that has finished: mil-hwx-compiler's PR failed the
+      # same build 59 times, once per run, and each fresh push left the
+      # summary reporting it as pending. Leave such a PR alone, so its
+      # finished checks are what the summary reads. A change on master to the
+      # package or to anything outside pkgbuilds/ still refreshes it.
+      #
+      # self-tests and build-isolation read the whole tree, so a PR that
+      # failed one of them is refreshed every run as before: one package's
+      # bad metadata on master failed every PR's self-tests on 2026-10-21
+      # until a fix in that package's directory, and a mirror timeout
+      # passes on the next try. The build is reused unless it failed too.
+      # So is a PR missing one of the three required checks, or with any
+      # check that was cancelled or timed out: a push is the only thing that
+      # starts them again. A build job past its timeout-minutes still leaves
+      # `result` failed, so the jobs are read, not only `result`.
+      #
+      # A PR left behind master still merges, because master does not require
+      # branches to be up to date. This only saves work, so any error here
+      # falls back to pushing.
+      - name: Check whether the open PR already has this update
+        id: current
+        if: ${{ steps.apply.outcome == 'success' }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.PKGS_BOT_TOKEN }}
+          BRANCH: ${{ matrix.group.branch }}
+          PACKAGES: ${{ matrix.group.packages }}
+        run: |
+          # Prints the PR number, how many of its checks failed, and whether
+          # its checks leave nothing a push would change: the build ran or is
+          # running, the whole-tree checks passed or are running, and no check
+          # was cut short.
+          # A check re-run appears once per run; the newest one counts, and a
+          # queued run (zero startedAt, empty conclusion) is the newest.
+          read -r number failed settled < <(gh pr list -R "$GITHUB_REPOSITORY" \
+            --head "$BRANCH" --base "$GITHUB_REF_NAME" --state open \
+            --json number,isCrossRepository,statusCheckRollup --jq '
+              map(select(.isCrossRepository | not))[0] // empty
+              | (.statusCheckRollup // []) as $rollup
+              | ($rollup | map(select(.name)) | group_by(.name)
+                  | map(max_by([.status != "COMPLETED", .startedAt])
+                      | {key: .name, value: (if .status == "COMPLETED" then .conclusion else "RUNNING" end)})
+                  | from_entries) as $checks
+              | [$checks[], ($rollup[] | select(.context) | .state)
+                  | select(. == "FAILURE" or . == "ERROR" or . == "TIMED_OUT" or
+                      . == "CANCELLED" or . == "STARTUP_FAILURE")] as $failed
+              | ($checks.result | . == "FAILURE" or . == "SUCCESS" or . == "RUNNING") as $built
+              | ([$checks["self-tests", "build-isolation"] | . == "SUCCESS" or . == "RUNNING"] | all) as $tested
+              | ([$checks[] | select(. == "TIMED_OUT" or . == "CANCELLED" or . == "STARTUP_FAILURE")]
+                  | length == 0) as $completed
+              | "\(.number) \($failed | length) \($built and $tested and $completed)"') || true
+          [[ -n $number ]] || exit 0
+          if (( failed )); then
+            echo "previous=failing" >> "$GITHUB_OUTPUT"
+          fi
+          if [[ $settled != true ]]; then
+            echo "#$number has a whole-tree failure or a missing or aborted check; refreshing it"
+            exit 0
+          fi
+          git fetch --no-tags --depth=1 origin "refs/heads/$BRANCH"
+          read -r -a packages <<<"$PACKAGES"
+          recipes=("${packages[@]/#/pkgbuilds/}")
+          # Stage the proposal in a scratch index; the real one stays as
+          # create-pull-request expects it.
+          export GIT_INDEX_FILE=$RUNNER_TEMP/proposed.index
+          git read-tree HEAD
+          git add -A -- "${recipes[@]}"
+          if git diff --cached --quiet FETCH_HEAD -- "${recipes[@]}" &&
+            git diff --cached --quiet FETCH_HEAD -- . ':!pkgbuilds'; then
+            echo "#$number already has this update and master's tooling; not pushing"
+            echo "number=$number" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Open or update the PR
         id: pr
-        if: ${{ steps.apply.outcome == 'success' }}
+        if: ${{ steps.apply.outcome == 'success' && steps.current.outputs.number == '' }}
         continue-on-error: ${{ inputs.report-package-failures }}
         uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1 # v8.1.1
         with:
@@ -104,11 +179,11 @@ jobs:
       # outcome wanted.
       - name: Enable auto-merge
         id: merge
-        if: ${{ steps.pr.outcome == 'success' && steps.pr.outputs.pull-request-number != '' }}
+        if: ${{ (steps.pr.outcome == 'success' && steps.pr.outputs.pull-request-number != '') || steps.current.outputs.number != '' }}
         continue-on-error: ${{ inputs.report-package-failures }}
         env:
           GH_TOKEN: ${{ secrets.PKGS_BOT_TOKEN }}
-          PR: ${{ steps.pr.outputs.pull-request-number }}
+          PR: ${{ steps.pr.outputs.pull-request-number || steps.current.outputs.number }}
         run: |
           armed() { [[ "$(gh pr view "$PR" -R "$GITHUB_REPOSITORY" --json autoMergeRequest --jq '.autoMergeRequest != null')" == true ]]; }
           if armed; then
@@ -135,9 +210,11 @@ jobs:
           jq -n --argjson group "$GROUP_JSON" --argjson steps "$STEPS_JSON" '
             $group + {
               apply: ($steps.apply.outcome // "skipped"),
-              pr: ($steps.pr.outcome // "skipped"),
+              pr: (if ($steps.current.outputs.number // "") != "" then "unchanged"
+                else $steps.pr.outcome // "skipped" end),
               merge: ($steps.merge.outcome // "skipped"),
-              number: ($steps.pr.outputs["pull-request-number"] // "")
+              number: ($steps.pr.outputs["pull-request-number"] // $steps.current.outputs.number // ""),
+              previous: ($steps.current.outputs.previous // "")
             }
           ' > "$RUNNER_TEMP/package-pr-results/$key.json"
 
