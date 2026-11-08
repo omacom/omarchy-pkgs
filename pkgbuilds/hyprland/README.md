@@ -6,6 +6,15 @@ Automatic upstream version bumps are held (`sync: false`) because `omarchy-hyprl
 
 `wl-output-global-grace.patch` keeps a removed `wl_output` global for five seconds before destroying it, as wlroots does. Without it, an output that comes and goes within a roundtrip, such as a dock's monitor flapping while its tunnel comes up, disconnects every client that has not bound it yet with "global wl_output (N) is unavailable". `monitor-rule-vrr.patch` makes a config reload apply a monitor rule's `vrr`; without it, changing only `vrr` is ignored until the next session. `nvidia-egl-teardown.patch` releases the EGL context before Hyprland terminates the display, which NVIDIA's EGL otherwise crashes on at exit. Two earlier carries, the removed-output session-lock fix and the dmabuf format-table fix, shipped upstream in 0.57.1 and were dropped here. Rebase each patch with `--fuzz=0` on a version bump, and drop each once the selected release carries the fix.
 
+## Startup splash
+
+`startup-splash.patch` lets Hyprland take the display over from Omarchy's Plymouth splash without the screen changing. Omarchy's config (`default/hypr/boot-splash.lua`, while Plymouth still holds its frame) sets `misc:startup_splash_logo`, the bar images and offset, and `misc:startup_splash_bar_start`, the CLOCK_MONOTONIC millisecond the splash's progress bar started, which `omarchy-plymouth-handoff` reads off Plymouth's last frame. Hyprland then draws the splash's colour, logo and bar, the bar on Plymouth's curve `limit * (1 - (1 - t / duration)^2)`, at Plymouth's device scale, over everything:
+
+- as soon as aquamarine reports the output, before the rest of Hyprland has started, by committing a CPU-painted buffer (cairo), and on every later commit that carries no rendered frame, so the bar keeps moving through startup and no modeset scans out a buffer nothing has drawn into, which showed as 130–170 ms of black;
+- on every frame after that, with the monitor-added zoom skipped and the pointer hidden. It is drawn just short of opaque so the render pass does not cull the clients underneath, which keep receiving their frames.
+
+When the shell sets `misc:startup_splash_finish`, the bar fills over `startup_splash_fill_duration` ms, the splash fades over `startup_splash_fade_duration` ms, announced on socket2 as `startupsplash>>fade` so an intro can start with it, and the pointer returns. If nobody asks within `startup_splash_timeout` seconds it finishes by itself. Nothing in the renderer's or a monitor's class layout changes, so plugins built against the unpatched headers stay compatible. Unset, `misc:startup_splash_logo` leaves Hyprland exactly as upstream draws it.
+
 ## x86_64
 
 This recipe also builds for x86_64, so PCs take this build instead of Arch's `extra/hyprland`: `[omarchy]` comes before `[extra]` in Omarchy's `pacman.conf`. That gives PCs the patches above and keeps them on the Hyprland the titlebars plugin was built against when Arch moves first. Move both architectures and the plugin to a newer Hyprland in one change, with a `pkgrel` above Arch's for the same version so a machine already on Arch's build moves to this one.
