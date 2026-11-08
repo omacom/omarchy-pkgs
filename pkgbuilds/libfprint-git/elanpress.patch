@@ -1,0 +1,2530 @@
+diff --git c/data/autosuspend.hwdb i/data/autosuspend.hwdb
+index 104ce5e6..a37ba236 100644
+--- c/data/autosuspend.hwdb
++++ i/data/autosuspend.hwdb
+@@ -152,9 +152,6 @@ usb:v04F3p0C3D*
+ usb:v04F3p0C42*
+ usb:v04F3p0C4B*
+ usb:v04F3p0C4D*
+-usb:v04F3p0C4F*
+-usb:v04F3p0C63*
+-usb:v04F3p0C6E*
+ usb:v04F3p0C58*
+  ID_AUTOSUSPEND=1
+  ID_PERSIST=0
+@@ -180,6 +177,13 @@ usb:v04F3p0CB6*
+  ID_AUTOSUSPEND=1
+  ID_PERSIST=0
+ 
++# Supported by libfprint driver elanpress
++usb:v04F3p0C6E*
++usb:v04F3p0C4F*
++usb:v04F3p0C63*
++ ID_AUTOSUSPEND=1
++ ID_PERSIST=0
++
+ # Supported by libfprint driver etes603
+ usb:v1C7Ap0603*
+  ID_AUTOSUSPEND=1
+diff --git c/libfprint/drivers/elan.h i/libfprint/drivers/elan.h
+index 6bbaae04..80f598b2 100644
+--- c/libfprint/drivers/elan.h
++++ i/libfprint/drivers/elan.h
+@@ -220,9 +220,7 @@ static const FpIdEntry elan_id_table[] = {
+   {.vid = ELAN_VEND_ID,  .pid = 0x0c42, .driver_data = ELAN_0C42},
+   {.vid = ELAN_VEND_ID,  .pid = 0x0c4b, .driver_data = ELAN_ALL_DEV},
+   {.vid = ELAN_VEND_ID,  .pid = 0x0c4d, .driver_data = ELAN_ALL_DEV},
+-  {.vid = ELAN_VEND_ID,  .pid = 0x0c4f, .driver_data = ELAN_ALL_DEV},
+-  {.vid = ELAN_VEND_ID,  .pid = 0x0c63, .driver_data = ELAN_ALL_DEV},
+-  {.vid = ELAN_VEND_ID,  .pid = 0x0c6e, .driver_data = ELAN_ALL_DEV},
++  /* 0x0c4f, 0x0c63 and 0x0c6e are press sensors, claimed by elanpress. */
+   {.vid = ELAN_VEND_ID,  .pid = 0x0c58, .driver_data = ELAN_0C58},
+   {.vid = 0,  .pid = 0,  .driver_data = 0},
+ };
+diff --git c/libfprint/drivers/elanpress-match.c i/libfprint/drivers/elanpress-match.c
+new file mode 100644
+index 00000000..815bb737
+--- /dev/null
++++ i/libfprint/drivers/elanpress-match.c
+@@ -0,0 +1,452 @@
++/*
++ * Image processing and keypoint matching for ELAN press-type sensors
++ * Copyright (C) 2026 Filip Spanne
++ *
++ * The imaged area of these sensors is far too small for reliable minutiae
++ * matching, so prints store the enrolled images themselves and a press is
++ * matched against them by pairing up local keypoint features (see
++ * elanpress-sift.c), like the Windows driver does.
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++#include "elanpress-match.h"
++
++#include <math.h>
++#include <stdlib.h>
++#include <string.h>
++
++static int
++elanpress_cmp_short (const void *a, const void *b)
++{
++  return (int) (*(unsigned short *) a - *(unsigned short *) b);
++}
++
++/* the wire format is column-major with frame-height-tall columns; rotate
++ * to row-major (same layout as the elan driver uses for these sensors) */
++void
++elanpress_rotate_frame (const guint8 *raw, unsigned short *out, int w, int h)
++{
++  for (int y = 0; y < h; y++)
++    for (int x = 0; x < w; x++)
++      out[y * w + x] = ((const guint16 *) raw)[y + x * h];
++}
++
++/* Elantech's recommended 2-step non-linear normalization of the 14-bit
++ * background-subtracted frame onto 8 bits (see the elan driver) */
++static void
++elanpress_normalize (const unsigned short *in, guint8 *out, unsigned int size)
++{
++  g_autofree unsigned short *sorted = g_malloc (size * sizeof (short));
++  unsigned short lvl0, lvl1, lvl2, lvl3;
++  unsigned short px;
++
++  memcpy (sorted, in, size * sizeof (short));
++  qsort (sorted, size, sizeof (short), elanpress_cmp_short);
++
++  lvl0 = sorted[0];
++  lvl1 = sorted[size * 3 / 10];
++  lvl2 = sorted[size * 65 / 100];
++  lvl3 = sorted[size - 1];
++
++  for (unsigned int i = 0; i < size; i++)
++    {
++      px = in[i];
++      /* When a third of the frame shares one floor (the untouched area of a
++       * partial press), lvl0 == lvl1 and the old test never maps that floor
++       * to black. It is lifted to 99, and the resulting flat field matches
++       * nothing. */
++      if (px <= lvl0)
++        px = 0;
++      else if (px < lvl1)
++        px = (px - lvl0) * 99 / MAX (lvl1 - lvl0, 1);
++      else if (px < lvl2)
++        px = 99 + ((px - lvl1) * 56 / MAX (lvl2 - lvl1, 1));
++      else
++        px = 155 + MIN ((px - lvl2) * 100 / MAX (lvl3 - lvl2, 1), 100);
++      out[i] = (guint8) px;
++    }
++}
++
++/* average the stable frames of a touch (newest-first list), subtract the
++ * background and normalize; returns NULL if the finger wasn't properly on
++ * the sensor */
++guint8 *
++elanpress_process_frames (GSList *frames, int num_frames,
++                          const unsigned short *background,
++                          unsigned int size)
++{
++  g_autofree unsigned int *sum = g_malloc0 (size * sizeof (unsigned int));
++  g_autofree unsigned short *avg = g_malloc (size * sizeof (unsigned short));
++  guint8 *out;
++  int skip_oldest = 0, skip_newest = 0, used = 0, i;
++  unsigned long total = 0;
++  GSList *l;
++
++  if (num_frames >= 6)
++    {
++      skip_oldest = ELANPRESS_SKIP_OLDEST;
++      skip_newest = ELANPRESS_SKIP_NEWEST;
++    }
++  else if (num_frames >= 4)
++    {
++      skip_oldest = 1;
++      skip_newest = 1;
++    }
++
++  for (l = frames, i = 0; l; l = l->next, i++)
++    {
++      const unsigned short *frame = l->data;
++
++      if (i < skip_newest || i >= num_frames - skip_oldest)
++        continue;
++      for (unsigned int j = 0; j < size; j++)
++        sum[j] += frame[j];
++      used++;
++    }
++
++  if (used == 0)
++    return NULL;
++
++  for (unsigned int j = 0; j < size; j++)
++    {
++      unsigned int px = sum[j] / used;
++      unsigned short bg = background ? background[j] : 0;
++
++      avg[j] = px > bg ? px - bg : 0;
++      total += avg[j];
++    }
++
++  if (total == 0)
++    {
++      g_debug ("touch darker than background, ignoring");
++      return NULL;
++    }
++
++  out = g_malloc (size);
++  elanpress_normalize (avg, out, size);
++  return out;
++}
++
++/* standard deviation of the pixel values of a normalized touch image, as a
++ * cheap proxy for how much ridge contrast it actually holds. Flat captures
++ * correlate poorly against everything, genuine or not, so it is better to
++ * reject them at capture time than to store one or match against it. */
++gdouble
++elanpress_image_quality (const guint8 *img, unsigned int size)
++{
++  gdouble sum = 0, sum_sq = 0, mean;
++
++  if (!img || size == 0)
++    return 0.0;
++
++  for (unsigned int i = 0; i < size; i++)
++    sum += img[i];
++  mean = sum / size;
++
++  for (unsigned int i = 0; i < size; i++)
++    {
++      gdouble d = img[i] - mean;
++
++      sum_sq += d * d;
++    }
++
++  return sqrt (sum_sq / size);
++}
++
++/* counts how many pixels sit clearly above the background frame, to infer a
++ * touch without asking cmd_pre_scan (see the capture state machine) */
++gboolean
++elanpress_frame_has_touch (const unsigned short *frame,
++                           const unsigned short *background,
++                           unsigned int size,
++                           ElanpressTouchStats *stats)
++{
++  gint64 sum = 0;
++  unsigned int covered = 0;
++
++  if (stats)
++    {
++      stats->mean_delta = 0;
++      stats->coverage = 0;
++    }
++
++  /* without a reference frame presence cannot be told apart from an evenly
++   * lit sensor, so report no touch rather than guess */
++  if (!frame || !background || size == 0)
++    return FALSE;
++
++  for (unsigned int i = 0; i < size; i++)
++    {
++      int d = (int) frame[i] - (int) background[i];
++
++      if (d <= 0)
++        continue;
++
++      sum += d;
++      if (d >= ELANPRESS_TOUCH_PIXEL_DELTA)
++        covered++;
++    }
++
++  if (stats)
++    {
++      stats->mean_delta = (gdouble) sum / size;
++      stats->coverage = (gdouble) covered / size;
++    }
++
++  return covered >= size * ELANPRESS_TOUCH_MIN_COVERAGE;
++}
++
++ElanpressFeatures *
++elanpress_image_features (const guint8 *img, int w, int h)
++{
++  return elanpress_sift_features (img, w, h, ELANPRESS_MAX_KEYPOINTS);
++}
++
++static gint
++elanpress_desc_dist2 (const guint8 *a, const guint8 *b)
++{
++  gint sum = 0;
++
++  for (int k = 0; k < ELANPRESS_SIFT_DESC_LEN; k++)
++    {
++      gint d = (gint) a[k] - (gint) b[k];
++      sum += d * d;
++    }
++  return sum;
++}
++
++typedef struct
++{
++  gfloat px, py;        /* keypoint on the probe */
++  gfloat ex, ey;        /* its partner on the enrolled image */
++  gfloat rot;           /* rotation the pair's orientations imply */
++  guint  ei;            /* partner index, to count distinct partners */
++} ElanpressPair;
++
++typedef struct
++{
++  gfloat c, s, tx, ty;
++} ElanpressPlacement;
++
++/* the placement a single pair implies: its rotation, and the translation
++ * that then lands the probe keypoint exactly on its partner */
++static void
++elanpress_pair_placement (const ElanpressPair *p, ElanpressPlacement *m)
++{
++  m->c = cosf (p->rot);
++  m->s = sinf (p->rot);
++  m->tx = p->ex - (m->c * p->px - m->s * p->py);
++  m->ty = p->ey - (m->s * p->px + m->c * p->py);
++}
++
++static gboolean
++elanpress_pair_fits (const ElanpressPair *p, const ElanpressPlacement *m, gfloat tol2)
++{
++  gfloat dx = m->c * p->px - m->s * p->py + m->tx - p->ex;
++  gfloat dy = m->s * p->px + m->c * p->py + m->ty - p->ey;
++
++  return dx * dx + dy * dy < tol2;
++}
++
++/* least-squares rotation and translation taking the fitting pairs' probe
++ * keypoints onto their partners */
++static gboolean
++elanpress_refit (const ElanpressPair *pairs, const gboolean *fit, guint n,
++                 ElanpressPlacement *m)
++{
++  gdouble mpx = 0, mpy = 0, mex = 0, mey = 0, sxx = 0, sxy = 0, a;
++  guint cnt = 0;
++
++  for (guint i = 0; i < n; i++)
++    if (fit[i])
++      {
++        mpx += pairs[i].px;
++        mpy += pairs[i].py;
++        mex += pairs[i].ex;
++        mey += pairs[i].ey;
++        cnt++;
++      }
++  if (cnt < 2)
++    return FALSE;
++  mpx /= cnt;
++  mpy /= cnt;
++  mex /= cnt;
++  mey /= cnt;
++
++  for (guint i = 0; i < n; i++)
++    if (fit[i])
++      {
++        gdouble px = pairs[i].px - mpx, py = pairs[i].py - mpy;
++        gdouble ex = pairs[i].ex - mex, ey = pairs[i].ey - mey;
++
++        sxx += px * ex + py * ey;
++        sxy += px * ey - py * ex;
++      }
++
++  a = atan2 (sxy, sxx);
++  m->c = cos (a);
++  m->s = sin (a);
++  m->tx = mex - (m->c * mpx - m->s * mpy);
++  m->ty = mey - (m->s * mpx + m->c * mpy);
++  return TRUE;
++}
++
++/* fitting pairs, counted once per distinct keypoint on either side: a
++ * keypoint with two dominant directions yields two keypoints at one spot,
++ * and two probe keypoints can share a partner */
++static guint
++elanpress_count_distinct (const ElanpressPair *pairs, const gboolean *fit, guint n)
++{
++  guint probe = 0, enrolled = 0;
++
++  for (guint i = 0; i < n; i++)
++    {
++      gboolean seen_p = FALSE, seen_e = FALSE;
++
++      if (!fit[i])
++        continue;
++      for (guint j = 0; j < i; j++)
++        {
++          if (!fit[j])
++            continue;
++          if (pairs[j].px == pairs[i].px && pairs[j].py == pairs[i].py)
++            seen_p = TRUE;
++          if (pairs[j].ex == pairs[i].ex && pairs[j].ey == pairs[i].ey)
++            seen_e = TRUE;
++        }
++      probe += !seen_p;
++      enrolled += !seen_e;
++    }
++  return MIN (probe, enrolled);
++}
++
++/* the number of keypoint pairs that agree on one rigid placement of the
++ * probe on the enrolled image.
++ *
++ * Each pair's keypoint orientations already fix the rotation, so every pair
++ * proposes a complete placement on its own. Trying all of them, rather than
++ * sampling pairs of pairs as RANSAC would, makes the result deterministic
++ * and does not miss a genuine placement when most pairs are chance ones. The
++ * best supported proposals are then refined by least squares over the pairs
++ * they gather. */
++guint
++elanpress_match_features (const ElanpressFeatures *probe,
++                          const ElanpressFeatures *enrolled)
++{
++  const gfloat loose2 = ELANPRESS_MATCH_LOOSE_PX * ELANPRESS_MATCH_LOOSE_PX;
++  const gfloat tol2 = ELANPRESS_MATCH_TOL_PX * ELANPRESS_MATCH_TOL_PX;
++  const gdouble ratio2 = ELANPRESS_MATCH_RATIO * ELANPRESS_MATCH_RATIO;
++  g_autofree ElanpressPair *pairs = NULL;
++  g_autofree guint *support = NULL;
++  g_autofree gboolean *fit = NULL, *next = NULL;
++  guint n = 0, best = 0;
++
++  if (!probe || !enrolled || probe->n < 2 || enrolled->n < 2)
++    return 0;
++
++  pairs = g_new (ElanpressPair, probe->n);
++  for (guint i = 0; i < probe->n; i++)
++    {
++      const ElanpressKeypoint *kp = &probe->kp[i];
++      gint d1 = G_MAXINT, d2 = G_MAXINT;
++      guint b1 = 0;
++
++      for (guint j = 0; j < enrolled->n; j++)
++        {
++          gint d = elanpress_desc_dist2 (kp->desc, enrolled->kp[j].desc);
++
++          if (d < d1)
++            {
++              d2 = d1;
++              d1 = d;
++              b1 = j;
++            }
++          else if (d < d2)
++            {
++              d2 = d;
++            }
++        }
++      if (d2 == G_MAXINT || d1 >= ratio2 * d2)
++        continue;
++
++      pairs[n].px = kp->x;
++      pairs[n].py = kp->y;
++      pairs[n].ex = enrolled->kp[b1].x;
++      pairs[n].ey = enrolled->kp[b1].y;
++      pairs[n].rot = enrolled->kp[b1].angle - kp->angle;
++      pairs[n].ei = b1;
++      n++;
++    }
++  if (n < 3)
++    return 0;
++
++  support = g_new0 (guint, n);
++  fit = g_new (gboolean, n);
++  next = g_new (gboolean, n);
++
++  /* support for the placement each pair proposes */
++  for (guint k = 0; k < n; k++)
++    {
++      ElanpressPlacement m;
++
++      elanpress_pair_placement (&pairs[k], &m);
++      for (guint i = 0; i < n; i++)
++        support[k] += elanpress_pair_fits (&pairs[i], &m, loose2);
++    }
++
++  /* refine the best supported proposals; a genuine placement is proposed by
++   * every one of its pairs, so it is among the first few */
++  for (int round = 0; round < ELANPRESS_MATCH_REFINED; round++)
++    {
++      ElanpressPlacement m;
++      guint top = 0, cnt;
++
++      for (guint k = 1; k < n; k++)
++        if (support[k] > support[top])
++          top = k;
++      if (support[top] < 3)
++        break;
++      support[top] = 0;
++
++      elanpress_pair_placement (&pairs[top], &m);
++      for (guint i = 0; i < n; i++)
++        fit[i] = elanpress_pair_fits (&pairs[i], &m, loose2);
++
++      for (int step = 0; step < 3; step++)
++        {
++          gboolean same = TRUE;
++          guint was = 0, now = 0;
++
++          if (!elanpress_refit (pairs, fit, n, &m))
++            break;
++          for (guint i = 0; i < n; i++)
++            {
++              next[i] = elanpress_pair_fits (&pairs[i], &m, tol2);
++              same &= next[i] == fit[i];
++              was += fit[i];
++              now += next[i];
++            }
++          memcpy (fit, next, n * sizeof (gboolean));
++          if (same || now < was)
++            break;
++        }
++
++      cnt = elanpress_count_distinct (pairs, fit, n);
++      best = MAX (best, cnt);
++    }
++
++  return best;
++}
+diff --git c/libfprint/drivers/elanpress-match.h i/libfprint/drivers/elanpress-match.h
+new file mode 100644
+index 00000000..d6c7c400
+--- /dev/null
++++ i/libfprint/drivers/elanpress-match.h
+@@ -0,0 +1,107 @@
++/*
++ * Image processing and correlation matching for ELAN press-type sensors
++ * Copyright (C) 2026 Filip Spanne
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++#pragma once
++
++#include <glib.h>
++
++#include "elanpress-sift.h"
++
++/* frames dropped at the start (finger settling) and end (possible lift)
++ * of a touch when enough frames are available */
++#define ELANPRESS_SKIP_OLDEST 2
++#define ELANPRESS_SKIP_NEWEST 1
++
++/* A press is matched against an enrolled image by pairing up keypoints whose
++ * descriptors are each other's clear nearest neighbour, then counting how
++ * many of those pairs agree on a single rigid placement of one image on the
++ * other. Unrelated fingers still pair up a handful of keypoints by chance,
++ * but their placements disagree, so they reach only a few such pairs.
++ *
++ * Measured on labelled presses from the reference sensor (40 genuine, 30
++ * from five other fingers, against 8 to 12 enrolled images): the other
++ * fingers reached at most 4 pairs, while 97-99% of genuine presses reached 12
++ * or more and half of them over 60. Correlating whole images instead (the
++ * previous matcher) left the two overlapping on the same data: at 0.68 it
++ * rejected about 1 genuine press in 10 and still accepted the odd impostor. */
++#define ELANPRESS_MATCH_MIN_PAIRS 12
++
++/* the nearest descriptor must be closer than this fraction of the distance
++ * to the second nearest to count as a pair (Lowe's ratio test) */
++#define ELANPRESS_MATCH_RATIO 0.8
++
++/* how far a keypoint may land from its partner under the placement, in
++ * pixels: the first value gathers support for a placement proposed by a
++ * single pair, the second decides the final count after refitting it */
++#define ELANPRESS_MATCH_LOOSE_PX 6.0
++#define ELANPRESS_MATCH_TOL_PX 3.0
++
++/* proposed placements refined by least squares, best supported first */
++#define ELANPRESS_MATCH_REFINED 8
++
++/* keypoints kept per image, strongest first */
++#define ELANPRESS_MAX_KEYPOINTS 300
++
++/* Presence is read out of the image, because the status byte cmd_pre_scan
++ * returns answers once per power-up and then wedges at "finger present".
++ *
++ * A pixel counts as covered when it sits this far above the background, and
++ * the frame counts as touched once that many of them are. Counting covered
++ * pixels rather than averaging the delta over the whole sensor is what keeps
++ * a lightly resting finger from being diluted by the untouched area around
++ * it: a finger landing on a third of the pad drives those pixels hard but
++ * moves the whole-sensor mean very little, so a mean test only notices once
++ * the finger is pressed hard or slid across to cover more of the pad. */
++#define ELANPRESS_TOUCH_PIXEL_DELTA 1200
++#define ELANPRESS_TOUCH_MIN_COVERAGE 0.12
++
++/* Image kept for matching. Presence is allowed on a small contact so a
++ * landing finger is noticed, but a frame stored before the finger covers
++ * the pad normalizes into a flat field and never matches. A settled press
++ * on this sensor covers essentially all of it. */
++#define ELANPRESS_ACCEPT_COVERAGE 0.85
++
++/* what a frame looked like against the background, for tuning the two
++ * constants above from fp_dbg output */
++typedef struct
++{
++  gdouble mean_delta;
++  gdouble coverage;
++} ElanpressTouchStats;
++
++/* a processed touch whose contrast (pixel std-dev) falls below this carries
++ * too little ridge detail to enroll or to match against: a light or partial
++ * press correlates poorly against everything, genuine or not. A well-imaged
++ * press lands around 30-50. Rejecting these is what makes a bad press fail
++ * rather than score like a stranger's finger. */
++#define ELANPRESS_MIN_QUALITY_STDDEV 10.0
++
++void     elanpress_rotate_frame (const guint8 *raw, unsigned short *out,
++                                 int w, int h);
++guint8 * elanpress_process_frames (GSList *frames, int num_frames,
++                                   const unsigned short *background,
++                                   unsigned int size);
++ElanpressFeatures * elanpress_image_features (const guint8 *img, int w, int h);
++guint    elanpress_match_features (const ElanpressFeatures *probe,
++                                   const ElanpressFeatures *enrolled);
++gboolean elanpress_frame_has_touch (const unsigned short *frame,
++                                    const unsigned short *background,
++                                    unsigned int size,
++                                    ElanpressTouchStats *stats);
++gdouble  elanpress_image_quality (const guint8 *img, unsigned int size);
+diff --git c/libfprint/drivers/elanpress-sift.c i/libfprint/drivers/elanpress-sift.c
+new file mode 100644
+index 00000000..a45c30d1
+--- /dev/null
++++ i/libfprint/drivers/elanpress-sift.c
+@@ -0,0 +1,660 @@
++/*
++ * Keypoint features for ELAN press-type sensors
++ * Copyright (C) 2026 Filip Spanne
++ *
++ * The sensor images a 150 x 52 pixel window of the finger, so two presses
++ * rarely show the same patch in the same place, and minutiae are far too few
++ * to match on. Like the Windows driver, prints are matched on local ridge
++ * features instead: keypoints are the extrema of a difference-of-gaussians
++ * scale space, and each is described by histograms of gradient orientation
++ * around it, relative to its own dominant direction (D. Lowe, "Distinctive
++ * image features from scale-invariant keypoints", IJCV 2004). The parameters
++ * are the ones the Windows driver uses for this sensor.
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++#include "elanpress-sift.h"
++
++#include <float.h>
++#include <math.h>
++#include <string.h>
++
++/* scale space: scales sampled per octave, blur of each octave's first scale,
++ * and the blur the input is assumed to already have */
++#define SIFT_INTERVALS 3
++#define SIFT_SIGMA 1.6f
++#define SIFT_INIT_SIGMA 0.5f
++#define SIFT_LAYERS (SIFT_INTERVALS + 3)
++
++/* extrema below this contrast (image scaled to [0, 1]) are noise, and those
++ * with a principal curvature ratio above SIFT_EDGE_RATIO lie on an edge,
++ * where their position along it is ill defined */
++#define SIFT_CONTRAST_THR 0.04f
++#define SIFT_EDGE_RATIO 10.0f
++#define SIFT_BORDER 5
++#define SIFT_MAX_INTERP_STEPS 5
++
++/* orientation: 36-bin gradient histogram over a gaussian window of 1.5x the
++ * keypoint's scale; every peak within 80% of the highest gives a keypoint */
++#define SIFT_ORI_BINS 36
++#define SIFT_ORI_SIG_FCTR 1.5f
++#define SIFT_ORI_RADIUS (3.0f * SIFT_ORI_SIG_FCTR)
++#define SIFT_ORI_PEAK_RATIO 0.8f
++
++/* descriptor: 4 x 4 cells of 8 orientation bins, each cell 3x the scale */
++#define SIFT_DESC_WIDTH 4
++#define SIFT_DESC_BINS 8
++#define SIFT_DESC_SCL_FCTR 3.0f
++#define SIFT_DESC_MAG_THR 0.2f
++#define SIFT_DESC_INT_FCTR 512.0f
++
++typedef struct
++{
++  int     w, h;
++  gfloat *px;
++} SiftImage;
++
++/* gradient magnitude and direction of one gaussian scale */
++typedef struct
++{
++  int     w, h;
++  gfloat *mag;
++  gfloat *ang;
++} SiftGrad;
++
++typedef struct
++{
++  int        n_octaves;
++  SiftImage *gauss;     /* n_octaves x SIFT_LAYERS */
++  SiftImage *dog;       /* n_octaves x (SIFT_LAYERS - 1) */
++  SiftGrad  *grad;      /* n_octaves x SIFT_LAYERS, filled in on demand */
++} SiftPyramid;
++
++#define GAUSS(p, o, l) (&(p)->gauss[(o) * SIFT_LAYERS + (l)])
++#define DOG(p, o, l) (&(p)->dog[(o) * (SIFT_LAYERS - 1) + (l)])
++
++static void
++sift_image_alloc (SiftImage *im, int w, int h)
++{
++  im->w = w;
++  im->h = h;
++  im->px = g_new (gfloat, (gsize) w * h);
++}
++
++static inline gfloat
++px_at (const SiftImage *im, int x, int y)
++{
++  return im->px[y * im->w + x];
++}
++
++static inline int
++reflect101 (int i, int n)
++{
++  if (n == 1)
++    return 0;
++  while (i < 0 || i >= n)
++    i = i < 0 ? -i : 2 * n - 2 - i;
++  return i;
++}
++
++/* separable gaussian blur, borders reflected about the edge pixel */
++static void
++sift_blur (const SiftImage *src, SiftImage *dst, gfloat sigma)
++{
++  int r = MAX (1, (int) (sigma * 4.0f + 0.5f));
++  int w = src->w, h = src->h;
++  g_autofree gfloat *k = g_new (gfloat, 2 * r + 1);
++  g_autofree gfloat *row = g_new (gfloat, w + 2 * r);
++  g_autofree gfloat *tmp = g_new (gfloat, (gsize) w * h);
++  gfloat sum = 0;
++
++  for (int i = -r; i <= r; i++)
++    sum += k[i + r] = expf (-(gfloat) (i * i) / (2.0f * sigma * sigma));
++  for (int i = 0; i <= 2 * r; i++)
++    k[i] /= sum;
++
++  for (int y = 0; y < h; y++)
++    {
++      const gfloat *in = src->px + (gsize) y * w;
++      gfloat *out = tmp + (gsize) y * w;
++
++      for (int x = -r; x < w + r; x++)
++        row[x + r] = in[reflect101 (x, w)];
++      for (int x = 0; x < w; x++)
++        {
++          gfloat acc = 0;
++          for (int i = 0; i <= 2 * r; i++)
++            acc += k[i] * row[x + i];
++          out[x] = acc;
++        }
++    }
++
++  for (int y = 0; y < h; y++)
++    {
++      gfloat *out = dst->px + (gsize) y * w;
++
++      memset (out, 0, sizeof (gfloat) * w);
++      for (int i = -r; i <= r; i++)
++        {
++          const gfloat *in = tmp + (gsize) reflect101 (y + i, h) * w;
++          gfloat kv = k[i + r];
++          for (int x = 0; x < w; x++)
++            out[x] += kv * in[x];
++        }
++    }
++}
++
++/* the first octave works on the image doubled in size, which roughly
++ * quadruples the keypoints found at the smallest scales (Lowe, 3.3) */
++static void
++sift_upsample (const guint8 *img, int w, int h, SiftImage *dst)
++{
++  sift_image_alloc (dst, 2 * w, 2 * h);
++  for (int Y = 0; Y < 2 * h; Y++)
++    {
++      gfloat fy = (Y + 0.5f) * 0.5f - 0.5f;
++      int y0 = (int) floorf (fy);
++      gfloat wy = fy - y0;
++      int ya = CLAMP (y0, 0, h - 1), yb = CLAMP (y0 + 1, 0, h - 1);
++
++      for (int X = 0; X < 2 * w; X++)
++        {
++          gfloat fx = (X + 0.5f) * 0.5f - 0.5f;
++          int x0 = (int) floorf (fx);
++          gfloat wx = fx - x0;
++          int xa = CLAMP (x0, 0, w - 1), xb = CLAMP (x0 + 1, 0, w - 1);
++          gfloat top = (1 - wx) * img[ya * w + xa] + wx * img[ya * w + xb];
++          gfloat bot = (1 - wx) * img[yb * w + xa] + wx * img[yb * w + xb];
++
++          dst->px[Y * dst->w + X] = ((1 - wy) * top + wy * bot) / 255.0f;
++        }
++    }
++}
++
++static void
++sift_pyramid_build (SiftPyramid *pyr, const guint8 *img, int w, int h)
++{
++  gfloat sig[SIFT_LAYERS];
++  gfloat k = powf (2.0f, 1.0f / SIFT_INTERVALS);
++  int ow = 2 * w, oh = 2 * h;
++  SiftImage base;
++
++  /* each octave needs room for the border plus the 3x3 extremum test */
++  pyr->n_octaves = 0;
++  while (MIN (ow, oh) >= 2 * SIFT_BORDER + 3)
++    {
++      pyr->n_octaves++;
++      ow /= 2;
++      oh /= 2;
++    }
++  pyr->gauss = g_new0 (SiftImage, pyr->n_octaves * SIFT_LAYERS);
++  pyr->dog = g_new0 (SiftImage, pyr->n_octaves * (SIFT_LAYERS - 1));
++  pyr->grad = g_new0 (SiftGrad, pyr->n_octaves * SIFT_LAYERS);
++
++  /* incremental blur taking scale i-1 to scale i */
++  sig[0] = SIFT_SIGMA;
++  for (int i = 1; i < SIFT_LAYERS; i++)
++    {
++      gfloat prev = powf (k, i - 1) * SIFT_SIGMA;
++      gfloat total = prev * k;
++      sig[i] = sqrtf (total * total - prev * prev);
++    }
++
++  sift_upsample (img, w, h, &base);
++  for (int o = 0; o < pyr->n_octaves; o++)
++    {
++      SiftImage *g0 = GAUSS (pyr, o, 0);
++
++      if (o == 0)
++        {
++          gfloat init = 2.0f * SIFT_INIT_SIGMA;
++
++          sift_image_alloc (g0, base.w, base.h);
++          sift_blur (&base, g0, sqrtf (MAX (SIFT_SIGMA * SIFT_SIGMA - init * init, 0.01f)));
++        }
++      else
++        {
++          /* scale SIFT_INTERVALS of the previous octave has twice the blur
++           * of its first one, so every other pixel of it starts this one */
++          const SiftImage *src = GAUSS (pyr, o - 1, SIFT_INTERVALS);
++
++          sift_image_alloc (g0, src->w / 2, src->h / 2);
++          for (int y = 0; y < g0->h; y++)
++            for (int x = 0; x < g0->w; x++)
++              g0->px[y * g0->w + x] = px_at (src, 2 * x, 2 * y);
++        }
++
++      for (int i = 1; i < SIFT_LAYERS; i++)
++        {
++          sift_image_alloc (GAUSS (pyr, o, i), g0->w, g0->h);
++          sift_blur (GAUSS (pyr, o, i - 1), GAUSS (pyr, o, i), sig[i]);
++        }
++
++      for (int i = 0; i < SIFT_LAYERS - 1; i++)
++        {
++          SiftImage *d = DOG (pyr, o, i);
++          const SiftImage *a = GAUSS (pyr, o, i), *b = GAUSS (pyr, o, i + 1);
++
++          sift_image_alloc (d, g0->w, g0->h);
++          for (int p = 0; p < g0->w * g0->h; p++)
++            d->px[p] = b->px[p] - a->px[p];
++        }
++    }
++  g_free (base.px);
++}
++
++static void
++sift_pyramid_clear (SiftPyramid *pyr)
++{
++  for (int i = 0; i < pyr->n_octaves * SIFT_LAYERS; i++)
++    {
++      g_free (pyr->gauss[i].px);
++      g_free (pyr->grad[i].mag);
++      g_free (pyr->grad[i].ang);
++    }
++  for (int i = 0; i < pyr->n_octaves * (SIFT_LAYERS - 1); i++)
++    g_free (pyr->dog[i].px);
++  g_free (pyr->gauss);
++  g_free (pyr->dog);
++  g_free (pyr->grad);
++}
++
++/* gradients of a gaussian scale, direction in [0, 2 pi) with y pointing
++ * down; the outermost pixels have none */
++static const SiftGrad *
++sift_grad (SiftPyramid *pyr, int o, int l)
++{
++  SiftGrad *g = &pyr->grad[o * SIFT_LAYERS + l];
++  const SiftImage *im = GAUSS (pyr, o, l);
++
++  if (g->mag)
++    return g;
++
++  g->w = im->w;
++  g->h = im->h;
++  g->mag = g_new0 (gfloat, (gsize) im->w * im->h);
++  g->ang = g_new0 (gfloat, (gsize) im->w * im->h);
++  for (int y = 1; y < im->h - 1; y++)
++    for (int x = 1; x < im->w - 1; x++)
++      {
++        gfloat dx = px_at (im, x + 1, y) - px_at (im, x - 1, y);
++        gfloat dy = px_at (im, x, y + 1) - px_at (im, x, y - 1);
++        gfloat a = atan2f (dy, dx);
++
++        g->mag[y * im->w + x] = sqrtf (dx * dx + dy * dy);
++        g->ang[y * im->w + x] = a < 0 ? a + 2 * G_PI : a;
++      }
++  return g;
++}
++
++static gboolean
++sift_is_extremum (const SiftPyramid *pyr, int o, int l, int x, int y, gfloat v)
++{
++  for (int dl = -1; dl <= 1; dl++)
++    {
++      const SiftImage *im = DOG (pyr, o, l + dl);
++
++      for (int dy = -1; dy <= 1; dy++)
++        for (int dx = -1; dx <= 1; dx++)
++          {
++            gfloat n = px_at (im, x + dx, y + dy);
++
++            if (dl == 0 && dx == 0 && dy == 0)
++              continue;
++            if (v > 0 ? n > v : n < v)
++              return FALSE;
++          }
++    }
++  return TRUE;
++}
++
++/* solve the 3x3 symmetric system H X = b; FALSE if H is singular */
++static gboolean
++sift_solve3 (const gfloat H[3][3], const gfloat b[3], gfloat X[3])
++{
++  gfloat c00 = H[1][1] * H[2][2] - H[1][2] * H[2][1];
++  gfloat c01 = H[1][2] * H[2][0] - H[1][0] * H[2][2];
++  gfloat c02 = H[1][0] * H[2][1] - H[1][1] * H[2][0];
++  gfloat det = H[0][0] * c00 + H[0][1] * c01 + H[0][2] * c02;
++  gfloat inv[3][3];
++
++  if (fabsf (det) < 1e-20f)
++    return FALSE;
++
++  inv[0][0] = c00;
++  inv[0][1] = H[0][2] * H[2][1] - H[0][1] * H[2][2];
++  inv[0][2] = H[0][1] * H[1][2] - H[0][2] * H[1][1];
++  inv[1][0] = c01;
++  inv[1][1] = H[0][0] * H[2][2] - H[0][2] * H[2][0];
++  inv[1][2] = H[0][2] * H[1][0] - H[0][0] * H[1][2];
++  inv[2][0] = c02;
++  inv[2][1] = H[0][1] * H[2][0] - H[0][0] * H[2][1];
++  inv[2][2] = H[0][0] * H[1][1] - H[0][1] * H[1][0];
++  for (int i = 0; i < 3; i++)
++    X[i] = (inv[i][0] * b[0] + inv[i][1] * b[1] + inv[i][2] * b[2]) / det;
++  return TRUE;
++}
++
++/* fit a quadratic to the scale space around a sampled extremum to locate it
++ * below the pixel and scale grid (Lowe, 4), then reject it if its contrast is
++ * too low or it lies on an edge. Moves (*l, *x, *y) to the nearest sample
++ * and returns the remaining offsets. */
++static gboolean
++sift_refine (const SiftPyramid *pyr, int o, int *l, int *x, int *y,
++             gfloat *ox, gfloat *oy, gfloat *ol, gfloat *contrast)
++{
++  const SiftImage *cur = DOG (pyr, o, *l);
++  gfloat H[3][3], dD[3], X[3] = { 0, 0, 0 };
++  gfloat dxx = 0, dyy = 0, dxy = 0;
++  int step;
++
++  for (step = 0; step < SIFT_MAX_INTERP_STEPS; step++)
++    {
++      const SiftImage *prev = DOG (pyr, o, *l - 1), *next = DOG (pyr, o, *l + 1);
++      int c = *x, r = *y;
++      gfloat v2;
++
++      cur = DOG (pyr, o, *l);
++      v2 = 2 * px_at (cur, c, r);
++      dD[0] = (px_at (cur, c + 1, r) - px_at (cur, c - 1, r)) * 0.5f;
++      dD[1] = (px_at (cur, c, r + 1) - px_at (cur, c, r - 1)) * 0.5f;
++      dD[2] = (px_at (next, c, r) - px_at (prev, c, r)) * 0.5f;
++
++      dxx = px_at (cur, c + 1, r) + px_at (cur, c - 1, r) - v2;
++      dyy = px_at (cur, c, r + 1) + px_at (cur, c, r - 1) - v2;
++      dxy = (px_at (cur, c + 1, r + 1) - px_at (cur, c - 1, r + 1) -
++             px_at (cur, c + 1, r - 1) + px_at (cur, c - 1, r - 1)) * 0.25f;
++      H[0][0] = dxx;
++      H[1][1] = dyy;
++      H[2][2] = px_at (next, c, r) + px_at (prev, c, r) - v2;
++      H[0][1] = H[1][0] = dxy;
++      H[0][2] = H[2][0] = (px_at (next, c + 1, r) - px_at (next, c - 1, r) -
++                           px_at (prev, c + 1, r) + px_at (prev, c - 1, r)) * 0.25f;
++      H[1][2] = H[2][1] = (px_at (next, c, r + 1) - px_at (next, c, r - 1) -
++                           px_at (prev, c, r + 1) + px_at (prev, c, r - 1)) * 0.25f;
++
++      if (!sift_solve3 ((const gfloat (*)[3]) H, dD, X))
++        return FALSE;
++      X[0] = -X[0];
++      X[1] = -X[1];
++      X[2] = -X[2];
++
++      if (fabsf (X[0]) < 0.5f && fabsf (X[1]) < 0.5f && fabsf (X[2]) < 0.5f)
++        break;
++      if (fabsf (X[0]) > 1e4f || fabsf (X[1]) > 1e4f || fabsf (X[2]) > 1e4f)
++        return FALSE;
++
++      *x += (int) roundf (X[0]);
++      *y += (int) roundf (X[1]);
++      *l += (int) roundf (X[2]);
++      if (*l < 1 || *l > SIFT_INTERVALS ||
++          *x < SIFT_BORDER || *x >= cur->w - SIFT_BORDER ||
++          *y < SIFT_BORDER || *y >= cur->h - SIFT_BORDER)
++        return FALSE;
++    }
++  if (step >= SIFT_MAX_INTERP_STEPS)
++    return FALSE;
++
++  *contrast = px_at (cur, *x, *y) + 0.5f * (dD[0] * X[0] + dD[1] * X[1] + dD[2] * X[2]);
++  if (fabsf (*contrast) * SIFT_INTERVALS < SIFT_CONTRAST_THR)
++    return FALSE;
++
++  {
++    gfloat tr = dxx + dyy, det = dxx * dyy - dxy * dxy;
++
++    if (det <= 0 ||
++        tr * tr * SIFT_EDGE_RATIO >= (SIFT_EDGE_RATIO + 1) * (SIFT_EDGE_RATIO + 1) * det)
++      return FALSE;
++  }
++
++  *ox = X[0];
++  *oy = X[1];
++  *ol = X[2];
++  *contrast = fabsf (*contrast);
++  return TRUE;
++}
++
++/* smoothed histogram of gradient directions around (cx, cy); returns the
++ * highest bin */
++static gfloat
++sift_ori_hist (const SiftGrad *g, int cx, int cy, int radius, gfloat sigma,
++               gfloat hist[SIFT_ORI_BINS])
++{
++  const int n = SIFT_ORI_BINS;
++  gfloat raw[SIFT_ORI_BINS + 4] = { 0 };
++  gfloat scale = -1.0f / (2.0f * sigma * sigma);
++  gfloat maxv = 0;
++
++  for (int i = -radius; i <= radius; i++)
++    {
++      int y = cy + i;
++
++      if (y <= 0 || y >= g->h - 1)
++        continue;
++      for (int j = -radius; j <= radius; j++)
++        {
++          int x = cx + j;
++          int bin;
++
++          if (x <= 0 || x >= g->w - 1)
++            continue;
++          bin = (int) roundf (n * g->ang[y * g->w + x] / (2 * G_PI));
++          bin = ((bin % n) + n) % n;
++          raw[bin + 2] += expf ((i * i + j * j) * scale) * g->mag[y * g->w + x];
++        }
++    }
++
++  raw[1] = raw[n + 1];
++  raw[0] = raw[n];
++  raw[n + 2] = raw[2];
++  raw[n + 3] = raw[3];
++  for (int i = 0; i < n; i++)
++    {
++      hist[i] = (raw[i] + raw[i + 4]) * (1.0f / 16) +
++                (raw[i + 1] + raw[i + 3]) * (4.0f / 16) +
++                raw[i + 2] * (6.0f / 16);
++      maxv = MAX (maxv, hist[i]);
++    }
++  return maxv;
++}
++
++/* gradient directions relative to the keypoint's, binned into a 4 x 4 grid
++ * that turns with it and spreads by trilinear interpolation (Lowe, 6) */
++static void
++sift_descriptor (const SiftGrad *g, gfloat px, gfloat py, gfloat angle,
++                 gfloat sigma, guint8 out[ELANPRESS_SIFT_DESC_LEN])
++{
++  const int d = SIFT_DESC_WIDTH, n = SIFT_DESC_BINS;
++  gfloat hist[(SIFT_DESC_WIDTH + 2) * (SIFT_DESC_WIDTH + 2) * (SIFT_DESC_BINS + 2)] = { 0 };
++  gfloat v[ELANPRESS_SIFT_DESC_LEN];
++  int cx = (int) roundf (px), cy = (int) roundf (py);
++  gfloat hist_width = SIFT_DESC_SCL_FCTR * sigma;
++  gfloat cos_t = cosf (angle) / hist_width, sin_t = sinf (angle) / hist_width;
++  gfloat bins_per_rad = n / (2 * G_PI);
++  gfloat wscale = -1.0f / (d * d * 0.5f);
++  int radius = (int) roundf (hist_width * G_SQRT2 * (d + 1) * 0.5f);
++  gfloat nrm2 = 0, thr;
++
++  radius = MIN (radius, (int) sqrtf ((gfloat) (g->w * g->w + g->h * g->h)));
++
++  for (int i = -radius; i <= radius; i++)
++    for (int j = -radius; j <= radius; j++)
++      {
++        /* the sample's position in the keypoint's own frame, in cells */
++        gfloat c_rot = j * cos_t + i * sin_t;
++        gfloat r_rot = -j * sin_t + i * cos_t;
++        gfloat rbin = r_rot + d / 2 - 0.5f;
++        gfloat cbin = c_rot + d / 2 - 0.5f;
++        int x = cx + j, y = cy + i;
++        gfloat mag, obin, v_r1, v_r0, v_rc11, v_rc10, v_rc01, v_rc00;
++        int r0, c0, o0, idx;
++
++        if (rbin <= -1 || rbin >= d || cbin <= -1 || cbin >= d ||
++            y <= 0 || y >= g->h - 1 || x <= 0 || x >= g->w - 1)
++          continue;
++
++        mag = g->mag[y * g->w + x] * expf ((c_rot * c_rot + r_rot * r_rot) * wscale);
++        obin = (g->ang[y * g->w + x] - angle) * bins_per_rad;
++        while (obin < 0)
++          obin += n;
++        while (obin >= n)
++          obin -= n;
++
++        r0 = (int) floorf (rbin);
++        c0 = (int) floorf (cbin);
++        o0 = (int) floorf (obin);
++        rbin -= r0;
++        cbin -= c0;
++        obin -= o0;
++
++        v_r1 = mag * rbin;
++        v_r0 = mag - v_r1;
++        v_rc11 = v_r1 * cbin;
++        v_rc10 = v_r1 - v_rc11;
++        v_rc01 = v_r0 * cbin;
++        v_rc00 = v_r0 - v_rc01;
++
++        idx = ((r0 + 1) * (d + 2) + c0 + 1) * (n + 2) + o0;
++        hist[idx] += v_rc00 * (1 - obin);
++        hist[idx + 1] += v_rc00 * obin;
++        hist[idx + (n + 2)] += v_rc01 * (1 - obin);
++        hist[idx + (n + 3)] += v_rc01 * obin;
++        hist[idx + (d + 2) * (n + 2)] += v_rc10 * (1 - obin);
++        hist[idx + (d + 2) * (n + 2) + 1] += v_rc10 * obin;
++        hist[idx + (d + 3) * (n + 2)] += v_rc11 * (1 - obin);
++        hist[idx + (d + 3) * (n + 2) + 1] += v_rc11 * obin;
++      }
++
++  for (int i = 0; i < d; i++)
++    for (int j = 0; j < d; j++)
++      {
++        int idx = ((i + 1) * (d + 2) + (j + 1)) * (n + 2);
++
++        /* fold the wrap-around orientation bins back */
++        hist[idx] += hist[idx + n];
++        hist[idx + 1] += hist[idx + n + 1];
++        for (int k = 0; k < n; k++)
++          v[(i * d + j) * n + k] = hist[idx + k];
++      }
++
++  /* unit length, then cap single gradients that dominate (lighting,
++   * saturation) and renormalize */
++  for (int k = 0; k < ELANPRESS_SIFT_DESC_LEN; k++)
++    nrm2 += v[k] * v[k];
++  thr = sqrtf (nrm2) * SIFT_DESC_MAG_THR;
++  nrm2 = 0;
++  for (int k = 0; k < ELANPRESS_SIFT_DESC_LEN; k++)
++    {
++      v[k] = MIN (v[k], thr);
++      nrm2 += v[k] * v[k];
++    }
++  nrm2 = SIFT_DESC_INT_FCTR / MAX (sqrtf (nrm2), FLT_EPSILON);
++  for (int k = 0; k < ELANPRESS_SIFT_DESC_LEN; k++)
++    out[k] = (guint8) CLAMP ((int) roundf (v[k] * nrm2), 0, 255);
++}
++
++static gint
++sift_cmp_response (gconstpointer a, gconstpointer b)
++{
++  const ElanpressKeypoint *ka = a, *kb = b;
++
++  return (ka->response < kb->response) - (ka->response > kb->response);
++}
++
++ElanpressFeatures *
++elanpress_sift_features (const guint8 *img, int width, int height, guint max_keypoints)
++{
++  SiftPyramid pyr;
++  GArray *kps = g_array_new (FALSE, FALSE, sizeof (ElanpressKeypoint));
++  ElanpressFeatures *f = g_new0 (ElanpressFeatures, 1);
++  gfloat prelim = 0.5f * SIFT_CONTRAST_THR / SIFT_INTERVALS;
++
++  sift_pyramid_build (&pyr, img, width, height);
++
++  for (int o = 0; o < pyr.n_octaves; o++)
++    for (int layer = 1; layer <= SIFT_INTERVALS; layer++)
++      {
++        const SiftImage *dog = DOG (&pyr, o, layer);
++
++        for (int y = SIFT_BORDER; y < dog->h - SIFT_BORDER; y++)
++          for (int x = SIFT_BORDER; x < dog->w - SIFT_BORDER; x++)
++            {
++              gfloat v = px_at (dog, x, y);
++              gfloat hist[SIFT_ORI_BINS], ox, oy, ol, contrast, sigma, omax;
++              gfloat octave_scale = ldexpf (1.0f, o - 1);
++              int l = layer, c = x, r = y;
++              const SiftGrad *g;
++
++              if (fabsf (v) <= prelim || !sift_is_extremum (&pyr, o, layer, x, y, v))
++                continue;
++              if (!sift_refine (&pyr, o, &l, &c, &r, &ox, &oy, &ol, &contrast))
++                continue;
++
++              sigma = SIFT_SIGMA * powf (2.0f, (l + ol) / SIFT_INTERVALS);
++              g = sift_grad (&pyr, o, l);
++              omax = sift_ori_hist (g, c, r, (int) roundf (SIFT_ORI_RADIUS * sigma),
++                                    SIFT_ORI_SIG_FCTR * sigma, hist);
++
++              for (int j = 0; j < SIFT_ORI_BINS; j++)
++                {
++                  int lb = j > 0 ? j - 1 : SIFT_ORI_BINS - 1;
++                  int rb = j < SIFT_ORI_BINS - 1 ? j + 1 : 0;
++                  ElanpressKeypoint kp;
++                  gfloat bin;
++
++                  if (!(hist[j] > hist[lb] && hist[j] > hist[rb] &&
++                        hist[j] >= omax * SIFT_ORI_PEAK_RATIO))
++                    continue;
++
++                  /* parabolic peak interpolation */
++                  bin = j + 0.5f * (hist[lb] - hist[rb]) / (hist[lb] - 2 * hist[j] + hist[rb]);
++                  if (bin < 0)
++                    bin += SIFT_ORI_BINS;
++                  else if (bin >= SIFT_ORI_BINS)
++                    bin -= SIFT_ORI_BINS;
++
++                  kp.x = (c + ox) * octave_scale;
++                  kp.y = (r + oy) * octave_scale;
++                  kp.scale = sigma * octave_scale;
++                  kp.angle = bin * (2 * G_PI / SIFT_ORI_BINS);
++                  kp.response = contrast;
++                  sift_descriptor (g, c + ox, r + oy, kp.angle, sigma, kp.desc);
++                  g_array_append_val (kps, kp);
++                }
++            }
++      }
++
++  sift_pyramid_clear (&pyr);
++
++  if (max_keypoints && kps->len > max_keypoints)
++    {
++      g_array_sort (kps, sift_cmp_response);
++      g_array_set_size (kps, max_keypoints);
++    }
++
++  f->n = kps->len;
++  f->kp = (ElanpressKeypoint *) g_array_free (kps, FALSE);
++  return f;
++}
++
++void
++elanpress_features_free (ElanpressFeatures *features)
++{
++  if (!features)
++    return;
++  g_free (features->kp);
++  g_free (features);
++}
+diff --git c/libfprint/drivers/elanpress-sift.h i/libfprint/drivers/elanpress-sift.h
+new file mode 100644
+index 00000000..cb9b8c0c
+--- /dev/null
++++ i/libfprint/drivers/elanpress-sift.h
+@@ -0,0 +1,53 @@
++/*
++ * Keypoint features for ELAN press-type sensors
++ * Copyright (C) 2026 Filip Spanne
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++#pragma once
++
++#include <glib.h>
++
++#define ELANPRESS_SIFT_DESC_LEN 128
++
++typedef struct
++{
++  /* position in input image pixels */
++  gfloat x, y;
++  /* dominant gradient direction in radians, measured in image coordinates
++   * (y pointing down): rotating an image by R(t) = [[cos t, -sin t],
++   * [sin t, cos t]] adds t to the angle of every keypoint on it */
++  gfloat angle;
++  /* blur, in input image pixels, of the scale the keypoint was found at */
++  gfloat scale;
++  /* contrast of the extremum, for keeping the strongest when capped */
++  gfloat response;
++  guint8 desc[ELANPRESS_SIFT_DESC_LEN];
++} ElanpressKeypoint;
++
++typedef struct
++{
++  ElanpressKeypoint *kp;
++  guint              n;
++} ElanpressFeatures;
++
++ElanpressFeatures *elanpress_sift_features (const guint8 *img,
++                                            int           width,
++                                            int           height,
++                                            guint         max_keypoints);
++void               elanpress_features_free (ElanpressFeatures *features);
++
++G_DEFINE_AUTOPTR_CLEANUP_FUNC (ElanpressFeatures, elanpress_features_free)
+diff --git c/libfprint/drivers/elanpress.c i/libfprint/drivers/elanpress.c
+new file mode 100644
+index 00000000..464c0fc8
+--- /dev/null
++++ i/libfprint/drivers/elanpress.c
+@@ -0,0 +1,1021 @@
++/*
++ * Driver for ELAN press-type (touch) fingerprint sensors
++ * Copyright (C) 2026 Filip Spanne
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++#define FP_COMPONENT "elanpress"
++
++#include "drivers_api.h"
++#include "elanpress.h"
++#include "elanpress-match.h"
++
++static const guint8 cmd_led_on[ELANPRESS_CMD_LEN] = {0x40, 0x31};
++static const guint8 cmd_get_image[ELANPRESS_CMD_LEN] = {0x00, 0x09};
++static const guint8 cmd_stop[ELANPRESS_CMD_LEN] = {0x00, 0x0b};
++static const guint8 cmd_get_sensor_dim[ELANPRESS_CMD_LEN] = {0x00, 0x0c};
++
++struct _FpiDeviceElanPress
++{
++  FpDevice        parent;
++
++  unsigned short  frame_width;
++  unsigned short  frame_height;
++
++  /* raw background frame (no finger), rotated to row-major */
++  unsigned short *background;
++
++  /* most recent frame polled from the sensor, not yet classified as a
++   * touch or a clear reading */
++  unsigned short *last_frame;
++
++  /* rotated raw frames of the touch being captured */
++  GSList         *frames;
++  int             num_frames;
++
++  /* hold capture off until the sensor has read clear for a while, so that
++   * one finger left resting cannot stand in for several separate presses.
++   * It carries over from one action to the next: a touch is imaged as soon
++   * as it settles, well before the finger lifts, so without it a verify
++   * retried after a no-match would image the same resting finger again
++   * rather than wait for the next press. */
++  gboolean        wait_for_finger_off;
++  guint           finger_off_frames;
++
++  /* consecutive clear polls while waiting for a press, used to decide when
++   * the background frame is worth retaking, and the request to do so */
++  guint           idle_frames;
++  gboolean        bg_refresh;
++
++  /* covering frames in a row. The image kept is the last of them. */
++  guint           good_frames;
++
++  /* the frame just read is a finger that was already down at open, so the
++   * next poll must classify it instead of asking the sensor again */
++  gboolean        replay_frame;
++
++  /* running totals for the current verify/identify: one accumulated score
++   * per gallery print (a single entry when verifying), summed over the
++   * presses sampled so far and averaged when the decision is reported */
++  int             match_sample;
++  int             match_retries;
++  gdouble        *score_sums;
++  guint           num_score_sums;
++
++  /* processed images collected during enrollment */
++  GPtrArray      *enroll_images;
++  int             enroll_stage;
++};
++
++G_DEFINE_TYPE (FpiDeviceElanPress, fpi_device_elanpress, FP_TYPE_DEVICE);
++
++/* === image processing === */
++
++static unsigned int
++elanpress_frame_size (FpiDeviceElanPress *self)
++{
++  return (unsigned int) self->frame_width * self->frame_height;
++}
++
++static gdouble
++elanpress_frame_mean (const unsigned short *frame, unsigned int size)
++{
++  gint64 sum = 0;
++
++  for (unsigned int i = 0; i < size; i++)
++    sum += frame[i];
++
++  return (gdouble) sum / size;
++}
++
++/* Darkest empty frame seen by this process. A later open, such as the lock
++ * screen retrying while the finger is still down, uses it instead of
++ * photographing the finger and calling that the background. */
++static unsigned short *elanpress_empty = NULL;
++static unsigned int elanpress_empty_n = 0;
++
++static void
++elanpress_remember_empty (const unsigned short *frame, unsigned int size)
++{
++  gsize bytes = (gsize) size * sizeof (unsigned short);
++
++  if (elanpress_empty_n != size)
++    {
++      g_free (elanpress_empty);
++      elanpress_empty = g_malloc (bytes);
++      elanpress_empty_n = size;
++    }
++
++  memcpy (elanpress_empty, frame, bytes);
++}
++
++static guint8 *
++elanpress_process_touch (FpiDeviceElanPress *self)
++{
++  return elanpress_process_frames (self->frames, self->num_frames,
++                                   self->background,
++                                   elanpress_frame_size (self));
++}
++
++/* === print (de)serialization === */
++
++static void
++elanpress_print_set_data (FpiDeviceElanPress *self, FpPrint *print,
++                          GPtrArray *images)
++{
++  GVariantBuilder images_builder = G_VARIANT_BUILDER_INIT (G_VARIANT_TYPE ("aay"));
++  GVariant *fpi_data;
++
++  for (guint i = 0; i < images->len; i++)
++    g_variant_builder_add_value (
++      &images_builder,
++      g_variant_new_fixed_array (G_VARIANT_TYPE_BYTE,
++                                 g_ptr_array_index (images, i),
++                                 elanpress_frame_size (self),
++                                 sizeof (guint8)));
++
++  fpi_data = g_variant_new ("(qqqaay)",
++                            (guint16) ELANPRESS_PRINT_VERSION,
++                            (guint16) self->frame_width,
++                            (guint16) self->frame_height,
++                            &images_builder);
++
++  fpi_print_set_type (print, FPI_PRINT_RAW);
++  g_object_set (print, "fpi-data", fpi_data, NULL);
++}
++
++/* returns the stored images or NULL if the print is not usable */
++static GPtrArray *
++elanpress_print_get_images (FpiDeviceElanPress *self, FpPrint *print)
++{
++  g_autoptr(GVariant) fpi_data = NULL;
++  g_autoptr(GVariant) images_v = NULL;
++  GPtrArray *images;
++  guint16 version = 0, width = 0, height = 0;
++  gsize n_images;
++
++  g_object_get (print, "fpi-data", &fpi_data, NULL);
++  if (!fpi_data || !g_variant_check_format_string (fpi_data, "(qqq@aay)", FALSE))
++    return NULL;
++
++  g_variant_get (fpi_data, "(qqq@aay)", &version, &width, &height, &images_v);
++  if (version != ELANPRESS_PRINT_VERSION ||
++      width != self->frame_width || height != self->frame_height)
++    return NULL;
++
++  n_images = g_variant_n_children (images_v);
++  if (n_images == 0)
++    return NULL;
++
++  images = g_ptr_array_new_full (n_images, g_free);
++  for (gsize i = 0; i < n_images; i++)
++    {
++      g_autoptr(GVariant) img_v = g_variant_get_child_value (images_v, i);
++      gsize len = 0;
++      gconstpointer data = g_variant_get_fixed_array (img_v, &len, sizeof (guint8));
++
++      if (len != elanpress_frame_size (self))
++        {
++          g_ptr_array_unref (images);
++          return NULL;
++        }
++      g_ptr_array_add (images, g_memdup2 (data, len));
++    }
++
++  return images;
++}
++
++/* the most keypoint pairs the probe shares with any one image of the print,
++ * or -1 if the print is unusable */
++static gint
++elanpress_match_print (FpiDeviceElanPress *self, const ElanpressFeatures *probe,
++                       FpPrint *print)
++{
++  g_autoptr(GPtrArray) images = elanpress_print_get_images (self, print);
++  gint best = -1;
++
++  if (!images)
++    return -1;
++
++  for (guint i = 0; i < images->len; i++)
++    {
++      g_autoptr(ElanpressFeatures) enrolled =
++        elanpress_image_features (g_ptr_array_index (images, i),
++                                  self->frame_width, self->frame_height);
++      guint pairs = elanpress_match_features (probe, enrolled);
++
++      fp_dbg ("  enrolled image %u/%u: %u pairs", i + 1, images->len, pairs);
++      best = MAX (best, (gint) pairs);
++      /* one confident hit is enough; spare the remaining comparisons */
++      if (best >= ELANPRESS_MATCH_MIN_PAIRS)
++        break;
++    }
++
++  return best;
++}
++
++/* === USB helpers === */
++
++static void
++elanpress_reset_capture (FpiDeviceElanPress *self)
++{
++  g_slist_free_full (g_steal_pointer (&self->frames), g_free);
++  self->num_frames = 0;
++  self->idle_frames = 0;
++  self->good_frames = 0;
++  self->replay_frame = FALSE;
++  self->bg_refresh = FALSE;
++  g_clear_pointer (&self->last_frame, g_free);
++}
++
++static void
++elanpress_send_cmd (FpiSsm *ssm, FpDevice *dev, const guint8 *cmd)
++{
++  FpiUsbTransfer *transfer = fpi_usb_transfer_new (dev);
++
++  transfer->ssm = ssm;
++  transfer->short_is_error = TRUE;
++  fpi_usb_transfer_fill_bulk_full (transfer, ELANPRESS_EP_CMD_OUT,
++                                   (guint8 *) cmd, ELANPRESS_CMD_LEN, NULL);
++  fpi_usb_transfer_submit (transfer, ELANPRESS_CMD_TIMEOUT,
++                           fpi_device_get_cancellable (dev),
++                           fpi_ssm_usb_transfer_cb, NULL);
++}
++
++static void
++elanpress_read (FpiSsm *ssm, FpDevice *dev, guint8 ep, gsize len,
++                guint timeout, FpiUsbTransferCallback callback)
++{
++  FpiUsbTransfer *transfer = fpi_usb_transfer_new (dev);
++
++  transfer->ssm = ssm;
++  transfer->short_is_error = TRUE;
++  fpi_usb_transfer_fill_bulk (transfer, ep, len);
++  fpi_usb_transfer_submit (transfer, timeout,
++                           fpi_device_get_cancellable (dev),
++                           callback, NULL);
++}
++
++/* === touch capture state machine === */
++
++/* Finger presence is inferred from the image rather than polled with
++ * cmd_pre_scan: that command's status byte reports correctly once per
++ * power-up and then answers "finger present" forever, which left capture
++ * spinning in its wait-for-lift loop until the operation timed out, with
++ * only a full power cycle to clear it. Comparing each frame against a
++ * background taken with the sensor clear tells presence apart without it. */
++
++enum capture_states {
++  CAPTURE_LED_ON,
++  CAPTURE_BG_REQUEST,
++  CAPTURE_BG_READ,
++  CAPTURE_POLL_REQUEST,
++  CAPTURE_POLL_READ,
++  CAPTURE_NUM_STATES,
++};
++
++static void
++elanpress_frame_cb (FpiUsbTransfer *transfer, FpDevice *dev,
++                    gpointer user_data, GError *error)
++{
++  FpiDeviceElanPress *self = FPI_DEVICE_ELANPRESS (dev);
++  unsigned short *frame;
++
++  if (error)
++    {
++      fpi_ssm_mark_failed (transfer->ssm, error);
++      return;
++    }
++
++  frame = g_malloc (elanpress_frame_size (self) * sizeof (short));
++  elanpress_rotate_frame (transfer->buffer, frame,
++                          self->frame_width, self->frame_height);
++
++  if (fpi_ssm_get_cur_state (transfer->ssm) == CAPTURE_BG_READ)
++    {
++      unsigned int size = elanpress_frame_size (self);
++
++      self->bg_refresh = FALSE;
++
++      if (!self->background)
++        {
++          if (elanpress_empty && elanpress_empty_n == size &&
++              elanpress_frame_mean (frame, size) >=
++              elanpress_frame_mean (elanpress_empty, size) + ELANPRESS_BG_DARKER_THAN)
++            {
++              self->background = g_memdup2 (elanpress_empty,
++                                            size * sizeof (unsigned short));
++              self->last_frame = frame;
++              self->replay_frame = TRUE;
++              fp_dbg ("finger already down, using the saved empty frame");
++            }
++          else
++            {
++              self->background = frame;
++              elanpress_remember_empty (frame, size);
++              fp_dbg ("captured background frame");
++            }
++        }
++      else if (elanpress_frame_mean (frame, size) <=
++               elanpress_frame_mean (self->background, size))
++        {
++          g_free (self->background);
++          self->background = frame;
++          elanpress_remember_empty (frame, size);
++          fp_dbg ("background refreshed");
++        }
++      else
++        {
++          /* a finger only ever adds brightness, so a brighter candidate
++           * means something was resting on the sensor. Adopting it would
++           * write that finger into the reference and hide it for good. */
++          fp_dbg ("background candidate brighter than current, keeping it");
++          g_free (frame);
++        }
++    }
++  else
++    {
++      g_free (self->last_frame);
++      self->last_frame = frame;
++    }
++
++  fpi_ssm_next_state (transfer->ssm);
++}
++
++static void
++capture_run_state (FpiSsm *ssm, FpDevice *dev)
++{
++  FpiDeviceElanPress *self = FPI_DEVICE_ELANPRESS (dev);
++  gsize frame_bytes = elanpress_frame_size (self) * 2;
++  ElanpressTouchStats stats = { 0, 0 };
++  gboolean has_touch;
++
++  switch (fpi_ssm_get_cur_state (ssm))
++    {
++    case CAPTURE_LED_ON:
++      elanpress_send_cmd (ssm, dev, cmd_led_on);
++      break;
++
++    case CAPTURE_BG_REQUEST:
++      if (self->background && !self->bg_refresh)
++        {
++          fpi_ssm_jump_to_state (ssm, CAPTURE_POLL_REQUEST);
++          break;
++        }
++      elanpress_send_cmd (ssm, dev, cmd_get_image);
++      break;
++
++    case CAPTURE_BG_READ:
++      elanpress_read (ssm, dev, ELANPRESS_EP_IMG_IN, frame_bytes,
++                      ELANPRESS_FRAME_TIMEOUT, elanpress_frame_cb);
++      break;
++
++    case CAPTURE_POLL_REQUEST:
++      if (self->replay_frame)
++        {
++          self->replay_frame = FALSE;
++          fpi_ssm_jump_to_state (ssm, CAPTURE_NUM_STATES);
++          break;
++        }
++      if (!self->wait_for_finger_off)
++        fpi_device_report_finger_status (dev, FP_FINGER_STATUS_NEEDED);
++      elanpress_send_cmd (ssm, dev, cmd_get_image);
++      break;
++
++    case CAPTURE_POLL_READ:
++      elanpress_read (ssm, dev, ELANPRESS_EP_IMG_IN, frame_bytes,
++                      ELANPRESS_FRAME_TIMEOUT, elanpress_frame_cb);
++      break;
++
++    default:
++      /* after a frame: classify it and decide what the touch needs next */
++      if (self->background && self->last_frame)
++        {
++          unsigned int size = elanpress_frame_size (self);
++
++          if (elanpress_frame_mean (self->last_frame, size) + ELANPRESS_BG_DARKER_THAN
++              <= elanpress_frame_mean (self->background, size))
++            {
++              g_free (self->background);
++              self->background = g_memdup2 (self->last_frame,
++                                            size * sizeof (unsigned short));
++              elanpress_remember_empty (self->background, size);
++              self->good_frames = 0;
++              self->idle_frames = 0;
++              fp_dbg ("background replaced with a darker frame");
++            }
++        }
++
++      has_touch = elanpress_frame_has_touch (self->last_frame,
++                                             self->background,
++                                             elanpress_frame_size (self),
++                                             &stats);
++
++      fp_dbg ("poll: %s (coverage %.1f%%, mean delta %.0f)",
++              has_touch ? "touch" : "clear",
++              stats.coverage * 100, stats.mean_delta);
++
++      if (self->wait_for_finger_off)
++        {
++          /* a press only counts once the sensor has read clear in between,
++           * so that a finger held down is not sampled twice */
++          g_clear_pointer (&self->last_frame, g_free);
++          if (has_touch)
++            {
++              self->finger_off_frames = 0;
++            }
++          else if (++self->finger_off_frames >= ELANPRESS_FINGER_OFF_FRAMES)
++            {
++              fp_dbg ("sensor clear, ready for the next press");
++              self->wait_for_finger_off = FALSE;
++              self->finger_off_frames = 0;
++              fpi_device_report_finger_status (dev, FP_FINGER_STATUS_NEEDED);
++            }
++          fpi_ssm_jump_to_state_delayed (ssm, CAPTURE_POLL_REQUEST,
++                                         ELANPRESS_IDLE_POLL_INTERVAL_MS);
++          break;
++        }
++
++      if (has_touch)
++        {
++          fpi_device_report_finger_status (dev,
++                                           FP_FINGER_STATUS_NEEDED |
++                                           FP_FINGER_STATUS_PRESENT);
++
++          if (stats.coverage < ELANPRESS_ACCEPT_COVERAGE)
++            {
++              self->good_frames = 0;
++              fp_dbg ("touch covers %.1f%%, waiting for a full press",
++                      stats.coverage * 100.0);
++              g_clear_pointer (&self->last_frame, g_free);
++              fpi_ssm_jump_to_state_delayed (ssm, CAPTURE_POLL_REQUEST,
++                                             ELANPRESS_IDLE_POLL_INTERVAL_MS);
++              break;
++            }
++
++          self->good_frames++;
++          if (self->good_frames < ELANPRESS_STABLE_FRAMES)
++            {
++              g_clear_pointer (&self->last_frame, g_free);
++              fpi_ssm_jump_to_state_delayed (ssm, CAPTURE_POLL_REQUEST,
++                                             ELANPRESS_IDLE_POLL_INTERVAL_MS);
++              break;
++            }
++
++          self->frames = g_slist_prepend (self->frames,
++                                          g_steal_pointer (&self->last_frame));
++          self->num_frames++;
++          self->idle_frames = 0;
++
++          if (self->num_frames >= ELANPRESS_MAX_FRAMES)
++            fpi_ssm_mark_completed (ssm);
++          else
++            fpi_ssm_jump_to_state_delayed (ssm, CAPTURE_POLL_REQUEST,
++                                           ELANPRESS_POLL_INTERVAL_MS);
++          break;
++        }
++
++      g_clear_pointer (&self->last_frame, g_free);
++
++      if (self->num_frames > 0)
++        {
++          /* finger lifted before ELANPRESS_MAX_FRAMES: use what there is */
++          fp_dbg ("touch complete, %d frames", self->num_frames);
++          fpi_ssm_mark_completed (ssm);
++        }
++      else
++        {
++          /* still waiting for a press */
++          self->good_frames = 0;
++
++          if (++self->idle_frames >= ELANPRESS_BG_REFRESH_FRAMES)
++            {
++              fp_dbg ("sensor clear for %u polls, retaking the background",
++                      self->idle_frames);
++              self->idle_frames = 0;
++              self->bg_refresh = TRUE;
++              fpi_ssm_jump_to_state_delayed (ssm, CAPTURE_BG_REQUEST,
++                                             ELANPRESS_IDLE_POLL_INTERVAL_MS);
++              break;
++            }
++
++          fpi_ssm_jump_to_state_delayed (ssm, CAPTURE_POLL_REQUEST,
++                                         ELANPRESS_IDLE_POLL_INTERVAL_MS);
++        }
++      break;
++    }
++}
++
++static void
++elanpress_capture_touch (FpiDeviceElanPress *self, FpiSsmCompletedCallback done)
++{
++  FpiSsm *ssm;
++
++  elanpress_reset_capture (self);
++  /* one extra state acts as the post-frame decision point */
++  ssm = fpi_ssm_new (FP_DEVICE (self), capture_run_state,
++                     CAPTURE_NUM_STATES + 1);
++  fpi_ssm_start (ssm, done);
++}
++
++/* === stop helper: turn the sensor off after an action === */
++
++static void
++elanpress_send_stop (FpDevice *dev)
++{
++  g_autoptr(FpiUsbTransfer) transfer = fpi_usb_transfer_new (dev);
++  g_autoptr(GError) error = NULL;
++
++  fpi_usb_transfer_fill_bulk_full (transfer, ELANPRESS_EP_CMD_OUT,
++                                   (guint8 *) cmd_stop, ELANPRESS_CMD_LEN,
++                                   NULL);
++  if (!fpi_usb_transfer_submit_sync (transfer, ELANPRESS_CMD_TIMEOUT, &error))
++    fp_warn ("failed to send stop command: %s", error->message);
++}
++
++/* === enroll === */
++
++static void
++elanpress_enroll_touch_done (FpiSsm *ssm, FpDevice *dev, GError *error)
++{
++  FpiDeviceElanPress *self = FPI_DEVICE_ELANPRESS (dev);
++  FpPrint *print = NULL;
++  guint8 *image;
++
++  fpi_device_report_finger_status (dev, FP_FINGER_STATUS_NONE);
++
++  if (error)
++    {
++      elanpress_send_stop (dev);
++      fpi_device_enroll_complete (dev, NULL, error);
++      return;
++    }
++
++  image = elanpress_process_touch (self);
++  elanpress_reset_capture (self);
++
++  if (image)
++    {
++      gdouble quality = elanpress_image_quality (image,
++                                                 elanpress_frame_size (self));
++
++      /* A light or partial press yields an image that correlates weakly
++       * against everything, so storing one both loses a stage and drags the
++       * template towards matching anyone. Ask for the press again instead. */
++      if (quality < ELANPRESS_MIN_QUALITY_STDDEV)
++        {
++          fp_dbg ("touch too low-contrast to enroll (std-dev %.1f < %.1f)",
++                  quality, ELANPRESS_MIN_QUALITY_STDDEV);
++          g_clear_pointer (&image, g_free);
++        }
++    }
++
++  /* each stage has to be its own press, not a continuation of this one */
++  self->wait_for_finger_off = TRUE;
++  self->finger_off_frames = 0;
++
++  if (!image)
++    {
++      fpi_device_enroll_progress (dev, self->enroll_stage, NULL,
++                                  fpi_device_retry_new (FP_DEVICE_RETRY_GENERAL));
++      elanpress_capture_touch (self, elanpress_enroll_touch_done);
++      return;
++    }
++
++  g_ptr_array_add (self->enroll_images, image);
++  self->enroll_stage++;
++  fpi_device_enroll_progress (dev, self->enroll_stage, NULL, NULL);
++
++  if (self->enroll_stage < ELANPRESS_ENROLL_STAGES)
++    {
++      elanpress_capture_touch (self, elanpress_enroll_touch_done);
++      return;
++    }
++
++  elanpress_send_stop (dev);
++
++  fpi_device_get_enroll_data (dev, &print);
++  elanpress_print_set_data (self, print, self->enroll_images);
++  g_clear_pointer (&self->enroll_images, g_ptr_array_unref);
++
++  fpi_device_enroll_complete (dev, g_object_ref (print), NULL);
++}
++
++static void
++elanpress_enroll (FpDevice *dev)
++{
++  FpiDeviceElanPress *self = FPI_DEVICE_ELANPRESS (dev);
++
++  self->enroll_stage = 0;
++  self->finger_off_frames = 0;
++  g_clear_pointer (&self->enroll_images, g_ptr_array_unref);
++  self->enroll_images = g_ptr_array_new_with_free_func (g_free);
++
++  elanpress_capture_touch (self, elanpress_enroll_touch_done);
++}
++
++/* === verify and identify === */
++
++static void
++elanpress_match_cleanup (FpiDeviceElanPress *self)
++{
++  g_clear_pointer (&self->score_sums, g_free);
++  self->num_score_sums = 0;
++}
++
++/* one running total per candidate print, allocated on the first press */
++static gboolean
++elanpress_match_alloc_sums (FpiDeviceElanPress *self, guint n)
++{
++  if (n == 0)
++    return FALSE;
++
++  if (!self->score_sums)
++    {
++      self->score_sums = g_new0 (gdouble, n);
++      self->num_score_sums = n;
++    }
++
++  return self->num_score_sums == n;
++}
++
++/* decide on the mean score across the presses that were sampled */
++static void
++elanpress_match_report (FpDevice *dev)
++{
++  FpiDeviceElanPress *self = FPI_DEVICE_ELANPRESS (dev);
++  FpiDeviceAction action = fpi_device_get_current_action (dev);
++  FpPrint *matched_print = NULL;
++  gdouble best_mean = -1.0;
++  guint best_index = 0;
++  gboolean matched;
++
++  elanpress_send_stop (dev);
++
++  for (guint i = 0; i < self->num_score_sums; i++)
++    {
++      gdouble mean = self->score_sums[i] / self->match_sample;
++
++      if (mean > best_mean)
++        {
++          best_mean = mean;
++          best_index = i;
++        }
++    }
++
++  matched = self->match_sample > 0 && best_mean >= ELANPRESS_MATCH_MIN_PAIRS;
++
++  fp_dbg ("%s on the mean of %d press(es): %.1f pairs (threshold %d)",
++          matched ? "MATCH" : "no match", self->match_sample,
++          best_mean, ELANPRESS_MATCH_MIN_PAIRS);
++
++  elanpress_match_cleanup (self);
++
++  if (action == FPI_DEVICE_ACTION_IDENTIFY)
++    {
++      GPtrArray *gallery = NULL;
++
++      fpi_device_get_identify_data (dev, &gallery);
++      if (matched && gallery && best_index < gallery->len)
++        matched_print = g_ptr_array_index (gallery, best_index);
++
++      fpi_device_identify_report (dev, matched_print, NULL, NULL);
++      fpi_device_identify_complete (dev, NULL);
++    }
++  else
++    {
++      fpi_device_verify_report (dev,
++                                matched ? FPI_MATCH_SUCCESS : FPI_MATCH_FAIL,
++                                NULL, NULL);
++      fpi_device_verify_complete (dev, NULL);
++    }
++}
++
++/* give up after too many presses that yielded nothing to score */
++static void
++elanpress_match_report_retry (FpDevice *dev)
++{
++  FpiDeviceElanPress *self = FPI_DEVICE_ELANPRESS (dev);
++  FpiDeviceAction action = fpi_device_get_current_action (dev);
++  GError *retry = fpi_device_retry_new (FP_DEVICE_RETRY_GENERAL);
++
++  elanpress_match_cleanup (self);
++  elanpress_send_stop (dev);
++
++  if (action == FPI_DEVICE_ACTION_IDENTIFY)
++    {
++      fpi_device_identify_report (dev, NULL, NULL, retry);
++      fpi_device_identify_complete (dev, NULL);
++    }
++  else
++    {
++      fpi_device_verify_report (dev, FPI_MATCH_ERROR, NULL, retry);
++      fpi_device_verify_complete (dev, NULL);
++    }
++}
++
++static void
++elanpress_match_touch_done (FpiSsm *ssm, FpDevice *dev, GError *error)
++{
++  FpiDeviceElanPress *self = FPI_DEVICE_ELANPRESS (dev);
++  FpiDeviceAction action = fpi_device_get_current_action (dev);
++  g_autofree guint8 *probe = NULL;
++  g_autoptr(ElanpressFeatures) features = NULL;
++  int probe_frames = self->num_frames;
++  gdouble quality = 0.0;
++  gint press_best = -1;
++
++  fpi_device_report_finger_status (dev, FP_FINGER_STATUS_NONE);
++
++  if (error)
++    {
++      elanpress_match_cleanup (self);
++      elanpress_send_stop (dev);
++      if (action == FPI_DEVICE_ACTION_IDENTIFY)
++        fpi_device_identify_complete (dev, error);
++      else
++        fpi_device_verify_complete (dev, error);
++      return;
++    }
++
++  probe = elanpress_process_touch (self);
++  elanpress_reset_capture (self);
++
++  if (probe)
++    {
++      quality = elanpress_image_quality (probe, elanpress_frame_size (self));
++
++      /* too little ridge detail to say anything about whose finger this is */
++      if (quality < ELANPRESS_MIN_QUALITY_STDDEV)
++        {
++          fp_dbg ("press too low-contrast to score (std-dev %.1f < %.1f)",
++                  quality, ELANPRESS_MIN_QUALITY_STDDEV);
++          g_clear_pointer (&probe, g_free);
++        }
++    }
++
++  /* whatever happens next needs its own press */
++  self->wait_for_finger_off = TRUE;
++  self->finger_off_frames = 0;
++
++  if (!probe)
++    {
++      /* a press that produced nothing is not evidence either way, so ask
++       * again rather than averaging it in */
++      if (self->match_retries < ELANPRESS_MATCH_MAX_RETRIES)
++        {
++          self->match_retries++;
++          fp_dbg ("unusable press, asking again (retry %d of %d)",
++                  self->match_retries, ELANPRESS_MATCH_MAX_RETRIES);
++          elanpress_capture_touch (self, elanpress_match_touch_done);
++          return;
++        }
++
++      elanpress_match_report_retry (dev);
++      return;
++    }
++
++  features = elanpress_image_features (probe, self->frame_width,
++                                       self->frame_height);
++
++  if (action == FPI_DEVICE_ACTION_IDENTIFY)
++    {
++      GPtrArray *gallery = NULL;
++
++      fpi_device_get_identify_data (dev, &gallery);
++
++      if (!elanpress_match_alloc_sums (self, gallery ? gallery->len : 0))
++        {
++          elanpress_match_cleanup (self);
++          elanpress_send_stop (dev);
++          fpi_device_identify_report (dev, NULL, NULL, NULL);
++          fpi_device_identify_complete (dev, NULL);
++          return;
++        }
++
++      for (guint i = 0; i < gallery->len; i++)
++        {
++          FpPrint *print = g_ptr_array_index (gallery, i);
++          gint c = elanpress_match_print (self, features, print);
++
++          /* an unusable stored print scores below zero; clamp so it simply
++           * never wins instead of dragging its own running total down */
++          self->score_sums[i] += MAX (c, 0);
++          press_best = MAX (press_best, c);
++        }
++    }
++  else
++    {
++      FpPrint *print = NULL;
++      gint c;
++
++      fpi_device_get_verify_data (dev, &print);
++      c = elanpress_match_print (self, features, print);
++
++      /* the stored print itself is unusable; more presses cannot help */
++      if (c < 0)
++        {
++          elanpress_match_cleanup (self);
++          elanpress_send_stop (dev);
++          fpi_device_verify_complete (dev,
++                                      fpi_device_error_new (FP_DEVICE_ERROR_DATA_INVALID));
++          return;
++        }
++
++      if (!elanpress_match_alloc_sums (self, 1))
++        {
++          elanpress_match_cleanup (self);
++          elanpress_send_stop (dev);
++          fpi_device_verify_complete (dev,
++                                      fpi_device_error_new (FP_DEVICE_ERROR_GENERAL));
++          return;
++        }
++
++      self->score_sums[0] += c;
++      press_best = c;
++    }
++
++  self->match_sample++;
++
++  fp_dbg ("press %d of %d: %d pairs from %d frame(s), %u keypoints, std-dev %.1f",
++          self->match_sample, ELANPRESS_MATCH_SAMPLES, press_best,
++          probe_frames, features->n, quality);
++
++  if (self->match_sample < ELANPRESS_MATCH_SAMPLES)
++    {
++      elanpress_capture_touch (self, elanpress_match_touch_done);
++      return;
++    }
++
++  elanpress_match_report (dev);
++}
++
++static void
++elanpress_identify_verify (FpDevice *dev)
++{
++  FpiDeviceElanPress *self = FPI_DEVICE_ELANPRESS (dev);
++
++  self->match_sample = 0;
++  self->match_retries = 0;
++  self->finger_off_frames = 0;
++  elanpress_match_cleanup (self);
++
++  elanpress_capture_touch (self, elanpress_match_touch_done);
++}
++
++/* === open and close === */
++
++enum open_states {
++  OPEN_GET_DIM_SEND,
++  OPEN_GET_DIM_READ,
++  OPEN_NUM_STATES,
++};
++
++static void
++elanpress_dim_cb (FpiUsbTransfer *transfer, FpDevice *dev,
++                  gpointer user_data, GError *error)
++{
++  FpiDeviceElanPress *self = FPI_DEVICE_ELANPRESS (dev);
++
++  if (error)
++    {
++      fpi_ssm_mark_failed (transfer->ssm, error);
++      return;
++    }
++
++  /* raw frames are column-major: byte 0 is the column height, byte 2 the
++   * number of columns (see the elan driver) */
++  self->frame_height = transfer->buffer[0];
++  self->frame_width = transfer->buffer[2];
++
++  /* work around sensors returning the sizes as zero-based index rather
++   * than the number of pixels (same quirk as the elan driver) */
++  if ((self->frame_width % 2 == 1) && (self->frame_height % 2 == 1))
++    {
++      self->frame_width++;
++      self->frame_height++;
++    }
++  fp_dbg ("sensor dimensions, WxH: %dx%d", self->frame_width,
++          self->frame_height);
++
++  if (self->frame_width < 50 || self->frame_height < 20)
++    {
++      fpi_ssm_mark_failed (transfer->ssm,
++                           fpi_device_error_new_msg (FP_DEVICE_ERROR_PROTO,
++                                                     "Unexpected sensor dimensions %dx%d",
++                                                     self->frame_width,
++                                                     self->frame_height));
++      return;
++    }
++
++  fpi_ssm_next_state (transfer->ssm);
++}
++
++static void
++open_run_state (FpiSsm *ssm, FpDevice *dev)
++{
++  switch (fpi_ssm_get_cur_state (ssm))
++    {
++    case OPEN_GET_DIM_SEND:
++      elanpress_send_cmd (ssm, dev, cmd_get_sensor_dim);
++      break;
++
++    case OPEN_GET_DIM_READ:
++      elanpress_read (ssm, dev, ELANPRESS_EP_CMD_IN, 4,
++                      ELANPRESS_CMD_TIMEOUT, elanpress_dim_cb);
++      break;
++    }
++}
++
++static void
++open_complete (FpiSsm *ssm, FpDevice *dev, GError *error)
++{
++  fpi_device_open_complete (dev, error);
++}
++
++static void
++elanpress_open (FpDevice *dev)
++{
++  FpiDeviceElanPress *self = FPI_DEVICE_ELANPRESS (dev);
++  GError *error = NULL;
++
++  /* a finger already on the sensor when the device is opened is the press
++   * the user meant for it, so it is imaged rather than waited out */
++  self->wait_for_finger_off = FALSE;
++
++  if (!g_usb_device_claim_interface (fpi_device_get_usb_device (dev),
++                                     0, 0, &error))
++    {
++      fpi_device_open_complete (dev, error);
++      return;
++    }
++
++  fpi_ssm_start (fpi_ssm_new (dev, open_run_state, OPEN_NUM_STATES),
++                 open_complete);
++}
++
++static void
++elanpress_close (FpDevice *dev)
++{
++  FpiDeviceElanPress *self = FPI_DEVICE_ELANPRESS (dev);
++  GError *error = NULL;
++
++  elanpress_reset_capture (self);
++  elanpress_match_cleanup (self);
++  g_clear_pointer (&self->background, g_free);
++  g_clear_pointer (&self->enroll_images, g_ptr_array_unref);
++
++  g_usb_device_release_interface (fpi_device_get_usb_device (dev),
++                                  0, 0, &error);
++  fpi_device_close_complete (dev, error);
++}
++
++static void
++elanpress_cancel (FpDevice *dev)
++{
++  /* in-flight transfers are submitted with the action's cancellable, so
++   * they fail on their own; nothing device-side to do here */
++}
++
++static void
++fpi_device_elanpress_init (FpiDeviceElanPress *self)
++{
++}
++
++static void
++fpi_device_elanpress_class_init (FpiDeviceElanPressClass *klass)
++{
++  FpDeviceClass *dev_class = FP_DEVICE_CLASS (klass);
++
++  dev_class->id = "elanpress";
++  dev_class->full_name = "ElanTech press-type fingerprint sensor";
++  dev_class->type = FP_DEVICE_TYPE_USB;
++  dev_class->id_table = elanpress_id_table;
++  dev_class->scan_type = FP_SCAN_TYPE_PRESS;
++  dev_class->nr_enroll_stages = ELANPRESS_ENROLL_STAGES;
++  /* the sensor spends lock-screen sessions waiting for a finger; it is a
++   * tiny capacitive sensor designed to be always-on */
++  dev_class->temp_hot_seconds = -1;
++
++  dev_class->open = elanpress_open;
++  dev_class->close = elanpress_close;
++  dev_class->enroll = elanpress_enroll;
++  dev_class->verify = elanpress_identify_verify;
++  dev_class->identify = elanpress_identify_verify;
++  dev_class->cancel = elanpress_cancel;
++
++  fpi_device_class_auto_initialize_features (dev_class);
++}
+diff --git c/libfprint/drivers/elanpress.h i/libfprint/drivers/elanpress.h
+new file mode 100644
+index 00000000..9fb95455
+--- /dev/null
++++ i/libfprint/drivers/elanpress.h
+@@ -0,0 +1,130 @@
++/*
++ * Driver for ELAN press-type (touch) fingerprint sensors
++ * Copyright (C) 2026 Filip Spanne
++ *
++ * These sensors stream raw frames like the swipe sensors handled by the
++ * elan driver, but the finger rests on the sensor instead of being swiped
++ * across it. The imaged area is far too small for reliable minutiae
++ * matching, so enrollment stores the images themselves and matching pairs
++ * up local keypoint features between them, like the Windows driver does.
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++#pragma once
++
++#include "fpi-device.h"
++#include "fpi-usb-transfer.h"
++
++#define ELANPRESS_VEND_ID 0x04f3
++
++#define ELANPRESS_EP_CMD_OUT (0x1 | FPI_USB_ENDPOINT_OUT)
++#define ELANPRESS_EP_CMD_IN (0x3 | FPI_USB_ENDPOINT_IN)
++#define ELANPRESS_EP_IMG_IN (0x2 | FPI_USB_ENDPOINT_IN)
++
++#define ELANPRESS_CMD_LEN 2
++#define ELANPRESS_CMD_TIMEOUT 5000
++#define ELANPRESS_FRAME_TIMEOUT 2000
++
++/* interval between polls while frames of a touch are being collected */
++#define ELANPRESS_POLL_INTERVAL_MS 30
++
++/* interval between polls while waiting for a finger to land or lift. Each
++ * poll pulls a whole frame rather than the single status byte it used to, so
++ * the transfer already paces the loop; a further delay on top of it only
++ * adds latency to noticing the finger. */
++#define ELANPRESS_IDLE_POLL_INTERVAL_MS 5
++
++/* consecutive untouched frames that end a touch. Presence is inferred from
++ * the image itself (see ELANPRESS_TOUCH_MIN_MEAN_DELTA) rather than asked of
++ * cmd_pre_scan, whose status byte answers once per power-up and then wedges
++ * at "finger present" for good, stranding capture in a wait-for-lift loop
++ * that only a full power cycle could clear. Requiring a run of clear frames
++ * keeps sensor noise from ending a touch early, and keeps a finger left
++ * resting on the sensor from being counted as the next press. */
++#define ELANPRESS_FINGER_OFF_FRAMES 10
++
++/* consecutive clear polls after which the background frame is retaken while
++ * waiting for a press. The background is the only reference for telling a
++ * touch apart, so one captured while a finger happened to be resting would
++ * make every later frame look untouched and strand capture just as the
++ * wedged status byte used to. Retaking it on a long clear stretch recovers
++ * from that by itself, and otherwise just tracks the sensor's drift. */
++#define ELANPRESS_BG_REFRESH_FRAMES 50
++
++/* a touch is imaged once. The sensor's frames are nearly noise-free
++ * (consecutive frames of a resting finger correlate at 0.999), so averaging
++ * several buys nothing, but it does smear the ridges whenever the finger
++ * shifts while resting: on recorded presses that happened in about one press
++ * in ten, between 170 ms and 900 ms after landing, and averaged frames from
++ * such presses failed to match where a single frame of the same press did. */
++#define ELANPRESS_MAX_FRAMES 1
++
++/* number of touches stored during enrollment. The sensor sees a different
++ * part of the finger on each press, and a press only matches an enrolled one
++ * it overlaps, so more touches cover more of the finger: measured on
++ * recorded presses, 1 genuine press in 40 failed to match against 8 stored
++ * touches, 1 in 80 against 12 and 1 in 170 against 16. */
++#define ELANPRESS_ENROLL_STAGES 12
++
++/* Covering frames in a row before one is kept. Polling stays at the idle
++ * rate, so this is a few tens of milliseconds, not a blind pause. The first
++ * frame that crosses the coverage line is still the finger landing, and a
++ * 200 ms gap with no reads was landing on a blank frame. */
++#define ELANPRESS_STABLE_FRAMES 3
++
++/* A frame this much darker than the background is the empty sensor and
++ * replaces it at once. The lock screen opens the reader again while the
++ * finger is still down; without a saved empty frame that open would store
++ * the finger as the background and then never see it. */
++#define ELANPRESS_BG_DARKER_THAN 500
++
++/* separate presses averaged into one verify/identify decision.
++ *
++ * Resampling until some press cleared the threshold made the verdict the best
++ * of everything tried: the best of several presses, each scored against the
++ * best of the enrolled images, each of those the best over a few thousand
++ * candidate alignments. A maximum taken over that many chances lifts a
++ * stranger's score about as readily as the owner's, which is the likely
++ * reason the driver has been reported as accepting any finger.
++ *
++ * Dropping that loop is what fixed it, not the averaging. A single press
++ * already sits clearly either side of the threshold (see
++ * ELANPRESS_MATCH_MIN_PAIRS), so averaging further presses only buys margin
++ * against an unusually poor genuine one, and on a lockscreen that margin is
++ * better spent on convenience: a false reject there costs one more press,
++ * whereas a second mandatory press costs one every single time. Raise this
++ * if the score distributions on some other sensor turn out to sit closer
++ * together. */
++#define ELANPRESS_MATCH_SAMPLES 1
++
++/* extra presses allowed when one yields no usable image at all: too few
++ * frames, or too little contrast to be worth scoring. These do not count
++ * towards the average, because a press that produced nothing is not evidence
++ * either way, whereas one that produced a poor score is. */
++#define ELANPRESS_MATCH_MAX_RETRIES 3
++
++/* version tag for the serialized print data */
++#define ELANPRESS_PRINT_VERSION 1
++
++G_DECLARE_FINAL_TYPE (FpiDeviceElanPress, fpi_device_elanpress, FPI,
++                      DEVICE_ELANPRESS, FpDevice);
++
++static const FpIdEntry elanpress_id_table[] = {
++  {.vid = ELANPRESS_VEND_ID, .pid = 0x0c6e, }, /* 04f3:0c6e Rog Flow x13 etc. */
++  {.vid = ELANPRESS_VEND_ID, .pid = 0x0c4f, }, /* 04f3:0c4f Acer Aspire A515-45 */
++  {.vid = ELANPRESS_VEND_ID, .pid = 0x0c63, }, /* 04f3:0c63 */
++  {.vid = 0, .pid = 0, },
++};
+diff --git c/libfprint/meson.build i/libfprint/meson.build
+index f11533ca..5f9d6aec 100644
+--- c/libfprint/meson.build
++++ i/libfprint/meson.build
+@@ -120,6 +120,11 @@ driver_sources = {
+     'egis_etu905' : files('drivers/egismoc/egis_etu905.c'),
+     'vfs0050' : files('drivers/vfs0050.c'),
+     'elan' : files('drivers/elan.c'),
++    'elanpress' : files(
++        'drivers/elanpress.c',
++        'drivers/elanpress-match.c',
++        'drivers/elanpress-sift.c',
++    ),
+     'elanmoc' : files('drivers/elanmoc/elanmoc.c'),
+     'elanspi' : files('drivers/elanspi.c'),
+     'nb1010' : files('drivers/nb1010.c'),
+diff --git c/meson.build i/meson.build
+index ab09dc1d..9e33a3ab 100644
+--- c/meson.build
++++ i/meson.build
+@@ -135,6 +135,7 @@ drivers_info = {
+     'vcom5s': {},
+     'synaptics': {},
+     'elan': { 'endian_dependent': true },
++    'elanpress': {},
+     'elanmoc': {},
+     'uru4000': { 'helper': ['openssl'] },
+     'upektc': {},
