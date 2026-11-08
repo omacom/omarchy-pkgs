@@ -6,7 +6,9 @@ This package activates coordinated suspend-to-idle automatically on ASUS ProArt 
 
 Boot the updated kernel normally and use `s2idle`. To disable this correction for troubleshooting, add `acpi.n1x_coordinated_s2idle=0` to the kernel command line and reboot. The legacy `=1` value is accepted but cannot force activation on unrelated hardware. An invalid value disables the correction and logs a warning. Keep a working kernel entry available during validation.
 
-Hardware matching establishes eligibility. Actual activation still requires the firmware OSLPI acknowledgement and cached PSCI OSI capability. This private P16 policy is qualified only on the tested 20-CPU configuration: each present CPU must have the validated four-level hierarchy, three parents and seven complete compositions before coordinated mode is published. NVIDIA also ships 18-CPU N1X SKUs; this policy does not yet qualify their ACPI hierarchy. Those systems keep the normal fallback without repeated activation attempts. The count restriction expresses this policy's tested coverage, not a restriction of N1X hardware. The raw LPI state shape, registers, LevelIDs, context-loss semantics and topology are checked; incompatible firmware is refused regardless of BIOS version. Ordinary idle retains the prepared leaf path, and shared-domain selection requires actual suspend-to-idle.
+Hardware matching establishes eligibility. Actual activation still requires the firmware OSLPI acknowledgement and cached PSCI OSI capability. The P16 policy admits 18- and 20-CPU N1X configurations only when every present CPU has complete coverage and passes the existing four-level hierarchy, three-parent and seven-composition contract. Raw LPI state shape, registers, LevelIDs, context-loss semantics and parent paths remain checked; incompatible firmware is refused regardless of CPU count or BIOS version. Ordinary idle retains the prepared leaf path, and shared-domain selection requires actual suspend-to-idle.
+
+18-CPU support is provisional: we assume that SKU uses the same validated ACPI hierarchy with two fewer cores, and let the existing runtime checks test that assumption. We have access only to the 20-CPU P16 and cannot physically test the 18-CPU version. A native 18-CPU owner must validate boot, suspend/resume and power consumption; their ACPI/topology and kernel logs will guide any further adaptation. Passing source tests or reducing the CPUs exposed on a 20-CPU machine does not establish native 18-CPU hardware compatibility. If the firmware contract does not match, the existing non-coordinated fallback remains available.
 
 Only H7607BA BIOS 303 has been physically tested so far. Removing the version and hash pins does not establish hardware validation of other firmware revisions.
 
@@ -93,8 +95,9 @@ reports the compiled tests as skipped when no prepared tree is supplied.
 The PR is refreshed on the official 7.3-37 recipe and uses pkgrel 38 so its
 packaging change is shipped. It retains upstream's separate kernel, headers and
 NVIDIA open-module split, driver version and seven NVIDIA patches unchanged.
-The six P16 sleep patches retain the executable behavior of the locally built
-and booted Linux 7.3 test candidate; 1122 only adds the SKU-scope comment. That local candidate also includes
+The sleep implementation retains its existing firmware-state and lifecycle
+checks. The 1122 follow-up admits 18 CPUs as well as 20, with provisional
+18-CPU support and no physical validation of that SKU. That local candidate also includes
 ASUS platform changes. That kernel portion is now included in this package PR
 (see README-P16-PLATFORM.md); userspace battery integration remains excluded.
 Its successful build/boot and the extracted-function tests do not establish new physical
