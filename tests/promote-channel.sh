@@ -18,7 +18,7 @@ BIN="$T/root/bin"
 mkdir -p "$BIN"
 cp -r "$ROOT/helpers" "$T/root/"
 cp -r "$ROOT/release" "$T/root/"
-cp "$ROOT/bin/promote-channel" "$ROOT/bin/publish-artifact" "$ROOT/bin/check-mac-set" "$BIN/"
+cp "$ROOT/bin/promote-channel" "$ROOT/bin/publish-artifact" "$ROOT/bin/check-mac-set" "$ROOT/bin/check-channel-deps" "$BIN/"
 PKGBUILDS_DIR="$T/root/pkgbuilds"
 recipe() { # recipe <dir> <metadata json> [pkgbase] [arch]
   mkdir -p "$PKGBUILDS_DIR/$1/.omarchy"
@@ -35,8 +35,9 @@ recipe big '{"source": "local"}'
 # Built for x86_64 once; the recipe has since dropped it.
 recipe dropped '{"source": "local"}' "" aarch64
 
-# minimal real packages via makepkg; a second name makes a split package
-mkpkg() { # mkpkg <base> <pkgrel> [second pkgname]
+# minimal real packages via makepkg; a second name makes a split package, and
+# DEPENDS gives a single package its depends
+mkpkg() { # [DEPENDS=...] mkpkg <base> <pkgrel> [second pkgname]
   local d="$T/src/$1-$2"; mkdir -p "$d"; cd "$d"
   {
     if [[ -n ${3:-} ]]; then
@@ -45,6 +46,7 @@ mkpkg() { # mkpkg <base> <pkgrel> [second pkgname]
       printf 'package_%s(){ install -Dm644 /dev/null "$pkgdir/usr/share/%s"; }\n' "$3" "$3"
     else
       printf 'pkgname=%s\npackage(){ install -Dm644 /dev/null "$pkgdir/usr/share/%s-%s"; }\n' "$1" "$1" "$2"
+      printf 'depends=(%s)\n' "${DEPENDS:-}"
     fi
     printf 'pkgver=1.0\npkgrel=%s\narch=(x86_64)\n' "$2"
   } > PKGBUILD
@@ -159,3 +161,39 @@ fastring --to rc && [[ $(plan_action fast) == current ]] && pass "--fast-ring is
 if "$BIN/promote-channel" --remote "$REMOTE" --fast-ring --from rc --to stable --arch x86_64 >"$T/out" 2>&1; then
   fail "--fast-ring from rc should refuse"
 else grep -q 'fast ring follows edge' "$T/out" && pass "--fast-ring only follows edge" || fail "fast-ring direction reason"; fi
+
+# A package whose new version needs one the promotion leaves behind is
+# refused, and the refusal names the package to promote with it.
+recipe kern '{"source": "local"}'
+recipe trees '{"source": "local"}'
+recipe mods '{"source": "local"}'
+pub rc $(mkpkg kern 1) $(DEPENDS=kern=1.0-1 mkpkg mods 1)
+pub edge $(DEPENDS=trees mkpkg kern 2) $(mkpkg trees 1) $(DEPENDS=kern=1.0-2 mkpkg mods 2)
+rc_before=$(entries rc)
+: > "$T/record"
+if promote kern; then fail "kern without trees should refuse"; else
+  grep -q 'kern needs trees; rc would not have trees (promote trees with it)' "$T/out" \
+    && grep -q 'mods needs kern=1.0-1; rc would offer only kern 1.0-2' "$T/out" \
+    && grep -q 'nothing published' "$T/out" && [[ "$(entries rc)" == "$rc_before" ]] \
+    && jq -e -s '[.[] | select(.type=="deps")] | length == 1 and .[0].result == "refused" and ([.[0].problems[].package] | sort == ["kern", "mods"])' "$T/record" >/dev/null \
+    && pass "a package does not move without one it newly depends on, or away from one that needs its old version" || fail "unmet dependency refusal"
+fi
+: > "$T/record"
+if promote kern trees --dry-run; then fail "kern without mods should refuse, dry run included"; else
+  grep -q 'mods needs kern=1.0-1' "$T/out" && ! grep -q 'kern needs trees' "$T/out" \
+    && pass "the dry run refuses the same way and names only what is still missing" || fail "dry-run refusal"
+fi
+: > "$T/record"
+promote kern trees mods && [[ "$(entries rc)" == *"kern-1.0-2 mods-1.0-2 "*"trees-1.0-1 "* ]] \
+  && jq -e -s '[.[] | select(.type=="deps")] | .[0].result == "pass"' "$T/record" >/dev/null \
+  && pass "named together, they move together" || fail "kern with trees and mods: $(entries rc)"
+
+# A dependency already broken in rc does not block an unrelated promotion; it
+# is reported and recorded as existing.
+recipe stale '{"source": "local"}'
+pub rc $(DEPENDS=gone mkpkg stale 1)
+pub edge $(mkpkg gone 1) $(mkpkg alpha 5)
+: > "$T/record"
+promote alpha && [[ "$(entries rc)" == *"alpha-1.0-5 "* ]] && grep -q 'stale needs gone' "$T/out" \
+  && jq -e -s '[.[] | select(.type=="deps")] | .[0].result == "pass" and .[0].existing[0].package == "stale"' "$T/record" >/dev/null \
+  && pass "a dependency rc already lacked is reported, not held against the promotion" || fail "existing breakage"
