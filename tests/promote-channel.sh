@@ -162,56 +162,38 @@ if "$BIN/promote-channel" --remote "$REMOTE" --fast-ring --from rc --to stable -
   fail "--fast-ring from rc should refuse"
 else grep -q 'fast ring follows edge' "$T/out" && pass "--fast-ring only follows edge" || fail "fast-ring direction reason"; fi
 
-# A pkgbase whose move would leave a dependency in rc unresolved is held back
-# with the reason, and everything else still moves.
+# A package whose new version needs one the promotion leaves behind is
+# refused, and the refusal names the package to promote with it.
 recipe kern '{"source": "local"}'
 recipe trees '{"source": "local"}'
 recipe mods '{"source": "local"}'
 pub rc $(mkpkg kern 1) $(DEPENDS=kern=1.0-1 mkpkg mods 1)
-pub edge $(DEPENDS=trees mkpkg kern 2) $(mkpkg trees 1) $(DEPENDS=kern=1.0-2 mkpkg mods 2) $(mkpkg alpha 5)
+pub edge $(DEPENDS=trees mkpkg kern 2) $(mkpkg trees 1) $(DEPENDS=kern=1.0-2 mkpkg mods 2)
 rc_before=$(entries rc)
-reason() { jq -r --arg n "$1" 'select(.type=="plan" and .name==$n) | .reason' "$T/record" | tail -1; }
 : > "$T/record"
-promote kern alpha || fail "a promotion with a held package should still run"
-[[ $(plan_action kern) == hold && $(plan_action alpha) == promote ]] \
-  && [[ $(reason kern) == "held for a dependency: kern needs trees; rc/x86_64 would not have trees (promote trees with it)" ]] \
-  && [[ "$(entries rc)" == "${rc_before/alpha-1.0-4/alpha-1.0-5}" ]] \
-  && jq -e -s '[.[] | select(.type=="deps")] | length == 1 and .[0].result == "pass"' "$T/record" >/dev/null \
-  && pass "a kernel named without the package it newly depends on is held back, and the rest moves" || fail "held kernel: $(entries rc)"
-
+if promote kern; then fail "kern without trees should refuse"; else
+  grep -q 'kern needs trees; rc would not have trees (promote trees with it)' "$T/out" \
+    && grep -q 'mods needs kern=1.0-1; rc would offer only kern 1.0-2' "$T/out" \
+    && grep -q 'nothing published' "$T/out" && [[ "$(entries rc)" == "$rc_before" ]] \
+    && jq -e -s '[.[] | select(.type=="deps")] | length == 1 and .[0].result == "refused" and ([.[0].problems[].package] | sort == ["kern", "mods"])' "$T/record" >/dev/null \
+    && pass "a package does not move without one it newly depends on, or away from one that needs its old version" || fail "unmet dependency refusal"
+fi
 : > "$T/record"
-promote kern trees || fail "kern with trees"
-[[ $(plan_action trees) == promote && $(plan_action kern) == hold ]] \
-  && [[ $(reason kern) == "held for a dependency: mods needs kern=1.0-1; rc/x86_64 would offer only kern 1.0-2" ]] \
-  && [[ "$(entries rc)" == *"kern-1.0-1 "* && "$(entries rc)" == *"trees-1.0-1 "* ]] \
-  && pass "a package is held back when one that stays needs the version rc has" || fail "held for what stays: $(entries rc)"
-
-: > "$T/record"
-promote --dry-run || fail "whole-channel dry run"
-[[ $(plan_action kern) == promote && $(plan_action mods) == promote ]] \
-  && pass "a whole-channel promotion moves them together" || fail "whole channel: $(cat "$T/out")"
+if promote kern trees --dry-run; then fail "kern without mods should refuse, dry run included"; else
+  grep -q 'mods needs kern=1.0-1' "$T/out" && ! grep -q 'kern needs trees' "$T/out" \
+    && pass "the dry run refuses the same way and names only what is still missing" || fail "dry-run refusal"
+fi
 : > "$T/record"
 promote kern trees mods && [[ "$(entries rc)" == *"kern-1.0-2 mods-1.0-2 "*"trees-1.0-1 "* ]] \
+  && jq -e -s '[.[] | select(.type=="deps")] | .[0].result == "pass"' "$T/record" >/dev/null \
   && pass "named together, they move together" || fail "kern with trees and mods: $(entries rc)"
 
-# Holding one pkgbase can expose another: what depended on it then lacks it.
-recipe lib '{"source": "local"}'
-recipe app '{"source": "local"}'
-recipe plugin '{"source": "local"}'
-pub edge $(DEPENDS=nowhere mkpkg lib 1) $(DEPENDS=lib mkpkg app 1) $(DEPENDS=app mkpkg plugin 1) $(mkpkg nowhere 1)
-: > "$T/record"
-promote lib app plugin || fail "a chain of holds"
-[[ $(plan_action lib) == hold && $(plan_action app) == hold && $(plan_action plugin) == hold ]] \
-  && [[ $(reason app) == *"app needs lib; rc/x86_64 would not have lib"* ]] \
-  && grep -q 'held back for a dependency' "$T/out" \
-  && pass "holding a package holds what depends on it, until the rest resolves" || fail "hold chain: $(cat "$T/out")"
-
-# A dependency already broken in rc does not hold anything back; it is
-# reported and recorded as existing.
+# A dependency already broken in rc does not block an unrelated promotion; it
+# is reported and recorded as existing.
 recipe stale '{"source": "local"}'
 pub rc $(DEPENDS=gone mkpkg stale 1)
-pub edge $(mkpkg gone 1) $(mkpkg alpha 6)
+pub edge $(mkpkg gone 1) $(mkpkg alpha 5)
 : > "$T/record"
-promote alpha && [[ "$(entries rc)" == *"alpha-1.0-6 "* ]] && grep -q 'stale needs gone' "$T/out" \
+promote alpha && [[ "$(entries rc)" == *"alpha-1.0-5 "* ]] && grep -q 'stale needs gone' "$T/out" \
   && jq -e -s '[.[] | select(.type=="deps")] | .[0].result == "pass" and .[0].existing[0].package == "stale"' "$T/record" >/dev/null \
   && pass "a dependency rc already lacked is reported, not held against the promotion" || fail "existing breakage"

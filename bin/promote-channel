@@ -41,12 +41,10 @@
 # nothing the Mac set depends on is not affected.
 #
 # Then bin/check-channel-deps holds the same view to this repository's
-# dependencies: every package there must still find what it depends on,
-# version included. A pkgbase whose move would break that is held back with
-# the reason, and everything else still moves: a kernel stays where it is
-# when the package it newly depends on does not move with it. Dependencies
-# already broken before are reported, not held against anything. When
-# something is held back, the Mac check runs again on what is left.
+# dependencies: every package the destination would serve must still find
+# what it depends on there, version included, so a kernel cannot move
+# without a package it newly depends on. It refuses the whole plan the same
+# way, and names the package to promote with it.
 #
 # --record appends one JSON object per line: {"type":"plan",...} for every
 # package considered, {"type":"mac-set",...} for the Mac package-set check,
@@ -79,7 +77,7 @@ while [[ $# -gt 0 ]]; do
   --fast-ring) FAST_RING=true; shift ;;
   --record) RECORD=$2; shift 2 ;;
   --batch-bytes) BATCH_BYTES=$2; shift 2 ;;
-  -h|--help) sed -n '2,57p' "$0"; exit 0 ;;
+  -h|--help) sed -n '2,55p' "$0"; exit 0 ;;
   -*) print_error "Unknown option: $1"; exit 1 ;;
   *) ONLY+=("$1"); shift ;;
   esac
@@ -183,13 +181,9 @@ hold_reason() { # hold_reason <pkgbase>
   fi
 }
 
-# One line per package of the plan, decided here and printed and recorded
-# once the dependency check below has settled it: base, name, from (source
-# version), have (destination's), file, size, action, reason, split by the
-# unit separator, which read does not merge when a field is empty, as it
-# does tabs.
-US=$'\037'
-: > "$WORK/plan.tsv"
+: > "$WORK/promote.tsv"
+: > "$WORK/promote-names.tsv"
+promoted=0 held=0 current=0
 for base in "${BASES[@]}"; do
   rows=$(awk -F'\t' -v b="$base" '$3==b' "$WORK/src.tsv")
   reason=$(hold_reason "$base")
@@ -206,15 +200,21 @@ for base in "${BASES[@]}"; do
   while IFS=$'\t' read -r name ver _ file _ size; do
     have=${DEST_VER[$name]:-}
     if [[ -n $reason ]]; then
-      action=hold; why=$reason
+      action=hold; why=$reason; held=$((held + 1))
     elif [[ -n $have ]] && (( $(vercmp "$ver" "$have") == 0 )); then
-      action=current; why="$TO already has $ver"
+      action=current; why="$TO already has $ver"; current=$((current + 1))
     else
-      action=promote; why=""
+      action=promote; why=""; promoted=$((promoted + 1))
+      printf '%s\t%s\n' "$base" "$file" >> "$WORK/promote.tsv"
+      printf '%s\t%s\n' "$name" "$ver" >> "$WORK/promote-names.tsv"
     fi
-    printf '%s\037%s\037%s\037%s\037%s\037%s\037%s\037%s\n' "$base" "$name" "$ver" "$have" "$file" "${size:-0}" "$action" "$why" >> "$WORK/plan.tsv"
+    [[ $action == current ]] || print_step "$action $name ${have:-(none)} -> $ver${why:+ — $why}"
+    record --arg arch "$ARCH" --arg base "$base" --arg name "$name" --arg from "$ver" --arg to "$have" \
+      --arg file "$file" --arg action "$action" --arg reason "$why" --argjson size "${size:-0}" \
+      '{type:"plan", arch:$arch, base:$base, name:$name, from_version:$from, to_version:(if $to=="" then null else $to end), file:$file, size:$size, action:$action, reason:(if $reason=="" then null else $reason end)}'
   done <<<"$rows"
 done
+print_info "Plan for $ARCH: $promoted to promote, $held held back, $current already current"
 
 # --- 2b. the destination as the plan would leave it --------------------------
 # The Mac package set (bin/check-mac-set) and the dependencies
@@ -222,102 +222,33 @@ done
 # lock the plan was made in.
 # Every step checks its own status: inside an `if` condition set -e is off.
 after_view() {
-  rm -rf "$WORK/after" || return 1
   mkdir -p "$WORK/dest.db.tar.zst.d" "$WORK/after" || return 1
   cp -R "$WORK/dest.db.tar.zst.d/." "$WORK/after/" || return 1
-  awk -F"$US" '$7 == "promote" { print $2 "\t" $3 }' "$WORK/plan.tsv" > "$WORK/promote-names.tsv" || return 1
   while IFS=$'\t' read -r name ver; do
     if [[ -n ${DEST_VER[$name]:-} ]]; then rm -rf "$WORK/after/$name-${DEST_VER[$name]}" || return 1; fi
     cp -R "$WORK/src.db.tar.zst.d/$name-$ver" "$WORK/after/" || return 1
   done < "$WORK/promote-names.tsv"
 }
-deps_check() { # deps_check [check-channel-deps flags...]
-  "$BUILD_ROOT/bin/check-channel-deps" --channel "$TO" --arch "$ARCH" \
-    --source "$WORK/src.db.tar.zst.d" --before "$WORK/dest.db.tar.zst.d" --after "$WORK/after" "$@"
-}
-# The plan as it stands, printed and recorded once: when it is settled, or
-# when it is refused, so the record shows what would have moved.
-plan_emitted=false
-emit_plan() {
-  [[ $plan_emitted == false ]] || return 0
-  plan_emitted=true
-  promoted=0 held=0 current=0
-  local base name ver have file size action why
-  while IFS=$US read -r base name ver have file size action why; do
-    case $action in promote) promoted=$((promoted + 1)) ;; hold) held=$((held + 1)) ;; current) current=$((current + 1)) ;; esac
-    [[ $action == current ]] || print_step "$action $name ${have:-(none)} -> $ver${why:+ — $why}"
-    record --arg arch "$ARCH" --arg base "$base" --arg name "$name" --arg from "$ver" --arg to "$have" \
-      --arg file "$file" --arg action "$action" --arg reason "$why" --argjson size "${size:-0}" \
-      '{type:"plan", arch:$arch, base:$base, name:$name, from_version:$from, to_version:(if $to=="" then null else $to end), file:$file, size:$size, action:$action, reason:(if $reason=="" then null else $reason end)}'
-  done < "$WORK/plan.tsv"
-  awk -F"$US" '$7 == "promote" { print $1 "\t" $5 }' "$WORK/plan.tsv" > "$WORK/promote.tsv"
-  print_info "Plan for $ARCH: $promoted to promote, $held held back, $current already current"
-}
-refuse() { emit_plan; print_error "$1; refusing to promote $FROM/$ARCH into $TO/$ARCH: nothing published"; exit 1; }
-# A check that refuses has said why; this only says what it means.
-refused() { emit_plan; print_error "Refusing to promote $FROM/$ARCH into $TO/$ARCH: nothing published"; exit 1; }
-mac_check() {
-  "$BUILD_ROOT/bin/check-mac-set" --channel "$TO" --arch "$ARCH" \
-    --before "$WORK/dest.db.tar.zst.d" --after "$WORK/after" --record "$RECORD"
-}
-
-# The Mac set first, on the plan as made, so its rules stand as they are.
-# Fail closed: a plan the Mac check cannot vouch for, because it could not
-# run, is refused like one it rejects.
-after_view || refuse "Could not build $TO/$ARCH as this plan would leave it"
-mac_check || refused
-
-# A pkgbase whose move would leave a dependency in the destination
-# unresolved stays where it is, and everything else still moves: its own
-# new version needs what the destination would not have, or a package that
-# stays needs the version it has now. Holding one can expose another (what
-# depended on it now lacks it), so this repeats until the view resolves.
-# The plan only shrinks, so it ends; a problem the check cannot pin on a
-# moving pkgbase refuses the plan instead.
-holds_made=false
-while true; do
-  [[ $holds_made == false ]] || after_view || refuse "Could not build $TO/$ARCH as this plan would leave it"
-  : > "$WORK/holds"
-  status=0
-  deps_check --holds "$WORK/holds" >"$WORK/deps.log" 2>&1 || status=$?
-  (( status == 0 )) && break
-  (( status == 1 )) || { cat "$WORK/deps.log"; refuse "The dependency check could not run"; }
-  [[ -s $WORK/holds ]] || { cat "$WORK/deps.log"; refuse "A dependency would break that no moving package causes"; }
-  held_now=0
-  while IFS=$'\t' read -r base text; do
-    # Only rows still moving: a base held in an earlier round keeps its reason.
-    if awk -F"$US" -v b="$base" '$1 == b && $7 == "promote" { found = 1 } END { exit !found }' "$WORK/plan.tsv"; then
-      awk -F"$US" -v b="$base" -v why="held for a dependency: $text" 'BEGIN { OFS = FS }
-        $1 == b && $7 == "promote" { $7 = "hold"; $8 = why } 1' "$WORK/plan.tsv" > "$WORK/plan.tmp"
-      mv "$WORK/plan.tmp" "$WORK/plan.tsv"
-      held_now=$((held_now + 1))
-    fi
-  done < "$WORK/holds"
-  (( held_now )) || { cat "$WORK/deps.log"; refuse "Holding back the pkgbases a dependency check names did not resolve it"; }
-  holds_made=true
-done
-emit_plan
-
-# The record's dependency line, for the plan as settled: what still breaks
-# that was already broken before, and nothing new.
-deps_check --record "$RECORD" || { cat "$WORK/deps.log"; refuse "The settled plan still leaves a dependency unresolved"; }
-# What was held back may have been part of the Mac set: check it again.
-if [[ $holds_made == true ]]; then
-  mac_check || refused
+# Fail closed: a plan the checks cannot vouch for, because the view could not
+# be built or a check could not run, is refused like one they reject.
+if ! after_view; then
+  print_error "Could not build $TO/$ARCH as this plan would leave it; refusing to promote $FROM/$ARCH into $TO/$ARCH: nothing published"
+  exit 1
+elif ! "$BUILD_ROOT/bin/check-mac-set" --channel "$TO" --arch "$ARCH" \
+  --before "$WORK/dest.db.tar.zst.d" --after "$WORK/after" --record "$RECORD"; then
+  print_error "Refusing to promote $FROM/$ARCH into $TO/$ARCH: nothing published"
+  exit 1
+elif ! "$BUILD_ROOT/bin/check-channel-deps" --channel "$TO" --arch "$ARCH" \
+  --source "$WORK/src.db.tar.zst.d" --before "$WORK/dest.db.tar.zst.d" --after "$WORK/after" --record "$RECORD"; then
+  print_error "Refusing to promote $FROM/$ARCH into $TO/$ARCH: nothing published"
+  exit 1
 fi
 
 if [[ $DRY_RUN == true ]]; then
   print_success "Dry run: nothing published"
   exit 0
 fi
-if (( ! promoted )); then
-  if grep -q "${US}held for a dependency: " "$WORK/plan.tsv"; then
-    print_success "Nothing to promote from $FROM/$ARCH to $TO/$ARCH: what would move is held back for a dependency"
-  else
-    print_success "$TO/$ARCH is already up to date with $FROM"
-  fi
-  exit 0
-fi
+(( promoted )) || { print_success "$TO/$ARCH is already up to date with $FROM"; exit 0; }
 
 # --- 3. copy, verify, publish in batches -------------------------------------
 # Batches break between pkgbases, never inside one.
