@@ -29,4 +29,14 @@ if [[ -n "${WAYLAND_DISPLAY:-}" || "${XDG_SESSION_TYPE:-}" == wayland ]]; then
   done
 fi
 
-exec /usr/lib/claude-desktop/claude-desktop "${platform_flags[@]}" "${user_flags[@]}" "$@"
+# Chromium's own keyring detection fails on Hyprland, even with GNOME Keyring
+# running, and the fallback store keeps no sign-in across restarts. Ask for
+# libsecret directly, unless the user has already picked a store themselves.
+store_flags=(--password-store=gnome-libsecret)
+for flag in "${user_flags[@]}" "$@"; do
+  case "$flag" in
+    --password-store=*) store_flags=() ;;
+  esac
+done
+
+exec /usr/lib/claude-desktop/claude-desktop "${platform_flags[@]}" "${store_flags[@]}" "${user_flags[@]}" "$@"
