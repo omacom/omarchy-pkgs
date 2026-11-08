@@ -152,6 +152,8 @@ Two differences from Arch Linux ARM's kernel matter on these laptops. Omarchy's 
 
 `2183` makes rtc-pm8xxx honour the time zone stored next to the RTC offset in the `RTCInfo` EFI variable. The firmware and Windows keep that offset in local time, with the EFI_TIME TimeZone and Daylight bytes after it, and the driver read it as UTC: a Zenbook 14 UX3480QA set to UTC+8 booted 8 hours ahead, and after NTP set the RTC, the firmware and Windows read it 8 hours behind. An unspecified (0x7ff) or out-of-range time zone keeps the old behaviour.
 
+`2184`-`2185` are Mohit Sharma's "Fix GPR callback registration race during probe" (October 22). `2184` is upstream ef7062864c05, merged after 7.3, and `2185` is not merged yet. apr_device_probe() installed the GPR callback only after the client's probe returned, and q6apm sends GET_SPF_STATE from its probe, so the DSP's immediate reply was dropped and the sound card bound 5 s late, after `CMD timeout for [1001021] opcode`. q6apm and q6prm now ignore packets until their driver data is set, and the bus publishes the callback before the probe.
+
 ### Surface Pro 11
 
 `2110`-`2169` bring up the Microsoft Surface Pro 11 (X1E80100, `microsoft,denali-oled`), replacing its separate `linux-sp11` package. They come from github.com/turbineBMW/linux `sp11/n1x-7.2.8` (v7.2.8 with this recipe's patches as commits), rebased onto 7.3, and apply after `2006`.
