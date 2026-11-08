@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Gate the actual private coverage predicate before global mode publication."""
+"""Gate the tested private hierarchy; other N1x SKUs keep the normal fallback."""
 from pathlib import Path
 import sys
 KERNEL_SOURCE = Path(sys.argv[1]).resolve()
@@ -43,19 +43,22 @@ int main(void){
   assert(gate()==-EINVAL&&acpi_lpi_retryable_error(-EINVAL)&&osi_calls==1);
   records[i].n1x_private=true;
  }
- present=19;
- assert(gate()==-EOPNOTSUPP&&osi_calls==1);
- assert(!acpi_lpi_retryable_error(-EOPNOTSUPP));
- present=16;
- assert(gate()==-EOPNOTSUPP&&osi_calls==1);
- assert(!acpi_lpi_retryable_error(-EOPNOTSUPP));
+ /* An 18-CPU N1x SKU is real hardware, not a transient incomplete probe.
+  * The current firmware policy is tested only for the 20-CPU P16; a count
+  * reduction (including nr_cpus=18 on that P16) must not cause rebuild loops. */
+ const int unvalidated_counts[]={16,18,19};
+ for(unsigned int i=0;i<sizeof(unvalidated_counts)/sizeof(unvalidated_counts[0]);i++){
+  present=unvalidated_counts[i];
+  assert(gate()==-EOPNOTSUPP&&osi_calls==1);
+  assert(!acpi_lpi_retryable_error(-EOPNOTSUPP));
+ }
  present=20;firmware=false;
  assert(gate()==-EOPNOTSUPP&&osi_calls==1);
  assert(!acpi_lpi_retryable_error(-EOPNOTSUPP));
  assert(acpi_lpi_retryable_error(-EINVAL));
  assert(acpi_lpi_retryable_error(-ENOMEM));
  assert(!acpi_lpi_retryable_error(-ENODEV));
- puts("PASS actual pre-mode coverage: permanent platform rejection stops retries; incomplete per-CPU hierarchy remains retryable");
+ puts("PASS actual pre-mode coverage: 16/18/19 CPU fallback stops retries; validated 20-CPU hierarchy and transient per-CPU retries preserved");
  return 0;
 }
 '''

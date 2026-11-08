@@ -6,7 +6,7 @@ This package activates coordinated suspend-to-idle automatically on ASUS ProArt 
 
 Boot the updated kernel normally and use `s2idle`. To disable this correction for troubleshooting, add `acpi.n1x_coordinated_s2idle=0` to the kernel command line and reboot. The legacy `=1` value is accepted but cannot force activation on unrelated hardware. An invalid value disables the correction and logs a warning. Keep a working kernel entry available during validation.
 
-Hardware matching establishes eligibility. Actual activation still requires the firmware OSLPI acknowledgement and cached PSCI OSI capability. Each of the 20 CPUs must have the validated four-level hierarchy, three parents and seven complete compositions before coordinated mode is published. The raw LPI state shape, registers, LevelIDs, context-loss semantics and topology are checked; incompatible firmware is refused regardless of BIOS version. Ordinary idle retains the prepared leaf path, and shared-domain selection requires actual suspend-to-idle.
+Hardware matching establishes eligibility. Actual activation still requires the firmware OSLPI acknowledgement and cached PSCI OSI capability. This private P16 policy is qualified only on the tested 20-CPU configuration: each present CPU must have the validated four-level hierarchy, three parents and seven complete compositions before coordinated mode is published. NVIDIA also ships 18-CPU N1X SKUs; this policy does not yet qualify their ACPI hierarchy. Those systems keep the normal fallback without repeated activation attempts. The count restriction expresses this policy's tested coverage, not a restriction of N1X hardware. The raw LPI state shape, registers, LevelIDs, context-loss semantics and topology are checked; incompatible firmware is refused regardless of BIOS version. Ordinary idle retains the prepared leaf path, and shared-domain selection requires actual suspend-to-idle.
 
 Only H7607BA BIOS 303 has been physically tested so far. Removing the version and hash pins does not establish hardware validation of other firmware revisions.
 
@@ -90,12 +90,31 @@ reports the compiled tests as skipped when no prepared tree is supplied.
 
 ## Current recipe compatibility
 
-The PR is refreshed on the official 7.3-12 recipe and uses pkgrel 15 so its
+The PR is refreshed on the official 7.3-37 recipe and uses pkgrel 38 so its
 packaging change is shipped. It retains upstream's separate kernel, headers and
 NVIDIA open-module split, driver version and seven NVIDIA patches unchanged.
-The six P16 sleep patches are byte-identical to those in the locally built and
-booted local Linux 7.3 test candidate. That local candidate also includes
+The six P16 sleep patches retain the executable behavior of the locally built
+and booted Linux 7.3 test candidate; 1122 only adds the SKU-scope comment. That local candidate also includes
 ASUS platform changes. That kernel portion is now included in this package PR
 (see README-P16-PLATFORM.md); userspace battery integration remains excluded.
 Its successful build/boot and the extracted-function tests do not establish new physical
 suspend measurements for this refreshed official recipe.
+
+## Independent sleep report and remaining wake-source limits
+
+An independent owner, `jlobue10`, tested a second H7607BA BIOS303 with 20 CPUs
+and the byte-identical 1120-1125 set at commit `8abf19a4`, without the ASUS/SPI
+platform patches. On an Omarchy 7.3-3.1 base, the stock/control kernels woke
+after about 4-6 seconds; the patched candidate remained asleep for 12 minutes,
+33 minutes, 49 minutes and 3 hours 17 minutes until an external wake. Two
+usable energy intervals measured 1.546 W and 1.559 W. These are that owner's
+observations, not a rerun on the current recipe or a physical DRIPS reading.
+Full report: https://github.com/omacom/omarchy-pkgs/pull/1958#issuecomment-6715195039
+
+That owner reports that RTC alarms did not wake their patched candidate; the
+stock/control kernels woke too early to compare RTC behavior. Timed wake has
+not been validated here either. Lid wake is tested; do not assume RTC wake
+works from this coordinated state. A USB mouse receiver disconnect also
+coincided with an early, noisy cycle in that report. Peripheral wake behavior
+and RTC limitations need separate controlled testing; this contribution does
+not claim to fix them.
