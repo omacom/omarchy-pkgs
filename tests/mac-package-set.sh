@@ -18,7 +18,7 @@ unset GNUPGHOME
 BIN="$T/root/bin"
 mkdir -p "$BIN" "$T/root/release"
 cp -r "$ROOT/helpers" "$T/root/"
-cp "$ROOT/bin/promote-channel" "$ROOT/bin/publish-artifact" "$ROOT/bin/check-mac-set" "$BIN/"
+cp "$ROOT/bin/promote-channel" "$ROOT/bin/publish-artifact" "$ROOT/bin/check-mac-set" "$ROOT/bin/check-channel-deps" "$BIN/"
 PKGBUILDS_DIR="$T/root/pkgbuilds"
 recipe() { # recipe <dir> <metadata json> <arch...>
   local dir=$1 meta=$2; shift 2
@@ -83,8 +83,11 @@ pass() { echo "PASS: $1"; }
 fail() { echo "FAIL: $1"; cat "$T/out"; cat "$T/record" 2>/dev/null; exit 1; }
 
 # rc before the candidate: a shared library the Mac set links, a shared
-# fast-ring tool it uses, and one x86 package.
-pub rc aarch64 $(mkpkg alpha 1 aarch64) $(mkpkg shared-lib 1 aarch64 +libshared.so=1) $(mkpkg fast-tool 1 aarch64 +tool-api=1)
+# fast-ring tool it uses, and one x86 package. The merge published the
+# fast-ring tool to stable too.
+FAST1=$(mkpkg fast-tool 1 aarch64 +tool-api=1)
+pub rc aarch64 $(mkpkg alpha 1 aarch64) $(mkpkg shared-lib 1 aarch64 +libshared.so=1) "$FAST1"
+pub stable aarch64 "$FAST1"
 # edge carries the candidate, which matches the inventory.
 AUDIO1=$(mkpkg mac-audio 1 any)
 pub edge aarch64 $(mkpkg mac-kernel 1 aarch64 'mac-boot>=1.0') $(mkpkg mac-boot 1 aarch64 'shared-lib>=1.0' libshared.so=1 tool-api=1 bash) \
