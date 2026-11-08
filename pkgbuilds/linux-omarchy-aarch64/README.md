@@ -406,6 +406,14 @@ USB-C charging is the gap. The laptop's Samsung S2MM006 PD controller agrees on 
 
 `2790` adds the compatible to the board binding, and `2786` already covers it for QSEECOM as an X1P42100. systemd doesn't list the laptop, so the package installs `x1p42100-samsung-galaxy-book4-edge-15.json` with the two hardware IDs anatase-org carries for it. Samsung puts the keyboard's country in the board name, so units sold elsewhere may report IDs these don't cover.
 
+### ASUS Vivobook S14
+
+`2796` is Jonas Lindeburg's tree for the ASUS Vivobook S 14 S3407QA (X1-26-100, `asus,vivobook-s14-s3407qa`), as he published it on 2026-09-13, unchanged apart from the Makefile entry. It's derived from the Vivobook S 15's tree, and he runs it on Ubuntu with the keyboard, touchpad, OLED panel, GPU, NVMe, USB-A and USB-C, HDMI through its Parade PS185HDM bridge, Bluetooth, speakers, headset jack, battery and suspend working. Wi-Fi comes up on about three boots in five, because the WCN6855's PCIe PHY sometimes times out. The microphones capture silence and the webcam doesn't work yet. `2797` names its sound card `X1E80100-ASUS-Vivobook-S15`, since no firmware package has a topology under the tree's own name, and linux-firmware ships Qualcomm's T14s topology under the Vivobook S 15's, the tree it's derived from, with the same WCD, WSA and VA links. Its firmware is in `asus-vivobook-s14-firmware`, under the `qcom/x1p42100/ASUSTeK/vivobook-s14/` paths the tree loads.
+
+`2795` adds the compatible to the board binding and the Samsung ATNA40KW01 panel to the ATNA33XC20 binding it falls back to. `2786` already covers it for QSEECOM as an X1P42100. systemd doesn't list the laptop, so the package installs `x1p42100-asus-vivobook-s14.json` with two hardware IDs from his boot log (`ASUSTeK COMPUTER INC. ASUS Vivobook S 14 S3407QA_S3407QA/S3407QA`, BIOS S3407QA.311). The board vendor in the first one is what the Vivobook S16 S3607QA reports on the same BIOS build.
+
+The tree builds with `W=1` and `CHECK_DTBS=y` with two warnings, on the camera clock controller's power domains, which every X1P tree here gets, and on the Bluetooth node's `vddrfa1p8-supply`, which the Vivobook S 15's tree in 7.3 uses too.
+
 ## NVIDIA modules
 
 `linux-omarchy-nvidia-open` is NVIDIA's open kernel modules prebuilt for this kernel, so an N1x or GB10 machine on `linux-omarchy` doesn't compile them through DKMS on every kernel update. It's a third package of this recipe rather than a recipe of its own because CI builds each recipe alone against what edge already serves: a separate recipe would build against the previous kernel's headers and land after the kernel it's for, and its exact `linux-omarchy=$pkgver-$pkgrel` dependency would hold back `pacman -Syu` until it did. Built here, the modules come from the same tree as the kernel and publish with it.
