@@ -111,6 +111,18 @@ Since `7.2.8-4` this is also the kernel for the Snapdragon X laptops. Their driv
 
 The laptops get no device tree from their firmware, so the package builds the Windows-on-ARM families' trees (`x1*`, `hamoa*`, `glymur*`, `sc8280xp*`) and installs them under `/boot/dtbs/linux-omarchy-n1x/qcom`. They sit under the package's name so that no file is shared with Arch Linux ARM's `linux-aarch64`, which keeps its own in `/boot/dtbs`. Omarchy's Snapdragon setup lists them for the UKI.
 
+`linux-omarchy-headers` ships the sources of these trees and every file they include, under `arch/arm64/boot/dts/qcom` in its build tree, next to the kernel's own `dtc` and dt-bindings headers. A laptop's tree can then be changed and rebuilt on the laptop, without building the kernel:
+
+```sh
+build=/usr/lib/modules/$(uname -r)/build
+qcom=$build/arch/arm64/boot/dts/qcom
+inc=$build/scripts/dtc/include-prefixes
+gcc -E -nostdinc -undef -D__DTS__ -x assembler-with-cpp -I "$qcom" -I "$inc" -o board.pre.dts board.dts
+"$build/scripts/dtc/dtc" -O dtb -b 0 -i "$qcom" -i "$inc" -o board.dtb board.pre.dts
+```
+
+The package build fails unless every tree it installs rebuilds from the shipped sources this way to the same bytes, with `-@` added for the trees Kbuild builds with symbols.
+
 `2000` is "media: iris: reset AHB bridge before enabling HW mode" (cc330f558996, in the media tree for 7.4). This config builds the Iris video decoder, and without the fix its firmware can assert when a video starts after the decoder has been idle. It was reported and tested on the Yoga Slim 7x.
 
 `2001` fixes capture from the Snapdragon laptops' digital microphones, which `0511-asoc-updates.patch` broke. It carries mainline's c663014e452d, which builds the codec DMA active channel mask from the port's channel map. `q6dma_hw_params()` never clears that map, and its default mapping covers only one, two and four channels, so a stream gets a mask that does not match its channel count, and the DSP refuses to start the port ("Failed to start APM port 110" on `VA_CODEC_DMA_TX_0`). `2001` clears the map before filling it and maps any channel the default mapping leaves out. Mainline has no fix yet. Tested on the Yoga Slim 7x, through PipeWire and with direct captures of two, four and two channels in a row.
