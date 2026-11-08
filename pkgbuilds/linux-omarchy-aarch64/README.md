@@ -150,6 +150,8 @@ Two differences from Arch Linux ARM's kernel matter on these laptops. Omarchy's 
 - The X1 pin control, interconnect, PMIC and bus drivers are modules here and built in there. mkinitcpio's hooks only pick storage, input and display drivers, so the setup names them for the initramfs.
 - `IOMMU_DEFAULT_PASSTHROUGH` is on here. Under it the Yoga Slim 7x's keyboard, touchpad and touchscreen read back empty HID descriptors and never appear, so the setup boots with `iommu.passthrough=0`.
 
+`2183` makes rtc-pm8xxx honour the time zone stored next to the RTC offset in the `RTCInfo` EFI variable. The firmware and Windows keep that offset in local time, with the EFI_TIME TimeZone and Daylight bytes after it, and the driver read it as UTC: a Zenbook 14 UX3480QA set to UTC+8 booted 8 hours ahead, and after NTP set the RTC, the firmware and Windows read it 8 hours behind. An unspecified (0x7ff) or out-of-range time zone keeps the old behaviour.
+
 ### Surface Pro 11
 
 `2110`-`2169` bring up the Microsoft Surface Pro 11 (X1E80100, `microsoft,denali-oled`), replacing its separate `linux-sp11` package. They come from github.com/turbineBMW/linux `sp11/n1x-7.2.8` (v7.2.8 with this recipe's patches as commits), rebased onto 7.3, and apply after `2006`.
