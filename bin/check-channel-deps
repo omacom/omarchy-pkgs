@@ -1,9 +1,11 @@
 #!/bin/bash
 # Check that a promotion leaves every dependency in the destination channel
-# resolving, for one architecture.
+# resolving, for one architecture, and say which pkgbase to hold back when it
+# does not.
 #
 #   check-channel-deps --channel <rc|stable> --arch <arch> \
-#     --source <db|dir> --before <db|dir> --after <db|dir> [--record FILE]
+#     --source <db|dir> --before <db|dir> --after <db|dir> \
+#     [--holds FILE] [--record FILE]
 #
 # The source channel, and the destination before the promotion and as it
 # would leave it, come as package databases (omarchy.db.tar.zst, or the
@@ -15,22 +17,25 @@
 # package in the destination provides it, version included, as pacman
 # decides.
 #
-# The check refuses a dependency that would not resolve after the promotion
-# and did resolve before it, or was not there before: a package whose new
-# version needs a package the plan leaves behind, or a package the plan
-# leaves behind whose version no longer satisfies what stays. A dependency
-# that was already broken before is reported but not held against the
-# promotion, so one old problem does not block every promotion after it.
+# A problem is a dependency that would not resolve after the promotion and
+# did resolve before it, or was not there before. Each one has a pkgbase
+# whose move causes it: the package's own, when its new version needs what
+# the destination would not have, or the provider's, when its new version no
+# longer satisfies a package that stays. --holds writes one
+# "<pkgbase>\t<problem>" line per problem, for bin/promote-channel to take
+# those pkgbases out of its plan. A dependency that was already unresolved
+# before is reported but is not a problem, so one old break does not hold
+# anything back.
 #
-# Exit status: 0 passes, 1 refuses and names every new problem with the
-# package that would fix it, 2 on a usage error. --record appends one JSON
-# line: {"type":"deps", arch, channel, result: "pass"|"refused",
-#  problems: [{package, dependency, problem}], existing: [...the same]}.
+# Exit status: 0 when nothing is a problem, 1 when something is, 2 on a
+# usage error. --record appends one JSON line:
+# {"type":"deps", arch, channel, result: "pass"|"refused",
+#  problems: [{package, dependency, problem, hold}], existing: [...the same]}.
 set -euo pipefail
 BUILD_ROOT=$(realpath "${BASH_SOURCE[0]%/*}/..")
 source "$BUILD_ROOT/helpers/message-helpers.sh"
 
-RECORD=/dev/null
+RECORD=/dev/null HOLDS=/dev/null
 SOURCE="" BEFORE="" AFTER=""
 while [[ $# -gt 0 ]]; do
   case $1 in
@@ -39,8 +44,9 @@ while [[ $# -gt 0 ]]; do
   --source) SOURCE=$2; shift 2 ;;
   --before) BEFORE=$2; shift 2 ;;
   --after) AFTER=$2; shift 2 ;;
+  --holds) HOLDS=$2; shift 2 ;;
   --record) RECORD=$2; shift 2 ;;
-  -h|--help) sed -n '2,28p' "$0"; exit 0 ;;
+  -h|--help) sed -n '2,33p' "$0"; exit 0 ;;
   *) print_error "Unknown argument: $1"; exit 2 ;;
   esac
 done
@@ -61,19 +67,20 @@ unpack() { # unpack <db|dir|""> <dir>: a database's entries as <dir>/<name-versi
     usage "No database at $1"
   fi
 }
-# One line per package: name|version|depends|provides, the lists
+# One line per package: name|version|base|depends|provides, the lists
 # space-separated.
 entries() { # entries <dir>
   find "$1" -name desc -print0 | xargs -0r awk '
-    function flush() { if (name != "") print name "|" ver "|" deps "|" provs; name = ver = deps = provs = ""; section = "" }
+    function flush() { if (name != "") print name "|" ver "|" base "|" deps "|" provs; name = ver = base = deps = provs = ""; section = "" }
     FNR == 1 { flush() }
     /^%[A-Z0-9]+%$/ { section = $0; next }
     /^$/ { section = ""; next }
     section == "%NAME%" { name = $0 }
     section == "%VERSION%" { ver = $0 }
+    section == "%BASE%" { base = $0 }
     section == "%DEPENDS%" { deps = deps (deps == "" ? "" : " ") $0 }
     section == "%PROVIDES%" { provs = provs (provs == "" ? "" : " ") $0 }
-    END { flush() }' | sort
+    END { flush() }' | awk -F'|' '$3 == "" { $3 = $1 } 1' OFS='|' | sort
 }
 for view in source before after; do
   dir=${view^^}
@@ -85,8 +92,8 @@ done
 declare -A SERVED=() SOURCE_PROV=() BEFORE_PROV=() AFTER_PROV=()
 index() { # index <tsv> <array name>
   local -n idx=$2
-  local name ver deps provs p
-  while IFS='|' read -r name ver deps provs; do
+  local name ver base deps provs p
+  while IFS='|' read -r name ver base deps provs; do
     idx[$name]+="$name"$'\t'"$ver"$'\n'
     SERVED[$name]=1
     for p in $provs; do
@@ -99,6 +106,15 @@ index() { # index <tsv> <array name>
 index "$WORK/source.tsv" SOURCE_PROV
 index "$WORK/before.tsv" BEFORE_PROV
 index "$WORK/after.tsv" AFTER_PROV
+
+# What the promotion moves: a package whose version after is not the one
+# before. Pkgbases come from the view the package is in.
+declare -A B_VER=() B_BASE=() A_BASE=() MOVED=()
+while IFS='|' read -r name ver base _; do B_VER[$name]=$ver B_BASE[$name]=$base; done < "$WORK/before.tsv"
+while IFS='|' read -r name ver base _; do
+  A_BASE[$name]=$base
+  [[ ${B_VER[$name]:-} == "$ver" ]] || MOVED[$name]=1
+done < "$WORK/after.tsv"
 
 split_dep() { # split_dep <dep>: prints "name op version" (op and version may be empty)
   if [[ $1 =~ ^([^<>=]+)(>=|<=|=|<|>)(.+)$ ]]; then
@@ -129,8 +145,8 @@ resolves() { # resolves <providers> <op> <version>
 # the view does not satisfy.
 unresolved() {
   local -n prov=${1^^}_PROV
-  local name ver deps _ dep dname op want
-  while IFS='|' read -r name ver deps _; do
+  local name ver base deps _ dep dname op want
+  while IFS='|' read -r name ver base deps _; do
     for dep in $deps; do
       read -r dname op want <<<"$(split_dep "$dep")"
       [[ -n ${SERVED[$dname]:-} ]] || continue
@@ -155,36 +171,57 @@ explain() { # explain <package> <dependency>
     satisfies "$pver" "${op:-}" "${want:-}" && { fix=$p; break; }
   done <<<"${SOURCE_PROV[$dname]:-}"
   if [[ -n $offered ]]; then
-    printf '%s needs %s; %s would offer only %s' "$1" "$2" "$CHANNEL" "$offered"
+    printf '%s needs %s; %s/%s would offer only %s' "$1" "$2" "$CHANNEL" "$ARCH" "$offered"
   else
-    printf '%s needs %s; %s would not have %s' "$1" "$2" "$CHANNEL" "$dname"
+    printf '%s needs %s; %s/%s would not have %s' "$1" "$2" "$CHANNEL" "$ARCH" "$dname"
   fi
-  [[ -n $fix ]] && printf ' (promote %s with it)' "$fix"
+  [[ -n $fix && -z ${MOVED[$fix]:-} ]] && printf ' (promote %s with it)' "$fix"
   return 0
 }
-explain_all() { # explain_all <broken file> <out>
-  : > "$2"
-  while IFS=$'\t' read -r name dep; do
-    printf '%s\t%s\t%s\n' "$name" "$dep" "$(explain "$name" "$dep")" >> "$2"
-  done < "$1"
+# The pkgbases whose move causes a problem, one per line: the package's own
+# when it moves, else every provider of the dependency that moves.
+culprits() { # culprits <package> <dependency>
+  local dname p
+  if [[ -n ${MOVED[$1]:-} ]]; then echo "${A_BASE[$1]}"; return; fi
+  read -r dname _ <<<"$(split_dep "$2")"
+  while IFS=$'\t' read -r p _; do
+    [[ -n $p && -n ${MOVED[$p]:-} ]] && echo "${A_BASE[$p]}"
+  done <<<"${AFTER_PROV[$dname]:-}"
+  # A provider that moved and stopped providing the name.
+  while IFS=$'\t' read -r p _; do
+    [[ -n $p && -n ${A_BASE[$p]:-} && -n ${MOVED[$p]:-} ]] && echo "${A_BASE[$p]}"
+  done <<<"${BEFORE_PROV[$dname]:-}"
+  return 0
 }
-explain_all "$WORK/new.broken" "$WORK/new.txt"
-explain_all "$WORK/old.broken" "$WORK/old.txt"
+: > "$WORK/new.txt"
+while IFS=$'\t' read -r name dep; do
+  text=$(explain "$name" "$dep")
+  bases=$(culprits "$name" "$dep" | sort -u | paste -sd' ' -)
+  printf '%s\t%s\t%s\t%s\n' "$name" "$dep" "$text" "$bases" >> "$WORK/new.txt"
+done < "$WORK/new.broken"
+: > "$WORK/old.txt"
+while IFS=$'\t' read -r name dep; do
+  printf '%s\t%s\t%s\t\n' "$name" "$dep" "$(explain "$name" "$dep")" >> "$WORK/old.txt"
+done < "$WORK/old.broken"
 
 finish() { # finish <result>
   jq -nc --arg arch "$ARCH" --arg channel "$CHANNEL" --arg result "$1" \
     --rawfile new "$WORK/new.txt" --rawfile old "$WORK/old.txt" '
-    def rows: split("\n") | map(select(length > 0) | split("\t") | {package: .[0], dependency: .[1], problem: .[2]});
-    {type:"deps", arch:$arch, channel:$channel, result:$result, problems: ($new | rows), existing: ($old | rows)}' >> "$RECORD"
+    def rows: split("\n") | map(select(length > 0) | split("\t") | {package: .[0], dependency: .[1], problem: .[2], hold: (.[3] // "" | split(" ") | map(select(length > 0)))});
+    {type:"deps", arch:$arch, channel:$channel, result:$result, problems: ($new | rows), existing: ($old | rows | map(del(.hold)))}' >> "$RECORD"
 }
 
 if [[ -s $WORK/old.txt ]]; then
   print_warning "Already unresolved in $CHANNEL/$ARCH before this promotion, so not held against it:"
   cut -f3 "$WORK/old.txt" | while IFS= read -r text; do print_step "$text"; done
 fi
+: > "$HOLDS"
 if [[ -s $WORK/new.txt ]]; then
-  print_error "Refusing: this promotion would leave dependencies in $CHANNEL/$ARCH unresolved"
-  cut -f3 "$WORK/new.txt" | while IFS= read -r text; do print_step "$text"; done
+  print_warning "This promotion would leave dependencies in $CHANNEL/$ARCH unresolved:"
+  while IFS=$'\t' read -r _ _ text bases; do
+    print_step "$text${bases:+ (moving $bases)}"
+    for b in $bases; do printf '%s\t%s\n' "$b" "$text" >> "$HOLDS"; done
+  done < "$WORK/new.txt"
   finish refused
   exit 1
 fi
