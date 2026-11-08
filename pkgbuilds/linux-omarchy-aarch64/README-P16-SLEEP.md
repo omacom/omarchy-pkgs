@@ -92,7 +92,7 @@ reports the compiled tests as skipped when no prepared tree is supplied.
 
 ## Current recipe compatibility
 
-The PR is refreshed on the official 7.3-37 recipe and uses pkgrel 38 so its
+The PR is refreshed on the official 7.3-41 recipe and uses pkgrel 42 so its
 packaging change is shipped. It retains upstream's separate kernel, headers and
 NVIDIA open-module split, driver version and seven NVIDIA patches unchanged.
 The sleep implementation retains its existing firmware-state and lifecycle
@@ -117,7 +117,17 @@ Full report: https://github.com/omacom/omarchy-pkgs/pull/1958#issuecomment-67151
 That owner reports that RTC alarms did not wake their patched candidate; the
 stock/control kernels woke too early to compare RTC behavior. Timed wake has
 not been validated here either. Lid wake is tested; do not assume RTC wake
-works from this coordinated state. A USB mouse receiver disconnect also
-coincided with an early, noisy cycle in that report. Peripheral wake behavior
-and RTC limitations need separate controlled testing; this contribution does
-not claim to fix them.
+works from this coordinated state. The USB receiver disconnect in that report
+was a manual unplug, as `jlobue10` later clarified; it is not evidence of a
+spontaneous receiver disconnect or a USB-caused wake:
+https://github.com/omacom/omarchy-pkgs/pull/1958#issuecomment-6727318724
+RTC wake remains unresolved. A separate MT8901 USB remote-wake correction and
+its bounded hardware test are documented in README-P16-PLATFORM.md.
+
+## Acknowledgments
+
+Thank you to `jlobue10` for the independent kernel comparisons, raw logs,
+energy measurements and follow-up reports. Their testing helped distinguish
+the suspension improvement from the remaining RTC and peripheral wake issues
+and prompted the USB wake-route investigation. The USB kernel fixes retain
+their NVIDIA authorship and review credits in the original patches.

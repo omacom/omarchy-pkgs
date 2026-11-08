@@ -1,6 +1,6 @@
 # ASUS ProArt P16 platform enablement
 
-This section documents the three platform patches carried with the P16 sleep
+This section documents the platform patches carried with the P16 sleep
 patch set. They add ARM64 reachability for the existing ASUS WMI drivers,
 describe the MT8901's interrupt-only GPIO lines, and retry ACPI IRQ lookup for
 SPI-HID when SPI enumeration did not provide an IRQ. They do not add a GNOME
@@ -102,7 +102,7 @@ ACPI evaluation, and no sensor interrupts or bus transfers.
 
 The production callback regression requires `_RST` to run on the saved handle
 and checks success plus firmware-error reporting. The complete native ARM64
-kernel build and the existing function harnesses passed. On H7607BA BIOS303,
+kernel build and the existing function harnesses passed. On H7607BA BIOS 303,
 a boot with this patch shows successful `_RST`, the first GPIO190 interrupt,
 a SPI HID sensor hub and an ambient-light IIO device. A physical cover and
 phone-light test changed the desktop sensor reading from 0 to about2175 lux
@@ -131,7 +131,7 @@ duplicate prevention, record capacity and initial-primary cases. Both real
 add-time ASSOC callers must pass the same pending link. `check()` runs this
 test alongside the existing sleep and platform tests.
 
-The patch was fully built and booted on H7607BA BIOS303 in an isolated Linux
+The patch was fully built and booted on H7607BA BIOS 303 in an isolated Linux
 7.3 test kernel using the same Omarchy 7.3-26 base and P16 patch set. Active
 MLO links at 5975 and 5500 MHz carried a 120-second simultaneous ping test:
 240/240 replies each from gateway, LAN host and Internet through VPN, with
@@ -145,3 +145,52 @@ warnings remain, and suspend/resume with this Wi-Fi change is untested.
 No frequency band, BSSID, VPN or roaming configuration is changed by this
 kernel patch. These observations support the narrow backport; they do not
 establish that every MT7925 connectivity issue is resolved.
+
+## MT8901 USB Remote Wake
+
+Patches `9106` and `9107` carry two unmodified NVIDIA fixes for
+[MT8901 USB wake from s2idle](https://bugs.launchpad.net/bugs/2172005):
+
+- `906426cf64e3873ac821d1d7c4cbfeabe7972f4f` reports debounce as unsupported
+  for EINT lines without debounce hardware, instead of emitting an invalid
+  argument warning for the optional setting.
+- `f942d998370e28b184497c0db73787947be06039` prefers the firmware's
+  wake-capable ACPI GpioInt as the MediaTek v2 xHCI dedicated wake IRQ, retains
+  the previous ordinary IRQ fallback and enables controller wakeup when the
+  firmware marks the GPIO line wake-capable. Deferred lookup and probe-error
+  cleanup are preserved.
+
+Both commits are authored by Kiran Maddaraki, acknowledged by NVIDIA reviewers
+and signed off by Brad Figg. The existing `9101` virtual GPIO/input-only
+handling supplies the EINT-only pin prerequisite. This change is confined to
+the MediaTek v2 controller path; global platform IRQ indexing is unchanged.
+
+On H7607BA BIOS 303 with the 20-CPU N1X, USB5 describes normal interrupt GSI 584
+and a separate wake-capable GpioInt on pin 182. Its old optional IRQ1 lookup
+did not find that GPIO. Merely enabling the receiver, root hub and controller
+wakeup permissions had not allowed the same Corsair `1b1c:1b65` mouse to wake
+the machine. With these fixes, boot registered GPIO 182 as dedicated wake
+IRQ 226 and enabled controller wakeup without a manual root-hub policy change.
+
+A coordinated manual test on a Linux 7.3 test kernel built from the Omarchy
+7.3-39 base plus the same P16 patch set entered s2idle for 33.9568 seconds. A
+click on that same mouse resumed the system, `pm_wakeup_irq` reported 226 and
+the dedicated wake IRQ counter increased to 1. Suspend statistics increased
+success by 1 and failure by 0, and the captured interval had no USB disconnect.
+The mouse remained usable after resume. This is one confirmed USB remote-wake
+cycle on this firmware, not validation of every device/port, repeated-cycle
+reliability, other firmware or a new long-term power measurement. RTC wake is
+not fixed or claimed by these patches.
+
+`test_usb_wake.py` and `test_usb_debounce.py` compile the actual prepared-source
+lookup, wake registration/removal and debounce code with ASan/UBSan. All 21
+checks pass; the pre-fix implementation fails 7. They cover GPIO preference,
+missing/non-wake/error fallback, deferred probing, non-MTK exclusion, wakeup
+defaults and cleanup, plus supported/unsupported debounce and error
+propagation. The full native kernel build also passed before the hardware
+test; those results do not replace a build of every future recipe refresh.
+
+Thank you to `jlobue10` for the independent tests, detailed raw logs and
+follow-up reports that led us to investigate the USB wake route. Their
+reported receiver disconnect was a manual unplug, not a spontaneous fault:
+https://github.com/omacom/omarchy-pkgs/pull/1958#issuecomment-6727318724
