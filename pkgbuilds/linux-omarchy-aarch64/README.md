@@ -232,6 +232,8 @@ The Surface Pro 12in's tree has been in Linux since 7.3 (`x1p42100-microsoft-sp1
 
 Outside the board files they only add two entries to the QSEECOM allowlist. The patches by other authors carry their sign-offs, except `2530`, whose source has none.
 
+HP builds the ProBook 4 G1q on the EliteBook 6 G1q's mainboard (board 8E06, which HP's driver packs sp172193 and sp174046 list for both), so it takes the EliteBook's tree. systemd doesn't list it, so the package installs `x1p42100-hp-probook-4-g1q.json` with two hardware IDs from an owner's boot logs on [Launchpad bug 2167258](https://bugs.launchpad.net/ubuntu-concept/+bug/2167258) (`HP HP ProBook 4 G1q 14 inch Notebook Next Gen AI PC/8E06`, BIOS X68 01.06.01). They're built from the product name, so they can't match the EliteBook. The board vendor in the first one is `HP`, as the EliteBook reports on the same board.
+
 ### HP EliteBook X G2q, Lenovo Yoga Slim 7x Gen 11 and ThinkPad T14s Gen 7
 
 `2540`-`2562` add three X2 laptops whose trees are in linux-next for 7.4, as the qcom tree applied them, with their bindings and QSEECOM allowlist entries.
