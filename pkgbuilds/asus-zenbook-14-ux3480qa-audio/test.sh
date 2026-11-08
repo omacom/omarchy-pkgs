@@ -19,9 +19,11 @@ pkgdir="$scratch/pkg"
 (cd "$package_dir" && package)
 
 ucm="$pkgdir/usr/share/alsa/ucm2/conf.d/x1e80100/ASUSTeKCOMPUTERINC.-Zenbook14UX3480QA-1.0-UX3480QA.conf"
-[[ -f $ucm ]] || fail "the profile is named after the card's long name"
-grep -qxF 'Include.t14s.File "/Qualcomm/x1e80100/LENOVO-T14s.conf"' "$ucm" ||
-  fail "the profile includes the T14s profile"
+# A symlink, not a wrapper: a wrapper declares its own Syntax, and UCM
+# rejects the T14s profile's Syntax 6 macros under a wrapper's Syntax 4.
+[[ -L $ucm ]] || fail "the profile is named after the card's long name and is a symlink"
+[[ $(readlink "$ucm") == ../../Qualcomm/x1e80100/LENOVO-T14s.conf ]] ||
+  fail "the profile links to the T14s profile"
 
 # Where alsa-ucm-conf is installed, check that the profile it names still
 # exists and still drives two speakers.
