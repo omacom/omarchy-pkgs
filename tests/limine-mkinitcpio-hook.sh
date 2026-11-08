@@ -1,7 +1,7 @@
 #!/bin/bash
 # limine-mkinitcpio-hook: the x86_64 package is upstream's as before. On
-# aarch64, limine-apple-gate leaves every machine but an Apple Silicon Mac as
-# the x86_64 package behaves; a Mac keeps /boot current through mkinitcpio's
+# aarch64, Limine also watches early-boot inputs. An Apple Silicon Mac keeps
+# /boot current through mkinitcpio's
 # own kernel hook, and Limine waits until Omarchy activates it.
 #
 # The package() of the PKGBUILD runs over an upstream-shaped source tree
@@ -457,6 +457,14 @@ transaction kernel \
   'Upgrade Package linux-asahi'
 transaction firmware 'Upgrade Path usr/lib/firmware/brcm/fixture.bin' 'Upgrade Package linux-firmware'
 transaction modprobe 'Upgrade Path usr/lib/modprobe.d/' 'Install Path usr/lib/modprobe.d/omarchy-mac.conf' 'Upgrade Package omarchy-mac'
+transaction initramfs-inputs \
+  'Upgrade Path usr/lib/systemd/systemd-udevd' \
+  'Install Path usr/bin/mdadm' \
+  'Upgrade Path usr/bin/pdata_tools' \
+  'Remove Path usr/lib/libcryptsetup.so' \
+  'Upgrade Path usr/lib/libp11-kit.so' \
+  'Upgrade Path usr/lib/libpcsclite.so' \
+  'Upgrade Path usr/lib/modprobe.d/fixture.conf'
 transaction limine 'Upgrade Path usr/share/limine/BOOTAA64.EFI' 'Upgrade Package limine'
 
 replay() {
@@ -473,6 +481,7 @@ limine_kernel=$'limine-mkinitcpio-remove pre\n  usr/lib/modules/7.0.0-asahi/modu
 stock_kernel=$'mkinitcpio install\n  usr/lib/modules/7.1.0-asahi/vmlinuz'
 limine_firmware=$'limine-mkinitcpio-install\n  usr/lib/firmware/brcm/fixture.bin'
 stock_firmware=$'mkinitcpio install\n  usr/lib/firmware/brcm/fixture.bin'
+limine_modprobe=$'limine-mkinitcpio-install\n  usr/lib/modprobe.d/\n  usr/lib/modprobe.d/omarchy-mac.conf'
 stock_modprobe=$'mkinitcpio install\n  usr/lib/modprobe.d/'
 
 declare -A want=(
@@ -486,7 +495,7 @@ declare -A want=(
   [limine/mac-dormant]=''
   [kernel/mac-active]=$'limine-mkinitcpio-remove pre\n  usr/lib/modules/7.0.0-asahi/modules.builtin\nlimine-mkinitcpio-remove post\n'"$stock_kernel"$'\nlimine-mkinitcpio-install\n  usr/lib/modules/7.1.0-asahi/modules.builtin'
   [firmware/mac-active]=$stock_firmware$'\n'$limine_firmware
-  [modprobe/mac-active]=$stock_modprobe
+  [modprobe/mac-active]=$stock_modprobe$'\n'$limine_modprobe
   [limine/mac-active]=''
 )
 want[kernel/mac-marker-only]=${want[kernel/mac-dormant]}
@@ -496,10 +505,12 @@ for name in kernel firmware modprobe limine; do
   [[ $got == "${want[$name/other]}" ]] || fail "x86_64: $name transaction runs upstream's hooks" "$got"
   for m in generic-aarch64 qualcomm; do
     got=$(replay aarch64 "$m" "$name")
-    [[ $got == "${want[$name/other]}" ]] || fail "aarch64 $m: $name transaction runs as on x86_64" "$got"
+    expected=${want[$name/other]}
+    [[ $name != modprobe ]] || expected=$limine_modprobe
+    [[ $got == "$expected" ]] || fail "aarch64 $m: $name runs the expected Limine hooks" "$got"
   done
 done
-pass "x86_64, generic aarch64 and Snapdragon transactions run Limine's hooks as upstream ships them"
+pass "x86_64 keeps upstream triggers and other aarch64 systems also rebuild after modprobe changes"
 
 for m in mac-dormant mac-marker-only mac-active; do
   for name in kernel firmware modprobe limine; do
@@ -509,6 +520,16 @@ for m in mac-dormant mac-marker-only mac-active; do
   done
 done
 pass "a dormant Mac defers to mkinitcpio's own hook; an active Mac also writes Limine's entries after it"
+
+# A transaction may ship only these inputs, with no kernel or firmware file.
+initramfs_inputs=$'limine-mkinitcpio-install\n  usr/bin/mdadm\n  usr/bin/pdata_tools\n  usr/lib/libcryptsetup.so\n  usr/lib/libp11-kit.so\n  usr/lib/libpcsclite.so\n  usr/lib/modprobe.d/fixture.conf\n  usr/lib/systemd/systemd-udevd'
+stock_inputs=$'mkinitcpio install\n  usr/bin/mdadm\n  usr/bin/pdata_tools\n  usr/lib/libcryptsetup.so\n  usr/lib/libp11-kit.so\n  usr/lib/libpcsclite.so\n  usr/lib/systemd/systemd-udevd'
+got=$(replay aarch64 mac-active initramfs-inputs)
+[[ $got == "$stock_inputs"$'\n'"$initramfs_inputs" ]] ||
+  fail "an active Mac refreshes /boot and the UKI when only early-boot inputs change" "$got"
+got=$(replay aarch64 mac-dormant initramfs-inputs)
+[[ $got == "$stock_inputs" ]] || fail "a dormant Mac only refreshes /boot" "$got"
+pass "a Mac refreshes the UKI for early-boot input changes after it activates Limine"
 
 # ---------------------------------------------------------------------------
 # The wrapper, as sudo mkinitcpio -P and mkinitcpio's hook script call it
