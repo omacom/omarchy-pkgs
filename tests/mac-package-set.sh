@@ -8,6 +8,8 @@ set -euo pipefail
 ROOT=$(realpath "${BASH_SOURCE[0]%/*}/..")
 T=$(mktemp -d); chmod 755 "$T"; trap 'rm -rf "$T"' EXIT
 REMOTE="$T/r2"; mkdir -p "$REMOTE"
+# No Arch snapshot: promote-channel would fetch the channel's otherwise.
+export OMARCHY_ARCH_SNAPSHOT=
 
 export GNUPGHOME="$T/g"; mkdir -m700 "$GNUPGHOME"
 gpg --batch --quiet --passphrase '' --quick-gen-key 'Test <t@t>' ed25519 sign 0 2>/dev/null
