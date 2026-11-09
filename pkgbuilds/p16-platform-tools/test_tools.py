@@ -19,8 +19,11 @@ TOOL = HERE / 'p16-platform-tools'
 def cpio(files):
     out = bytearray()
     for name, content in [*files.items(), ('TRAILER!!!', b'')]:
+        mode = 0o100644
+        if isinstance(content, tuple):
+            mode, content = content
         name = name.encode() + b'\0'
-        fields = [0, 0o100644, 0, 0, 1, 0, len(content), 0, 0, 0, 0, len(name), 0]
+        fields = [0, mode, 0, 0, 1, 0, len(content), 0, 0, 0, 0, len(name), 0]
         out += b'070701' + ''.join(f'{n:08x}' for n in fields).encode() + name
         out += b'\0' * (-len(out) % 4)
         out += content
@@ -160,6 +163,18 @@ elif name == 'pacman':
         combined += b'\0' * (-len(combined) % 512)
         combined += gzip.compress(cpio({'usr/file': b'value'}))
         self.assertEqual(module.initrd_files(combined)['usr/file'], b'value')
+        early = cpio({'bin': (0o120777, b'usr/bin'), 'usr': (0o40755, b'')})
+        overlay = early + gzip.compress(cpio({'bin': (0o120777, b'usr/bin'),
+                                             'usr': (0o40700, b''), 'usr/file': b'ok'}))
+        self.assertEqual(module.initrd_files(overlay)['usr/file'], b'ok')
+        for tail in [{'bin': (0o120777, b'evil')},
+                     {'bin': b'regular replacement'}]:
+            with self.assertRaises(ValueError):
+                module.initrd_files(early + cpio(tail))
+        name = 'usr/lib/modules/7.3-test/spi-hid.ko'
+        for content in [b'original', b'changed', (0o120777, b'elsewhere')]:
+            with self.assertRaises(ValueError):
+                module.initrd_files(cpio({name: b'original'}) + cpio({name: content}))
         data = cpio({'usr/file': b'value'})
         self.assertEqual(module.initrd_files(lzma.compress(data))['usr/file'], b'value')
         compressed = subprocess.check_output(['zstd', '-q', '-c'], input=data)

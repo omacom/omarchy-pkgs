@@ -32,8 +32,9 @@ Built-in base drivers are currently rejected, rather than claiming module parity
 PE checksum, certificate-table metadata and a trailing Authenticode certificate;
 other kernel bytes must match. This does not verify the certificate. It requires unique `.uname`,
 `.linux` and `.initrd` sections, exact kernel content and release, and exact
-uncompressed SPI module bytes. It rejects early NPU/DSP modules, duplicate or
-unsafe CPIO names, malformed sections and multi-profile UKIs. The initrd is
+uncompressed SPI module bytes. It rejects early NPU/DSP modules, conflicting/duplicate regular files or
+unsafe CPIO names, malformed sections and multi-profile UKIs. Repeated directories and identical symlinks across early/main archives are
+accepted; regular file overlays are rejected. The initrd is
 parsed in memory; paths and symlinks are never extracted or followed. Supported
 initrd formats are newc CPIO, gzip, xz and zstd, including an early archive
 followed by a compressed main archive. Other compression formats fail clearly.
