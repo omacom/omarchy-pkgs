@@ -233,3 +233,18 @@ if promote aqua; then fail "Omarchy's aqua dropping a library an Arch package li
   grep -q "toolkit: unable to satisfy dependency 'libaq.so=14' required by toolkit" "$T/out" \
     && pass "an Arch package that links what Omarchy's build of a library drops is refused" || fail "Arch dependent: $(cat "$T/out")"
 fi
+
+# Into an empty destination every package is new, and is checked.
+recipe plug '{"source": "local"}'
+repo-add -q "$OMARCHY_ARCH_SNAPSHOT/extra.db.tar.gz" $(DEPENDS="plug nothere" mkpkg plugext 1) >/dev/null 2>&1
+rm -rf "$REMOTE/stable"
+stable() { "$BIN/promote-channel" --remote "$REMOTE" --from rc --to stable --arch x86_64 --record "$T/record" "$@" >"$T/out" 2>&1; }
+: > "$T/record"
+if stable stale; then fail "stale into an empty stable should refuse"; else
+  grep -q "stale: unable to satisfy dependency 'gone' required by stale" "$T/out" \
+    && pass "a package promoted into an empty channel is checked like any other" || fail "empty destination: $(cat "$T/out")"
+fi
+: > "$T/record"
+stable plug && [[ "$(entries stable)" == "plug-1.0-1 " ]] && grep -q "plugext: unable to satisfy dependency 'nothere'" "$T/out" \
+  && jq -e -s '[.[] | select(.type=="deps")] | .[0].result == "pass" and .[0].existing[0].package == "plugext"' "$T/record" >/dev/null \
+  && pass "the empty channel still has its Arch snapshot: plug resolves from it, and an Arch package already broken there is not held against it" || fail "empty destination with Arch: $(cat "$T/out")"
