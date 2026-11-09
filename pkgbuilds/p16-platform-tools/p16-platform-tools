@@ -1,0 +1,290 @@
+#!/usr/bin/python
+# SPDX-License-Identifier: MIT
+"""Read-only P16 kernel/UKI checks and an opt-in USB4 command-line renderer."""
+import argparse
+import gzip
+import io
+import lzma
+import os
+from pathlib import Path, PurePosixPath
+import re
+import subprocess
+import sys
+import tempfile
+
+BASE_MODULES = ('spi_hid', 'spi_hid_acpi', 'asus_wmi')
+EARLY_FORBIDDEN = ('n1x_adsp', 'n1x_npu_bootstrap')
+LIMIT = 1024 * 1024 * 1024
+
+
+def command(args, binary=False, data=None):
+    result = subprocess.run(args, input=data, capture_output=True, timeout=90,
+                            text=not binary, env=dict(os.environ, LC_ALL='C'))
+    if result.returncode:
+        error = result.stderr.decode(errors='replace') if binary else result.stderr
+        raise ValueError(f'{args[0]} failed: {error.strip()}')
+    return result.stdout if binary else result.stdout.strip()
+
+
+def read_bytes(path):
+    with open(path, 'rb') as stream:
+        data = stream.read(LIMIT + 1)
+    if len(data) > LIMIT:
+        raise ValueError(f'Input exceeds 1 GiB: {path}')
+    return data
+
+
+def unpack_module(path):
+    data = read_bytes(path)
+    return decompress(data)
+
+
+def decompress(data):
+    if data.startswith(b'\x1f\x8b'):
+        reader = gzip.GzipFile(fileobj=io.BytesIO(data))
+    elif data.startswith(b'\xfd7zXZ\0'):
+        reader = lzma.LZMAFile(io.BytesIO(data))
+    elif data.startswith(b'\x28\xb5\x2f\xfd'):
+        with tempfile.TemporaryFile() as source:
+            source.write(data)
+            source.seek(0)
+            with subprocess.Popen(['zstd', '-dq', '-c'], stdin=source,
+                                  stdout=subprocess.PIPE, stderr=subprocess.DEVNULL) as process:
+                try:
+                    result = process.stdout.read(LIMIT + 1)
+                    if len(result) > LIMIT:
+                        raise ValueError('Decompressed input exceeds 1 GiB')
+                    if process.wait(timeout=90):
+                        raise ValueError('zstd decompression failed')
+                    return result
+                finally:
+                    if process.poll() is None:
+                        process.kill()
+    else:
+        return data
+    with reader:
+        result = reader.read(LIMIT + 1)
+    if len(result) > LIMIT:
+        raise ValueError('Decompressed input exceeds 1 GiB')
+    return result
+
+
+def initrd_files(data):
+    """Read newc archives in memory, including an early archive plus compressed main."""
+    files = {}
+    while data:
+        data = data.lstrip(b'\0')
+        if not data:
+            break
+        data = decompress(data)
+        if len(data) > LIMIT:
+            raise ValueError('Decompressed initrd exceeds 1 GiB')
+        offset = 0
+        while True:
+            if data[offset:offset+6] not in (b'070701', b'070702') or len(data)-offset < 110:
+                raise ValueError('Unsupported or truncated initrd; expected newc CPIO (gzip/xz/zstd supported)')
+            try:
+                fields = [int(data[offset+6+i*8:offset+14+i*8], 16) for i in range(13)]
+            except ValueError as error:
+                raise ValueError('Malformed CPIO header') from error
+            mode, size, namesize = fields[1], fields[6], fields[11]
+            start = offset + 110
+            end = start + namesize
+            if namesize < 1 or end > len(data) or data[end-1] != 0:
+                raise ValueError('Malformed CPIO filename')
+            name = data[start:end-1].decode('utf-8')
+            payload = (end + 3) & ~3
+            next_offset = (payload + size + 3) & ~3
+            if next_offset > len(data):
+                raise ValueError('Truncated CPIO payload')
+            if name == 'TRAILER!!!':
+                data = data[next_offset:]
+                break
+            parts = PurePosixPath(name).parts
+            if name.startswith('/') or '..' in parts or '\\' in name or '\0' in name:
+                raise ValueError('Unsafe CPIO filename')
+            normalized = str(PurePosixPath(name))
+            if normalized in files:
+                raise ValueError(f'Duplicate CPIO filename: {normalized}')
+            # Directories/symlinks are never extracted or followed.
+            files[normalized] = data[payload:payload+size] if mode & 0o170000 == 0o100000 else None
+            offset = next_offset
+    return files
+
+
+def uki_sections(path):
+    import pefile
+    raw = read_bytes(path)
+    with pefile.PE(data=raw, fast_load=True) as image:
+        if image.OPTIONAL_HEADER.Subsystem != 10:
+            raise ValueError('UKI is not an EFI application')
+        sections = {}
+        for section in image.sections:
+            name = section.Name.rstrip(b'\0').decode('ascii')
+            if name == '.profile':
+                raise ValueError('Multi-profile UKIs require a profile-aware auditor')
+            if name not in ('.uname', '.linux', '.initrd'):
+                continue
+            if name in sections:
+                raise ValueError(f'Duplicate UKI section: {name}')
+            start, size = section.PointerToRawData, section.Misc_VirtualSize
+            if not size or size > section.SizeOfRawData or start + size > len(raw):
+                raise ValueError(f'Truncated UKI section: {name}')
+            sections[name] = raw[start:start+size]
+        if set(sections) != {'.uname', '.linux', '.initrd'}:
+            raise ValueError('UKI audit requires .uname, .linux and .initrd')
+        return sections
+
+
+def kernel_content(data):
+    """Ignore only PE checksum/certificate metadata added by Authenticode signing."""
+    import pefile
+    if not data.startswith(b'MZ'):
+        return data
+    with pefile.PE(data=data, fast_load=True) as image:
+        security = image.OPTIONAL_HEADER.DATA_DIRECTORY[4]
+        normalized = bytearray(data)
+        checksum = image.OPTIONAL_HEADER.get_field_absolute_offset('CheckSum')
+        normalized[checksum:checksum+4] = bytes(4)
+        directory = security.get_file_offset()
+        normalized[directory:directory+8] = bytes(8)
+        extent = max([image.OPTIONAL_HEADER.SizeOfHeaders,
+                      *(s.PointerToRawData+s.SizeOfRawData for s in image.sections)])
+        if security.VirtualAddress or security.Size:
+            start, end = security.VirtualAddress, security.VirtualAddress + security.Size
+            if (not security.Size or start < extent or end != len(data)
+                    or start - extent > 7 or any(data[extent:start])):
+                raise ValueError('Invalid kernel certificate extent')
+            normalized = normalized[:extent]
+        return bytes(normalized)
+
+
+def audit_uki(path, release, base, installed):
+    sections = uki_sections(path)
+    embedded = sections['.uname'].rstrip(b'\0\n').decode('ascii')
+    if embedded != release:
+        raise ValueError(f'UKI release mismatch: {embedded}')
+    if kernel_content(sections['.linux']) != kernel_content(read_bytes(base / 'vmlinuz')):
+        raise ValueError('UKI kernel differs from installed vmlinuz content')
+    files = initrd_files(sections['.initrd'])
+    for name in files:
+        filename = PurePosixPath(name).name.replace('-', '_')
+        if any(re.fullmatch(re.escape(module) + r'\.ko(?:\.(?:zst|xz|gz))?', filename)
+               for module in EARLY_FORBIDDEN):
+            raise ValueError(f'NPU/DSP module forbidden in early initrd: {name}')
+    prefix = f'usr/lib/modules/{release}/'
+    for module in ('spi_hid', 'spi_hid_acpi'):
+        matches = [name for name in files if name.startswith((prefix, 'lib/modules/'+release+'/'))
+                   and re.fullmatch(re.escape(module) + r'\.ko(?:\.(?:zst|xz|gz))?', PurePosixPath(name).name.replace('-', '_'))]
+        if len(matches) != 1 or files[matches[0]] is None:
+            raise ValueError(f'Expected one regular embedded module: {module}')
+        blob = files[matches[0]]
+        blob = decompress(blob)
+        if blob != unpack_module(installed[module]):
+            raise ValueError(f'Stale embedded module: {module}')
+    print('UKI: exact kernel/release and SPI module parity; no early NPU/DSP')
+
+
+def audit(args):
+    if not re.fullmatch(r'[A-Za-z0-9._+\-]+', args.release) or args.release in ('.', '..'):
+        raise ValueError('Invalid kernel release')
+    base = args.modules_dir / args.release
+    if not (base / 'vmlinuz').is_file() or not (base / 'build/Makefile').is_file():
+        raise ValueError('Installed kernel image or matching headers missing')
+    header_release = (base / 'build/include/config/kernel.release').read_text().strip()
+    if header_release != args.release:
+        raise ValueError('Header release mismatch')
+    installed = {}
+    def module_file(path):
+        candidate = Path(path)
+        return (candidate.is_file() and candidate.resolve().is_relative_to(base.resolve())
+                and re.search(r'\.ko(?:\.(?:zst|xz|gz))?$', candidate.name))
+    for module in dict.fromkeys((*BASE_MODULES, *args.module)):
+        if not re.fullmatch(r'[A-Za-z0-9_]+', module):
+            raise ValueError(f'Invalid module name: {module}')
+        def info(field):
+            return command(['modinfo', '-k', args.release, '-F', field, module])
+        path = info('filename')
+        if path == '(builtin)':
+            raise ValueError(f'{module}: expected loadable P16 module, found builtin')
+        installed[module] = Path(path)
+        if not module_file(path):
+            raise ValueError(f'Missing module file: {module}')
+        vermagic = info('vermagic').split()
+        if not vermagic or vermagic[0] != args.release:
+            raise ValueError(f'Module vermagic mismatch: {module}')
+        dependencies = command(['modprobe', '-S', args.release, '--show-depends', module])
+        for line in dependencies.splitlines():
+            fields = line.split()
+            if fields and fields[0] == 'insmod':
+                if len(fields) < 2 or not module_file(fields[1]):
+                    raise ValueError(f'Missing dependency: {line}')
+            elif fields and fields[0] != 'builtin':
+                raise ValueError(f'Unverifiable modprobe dependency directive: {line}')
+        signer = info('signer')
+        print(f'{module}: ABI/dependencies OK; signature {"present" if signer else "absent"}')
+        if args.require_signatures and not signer:
+            raise ValueError(f'Module signature absent: {module}')
+        if module.startswith('nvidia'):
+            package = command(['pacman', '-Q', 'nvidia-utils']).split()
+            if len(package) != 2 or package[0] != 'nvidia-utils':
+                raise ValueError('Unexpected nvidia-utils package query result')
+            version = package[1].split(':')[-1].rsplit('-', 1)[0]
+            if info('version') != version:
+                raise ValueError(f'NVIDIA kernel/userspace version mismatch: {module}')
+    if args.uki:
+        audit_uki(args.uki, args.release, base, installed)
+    print(f'Kernel audit passed: {args.release}; signatures are presence checks, not trust verification')
+
+
+def usb4(line):
+    if any(ord(char) < 32 or ord(char) == 127 for char in line):
+        raise ValueError('Command line must be one line without control characters')
+    # Keep original token spelling, including kernel double-quoted values.
+    tokens = re.findall(r'(?:[^\s"\']+|"[^"]*"|\'[^\']*\')+', line)
+    if (sum(token.count('"') for token in tokens) != line.count('"')
+            or sum(token.count("'") for token in tokens) != line.count("'")):
+        raise ValueError('Unmatched command-line quote')
+    kept = []
+    pci = []
+    for token in tokens:
+        if token.startswith('pci='):
+            pci.extend(part for part in token[4:].split(',')
+                       if not part.startswith(('hpbussize=', 'hpmemsize=', 'hpmmiosize=', 'hpmmioprefsize=', 'hpprefsize=')))
+        elif not token.startswith('power_wrap_drv.usb4_release='):
+            kept.append(token)
+    kept += ['pci=' + ','.join([*pci, 'hpbussize=0x80', 'hpmmiosize=32M', 'hpmmioprefsize=32G']),
+             'power_wrap_drv.usb4_release=0']
+    return ' '.join(kept)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    commands = parser.add_subparsers(dest='action', required=True)
+    check = commands.add_parser('audit', help='read-only installed kernel/module and optional UKI audit')
+    check.add_argument('--release', default=os.uname().release)
+    check.add_argument('--modules-dir', type=Path, default=Path('/usr/lib/modules'),
+                       help='kernel image/header root (modinfo uses the host module database)')
+    check.add_argument('--module', action='append', default=[], help='additional required module; repeatable')
+    check.add_argument('--require-signatures', action='store_true', help='require module signer metadata')
+    check.add_argument('--uki', type=Path, help='explicit UKI to compare; no boot path assumptions')
+    policy = commands.add_parser('usb4', help='print opt-in kernel cmdline for a Limine cmdline field')
+    policy.add_argument('--cmdline', required=True, help='original kernel command line; output to stdout only')
+    args = parser.parse_args()
+    try:
+        if args.action == 'audit':
+            audit(args)
+        else:
+            print(usb4(args.cmdline))
+    except (OSError, ValueError, EOFError, lzma.LZMAError, subprocess.SubprocessError) as error:
+        print(f'p16-platform-tools: {error}', file=sys.stderr)
+        return 1
+    except Exception as error:
+        # pefile has its own malformed-input exception; no partial success on parse errors.
+        print(f'p16-platform-tools: audit failed: {error}', file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())
