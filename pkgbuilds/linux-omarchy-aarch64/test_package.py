@@ -51,4 +51,10 @@ for name in ('9110-n1x-sroot-noncoherent-dma.patch', '9111-spi-hid-serialize-get
 assert not any('p16-platform-bundle' in name for name in sources)
 assert not any('rtc-diagnostic' in name or 'rtc-debug' in name for name in sources)
 assert not any('p16-platform-support' in name for name in sources)
+no_source = subprocess.run([sys.executable, str(package / 'test_npu_cca.py')],
+                           text=True, capture_output=True)
+assert no_source.returncode == 2, no_source.stderr
+assert 'usage:' in no_source.stderr and 'kernel_source' in no_source.stderr
+assert 'Traceback' not in no_source.stderr and not no_source.stdout
+print('PASS SROOT coherency harness requires an explicit prepared kernel tree')
 print(f'PASS package sources/checksums: {checked} local files; coordinated suspend config prerequisites')

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Apply the SROOT kernel patch and exercise its actual coherency function.
+"""Exercise the SROOT coherency function from a prepared kernel source tree.
 
 Uses the supplied Linux source without modifying it. OS/ACPI calls are mocks;
 this checks quirk scope and precedence, not actual DMA or firmware operation.
@@ -10,56 +10,15 @@ from pathlib import Path
 import subprocess
 import tempfile
 
-ROOT = Path(__file__).resolve().parents[1]
-UPSTREAM_SCAN_C = r'''static void acpi_init_coherency(struct acpi_device *adev)
-{
-	unsigned long long cca = 0;
-	acpi_status status;
-	struct acpi_device *parent = acpi_dev_parent(adev);
-
-	if (parent && parent->flags.cca_seen) {
-		/*
-		 * From ACPI spec, OSPM will ignore _CCA if an ancestor
-		 * already saw one.
-		 */
-		adev->flags.cca_seen = 1;
-		cca = parent->flags.coherent_dma;
-	} else {
-		status = acpi_evaluate_integer(adev->handle, "_CCA",
-					       NULL, &cca);
-		if (ACPI_SUCCESS(status))
-			adev->flags.cca_seen = 1;
-		else if (!IS_ENABLED(CONFIG_ACPI_CCA_REQUIRED))
-			/*
-			 * If architecture does not specify that _CCA is
-			 * required for DMA-able devices (e.g. x86),
-			 * we default to _CCA=1, that is, coherent DMA.
-			 */
-			cca = 1;
-		else
-			acpi_handle_debug(adev->handle,
-					  "ACPI _CCA is required on this arch\n");
-	}
-
-	adev->flags.coherent_dma = cca;
-}
-
-static int acpi_check_serial_bus_slave(struct acpi_resource *ares, void *data)
-'''
-
-
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('kernel_source', type=Path, nargs='?')
+    parser.add_argument('kernel_source', type=Path, help='prepared kernel source tree with the SROOT DMA correction')
     args = parser.parse_args()
     with tempfile.TemporaryDirectory(prefix='n1x-cca-') as tmp:
         root = Path(tmp)
         target = root/'drivers/acpi/scan.c'
         target.parent.mkdir(parents=True)
-        if args.kernel_source is not None:
-            target.write_bytes((args.kernel_source/'drivers/acpi/scan.c').read_bytes())
-        else:
-            target.write_text(UPSTREAM_SCAN_C)
+        target.write_bytes((args.kernel_source/'drivers/acpi/scan.c').read_bytes())
         source = target.read_text()
         start = source.index('static void acpi_init_coherency(')
         end = source.index('\nstatic int acpi_check_serial_bus_slave', start)
