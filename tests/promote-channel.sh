@@ -280,3 +280,35 @@ fi
 stable plug && [[ "$(entries stable)" == "plug-1.0-1 " ]] && grep -q "plugext: unable to satisfy dependency 'nothere'" "$T/out" \
   && jq -e -s '[.[] | select(.type=="deps")] | .[0].result == "pass" and .[0].existing[0].package == "plugext"' "$T/record" >/dev/null \
   && pass "the empty channel still has its Arch snapshot: plug resolves from it, and an Arch package already broken there is not held against it" || fail "empty destination with Arch: $(cat "$T/out")"
+
+# The check sorts the files of a database to read each package's desc and
+# depends together. A locale's sort ignores punctuation, so on a builder with
+# LANG=en_US.UTF-8 another entry can fall between one package's two files, as
+# xdep-1.0-1depz does between xdep-1.0-1/depends and xdep-1.0-1/desc, and the
+# depends were lost. Arch Linux ARM's databases keep depends in that separate
+# file, so this snapshot does too.
+if ! locale -a 2>/dev/null | grep -qx 'en_US.utf8' && (( EUID == 0 )); then
+  localedef -i en_US -f UTF-8 en_US.UTF-8 >/dev/null 2>&1 || true
+fi
+if locale -a 2>/dev/null | grep -qx 'en_US.utf8'; then
+  recipe xlib '{"source": "local"}'
+  pub rc $(PROVIDES="libx.so=1" mkpkg xlib 1)
+  pub edge $(PROVIDES="libx.so=2" mkpkg xlib 2)
+  rm -f "$OMARCHY_ARCH_SNAPSHOT"/extra.*
+  repo-add -q "$OMARCHY_ARCH_SNAPSHOT/extra.db.tar.gz" $(DEPENDS="libx.so=1" mkpkg xdep 1) $(mkpkg xdep-1.0-1depz 1) >/dev/null 2>&1
+  alarm="$T/alarm"; mkdir -p "$alarm"; tar -xf "$OMARCHY_ARCH_SNAPSHOT/extra.db.tar.gz" -C "$alarm"
+  for desc in "$alarm"/*/desc; do
+    awk '/^%(DEPENDS|PROVIDES)%$/ { s = 1 } s { print } /^$/ { s = 0 }' "$desc" > "${desc%/desc}/depends"
+    awk '/^%(DEPENDS|PROVIDES)%$/ { s = 1 } /^$/ { if (s) { s = 0; next } } !s' "$desc" > "$desc.new" && mv "$desc.new" "$desc"
+  done
+  rm -f "$OMARCHY_ARCH_SNAPSHOT"/extra.*
+  (cd "$alarm" && tar -czf "$OMARCHY_ARCH_SNAPSHOT/extra.db.tar.gz" -- */) && ln -s extra.db.tar.gz "$OMARCHY_ARCH_SNAPSHOT/extra.db"
+  rc_before=$(entries rc)
+  : > "$T/record"
+  if LANG=en_US.UTF-8 LC_ALL='' promote xlib; then fail "xlib dropping libx.so=1 under Arch's xdep should refuse in any locale"; else
+    grep -q "xdep: unable to satisfy dependency 'libx.so=1' required by xdep" "$T/out" && [[ "$(entries rc)" == "$rc_before" ]] \
+      && pass "a builder's locale does not split a package's desc from its depends file" || fail "locale: $(cat "$T/out")"
+  fi
+else
+  echo "SKIP: no en_US.UTF-8 locale to sort in"
+fi
