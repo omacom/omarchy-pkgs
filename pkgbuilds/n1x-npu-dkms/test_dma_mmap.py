@@ -3,11 +3,12 @@
 import argparse
 import hashlib
 import json
+import os
 from pathlib import Path
 import subprocess
 import tempfile
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parent
 
 
 def function(source, marker):
@@ -23,11 +24,18 @@ def function(source, marker):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("kernel", type=Path)
-    parser.add_argument("--provider", type=Path, default=ROOT / "src/n1x-npu/driver/n1x_dla_accel.c")
+    parser.add_argument("kernel", type=Path, nargs="?")
+    parser.add_argument("--fixture", type=Path)
+    parser.add_argument("--provider", type=Path, default=Path(os.environ.get("N1X_SOURCE_ROOT", ROOT / "src/n1x-npu")) / "driver/n1x_dla_accel.c")
     args = parser.parse_args()
-    paths = {name: args.kernel / name for name in ("drivers/iommu/dma-iommu.c", "kernel/dma/remap.c", "mm/memory.c")}
-    sources = {name: path.read_text() for name, path in paths.items()}
+    if args.fixture:
+        fixture = json.loads(args.fixture.read_text())
+        sources = fixture["sources"]
+        hashes = fixture["source_sha256"]
+    else:
+        paths = {name: args.kernel / name for name in ("drivers/iommu/dma-iommu.c", "kernel/dma/remap.c", "mm/memory.c")}
+        sources = {name: path.read_text() for name, path in paths.items()}
+        hashes = {name: hashlib.sha256(path.read_bytes()).hexdigest() for name, path in paths.items()}
     bodies = function(sources["kernel/dma/remap.c"], "struct page **dma_common_find_pages(")
     bodies += function(sources["mm/memory.c"], "static int __vm_map_pages(")
     bodies += function(sources["mm/memory.c"], "int vm_map_pages(")
@@ -120,7 +128,7 @@ int main(void) {
         run = subprocess.run([str(path / "test")], capture_output=True, text=True)
         print(run.stdout, end="")
         print(run.stderr, end="")
-        print(json.dumps({"kernel": str(args.kernel), "provider": str(args.provider), "source_sha256": {name: hashlib.sha256(path.read_bytes()).hexdigest() for name, path in paths.items()}, "exit_code": run.returncode}))
+        print(json.dumps({"kernel": str(args.kernel), "provider": str(args.provider), "source_sha256": hashes, "exit_code": run.returncode}))
         raise SystemExit(run.returncode)
 
 

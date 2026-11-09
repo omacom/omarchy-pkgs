@@ -4,7 +4,8 @@ Source pin: n1x-npu-linux 92e9434a65d2b9d3bb0517efb9efc371e9c6b42c.
 The local mmap patch preserves the original DMA allocation and selects image
 pages through vm_pgoff; the unpatched IOMMU path exposed descriptor pages.
 
-ARM64 kernel with DRM_ACCEL, matching headers, ACPI NVDA200A revision 0x34 and
+ARM64 kernel with 4 KiB pages (16/64 KiB kernels are refused before driver
+registration), DRM_ACCEL, matching headers, ACPI NVDA200A revision 0x34 and
 NVDA8600 revision 1, translated isolated IOMMU groups, and the upstream
 NVDA8600 missing-_CCA noncoherent quirk are required. The driver checks
 CCA/coherency/IORT/domain membership before mapping registers. That quirk is
@@ -39,8 +40,8 @@ s2idle. These public opt-in packaging gates require their own first-boot QA;
 this does not establish support for all N1X systems or kernel versions.
 
 `makepkg` checks have no vendor inputs or hardware access. Optional exact-kernel
-regression: `python tests/test_dma_mmap.py /path/to/linux-source` after
-`makepkg --nobuild`. `python tests/test_packaged_accel.py` checks the patched
+regression: `python test_dma_mmap.py /path/to/linux-source` after
+`makepkg --nobuild`. `python test_packaged_accel.py` checks the patched
 EXEC/read/info/mmap/ownership/close implementation with UBSan.
 
 Update automation is disabled while the source/firmware ABI and PM behavior
