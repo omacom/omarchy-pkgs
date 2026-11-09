@@ -8,8 +8,10 @@ set -euo pipefail
 ROOT=$(realpath "${BASH_SOURCE[0]%/*}/..")
 T=$(mktemp -d); chmod 755 "$T"; trap 'rm -rf "$T"' EXIT
 REMOTE="$T/r2"; mkdir -p "$REMOTE"
-# No Arch snapshot: promote-channel would fetch the channel's otherwise.
-export OMARCHY_ARCH_SNAPSHOT=
+# The Arch snapshot the promotions resolve against: the fixtures need only
+# bash from it. Filled once mkpkg exists below; promote-channel would fetch
+# the channel's otherwise.
+export OMARCHY_ARCH_SNAPSHOT="$T/arch"; mkdir -p "$OMARCHY_ARCH_SNAPSHOT"
 
 export GNUPGHOME="$T/g"; mkdir -m700 "$GNUPGHOME"
 gpg --batch --quiet --passphrase '' --quick-gen-key 'Test <t@t>' ed25519 sign 0 2>/dev/null
@@ -68,6 +70,7 @@ mkpkg() { # mkpkg <name>[@pkgbase] <pkgrel> <arch> [dep|+provide...]
   ls "$d"/*.pkg.tar.zst
 }
 
+repo-add -q "$OMARCHY_ARCH_SNAPSHOT/extra.db.tar.gz" $(mkpkg bash 1 any) >/dev/null 2>&1
 pub() { # pub <mirror> <arch> <files...>
   local mirror=$1 arch=$2; shift 2
   "$BIN/publish-artifact" --remote "$REMOTE" --mirror "$mirror" --arch "$arch" "$@" >"$T/out" 2>&1 || { cat "$T/out"; exit 1; }

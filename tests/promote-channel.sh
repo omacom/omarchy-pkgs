@@ -39,8 +39,8 @@ recipe big '{"source": "local"}'
 recipe dropped '{"source": "local"}' "" aarch64
 
 # minimal real packages via makepkg; a second name makes a split package, and
-# DEPENDS gives a single package its depends
-mkpkg() { # [DEPENDS=...] mkpkg <base> <pkgrel> [second pkgname]
+# DEPENDS and PROVIDES give a single package its depends and provides
+mkpkg() { # [DEPENDS=...] [PROVIDES=...] mkpkg <base> <pkgrel> [second pkgname]
   local d="$T/src/$1-$2"; mkdir -p "$d"; cd "$d"
   {
     if [[ -n ${3:-} ]]; then
@@ -51,6 +51,7 @@ mkpkg() { # [DEPENDS=...] mkpkg <base> <pkgrel> [second pkgname]
       printf 'pkgname=%s\npackage(){ install -Dm644 /dev/null "$pkgdir/usr/share/%s-%s"; }\n' "$1" "$1" "$2"
       # Quoted: a bare > in a version constraint would be a redirection.
       printf 'depends=('; for dep in ${DEPENDS:-}; do printf "'%s' " "$dep"; done; printf ')\n'
+      printf 'provides=('; for prov in ${PROVIDES:-}; do printf "'%s' " "$prov"; done; printf ')\n'
     fi
     printf 'pkgver=1.0\npkgrel=%s\narch=(x86_64)\n' "$2"
   } > PKGBUILD
@@ -167,7 +168,8 @@ if "$BIN/promote-channel" --remote "$REMOTE" --fast-ring --from rc --to stable -
 else grep -q 'fast ring follows edge' "$T/out" && pass "--fast-ring only follows edge" || fail "fast-ring direction reason"; fi
 
 # A package whose new version needs one the promotion leaves behind is
-# refused, and the refusal names the package to promote with it.
+# refused, and so is one that moves away from a version a package staying
+# behind needs; pacman says why.
 recipe kern '{"source": "local"}'
 recipe trees '{"source": "local"}'
 recipe mods '{"source": "local"}'
@@ -176,48 +178,58 @@ pub edge $(DEPENDS=trees mkpkg kern 2) $(mkpkg trees 1) $(DEPENDS=kern=1.0-2 mkp
 rc_before=$(entries rc)
 : > "$T/record"
 if promote kern; then fail "kern without trees should refuse"; else
-  grep -q 'kern needs trees; rc/x86_64 would not have trees (promote trees with it)' "$T/out" \
-    && grep -q 'mods needs kern=1.0-1; rc/x86_64 would offer only kern 1.0-2' "$T/out" \
+  grep -q "kern: unable to satisfy dependency 'trees' required by kern" "$T/out" \
+    && grep -q "mods: unable to satisfy dependency 'kern=1.0-1' required by mods" "$T/out" \
     && grep -q 'nothing published' "$T/out" && [[ "$(entries rc)" == "$rc_before" ]] \
     && jq -e -s '[.[] | select(.type=="deps")] | length == 1 and .[0].result == "refused" and ([.[0].problems[].package] | sort == ["kern", "mods"])' "$T/record" >/dev/null \
     && pass "a package does not move without one it newly depends on, or away from one that needs its old version" || fail "unmet dependency refusal"
 fi
 : > "$T/record"
 if promote kern trees --dry-run; then fail "kern without mods should refuse, dry run included"; else
-  grep -q 'mods needs kern=1.0-1' "$T/out" && ! grep -q 'kern needs trees' "$T/out" \
+  grep -q "mods: unable to satisfy dependency 'kern=1.0-1'" "$T/out" && ! grep -q "required by kern" "$T/out" \
     && pass "the dry run refuses the same way and names only what is still missing" || fail "dry-run refusal"
 fi
+# Small batches still publish them in one database update: kern needs trees,
+# and mods needs kern.
 : > "$T/record"
-promote kern trees mods && [[ "$(entries rc)" == *"kern-1.0-2 mods-1.0-2 "*"trees-1.0-1 "* ]] \
+promote --batch-bytes 1 kern trees mods && [[ "$(entries rc)" == *"kern-1.0-2 mods-1.0-2 "*"trees-1.0-1 "* ]] \
   && jq -e -s '[.[] | select(.type=="deps")] | .[0].result == "pass"' "$T/record" >/dev/null \
-  && pass "named together, they move together" || fail "kern with trees and mods: $(entries rc)"
+  && jq -e -s '[.[] | select(.type=="slot")] | length == 1 and (.[0].packages | sort == ["kern-1.0-2-x86_64", "mods-1.0-2-x86_64", "trees-1.0-1-x86_64"])' "$T/record" >/dev/null \
+  && pass "named together, they move together, in one database update however small the batches" || fail "kern with trees and mods: $(entries rc) $(jq -c 'select(.type=="slot")' "$T/record")"
 
-# A dependency already broken in rc does not block an unrelated promotion; it
-# is reported and recorded as existing.
+# A package already not installable in rc does not block a promotion it
+# depends on; it is reported and recorded as existing.
 recipe stale '{"source": "local"}'
-pub rc $(DEPENDS=gone mkpkg stale 1)
+pub rc $(DEPENDS="gone alpha" mkpkg stale 1)
 pub edge $(mkpkg gone 1) $(mkpkg alpha 5)
 : > "$T/record"
-promote alpha && [[ "$(entries rc)" == *"alpha-1.0-5 "* ]] && grep -q 'stale needs gone' "$T/out" \
+promote alpha && [[ "$(entries rc)" == *"alpha-1.0-5 "* ]] && grep -q "stale: unable to satisfy dependency 'gone' required by stale" "$T/out" \
   && jq -e -s '[.[] | select(.type=="deps")] | .[0].result == "pass" and .[0].existing[0].package == "stale"' "$T/record" >/dev/null \
-  && pass "a dependency rc already lacked is reported, not held against the promotion" || fail "existing breakage"
+  && pass "a package rc already could not install is reported, not held against the promotion" || fail "existing breakage: $(cat "$T/out")"
 
-# With the channel's Arch snapshot, a dependency resolves the way pacman on
-# the channel resolves it: a name Omarchy serves takes over from Arch's.
+# With the channel's Arch snapshot, pacman resolves as on a machine on the
+# channel: a name Omarchy serves takes over from Arch's.
 recipe hyprwm '{"source": "local"}'
 recipe tool '{"source": "local"}'
-repo-add -q "$OMARCHY_ARCH_SNAPSHOT/extra.db.tar.gz" $(mkpkg hyprwm 1) $(mkpkg archlib 1) >/dev/null 2>&1
+recipe aqua '{"source": "local"}'
+repo-add -q "$OMARCHY_ARCH_SNAPSHOT/extra.db.tar.gz" $(mkpkg hyprwm 1) $(mkpkg archlib 1) \
+  $(PROVIDES="libaq.so=14" mkpkg aqua 1) $(DEPENDS="libaq.so=14" mkpkg toolkit 1) >/dev/null 2>&1
 pub rc $(DEPENDS="hyprwm=1.0-1 archlib" mkpkg plug 1)
-pub edge $(mkpkg hyprwm 2) $(DEPENDS="archlib>=1.0-2" mkpkg tool 1)
+pub edge $(mkpkg hyprwm 2) $(DEPENDS="archlib>=1.0-2" mkpkg tool 1) $(PROVIDES="libaq.so=15" mkpkg aqua 2)
 rc_before=$(entries rc)
 : > "$T/record"
 if promote hyprwm; then fail "Omarchy's hyprwm taking over under a plugin pinned to Arch's should refuse"; else
-  grep -q "plug needs hyprwm=1.0-1; rc/x86_64 would offer only hyprwm 1.0-2, which pacman takes over Arch's 1.0-1" "$T/out" \
-    && [[ "$(entries rc)" == "$rc_before" ]] && ! grep -q 'plug needs archlib' "$T/out" \
-    && pass "a dependency Arch's snapshot satisfies passes, and Omarchy's build taking over from Arch's under a pin is refused" || fail "Arch snapshot: $(cat "$T/out")"
+  grep -q "plug: unable to satisfy dependency 'hyprwm=1.0-1' required by plug" "$T/out" \
+    && [[ "$(entries rc)" == "$rc_before" ]] && ! grep -q "'archlib' required" "$T/out" \
+    && pass "what Arch's snapshot satisfies passes, and Omarchy's build taking over from Arch's under a pin is refused" || fail "Arch snapshot: $(cat "$T/out")"
 fi
 : > "$T/record"
 if promote tool; then fail "a package needing a newer Arch package than the snapshot has should refuse"; else
-  grep -q "tool needs archlib>=1.0-2; rc/x86_64 would offer only Arch's archlib 1.0-1" "$T/out" \
+  grep -q "tool: unable to satisfy dependency 'archlib>=1.0-2' required by tool" "$T/out" \
     && pass "a package needing a newer Arch package than the channel's snapshot is refused" || fail "Arch too old: $(cat "$T/out")"
+fi
+: > "$T/record"
+if promote aqua; then fail "Omarchy's aqua dropping a library an Arch package links should refuse"; else
+  grep -q "toolkit: unable to satisfy dependency 'libaq.so=14' required by toolkit" "$T/out" \
+    && pass "an Arch package that links what Omarchy's build of a library drops is refused" || fail "Arch dependent: $(cat "$T/out")"
 fi
