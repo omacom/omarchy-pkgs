@@ -196,6 +196,15 @@ promote --batch-bytes 1 kern trees mods && [[ "$(entries rc)" == *"kern-1.0-2 mo
   && jq -e -s '[.[] | select(.type=="deps")] | .[0].result == "pass"' "$T/record" >/dev/null \
   && jq -e -s '[.[] | select(.type=="slot")] | length == 1 and (.[0].packages | sort == ["kern-1.0-2-x86_64", "mods-1.0-2-x86_64", "trees-1.0-1-x86_64"])' "$T/record" >/dev/null \
   && pass "named together, they move together, in one database update however small the batches" || fail "kern with trees and mods: $(entries rc) $(jq -c 'select(.type=="slot")' "$T/record")"
+# A package with no depends of its own still links what it provides:
+# vapp needs the vapi that vlib provides, so they share a batch.
+recipe vlib '{"source": "local"}'
+recipe vapp '{"source": "local"}'
+pub edge $(PROVIDES=vapi mkpkg vlib 1) $(DEPENDS=vapi mkpkg vapp 1)
+: > "$T/record"
+promote --batch-bytes 1 vlib vapp \
+  && jq -e -s '[.[] | select(.type=="slot")] | length == 1 and (.[0].packages | sort == ["vapp-1.0-1-x86_64", "vlib-1.0-1-x86_64"])' "$T/record" >/dev/null \
+  && pass "a package with no depends keeps its provides, so what needs them shares its batch" || fail "provides without depends: $(jq -c 'select(.type=="slot")' "$T/record")"
 
 # A package already not installable in rc does not block a promotion it
 # depends on; it is reported and recorded as existing.
