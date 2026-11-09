@@ -1,6 +1,6 @@
 # linux-omarchy-dtbs
 
-The Snapdragon laptops get no device tree from their firmware. Their UKI carries one for each laptop (`DeviceTreeAuto=`), and systemd-stub picks it by the laptop's hardware IDs. This package installs those trees under `/boot/dtbs/linux-omarchy/qcom`, and under `/usr/lib/systemd/boot/hwids/aa64/linux-omarchy` the hardware IDs systemd's own list doesn't have yet. `linux-omarchy` shipped both itself until `7.3-40` and now depends on this package, so the two always come together.
+The Snapdragon laptops get no device tree from their firmware. Their UKI carries one for each laptop (`DeviceTreeAuto=`), and systemd-stub picks it by the laptop's hardware IDs. This package installs those trees under `/boot/dtbs/linux-omarchy/qcom`, and under `/usr/lib/systemd/boot/hwids/aa64/linux-omarchy` the hardware IDs systemd's own list doesn't have yet. `linux-omarchy` shipped both itself until `7.3-42` and now depends on this package, so the two always come together.
 
 ## How it builds
 
