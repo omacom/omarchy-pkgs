@@ -1,246 +1,207 @@
 #!/bin/bash
-# Check that a promotion leaves every dependency in the destination channel
-# resolving, for one architecture.
+# Check with pacman that a promotion leaves what the destination channel
+# serves installable, for one architecture.
 #
 #   check-channel-deps --channel <rc|stable> --arch <arch> \
-#     --source <db|dir> --before <db|dir> --after <db|dir> \
-#     [--arch-db <db>]... [--record FILE]
+#     --before <db|dir> --after <db|dir> [--arch-db <repo>.db]... [--record FILE]
 #
-# The source channel, and the destination before the promotion and as it
-# would leave it, come as package databases (omarchy.db.tar.zst, or the
-# directory it unpacks to). Each --arch-db is one repository of the Arch
-# snapshot the destination channel serves (its core, extra and so on), in
-# the order pacman.conf lists them after [omarchy].
+# The destination before the promotion and as it would leave it come as
+# package databases (omarchy.db.tar.zst, or the directory it unpacks to).
+# Each --arch-db is one repository of the Arch snapshot the channel serves,
+# named <repo>.db (core.db, extra.db and so on), in the order pacman.conf
+# lists them after [omarchy].
 #
-# A dependency resolves the way pacman resolves it on a machine on that
-# channel. A package named like the dependency decides it: Omarchy's when
-# the channel serves one, since [omarchy] comes first and an installed
-# package follows the first repository that has its name, else the first
-# Arch repository's. Its version must satisfy the dependency. With no
-# package of that name, any package providing it in Omarchy or Arch will
-# do.
+# For each view the check writes a pacman.conf with [omarchy] serving that
+# view and the snapshot's repositories after it, as a machine on the channel
+# has them, less the Arch packages Omarchy serves a package of the same name
+# for: a machine that has one installed follows [omarchy] for it on every
+# update, so a dependency pinned to Arch's version breaks once Omarchy's
+# differs, though pacman on an empty system would install Arch's. It then
+# asks pacman (-Sp, against an empty system) to resolve:
+#   - every Omarchy package the promotion moves, and
+#   - every package that depends on a name a moved package provides, before
+#     or after: Omarchy's, and Arch's unless Omarchy serves its name, since
+#     an Omarchy build can break an Arch package that links it.
+# A target that pacman resolves before the promotion, or that did not exist
+# before, and fails after it is a problem, and pacman's own reason is the
+# message. A target that already failed before is reported but not held
+# against the promotion, so one old problem does not block every promotion
+# after it.
 #
-# The check refuses a dependency that would not resolve after the promotion
-# and did resolve before it, or was not there before: a package whose new
-# version needs a package the plan leaves behind, or a package the plan
-# moves whose version no longer satisfies what stays, as Omarchy's hyprland
-# taking over from Arch's under a plugin pinned to Arch's. A dependency that
-# was already broken before is reported but not held against the
-# promotion, so one old problem does not block every promotion after it.
-#
-# Without --arch-db the Arch side cannot be seen, so only names Omarchy
-# serves in one of the three views are checked, and the rest are left to
-# Arch.
-#
-# Exit status: 0 passes, 1 refuses and names every new problem with the
-# package that would fix it, 2 on a usage error. --record appends one JSON
-# line: {"type":"deps", arch, channel, result: "pass"|"refused",
-#  problems: [{package, dependency, problem}], existing: [...the same]}.
+# Exit status: 0 passes, 1 refuses and names every new problem, 2 on a usage
+# error. --record appends one JSON line: {"type":"deps", arch, channel,
+#  result: "pass"|"refused", problems: [{package, problem}], existing: [...]}.
 set -euo pipefail
 BUILD_ROOT=$(realpath "${BASH_SOURCE[0]%/*}/..")
 source "$BUILD_ROOT/helpers/message-helpers.sh"
 
 RECORD=/dev/null
-SOURCE="" BEFORE="" AFTER="" ARCH_DBS=()
+BEFORE="" AFTER="" ARCH_DBS=()
 while [[ $# -gt 0 ]]; do
   case $1 in
   --channel) CHANNEL=$2; shift 2 ;;
   --arch) ARCH=$2; shift 2 ;;
-  --source) SOURCE=$2; shift 2 ;;
   --before) BEFORE=$2; shift 2 ;;
   --after) AFTER=$2; shift 2 ;;
   --arch-db) ARCH_DBS+=("$2"); shift 2 ;;
   --record) RECORD=$2; shift 2 ;;
-  -h|--help) sed -n '2,38p' "$0"; exit 0 ;;
+  -h|--help) sed -n '2,33p' "$0"; exit 0 ;;
   *) print_error "Unknown argument: $1"; exit 2 ;;
   esac
 done
 usage() { print_error "$1"; exit 2; }
 [[ -n ${CHANNEL:-} && -n ${ARCH:-} ]] || usage "--channel and --arch are required"
-[[ -n $SOURCE && -n $AFTER ]] || usage "--source and --after are required"
+[[ -n $AFTER ]] || usage "--after is required"
 
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
 
-unpack() { # unpack <db|dir|""> <dir>: a database's entries as <dir>/<name-version>/{desc,depends}
+unpack() { # unpack <db|dir|""> <dir>: a database's entries as <dir>/<name-version>/...
   mkdir -p "$2"
   if [[ -d $1 ]]; then
     cp -R "$1/." "$2/"
   elif [[ -f $1 ]]; then
-    # Everything: an include pattern that matches nothing is an error, and
-    # a database has depends files or not by its age.
     bsdtar -xf "$1" -C "$2"
   elif [[ -n $1 ]]; then
     usage "No database at $1"
   fi
 }
 # One line per package: name|version|depends|provides, the lists
-# space-separated. Newer databases keep everything in desc; older ones, as
-# Arch Linux ARM's, put depends and provides in a depends file beside it.
+# space-separated and without versions. Newer databases keep everything in
+# desc; older ones, as Arch Linux ARM's, put depends and provides in a
+# depends file beside it. One awk reads every file, named on stdin rather
+# than on its command line, so a package's two files are never split.
 entries() { # entries <dir>
-  find "$1" -mindepth 2 -maxdepth 2 \( -name desc -o -name depends \) | sort | tr '\n' '\0' | xargs -0r awk '
+  find "$1" -mindepth 2 -maxdepth 2 \( -name desc -o -name depends \) | sort | awk '
     function flush() { if (name != "") print name "|" ver "|" deps "|" provs; name = ver = deps = provs = "" }
-    FNR == 1 { dir = FILENAME; sub(/\/[^\/]*$/, "", dir); if (dir != last) flush(); last = dir; section = "" }
-    /^%[A-Z0-9]+%$/ { section = $0; next }
-    /^$/ { section = ""; next }
-    section == "%NAME%" { name = $0 }
-    section == "%VERSION%" { ver = $0 }
-    section == "%DEPENDS%" { deps = deps (deps == "" ? "" : " ") $0 }
-    section == "%PROVIDES%" { provs = provs (provs == "" ? "" : " ") $0 }
-    END { flush() }' | sort
+    function bare(s) { sub(/(>=|<=|=|<|>).*/, "", s); return s }
+    {
+      file = $0; dir = file; sub(/\/[^\/]*$/, "", dir)
+      if (dir != last) flush()
+      last = dir; section = ""
+      while ((getline line < file) > 0) {
+        if (line ~ /^%[A-Z0-9]+%$/) { section = line; continue }
+        if (line == "") { section = ""; continue }
+        if (section == "%NAME%") name = line
+        else if (section == "%VERSION%") ver = line
+        else if (section == "%DEPENDS%") deps = deps " " bare(line)
+        else if (section == "%PROVIDES%") provs = provs " " bare(line)
+      }
+      close(file)
+    }
+    END { flush() }'
 }
-for view in source before after; do
-  dir=${view^^}
-  unpack "${!dir}" "$WORK/$view"
-  entries "$WORK/$view" > "$WORK/$view.tsv"
-done
-# The Arch snapshot, cut to the names the three views depend on: the
-# packages named like one, and the ones providing one.
-cut -d'|' -f3 "$WORK/source.tsv" "$WORK/before.tsv" "$WORK/after.tsv" | tr ' ' '\n' \
-  | sed -E 's/(>=|<=|=|<|>).*//' | sed '/^$/d' | sort -u > "$WORK/wanted"
+
+# --- the two views, as pacman sees them ----------------------------------------
+REPOS=()
 : > "$WORK/arch.tsv"
-i=0
 for db in "${ARCH_DBS[@]}"; do
   [[ -f $db ]] || usage "No Arch repository database at $db"
-  i=$((i + 1))
-  unpack "$db" "$WORK/arch-$i"
-  # Repository rank first, so the first repository with a name wins.
-  entries "$WORK/arch-$i" | awk -F'|' -v rank="$i" 'NR == FNR { want[$0] = 1; next }
-    { keep = ($1 in want); n = split($4, p, " ")
-      for (k = 1; k <= n; k++) { sub(/=.*/, "", p[k]); if (p[k] in want) keep = 1 }
-      if (keep) print rank "|" $0 }' "$WORK/wanted" - >> "$WORK/arch.tsv"
+  r=$(basename "$db" .db)
+  REPOS+=("$r")
+  unpack "$db" "$WORK/arch-$r"
+  entries "$WORK/arch-$r" | sed "s/^/$r|/" >> "$WORK/arch.tsv"
+  # <entry directory>\t<name>, to leave entries out by name.
+  find "$WORK/arch-$r" -mindepth 2 -maxdepth 2 -name desc | awk '
+    { file = $0; dir = file; sub(/\/desc$/, "", dir); sub(/.*\//, "", dir)
+      while ((getline line < file) > 0) { if (line == "%NAME%") { getline line < file; print dir "\t" line; break } }
+      close(file) }' > "$WORK/arch-$r.dirs"
+done
+for view in before after; do
+  dir=${view^^}
+  unpack "${!dir}" "$WORK/$view"
+  entries "$WORK/$view" | sort > "$WORK/$view.tsv"
+  mkdir -p "$WORK/db-$view/sync"
+  # An empty view still needs a database pacman can read.
+  if compgen -G "$WORK/$view/*/desc" >/dev/null; then
+    (cd "$WORK/$view" && bsdtar -czf "$WORK/db-$view/sync/omarchy.db" -- */)
+  else
+    bsdtar -czf "$WORK/db-$view/sync/omarchy.db" --files-from /dev/null
+  fi
+  for r in "${REPOS[@]}"; do
+    awk -F'\t' 'NR == FNR { split($0, f, "|"); omarchy[f[1]] = 1; next } !($2 in omarchy) { print $1 }' \
+      "$WORK/$view.tsv" "$WORK/arch-$r.dirs" > "$WORK/$view-$r.keep"
+    if [[ -s $WORK/$view-$r.keep ]]; then
+      (cd "$WORK/arch-$r" && bsdtar -czf "$WORK/db-$view/sync/$r.db" -T "$WORK/$view-$r.keep")
+    else
+      bsdtar -czf "$WORK/db-$view/sync/$r.db" --files-from /dev/null
+    fi
+  done
+  {
+    printf '[options]\nArchitecture = %s\nSigLevel = Never\n\n[omarchy]\nServer = file:///nonexistent\n' "$ARCH"
+    for r in "${REPOS[@]}"; do printf '\n[%s]\nServer = file:///nonexistent\n' "$r"; done
+  } > "$WORK/$view.conf"
 done
 
-# LIT: the version a package of exactly that name has. PROV: who provides a
-# name, as "<name>\t<version or empty>" lines, packages of that name
-# included.
-declare -A SOURCE_LIT=() BEFORE_LIT=() AFTER_LIT=() ARCH_LIT=()
-declare -A SOURCE_PROV=() BEFORE_PROV=() AFTER_PROV=() ARCH_PROV=()
-# SERVED: every name an Omarchy view has as a package or a provides.
-declare -A SERVED=()
-index() { # index <tsv> <view name>
-  local -n lit=${2}_LIT prov=${2}_PROV
-  local name ver deps provs p
-  while IFS='|' read -r name ver deps provs; do
-    [[ -n ${lit[$name]:-} ]] || lit[$name]=$ver
-    prov[$name]+="$name"$'\t'"$ver"$'\n'
-    [[ $2 == ARCH ]] || SERVED[$name]=1
-    for p in $provs; do
-      [[ $2 == ARCH ]] || SERVED[${p%%=*}]=1
-      if [[ $p == *=* ]]; then prov[${p%%=*}]+="$name"$'\t'"${p#*=}"$'\n'
-      else prov[$p]+="$name"$'\t'$'\n'
-      fi
-    done
-  done < "$1"
-}
-index "$WORK/source.tsv" SOURCE
-index "$WORK/before.tsv" BEFORE
-index "$WORK/after.tsv" AFTER
-sort -t'|' -k1,1n -s "$WORK/arch.tsv" | cut -d'|' -f2- > "$WORK/arch.sorted"
-index "$WORK/arch.sorted" ARCH
+# --- what to resolve -------------------------------------------------------------
+# Moved: an Omarchy package whose version after is not the one before. Its
+# names: what it is and provides, before and after.
+awk -F'|' 'NR == FNR { before[$1] = $2; bp[$1] = $4; next }
+  before[$1] != $2 { print "omarchy/" $1 > moved; n = split($1 " " $4 " " bp[$1], w, " "); for (i = 1; i <= n; i++) print w[i] > names }' \
+  moved="$WORK/moved" names="$WORK/names.raw" "$WORK/before.tsv" "$WORK/after.tsv"
+touch "$WORK/moved" "$WORK/names.raw"
+sort -u "$WORK/names.raw" > "$WORK/names"
+# Dependents: packages, in either view or in Arch, depending on one of those
+# names. An Arch package Omarchy serves the name of is never installed.
+awk -F'|' -v out="$WORK/dependents.raw" '
+  FILENAME == ARGV[1] { name[$0] = 1; next }
+  FILENAME == ARGV[2] || FILENAME == ARGV[3] { omarchy[$1] = 1
+    n = split($3, d, " "); for (i = 1; i <= n; i++) if (d[i] in name) { print "omarchy/" $1 > out; break }
+    next }
+  !($2 in omarchy) && !seen[$2]++ {
+    n = split($4, d, " "); for (i = 1; i <= n; i++) if (d[i] in name) { print $1 "/" $2 > out; break } }' \
+  "$WORK/names" "$WORK/before.tsv" "$WORK/after.tsv" "$WORK/arch.tsv"
+touch "$WORK/dependents.raw"
+sort -u "$WORK/moved" "$WORK/dependents.raw" > "$WORK/targets"
 
-split_dep() { # split_dep <dep>: prints "name op version" (op and version may be empty)
-  if [[ $1 =~ ^([^<>=]+)(>=|<=|=|<|>)(.+)$ ]]; then
-    echo "${BASH_REMATCH[1]} ${BASH_REMATCH[2]} ${BASH_REMATCH[3]}"
-  else
-    echo "$1"
+# --- resolve -----------------------------------------------------------------------
+# resolve <view> <repo/name>: 0 when pacman resolves it, 1 when it fails
+# (reasons on stdout), 3 when the view has no such package.
+resolve() {
+  local out
+  if out=$(pacman --config "$WORK/$1.conf" --dbpath "$WORK/db-$1" --noconfirm -Sp --print-format '%r/%n' "$2" 2>&1); then
+    return 0
   fi
-}
-satisfies() { # satisfies <provided version or ""> <op> <version>: as pacman decides
-  local have=$1 op=$2 want=$3 c
-  [[ -z $op ]] && return 0
-  [[ -n $have ]] || return 1
-  c=$(vercmp "$have" "$want")
-  case $op in
-  '>=') (( c >= 0 )) ;; '<=') (( c <= 0 )) ;; '=') (( c == 0 )) ;; '>') (( c > 0 )) ;; '<') (( c < 0 )) ;;
-  esac
-}
-any_satisfies() { # any_satisfies <providers> <op> <version>
-  local p pver
-  while IFS=$'\t' read -r p pver; do
-    [[ -n $p ]] || continue
-    satisfies "$pver" "$2" "$3" && return 0
-  done <<<"$1"
+  if grep -q '^error: target not found' <<<"$out"; then return 3; fi
+  grep -E '^(::|error:)' <<<"$out" | grep -v 'failed to prepare transaction' | sed -E 's/^(:: |error: )//' \
+    | awk '!seen[$0]++' | paste -sd ';' - | sed 's/;/; /g'
   return 1
 }
-# resolves <view> <name> <op> <version>: as pacman on that channel would.
-resolves() {
-  local -n lit=${1}_LIT prov=${1}_PROV
-  if [[ -n ${lit[$2]:-} ]]; then satisfies "${lit[$2]}" "$3" "$4"; return; fi
-  if [[ -n ${ARCH_LIT[$2]:-} ]]; then satisfies "${ARCH_LIT[$2]}" "$3" "$4"; return; fi
-  any_satisfies "${prov[$2]:-}" "$3" "$4" || any_satisfies "${ARCH_PROV[$2]:-}" "$3" "$4"
-}
-
-# unresolved <view>: "<package>\t<dependency>" for every dependency of an
-# Omarchy package in the view that the channel would not satisfy.
-unresolved() {
-  local view=${1^^} name ver deps _ dep dname op want
-  while IFS='|' read -r name ver deps _; do
-    for dep in $deps; do
-      read -r dname op want <<<"$(split_dep "$dep")"
-      (( ${#ARCH_DBS[@]} )) || [[ -n ${SERVED[$dname]:-} ]] || continue
-      resolves "$view" "$dname" "${op:-}" "${want:-}" && continue
-      printf '%s\t%s\n' "$name" "$dep"
-    done
-  done < "$WORK/$1.tsv"
-}
-unresolved before | sort -u > "$WORK/before.broken"
-unresolved after | sort -u > "$WORK/after.broken"
-comm -23 "$WORK/after.broken" "$WORK/before.broken" > "$WORK/new.broken"
-comm -12 "$WORK/after.broken" "$WORK/before.broken" > "$WORK/old.broken"
-
-# Say what the channel would offer instead and which package in the source
-# channel would fix it.
-explain() { # explain <package> <dependency>
-  local dname op want offered fix="" p pver where="$CHANNEL/$ARCH"
-  read -r dname op want <<<"$(split_dep "$2")"
-  if [[ -n ${AFTER_LIT[$dname]:-} && -n ${ARCH_LIT[$dname]:-} ]]; then
-    offered="$dname ${AFTER_LIT[$dname]}, which pacman takes over Arch's ${ARCH_LIT[$dname]}"
-  elif [[ -n ${AFTER_LIT[$dname]:-} ]]; then
-    offered="$dname ${AFTER_LIT[$dname]}"
-  elif [[ -n ${ARCH_LIT[$dname]:-} ]]; then
-    offered="Arch's $dname ${ARCH_LIT[$dname]}"
+: > "$WORK/new.txt"
+: > "$WORK/old.txt"
+checked=0
+while IFS= read -r target; do
+  checked=$((checked + 1))
+  status=0
+  why=$(resolve after "$target") || status=$?
+  (( status == 0 )) && continue
+  (( status == 3 )) && continue
+  before_status=0
+  resolve before "$target" >/dev/null || before_status=$?
+  if (( before_status == 1 )); then
+    printf '%s\t%s\n' "${target#*/}" "$why" >> "$WORK/old.txt"
   else
-    offered=$(printf '%s%s' "${AFTER_PROV[$dname]:-}" "${ARCH_PROV[$dname]:-}" | awk -F'\t' -v d="$dname" 'NF && $1 != "" {
-      printf "%s%s", (n++ ? ", " : ""), d ($2 == "" ? "" : "=" $2) " (from " $1 ")" }')
+    printf '%s\t%s\n' "${target#*/}" "$why" >> "$WORK/new.txt"
   fi
-  while IFS=$'\t' read -r p pver; do
-    [[ -n $p ]] || continue
-    satisfies "$pver" "${op:-}" "${want:-}" && { fix=$p; break; }
-  done <<<"${SOURCE_PROV[$dname]:-}"
-  if [[ -n $offered ]]; then
-    printf '%s needs %s; %s would offer only %s' "$1" "$2" "$where" "$offered"
-  else
-    printf '%s needs %s; %s would not have %s' "$1" "$2" "$where" "$dname"
-  fi
-  [[ -n $fix ]] && printf ' (promote %s with it)' "$fix"
-  return 0
-}
-explain_all() { # explain_all <broken file> <out>
-  : > "$2"
-  while IFS=$'\t' read -r name dep; do
-    printf '%s\t%s\t%s\n' "$name" "$dep" "$(explain "$name" "$dep")" >> "$2"
-  done < "$1"
-}
-explain_all "$WORK/new.broken" "$WORK/new.txt"
-explain_all "$WORK/old.broken" "$WORK/old.txt"
+done < "$WORK/targets"
 
 finish() { # finish <result>
   jq -nc --arg arch "$ARCH" --arg channel "$CHANNEL" --arg result "$1" \
     --rawfile new "$WORK/new.txt" --rawfile old "$WORK/old.txt" '
-    def rows: split("\n") | map(select(length > 0) | split("\t") | {package: .[0], dependency: .[1], problem: .[2]});
+    def rows: split("\n") | map(select(length > 0) | split("\t") | {package: .[0], problem: .[1]});
     {type:"deps", arch:$arch, channel:$channel, result:$result, problems: ($new | rows), existing: ($old | rows)}' >> "$RECORD"
 }
+say() { while IFS=$'\t' read -r name why; do print_step "$name: $why"; done < "$1"; }
 
 if [[ -s $WORK/old.txt ]]; then
-  print_warning "Already unresolved in $CHANNEL/$ARCH before this promotion, so not held against it:"
-  cut -f3 "$WORK/old.txt" | while IFS= read -r text; do print_step "$text"; done
+  print_warning "Already not installable in $CHANNEL/$ARCH before this promotion, so not held against it:"
+  say "$WORK/old.txt"
 fi
 if [[ -s $WORK/new.txt ]]; then
-  print_error "Refusing: this promotion would leave dependencies in $CHANNEL/$ARCH unresolved"
-  cut -f3 "$WORK/new.txt" | while IFS= read -r text; do print_step "$text"; done
+  print_error "Refusing: after this promotion pacman could not install these from $CHANNEL/$ARCH"
+  say "$WORK/new.txt"
   finish refused
   exit 1
 fi
-print_success "Dependencies: everything $CHANNEL/$ARCH serves still resolves"
+print_success "Dependencies: pacman resolves the $checked package(s) this promotion moves or touches in $CHANNEL/$ARCH"
 finish pass

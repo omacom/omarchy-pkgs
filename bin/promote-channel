@@ -40,14 +40,12 @@
 # run included, when it does not hold. A plan that moves no Mac package and
 # nothing the Mac set depends on is not affected.
 #
-# Then bin/check-channel-deps holds the same view, with the Arch snapshot the
-# destination serves, to the packages' dependencies: every package the
-# destination would serve must still find what it depends on there, version
-# included, the way pacman on that channel resolves it. A kernel cannot move
-# without a package it newly depends on, and Omarchy's build of a package
-# cannot take over from Arch's under something pinned to Arch's version. It
-# refuses the whole plan the same way, and names the package to promote
-# with it.
+# Then bin/check-channel-deps asks pacman, with the same view and the Arch
+# snapshot the destination serves, to resolve every package the plan moves
+# and everything depending on one, Arch's packages included. A kernel cannot
+# move without a package it newly depends on, and Omarchy's build of a
+# library cannot take over from Arch's under an Arch package linked to
+# Arch's. It refuses the whole plan the same way, with pacman's reasons.
 #
 # --record appends one JSON object per line: {"type":"plan",...} for every
 # package considered, {"type":"mac-set",...} for the Mac package-set check,
@@ -160,11 +158,12 @@ else
     url=${server//\$repo/$r}
     url=${url//\$arch/$ARCH}/$r.db
     # Fail closed: without the snapshot the check cannot vouch for the plan.
-    if ! curl -fsSL --retry 3 -o "$WORK/arch-$r.db" "$url"; then
+    mkdir -p "$WORK/arch"
+    if ! curl -fsSL --retry 3 -o "$WORK/arch/$r.db" "$url"; then
       print_error "Could not fetch $url, the Arch snapshot of $TO/$ARCH; refusing to promote $FROM/$ARCH into $TO/$ARCH: nothing published"
       exit 1
     fi
-    ARCH_DB_ARGS+=(--arch-db "$WORK/arch-$r.db")
+    ARCH_DB_ARGS+=(--arch-db "$WORK/arch/$r.db")
   done
 fi
 
@@ -273,7 +272,7 @@ elif ! "$BUILD_ROOT/bin/check-mac-set" --channel "$TO" --arch "$ARCH" \
   print_error "Refusing to promote $FROM/$ARCH into $TO/$ARCH: nothing published"
   exit 1
 elif ! "$BUILD_ROOT/bin/check-channel-deps" --channel "$TO" --arch "$ARCH" \
-  --source "$WORK/src.db.tar.zst.d" --before "$WORK/dest.db.tar.zst.d" --after "$WORK/after" \
+  --before "$WORK/dest.db.tar.zst.d" --after "$WORK/after" \
   "${ARCH_DB_ARGS[@]}" --record "$RECORD"; then
   print_error "Refusing to promote $FROM/$ARCH into $TO/$ARCH: nothing published"
   exit 1
@@ -286,7 +285,47 @@ fi
 (( promoted )) || { print_success "$TO/$ARCH is already up to date with $FROM"; exit 0; }
 
 # --- 3. copy, verify, publish in batches -------------------------------------
-# Batches break between pkgbases, never inside one.
+# Every batch is its own database update, so batches break only between
+# pkgbases that do not depend on each other: a moving pkgbase that needs a
+# name another moving pkgbase provides goes in the same batch, and so on
+# through the chain. Publishing a kernel in one batch and the package it
+# newly depends on in the next would leave the channel broken in between,
+# and for good if the second batch failed.
+declare -A PARENT=() PROVIDED_BY=() BASE_OF=()
+while IFS=$'\t' read -r name _ base _; do BASE_OF[$name]=$base; done < "$WORK/src.tsv"
+root_of() { # root_of <pkgbase>
+  local b=$1
+  while [[ ${PARENT[$b]} != "$b" ]]; do b=${PARENT[$b]}; done
+  echo "$b"
+}
+# name<TAB>depends<TAB>provides of every package moving, the lists
+# space-separated and without versions.
+while IFS=$'\t' read -r name ver; do
+  awk -v n="$name" '/^%[A-Z0-9]+%$/ { s = $0; next } /^$/ { s = ""; next }
+    s == "%DEPENDS%" { sub(/(>=|<=|=|<|>).*/, ""); d = d " " $0 }
+    s == "%PROVIDES%" { sub(/=.*/, ""); p = p " " $0 }
+    END { print n "\t" d "\t" p }' "$WORK/src.db.tar.zst.d/$name-$ver/desc"
+done < "$WORK/promote-names.tsv" > "$WORK/links.tsv"
+while IFS=$'\t' read -r name _ provides; do
+  base=${BASE_OF[$name]}
+  PARENT[$base]=$base
+  PROVIDED_BY[$name]=$base
+  for p in $provides; do PROVIDED_BY[$p]=$base; done
+done < "$WORK/links.tsv"
+while IFS=$'\t' read -r name depends _; do
+  for d in $depends; do
+    other=${PROVIDED_BY[$d]:-}
+    [[ -n $other ]] || continue
+    a=$(root_of "${BASE_OF[$name]}") b=$(root_of "$other")
+    [[ $a == "$b" ]] || PARENT[$b]=$a
+  done
+done < "$WORK/links.tsv"
+# promote.tsv regrouped, each group where its first pkgbase was: group, base,
+# file.
+awk -F'\t' 'NR == FNR { group[$1] = $2; next }
+  { g = group[$1]; if (!(g in seen)) { seen[g] = 1; order[++n] = g } rows[g] = rows[g] g "\t" $0 "\n" }
+  END { for (i = 1; i <= n; i++) printf "%s", rows[order[i]] }' \
+  <(for b in "${!PARENT[@]}"; do printf '%s\t%s\n' "$b" "$(root_of "$b")"; done) "$WORK/promote.tsv" > "$WORK/batches.tsv"
 publish_batch() { # publish_batch <file...>
   local f expected got files=() status=published
   mkdir -p "$WORK/files"
@@ -310,14 +349,14 @@ publish_batch() { # publish_batch <file...>
   [[ $status == published ]]
 }
 
-batch=() batch_bytes=0 last_base=""
-while IFS=$'\t' read -r base file; do
+batch=() batch_bytes=0 last_group=""
+while IFS=$'\t' read -r group base file; do
   size=$(awk -F'\t' -v f="$file" '$4==f {print $6}' "$WORK/src.tsv")
-  if (( ${#batch[@]} )) && [[ $base != "$last_base" ]] && (( batch_bytes + ${size:-0} > BATCH_BYTES )); then
+  if (( ${#batch[@]} )) && [[ $group != "$last_group" ]] && (( batch_bytes + ${size:-0} > BATCH_BYTES )); then
     publish_batch "${batch[@]}" || exit 1
     batch=() batch_bytes=0
   fi
-  batch+=("$file"); batch_bytes=$((batch_bytes + ${size:-0})); last_base=$base
-done < "$WORK/promote.tsv"
+  batch+=("$file"); batch_bytes=$((batch_bytes + ${size:-0})); last_group=$group
+done < "$WORK/batches.tsv"
 publish_batch "${batch[@]}" || exit 1
 print_success "Promoted $promoted package(s) from $FROM/$ARCH to $TO/$ARCH"
