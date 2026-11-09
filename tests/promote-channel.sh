@@ -208,6 +208,28 @@ promote alpha && [[ "$(entries rc)" == *"alpha-1.0-5 "* ]] && grep -q "stale: un
   && jq -e -s '[.[] | select(.type=="deps")] | .[0].result == "pass" and .[0].existing[0].package == "stale"' "$T/record" >/dev/null \
   && pass "a package rc already could not install is reported, not held against the promotion, and only alpha and stale are checked" || fail "existing breakage: $(cat "$T/out")"
 
+# A pacman that fails for another reason than a dependency refuses: it must
+# not count every target as already broken and pass. That holds when the
+# failure comes with pacman's dependency or not-found message too, and
+# however long its output is.
+mkdir -p "$T/broken-pacman"
+printf '#!/bin/sh\ncat "$BROKEN_PACMAN_OUT"\nexit 1\n' > "$T/broken-pacman/pacman"
+chmod +x "$T/broken-pacman/pacman"
+printf '%s\n' 'error: failed to initialize alpm library:' '(could not find or read directory)' > "$T/broken-init"
+printf '%s\n' 'error: core database is inconsistent: filename of package dep is illegal' \
+  'error: failed to prepare transaction (could not satisfy dependencies)' ":: unable to satisfy dependency 'dep' required by alpha" > "$T/broken-db"
+for i in $(seq 3000); do echo "error: extra database is inconsistent: filename of package p$i is illegal"; done > "$T/broken-many"
+echo 'error: target not found: alpha' >> "$T/broken-many"
+pub edge $(mkpkg alpha 6)
+rc_before=$(entries rc)
+for broken in init db many; do
+  : > "$T/record"
+  if BROKEN_PACMAN_OUT="$T/broken-$broken" PATH="$T/broken-pacman:$PATH" promote alpha; then fail "a pacman that fails ($broken) should refuse"; fi
+  grep -q "pacman could not check alpha against rc/x86_64 (after this promotion): error: " "$T/out" \
+    && grep -q 'nothing published' "$T/out" && [[ "$(entries rc)" == "$rc_before" ]] || fail "broken pacman ($broken): $(cat "$T/out")"
+done
+pass "a pacman that cannot run, or reports a broken database, refuses the promotion instead of passing it"
+
 # With the channel's Arch snapshot, pacman resolves as on a machine on the
 # channel: a name Omarchy serves takes over from Arch's.
 recipe hyprwm '{"source": "local"}'
