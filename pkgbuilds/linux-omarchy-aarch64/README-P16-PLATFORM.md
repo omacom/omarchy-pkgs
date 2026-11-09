@@ -194,3 +194,55 @@ Thank you to `jlobue10` for the independent tests, detailed raw logs and
 follow-up reports that led us to investigate the USB wake route. Their
 reported receiver disconnect was a manual unplug, not a spontaneous fault:
 https://github.com/omacom/omarchy-pkgs/pull/1958#issuecomment-6727318724
+
+
+## SROOT DMA and SPI-HID response follow-up
+
+Patch 9110 limits a missing-`_CCA` correction to ACPI `NVDA8600` revision 1
+on architectures that require the attribute. It records noncoherent DMA
+before normal ACPI/IORT DMA configuration. Explicit and inherited `_CCA`,
+other devices/revisions and the existing IOMMU route remain authoritative.
+The firmware's SROOT mapping and the vendor provider's noncached allocation
+motivated this correction. It does not borrow the NPU device's coherent DMA
+context or ship NPU firmware, userspace packages or a model runtime.
+
+Patches 9111--9113 build on the existing GPIO IRQ and ACPI namespace reset
+fixes. GET input/feature requests use their corresponding wire command and
+validate the response type and report ID. The output mutex stays held until
+the response is copied, preventing another caller from replacing the shared
+reply. `MSFW1111` with VID 0000/PID 0100 supplies input through asynchronous
+DATA reports; sensor pending reads wait for those samples, while synchronous
+raw input requests return `-EOPNOTSUPP`. A private native-order input-body
+structure keeps decoded lengths separate from the packed wire ABI.
+
+9111 and 9112 retain Johann-Peter Hartmann's original review-draft headers
+and patch bytes. They are not accepted upstream commits. 9113 is the original
+follow-up from `asus-proart-p16-rtx-spark-linux` commit
+`cab38b1357af8683ba2156bec4dbe132abd8399d`; its published patch has no author
+or DCO header, so none is invented. The existing transport prerequisites and
+public wire layout are preserved. Thanks to Johann Hartmann and Josephine
+Pfeiffer for the platform work and shared sources, and to `jlobue10` for
+independent hardware reports and careful follow-up testing.
+
+`test_npu_cca.py` compiles the actual prepared `acpi_init_coherency` function
+and checks missing, explicit and inherited attributes, device/revision scope,
+firmware errors and architectures that do not require `_CCA`.
+`test_spi_get_requests.py` compiles the actual GET callback with ASan/UBSan
+and `-Werror`: feature/input typing, response mismatch, zero/short/truncated
+buffers, timeout recovery and deterministic concurrent response ownership.
+`test_spi_lengths_stream.py` compiles the actual parser, header validator and
+request dispatcher, checking all 16384 encoded lengths, bad fields and
+stream-only dispatch. The canonical `test.sh` runs these with the complete
+existing production-function suite against the prepared source tree.
+
+Physical evidence is limited to a 20-CPU ASUS H7607BA on BIOS 303. An isolated
+Linux 7.3 candidate carrying these same four patch bytes completed three NPU
+jobs, then an operator-controlled s2idle cycle lasting about 78 seconds;
+suspend statistics increased success by one and failure by zero. These NPU
+observations used a separately supplied experimental driver/runtime and do
+not establish that this kernel package alone provides an NPU userspace API.
+The SPI sensor remained available after resume. The earlier USB remote-wake
+result above remains a separate test. USB4 docking, other BIOS revisions,
+18-CPU physical hardware, long-term reliability and sustained NPU workloads
+remain untested. No RTC diagnostic instrumentation or functional RTC wake fix
+is included, and these results do not establish physical DRIPS residency.

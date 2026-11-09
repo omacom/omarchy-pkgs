@@ -44,6 +44,11 @@ assert len(platform) == 8 and platform == sorted(platform)
 assert '9105-mt7925-mld-membership.patch' in sources and 'test_mld.py' in sources
 assert '9106-pinctrl-unsupported-debounce.patch' in sources and 'test_usb_debounce.py' in sources
 assert '9107-xhci-acpi-gpio-wake.patch' in sources and 'test_usb_wake.py' in sources
+for name in ('9110-n1x-sroot-noncoherent-dma.patch', '9111-spi-hid-serialize-get.patch',
+             '9112-spi-hid-stream-only.patch', '9113-spi-hid-native-input-length.patch',
+             'test_npu_cca.py', 'test_spi_get_requests.py', 'test_spi_lengths_stream.py'):
+    assert sources.count(name) == 1, name
+assert not any('p16-platform-bundle' in name for name in sources)
 assert not any('rtc-diagnostic' in name or 'rtc-debug' in name for name in sources)
 assert not any('p16-platform-support' in name for name in sources)
 print(f'PASS package sources/checksums: {checked} local files; coordinated suspend config prerequisites')
