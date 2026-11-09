@@ -204,8 +204,9 @@ pub rc $(DEPENDS="gone alpha" mkpkg stale 1)
 pub edge $(mkpkg gone 1) $(mkpkg alpha 5)
 : > "$T/record"
 promote alpha && [[ "$(entries rc)" == *"alpha-1.0-5 "* ]] && grep -q "stale: unable to satisfy dependency 'gone' required by stale" "$T/out" \
+  && grep -q 'resolves the 2 package(s)' "$T/out" \
   && jq -e -s '[.[] | select(.type=="deps")] | .[0].result == "pass" and .[0].existing[0].package == "stale"' "$T/record" >/dev/null \
-  && pass "a package rc already could not install is reported, not held against the promotion" || fail "existing breakage: $(cat "$T/out")"
+  && pass "a package rc already could not install is reported, not held against the promotion, and only alpha and stale are checked" || fail "existing breakage: $(cat "$T/out")"
 
 # With the channel's Arch snapshot, pacman resolves as on a machine on the
 # channel: a name Omarchy serves takes over from Arch's.
