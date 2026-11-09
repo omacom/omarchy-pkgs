@@ -439,6 +439,12 @@ for tool in surface-pro-11-flex-pair surface-pro-11-pen-pair; do
   python -c 'import ast, sys; ast.parse(open(sys.argv[1]).read())' "$package_dir/$tool" ||
     fail "$tool is valid Python"
 done
+python - "$package_dir/51-surface-pro-11-speakers.conf" <<'CHECK' || fail "the speaker card's outputs start at unity gain behind the limiters"
+import re, sys
+conf = open(sys.argv[1]).read()
+rule = re.search(r'device\.name = "alsa_card\.platform-sound".*?update-props = \{(.*?)\}', conf, re.S)
+sys.exit(0 if rule and re.search(r'device\.routes\.default-sink-volume = 1\.0\b', rule.group(1)) else 1)
+CHECK
 for unit in surface-pro-11-flex-autopair surface-pro-11-flex-reconnect; do
   grep -qx 'ConditionFirmware=device-tree-compatible(microsoft,denali)' "$package_dir/$unit.service" ||
     fail "$unit runs only on the Surface Pro 11"
