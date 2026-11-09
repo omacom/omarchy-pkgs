@@ -1,6 +1,6 @@
 # microsoft-surface-pro-11-support
 
-Hardware support for the Microsoft Surface Pro 11 with Snapdragon X Elite and OLED display (`microsoft,denali-oled`) that no upstream package carries yet. Omarchy's Surface Pro 11 hardware setup (`install/hardware/microsoft/surface-pro-11.sh`) installs it with the `linux-sp11` kernel.
+Hardware support for the Microsoft Surface Pro 11, with Snapdragon X Elite and OLED display (`microsoft,denali-oled`) or Snapdragon X Plus and LCD (`microsoft,denali-lcd`), that no upstream package carries yet. Omarchy's Surface Pro 11 hardware setup (`install/hardware/microsoft/surface-pro-11.sh`) installs it with the `linux-sp11` kernel.
 
 The package contains no Microsoft or Qualcomm DSP firmware; `qcom-firmware-extract` copies that from the machine's own Windows installation.
 
@@ -23,7 +23,7 @@ The package contains no Microsoft or Qualcomm DSP firmware; `qcom-firmware-extra
 - **Lid**: with the cover open, the lid line shows a false edge just after the SoC powers down in suspend, which wakes the machine at once. A sleep hook arms lid wake only when the machine suspends with the cover closed, so opening the cover still wakes it; the power button wakes it either way.
 - **Pen and touch**: the touch controller resets its firmware on resume, and a running iptsd never recovers. A sleep hook stops iptsd before suspend and starts it again after.
 
-Every service and sleep hook checks for the `microsoft,denali-oled` device tree and does nothing elsewhere.
+Every service and sleep hook checks for the `microsoft,denali` device tree, which both the OLED (X Elite, `microsoft,denali-oled`) and LCD (X Plus, `microsoft,denali-lcd`) trees carry, and does nothing elsewhere. The LCD model was checked on a Surface Pro 11 with the Snapdragon X Plus X1P-64-100 and the LG LP129WT3 panel: Wi-Fi, Bluetooth, the speakers and microphones, both cameras, the Surface Pro Keyboard's keyboard and touchpad, and touch and pen, after resume too, work with the same files. The Flex Keyboard's Bluetooth pairing and the Slim Pen's were not tried there.
 
 ## Retirement
 

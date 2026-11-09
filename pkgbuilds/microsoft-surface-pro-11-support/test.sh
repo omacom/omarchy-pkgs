@@ -66,8 +66,9 @@ grep -A1 -- '- BlackLevel:' "$package_dir/imx681.yaml" | grep -q 'blackLevel: 40
 bin="$scratch/bin"
 mkdir -p "$bin"
 
-# Every hook acts only on the Surface Pro 11 OLED.
+# Every hook acts only on the Surface Pro 11, OLED (X Elite) or LCD (X Plus).
 printf 'microsoft,denali-oled\0microsoft,denali\0qcom,x1e80100\0' >"$scratch/denali"
+printf 'microsoft,denali-lcd\0microsoft,denali\0qcom,x1p64100\0qcom,x1e80100\0' >"$scratch/denali-lcd"
 printf 'lenovo,yoga-slim7x\0qcom,x1e80100\0' >"$scratch/other"
 
 # Battery: after resume the thresholds already set are written back unchanged.
@@ -90,6 +91,8 @@ thresholds 0 100
 [[ -z $(charge_sleep denali post suspend) ]] || fail "with no charge limit set, nothing is written"
 thresholds 60 90
 [[ -z $(charge_sleep other post suspend) ]] || fail "the charge hook does nothing on other hardware"
+[[ $(charge_sleep denali-lcd post suspend) == *"restored start=60 end=90" ]] ||
+  fail "the charge hook also restores the thresholds on the Surface Pro 11 LCD"
 [[ -z $(charge_sleep denali pre suspend) ]] || fail "the charge hook acts only after resume"
 ! grep -l 'charge' "$package_dir"/*.service >/dev/null 2>&1 ||
   fail "no boot-time service imposes a charge window"
@@ -437,8 +440,8 @@ for tool in surface-pro-11-flex-pair surface-pro-11-pen-pair; do
     fail "$tool is valid Python"
 done
 for unit in surface-pro-11-flex-autopair surface-pro-11-flex-reconnect; do
-  grep -qx 'ConditionFirmware=device-tree-compatible(microsoft,denali-oled)' "$package_dir/$unit.service" ||
-    fail "$unit runs only on the Surface Pro 11 OLED"
+  grep -qx 'ConditionFirmware=device-tree-compatible(microsoft,denali)' "$package_dir/$unit.service" ||
+    fail "$unit runs only on the Surface Pro 11"
   grep -q "start $unit.service" "$package_dir/70-surface-pro-11-flex-keyboard.rules" ||
     fail "attaching or detaching the keyboard starts $unit"
 done
