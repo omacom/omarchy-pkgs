@@ -92,7 +92,7 @@ reports the compiled tests as skipped when no prepared tree is supplied.
 
 ## Current recipe compatibility
 
-The PR is refreshed on the official 7.3-41 recipe and uses pkgrel 42 so its
+The PR is refreshed on the official 7.3-46 recipe and uses pkgrel 47 so its
 packaging change is shipped. It retains upstream's separate kernel, headers and
 NVIDIA open-module split, driver version and seven NVIDIA patches unchanged.
 The sleep implementation retains its existing firmware-state and lifecycle
@@ -131,3 +131,23 @@ energy measurements and follow-up reports. Their testing helped distinguish
 the suspension improvement from the remaining RTC and peripheral wake issues
 and prompted the USB wake-route investigation. The USB kernel fixes retain
 their NVIDIA authorship and review credits in the original patches.
+
+
+## BIOS305 LPI contract follow-up
+
+Patch1126 retains the BIOS303 descriptor profiles and admits only the complete
+known BIOS305 cluster/package descriptors with uniform valid enabled flags.
+The system level additionally accepts the exact paired U32_MAX residency and
+latency sentinel while MPEL is unset. Firmware timings remain unchanged; finite
+QoS limits still reject this sentinel conservatively. Tuple, GAS, topology,
+PSCI and suspend-only entry checks remain required. This does not write MPEL,
+ELST or SYSRAM. The new admission and governor harnesses run from check().
+
+On one 20-CPU H7607BA with BIOS305, Experimental7.3-44.10 completed one physical
+suspend/resume cycle lasting6m34.688s. Battery energy decreased0.209Wh over
+400.983s, averaging1.876W including transitions and6.295s awake around the
+suspend interval. This is a whole-interval measurement, not steady sleep power
+or physical DRIPS residency. The normal7.3-44.10 kernel was booted and its
+admission checked; no physical power measurement was made on that kernel.
+BIOS303 evidence above remains separate. Native18-CPU hardware remains untested,
+and this change does not establish an RTC wake fix.

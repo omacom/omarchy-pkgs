@@ -19,6 +19,7 @@ preamble=r'''
 #define _POSIX_C_SOURCE 200809L
 #include <assert.h>
 #include <stdint.h>
+#define U32_MAX UINT32_MAX
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
