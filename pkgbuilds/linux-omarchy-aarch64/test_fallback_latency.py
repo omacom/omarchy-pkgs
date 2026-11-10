@@ -111,7 +111,7 @@ static void check(const char *name, bool ok)
     failures += !ok;
 }
 static void run_case(const char *name, bool coordinated, bool present,
-                     u32 residency, unsigned int expected_latency,
+                     u32 residency, u32 wake_latency, unsigned int expected_latency,
                      int expected_selected)
 {
     struct acpi_processor pr = { .flags.has_lpi = true, .power.count = 3 };
@@ -122,7 +122,7 @@ static void run_case(const char *name, bool coordinated, bool present,
 
     pr.power.lpi_states[1].wake_latency = 967;
     pr.power.lpi_states[1].min_residency = 2000;
-    pr.power.lpi_states[2].wake_latency = 966;
+    pr.power.lpi_states[2].wake_latency = wake_latency;
     pr.power.lpi_states[2].min_residency = residency;
     for (i = 0; i < 3; i++)
         pr.power.lpi_states[i].entry_method = ACPI_CSTATE_FFH;
@@ -155,11 +155,18 @@ static void run_case(const char *name, bool coordinated, bool present,
 }
 int main(void)
 {
-    run_case("N1x fallback sentinel selects DRIPS", false, true, U32_MAX, 7576, 2);
-    run_case("N1x coordinated sentinel unchanged", true, true, U32_MAX, 966, 2);
-    run_case("non-N1x fallback unchanged", false, false, U32_MAX, 966, 1);
-    run_case("N1x normal residency unchanged", false, true, 1437, 966, 1);
-    run_case("non-N1x coordinated unchanged", true, false, U32_MAX, 966, 2);
+    run_case("N1x fallback sentinel selects DRIPS", false, true, U32_MAX, 966, 7576, 2);
+    run_case("N1x coordinated sentinel unchanged", true, true, U32_MAX, 966, 966, 2);
+    run_case("non-N1x fallback unchanged", false, false, U32_MAX, 966, 966, 1);
+    run_case("N1x normal residency unchanged", false, true, 1437, 966, 966, 1);
+    run_case("non-N1x coordinated unchanged", true, false, U32_MAX, 966, 966, 2);
+    run_case("BIOS305 paired sentinel saturates", false, true, U32_MAX, U32_MAX, U32_MAX, 2);
+    run_case("fallback near boundary saturates", false, true, U32_MAX, U32_MAX - 1, U32_MAX, 2);
+    run_case("fallback exact boundary remains representable", false, true, U32_MAX, U32_MAX - 6610, U32_MAX, 2);
+    run_case("fallback below boundary adds offset", false, true, U32_MAX, U32_MAX - 6611, U32_MAX - 1, 2);
+    run_case("coordinated sentinel unaffected", true, true, U32_MAX, U32_MAX, U32_MAX, 2);
+    run_case("non-N1x sentinel unaffected", false, false, U32_MAX, U32_MAX, U32_MAX, 2);
+    run_case("finite residency sentinel unaffected", false, true, 1437, U32_MAX, U32_MAX, 2);
     return failures ? EXIT_FAILURE : EXIT_SUCCESS;
 }
 '''

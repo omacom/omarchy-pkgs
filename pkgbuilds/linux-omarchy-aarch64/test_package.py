@@ -37,12 +37,14 @@ for option in ('ACPI_WMI', 'ASUS_WMI', 'ASUS_NB_WMI', 'SPI_HID_ACPI'):
 for option in ('ASUS_ARMOURY', 'ASUS_WMI_DEPRECATED_ATTRS'):
     assert f'# CONFIG_{option} is not set' in config, option
 sources = arrays[0]
-ordered = [name for name in sources if name.startswith(('1120-', '1121-', '1122-', '1123-', '1124-', '1125-', '1126-'))]
-assert len(ordered) == 7 and ordered == sorted(ordered)
+ordered = [name for name in sources if name.startswith(('1120-', '1121-', '1122-', '1123-', '1124-', '1125-', '1126-', '1127-'))]
+assert len(ordered) == 8 and ordered == sorted(ordered)
 platform = [name for name in sources if name.startswith(('9100-', '9101-', '9102-', '9103-', '9104-', '9105-', '9106-', '9107-'))]
 assert len(platform) == 8 and platform == sorted(platform)
 for name in ('1126-acpi-n1x-p16-bios305-lpi-profiles.patch',
-             'test_bios305_policy.py', 'test_bios305_governor.py'):
+             'test_bios305_policy.py', 'test_bios305_governor.py',
+             '1127-acpi-n1x-saturate-drips-fallback-latency.patch',
+             'test_fallback_latency.py'):
     assert sources.count(name) == 1, name
 assert '9105-mt7925-mld-membership.patch' in sources and 'test_mld.py' in sources
 assert '9106-pinctrl-unsupported-debounce.patch' in sources and 'test_usb_debounce.py' in sources

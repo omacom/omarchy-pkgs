@@ -96,7 +96,7 @@ reports the compiled tests as skipped when no prepared tree is supplied.
 
 ## Current recipe compatibility
 
-The PR is refreshed on the official 7.3-46 recipe and uses pkgrel 47 so its
+The PR is refreshed on the official 7.3-46 recipe and uses pkgrel 48 so its
 packaging change is shipped. It retains upstream's separate kernel, headers and
 NVIDIA open-module split, driver version and seven NVIDIA patches unchanged.
 The sleep implementation retains its existing firmware-state and lifecycle
@@ -155,3 +155,11 @@ or physical DRIPS residency. The normal7.3-44.10 kernel was booted and its
 admission checked; no physical power measurement was made on that kernel.
 BIOS303 evidence above remains separate. Native18-CPU hardware remains untested,
 and this change does not establish an RTC wake fix.
+
+
+Patch1127 saturates the non-coordinated N1x DRIPS fallback latency adjustment
+at U32_MAX before converting it to nanoseconds. This preserves BIOS305's paired
+sentinel instead of wrapping its wake latency to6609us. The actual setup and
+selection harness checks both sentinel and near-boundary values, finite latency,
+and unchanged coordinated/non-N1x controls. The physical measurements above
+predate this arithmetic follow-up; no new hardware result is claimed.
