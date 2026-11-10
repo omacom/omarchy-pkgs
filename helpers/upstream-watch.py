@@ -45,6 +45,23 @@ def https(url):
     return url
 
 
+class HTTPStatusError(ValueError):
+    def __init__(self, url, status):
+        super().__init__(f"{url} returned HTTP {status}")
+        self.url, self.status = url, status
+
+
+class NotPublished(Exception):
+    """A release is announced, but one of its files is not there yet."""
+    def __init__(self, error):
+        super().__init__(str(error))
+        self.url, self.status = error.url, error.status
+
+
+# S3 and CloudFront answer 403 for an object that does not exist.
+MISSING = {403, 404, 410}
+
+
 class Fetcher:
     def __init__(self, cache):
         self.cache = Path(cache)
@@ -58,14 +75,23 @@ class Fetcher:
             # HTTP/1.1: HTTP/2 stream resets from GitHub and vendor servers
             # fail the fetch outright, and --retry does not cover them.
             command = ["curl", "--http1.1", "--proto", "=https", "--proto-redir", "=https", "-fsSL",
-                       "--connect-timeout", "20", "--max-time", "300", "--retry", "2", "-o", str(scratch), url]
+                       "--connect-timeout", "20", "--max-time", "300", "--retry", "2",
+                       "--write-out", "%{http_code}", "-o", str(scratch), url]
             # Credentials only go to GitHub's API, never to release assets or vendors.
             token = os.environ.get("UPSTREAM_GITHUB_TOKEN")
+            options = {"stdout": subprocess.PIPE, "text": True, "check": True}
             if token and urlsplit(url).hostname == "api.github.com":
                 command[1:1] = ["--config", "-"]
-                subprocess.run(command, input=f'header = "Authorization: Bearer {token}"\n', text=True, check=True)
-            else:
-                subprocess.run(command, check=True)
+                options["input"] = f'header = "Authorization: Bearer {token}"\n'
+            try:
+                subprocess.run(command, **options)
+            except subprocess.CalledProcessError as error:
+                scratch.unlink(missing_ok=True)
+                # curl exits 22 for an HTTP error and has printed its status.
+                status = (error.stdout or "").strip()
+                if error.returncode == 22 and re.fullmatch(r"[0-9]{3}", status):
+                    raise HTTPStatusError(url, int(status)) from error
+                raise
             scratch.replace(dest)
         return dest
 
@@ -513,7 +539,12 @@ def updated_checksums(before, after, package, fetch, release, watch):
                 if url.startswith("git+https://"):
                     file = git_source_file(url, fetch.cache)
                 elif url.startswith("https://"):
-                    file = fetch.file(url)
+                    try:
+                        file = fetch.file(url)
+                    except HTTPStatusError as error:
+                        if error.status in MISSING:
+                            raise NotPublished(error) from error
+                        raise
                 elif "://" not in url:
                     file = (package / url).resolve()
                     if not file.is_relative_to(package.resolve()) or not file.is_file():
@@ -600,7 +631,13 @@ def sync(package, fetch, min_age=0, check=False):
             raise ValueError("complete package version must increase")
         if before["arch"] != after["arch"]:
             raise ValueError("release changed supported architectures")
-        arrays = updated_checksums(before, after, package, fetch, release, watch)
+        try:
+            arrays = updated_checksums(before, after, package, fetch, release, watch)
+        except NotPublished as error:
+            # The feed names the release before every file of it is up. The
+            # recipe stays as it is, and the next run tries again.
+            return {"status": "waiting", "current": current, "available": release["pkgver"],
+                    "reason": f"upstream has not published {error.url} (HTTP {error.status})"}
         for name, values in arrays.items():
             text = replace_array(text, name, values)
         scratch.write_text(text)

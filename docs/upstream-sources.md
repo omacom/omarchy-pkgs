@@ -118,6 +118,23 @@ publishing without manual approval. No GitHub App is required.
    Subsequent runs happen hourly.
 
 Checksums retain their algorithms (SHA256, SHA512, BLAKE2, etc.) and source order.
+
+## When a release is not complete yet
+
+A vendor can list a release in its feed before every file of it is up. When
+a changed source of the new version answers HTTP 403, 404 or 410, the watch
+reports the package as `waiting`: the recipe is not touched, the run does not
+fail, and the next run tries again. S3 and CloudFront answer 403 for an
+object that does not exist, so 403 counts as missing. Any other error on a
+source, and any error on the feed itself, is a failure.
+
+`bin/sync-upstream` writes one JSON line for each failed or waiting package to
+the file named by `SYNC_UPSTREAM_REPORT`, with its `package`, `status`
+(`failed` or `waiting`) and `reason`. The workflow passes these to the
+notification, so it names the package and the cause.
+
+A package that waits for many runs needs a look: the vendor may have moved
+the file for good, and then the recipe's source needs to change.
 Changed git sources are hashed with makepkg's git-archive convention. Unchanged
 sources retain their hashes; `mutable_sources` explicitly names entries such as
 `source:0` that must be fetched again for a new version despite a stable URL.

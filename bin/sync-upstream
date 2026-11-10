@@ -103,7 +103,19 @@ print_header "Upstream Package Sync"
 UPDATED=0
 SKIPPED=0
 FAILED=0
+WAITING=0
 SPECIFIC_MODE=false
+declare -A REPORT_STATUS=()
+
+# One JSON line per package that failed or waits on upstream, for whoever
+# runs this to name them. Without SYNC_UPSTREAM_REPORT nothing is written.
+report_package() {
+  local package="$1" status="$2" reason="$3"
+  REPORT_STATUS["$package"]="$status"
+  [[ -n "${SYNC_UPSTREAM_REPORT:-}" ]] || return 0
+  jq -cn --arg package "$package" --arg status "$status" --arg reason "${reason:0:300}" \
+    '{package: $package, status: $status, reason: $reason}' >>"$SYNC_UPSTREAM_REPORT"
+}
 
 get_pkgver() {
   local package_dir="$1"
@@ -402,13 +414,22 @@ sync_package() {
   print_info "Checking $package for upstream releases..."
 
   if [[ "$provider" == watch ]]; then
-    local result
-    if ! result=$(python3 "$BUILD_ROOT/helpers/upstream-watch.py" sync "$package_dir" --min-age "$min_age"); then
+    local result status=0 errors="$TEMP_DIR/watch.err" reason
+    result=$(python3 "$BUILD_ROOT/helpers/upstream-watch.py" sync "$package_dir" --min-age "$min_age" 2>"$errors") || status=$?
+    cat "$errors" >&2
+    if (( status != 0 )); then
       print_error "Upstream watch failed for $package"
       ((++FAILED))
+      reason=$(sed -n 's/^upstream watch failed: //p' "$errors" | tail -n 1)
+      report_package "$package" failed "${reason:-see the run log}"
     elif [[ $(jq -r .status <<<"$result") == updated ]]; then
       print_success "  $(jq -r '.before + " -> " + .after' <<<"$result")"
       ((++UPDATED))
+    elif [[ $(jq -r .status <<<"$result") == waiting ]]; then
+      reason=$(jq -r '.available + ": " + .reason' <<<"$result")
+      print_warning "  Waiting for $reason"
+      ((++WAITING))
+      report_package "$package" waiting "$reason"
     else
       print_info "  $(jq -r '.reason' <<<"$result")"
       ((++SKIPPED))
@@ -1104,8 +1125,29 @@ enforce_branch_lockstep() {
       printf '%s\n' "${pin:-missing:$package}"
     done | sort -u | grep -c .)
     (( commits > 1 )) || continue
-    print_error "Lockstep violation on $key: ${members[*]} pin different commits; restoring all of them"
+    # When the only reason is a member waiting on upstream, the group waits
+    # with it. Nothing failed, so the run must not fail either.
+    local outcome=failed statuses=""
     for package in "${members[@]}"; do
+      statuses+="${REPORT_STATUS[$package]:-} "
+    done
+    if [[ "$statuses" == *waiting* && "$statuses" != *failed* ]]; then
+      outcome=waiting
+    fi
+    if [[ "$outcome" == failed ]]; then
+      print_error "Lockstep violation on $key: ${members[*]} pin different commits; restoring all of them"
+    else
+      print_warning "  ${members[*]} move together on $key; restoring all of them until upstream is complete"
+    fi
+    for package in "${members[@]}"; do
+      if [[ -z "${REPORT_STATUS[$package]:-}" ]]; then
+        if [[ "$outcome" == failed ]]; then
+          report_package "$package" failed "pins a different commit than ${members[*]}; all were restored"
+        else
+          report_package "$package" waiting "restored with ${members[*]}, which move together"
+          ((++WAITING))
+        fi
+      fi
       if ! cmp -s "$TEMP_DIR/before/$package" "$PKGBUILDS_DIR/$package/PKGBUILD"; then
         cp "$TEMP_DIR/before/$package" "$PKGBUILDS_DIR/$package/PKGBUILD"
         # Not ((--UPDATED)): an arithmetic command that evaluates to zero
@@ -1113,7 +1155,7 @@ enforce_branch_lockstep() {
         UPDATED=$((UPDATED > 0 ? UPDATED - 1 : 0))
       fi
     done
-    ((++FAILED))
+    [[ "$outcome" != failed ]] || ((++FAILED))
   done
 }
 
@@ -1125,7 +1167,11 @@ sync_in_lane() {
     ((++SKIPPED))
     return 0
   fi
+  local failed_before=$FAILED
   sync_package "$package"
+  if (( FAILED > failed_before )) && [[ -z "${REPORT_STATUS[$package]:-}" ]]; then
+    report_package "$package" failed "see the run log"
+  fi
 }
 
 if [[ ${#SPECIFIC_PACKAGES[@]} -gt 0 ]]; then
@@ -1166,6 +1212,7 @@ fi
 echo "  Target: $PKGBUILDS_DIR"
 echo "  Updated: $UPDATED"
 echo "  Skipped: $SKIPPED"
+echo "  Waiting: $WAITING"
 echo "  Failed: $FAILED"
 
 if [[ $FAILED -gt 0 ]]; then

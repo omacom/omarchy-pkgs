@@ -555,6 +555,10 @@ prefixes remain unchanged so existing PRs keep receiving updates. The separate
   current PR check results are counted separately: checks still running (or
   not started yet) are pending, and the sync does not wait for builds.
   Feed-fetch, setup, and missing-result failures still fail the workflow.
+  The notification names each package whose feed failed, with the error.
+  A release whose files upstream has not all published yet is not a
+  failure: the package waits, its recipe stays as it is, and the
+  notification turns yellow and names it until the files arrive.
   A failed `sync-rebuilds.yml` run also posts to Basecamp.
 - Every self-merging path (both workflows and `auto-merge-pr.yml`) needs
   the `PKGS_BOT_TOKEN` secret: a personal access token with Contents and Pull
