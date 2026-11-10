@@ -1,17 +1,23 @@
 # m1n1-aurora
 
 Build the canonical Aurora bootloader package from an immutable omacom/m1n1
-commit. The current candidate is bc79acc434e612ffcb95bfc7cb2fd7543afac5f2
-(merged source PRs #6, #7, #8, #10, #12, #13, #14, #15, #17, #18 and #19: on
-the 16-inch M3 Max with the 40-core GPU, J516C, m1n1 requests its existing display and GPU
-handoffs by default, subject to the existing checks), with Clang/lld, Rust 1.89.0 and
-`-Os`. Native J516C graphics also need the kernel's automatic J516C display request and
-display-before-GPU gate (omacom/linux-aurora#246) and the kernel's J516C board data; those
-are outside this package. The merge also includes #17's T6030 external-display
-dependency fix: a display handoff requests its required memory handoff. The
-package's existing 48/128/256 artwork is unchanged. The former USB4
-alias patch is already in the source; the APFS preboot UUID handoff proposed in
-omarchy-pkgs #1485 is also present upstream, so neither needs a local patch.
+commit. The current candidate is ba130ffbeeadaa35215ed88b07ebcee3199d0be7
+(integration/aurora after omacom/m1n1 #44). Since the previous candidate
+(bc79acc4) it adds #20 (T8122 powered GPU identity on 25G83), #25 (J504
+display and GPU defaults), #31 (J514C
+display and GPU defaults), #32 (J514M display and GPU defaults), #42 (J516M
+display and GPU defaults, and the T6031 device-tree allowance for T6034 boards)
+and #44 (J613 external display by default, only when the kernel's device tree
+has `apple,dma-range` on `apple,t8122-display-subsystem`, i.e. aurora15 or
+newer). Built with Clang/lld, Rust 1.89.0 and `-Os`. The package's existing
+48/128/256 artwork is unchanged.
+
+The J514M and J516M GPU defaults need mesa-aurora
+1:26.3.0_devel.20261107.231485.b7b03c5b3b8-1 (omacom/mesa #33) or newer on the
+same channel: older Mesa refuses the T6034 GPU and the desktop stays black.
+J613's external display is chosen from the device trees `update-m1n1` puts in
+`boot.bin`, not the booted kernel's, so a Limine snapshot of an older kernel
+still gets it; `chosen.asahi,t8122-dcpext=0` in `/etc/m1n1.conf` turns it off.
 
 ## Existing installations
 
@@ -56,10 +62,10 @@ This source and provider change also requires explicit maintainer approval.
 
 ## Qualification
 
-The #19 merge pin includes #17; this exact combined package has not yet been
-natively built or booted. The earlier #19 package was cold-booted by its J516C
-owner, and #17 was separately boot-tested on an M3 Pro. Those results do not
-replace qualification of this merge pin.
+This exact pin has not been natively built as a package or booted. A local
+build of integration/aurora + #42 (47820c81, which differs from this pin only
+by #44) booted a J514M to the GPU desktop with the matching kernel and Mesa in
+the lab. That result does not replace qualification of this package.
 
 Edge is the qualification channel. `package()` uses `--build-only`, so merging
 this PR allows the normal build/publish workflow to publish an edge candidate;
