@@ -13,6 +13,10 @@ Every tree gets the symbols an overlay needs (`-@`). Kbuild adds them only to th
 ## Adding a laptop
 
 - A tree, or a fix to one the kernel ships: a patch in kernel format (`git format-patch` against the kernel's tree), added to `source` and `b2sums`. It can only touch files under `arch/arm64/boot/dts/` or `include/dt-bindings/`, so a posted patch loses its `Makefile` and binding hunks first. Every `qcom/*.dts` is built, so a new tree needs no `Makefile` line. Patches apply in the order of `source`.
-- Hardware IDs systemd doesn't list: the laptop's `.json` file, added to `source` and `b2sums`. The notes on the files here are in the kernel's README, with each laptop.
+- Hardware IDs systemd doesn't list: the laptop's `.json` file, added to `source` and `b2sums`. The notes on the hardware ID files are in the kernel's README, with each laptop. A patch's notes are below.
 
 A patch stays here until the kernel moves to a new version. Then `pkgver` follows it, `pkgrel` starts again at 1, and the patches the new kernel has are dropped. If the kernel's recipe takes a patch from here before that, `prepare()` finds it in the kernel's sources, skips it and raises a warning on the CI run, and the patch can go. A patch that neither applies nor is in the sources stops the build.
+
+## Patches
+
+`0001` adds the Surface Laptop 7 15" (`x1e80100-microsoft-romulus15`) touchpad, a HID-over-SPI device on `spi19`, using the Surface Pro 11's spi-hid and QSPI patches in the kernel. On its own the pad stays in a mouse mode: pointer, tap and press to click. iptsd adds two-finger scroll, pinch and two-finger tap, but press to click stops registering, because iptsd doesn't decode the pad's haptic report yet. The 13.8" isn't covered, and hasn't been tested. By Jason Bruce Jones.
