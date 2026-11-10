@@ -10,7 +10,9 @@ Hardware matching establishes eligibility. Actual activation still requires the 
 
 18-CPU support is provisional: we assume that SKU uses the same validated ACPI hierarchy with two fewer cores, and let the existing runtime checks test that assumption. We have access only to the 20-CPU P16 and cannot physically test the 18-CPU version. A native 18-CPU owner must validate boot, suspend/resume and power consumption; their ACPI/topology and kernel logs will guide any further adaptation. Passing source tests or reducing the CPUs exposed on a 20-CPU machine does not establish native 18-CPU hardware compatibility. If the firmware contract does not match, the existing non-coordinated fallback remains available.
 
-Only H7607BA BIOS 303 has been physically tested so far. Removing the version and hash pins does not establish hardware validation of other firmware revisions.
+H7607BA BIOS 303 and 305 have physical test evidence, scoped to the kernels and
+intervals recorded below. Removing version and hash pins does not establish
+hardware validation of other firmware revisions.
 
 ## Patch order and provenance
 
@@ -48,6 +50,8 @@ claimed. Its SHA-256 is
 `8a2319ae87519a94298e5e086c0b5ce2729fda8d6496728147e475033d60d8ae`.
 
 6. `1125`: preserve Ryan Hughes' existing DRIPS latency adjustment for non-coordinated N1x states, including fallback when coordination is refused. Coordinated composite latencies are unchanged.
+7. `1126`: admit the complete known BIOS 305 parent profiles while retaining BIOS
+   303 support, firmware timing sentinels, system QoS and suspend-only guards.
 
 ## Evidence and limits
 
