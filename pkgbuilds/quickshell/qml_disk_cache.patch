@@ -1,0 +1,513 @@
+diff --git c/CMakeLists.txt i/CMakeLists.txt
+index ac82237..76a7d2b 100644
+--- c/CMakeLists.txt
++++ i/CMakeLists.txt
+@@ -111,7 +111,7 @@ if (NOT CMAKE_BUILD_TYPE)
+ endif()
+ 
+ set(QT_FPDEPS Gui Qml Quick QuickControls2 Widgets ShaderTools)
+-set(QT_PRIVDEPS QuickPrivate)
++set(QT_PRIVDEPS QuickPrivate QmlCompilerPrivate)
+ 
+ include(cmake/pch.cmake)
+ 
+diff --git c/src/core/CMakeLists.txt i/src/core/CMakeLists.txt
+index 4824965..b1b46e6 100644
+--- c/src/core/CMakeLists.txt
++++ i/src/core/CMakeLists.txt
+@@ -15,6 +15,7 @@ qt_add_library(quickshell-core STATIC
+ 	scan.cpp
+ 	scanenv.cpp
+ 	qsintercept.cpp
++	qmlcache.cpp
+ 	incubator.cpp
+ 	lazyloader.cpp
+ 	easingcurve.cpp
+@@ -55,7 +56,7 @@ qt_add_qml_module(quickshell-core
+ 
+ install_qml_module(quickshell-core)
+ 
+-target_link_libraries(quickshell-core PRIVATE Qt::Quick Qt::QuickPrivate Qt::Widgets quickshell-build PkgConfig::libdrm)
++target_link_libraries(quickshell-core PRIVATE Qt::Quick Qt::QuickPrivate Qt::QmlCompilerPrivate Qt::Widgets quickshell-build PkgConfig::libdrm)
+ 
+ qs_module_pch(quickshell-core SET large)
+ 
+diff --git c/src/core/generation.cpp i/src/core/generation.cpp
+index 878abbc..3825b8a 100644
+--- c/src/core/generation.cpp
++++ i/src/core/generation.cpp
+@@ -25,6 +25,7 @@
+ #include "incubator.hpp"
+ #include "logcat.hpp"
+ #include "plugin.hpp"
++#include "qmlcache.hpp"
+ #include "qsintercept.hpp"
+ #include "reload.hpp"
+ #include "scan.hpp"
+@@ -50,6 +51,8 @@ EngineGeneration::EngineGeneration(const QDir& rootPath, QmlScanner scanner)
+ 	this->engine->addImportPath("qs:@/");
+ 
+ 	this->engine->setNetworkAccessManagerFactory(&this->interceptNetFactory);
++	// A default generation (the reload popup's) serves no config of its own.
++	if (this->rootPath != QDir()) qs::qmlcache::setGeneration(this->rootPath, &this->scanner.fileIntercepts);
+ 	this->incubationController.initLoop();
+ 	this->engine->setIncubationController(&this->incubationController);
+ 
+@@ -63,6 +66,8 @@ EngineGeneration::EngineGeneration(const QDir& rootPath, QmlScanner scanner)
+ EngineGeneration::EngineGeneration(): EngineGeneration(QDir(), QmlScanner()) {}
+ 
+ EngineGeneration::~EngineGeneration() {
++	qs::qmlcache::clearGeneration(&this->scanner.fileIntercepts);
++
+ 	for (auto* extension: this->extensions.values()) {
+ 		delete extension;
+ 	}
+diff --git c/src/core/qmlcache.cpp i/src/core/qmlcache.cpp
+new file mode 100644
+index 0000000..be2e7e8
+--- /dev/null
++++ i/src/core/qmlcache.cpp
+@@ -0,0 +1,296 @@
++#include "qmlcache.hpp"
++
++#include <cstddef>
++#include <cstring>
++#include <limits>
++
++#include <fcntl.h>
++#include <sys/mman.h>
++#include <sys/stat.h>
++#include <unistd.h>
++
++#include <private/qqmljscompiler_p.h>
++#include <private/qv4compileddata_p.h>
++#include <qcryptographichash.h>
++#include <qdatetime.h>
++#include <qdiriterator.h>
++#include <qfile.h>
++#include <qhash.h>
++#include <qlogging.h>
++#include <qloggingcategory.h>
++#include <qmutex.h>
++#include <qqmlprivate.h>
++#include <qsavefile.h>
++#include <qset.h>
++#include <qthread.h>
++#include <qthreadpool.h>
++#include <qurl.h>
++
++#include "logcat.hpp"
++
++namespace qs::qmlcache {
++
++namespace {
++QS_LOGGING_CATEGORY(logQmlCache, "quickshell.qmlcache", QtWarningMsg);
++
++// Entries not loaded for this long are removed when the cache is installed.
++constexpr qint64 PRUNE_AFTER_DAYS = 30;
++
++struct Generation {
++	QDir configRoot;
++	const QHash<QString, QString>* fileIntercepts = nullptr;
++};
++
++struct State {
++	QMutex mutex;
++	QDir cacheDir;
++	// Live generations; the cache serves only while there is one.
++	QList<Generation> generations;
++	QHash<QByteArray, QQmlPrivate::CachedQmlUnit*> units;
++	QSet<QByteArray> pending;
++};
++
++State* state = nullptr; // NOLINT
++
++// The local file a qs: URL is served from (see QsInterceptNetworkAccessManager).
++QString localPath(const Generation& generation, const QUrl& url) {
++	auto path = url.path();
++	if (path.startsWith(QStringLiteral("@/qs/"))) return generation.configRoot.filePath(path.sliced(5));
++	if (path.startsWith('/')) return path;
++	return QString();
++}
++
++// Exactly what the engine would load: the scanner's rewrite of the file, or the file.
++bool servedText(const Generation& generation, const QString& path, QString& text) {
++	{
++		auto lock = QMutexLocker(&interceptMutex());
++		if (auto it = generation.fileIntercepts->constFind(path);
++		    it != generation.fileIntercepts->constEnd() && !it->isEmpty())
++		{
++			text = *it;
++			return true;
++		}
++	}
++
++	auto file = QFile(path);
++	if (!file.open(QFile::ReadOnly)) return false;
++	text = QString::fromUtf8(file.readAll());
++	return file.error() == QFile::NoError;
++}
++
++// The engine trusts a cached unit's offsets, so a damaged file must not reach
++// it. The checksum covers the flags, which saving sets after it was computed.
++bool checksumMatches(const QV4::CompiledData::Unit* unit) {
++	using Unit = QV4::CompiledData::Unit;
++	const auto* bytes = reinterpret_cast<const char*>(unit);
++	const auto start = offsetof(Unit, md5Checksum) + sizeof(unit->md5Checksum);
++	const auto flagsAt = offsetof(Unit, flags);
++	static_assert(offsetof(Unit, flags) > offsetof(Unit, md5Checksum));
++
++	const quint32_le flags(unit->flags & ~quint32(Unit::StaticData | Unit::PendingTypeCompilation));
++	auto hash = QCryptographicHash(QCryptographicHash::Md5);
++	hash.addData(QByteArrayView(bytes + start, flagsAt - start));
++	hash.addData(QByteArrayView(reinterpret_cast<const char*>(&flags), sizeof(flags)));
++	hash.addData(QByteArrayView(bytes + flagsAt + sizeof(flags), unit->unitSize - flagsAt - sizeof(flags)));
++	return std::memcmp(hash.result().constData(), unit->md5Checksum, sizeof(unit->md5Checksum)) == 0;
++}
++
++// Maps a compiled unit for the life of the process, as the engine expects of
++// a cached unit. A truncated, damaged or foreign file is rejected.
++const QV4::CompiledData::Unit* mapUnit(const QString& path, qint64* mtime) {
++	auto fd = ::open(path.toLocal8Bit().constData(), O_RDONLY | O_CLOEXEC);
++	if (fd == -1) return nullptr;
++
++	struct stat info {};
++	void* data = MAP_FAILED;
++	if (::fstat(fd, &info) == 0 && info.st_size >= static_cast<off_t>(sizeof(QV4::CompiledData::Unit))
++	    && info.st_size <= static_cast<off_t>(std::numeric_limits<quint32>::max()))
++	{
++		data = ::mmap(nullptr, info.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
++	}
++	::close(fd);
++	if (data == MAP_FAILED) return nullptr;
++
++	// The engine checks the header again (Unit::verifyHeader is not exported);
++	// a unit from another Qt is recompiled here rather than refused there.
++	const auto* unit = static_cast<const QV4::CompiledData::Unit*>(data);
++	if (unit->unitSize != static_cast<quint32>(info.st_size)
++	    || std::memcmp(unit->magic, QV4::CompiledData::magic_str, sizeof(unit->magic)) != 0
++	    || unit->version != static_cast<quint32>(QV4_DATA_STRUCTURE_VERSION) || !checksumMatches(unit))
++	{
++		qCDebug(logQmlCache) << "Discarding" << path;
++		::munmap(data, info.st_size);
++		return nullptr;
++	}
++
++	*mtime = info.st_mtim.tv_sec;
++	return unit;
++}
++
++bool compile(const QUrl& url, const QString& text, const QString& out) {
++	auto file = QSaveFile(out);
++	if (!file.open(QIODevice::WriteOnly)) return false;
++
++	auto save = [&](const QV4::CompiledData::SaveableUnitPointer& unit,
++	                const QQmlJSAotFunctionMap& /*aot*/,
++	                const LookupSignatures& /*signatures*/,
++	                QString* /*error*/) {
++		return unit.saveToDisk<char>([&](const char* data, quint32 size) {
++			return file.write(data, size) == size;
++		});
++	};
++
++	// The unit records the URL it was compiled for, which the engine resolves
++	// relative URLs against, so it is the URL the engine asked for.
++	QmlIR::Document document(QString(), QString(), false);
++	QQmlJSCompileError error;
++	if (!qCompileQmlFile(
++	        document,
++	        url.toString(),
++	        save,
++	        nullptr,
++	        &error,
++	        false,
++	        QV4::Compiler::defaultCodegenWarningInterface(),
++	        &text
++	    ))
++	{
++		// The engine compiles the source itself and reports the error.
++		qCDebug(logQmlCache) << "Not caching" << url << error.message;
++		file.cancelWriting();
++		return false;
++	}
++
++	return file.commit();
++}
++
++// Compiles in the background, at idle priority, for the next start; this one
++// loads the source as it would have without a cache.
++QThreadPool* compilePool() {
++	static auto* pool = []() {
++		auto* pool = new QThreadPool();
++		pool->setMaxThreadCount(1);
++		pool->setThreadPriority(QThread::IdlePriority);
++		return pool;
++	}();
++	return pool;
++}
++
++void scheduleCompile(const QByteArray& key, const QUrl& url, const QString& text, const QString& file) {
++	compilePool()->start([key, url, text, file]() {
++		if (compile(url, text, file)) qCDebug(logQmlCache) << "Compiled" << url;
++		auto lock = QMutexLocker(&state->mutex);
++		state->pending.remove(key);
++	});
++}
++
++void schedulePrune() {
++	auto dir = state->cacheDir.path();
++	compilePool()->start([dir]() {
++		auto cutoff = QDateTime::currentDateTime().addDays(-PRUNE_AFTER_DAYS);
++		// With the temporary files a compile killed midway leaves.
++		auto it = QDirIterator(dir, {QStringLiteral("*.qmlc*")}, QDir::Files);
++		while (it.hasNext()) {
++			auto entry = it.nextFileInfo();
++			if (entry.lastModified() < cutoff) QFile::remove(entry.filePath());
++		}
++	});
++}
++
++const QQmlPrivate::CachedQmlUnit* lookup(const QUrl& url) {
++	if (state == nullptr || url.scheme() != QStringLiteral("qs")) return nullptr;
++	if (!url.path().endsWith(QStringLiteral(".qml"))) return nullptr;
++
++	// Held throughout, so the generation cannot be destroyed under the lookup.
++	// While a reload overlaps two generations, a lookup cannot tell which
++	// engine asks, and each is served its own scanner's text, so both compile.
++	auto lock = QMutexLocker(&state->mutex);
++	if (state->generations.size() != 1) return nullptr;
++	const auto& generation = state->generations.first();
++
++	auto path = localPath(generation, url);
++	if (path.isEmpty()) return nullptr;
++
++	QString text;
++	if (!servedText(generation, path, text)) return nullptr;
++
++	auto hash = QCryptographicHash(QCryptographicHash::Sha256);
++	hash.addData(QByteArrayView("quickshell-qmlcache-1\n"));
++	hash.addData(QByteArrayView(qVersion()));
++	hash.addData(QByteArray::number(QV4_DATA_STRUCTURE_VERSION));
++	hash.addData(url.toEncoded());
++	hash.addData(text.toUtf8());
++	auto key = hash.result().toHex();
++
++	if (auto it = state->units.constFind(key); it != state->units.constEnd()) return *it;
++
++	auto file = state->cacheDir.filePath(QString::fromLatin1(key) + QStringLiteral(".qmlc"));
++	qint64 mtime = 0;
++	const auto* unit = mapUnit(file, &mtime);
++
++	if (unit == nullptr) {
++		if (!state->pending.contains(key)) {
++			state->pending.insert(key);
++			scheduleCompile(key, url, text, file);
++		}
++		return nullptr;
++	}
++
++	// Loading an entry keeps it from being pruned.
++	if (QDateTime::currentSecsSinceEpoch() - mtime > 86400) {
++		auto handle = QFile(file);
++		if (handle.open(QFile::ReadWrite)) {
++			handle.setFileTime(QDateTime::currentDateTime(), QFile::FileModificationTime);
++		}
++	}
++
++	qCDebug(logQmlCache) << "Loaded" << url;
++	auto* cached = new QQmlPrivate::CachedQmlUnit {unit, nullptr, nullptr};
++	state->units.insert(key, cached);
++	return cached;
++}
++
++} // namespace
++
++QRecursiveMutex& scanMutex() {
++	static QRecursiveMutex mutex;
++	return mutex;
++}
++
++QMutex& interceptMutex() {
++	static QMutex mutex;
++	return mutex;
++}
++
++void install(const QDir& cacheDir) {
++	if (state != nullptr) return;
++	if (qEnvironmentVariableIntValue("QS_DISABLE_QML_CACHE") == 1) return;
++
++	if (!cacheDir.mkpath(QStringLiteral("."))) {
++		qCWarning(logQmlCache) << "Could not create QML cache directory" << cacheDir.path();
++		return;
++	}
++
++	state = new State();
++	state->cacheDir = cacheDir;
++	schedulePrune();
++
++	static QQmlPrivate::RegisterQmlUnitCacheHook hook {0, &lookup};
++	QQmlPrivate::qmlregister(QQmlPrivate::QmlUnitCacheHookRegistration, &hook);
++}
++
++void setGeneration(const QDir& configRoot, const QHash<QString, QString>* fileIntercepts) {
++	if (state == nullptr) return;
++	auto lock = QMutexLocker(&state->mutex);
++	state->generations.append({.configRoot = configRoot, .fileIntercepts = fileIntercepts});
++}
++
++void clearGeneration(const QHash<QString, QString>* fileIntercepts) {
++	if (state == nullptr) return;
++	auto lock = QMutexLocker(&state->mutex);
++	state->generations.removeIf([&](const Generation& generation) {
++		return generation.fileIntercepts == fileIntercepts;
++	});
++}
++
++} // namespace qs::qmlcache
+diff --git c/src/core/qmlcache.hpp i/src/core/qmlcache.hpp
+new file mode 100644
+index 0000000..24bdc8d
+--- /dev/null
++++ i/src/core/qmlcache.hpp
+@@ -0,0 +1,28 @@
++#pragma once
++
++#include <qdir.h>
++#include <qhash.h>
++#include <qmutex.h>
++#include <qstring.h>
++
++namespace qs::qmlcache {
++
++// Serializes the URL interceptor's on-demand scans across the GUI and loader threads.
++QRecursiveMutex& scanMutex();
++
++// Guards the scanner's file intercepts, which the loader thread reads while a
++// scan can still add to them. Held only around the map itself, never while
++// calling out, since the cache hook takes it under Qt's metatype lock.
++QMutex& interceptMutex();
++
++// Serves QML from a compiled cache in `cacheDir`, so a later start skips
++// parsing and compiling every file it loads. Units are keyed by the exact text
++// the engine would load, so any change to a file, an intercept or a Qt update
++// misses and compiles again.
++void install(const QDir& cacheDir);
++
++// The config root `qs:@/qs/` maps to and the scanner's intercepted texts.
++void setGeneration(const QDir& configRoot, const QHash<QString, QString>* fileIntercepts);
++void clearGeneration(const QHash<QString, QString>* fileIntercepts);
++
++} // namespace qs::qmlcache
+diff --git c/src/core/qsintercept.cpp i/src/core/qsintercept.cpp
+index 8f14178..cc4dcbe 100644
+--- c/src/core/qsintercept.cpp
++++ i/src/core/qsintercept.cpp
+@@ -17,6 +17,7 @@
+ #include <qurl.h>
+ 
+ #include "logcat.hpp"
++#include "qmlcache.hpp"
+ #include "scan.hpp"
+ 
+ QS_LOGGING_CATEGORY(logQsIntercept, "quickshell.interceptor", QtWarningMsg);
+@@ -30,7 +31,9 @@ QUrl QsUrlInterceptor::intercept(
+ 	    && url.isLocalFile())
+ 	{
+ 		auto path = QFileInfo(url.toLocalFile()).absoluteFilePath();
++		auto lock = QMutexLocker(&qs::qmlcache::scanMutex());
+ 		this->scanner.scanDir(QFileInfo(path).dir());
++		auto interceptLock = QMutexLocker(&qs::qmlcache::interceptMutex());
+ 		if (this->scanner.fileIntercepts.contains(path)) url.setScheme("qs");
+ 	}
+ 
+@@ -115,13 +118,16 @@ QNetworkReply* QsInterceptNetworkAccessManager::createRequest(
+ 		if (path.startsWith("@/qs/")) path = this->configRoot.filePath(path.sliced(5));
+ 		// otherwise pass through to fs
+ 
+-		qCDebug(logQsIntercept) << "Got intercept for" << path << "contains"
+-		                        << this->fileIntercepts.value(path);
+-
+-		if (auto data = this->fileIntercepts.value(path); !data.isEmpty()) {
+-			return new QsInterceptDataReply(data, this);
++		QString data;
++		{
++			auto lock = QMutexLocker(&qs::qmlcache::interceptMutex());
++			data = this->fileIntercepts.value(path);
+ 		}
+ 
++		qCDebug(logQsIntercept) << "Got intercept for" << path << "contains" << data;
++
++		if (!data.isEmpty()) return new QsInterceptDataReply(data, this);
++
+ 		auto fileReq = req;
+ 		auto fileUrl = req.url();
+ 		fileUrl.setScheme("file");
+diff --git c/src/core/scan.cpp i/src/core/scan.cpp
+index de443ba..099fe40 100644
+--- c/src/core/scan.cpp
++++ i/src/core/scan.cpp
+@@ -19,6 +19,7 @@
+ #include <qtextstream.h>
+ 
+ #include "logcat.hpp"
++#include "qmlcache.hpp"
+ #include "scanenv.hpp"
+ 
+ QS_LOGGING_CATEGORY(logQmlScanner, "quickshell.qmlscanner", QtWarningMsg);
+@@ -132,6 +133,7 @@ void QmlScanner::scanDir(const QDir& dir) {
+ 		}
+ 
+ 		qCDebug(logQmlScanner) << "Synthesized qmldir for" << path << qPrintable("\n" + qmldir);
++		auto lock = QMutexLocker(&qs::qmlcache::interceptMutex());
+ 		this->fileIntercepts.insert(QDir(path).filePath("qmldir"), qmldir);
+ 	}
+ 
+@@ -263,6 +265,7 @@ bool QmlScanner::scanQmlFile(const QString& path, bool& singleton, bool& interna
+ 	}
+ 
+ 	if (isOverridden) {
++		auto lock = QMutexLocker(&qs::qmlcache::interceptMutex());
+ 		this->fileIntercepts.insert(path, overrideText);
+ 	}
+ 
+@@ -338,6 +341,7 @@ bool QmlScanner::scanQmlJson(const QString& path) {
+ 
+ 	qCDebug(logQmlScanner) << "Synthesized qml file for" << path << qPrintable("\n" + body);
+ 
++	auto lock = QMutexLocker(&qs::qmlcache::interceptMutex());
+ 	this->fileIntercepts.insert(path.first(path.length() - 5), body);
+ 	this->scannedFiles.push_back(path);
+ 	return true;
+diff --git c/src/launch/launch.cpp i/src/launch/launch.cpp
+index f2542ae..feaa6e3 100644
+--- c/src/launch/launch.cpp
++++ i/src/launch/launch.cpp
+@@ -22,6 +22,7 @@
+ #include "../core/logging.hpp"
+ #include "../core/paths.hpp"
+ #include "../core/plugin.hpp"
++#include "../core/qmlcache.hpp"
+ #include "../core/qmlglobal.hpp"
+ #include "../core/rootwrapper.hpp"
+ #include "../ipc/ipc.hpp"
+@@ -232,7 +233,7 @@ int launch(const LaunchArgs& args, char** argv) {
+ 		}
+ 	}
+ 
+-	// The qml engine currently refuses to cache non file (qsintercept) paths.
++	// The qml engine refuses to cache non file (qsintercept) paths itself; qmlcache.cpp does.
+ 
+ 	// if (auto* cacheDir = QsPaths::instance()->cacheDir()) {
+ 	// 	auto qmlCacheDir = cacheDir->filePath("qml-engine-cache");
+@@ -293,6 +294,11 @@ int launch(const LaunchArgs& args, char** argv) {
+ 	LogManager::initThreadLogging();
+ 	LogManager::initFs();
+ 
++	// A cache directory that could not be made reads as the working directory.
++	if (auto cacheDir = QsPaths::instance()->shellCacheDir(); cacheDir != QDir()) {
++		qs::qmlcache::install(QDir(cacheDir.filePath("qmlcache")));
++	}
++
+ 	QGuiApplication::setDesktopFileName(appId);
+ 
+ 	if (args.debugPort != -1) {
