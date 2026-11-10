@@ -217,6 +217,21 @@ promote alpha && [[ "$(entries rc)" == *"alpha-1.0-5 "* ]] && grep -q "stale: un
   && jq -e -s '[.[] | select(.type=="deps")] | .[0].result == "pass" and .[0].existing[0].package == "stale"' "$T/record" >/dev/null \
   && pass "a package rc already could not install is reported, not held against the promotion, and only alpha and stale are checked" || fail "existing breakage: $(cat "$T/out")"
 
+# A package already broken is excused only for the reasons it already had:
+# old2 lacked gone2 before, and promoting beta also takes away the beta it
+# pins, so the promotion is refused and names only the new reason.
+recipe beta '{"source": "local"}'
+recipe old2 '{"source": "local"}'
+pub rc $(mkpkg beta 1) $(DEPENDS="gone2 beta=1.0-1" mkpkg old2 1)
+pub edge $(mkpkg beta 2)
+rc_before=$(entries rc)
+: > "$T/record"
+if promote beta; then fail "a package that gains a reason to fail should refuse"; else
+  grep -q "old2: unable to satisfy dependency 'beta=1.0-1' required by old2" "$T/out" && [[ "$(entries rc)" == "$rc_before" ]] \
+    && jq -e -s '[.[] | select(.type=="deps")] | .[0].result == "refused" and .[0].problems == [{"package": "old2", "problem": "unable to satisfy dependency '"'"'beta=1.0-1'"'"' required by old2"}]' "$T/record" >/dev/null \
+    && pass "a package already broken is excused only for the reasons it already had" || fail "gained reason: $(cat "$T/out")"
+fi
+
 # A pacman that fails for another reason than a dependency refuses: it must
 # not count every target as already broken and pass. That holds when the
 # failure comes with pacman's dependency or not-found message too, and
@@ -238,6 +253,24 @@ for broken in init db many; do
     && grep -q 'nothing published' "$T/out" && [[ "$(entries rc)" == "$rc_before" ]] || fail "broken pacman ($broken): $(cat "$T/out")"
 done
 pass "a pacman that cannot run, or reports a broken database, refuses the promotion instead of passing it"
+
+# Reasons are compared one by one, not as joined text: a version may hold a
+# semicolon, and split on "; " the new reason 'foo=1;4' would look like
+# pieces of the two old ones.
+mkdir -p "$T/twoview-pacman"
+cat > "$T/twoview-pacman/pacman" <<'PACMAN'
+#!/bin/sh
+echo 'error: failed to prepare transaction (could not satisfy dependencies)'
+echo ":: unable to satisfy dependency 'foo=1;2' required by p"
+echo ":: unable to satisfy dependency 'bar=3;4' required by p"
+case "$*" in *db-after*) echo ":: unable to satisfy dependency 'foo=1;4' required by p" ;; esac
+exit 1
+PACMAN
+chmod +x "$T/twoview-pacman/pacman"
+: > "$T/record"
+if PATH="$T/twoview-pacman:$PATH" promote alpha; then fail "a reason gained after the promotion should refuse, semicolons and all"; fi
+grep -q "alpha: unable to satisfy dependency 'foo=1;4' required by p" "$T/out" && [[ "$(entries rc)" == "$rc_before" ]] \
+  && pass "a gained reason is found even when versions hold semicolons" || fail "semicolon reasons: $(cat "$T/out")"
 
 # With the channel's Arch snapshot, pacman resolves as on a machine on the
 # channel: a name Omarchy serves takes over from Arch's.
