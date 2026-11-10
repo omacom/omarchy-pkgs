@@ -265,3 +265,14 @@ if promote edge rc aarch64 alpha; then fail "a crashing check should refuse"; fi
 grep -q 'Refusing to promote edge/aarch64 into rc/aarch64: nothing published' "$T/out" && [[ "$(entries rc aarch64)" == "$rc_before" ]] \
   && pass "a check that cannot run refuses and publishes nothing" || fail "check crash: $(entries rc aarch64)"
 cp "$T/check-mac-set" "$BIN/check-mac-set"
+
+# The check resolves against the repositories an ARM machine has: [omarchy],
+# core, extra and alarm. Arch Linux ARM's aur is mirrored but no machine
+# lists it, so a dependency only it provides refuses the promotion.
+recipe aur-user '{"source": "local"}' aarch64
+repo-add -q "$OMARCHY_ARCH_SNAPSHOT/aur.db.tar.gz" $(mkpkg aur-only 1 aarch64) >/dev/null 2>&1
+pub edge aarch64 $(mkpkg aur-user 1 aarch64 aur-only)
+rc_before=$(entries rc aarch64)
+if promote edge rc aarch64 aur-user; then fail "a package needing what only Arch Linux ARM's aur has should refuse"; fi
+grep -q "aur-user: unable to satisfy dependency 'aur-only' required by aur-user" "$T/out" && [[ "$(entries rc aarch64)" == "$rc_before" ]] \
+  && pass "a dependency only Arch Linux ARM's aur provides is not installable on an ARM machine" || fail "aur: $(cat "$T/out")"
