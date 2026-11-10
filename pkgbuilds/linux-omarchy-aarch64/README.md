@@ -468,6 +468,10 @@ The tablet has two speakers and two microphones like the Zenbook A14, so the sou
 
 The package installs `glymur-asus-proart-pz14-ht7407na.json` with five hardware IDs, the ones systemd-stub compares that hold across BIOS updates and need neither the SKU, which is blank, nor the panel.
 
+### Surface Laptop 7 15-inch touchpad
+
+`linux-omarchy-dtbs`'s `0001` adds the Surface Laptop 7 15" (`x1e80100-microsoft-romulus15`) touchpad, a HID-over-SPI device on `spi19`, using the Surface Pro 11's spi-hid and QSPI patches above. On its own the pad stays in a mouse mode: pointer, tap and press to click. iptsd adds two-finger scroll, pinch and two-finger tap, but press to click stops registering, because iptsd doesn't decode the pad's haptic report yet. The 13.8" isn't covered, and hasn't been tested.
+
 ## NVIDIA modules
 
 `linux-omarchy-nvidia-open` is NVIDIA's open kernel modules prebuilt for this kernel, so an N1x or GB10 machine on `linux-omarchy` doesn't compile them through DKMS on every kernel update. It's a third package of this recipe rather than a recipe of its own because CI builds each recipe alone against what edge already serves: a separate recipe would build against the previous kernel's headers and land after the kernel it's for, and its exact `linux-omarchy=$pkgver-$pkgrel` dependency would hold back `pacman -Syu` until it did. Built here, the modules come from the same tree as the kernel and publish with it.
