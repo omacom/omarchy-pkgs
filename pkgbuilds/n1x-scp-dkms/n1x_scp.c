@@ -104,6 +104,18 @@ static int n1x_scp_query(struct n1x_scp *scp, u16 command,
 		ret = -EPROTO;
 		goto out;
 	}
+	/* Validate the command payload while holding query_lock, before another
+	 * caller can use a channel whose firmware ABI no longer matches.
+	 */
+	if ((command == 0x25 &&
+	     (le16_to_cpu(reply->length) != 1 || reply->payload[0] != 2)) ||
+	    (command == 0x26 &&
+	     (le16_to_cpu(reply->length) != 121 ||
+	      reply->payload[0] != request.payload[0]))) {
+		scp->mailbox_poisoned = true;
+		ret = -EPROTO;
+		goto out;
+	}
 	/* Only acknowledge the channel after copying our matching response. */
 	iowrite32(BIT(0), scp->mailbox[1] + N1X_MBOX_OUT_CLEAR);
 	ret = 0;
@@ -133,8 +145,6 @@ static int n1x_scp_sensors_show(struct seq_file *seq, void *unused)
 
 	if (ret)
 		return ret;
-	if (le16_to_cpu(reply.length) != 1 || reply.payload[0] != 2)
-		return -EPROTO;
 	count = reply.payload[0];
 	seq_printf(seq, "descriptor_slots=%u\n", count);
 	/* Slot zero is empty in firmware 2.0.8.0. Slot one is the VEML3328.
@@ -147,8 +157,6 @@ static int n1x_scp_sensors_show(struct seq_file *seq, void *unused)
 		ret = n1x_scp_query(scp, 0x26, &id, sizeof(id), &reply);
 		if (ret)
 			return ret;
-		if (le16_to_cpu(reply.length) != 121 || reply.payload[0] != id)
-			return -EPROTO;
 		seq_printf(seq, "slot=%u descriptor=", id);
 		for (byte = 1; byte <= 120; byte++)
 			seq_printf(seq, "%02x", reply.payload[byte]);

@@ -34,18 +34,22 @@ The upstream README.md documents firmware offsets and OEM reference hashes.
 
 ## Validation and limits
 
-The reviewed source was physically tested on ASUS ProArt P16 H7607BA, BIOS 303,
+The upstream reviewed source was physically tested on ASUS ProArt P16 H7607BA, BIOS 303,
 ARM64 kernel 7.3.0-41.8, before and after a roughly 78-second s2idle cycle.
-The SCP status/version/descriptors and Pluton typed 4/5/7 queries succeeded.
+The SCP status/version/descriptors succeeded in that upstream validation.
 This is single-machine evidence, not a claim for every N1X BIOS or firmware.
-Both modules compile with W=1 against the tested 41.8 headers. check() runs
-sanitized fault tests plus packaging checks; Pluton also exercises malformed
-protocol replies, user-copy failures and eight serialized callers.
+The upstream SCP module compiled with W=1 against the tested 41.8 headers.
+These are historical upstream results, not hardware validation of this package's
+adaptations. Package `check()` runs `test_snapshot.py`, `test_mailbox.py` and
+`test_package.py`. The first two compile extracted production C with ASan/UBSan:
+snapshot allocation/copy/lifetime and mailbox token/command mismatches, oversized
+replies, timeouts, malformed descriptor counts/lengths/slots, poison before lock
+release and refusal of later queries. The packaging test checks manual loading
+and the ARM64 DKMS restriction. No hardware is accessed by these tests.
 
 PM callbacks serialize requests with suspend/resume and reject suspended
 operations. They do not manage firmware lifecycle/power. SCP snapshot opens
-copy SRAM privately; Pluton retains state for open files across removal and
-rejects removed-device requests. Hardware PM/unload behavior on other firmware
+copy SRAM privately. Hardware PM/unload behavior on other firmware
 remains unvalidated. Close diagnostic readers before manual removal; no automatic
 unload, reset or suspend is performed. No DSP/AFE/ALS/battery policy is installed.
 

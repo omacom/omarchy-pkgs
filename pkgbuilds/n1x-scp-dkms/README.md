@@ -14,7 +14,7 @@ queries for that driver instance.
 The register and log reference is OEM nvSCP 2.17.0.0, SHA256
 `d1cc1ae1a907d607ad979e84116a5febdb2f55136b612b210c68fdd57f901a47`,
 logger setup at `0x1400050a8`. Input metadata is recorded in
-`config/platform-oem.json`. The FreeRTOS 2.0.8.0 dispatch and reply
+`source-provenance.json` in this package. The FreeRTOS 2.0.8.0 dispatch and reply
 handlers are at Cortex-M offsets `0x3ff0`, `0x40f8` and `0x41a4`; the probe
 checks the instruction sequence at SRAM offset `0x41ce`.
 
