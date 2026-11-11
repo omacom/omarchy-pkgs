@@ -511,6 +511,40 @@ done
 pass "a dormant Mac defers to mkinitcpio's own hook; an active Mac also writes Limine's entries after it"
 
 # ---------------------------------------------------------------------------
+# Device trees and hardware IDs: a package that brings only these reaches the
+# UKIs on aarch64 through Limine's kernel hook, installed or removed. x86_64
+# keeps upstream's hook, and a Mac that has not activated Limine its own.
+arm_hook=$PKG_ARM/etc/pacman.d/hooks/90-mkinitcpio-install.hook
+diff <(grep -v '^Exec = ' "$upstream_hook/etc/pacman.d/hooks/90-mkinitcpio-install.hook") \
+  <(grep -v -e '^Exec = ' -e '^Target = boot/dtbs/\*$' -e '^Target = usr/lib/systemd/boot/hwids/\*$' "$arm_hook") >/dev/null ||
+  fail "aarch64's Limine kernel hook is upstream's with the gate and two targets added"
+[[ $(sed -n '/^Target = usr\/lib\/firmware\/\*$/{n;p;n;p;}' "$arm_hook") == $'Target = boot/dtbs/*\nTarget = usr/lib/systemd/boot/hwids/*' ]] ||
+  fail "the device tree and hardware ID targets follow the firmware target"
+pass "aarch64's Limine kernel hook also watches device trees and hardware IDs"
+
+dtb=boot/dtbs/linux-omarchy/qcom/x1e80100-fixture.dtb
+hwid=usr/lib/systemd/boot/hwids/aa64/linux-omarchy/x1e80100-fixture.json
+transaction trees "Upgrade Path $dtb" 'Upgrade Package linux-omarchy-dtbs'
+transaction hwids "Install Path $hwid" 'Upgrade Package linux-omarchy-dtbs'
+transaction trees-removed "Remove Path $hwid" "Remove Path $dtb" 'Remove Package linux-omarchy-dtbs'
+declare -A want_trees=(
+  [trees]=$'limine-mkinitcpio-install\n  '"$dtb"
+  [hwids]=$'limine-mkinitcpio-install\n  '"$hwid"
+  [trees-removed]=$'limine-mkinitcpio-install\n  '"$dtb"$'\n  '"$hwid"
+)
+for name in trees hwids trees-removed; do
+  got=$(replay x86_64 x86 "$name")
+  [[ -z $got ]] || fail "x86_64: $name transaction runs no hook" "$got"
+  for m in generic-aarch64 qualcomm mac-active; do
+    got=$(replay aarch64 "$m" "$name")
+    [[ $got == "${want_trees[$name]}" ]] || fail "aarch64 $m: $name transaction rebuilds the UKIs" "$got"
+  done
+  got=$(replay aarch64 mac-dormant "$name")
+  [[ -z $got ]] || fail "mac-dormant: $name transaction runs no hook" "$got"
+done
+pass "on aarch64 a device tree or hardware ID change alone rebuilds the UKIs; x86_64 and a dormant Mac run nothing"
+
+# ---------------------------------------------------------------------------
 # The wrapper, as sudo mkinitcpio -P and mkinitcpio's hook script call it
 # (/usr/local/bin first in PATH, stdin at its end).
 wrapper() {

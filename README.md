@@ -39,6 +39,10 @@ Questions and problems: open an issue on this repository.
    - Fill the checksums: run `updpkgsums` (from `pacman-contrib`) in the
      package directory. For a git source it leaves a clone of the source
      there; delete it before committing.
+   - Extract a vendor archive in `package()` with `bsdtar --no-same-owner`.
+     pacman installs the numeric owners a package records, so every file
+     must be owned by root. The build fails on any other owner, or on a
+     group other than root, tty, ftp or games.
 4. Declare where new releases come from in
    `pkgbuilds/my-package/.omarchy/package.json`, so updates arrive without
    another PR. See [docs/upstream-sources.md](docs/upstream-sources.md).
