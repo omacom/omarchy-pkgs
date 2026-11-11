@@ -11,7 +11,16 @@ if [[ -n "$flags_file" && -f "$flags_file" && -r "$flags_file" ]]; then
     line="${line%%#*}"
     [[ -n "${line//[[:space:]]/}" ]] || continue
     read -r -a flags <<<"$line"
-    user_flags+=("${flags[@]}")
+    for flag in "${flags[@]}"; do
+      case $flag in
+        --omarchy-disable-dictation-ducking)
+          export OMARCHY_CODEX_DISABLE_DICTATION_DUCKING=1
+          ;;
+        *)
+          user_flags+=("$flag")
+          ;;
+      esac
+    done
   done <"$flags_file"
 fi
 
