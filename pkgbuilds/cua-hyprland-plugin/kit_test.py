@@ -42,7 +42,7 @@ class KitTests(unittest.TestCase):
         derived = self.srcdir / kit.KIT
         self.assertEqual((derived / "PROFILE.json").read_bytes(), PROFILE.read_bytes())
         self.assertEqual(kit.sha256((derived / "KIT-PROVENANCE.json").read_bytes()), KIT_SHA256)
-        self.assertTrue((self.srcdir / "cua-hyprland-plugin-0.33.2-c82d32e3e1adbc6578a148962002ddf6e3e8a15a"
+        self.assertTrue((self.srcdir / "cua-hyprland-plugin-0.47.8-87558bfd064787c7839351c55d667dc8244044a4"
                          / "SOURCE-PROVENANCE.json").is_file())
 
     def test_moved_abi_version_is_admitted(self):
@@ -58,7 +58,7 @@ class KitTests(unittest.TestCase):
         changes = {
             "an extra runtime pin": lambda p: p["runtime"]["packages"].update(mesa="1:26.2.4-1"),
             "a dropped runtime pin": lambda p: p["runtime"]["packages"].pop("libxkbcommon"),
-            "a rebuilt compositor": lambda p: p["hyprland"].update(package_version="0.56.2-5"),
+            "a rebuilt compositor": lambda p: p["hyprland"].update(package_version="0.57.2-2"),
             "a changed compositor hash": lambda p: p["hyprland"].update(sha256="0" * 64),
             "a changed header hash": lambda p: p["hyprland"].update(headers_sha256="0" * 64),
             "a changed compiler hash": lambda p: p["compiler"].update(sha256="0" * 64),

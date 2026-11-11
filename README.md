@@ -39,6 +39,19 @@ Questions and problems: open an issue on this repository.
    - Fill the checksums: run `updpkgsums` (from `pacman-contrib`) in the
      package directory. For a git source it leaves a clone of the source
      there; delete it before committing.
+   - If upstream signs its releases, list the key's full fingerprint in
+     `validpgpkeys=()` and ship the key as
+     `pkgbuilds/my-package/keys/pgp/<FINGERPRINT>.asc`, the way Arch does.
+     Builds never ask a keyserver, so a key that is not in the file fails
+     the build; `tests/pgp-keys-vendored.sh` checks it locally. Take the
+     key from its owner (their site or WKD), and check that its fingerprint
+     matches what upstream publishes:
+
+     ```bash
+     gpg --auto-key-locate clear,nodefault,wkd --locate-external-keys dev@example.org
+     gpg --armor --export-options export-minimal --export <FINGERPRINT> \
+       > pkgbuilds/my-package/keys/pgp/<FINGERPRINT>.asc
+     ```
    - Extract a vendor archive in `package()` with `bsdtar --no-same-owner`.
      pacman installs the numeric owners a package records, so every file
      must be owned by root. The build fails on any other owner, or on a
@@ -619,6 +632,14 @@ Both can also be run from the Actions tab. Read
   with a dispatch.
 - **Check after a manual publish.** Confirm the package and version are in
   the channel database for each architecture it ships to.
+- **No network for keys in a build.** Source signatures verify against the
+  keys in each recipe's `keys/pgp/` only. A build that asks a keyserver
+  waits on someone else's uptime: on 11 November 2026 keyserver.ubuntu.com
+  went down, builds hung on `gpg --receive-keys` for up to two hours and
+  held every builder. `refresh-pgp-keys.yml` brings revocations and new
+  expiry dates in once a day; when it goes red, apply its
+  `refreshed-keys.patch` artifact, or run `bin/refresh-pgp-keys`, and open
+  a PR.
 
 ## Layout
 
@@ -648,6 +669,7 @@ docs/                          Reference
 | `sync-rebuilds.yml` | every 6 hours, dispatch | Dependency rebuild PR |
 | `package-prs.yml` | called by the sync workflows | Opens, updates and closes their PRs |
 | `builder-images.yml` | daily, changes to the image's inputs (push and PR), dispatch | Builds and tests the builder image; publishes it from `master` |
+| `refresh-pgp-keys.yml` | daily, dispatch | Merges revocations and new expiry dates into the shipped source-signing keys; fails with a patch when any changed |
 
 Secrets: the `publish` environment (usable from `master` only) holds the
 signing key and bucket credentials: `GPG_PRIVATE_KEY`, `GPG_PASSPHRASE`,

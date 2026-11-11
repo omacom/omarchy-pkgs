@@ -118,9 +118,19 @@ RUN ln -sf /usr/lib/os-release /etc/os-release && \
 # anything. Bootstrapping from the target's own tree would make the first
 # aarch64 build depend on an aarch64 repository that only that build can
 # create.
+#
+# The key comes from Omarchy's own WKD for pkgs@omarchy.org, never a public
+# keyserver. Only the pinned fingerprint is exported, so a different key
+# there leaves the export empty and fails the build.
 ARG MIRROR=edge
-RUN pacman-key --recv-keys 40DFB630FF42BCFFB047046CF0134EE680CAC571 --keyserver keys.openpgp.org && \
-    pacman-key --lsign-key 40DFB630FF42BCFFB047046CF0134EE680CAC571 && \
+ARG OMARCHY_KEY=40DFB630FF42BCFFB047046CF0134EE680CAC571
+RUN export GNUPGHOME="$(mktemp -d)" && \
+    gpg --batch --auto-key-locate clear,nodefault,wkd --locate-external-keys pkgs@omarchy.org && \
+    gpg --batch --export "${OMARCHY_KEY}" > /tmp/omarchy.gpg && \
+    test -s /tmp/omarchy.gpg && \
+    pacman-key --add /tmp/omarchy.gpg && \
+    rm -rf "${GNUPGHOME}" /tmp/omarchy.gpg && \
+    pacman-key --lsign-key "${OMARCHY_KEY}" && \
     printf '\n[omarchy]\nSigLevel = Optional\nServer = https://pkgs.omarchy.org/%s/x86_64\n' "${MIRROR}" >> /etc/pacman.conf && \
     pacman -Sy --noconfirm && \
     pacman -S --noconfirm omarchy-keyring && \
