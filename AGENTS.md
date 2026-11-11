@@ -6,11 +6,11 @@ omacom/omarchy.
 
 ## Signing keys
 
-- Builds never fetch PGP keys. No `gpg --recv-keys`, `--receive-keys`,
-  `--locate-keys` or key download in `build/`, `bin/build`, `helpers/`,
-  the workflows that build, or a PKGBUILD. On 11 November 2026
-  keyserver.ubuntu.com went down and such a lookup, with no timeout, held
-  every builder for two hours.
+- Builds never fetch the PGP keys that verify sources. No
+  `gpg --recv-keys`, `--receive-keys`, `--locate-keys` or key download in
+  `build/`, `bin/build`, `helpers/`, the workflows that build, or a
+  PKGBUILD. On 11 November 2026 keyserver.ubuntu.com went down and such a
+  lookup, with no timeout, held every builder for two hours.
 - Every fingerprint in a recipe's `validpgpkeys` ships as
   `pkgbuilds/<package>/keys/pgp/<FINGERPRINT>.asc`, with that fingerprint
   inside. `tests/pgp-keys-vendored.sh` fails otherwise.
@@ -23,6 +23,10 @@ omacom/omarchy.
   makepkg refuses its signatures.
 - The builder image takes Omarchy's own repository key from Omarchy's WKD
   and exports only the pinned fingerprint (`build/Dockerfile`).
+- These rules cover the keys that verify sources. The image bootstrap in
+  `build/Dockerfile` still downloads pacman's own trust roots, the
+  archlinux-keyring package and the Arch Linux ARM keyring files, when the
+  image is built. That happens once per image, not per package build.
 
 ## Tooling and packages
 
