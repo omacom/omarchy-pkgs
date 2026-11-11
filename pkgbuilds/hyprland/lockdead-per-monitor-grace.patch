@@ -1,0 +1,205 @@
+Give a monitor that returns mid-lock its own lockdead_screen_delay
+
+misc:lockdead_screen_delay is measured once, from when the session was
+locked. A monitor that comes back later in the lock -- a display waking from
+DPMS off whose link dropped, a dock re-enumerating after resume -- has no lock
+surface on its first frames, and since the lock is already older than the
+delay, Hyprland draws lockdead on it at once. The lock client is alive and is
+about to cover the new output, so every wake flashes "lockscreen app died".
+
+Track, per monitor, when it was first drawn without a mapped lock surface, and
+draw lockdead only once both the lock and that monitor are past the delay. The
+grace starts afresh when the monitor is connected, disconnected or changes
+DPMS, since monitor ids are reused and a waking display is a returning one. A
+timer redraws the monitor when its grace runs out, so a client that is alive
+but never covers it still gets lockdead. A client that dies drops the session
+lock and shows lockdead at once as before, and a denied lock is unchanged.
+Workspaces stay hidden behind the primer during the grace exactly as before.
+
+Not yet upstream.
+
+diff --git a/src/managers/SessionLockManager.cpp b/src/managers/SessionLockManager.cpp
+index 960127b..e95b3ba 100644
+--- a/src/managers/SessionLockManager.cpp
++++ b/src/managers/SessionLockManager.cpp
+@@ -10,6 +10,7 @@
+ #include "../managers/input/InputManager.hpp"
+ #include "../managers/eventLoop/EventLoopManager.hpp"
+ #include "../state/MonitorState.hpp"
++#include "../event/EventBus.hpp"
+ #include <algorithm>
+ #include <ranges>
+ 
+@@ -47,6 +48,14 @@ SSessionLockSurface::SSessionLockSurface(SP<CSessionLockSurface> surface_) : sur
+ 
+ CSessionLockManager::CSessionLockManager() {
+     m_listeners.newLock = PROTO::sessionLock->m_events.newLock.listen([this](const auto& lock) { this->onNewSessionLock(lock); });
++
++    // Monitor ids are reused, so an output that comes or goes starts its grace afresh.
++    const auto FORGETMONITOR = [this](PHLMONITOR m) {
++        if (m_sessionLock && m)
++            m_sessionLock->surfaceMissing.erase(m->m_id);
++    };
++    m_listeners.monitorAdded   = Event::bus()->m_events.monitor.added.listen(FORGETMONITOR);
++    m_listeners.monitorRemoved = Event::bus()->m_events.monitor.removed.listen(FORGETMONITOR);
+ }
+ 
+ void CSessionLockManager::onNewSessionLock(SP<CSessionLock> pLock) {
+@@ -66,6 +75,7 @@ void CSessionLockManager::onNewSessionLock(SP<CSessionLock> pLock) {
+     m_sessionLock       = makeUnique<SSessionLock>();
+     m_sessionLock->lock = pLock;
+     m_sessionLock->lockTimer.reset();
++    m_sessionLock->lockStart = Time::steadyNow();
+ 
+     m_sessionLock->listeners.newSurface = pLock->m_events.newLockSurface.listen([this](const SP<CSessionLockSurface>& surface) {
+         const auto PMONITOR = surface->monitor();
+@@ -161,6 +171,9 @@ WP<SSessionLockSurface> CSessionLockManager::getSessionLockSurfaceForMonitor(uin
+ }
+ 
+ void CSessionLockManager::onLockscreenRenderedOnMonitor(uint64_t id) {
++    if (m_sessionLock)
++        m_sessionLock->surfaceMissing.erase(id);
++
+     if (!m_sessionLock || m_sessionLock->hasSentLocked || m_sessionLock->hasSentDenied)
+         return;
+ 
+@@ -249,3 +262,76 @@ bool CSessionLockManager::shallConsiderLockMissing() {
+ 
+     return m_sessionLock->lockTimer.getMillis() > *LOCKDEAD_SCREEN_DELAY;
+ }
++
++// The lock-wide delay alone shows lockdead on the first frame of a monitor that comes back
++// mid-lock, before a live client has had any chance to put a surface on it.
++bool CSessionLockManager::shallConsiderLockMissingOnMonitor(PHLMONITOR pMonitor) {
++    if (!m_sessionLock || !pMonitor)
++        return shallConsiderLockMissing();
++
++    static auto LOCKDEAD_SCREEN_DELAY = CConfigValue<Config::INTEGER>("misc:lockdead_screen_delay");
++
++    const auto [it, inserted] = m_sessionLock->surfaceMissing.try_emplace(pMonitor->m_id);
++    if (inserted) {
++        it->second.since = Time::steadyNow();
++        // A display waking from DPMS is a returning monitor too. Restart rather than
++        // erase: this listener is the one being emitted.
++        it->second.dpms = pMonitor->m_events.dpmsChanged.listen([this, id = pMonitor->m_id] {
++            if (!m_sessionLock || !m_sessionLock->surfaceMissing.contains(id))
++                return;
++            m_sessionLock->surfaceMissing.at(id).since = Time::steadyNow();
++            armLockMissingTimer();
++        });
++        armLockMissingTimer();
++    }
++
++    return shallConsiderLockMissing() &&
++        std::chrono::duration_cast<std::chrono::milliseconds>(Time::steadyNow() - it->second.since).count() > *LOCKDEAD_SCREEN_DELAY;
++}
++
++// Nothing else may damage a monitor whose grace runs out, so redraw it then.
++void CSessionLockManager::armLockMissingTimer() {
++    if (!m_sessionLock)
++        return;
++
++    static auto LOCKDEAD_SCREEN_DELAY = CConfigValue<Config::INTEGER>("misc:lockdead_screen_delay");
++
++    const auto                     NOW   = Time::steadyNow();
++    const auto                     DELAY = std::chrono::milliseconds(*LOCKDEAD_SCREEN_DELAY + 1);
++    std::optional<Time::steady_tp> next;
++
++    // The lock-wide delay must have passed too, and is never later than a monitor's own.
++    for (auto const& [id, missing] : m_sessionLock->surfaceMissing) {
++        const auto DUE = std::max(missing.since, m_sessionLock->lockStart) + DELAY;
++        if (DUE > NOW && (!next || DUE < *next))
++            next = DUE;
++    }
++
++    if (!next)
++        return;
++
++    if (!m_sessionLock->lockMissingTimer) {
++        m_sessionLock->lockMissingTimer = makeShared<CEventLoopTimer>(
++            std::nullopt,
++            [](auto, auto) {
++                if (!g_pSessionLockManager || !g_pSessionLockManager->m_sessionLock)
++                    return;
++
++                for (auto const& m : State::monitorState()->monitors()) {
++                    if (g_pSessionLockManager->m_sessionLock->surfaceMissing.contains(m->m_id))
++                        g_pHyprRenderer->damageMonitor(m);
++                }
++
++                g_pSessionLockManager->armLockMissingTimer();
++            },
++            nullptr);
++        g_pEventLoopManager->addTimer(m_sessionLock->lockMissingTimer);
++    }
++
++    m_sessionLock->lockMissingTimer->updateTimeout(*next - NOW);
++}
++
++SSessionLock::~SSessionLock() {
++    if (lockMissingTimer && g_pEventLoopManager)
++        g_pEventLoopManager->removeTimer(lockMissingTimer);
++}
+diff --git a/src/managers/SessionLockManager.hpp b/src/managers/SessionLockManager.hpp
+index cd312d5..57a319e 100644
+--- a/src/managers/SessionLockManager.hpp
++++ b/src/managers/SessionLockManager.hpp
+@@ -34,10 +34,22 @@ struct SSessionLockSurface {
+ };
+ 
+ struct SSessionLock {
++    ~SSessionLock();
++
+     WP<CSessionLock>                     lock;
+     CTimer                               lockTimer;
++    Time::steady_tp                      lockStart;
+     SP<CEventLoopTimer>                  sendLockedTimer;
+ 
++    // When each monitor was first drawn without a mapped lock surface, restarted when it
++    // wakes. A monitor that returns mid-lock gets its own lockdead_screen_delay to receive one.
++    struct SSurfaceMissing {
++        Time::steady_tp     since;
++        CHyprSignalListener dpms;
++    };
++    std::unordered_map<uint64_t, SSurfaceMissing> surfaceMissing;
++    SP<CEventLoopTimer>                           lockMissingTimer;
++
+     std::vector<SP<SSessionLockSurface>> vSessionLockSurfaces;
+ 
+     struct {
+@@ -72,6 +84,7 @@ class CSessionLockManager {
+     void                    onLockscreenRenderedOnMonitor(uint64_t id);
+ 
+     bool                    shallConsiderLockMissing();
++    bool                    shallConsiderLockMissingOnMonitor(PHLMONITOR pMonitor);
+ 
+     struct {
+         CSignalT<> lock;
+@@ -83,10 +96,13 @@ class CSessionLockManager {
+ 
+     struct {
+         CHyprSignalListener newLock;
++        CHyprSignalListener monitorAdded;
++        CHyprSignalListener monitorRemoved;
+     } m_listeners;
+ 
+     void onNewSessionLock(SP<CSessionLock> pWlrLock);
+     void removeSendLockedTimer();
++    void armLockMissingTimer();
+     void clearSessionLock();
+ };
+ 
+diff --git a/src/render/Renderer.cpp b/src/render/Renderer.cpp
+index 4bbb606..35b0792 100644
+--- a/src/render/Renderer.cpp
++++ b/src/render/Renderer.cpp
+@@ -1792,7 +1792,8 @@ void IHyprRenderer::renderLockscreen(CRenderContext& ctx, PHLMONITOR pMonitor, c
+         renderSessionLockPrimer(ctx, pMonitor);
+ 
+     const auto PSLS              = g_pSessionLockManager->getSessionLockSurfaceForMonitor(pMonitor->m_id);
+-    const bool RENDERLOCKMISSING = (PSLS.expired() || g_pSessionLockManager->clientDenied()) && g_pSessionLockManager->shallConsiderLockMissing();
++    const bool RENDERLOCKMISSING = (g_pSessionLockManager->clientDenied() && g_pSessionLockManager->shallConsiderLockMissing()) ||
++        (PSLS.expired() && g_pSessionLockManager->shallConsiderLockMissingOnMonitor(pMonitor));
+ 
+     ensureLockTexturesRendered(RENDERLOCKMISSING);
+ 
