@@ -212,6 +212,12 @@ b2sums=('old' 'local-b2')
             archive = w.git_source_file('git+https://example.test/tool.git#tag=v1.0', self.fetch.cache)
         expected = subprocess.check_output(['git', '-c', 'core.abbrev=no', '-C', str(repo), 'archive', '--format', 'tar', 'v1.0'])
         self.assertEqual(archive.read_bytes(), expected)
+        # A signed tag's makepkg option, after or before the fragment, reaches
+        # neither the fetch URL nor the tag name.
+        for signed in ('git+https://example.test/tool.git#tag=v1.0?signed',
+                       'git+https://example.test/tool.git?signed#tag=v1.0'):
+            with patch.object(w.subprocess, 'run', side_effect=redirect):
+                self.assertEqual(w.git_source_file(signed, self.fetch.cache).read_bytes(), expected)
 
     def branch_fixture(self, fresh_tip=False):
         """An upstream with two release tags and commits past the newest one,

@@ -461,6 +461,11 @@ def source_url(source):
 
 def git_source_file(url, cache):
     base, fragment = url.removeprefix("git+").split("#", 1)
+    # makepkg options such as ?signed may follow the fragment (Arch's usual
+    # #tag=v1?signed) or precede it (?signed#tag=v1). They tell makepkg to
+    # verify the tag; neither the fetch URL nor the ref name includes them.
+    base = base.split("?", 1)[0]
+    fragment = fragment.split("?", 1)[0]
     kind, ref = fragment.split("=", 1)
     https(base)
     if kind not in {"tag", "commit"} or (kind == "commit" and not re.fullmatch(r"[0-9a-f]{40}", ref)):
