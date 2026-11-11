@@ -20,3 +20,5 @@ A patch stays here until the kernel moves to a new version. Then `pkgver` follow
 ## Patches
 
 `0001` adds the Surface Laptop 7 15" (`x1e80100-microsoft-romulus15`) touchpad, a HID-over-SPI device on `spi19`, using the Surface Pro 11's spi-hid and QSPI patches in the kernel. On its own the pad stays in a mouse mode: pointer, tap and press to click. iptsd adds two-finger scroll, pinch and two-finger tap, but press to click stops registering, because iptsd doesn't decode the pad's haptic report yet. The 13.8" isn't covered, and hasn't been tested. By Jason Bruce Jones.
+
+`0002` adds the Lenovo IdeaCentre Mini 01Q8X10 with the Snapdragon X X1-26-100 (`purwa-lenovo-ideacentre-mini-01q8x10`), on the board file the kernel's `2821` splits out of the X1P-64 model's tree. systemd's own hardware IDs already pick it. The compatible follows the binding in `2820`, so it ends in `qcom,x1p42100` where Jens Glathe's latest tree has `lenovo,thinkpad-t14s`, `qcom,x1e80100`. It loads its firmware from `qcom/x1p42100/LENOVO/91B6`, which `lenovo-ideacentre-mini-x-firmware` installs. By Jens Glathe.
