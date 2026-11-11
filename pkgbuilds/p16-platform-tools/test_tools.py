@@ -79,6 +79,8 @@ if os.environ.get('FAIL_COMMAND') == name:
 if name == 'modinfo':
  field = args[args.index('-F')+1]; module = args[-1]
  if module == os.environ.get('MISSING_MODULE'): sys.exit(1)
+ if field == 'vermagic' and module == os.environ.get('STALE_DEPENDENCY'):
+  print('stale-kernel SMP'); sys.exit(0)
  print({'filename': str(Path(os.environ['MODULES'])/'7.3-test'/(module+'.ko')),
         'vermagic': os.environ.get('VERMAGIC', '7.3-test SMP'),
         'signer': '' if os.environ.get('UNSIGNED') else 'fixture signer',
@@ -125,6 +127,53 @@ elif name == 'pacman':
         p.write_bytes(pe([('.uname', release), ('.linux', kernel),
                           ('.initrd', gzip.compress(cpio(files))), *extra]))
         return p
+
+    def test_audit_checks_dependency_vermagic_by_exact_file_path(self):
+        dependency = self.base / 'extra' / 'spi_hid.ko'
+        dependency.parent.mkdir()
+        dependency.write_bytes(b'stale copy with same module name')
+        good = self.audit(DEPENDENCY=str(dependency))
+        self.assertEqual(good.returncode, 0, good.stdout + good.stderr)
+        bad = self.audit(DEPENDENCY=str(dependency), STALE_DEPENDENCY=str(dependency))
+        self.assertEqual(bad.returncode, 1, bad.stdout + bad.stderr)
+        self.assertIn(str(dependency), bad.stderr)
+        self.assertNotIn('Kernel audit passed', bad.stdout)
+
+    def test_usb4_rewrites_quoted_pci_values(self):
+        for source in ['pci="nomsi,hpmmiosize=16M"',
+                       '"pci=nomsi,hpmmiosize=16M"',
+                       'pci="nomsi,other=two words,hpmmiosize=16M"']:
+            with self.subTest(source=source):
+                result = self.run_cli('usb4', '--cmdline', source)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                expected = 'pci=nomsi,hpbussize=0x80,hpmmiosize=32M,hpmmioprefsize=32G'
+                if 'other=' in source:
+                    expected = 'pci="nomsi,other=two words,hpbussize=0x80,hpmmiosize=32M,hpmmioprefsize=32G"'
+                self.assertEqual(result.stdout, expected + ' power_wrap_drv.usb4_release=0\n')
+                self.assertEqual(self.run_cli('usb4', '--cmdline', result.stdout.rstrip('\n')).stdout,
+                                 result.stdout)
+
+    def test_usb4_preserves_init_suffix_exactly(self):
+        suffix = '  --  pci="init,unchanged"  power_wrap_drv.usb4_release=1 "two words" single\'quote  '
+        result = self.run_cli('usb4', '--cmdline', 'quiet pci=nomsi' + suffix)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        expected = ('quiet pci=nomsi,hpbussize=0x80,hpmmiosize=32M,hpmmioprefsize=32G '
+                    'power_wrap_drv.usb4_release=0' + suffix + '\n')
+        self.assertEqual(result.stdout, expected)
+        self.assertEqual(self.run_cli('usb4', '--cmdline', result.stdout.rstrip('\n')).stdout,
+                         expected)
+        for suffix in ['--', '--  arg="unfinished', '"--" pci=init']:
+            with self.subTest(suffix=suffix):
+                result = self.run_cli('usb4', '--cmdline=' + suffix)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout,
+                                 'pci=hpbussize=0x80,hpmmiosize=32M,hpmmioprefsize=32G '
+                                 'power_wrap_drv.usb4_release=0 ' + suffix + '\n')
+
+    def test_usb4_treats_single_quotes_as_literal_kernel_characters(self):
+        result = self.run_cli('usb4', '--cmdline', "label=owner's pci=nomsi")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("label=owner's pci=nomsi,", result.stdout)
 
     def test_uki_exact_kernel_release_modules_and_early_dsp(self):
         self.assertEqual(self.audit('--uki', str(self.make_uki())).returncode, 0)

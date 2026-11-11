@@ -63,11 +63,14 @@ argument. Preserve and review the rest of that entry using your normal boot
 configuration process. The tool does not read or modify any Limine file and
 prints no automatic install instructions or global drop-in.
 
-The proposal preserves other parameters (including quoted values), consolidates
+The proposal preserves other parameters (including kernel double-quoted values), consolidates
 `pci=` options and replaces `hpbussize=0x80`, `hpmmiosize=32M`,
 `hpmmioprefsize=32G`, and `power_wrap_drv.usb4_release=0`. The last parameter is
 compatible with kernels exposing that power_wrap option; these options alone
 do not add USB4 host-driver or PCI allocation support to an unsupported kernel.
+Options are rewritten before a standalone `--`; that separator and its init
+arguments retain their original spelling and spacing. Single quotes are literal
+characters, as in Linux kernel argument parsing, rather than shell quoting.
 Review the generated value, build an isolated candidate and keep recovery.
 No USB4 dock has been physically qualified by this package.
 
