@@ -658,7 +658,7 @@ docs/                          Reference
 | Workflow | Trigger | Does |
 |---|---|---|
 | `build-pr.yml` | PR, dispatch | Builds changed packages; reports `result` |
-| `test.yml` | PR, dispatch | `self-tests` and `build-isolation` |
+| `test.yml` | PR, dispatch | `self-tests`, `build-isolation`, `recipes` and `lint-workflows` (jactionlint and shellcheck over the workflows and `.github/scripts`) |
 | `publish.yml` | push to `master`, dispatch | Signs and publishes; brings `rc` and `stable` in line with `edge` for the fast ring |
 | `promote.yml` | dispatch | Promote channel: `edge` → `rc`, `rc` → `stable` |
 | `release-rc.yml` | dispatch | Build release candidate: the `rc` branch's pins into `rc`, then `edge` |
