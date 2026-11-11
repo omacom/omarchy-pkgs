@@ -6,6 +6,10 @@ Automatic upstream version bumps are held (`sync: false`) because `omarchy-hyprl
 
 `wl-output-global-grace.patch` keeps a removed `wl_output` global for five seconds before destroying it, as wlroots does. Without it, an output that comes and goes within a roundtrip, such as a dock's monitor flapping while its tunnel comes up, disconnects every client that has not bound it yet with "global wl_output (N) is unavailable". `monitor-rule-vrr.patch` makes a config reload apply a monitor rule's `vrr`; without it, changing only `vrr` is ignored until the next session. `nvidia-egl-teardown.patch` releases the EGL context before Hyprland terminates the display, which NVIDIA's EGL otherwise crashes on at exit. Two earlier carries, the removed-output session-lock fix and the dmabuf format-table fix, shipped upstream in 0.57.1 and were dropped here. Rebase each patch with `--fuzz=0` on a version bump, and drop each once the selected release carries the fix.
 
+## Hidden special workspace reappearing
+
+`layer-refocus-hidden-workspace.patch` stops a hidden special workspace, such as the Quake console or the scratchpad, from coming back when a bar popup closes. Hiding a special workspace can leave focus on its window when the regular workspace has no window to take it. When a layer surface that held the keyboard then closes with the pointer over a layer surface that cannot take the keyboard, such as the bar, `CInputManager::refocusLastWindow` focused that window whatever its workspace, and focusing a window on a hidden workspace switches to it. The patch gives that fallback the visibility check the branch above it already has. Drop it once the selected release carries the fix.
+
 ## x86_64
 
 This recipe also builds for x86_64, so PCs take this build instead of Arch's `extra/hyprland`: `[omarchy]` comes before `[extra]` in Omarchy's `pacman.conf`. That gives PCs the patches above and keeps them on the Hyprland the titlebars plugin was built against when Arch moves first. Move both architectures and the plugin to a newer Hyprland in one change, with a `pkgrel` above Arch's for the same version so a machine already on Arch's build moves to this one.
