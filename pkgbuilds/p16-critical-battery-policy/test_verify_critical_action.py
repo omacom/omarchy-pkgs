@@ -17,6 +17,12 @@ class CriticalActionVerifierTests(unittest.TestCase):
         busctl.write_text(
             "#!/usr/bin/env python3\n"
             "import os, sys\n"
+            "expected = ['--system', 'call', 'org.freedesktop.UPower',\n"
+            "            '/org/freedesktop/UPower', 'org.freedesktop.UPower',\n"
+            "            'GetCriticalAction']\n"
+            "if sys.argv[1:] != expected:\n"
+            "    print(f'unexpected busctl arguments: {sys.argv[1:]!r}', file=sys.stderr)\n"
+            "    sys.exit(2)\n"
             "if os.environ.get('BUSCTL_FAIL'):\n"
             "    print('D-Bus unavailable', file=sys.stderr)\n"
             "    sys.exit(1)\n"
