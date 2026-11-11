@@ -83,8 +83,6 @@ if [[ "$DRY_RUN" != true ]]; then
     echo "Package is not in the build plan: $BUILD_PACKAGE" >&2
     exit 1
   fi
-  # Import GPG keys
-  /build/import-gpg-keys.sh || exit 1
 
   mkdir -p "$BUILD_OUTPUT_DIR" "$FINAL_OUTPUT_DIR"
 
@@ -383,14 +381,8 @@ build_package() {
     echo "    New package (version: $pkgbuild_version)"
   fi
 
-  # Import PGP keys from PKGBUILD validpgpkeys and keys/pgp/ directory
-  local pgp_keys=$(bash -c 'source PKGBUILD 2>/dev/null; echo "${validpgpkeys[@]}"')
-  if [[ -n "$pgp_keys" ]]; then
-    echo "    Importing PGP keys from validpgpkeys..."
-    for key in $pgp_keys; do
-      gpg --receive-keys "$key" 2>/dev/null && echo "      Received $key" || echo "      Failed to receive $key"
-    done
-  fi
+  # The keys a recipe trusts ship with it (tests/pgp-keys-vendored.sh), so no
+  # build waits on a keyserver.
   if [[ -d "keys/pgp" ]]; then
     echo "    Importing package-specific PGP keys..."
     for keyfile in keys/pgp/*.asc; do
