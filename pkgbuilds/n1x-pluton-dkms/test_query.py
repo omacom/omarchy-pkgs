@@ -38,7 +38,6 @@ struct mutex {pthread_mutex_t native;};struct file {void *private_data;};
 #define __user
 #define __iomem
 #define GFP_KERNEL 0
-#define CAP_SYS_RAWIO 17
 #define U8_MAX UINT8_MAX
 #define BIT(n) (1U << (n))
 #define u64_to_user_ptr(x) ((void *)(uintptr_t)(x))
@@ -55,13 +54,12 @@ static unsigned writes;
 static int wait_error,flush_error;
 static _Thread_local unsigned locked;
 static _Thread_local struct n1x_pluton_query *user_query;
-static _Thread_local bool fail_from,fail_descriptor,fail_payload,fail_access,fail_alloc,raw_cap;
+static _Thread_local bool fail_from,fail_descriptor,fail_payload,fail_access,fail_alloc;
 static _Thread_local int lock_error,rpc_error,reply_fault;
 static int mutex_lock_interruptible(struct mutex *lock)
 {if(lock_error)return lock_error;assert(!locked);assert(!pthread_mutex_lock(&lock->native));locked=1;return 0;}
 static void mutex_unlock(struct mutex *lock)
 {assert(locked);locked=0;assert(!pthread_mutex_unlock(&lock->native));}
-static bool capable(int cap) {assert(cap==CAP_SYS_RAWIO);return raw_cap;}
 static unsigned long copy_from_user(void *dst,const void *src,size_t n)
 {if(fail_from)return n;memcpy(dst,src,n);return 0;}
 static unsigned long copy_to_user(void *dst,const void *src,size_t n)
@@ -79,9 +77,6 @@ static int n1x_rot_wait(struct n1x_pluton *p,unsigned int reg,unsigned long dead
 {assert(p==&device && locked && reg==N1X_ROT_READY && deadline==jiffies+10000);return wait_error;}
 ''' + init + r'''
 static void put32(u8 *p,u32 n) {for(unsigned i=0;i<4;i++)p[i]=n>>(8*i);}
-static int n1x_pfi_channels(struct n1x_pluton *p,struct n1x_pluton_channels *channels,
- unsigned long deadline)
-{assert(p==&device && locked && deadline==jiffies+10000);memset(channels,0,sizeof(*channels));return 0;}
 static int n1x_pluton_rpc(struct n1x_pluton *p,struct n1x_pluton_transfer *exchange,
  const u8 *tx,u8 *rx,unsigned long deadline)
 {
@@ -119,7 +114,7 @@ static void reset(void)
  device.poisoned=device.removed=device.suspended=false;
  enable_transport=true;
  calls=max_rpc=writes=0;flush_error=wait_error=0;
- fail_from=fail_descriptor=fail_payload=fail_access=fail_alloc=raw_cap=false;
+ fail_from=fail_descriptor=fail_payload=fail_access=fail_alloc=false;
  lock_error=rpc_error=reply_fault=0;
  memset(&query,0,sizeof(query));memset(output,0xa5,sizeof(output));
  query.command=7;query.rx_size=1024;query.rx_ptr=(uintptr_t)output;user_query=&query;
@@ -186,8 +181,7 @@ int main(void)
   else assert(ret==(stage==1?-EBUSY:stage==2?-ETIMEDOUT:-EIO) && !calls && device.poisoned);
  }
  reset();assert(n1x_pluton_ioctl(&file,N1X_PLUTON_CHANNELS,0)==-ENOTTY && !calls && !writes);
- reset();raw_cap=true;assert(n1x_pluton_ioctl(&file,0xc0285002U,0)==-ENOTTY);
- raw_cap=false;assert(n1x_pluton_ioctl(&file,0xc0285002U,0)==-ENOTTY);
+ reset();assert(n1x_pluton_ioctl(&file,0xc0285002U,0)==-ENOTTY);
  assert(n1x_pluton_ioctl(&file,0,0)==-ENOTTY && !calls && !writes);
  reset();pthread_t threads[8];
  for(unsigned i=0;i<8;i++)assert(!pthread_create(&threads[i],NULL,thread_query,(void *)(uintptr_t)commands[i%3]));

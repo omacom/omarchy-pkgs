@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /* N1X ROT1 mailbox/PFI transport for PCBI requests. */
 #include <linux/acpi.h>
-#include <linux/capability.h>
 #include <linux/compat.h>
 #include <linux/delay.h>
 #include <linux/fs.h>
@@ -70,10 +69,12 @@ static int n1x_rot_wait(struct n1x_pluton *p, unsigned int reg, unsigned long de
 {
 	u32 value;
 	unsigned long remaining;
+	unsigned long now = jiffies;
 
-	if (time_after_eq(jiffies, deadline))
+	/* A second jiffies read could yield zero, disabling the poll timeout. */
+	if (time_after_eq(now, deadline))
 		return -ETIMEDOUT;
-	remaining = jiffies_to_usecs(deadline - jiffies);
+	remaining = jiffies_to_usecs(deadline - now);
 	return readl_poll_timeout(n1x_rot_reg(p, reg), value, value & BIT(0), 1000, remaining);
 }
 
@@ -386,18 +387,14 @@ static long n1x_pluton_ioctl(struct file *file, unsigned int command, unsigned l
 	struct n1x_pluton *p = file->private_data;
 	void __user *user = (void __user *)arg;
 	struct n1x_pluton_info info = { };
-	struct n1x_pluton_channels channels;
-	unsigned long deadline;
 	int ret;
 
 	if (command == N1X_PLUTON_CHANNELS)
 		return -ENOTTY;
 	if (command == N1X_PLUTON_QUERY)
 		return n1x_pluton_query_ioctl(p, user);
-	if (command != N1X_PLUTON_INFO && command != N1X_PLUTON_CHANNELS)
+	if (command != N1X_PLUTON_INFO)
 		return -ENOTTY;
-	if (command == N1X_PLUTON_CHANNELS && !capable(CAP_SYS_RAWIO))
-		return -EPERM;
 	ret = mutex_lock_interruptible(&p->lock);
 	if (ret)
 		return ret;
@@ -405,23 +402,14 @@ static long n1x_pluton_ioctl(struct file *file, unsigned int command, unsigned l
 		ret = -ENODEV;
 		goto unlock;
 	}
-	if (command == N1X_PLUTON_INFO) {
-		info.abi_version = 1;
-		info.boot_status = ioread32(n1x_rot_reg(p, N1X_ROT_BOOT_STATUS));
-		info.register_stride = 0x10;
-		info.transport_enabled = enable_transport;
-		info.initialized = p->initialized;
-		info.poisoned = p->poisoned;
-		info.last_pfi_status = p->last_pfi_status;
-		ret = copy_to_user(user, &info, sizeof(info)) ? -EFAULT : 0;
-		goto unlock;
-	}
-	deadline = jiffies + msecs_to_jiffies(10000);
-	ret = n1x_rot_init(p, deadline);
-	if (!ret)
-		ret = n1x_pfi_channels(p, &channels, deadline);
-	if (!ret && copy_to_user(user, &channels, sizeof(channels)))
-		ret = -EFAULT;
+	info.abi_version = 1;
+	info.boot_status = ioread32(n1x_rot_reg(p, N1X_ROT_BOOT_STATUS));
+	info.register_stride = 0x10;
+	info.transport_enabled = enable_transport;
+	info.initialized = p->initialized;
+	info.poisoned = p->poisoned;
+	info.last_pfi_status = p->last_pfi_status;
+	ret = copy_to_user(user, &info, sizeof(info)) ? -EFAULT : 0;
 unlock:
 	mutex_unlock(&p->lock);
 	return ret;
