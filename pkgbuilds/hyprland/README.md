@@ -10,6 +10,8 @@ Automatic upstream version bumps are held (`sync: false`) because `omarchy-hyprl
 
 `xwayland-scale.patch` adds `xwayland:scale` ([ParkerrDev/xscale](https://github.com/ParkerrDev/xscale)): one scale that every X11 client renders at, so X11 apps are sharp and the size of their Wayland selves on every monitor, instead of upscaled and blurry, or tiny under `force_zero_scaling`. Hyprland scales the X11 windows itself, so it works with Arch's `xorg-xwayland` and changes no protocol. At `0`, the default, it changes nothing. It is not upstream yet. Apply it after the other patches, rebase it with `--fuzz=0` on a version bump, and drop it once the selected release carries the setting.
 
+Open X11 menus follow changes to their owner's `xwayland_unscaled` rule immediately, preserving their X11 pixel size and offset when the rule is enabled or disabled. The 0.57.1 recipe requires hyprutils 0.14.3 and Aquamarine 0.16.0: the release uses `COutputState::setMaxBpc`, which Aquamarine 0.15.1 does not provide even though Hyprland's upstream CMake minimum still permits it.
+
 ## x86_64
 
 This recipe also builds for x86_64, so PCs take this build instead of Arch's `extra/hyprland`: `[omarchy]` comes before `[extra]` in Omarchy's `pacman.conf`. That gives PCs the patches above and keeps them on the Hyprland the titlebars plugin was built against when Arch moves first. Move both architectures and the plugin to a newer Hyprland in one change, with a `pkgrel` above Arch's for the same version so a machine already on Arch's build moves to this one.
