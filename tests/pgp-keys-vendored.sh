@@ -9,17 +9,31 @@ GNUPGHOME=$(mktemp -d)
 export GNUPGHOME
 trap 'rm -rf "$GNUPGHOME"' EXIT
 
-missing=""
+# The primary-key fingerprints a key file holds, one per line.
+primaries() {
+  gpg --show-keys --with-colons "$1" 2>/dev/null |
+    awk -F: '$1 == "pub" { want = 1; next } $1 == "fpr" && want { print $10; want = 0 }'
+}
+
+problems=""
 for pkgdir in "$ROOT"/pkgbuilds/*/; do
-  shipped=$(cat "$pkgdir"/keys/pgp/*.asc 2>/dev/null |
-    gpg --show-keys --with-colons 2>/dev/null | awk -F: '$1 == "fpr" { print $10 }') || true
+  pkg=$(basename "$pkgdir")
+  # bin/refresh-pgp-keys reads the fingerprint from the file name, so each
+  # file must be <FINGERPRINT>.asc and hold that one primary key.
+  for file in "$pkgdir"keys/pgp/*.asc; do
+    [[ -e $file ]] || continue
+    name=$(basename "$file" .asc)
+    [[ $(primaries "$file") == "$name" ]] ||
+      problems+="  $pkg: keys/pgp/$name.asc must hold exactly the primary key $name"$'\n'
+  done
   for key in $(cd "$pkgdir" && bash -c 'source ./PKGBUILD >/dev/null 2>&1; echo "${validpgpkeys[@]}"' 2>/dev/null); do
-    grep -qix -- "$key" <<<"$shipped" || missing+="  $(basename "$pkgdir"): $key"$'\n'
+    [[ -f $pkgdir/keys/pgp/$key.asc ]] ||
+      problems+="  $pkg: validpgpkeys $key has no keys/pgp/$key.asc"$'\n'
   done
 done
 
-if [[ -n $missing ]]; then
-  printf 'FAIL: recipes trust keys they do not ship in keys/pgp/:\n%s' "$missing"
+if [[ -n $problems ]]; then
+  printf 'FAIL: shipped signing keys:\n%s' "$problems"
   exit 1
 fi
-echo "PASS: every validpgpkeys entry ships in its recipe's keys/pgp/"
+echo "PASS: every validpgpkeys entry ships as keys/pgp/<FINGERPRINT>.asc holding that key"

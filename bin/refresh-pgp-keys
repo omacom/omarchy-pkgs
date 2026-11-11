@@ -25,20 +25,32 @@ state() {
     awk -F: '$1 == "pub" || $1 == "sub" { print $1, $2, $5, $7, $12 }'
 }
 
+# The same, as one shipped file carries it, in a keyring of its own.
+file_state() (
+  GNUPGHOME=$(mktemp -d)
+  export GNUPGHOME
+  gpg -q --batch --import "$1" 2>/dev/null
+  state "$2"
+  rm -rf "$GNUPGHOME"
+)
+
+# Fingerprint -> newline-separated paths of every file that carries it.
 declare -A files
-while IFS= read -r file; do
+while IFS= read -r -d '' file; do
   fpr=$(basename "$file" .asc)
-  files[$fpr]+="$file "
-done < <(find "$ROOT/pkgbuilds" -path '*/keys/pgp/*.asc' | sort)
+  files[$fpr]+="$file"$'\n'
+done < <(find "$ROOT/pkgbuilds" -path '*/keys/pgp/*.asc' -print0 | sort -z)
 
 status=0
 for fpr in $(printf '%s\n' "${!files[@]}" | sort); do
-  read -ra paths <<<"${files[$fpr]}"
+  mapfile -t paths < <(printf '%s' "${files[$fpr]}")
   GNUPGHOME=$(mktemp -d)
   export GNUPGHOME
-  gpg -q --batch --import "${paths[0]}" 2>/dev/null
-  before=$(state "$fpr")
-  if [[ -z $before ]]; then
+  # Merge every copy first, so a revocation any one of them carries survives.
+  for path in "${paths[@]}"; do
+    gpg -q --batch --import "$path" 2>/dev/null
+  done
+  if [[ -z $(state "$fpr") ]]; then
     echo "MISSING  $fpr: ${paths[0]#"$ROOT"/} does not carry this key"
     status=$((status > 1 ? status : 1))
     rm -rf "$GNUPGHOME"
@@ -55,20 +67,35 @@ for fpr in $(printf '%s\n' "${!files[@]}" | sort); do
     timeout "$TIMEOUT" gpg -q --batch --keyserver "$server" --recv-keys "$fpr" >/dev/null 2>&1 &&
       reached+=("${server#hkps://}")
   done
+  merged=$(state "$fpr")
 
-  # A revoked key is written back too: makepkg then refuses its signatures.
-  after=$(state "$fpr")
-  if [[ $after != "$before" ]]; then
-    for path in "${paths[@]}"; do
-      gpg --batch --armor --export-options export-clean --export "$fpr" >"$path"
-    done
-    echo "UPDATED  $fpr from ${reached[*]:-nowhere}"
-    diff <(echo "$before") <(echo "$after") | sed -n 's/^[<>]/        &/p'
+  # Export once and check it before any shipped file is touched.
+  export_file="$GNUPGHOME/export.asc"
+  if ! gpg --batch --armor --export-options export-clean --export "$fpr" >"$export_file" ||
+    [[ $(gpg --show-keys --with-colons "$export_file" 2>/dev/null | awk -F: '$1 == "fpr" { print $10; exit }') != "$fpr" ]]; then
+    echo "FAILED   $fpr: could not export the merged key; no file changed"
+    status=$((status > 1 ? status : 1))
+    rm -rf "$GNUPGHOME"
+    continue
+  fi
+
+  # Compare each file with the merged key on its own, so every stale copy is
+  # rewritten. A revoked key is written back too: makepkg then refuses it.
+  changed=()
+  for path in "${paths[@]}"; do
+    if [[ $(file_state "$path" "$fpr") != "$merged" ]]; then
+      cp "$export_file" "$path"
+      changed+=("${path#"$ROOT"/}")
+    fi
+  done
+  if ((${#changed[@]})); then
+    echo "UPDATED  $fpr from ${reached[*]:-nowhere}: ${changed[*]}"
+    while IFS= read -r line; do echo "        now: $line"; done <<<"$merged"
     status=$((status > 1 ? status : 1))
   else
     echo "current  $fpr (reached: ${reached[*]:-none})"
   fi
-  if grep -q '^pub r ' <<<"$after"; then
+  if grep -q '^pub r ' <<<"$merged"; then
     echo "REVOKED  $fpr: ${paths[*]#"$ROOT"/}"
     status=2
   fi
