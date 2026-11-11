@@ -25,13 +25,35 @@ state() {
     awk -F: '$1 == "pub" || $1 == "sub" { print $1, $2, $5, $7, $12 }'
 }
 
+# Stop the keyring's gpg daemons, then remove it. gpgconf blocks on a
+# dirmngr that still waits on DNS, so its wait is bounded.
+drop_keyring() {
+  timeout 5 gpgconf --kill all 2>/dev/null
+  rm -rf "$GNUPGHOME"
+}
+
 # The same, as one shipped file carries it, in a keyring of its own.
 file_state() (
   GNUPGHOME=$(mktemp -d)
   export GNUPGHOME
   gpg -q --batch --import "$1" 2>/dev/null
   state "$2"
-  rm -rf "$GNUPGHOME"
+  drop_keyring
+)
+
+# One lookup in a keyring of its own, seeded with the shipped key; on
+# success, keep what it holds for the pinned fingerprint. gpg can outlive
+# timeout's SIGTERM while its dirmngr waits on DNS, so SIGKILL follows.
+lookup() (
+  GNUPGHOME=$(mktemp -d)
+  export GNUPGHOME
+  local n=$1 source=$2
+  shift 2
+  gpg -q --batch --import "$work/base.gpg" 2>/dev/null
+  if timeout --kill-after=5 "$TIMEOUT" gpg -q --batch "$@" >/dev/null 2>&1; then
+    gpg --batch --export "$fpr" >"$work/$n.gpg" && echo "$source" >"$work/$n.source"
+  fi
+  drop_keyring
 )
 
 # Fingerprint -> newline-separated paths of every file that carries it.
@@ -53,20 +75,33 @@ for fpr in $(printf '%s\n' "${!files[@]}" | sort); do
   if [[ -z $(state "$fpr") ]]; then
     echo "MISSING  $fpr: ${paths[0]#"$ROOT"/} does not carry this key"
     status=$((status > 1 ? status : 1))
-    rm -rf "$GNUPGHOME"
+    drop_keyring
     continue
   fi
 
-  reached=()
-  for address in $(gpg --with-colons --list-keys "$fpr" | awk -F: '$1 == "uid" { print $10 }' |
+  # Every lookup runs at once, each in a keyring seeded with the shipped key
+  # (keys.openpgp.org serves updates without user IDs, which gpg merges only
+  # into a key it already has). One key then costs at most one timeout.
+  work=$(mktemp -d)
+  gpg --batch --export "$fpr" >"$work/base.gpg"
+  n=0
+  for address in $(gpg --with-colons --list-keys "$fpr" | awk -F: '$1 == "uid" && $2 != "r" { print $10 }' |
     grep -oE '<[^>]+@[^>]+>' | tr -d '<>' | sort -u); do
-    timeout "$TIMEOUT" gpg -q --batch --auto-key-locate clear,nodefault,wkd \
-      --locate-external-keys "$address" >/dev/null 2>&1 && reached+=("wkd:$address")
+    n=$((n + 1))
+    lookup "$n" "wkd:$address" --auto-key-locate clear,nodefault,wkd --locate-external-keys "$address" &
   done
   for server in "${KEYSERVERS[@]}"; do
-    timeout "$TIMEOUT" gpg -q --batch --keyserver "$server" --recv-keys "$fpr" >/dev/null 2>&1 &&
-      reached+=("${server#hkps://}")
+    n=$((n + 1))
+    lookup "$n" "${server#hkps://}" --keyserver "$server" --recv-keys "$fpr" &
   done
+  wait
+  reached=()
+  for result in "$work"/*.gpg; do
+    [[ $result == */base.gpg ]] && continue
+    gpg -q --batch --import "$result" 2>/dev/null
+    reached+=("$(<"${result%.gpg}.source")")
+  done
+  rm -rf "$work"
   merged=$(state "$fpr")
 
   # Export once and check it before any shipped file is touched.
@@ -75,7 +110,7 @@ for fpr in $(printf '%s\n' "${!files[@]}" | sort); do
     [[ $(gpg --show-keys --with-colons "$export_file" 2>/dev/null | awk -F: '$1 == "fpr" { print $10; exit }') != "$fpr" ]]; then
     echo "FAILED   $fpr: could not export the merged key; no file changed"
     status=$((status > 1 ? status : 1))
-    rm -rf "$GNUPGHOME"
+    drop_keyring
     continue
   fi
 
@@ -99,6 +134,6 @@ for fpr in $(printf '%s\n' "${!files[@]}" | sort); do
     echo "REVOKED  $fpr: ${paths[*]#"$ROOT"/}"
     status=2
   fi
-  rm -rf "$GNUPGHOME"
+  drop_keyring
 done
 exit "$status"
