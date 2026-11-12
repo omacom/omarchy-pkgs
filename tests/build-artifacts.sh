@@ -161,15 +161,14 @@ run_json 4 "$k=404"
   pass "a planned package missing from the head fails" || fail "recipe: $(cat "$tmp/stderr")"
 
 # A copy that fails stops the collection, it does not leave a package out.
-mkdir -p "$tmp/ro"
-chmod a-w "$tmp/ro"
-if [[ $(id -u) != 0 ]]; then
-  request 1 "$(jq -n --argjson m "$(matrix linux-omarchy:x86_64)" '{trusted: true, matrix: $m, reused: []}')"
-  ! (cd "$tmp/repo" && "$ROOT/bin/build-artifacts" "$tmp/ro" 1 "$head") 2>"$tmp/stderr" &&
-    grep -q "cannot copy linux-omarchy-.* from artifact $k" "$tmp/stderr" &&
-    pass "a package that cannot be copied fails the collection" || fail "copy: $(cat "$tmp/stderr")"
-fi
-chmod u+w "$tmp/ro"
+# A directory where a package would land fails cp for root too, so the
+# self-tests' container runs this case as well.
+request 1 "$(jq -n --argjson m "$(matrix linux-omarchy:x86_64)" '{trusted: true, matrix: $m, reused: []}')"
+(cd "$tmp/repo" && "$ROOT/bin/build-artifacts" "$tmp/probe" 1 "$head") >/dev/null 2>"$tmp/stderr" || fail "probe: $(cat "$tmp/stderr")"
+for f in "$tmp/probe"/*; do mkdir -p "$tmp/clash/${f##*/}"; done
+! (cd "$tmp/repo" && "$ROOT/bin/build-artifacts" "$tmp/clash" 1 "$head") 2>"$tmp/stderr" &&
+  grep -q "cannot copy linux-omarchy-.* from artifact $k" "$tmp/stderr" &&
+  pass "a package that cannot be copied fails the collection" || fail "copy: $(cat "$tmp/stderr")"
 
 # The request: a pull request's run wrote it, so its shape is checked first.
 run_json 6 "$k=11"
