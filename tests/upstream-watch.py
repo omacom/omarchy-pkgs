@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
 """Offline integration tests for owned-recipe updates and failure isolation."""
 import importlib.util
+import io
 import json
 import os
+import re
 from pathlib import Path
 import shutil
+import stat
 import subprocess
+import tarfile
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -452,6 +456,145 @@ os.execv(os.environ['REAL_GIT'], ['git', *args])
         watch = json.loads((ROOT / 'pkgbuilds/yt6801-dkms/.omarchy/package.json').read_text())['upstream']['watch']
         with patch.object(self.fetch, 'file', return_value=archive):
             self.assertEqual(w.discover(watch, self.fetch)[0]['pkgver'], '1.0.34')
+
+    def build_deb(self, name, files):
+        """A real .deb (ar: debian-binary, control.tar.xz, data.tar.zst)."""
+        work = self.root / f"deb-{name}"
+        tree = work / "tree"
+        for path, text in files.items():
+            (tree / path).parent.mkdir(parents=True, exist_ok=True)
+            (tree / path).write_text(text)
+        (work / "debian-binary").write_text("2.0\n")
+        (work / "control").write_text("Package: app\nVersion: 2.0\n")
+        subprocess.run(["bsdtar", "-C", str(work), "-cJf", str(work / "control.tar.xz"), "control"], check=True)
+        subprocess.run(["bsdtar", "-C", str(tree), "--zstd", "-cf", str(work / "data.tar.zst"), "."], check=True)
+        deb = self.root / f"{name}.deb"
+        subprocess.run(["bsdtar", "-C", str(work), "--format", "ar", "-cf", str(deb),
+                        "debian-binary", "control.tar.xz", "data.tar.zst"], check=True)
+        return deb
+
+    def source_variable_package(self):
+        self.write_watch({"json": "https://example.test/feed", "path": "version", "source_variables": {
+            "_runtimever": {"source": "source:0", "member": "usr/lib/app/version",
+                            "pattern": r"(?P<value>[0-9]+(?:\.[0-9]+)+)"}}})
+        self.recipe.write_text("""pkgname=app
+pkgver=1.0
+pkgrel=2
+_runtimever=1.1.1
+arch=('x86_64' 'aarch64')
+source=("app-$pkgver.deb::https://example.test/app-$pkgver.deb")
+source_aarch64=("https://example.test/runtime-v$_runtimever-arm64.zip")
+sha256sums=('old-deb')
+sha256sums_aarch64=('old-runtime')
+""")
+
+    def test_source_variable_follows_the_version_inside_the_new_deb(self):
+        self.source_variable_package()
+        deb = self.build_deb("app-2.0", {"usr/lib/app/version": "2.2.2\n", "usr/lib/app/app": "binary"})
+        file = lambda url: deb if url.endswith("/app-2.0.deb") else self.fake_file(url)
+        self.assertEqual(self.sync_release(self.release("2.0"), file)["status"], "updated")
+        recipe = w.read_recipe(self.recipe, "aarch64")
+        self.assertEqual((recipe["pkgver"], recipe["pkgrel"], recipe["_runtimever"]), (["2.0"], ["1"], ["2.2.2"]))
+        self.assertEqual(recipe["sha256sums"], [w.hash_file(deb, "sha256")])
+        runtime = self.fake_file("https://example.test/runtime-v2.2.2-arm64.zip")
+        self.assertEqual(recipe["sha256sums_aarch64"], [w.hash_file(runtime, "sha256")])
+
+    def test_source_variable_missing_from_the_deb_leaves_the_recipe_alone(self):
+        self.source_variable_package()
+        before = self.recipe.read_text()
+        deb = self.build_deb("app-2.0", {"usr/lib/app/app": "binary"})
+        file = lambda url: deb if url.endswith(".deb") else self.fake_file(url)
+        with self.assertRaisesRegex(ValueError, "missing or ambiguous"):
+            self.sync_release(self.release("2.0"), file)
+        self.assertEqual(self.recipe.read_text(), before)
+        self.assertFalse((self.package / "PKGBUILD.sync-upstream").exists())
+
+    def test_source_variable_must_match_its_pattern(self):
+        self.source_variable_package()
+        deb = self.build_deb("app-2.0", {"usr/lib/app/version": "2.2.2; rm -rf /\n"})
+        file = lambda url: deb if url.endswith(".deb") else self.fake_file(url)
+        with self.assertRaisesRegex(ValueError, "does not match its pattern"):
+            self.sync_release(self.release("2.0"), file)
+
+    def deb_with_entries(self, name, entries):
+        """A .deb whose data.tar.xz holds exactly these raw tar entries."""
+        work = self.root / f"raw-{name}"
+        work.mkdir()
+        with tarfile.open(work / "data.tar.xz", "w:xz") as data:
+            for path, body in entries:
+                info = tarfile.TarInfo(path)
+                if isinstance(body, tuple):
+                    info.type, info.linkname = tarfile.SYMTYPE, body[1]
+                    data.addfile(info)
+                else:
+                    info.size = len(body)
+                    data.addfile(info, io.BytesIO(body))
+        (work / "debian-binary").write_text("2.0\n")
+        deb = self.root / f"{name}.deb"
+        subprocess.run(["bsdtar", "-C", str(work), "--format", "ar", "-cf", str(deb), "debian-binary", "data.tar.xz"], check=True)
+        return deb
+
+    def test_archive_member_rejects_ambiguous_large_and_linked_entries(self):
+        member = "usr/lib/app/version"
+        self.assertEqual(w.archive_member(self.deb_with_entries("plain", [("./" + member, b"2.2.2\n")]), member), b"2.2.2\n")
+        # libarchive would match both spellings and concatenate them into 45.1.0.
+        dup = self.deb_with_entries("dup", [(member, b"45.1."), ("././" + member, b"0")])
+        with self.assertRaisesRegex(ValueError, "ambiguous"):
+            w.archive_member(dup, member)
+        big = self.deb_with_entries("big", [(member, b"1" * 65537)])
+        with self.assertRaisesRegex(ValueError, "at most 65536 bytes"):
+            w.archive_member(big, member)
+        link = self.deb_with_entries("link", [(member, ("link", "/etc/hostname"))])
+        with self.assertRaisesRegex(ValueError, "regular file"):
+            w.archive_member(link, member)
+
+    def test_archive_member_never_reads_files_an_mtree_names(self):
+        # libarchive reads an mtree manifest as an archive and fills
+        # contents= from the local disk; only real tar and zip are accepted.
+        secret = self.root / "secret"
+        secret.write_text("45.1.0")
+        manifest = f"#mtree\nusr/lib/app/version type=file contents={secret}\n".encode()
+        plain = self.root / "manifest.tar"
+        plain.write_bytes(manifest)
+        work = self.root / "mtree-deb"
+        work.mkdir()
+        (work / "debian-binary").write_text("2.0\n")
+        (work / "data.tar").write_bytes(manifest)
+        deb = self.root / "mtree.deb"
+        subprocess.run(["bsdtar", "-C", str(work), "--format", "ar", "-cf", str(deb), "debian-binary", "data.tar"], check=True)
+        for archive in (plain, deb):
+            with self.subTest(archive=archive.name), self.assertRaisesRegex(ValueError, "cannot read"):
+                w.archive_member(archive, "usr/lib/app/version")
+
+    def test_archive_member_reads_zip_files_but_not_zip_symlinks(self):
+        archive = self.root / "runtime.zip"
+        with zipfile.ZipFile(archive, "w") as z:
+            z.writestr("./usr/lib/app/version", "2.2.2\n")
+            link = zipfile.ZipInfo("usr/lib/app/link")
+            link.create_system, link.external_attr = 3, (stat.S_IFLNK | 0o777) << 16
+            z.writestr(link, "45.1.0")
+        self.assertEqual(w.archive_member(archive, "usr/lib/app/version"), b"2.2.2\n")
+        with self.assertRaisesRegex(ValueError, "regular file"):
+            w.archive_member(archive, "usr/lib/app/link")
+
+    def test_invalid_source_variables_fail_validation(self):
+        good = {"source": "source:0", "member": "usr/lib/app/version", "pattern": "(?P<value>.+)"}
+        for bad in ({"_x": {**good, "pattern": "(.+)"}}, {"_x": {**good, "source": "sources:0"}},
+                    {"_x": {**good, "member": "../etc/passwd"}}, {"_x": {**good, "member": "./usr/lib/app/version"}},
+                    {"_x": {**good, "member": "usr//lib/app/version"}}, {"_x": {**good, "member": "/usr/lib/app/version"}},
+                    {"x": good}, {"_x": {**good, "extra": "1"}}):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                w.validate({"json": "https://example.test/feed", "path": "version", "source_variables": bad})
+        with self.assertRaisesRegex(ValueError, "cannot also be"):
+            w.validate({"json": "https://example.test/feed", "path": "version",
+                        "variables": {"_x": "{version}"}, "source_variables": {"_x": good}})
+
+    def test_slack_reads_its_electron_version_from_its_deb(self):
+        watch = json.loads((ROOT / "pkgbuilds/slack-desktop/.omarchy/package.json").read_text())["upstream"]["watch"]
+        w.validate(watch)
+        spec = watch["source_variables"]["_electronver"]
+        deb = self.build_deb("slack", {"usr/lib/slack/version": "45.1.0"})
+        self.assertEqual(re.fullmatch(spec["pattern"], w.archive_member(deb, spec["member"]).decode().strip())["value"], "45.1.0")
 
     def test_cursor_same_day_hash_uses_counter_not_hash_order(self):
         self.write_watch({'regex': 'https://example.test/feed', 'pattern': r'(?P<version>[0-9.]+)-(?P<hash>[a-f0-9]+)',
