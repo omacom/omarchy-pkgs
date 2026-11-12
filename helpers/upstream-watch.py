@@ -11,15 +11,19 @@ import gzip
 import hashlib
 import io
 import json
+import lzma
 import os
+import posixpath
 from pathlib import Path
 import re
+import stat
 import subprocess
 import sys
 import tarfile
 import tempfile
 from urllib.parse import quote, urlsplit
 import zipfile
+import zlib
 
 PROVIDERS = {"github", "git_tags", "git_branch", "npm", "pypi", "debian", "json", "regex", "archive", "redirect"}
 VERSION = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+]*\Z")
@@ -86,7 +90,7 @@ def validate(watch):
     allowed = PROVIDERS | {"pattern", "path", "package", "branch", "variables", "fields",
                            "submodules", "allow_prerelease", "unescape_json", "filenames",
                            "sequence", "version", "revision", "revision_variable",
-                           "mutable_sources", "member", "dist_tag", "tag_pattern"}
+                           "mutable_sources", "member", "dist_tag", "tag_pattern", "source_variables"}
     if watch.keys() - allowed:
         raise ValueError(f"unknown watch fields: {sorted(watch.keys() - allowed)}")
     value = watch[provider]
@@ -154,6 +158,21 @@ def validate(watch):
         name = watch["revision_variable"]
         if not isinstance(name, str) or name not in watch.get("variables", {}) or not watch.get("revision"):
             raise ValueError("revision_variable requires a declared variable and revision template")
+    sourced = watch.get("source_variables", {})
+    if not isinstance(sourced, dict):
+        raise ValueError("watch.source_variables must map recipe variables to source files")
+    for name, spec in sourced.items():
+        if (not re.fullmatch(r"_[a-z][a-z0-9_]*", name) or not isinstance(spec, dict)
+                or spec.keys() != {"source", "member", "pattern"}
+                or not all(isinstance(v, str) and v for v in spec.values())
+                or not re.fullmatch(r"source(?:_[a-z0-9_]+)?:[0-9]+", spec["source"])
+                or posixpath.normpath(spec["member"]) != spec["member"]
+                or spec["member"].startswith(("/", "../")) or spec["member"] in {".", ".."}):
+            raise ValueError(f"invalid watch.source_variables.{name}")
+        if "value" not in re.compile(spec["pattern"]).groupindex:
+            raise ValueError(f"watch.source_variables.{name} pattern needs a named value group")
+    if sourced.keys() & (watch.get("variables", {}).keys() | watch.get("submodules", {}).keys()):
+        raise ValueError("a source variable cannot also be a release variable or submodule")
     for field in ("mutable_sources",):
         entries = watch.get(field, [])
         if not isinstance(entries, list) or any(not isinstance(v, str) or not re.fullmatch(r"source(?:_[a-z0-9_]+)?:[0-9]+", v) for v in entries):
@@ -549,6 +568,123 @@ def resolve_release_fields(watch, release, fetch):
     return release
 
 
+class _Slice(io.RawIOBase):
+    """Read at most `size` bytes of `stream` from its current offset."""
+    def __init__(self, stream, size):
+        self.stream, self.left = stream, size
+
+    def readable(self):
+        return True
+
+    def readinto(self, buffer):
+        data = self.stream.read(min(len(buffer), self.left))
+        self.left -= len(data)
+        buffer[:len(data)] = data
+        return len(data)
+
+
+def deb_data(stream):
+    """Position `stream` at a .deb's data.tar.* member and return its size.
+
+    A .deb is a plain ar archive: an 8-byte magic, then a 60-byte header and
+    an even-padded body per member. Parsing it here keeps archive format
+    detection out of libarchive, which also reads mtree manifests that name
+    files on the local disk.
+    """
+    if stream.read(8) != b"!<arch>\n":
+        raise ValueError("not a deb")
+    found = []
+    while header := stream.read(60):
+        if len(header) != 60 or header[58:60] != b"`\n" or not header[48:58].strip().isdigit():
+            raise ValueError("malformed deb member header")
+        name, size = header[:16].decode("ascii", "replace").strip().rstrip("/"), int(header[48:58])
+        if name.startswith("data.tar"):
+            found.append((stream.tell(), size))
+        stream.seek(size + size % 2, os.SEEK_CUR)
+    if len(found) != 1:
+        raise ValueError("deb does not contain exactly one data archive")
+    stream.seek(found[0][0])
+    return found[0][1]
+
+
+def archive_member(file, member, limit=65536):
+    """Read one small file from a zip, a tar or a .deb's data archive.
+
+    Nothing else is extracted and nothing inside runs. A .deb's data.tar.*
+    member holds the installed tree, so its names are paths like
+    ./usr/lib/app/version. Every entry name is normalized the same way
+    (././a and /a both mean a). The member must be exactly one regular file,
+    and its declared size is checked before a byte of it is read. Tar
+    archives stream through Python's tarfile, which decompresses gzip, bzip2,
+    xz and zstd itself and reads no other formats, so a 100 MB .deb is never
+    held in memory.
+    """
+    def same(name):
+        return posixpath.normpath(name).lstrip("/") == member
+
+    if zipfile.is_zipfile(file):
+        with zipfile.ZipFile(file) as archive:
+            entries = [e for e in archive.infolist() if same(e.filename)]
+            if len(entries) != 1:
+                raise ValueError(f"{member} is missing or ambiguous in {file.name}")
+            # Unix-made zips carry the file type; a symlink's body is its target.
+            kind = stat.S_IFMT(entries[0].external_attr >> 16) if entries[0].create_system == 3 else 0
+            if entries[0].is_dir() or kind not in (0, stat.S_IFREG) or entries[0].file_size > limit:
+                raise ValueError(f"{member} in {file.name} is not a regular file of at most {limit} bytes")
+            with archive.open(entries[0]) as stream:
+                return stream.read(limit + 1)[:limit]
+    found = None
+    with open(file, "rb") as raw:
+        is_deb = raw.read(8) == b"!<arch>\n"
+        raw.seek(0)
+        stream = io.BufferedReader(_Slice(raw, deb_data(raw))) if is_deb else raw
+        # tarfile reads zstd from Python 3.14; Debian and vendors use it widely.
+        if stream.peek(4)[:4] == b"\x28\xb5\x2f\xfd" and "zst" not in tarfile.TarFile.OPEN_METH:
+            raise ValueError(f"{file.name} is zstd-compressed; reading it needs Python 3.14 or newer")
+        try:
+            with tarfile.open(fileobj=stream, mode="r|*") as archive:
+                for entry in archive:
+                    if not same(entry.name):
+                        continue
+                    if found is not None:
+                        raise ValueError(f"{member} is ambiguous in {file.name}")
+                    if not entry.isreg() or entry.size > limit:
+                        raise ValueError(f"{member} in {file.name} is not a regular file of at most {limit} bytes")
+                    found = archive.extractfile(entry).read()
+        except (tarfile.TarError, EOFError, lzma.LZMAError, zlib.error) as error:
+            raise ValueError(f"cannot read {file.name} as a tar archive: {error}") from error
+    if found is None:
+        raise ValueError(f"{member} is missing or ambiguous in {file.name}")
+    return found
+
+
+def resolve_source_variables(watch, path, fetch):
+    """Read release variables from files inside the release's own sources.
+
+    Some vendors publish facts a recipe needs only inside the artifact: Slack's
+    .deb names the Electron release it was built on, and its AArch64 package
+    must download exactly that Electron. Reading it here, after the new pkgver
+    is written, keeps the recipe in step without a hand edit per release. The
+    named source must not itself depend on another source variable.
+    """
+    found = {}
+    for name, spec in watch.get("source_variables", {}).items():
+        array, index = spec["source"].split(":")
+        arch = array.removeprefix("source_") if array != "source" else "x86_64"
+        sources = read_recipe(path, arch).get(array, [])
+        if int(index) >= len(sources):
+            raise ValueError(f"source_variables.{name}: {spec['source']} does not exist")
+        url = source_url(sources[int(index)])
+        if not url.startswith("https://"):
+            raise ValueError(f"source_variables.{name} reads only HTTPS sources")
+        text = archive_member(fetch.file(url), spec["member"]).decode().strip()
+        match = re.fullmatch(spec["pattern"], text)
+        if not match or not SCALAR.fullmatch(match["value"]):
+            raise ValueError(f"source_variables.{name}: {spec['member']} does not match its pattern")
+        found[name] = match["value"]
+    return found
+
+
 def sync(package, fetch, min_age=0, check=False):
     metadata = json.loads((package / ".omarchy/package.json").read_text())
     if metadata.get("sync") is False:
@@ -592,6 +728,9 @@ def sync(package, fetch, min_age=0, check=False):
         return {"status": "available", "current": current, "release": release}
     scratch = path.with_name("PKGBUILD.sync-upstream")
     try:
+        scratch.write_text(text)
+        for name, value in resolve_source_variables(watch, scratch, fetch).items():
+            text = replace_scalar(text, name, value)
         scratch.write_text(text)
         after = read_recipe(scratch)
         if scalar(after, "pkgver") != release["pkgver"] or scalar(after, "pkgrel") != new_pkgrel:
