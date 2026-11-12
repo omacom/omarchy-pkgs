@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Exercise the kit derivation against Cua's published kit, with tampered inputs.
 
-Usage: kit_test.py ARCHIVE ARCHIVE_SHA256 PROFILE KIT_SHA256
+Usage: kit_test.py ARCHIVE ARCHIVE_SHA256 PROFILE
 """
 
 import importlib._bootstrap_external
@@ -13,10 +13,14 @@ import sys
 import tarfile
 import tempfile
 import unittest
+from unittest import mock
 
 import kit
 
-ARCHIVE = CHECKSUM = PROFILE = KIT_SHA256 = None
+ARCHIVE = CHECKSUM = PROFILE = None
+# Omarchy's own build of the release the kit supports: a version and bytes the kit has never seen.
+HYPRLAND = {"package_version": "0.57.2-2", "sha256": "d" * 64, "headers_sha256": "1" * 64}
+RELEASE = "3"
 
 
 class KitTests(unittest.TestCase):
@@ -27,31 +31,61 @@ class KitTests(unittest.TestCase):
         self.srcdir = self.root / "src"
         self.srcdir.mkdir()
         self.profile = json.loads(PROFILE.read_bytes())
+        self.installed = dict(HYPRLAND)
+        measure = mock.patch.object(kit, "measure", side_effect=lambda verify: dict(self.installed))
+        measure.start()
+        self.addCleanup(measure.stop)
 
-    def run_kit(self, mode, archive=None, checksum=None, profile=None):
-        kit.run(mode, archive or ARCHIVE, checksum or CHECKSUM, profile or PROFILE, self.srcdir, KIT_SHA256)
+    def run_kit(self, mode, archive=None, checksum=None, profile=None, release=RELEASE):
+        kit.run(mode, archive or ARCHIVE, checksum or CHECKSUM, profile or PROFILE, self.srcdir, release)
 
     def write_profile(self, value, indent=2):
         path = self.root / "PROFILE.json"
         path.write_text(json.dumps(value, sort_keys=True, indent=indent) + "\n")
         return path
 
-    def test_derives_the_reviewed_kit(self):
+    def test_derives_the_kit_for_the_installed_hyprland(self):
         self.run_kit("extract")
         self.run_kit("check")
         derived = self.srcdir / kit.KIT
-        self.assertEqual((derived / "PROFILE.json").read_bytes(), PROFILE.read_bytes())
-        self.assertEqual(kit.sha256((derived / "KIT-PROVENANCE.json").read_bytes()), KIT_SHA256)
+        built = json.loads((derived / "PROFILE.json").read_bytes())
+        self.assertEqual(built, dict(self.profile, package_release=3, hyprland=dict(self.profile["hyprland"], **HYPRLAND)))
+        self.assertEqual(json.loads((derived / "KIT-PROVENANCE.json").read_bytes())["profile_sha256"],
+                         kit.sha256((derived / "PROFILE.json").read_bytes()))
+        recipe = (derived / "PKGBUILD").read_text()
+        self.assertIn("depends=('hyprland=0.57.2-2' ", recipe)
+        self.assertIn("\npkgrel=3\n", recipe)
         self.assertTrue((self.srcdir / "cua-hyprland-plugin-0.47.8-87558bfd064787c7839351c55d667dc8244044a4"
                          / "SOURCE-PROVENANCE.json").is_file())
+
+    def test_another_hyprland_release_refuses(self):
+        for version in ("0.57.3-1", "0.58.0-1", "1:0.57.2-2", "0.57.2"):
+            with self.subTest(version):
+                self.installed["package_version"] = version
+                with self.assertRaisesRegex(ValueError, "not a build of the release"):
+                    self.run_kit("extract")
+                shutil.rmtree(self.srcdir)
+                self.srcdir.mkdir()
+
+    def test_hyprland_replaced_after_extraction_refuses(self):
+        self.run_kit("extract")
+        for field, value in (("package_version", "0.57.2-3"), ("sha256", "0" * 64), ("headers_sha256", "0" * 64)):
+            with self.subTest(field):
+                self.installed = dict(HYPRLAND, **{field: value})
+                with self.assertRaisesRegex(ValueError, "differs from derivation"):
+                    self.run_kit("check")
+
+    def test_fractional_release_refuses(self):
+        with self.assertRaisesRegex(ValueError, "whole number"):
+            self.run_kit("extract", release="3.1")
 
     def test_moved_abi_version_is_admitted(self):
         payload = kit.read_kit(ARCHIVE, CHECKSUM)
         verify = kit.load_verifier(self.root / "profile_verify.py", payload["profile_verify.py"])
         self.profile["runtime"]["packages"]["wayland"] = "1.26.0-2"
         data = self.write_profile(self.profile).read_bytes()
-        derived, _ = kit.derive(payload, data, verify)
-        self.assertEqual(derived["PROFILE.json"], data)
+        derived, _ = kit.derive(payload, data, verify, HYPRLAND, RELEASE)
+        self.assertEqual(json.loads(derived["PROFILE.json"])["runtime"], self.profile["runtime"])
         self.assertIn(b"'wayland=1.26.0-2'", derived["PKGBUILD"])
 
     def test_profile_changes_beyond_scope_refuse(self):
@@ -125,10 +159,6 @@ class KitTests(unittest.TestCase):
             self.run_kit("check")
         self.assertFalse(marker.exists())
 
-    def test_unreviewed_kit_provenance_refuses(self):
-        with self.assertRaisesRegex(ValueError, "kit provenance checksum"):
-            kit.run("extract", ARCHIVE, CHECKSUM, PROFILE, self.srcdir, "0" * 64)
-
     def test_reused_destination_refuses(self):
         self.run_kit("extract")
         with self.assertRaisesRegex(ValueError, "fresh destination"):
@@ -136,5 +166,5 @@ class KitTests(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    ARCHIVE, CHECKSUM, PROFILE, KIT_SHA256 = Path(sys.argv[1]), sys.argv[2], Path(sys.argv[3]), sys.argv[4]
+    ARCHIVE, CHECKSUM, PROFILE = Path(sys.argv[1]), sys.argv[2], Path(sys.argv[3])
     unittest.main(argv=sys.argv[:1])
