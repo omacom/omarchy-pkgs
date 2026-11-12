@@ -297,6 +297,35 @@ legs=$(matrix) || fail "a channel's matrix: $(cat "$tmp/stderr")"
 jq -e 'length == 2 and (map(.module) | sort) == ["intel-ipu7-camera 1.0.6-3", "tuxedo-drivers-nocompatcheck-dkms 4.22.1-2"]
   and all(.arch == "x86_64" and .kernel == "linux-omarchy-headers 7.2.8-9")' <<<"$legs" >/dev/null &&
   pass "a channel's matrix has one leg per kernel and DKMS package, named with versions, however many trees it ships" || fail "legs: $legs"
+# A channel database is read from the bucket, past the CDN's cache: curl is a
+# stub that serves the fixture database and answers -w with $FAKE_CACHE.
+mkdir -p "$tmp/curlbin"
+cat >"$tmp/curlbin/curl" <<'CURL'
+#!/bin/bash
+out="" fmt="" url=""
+while (($#)); do
+  case $1 in
+    -o) out=$2; shift 2 ;;
+    -w) fmt=$2; shift 2 ;;
+    --retry) shift 2 ;;
+    -*) shift ;;
+    *) url=$1; shift ;;
+  esac
+done
+echo "$url" >>"$FAKE_CURL_LOG"
+[[ $url == https://pkgs.omarchy.org/edge/x86_64/omarchy.files\?fresh=* ]] || exit 22
+cp "$FAKE_DB" "$out"
+[[ -z $fmt ]] || printf '%s' "$FAKE_CACHE"
+CURL
+chmod +x "$tmp/curlbin/curl"
+fetched() { PATH="$tmp/curlbin:$PATH" FAKE_CURL_LOG="$tmp/curl.log" FAKE_DB="$tmp/edge.files" FAKE_CACHE=$1 \
+  "$ROOT/bin/check-dkms" matrix --arch x86_64 --channel edge 2>"$tmp/stderr"; }
+: >"$tmp/curl.log"
+[[ $(fetched MISS) == "$legs" ]] && grep -qE '^https://pkgs\.omarchy\.org/edge/x86_64/omarchy\.files\?fresh=[0-9]+$' "$tmp/curl.log" &&
+  pass "a channel database is fetched past the CDN's cache" || fail "fresh fetch: $(cat "$tmp/curl.log" "$tmp/stderr")"
+if fetched HIT >/dev/null; then fail "a channel database the CDN served from its cache must be refused"; fi
+grep -qF "edge/x86_64/omarchy.files came from the CDN's cache (HIT), not the bucket" "$tmp/stderr" &&
+  pass "a channel database that came from the CDN's cache is refused" || fail "cached: $(cat "$tmp/stderr")"
 package "$tmp/local-plain" hyprland 0.56.2-5 x86_64 usr/bin/Hyprland
 [[ $(matrix --local "$tmp/local-plain") == '[]' ]] &&
   pass "a build without kernels or DKMS packages has no legs" || fail "plain: $(cat "$tmp/stderr")"
