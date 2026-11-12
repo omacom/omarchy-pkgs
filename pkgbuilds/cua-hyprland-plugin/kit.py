@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-"""Derive the ABI-scoped profile kit from Cua's published kit, the way its profile_bundle.py builds one."""
+"""Derive the profile kit for the installed Hyprland from Cua's published kit, the way its profile_bundle.py builds one."""
 
 import argparse
 import hashlib
 import io
 from pathlib import Path, PurePosixPath
+import re
+import subprocess
 import tarfile
 import types
 
@@ -53,7 +55,14 @@ def load_verifier(path, source):
     return module
 
 
-def derive(payload, profile_data, verify):
+def measure(verify):
+    # Omarchy builds its own Hyprland, so the build it compiles against is read here, never taken from the kit.
+    return {"package_version": verify.run("pacman", "-Q", "hyprland").split()[1],
+            "sha256": verify.digest(Path("/usr/bin/Hyprland")),
+            "headers_sha256": verify.header_inventory_sha256()}
+
+
+def derive(payload, profile_data, verify, hyprland, release):
     upstream = verify.read_json(payload["PROFILE.json"])
     provenance = verify.read_json(payload["KIT-PROVENANCE.json"])
     require(payload["KIT-PROVENANCE.json"] == verify.json_bytes(provenance) and
@@ -62,12 +71,20 @@ def derive(payload, profile_data, verify):
     require(profile_data == verify.json_bytes(profile), "profile is not in the kit's canonical form")
     require(set(ABI_RUNTIME) <= set(upstream["runtime"]["packages"]), "upstream profile lacks an ABI runtime package")
     # Versions may follow Omarchy's own profile_measure.py run; everything else stays Cua's measurement,
-    # so a rebuilt Hyprland, GCC or libstdc++ still needs a new kit.
+    # so a new GCC or libstdc++ still needs a new kit.
     packages = profile["runtime"]["packages"]
     expected = dict(upstream, profile_id=profile["profile_id"], package_release=profile["package_release"],
                     runtime=dict(upstream["runtime"], packages=packages))
     require(set(packages) == set(ABI_RUNTIME) and profile == expected,
             "profile changes more than its ID, release and ABI package versions")
+    # A rebuild of the Hyprland release the kit was qualified on is Omarchy's to follow; another release is Cua's.
+    require(set(hyprland) == {"package_version", "sha256", "headers_sha256"} and
+            hyprland["package_version"].rpartition("-")[0] == upstream["hyprland"]["header_version"],
+            "installed Hyprland is not a build of the release this kit supports")
+    require(re.fullmatch(r"[0-9]+", release), "pkgrel must be a whole number")
+    profile = verify.validate_profile(
+        dict(profile, package_release=int(release), hyprland=dict(profile["hyprland"], **hyprland)))
+    profile_data = verify.json_bytes(profile)
     provenance["profile_sha256"] = sha256(profile_data)
     derived = {name: data for name, data in payload.items() if name != "SHA256SUMS"}
     derived["PROFILE.json"] = profile_data
@@ -95,7 +112,7 @@ def extract_source(data, stem, destination):
         path.write_bytes(content)
 
 
-def run(mode, archive, archive_sha256, profile, srcdir, kit_sha256):
+def run(mode, archive, archive_sha256, profile, srcdir, release):
     payload = read_kit(archive, archive_sha256)
     kit = srcdir / KIT
     if mode == "extract":
@@ -108,7 +125,7 @@ def run(mode, archive, archive_sha256, profile, srcdir, kit_sha256):
     require(verifier.is_file() and not verifier.is_symlink() and verifier.read_bytes() == payload["profile_verify.py"],
             "extracted verifier differs from the kit")
     verify = load_verifier(verifier, payload["profile_verify.py"])
-    derived, stem = derive(payload, profile.read_bytes(), verify)
+    derived, stem = derive(payload, profile.read_bytes(), verify, measure(verify), release)
     if mode == "extract":
         for name, content in derived.items():
             (kit / name).write_bytes(content)
@@ -119,7 +136,7 @@ def run(mode, archive, archive_sha256, profile, srcdir, kit_sha256):
         require(path.is_file() and not path.is_symlink() and path.read_bytes() == content,
                 "extracted kit differs from derivation: " + name)
     # Cua's own completeness check: profile, provenance, tooling and the rendered recipe agree.
-    verify.verify_kit(kit, kit_sha256, complete=True)
+    verify.verify_kit(kit, sha256(derived["KIT-PROVENANCE.json"]), complete=True)
 
 
 def main():
@@ -129,11 +146,11 @@ def main():
     parser.add_argument("--archive-sha256", required=True)
     parser.add_argument("--profile", required=True, type=Path)
     parser.add_argument("--srcdir", required=True, type=Path)
-    parser.add_argument("--kit-sha256", required=True)
+    parser.add_argument("--package-release", required=True)
     args = parser.parse_args()
     try:
-        run(args.mode, args.archive, args.archive_sha256, args.profile, args.srcdir, args.kit_sha256)
-    except (ValueError, KeyError, TypeError, OSError, tarfile.TarError) as error:
+        run(args.mode, args.archive, args.archive_sha256, args.profile, args.srcdir, args.package_release)
+    except (ValueError, KeyError, TypeError, OSError, IndexError, tarfile.TarError, subprocess.CalledProcessError) as error:
         parser.exit(1, f"error: {error}\n")
 
 
