@@ -1,0 +1,276 @@
+#!/usr/bin/env python3
+# Give a Qualcomm Wi-Fi card ath12k or ath11k board data while linux-firmware has no entry for it.
+#
+# ath12k and ath11k look a card up in board-2.bin by its PCI IDs and load board.bin when no
+# entry matches, so a card linux-firmware doesn't list has no Wi-Fi. Qualcomm's Windows driver gives
+# every card of one family (an M.2 module such as the NCM825A) the same board file, and
+# linux-firmware gives the cards of a family it lists the same record. The cards file maps each
+# card to its family and each family to the records linux-firmware ships for it. For a card
+# this machine has and linux-firmware doesn't list, this installs its family's record as
+# board.bin under /usr/lib/firmware/updates. It removes that copy again once linux-firmware
+# lists the card or a package installs its own board.bin for the chip.
+#
+# Usage: ath12k-board-fallback [--check | --remove]
+#   (none)    install or remove the copy for each Wi-Fi chip in this machine
+#   --check   say what it would do and change nothing
+#   --remove  remove every copy this tool installed
+
+import hashlib
+import lzma
+import os
+import re
+import struct
+import subprocess
+import sys
+import tempfile
+
+SYSFS = os.environ.get("ATH12K_BOARD_SYSFS", "/sys/bus/pci/devices")
+FIRMWARE = os.environ.get("ATH12K_BOARD_FIRMWARE", "/usr/lib/firmware")
+CARDS = os.environ.get("ATH12K_BOARD_CARDS", "/usr/share/ath12k-board-fallback/cards")
+STATE = os.environ.get("ATH12K_BOARD_STATE", "/var/lib/ath12k-board-fallback/installed")
+
+# The firmware folder the driver loads each chip's board data from. ath11k's WCN6855 has two
+# revisions behind one PCI ID; the Snapdragon X laptops' is hw2.1.
+CHIPS = {
+    "17cb:1103": "ath11k/WCN6855/hw2.1",
+    "17cb:1107": "ath12k/WCN7850/hw2.0",
+    "17cb:1112": "ath12k/QCC2072/hw1.0",
+}
+# Each driver's board-2.bin starts with its own magic.
+MAGIC = {"ath11k": b"QCA-ATH11K-BOARD\0", "ath12k": b"QCA-ATH12K-BOARD\0"}
+BOARD, NAME, DATA = 0, 0, 1
+
+
+def log(msg):
+    print(f"ath12k-board-fallback: {msg}")
+
+
+def read_cards(path):
+    """Families with the records that hold their board data, and each card's family."""
+    records, cards = {}, {}
+    with open(path) as f:
+        for n, line in enumerate(f, 1):
+            words = line.split("#", 1)[0].split()
+            if not words:
+                continue
+            if words[0] == "record" and len(words) == 3:
+                records.setdefault(words[1], []).append(words[2])
+            elif words[0] == "card" and len(words) == 4 and words[1] in CHIPS and re.fullmatch(r"[0-9a-f]{4}:[0-9a-f]{4}", words[2]):
+                cards[(words[1], words[2])] = words[3]
+            else:
+                sys.exit(f"ath12k-board-fallback: {path}:{n}: cannot read {line.strip()!r}")
+    for (chip, card), family in cards.items():
+        if family not in records:
+            sys.exit(f"ath12k-board-fallback: {path}: card {chip} {card} has family {family}, which has no record")
+    return records, cards
+
+
+def machine_cards():
+    """(chip, subsystem) for each Qualcomm Wi-Fi card on the PCI bus."""
+    found = []
+    try:
+        devices = sorted(os.listdir(SYSFS))
+    except FileNotFoundError:
+        return found
+
+    def ident(dev, a, b):
+        return ":".join(open(os.path.join(SYSFS, dev, x)).read().strip().lower().removeprefix("0x").zfill(4) for x in (a, b))
+
+    for dev in devices:
+        try:
+            chip = ident(dev, "vendor", "device")
+            if chip in CHIPS:
+                found.append((chip, ident(dev, "subsystem_vendor", "subsystem_device")))
+        except OSError:
+            continue
+    return found
+
+
+def read_firmware(rel):
+    """The file the kernel would load for rel: plain before compressed, updates first."""
+    for suffix in ("", ".zst", ".xz"):
+        for base in (os.path.join(FIRMWARE, "updates"), FIRMWARE):
+            path = os.path.join(base, rel + suffix)
+            if not os.path.isfile(path):
+                continue
+            raw = open(path, "rb").read()
+            if suffix == ".xz":
+                return lzma.decompress(raw)
+            if suffix == ".zst":
+                try:
+                    from compression import zstd
+                    return zstd.decompress(raw)
+                except ImportError:
+                    return subprocess.run(["zstd", "-dcq"], input=raw, capture_output=True, check=True).stdout
+            return raw
+    return None
+
+
+def board_records(container, driver):
+    """{board name: data} from a driver's board-2.bin."""
+    magic = MAGIC[driver]
+    if not container.startswith(magic):
+        raise ValueError(f"not an {driver} board-2.bin")
+
+    def ies(buf, off, end):
+        while off < end:
+            if end - off < 8:
+                raise ValueError("truncated board-2.bin")
+            kind, length = struct.unpack_from("<II", buf, off)
+            if off + 8 + length > end:
+                raise ValueError("truncated board-2.bin")
+            yield kind, buf[off + 8:off + 8 + length]
+            off += 8 + ((length + 3) & ~3)
+
+    out = {}
+    for kind, board in ies(container, (len(magic) + 3) & ~3, len(container)):
+        if kind != BOARD:
+            continue
+        names, data = [], None
+        for sub, payload in ies(board, 0, len(board)):
+            if sub == NAME:
+                names.append(payload.decode("ascii", "replace").rstrip("\0"))
+            elif sub == DATA:
+                data = payload
+        if data is not None:
+            for name in names:
+                out[name] = data
+    return out
+
+
+def lists_card(records, chip, card):
+    vendor, device = chip.split(":")
+    sub_vendor, sub_device = card.split(":")
+    key = f"vendor={vendor},device={device},subsystem-vendor={sub_vendor},subsystem-device={sub_device},"
+    return any(key in name for name in records)
+
+
+def read_state():
+    state = {}
+    try:
+        for line in open(STATE):
+            rel, digest = line.split()
+            state[rel] = digest
+    except FileNotFoundError:
+        pass
+    return state
+
+
+def write_state(state, check):
+    if check:
+        return
+    os.makedirs(os.path.dirname(STATE), exist_ok=True)
+    with tempfile.NamedTemporaryFile("w", dir=os.path.dirname(STATE), delete=False) as f:
+        for rel, digest in sorted(state.items()):
+            f.write(f"{rel} {digest}\n")
+    os.chmod(f.name, 0o644)
+    os.replace(f.name, STATE)
+
+
+def sha256(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def remove_copy(rel, state, check, why):
+    path = os.path.join(FIRMWARE, "updates", rel)
+    if rel not in state:
+        return
+    if not os.path.isfile(path):
+        del state[rel]
+        return
+    if sha256(open(path, "rb").read()) != state[rel]:
+        log(f"leaving {path} in place: it changed since this tool installed it")
+        del state[rel]
+        return
+    log(f"removing {path}: {why}")
+    if not check:
+        os.remove(path)
+        try:
+            os.removedirs(os.path.dirname(path))
+        except OSError:
+            pass
+    del state[rel]
+
+
+def install_copy(rel, data, state, check, why):
+    path = os.path.join(FIRMWARE, "updates", rel)
+    digest = sha256(data)
+    if os.path.isfile(path):
+        current = sha256(open(path, "rb").read())
+        if state.get(rel) != current:
+            # Not this tool's file, or changed since: never take it over, so it is never removed.
+            state.pop(rel, None)
+            if current != digest:
+                log(f"leaving {path} in place: this tool did not install it")
+            return
+        if current == digest:
+            return
+    log(f"installing {path}: {why}")
+    if not check:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with tempfile.NamedTemporaryFile(dir=os.path.dirname(path), delete=False) as f:
+            f.write(data)
+        os.chmod(f.name, 0o644)
+        os.replace(f.name, path)
+    state[rel] = digest
+
+
+def main():
+    args = sys.argv[1:]
+    if args not in ([], ["--check"], ["--remove"]):
+        sys.exit(__doc__ or "usage: ath12k-board-fallback [--check | --remove]")
+    check = args == ["--check"]
+    state = read_state()
+
+    if args == ["--remove"]:
+        for rel in list(state):
+            remove_copy(rel, state, False, "removing every copy this tool installed")
+        write_state(state, False)
+        return
+
+    families, card_family = read_cards(CARDS)
+    here = machine_cards()
+    for chip, folder in sorted(CHIPS.items()):
+        rel = f"{folder}/board.bin"
+        cards = [card for c, card in here if c == chip]
+        if not cards:
+            remove_copy(rel, state, check, "no card with this chip is in this machine")
+            continue
+        if any(os.path.isfile(os.path.join(FIRMWARE, rel + s)) for s in ("", ".zst", ".xz")):
+            remove_copy(rel, state, check, "a package installs board.bin for this chip")
+            continue
+        container = read_firmware(f"{folder}/board-2.bin")
+        try:
+            records = board_records(container, folder.split("/")[0]) if container else {}
+        except ValueError as e:
+            log(f"cannot read {folder}/board-2.bin: {e}")
+            continue
+
+        needed = {}
+        for card in cards:
+            if lists_card(records, chip, card):
+                continue
+            family = card_family.get((chip, card))
+            if family is None:
+                log(f"linux-firmware has no board data for the {chip} card {card}, and its family is not known")
+                continue
+            needed[card] = family
+        if not needed:
+            remove_copy(rel, state, check, "linux-firmware lists this machine's card")
+            continue
+        if len(set(needed.values())) > 1:
+            log(f"cards of different families share {folder}; installing nothing")
+            continue
+
+        family = next(iter(needed.values()))
+        source = next((name for name in families[family] if name in records), None)
+        if source is None:
+            log(f"linux-firmware ships none of the {family} records for {', '.join(needed)}; leaving {rel} as it is")
+            continue
+        install_copy(rel, records[source], state, check,
+                     f"linux-firmware has no entry for the {chip} card {', '.join(needed)}; using the record it ships for the card's family, {family}")
+    write_state(state, check)
+
+
+if __name__ == "__main__":
+    main()

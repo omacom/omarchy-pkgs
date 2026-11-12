@@ -14,8 +14,6 @@ trap 'rm -rf "$TEST_ROOT"' EXIT
 mkdir -p "$TEST_ROOT/bin" "$TEST_ROOT/pkgbuilds" "$TEST_ROOT/build-output/edge/$TEST_ARCH"
 cp "$BUILD_ROOT/bin/build" "$TEST_ROOT/bin/"
 cp -r "$BUILD_ROOT/build" "$BUILD_ROOT/helpers" "$TEST_ROOT/"
-# No external verification keys are needed for source-free fixtures.
-: > "$TEST_ROOT/build/gpg-keys.txt"
 
 # The runner expects the normal image tag. Use an engine wrapper to select
 # the supplied test image without overwriting an operator's builder image.
@@ -187,6 +185,30 @@ run_build scratch > "$TEST_ROOT/scratch.log" 2>&1 || {
   exit 1
 }
 printf 'PASS: /tmp, and /src on large hosts, are executable tmpfs mounts\n'
+
+# pacman installs the owners a package records, so a file left owned by a
+# build machine's uid must stop the build before it reaches the output.
+fixture runner-owned ''
+cat >> "$TEST_ROOT/pkgbuilds/runner-owned/PKGBUILD" <<'EOF'
+package() {
+  install -Dm755 /dev/null "$pkgdir/opt/runner-owned/app"
+  chown -R 1001:1001 "$pkgdir/opt/runner-owned"
+}
+EOF
+owner_status=0
+OMARCHY_BUILD_RESULT_DIR="$TEST_ROOT/owner-results" run_build runner-owned > "$TEST_ROOT/owner.log" 2>&1 || owner_status=$?
+if (( owner_status != 2 )); then
+  cat "$TEST_ROOT/owner.log"
+  echo "FAIL: expected a refused package (2), got $owner_status" >&2
+  exit 1
+fi
+[[ $(cat "$TEST_ROOT/owner-results/failed") == "runner-owned" ]]
+grep -q 'files that pacman would install with a non-root owner' "$TEST_ROOT/owner.log"
+if compgen -G "$TEST_ROOT/build-output/edge/$TEST_ARCH/runner-owned-*.pkg.tar.zst" >/dev/null; then
+  echo 'FAIL: a package with a uid 1001 file reached the build output' >&2
+  exit 1
+fi
+printf 'PASS: a package with a file owned by uid 1001 never reaches the output\n'
 
 fixture excluded ''
 other_arch=aarch64
