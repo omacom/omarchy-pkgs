@@ -87,6 +87,13 @@ plan=$(promote target source)
 [[ $(grep -c '^pair' <<<"$plan") == 1 ]] &&
   grep -qP '^pair\tlinux-omarchy-headers 7.3.0-3-omarchy\txpadneo-dkms hid-xpadneo-v0.10.5$' <<<"$plan" &&
   pass "a kernel and a module promoted together are built against each other" || fail "both: $plan"
+# --packages reads names the way promote.yml hands them to promote-channel,
+# split on any whitespace: a blank filter is none, so the check covers
+# everything the promotion moves, and a tab separates names too.
+[[ $(promote target source --packages ' ') == "$(promote target source)" ]] &&
+  pass "a blank package filter checks everything, as the promotion moves everything" || fail "blank filter: $(promote target source --packages ' ')"
+[[ $(promote target source --packages $'xpadneo-dkms\tlinux-omarchy-headers') == "$(promote target source --packages 'xpadneo-dkms linux-omarchy-headers')" ]] &&
+  pass "names separated by a tab are two names" || fail "tab filter: $(promote target source --packages $'xpadneo-dkms\tlinux-omarchy-headers')"
 legs=$("$ROOT/bin/check-dkms" matrix --arch x86_64 --files-db "$tmp/target.files" --from-db "$tmp/source.files" \
   --packages linux-omarchy-headers 2>/dev/null)
 [[ $legs == '[{"arch":"x86_64","kernel":"linux-omarchy-headers 7.3-3","module":"xpadneo-dkms 0.10.4-1"}]' ]] &&
