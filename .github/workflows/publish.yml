@@ -200,6 +200,9 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           CONTAINER_ENGINE: docker
+          # Only for the record's target: a proof run that fails here is
+          # still a proof run.
+          OMARCHY_PUBLISH_PREFIX: ${{ vars.OMARCHY_PUBLISH_PREFIX }}
         run: |
           set -uo pipefail
           source helpers/artifact-helpers.sh
@@ -355,10 +358,29 @@ jobs:
           # Every slot's outcome goes into publish-record.json for the report
           # job: what was published, where, from which artifact, and whether
           # the slot succeeded. A failing slot stops the loop (set -e) but the
-          # record still shows everything before it landed.
+          # record still shows everything before it landed, and every planned
+          # slot after it as not-run.
           : > slots.jsonl
-          record_slot() { jq -nc --arg m "$1" --arg a "$2" --arg st "$3" --arg files "$4" \
-            '{mirror:$m, arch:$a, status:$st, packages:[$files | split(" ") | .[] | select(length>0) | sub(".*/";"") | sub("\\.pkg\\.tar\\.zst$";"")]}' >> slots.jsonl; }
+          # The builder image runs as its own user; let it write the
+          # per-slot records and the Mac-set check's.
+          mkdir -p "$RUNNER_TEMP/slots"
+          chmod 0777 "$RUNNER_TEMP/slots"
+          # record_slot <mirror> <arch> <status> <files> [<publish-artifact record>]
+          # A slot that ran takes its packages from publish-artifact's record:
+          # the files it published, not every file it was handed. One that
+          # published none of them is "unchanged". Otherwise packages are
+          # the files the slot was handed.
+          record_slot() {
+            jq -nc --arg m "$1" --arg a "$2" --arg st "$3" --arg files "$4" --slurpfile r "${5:-/dev/null}" '
+              ($files | split(" ") | map(select(length > 0) | sub(".*/"; "") | sub("\\.pkg\\.tar\\.zst$"; ""))) as $handed
+              | if ($r | length) > 0 then
+                  {mirror: $m, arch: $a,
+                   status: (if ($r[0].published | length) > 0 then "published" else "unchanged" end),
+                   packages: [$r[0].published[].file], skipped: [$r[0].skipped[].file],
+                   entries: ([$r[0].published[] | . + {status: "published"}] + [$r[0].skipped[] | . + {status: "skipped"}]),
+                   signer: $r[0].signer}
+                else {mirror: $m, arch: $a, status: $st, packages: $handed} end' >> slots.jsonl
+          }
           status=0
           # rc and stable get fast-ring builds here, held to the qualified Mac
           # set like any promotion (bin/check-mac-set). Every one of those
@@ -371,15 +393,26 @@ jobs:
               [[ -z "$files" ]] || echo "$mirror $parch $files" >> mac-slots.txt
             done
           done
+          : > "$RUNNER_TEMP/slots/mac-set.jsonl"
+          chmod 0666 "$RUNNER_TEMP/slots/mac-set.jsonl"
           if [[ -s mac-slots.txt ]] && ! docker run --rm \
             -e OMARCHY_PUBLISH_PREFIX \
             -e RCLONE_CONFIG_R2_TYPE -e RCLONE_CONFIG_R2_PROVIDER -e RCLONE_CONFIG_R2_ENDPOINT -e RCLONE_CONFIG_R2_NO_CHECK_BUCKET \
             -e RCLONE_CONFIG_R2_ACCESS_KEY_ID -e RCLONE_CONFIG_R2_SECRET_ACCESS_KEY \
-            -v "$PWD:/w:ro" -w /w \
+            -v "$PWD:/w:ro" -v "$RUNNER_TEMP/slots:/out" -w /w \
             omarchy-pkg-builder:latest-x86_64-edge \
-            bin/check-mac-set --remote R2:omarchy-pkgs --slots mac-slots.txt; then
+            bin/check-mac-set --remote R2:omarchy-pkgs --slots mac-slots.txt --record /out/mac-set.jsonl; then
             echo "::error title=Mac package set::this merge would leave rc or stable without the qualified Mac set; nothing published"
-            while read -r mirror parch files; do record_slot "$mirror" "$parch" refused "$files"; done < mac-slots.txt
+            # The refused slots carry the check's reasons, as the fast-ring
+            # step's refusals do. The edge slots never run either; the
+            # not-run loop below records them.
+            while read -r mirror parch files; do
+              record_slot "$mirror" "$parch" refused "$files"
+              jq -c --arg m "$mirror" --arg a "$parch" --slurpfile r "$RUNNER_TEMP/slots/mac-set.jsonl" \
+                'if .mirror == $m and .arch == $a and .status == "refused"
+                 then . + {mac_set: [$r[] | select(.channel == $m and .arch == $a) | del(.type)]} else . end' \
+                slots.jsonl > slots.tmp && mv slots.tmp slots.jsonl
+            done < mac-slots.txt
             status=1
           fi
           (( status == 0 )) && for mirror in edge rc stable; do
@@ -387,20 +420,34 @@ jobs:
               files=${slot_files["$mirror/$parch"]:-}
               [[ -n "$files" ]] || continue
               echo "==> $mirror/$parch: $files"
+              slot_record="$RUNNER_TEMP/slots/$mirror-$parch.jsonl"
+              : > "$slot_record"
+              chmod 0666 "$slot_record"
               # shellcheck disable=SC2086 # $files is a space-separated list of package files
               if docker run --rm \
                 -e GPG_PRIVATE_KEY -e GPG_PASSPHRASE -e OMARCHY_PUBLISH_PREFIX \
                 -e RCLONE_CONFIG_R2_TYPE -e RCLONE_CONFIG_R2_PROVIDER -e RCLONE_CONFIG_R2_ENDPOINT -e RCLONE_CONFIG_R2_NO_CHECK_BUCKET \
                 -e RCLONE_CONFIG_R2_ACCESS_KEY_ID -e RCLONE_CONFIG_R2_SECRET_ACCESS_KEY \
-                -v "$PWD:/w:ro" -w /w \
+                -v "$PWD:/w:ro" -v "$RUNNER_TEMP/slots:/out" -w /w \
                 omarchy-pkg-builder:latest-x86_64-edge \
-                bin/publish-artifact --remote R2:omarchy-pkgs --mirror "$mirror" --arch "$parch" $files; then
-                record_slot "$mirror" "$parch" published "$files"
+                bin/publish-artifact --remote R2:omarchy-pkgs --mirror "$mirror" --arch "$parch" \
+                  --record "/out/$mirror-$parch.jsonl" $files; then
+                record_slot "$mirror" "$parch" published "$files" "$slot_record"
               else
                 record_slot "$mirror" "$parch" failed "$files"
                 status=1
                 break 2
               fi
+            done
+          done
+          # Every planned slot that did not run: after a failed slot, or
+          # all of them after a Mac-set refusal.
+          for mirror in edge rc stable; do
+            for parch in x86_64 aarch64; do
+              files=${slot_files["$mirror/$parch"]:-}
+              [[ -n "$files" ]] || continue
+              jq -e --arg m "$mirror" --arg a "$parch" 'select(.mirror == $m and .arch == $a)' slots.jsonl >/dev/null \
+                || record_slot "$mirror" "$parch" not-run "$files"
             done
           done
           jq -n --arg sha "${{ github.sha }}" --arg run "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
@@ -511,8 +558,8 @@ jobs:
             done
           done
           # Its publishes join the run's record as slots, as the Publish
-          # step's own do.
-          jq -c 'select(.type == "slot") | del(.type)' "$RUNNER_TEMP/fast-ring/record.jsonl" > fast-ring-slots.jsonl
+          # step's own do, with entries per file (helpers/fast-ring-slots.jq).
+          jq -sc -f helpers/fast-ring-slots.jq "$RUNNER_TEMP/fast-ring/record.jsonl" > fast-ring-slots.jsonl
           jq --slurpfile extra fast-ring-slots.jsonl '.slots += $extra' publish-record.json > publish-record.tmp
           mv publish-record.tmp publish-record.json
           echo "fast-ring slots: $(wc -l < fast-ring-slots.jsonl)"

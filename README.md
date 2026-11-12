@@ -393,7 +393,7 @@ for a cancelled one, [check the channel](#check-that-a-version-is-live).
 | `target` | `live`, or the scratch prefix of a proof run |
 | `plan` | Every package, architecture and channel the run set out to publish |
 | `sources` | Per package and architecture, where its files came from. Stops at the first one that failed |
-| `slots` | Per channel and architecture attempted: `status`, and `packages` as file names without `.pkg.tar.zst` |
+| `slots` | Per channel and architecture the run planned: `status`, and `packages` as file names without `.pkg.tar.zst` |
 
 `sources[].source` is one of:
 
@@ -406,9 +406,26 @@ for a cancelled one, [check the channel](#check-that-a-version-is-live).
 | `artifact-download-failed` | The artifact exists but could not be fetched or unpacked |
 | `built`, `native-rebuild`, `native-build-failed` | Written by earlier versions of the workflow: built during the run, or failed to |
 
-`slots[].status` is `published` or `failed`. An empty `slots` means the run
-wrote no channel. The fast-ring step's copies into `rc` and `stable` are
-slots of the same run.
+`slots[].status` is one of:
+
+| Value | Meaning |
+|---|---|
+| `published` | The slot ran and wrote at least one file; `packages` lists only the files it wrote |
+| `unchanged` | The slot ran, but the channel already served every file at that version or newer |
+| `failed` | The slot ran and failed; the slots after it did not run |
+| `refused` | The Mac package set check refused it before any slot ran; `mac_set` holds the check's reasons |
+| `not-run` | Planned, but an earlier slot failed or a refusal stopped the run |
+
+For a slot that did not run, `packages` lists the files it was handed. A
+slot that ran also has `skipped` (the files the channel already served),
+`signer` (the fingerprint of the signing key) and `entries`: per file, its
+`name`, `base`, `version`, `was` (what the channel served for that name
+before, `null` when new), `size` and `was_size` in bytes, and `status`
+(`published` or `skipped`). Older records have only `packages`, and may
+list skipped files there as published.
+
+An empty `slots` means the run wrote no channel. The fast-ring step's copies
+into `rc` and `stable` are slots of the same run.
 
 A [promotion](#promote-a-channel) appends a line with `"kind": "promote"`
 (publish runs have no `kind`) and these fields besides `time`, `commit`,
