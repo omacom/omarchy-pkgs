@@ -345,7 +345,9 @@ destination. A re-run after a failure picks up where it stopped.
 The run's summary lists what moved and what stayed back, with the reason;
 the full plan is kept as the `promote-record-<run-id>` artifact for 90 days,
 and a run that publishes appends to the [publish log](#read-the-publish-log)
-with who ran it.
+with who ran it. Afterwards each merged PR whose files it published gets its
+publish comment redrawn, so the comment's `rc` and `stable` cells show the
+move (`bin/publish-report-refresh`, at most 100 PRs a run, newest first).
 
 ### Check that a version is live
 
@@ -484,7 +486,8 @@ next release candidate, or the Mac package set holding another version. The
 heading says "Live" only when every channel the run wrote lists its files
 as users read them, and how long that took from the merge; a folded table
 gives each job's and each publish step's time. A failure names the check
-that stopped the run and what to do next. The
+that stopped the run and what to do next. A rerun, and a later promotion
+of the same files, edit this comment rather than add one. The
 record itself is kept as an artifact of the run for 90 days: `gh run download <run-id> -n publish-record-<run-id>`.
 
 ## When a publish fails

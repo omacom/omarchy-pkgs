@@ -83,6 +83,9 @@ report --outcome success && head -1 "$T/out" | grep -qx '### Live on edge · 2m 
   && pass "the heading says how long merge to served took, the details say where" || fail "timing"
 grep -q '^\*\*omarchy-mac-installer was not told\*\* (HTTP 401)' "$T/out" \
   && pass "a failed Mac installer dispatch is named" || fail "Mac installer line"
+tail -1 "$T/out" | grep -qx '<!-- publish-report cad67735c43ec596364c6925b681796f4a59a996 -->' \
+  && pass "the report ends in the marker a redraw finds it by" || fail "marker"
+
 # Without the Mac set, a normal-ring package waits for the next promotion.
 : > "$T/inventory"
 report --outcome success && row alpha | grep -q '| 1.0-1 · next: promotion | 1.0-1 · next: promotion |' \
@@ -143,4 +146,5 @@ report --outcome failure && grep -q 'Writing `edge/aarch64` failed; `rc/x86_64` 
 rm "$T/record.json"
 "$ROOT/bin/publish-report" --outcome failure --run https://example.invalid/run --commit cad67735 > "$T/out" 2>&1 \
   && grep -q 'before it wrote a record' "$T/out" && grep -q '\[run\](https://example.invalid/run)' "$T/out" \
+  && tail -1 "$T/out" | grep -qx '<!-- publish-report cad67735 -->' \
   && pass "a publish that wrote no record still gets a report" || fail "missing record"

@@ -1,0 +1,76 @@
+#!/bin/bash
+# Redraw the publish report of every merged PR whose files a promotion
+# carried into rc or stable.
+#
+#   publish-report-refresh --repo OWNER/NAME [--max N] [--dry-run]
+#                          [--channels URL] RECORD LOG
+#
+# RECORD is a promotion's record (promote.yml); LOG is the publish log
+# (publish-log.jsonl). A promoted file is the same file a merge published
+# to edge, so the merge is found in LOG by file name, and its newest
+# record there (a rerun included) is the one drawn. That record is drawn
+# again with bin/publish-report, which reads what each channel serves now,
+# and bin/publish-report-post --edit-only puts it over the PR's existing
+# report. A PR without a report from this tooling is left alone.
+#
+# At most --max PRs (default 100), newest first, so one large promotion
+# cannot run into GitHub's rate limits; the rest are listed. --dry-run
+# prints what it would redraw and edits nothing. --channels goes to
+# bin/publish-report.
+set -euo pipefail
+ROOT=$(realpath "${BASH_SOURCE[0]%/*}/..")
+
+REPO=""
+MAX=100
+DRY_RUN=false
+CHANNELS=https://pkgs.omarchy.org
+ARGS=()
+while [[ $# -gt 0 ]]; do
+  case $1 in
+  --repo) REPO=$2; shift 2 ;;
+  --max) MAX=$2; shift 2 ;;
+  --dry-run) DRY_RUN=true; shift ;;
+  --channels) CHANNELS=$2; shift 2 ;;
+  -h|--help) sed -n '2,19p' "$0"; exit 0 ;;
+  -*) echo "Unknown option: $1" >&2; exit 64 ;;
+  *) ARGS+=("$1"); shift ;;
+  esac
+done
+(( ${#ARGS[@]} == 2 )) && [[ -n $REPO ]] || { echo "Usage: publish-report-refresh --repo OWNER/NAME [--max N] [--dry-run] RECORD LOG" >&2; exit 64; }
+RECORD=${ARGS[0]} LOG=${ARGS[1]}
+
+promoted=$(jq -c '[.slots[]? | select(.status == "published") | .packages[]] | unique' "$RECORD")
+if [[ $promoted == "[]" ]]; then
+  echo "the promotion published nothing; no report to redraw"
+  exit 0
+fi
+
+# The merges whose publish put a promoted file on edge, then each one's
+# newest record: a rerun that found the files already there (unchanged)
+# is newer than the attempt that wrote them, and says how it ended.
+T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
+jq -c 'select((.kind // "publish") == "publish" and .event == "push" and .target == "live")' "$LOG" > "$T/publishes.jsonl"
+jq -sc --argjson promoted "$promoted" '
+  ([.[] | select(any(.slots[]; .mirror == "edge" and .status == "published"
+      and any(.packages[]; . as $f | $promoted | index($f)))) | .commit] | unique) as $commits
+  | [.[] | select(.commit as $c | $commits | index($c))]
+  | group_by(.commit) | map(last) | sort_by(.time) | reverse | .[]' "$T/publishes.jsonl" > "$T/records.jsonl"
+
+total=$(wc -l < "$T/records.jsonl")
+echo "$total merged PR(s) published files this promotion carried"
+n=0
+while IFS= read -r record; do
+  n=$((n + 1))
+  commit=$(jq -r .commit <<<"$record")
+  if (( n > MAX )); then
+    echo "not redrawn (over --max $MAX): $commit"
+    continue
+  fi
+  printf '%s\n' "$record" > "$T/record.json"
+  "$ROOT/bin/publish-report" --channels "$CHANNELS" --outcome "$(jq -r '.outcome // "success"' <<<"$record")" "$T/record.json" > "$T/body.md"
+  if [[ $DRY_RUN == true ]]; then
+    echo "would redraw the report for $commit from run $(jq -r .run <<<"$record")"
+  else
+    "$ROOT/bin/publish-report-post" --repo "$REPO" --commit "$commit" --edit-only "$T/body.md"
+  fi
+done < "$T/records.jsonl"
