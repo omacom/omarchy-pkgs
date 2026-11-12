@@ -81,8 +81,25 @@ cp "$B1" "$T/renamed-1.0-1-x86_64.pkg.tar.zst"
 if pub "$T/renamed-1.0-1-x86_64.pkg.tar.zst"; then fail "filename/PKGINFO mismatch should refuse"; else grep -q 'does not match PKGINFO' "$T/out" && pass "filename must match PKGINFO" || fail "mismatch reason"; fi
 
 A3=$(mkpkg alpha 3 any); D1=$(mkpkg delta 1 any)
-pub "$A1" "$A3" "$D1" && [[ "$(entries)" == "alpha-1.0-3/ beta-1.0-1/ delta-1.0-1/ " ]] \
+a2_size=$(stat -c %s "$A2")
+pub --record "$T/record.jsonl" "$A1" "$A3" "$D1" && [[ "$(entries)" == "alpha-1.0-3/ beta-1.0-1/ delta-1.0-1/ " ]] \
   && pass "newer and new packages publish, the rest are dropped" || fail "mixed publish"
+
+# The record names what really went out, and what each entry replaced: the
+# workflow's slot and the PR comment are built from it. alpha 1.0-1 was
+# handed in but skipped, so it must not be reported as published.
+jq -e --argjson a2 "$a2_size" '
+  ([.published[] | "\(.name) \(.was) -> \(.version)"] == ["alpha 1.0-2 -> 1.0-3", "delta null -> 1.0-1"])
+  and (.published[0].was_size == $a2) and (.published[1].was_size == null)
+  and ([.skipped[] | "\(.name) \(.version) kept out by \(.was)"] == ["alpha 1.0-1 kept out by 1.0-2"])
+  and (.signer | test("^[0-9A-F]{40}$"))' "$T/record.jsonl" >/dev/null \
+  && pass "the record lists published and skipped files with the versions they replace" \
+  || { cat "$T/record.jsonl"; fail "publish record"; }
+
+# A run that publishes nothing still says so, with nothing signed.
+: > "$T/record.jsonl"
+pub --record "$T/record.jsonl" "$A3" && jq -e '.published == [] and (.skipped | length) == 1 and .signer == null' "$T/record.jsonl" >/dev/null \
+  && pass "a run that publishes nothing records only skips" || { cat "$T/record.jsonl"; fail "empty publish record"; }
 
 # db must verify: pacman can read it and each package's signature checks
 gpg --batch --quiet --import <<<"$GPG_PRIVATE_KEY" 2>/dev/null || true
