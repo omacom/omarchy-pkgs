@@ -251,8 +251,10 @@ remote_version_is_published() {
     done
   done
   # What `curl -f` accepted when the names were tried in turn: the transfer
-  # itself succeeded, and the status is below 400.
-  curl -sI --parallel -w '%{exitcode} %{http_code}\n' "${requests[@]}" | awk '$1 == 0 && $2 >= 200 && $2 < 400 { found = 1 } END { exit !found }'
+  # itself succeeded, and the status is below 400. All four are awaited, so
+  # each gets a time limit: one name that never answers must not hold up an
+  # archive another name already found.
+  curl -sI --parallel --max-time 10 -w '%{exitcode} %{http_code}\n' "${requests[@]}" | awk '$1 == 0 && $2 >= 200 && $2 < 400 { found = 1 } END { exit !found }'
 }
 
 # Check if package should be built for current architecture
