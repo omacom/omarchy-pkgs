@@ -14,8 +14,6 @@ trap 'rm -rf "$TEST_ROOT"' EXIT
 mkdir -p "$TEST_ROOT/bin" "$TEST_ROOT/pkgbuilds" "$TEST_ROOT/build-output/edge/$TEST_ARCH"
 cp "$BUILD_ROOT/bin/build" "$TEST_ROOT/bin/"
 cp -r "$BUILD_ROOT/build" "$BUILD_ROOT/helpers" "$TEST_ROOT/"
-# No external verification keys are needed for source-free fixtures.
-: > "$TEST_ROOT/build/gpg-keys.txt"
 
 # The runner expects the normal image tag. Use an engine wrapper to select
 # the supplied test image without overwriting an operator's builder image.
