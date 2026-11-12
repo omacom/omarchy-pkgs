@@ -147,7 +147,9 @@ class EdgeMetadataTests(unittest.TestCase):
     def test_omacom_loader_migrates_only_downstream_providers(self):
         package = srcinfo('m1n1-aurora')['m1n1-aurora']
         self.assertEqual(package['replaces'], ['aura', 'm1n1-neo'])
-        self.assertEqual(package['conflicts'], ['m1n1', 'aura', 'm1n1-neo'])
+        self.assertEqual(package['conflicts'], ['m1n1', 'aura', 'm1n1-neo', 'linux-aurora<7.2.11.aurora16'])
+        # The kernel floor is a conflict: linux-aurora depends on m1n1, so a dependency would loop.
+        self.assertFalse(any(d.startswith('linux-aurora') for d in package['depends']))
         self.assertNotIn('install', package)
         version = package['pkgver'][0]
         self.assertGreater(int(subprocess.check_output(['vercmp', version, '1.6.1.aurora1'], text=True)), 0)
