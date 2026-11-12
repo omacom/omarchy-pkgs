@@ -18,7 +18,7 @@ Profile `omarchy-edge-20261111-abi` and kit tooling `1.4.0` pin:
 
 ### Omarchy's Hyprland
 
-Omarchy publishes its own Hyprland, patched and one release above Arch's, and `[omarchy]` comes before `[extra]` on every machine and in the builder. The kit's profile names the build Cua measured, which is Arch's. A package pinned to that build is satisfied only by `[extra]`, so installing it replaces Omarchy's Hyprland with Arch's, and the next update, which wants Omarchy's back, is refused. Which Hyprland a machine runs is Omarchy's decision and this package never changes it, so the build is never read from the kit.
+Omarchy publishes its own Hyprland, patched and with a package release above Arch's, and Omarchy's pacman configuration and the builder both list `[omarchy]` before `[extra]`. The kit's profile names the build Cua measured, which is Arch's. A package pinned to that build is satisfied only by `[extra]`, so installing it replaces Omarchy's Hyprland with Arch's, and the next update, which wants Omarchy's back, is refused. Which Hyprland a machine runs is Omarchy's decision and this package never changes it, so the build is never read from the kit.
 
 `prepare()` measures the installed `hyprland` package with the kit's own verifier: its version, the bytes of `/usr/bin/Hyprland`, and the header inventory. `kit.py` writes those into the profile the kit is derived for, along with the package's own release, and every later step derives the kit again and requires the extracted one to match, so a Hyprland replaced during the build stops it. `package()` then depends on exactly that build, `hyprland=<version>-<release>`. The recipe's own `depends` names `hyprland` without a version, which is what lets the builder resolve Omarchy's.
 
