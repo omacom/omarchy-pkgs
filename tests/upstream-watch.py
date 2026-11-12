@@ -589,6 +589,12 @@ sha256sums_aarch64=('old-runtime')
             w.validate({"json": "https://example.test/feed", "path": "version",
                         "variables": {"_x": "{version}"}, "source_variables": {"_x": good}})
 
+    def test_zstd_without_tarfile_support_names_the_python_it_needs(self):
+        deb = self.build_deb("old-python", {"usr/lib/app/version": "2.2.2"})
+        methods = {k: v for k, v in w.tarfile.TarFile.OPEN_METH.items() if k != "zst"}
+        with patch.object(w.tarfile.TarFile, "OPEN_METH", methods), self.assertRaisesRegex(ValueError, "Python 3.14"):
+            w.archive_member(deb, "usr/lib/app/version")
+
     def test_slack_reads_its_electron_version_from_its_deb(self):
         watch = json.loads((ROOT / "pkgbuilds/slack-desktop/.omarchy/package.json").read_text())["upstream"]["watch"]
         w.validate(watch)

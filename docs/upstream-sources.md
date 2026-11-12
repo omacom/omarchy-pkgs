@@ -154,8 +154,9 @@ release each Slack `.deb` ships.
 
 ## Maintenance and validation
 
-Running watches locally requires Python 3.11+, Bash, curl, git, jq, Arch's
-`vercmp`, and `bsdtar`. CI installs these in its Arch container.
+Running watches locally requires Python 3.14+ (its `tarfile` reads zstd), Bash,
+curl, git, jq, Arch's `vercmp`, and `bsdtar`. CI installs these in its Arch
+container.
 
 - Edit packaging and architecture changes directly in PKGBUILD. The old AUR
   overlays have been folded into these recipes and removed.

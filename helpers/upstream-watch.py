@@ -638,6 +638,9 @@ def archive_member(file, member, limit=65536):
         is_deb = raw.read(8) == b"!<arch>\n"
         raw.seek(0)
         stream = io.BufferedReader(_Slice(raw, deb_data(raw))) if is_deb else raw
+        # tarfile reads zstd from Python 3.14; Debian and vendors use it widely.
+        if stream.peek(4)[:4] == b"\x28\xb5\x2f\xfd" and "zst" not in tarfile.TarFile.OPEN_METH:
+            raise ValueError(f"{file.name} is zstd-compressed; reading it needs Python 3.14 or newer")
         try:
             with tarfile.open(fileobj=stream, mode="r|*") as archive:
                 for entry in archive:
