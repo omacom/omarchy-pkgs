@@ -75,6 +75,15 @@ test('a promotion stops when the channels moved after its DKMS check', () => {
   assert.match(promote, /if \[\[ \$now != "\$built" \]\]; then/);
 });
 
+test('the DKMS workflows pin every action by commit, as the other workflows do', () => {
+  for (const name of ['dkms-check.yml', 'dkms-matrix.yml']) {
+    for (const [, ref] of read(name).matchAll(/^\s+(?:- )?uses: ([^\s]+.*)$/gm)) {
+      if (ref.startsWith('./')) continue;
+      assert.match(ref, /^[\w.-]+\/[\w./-]+@[0-9a-f]{40} # v\d+(\.\d+)*$/, `${name}: ${ref}`);
+    }
+  }
+});
+
 test('a pull request build records what the DKMS check reads', () => {
   const build = read('build-pr.yml');
   const changes = jobs(build).changes;
