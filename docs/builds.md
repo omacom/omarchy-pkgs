@@ -79,4 +79,6 @@ refreshes preserve that package visibility.
 `publish.yml`, `promote.yml`, `release-rc.yml` and `unpublish.yml` pull the
 compatible image to sign and update databases, and build it on the runner when
 no image carries the key yet (a change to `build/` publishes before its image
-refresh has finished). Package build jobs still build their own image on the runner.
+refresh has finished). Package build jobs in `build-pr.yml` pull it the same
+way, for their own architecture, and build it only when no image carries the
+key.
