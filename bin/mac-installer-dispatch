@@ -2,7 +2,7 @@
 # Tell omacom/omarchy-mac-installer that a publish changed the edge channel
 # for aarch64, so it can decide whether to build a new Mac image.
 #
-#   mac-installer-dispatch [--dry-run] RECORD
+#   mac-installer-dispatch [--dry-run] [--result FILE] RECORD
 #
 # RECORD is the publish job's publish-record.json. Only packages the record
 # shows as published into edge/aarch64 are sent (debug packages left out),
@@ -22,34 +22,47 @@
 # 0. A failed dispatch is a warning, never a failure: the packages are
 # already published, and the installer can always be built by hand.
 # --dry-run prints the payload instead of sending it, and needs no token.
+# --result FILE writes what happened as {status, detail, packages}, for the
+# publish record: status is sent, failed, skipped, disabled or dry-run.
 set -euo pipefail
 
 REPOSITORY=omacom/omarchy-mac-installer
 EVENT_TYPE=edge-mac-changed
 DB_URL=https://pkgs.omarchy.org/edge/aarch64/omarchy.db
 DRY_RUN=false
+RESULT=""
 RECORD=""
 while [[ $# -gt 0 ]]; do
   case $1 in
   --dry-run) DRY_RUN=true; shift ;;
-  -h|--help) sed -n '2,24p' "$0"; exit 0 ;;
+  --result) RESULT=$2; shift 2 ;;
+  -h|--help) sed -n '2,26p' "$0"; exit 0 ;;
   -*) echo "Unknown option: $1" >&2; exit 64 ;;
   *) [[ -z $RECORD ]] || { echo "One record only" >&2; exit 64; }; RECORD=$1; shift ;;
   esac
 done
-[[ -n $RECORD ]] || { echo "Usage: mac-installer-dispatch [--dry-run] RECORD" >&2; exit 64; }
+[[ -n $RECORD ]] || { echo "Usage: mac-installer-dispatch [--dry-run] [--result FILE] RECORD" >&2; exit 64; }
 
 notice() { echo "::notice title=Mac installer dispatch::$1"; }
 warning() { echo "::warning title=Mac installer dispatch::$1"; }
+packages='[]'
+# result <status> <detail>: what --result keeps.
+result() {
+  [[ -n $RESULT ]] || return 0
+  jq -nc --arg status "$1" --arg detail "$2" --argjson packages "$packages" \
+    '{status: $status, detail: $detail, packages: $packages}' > "$RESULT"
+}
 
 if ! jq -e 'type == "object" and (.slots | type == "array")' "$RECORD" >/dev/null 2>&1; then
   warning "$RECORD is not a publish record; nothing sent"
+  result skipped "not a publish record"
   exit 0
 fi
 
 target=$(jq -r '.target // ""' "$RECORD")
 if [[ $target != live ]]; then
   notice "publish target is ${target:-unknown}, not the live channels; nothing sent"
+  result skipped "proof run"
   exit 0
 fi
 
@@ -63,11 +76,13 @@ packages=$(jq -c '
   | unique_by(.name)' "$RECORD")
 if [[ $(jq length <<<"$packages") == 0 ]]; then
   notice "nothing was published into edge/aarch64; nothing sent"
+  result skipped "nothing new in edge/aarch64"
   exit 0
 fi
 
 if [[ $DRY_RUN != true && -z ${MAC_INSTALLER_DISPATCH_TOKEN:-} ]]; then
   notice "MAC_INSTALLER_DISPATCH_TOKEN is not set; not notifying $REPOSITORY"
+  result disabled "no dispatch token"
   exit 0
 fi
 
@@ -89,6 +104,7 @@ payload=$(jq -nc --argjson packages "$packages" --arg db "$database_sha256" \
 
 if [[ $DRY_RUN == true ]]; then
   jq . <<<"$payload"
+  result dry-run ""
   exit 0
 fi
 
@@ -101,6 +117,8 @@ status=$(printf 'header = "Authorization: Bearer %s"\n' "$MAC_INSTALLER_DISPATCH
     --data "$body" "https://api.github.com/repos/$REPOSITORY/dispatches") || status=000
 if [[ $status == 204 ]]; then
   echo "==> Notified $REPOSITORY ($EVENT_TYPE): $(jq -r '[.[] | .name + " " + .version] | join(", ")' <<<"$packages")"
+  result sent ""
 else
   warning "dispatch to $REPOSITORY failed (HTTP $status); start its Mac image build by hand if this publish matters to it"
+  result failed "HTTP $status"
 fi

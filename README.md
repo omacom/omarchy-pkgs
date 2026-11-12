@@ -396,6 +396,7 @@ for a cancelled one, [check the channel](#check-that-a-version-is-live).
 | `plan` | Every package, architecture and channel the run set out to publish |
 | `sources` | Per package and architecture, where its files came from. Stops at the first one that failed |
 | `slots` | Per channel and architecture the run planned: `status`, and `packages` as file names without `.pkg.tar.zst` |
+| `mac_installer` | What `bin/mac-installer-dispatch` did: `status` (`sent`, `failed`, `skipped`, `disabled`), `detail` and `packages` |
 
 `sources[].source` is one of:
 

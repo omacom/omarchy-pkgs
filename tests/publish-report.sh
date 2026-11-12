@@ -70,6 +70,13 @@ report --outcome failure && head -1 "$T/out" | grep -qx '### Published to edge, 
   && grep -q '`edge/aarch64` does not list alpha-1.0-3 after 3 reads' "$T/out" \
   && pass "a publish the channel does not list yet says so, not live and not a failed build" || fail "unserved heading"
 
+# The record says whether the Mac installer was told.
+jq '.mac_installer = {status: "failed", detail: "HTTP 401", packages: [{name: "alpha", version: "1.0-3"}]}' \
+  "$T/record.json" > "$T/live.json"
+mv "$T/live.json" "$T/record.json"
+report --outcome failure && grep -q '^\*\*omarchy-mac-installer was not told\*\* (HTTP 401)' "$T/out" \
+  && pass "a failed Mac installer dispatch is named" || fail "Mac installer line"
+
 # Without the Mac set, a normal-ring package waits for the next promotion.
 : > "$T/inventory"
 report --outcome success && row alpha | grep -q '| 1.0-1 · next: promotion | 1.0-1 · next: promotion |' \

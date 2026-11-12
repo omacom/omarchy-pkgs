@@ -81,6 +81,13 @@ out=$(MAC_INSTALLER_DISPATCH_TOKEN=secret-token STUB_STATUS=401 run) \
 out=$(MAC_INSTALLER_DISPATCH_TOKEN=secret-token STUB_STATUS=fail run) \
   && [[ $out == *"::warning"*"HTTP 000"* ]] && pass "an unreachable API warns and exits 0" || fail "network: $out"
 
+# The publish record keeps the outcome, so the PR comment can say it.
+out=$(MAC_INSTALLER_DISPATCH_TOKEN=secret-token run --result "$T/result.json") \
+  && jq -e '.status == "sent" and ([.packages[].name] | join(" ")) == "asdcontrol linux-aurora omarchy-settings-dev"' "$T/result.json" >/dev/null \
+  && out=$(MAC_INSTALLER_DISPATCH_TOKEN=secret-token STUB_STATUS=401 run --result "$T/result.json") \
+  && jq -e '.status == "failed" and .detail == "HTTP 401"' "$T/result.json" >/dev/null \
+  && pass "--result records a sent and a refused dispatch" || fail "result: $(cat "$T/result.json")"
+
 # --- when nothing is sent ---------------------------------------------------
 out=$(MAC_INSTALLER_DISPATCH_TOKEN= run) && [[ $out == *"::notice"*"not set"* && ! -e $T/post-args ]] \
   && pass "without the token it skips with a notice and exits 0" || fail "no token: $out"
