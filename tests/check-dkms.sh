@@ -414,6 +414,21 @@ out=$(raw macbook12-spi-driver-dkms macbook12-spi-driver-0+git.315 excluded | ju
   pass "a known-broken package that a kernel excludes is neither broken nor fixed" || fail "excluded: $out"
 if out=$(raw tuxedo-drivers-nocompatcheck-dkms tuxedo-drivers-v4.22.1 failed | judge); then fail "an unmarked failure must fail: $out"; fi
 [[ $(verdicts "$out") == "failed " ]] && pass "a package without the mark that fails, fails" || fail "failed: $out"
+# An outcome judge does not know is an error in every awk: mawk lets END's
+# exit replace the one that stopped the rules.
+for awk_bin in awk mawk; do
+  command -v "$awk_bin" >/dev/null || continue
+  mkdir -p "$tmp/awk-$awk_bin" && ln -sf "$(command -v "$awk_bin")" "$tmp/awk-$awk_bin/awk"
+  status=0
+  # After a failed pair too: gawk then also takes END's status, which was 1.
+  for first in built failed; do
+    status=0
+    printf '%s\n' "$(raw tuxedo-drivers-nocompatcheck-dkms tuxedo-drivers-v4.22.1 "$first")" "$(raw tuxedo-drivers-nocompatcheck-dkms tuxedo-drivers-v4.22.1 bogus)" |
+      PATH="$tmp/awk-$awk_bin:$PATH" judge >/dev/null || status=$?
+    [[ $status == 2 ]] && grep -q 'unknown outcome bogus' "$tmp/stderr" &&
+      pass "an unknown outcome after a $first pair fails judge with $awk_bin" || fail "unknown outcome after $first with $awk_bin: status $status"
+  done
+done
 plan=$(ARCH=aarch64 "$ROOT/bin/check-dkms" plan --arch aarch64 --files-db "$tmp/edge.files" 2>&1 || true)
 ! grep -q 'macbook12-spi-driver-dkms is listed for aarch64' <<<"$plan" &&
   pass "an architecture named inside a reason does not list the package for it" || fail "reason fields: $plan"
