@@ -78,6 +78,16 @@ function decide({ pr, files, vouchStatus, repository, owners }) {
   return { enable: true, reason: `${vouchStatus === 'unknown' ? 'build-approved' : vouchStatus} author, package changes only` };
 }
 
+// Whether to take back auto-merge an earlier event turned on. GitHub keeps
+// auto-merge through later pushes by anyone with write access, so a PR that
+// qualified and then added a change outside packages, or to the approved
+// list of release/owners.json, would still merge by itself. A failed author
+// lookup is no answer, so it withdraws nothing.
+function withdraw(decision, vouchStatus) {
+  const known = ['bot', 'collaborator', 'vouched', 'unknown', 'denounced'];
+  return !decision.enable && known.includes(vouchStatus);
+}
+
 module.exports = async function autoMerge({ github, context, core, number, vouchStatus }) {
   const { data: pr } = await github.rest.pulls.get({ ...context.repo, pull_number: number });
   const files = await github.paginate(github.rest.pulls.listFiles, {
@@ -95,7 +105,9 @@ module.exports = async function autoMerge({ github, context, core, number, vouch
   });
   core.info(`#${number}: ${decision.enable ? 'auto-merge' : 'leave for a maintainer'} (${decision.reason})`);
   core.setOutput('enable', String(decision.enable));
+  core.setOutput('withdraw', String(withdraw(decision, vouchStatus)));
   core.setOutput('head_sha', pr.head.sha);
   return decision;
 };
 module.exports.decide = decide;
+module.exports.withdraw = withdraw;
