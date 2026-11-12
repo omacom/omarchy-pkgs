@@ -465,8 +465,14 @@ curl -fsSL $log | jq -c '
   | {time, run, kind: (.kind // "publish"), failed: [.sources[] | select(.source | test("failed")) | "\(.package) \(.arch) \(.source)"]}'
 ```
 
-A merge also gets a summary of its record as a comment on the PR. The record
-itself is kept as an artifact of the run for 90 days: `gh run download <run-id> -n publish-record-<run-id>`.
+A merge also gets its record as a comment on the PR, written by
+`bin/publish-report`: one row per package with the version edge served
+before, the new version and its size, and one cell per channel. A channel
+the run wrote shows what happened there. Any other channel shows the
+version it serves now and why it did not move: the next promotion, the
+next release candidate, or the Mac package set holding another version. A
+failure names the check that stopped the run and what to do next. The
+record itself is kept as an artifact of the run for 90 days: `gh run download <run-id> -n publish-record-<run-id>`.
 
 ## When a publish fails
 

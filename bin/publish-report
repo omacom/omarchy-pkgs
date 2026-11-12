@@ -1,0 +1,192 @@
+#!/bin/bash
+# Render a publish record (publish.yml's publish-record.json) as the
+# Markdown report the merged PR gets.
+#
+#   publish-report --outcome <success|failure|cancelled> [--channels URL|none]
+#                  [--inventory FILE] [--run URL] [--commit SHA] [RECORD]
+#
+# One row per package and architecture: the version edge served before,
+# the version this run brings, its size, and one cell per channel. A
+# channel this run wrote shows what happened there. A channel it did not
+# write shows the version it serves now, read from --channels (default
+# https://pkgs.omarchy.org, past the CDN cache), and why it did not move:
+# the next promotion, the next release candidate, or the Mac package set
+# holding another version (release/mac-inventory.txt, or --inventory).
+# --channels none skips those reads.
+#
+# A failure says which check stopped the run and what to do next. A run
+# that wrote no record (RECORD missing or not a publish record) gets a
+# short failure report that points at the run.
+set -euo pipefail
+ROOT=$(realpath "${BASH_SOURCE[0]%/*}/..")
+
+OUTCOME=success
+CHANNELS=https://pkgs.omarchy.org
+INVENTORY=$ROOT/release/mac-inventory.txt
+RUN=""
+COMMIT=""
+RECORD=""
+while [[ $# -gt 0 ]]; do
+  case $1 in
+  --outcome) OUTCOME=$2; shift 2 ;;
+  --channels) CHANNELS=$2; shift 2 ;;
+  --inventory) INVENTORY=$2; shift 2 ;;
+  --run) RUN=$2; shift 2 ;;
+  --commit) COMMIT=$2; shift 2 ;;
+  -h|--help) sed -n '2,20p' "$0"; exit 0 ;;
+  -*) echo "Unknown option: $1" >&2; exit 64 ;;
+  *) [[ -z $RECORD ]] || { echo "One record only" >&2; exit 64; }; RECORD=$1; shift ;;
+  esac
+done
+
+if [[ -z $RECORD || ! -s $RECORD ]] || ! jq -e 'type == "object" and (.slots | type == "array")' "$RECORD" >/dev/null 2>&1; then
+  echo "### Publish FAILED before it wrote a record"
+  echo
+  echo "The publish job stopped before it recorded anything, so this report cannot say what reached the channels."
+  echo "Read the run, then [check the channels](https://github.com/omacom/omarchy-pkgs#check-that-a-version-is-live)."
+  echo
+  echo "${COMMIT:+Commit ${COMMIT:0:7} · }[run]($RUN)"
+  exit 0
+fi
+
+# What each recipe of the plan is: its pkgbase, whether it is pinned, and
+# the version the qualified Mac set lists for it.
+recipes=$(
+  cd "$ROOT"
+  jq -r '.plan[]? | "\(.package) \(.arch) \(.channels)"' "$RECORD" | sort -u |
+    while read -r package arch channels; do
+      base=$(BUILD_ROOT=$ROOT bash -c 'source helpers/paths.sh; source helpers/package-metadata.sh; package_pkgbase "pkgbuilds/$1" "$2"' _ "$package" "$arch" 2>/dev/null) || base=$package
+      pinned=false
+      BUILD_ROOT=$ROOT bash -c 'source helpers/paths.sh; source helpers/package-metadata.sh; package_is_pinned "pkgbuilds/$1"' _ "$package" 2>/dev/null && pinned=true
+      mac=$(awk -v b="$base" '!/^#/ && $1 == b {print $2; exit}' "$INVENTORY" 2>/dev/null)
+      jq -nc --arg package "$package" --arg base "${base:-$package}" --arg channels "$channels" --argjson pinned "$pinned" --arg mac "$mac" \
+        '{package: $package, base: $base, channels: ($channels | split(" ")), pinned: $pinned, mac: (if $mac == "" then null else $mac end)}'
+    done | jq -sc .
+)
+
+# What every channel serves for each architecture this run touched:
+# {"edge/aarch64": {"name": "version", ...}, ...}, null where unreadable.
+served='{}'
+if [[ $CHANNELS != none && $(jq -r .target "$RECORD") == live ]]; then
+  for arch in $(jq -r '[.slots[].arch, (.plan[]?.publish_arches | split(" ")[])] | unique | .[]' "$RECORD"); do
+    for channel in edge rc stable; do
+      url="$CHANNELS/$channel/$arch/omarchy.db"
+      [[ $url == http* ]] && url="$url?$(date +%s)"
+      if list=$(curl -fsSL --max-time 60 -H 'Cache-Control: no-cache' "$url" | tar --zstd -tf - 2>/dev/null); then
+        versions=$(sed -n 's|/$||p' <<<"$list" | awk '{n = split($0, p, "-"); name = p[1]; for (i = 2; i <= n - 2; i++) name = name "-" p[i]; print name "\t" p[n-1] "-" p[n]}' |
+          jq -Rsc 'split("\n") | map(select(length > 0) | split("\t") | {(.[0]): .[1]}) | add // {}')
+      else
+        versions=null
+      fi
+      served=$(jq -c --arg k "$channel/$arch" --argjson v "$versions" '. + {($k): $v}' <<<"$served")
+    done
+  done
+fi
+
+jq -r --arg outcome "$OUTCOME" --argjson recipes "$recipes" --argjson served "$served" '
+  def stem: sub("-[^-]+-[^-]+-[^-]+$"; "");
+  def filever: (capture("-(?<v>[^-]+-[^-]+)-[^-]+$") // {v: null}).v;
+  def human:
+    if . >= 1048576 then "\((. / 104857.6 | round) / 10) MB"
+    elif . >= 1024 then "\(. / 1024 | round) KB"
+    else "\(.) B" end;
+  def delta: if . > 0 then "+" + human elif . < 0 then "-" + (-. | human) else "±0" end;
+  def slotname: "`\(.mirror)/\(.arch)`";
+  def source_text:
+    {"pr-artifact": "the PR'"'"'s build artifact", "rebuild": "a build made at merge",
+     "native-rebuild": "a build made at merge", "built": "a build made at merge"}[.] // .;
+
+  . as $r
+  | ($r.target != "live") as $proof
+  # One cell per package, architecture and channel this run wrote or meant to.
+  | [$r.slots[] as $s
+      # A slot with no entries (one that did not run, or a record older than
+      # entries) knows its file names only, not what they replaced.
+      # A slot handed two files of one name keeps the one it published.
+      | if $s.entries then ($s.entries | [.[] | select(.status == "published") | .name] as $pub
+          | .[] | select(.status == "published" or (.name as $n | $pub | index($n) | not))
+          | {name, base, arch: $s.arch, mirror: $s.mirror, version, was, size, was_size, status, known: true})
+        else ($s.packages[] | {name: stem, base: null, arch: $s.arch, mirror: $s.mirror, version: filever, was: null, size: null, was_size: null, status: $s.status, known: false}) end
+      | select(.name | endswith("-debug") | not)] as $cells
+  | ($r.slots | map(select(.status == "failed" or .status == "refused" or .status == "not-run"))) as $bad_slots
+  | ($r.sources | map(select(.source | test("failed")))) as $bad_sources
+  | ($outcome != "success" or ($bad_slots | length) > 0 or ($bad_sources | length) > 0) as $failed
+  | ([$cells[] | select(.status == "published") | .mirror] | unique) as $moved
+  | ([$cells[] | {name, arch}] | unique) as $keys
+  | [$keys[] as $k
+      | [$cells[] | select(.name == $k.name and .arch == $k.arch)] as $mine
+      | (([$mine[].base | select(. != null)] | first) // $k.name) as $base
+      | ([$recipes[] | select(.base == $base)] | first) as $recipe
+      | (([$mine[] | select(.mirror == "edge")] | first) // $mine[0]) as $lead
+      | {name: $k.name, arch: $k.arch, now: $lead.version,
+         was: (if $lead.known then ($lead.was // "new") else "" end),
+         size: (if $lead.status == "published" and $lead.size then ($lead.size | human) + (if $lead.was_size then " (\($lead.size - $lead.was_size | delta))" else "" end) else "" end),
+         cells: [("edge", "rc", "stable") as $c
+           # The last write wins: a fast-ring catch-up later in the run can
+           # replace what the Publish step wrote to the same channel.
+           | ([$mine[] | select(.mirror == $c)] | last) as $cell
+           | if $cell then
+               {published: "**\($cell.version)**", skipped: "\($cell.was) already",
+                failed: "**failed**", refused: "**refused**", "not-run": "not run"}[$cell.status] // $cell.status
+             elif $proof then "–"
+             else
+               ($served["\($c)/\($k.arch)"]) as $db
+               | (if $db == null then "unread" else ($db[$k.name] // "–") end) as $have
+               | (if $recipe == null or $c == "edge" or ($recipe.channels | index($c)) or $have == $lead.version then ""
+                  elif $recipe.pinned and $c == "rc" then "next: release candidate"
+                  elif $recipe.mac == "none" then "Mac set: not qualified"
+                  elif $recipe.mac != null and $recipe.mac != $lead.version then "Mac set holds \($recipe.mac)"
+                  else "next: promotion" end) as $why
+               | $have + (if $why == "" then "" else " · " + $why end)
+             end]}]
+  # An arch=any package reads the same on both architectures: one row.
+  | (group_by([.name, .now, .was, .size, .cells]) | map(.[0] + {arch: (map(.arch) | sort_by(if . == "x86_64" then 0 else 1 end) | join(", "))}) | sort_by(.name)) as $rows
+
+  | (if $failed then "### Publish FAILED"
+     elif ($moved | length) > 0 then "### Published to \($moved | join(", "))"
+     else "### Nothing to publish" end)
+    + (if $proof then " · proof run into `\($r.target)`, not live" else "" end),
+    "",
+    (if ($rows | length) > 0 then
+       "| Package | Arch | Was | Now | Size | edge | rc | stable |",
+       "|---|---|---|---|---|---|---|---|",
+       ($rows[] | "| \(.name) | \(.arch) | \(.was) | \(.now // "") | \(.size) | \(.cells | join(" | ")) |"),
+       ""
+     else empty end),
+    ([$r.sources[] | select(.source | test("failed") | not) | select(.source != "already-published")] as $ok
+     | if ($ok | length) == 0 then empty
+       elif ([$ok[].source] | unique | length) == 1 then "Built from \($ok[0].source | source_text)."
+       else "Built from: " + ([$ok[] | "\(.package) (\(.arch)) \(.source | source_text)"] | join("; ")) + "." end),
+    ([$r.sources[] | select(.source == "already-published") | "\(.package) (\(.arch))"] as $have
+     | if ($have | length) > 0 then "Edge already serves master'"'"'s version of \($have | join(", ")); nothing to do for it." else empty end),
+    ($bad_sources[] |
+      if .source == "artifact-download-failed" then
+        "**\(.package) (\(.arch))**: its build artifact could not be downloaded or unpacked, so no channel was written. Rerun the failed jobs; if it fails again, bump `pkgrel`."
+      else
+        "**\(.package) (\(.arch))** has no build: the build failed or its artifact expired, so no channel was written. Read the `rebuild` job; if it passed, rerun every job."
+      end),
+    ([$bad_slots[] | select(.status == "refused")] as $refused
+     | if ($refused | length) == 0 then empty else
+         "The Mac package set check refused \([$refused[] | slotname] | join(", "))"
+         # The Publish step checks before any slot runs; the fast-ring
+         # catch-up checks after the merge itself published.
+         + (if any($r.slots[]; .status == "published" or .status == "unchanged")
+            then ", so the fast-ring catch-up into it did not run. The channels above it are written."
+            else ", so no channel was written, edge included." end)
+         + ([$refused[].mac_set[]?.problems[]? | "\(.package): \(.problem)"] | if length > 0 then " " + join("; ") + "." else "" end)
+         + " Bring `release/mac-inventory.txt` in line, or leave the package out."
+       end),
+    ([$bad_slots[] | select(.status == "failed")] as $broke
+     | if ($broke | length) == 0 then empty else
+         "Writing \([$broke[] | slotname] | join(", ")) failed"
+         + ([$bad_slots[] | select(.status == "not-run")] | if length > 0 then "; \(map(slotname) | join(", ")) did not run" else "" end)
+         + ". The channels before it are complete. Rerun the failed jobs while the build artifact exists (7 days)."
+       end),
+    (if $outcome != "success" and ($bad_slots | length) == 0 and ($bad_sources | length) == 0 then
+       "The publish job did not finish. The table shows what it wrote before it stopped; read the run for the rest."
+     else empty end),
+    (if $failed then "[What to do when a publish fails](https://github.com/omacom/omarchy-pkgs#when-a-publish-fails)" else empty end),
+    "",
+    ([$r.slots[].signer | select(. != null)] | unique | if length > 0 then "Signed with `\(map(.[-16:]) | join("`, `"))` · " else "" end)
+    + "Commit \($r.commit[0:7]) · [run](\($r.run))"
+' "$RECORD"
