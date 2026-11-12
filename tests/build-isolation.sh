@@ -168,10 +168,17 @@ check() {
   own_mount() {
     awk -v target="$1" '$4 == "/" && $5 == target { sub(/.* - /, ""); print }' /proc/self/mountinfo
   }
+  # Configure scripts and build systems run the programs they compile both
+  # in /tmp and in the source tree.
+  exec_probe() {
+    printf '#!/bin/sh\nexit 0\n' > "$1/omarchy-exec-probe"
+    chmod +x "$1/omarchy-exec-probe"
+    "$1/omarchy-exec-probe"
+  }
   [[ $(own_mount /tmp) == "tmpfs "*"size=16777216k"* ]]
-  printf '#!/bin/sh\nexit 0\n' > /tmp/omarchy-exec-probe
-  chmod +x /tmp/omarchy-exec-probe
-  /tmp/omarchy-exec-probe
+  exec_probe /tmp
+  [[ $srcdir == /src/* ]]
+  exec_probe "$srcdir"
   # The source tree moves to memory only where a kernel tree fits.
   if (( $(awk '/^MemTotal:/ { print $2 }' /proc/meminfo) >= 56 * 1024 * 1024 )); then
     [[ $(own_mount /src) == "tmpfs "*"size=41943040k"* ]]
