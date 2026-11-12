@@ -14,10 +14,16 @@
 //   test.yml runs on PRs only; an existing test may also run on master
 //   (builder-images.yml runs tests/build-isolation.sh with packages: write),
 //   so editing one still needs a maintainer.
+// - release/owners.json may change only where bin/release-owners writes it
+//   from the recipes: the self-tests fail unless it matches them. Its
+//   "approved" list lets a directory claim a name that is not its own, so a
+//   change to it, read from the parsed file at the base and the head, always
+//   needs a maintainer.
 const PACKAGES = 'pkgbuilds/';
 const TESTS = 'tests/';
 const TEST_WORKFLOW = '.github/workflows/test.yml';
 const TEST_LINE = /^\+\s*\.\/tests\/[A-Za-z0-9._-]+\.sh\s*$/;
+const OWNERS = 'release/owners.json';
 
 // Every changed line adds a ./tests/<name>.sh call; nothing removed. A diff
 // too large for the API has no patch and does not qualify.
@@ -28,15 +34,27 @@ function onlyRunsTests(patch) {
   return changed.length > 0 && changed.every(line => TEST_LINE.test(line));
 }
 
-function packageChange(file) {
+// Whether two texts of release/owners.json have the same version and the
+// same approvals. Anything that does not parse does not qualify.
+function sameApprovals(base, head) {
+  try {
+    const a = JSON.parse(base), b = JSON.parse(head);
+    return a.version === b.version && JSON.stringify(a.approved) === JSON.stringify(b.approved);
+  } catch {
+    return false;
+  }
+}
+
+function packageChange(file, owners) {
   if (file.previous_filename && !file.previous_filename.startsWith(PACKAGES)) return false;
   if (file.filename.startsWith(PACKAGES)) return true;
   if (file.filename.startsWith(TESTS)) return file.status === 'added';
   if (file.filename === TEST_WORKFLOW) return file.status === 'modified' && onlyRunsTests(file.patch);
+  if (file.filename === OWNERS) return file.status === 'modified' && Boolean(owners) && sameApprovals(owners.base, owners.head);
   return false;
 }
 
-function decide({ pr, files, vouchStatus, repository }) {
+function decide({ pr, files, vouchStatus, repository, owners }) {
   if (pr.state !== 'open') return { enable: false, reason: 'PR is not open' };
   if (pr.draft) return { enable: false, reason: 'PR is a draft' };
 
@@ -52,10 +70,10 @@ function decide({ pr, files, vouchStatus, repository }) {
   }
 
   if (!files.length) return { enable: false, reason: 'PR changes no files' };
-  const outside = files.filter(file => !packageChange(file));
+  const outside = files.filter(file => !packageChange(file, owners));
   if (outside.length) {
     const names = outside.slice(0, 3).map(file => file.filename).join(', ');
-    return { enable: false, reason: `changes more than packages and their new tests: ${names}${outside.length > 3 ? ', ...' : ''}` };
+    return { enable: false, reason: `changes more than packages, their new tests and their owners.json lines: ${names}${outside.length > 3 ? ', ...' : ''}` };
   }
   return { enable: true, reason: `${vouchStatus === 'unknown' ? 'build-approved' : vouchStatus} author, package changes only` };
 }
@@ -65,8 +83,15 @@ module.exports = async function autoMerge({ github, context, core, number, vouch
   const files = await github.paginate(github.rest.pulls.listFiles, {
     ...context.repo, pull_number: number, per_page: 100,
   });
+  // release/owners.json at the base and the head, for its approvals.
+  let owners;
+  if (files.some(file => file.filename === OWNERS)) {
+    const read = ref => github.rest.repos.getContent({ ...context.repo, path: OWNERS, ref })
+      .then(({ data }) => Buffer.from(data.content, 'base64').toString('utf8'), () => '');
+    owners = { base: await read(pr.base.sha), head: await read(pr.head.sha) };
+  }
   const decision = decide({
-    pr, files, vouchStatus, repository: `${context.repo.owner}/${context.repo.repo}`,
+    pr, files, vouchStatus, repository: `${context.repo.owner}/${context.repo.repo}`, owners,
   });
   core.info(`#${number}: ${decision.enable ? 'auto-merge' : 'leave for a maintainer'} (${decision.reason})`);
   core.setOutput('enable', String(decision.enable));
