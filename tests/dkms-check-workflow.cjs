@@ -64,7 +64,7 @@ test('a promotion stops when the channels moved after its DKMS check', () => {
   const matrix = read('dkms-matrix.yml');
   assert.match(matrix, /^      legs:\n.*\n        value: \$\{\{ jobs\.plan\.outputs\.legs \}\}$/m, 'the matrix hands its legs to the caller');
   const promote = jobs(read('promote.yml')).promote;
-  assert.match(promote, /^    needs: dkms$/m);
+  assert.match(promote, /^    needs: \[prefix, dkms\]$/m);
   assert.match(promote, /group: publish/, 'the comparison runs under the publish lock');
   const compare = promote.indexOf('name: Check that the channels still hold what the DKMS check built');
   const publish = promote.indexOf('name: Promote');
@@ -73,6 +73,37 @@ test('a promotion stops when the channels moved after its DKMS check', () => {
   assert.match(promote, /bin\/check-dkms matrix --arch x86_64 "\$\{args\[@\]\}"/);
   assert.match(promote, /bin\/check-dkms matrix --arch aarch64 "\$\{args\[@\]\}"/);
   assert.match(promote, /if \[\[ \$now != "\$built" \]\]; then/);
+});
+
+test('a proof promotion checks the channels it promotes, not the live ones', () => {
+  // promote-channel reads and writes OMARCHY_PUBLISH_PREFIX, a variable of the
+  // publish environment. Both DKMS plans and every leg must read the same
+  // place, or a green check proves nothing.
+  const matrix = read('dkms-matrix.yml');
+  assert.match(matrix, /^      pkgs_base:\n/m, 'the matrix takes where to read the channels');
+  const env = matrix.split(/^env:\n/m)[1].split(/^\S/m)[0];
+  assert.match(env, /^  OMARCHY_PKGS_BASE: \$\{\{ inputs\.pkgs_base \|\| 'https:\/\/pkgs\.omarchy\.org' \}\}$/m,
+    'every job of the matrix reads the channels from there');
+  const all = jobs(read('promote.yml'));
+  // Only a job in the publish environment sees its variables.
+  assert.match(all.prefix, /^    environment: publish$/m);
+  assert.match(all.prefix, /PREFIX: \$\{\{ vars\.OMARCHY_PUBLISH_PREFIX \}\}/);
+  assert.match(all.prefix, /^    permissions: \{\}$/m, 'it holds no token');
+  const code = all.prefix.replace(/^\s*#.*$/gm, '');
+  assert.doesNotMatch(code, /secrets\.|actions\/checkout|\bbin\//, 'it uses no secret and runs no repository code');
+  assert.match(all.dkms, /^    needs: prefix$/m);
+  assert.match(all.dkms, /pkgs_base: \$\{\{ needs\.prefix\.outputs\.pkgs_base \}\}/, 'the DKMS check reads there');
+  const step = all.promote.split('name: Check that the channels still hold what the DKMS check built')[1].split(/^      - /m)[0];
+  assert.match(step, /OMARCHY_PKGS_BASE: \$\{\{ needs\.prefix\.outputs\.pkgs_base \}\}/, 'and so does the check under the lock');
+  // The promotion publishes where the checks looked: one reading of the
+  // variable, in the prefix job.
+  assert.match(all.promote, /OMARCHY_PUBLISH_PREFIX: \$\{\{ needs\.prefix\.outputs\.prefix \}\}/);
+  // A dropped output must stop the run, not fall back to the live channels.
+  const guard = all.promote.indexOf('name: Check where the checks read and the promotion writes');
+  assert.ok(guard > 0 && guard < all.promote.indexOf('name: Promote'), 'the outputs are checked before the promotion');
+  assert.ok(all.promote.includes('if [[ $BASE != "https://pkgs.omarchy.org${PREFIX:+/$PREFIX}" ]]; then'),
+    'a missing or mismatched base fails');
+  assert.doesNotMatch(all.promote + all.dkms, /vars\.OMARCHY_PUBLISH_PREFIX/, 'never a second reading of the variable');
 });
 
 test('the DKMS workflows pin every action by commit, as the other workflows do', () => {
