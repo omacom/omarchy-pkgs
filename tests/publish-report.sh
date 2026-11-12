@@ -59,6 +59,17 @@ row alpha | grep -q '| 1.0-1 · Mac set holds 1.0-1 |' && pass "a channel the ru
 grep -q 'Built from the PR.s build artifact.' "$T/out" && grep -q 'Signed with `89ABCDEF01234567`' "$T/out" \
   && pass "the source and the signing key are named once" || fail "source and signer"
 
+# "Live" only when bin/check-served found every written slot served.
+jq '.slots |= map(. + {served: {ok: true, checked_at: "2026-11-12T09:24:20Z", tries: 1, missing: []}})' "$T/record.json" > "$T/live.json"
+mv "$T/live.json" "$T/record.json"
+report --outcome success && head -1 "$T/out" | grep -qx '### Live on edge' \
+  && pass "a publish every channel serves reads as live" || fail "live heading"
+jq '.slots[1].served = {ok: false, checked_at: "2026-11-12T09:24:40Z", tries: 3, missing: ["alpha-1.0-3"]}' "$T/record.json" > "$T/live.json"
+mv "$T/live.json" "$T/record.json"
+report --outcome failure && head -1 "$T/out" | grep -qx '### Published to edge, but not served' \
+  && grep -q '`edge/aarch64` does not list alpha-1.0-3 after 3 reads' "$T/out" \
+  && pass "a publish the channel does not list yet says so, not live and not a failed build" || fail "unserved heading"
+
 # Without the Mac set, a normal-ring package waits for the next promotion.
 : > "$T/inventory"
 report --outcome success && row alpha | grep -q '| 1.0-1 · next: promotion | 1.0-1 · next: promotion |' \

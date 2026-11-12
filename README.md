@@ -169,8 +169,10 @@ To ship a change: open a PR, wait for green, merge. Nothing else is needed.
    it, and publishes it to every channel and architecture the package ships
    to. When no artifact exists it builds one first, in a separate job. Its
    last step copies `edge`'s file to `rc` or `stable` for any fast-ring
-   package either is missing. It reports in a comment on the merged PR and
-   appends to the [publish log](#read-the-publish-log).
+   package either is missing. Then it reads every database it wrote through
+   the CDN, as users do, and fails if one does not list what it published.
+   It reports in a comment on the merged PR and appends to the
+   [publish log](#read-the-publish-log).
 
 Nothing else moves on its own: `rc` and `stable` change only when someone
 [promotes](#promote-a-channel) them or [cuts a release](#releases).
@@ -418,7 +420,10 @@ for a cancelled one, [check the channel](#check-that-a-version-is-live).
 
 For a slot that did not run, `packages` lists the files it was handed. A
 slot that ran also has `skipped` (the files the channel already served),
-`signer` (the fingerprint of the signing key) and `entries`: per file, its
+`signer` (the fingerprint of the signing key), `served` and `entries`.
+`served` is what `bin/check-served` found when it read the channel's
+database past the CDN cache: `ok`, `checked_at`, `tries` and the entries
+still `missing`. `entries` holds, per file, its
 `name`, `base`, `version`, `was` (what the channel served for that name
 before, `null` when new), `size` and `was_size` in bytes, and `status`
 (`published` or `skipped`). Older records have only `packages`, and may
@@ -461,7 +466,8 @@ curl -fsSL $log | jq -c --arg p "<package>" '
 
 # Every run where something failed
 curl -fsSL $log | jq -c '
-  select(.result == "failed" or any(.sources[]; .source | test("failed")) or any(.slots[]; .status == "failed"))
+  select(.result == "failed" or any(.sources[]; .source | test("failed"))
+    or any(.slots[]; .status == "failed" or .status == "refused" or .served.ok == false))
   | {time, run, kind: (.kind // "publish"), failed: [.sources[] | select(.source | test("failed")) | "\(.package) \(.arch) \(.source)"]}'
 ```
 
@@ -470,8 +476,10 @@ A merge also gets its record as a comment on the PR, written by
 before, the new version and its size, and one cell per channel. A channel
 the run wrote shows what happened there. Any other channel shows the
 version it serves now and why it did not move: the next promotion, the
-next release candidate, or the Mac package set holding another version. A
-failure names the check that stopped the run and what to do next. The
+next release candidate, or the Mac package set holding another version. The
+heading says "Live" only when every channel the run wrote lists its files
+as users read them. A failure names the check that stopped the run and
+what to do next. The
 record itself is kept as an artifact of the run for 90 days: `gh run download <run-id> -n publish-record-<run-id>`.
 
 ## When a publish fails
@@ -498,6 +506,7 @@ Then act on which job failed:
 | `publish`, step "Publish" | `Already published with DIFFERENT bytes, refusing to overwrite` | That version is already out with other contents. Bump `pkgrel` in a PR |
 | `publish`, step "Publish" | `its artifact has no files with pkgbase <base>` | The build produced packages under another pkgbase than the recipe declares. Fix the recipe's `pkgbase`/`pkgname` in a PR |
 | `publish`, step "Publish" | `Upload incomplete`, or an rclone or gpg error | Storage or signing trouble. Rerun: `gh run rerun <run-id> --failed` |
+| `publish`, step "Check that the channels serve it" | `does not serve <entries> after 3 tries` | The bucket has the files, but the channel's database as users read it does not list them. [Check the channel](#check-that-a-version-is-live) by hand; if it is still missing, rerun: `gh run rerun <run-id> --failed` |
 | `publish`, step "Bring the fast ring in line with edge" | `does not match its database entry`, or an rclone or gpg error | `edge`'s file or the bucket is at fault, not the merge: the merge itself published. Rerun: `gh run rerun <run-id> --failed`, or dispatch the package later |
 | `publish` shows cancelled | | Someone cancelled it, or it timed out. Merges queue for the publish lock rather than replacing each other. Republish the merge's packages with a dispatch |
 

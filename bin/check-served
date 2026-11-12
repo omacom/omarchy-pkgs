@@ -1,0 +1,100 @@
+#!/bin/bash
+# Check that pkgs.omarchy.org serves what a publish wrote, and add the
+# result to the publish record.
+#
+#   check-served [--channels URL] [--tries N] [--wait SECONDS] RECORD
+#
+# A slot is written once its database reaches the bucket, but users read
+# the channel through the CDN. For every slot that ran and wrote or kept
+# files (published or unchanged), this reads that channel's database from
+# --channels (default https://pkgs.omarchy.org) past the CDN's cache, the
+# way pacman would get it on a cache miss. It looks for each entry the
+# slot leaves the bucket serving: a file it published at its version, a
+# file it skipped at the version the bucket already had. A rerun of a slot
+# that wrote the bucket but was not served therefore checks the same
+# entries again. It retries --tries times (default 3), --wait seconds apart (default 10).
+#
+# Each checked slot gains
+#   served: {ok, checked_at, tries, missing: [<name>-<version>...]}
+# and RECORD is rewritten in place. A record for a proof run (target not
+# "live") is left alone: its files are not on the public channels.
+#
+# Exits 1 when a slot is still missing an entry after the last try: the
+# publish wrote the bucket, but users cannot install it. Exits 0 otherwise.
+set -euo pipefail
+
+CHANNELS=https://pkgs.omarchy.org
+TRIES=3
+WAIT=10
+RECORD=""
+while [[ $# -gt 0 ]]; do
+  case $1 in
+  --channels) CHANNELS=$2; shift 2 ;;
+  --tries) TRIES=$2; shift 2 ;;
+  --wait) WAIT=$2; shift 2 ;;
+  -h|--help) sed -n '2,23p' "$0"; exit 0 ;;
+  -*) echo "Unknown option: $1" >&2; exit 64 ;;
+  *) [[ -z $RECORD ]] || { echo "One record only" >&2; exit 64; }; RECORD=$1; shift ;;
+  esac
+done
+[[ -n $RECORD && -s $RECORD ]] || { echo "Usage: check-served [--channels URL] RECORD" >&2; exit 64; }
+
+target=$(jq -r '.target // ""' "$RECORD")
+if [[ $target != live ]]; then
+  echo "publish target is ${target:-unknown}, not the live channels; nothing checked"
+  exit 0
+fi
+
+# The entries a database lists, one "<name>-<version>" per line.
+entries() { # entries <channel> <arch>
+  local url="$CHANNELS/$1/$2/omarchy.db"
+  [[ $url == http* ]] && url="$url?$(date +%s%N)"
+  curl -fsSL --max-time 60 -H 'Cache-Control: no-cache' "$url" | tar --zstd -tf - | sed -n 's|/$||p'
+}
+
+status=0
+results='[]'
+for slot in $(jq -r '.slots | to_entries[] | select(.value.status == "published" or .value.status == "unchanged") | "\(.key):\(.value.mirror)/\(.value.arch)"' "$RECORD"); do
+  index=${slot%%:*} where=${slot#*:}
+  # A database entry is <name>-<version>. Without entries (an older record),
+  # it is a file name <name>-<pkgver>-<pkgrel>-<arch> without its arch.
+  # A later slot of the same channel can replace a package (the fast-ring
+  # catch-up copying edge's newer file): that slot's entry is the one to see.
+  mapfile -t want < <(jq -r --argjson i "$index" '
+    # A slot handed two files of one name keeps the one it published.
+    def written: if .entries then (.entries | [.[] | select(.status == "published") | .name] as $pub
+        | .[] | select(.status == "published" or (.name as $n | $pub | index($n) | not)))
+        | {name, entry: "\(.name)-\(if .status == "skipped" then .was else .version end)"}
+      else .packages[] | sub("-[^-]+$"; "") as $e | {name: ($e | sub("-[^-]+-[^-]+$"; "")), entry: $e} end;
+    .slots[$i] as $s
+    | [.slots[($i + 1):][] | select(.mirror == $s.mirror and .arch == $s.arch
+        and (.status == "published" or .status == "unchanged")) | written.name] as $later
+    | $s | written | select(.name as $n | $later | index($n) | not) | .entry' "$RECORD")
+  missing=("${want[@]}")
+  try=0
+  while (( try < TRIES )); do
+    try=$((try + 1))
+    if list=$(entries "${where%/*}" "${where#*/}" 2>/dev/null); then
+      missing=()
+      for entry in "${want[@]}"; do
+        grep -qxF "$entry" <<<"$list" || missing+=("$entry")
+      done
+    fi
+    (( ${#missing[@]} == 0 )) && break
+    (( try < TRIES )) && sleep "$WAIT"
+  done
+  checked=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  if (( ${#missing[@]} == 0 )); then
+    echo "==> $where serves all ${#want[@]} file(s) (try $try)"
+  else
+    echo "::error title=Not served::$where does not serve ${missing[*]} after $try tries"
+    status=1
+  fi
+  results=$(jq -c --argjson i "$index" --arg at "$checked" --argjson tries "$try" \
+    '. + [{index: $i, served: {ok: ($ARGS.positional | length == 0), checked_at: $at, tries: $tries, missing: $ARGS.positional}}]' \
+    --args "${missing[@]}" <<<"$results")
+done
+
+jq --argjson results "$results" 'reduce $results[] as $r (.; .slots[$r.index].served = $r.served)' "$RECORD" > "$RECORD.tmp"
+mv "$RECORD.tmp" "$RECORD"
+exit $status
