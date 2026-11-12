@@ -30,6 +30,7 @@ fixture unindexed 1 1
 fixture signature-only 1 1
 fixture other-arch 1 1
 fixture new-package 1 1
+fixture broken-response 1 1
 
 db_entry() {
   local name=$1 version=$2
@@ -39,7 +40,7 @@ db_entry() {
 db_entry omarchy 4.0.4rc1-1
 db_entry omarchy-settings 4.0.4rc1-1
 for package in current update rebuild; do db_entry "$package" 1-1; done
-printf '%s\n' new-package other-arch rebuild signature-only update | sort > "$TEST_ROOT/expected"
+printf '%s\n' broken-response new-package other-arch rebuild signature-only update | sort > "$TEST_ROOT/expected"
 
 for arch in x86_64 aarch64; do
   repo="$TEST_ROOT/pkgs.omarchy.org/edge/$arch"
@@ -55,7 +56,7 @@ for arch in x86_64 aarch64; do
   touch "$repo/other-arch-1-1-$other.pkg.tar.zst"
 
 
-  for selection in '' 'omarchy omarchy-settings current update rebuild unindexed signature-only other-arch new-package'; do
+  for selection in '' 'omarchy omarchy-settings current update rebuild unindexed signature-only other-arch new-package broken-response'; do
     ARCH="$arch" MIRROR=edge DRY_RUN=true PACKAGES="$selection" \
       PKGBUILDS_DIR="$TEST_ROOT/pkgbuilds" HELPERS_DIR="$TEST_ROOT/helpers" \
       FINAL_OUTPUT_DIR="$repo" BUILD_PLAN_DIR="$TEST_ROOT/plan" \
@@ -69,9 +70,27 @@ done
 
 # CI has no local published tree: build.sh reads the public channel's
 # database, and a retained archive is only there to see over HTTP. Serve the
-# same channels and plan against them with nothing mounted.
+# same channels and plan against them with nothing mounted. broken-response's
+# archive answers 200 with headers curl cannot parse: a transfer that failed,
+# which must not count as published.
 port=$(python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')
-python3 -m http.server --bind 127.0.0.1 --directory "$TEST_ROOT/pkgs.omarchy.org" "$port" >/dev/null 2>&1 &
+cat > "$TEST_ROOT/server.py" <<'PY'
+import functools, http.server, sys
+
+class Handler(http.server.SimpleHTTPRequestHandler):
+    def do_HEAD(self):
+        if "/broken-response-" in self.path:
+            self.wfile.write(b"HTTP/1.1 200 OK\r\nContent-Length: nonsense\r\nConnection: close\r\n\r\n")
+            return
+        super().do_HEAD()
+
+    def log_message(self, *args):
+        pass
+
+handler = functools.partial(Handler, directory=sys.argv[2])
+http.server.ThreadingHTTPServer(("127.0.0.1", int(sys.argv[1])), handler).serve_forever()
+PY
+python3 -I "$TEST_ROOT/server.py" "$port" "$TEST_ROOT/pkgs.omarchy.org" >/dev/null 2>&1 &
 server=$!
 trap 'kill "$server" 2>/dev/null; rm -rf "$TEST_ROOT"' EXIT
 for _ in {1..50}; do
