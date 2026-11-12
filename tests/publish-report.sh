@@ -70,13 +70,19 @@ report --outcome failure && head -1 "$T/out" | grep -qx '### Published to edge, 
   && grep -q '`edge/aarch64` does not list alpha-1.0-3 after 3 reads' "$T/out" \
   && pass "a publish the channel does not list yet says so, not live and not a failed build" || fail "unserved heading"
 
-# The record says whether the Mac installer was told.
-jq '.mac_installer = {status: "failed", detail: "HTTP 401", packages: [{name: "alpha", version: "1.0-3"}]}' \
+# With the run's timings: how long from merge to served, and per job.
+jq '.slots[1].served.ok = true | .slots[1].served.missing = []
+    | .timing = {merged_at: "2026-11-12T09:22:33Z", run_started_at: "2026-11-12T09:22:40Z",
+                 jobs: [{name: "publish", started_at: "2026-11-12T09:23:01Z", completed_at: "2026-11-12T09:24:22Z",
+                         steps: [{name: "Publish", started_at: "2026-11-12T09:23:20Z", completed_at: "2026-11-12T09:24:01Z"}]}]}
+    | .mac_installer = {status: "failed", detail: "HTTP 401", packages: [{name: "alpha", version: "1.0-3"}]}' \
   "$T/record.json" > "$T/live.json"
 mv "$T/live.json" "$T/record.json"
-report --outcome failure && grep -q '^\*\*omarchy-mac-installer was not told\*\* (HTTP 401)' "$T/out" \
+report --outcome success && head -1 "$T/out" | grep -qx '### Live on edge · 2m 7s after merge' \
+  && grep -qx '| publish | 28s | 1m 21s |' "$T/out" && grep -qx '| · Publish | | 41s |' "$T/out" \
+  && pass "the heading says how long merge to served took, the details say where" || fail "timing"
+grep -q '^\*\*omarchy-mac-installer was not told\*\* (HTTP 401)' "$T/out" \
   && pass "a failed Mac installer dispatch is named" || fail "Mac installer line"
-
 # Without the Mac set, a normal-ring package waits for the next promotion.
 : > "$T/inventory"
 report --outcome success && row alpha | grep -q '| 1.0-1 · next: promotion | 1.0-1 · next: promotion |' \

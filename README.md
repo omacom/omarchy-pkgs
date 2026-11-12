@@ -396,6 +396,8 @@ for a cancelled one, [check the channel](#check-that-a-version-is-live).
 | `plan` | Every package, architecture and channel the run set out to publish |
 | `sources` | Per package and architecture, where its files came from. Stops at the first one that failed |
 | `slots` | Per channel and architecture the run planned: `status`, and `packages` as file names without `.pkg.tar.zst` |
+| `outcome` | How the publish job ended: `success`, `failure` or `cancelled` |
+| `timing` | `merged_at` (the PR's merge; `null` for a dispatch), `run_started_at`, and `jobs`: each finished job's `name`, `started_at` and `completed_at`, and the publish job's `steps` |
 | `mac_installer` | What `bin/mac-installer-dispatch` did: `status` (`sent`, `failed`, `skipped`, `disabled`), `detail` and `packages` |
 
 `sources[].source` is one of:
@@ -468,6 +470,7 @@ curl -fsSL $log | jq -c --arg p "<package>" '
 # Every run where something failed
 curl -fsSL $log | jq -c '
   select(.result == "failed" or any(.sources[]; .source | test("failed"))
+    or (.outcome // "success") != "success"
     or any(.slots[]; .status == "failed" or .status == "refused" or .served.ok == false))
   | {time, run, kind: (.kind // "publish"), failed: [.sources[] | select(.source | test("failed")) | "\(.package) \(.arch) \(.source)"]}'
 ```
@@ -479,8 +482,9 @@ the run wrote shows what happened there. Any other channel shows the
 version it serves now and why it did not move: the next promotion, the
 next release candidate, or the Mac package set holding another version. The
 heading says "Live" only when every channel the run wrote lists its files
-as users read them. A failure names the check that stopped the run and
-what to do next. The
+as users read them, and how long that took from the merge; a folded table
+gives each job's and each publish step's time. A failure names the check
+that stopped the run and what to do next. The
 record itself is kept as an artifact of the run for 90 days: `gh run download <run-id> -n publish-record-<run-id>`.
 
 ## When a publish fails
