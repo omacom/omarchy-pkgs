@@ -25,6 +25,7 @@ SRC_DIR=${SRC_DIR:-/src}
 DEFER_RUNTIME_DEPS=${DEFER_RUNTIME_DEPS:-false}
 
 source "$HELPERS_DIR/package-metadata.sh"
+source "$HELPERS_DIR/package-owners.sh"
 
 # Where the channel's published database is read from for planning: a local
 # copy when one is mounted (the build-plan test uses one), otherwise the public
@@ -82,8 +83,6 @@ if [[ "$DRY_RUN" != true ]]; then
     echo "Package is not in the build plan: $BUILD_PACKAGE" >&2
     exit 1
   fi
-  # Import GPG keys
-  /build/import-gpg-keys.sh || exit 1
 
   mkdir -p "$BUILD_OUTPUT_DIR" "$FINAL_OUTPUT_DIR"
 
@@ -382,14 +381,8 @@ build_package() {
     echo "    New package (version: $pkgbuild_version)"
   fi
 
-  # Import PGP keys from PKGBUILD validpgpkeys and keys/pgp/ directory
-  local pgp_keys=$(bash -c 'source PKGBUILD 2>/dev/null; echo "${validpgpkeys[@]}"')
-  if [[ -n "$pgp_keys" ]]; then
-    echo "    Importing PGP keys from validpgpkeys..."
-    for key in $pgp_keys; do
-      gpg --receive-keys "$key" 2>/dev/null && echo "      Received $key" || echo "      Failed to receive $key"
-    done
-  fi
+  # The keys a recipe trusts ship with it (tests/pgp-keys-vendored.sh), so no
+  # build waits on a keyserver.
   if [[ -d "keys/pgp" ]]; then
     echo "    Importing package-specific PGP keys..."
     for keyfile in keys/pgp/*.asc; do
@@ -444,6 +437,10 @@ build_package() {
         echo "    Expected package file was not produced: $pkg_file"
         return 1
       fi
+
+      # pacman installs the owners a package records, so a package with a
+      # file a local user would own never leaves the build.
+      check_package_owners "$pkg_file" || return 1
 
       cp "$pkg_file" "$BUILD_OUTPUT_DIR/" || return 1
       new_pkgs+=("$pkg_file")
