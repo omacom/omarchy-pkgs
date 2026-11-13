@@ -1,0 +1,354 @@
+From 6f59fda4496d9a7b0c4c2b9fc32d107133fedf39 Mon Sep 17 00:00:00 2001
+From: MarkPronkin <109197080+MarkPronkin@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 00:58:40 +0200
+Subject: [PATCH] cpufreq: Support passive Intel profiles on MacBookPro8,2
+
+---
+ README.md                 |  18 ++++++
+ src/ppd-driver-cpufreq.c  | 131 +++++++++++++++++++++++++++++++++++++-
+ tests/integration_test.py |  95 +++++++++++++++++++++++++++
+ 3 files changed, 243 insertions(+), 1 deletion(-)
+
+diff --git a/README.md b/README.md
+index bc7b8f7..df9c9c3 100644
+--- a/README.md
++++ b/README.md
+@@ -308,6 +308,24 @@ next profile change or resume, which caps it like the others. A cluster that is
+ offline when the daemon stops can't have its cap lifted, and keeps it until it
+ is written again or the system restarts.
+ 
++### Passive Intel P-State on the 2011 15-inch MacBook Pro
++
++On `MacBookPro8,2`, the cpufreq driver also handles passive `intel_cpufreq`
++when no energy-performance preference is available. The existing Intel
++P-State driver still takes priority when it can use EPP or EPB. All other
++Intel models keep their current driver.
++
++The tested i7-2760QM uses `schedutil` in all three profiles to avoid pinning
++this 45 W CPU at maximum frequency. Performance raises the floor to 1.2 GHz;
++balanced uses the hardware minimum and maximum. Power-saver restores the
++hardware minimum, caps the maximum at 1.8 GHz and disables turbo. Limits are
++clamped to each policy's hardware range. No frequency table is required.
++
++Profiles are reapplied after resume and include policies that have become
++available since startup. Stopping the daemon restores balanced settings.
++The standard daemon owns D-Bus, authorization, holds and profile persistence;
++no separate service is needed.
++
+ ## Multiple driver and multiple action operations
+ 
+ Power-profiles daemon will load all supported drivers and actions by default.
+diff --git a/src/ppd-driver-cpufreq.c b/src/ppd-driver-cpufreq.c
+index 3940c73..cc29b0e 100644
+--- a/src/ppd-driver-cpufreq.c
++++ b/src/ppd-driver-cpufreq.c
+@@ -1,6 +1,7 @@
+ /*
+  * Copyright (c) 2026 Daaboulex
+  * Copyright (c) 2026 Brandon Williams <turbine.bmw@gmail.com>
++ * Copyright (c) 2026 MarkPronkin <109197080+MarkPronkin@users.noreply.github.com>
+  *
+  * This program is free software; you can redistribute it and/or modify it
+  * under the terms of the GNU General Public License version 3 as published by
+@@ -11,7 +12,7 @@
+ /*
+  * Generic cpufreq CPU driver, for cpufreq scaling drivers that have no
+  * energy performance preference interface. Each supported scaling driver
+- * uses one of two methods:
++ * uses one of the methods below:
+  *
+  * - boost: the global boost switch, see "Frequency Boost Support" in
+  *   https://docs.kernel.org/admin-guide/pm/cpufreq.html
+@@ -38,6 +39,10 @@
+  * governor follows the profile as with any caps: on a MacBook Neo (A18 Pro),
+  * Speedometer 3.1 scored 28.8 under schedutil and 34.4 under performance.
+  *
++ * On MacBookPro8,2, passive intel_cpufreq without EPP uses schedutil with
++ * a 1.2 GHz performance floor, uncapped balanced, and a 1.8 GHz power-saver
++ * ceiling with turbo disabled. Other Intel models are not claimed.
++ *
+  * It is only used when every cpufreq policy runs one of the scaling drivers
+  * in the table below. Any other system keeps its current driver.
+  *
+@@ -59,6 +64,7 @@
+ 
+ #define CPUFREQ_POLICY_DIR "/sys/devices/system/cpu/cpufreq/"
+ #define CPUFREQ_BOOST_PATH "/sys/devices/system/cpu/cpufreq/boost"
++#define INTEL_PSTATE_DIR "/sys/devices/system/cpu/intel_pstate/"
+ 
+ /* Share of each policy's maximum frequency allowed per profile with the caps
+  * method. Measured on a Snapdragon X Elite, 75% costs ~16% of sustained
+@@ -74,6 +80,7 @@ typedef enum {
+   CPUFREQ_METHOD_NONE,
+   CPUFREQ_METHOD_BOOST,
+   CPUFREQ_METHOD_CAPS,
++  CPUFREQ_METHOD_INTEL_PASSIVE,
+ } CpufreqMethod;
+ 
+ static const struct {
+@@ -85,6 +92,7 @@ static const struct {
+    * series */
+   { "scmi", CPUFREQ_METHOD_CAPS },
+   { "qcom-cpufreq-hw", CPUFREQ_METHOD_CAPS },
++  { "intel_cpufreq", CPUFREQ_METHOD_INTEL_PASSIVE },
+ };
+ 
+ typedef struct {
+@@ -436,6 +444,39 @@ ppd_driver_cpufreq_probe (PpdDriver *driver)
+     cpufreq->balanced_percent = BALANCED_PERCENT;
+     ret = probe_caps (cpufreq, policy_dirs);
+     break;
++  case CPUFREQ_METHOD_INTEL_PASSIVE: {
++    g_autofree char *dmi = ppd_utils_get_sysfs_path ("/sys/class/dmi/id");
++    g_autofree char *model = read_attr (dmi, "product_name");
++    g_autofree char *pstate = ppd_utils_get_sysfs_path (INTEL_PSTATE_DIR);
++    g_autofree char *status = read_attr (pstate, "status");
++    g_autofree char *no_turbo = g_build_filename (pstate, "no_turbo", NULL);
++    int fd;
++
++    /* Only the tested Sandy Bridge MacBook. Active pstate, EPP and EPB
++     * remain with the existing intel_pstate driver, which probes first. */
++    if (g_strcmp0 (model, "MacBookPro8,2") != 0 ||
++        g_strcmp0 (status, "passive") != 0)
++      break;
++    fd = g_open (no_turbo, O_WRONLY);
++    if (fd < 0)
++      break;
++    g_close (fd, NULL);
++
++    ret = policy_dirs->len > 0;
++    for (guint i = 0; i < policy_dirs->len && ret; i++) {
++      const char *dir = g_ptr_array_index (policy_dirs, i);
++      g_autofree char *epp = read_attr (dir, "energy_performance_preference");
++      g_autofree char *available = read_attr (dir, "scaling_available_governors");
++      g_auto(GStrv) governors = available ? g_strsplit_set (available, " \n\t", -1) : NULL;
++      guint64 min, max;
++
++      ret = !epp && governors &&
++            g_strv_contains ((const char * const *) governors, DEFAULT_GOVERNOR) &&
++            read_freq (dir, "cpuinfo_min_freq", &min) &&
++            read_freq (dir, "cpuinfo_max_freq", &max) && min <= max;
++    }
++    break;
++  }
+   }
+ 
+   return ret ? PPD_PROBE_RESULT_SUCCESS : PPD_PROBE_RESULT_FAIL;
+@@ -692,6 +733,83 @@ apply_boost (PpdDriverCpufreq  *cpufreq,
+   return TRUE;
+ }
+ 
++static gboolean
++write_freq (const char *dir,
++            const char *attr,
++            guint64     freq,
++            GError    **error)
++{
++  g_autofree char *path = g_build_filename (dir, attr, NULL);
++  g_autofree char *value = g_strdup_printf ("%" G_GUINT64_FORMAT, freq);
++
++  return ppd_utils_write (path, value, error);
++}
++
++static gboolean
++apply_intel_passive (PpdProfile profile,
++                     GError   **error)
++{
++  g_autofree char *pstate = ppd_utils_get_sysfs_path (INTEL_PSTATE_DIR);
++  g_autofree char *no_turbo = g_build_filename (pstate, "no_turbo", NULL);
++  g_autoptr(GPtrArray) dirs = list_policy_dirs ();
++  gboolean success = TRUE;
++  guint written = 0;
++
++  /* no_turbo=1 also lowers cpuinfo_max_freq. Re-enable turbo before reading
++   * it, or leaving power-saver would accidentally keep the non-turbo cap. */
++  if (!ppd_utils_write (no_turbo, "0", error))
++    return FALSE;
++
++  for (guint i = 0; i < dirs->len; i++) {
++    const char *dir = g_ptr_array_index (dirs, i);
++    g_autofree char *scaling_driver = read_attr (dir, "scaling_driver");
++    g_autofree char *governor = g_build_filename (dir, "scaling_governor", NULL);
++    guint64 min, max, floor;
++
++    /* Offline policies have no readable scaling_driver; pick them up at the
++     * next profile change or resume, like the other cpufreq methods. */
++    if (!scaling_driver)
++      continue;
++    if (g_strcmp0 (scaling_driver, "intel_cpufreq") != 0 ||
++        !read_freq (dir, "cpuinfo_min_freq", &min) ||
++        !read_freq (dir, "cpuinfo_max_freq", &max) || min > max) {
++      g_set_error (error, G_IO_ERROR, G_IO_ERROR_FAILED,
++                   "Invalid passive Intel policy %s", dir);
++      success = FALSE;
++      break;
++    }
++    if (profile == PPD_PROFILE_POWER_SAVER)
++      max = CLAMP ((guint64) 1800000, min, max);
++    floor = profile == PPD_PROFILE_PERFORMANCE ? CLAMP ((guint64) 1200000, min, max) : min;
++
++    /* Lower the floor before lowering a ceiling, and raise the ceiling
++     * before raising the floor. schedutil avoids pinning this 45W CPU. */
++    if (!write_freq (dir, "scaling_min_freq", min, error) ||
++        !write_freq (dir, "scaling_max_freq", max, error) ||
++        !write_freq (dir, "scaling_min_freq", floor, error) ||
++        !ppd_utils_write (governor, DEFAULT_GOVERNOR, error)) {
++      success = FALSE;
++      break;
++    }
++    written++;
++  }
++
++  if (profile == PPD_PROFILE_POWER_SAVER) {
++    g_autoptr(GError) turbo_error = NULL;
++
++    if (!ppd_utils_write (no_turbo, "1", &turbo_error)) {
++      if (success)
++        g_propagate_error (error, g_steal_pointer (&turbo_error));
++      success = FALSE;
++    }
++  }
++  if (success && written == 0) {
++    g_set_error (error, G_IO_ERROR, G_IO_ERROR_NOT_FOUND, "No passive Intel policy to configure");
++    return FALSE;
++  }
++  return success;
++}
++
+ static gboolean
+ apply_profile (PpdDriverCpufreq  *cpufreq,
+                PpdProfile         profile,
+@@ -702,6 +820,8 @@ apply_profile (PpdDriverCpufreq  *cpufreq,
+     return apply_boost (cpufreq, profile, error);
+   case CPUFREQ_METHOD_CAPS:
+     return apply_caps (cpufreq, profile, error);
++  case CPUFREQ_METHOD_INTEL_PASSIVE:
++    return apply_intel_passive (profile, error);
+   case CPUFREQ_METHOD_NONE:
+     break;
+   }
+@@ -769,6 +889,15 @@ ppd_driver_cpufreq_dispose (GObject *object)
+ {
+   PpdDriverCpufreq *cpufreq = PPD_DRIVER_CPUFREQ (object);
+ 
++  if (cpufreq->method == CPUFREQ_METHOD_INTEL_PASSIVE &&
++      cpufreq->activated_profile != PPD_PROFILE_UNSET) {
++    g_autoptr(GError) error = NULL;
++
++    if (!apply_intel_passive (PPD_PROFILE_BALANCED, &error))
++      g_warning ("Could not restore balanced passive Intel settings: %s", error->message);
++    cpufreq->activated_profile = PPD_PROFILE_UNSET;
++  }
++
+   if (cpufreq->method == CPUFREQ_METHOD_CAPS &&
+       cpufreq->policies &&
+       cpufreq->activated_profile != PPD_PROFILE_UNSET) {
+diff --git a/tests/integration_test.py b/tests/integration_test.py
+index 2bd362f..d4ce1da 100644
+--- a/tests/integration_test.py
++++ b/tests/integration_test.py
+@@ -1777,6 +1777,101 @@ class Tests(dbusmock.DBusTestCase):
+         self.write_file_contents(boost, "0\n")
+         return max0, max1, boost
+ 
++    def create_macbook_passive(self, model="MacBookPro8,2", status="passive", epp=False):
++        root = self.testbed.get_root_dir()
++        dmi = os.path.join(root, "sys/class/dmi/id")
++        pstate = os.path.join(root, "sys/devices/system/cpu/intel_pstate")
++        os.makedirs(dmi, exist_ok=True)
++        os.makedirs(pstate, exist_ok=True)
++        self.write_file_contents(os.path.join(dmi, "product_name"), model + "\n")
++        self.write_file_contents(os.path.join(pstate, "status"), status + "\n")
++        no_turbo = os.path.join(pstate, "no_turbo")
++        self.write_file_contents(no_turbo, "0\n")
++        policies = []
++        for name in ("policy0", "policy4"):
++            maximum = self.create_cpufreq_policy(
++                name, "intel_cpufreq", "800000 3500000", epp=epp,
++                governors="performance powersave schedutil",
++            )
++            directory = os.path.dirname(maximum)
++            os.unlink(os.path.join(directory, "scaling_available_frequencies"))
++            self.write_file_contents(os.path.join(directory, "cpuinfo_min_freq"), "800000\n")
++            self.write_file_contents(os.path.join(directory, "scaling_min_freq"), "800000\n")
++            policies.append(directory)
++        return policies, no_turbo
++
++    def test_cpufreq_macbook_passive_profiles(self):
++        """Sandy Bridge profiles affect every policy without a frequency table"""
++        policies, no_turbo = self.create_macbook_passive()
++        self.start_daemon()
++        profiles = self.get_dbus_property("Profiles")
++        self.assertEqual(len(profiles), 3)
++        self.assertEqual(profiles[0]["CpuDriver"], "cpufreq")
++        for profile, minimum, maximum, turbo in (
++            ("balanced", "800000", "3500000", "0"),
++            ("performance", "1200000", "3500000", "0"),
++            ("power-saver", "800000", "1800000", "1"),
++            ("performance", "1200000", "3500000", "0"),
++            ("power-saver", "800000", "1800000", "1"),
++        ):
++            self.set_dbus_property("ActiveProfile", GLib.Variant.new_string(profile))
++            for directory in policies:
++                for attr, value in (("scaling_min_freq", minimum),
++                                    ("scaling_max_freq", maximum),
++                                    ("scaling_governor", "schedutil")):
++                    self.assert_file_eventually_contains(os.path.join(directory, attr), value)
++            self.assert_file_eventually_contains(no_turbo, turbo)
++        self.stop_daemon()
++        for directory in policies:
++            self.assertEqual(self.read_file_contents(os.path.join(directory, "scaling_max_freq")), b"3500000")
++            self.assertEqual(self.read_file_contents(os.path.join(directory, "scaling_min_freq")), b"800000")
++        self.assertEqual(self.read_file_contents(no_turbo), b"0")
++
++    def test_cpufreq_macbook_passive_resume(self):
++        """Resume reapplies the cap, floor, governor and turbo setting"""
++        policies, no_turbo = self.create_macbook_passive()
++        _, obj_logind, _ = self.start_dbus_template("logind", {})
++        self.start_daemon()
++        self.set_dbus_property("ActiveProfile", GLib.Variant.new_string("power-saver"))
++        self.wait_for_sleep_monitor()
++        for directory in policies:
++            self.write_file_contents(os.path.join(directory, "scaling_max_freq"), "3500000")
++            self.write_file_contents(os.path.join(directory, "scaling_min_freq"), "1200000")
++            self.write_file_contents(os.path.join(directory, "scaling_governor"), "performance")
++        self.write_file_contents(no_turbo, "0")
++        obj_logind.EmitSignal("org.freedesktop.login1.Manager", "PrepareForSleep", "b", [True])
++        obj_logind.EmitSignal("org.freedesktop.login1.Manager", "PrepareForSleep", "b", [False])
++        for directory in policies:
++            self.assert_file_eventually_contains(os.path.join(directory, "scaling_max_freq"), "1800000", timeout=3000)
++            self.assert_file_eventually_contains(os.path.join(directory, "scaling_min_freq"), "800000")
++            self.assert_file_eventually_contains(os.path.join(directory, "scaling_governor"), "schedutil")
++        self.assert_file_eventually_contains(no_turbo, "1")
++
++    def test_cpufreq_macbook_passive_gates(self):
++        """Other models, active pstate, EPP and incomplete policies are untouched"""
++        for case in ("other-model", "active", "epp", "missing-turbo", "missing-limits", "no-schedutil"):
++            with self.subTest(case=case):
++                policies, no_turbo = self.create_macbook_passive(
++                    model="MacBookPro8,1" if case == "other-model" else "MacBookPro8,2",
++                    status="active" if case == "active" else "passive",
++                    epp=case == "epp",
++                )
++                if case == "missing-turbo":
++                    os.unlink(no_turbo)
++                elif case == "missing-limits":
++                    os.unlink(os.path.join(policies[0], "cpuinfo_min_freq"))
++                elif case == "no-schedutil":
++                    self.write_file_contents(os.path.join(policies[0], "scaling_available_governors"), "performance powersave")
++                self.start_daemon()
++                profiles = self.get_dbus_property("Profiles")
++                self.assertEqual(len(profiles), 2)
++                self.assertEqual(profiles[0]["Driver"], "placeholder")
++                self.set_dbus_property("ActiveProfile", GLib.Variant.new_string("power-saver"))
++                for directory in policies:
++                    self.assertEqual(self.read_file_contents(os.path.join(directory, "scaling_max_freq")), b"3500000\n")
++                self.stop_daemon(delete_profile=True)
++                shutil.rmtree(os.path.join(self.testbed.get_root_dir(), "sys/devices/system/cpu"))
++
+     def test_cpufreq_apple_without_boost(self):
+         """Apple Silicon without boost frequencies caps only power-saver"""
+         max0, max1, boost = self.create_apple_without_boost()
+-- 
+2.56.0
+
