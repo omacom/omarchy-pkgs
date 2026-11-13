@@ -80,9 +80,15 @@ if (( EUID != 0 )); then
   fi
 fi
 
-printf 'microsoft,denali\0qcom,x1p64100\0' >"$scratch/compatible"
+printf 'lenovo,yoga-slim7x\0qcom,x1e80100\0' >"$scratch/compatible"
 rm -rf "$root"
 run -d "$store" >/dev/null 2>&1 || fail "other machines exit cleanly"
 [[ ! -e $root ]] || fail "other machines get no sensor configuration"
+
+# The LCD (X Plus) model carries the same sensor configuration as the OLED.
+printf 'microsoft,denali-lcd\0microsoft,denali\0qcom,x1p64100\0qcom,x1e80100\0' >"$scratch/compatible"
+rm -rf "$root"
+run -d "$store" >/dev/null 2>&1 || fail "the extractor accepts the Surface Pro 11 LCD"
+[[ -f $root/sensors/config/json.lst ]] || fail "the Surface Pro 11 LCD gets the sensor configuration"
 
 echo "ok - surface-pro-11-sensors-extract builds the sensor root from a Windows driver store"

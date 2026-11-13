@@ -51,8 +51,12 @@ assert '9106-pinctrl-unsupported-debounce.patch' in sources and 'test_usb_deboun
 assert '9107-xhci-acpi-gpio-wake.patch' in sources and 'test_usb_wake.py' in sources
 for name in ('9110-n1x-sroot-noncoherent-dma.patch', '9111-spi-hid-serialize-get.patch',
              '9112-spi-hid-stream-only.patch', '9113-spi-hid-native-input-length.patch',
+             '9116-mt7925-reset-wm2-mask.patch', 'test_reset.py',
              'test_npu_cca.py', 'test_spi_get_requests.py', 'test_spi_lengths_stream.py'):
     assert sources.count(name) == 1, name
+reset_patch = package / '9116-mt7925-reset-wm2-mask.patch'
+assert hashlib.sha256(reset_patch.read_bytes()).hexdigest() == (
+    '62ec6a84533eb9090fdaab7b0b217da7180085205bf22b5cfce50010b1db6f93')
 assert not any('p16-platform-bundle' in name for name in sources)
 assert not any('rtc-diagnostic' in name or 'rtc-debug' in name for name in sources)
 assert not any('p16-platform-support' in name for name in sources)

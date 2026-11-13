@@ -1,0 +1,144 @@
+#!/bin/bash
+# Refresh the upstream signing keys in pkgbuilds/*/keys/pgp/ from the places
+# their owners publish them. Builds never fetch keys
+# (tests/pgp-keys-vendored.sh), so this is how a revocation, a new expiry
+# date or a new subkey reaches the repository.
+#
+# For every fingerprint, merge in what the key's own WKD (each user ID's
+# address) and keys.openpgp.org serve. gpg merges only signatures made by
+# the pinned primary key, so a source can add its owner's updates but
+# cannot swap the key. A key whose validity, expiry, subkeys or user IDs
+# changed is written back to every file that carries it.
+#
+# Exit 0: nothing changed. 1: key files changed (review and commit them).
+# 2: a key is revoked; the recipes that trust it must stop until upstream
+# says what replaces it. An unreachable source is reported, not an error.
+set -uo pipefail
+ROOT=$(realpath "${BASH_SOURCE[0]%/*}/..")
+TIMEOUT=${REFRESH_TIMEOUT:-20}
+# Not keyserver.ubuntu.com: it went down with the rest of Canonical on
+# 11 November 2026, and it syncs only with Canonical's own servers. Owners
+# publish their updates by WKD or to keys.openpgp.org.
+KEYSERVERS=(hkps://keys.openpgp.org)
+
+# What a refresh can change: per primary key and subkey, its validity
+# (r = revoked), expiry and capabilities; per user ID, its validity, keyed
+# by the user ID's hash, so a revoked address is kept too.
+state() {
+  gpg --with-colons --list-keys "$1" 2>/dev/null |
+    awk -F: '$1 == "pub" || $1 == "sub" { print $1, $2, $5, $7, $12 }
+             $1 == "uid" { print $1, $2, $8 }'
+}
+
+# Stop the keyring's gpg daemons, then remove it. gpgconf blocks on a
+# dirmngr that still waits on DNS, so its wait is bounded.
+drop_keyring() {
+  timeout 5 gpgconf --kill all 2>/dev/null
+  rm -rf "$GNUPGHOME"
+}
+
+# The same, as one shipped file carries it, in a keyring of its own.
+file_state() (
+  GNUPGHOME=$(mktemp -d)
+  export GNUPGHOME
+  gpg -q --batch --import "$1" 2>/dev/null
+  state "$2"
+  drop_keyring
+)
+
+# One lookup in a keyring of its own, seeded with the shipped key; on
+# success, keep what it holds for the pinned fingerprint. gpg can outlive
+# timeout's SIGTERM while its dirmngr waits on DNS, so SIGKILL follows.
+lookup() (
+  GNUPGHOME=$(mktemp -d)
+  export GNUPGHOME
+  local n=$1 source=$2
+  shift 2
+  gpg -q --batch --import "$work/base.gpg" 2>/dev/null
+  if timeout --kill-after=5 "$TIMEOUT" gpg -q --batch "$@" >/dev/null 2>&1; then
+    gpg --batch --export "$fpr" >"$work/$n.gpg" && echo "$source" >"$work/$n.source"
+  fi
+  drop_keyring
+)
+
+# Fingerprint -> newline-separated paths of every file that carries it.
+declare -A files
+while IFS= read -r -d '' file; do
+  fpr=$(basename "$file" .asc)
+  files[$fpr]+="$file"$'\n'
+done < <(find "$ROOT/pkgbuilds" -path '*/keys/pgp/*.asc' -print0 | sort -z)
+
+status=0
+for fpr in $(printf '%s\n' "${!files[@]}" | sort); do
+  mapfile -t paths < <(printf '%s' "${files[$fpr]}")
+  GNUPGHOME=$(mktemp -d)
+  export GNUPGHOME
+  # Merge every copy first, so a revocation any one of them carries survives.
+  for path in "${paths[@]}"; do
+    gpg -q --batch --import "$path" 2>/dev/null
+  done
+  if [[ -z $(state "$fpr") ]]; then
+    echo "MISSING  $fpr: ${paths[0]#"$ROOT"/} does not carry this key"
+    status=$((status > 1 ? status : 1))
+    drop_keyring
+    continue
+  fi
+
+  # Every lookup runs at once, each in a keyring seeded with the shipped key
+  # (keys.openpgp.org serves updates without user IDs, which gpg merges only
+  # into a key it already has). One key then costs at most one timeout.
+  work=$(mktemp -d)
+  gpg --batch --export "$fpr" >"$work/base.gpg"
+  n=0
+  for address in $(gpg --with-colons --list-keys "$fpr" | awk -F: '$1 == "uid" && $2 != "r" { print $10 }' |
+    grep -oE '<[^>]+@[^>]+>' | tr -d '<>' | sort -u); do
+    n=$((n + 1))
+    lookup "$n" "wkd:$address" --auto-key-locate clear,nodefault,wkd --locate-external-keys "$address" &
+  done
+  for server in "${KEYSERVERS[@]}"; do
+    n=$((n + 1))
+    lookup "$n" "${server#hkps://}" --keyserver "$server" --recv-keys "$fpr" &
+  done
+  wait
+  reached=()
+  for result in "$work"/*.gpg; do
+    [[ $result == */base.gpg ]] && continue
+    gpg -q --batch --import "$result" 2>/dev/null
+    reached+=("$(<"${result%.gpg}.source")")
+  done
+  rm -rf "$work"
+  merged=$(state "$fpr")
+
+  # Export once and check it before any shipped file is touched.
+  export_file="$GNUPGHOME/export.asc"
+  if ! gpg --batch --armor --export-options export-clean --export "$fpr" >"$export_file" ||
+    [[ $(gpg --show-keys --with-colons "$export_file" 2>/dev/null | awk -F: '$1 == "fpr" { print $10; exit }') != "$fpr" ]]; then
+    echo "FAILED   $fpr: could not export the merged key; no file changed"
+    status=$((status > 1 ? status : 1))
+    drop_keyring
+    continue
+  fi
+
+  # Compare each file with the merged key on its own, so every stale copy is
+  # rewritten. A revoked key is written back too: makepkg then refuses it.
+  changed=()
+  for path in "${paths[@]}"; do
+    if [[ $(file_state "$path" "$fpr") != "$merged" ]]; then
+      cp "$export_file" "$path"
+      changed+=("${path#"$ROOT"/}")
+    fi
+  done
+  if ((${#changed[@]})); then
+    echo "UPDATED  $fpr from ${reached[*]:-nowhere}: ${changed[*]}"
+    while IFS= read -r line; do echo "        now: $line"; done <<<"$merged"
+    status=$((status > 1 ? status : 1))
+  else
+    echo "current  $fpr (reached: ${reached[*]:-none})"
+  fi
+  if grep -q '^pub r ' <<<"$merged"; then
+    echo "REVOKED  $fpr: ${paths[*]#"$ROOT"/}"
+    status=2
+  fi
+  drop_keyring
+done
+exit "$status"

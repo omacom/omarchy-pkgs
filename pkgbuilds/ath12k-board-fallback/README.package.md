@@ -8,6 +8,10 @@ card reports. When no entry matches, it loads `board.bin`, and when there is non
 no Wi-Fi. linux-firmware's QCC2072 file lists 2 of the 8 cards Qualcomm's Windows driver knows,
 and its WCN7850 file lacks 6 of 32, so a laptop with one of those cards comes up without Wi-Fi.
 
+ath11k finds its board data the same way, and the tool covers one of its cards too: the WCN6855
+in the HP OmniBook X 14 (`105b:e108`), which linux-firmware doesn't list. Its Windows driver
+gives it the same board file as `105b:e105`, and that card's record gave it a working link.
+
 ## Why a card's family is enough
 
 The cards are M.2 modules, such as Foxconn's NCM825A, that several makers fit in their laptops
@@ -18,22 +22,22 @@ that hold its data.
 
 ## What the tool does
 
-`ath12k-board-fallback` runs from a pacman hook whenever linux-firmware's `ath12k` files or the
-card list change, and when this package is installed. For each Qualcomm Wi-Fi chip in the
-machine:
+`ath12k-board-fallback` runs from a pacman hook whenever linux-firmware's `ath12k` or `ath11k`
+files or the card list change, and when this package is installed. For each Qualcomm Wi-Fi chip
+in the machine:
 
 - If linux-firmware lists the machine's card, it does nothing, and removes a copy it installed
   earlier.
 - If a package installs its own `board.bin` for the chip, it does nothing, and removes a copy it
   installed earlier.
 - Otherwise, when `cards` knows the card's family, it copies the family's record from the
-  installed linux-firmware to `/usr/lib/firmware/updates/ath12k/<chip>/<hw>/board.bin`. ath12k
-  reads `board.bin` only when `board-2.bin` has no entry for the card, so the copy stops being
-  used once linux-firmware lists the card, and the next run removes it.
+  installed linux-firmware to `/usr/lib/firmware/updates/<driver>/<chip>/<hw>/board.bin`. The
+  driver reads `board.bin` only when `board-2.bin` has no entry for the card, so the copy stops
+  being used once linux-firmware lists the card, and the next run removes it.
 
 It never removes a file it did not install or that changed since, and it records what it
-installed in `/var/lib/ath12k-board-fallback/installed`. ath12k reads the board data when it
-probes the card, so a new copy takes effect after a reboot. `ath12k-board-fallback --check`
+installed in `/var/lib/ath12k-board-fallback/installed`. The driver reads the board data when
+it probes the card, so a new copy takes effect after a reboot. `ath12k-board-fallback --check`
 prints what it would do. The package ships no firmware: the copy comes from the machine's own
 linux-firmware.
 

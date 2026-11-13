@@ -55,13 +55,13 @@ claimed. Its SHA-256 is
 
 ## Evidence and limits
 
-The recipe is based on the current `7.3-9` package and proposes `7.3-10`, retaining the upstream P14 BIOS 303 keyboard and Copilot-key changes. The physical measurements below belong to the earlier isolated test build; the updated package revision has not been physically retested.
+The recipe is based on the official `7.3-59` package and proposes `7.3-60`. The physical measurements below belong to the earlier isolated test builds; this refreshed package revision has not been physically retested.
 
 The five-patch implementation before the fallback-only follow-up was built as `7.3.0-8-omarchy-n1x-pr1958-1` and physically tested on H7607BA BIOS 303. It boots with no activation argument, no external LPS0 module, and automatic OSI/genpd admission of all 20 CPUs. The in-tree LPS0 driver advertises functions `0x3f8`. NVIDIA 615.78.08, Wi-Fi and the SD reader work after boot.
 
 Two five-second platform PM tests passed, followed by three manual lid cycles with estimated suspended times of 380.317, 152.117 and 1221.047 seconds. The first was confirmed to wake solely on lid open; the logs for the other cycles show resume at lid opening. GPU, Wi-Fi and SD recovered, with no blocking kernel warnings/errors in these captures. An earlier external-module trial had an intermittent Wi-Fi scan failure, which is not claimed fixed generally.
 
-The long integrated-kernel battery test reported 92.296 Wh before and 91.847 Wh immediately after resume: **0.449 Wh over 1225.775 seconds = 1.319 W**, including suspend/resume transitions and approximately 4.728 seconds of awake overhead. AC was disconnected in every captured sample, the gauge was confirmed decreasing below full charge, and neither endpoint snapshot crossed suspend. The following 0.209 Wh consumed while awake during settling is excluded. This validates the integrated implementation on this machine, not physical DRIPS residency or other models/BIOS revisions; gauge update timing and a single long measurement limit precision.
+The long integrated-kernel battery test reported 92.296 Wh before and 91.847 Wh immediately after resume: **0.449 Wh over 1225.775 seconds = 1.319 W**, including suspend/resume transitions and approximately 4.728 seconds of awake overhead. AC was disconnected in every captured sample, the gauge was confirmed decreasing below full charge, and neither endpoint snapshot crossed suspend. The following 0.209 Wh consumed while awake during settling is excluded. This records the integrated implementation's behavior on this machine, not physical DRIPS residency or other models/BIOS revisions; gauge update timing and a single long measurement limit precision.
 
 For reference, the earlier three-patch kernel plus temporary LPS0 module measured 0.497 Wh over 1181.737 seconds, about1.514 W including transitions. These are separate trials, not a controlled percentage comparison. No private-layout module is required by this package.
 
@@ -96,9 +96,11 @@ reports the compiled tests as skipped when no prepared tree is supplied.
 
 ## Current recipe compatibility
 
-The PR is refreshed on the official 7.3-46 recipe and uses pkgrel 48 so its
+The PR is refreshed on the official 7.3-59 recipe and uses pkgrel 60 so its
 packaging change is shipped. It retains upstream's separate kernel, headers and
 NVIDIA open-module split, driver version and seven NVIDIA patches unchanged.
+It also retains upstream's separate `linux-omarchy-dtbs` package and the
+1115 DVFSRC laptop guard, alongside all existing 1120-1127 P16 patches.
 The sleep implementation retains its existing firmware-state and lifecycle
 checks. The 1122 follow-up admits 18 CPUs as well as 20, with provisional
 18-CPU support and no physical validation of that SKU. That local candidate also includes
@@ -163,3 +165,19 @@ sentinel instead of wrapping its wake latency to6609us. The actual setup and
 selection harness checks both sentinel and near-boundary values, finite latency,
 and unchanged coordinated/non-N1x controls. The physical measurements above
 predate this arithmetic follow-up; no new hardware result is claimed.
+
+## MT7925 reset recovery follow-up
+
+Patch `9116-mt7925-reset-wm2-mask.patch` is the unmodified upstream commit
+[`c182bfe944eb275f7526cc326f81229b0e974a0c`](https://github.com/torvalds/linux/commit/c182bfe944eb275f7526cc326f81229b0e974a0c),
+authored by ck.chang and signed off by ck.chang and Felix Fietkau. Its SHA-256
+is `62ec6a84533eb9090fdaab7b0b217da7180085205bf22b5cfce50010b1db6f93`.
+It removes the MT7925 WM2 receive interrupt mask because that chip does not
+allocate the corresponding queue/NAPI; otherwise reset can disable an
+unregistered NAPI and panic. MT7927/MT7928 keep their allocated WM2 queues.
+
+`test_reset.py` compiles the production queue layouts, allocation and reset
+functions under ASan/UBSan and checks NAPI lifecycle and receive-mask coherence
+for MT7925, MT7927 and MT7928. Hardware and firmware operations are stubbed;
+this test does not validate firmware recovery, DMA transfers, physical sleep
+or a general Wi-Fi suspend/resume fix.
