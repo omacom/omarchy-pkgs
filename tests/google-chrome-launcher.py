@@ -40,6 +40,26 @@ class LauncherTest(unittest.TestCase):
         _, argv = self.launch('--name="home config"', xdg=False)
         self.assertEqual(argv[1], "--name=home config")
 
+    def test_unquoted_url_fragment_and_following_flag(self):
+        _, argv = self.launch("--app=https://example.test/#/inbox --disable-gpu # comment\n--next\n")
+        self.assertEqual(argv[1:-2], ["--app=https://example.test/#/inbox", "--disable-gpu", "--next"])
+
+    def test_hashes_joined_to_quoted_and_escaped_text(self):
+        _, argv = self.launch("\\#literal ''#joined \"#quoted\" --name=two\\ words#hash # ignored\n")
+        self.assertEqual(argv[1:-2], ["#literal", "#joined", "#quoted", "--name=two words#hash"])
+
+    def test_comment_quotes_and_escapes_do_not_affect_next_line(self):
+        _, argv = self.launch('# ignored \" \' \\\n--next # ignored\n--last')
+        self.assertEqual(argv[1:-2], ["--next", "--last"])
+
+    def test_environment_url_fragment(self):
+        _, argv = self.launch(env_flags="--app=https://example.test/#inbox --disable-gpu")
+        self.assertEqual(argv[1:-2], ["--app=https://example.test/#inbox", "--disable-gpu"])
+
+    def test_trailing_escape_does_not_launch(self):
+        with self.assertRaisesRegex(SystemExit, "Cannot read Chrome flags"):
+            self.launch("--name=trailing\\")
+
     def test_empty_file_overrides_environment(self):
         _, argv = self.launch("", env_flags="--disable-gpu")
         self.assertEqual(argv[1:], ["--new-window", "https://example.test/a b"])
