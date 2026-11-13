@@ -10,7 +10,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
 NAMES = ['linux-aurora', 'mesa-aurora', 'aura', 'm1n1-aurora', 'uboot-aurora', 'aurora-bless',
-         'speakerguardd', 'aurora-audio', 'alsa-ucm-conf-aurora', 'omarchy-aurora-firmware',
+         'speakerguardd', 'speakerguardd-k114', 'aurora-audio', 'alsa-ucm-conf-aurora', 'omarchy-aurora-firmware',
          'speakersafetyd', 'bankstown', 'triforce-lv2', 'lzfse', 'aurora-scripts', 'aurora-fwextract',
          'muvm', 'fex-emu', 'widevine']
 # Same-name imports from asahi-alarm, with the version each replaces on installed Macs.
