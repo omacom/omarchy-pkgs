@@ -48,7 +48,7 @@ class EdgeMetadataTests(unittest.TestCase):
             'omarchy-steam-fex': ['bash', 'coreutils', 'python', 'steam', 'muvm', 'FEX-Emu'],
             'aurora-audio': ['alsa-ucm-conf-aurora', 'pipewire-audio', 'wireplumber',
                              'bankstown', 'lsp-plugins-lv2', 'triforce-lv2>=0.2.0',
-                             'speakersafetyd', 'speakerguardd'],
+                             'speakersafetyd', 'speakerguardd', 'speakerguardd-k114'],
             'omarchy-aurora-firmware': ['bash', 'iw', 'kmod', 'omarchy-mac-boot',
                                        'wireless-regdb', 'linux-aurora>=7.1.12.aurora5'],
         }
