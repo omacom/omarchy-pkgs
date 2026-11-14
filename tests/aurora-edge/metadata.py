@@ -10,7 +10,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
 NAMES = ['linux-aurora', 'mesa-aurora', 'aura', 'm1n1-aurora', 'uboot-aurora', 'aurora-bless',
-         'speakerguardd', 'aurora-audio', 'alsa-ucm-conf-aurora', 'omarchy-aurora-firmware']
+         'speakerguardd', 'speakerguardd-k114', 'aurora-audio', 'alsa-ucm-conf-aurora', 'omarchy-aurora-firmware']
 
 
 def srcinfo(name):
@@ -39,7 +39,7 @@ class EdgeMetadataTests(unittest.TestCase):
             'm1n1-aurora': ['asahi-scripts>=20260127.1', 'uboot-asahi'],
             'aurora-audio': ['alsa-ucm-conf-aurora', 'pipewire-audio', 'wireplumber',
                              'bankstown', 'lsp-plugins-lv2', 'triforce-lv2>=0.2.0',
-                             'speakersafetyd', 'speakerguardd'],
+                             'speakersafetyd', 'speakerguardd', 'speakerguardd-k114'],
             'omarchy-aurora-firmware': ['bash', 'iw', 'kmod', 'omarchy-mac-boot',
                                        'wireless-regdb', 'linux-aurora>=7.1.12.aurora5'],
         }

@@ -1,0 +1,363 @@
+diff --git a/README.md b/README.md
+index 900f886..21687e7 100644
+--- a/README.md
++++ b/README.md
+@@ -14,9 +14,18 @@ play; if the daemon stops for any reason, the card locks the volume again
+ within 250 ms.  The configuration files use the same keys, so a speaker
+ description reads the same way in both projects.
+ 
++`[Globals]` may set `sense_format = S16_LE` for a card whose sense PCM offers
++only 16-bit samples (the MacBook Pro 14-inch with M5 Max does); the default is
++`S32_LE`.  S16 words are shifted to the top of a 32-bit word, so `vs_scale`
++still means volts at full scale in both.
++
++`period` must also fit the sense PCM's own limit, or the open fails with
++EINVAL: that PCM caps one period at 65520 bytes, which is 2730 frames of 12
++channels at S16, so the M5 Max config uses 2048.
++
+ ### How it works
+ 
+-Every period (4096 frames) the sense words of each channel are scaled to the
++Every period (4096 frames by default; `period` sets it) the sense words of each channel are scaled to the
+ amplifier's output voltage (`vs_scale` volts at full scale) and squared into
+ the power in the coil (`z_nominal`).  That power drives a two-stage lumped
+ thermal model - voice coil into magnet (`tr_coil` K/W, `tau_coil` s), magnet
+diff --git a/src/alsa.rs b/src/alsa.rs
+index 67bbe36..83e4c61 100644
+--- a/src/alsa.rs
++++ b/src/alsa.rs
+@@ -380,6 +380,75 @@ const PARAM_PERIODS: usize = 15 - 8;
+ const ACCESS_RW_INTERLEAVED: u32 = 3;
+ const FORMAT_S32_LE: u32 = 10;
+ const SUBFORMAT_STD: u32 = 0;
++const FORMAT_S16_LE: u32 = 2;
++
++/// Sample format of the sense PCM.  The J700 captures S32_LE; the K114c
++/// offers S16_LE only.  Words are widened to i32 with full scale at the top
++/// (see `widen_s16`), so `vs_scale` means the same in both.
++#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
++pub enum SenseFormat {
++    #[default]
++    S32Le,
++    S16Le,
++}
++
++impl SenseFormat {
++    pub fn parse(name: &str) -> Option<SenseFormat> {
++        match name {
++            "S32_LE" => Some(SenseFormat::S32Le),
++            "S16_LE" => Some(SenseFormat::S16Le),
++            _ => None,
++        }
++    }
++
++    /// The step between two adjacent words, in widened i32 units.
++    pub fn quantum(self) -> f64 {
++        match self {
++            SenseFormat::S32Le => 1.0,
++            SenseFormat::S16Le => 65536.0,
++        }
++    }
++
++    fn alsa(self) -> u32 {
++        match self {
++            SenseFormat::S32Le => FORMAT_S32_LE,
++            SenseFormat::S16Le => FORMAT_S16_LE,
++        }
++    }
++}
++
++/// S16 words shifted to the top of an i32: full scale is the same number as
++/// in S32_LE.
++pub fn widen_s16(src: &[i16], dst: &mut [i32]) {
++    for (d, s) in dst.iter_mut().zip(src) {
++        *d = i32::from(*s) << 16;
++    }
++}
++
++/// The hw_params request for the sense capture: one format, fixed geometry.
++fn sense_hw_params(format: SenseFormat, channels: usize, rate: u32, period: usize) -> HwParams {
++    // SAFETY: an all-ones/zeroed parameter block is the "unconstrained"
++    // request the kernel refines.
++    let mut hw: HwParams = unsafe { std::mem::zeroed() };
++    for m in hw.masks.iter_mut() {
++        m.bits = [0; 8];
++    }
++    for i in hw.intervals.iter_mut() {
++        *i = Interval { min: 0, max: u32::MAX, flags: 0 };
++    }
++    hw.masks[PARAM_ACCESS].bits[0] = 1 << ACCESS_RW_INTERLEAVED;
++    hw.masks[PARAM_FORMAT].bits[0] = 1 << format.alsa();
++    hw.masks[PARAM_SUBFORMAT].bits[0] = 1 << SUBFORMAT_STD;
++    let fixed = |i: &mut Interval, v: u32| {
++        *i = Interval { min: v, max: v, flags: INTERVAL_INTEGER };
++    };
++    fixed(&mut hw.intervals[PARAM_CHANNELS], channels as u32);
++    fixed(&mut hw.intervals[PARAM_RATE], rate);
++    fixed(&mut hw.intervals[PARAM_PERIOD_SIZE], period as u32);
++    fixed(&mut hw.intervals[PARAM_PERIODS], 4);
++    hw.rmask = u32::MAX;
++    hw
++}
+ const INTERVAL_INTEGER: u32 = 1 << 2;
+ 
+ const PCM_IOCTL_HW_PARAMS: libc::c_ulong = iowr::<HwParams>(b'A', 0x11);
+@@ -409,6 +478,10 @@ pub trait PcmIo {
+ /// The capture PCM file itself.
+ pub struct PcmFile {
+     file: File,
++    format: SenseFormat,
++    channels: usize,
++    /// Transfer buffer for S16_LE (unused for S32_LE).
++    raw: Vec<i16>,
+ }
+ 
+ impl PcmIo for PcmFile {
+@@ -421,6 +494,14 @@ impl PcmIo for PcmFile {
+     }
+ 
+     fn readi(&mut self, buf: &mut [i32], frames: usize) -> io::Result<i64> {
++        if self.format == SenseFormat::S16Le {
++            self.raw.resize(frames * self.channels, 0);
++            let mut xfer = Xferi { result: 0, buf: self.raw.as_mut_ptr().cast(), frames: frames as u64 };
++            ioctl(&self.file, PCM_IOCTL_READI_FRAMES, &mut xfer)?;
++            let words = xfer.result.max(0) as usize * self.channels;
++            widen_s16(&self.raw[..words], &mut buf[..words]);
++            return Ok(xfer.result);
++        }
+         let mut xfer = Xferi { result: 0, buf: buf.as_mut_ptr().cast(), frames: frames as u64 };
+         ioctl(&self.file, PCM_IOCTL_READI_FRAMES, &mut xfer)?;
+         Ok(xfer.result)
+@@ -471,11 +552,11 @@ pub struct PeriodReader<P: PcmIo> {
+     started: bool,
+ }
+ 
+-/// An interleaved S32_LE capture stream with fixed period geometry.
++/// An interleaved capture stream (S32_LE or S16_LE words, read as i32) with fixed period geometry.
+ pub type Capture = PeriodReader<PcmFile>;
+ 
+ impl Capture {
+-    pub fn open(card: u32, device: u32, channels: usize, rate: u32, period: usize) -> io::Result<Capture> {
++    pub fn open(card: u32, device: u32, channels: usize, rate: u32, period: usize, format: SenseFormat) -> io::Result<Capture> {
+         let path = format!("/dev/snd/pcmC{card}D{device}c");
+         // A blocking open would wait, silently, for whoever holds the sense
+         // PCM to let go, and the volume lock would time out meanwhile: ask
+@@ -485,26 +566,7 @@ impl Capture {
+             .write(true)
+             .custom_flags(libc::O_NONBLOCK)
+             .open(&path)?;
+-        // SAFETY: an all-ones/zeroed parameter block is the "unconstrained"
+-        // request the kernel refines.
+-        let mut hw: HwParams = unsafe { std::mem::zeroed() };
+-        for m in hw.masks.iter_mut() {
+-            m.bits = [0; 8];
+-        }
+-        for i in hw.intervals.iter_mut() {
+-            *i = Interval { min: 0, max: u32::MAX, flags: 0 };
+-        }
+-        hw.masks[PARAM_ACCESS].bits[0] = 1 << ACCESS_RW_INTERLEAVED;
+-        hw.masks[PARAM_FORMAT].bits[0] = 1 << FORMAT_S32_LE;
+-        hw.masks[PARAM_SUBFORMAT].bits[0] = 1 << SUBFORMAT_STD;
+-        let fixed = |i: &mut Interval, v: u32| {
+-            *i = Interval { min: v, max: v, flags: INTERVAL_INTEGER };
+-        };
+-        fixed(&mut hw.intervals[PARAM_CHANNELS], channels as u32);
+-        fixed(&mut hw.intervals[PARAM_RATE], rate);
+-        fixed(&mut hw.intervals[PARAM_PERIOD_SIZE], period as u32);
+-        fixed(&mut hw.intervals[PARAM_PERIODS], 4);
+-        hw.rmask = u32::MAX;
++        let mut hw = sense_hw_params(format, channels, rate, period);
+         ioctl(&file, PCM_IOCTL_HW_PARAMS, &mut hw)?;
+ 
+         // SAFETY: zeroed is a valid base; every field is set below.
+@@ -521,7 +583,7 @@ impl Capture {
+         sw.silence_size = 0;
+         sw.boundary = (period * 4) as u64 * (1 << 20);
+         ioctl(&file, PCM_IOCTL_SW_PARAMS, &mut sw)?;
+-        let mut io = PcmFile { file };
++        let mut io = PcmFile { file, format, channels, raw: Vec::new() };
+         io.prepare()?;
+         Ok(PeriodReader::new(io, channels, period))
+     }
+@@ -632,6 +694,44 @@ mod tests {
+         assert_eq!(std::mem::size_of::<Xferi>(), 24);
+     }
+ 
++    /// The K114c's sense PCM offers S16_LE only; a request for S32_LE alone
++    /// fails with EINVAL there, so the daemon never pings and the card
++    /// relocks.  The request must carry exactly the configured format.
++    #[test]
++    fn the_sense_request_names_only_the_configured_format() {
++        let hw = sense_hw_params(SenseFormat::S32Le, 12, 48000, 4096);
++        assert_eq!(hw.masks[PARAM_FORMAT].bits[0], 1 << 10);
++        let hw = sense_hw_params(SenseFormat::S16Le, 12, 48000, 4096);
++        assert_eq!(hw.masks[PARAM_FORMAT].bits[0], 1 << 2);
++        assert_eq!((hw.intervals[PARAM_CHANNELS].min, hw.intervals[PARAM_CHANNELS].max), (12, 12));
++        assert_eq!((hw.intervals[PARAM_RATE].min, hw.intervals[PARAM_RATE].max), (48000, 48000));
++        assert_eq!((hw.intervals[PARAM_PERIOD_SIZE].min, hw.intervals[PARAM_PERIOD_SIZE].max), (4096, 4096));
++    }
++
++    /// S16 words are shifted to the top of an i32 so that full scale is the
++    /// same number in both formats and `vs_scale` keeps one meaning.
++    #[test]
++    fn s16_words_widen_to_full_scale_s32() {
++        let mut dst = [0i32; 5];
++        widen_s16(&[0, 1, -1, i16::MAX, i16::MIN], &mut dst);
++        assert_eq!(dst, [0, 65536, -65536, 0x7fff_0000, i32::MIN]);
++    }
++
++    /// The step between two words, in widened i32 units.
++    #[test]
++    fn a_format_names_its_quantization_step() {
++        assert_eq!(SenseFormat::S32Le.quantum(), 1.0);
++        assert_eq!(SenseFormat::S16Le.quantum(), 65536.0);
++    }
++
++    #[test]
++    fn format_names_parse() {
++        assert_eq!(SenseFormat::parse("S32_LE"), Some(SenseFormat::S32Le));
++        assert_eq!(SenseFormat::parse("S16_LE"), Some(SenseFormat::S16Le));
++        assert_eq!(SenseFormat::parse("s16"), None);
++        assert_eq!(SenseFormat::default(), SenseFormat::S32Le);
++    }
++
+     #[test]
+     fn ioctl_numbers() {
+         // known values from the kernel headers on 64-bit Linux
+diff --git a/src/config.rs b/src/config.rs
+index d64fe26..6d91107 100644
+--- a/src/config.rs
++++ b/src/config.rs
+@@ -10,6 +10,8 @@ use std::fmt;
+ use std::fs;
+ use std::path::Path;
+ 
++use crate::alsa::SenseFormat;
++
+ #[derive(Debug)]
+ pub struct ConfigError(pub String);
+ 
+@@ -36,6 +38,8 @@ pub struct Globals {
+     pub channels: usize,
+     /// Frames per model step.
+     pub period: usize,
++    /// Sample format of the sense PCM (`sense_format`, S32_LE when absent).
++    pub sense_format: SenseFormat,
+     /// Reduction the thermal governor reaches at the coil's working limit
+     /// (dB); more than this means the model, not the music, is wrong.
+     pub t_reduction_max: f64,
+@@ -146,6 +150,11 @@ impl Config {
+             t_window: num(g, "Globals", "t_window")?,
+             channels: num(g, "Globals", "channels")?,
+             period: num(g, "Globals", "period")?,
++            sense_format: match g.get("sense_format") {
++                None => SenseFormat::default(),
++                Some(v) => SenseFormat::parse(v)
++                    .ok_or_else(|| ConfigError(format!("[Globals] sense_format: {v} is not S32_LE or S16_LE")))?,
++            },
+             t_reduction_max: match g.get("t_reduction_max") {
+                 None => 12.0,
+                 Some(_) => num(g, "Globals", "t_reduction_max")?,
+@@ -283,6 +292,15 @@ mod tests {
+         assert!((c.globals.t_reduction_max - 12.0).abs() < 1e-9);
+     }
+ 
++    #[test]
++    fn sense_format_defaults_to_s32_and_accepts_s16() {
++        assert_eq!(Config::parse(J700).unwrap().globals.sense_format, SenseFormat::S32Le);
++        let s16 = J700.replace("period = 4096", "period = 4096\nsense_format = S16_LE");
++        assert_eq!(Config::parse(&s16).unwrap().globals.sense_format, SenseFormat::S16Le);
++        let bad = J700.replace("period = 4096", "period = 4096\nsense_format = S24_LE");
++        assert!(Config::parse(&bad).is_err());
++    }
++
+     #[test]
+     fn power_budget_is_optional() {
+         let none = J700.replace("p_limit_1s = 2.8154\n", "").replace("p_limit_60s = 2.5\n", "");
+diff --git a/src/guard.rs b/src/guard.rs
+index ac30380..2f2ed9b 100644
+--- a/src/guard.rs
++++ b/src/guard.rs
+@@ -1253,7 +1253,7 @@ impl Guard {
+             }).collect()
+         };
+         for s in self.speakers.iter_mut() {
+-            let (p, q) = s.frame_powers(all, ch, &possible);
++            let (p, q) = s.frame_powers(all, ch, &possible, globals.sense_format.quantum());
+             if p.iter().any(|x| !x.is_finite()) || q.iter().any(|x| !x.is_finite() || *x < 0.0) {
+                 return Err("invalid speaker sense voltage or power".into());
+             }
+diff --git a/src/main.rs b/src/main.rs
+index 27fe807..f80287c 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -305,7 +305,7 @@ impl Hw for RealHw {
+     }
+     fn open_sense(&mut self, rate: u32) -> std::io::Result<()> {
+         let g = self.globals.clone();
+-        let c = self.timed(stats::Call::Open, |h| Capture::open(h.card.ctl.card, g.sense_pcm, g.channels, rate, g.period))?;
++        let c = self.timed(stats::Call::Open, |h| Capture::open(h.card.ctl.card, g.sense_pcm, g.channels, rate, g.period, g.sense_format))?;
+         self.capture = Some(c);
+         Ok(())
+     }
+diff --git a/src/model.rs b/src/model.rs
+index 3f0bf00..814f642 100644
+--- a/src/model.rs
++++ b/src/model.rs
+@@ -129,7 +129,9 @@ impl SpeakerState {
+     /// what was played: r fits iff r <= 20 log10(vs_scale / word).  What
+     /// was played is within a step above the word: the step up is its
+     /// power's bound (it matters only where the gain undone is deep).
+-    pub fn frame_powers(&self, words: &[i32], channels: usize, possible: &[(f64, f64)]) -> (Vec<f64>, Vec<f64>) {
++    /// `quantum` is the step between two words of the sense format, in
++    /// the same widened units as `words`.
++    pub fn frame_powers(&self, words: &[i32], channels: usize, possible: &[(f64, f64)], quantum: f64) -> (Vec<f64>, Vec<f64>) {
+         let ch = self.spec.vs_chan;
+         let frames = words.len() / channels;
+         let scale = self.spec.vs_scale / 2147483648.0;
+@@ -142,7 +144,7 @@ impl SpeakerState {
+             p.push(v * v / self.spec.z_nominal);
+             let w = w.abs();
+             let room = if w > 0.0 { 20.0 * (2147483648.0 / w).log10() } else { f64::INFINITY };
+-            let up = (w + 1.0) * scale;
++            let up = (w + quantum) * scale;
+             let pre = up * up / self.spec.z_nominal * 10f64.powf(converted_at(room, possible) / 10.0);
+             q.push(if pre > full { full } else { pre });
+         }
+@@ -569,12 +571,26 @@ mod tests {
+     #[test]
+     fn a_quantized_word_is_undone_from_the_step_above() {
+         let s = SpeakerState::new(spec(), 35.0);
+-        let (_, pre) = s.frame_powers(&[1288, 1288], 2, &[(120.0, 120.0)]);
++        let (_, pre) = s.frame_powers(&[1288, 1288], 2, &[(120.0, 120.0)], 1.0);
+         let up = 1289.0 * s.spec.vs_scale / 2147483648.0;
+         let want = up * up / s.spec.z_nominal * 1e12;
+         assert!(pre[0] >= want * (1.0 - 1e-12), "{} W before the gain, the step above gives {want} W", pre[0]);
+     }
+ 
++    /// Review of #177 (P2): an S16 sense word is 65536 units from its
++    /// neighbour once widened, so a word of 0 behind the 120 dB minimum can
++    /// have been a full-scale signal.  The budgets charge the step above
++    /// the word, whatever the format's step is.
++    #[test]
++    fn an_s16_zero_word_behind_deep_gain_charges_full_scale() {
++        let s = SpeakerState::new(spec(), 35.0);
++        let full = s.worst_case_power(0.0);
++        let (_, one) = s.frame_powers(&[0, 0], 2, &[(120.0, 120.0)], 1.0);
++        let (_, s16) = s.frame_powers(&[0, 0], 2, &[(120.0, 120.0)], 65536.0);
++        assert!(one[0] < full * 1e-3, "an S32 zero word is one unit of doubt: {} of {full} W", one[0]);
++        assert_eq!(s16[0], full, "an S16 zero word may have been full scale");
++    }
++
+     fn spec() -> Speaker {
+         Speaker {
+             name: "Left".into(),
+@@ -594,7 +610,7 @@ mod tests {
+     }
+ 
+     fn globals() -> Globals {
+-        Globals { sense_pcm: 2, t_ambient: 35.0, t_hysteresis: 5.0, t_window: 20.0, channels: 2, period: 4096, t_reduction_max: 20.0, safe_reduction: 20.0 }
++        Globals { sense_pcm: 2, t_ambient: 35.0, t_hysteresis: 5.0, t_window: 20.0, channels: 2, period: 4096, sense_format: Default::default(), t_reduction_max: 20.0, safe_reduction: 20.0 }
+     }
+ 
+     #[test]
