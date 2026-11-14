@@ -1,97 +1,185 @@
-From 2f9532da46ddc5166e5761585981b89ce3015e2b Mon Sep 17 00:00:00 2001
-From: Joshua Warren <816217+joshuaswarren@users.noreply.github.com>
-Date: Fri, 13 Nov 2026 21:30:53 -0600
-Subject: [PATCH] drm: use the alpha variant when the scanout plane lacks the X
- variant
-
-Some scanout planes (Apple M5 internal panel) offer only ARGB8888 and
-ABGR8888 for 8 bpc, not XRGB8888 or XBGR8888. A compositor that asks
-for XRGB8888 gets "format XR24 isn't supported by primary backend".
-
-Allocate the alpha variant in that case, and let the three commit-time
-format checks (setFormat validation, mismatch detection, async commit)
-treat it as equal to the requested opaque format, so no modeset is
-forced.
----
- src/allocator/GBM.cpp       | 11 +++++++++++
- src/backend/drm/DRM.cpp     |  6 +++---
- src/include/FormatUtils.hpp | 10 ++++++++++
- 3 files changed, 24 insertions(+), 3 deletions(-)
-
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 8558e2e..3d1166b 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -167,6 +167,15 @@ add_test(
+   COMMAND commitThread "commitThread")
+ add_dependencies(tests commitThread)
+ 
++add_executable(scanoutAlias "tests/ScanoutAlias.cpp")
++target_include_directories(scanoutAlias PRIVATE "./src/include" "./include")
++target_link_libraries(scanoutAlias PRIVATE PkgConfig::deps)
++add_test(
++  NAME "scanoutAlias"
++  WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}/tests
++  COMMAND scanoutAlias)
++add_dependencies(tests scanoutAlias)
++
+ # Installation
+ install(TARGETS aquamarine)
+ install(DIRECTORY "include/aquamarine" DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 diff --git a/src/allocator/GBM.cpp b/src/allocator/GBM.cpp
-index 6f596b7..a6d0344 100644
+index 6f596b7..b5a724e 100644
 --- a/src/allocator/GBM.cpp
 +++ b/src/allocator/GBM.cpp
-@@ -101,6 +101,17 @@ Aquamarine::CGBMBuffer::CGBMBuffer(const SAllocatorBufferParams& params, Hypruti
+@@ -4,6 +4,7 @@
+ #include <aquamarine/backend/DRM.hpp>
+ #include <aquamarine/allocator/Swapchain.hpp>
+ #include "FormatUtils.hpp"
++#include "ScanoutAlias.hpp"
+ #include "Shared.hpp"
+ #include <xf86drm.h>
+ #include <gbm.h>
+@@ -101,6 +102,13 @@ Aquamarine::CGBMBuffer::CGBMBuffer(const SAllocatorBufferParams& params, Hypruti
          return;
      }
  
 +    // Scanout planes that offer only the alpha variant of an 8 bpc format (Apple M5 internal panel):
 +    // allocate the A variant when the X variant is requested but not offered.
-+    if (params.scanout && !CURSOR) {
-+        const auto hasFmt = [&FORMATS](uint32_t fmt) { return std::ranges::any_of(FORMATS, [fmt](const auto& f) { return f.drmFormat == fmt; }); };
-+        const uint32_t alt = opaqueToAlphaFormat(attrs.format);
-+        if (alt != DRM_FORMAT_INVALID && !hasFmt(attrs.format) && hasFmt(alt)) {
-+            allocator->backend->log(AQ_LOG_DEBUG, std::format("GBM: {} not offered by the scanout plane, using {}", fourccToName(attrs.format), fourccToName(alt)));
-+            attrs.format = alt;
-+        }
++    if (const uint32_t alt = scanoutAlphaAlias(FORMATS, attrs.format, params.scanout, CURSOR); alt != DRM_FORMAT_INVALID) {
++        allocator->backend->log(AQ_LOG_DEBUG, std::format("GBM: {} not offered by the scanout plane, using {}", fourccToName(attrs.format), fourccToName(alt)));
++        attrs.format = alt;
 +    }
 +
      bool foundFormat = false;
      // check if we can use modifiers. If the requested support has any explicit modifier
      // supported by the primary backend, we can.
+@@ -145,12 +153,9 @@ Aquamarine::CGBMBuffer::CGBMBuffer(const SAllocatorBufferParams& params, Hypruti
+     if (MULTIGPU && !forceLinearBlit) {
+         // Try to use the linear format if available for cross-GPU compatibility.
+         // However, Nvidia doesn't support linear, so this is a best-effort basis.
+-        for (auto const& f : FORMATS) {
+-            if (f.drmFormat == DRM_FORMAT_MOD_LINEAR) {
+-                allocator->backend->log(AQ_LOG_DEBUG, "GBM: Buffer is marked as multigpu, using linear format");
+-                explicitModifiers = {DRM_FORMAT_MOD_LINEAR};
+-                break;
+-            }
++        if (std::ranges::find(explicitModifiers, DRM_FORMAT_MOD_LINEAR) != explicitModifiers.end()) {
++            allocator->backend->log(AQ_LOG_DEBUG, "GBM: Buffer is marked as multigpu, using linear format");
++            explicitModifiers = {DRM_FORMAT_MOD_LINEAR};
+         }
+     } else if (MULTIGPU && forceLinearBlit) {
+         // FIXME: Nvidia cannot render to linear buffers. What do?
+@@ -200,21 +205,19 @@ Aquamarine::CGBMBuffer::CGBMBuffer(const SAllocatorBufferParams& params, Hypruti
+         }
+     }
+ 
+-    if (MULTIGPU && forceLinearBlit) {
+-        // FIXME: most likely nvidia main gpu on multigpu
+-        if (!bo) {
+-            if (oldMods.empty())
+-                bo = gbm_bo_create(allocator->gbmDevice, attrs.size.x, attrs.size.y, attrs.format, GBM_BO_USE_RENDERING);
+-            else
+-                bo = gbm_bo_create_with_modifiers(allocator->gbmDevice, attrs.size.x, attrs.size.y, attrs.format, oldMods.data(), oldMods.size());
+-
+-            if (!bo) {
+-                allocator->backend->log(AQ_LOG_ERROR, "GBM: Failed to allocate a GBM buffer: bo null");
+-                return;
+-            }
++    // FIXME: most likely nvidia main gpu on multigpu
++    if (MULTIGPU && !bo) {
++        if (oldMods.empty())
++            bo = gbm_bo_create(allocator->gbmDevice, attrs.size.x, attrs.size.y, attrs.format, GBM_BO_USE_RENDERING);
++        else
++            bo = gbm_bo_create_with_modifiers(allocator->gbmDevice, attrs.size.x, attrs.size.y, attrs.format, oldMods.data(), oldMods.size());
+ 
+-            modifier = gbm_bo_get_modifier(bo);
++        if (!bo) {
++            allocator->backend->log(AQ_LOG_ERROR, "GBM: Failed to allocate a GBM buffer: bo null");
++            return;
+         }
++
++        modifier = gbm_bo_get_modifier(bo);
+     }
+ 
+     if (!bo) {
+@@ -284,7 +287,7 @@ bool Aquamarine::CGBMBuffer::isSynchronous() {
+ }
+ 
+ bool Aquamarine::CGBMBuffer::good() {
+-    return bo;
++    return bo && attrs.success;
+ }
+ 
+ SDMABUFAttrs Aquamarine::CGBMBuffer::dmabuf() {
 diff --git a/src/backend/drm/DRM.cpp b/src/backend/drm/DRM.cpp
-index 688ed97..1609098 100644
+index 688ed97..d313e33 100644
 --- a/src/backend/drm/DRM.cpp
 +++ b/src/backend/drm/DRM.cpp
-@@ -2548,7 +2548,7 @@ bool Aquamarine::CDRMOutput::commitState(bool onlyTest) {
+@@ -35,6 +35,7 @@ extern "C" {
+ 
+ #include "Props.hpp"
+ #include "FormatUtils.hpp"
++#include "ScanoutAlias.hpp"
+ #include "Shared.hpp"
+ #include "hwdata.hpp"
+ #include "Renderer.hpp"
+@@ -1949,7 +1950,7 @@ IOutput::SParsedEDID Aquamarine::SDRMConnector::parseEDID(std::vector<uint8_t> d
+         TRACE(backend->backend->log(AQ_LOG_TRACE,
+                                     std::format("EDID: chromaticity coords {},{} {},{} {},{} {},{}", parsed.chromaticityCoords->red.x, parsed.chromaticityCoords->red.y,
+                                                 parsed.chromaticityCoords->green.x, parsed.chromaticityCoords->green.y, parsed.chromaticityCoords->blue.x,
+-                                                parsed.chromaticityCoords->blue.y, parsed.chromaticityCoords->white.y, parsed.chromaticityCoords->white.y)));
++                                                parsed.chromaticityCoords->blue.y, parsed.chromaticityCoords->white.x, parsed.chromaticityCoords->white.y)));
+     }
+ 
+     const auto* hdr_static_metadata = di_info_get_hdr_static_metadata(info);
+@@ -2255,6 +2256,7 @@ void Aquamarine::SDRMConnector::applyCommit(SDRMConnectorCommitData& data) {
+         auto bk = backend.lock();
+         if (bk) {
+             bk->backend->log(AQ_LOG_DEBUG, std::format("drm: Connector {} enabledState changed {} -> {}", szName, wasEnabled, output->enabledState));
++            bk->recheckCRTCs();
+             auto weak = bk->self;
+             bk->backend->addIdleEvent(makeShared<std::function<void(void)>>([weak] {
+                 auto b = weak.lock();
+@@ -2374,8 +2376,6 @@ bool Aquamarine::CDRMOutput::test() {
+     const auto QUEUE_KEY = connector->crtc->id;
+     if (pendingAsyncCommit)
+         backend->cancelAsyncOutput(this, true);
+-    if (pendingAsyncCommit)
+-        return false;
+     if (!backend->pauseCommitQueue(QUEUE_KEY))
+         return false;
+     CScopeGuard resume([this, QUEUE_KEY] { backend->resumeCommitQueue(QUEUE_KEY); });
+@@ -2546,9 +2546,11 @@ bool Aquamarine::CDRMOutput::commitState(bool onlyTest) {
+ 
+     if (COMMITTED & COutputState::eOutputStateProperties::AQ_OUTPUT_STATE_FORMAT) {
          // verify the format is valid for the primary plane
-         bool ok = false;
-         for (auto const& f : getRenderFormats()) {
+-        bool ok = false;
+-        for (auto const& f : getRenderFormats()) {
 -            if (f.drmFormat == STATE.drmFormat) {
-+            if (f.drmFormat == STATE.drmFormat || f.drmFormat == opaqueToAlphaFormat(STATE.drmFormat)) {
++        const auto FORMATS = getRenderFormats();
++        const auto ALIAS   = scanoutAlphaAlias(FORMATS, STATE.drmFormat, true, false);
++        bool       ok      = false;
++        for (auto const& f : FORMATS) {
++            if (f.drmFormat == STATE.drmFormat || f.drmFormat == ALIAS) {
                  ok = true;
                  break;
              }
-@@ -2768,7 +2768,7 @@ bool Aquamarine::CDRMOutput::commitState(bool onlyTest) {
+@@ -2768,7 +2770,8 @@ bool Aquamarine::CDRMOutput::commitState(bool onlyTest) {
      // sometimes, our consumer could f up the swapchain format and change it without the state changing
      bool formatMismatch = false;
      if (data.mainFB) {
 -        if (const auto params = data.mainFB->buffer->dmabuf(); params.success && params.format != STATE.drmFormat) {
-+        if (const auto params = data.mainFB->buffer->dmabuf(); params.success && params.format != STATE.drmFormat && params.format != opaqueToAlphaFormat(STATE.drmFormat)) {
++        if (const auto params = data.mainFB->buffer->dmabuf(); params.success && params.format != STATE.drmFormat &&
++            !scanoutAlphaAliasAccepted(getRenderFormats(), STATE.drmFormat, params.format, true, false)) {
              // formats mismatch. Update the state format and roll with it
              backend->backend->log(AQ_LOG_WARNING,
                                    std::format("drm: Formats mismatch in commit, buffer is {} but output is set to {}. Modesetting to {}", fourccToName(params.format),
-@@ -3168,7 +3168,7 @@ Aquamarine::IOutput::SCommitSubmission Aquamarine::CDRMOutput::commitAsync(const
+@@ -3168,7 +3171,7 @@ Aquamarine::IOutput::SCommitSubmission Aquamarine::CDRMOutput::commitAsync(const
  
      const auto MAIN_BUFFER = data.mainFB ? data.mainFB->buffer.lock() : nullptr;
      const auto ATTRS       = MAIN_BUFFER ? MAIN_BUFFER->dmabuf() : SDMABUFAttrs{};
 -    if (ATTRS.success && ATTRS.format != STATE.drmFormat)
-+    if (ATTRS.success && ATTRS.format != STATE.drmFormat && ATTRS.format != opaqueToAlphaFormat(STATE.drmFormat))
++    if (ATTRS.success && ATTRS.format != STATE.drmFormat && !scanoutAlphaAliasAccepted(getRenderFormats(), STATE.drmFormat, ATTRS.format, true, false))
          return {.error = ENOTSUP};
  
      if (options.lateCursor && cursorVisible && connector->crtc->cursor)
 diff --git a/src/include/FormatUtils.hpp b/src/include/FormatUtils.hpp
-index 75c8733..ea2ab0a 100644
+index 75c8733..33f0e6a 100644
 --- a/src/include/FormatUtils.hpp
 +++ b/src/include/FormatUtils.hpp
-@@ -2,6 +2,16 @@
- 
- #include <string>
- #include <cstdint>
-+#include <drm_fourcc.h>
+@@ -5,3 +5,4 @@
  
  std::string fourccToName(uint32_t drmFormat);
  std::string drmModifierToName(uint64_t drmModifier);
 +
-+// Alpha variant of an opaque 8 bpc format, or DRM_FORMAT_INVALID. Used when a scanout plane offers only the alpha variant.
-+inline uint32_t opaqueToAlphaFormat(uint32_t fmt) {
-+    if (fmt == DRM_FORMAT_XRGB8888)
-+        return DRM_FORMAT_ARGB8888;
-+    if (fmt == DRM_FORMAT_XBGR8888)
-+        return DRM_FORMAT_ABGR8888;
-+    return DRM_FORMAT_INVALID;
-+}
--- 
-2.39.5
-
