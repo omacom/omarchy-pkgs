@@ -32,3 +32,19 @@ A patch stays here until the kernel moves to a new version. Then `pkgver` follow
 `0007` lets the Surface Laptop 7's Wi-Fi (`x1e80100-microsoft-romulus.dtsi`, both sizes) ignore its rfkill pin. The WCN7850's hardware rfkill input reads as "radio off", so Wi-Fi comes up hard-blocked and never connects. The laptop has no Wi-Fi switch, and Windows ignores the pin through an ACPI setting a device tree boot doesn't see. ath12k skips the pin when the node has `disable-rfkill`, as the Surface Pro 11's and Surface Laptop 8's trees have it. Tested on the 15"; the 13.8" shares the node and hasn't been tested. By Jason Bruce Jones.
 
 `0008` to `0011` give the Dell XPS 13 9345 (`x1e80100-dell-xps13-9345`) its sound card. `0008` adds its four WSA8845 amplifiers, two woofers and two tweeters on the WSA and WSA2 buses, and the speaker and microphone links, from Sibi Sankar's patch as Aleksandrs Vinarskis carries it. `0009` powers the two digital microphones from the LPASS microphone supply, by Aleksandrs Vinarskis. `0010` routes the right woofer from SPK1, which matches its SoundWire ports. `0011` switches the card to `dell,xps13-9345-sndcard`, so the kernel's `2451` plays four-channel streams to the right pair first, as the XPS 13 is wired. Without `2451` the card doesn't bind, so these need `linux-omarchy` 7.3-61. Its UCM profile is alsa-ucm-conf's own. Adapted and tested by 42lizard (Oliver Gassner), with all four channels on the right side after a clean boot (omacom/omarchy-pkgs#2293).
+
+`0012` adds Qualcomm's Kalambo, the 6-core Snapdragon X2 Plus X2P-42-100 (`kalambo.dtsi`), as accepted into the qcom tree for 7.5. It is Mahua without CPU cluster 0, with its own PDC ranges and SCMI mailbox, and needs no driver change. It labels `cpus` and `cpu-map` in `glymur.dtsi`, which only adds those two symbols to the Glymur and Mahua trees. By Gopikrishna Garmidi.
+
+`0013` to `0019` add 15 laptops and desktops, written from the DSDT in each maker's BIOS update on the sibling tree whose power tables match. Each patch says what it describes and from where.
+
+- `0013` HP EliteBook 6 G2q (`mahua-hp-elitebook-6-g2q`), on the OmniBook X 16's tree.
+- `0014` ASUS Vivobook S16 S3607NA (`glymur-asus-vivobook-s16-s3607na`), on the Zenbook A14 UX3407NA's.
+- `0015` ASUS Vivobook S14 S5408QA, S14 Flip TP5408QA, S16 S5608QA and S16 Flip TP5608QA (`x126100-asus-vivobook-s*`), one board file on the Zenbook 14 UX3480QA's tree.
+- `0016` Lenovo IdeaPad Vibe 14Q8X12 and 15Q8X12 (`x126100-lenovo-ideapad-vibe-*`), on the IdeaPad Slim 3x's.
+- `0017` Dynabook XD5 (`x1p42100-dynabook-xd5`), on the HP EliteBook 6 G1q's.
+- `0018` ASUS V400 AiO VM441QA and VM471QA (`x126100-asus-v400-aio-*`).
+- `0019` Lenovo IdeaPad Slim 5x 13Q8Y11 and 15Q8Y11, IdeaPad 5x 2-in-1 14Q8Y11 and ThinkBook 14 Gen 9 (`kalambo-lenovo-*`), on `0012`, with the Yoga Slim 7x Gen 11's rails.
+
+Most firmware folders they name aren't installed by any package yet, so those machines start without their DSPs.
+
+`x1e80100-microsoft-denali-5g.json` gives the Surface Pro 11 with 5G the OLED tree. It reads `Microsoft Surface Pro with 5G, 11th Edition`, which systemd's entry doesn't list, so it got no tree. The entry carries CHIDs 3 to 10 from an owner's SMBIOS (DanaGoyette in ubuntu/stubble#34) and the manufacturer and SKU CHID of its other three SKUs. The 5G comes with both panels, and systemd-stub compares the panel CHIDs in `x1p64100-microsoft-denali.json` first, so an LCD unit keeps the LCD tree. Neither tree has a PCIe port for the modem.
