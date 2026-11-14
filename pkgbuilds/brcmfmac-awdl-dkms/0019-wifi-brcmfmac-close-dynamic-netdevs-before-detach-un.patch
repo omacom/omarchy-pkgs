@@ -1,0 +1,80 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Net Mojo <56850867+netmojo@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 12:00:00 -0600
+Subject: [PATCH 19/19] wifi: brcmfmac: close dynamic netdevs before detach
+ unregisters them
+
+brcmf_detach() reads iflist[i] and ifp->ndev without RTNL or the wiphy
+lock, then removes netdev interfaces unlocked. brcmf_p2p_del_vif(),
+reached from NL80211_CMD_DEL_INTERFACE under both locks, can free a P2P
+client or GO interface in that window. Only the P2P device interface,
+which has no netdev, was removed under the locks.
+
+Remove every interface except the primary one under RTNL and the wiphy
+lock, and re-read the slot under them. Simply taking both locks around
+brcmf_remove_interface(ifp, true) is not enough for a netdev that is up:
+cfg80211_unregister_netdevice() closes it, and cfg80211's
+NETDEV_GOING_DOWN and NETDEV_DOWN handlers take the wiphy mutex again.
+The mutex is not recursive and RTNL is held, so every RTNL user on the
+system hangs. awdl0 is a cfg80211 netdev and is up for the whole of an
+AirDrop window, so a firmware crash during a window would reach this.
+
+Do what nl80211_del_interface() does: dev_close() under RTNL alone,
+then take the wiphy lock and unregister. brcmf_p2p_del_vif() needs RTNL
+and the event worker has been cancelled, so the slot cannot change
+between the two reads. The primary interface is still removed unlocked.
+brcmf_del_if() takes RTNL itself to stop it.
+
+Signed-off-by: Net Mojo <56850867+netmojo@users.noreply.github.com>
+---
+ .../broadcom/brcm80211/brcmfmac/core.c        | 28 +++++++++++++------
+ 1 file changed, 20 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/core.c b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/core.c
+index cea985e..44b26d0 100644
+--- a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/core.c
++++ b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/core.c
+@@ -1641,20 +1641,32 @@ void brcmf_detach(struct device *dev)
+ 		if (!ifp)
+ 			continue;
+ 
+-		if (ifp->ndev) {
++		if (i == 0) {
+ 			brcmf_remove_interface(ifp, false);
+ 			continue;
+ 		}
+ 
+-		/* The P2P device interface has no netdev. Its removal can
+-		 * race with NL80211_CMD_DEL_INTERFACE issued by a user space
+-		 * process that is exiting (e.g. wpa_supplicant), which ends
+-		 * in brcmf_p2p_del_vif() under RTNL and the wiphy mutex. If
+-		 * both paths remove the interface, the wdev is unregistered
+-		 * twice and the vif is used after being freed. Take the same
+-		 * locks and re-read iflist, so only one path removes it.
++		/* Dynamic interfaces (P2P device, client and GO, AWDL) can be
++		 * removed concurrently by NL80211_CMD_DEL_INTERFACE from a user
++		 * space process that is exiting (e.g. wpa_supplicant), which
++		 * ends in brcmf_p2p_del_vif() under RTNL and the wiphy mutex.
++		 * If both paths remove the interface, the wdev is unregistered
++		 * twice and the vif is used after being freed. So iflist is
++		 * only read, and the interface only removed, under the same
++		 * locks.
++		 *
++		 * Close a netdev under RTNL alone first, as
++		 * nl80211_del_interface() does: closing an up wireless netdev
++		 * runs cfg80211's NETDEV_GOING_DOWN and NETDEV_DOWN handlers,
++		 * which take the wiphy mutex themselves. Unregistering it while
++		 * it is still up with that mutex held deadlocks, with RTNL held.
++		 * brcmf_p2p_del_vif() needs RTNL, and the event worker has been
++		 * cancelled, so the slot cannot change between the two reads.
+ 		 */
+ 		rtnl_lock();
++		ifp = drvr->iflist[i];
++		if (ifp && ifp->ndev)
++			dev_close(ifp->ndev);
+ 		wiphy_lock(drvr->wiphy);
+ 		ifp = drvr->iflist[i];
+ 		if (ifp)
+-- 
+2.56.0
+
