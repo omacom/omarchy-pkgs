@@ -69,9 +69,17 @@ ln -sfn "$steamroot" "$HOME/.steam/root"
 # that load the Steam API from ~/.steam.
 ln -sfn "$steamroot/linuxarm64" "$HOME/.steam/sdkarm64"
 
+# Valve's arm64 client is linked for 4K pages and a 16K-page kernel (Apple
+# Silicon) cannot exec it. There, ask linux-aurora for 4K user pages, which
+# the client's whole process tree inherits.
+client=("$steamroot/steamrtarm64/steam")
+if [[ $(getconf PAGESIZE) != 4096 ]]; then
+  client=(/usr/lib/steam/steam-4k-pages "${client[@]}")
+fi
+
 cd "$steamroot"
 while :; do
   status=0
-  "$steamroot/steamrtarm64/steam" "$@" || status=$?
+  "${client[@]}" "$@" || status=$?
   ((status == restart_status)) || exit "$status"
 done
