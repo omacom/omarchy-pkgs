@@ -1,0 +1,482 @@
+#!/usr/bin/env python3
+"""Write or check release/owners.json: which package directory makes
+which package names, and on which architectures.
+
+    bin/release-owners                   regenerate the file from every recipe
+    bin/release-owners DIR...            regenerate only these directories
+    bin/release-owners --check           fail if the file is stale or breaks a rule
+    bin/release-owners --check --base REV  regenerate only the directories that
+                                         changed since REV, and take the others
+                                         from the committed file
+    bin/release-owners --self-test       test the rules, without makepkg
+
+makepkg --printsrcinfo takes about 1.7 s per recipe and architecture: it
+runs a grep for every variable of every package function. So the recipes
+are read in parallel, one per CPU, and CI reads only the ones a change
+touched. A change to any file outside pkgbuilds/ can change a directory's
+architectures, or a file a recipe sources, so it reads every recipe.
+
+Each directory's entry comes from its recipe, read with
+`makepkg --printsrcinfo` for each architecture it publishes to
+(bin/build-matrix decides those). The "approved" list is the one part
+written by hand: the generator keeps it as it is and never adds to it.
+
+The rules:
+  - one architecture never has two directories that make the same package
+    name, or the same <pkgbase>-debug;
+  - a directory may provide a name another directory makes only with an
+    approval for each architecture they share;
+  - a directory may replace a name that is not its own only with an
+    approval for each of its architectures, whoever makes that name:
+    pacman -Syu offers every replacement, and yes is its default;
+  - no directory may make, provide or replace omarchy-keyring;
+  - an approval nothing needs is an error, so none outlives its reason.
+
+Directories that build nothing (bin/build-matrix gives them no entry) and
+omarchy-keyring are left out.
+"""
+
+import argparse
+import concurrent.futures
+import difflib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+OWNERS = ROOT / "release" / "owners.json"
+VERSION = 2
+ARCHES = ("x86_64", "aarch64")
+# Released by other means: no directory here may take its name.
+UNMAPPED = {"omarchy-keyring"}
+RESERVED = {"omarchy-keyring"}
+KINDS = ("provides", "replaces")
+DIR_KEYS = ("dir", "pkgbase", "arches", "names", "provides", "replaces")
+APPROVAL_KEYS = ("dir", "kind", "name", "arches")
+PKGNAME = re.compile(r"^[a-z0-9@_+][a-z0-9@._+-]{0,127}$")
+RELNAME = re.compile(r"^[A-Za-z0-9@_+][A-Za-z0-9@._+-]{0,127}$")
+
+
+def relation_name(value):
+    """'foo>=1.2' and 'foo=1' name foo."""
+    return re.split(r"[<>=]", value, maxsplit=1)[0]
+
+
+def parse_srcinfo(text, arch):
+    """Return (pkgbase, names, provides, replaces) from .SRCINFO text for
+    one architecture, by SRCINFO(5)'s rules: a package section's value
+    for a key replaces the pkgbase section's, an empty value clears it,
+    and provides_<arch> is a key of its own, added to provides."""
+    pkgbase, base, packages, current = None, {}, [], None
+    keys = [k + suffix for k in KINDS for suffix in ("", f"_{arch}")]
+    for line in text.splitlines():
+        key, sep, value = line.strip().partition("=")
+        key, value = key.strip(), value.strip()
+        if not sep:
+            continue
+        if key == "pkgbase":
+            pkgbase, current = value, None
+        elif key == "pkgname":
+            current = {}
+            packages.append((value, current))
+        elif key in keys:
+            values = (base if current is None else current).setdefault(key, [])
+            if value:
+                values.append(relation_name(value))
+    names, rel = set(), {k: set() for k in KINDS}
+    for name, own in packages:
+        names.add(name)
+        for kind in KINDS:
+            for key in (kind, f"{kind}_{arch}"):
+                rel[kind].update(own[key] if key in own else base.get(key, []))
+    return pkgbase, names, rel["provides"], rel["replaces"]
+
+
+def publish_arches(dirs):
+    """Each directory's publish architectures, from bin/build-matrix."""
+    out = subprocess.run(
+        [str(ROOT / "bin" / "build-matrix"), "--arch", "all", *dirs],
+        capture_output=True, text=True, check=True)
+    arches = {}
+    for entry in json.loads(out.stdout)["include"]:
+        arches.setdefault(entry["package"], set()).update(entry["publish_arches"].split())
+    return arches
+
+
+def srcinfo_conf(arch, work):
+    """A makepkg.conf for one architecture, writing only under work."""
+    build = work / f"build-{arch}"
+    build.mkdir(mode=0o777)
+    build.chmod(0o777)
+    base = Path("/etc/makepkg.conf").read_text()
+    base = re.sub(r"(?m)^CARCH=.*$", f'CARCH="{arch}"', base)
+    dirs = "".join(f"{k}={build}\n" for k in ("BUILDDIR", "PKGDEST", "SRCDEST", "SRCPKGDEST", "LOGDEST"))
+    (work / f"makepkg-{arch}.conf").write_text(base + dirs)
+
+
+def srcinfo(pkgdir, arch, work):
+    """Run makepkg --printsrcinfo for one architecture."""
+    conf = work / f"makepkg-{arch}.conf"
+    cmd = ["makepkg", "--config", str(conf), "--printsrcinfo"]
+    out = subprocess.run(cmd, cwd=pkgdir, capture_output=True, text=True)
+    if out.returncode:
+        sys.exit(f"{pkgdir.name}: makepkg --printsrcinfo for {arch} failed:\n{out.stderr}")
+    return out.stdout
+
+
+def recipe_dirs():
+    return sorted(p.name for p in (ROOT / "pkgbuilds").iterdir()
+                  if (p / "PKGBUILD").is_file() and p.name not in UNMAPPED)
+
+
+def entries(names):
+    """The owners entries of the named directories, read in parallel."""
+    if shutil.which("makepkg") is None:
+        sys.exit("release-owners needs makepkg: run it on Arch, or in the self-tests container")
+    if not names:
+        return {}
+    arches = publish_arches(names)
+    jobs = [(n, a) for n in names if n in arches for a in sorted(arches[n])]
+    with tempfile.TemporaryDirectory() as tmp:
+        work = Path(tmp)
+        work.chmod(0o755)
+        for arch in ARCHES:
+            srcinfo_conf(arch, work)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=os.cpu_count() or 1) as pool:
+            texts = dict(zip(jobs, pool.map(lambda j: srcinfo(ROOT / "pkgbuilds" / j[0], j[1], work), jobs)))
+    out = {}
+    for (name, arch), text in texts.items():
+        base, pkgnames, provides, replaces = parse_srcinfo(text, arch)
+        entry = out.setdefault(name, {"dir": name, "pkgbase": base, "arches": sorted(arches[name]),
+                                      "names": set(), "provides": set(), "replaces": set()})
+        # This file lists one pkgbase and one set of names per directory,
+        # owned on each of its architectures. A recipe that varies them by
+        # architecture would own names on an architecture that never makes
+        # them, and could replace them there without an approval.
+        if entry["pkgbase"] != base:
+            sys.exit(f"{name}: pkgbase is {entry['pkgbase']} on one architecture and {base} on {arch}; keep one pkgbase")
+        if entry["names"] and entry["names"] != pkgnames:
+            sys.exit(f"{name}: makes {sorted(entry['names'])} on one architecture and {sorted(pkgnames)} on {arch}; make the same packages on each")
+        entry["names"] |= pkgnames
+        entry["provides"] |= provides
+        entry["replaces"] |= replaces
+    for entry in out.values():
+        for key in ("names", "provides", "replaces"):
+            entry[key] = sorted(entry[key])
+    return out
+
+
+def changed_since(base):
+    """The recipe directories changed since base, or None when anything
+    else changed and every recipe must be read again: tooling, or any file
+    a recipe could source."""
+    diff = [p for p in subprocess.run(
+        ["git", "-C", str(ROOT), "diff", "--name-only", "--no-renames", "-z", f"{base}...HEAD"],
+        capture_output=True, text=True, check=True).stdout.split("\0") if p]
+    if any(not (p.startswith("pkgbuilds/") and p.count("/") >= 2) and p != "release/owners.json" for p in diff):
+        return None
+    return {p.split("/")[1] for p in diff if p.startswith("pkgbuilds/")}
+
+
+def base_owners(base):
+    """release/owners.json as base has it, or None."""
+    out = subprocess.run(["git", "-C", str(ROOT), "show", f"{base}:release/owners.json"],
+                         capture_output=True, text=True)
+    return json.loads(out.stdout) if out.returncode == 0 else None
+
+
+def generate(approved, known=None, changed=None):
+    """The whole file. With known, a trusted earlier file such as the base
+    branch's, and changed, only the changed directories are read, and
+    every other directory takes its entry from known. A directory known
+    does not list is read too."""
+    names = recipe_dirs()
+    if known is None or changed is None:
+        dirs = entries(names)
+    else:
+        dirs = {d["dir"]: d for d in known.get("dirs", []) if d["dir"] in names and d["dir"] not in changed}
+        dirs.update(entries(sorted(n for n in names if n not in dirs)))
+    return {"version": VERSION, "approved": approved, "dirs": [dirs[n] for n in sorted(dirs)]}
+
+
+def keyring_errors():
+    """omarchy-keyring is left out of the file, so its own recipe is held
+    here: it makes omarchy-keyring and nothing else."""
+    if not (ROOT / "pkgbuilds" / "omarchy-keyring" / "PKGBUILD").is_file():
+        return []
+    e = next(iter(entries(["omarchy-keyring"]).values()), None)
+    if e and (e["pkgbase"], e["names"], e["provides"], e["replaces"]) == ("omarchy-keyring", ["omarchy-keyring"], [], []):
+        return []
+    return [f"pkgbuilds/omarchy-keyring must make omarchy-keyring and nothing else, with no provides or replaces: {e}"]
+
+
+def render(doc):
+    """One approval and one directory per line, so a diff shows exactly
+    which directory changed."""
+    def block(items):
+        if not items:
+            return "[]"
+        return "[\n" + ",\n".join(" " + json.dumps(o, separators=(",", ":")) for o in items) + "\n]"
+    return '{"version":%d,\n"approved":%s,\n"dirs":%s}\n' % (
+        doc["version"], block(doc["approved"]), block(doc["dirs"]))
+
+
+def check(doc):
+    """Every rule in the module docstring, as a list of problems, each with
+    the fix."""
+    if set(doc) != {"version", "approved", "dirs"} or doc["version"] != VERSION:
+        return [f"want exactly version {VERSION}, approved and dirs at the top, got {sorted(doc)} and version {doc.get('version')}"]
+    errors = []
+    for e in doc["dirs"]:
+        if set(e) != set(DIR_KEYS) or not isinstance(e["dir"], str) or not isinstance(e["pkgbase"], str) or \
+                not all(isinstance(e[k], list) and all(isinstance(v, str) for v in e[k]) for k in DIR_KEYS[2:]):
+            errors.append(f"directory line {json.dumps(e)} must have exactly {', '.join(DIR_KEYS)}")
+    for c in doc["approved"]:
+        if set(c) != set(APPROVAL_KEYS) or not all(isinstance(c[k], str) for k in APPROVAL_KEYS[:3]) or \
+                not isinstance(c["arches"], list):
+            errors.append(f"approval {json.dumps(c)} must have exactly {', '.join(APPROVAL_KEYS)}")
+    if errors:
+        return errors
+    dirs = {}
+    owner = {a: {} for a in ARCHES}
+    for e in doc.get("dirs", []):
+        d = e["dir"]
+        if d in dirs:
+            errors.append(f"{d} is listed twice")
+            continue
+        dirs[d] = e
+        for n in e["names"]:
+            if not PKGNAME.match(n):
+                errors.append(f"{d} makes {n!r}, not a valid package name")
+        for kind in KINDS:
+            for n in e[kind]:
+                if not RELNAME.match(n):
+                    errors.append(f"{d} {kind} {n!r}, not a valid name")
+        for kind in ("names", *KINDS):
+            for n in e[kind]:
+                if n in RESERVED:
+                    errors.append(f"{d}: no directory may make, provide or replace {n}")
+        if e["pkgbase"] + "-debug" in e["names"]:
+            errors.append(f"{d} lists its own debug package {e['pkgbase']}-debug")
+        for a in e["arches"]:
+            if a not in ARCHES:
+                errors.append(f"{d} lists architecture {a!r}")
+                continue
+            for n in [*e["names"], e["pkgbase"] + "-debug"]:
+                other = owner[a].get(n)
+                if other:
+                    errors.append(f"{n} on {a} is made by both {other} and {d}: rename one of them")
+                else:
+                    owner[a][n] = d
+
+    approved = {}
+    for c in doc.get("approved", []):
+        e = dirs.get(c.get("dir"))
+        if e is None or c.get("kind") not in KINDS:
+            errors.append(f"approval {json.dumps(c)} names no directory or kind here")
+            continue
+        if c["name"] not in e[c["kind"]]:
+            errors.append(f"approval for {c['dir']} to {c['kind']} {c['name']}: its recipe does not, so remove the approval")
+        for a in c.get("arches") or ["(none)"]:
+            key = (c["dir"], c["kind"], c["name"], a)
+            if a not in e["arches"]:
+                errors.append(f"approval for {c['dir']} to {c['kind']} {c['name']} on {a}, which it does not publish")
+            elif key in approved:
+                errors.append(f"approval for {c['dir']} to {c['kind']} {c['name']} on {a} is listed twice")
+            approved[key] = False
+
+    for d, e in sorted(dirs.items()):
+        for kind in KINDS:
+            for n in e[kind]:
+                need = []
+                for a in e["arches"]:
+                    other = owner.get(a, {}).get(n)
+                    if other == d or (kind == "provides" and other is None):
+                        continue
+                    key = (d, kind, n, a)
+                    if key in approved:
+                        approved[key] = True
+                    else:
+                        need.append(a)
+                if need:
+                    who = sorted({owner[a][n] for a in need if owner[a].get(n)})
+                    what = f"{n}, which {', '.join(who)} makes" if who else n
+                    fix = json.dumps({"dir": d, "kind": kind, "name": n, "arches": need}, separators=(",", ":"))
+                    errors.append(f"{d} {kind} {what}, without an approval. If that is intended, a maintainer adds to \"approved\": {fix}")
+    for (d, kind, n, a), used in sorted(approved.items()):
+        if not used and a in dirs.get(d, {}).get("arches", []) and n in dirs.get(d, {}).get(kind, []):
+            errors.append(f"approval for {d} to {kind} {n} on {a} is not needed: remove it")
+    return errors
+
+
+def unprivileged():
+    """A recipe is bash, and reading it runs it. Never read one as root:
+    as root, run this tool again as nobody."""
+    if os.geteuid() != 0:
+        return
+    env = dict(os.environ, HOME="/tmp", GIT_CONFIG_COUNT="1",
+               GIT_CONFIG_KEY_0="safe.directory", GIT_CONFIG_VALUE_0="*")
+    os.execvpe("setpriv", ["setpriv", "--reuid=nobody", "--regid=nobody", "--clear-groups",
+                           sys.executable, str(Path(__file__).resolve()), *sys.argv[1:]], env)
+
+
+def load(path):
+    try:
+        return json.loads(path.read_text())
+    except FileNotFoundError:
+        return None
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--check", action="store_true", help="fail if release/owners.json is stale or breaks a rule")
+    parser.add_argument("dirs", nargs="*", metavar="DIR", help="regenerate only these package directories")
+    parser.add_argument("--base", metavar="REV", help="with --check, read only the directories changed since REV")
+    parser.add_argument("--self-test", action="store_true", help="test the rules without makepkg")
+    args = parser.parse_args()
+    if args.self_test:
+        return self_test()
+
+    unprivileged()
+    current = load(OWNERS)
+    approved = (current or {}).get("approved", [])
+    # In CI the other directories' entries come from the base branch, never
+    # from the pull request's own file.
+    known = changed = None
+    if args.check and args.base:
+        known = base_owners(args.base)
+        changed = changed_since(args.base) if known else None
+    elif args.dirs and current and not args.check:
+        known, changed = current, set(args.dirs)
+    fresh = render(generate(approved, known, changed))
+    errors = []
+    if args.check:
+        committed = OWNERS.read_text() if OWNERS.exists() else ""
+        if committed != fresh:
+            sys.stdout.writelines(difflib.unified_diff(
+                committed.splitlines(True), fresh.splitlines(True),
+                "release/owners.json (committed)", "release/owners.json (from the recipes)"))
+            errors.append("release/owners.json does not match the recipes. Run bin/release-owners and commit the result.")
+    else:
+        OWNERS.write_text(fresh)
+    # The rules apply to what the recipes say, so a stale file and a
+    # broken rule show up in one run.
+    errors += check(json.loads(fresh))
+    if changed is None or "omarchy-keyring" in changed:
+        errors += keyring_errors()
+    for e in errors:
+        print(f"::error file=release/owners.json::{e}")
+    if not errors:
+        doc = json.loads(fresh)
+        print(f"release/owners.json: {len(doc['dirs'])} directories, {len(doc['approved'])} approvals, every rule holds")
+    return 1 if errors else 0
+
+
+def self_test():
+    def entry(d, names, arches=("x86_64",), provides=(), replaces=(), pkgbase=None):
+        return {"dir": d, "pkgbase": pkgbase or d, "arches": list(arches), "names": list(names),
+                "provides": list(provides), "replaces": list(replaces)}
+
+    def doc(*dirs, approved=()):
+        return {"version": VERSION, "approved": list(approved), "dirs": list(dirs)}
+
+    def approve(d, kind, name, arches):
+        return {"dir": d, "kind": kind, "name": name, "arches": list(arches)}
+
+    good = doc(
+        entry("omarchy", ["omarchy"], ARCHES),
+        entry("omarchy-dev", ["omarchy-dev"], ARCHES, provides=["omarchy"]),
+        entry("linux-omarchy", ["linux-omarchy"], ["x86_64"], provides=["NVIDIA-MODULE"]),
+        entry("linux-omarchy-aarch64", ["linux-omarchy"], ["aarch64"], provides=["NVIDIA-MODULE"]),
+        entry("nvidia-utils", ["nvidia-utils"], provides=["opengl-driver"], replaces=["nvidia-libgl"]),
+        entry("mesa-aurora", ["mesa-aurora"], ["aarch64"], provides=["opengl-driver"]),
+        entry("yaru-icon-theme", ["yaru-icon-theme", "yaru-sound-theme"], pkgbase="yaru"),
+        approved=[approve("omarchy-dev", "provides", "omarchy", ARCHES),
+                  approve("nvidia-utils", "replaces", "nvidia-libgl", ["x86_64"])])
+    cases = [
+        ("the shapes omarchy-pkgs has", good, None),
+        ("one name, two directories, one arch",
+         doc(entry("weather", ["omarchy"]), entry("omarchy", ["omarchy"])), "omarchy on x86_64 is made by both"),
+        ("another directory's debug package",
+         doc(entry("walker", ["walker"]), entry("evil", ["walker-debug"])), "walker-debug on x86_64 is made by both"),
+        ("provides another's package",
+         doc(entry("omarchy", ["omarchy"]), entry("weather", ["weather"], provides=["omarchy"])), "weather provides omarchy, which omarchy makes, without an approval"),
+        ("replaces an Arch package",
+         doc(entry("weather", ["weather"], replaces=["sudo"])), "weather replaces sudo, without an approval"),
+        ("replaces a name no directory makes",
+         doc(entry("weather", ["weather"], replaces=["weather-old"])), "weather replaces weather-old, without an approval"),
+        ("provides approval does not cover replaces",
+         doc(entry("omarchy", ["omarchy"]), entry("weather", ["weather"], provides=["omarchy"], replaces=["omarchy"]),
+             approved=[approve("weather", "provides", "omarchy", ["x86_64"])]), "weather replaces omarchy, which omarchy makes, without an approval"),
+        ("approval for one arch of two",
+         doc(entry("omarchy", ["omarchy"], ARCHES), entry("weather", ["weather"], ARCHES, provides=["omarchy"]),
+             approved=[approve("weather", "provides", "omarchy", ["x86_64"])]), '"arches":["aarch64"]'),
+        ("approval nothing needs",
+         doc(entry("weather", ["weather"], replaces=["weather"]), approved=[approve("weather", "replaces", "weather", ["x86_64"])]), "is not needed: remove it"),
+        ("approval for a claim the recipe dropped",
+         doc(entry("weather", ["weather"]), approved=[approve("weather", "replaces", "old", ["x86_64"])]), "its recipe does not, so remove the approval"),
+        ("makes the keyring",
+         doc(entry("evil", ["omarchy-keyring"])), "no directory may make, provide or replace omarchy-keyring"),
+        ("provides the keyring",
+         doc(entry("evil", ["evil"], provides=["omarchy-keyring"])), "no directory may make, provide or replace omarchy-keyring"),
+        ("lists its own debug package",
+         doc(entry("walker", ["walker", "walker-debug"])), "lists its own debug package"),
+        ("unknown architecture",
+         doc(entry("walker", ["walker"], ["i686"])), "architecture 'i686'"),
+    ]
+    failed = 0
+    for name, d, want in cases:
+        errors = check(d)
+        ok = not errors if want is None else any(want in e for e in errors)
+        print(f"{'PASS' if ok else 'FAIL'}: {name}" + ("" if ok else f": got {errors}"))
+        failed += not ok
+    srcinfo_cases = [
+        ("a package section's value replaces the base's",
+         "pkgbase = cuda\n\tprovides = cuda-toolkit\n\treplaces = cuda-sdk<12\n\tprovides_aarch64 = arm-only\n\npkgname = cuda\n\tprovides = opencl-driver=3.0\n",
+         "x86_64", ("cuda", {"cuda"}, {"opencl-driver"}, {"cuda-sdk"})),
+        ("the base's values reach a package that sets none, with this arch's keys",
+         "pkgbase = cuda\n\tprovides = cuda-toolkit\n\tprovides_aarch64 = arm-only\n\npkgname = cuda\n",
+         "aarch64", ("cuda", {"cuda"}, {"cuda-toolkit", "arm-only"}, set())),
+        ("an empty value clears the base's",
+         "pkgbase = nv\n\treplaces = nvidia-libgl\n\npkgname = nv\n\treplaces = \n\npkgname = nv-dkms\n\treplaces =\n",
+         "x86_64", ("nv", {"nv", "nv-dkms"}, set(), set())),
+        ("split packages each keep their own",
+         "pkgbase = mesa\n\npkgname = mesa\n\tprovides = opengl-driver\n\npkgname = vulkan-mesa\n\tprovides = vulkan-driver\n\treplaces = vulkan-old\n",
+         "x86_64", ("mesa", {"mesa", "vulkan-mesa"}, {"opengl-driver", "vulkan-driver"}, {"vulkan-old"})),
+    ]
+    for name, text, arch, want in srcinfo_cases:
+        got = parse_srcinfo(text, arch)
+        ok = got == want
+        print(f"{'PASS' if ok else 'FAIL'}: .SRCINFO: {name}" + ("" if ok else f": got {got}"))
+        failed += not ok
+    for name, d, want in [
+        ("an approval with a directory's keys",
+         doc(entry("weather", ["weather"], replaces=["sudo"]),
+             approved=[{**approve("weather", "replaces", "sudo", ["x86_64"]), "pkgbase": "weather"}]),
+         "must have exactly dir, kind, name, arches"),
+        ("a directory line with an extra key",
+         doc({**entry("weather", ["weather"]), "kind": "replaces"}), "must have exactly dir, pkgbase"),
+        ("another top-level key",
+         {**doc(entry("weather", ["weather"])), "extra": []}, "want exactly version"),
+    ]:
+        errors = check(d)
+        ok = any(want in e for e in errors)
+        print(f"{'PASS' if ok else 'FAIL'}: {name}" + ("" if ok else f": got {errors}"))
+        failed += not ok
+    rendered = render(good)
+    lines = rendered.splitlines()
+    ok = json.loads(rendered) == good and all(
+        " " + json.dumps(o, separators=(",", ":")) + "," in lines or " " + json.dumps(o, separators=(",", ":")) in lines
+        for o in good["dirs"] + good["approved"])
+    print(f"{'PASS' if ok else 'FAIL'}: one line per directory and approval")
+    failed += not ok
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

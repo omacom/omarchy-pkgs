@@ -472,6 +472,42 @@ test('auto-merge accepts the test a package PR brings, and nothing else outside 
   assert.equal(check([...packageFiles, wiring(undefined)]), false);
 });
 
+test('auto-merge accepts regenerated owners.json directories, never a change to an approval', () => {
+  const file = { filename: 'release/owners.json', status: 'modified' };
+  const owners = (approved, dirs) => JSON.stringify({ version: 2, approved, dirs });
+  const dir = (name, names) => ({ dir: name, pkgbase: name, arches: ['x86_64'], names, provides: [], replaces: [] });
+  const sudo = { dir: 'weather', kind: 'replaces', name: 'sudo', arches: ['x86_64'] };
+  const base = owners([], [dir('walker', ['walker'])]);
+  const check = (head, files = [...packageFiles, file]) =>
+    decide({ pr: mergeable(), files, vouchStatus: 'collaborator', repository, owners: { base, head } }).enable;
+  // A new package, and a renamed one: only directories change.
+  assert.equal(check(owners([], [dir('walker', ['walker']), dir('weather', ['weather'])])), true);
+  assert.equal(check(owners([], [dir('walker', ['walker', 'walker-git'])])), true);
+  // An approval lets a directory claim another's name: a maintainer decides,
+  // however the line is written.
+  assert.equal(check(owners([sudo], [dir('walker', ['walker'])])), false);
+  assert.equal(check(owners([{ ...sudo, pkgbase: 'weather' }], [dir('walker', ['walker'])])), false);
+  // Another version, a file that does not parse, a new file, or no contents.
+  assert.equal(check(JSON.stringify({ version: 3, approved: [], dirs: [] })), false);
+  assert.equal(check('{"version":2,'), false);
+  assert.equal(check(owners([], []), [...packageFiles, { ...file, status: 'added' }]), false);
+  assert.equal(decide({ pr: mergeable(), files: [...packageFiles, file], vouchStatus: 'collaborator', repository }).enable, false);
+});
+
+test('auto-merge is withdrawn when a later push no longer qualifies, not on a failed lookup', () => {
+  const { withdraw } = require('../.github/scripts/auto-merge-pr.cjs');
+  const no = { enable: false }, yes = { enable: true };
+  for (const status of ['bot', 'collaborator', 'vouched', 'unknown', 'denounced']) {
+    assert.equal(withdraw(no, status), true, status);
+    assert.equal(withdraw(yes, status), false, status);
+  }
+  // The vouch lookup failed: no answer, so auto-merge stays as it is.
+  for (const status of ['', undefined, 'error']) assert.equal(withdraw(no, status), false, String(status));
+  const text = readFileSync(join(__dirname, '../.github/workflows/auto-merge-pr.yml'), 'utf8');
+  assert.match(text, /types: \[opened, reopened, synchronize,/);
+  assert.match(text, /if: steps\.decide\.outputs\.withdraw == 'true'/);
+});
+
 test('auto-merge skips drafts and closed PRs, and arms every bot lane', () => {
   const check = pr => decide({ pr, files: packageFiles, vouchStatus: 'bot', repository }).enable;
   assert.equal(check(mergeable({ draft: true })), false);
