@@ -1,0 +1,166 @@
+From 8c0c59ba9383dc90a6b06d0f6d5b14d815b086c2 Mon Sep 17 00:00:00 2001
+From: Johann-Peter Hartmann <johannhartmann@gmail.com>
+Date: Fri, 6 Nov 2026 11:32:55 +0100
+Subject: [PATCH RFC 3/4] HID: spi-hid: serialize and type GET report responses
+
+Select GET_INPUT_REPORT for input reports and accept its response type.
+Hold output_lock through response validation and copying, preventing
+another caller from replacing the shared reply after completion.
+
+Fixes: 0534d05f102e ("HID: spi-hid: add spi-hid driver HID layer")
+---
+ drivers/hid/spi-hid/spi-hid-core.c | 70 +++++++++++++++++-------------
+ 1 file changed, 41 insertions(+), 29 deletions(-)
+
+diff --git a/drivers/hid/spi-hid/spi-hid-core.c b/drivers/hid/spi-hid/spi-hid-core.c
+index e04810d03..a562b5e64 100644
+--- a/drivers/hid/spi-hid/spi-hid-core.c
++++ b/drivers/hid/spi-hid/spi-hid-core.c
+@@ -594,14 +594,12 @@ static int spi_hid_send_output_report(struct spi_hid *shid,
+ 	return __spi_hid_send_output_report(shid, report);
+ }
+ 
+-static int spi_hid_sync_request(struct spi_hid *shid,
++static int __spi_hid_sync_request(struct spi_hid *shid,
+ 				struct spi_hid_output_report *report)
+ {
+ 	struct device *dev = &shid->spi->dev;
+ 	int error;
+ 
+-	guard(mutex)(&shid->output_lock);
+-
+ 	reinit_completion(&shid->output_done);
+ 
+ 	error = __spi_hid_send_output_report(shid, report);
+@@ -620,6 +618,13 @@ static int spi_hid_sync_request(struct spi_hid *shid,
+ 	return 0;
+ }
+ 
++static int spi_hid_sync_request(struct spi_hid *shid,
++				struct spi_hid_output_report *report)
++{
++	guard(mutex)(&shid->output_lock);
++	return __spi_hid_sync_request(shid, report);
++}
++
+ /*
+  * Handle the reset response from the FW by sending a request for the device
+  * descriptor.
+@@ -697,7 +702,8 @@ static void spi_hid_response_handler(struct spi_hid *shid,
+ 		dev_err(&shid->spi->dev, "Unexpected response report\n");
+ 	} else {
+ 		if (body->input_report_type == REPORT_DESCRIPTOR_RESPONSE ||
+-		    body->input_report_type == GET_FEATURE_RESPONSE) {
++		    body->input_report_type == GET_FEATURE_RESPONSE ||
++		    body->input_report_type == GET_INPUT_REPORT_RESPONSE) {
+ 			memcpy(shid->response->body, shid->input->body,
+ 			       sizeof(shid->input->body));
+ 			memcpy(shid->response->content, shid->input->content,
+@@ -939,15 +945,14 @@ static int spi_hid_process_input_report(struct spi_hid *shid,
+ 		}
+ 		fallthrough;
+ 	case GET_FEATURE_RESPONSE:
++	case GET_INPUT_REPORT_RESPONSE:
+ 	case SET_FEATURE_RESPONSE:
+ 	case REPORT_DESCRIPTOR_RESPONSE:
+ 		spi_hid_response_handler(shid, &body);
+ 		break;
+ 	/*
+-	 * FIXME: sending GET_INPUT and COMMAND reports not supported, thus
+-	 * throw away responses to those, they should never come.
++	 * Sending COMMAND reports is not supported.
+ 	 */
+-	case GET_INPUT_REPORT_RESPONSE:
+ 	case COMMAND_RESPONSE:
+ 		dev_err(dev, "Not a supported report type: 0x%x\n",
+ 			body.input_report_type);
+@@ -992,7 +997,8 @@ static int spi_hid_bus_validate_header(struct spi_hid *shid,
+ 	return 0;
+ }
+ 
+-static int spi_hid_get_request(struct spi_hid *shid, u8 content_id)
++static int spi_hid_get_request(struct spi_hid *shid, u8 content_id, u8 rtype,
++			       u8 *buffer, size_t length)
+ {
+ 	struct device *dev = &shid->spi->dev;
+ 	struct spi_hid_output_report report = {
+@@ -1002,8 +1008,26 @@ static int spi_hid_get_request(struct spi_hid *shid, u8 content_id)
+ 		.content = NULL,
+ 	};
+ 	int error;
++	size_t content_len;
++	u8 expected;
+ 
+-	error = spi_hid_sync_request(shid, &report);
++	if (rtype == HID_FEATURE_REPORT) {
++		expected = GET_FEATURE_RESPONSE;
++	} else if (rtype == HID_INPUT_REPORT) {
++		report.report_type = GET_INPUT_REPORT;
++		expected = GET_INPUT_REPORT_RESPONSE;
++	} else {
++		return -EOPNOTSUPP;
++	}
++	if (!length)
++		return -EINVAL;
++
++	/* Keep the matching response private until it has been copied. Other
++	 * feature/input requests must not replace it between completion/copy.
++	 */
++	guard(mutex)(&shid->output_lock);
++
++	error = __spi_hid_sync_request(shid, &report);
+ 	if (error) {
+ 		dev_err(dev,
+ 			"Expected get request response not received! Error %d\n",
+@@ -1013,7 +1037,13 @@ static int spi_hid_get_request(struct spi_hid *shid, u8 content_id)
+ 		return error;
+ 	}
+ 
+-	return 0;
++	if (shid->response->body[0] != expected ||
++	    shid->response->body[3] != content_id)
++		return -EPROTO;
++	content_len = min_t(size_t, length - 1, shid->response_length);
++	buffer[0] = content_id;
++	memcpy(buffer + 1, shid->response->content, content_len);
++	return content_len + 1;
+ }
+ 
+ static int spi_hid_set_request(struct spi_hid *shid, u8 *arg_buf, u16 arg_len,
+@@ -1308,7 +1338,6 @@ static int spi_hid_ll_raw_request(struct hid_device *hid,
+ 	struct spi_hid *shid = spi_get_drvdata(spi);
+ 	struct device *dev = &spi->dev;
+ 	int ret;
+-	size_t content_len;
+ 
+ 	if (!len)
+ 		return -EINVAL;
+@@ -1330,24 +1359,7 @@ static int spi_hid_ll_raw_request(struct hid_device *hid,
+ 		ret = len;
+ 		break;
+ 	case HID_REQ_GET_REPORT:
+-		ret = spi_hid_get_request(shid, reportnum);
+-		if (ret) {
+-			dev_err(dev, "failed to get report\n");
+-			return ret;
+-		}
+-
+-		if (shid->response->body[3] != reportnum) {
+-			dev_err(dev,
+-				"get report id mismatch: expected 0x%02x, got 0x%02x\n",
+-				reportnum, shid->response->body[3]);
+-			return -EPROTO;
+-		}
+-
+-		/* Leave room for the report ID at buf[0]. */
+-		content_len = min_t(size_t, len - 1, shid->response_length);
+-		buf[0] = reportnum;
+-		memcpy(buf + 1, shid->response->content, content_len);
+-		ret = content_len + 1;
++		ret = spi_hid_get_request(shid, reportnum, rtype, buf, len);
+ 		break;
+ 	default:
+ 		dev_err(dev, "invalid request type\n");
+-- 
+2.56.0
+
