@@ -1,6 +1,6 @@
 # Opt-in N1X NPU provider
 
-Source pin: n1x-npu-linux 92e9434a65d2b9d3bb0517efb9efc371e9c6b42c.
+Source pin: n1x-npu-linux 5f0dd10dda9dda7559d3b4086020ef9da3d975d3.
 The local mmap patch preserves the original DMA allocation and selects image
 pages through vm_pgoff; the unpatched IOMMU path exposed descriptor pages.
 
@@ -47,3 +47,25 @@ EXEC/read/info/mmap/ownership/close implementation with UBSan.
 Update automation is disabled while the source/firmware ABI and PM behavior
 require review together. Licenses follow upstream file-level notices;
 NVIDIA inputs are separate and are not licensed by this source project.
+
+## Provider refresh
+
+The selected source is 5f0dd10dda9dda7559d3b4086020ef9da3d975d3 (Johann-Peter
+Hartmann, n1x-npu-linux). It adds per-platform provider contexts, scoped
+firmware/board-policy caches and the SROOT v5 / typed DSP reinitialization
+interfaces. The public package still installs no DSP consumer, OEM firmware
+or runtime binary and retains explicit enable=1, no ACPI autoload aliases,
+4 KiB page admission and early translated-IOMMU checks. The local mmap fix is
+rebased once and continues to map pages from the original DMA allocation.
+
+Package version 0.1.1.r5f0dd10 is intentionally newer than the previous
+0.1.0.r92e9434 despite the lexically lower git abbreviation; DKMS uses the
+same explicitly documented package version. Public n1x names and portable
+hardware checks are preserved; no private kernel suffix, boot marker or
+platform service gate is included.
+
+Numerical evidence from a matching private provider on one P16 found 16/16
+exact FP16 matches for bounded ReLU/Conv1x1/Conv1x1+ReLU cases with changing
+inputs and no retained jobs. That boot already had Lockdep disabled, so this
+is not PM/lock-order qualification or validation of this public adaptation.
+MNIST remains numerically incorrect; full ONNX/model accuracy is not claimed.

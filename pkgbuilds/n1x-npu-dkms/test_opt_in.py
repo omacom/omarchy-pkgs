@@ -19,6 +19,7 @@ static bool enable;
 static unsigned firmware_variant,registered;
 static int n1x_boot_driver,n1x_debugfs_status_fops,n1x_debugfs_hfrp_status_fops,n1x_debugfs_shutdown_status_fops;
 static void *boot_debugfs_dir;
+static void debugfs_remove_recursive(void *p) {(void)p;}
 static int platform_driver_register(int *p) {(void)p;registered++;return 0;}
 static void *debugfs_create_dir(const char *n,void *p) {(void)n;return p;}
 static void debugfs_create_file(const char *n,int m,void *p,void *d,int *ops) {(void)n;(void)m;(void)p;(void)d;(void)ops;}
@@ -30,6 +31,6 @@ with tempfile.TemporaryDirectory() as tmp:
  subprocess.run(['cc','-Wall','-Wextra','-Werror','-fsanitize=undefined',str(p/'test.c'),'-o',str(p/'test')],check=True)
  subprocess.run([str(p/'test')],check=True)
 assert 'MODULE_DEVICE_TABLE(acpi' not in s
-probe=s[s.index('static int n1x_boot_probe('):s.index('static bool boot_suspended')]
+probe=s[s.index('static int n1x_boot_probe('):s.index('static void n1x_boot_remove(')]
 assert probe.index('n1x_boot_dma_gate(endpoint)') < probe.index('devm_ioremap_resource(')
 print('Explicit opt-in C gate and early DMA check ordering passed; no hardware')
