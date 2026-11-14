@@ -228,6 +228,55 @@ test('a failed sync with no groups still produces a failure notification', async
   assert.doesNotMatch(result.content, /No package updates needed/);
 });
 
+test('a failed sync names each failed package and its reason', async t => {
+  const f = fixture(t, 0);
+  const result = await f.invoke({ syncResult: 'failure', prsResult: 'skipped', report: [
+    { package: 'bambustudio-bin', status: 'failed', reason: 'no matching releases in https://example.test/feed' },
+  ] });
+  assert.equal(result.succeeded, false);
+  assert.match(result.content, /bambustudio-bin: no matching releases in https:\/\/example\.test\/feed/);
+  assert.doesNotMatch(result.content, /Sync job: failure/);
+});
+
+test('a failed sync without a report keeps the plain job failure', async t => {
+  const f = fixture(t, 0);
+  const result = await f.invoke({ syncResult: 'failure', prsResult: 'skipped', report: [
+    { package: 'nvidia-sync', status: 'waiting', reason: 'upstream has not published it' },
+  ] });
+  assert.equal(result.succeeded, false);
+  assert.match(result.content, /Sync job: failure/);
+});
+
+test('a package waiting on upstream is named and leaves the sync successful', async t => {
+  const f = fixture(t, 0);
+  const result = await f.invoke({ prsResult: 'skipped', report: [
+    { package: 'nvidia-sync', status: 'waiting', reason: '0.148.0_153: upstream has not published https://example.test/NOTICES (HTTP 403)' },
+  ] });
+  assert.equal(result.succeeded, true);
+  assert.deepEqual(f.failures, []);
+  assert.match(result.content, /🟡 Upstream sync ran; 1 package is waiting on upstream/);
+  assert.match(result.content, /nvidia-sync: 0\.148\.0_153: upstream has not published/);
+  assert.doesNotMatch(result.content, /No package updates needed/);
+});
+
+test('a malformed report falls back to the plain job failure', async t => {
+  const f = fixture(t, 0);
+  for (const report of [{}, 'broken', [null, { status: 'failed' }]]) {
+    const result = await f.invoke({ syncResult: 'failure', prsResult: 'skipped', report });
+    assert.match(result.content, /Sync job: failure/);
+    assert.doesNotMatch(result.content, /undefined/);
+  }
+});
+
+test('report text is escaped in the notification', async t => {
+  const f = fixture(t, 0);
+  const result = await f.invoke({ syncResult: 'failure', prsResult: 'skipped', report: [
+    { package: '<b>pkg</b>', status: 'failed', reason: '<script>x</script>' },
+  ] });
+  assert.match(result.content, /&lt;b&gt;pkg&lt;\/b&gt;: &lt;script&gt;/);
+  assert.doesNotMatch(result.content, /<script>/);
+});
+
 test('notification and summary escape package names', async t => {
   const f = fixture(t);
   f.groups[0].packages = f.results[0].packages = '<unsafe & "name">';

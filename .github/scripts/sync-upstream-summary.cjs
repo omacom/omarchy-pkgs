@@ -67,10 +67,18 @@ async function inspectPR({ github, context, group, result }) {
 }
 
 module.exports = async function summarize({ github, context, core, groups,
-  syncResult, prsResult, resultsPath, cadence }) {
+  syncResult, prsResult, resultsPath, cadence, report = [] }) {
   const runUrl = `${context.serverUrl || 'https://github.com'}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
   const problems = [];
-  if (syncResult !== 'success') problems.push(`Sync job: ${syncResult}`);
+  // bin/sync-upstream names the packages it could not update. Without those
+  // names a failed job says only that something, somewhere, went wrong.
+  const entries = Array.isArray(report) ? report.filter(entry => entry?.package) : [];
+  const failed = entries.filter(entry => entry.status === 'failed');
+  const waiting = entries.filter(entry => entry.status === 'waiting');
+  if (syncResult !== 'success') {
+    if (failed.length) for (const entry of failed) problems.push(`${entry.package}: ${entry.reason}`);
+    else problems.push(`Sync job: ${syncResult}`);
+  }
   if (prsResult !== 'success' && !(prsResult === 'skipped' && groups.length === 0)) {
     problems.push(`PR workflow: ${prsResult}`);
   }
@@ -107,7 +115,10 @@ module.exports = async function summarize({ github, context, core, groups,
   }
 
   const succeeded = problems.length === 0;
-  const heading = succeeded ? '🟢 Upstream sync ran successfully' : '🔴 Upstream sync failed';
+  let heading = '🔴 Upstream sync failed';
+  if (succeeded && waiting.length) {
+    heading = `🟡 Upstream sync ran; ${waiting.length} package${waiting.length === 1 ? ' is' : 's are'} waiting on upstream`;
+  } else if (succeeded) heading = '🟢 Upstream sync ran successfully';
   const content = [`<strong>${heading}</strong>`];
   if (cadence) content.push(`Package group: ${escape(cadence)}.`);
   if (groups.length) {
@@ -115,9 +126,10 @@ module.exports = async function summarize({ github, context, core, groups,
       (updates.unknown ? `, ${updates.unknown} unknown` : '') + '.');
     content.push(`PR checks at notification time: ${checks.passing} passing, ${checks.failing} failing, ${checks.pending} pending` +
       (checks.unknown ? `, ${checks.unknown} unknown` : '') + '.');
-  } else if (succeeded) content.push('No package updates needed.');
+  } else if (succeeded && !waiting.length) content.push('No package updates needed.');
 
   for (const problem of problems) content.push(escape(problem));
+  for (const entry of waiting) content.push(escape(`Waiting: ${entry.package}: ${entry.reason}`));
   for (const row of rows) {
     const reasons = [];
     if (row.failure) reasons.push(row.failure);
@@ -139,5 +151,5 @@ module.exports = async function summarize({ github, context, core, groups,
   // Missing reports and orchestration errors remain failures. Individual PR
   // update/check failures are actionable summary data, not a failed sync.
   if (!succeeded) core.setFailed('Upstream sync did not complete; see the summary.');
-  return { succeeded, updates, checks, rows, content: html };
+  return { succeeded, updates, checks, rows, waiting: waiting.length, content: html };
 };
