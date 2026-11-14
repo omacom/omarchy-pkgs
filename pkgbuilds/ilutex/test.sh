@@ -30,8 +30,13 @@ srcdir="$scratch/src"
 pkgdir="$scratch/pkg"
 mkdir -p "$srcdir" "$pkgdir"
 
-source_file=$(echo "${source[0]}" | sed 's/.*:://')
-[[ -f $source_file ]] || source_file="$package_dir/$(basename "$source_file")"
+# `name::url` keeps the archive under its local name; a bare URL keeps the URL's.
+source_file="${source[0]%%::*}"
+if [[ $source_file == http* ]]; then
+  source_file="$package_dir/$(basename "$source_file")"
+elif [[ ! -f $source_file ]]; then
+  source_file="$package_dir/$source_file"
+fi
 bsdtar -xf "$source_file" -C "$srcdir" --no-same-owner
 
 # The archive root is named after the repository, not the package.
