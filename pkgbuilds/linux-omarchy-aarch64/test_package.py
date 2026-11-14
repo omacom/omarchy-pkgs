@@ -67,3 +67,16 @@ assert 'usage:' in no_source.stderr and 'kernel_source' in no_source.stderr
 assert 'Traceback' not in no_source.stderr and not no_source.stdout
 print('PASS SROOT coherency harness requires an explicit prepared kernel tree')
 print(f'PASS package sources/checksums: {checked} local files; coordinated suspend config prerequisites')
+
+cppc = [name for name in sources if name.startswith('9200-cppc-') and name.endswith('.patch')]
+assert len(cppc) == 34 and cppc == sorted(cppc)
+for prefix in ('9240-', '9241-', '9242-', '9243-', '9244-', '9245-'):
+    assert len([name for name in sources if name.startswith(prefix)]) == 1, prefix
+for name in ('test_cppc_candidate.py', 'test_mt792x_rcu.py', 'test_webcam_dma.py',
+             'nvidia-pm-notifier-owner.patch', 'nvidia-drm-colorspace-deadlock.patch',
+             'test_nvidia_pm.py', 'test_nvidia_drm.py', 'nvidia-drm-harness.py'):
+    assert sources.count(name) == 1, name
+recipe = (package / 'PKGBUILD').read_text()
+assert '_nvidiaver=615.78.08' in recipe
+assert '"$_kernel-dtbs"' in recipe
+print('PASS complete CPPC/kernfs dependencies, NVIDIA615 and official DTBS contract')

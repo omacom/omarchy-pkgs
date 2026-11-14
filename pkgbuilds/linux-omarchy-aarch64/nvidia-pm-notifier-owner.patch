@@ -1,0 +1,131 @@
+--- a/kernel-open/nvidia/nv.c
++++ b/kernel-open/nvidia/nv.c
+@@ -65,6 +65,8 @@
+ 
+ #include <linux/firmware.h>
+ #include <linux/cdev.h>
++#include <linux/completion.h>
++#include <linux/kthread.h>
+ 
+ #include <sound/core.h>             /* HDA struct snd_card */
+ 
+@@ -1113,6 +1115,13 @@
+ {
+     nvidia_stack_t *sp = __nv_init_sp;
+ 
++#if defined(CONFIG_PM)
++    if (NVreg_UseKernelSuspendNotifiers)
++    {
++        unregister_pm_notifier(&nv_pm_nb);
++    }
++#endif
++
+     nv_unregister_chrdev(NV_MINOR_DEVICE_NUMBER_CONTROL_DEVICE, 1,
+         &nv_linux_control_device_cdev);
+     nv_unregister_chrdev(0, NV_MINOR_DEVICE_NUMBER_REGULAR_MAX + 1,
+@@ -1129,13 +1138,6 @@
+     nv_caps_imex_exit();
+ 
+     nv_caps_root_exit();
+-
+-#if defined(CONFIG_PM)
+-    if (NVreg_UseKernelSuspendNotifiers)
+-    {
+-        unregister_pm_notifier(&nv_pm_nb);
+-    }
+-#endif
+ 
+     nv_procfs_exit();
+ 
+@@ -4625,8 +4627,43 @@
+ }
+ 
+ /*
+- * PM notifier for automatic suspend/resume functionality
++ * Keep the suspend gates owned by one non-freezable task until resume. The
++ * blocking PM notifier rwsem must not be reacquired by a task still holding
++ * those gates: PREPARE and POST are separate calls into that notifier chain.
++ * PM callbacks are serialized by the kernel's system_transition_mutex.
+  */
++static struct {
++    struct completion prepared;
++    struct task_struct *task;
++    nv_power_state_t power_state;
++    NV_STATUS status;
++} nv_pm_context;
++
++static int nv_pm_thread(void *unused)
++{
++    NV_STATUS status;
++
++    status = nv_set_system_power_state(nv_pm_context.power_state,
++                                       nv_procfs_pm_action_depth);
++    nv_pm_context.status = status;
++    complete(&nv_pm_context.prepared);
++
++    /* Even a failed PREPARE waits for kthread_stop(), keeping task valid. */
++    for (;;)
++    {
++        set_current_state(TASK_INTERRUPTIBLE);
++        if (kthread_should_stop())
++            break;
++        schedule();
++    }
++    __set_current_state(TASK_RUNNING);
++
++    if (status == NV_OK)
++        status = nv_set_system_power_state(NV_POWER_STATE_RUNNING,
++                                           nv_procfs_pm_action_depth);
++    return status;
++}
++
+ static int nv_pm_notifier(struct notifier_block *nb, unsigned long event, void *unused)
+ {
+     NV_STATUS status;
+@@ -4646,15 +4683,43 @@
+ 
+     case PM_POST_SUSPEND:
+     case PM_POST_HIBERNATION:
+-        power_state = NV_POWER_STATE_RUNNING;
++        if (nv_pm_context.task == NULL)
++            return NOTIFY_DONE;
++        status = kthread_stop(nv_pm_context.task);
++        nv_pm_context.task = NULL;
++        /* Module exit unregisters this callback before tearing down state. */
++        module_put(THIS_MODULE);
+         name = "resume";
+-        break;
++        goto done;
+ 
+     default:
+         return NOTIFY_DONE;
+     }
+ 
+-    status = nv_set_system_power_state(power_state, nv_procfs_pm_action_depth);
++    if (nv_pm_context.task != NULL || !try_module_get(THIS_MODULE))
++        return NOTIFY_BAD;
++
++    init_completion(&nv_pm_context.prepared);
++    nv_pm_context.power_state = power_state;
++    nv_pm_context.task = kthread_run(nv_pm_thread, NULL, "nvidia-pm");
++    if (IS_ERR(nv_pm_context.task))
++    {
++        nv_pm_context.task = NULL;
++        module_put(THIS_MODULE);
++        return NOTIFY_BAD;
++    }
++
++    wait_for_completion(&nv_pm_context.prepared);
++    status = nv_pm_context.status;
++    if (status != NV_OK)
++    {
++        /* A failed notifier is not included in the PM core's POST unwind. */
++        kthread_stop(nv_pm_context.task);
++        nv_pm_context.task = NULL;
++        module_put(THIS_MODULE);
++    }
++
++done:
+     if (status != NV_OK) {
+         nv_printf(NV_DBG_ERRORS, "NVRM: PM %s notifier failed: 0x%x\n", name, status);
+         return NOTIFY_BAD;

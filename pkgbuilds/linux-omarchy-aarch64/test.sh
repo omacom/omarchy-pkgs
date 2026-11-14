@@ -10,7 +10,7 @@ if [[ -z $kernel_source ]]; then
   exit 0
 fi
 for test in "$package_dir"/test_*.py; do
-  [[ $test = */test_package.py ]] && continue
+  [[ $test = */test_package.py || $test = */test_nvidia_*.py ]] && continue
   if [[ $test = */test_gate.py ]]; then
     python "$test" --processor-source "$kernel_source/drivers/acpi/processor_idle.c" --pci-source "$kernel_source/drivers/pci/hotplug/pciehp_core.c"
   elif [[ $test = */test_fallback_latency.py ]]; then

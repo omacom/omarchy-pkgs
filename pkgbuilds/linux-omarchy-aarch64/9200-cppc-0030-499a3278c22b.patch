@@ -1,0 +1,177 @@
+From 499a3278c22bdd30ac2d6efd63fce4c2a30eded2 Mon Sep 17 00:00:00 2001
+From: Sumit Gupta <sumitg@nvidia.com>
+Date: Tue, 10 Nov 2026 01:43:17 +0530
+Subject: [PATCH 30/34] cpufreq: CPPC: Reflect the OSPM nominal in boost and
+ limits
+
+Boost is the performance range above nominal, so lowering the OSPM
+Nominal Performance enlarges the boost range and drops the non-boost
+ceiling. Keep the policy limits consistent with the register.
+
+Add cppc_cpufreq_effective_nominal(), which returns the OSPM Nominal
+Performance when set and the platform nominal otherwise. Use it for the
+non-boost ceiling in set_boost(), and to update the policy limits when
+ospm_nominal_freq is written.
+
+The cpufreq core caps scaling_max_freq with a per-policy QoS request,
+boost_freq_req, that it sets to cpuinfo.max_freq and refreshes only when
+boost is toggled. A write to ospm_nominal_freq changes cpuinfo.max_freq
+without toggling boost, so cppc_cpufreq_update_nominal_limits() updates
+the request itself, rather than leaving scaling_max_freq at the old
+nominal.
+
+When boost is enabled the ceiling is highest_perf, not the nominal, so
+the update is skipped. set_boost() applies the new nominal when boost is
+turned off.
+
+A platform with highest_perf == nominal_perf has no boost range at boot.
+Lowering the OSPM nominal from sysfs can create one. The core, however,
+adds its boost FREQ_QOS_MAX request only at policy setup, and only if
+boost_supported is already set. Set boost_supported in init() when the
+OSPM register is supported and highest_perf > lowest_perf. Boost can
+then be enabled after the nominal is lowered.
+
+Suggested-by: Pierre Gondois <pierre.gondois@arm.com>
+Reviewed-by: Christian Loehle <christian.loehle@arm.com>
+Signed-off-by: Sumit Gupta <sumitg@nvidia.com>
+Link: https://patch.msgid.link/20261109195400.3600561-4-sumitg@nvidia.com
+Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+(cherry picked from commit d2c6f15e21920e7a0bf16585cd8abbc6a007d3f9 linux-next)
+Signed-off-by: Jamie Nguyen <jamien@nvidia.com>
+---
+ .../ABI/testing/sysfs-devices-system-cpu      |  4 ++
+ drivers/cpufreq/cppc_cpufreq.c                | 72 ++++++++++++++++++-
+ 2 files changed, 73 insertions(+), 3 deletions(-)
+
+diff --git a/Documentation/ABI/testing/sysfs-devices-system-cpu b/Documentation/ABI/testing/sysfs-devices-system-cpu
+index a0ecdb12a830c..1a7400586dc14 100644
+--- a/Documentation/ABI/testing/sysfs-devices-system-cpu
++++ b/Documentation/ABI/testing/sysfs-devices-system-cpu
+@@ -362,6 +362,10 @@ Description:	OSPM Nominal Performance (kHz)
+ 		Write a value in kHz, between the frequencies corresponding to
+ 		Lowest Performance and Nominal Performance.
+ 
++		While boost is disabled, cpuinfo_max_freq is set to this value
++		and scaling_max_freq cannot go above it. While boost is
++		enabled, cpuinfo_max_freq is the Highest Performance frequency.
++
+ 		The register cannot be read back, so a read returns the last
+ 		value written, rounded to a performance level. It returns
+ 		"<unset>" before the first write. Reads and writes fail with
+diff --git a/drivers/cpufreq/cppc_cpufreq.c b/drivers/cpufreq/cppc_cpufreq.c
+index fa953d8d019d0..0f11e52728315 100644
+--- a/drivers/cpufreq/cppc_cpufreq.c
++++ b/drivers/cpufreq/cppc_cpufreq.c
+@@ -916,6 +916,29 @@ static void cppc_cpufreq_put_cpu_data(struct cpufreq_policy *policy)
+ 	policy->driver_data = NULL;
+ }
+ 
++/*
++ * Return the non-boost performance ceiling. This is the OSPM Nominal
++ * Performance the driver last requested, or the platform-reported Nominal
++ * Performance if none was requested.
++ *
++ * The register is write-only, so the requested value comes from the
++ * software-tracked state rather than from hardware.
++ */
++static u32 cppc_cpufreq_effective_nominal(struct cpufreq_policy *policy)
++{
++	const struct cppc_policy_state *st = cppc_cpufreq_policy_state(policy);
++	struct cppc_cpudata *cpu_data = policy->driver_data;
++	u64 ospm_nominal;
++
++	ospm_nominal = st->regs[CPPC_SAVED_OSPM_NOMINAL_PERF][CPPC_SAVED_REQUESTED];
++
++	/* U64_MAX means OSPM has not selected a nominal level. */
++	if (ospm_nominal == U64_MAX)
++		return cpu_data->perf_caps.nominal_perf;
++
++	return (u32)ospm_nominal;
++}
++
+ static int cppc_cpufreq_cpu_init(struct cpufreq_policy *policy)
+ {
+ 	unsigned int cpu = policy->cpu;
+@@ -975,9 +998,14 @@ static int cppc_cpufreq_cpu_init(struct cpufreq_policy *policy)
+ 
+ 	/*
+ 	 * If 'highest_perf' is greater than 'nominal_perf', we assume CPU Boost
+-	 * is supported.
++	 * is supported. A writable OSPM Nominal Performance register can also
++	 * open a boost range at runtime by lowering the nominal, so assume
++	 * boost is supported in that case too, letting the core register its
++	 * QoS request up front.
+ 	 */
+-	if (caps->highest_perf > caps->nominal_perf)
++	if (caps->highest_perf > caps->nominal_perf ||
++	    (caps->highest_perf > caps->lowest_perf &&
++	     cppc_ospm_nominal_perf_supported(cpu)))
+ 		policy->boost_supported = true;
+ 
+ 	/*
+@@ -1281,11 +1309,12 @@ static int cppc_cpufreq_set_boost(struct cpufreq_policy *policy, int state)
+ {
+ 	struct cppc_cpudata *cpu_data = policy->driver_data;
+ 	struct cppc_perf_caps *caps = &cpu_data->perf_caps;
++	u32 nominal = cppc_cpufreq_effective_nominal(policy);
+ 
+ 	if (state)
+ 		policy->cpuinfo.max_freq = cppc_perf_to_khz(caps, caps->highest_perf);
+ 	else
+-		policy->cpuinfo.max_freq = cppc_perf_to_khz(caps, caps->nominal_perf);
++		policy->cpuinfo.max_freq = cppc_perf_to_khz(caps, nominal);
+ 
+ 	return 0;
+ }
+@@ -1495,6 +1524,41 @@ static int cppc_get_perf_limited_filtered(int cpu, u64 *perf_limited)
+ CPPC_CPUFREQ_ATTR_RW_U64(perf_limited, cppc_get_perf_limited_filtered,
+ 			 cppc_set_perf_limited)
+ 
++/*
++ * While boost is disabled, the nominal is the ceiling. Set cpuinfo.max_freq to
++ * it and update the core's boost_freq_req to match. The core only syncs
++ * boost_freq_req when boost is enabled or disabled, so a plain nominal change
++ * must update it here. Without that, raising the nominal again would leave the
++ * stale request capping the policy.
++ *
++ * Refresh the limits directly rather than leave it to the QoS notifier, which
++ * only schedules the update, so the new ceiling is in place once the write
++ * returns. The sysfs store path holds policy->rwsem, which the refresh needs.
++ */
++static void cppc_cpufreq_update_nominal_limits(struct cpufreq_policy *policy)
++{
++	struct cppc_cpudata *cpu_data = policy->driver_data;
++	u32 nominal;
++	int ret;
++
++	if (policy->boost_enabled)
++		return;
++
++	nominal = cppc_cpufreq_effective_nominal(policy);
++	policy->cpuinfo.max_freq = cppc_perf_to_khz(&cpu_data->perf_caps,
++						    nominal);
++
++	if (freq_qos_request_active(&policy->boost_freq_req)) {
++		ret = freq_qos_update_request(&policy->boost_freq_req,
++					      policy->cpuinfo.max_freq);
++		if (ret < 0)
++			pr_debug("Failed to update boost limit on CPU%u (%d)\n",
++				 policy->cpu, ret);
++	}
++
++	refresh_frequency_limits(policy);
++}
++
+ static ssize_t show_ospm_nominal_freq(struct cpufreq_policy *policy, char *buf)
+ {
+ 	const struct cppc_policy_state *st = cppc_cpufreq_policy_state(policy);
+@@ -1553,6 +1617,8 @@ static ssize_t store_ospm_nominal_freq(struct cpufreq_policy *policy,
+ 	st->regs[CPPC_SAVED_OSPM_NOMINAL_PERF][CPPC_SAVED_FIRMWARE] =
+ 		cpu_data->perf_caps.nominal_perf;
+ 
++	cppc_cpufreq_update_nominal_limits(policy);
++
+ 	return count;
+ }
+ 
+

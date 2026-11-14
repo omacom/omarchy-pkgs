@@ -246,3 +246,52 @@ result above remains a separate test. USB4 docking, other BIOS revisions,
 18-CPU physical hardware, long-term reliability and sustained NPU workloads
 remain untested. No RTC diagnostic instrumentation or functional RTC wake fix
 is included, and these results do not establish physical DRIPS residency.
+
+## CPPC, lifetime and lock-order follow-up
+
+The 2026-11-15 refresh retains NVIDIA 615.78.08 and its exact matching
+nvidia-utils dependency, and preserves the official linux-omarchy-dtbs
+integration. It does not include personal boot configuration, private bundle
+markers, DSP startup, OEM binaries or a NVIDIA 620 version override.
+
+- `9200-cppc-0001` through `0034` carry the complete CPPC series in order.
+  Each mail patch retains its commit identity, author and sign-offs. The
+  actual-source parser/restore regression runs from `check()`.
+- `9240` gives each registered bus notifier its own lockdep class. Actual
+  EFI/KVM guests reproduced the false cross-bus inversion before the fix;
+  the fixed cross-bus case keeps lockdep active, while the same-bus positive
+  control still detects the real inversion. Lockdep is not disabled.
+- `9241` accepts genuine RCU readers in MT792x MLO BSS lookups and preserves
+  updater locking checks. Driver-owned BSS/broadcast-station links are
+  unpublished before deferred reclamation; failed MCU-add cleanup also
+  unpublishes its own WCID. The actual-C regression covers predicates,
+  lifetimes, cleanup and invalid/default links with ASan/UBSan.
+- `9242` declares the maximum DMA segment on xHCI platform's actual DMA
+  device after mask setup, matching the software splitting capability
+  already declared by PCI/MTK. It changes no hardware TRB limit or DMA-debug
+  policy. The regression executes the probe setup and 64KiB splitting code.
+- `9243` through `9245` are the complete ordered accepted upstream kernfs
+  series: `5ebcb578adeec7407dd501108ab2f423ca8e3e55`,
+  `45126ed80bb1c5eaf3d83aebc963826798d555b9`, and
+  `341c65579de5b632eb7913bb68b3e375eeeb3ddf`. Together they fix directory
+  resume/name lifetime and release kernfs_rwsem across dir_emit usercopy.
+  Actual EFI/KVM tests observed 1290 baseline faults holding that lock and
+  zero on the candidate across 30 scans, with no missing/repeated stable
+  entries after the fix. The complete dependencies must remain together.
+- The two additional NVIDIA patches retain one worker's PM lock ownership
+  across PREPARE/POST, unwind failed preparation, protect module lifetime,
+  and repair colorspace atomic backoff/cleanup. `check()` compiles the
+  actual packaged vendor callbacks with injected worker/PM and DRM failures.
+
+The bus, MT792x and xHCI changes are local repairs; the kernfs and CPPC mail
+patches retain their own upstream provenance. The DRM colorspace repair is
+from Johann-Peter Hartmann's published fix; the PM ownership repair is local.
+External EFI/KVM proofs are release evidence rather than package check jobs.
+
+The local combined candidate's bounded webcam test captured 60 frames to a
+null sink without a new DMA warning. A later UVM/kernfs warning motivated the
+kernfs series; that earlier boot is not evidence of sustained warning-free
+operation. Guest tests remove the demonstrated kernfs usercopy edge but do
+not certify final native UVM behavior. Physical sleep, acoustic endpoints,
+other BIOS/SKUs and sustained hardware behavior still need scoped QA. Native
+NVIDIA 620/CUDA work is separate and does not qualify this 615 public recipe.
