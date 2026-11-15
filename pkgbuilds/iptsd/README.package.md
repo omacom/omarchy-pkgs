@@ -10,6 +10,8 @@ The packaged udev rule also runs on "change" events. Upstream's runs only on "ad
 
 On the Surface Laptop 7 15" (Snapdragon X Elite), the touchpad needs iptsd for two-finger scroll, pinch and two-finger tap. It resets during resume and comes back in its mouse mode, and a running iptsd doesn't notice, so `iptsd-romulus15-resume.service` restarts iptsd after a suspend. It does nothing on any other machine. Press to click doesn't register under iptsd yet.
 
+On some boots of the same laptop the pad stops answering for a few seconds just as its HID device is re-bound to hid-multitouch. iptsd's udev rule then finds it silent and never starts iptsd, so the pad stays in its mouse mode until the rule runs again. `iptsd-romulus15-boot.service` waits, checks whether iptsd runs for the touchpad and re-runs the rule until it does. Seen on 3 of 6 boots on one laptop. It does nothing on any other machine.
+
 ## Retirement
 
 Drop once Arch Linux ARM packages iptsd, or once the Surface Pro 11's pen and the Surface Laptop 7's touchpad work through the kernel alone.
