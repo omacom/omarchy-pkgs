@@ -8,9 +8,10 @@ card reports. When no entry matches, it loads `board.bin`, and when there is non
 no Wi-Fi. linux-firmware's QCC2072 file lists 2 of the 8 cards Qualcomm's Windows driver knows,
 and its WCN7850 file lacks 6 of 32, so a laptop with one of those cards comes up without Wi-Fi.
 
-ath11k finds its board data the same way, and the tool covers one of its cards too: the WCN6855
-in the HP OmniBook X 14 (`105b:e108`), which linux-firmware doesn't list. Its Windows driver
-gives it the same board file as `105b:e105`, and that card's record gave it a working link.
+ath11k finds its board data the same way, and the tool covers two of its cards too: the WCN6855
+in the HP OmniBook X 14 (`105b:e108`) and in the HP OmniBook 3 14 (`103c:8d9a`), which
+linux-firmware doesn't list. Their Windows drivers give them the same board file as `105b:e105`,
+and that card's record gave the OmniBook X 14 a working link.
 
 ## Why a card's family is enough
 
