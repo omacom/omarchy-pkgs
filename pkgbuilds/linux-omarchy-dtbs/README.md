@@ -50,3 +50,13 @@ A patch stays here until the kernel moves to a new version. Then `pkgver` follow
 Most firmware folders they name aren't installed by any package yet, so those machines start without their DSPs.
 
 `x1e80100-microsoft-denali-5g.json` gives the Surface Pro 11 with 5G the OLED tree. It reads `Microsoft Surface Pro with 5G, 11th Edition`, which systemd's entry doesn't list, so it got no tree. The entry carries CHIDs 3 to 10 from an owner's SMBIOS (DanaGoyette in ubuntu/stubble#34) and the manufacturer and SKU CHID of its other three SKUs. The 5G comes with both panels, and systemd-stub compares the panel CHIDs in `x1p64100-microsoft-denali.json` first, so an LCD unit keeps the LCD tree. Neither tree has a PCIe port for the modem.
+
+`0022` moves the Surface Pro 12th Edition's audio and compute DSP firmware to `qcom/glymur/microsoft/surface-pro-12th-edition`, where its tree already loads the SoCCP and USB4 router images. It loaded them from the Surface Laptop 8's folder, but Microsoft's package for the tablet has an audio DSP image of its own.
+
+Hardware IDs for eight of the machines `0013` to `0019` added, so systemd-stub picks their trees. They are the manufacturer and product CHID, and with the board where it is known, from units that ran Geekbench. The HP split reproduces the IDs an OmniBook 5 14-he0 reports in ubuntu/stubble#75, and the Lenovo one the Yoga Slim 7x Gen 11's in stubble.
+
+- `mahua-hp-elitebook-6-g2q.json`: `HP`, `HP EliteBook 6 G2q 14 inch Notebook Next Gen AI PC`, board `8F2B`, the same on X2E-84-100 and X2P-64-100 units.
+- `kalambo-lenovo-ideapad-slim5x-13q8y11.json`, `-15q8y11.json` and `kalambo-lenovo-ideapad-5x-2in1-14q8y11.json`: `LENOVO` with the machine types `83RK`, `83RL` and `83UK` and board `LNVNB161216`. One 83UK reported them from Ubuntu.
+- `kalambo-lenovo-thinkbook-14-gen9.json`, `x126100-lenovo-ideapad-vibe-14q8x12.json` and `-15q8x12.json`: `LENOVO` with the machine types `22BB`, `84A9` and `84AA`, which Lenovo reports as the product name on its laptops. No unit of these has reported yet.
+- `x1p42100-dynabook-xd5.json`: `Dynabook Inc.`, `dynabook XD5`, board `DBIFXN00`. The direct-sale `dynabook XD/ZA` on the same board, sometimes with the X1E-78-100, reports another product name and doesn't match.
+
