@@ -65,7 +65,7 @@ class JackPolicyTests(unittest.TestCase):
             self.assertIsNotNone(block)
             self.assertIn('node.param.Props = { mute = true }', block[1])
 
-    def transition(self, mode, default, saved):
+    def transition(self, mode, default, saved, raw_nodes=None):
         calls = []
         sinks = [{'name': 'p16_two_way', 'volume': {'front-left': {'value': 8192},
                   'front-right': {'value': 8192}}, 'mute': True}]
@@ -76,7 +76,7 @@ class JackPolicyTests(unittest.TestCase):
             if args[:2] == ('pactl', 'get-default-sink'):
                 return default
             if args == ('pw-dump',):
-                return '[]'
+                return json.dumps(raw_nodes or [])
             return ''
         with tempfile.TemporaryDirectory() as directory:
             state = Path(directory) / 'state.json'
@@ -106,6 +106,33 @@ class JackPolicyTests(unittest.TestCase):
         for mode in ('headphones', 'speakers'):
             calls, _, _ = self.transition(mode, 'bluez_output.test', {'volume': {}, 'mute': False, 'dolby': True})
             self.assertFalse(any(c[:2] == ('pactl', 'set-default-sink') for c in calls))
+
+    def test_raw_names_accept_only_optional_numeric_disambiguator(self):
+        for suffix in ('', '.3', '.10'):
+            for endpoint in ('Speaker', 'Headphones'):
+                name = f'alsa_output.platform-mtk_sdw_mc{suffix}.HiFi__{endpoint}__sink'
+                self.assertTrue(watch.is_raw_sink(name), name)
+        for name in (None, 'bluez_output.test',
+                     'alsa_output.platform-other.3.HiFi__Speaker__sink',
+                     'alsa_output.platform-mtk_sdw_mcX3.HiFi__Speaker__sink',
+                     'alsa_output.platform-mtk_sdw_mc.3junk.HiFi__Speaker__sink',
+                     'alsa_output.platform-mtk_sdw_mc.3.HiFi__Mic__source',
+                     'prefixalsa_output.platform-mtk_sdw_mc.HiFi__Speaker__sink'):
+            self.assertFalse(watch.is_raw_sink(name), name)
+
+    def test_numbered_raw_default_and_unity_only_for_our_card(self):
+        name = 'alsa_output.platform-mtk_sdw_mc.10.HiFi__Speaker__sink'
+        other = 'alsa_output.platform-other.10.HiFi__Speaker__sink'
+        nodes = [{'id': 31, 'info': {'props': {'node.name': name}}},
+                 {'id': 32, 'info': {'props': {'node.name': other}}}]
+        saved = {'volume': {'front-left': 8123, 'front-right': 9222},
+                 'mute': True, 'dolby': False}
+        calls, _, _ = self.transition('speakers', name, saved, nodes)
+        self.assertIn(('pactl', 'set-default-sink', 'p16_two_way'), calls)
+        self.assertIn(('wpctl', 'set-volume', '31', '1.0'), calls)
+        self.assertFalse(any(c[0] == 'wpctl' and '32' in c for c in calls))
+        self.assertIn(('pactl', 'set-sink-volume', 'p16_two_way', '8123', '9222'), calls)
+        self.assertIn(('pactl', 'set-sink-mute', 'p16_two_way', '1'), calls)
 
     def test_headphone_reader_uses_named_card(self):
         with patch.object(watch, 'run', return_value='values=on') as run:

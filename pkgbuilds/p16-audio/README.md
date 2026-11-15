@@ -47,3 +47,10 @@ Bluetooth/HDMI defaults are not changed during recovery.
 `check()` runs the nine mocked jack/state regression cases; a separate isolated
 PipeWire/Pulse server test also recovered exact volume/mute after host restart.
 These checks do not replace physical wired-headphone or acoustic validation.
+
+Reconnect fix (0.1.0-8): raw MT8901 speaker/headphone rules accept only an
+optional numeric node-name disambiguator, so card recreation does not break
+internal classification or splitter targets. The watcher uses the same
+bounded identity and preserves saved volumes/mute and unrelated defaults.
+The installer upgrades only the exact unmodified 0.1.0-7 hiding rule; custom
+files and symlinks are preserved. No DSP or driver change is included.
