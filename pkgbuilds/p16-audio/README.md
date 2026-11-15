@@ -54,3 +54,8 @@ internal classification or splitter targets. The watcher uses the same
 bounded identity and preserves saved volumes/mute and unrelated defaults.
 The installer upgrades only the exact unmodified 0.1.0-7 hiding rule; custom
 files and symlinks are preserved. No DSP or driver change is included.
+
+Global migration follow-up (0.1.0-9): installation and removal retire only
+regular non-symlink global rules with the exact known old or current package
+hash. post_remove uses the same closed hash list without depending on the
+already removed /usr/share source. Custom global rules and symlinks remain.

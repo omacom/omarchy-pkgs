@@ -96,6 +96,54 @@ class InstallerTests(unittest.TestCase):
     def run_logged_out(self):
         return subprocess.run([str(self.logged_out_installer)], env=self.env, text=True, capture_output=True)
 
+    def old_global_rule(self):
+        text = self.config.read_text()
+        for endpoint in ('Speaker', 'Headphones'):
+            text = text.replace('~^alsa_output[.]platform-mtk_sdw_mc([.][0-9]+)?[.]HiFi__'+endpoint+'__sink$', 'alsa_output.platform-mtk_sdw_mc.HiFi__'+endpoint+'__sink')
+        return text
+
+    def test_old_global_rule_removed_both_modes(self):
+        for mode in ('--install', '--remove'):
+            self.legacy.write_text(self.old_global_rule())
+            result = subprocess.run([str(self.installer), mode], env=self.env, text=True, capture_output=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertFalse(self.legacy.exists())
+
+    def test_custom_global_and_symlink_preserved_both_modes(self):
+        for mode in ('--install', '--remove'):
+            self.legacy.write_text('custom rule\n')
+            result = subprocess.run([str(self.installer), mode], env=self.env, text=True, capture_output=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(self.legacy.read_text(), 'custom rule\n')
+            self.legacy.unlink()
+            target = self.root / 'global-target'
+            target.write_text(self.old_global_rule())
+            self.legacy.symlink_to(target)
+            result = subprocess.run([str(self.installer), mode], env=self.env, text=True, capture_output=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue(self.legacy.is_symlink())
+            self.assertEqual(target.read_text(), self.old_global_rule())
+            self.legacy.unlink()
+
+    def test_post_remove_without_package_source(self):
+        script = (PACKAGE / 'p16-audio.install').read_text().replace('/etc/wireplumber/wireplumber.conf.d/80-p16-internal-sinks.conf', str(self.legacy))
+        path = self.root / 'post-remove.sh'
+        path.write_text(script+'\npost_remove\n')
+        for text in (self.old_global_rule(), self.config.read_text()):
+            self.legacy.write_text(text)
+            subprocess.run(['bash', str(path)], check=True)
+            self.assertFalse(self.legacy.exists())
+        self.legacy.write_text('custom rule\n')
+        subprocess.run(['bash', str(path)], check=True)
+        self.assertEqual(self.legacy.read_text(), 'custom rule\n')
+        self.legacy.unlink()
+        target = self.root / 'post-target'
+        target.write_text(self.old_global_rule())
+        self.legacy.symlink_to(target)
+        subprocess.run(['bash', str(path)], check=True)
+        self.assertTrue(self.legacy.is_symlink())
+        self.assertEqual(target.read_text(), self.old_global_rule())
+
     def test_offline_user_gets_graph_and_scoped_rules(self):
         self.legacy.write_bytes(self.config.read_bytes())
         result = self.run_installer()
