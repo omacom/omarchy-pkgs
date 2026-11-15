@@ -46,4 +46,9 @@ grep -q 'multi-user.target.wants/iptsd-romulus15-boot.service' "$package_dir/PKG
 bash -n "$package_dir/iptsd-romulus15-boot" ||
   fail "the boot-time start script has valid syntax"
 
+grep -q 'ForceButton = 0x96' "$package_dir/0001-ipts-Handle-the-button-report-of-force-touchpads.patch" ||
+  fail "the force touchpad's button report is read"
+grep -q 'patch -d iptsd -Np1 -i ../0001-ipts-Handle-the-button-report-of-force-touchpads.patch' "$package_dir/PKGBUILD" ||
+  fail "the force touchpad patch is applied"
+
 echo "ok - iptsd builds pinned upstream source against Arch libraries"
