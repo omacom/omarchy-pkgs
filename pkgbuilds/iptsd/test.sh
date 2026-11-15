@@ -57,6 +57,8 @@ grep -q '^Product = 0x0C6F$' "$package_dir/surface-laptop-7-15.conf" ||
   fail "the position slop is limited to the Surface Laptop 7 15\" touchscreen"
 grep -q '^PositionSlop = 0.25$' "$package_dir/surface-laptop-7-15.conf" ||
   fail "a tap on the Surface Laptop 7 15\" touchscreen stays in place"
+grep -q '^  ./test-position-slop$' "$package_dir/PKGBUILD" ||
+  fail "the position slop is checked against contacts that land, move and lift"
 grep -q 'install -Dm644 surface-laptop-7-15.conf -t "$pkgdir/usr/share/iptsd"' "$package_dir/PKGBUILD" ||
   fail "the Surface Laptop 7 15\" preset is installed where iptsd reads presets"
 
