@@ -72,3 +72,6 @@ Hardware IDs for eight of the machines `0013` to `0019` added, so systemd-stub p
 
 `0026` turns on the Acer Aspire 16 AI's video encoder and decoder (Iris), so it gets hardware H.264 and HEVC through V4L2. Its firmware, `qcvss8380_pa.mbn`, isn't in Acer's driver download, but an owner's Windows copy is byte for byte the one in Dell's Adreno X1-85/X1-45 graphics driver 2CHK7, and `acer-aspire-16-ai-firmware` installs it into the laptop's own folder from there. Asked for by Phandoxx (birkskyum/arewearmyet#5).
 
+`0027` points the Lenovo IdeaPad Slim 5x 14Q8X9's (`x1p42100-lenovo-ideapad-slim5x`) video decoder at `qcvss8380_pa.mbn`, the Purwa image, in place of the Hamoa `qcvss8380.mbn` its tree named. Iris runs Purwa with one video pipe and firmware of its own, and Lenovo's graphics driver ships both images. `lenovo-ideapad-slim-5x-firmware` installs it from the laptop's Windows Update bundle.
+
+`0028` brings the HP OmniBook 5 16-bf1xxx's (`mahua-hp-omnibook-5-bf1xxx`) tree up to Rahul Pon's at a2e04f161: the sound card on the ADSP with the two WSA8845 speakers and the VA macro's microphones, the SMB2370 eUSB2 repeaters on both USB-C ports with the PMH0101 regulators they share, and thermal zones for four of the embedded controller's thermistors. The CoreSight overrides stay out and the GPU stays off, as in the kernel's `2712`. By Rahul Pon.
