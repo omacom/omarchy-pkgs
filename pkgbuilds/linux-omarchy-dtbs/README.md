@@ -70,3 +70,5 @@ Hardware IDs for eight of the machines `0013` to `0019` added, so systemd-stub p
 
 `mahua-acer-swift-sfsp14-q51t.json` carries the manufacturer and product CHID, `Acer` and `Swift SFSP14-Q51T`, which Geekbench units report and the BIOS image's SMBIOS defaults confirm.
 
+`0026` turns on the Acer Aspire 16 AI's video encoder and decoder (Iris), so it gets hardware H.264 and HEVC through V4L2. Its firmware, `qcvss8380_pa.mbn`, isn't in Acer's driver download, but an owner's Windows copy is byte for byte the one in Dell's Adreno X1-85/X1-45 graphics driver 2CHK7, and `acer-aspire-16-ai-firmware` installs it into the laptop's own folder from there. Asked for by Phandoxx (birkskyum/arewearmyet#5).
+
