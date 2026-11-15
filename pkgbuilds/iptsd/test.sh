@@ -32,4 +32,18 @@ done
 grep -q "sed -i 's/ACTION==\"add\"/ACTION!=\"remove\"/'" "$package_dir/PKGBUILD" ||
   fail "a udev change event, such as pacman's rule reload, keeps iptsd running"
 
+grep -q 'ConditionFirmware=device-tree-compatible(microsoft,romulus15)' \
+  "$package_dir/iptsd-romulus15-resume.service" ||
+  fail "the resume restart stays off every machine but the Surface Laptop 7 15"
+grep -q 'suspend.target.wants/iptsd-romulus15-resume.service' "$package_dir/PKGBUILD" ||
+  fail "the resume restart is enabled by the package"
+
+grep -q 'ConditionFirmware=device-tree-compatible(microsoft,romulus15)' \
+  "$package_dir/iptsd-romulus15-boot.service" ||
+  fail "the boot-time start stays off every machine but the Surface Laptop 7 15\""
+grep -q 'multi-user.target.wants/iptsd-romulus15-boot.service' "$package_dir/PKGBUILD" ||
+  fail "the boot-time start is enabled by the package"
+bash -n "$package_dir/iptsd-romulus15-boot" ||
+  fail "the boot-time start script has valid syntax"
+
 echo "ok - iptsd builds pinned upstream source against Arch libraries"

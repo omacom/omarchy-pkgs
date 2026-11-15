@@ -131,10 +131,32 @@ Archive watches use `member` to select a text member, or `filenames: true` to re
 versions from archive member names. Debian archives are read through their control
 metadata. `unescape_json` handles JSON strings embedded in a vendor's HTML page.
 
+`source_variables` sets a recipe variable from a file inside one of the new
+release's own sources, for facts a vendor publishes only in the artifact:
+
+```json
+"source_variables": {
+  "_electronver": {
+    "source": "source:0",
+    "member": "usr/lib/slack/version",
+    "pattern": "(?P<value>[0-9]+\\.[0-9]+\\.[0-9]+)"
+  }
+}
+```
+
+After the new pkgver is written, the watch fetches that source (`source:0`
+names the first `source` entry, `source_aarch64:1` the second AArch64 one),
+reads `member` from a zip, a tar or a `.deb`'s data archive without
+extracting anything else, and requires the whole trimmed file (64 KiB at most)
+to match `pattern`. The `value` capture replaces the variable, and sources that
+use it are hashed again. Slack's AArch64 build uses it to follow the Electron
+release each Slack `.deb` ships.
+
 ## Maintenance and validation
 
-Running watches locally requires Python 3.11+, Bash, curl, git, jq, Arch's
-`vercmp`, and `bsdtar`. CI installs these in its Arch container.
+Running watches locally requires Python 3.14+ (its `tarfile` reads zstd), Bash,
+curl, git, jq, Arch's `vercmp`, and `bsdtar`. CI installs these in its Arch
+container.
 
 - Edit packaging and architecture changes directly in PKGBUILD. The old AUR
   overlays have been folded into these recipes and removed.

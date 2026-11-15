@@ -1,0 +1,106 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jason Bruce Jones <jason@brucejones.biz>
+Date: Wed, 4 Nov 2026 14:00:00 -0500
+Subject: [PATCH] drm/msm/dp: equalize repeaters with TPS3 when TPS4 fails
+ below HBR3
+
+msm_dp_ctrl_link_train_2() picks the channel equalization pattern from
+the sink's DPCD, so a sink that supports TPS4 gets TPS4 at every
+LTTPR as well. Behind the PS8830 retimer on a Surface Laptop 7, the
+retimer passes clock recovery but never reports CHANNEL_EQ_DONE with
+TPS4 at HBR2: its PHY_REPEATER lane status reads 0x55 0x55 0x01 (clock
+recovery, symbol lock and interlane alignment, no EQ done) and no
+voltage swing or pre-emphasis change is requested. Every attempt at
+every lane count fails and the monitor stays dark. Windows drives the
+same retimer, cable and monitor (Dell U4919DW, 5120x1440@60, HBR2 x4).
+
+TPS4 is only required at HBR3. When channel equalization at a repeater
+fails with TPS4 at HBR2 or below, retry the training with TPS3 for the
+repeaters before the existing fallbacks, which still apply if TPS3
+fails too. The sink keeps TPS4. Links that train today never take this
+path.
+
+Tested on the Surface Laptop 7 15" (x1e80100-microsoft-romulus15)
+with the Dell U4919DW over USB-C: the retimer equalizes with TPS3 on
+the first attempt and the link comes up at HBR2 x4.
+
+Assisted-by: Opus 5.5
+Signed-off-by: Jason Bruce Jones <jason@brucejones.biz>
+[Birk: keep TPS4 at the repeaters at HBR3. A lane count fallback restores
+ the panel's highest rate, so the TPS3 override only applies at HBR2 and
+ below.]
+Signed-off-by: Birk Skyum <birk.skyum@pm.me>
+---
+ drivers/gpu/drm/msm/dp/dp_ctrl.c | 29 +++++++++++++++++++++++++++--
+ 1 file changed, 27 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/msm/dp/dp_ctrl.c b/drivers/gpu/drm/msm/dp/dp_ctrl.c
+--- a/drivers/gpu/drm/msm/dp/dp_ctrl.c
++++ b/drivers/gpu/drm/msm/dp/dp_ctrl.c
+@@ -184,6 +184,11 @@ struct msm_dp_ctrl_private {
+ 	bool link_clks_on;
+ 	bool stream_clks_on;
+ 	bool sink_fec_ready;
++
++	/* Channel EQ at a repeater failed with TPS4 on the last attempt. */
++	bool lttpr_tps4_eq_failed;
++	/* Equalize repeaters with TPS3 instead of TPS4 for this link. */
++	bool lttpr_eq_tps3;
+ };
+ 
+ static inline u32 msm_dp_read_ahb(const struct msm_dp_ctrl_private *ctrl, u32 offset)
+@@ -1820,8 +1825,11 @@ static int msm_dp_ctrl_link_train_2(stru
+ 	msm_dp_write_link(ctrl, REG_DP_STATE_CTRL, 0);
+ 
+ 	*training_step = DP_TRAINING_2;
++	ctrl->lttpr_tps4_eq_failed = false;
+ 
+-	if (drm_dp_tps4_supported(panel->dpcd)) {
++	if (drm_dp_tps4_supported(panel->dpcd) &&
++	    !(ctrl->lttpr_eq_tps3 && dp_phy != DP_PHY_DPRX &&
++	      ctrl->link->link_params.rate <= 540000)) {
+ 		pattern = DP_TRAINING_PATTERN_4;
+ 		state_ctrl_bit = 4;
+ 	} else if (drm_dp_tps3_supported(panel->dpcd)) {
+@@ -1857,6 +1865,8 @@ static int msm_dp_ctrl_link_train_2(stru
+ 
+ 	}
+ 
++	ctrl->lttpr_tps4_eq_failed = dp_phy != DP_PHY_DPRX && state_ctrl_bit == 4;
++
+ 	return -ETIMEDOUT;
+ }
+ 
+@@ -2944,6 +2954,8 @@ int msm_dp_ctrl_on_link(struct msm_dp_ct
+ 	if (rc)
+ 		return rc;
+ 
++	ctrl->lttpr_eq_tps3 = false;
++
+ 	while (--link_train_max_retries) {
+ 		training_step = DP_TRAINING_NONE;
+ 		rc = msm_dp_ctrl_setup_main_link(ctrl, panel, &training_step);
+@@ -2983,7 +2995,20 @@ int msm_dp_ctrl_on_link(struct msm_dp_ct
+ 			if (!msm_dp_aux_link_plugged(ctrl->aux))
+ 				break;
+ 
+-			if (!is_edp && same_params_retries-- > 0) {
++			if (ctrl->lttpr_tps4_eq_failed && !ctrl->lttpr_eq_tps3 &&
++			    ctrl->link->link_params.rate <= 540000 &&
++			    drm_dp_tps3_supported(panel->dpcd)) {
++				/*
++				 * TPS4 is only required at HBR3. Some repeaters
++				 * never report channel EQ done with it at lower
++				 * rates but equalize with TPS3, so retry with TPS3
++				 * before lowering the rate or the lane count.
++				 */
++				ctrl->lttpr_eq_tps3 = true;
++				link_train_max_retries++;
++				dev_info(ctrl->dev,
++					 "LTTPR channel EQ failed with TPS4, retrying with TPS3\n");
++			} else if (!is_edp && same_params_retries-- > 0) {
+ 				/* Retries at the same rate don't use up the fallback steps. */
+ 				link_train_max_retries++;
+ 				drm_dbg_dp(ctrl->drm_dev,
+-- 
+2.56.0
