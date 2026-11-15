@@ -66,3 +66,7 @@ Hardware IDs for eight of the machines `0013` to `0019` added, so systemd-stub p
 
 `x1p42100-hp-omnibook-x14-kr0.json`, `x1p42100-hp-omnibook-x16-cp0.json` and `kalambo-hp-omnibook-5-14-he1xxx.json` carry the manufacturer and product, and manufacturer, product and board CHIDs, from units that ran Geekbench: `HP OmniBook X Laptop 14-kr0xxx` and `16-cp0xxx` on board `8F45`, and `HP OmniBook 5 Laptop 14-he1xxx` on `8F47`.
 
+`0025` adds the Acer Swift Spin 14 AI (SFSP14-Q51T) with the Snapdragon X2 Elite X2E-78-100, a Mahua (`mahua-acer-swift-sfsp14-q51t`). It is written from the ACPI tables in Acer's BIOS 1.06, whose power tables match the HP EliteBook 6 G2q's, so it starts from that tree: keyboard at 0x3c on i2c0, an ELAN or PixArt touchpad on i2c4, the Wacom touchscreen and pen on i2c8, its two USB-C ports on `usb_0` and `usb_2`, the USB-A port on the multiport controller and the cameras on `usb_hs`. The GPU stays off, as on the other Mahua trees. It loads its DSP firmware from `qcom/glymur/ACER/SFSP14-Q51T`, which `acer-swift-spin-14-ai-firmware` fills.
+
+`mahua-acer-swift-sfsp14-q51t.json` carries the manufacturer and product CHID, `Acer` and `Swift SFSP14-Q51T`, which Geekbench units report and the BIOS image's SMBIOS defaults confirm.
+
