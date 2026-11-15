@@ -1,0 +1,116 @@
+From: Staticduo P16 experimental integration
+Subject: [PATCH] wifi: mt76: mt792x: honor RCU readers of MLO BSS links
+
+mt792x_vif_to_link() is used by mac80211 callbacks holding the wiphy
+mutex and by the TX path under rcu_read_lock(). The IPv6 address callback
+also reaches mt792x_vif_to_bss_conf() from an RCU notifier. Protected-only
+loads reject these legitimate reader contexts and omit RCU load semantics.
+
+Use checked RCU loads, accepting the mt76/wiphy updater locks where
+appropriate. Retain validation for genuinely unprotected callers.
+
+Give dynamically allocated BSS and broadcast STA links an RCU lifetime before
+admitting RCU readers: unpublish on removal, then reclaim via kfree_rcu().
+Release allocation failures consistently after replacing devm allocation.
+The embedded default BSS remains vif-owned.
+
+This local correction follows the Linux RCU check/protected contract and
+the analogous upstream MT7925 STA RCU lifetime fix by Sean Wang,
+9fbe29ba429e56c66b5821fad0e39f9d4845b773. It is not an upstream backport.
+
+--- a/drivers/net/wireless/mediatek/mt76/mt792x.h
++++ b/drivers/net/wireless/mediatek/mt76/mt792x.h
+@@ -158,6 +158,7 @@
+ 
+ struct mt792x_bss_conf {
+ 	struct mt76_vif_link mt76; /* must be first */
++	struct rcu_head rcu_head;
+ 	struct mt792x_vif *vif;
+ 	struct ewma_rssi rssi;
+ 	struct ieee80211_tx_queue_params queue_params[IEEE80211_NUM_ACS];
+@@ -356,8 +357,10 @@
+ 	    link_id >= IEEE80211_LINK_UNSPECIFIED)
+ 		return &mvif->bss_conf;
+ 
+-	bss_conf = rcu_dereference_protected(mvif->link_conf[link_id],
+-					     lockdep_is_held(&mvif->phy->dev->mt76.mutex));
++	/* TX and IPv6 notification readers hold RCU instead of mt76.mutex. */
++	bss_conf = rcu_dereference_check(mvif->link_conf[link_id],
++		lockdep_is_held(&mvif->phy->dev->mt76.mutex) ||
++		lockdep_vif_wiphy_mutex_held(vif));
+ 
+ 	return bss_conf ? bss_conf : &mvif->bss_conf;
+ }
+@@ -393,7 +396,7 @@
+ 	    link_id >= IEEE80211_LINK_UNSPECIFIED)
+ 		return &vif->bss_conf;
+ 
+-	return link_conf_dereference_protected(vif, link_id);
++	return link_conf_dereference_check(vif, link_id);
+ }
+ 
+ static inline struct ieee80211_link_sta *
+--- a/drivers/net/wireless/mediatek/mt76/mt7925/main.c
++++ b/drivers/net/wireless/mediatek/mt76/mt7925/main.c
+@@ -2233,14 +2233,13 @@
+ 		if (!mconf || !mlink)
+ 			continue;
+ 
++		rcu_assign_pointer(mvif->link_conf[link_id], NULL);
++		rcu_assign_pointer(mvif->sta.link[link_id], NULL);
+ 		if (mconf != &mvif->bss_conf) {
+ 			mt792x_mac_link_bss_remove(dev, mconf, mlink);
+-			devm_kfree(dev->mt76.dev, mconf);
+-			devm_kfree(dev->mt76.dev, mlink);
++			kfree_rcu(mconf, rcu_head);
++			kfree_rcu(mlink, rcu_head);
+ 		}
+-
+-		rcu_assign_pointer(mvif->link_conf[link_id], NULL);
+-		rcu_assign_pointer(mvif->sta.link[link_id], NULL);
+ 	}
+ 
+ 	for_each_set_bit(link_id, &add, IEEE80211_MLD_MAX_NUM_LINKS) {
+@@ -2249,13 +2248,13 @@
+ 			mconf = &mvif->bss_conf;
+ 			mlink = &mvif->sta.deflink;
+ 		} else {
+-			mconf = devm_kzalloc(dev->mt76.dev, sizeof(*mconf),
+-					     GFP_KERNEL);
+-			mlink = devm_kzalloc(dev->mt76.dev, sizeof(*mlink),
+-					     GFP_KERNEL);
++			mconf = kzalloc(sizeof(*mconf), GFP_KERNEL);
++			mlink = kzalloc(sizeof(*mlink), GFP_KERNEL);
+ 			if (!mconf || !mlink) {
+-				mt792x_mutex_release(dev);
+-				return -ENOMEM;
++				kfree(mconf);
++				kfree(mlink);
++				err = -ENOMEM;
++				goto free;
+ 			}
+ 		}
+ 
+@@ -2315,10 +2314,18 @@
+ 		rcu_assign_pointer(mvif->link_conf[link_id], NULL);
+ 		rcu_assign_pointer(mvif->sta.link[link_id], NULL);
+ 
+-		if (mconfs[link_id] != &mvif->bss_conf)
+-			devm_kfree(dev->mt76.dev, mconfs[link_id]);
+-		if (mlinks[link_id] != &mvif->sta.deflink)
+-			devm_kfree(dev->mt76.dev, mlinks[link_id]);
++		mlink = mlinks[link_id];
++		if (mlink && mlink->wcid.idx < ARRAY_SIZE(dev->mt76.wcid) &&
++		    rcu_access_pointer(dev->mt76.wcid[mlink->wcid.idx]) ==
++			     &mlink->wcid) {
++			rcu_assign_pointer(dev->mt76.wcid[mlink->wcid.idx], NULL);
++			mt76_wcid_cleanup(&dev->mt76, &mlink->wcid);
++		}
++
++		if (mconfs[link_id] && mconfs[link_id] != &mvif->bss_conf)
++			kfree_rcu(mconfs[link_id], rcu_head);
++		if (mlinks[link_id] && mlinks[link_id] != &mvif->sta.deflink)
++			kfree_rcu(mlinks[link_id], rcu_head);
+ 	}
+ 
+ 	mt792x_mutex_release(dev);

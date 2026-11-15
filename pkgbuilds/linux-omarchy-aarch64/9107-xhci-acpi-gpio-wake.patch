@@ -1,0 +1,130 @@
+From f942d998370e28b184497c0db73787947be06039 Mon Sep 17 00:00:00 2001
+From: Kiran Maddaraki <kmaddaraki@nvidia.com>
+Date: Wed, 14 Oct 2026 14:52:35 +0530
+Subject: [PATCH] NVIDIA: SAUCE: usb: xhci-plat: use the ACPI GpioInt as MTK v2
+ wake IRQ
+
+BugLink: https://bugs.launchpad.net/bugs/2172005
+
+On MediaTek v2 xHCI, firmware describes the system wake event as an
+ACPI GpioInt (an EINT line routed to the SPM) in addition to, on most
+controllers, a second normal interrupt.  Only ordinary Interrupt()
+resources become platform IRQs, so platform_get_irq(pdev, 1) returns
+the second normal interrupt, or nothing when ACPI describes none, and
+the GpioInt was never claimed.  The SPM therefore never saw a wake event
+for USB and a USB keyboard or mouse could not wake the system from
+s2idle.
+
+Prefer the GpioInt for the dedicated wake IRQ and fall back to the old
+lookup when firmware has none, it is not wake-capable or it cannot be
+resolved.  When firmware marks the line wake-capable, enable wakeup on
+the controller by default, since the wake IRQ is only armed for a device
+that may wake the system.
+
+Signed-off-by: Kiran Maddaraki <kmaddaraki@nvidia.com>
+Acked-by: Carol L Soto <csoto@nvidia.com>
+Acked-by: Nirmoy Das <nirmoyd@nvidia.com>
+Signed-off-by: Brad Figg <bfigg@nvidia.com>
+---
+ drivers/usb/host/xhci-plat.c | 59 ++++++++++++++++++++++++++++++++++--
+ 1 file changed, 56 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/usb/host/xhci-plat.c b/drivers/usb/host/xhci-plat.c
+index f189ba6449add..241518b8f4743 100644
+--- a/drivers/usb/host/xhci-plat.c
++++ b/drivers/usb/host/xhci-plat.c
+@@ -155,6 +155,38 @@ static const struct of_device_id usb_xhci_of_match[] = {
+ MODULE_DEVICE_TABLE(of, usb_xhci_of_match);
+ #endif
+ 
++/*
++ * On MediaTek v2 xHCI the system wake event is described by firmware as an
++ * ACPI GpioInt: an EINT line routed to the SPM, which is what can wake the SoC
++ * from s2idle.  It is not a platform IRQ resource, so the index 1 lookup never
++ * finds it, and the index 0 lookup only falls back to a GpioInt when there is
++ * no normal interrupt.  Look it up explicitly and prefer it when firmware marks
++ * it wake-capable, and fall back to the second normal interrupt otherwise.
++ */
++static int xhci_plat_mtk_get_wakeup_irq(struct platform_device *pdev,
++					bool *from_gpio, bool *wake_capable)
++{
++	struct acpi_device *adev = ACPI_COMPANION(&pdev->dev);
++	int irq;
++
++	*from_gpio = false;
++	*wake_capable = false;
++
++	if (adev) {
++		irq = acpi_dev_gpio_irq_wake_get(adev, 0, wake_capable);
++		if (irq > 0 && *wake_capable) {
++			*from_gpio = true;
++			return irq;
++		}
++		if (irq == -EPROBE_DEFER)
++			return irq;
++		dev_dbg(&pdev->dev, "no usable ACPI GpioInt wake irq (%d)\n", irq);
++		*wake_capable = false;
++	}
++
++	return platform_get_irq_optional(pdev, 1);
++}
++
+ int xhci_plat_probe(struct platform_device *pdev, struct device *sysdev, const struct xhci_plat_priv *priv_match)
+ {
+ 	const struct hc_driver	*driver;
+@@ -168,6 +200,8 @@ int xhci_plat_probe(struct platform_device *pdev, struct device *sysdev, const s
+ 	const struct of_device_id *of_match;
+ 	bool mtk_hw_prepared = false;
+ 	int wakeup_irq = -1;
++	bool wakeup_from_gpio = false;
++	bool wakeup_capable = false;
+ 
+ 	if (usb_disabled())
+ 		return -ENODEV;
+@@ -252,7 +286,8 @@ int xhci_plat_probe(struct platform_device *pdev, struct device *sysdev, const s
+ 
+ 	if (priv && priv->is_mtk_v2) {
+ 
+-		wakeup_irq = platform_get_irq_optional(pdev, 1);
++		wakeup_irq = xhci_plat_mtk_get_wakeup_irq(pdev, &wakeup_from_gpio,
++							  &wakeup_capable);
+ 		if (wakeup_irq == -EPROBE_DEFER) {
+ 			ret = wakeup_irq;
+ 			goto disable_clk;
+@@ -397,7 +432,23 @@ int xhci_plat_probe(struct platform_device *pdev, struct device *sysdev, const s
+ 			dev_err(&pdev->dev, "set wakeup irq %d failed\n", wakeup_irq);
+ 			goto dealloc_usb3_hcd;
+ 		}
+-		dev_info(&pdev->dev, "wakeup irq %d\n", wakeup_irq);
++		dev_info(&pdev->dev, "%swakeup irq %d\n",
++			 wakeup_from_gpio ? "ACPI GpioInt " : "", wakeup_irq);
++
++		/*
++		 * Firmware marked the wake line as wake-capable, so the
++		 * controller should be able to wake the system without
++		 * userspace having to enable it first.
++		 */
++		if (wakeup_capable) {
++			ret = device_init_wakeup(&pdev->dev, true);
++			if (ret) {
++				dev_err(&pdev->dev, "enable wakeup failed: %d\n", ret);
++				device_init_wakeup(&pdev->dev, false);
++				dev_pm_clear_wake_irq(&pdev->dev);
++				goto dealloc_usb3_hcd;
++			}
++		}
+ 	}
+ 
+ 	device_enable_async_suspend(&pdev->dev);
+@@ -560,8 +611,10 @@ void xhci_plat_remove(struct platform_device *dev)
+ 			xhci_plat_hc_died(xhci, mtk_hw_accessible);
+ 	}
+ 
+-	if (priv->is_mtk_v2)
++	if (priv->is_mtk_v2) {
+ 		dev_pm_clear_wake_irq(&dev->dev);
++		device_init_wakeup(&dev->dev, false);
++	}
+ 
+ 	if (shared_hcd) {
+ 		usb_remove_hcd(shared_hcd);

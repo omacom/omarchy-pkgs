@@ -1,0 +1,89 @@
+From: Johann Hartmann <johann@mayflower.de>
+Subject: [PATCH] nvidia-drm: back off color reset after modeset deadlock
+
+DRM atomic plane acquisition and commit can return -EDEADLK. Clear the
+partial state and use drm_modeset_backoff before restarting the transaction,
+including an interruptible backoff failure. Do not drop a contended context.
+
+--- a/kernel-open/nvidia-drm/nvidia-drm-drv.c
++++ b/kernel-open/nvidia-drm/nvidia-drm-drv.c
+@@ -1014,71 +1014,79 @@
+ }
+ #endif
+ 
+ static
+ int nv_drm_reset_input_colorspace(struct drm_device *dev)
+ {
+     nv_drm_atomic_state_base_t *state;
+     struct drm_plane_state *plane_state;
+     struct drm_plane *plane;
+     struct nv_drm_plane_state *nv_drm_plane_state;
+     struct drm_modeset_acquire_ctx ctx;
+     int ret = 0;
+     bool do_reset = false;
+     NvU32 flags = 0;
+ 
+     state = nv_drm_atomic_state_base_alloc(dev);
+     if (!state)
+         return -ENOMEM;
+ 
+ #if defined(DRM_MODESET_ACQUIRE_INTERRUPTIBLE)
+     flags |= DRM_MODESET_ACQUIRE_INTERRUPTIBLE;
+ #endif
+     drm_modeset_acquire_init(&ctx, flags);
+     state->acquire_ctx = &ctx;
+ 
++retry:
++    do_reset = false;
+     nv_drm_for_each_plane(plane, dev) {
+         plane_state = drm_atomic_get_plane_state(state, plane);
+         if (IS_ERR(plane_state)) {
+             ret = PTR_ERR(plane_state);
+             goto out;
+         }
+ 
+         nv_drm_plane_state = to_nv_drm_plane_state(plane_state);
+         if (nv_drm_plane_state) {
+             if (nv_drm_plane_state->input_colorspace != NV_DRM_INPUT_COLOR_SPACE_NONE) {
+                 nv_drm_plane_state->input_colorspace = NV_DRM_INPUT_COLOR_SPACE_NONE;
+                 do_reset = true;
+             }
+         }
+     }
+ 
+     if (do_reset) {
+         ret = drm_atomic_commit(state);
+     }
+ 
+ out:
++    if (ret == -EDEADLK) {
++        nv_drm_atomic_state_clear(state);
++        ret = drm_modeset_backoff(&ctx);
++        if (!ret)
++            goto retry;
++    }
+     nv_drm_atomic_state_base_put(state);
+     drm_modeset_drop_locks(&ctx);
+     drm_modeset_acquire_fini(&ctx);
+ 
+     return ret;
+ }
+ 
+ static
+ void nv_drm_master_drop(struct drm_device *dev, struct drm_file *file_priv)
+ {
+     struct nv_drm_device *nv_dev = to_nv_device(dev);
+ 
+     nv_drm_revoke_modeset_permission(dev, file_priv, 0);
+     nv_drm_revoke_sub_ownership(dev);
+ 
+     if (!nv_dev->hasFramebufferConsole) {
+         int err;
+ 
+         /*
+          * After dropping nvkms modeset onwership, it is not guaranteed that drm
+          * and nvkms modeset state will remain in sync.  Therefore, disable all
+          * outputs and crtcs before dropping nvkms modeset ownership.
+          *
+          * First disable all active outputs atomically and then disable each
+          * crtc one by one, there is not helper function available to disable

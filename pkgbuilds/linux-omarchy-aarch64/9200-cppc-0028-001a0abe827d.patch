@@ -1,0 +1,154 @@
+From 001a0abe827d77ba107bb58243a21a05e579283d Mon Sep 17 00:00:00 2001
+From: Sumit Gupta <sumitg@nvidia.com>
+Date: Tue, 10 Nov 2026 01:23:58 +0530
+Subject: [PATCH 28/34] ACPI: CPPC: Add ospm_nominal_perf support
+
+Expose the OSPM Nominal Performance register (ACPI 6.6, Section
+8.4.6.1.2.6), which conveys the nominal performance level at which the
+platform may run. Unlike the read-only Nominal Performance register, it
+is writable, so OSPM can ask for a nominal level below the
+platform-reported one, which then becomes the boundary between boosted
+and throttled operation.
+
+Add cppc_set_ospm_nominal_perf() to write the register. Per the spec,
+the value must lie in [Lowest Performance, Nominal Performance], which
+the caller is responsible for validating.
+
+Add cppc_ospm_nominal_perf_supported() to report whether the platform
+implements the register as writable, since a write-only register cannot
+be probed by reading it. It uses the same cpc_is_writable() test as the
+setter, so support is never reported for a register that a write would
+reject, and takes cpc_desc_lock while looking the descriptor up.
+
+Add the register to the writable set that the SystemMemory overlap
+validation uses, as the driver now writes it and can compete with
+another control sharing an access unit.
+
+If the register shares an access unit with Performance Limited, it is
+not used, since a write could overwrite the status bits. The register
+is write-only and its readback is undefined, so keep its range reserved
+rather than dropping it. The validation then still rejects another
+field that reads or rewrites these bits.
+
+Reviewed-by: Christian Loehle <christian.loehle@arm.com>
+Signed-off-by: Sumit Gupta <sumitg@nvidia.com>
+Link: https://patch.msgid.link/20261109195400.3600561-2-sumitg@nvidia.com
+Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+(cherry picked from commit 697bcc5b7c3c1289268ca034b020338757f36a2f linux-next)
+Signed-off-by: Jamie Nguyen <jamien@nvidia.com>
+---
+ drivers/acpi/cppc_acpi.c | 56 ++++++++++++++++++++++++++++++++++++++++
+ include/acpi/cppc_acpi.h | 10 +++++++
+ 2 files changed, 66 insertions(+)
+
+diff --git a/drivers/acpi/cppc_acpi.c b/drivers/acpi/cppc_acpi.c
+index 5a1f84fddb7fe..7bf7a4895ea9f 100644
+--- a/drivers/acpi/cppc_acpi.c
++++ b/drivers/acpi/cppc_acpi.c
+@@ -463,6 +463,7 @@ static bool cpc_reg_is_writable(unsigned int reg_idx)
+ 	case AUTO_SEL_ENABLE:
+ 	case AUTO_ACT_WINDOW:
+ 	case ENERGY_PERF:
++	case OSPM_NOMINAL_PERF:
+ 		return true;
+ 	default:
+ 		return false;
+@@ -1193,7 +1194,19 @@ static bool cpc_disable_new_sysmem_writer(struct cpc_desc *cpc_desc,
+ 
+ 	pr_warn_once("CPU%d: ignoring optional _CPC register %u sharing CPU%d Performance Limited access unit\n",
+ 		     cpc_desc->cpu_id, reg_idx, status_cpu);
++
++	/*
++	 * Keep a write-only range reserved. Its readback is undefined, so the
++	 * overlap checks must still reject another field that reads these bits
++	 * or writes them back through read-modify-write.
++	 */
++	if (cpc_reg_is_write_only(cpc_desc, reg_idx)) {
++		reg->cpc_entry.read_unsupported = true;
++		reg->cpc_entry.write_unsupported = true;
++		return false;
++	}
+ 	cpc_disable_reg(cpc_desc, reg_idx);
++
+ 	return true;
+ }
+ 
+@@ -3232,6 +3245,49 @@ int cppc_set_epp(int cpu, u64 epp_val)
+ }
+ EXPORT_SYMBOL_GPL(cppc_set_epp);
+ 
++/**
++ * cppc_set_ospm_nominal_perf() - Write OSPM Nominal Performance register.
++ * @cpu: CPU on which to write register.
++ * @ospm_nominal_perf: Value to write to the OSPM Nominal Performance register.
++ *
++ * OSPM Nominal Performance conveys the desired nominal performance level
++ * at which the platform may run. Per ACPI 6.6, s8.4.6.1.2.6, the value
++ * must lie within [Lowest Performance, Nominal Performance] and may be
++ * set independently of Minimum, Maximum and Desired performance. The
++ * caller is responsible for validating the range.
++ *
++ * Return: 0 on success, -EOPNOTSUPP if the platform does not implement the
++ * register as writable, or another negative error code.
++ */
++int cppc_set_ospm_nominal_perf(int cpu, u64 ospm_nominal_perf)
++{
++	return cppc_set_reg_val(cpu, OSPM_NOMINAL_PERF, ospm_nominal_perf);
++}
++EXPORT_SYMBOL_GPL(cppc_set_ospm_nominal_perf);
++
++/**
++ * cppc_ospm_nominal_perf_supported() - Check OSPM Nominal Performance support.
++ * @cpu: CPU to query.
++ *
++ * The OSPM Nominal Performance register is write-only, so its value
++ * cannot be read back. This only reports whether the platform implements
++ * it as a writable register.
++ *
++ * Context: Process context.
++ * Return: true if the register is supported, false otherwise.
++ */
++bool cppc_ospm_nominal_perf_supported(int cpu)
++{
++	struct cpc_desc *cpc_desc;
++
++	guard(mutex)(&cpc_desc_lock);
++	cpc_desc = per_cpu(cpc_desc_ptr, cpu);
++
++	return cpc_desc &&
++	       cpc_is_writable(&cpc_desc->cpc_regs[OSPM_NOMINAL_PERF]);
++}
++EXPORT_SYMBOL_GPL(cppc_ospm_nominal_perf_supported);
++
+ /**
+  * cppc_get_auto_act_window() - Read autonomous activity window register.
+  * @cpu: CPU from which to read register.
+diff --git a/include/acpi/cppc_acpi.h b/include/acpi/cppc_acpi.h
+index a5545fd3f8bdc..2cec54b4d2e28 100644
+--- a/include/acpi/cppc_acpi.h
++++ b/include/acpi/cppc_acpi.h
+@@ -195,6 +195,8 @@ extern int cpc_write_ffh(int cpunum, struct cpc_reg *reg, u64 val);
+ extern int cppc_get_epp_perf(int cpunum, u64 *epp_perf);
+ extern int cppc_set_epp_perf(int cpu, struct cppc_perf_ctrls *perf_ctrls, bool enable);
+ extern int cppc_set_epp(int cpu, u64 epp_val);
++extern int cppc_set_ospm_nominal_perf(int cpu, u64 ospm_nominal_perf);
++extern bool cppc_ospm_nominal_perf_supported(int cpu);
+ extern int cppc_get_auto_act_window(int cpu, u64 *auto_act_window);
+ extern int cppc_set_auto_act_window(int cpu, u64 auto_act_window);
+ extern int cppc_get_auto_sel(int cpu, u64 *enable);
+@@ -290,6 +292,14 @@ static inline int cppc_set_epp(int cpu, u64 epp_val)
+ {
+ 	return -EOPNOTSUPP;
+ }
++static inline int cppc_set_ospm_nominal_perf(int cpu, u64 ospm_nominal_perf)
++{
++	return -EOPNOTSUPP;
++}
++static inline bool cppc_ospm_nominal_perf_supported(int cpu)
++{
++	return false;
++}
+ static inline int cppc_get_auto_act_window(int cpu, u64 *auto_act_window)
+ {
+ 	return -EOPNOTSUPP;
+

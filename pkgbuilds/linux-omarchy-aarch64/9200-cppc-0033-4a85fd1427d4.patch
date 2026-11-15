@@ -1,0 +1,240 @@
+From 4a85fd1427d4c830ddb01652fea625b22b3867ab Mon Sep 17 00:00:00 2001
+From: Sumit Gupta <sumitg@nvidia.com>
+Date: Thu, 12 Nov 2026 13:34:42 +0530
+Subject: [PATCH 33/34] cpufreq: CPPC: Add autonomous mode boot parameter
+ support
+
+Configuring autonomous selection and Energy Performance Preference (EPP)
+at every boot currently requires per-policy sysfs writes.
+
+Add the 'cppc_cpufreq.auto_sel_mode' boot parameter to enable autonomous
+selection during policy initialization and optionally set EPP. In
+autonomous mode, the platform selects the performance level within the
+MIN and MAX limits, which the driver sets from the policy limits. The EPP
+hint guides that selection.
+
+The parameter accepts:
+- performance: enable autonomous selection and set EPP to 0x00
+- balance_performance: enable it and set EPP to 0x80
+- balance_power: enable it and set EPP to 0xc0
+- power: enable it and set EPP to 0xff
+- default_epp: enable it and preserve firmware EPP
+- disabled: preserve the firmware configuration (default)
+
+Warn about unrecognized values and ignore them.
+
+Skip policies without autonomous-selection support. The driver enables
+autonomous selection before writing EPP, as the platform may ignore EPP
+while autonomous selection is disabled.
+
+Record successful writes so the existing online and resume paths reapply
+the requested values. The offline and suspend paths restore the saved
+firmware values, including during driver unload.
+
+Signed-off-by: Sumit Gupta <sumitg@nvidia.com>
+Link: https://patch.msgid.link/20261112080442.4007723-1-sumitg@nvidia.com
+Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+(cherry picked from commit f69bf9e54e117a0ec0cd38525b12911dba73d8ff linux-pm)
+Signed-off-by: Jamie Nguyen <jamien@nvidia.com>
+---
+ .../admin-guide/kernel-parameters.txt         |  26 ++++
+ drivers/cpufreq/cppc_cpufreq.c                | 120 ++++++++++++++++++
+ include/acpi/cppc_acpi.h                      |   2 +
+ 3 files changed, 148 insertions(+)
+
+diff --git a/Documentation/admin-guide/kernel-parameters.txt b/Documentation/admin-guide/kernel-parameters.txt
+index b1ee9b34fe8fb..56a71dffb5f6a 100644
+--- a/Documentation/admin-guide/kernel-parameters.txt
++++ b/Documentation/admin-guide/kernel-parameters.txt
+@@ -1014,6 +1014,32 @@ Kernel parameters
+ 			Format:
+ 			<first_slot>,<last_slot>,<port>,<enum_bit>[,<debug>]
+ 
++	cppc_cpufreq.auto_sel_mode=
++			[ACPI,CPU_FREQ] Enable ACPI CPPC autonomous performance
++			selection on all CPUs at boot. In autonomous mode, the
++			platform selects the performance level within the CPPC
++			Minimum and Maximum Performance limits. The driver sets
++			these limits from scaling_min_freq and scaling_max_freq.
++			The Energy Performance Preference (EPP) hint guides the
++			platform toward performance (0x00) or energy efficiency
++			(0xff).
++			Requires the ACPI CPPC Autonomous Selection Enable
++			register. EPP is set only if the platform implements it.
++			Format: <string>
++			  performance:
++				  enable autonomous selection, set EPP to 0x00
++			  balance_performance:
++				  enable autonomous selection, set EPP to 0x80
++			  balance_power:
++				  enable autonomous selection, set EPP to 0xc0
++			  power:
++				  enable autonomous selection, set EPP to 0xff
++			  default_epp:
++				  enable autonomous selection, keep firmware EPP
++			  disabled:
++				  keep the firmware configuration (default)
++			An unrecognized value is ignored with a warning.
++
+ 	cpuidle.off=1	[CPU_IDLE]
+ 			disable the cpuidle sub-system
+ 
+diff --git a/drivers/cpufreq/cppc_cpufreq.c b/drivers/cpufreq/cppc_cpufreq.c
+index 8371f0a612ad3..3762b0d0ce8d3 100644
+--- a/drivers/cpufreq/cppc_cpufreq.c
++++ b/drivers/cpufreq/cppc_cpufreq.c
+@@ -238,6 +238,58 @@ static void cppc_cpufreq_apply_saved_regs(struct cpufreq_policy *policy,
+ 					     saved_type);
+ }
+ 
++/* Autonomous Selection boot parameter modes */
++enum {
++	AUTO_SEL_MODE_DISABLED,
++	AUTO_SEL_MODE_PERFORMANCE,
++	AUTO_SEL_MODE_BALANCE_PERFORMANCE,
++	AUTO_SEL_MODE_BALANCE_POWER,
++	AUTO_SEL_MODE_POWER,
++	AUTO_SEL_MODE_DEFAULT_EPP,
++};
++
++static const char * const auto_sel_mode_names[] = {
++	[AUTO_SEL_MODE_DISABLED]		= "disabled",
++	[AUTO_SEL_MODE_PERFORMANCE]		= "performance",
++	[AUTO_SEL_MODE_BALANCE_PERFORMANCE]	= "balance_performance",
++	[AUTO_SEL_MODE_BALANCE_POWER]		= "balance_power",
++	[AUTO_SEL_MODE_POWER]			= "power",
++	[AUTO_SEL_MODE_DEFAULT_EPP]		= "default_epp",
++};
++
++static int auto_sel_mode;
++
++static int auto_sel_mode_set(const char *val, const struct kernel_param *kp)
++{
++	int *mode = kp->arg;
++	int ret;
++
++	ret = sysfs_match_string(auto_sel_mode_names, val);
++	if (ret < 0) {
++		pr_warn("Invalid auto_sel_mode \"%s\", ignoring it\n", val);
++		return 0;
++	}
++
++	*mode = ret;
++	return 0;
++}
++
++static int auto_sel_mode_get(char *buffer, const struct kernel_param *kp)
++{
++	int *mode = kp->arg;
++
++	return sysfs_emit(buffer, "%s\n", auto_sel_mode_names[*mode]);
++}
++
++static const struct kernel_param_ops auto_sel_mode_ops = {
++	.set = auto_sel_mode_set,
++	.get = auto_sel_mode_get,
++};
++
++module_param_cb(auto_sel_mode, &auto_sel_mode_ops, &auto_sel_mode, 0444);
++MODULE_PARM_DESC(auto_sel_mode,
++		 "Autonomous selection mode: performance, balance_performance, balance_power, power, default_epp, disabled");
++
+ #ifdef CONFIG_ACPI_CPPC_CPUFREQ_FIE
+ static enum {
+ 	FIE_UNSET = -1,
+@@ -939,6 +991,72 @@ static u32 cppc_cpufreq_effective_nominal(struct cpufreq_policy *policy)
+ 	return (u32)ospm_nominal;
+ }
+ 
++/*
++ * Apply the auto_sel_mode boot parameter in init(). Enable autonomous
++ * selection unless it is already enabled. Then set EPP for the selected mode.
++ *
++ * Enable auto_sel before writing EPP, as the platform may ignore EPP while
++ * autonomous selection is disabled. Save each value written, so that online()
++ * and resume() write it again.
++ */
++static void cppc_cpufreq_setup_auto_sel_mode(struct cpufreq_policy *policy)
++{
++	struct cppc_policy_state *st = cppc_cpufreq_policy_state(policy);
++	struct cppc_cpudata *cpu_data = policy->driver_data;
++	unsigned int cpu = policy->cpu;
++	u64 auto_sel, epp;
++	int ret;
++
++	if (auto_sel_mode == AUTO_SEL_MODE_DISABLED)
++		return;
++
++	/* U64_MAX means the platform does not implement the register. */
++	auto_sel = st->regs[CPPC_SAVED_AUTO_SEL][CPPC_SAVED_FIRMWARE];
++	if (auto_sel == U64_MAX) {
++		pr_info_once("Autonomous selection is not supported, ignoring auto_sel_mode\n");
++		return;
++	}
++
++	if (!auto_sel) {
++		ret = cppc_set_auto_sel(cpu, true);
++		if (ret) {
++			pr_warn("Failed to enable auto_sel for CPU%u (%d)\n",
++				cpu, ret);
++			return;
++		}
++		cppc_cpufreq_save_requested(policy, CPPC_SAVED_AUTO_SEL, true);
++	}
++	cpu_data->perf_ctrls.auto_sel = true;
++
++	switch (auto_sel_mode) {
++	case AUTO_SEL_MODE_PERFORMANCE:
++		epp = CPPC_EPP_PERFORMANCE_PREF;
++		break;
++	case AUTO_SEL_MODE_BALANCE_PERFORMANCE:
++		epp = CPPC_EPP_BALANCE_PERFORMANCE_PREF;
++		break;
++	case AUTO_SEL_MODE_BALANCE_POWER:
++		epp = CPPC_EPP_BALANCE_POWER_PREF;
++		break;
++	case AUTO_SEL_MODE_POWER:
++		epp = CPPC_EPP_ENERGY_EFFICIENCY_PREF;
++		break;
++	default:
++		/* default_epp keeps the EPP value set by firmware. */
++		return;
++	}
++
++	/* EPP is optional. */
++	ret = cppc_set_epp(cpu, epp);
++	if (ret) {
++		if (ret != -EOPNOTSUPP)
++			pr_warn("Failed to set EPP for CPU%u (%d)\n", cpu, ret);
++		return;
++	}
++	cpu_data->perf_ctrls.energy_perf = epp;
++	cppc_cpufreq_save_requested(policy, CPPC_SAVED_EPP, epp);
++}
++
+ static int cppc_cpufreq_cpu_init(struct cpufreq_policy *policy)
+ {
+ 	unsigned int cpu = policy->cpu;
+@@ -1051,6 +1169,8 @@ static int cppc_cpufreq_cpu_init(struct cpufreq_policy *policy)
+ 	cpu_data->perf_limits_valid = true;
+ 	policy->cur = cppc_perf_to_khz(caps, desired_perf);
+ 
++	cppc_cpufreq_setup_auto_sel_mode(policy);
++
+ 	cppc_cpufreq_cpu_fie_init(policy);
+ 	return 0;
+ 
+diff --git a/include/acpi/cppc_acpi.h b/include/acpi/cppc_acpi.h
+index 2cec54b4d2e28..3d47c07f494ba 100644
+--- a/include/acpi/cppc_acpi.h
++++ b/include/acpi/cppc_acpi.h
+@@ -42,6 +42,8 @@
+ #define CPPC_AUTO_ACT_WINDOW_SIG_CARRY_THRESH 129
+ 
+ #define CPPC_EPP_PERFORMANCE_PREF		0x00
++#define CPPC_EPP_BALANCE_PERFORMANCE_PREF	0x80
++#define CPPC_EPP_BALANCE_POWER_PREF		0xC0
+ #define CPPC_EPP_ENERGY_EFFICIENCY_PREF		0xFF
+ 
+ #define CPPC_PERF_LIMITED_DESIRED_EXCURSION	BIT(0)
+
