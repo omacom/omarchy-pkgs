@@ -26,7 +26,7 @@ Windows Update hands out short-lived links only, so a `wu://` source names the u
 | `qcom/x1p42100/LENOVO/83HL/qcadsp8380.mbn` | `fd71bd1a2d8224ca58c9f5aee6ad14f151a093dfbee792169b64745c86e51a29` | Qualcomm Audio DSP Subsystem extension 2.0.7800.0002 for the 83HL (Windows Update 200.0.20.0), `qcadsp8380.mbn` |
 | `qcom/x1p42100/LENOVO/83HL/qccdsp8380.mbn` | `4387fa1a234aacbff50f8a215b96536d17c4b25b6b798392e15a162e4adcd7a0` | Qualcomm Compute DSP Subsystem extension 30.0.0140.1000 for the 83HL (Windows Update 200.0.20.0), `qccdsp8380.mbn` |
 | `qcom/x1p42100/LENOVO/83HL/qcdxkmsucpurwa.mbn` | `23788d4891403545c6d28cf09d97c5f6e81d9aed9d5f155c21fc8b39d03ef2a7` | Qualcomm Adreno graphics driver 31.0.98.1 for the 83HL (Windows Update 200.0.20.0), `qcdxkmsucpurwa.mbn` |
-| `qcom/x1p42100/LENOVO/83HL/qcvss8380.mbn` | `52d91d02e7470b615999208981877dc83d5450107122542e9780fa951303dd6a` | Qualcomm Adreno graphics driver 31.0.98.1 for the 83HL (Windows Update 200.0.20.0), `qcvss8380.mbn` |
+| `qcom/x1p42100/LENOVO/83HL/qcvss8380_pa.mbn` | `d153ae5029a19d734c9ff3149906abcddc93763ea493d1827974d61bac324bd3` | Qualcomm Adreno graphics driver 31.0.98.1 for the 83HL (Windows Update 200.0.20.0), `qcvss8380_pa.mbn` |
 
 ## How Omarchy installs it
 
