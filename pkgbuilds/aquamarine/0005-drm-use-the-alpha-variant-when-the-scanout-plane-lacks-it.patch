@@ -19,7 +19,7 @@ index 8558e2e..3d1166b 100644
  install(TARGETS aquamarine)
  install(DIRECTORY "include/aquamarine" DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 diff --git a/src/allocator/GBM.cpp b/src/allocator/GBM.cpp
-index 6f596b7..340d41f 100644
+index 6f596b7..6bade96 100644
 --- a/src/allocator/GBM.cpp
 +++ b/src/allocator/GBM.cpp
 @@ -4,6 +4,7 @@
@@ -44,66 +44,8 @@ index 6f596b7..340d41f 100644
      bool foundFormat = false;
      // check if we can use modifiers. If the requested support has any explicit modifier
      // supported by the primary backend, we can.
-@@ -145,12 +153,9 @@ Aquamarine::CGBMBuffer::CGBMBuffer(const SAllocatorBufferParams& params, Hypruti
-     if (MULTIGPU && !forceLinearBlit) {
-         // Try to use the linear format if available for cross-GPU compatibility.
-         // However, Nvidia doesn't support linear, so this is a best-effort basis.
--        for (auto const& f : FORMATS) {
--            if (f.drmFormat == DRM_FORMAT_MOD_LINEAR) {
--                allocator->backend->log(AQ_LOG_DEBUG, "GBM: Buffer is marked as multigpu, using linear format");
--                explicitModifiers = {DRM_FORMAT_MOD_LINEAR};
--                break;
--            }
-+        if (std::ranges::find(explicitModifiers, DRM_FORMAT_MOD_LINEAR) != explicitModifiers.end()) {
-+            allocator->backend->log(AQ_LOG_DEBUG, "GBM: Buffer is marked as multigpu, using linear format");
-+            explicitModifiers = {DRM_FORMAT_MOD_LINEAR};
-         }
-     } else if (MULTIGPU && forceLinearBlit) {
-         // FIXME: Nvidia cannot render to linear buffers. What do?
-@@ -200,21 +205,19 @@ Aquamarine::CGBMBuffer::CGBMBuffer(const SAllocatorBufferParams& params, Hypruti
-         }
-     }
- 
--    if (MULTIGPU && forceLinearBlit) {
--        // FIXME: most likely nvidia main gpu on multigpu
--        if (!bo) {
--            if (oldMods.empty())
--                bo = gbm_bo_create(allocator->gbmDevice, attrs.size.x, attrs.size.y, attrs.format, GBM_BO_USE_RENDERING);
--            else
--                bo = gbm_bo_create_with_modifiers(allocator->gbmDevice, attrs.size.x, attrs.size.y, attrs.format, oldMods.data(), oldMods.size());
--
--            if (!bo) {
--                allocator->backend->log(AQ_LOG_ERROR, "GBM: Failed to allocate a GBM buffer: bo null");
--                return;
--            }
-+    // FIXME: most likely nvidia main gpu on multigpu
-+    if (MULTIGPU && !bo) {
-+        if (oldMods.empty())
-+            bo = gbm_bo_create(allocator->gbmDevice, attrs.size.x, attrs.size.y, attrs.format, GBM_BO_USE_RENDERING);
-+        else
-+            bo = gbm_bo_create_with_modifiers(allocator->gbmDevice, attrs.size.x, attrs.size.y, attrs.format, oldMods.data(), oldMods.size());
- 
--            modifier = gbm_bo_get_modifier(bo);
-+        if (!bo) {
-+            allocator->backend->log(AQ_LOG_ERROR, "GBM: Failed to allocate a GBM buffer: bo null");
-+            return;
-         }
-+
-+        modifier = gbm_bo_get_modifier(bo);
-     }
- 
-     if (!bo) {
-@@ -284,7 +287,7 @@ bool Aquamarine::CGBMBuffer::isSynchronous() {
- }
- 
- bool Aquamarine::CGBMBuffer::good() {
--    return bo;
-+    return bo && attrs.success;
- }
- 
- SDMABUFAttrs Aquamarine::CGBMBuffer::dmabuf() {
 diff --git a/src/backend/drm/DRM.cpp b/src/backend/drm/DRM.cpp
-index 754e9c4..a42bd8f 100644
+index 754e9c4..d39b233 100644
 --- a/src/backend/drm/DRM.cpp
 +++ b/src/backend/drm/DRM.cpp
 @@ -35,6 +35,7 @@ extern "C" {
@@ -114,33 +56,7 @@ index 754e9c4..a42bd8f 100644
  #include "Shared.hpp"
  #include "hwdata.hpp"
  #include "Renderer.hpp"
-@@ -1965,7 +1966,7 @@ IOutput::SParsedEDID Aquamarine::SDRMConnector::parseEDID(std::vector<uint8_t> d
-         TRACE(backend->backend->log(AQ_LOG_TRACE,
-                                     std::format("EDID: chromaticity coords {},{} {},{} {},{} {},{}", parsed.chromaticityCoords->red.x, parsed.chromaticityCoords->red.y,
-                                                 parsed.chromaticityCoords->green.x, parsed.chromaticityCoords->green.y, parsed.chromaticityCoords->blue.x,
--                                                parsed.chromaticityCoords->blue.y, parsed.chromaticityCoords->white.y, parsed.chromaticityCoords->white.y)));
-+                                                parsed.chromaticityCoords->blue.y, parsed.chromaticityCoords->white.x, parsed.chromaticityCoords->white.y)));
-     }
- 
-     const auto* hdr_static_metadata = di_info_get_hdr_static_metadata(info);
-@@ -2271,6 +2272,7 @@ void Aquamarine::SDRMConnector::applyCommit(SDRMConnectorCommitData& data) {
-         auto bk = backend.lock();
-         if (bk) {
-             bk->backend->log(AQ_LOG_DEBUG, std::format("drm: Connector {} enabledState changed {} -> {}", szName, wasEnabled, output->enabledState));
-+            bk->recheckCRTCs();
-             auto weak = bk->self;
-             bk->backend->addIdleEvent(makeShared<std::function<void(void)>>([weak] {
-                 auto b = weak.lock();
-@@ -2375,8 +2377,6 @@ bool Aquamarine::CDRMOutput::commit() {
-     const auto QUEUE_KEY = connector->crtc->id;
-     if (pendingAsyncCommit)
-         backend->cancelAsyncOutput(this, true);
--    if (pendingAsyncCommit)
--        return false;
-     if (!backend->pauseCommitQueue(QUEUE_KEY))
-         return false;
-     CScopeGuard resume([this, QUEUE_KEY] { backend->resumeCommitQueue(QUEUE_KEY); });
-@@ -2562,9 +2562,11 @@ bool Aquamarine::CDRMOutput::commitState(bool onlyTest) {
+@@ -2562,9 +2563,11 @@ bool Aquamarine::CDRMOutput::commitState(bool onlyTest) {
  
      if (COMMITTED & COutputState::eOutputStateProperties::AQ_OUTPUT_STATE_FORMAT) {
          // verify the format is valid for the primary plane
@@ -155,7 +71,7 @@ index 754e9c4..a42bd8f 100644
                  ok = true;
                  break;
              }
-@@ -2784,7 +2786,8 @@ bool Aquamarine::CDRMOutput::commitState(bool onlyTest) {
+@@ -2784,7 +2787,8 @@ bool Aquamarine::CDRMOutput::commitState(bool onlyTest) {
      // sometimes, our consumer could f up the swapchain format and change it without the state changing
      bool formatMismatch = false;
      if (data.mainFB) {
@@ -165,7 +81,7 @@ index 754e9c4..a42bd8f 100644
              // formats mismatch. Update the state format and roll with it
              backend->backend->log(AQ_LOG_WARNING,
                                    std::format("drm: Formats mismatch in commit, buffer is {} but output is set to {}. Modesetting to {}", fourccToName(params.format),
-@@ -3184,7 +3187,7 @@ Aquamarine::IOutput::SCommitSubmission Aquamarine::CDRMOutput::commitAsync(const
+@@ -3184,7 +3188,7 @@ Aquamarine::IOutput::SCommitSubmission Aquamarine::CDRMOutput::commitAsync(const
  
      const auto MAIN_BUFFER = data.mainFB ? data.mainFB->buffer.lock() : nullptr;
      const auto ATTRS       = MAIN_BUFFER ? MAIN_BUFFER->dmabuf() : SDMABUFAttrs{};
