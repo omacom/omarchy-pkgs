@@ -1,0 +1,117 @@
+diff --git a/drivers/usb/typec/ucsi/ucsi.c b/drivers/usb/typec/ucsi/ucsi.c
+--- a/drivers/usb/typec/ucsi/ucsi.c
++++ b/drivers/usb/typec/ucsi/ucsi.c
+@@ -37,6 +37,8 @@
+  */
+ #define UCSI_SWAP_TIMEOUT_MS	5000
+ 
++#define UCSI_POLL_INTERVAL_MS	1000
++
+ void ucsi_notify_common(struct ucsi *ucsi, u32 cci)
+ {
+ 	/* Ignore bogus data in CCI if busy indicator is set. */
+@@ -67,6 +69,8 @@ int ucsi_sync_control_common(struct ucsi *ucsi, u64 command, u32 *cci,
+ 			     size_t msg_out_size)
+ {
+ 	bool ack = UCSI_COMMAND(command) == UCSI_ACK_CC_CI;
++	unsigned int interval = UCSI_TIMEOUT_MS;
++	unsigned long tmo;
+ 	int ret;
+ 
+ 	if (ack)
+@@ -91,28 +95,38 @@ int ucsi_sync_control_common(struct ucsi *ucsi, u64 command, u32 *cci,
+ 	if (ret)
+ 		goto out_clear_bit;
+ 
+-	if (!wait_for_completion_timeout(&ucsi->complete,
+-					 msecs_to_jiffies(UCSI_TIMEOUT_MS))) {
++	if (ucsi->quirks & UCSI_EARLY_CCI_POLL)
++		interval = UCSI_POLL_INTERVAL_MS;
++
++	tmo = jiffies + msecs_to_jiffies(UCSI_TIMEOUT_MS);
++
++	while (!wait_for_completion_timeout(&ucsi->complete,
++					    msecs_to_jiffies(interval))) {
+ 		u32 polled_cci = 0;
+ 
+ 		/*
+-		 * Notification from EC did not arrive.  Poll once to check
++		 * Notification from EC did not arrive.  Poll to check
+ 		 * whether the PPM actually finished without firing a notify.
+ 		 * If poll_cci() is missing or fails, polled_cci stays 0 and we
+-		 * correctly report -ETIMEDOUT below.
++		 * report -ETIMEDOUT once UCSI_TIMEOUT_MS has passed.
+ 		 */
+ 		if (ucsi->ops->poll_cci)
+ 			ucsi->ops->poll_cci(ucsi, &polled_cci);
+ 
+ 		/*
+-		 * If the relevant completion bit is not set, the EC has not
+-		 * completed the command; report the timeout.  Otherwise fall
+-		 * through to out_clear_bit, which reads CCI+data normally,
+-		 * and ucsi_run_command() will issue ACK_CC_CI as usual.
++		 * If the relevant completion bit is set, the EC completed the
++		 * command; go on to out_clear_bit, which reads CCI+data
++		 * normally, and ucsi_run_command() will issue ACK_CC_CI as
++		 * usual.
+ 		 */
+-		if (!((ack && (polled_cci & UCSI_CCI_ACK_COMPLETE)) ||
+-		      (!ack && (polled_cci & UCSI_CCI_COMMAND_COMPLETE))))
++		if ((ack && (polled_cci & UCSI_CCI_ACK_COMPLETE)) ||
++		    (!ack && (polled_cci & UCSI_CCI_COMMAND_COMPLETE)))
++			break;
++
++		if (time_after_eq(jiffies, tmo)) {
+ 			ret = -ETIMEDOUT;
++			break;
++		}
+ 	}
+ 
+ out_clear_bit:
+diff --git a/drivers/usb/typec/ucsi/ucsi.h b/drivers/usb/typec/ucsi/ucsi.h
+--- a/drivers/usb/typec/ucsi/ucsi.h
++++ b/drivers/usb/typec/ucsi/ucsi.h
+@@ -510,6 +510,7 @@ struct ucsi {
+ 
+ /* USB4 connection can imply that USB communcation is supported */
+ #define UCSI_USB4_IMPLIES_USB	BIT(2)
++#define UCSI_EARLY_CCI_POLL	BIT(3)
+ };
+ 
+ #define UCSI_MAX_DATA_LENGTH(u) (((u)->version < UCSI_VERSION_2_0) ? 0x10 : 0xff)
+diff --git a/drivers/usb/typec/ucsi/ucsi_acpi.c b/drivers/usb/typec/ucsi/ucsi_acpi.c
+--- a/drivers/usb/typec/ucsi/ucsi_acpi.c
++++ b/drivers/usb/typec/ucsi/ucsi_acpi.c
+@@ -207,6 +207,22 @@ static const struct dmi_system_id ucsi_acpi_quirks[] = {
+ 	{ }
+ };
+ 
++static const struct dmi_system_id ucsi_acpi_early_cci_poll[] = {
++	{
++		.matches = {
++			DMI_MATCH(DMI_SYS_VENDOR, "Dell Inc."),
++			DMI_MATCH(DMI_PRODUCT_NAME, "XPS 14 DA14260"),
++		},
++	},
++	{
++		.matches = {
++			DMI_MATCH(DMI_SYS_VENDOR, "Dell Inc."),
++			DMI_MATCH(DMI_PRODUCT_NAME, "XPS 16 DA16260"),
++		},
++	},
++	{ }
++};
++
+ static void ucsi_acpi_notify(acpi_handle handle, u32 event, void *data)
+ {
+ 	struct ucsi_acpi *ua = data;
+@@ -263,6 +279,9 @@ static int ucsi_acpi_probe(struct platform_device *pdev)
+ 
+ 	ucsi_set_drvdata(ua->ucsi, ua);
+ 
++	if (dmi_check_system(ucsi_acpi_early_cci_poll))
++		ua->ucsi->quirks |= UCSI_EARLY_CCI_POLL;
++
+ 	status = acpi_install_notify_handler(ACPI_HANDLE(&pdev->dev),
+ 					     ACPI_DEVICE_NOTIFY,
+ 					     ucsi_acpi_notify, ua);

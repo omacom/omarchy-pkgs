@@ -1,0 +1,472 @@
+diff --git a/drivers/acpi/Kconfig b/drivers/acpi/Kconfig
+--- a/drivers/acpi/Kconfig
++++ b/drivers/acpi/Kconfig
+@@ -171,8 +171,12 @@ config ACPI_AC
+ 	  To compile this driver as a module, choose M here:
+ 	  the module will be called ac.
+ 
++config ACPI_BATTERY_HOOKS
++	tristate
++
+ config ACPI_BATTERY
+ 	tristate "Battery"
++	select ACPI_BATTERY_HOOKS
+ 	select POWER_SUPPLY
+ 	default y
+ 	help
+@@ -445,6 +449,7 @@ config ACPI_HOTPLUG_IOAPIC
+ config ACPI_SBS
+ 	tristate "Smart Battery System"
+ 	depends on X86 && ACPI_EC
++	select ACPI_BATTERY_HOOKS
+ 	select POWER_SUPPLY
+ 	help
+ 	  This driver supports the Smart Battery System, another
+diff --git a/drivers/acpi/Makefile b/drivers/acpi/Makefile
+--- a/drivers/acpi/Makefile
++++ b/drivers/acpi/Makefile
+@@ -97,6 +97,7 @@ obj-$(CONFIG_ACPI_NHLT)		+= nhlt.o
+ obj-$(CONFIG_ACPI_NUMA)		+= numa/
+ obj-$(CONFIG_ACPI)		+= acpi_memhotplug.o
+ obj-$(CONFIG_ACPI_HOTPLUG_IOAPIC) += ioapic.o
++obj-$(CONFIG_ACPI_BATTERY_HOOKS)	+= battery_hooks.o
+ obj-$(CONFIG_ACPI_BATTERY)	+= battery.o
+ obj-$(CONFIG_ACPI_SBS)		+= sbshc.o
+ obj-$(CONFIG_ACPI_SBS)		+= sbs.o
+diff --git a/drivers/acpi/battery.c b/drivers/acpi/battery.c
+--- a/drivers/acpi/battery.c
++++ b/drivers/acpi/battery.c
+@@ -48,6 +48,7 @@ MODULE_AUTHOR("Paul Diefenbaugh");
+ MODULE_AUTHOR("Alexey Starikovskiy <astarikovskiy@suse.de>");
+ MODULE_DESCRIPTION("ACPI Battery Driver");
+ MODULE_LICENSE("GPL");
++MODULE_IMPORT_NS("ACPI_BATTERY_HOOKS");
+ 
+ static int battery_bix_broken_package;
+ static int battery_notification_delay_ms;
+@@ -97,7 +98,7 @@ struct acpi_battery {
+ 	struct acpi_device *device;
+ 	struct device *phys_dev;
+ 	struct notifier_block pm_nb;
+-	struct list_head list;
++	struct acpi_battery_hooks_list_entry hooks_list_entry;
+ 	unsigned long flags;
+ 
+ 	struct mutex property_lock; /* Protects properties below. */
+@@ -723,164 +724,6 @@ static struct attribute *acpi_battery_attrs[] = {
+ };
+ ATTRIBUTE_GROUPS(acpi_battery);
+ 
+-/*
+- * The Battery Hooking API
+- *
+- * This API is used inside other drivers that need to expose
+- * platform-specific behaviour within the generic driver in a
+- * generic way.
+- *
+- */
+-
+-static LIST_HEAD(acpi_battery_list);
+-static LIST_HEAD(battery_hook_list);
+-static DEFINE_MUTEX(hook_mutex);
+-
+-static void acpi_battery_hook_unregister_unlocked(struct acpi_battery_hook *hook)
+-{
+-	struct acpi_battery *battery;
+-
+-	/*
+-	 * In order to remove a hook, we first need to
+-	 * de-register all the batteries that are registered.
+-	 */
+-	list_for_each_entry(battery, &acpi_battery_list, list) {
+-		if (!hook->remove_battery(battery->bat, hook))
+-			power_supply_changed(battery->bat);
+-	}
+-	list_del_init(&hook->list);
+-
+-	pr_info("hook unregistered: %s\n", hook->name);
+-}
+-
+-void acpi_battery_hook_unregister(struct acpi_battery_hook *hook)
+-{
+-	mutex_lock(&hook_mutex);
+-	/*
+-	 * Ignore already unregistered battery hooks. This might happen
+-	 * if a battery hook was previously unloaded due to an error when
+-	 * adding a new battery.
+-	 */
+-	if (!list_empty(&hook->list))
+-		acpi_battery_hook_unregister_unlocked(hook);
+-
+-	mutex_unlock(&hook_mutex);
+-}
+-EXPORT_SYMBOL_GPL(acpi_battery_hook_unregister);
+-
+-void acpi_battery_hook_register(struct acpi_battery_hook *hook)
+-{
+-	struct acpi_battery *battery;
+-
+-	mutex_lock(&hook_mutex);
+-	list_add(&hook->list, &battery_hook_list);
+-	/*
+-	 * Now that the driver is registered, we need
+-	 * to notify the hook that a battery is available
+-	 * for each battery, so that the driver may add
+-	 * its attributes.
+-	 */
+-	list_for_each_entry(battery, &acpi_battery_list, list) {
+-		if (hook->add_battery(battery->bat, hook)) {
+-			/*
+-			 * If a add-battery returns non-zero,
+-			 * the registration of the hook has failed,
+-			 * and we will not add it to the list of loaded
+-			 * hooks.
+-			 */
+-			pr_err("hook failed to load: %s", hook->name);
+-			acpi_battery_hook_unregister_unlocked(hook);
+-			goto end;
+-		}
+-
+-		power_supply_changed(battery->bat);
+-	}
+-	pr_info("new hook: %s\n", hook->name);
+-end:
+-	mutex_unlock(&hook_mutex);
+-}
+-EXPORT_SYMBOL_GPL(acpi_battery_hook_register);
+-
+-static void devm_acpi_battery_hook_unregister(void *data)
+-{
+-	struct acpi_battery_hook *hook = data;
+-
+-	acpi_battery_hook_unregister(hook);
+-}
+-
+-int devm_acpi_battery_hook_register(struct device *dev, struct acpi_battery_hook *hook)
+-{
+-	acpi_battery_hook_register(hook);
+-
+-	return devm_add_action_or_reset(dev, devm_acpi_battery_hook_unregister, hook);
+-}
+-EXPORT_SYMBOL_GPL(devm_acpi_battery_hook_register);
+-
+-/*
+- * This function gets called right after the battery sysfs
+- * attributes have been added, so that the drivers that
+- * define custom sysfs attributes can add their own.
+- */
+-static void battery_hook_add_battery(struct acpi_battery *battery)
+-{
+-	struct acpi_battery_hook *hook_node, *tmp;
+-
+-	mutex_lock(&hook_mutex);
+-	INIT_LIST_HEAD(&battery->list);
+-	list_add(&battery->list, &acpi_battery_list);
+-	/*
+-	 * Since we added a new battery to the list, we need to
+-	 * iterate over the hooks and call add_battery for each
+-	 * hook that was registered. This usually happens
+-	 * when a battery gets hotplugged or initialized
+-	 * during the battery module initialization.
+-	 */
+-	list_for_each_entry_safe(hook_node, tmp, &battery_hook_list, list) {
+-		if (hook_node->add_battery(battery->bat, hook_node)) {
+-			/*
+-			 * The notification of the hook has failed, to
+-			 * prevent further errors we will unload the hook.
+-			 */
+-			pr_err("error in hook, unloading: %s",
+-					hook_node->name);
+-			acpi_battery_hook_unregister_unlocked(hook_node);
+-		}
+-	}
+-	mutex_unlock(&hook_mutex);
+-}
+-
+-static void battery_hook_remove_battery(struct acpi_battery *battery)
+-{
+-	struct acpi_battery_hook *hook;
+-
+-	mutex_lock(&hook_mutex);
+-	/*
+-	 * Before removing the hook, we need to remove all
+-	 * custom attributes from the battery.
+-	 */
+-	list_for_each_entry(hook, &battery_hook_list, list) {
+-		hook->remove_battery(battery->bat, hook);
+-	}
+-	/* Then, just remove the battery from the list */
+-	list_del(&battery->list);
+-	mutex_unlock(&hook_mutex);
+-}
+-
+-static void __exit battery_hook_exit(void)
+-{
+-	struct acpi_battery_hook *hook;
+-	struct acpi_battery_hook *ptr;
+-	/*
+-	 * At this point, the acpi_bus_unregister_driver()
+-	 * has called remove for all batteries. We just
+-	 * need to remove the hooks.
+-	 */
+-	list_for_each_entry_safe(hook, ptr, &battery_hook_list, list) {
+-		acpi_battery_hook_unregister(hook);
+-	}
+-	mutex_destroy(&hook_mutex);
+-}
+-
+ static int sysfs_add_battery(struct acpi_battery *battery)
+ {
+ 	struct power_supply_config psy_cfg = {
+@@ -936,7 +779,7 @@ static int sysfs_add_battery(struct acpi_battery *battery)
+ 		battery->bat = NULL;
+ 		return result;
+ 	}
+-	battery_hook_add_battery(battery);
++	acpi_battery_add_hooks(&battery->hooks_list_entry, battery->bat);
+ 	return 0;
+ }
+ 
+@@ -945,7 +788,7 @@ static void sysfs_remove_battery(struct acpi_battery *battery)
+ 	if (!battery->bat)
+ 		return;
+ 
+-	battery_hook_remove_battery(battery);
++	acpi_battery_remove_hooks(&battery->hooks_list_entry);
+ 	power_supply_unregister(battery->bat);
+ 	battery->bat = NULL;
+ }
+@@ -1391,7 +1234,6 @@ static int __init acpi_battery_init(void)
+ static void __exit acpi_battery_exit(void)
+ {
+ 	platform_driver_unregister(&acpi_battery_driver);
+-	battery_hook_exit();
+ }
+ 
+ module_init(acpi_battery_init);
+diff --git a/drivers/acpi/battery_hooks.c b/drivers/acpi/battery_hooks.c
+new file mode 100644
+--- /dev/null
++++ b/drivers/acpi/battery_hooks.c
+@@ -0,0 +1,159 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * ACPI Battery Hooks
++ *
++ * Provides helpers for registering and unregistering battery hooks for
++ * drivers that use platform-specific extensions to ACPI-enumerated
++ * batteries (both ACPI Control Method batteries and Smart Battery System
++ * batteries).
++ */
++
++#define pr_fmt(fmt) "ACPI: battery: " fmt
++
++#include <linux/cleanup.h>
++#include <linux/device.h>
++#include <linux/export.h>
++#include <linux/list.h>
++#include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/power_supply.h>
++#include <acpi/battery.h>
++
++static LIST_HEAD(acpi_battery_list);
++static LIST_HEAD(battery_hook_list);
++static DEFINE_MUTEX(hook_mutex);
++
++static void acpi_battery_hook_unregister_unlocked(struct acpi_battery_hook *hook)
++{
++	struct acpi_battery_hooks_list_entry *entry;
++
++	/*
++	 * In order to remove a hook, we first need to
++	 * de-register all the batteries that are registered.
++	 */
++	list_for_each_entry(entry, &acpi_battery_list, list_entry) {
++		if (!hook->remove_battery(entry->battery, hook))
++			power_supply_changed(entry->battery);
++	}
++	list_del_init(&hook->list);
++
++	pr_info("hook unregistered: %s\n", hook->name);
++}
++
++void acpi_battery_hook_unregister(struct acpi_battery_hook *hook)
++{
++	guard(mutex)(&hook_mutex);
++
++	/*
++	 * Ignore already unregistered battery hooks. This might happen
++	 * if a battery hook was previously unloaded due to an error when
++	 * adding a new battery.
++	 */
++	if (!list_empty(&hook->list))
++		acpi_battery_hook_unregister_unlocked(hook);
++}
++EXPORT_SYMBOL_GPL(acpi_battery_hook_unregister);
++
++void acpi_battery_hook_register(struct acpi_battery_hook *hook)
++{
++	struct acpi_battery_hooks_list_entry *entry;
++
++	guard(mutex)(&hook_mutex);
++
++	list_add(&hook->list, &battery_hook_list);
++	/*
++	 * Now that the driver is registered, we need
++	 * to notify the hook that a battery is available
++	 * for each battery, so that the driver may add
++	 * its attributes.
++	 */
++	list_for_each_entry(entry, &acpi_battery_list, list_entry) {
++		if (hook->add_battery(entry->battery, hook)) {
++			/*
++			 * If a add-battery returns non-zero,
++			 * the registration of the hook has failed,
++			 * and we will not add it to the list of loaded
++			 * hooks.
++			 */
++			pr_err("hook failed to load: %s\n", hook->name);
++			acpi_battery_hook_unregister_unlocked(hook);
++			return;
++		}
++
++		power_supply_changed(entry->battery);
++	}
++	pr_info("new hook: %s\n", hook->name);
++}
++EXPORT_SYMBOL_GPL(acpi_battery_hook_register);
++
++static void devm_acpi_battery_hook_unregister(void *data)
++{
++	struct acpi_battery_hook *hook = data;
++
++	acpi_battery_hook_unregister(hook);
++}
++
++int devm_acpi_battery_hook_register(struct device *dev,
++				    struct acpi_battery_hook *hook)
++{
++	acpi_battery_hook_register(hook);
++
++	return devm_add_action_or_reset(dev, devm_acpi_battery_hook_unregister, hook);
++}
++EXPORT_SYMBOL_GPL(devm_acpi_battery_hook_register);
++
++/*
++ * This function gets called right after the battery sysfs
++ * attributes have been added, so that the drivers that
++ * define custom sysfs attributes can add their own.
++ */
++void acpi_battery_add_hooks(struct acpi_battery_hooks_list_entry *entry,
++			    struct power_supply *battery)
++{
++	struct acpi_battery_hook *hook_node, *tmp;
++
++	entry->battery = battery;
++
++	guard(mutex)(&hook_mutex);
++
++	list_add(&entry->list_entry, &acpi_battery_list);
++	/*
++	 * Since we added a new battery to the list, we need to
++	 * iterate over the hooks and call add_battery for each
++	 * hook that was registered. This usually happens
++	 * when a battery gets hotplugged or initialized
++	 * during the battery module initialization.
++	 */
++	list_for_each_entry_safe(hook_node, tmp, &battery_hook_list, list) {
++		if (hook_node->add_battery(entry->battery, hook_node)) {
++			/*
++			 * The notification of the hook has failed, to
++			 * prevent further errors we will unload the hook.
++			 */
++			pr_err("error in hook, unloading: %s\n", hook_node->name);
++			acpi_battery_hook_unregister_unlocked(hook_node);
++		}
++	}
++}
++EXPORT_SYMBOL_NS_GPL(acpi_battery_add_hooks, "ACPI_BATTERY_HOOKS");
++
++void acpi_battery_remove_hooks(struct acpi_battery_hooks_list_entry *entry)
++{
++	struct acpi_battery_hook *hook;
++
++	guard(mutex)(&hook_mutex);
++	/*
++	 * Before removing the hook, we need to remove all
++	 * custom attributes from the battery.
++	 */
++	list_for_each_entry(hook, &battery_hook_list, list)
++		hook->remove_battery(entry->battery, hook);
++
++	/* Then, just remove the battery from the list */
++	list_del(&entry->list_entry);
++	entry->battery = NULL;
++}
++EXPORT_SYMBOL_NS_GPL(acpi_battery_remove_hooks, "ACPI_BATTERY_HOOKS");
++
++MODULE_DESCRIPTION("ACPI battery hooks");
++MODULE_LICENSE("GPL");
+diff --git a/drivers/acpi/sbs.c b/drivers/acpi/sbs.c
+--- a/drivers/acpi/sbs.c
++++ b/drivers/acpi/sbs.c
+@@ -36,6 +36,7 @@
+ MODULE_AUTHOR("Alexey Starikovskiy <astarikovskiy@suse.de>");
+ MODULE_DESCRIPTION("Smart Battery System ACPI interface driver");
+ MODULE_LICENSE("GPL");
++MODULE_IMPORT_NS("ACPI_BATTERY_HOOKS");
+ 
+ static unsigned int cache_time = 1000;
+ module_param(cache_time, uint, 0644);
+@@ -54,6 +55,7 @@ struct acpi_battery {
+ 	struct power_supply *bat;
+ 	struct power_supply_desc bat_desc;
+ 	struct acpi_sbs *sbs;
++	struct acpi_battery_hooks_list_entry hooks_list_entry;
+ 	unsigned long update_time;
+ 	char name[8];
+ 	char manufacturer_name[ACPI_SBS_BLOCK_MAX];
+@@ -555,6 +557,8 @@ static int acpi_battery_add(struct acpi_sbs *sbs, int id)
+ 		goto end;
+ 	}
+ 
++	acpi_battery_add_hooks(&battery->hooks_list_entry, battery->bat);
++
+       end:
+ 	pr_info("%s [%s]: Battery Slot [%s] (battery %s)\n",
+ 	       ACPI_SBS_DEVICE_NAME, acpi_device_bid(sbs->device),
+@@ -566,8 +570,10 @@ static void acpi_battery_remove(struct acpi_sbs *sbs, int id)
+ {
+ 	struct acpi_battery *battery = &sbs->battery[id];
+ 
+-	if (battery->bat)
++	if (battery->bat) {
++		acpi_battery_remove_hooks(&battery->hooks_list_entry);
+ 		power_supply_unregister(battery->bat);
++	}
+ }
+ 
+ static int acpi_charger_add(struct acpi_sbs *sbs)
+diff --git a/include/acpi/battery.h b/include/acpi/battery.h
+--- a/include/acpi/battery.h
++++ b/include/acpi/battery.h
+@@ -18,9 +18,18 @@ struct acpi_battery_hook {
+ 	struct list_head list;
+ };
+ 
++struct acpi_battery_hooks_list_entry {
++	struct list_head list_entry;
++	struct power_supply *battery;
++};
++
+ void acpi_battery_hook_register(struct acpi_battery_hook *hook);
+ void acpi_battery_hook_unregister(struct acpi_battery_hook *hook);
+ int devm_acpi_battery_hook_register(struct device *dev,
+ 				    struct acpi_battery_hook *hook);
+ 
++void acpi_battery_add_hooks(struct acpi_battery_hooks_list_entry *entry,
++			    struct power_supply *battery);
++void acpi_battery_remove_hooks(struct acpi_battery_hooks_list_entry *entry);
++
+ #endif

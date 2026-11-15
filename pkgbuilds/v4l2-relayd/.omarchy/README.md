@@ -32,13 +32,11 @@ Updates `PKGBUILD` to:
 
 ## pkgrel
 
-`package.json` includes a `pkgrel` suffix/offset so users who already received Omarchy's previous `0.2.0-2` build will upgrade to `0.2.0-2.1`.
-
-The `pkgrel` metadata is automatically removed by `bin/sync-aur` when AUR moves to a new `pkgver`.
+The recipe's `pkgrel` carries a fractional part (`2.2`) so machines that received Omarchy's earlier `0.2.0-2` builds upgrade. The upstream watch resets it to `1` with the next upstream version.
 
 ## Testing
 
 ```bash
-bin/sync-aur v4l2-relayd
-bin/repo build --package v4l2-relayd
+bin/sync-upstream v4l2-relayd
+bin/build --package v4l2-relayd
 ```

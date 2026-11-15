@@ -1,0 +1,246 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Brandon Williams <turbine.bmw@gmail.com>
+Date: Sat, 29 Aug 2026 18:47:25 -0400
+Subject: [PATCH] Bluetooth: SMP: implement LE legacy out-of-band pairing
+
+LE legacy pairing can authenticate with a 128-bit TK supplied out of
+band, but only the Secure Connections OOB path was implemented. The
+entire OOB block in build_pairing_cmd() sits inside the SMP_FLAG_SC
+branch, so a legacy pairing never advertised OOB data, and tk_request()
+had no REQ_OOB case at all -- its remote_oob argument was passed a
+hardcoded zero by all three callers.
+
+mgmt already reserved the P-192 fields for this, rejecting non-zero
+values for LE addresses with the comment "as long as legacy SMP OOB
+isn't implemented". Carry the TK in the P-192 random field: unlike an
+SC OOB pair, a legacy TK is a bare value with no confirm, so allow a
+rand192 with no hash192 and mark such data present as P-192 only.
+
+Select REQ_OOB when both sides signal OOB and a TK is held for the peer,
+and record the resulting keys as authenticated, since out-of-band
+authentication provides MITM protection.
+
+Finally, do not request Secure Connections when the only out-of-band
+data held for a peer is a legacy TK. The TK cannot authenticate an SC
+pairing, so requesting SC would leave it unused and fall back to an
+association model the peer may refuse -- a real case for keyboards that
+report DisplayOnly and require MITM, where no passkey model is possible.
+
+This makes the Surface Pro 11 Flex Keyboard pair for detached Bluetooth
+use without keys imported from another operating system.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+Signed-off-by: Brandon Williams <turbine.bmw@gmail.com>
+---
+ net/bluetooth/hci_core.c | 12 +++--
+ net/bluetooth/mgmt.c     | 14 +++---
+ net/bluetooth/smp.c      | 96 ++++++++++++++++++++++++++++++++++++++--
+ 3 files changed, 111 insertions(+), 11 deletions(-)
+
+diff --git a/net/bluetooth/hci_core.c b/net/bluetooth/hci_core.c
+index aea017ee5b0a..75b33d95a362 100644
+--- a/net/bluetooth/hci_core.c
++++ b/net/bluetooth/hci_core.c
+@@ -1526,8 +1526,14 @@ int hci_add_remote_oob_data(struct hci_dev *hdev, bdaddr_t *bdaddr,
+ 		list_add(&data->list, &hdev->remote_oob_data);
+ 	}
+ 
+-	if (hash192 && rand192) {
+-		memcpy(data->hash192, hash192, sizeof(data->hash192));
++	if (rand192) {
++		/* An LE legacy OOB TK is a bare 128-bit value: it has no
++		 * confirm, so hash192 may legitimately be absent.
++		 */
++		if (hash192)
++			memcpy(data->hash192, hash192, sizeof(data->hash192));
++		else
++			memset(data->hash192, 0, sizeof(data->hash192));
+ 		memcpy(data->rand192, rand192, sizeof(data->rand192));
+ 		if (hash256 && rand256)
+ 			data->present = 0x03;
+@@ -1546,7 +1552,7 @@ int hci_add_remote_oob_data(struct hci_dev *hdev, bdaddr_t *bdaddr,
+ 	} else {
+ 		memset(data->hash256, 0, sizeof(data->hash256));
+ 		memset(data->rand256, 0, sizeof(data->rand256));
+-		if (hash192 && rand192)
++		if (rand192)
+ 			data->present = 0x01;
+ 	}
+ 
+diff --git a/net/bluetooth/mgmt.c b/net/bluetooth/mgmt.c
+index deced8a5bc2d..1de5d77aa7fb 100644
+--- a/net/bluetooth/mgmt.c
++++ b/net/bluetooth/mgmt.c
+@@ -5918,11 +5918,12 @@ static int add_remote_oob_data(struct sock *sk, struct hci_dev *hdev,
+ 		u8 status;
+ 
+ 		if (bdaddr_type_is_le(cp->addr.type)) {
+-			/* Enforce zero-valued 192-bit parameters as
+-			 * long as legacy SMP OOB isn't implemented.
++			/* LE legacy SMP OOB authenticates with a single
++			 * 128-bit TK, which has no confirm value. Carry it in
++			 * the P-192 random field and require the unused P-192
++			 * hash to stay zero.
+ 			 */
+-			if (memcmp(cp->rand192, ZERO_KEY, 16) ||
+-			    memcmp(cp->hash192, ZERO_KEY, 16)) {
++			if (memcmp(cp->hash192, ZERO_KEY, 16)) {
+ 				err = mgmt_cmd_complete(sk, hdev->id,
+ 							MGMT_OP_ADD_REMOTE_OOB_DATA,
+ 							MGMT_STATUS_INVALID_PARAMS,
+@@ -5930,8 +5931,11 @@ static int add_remote_oob_data(struct sock *sk, struct hci_dev *hdev,
+ 				goto unlock;
+ 			}
+ 
+-			rand192 = NULL;
+ 			hash192 = NULL;
++			if (memcmp(cp->rand192, ZERO_KEY, 16))
++				rand192 = cp->rand192;
++			else
++				rand192 = NULL;
+ 		} else {
+ 			/* In case one of the P-192 values is set to zero,
+ 			 * then just disable OOB data for P-192.
+diff --git a/net/bluetooth/smp.c b/net/bluetooth/smp.c
+index 853d02d4f07f..ce0c7427728f 100644
+--- a/net/bluetooth/smp.c
++++ b/net/bluetooth/smp.c
+@@ -646,6 +646,29 @@ static void build_pairing_cmd(struct l2cap_conn *conn,
+ 	if (hci_dev_test_flag(hdev, HCI_PRIVACY))
+ 		local_dist |= SMP_DIST_ID_KEY;
+ 
++	/* A legacy OOB TK can only authenticate a legacy pairing. When that is
++	 * the only out of band data held for this peer, do not ask for Secure
++	 * Connections: the TK would go unused and pairing would fall back to an
++	 * association model the peer may refuse.
++	 */
++	if (authreq & SMP_AUTH_SC) {
++		struct oob_data *oob_legacy;
++		u8 legacy_type;
++
++		if (hcon->dst_type == ADDR_LE_DEV_PUBLIC)
++			legacy_type = BDADDR_LE_PUBLIC;
++		else
++			legacy_type = BDADDR_LE_RANDOM;
++
++		mutex_lock(&hdev->remote_oob_lock);
++		oob_legacy = hci_find_remote_oob_data(hdev, &hcon->dst,
++						      legacy_type);
++		if (oob_legacy && (oob_legacy->present & 0x01) &&
++		    !(oob_legacy->present & 0x02))
++			authreq &= ~SMP_AUTH_SC;
++		mutex_unlock(&hdev->remote_oob_lock);
++	}
++
+ 	if (hci_dev_test_flag(hdev, HCI_SC_ENABLED) &&
+ 	    (authreq & SMP_AUTH_SC)) {
+ 		struct oob_data *oob_data;
+@@ -675,7 +698,30 @@ static void build_pairing_cmd(struct l2cap_conn *conn,
+ 		mutex_unlock(&hdev->remote_oob_lock);
+ 
+ 	} else {
++		struct oob_data *oob_data;
++		u8 bdaddr_type;
++
+ 		authreq &= ~SMP_AUTH_SC;
++
++		/* LE legacy pairing can also authenticate out of band, using a
++		 * single 128-bit TK rather than the Secure Connections
++		 * random/confirm pair. Carry that TK in the P-192 random field,
++		 * which mgmt has always reserved for this purpose.
++		 */
++		if (hcon->dst_type == ADDR_LE_DEV_PUBLIC)
++			bdaddr_type = BDADDR_LE_PUBLIC;
++		else
++			bdaddr_type = BDADDR_LE_RANDOM;
++
++		mutex_lock(&hdev->remote_oob_lock);
++		oob_data = hci_find_remote_oob_data(hdev, &hcon->dst,
++						    bdaddr_type);
++		if (oob_data && (oob_data->present & 0x01)) {
++			set_bit(SMP_FLAG_REMOTE_OOB, &smp->flags);
++			oob_flag = SMP_OOB_PRESENT;
++			SMP_DBG("OOB legacy TK available");
++		}
++		mutex_unlock(&hdev->remote_oob_lock);
+ 	}
+ 
+ 	if (rsp == NULL) {
+@@ -842,6 +888,47 @@ static int tk_request(struct l2cap_conn *conn, u8 remote_oob, u8 auth,
+ 	bt_dev_dbg(hcon->hdev, "auth:%u lcl:%u rem:%u", auth, local_io,
+ 		   remote_io);
+ 
++	/* LE legacy out of band: used only when both sides hold the same TK,
++	 * per the spec. The Secure Connections OOB path is handled elsewhere.
++	 */
++	if (!test_bit(SMP_FLAG_SC, &smp->flags) &&
++	    remote_oob == SMP_OOB_PRESENT &&
++	    test_bit(SMP_FLAG_REMOTE_OOB, &smp->flags)) {
++		struct hci_dev *hdev = hcon->hdev;
++		struct oob_data *oob_data;
++		bool have_tk = false;
++		u8 bdaddr_type;
++
++		if (hcon->dst_type == ADDR_LE_DEV_PUBLIC)
++			bdaddr_type = BDADDR_LE_PUBLIC;
++		else
++			bdaddr_type = BDADDR_LE_RANDOM;
++
++		mutex_lock(&hdev->remote_oob_lock);
++		oob_data = hci_find_remote_oob_data(hdev, &hcon->dst,
++						    bdaddr_type);
++		if (oob_data && (oob_data->present & 0x01)) {
++			memcpy(smp->tk, oob_data->rand192, sizeof(smp->tk));
++			have_tk = true;
++		}
++		mutex_unlock(&hdev->remote_oob_lock);
++
++		if (have_tk) {
++			smp->method = REQ_OOB;
++			set_bit(SMP_FLAG_TK_VALID, &smp->flags);
++
++			/* Out of band authentication gives MITM protection,
++			 * so the resulting keys are authenticated.
++			 */
++			set_bit(SMP_FLAG_MITM_AUTH, &smp->flags);
++			if (hcon->pending_sec_level < BT_SECURITY_HIGH)
++				hcon->pending_sec_level = BT_SECURITY_HIGH;
++
++			SMP_DBG("Using OOB TK for LE legacy pairing");
++			return 0;
++		}
++	}
++
+ 	/* If neither side wants MITM, either "just" confirm an incoming
+ 	 * request or use just-works for outgoing ones. The JUST_CFM
+ 	 * will be converted to JUST_WORKS if necessary later in this
+@@ -1836,7 +1923,8 @@ static u8 smp_cmd_pairing_req(struct l2cap_conn *conn, struct sk_buff *skb)
+ 	}
+ 
+ 	/* Request setup of TK */
+-	ret = tk_request(conn, 0, auth, rsp.io_capability, req->io_capability);
++	ret = tk_request(conn, req->oob_flag, auth, rsp.io_capability,
++			 req->io_capability);
+ 	if (ret)
+ 		return SMP_UNSPECIFIED;
+ 
+@@ -1983,7 +2071,8 @@ static u8 smp_cmd_pairing_rsp(struct l2cap_conn *conn, struct sk_buff *skb)
+ 
+ 	auth |= req->auth_req;
+ 
+-	ret = tk_request(conn, 0, auth, req->io_capability, rsp->io_capability);
++	ret = tk_request(conn, rsp->oob_flag, auth, req->io_capability,
++			 rsp->io_capability);
+ 	if (ret)
+ 		return SMP_UNSPECIFIED;
+ 
+@@ -2045,7 +2134,8 @@ static int fixup_sc_false_positive(struct smp_chan *smp)
+ 
+ 	auth = req->auth_req & AUTH_REQ_MASK(hdev);
+ 
+-	if (tk_request(conn, 0, auth, rsp->io_capability, req->io_capability)) {
++	if (tk_request(conn, req->oob_flag, auth, rsp->io_capability,
++		       req->io_capability)) {
+ 		bt_dev_err(hdev, "failed to fall back to legacy SMP");
+ 		return SMP_UNSPECIFIED;
+ 	}

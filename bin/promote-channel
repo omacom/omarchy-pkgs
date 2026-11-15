@@ -1,0 +1,276 @@
+#!/bin/bash
+# Carry one channel's packages forward into the next, for one architecture.
+#
+#   promote-channel --from <edge|rc> --to <rc|stable> --arch <arch> \
+#     [--dry-run] [--record FILE] [--batch-bytes N] [pkgbase...]
+#   promote-channel --fast-ring --from edge --to <rc|stable> --arch <arch> ...
+#
+# What it does, in order:
+#   1. pull both channels' current databases from the remote
+#   2. plan, per pkgbase in the source channel (or only the named ones):
+#      promote it when its recipe on this checkout says it moves to the
+#      destination (package_moves_to_channel: not published there natively,
+#      so not fast ring, and not pinned into rc) and the source holds a newer
+#      version, or one the destination lacks. With no names that is
+#      everything on the source channel. A pkgbase moves whole: its split packages and
+#      -debug go with it, and a base the destination is ahead on for any of
+#      its packages is left alone rather than half moved. A recipe that no
+#      longer builds for the architecture leaves its old files where they are.
+#
+#      --fast-ring turns that around: only fast-ring pkgbases move, from edge
+#      straight to rc or stable. A merge publishes a fast-ring build to all
+#      three at once; this brings rc and stable back in line with edge when
+#      that did not happen (a package joining the fast ring after its build,
+#      or one published before CI covered its architecture).
+#   3. copy each planned file from the source channel, check it against the
+#      source database's SHA-256, and publish it with publish-artifact, in
+#      batches of about --batch-bytes so a runner's disk holds one batch at
+#      a time. publish-artifact pulls the destination database again, signs,
+#      repo-adds and uploads it last, so every batch leaves the channel
+#      whole.
+#
+# Forward only: a package the destination holds and the source does not is
+# not touched, and nothing is removed (that is unpublish-packages). A file
+# the destination already has with the same bytes is only added to its
+# database, so a re-run after a failed batch picks up where it stopped.
+#
+# Before anything is published, bin/check-mac-set holds the destination as
+# the plan would leave it to the qualified Mac set (release/mac-inventory.txt)
+# and that set's shared dependency closure, and refuses the whole plan, dry
+# run included, when it does not hold. A plan that moves no Mac package and
+# nothing the Mac set depends on is not affected.
+#
+# --record appends one JSON object per line: {"type":"plan",...} for every
+# package considered, {"type":"mac-set",...} for the Mac package-set check,
+# and {"type":"slot",...} for every publish attempted, in the publish log's
+# slot shape. --dry-run stops after the plan and the check.
+#
+# The remote is an rclone remote (REMOTE, default the production one);
+# OMARCHY_PUBLISH_PREFIX can point a proof run at a scratch prefix.
+set -euo pipefail
+BUILD_ROOT=$(realpath "${BASH_SOURCE[0]%/*}/..")
+source "$BUILD_ROOT/helpers/message-helpers.sh"
+source "$BUILD_ROOT/helpers/paths.sh"
+source "$BUILD_ROOT/helpers/package-metadata.sh"
+
+REMOTE=${REMOTE:-pkgs.omarchy.org:omarchy-pkgs}
+PREFIX=${OMARCHY_PUBLISH_PREFIX:-}
+DRY_RUN=false
+FAST_RING=false
+RECORD=/dev/null
+BATCH_BYTES=$((2 * 1024 * 1024 * 1024))
+ONLY=()
+while [[ $# -gt 0 ]]; do
+  case $1 in
+  --from) FROM=$2; require_valid_mirror "$FROM"; shift 2 ;;
+  --to) TO=$2; require_valid_mirror "$TO"; shift 2 ;;
+  --arch) ARCH=$2; require_valid_arch "$ARCH"; shift 2 ;;
+  --remote) REMOTE=$2; shift 2 ;;
+  --dry-run) DRY_RUN=true; shift ;;
+  --fast-ring) FAST_RING=true; shift ;;
+  --record) RECORD=$2; shift 2 ;;
+  --batch-bytes) BATCH_BYTES=$2; shift 2 ;;
+  -h|--help) sed -n '2,48p' "$0"; exit 0 ;;
+  -*) print_error "Unknown option: $1"; exit 1 ;;
+  *) ONLY+=("$1"); shift ;;
+  esac
+done
+: "${FROM:?--from is required}" "${TO:?--to is required}" "${ARCH:?--arch is required}"
+if [[ $FAST_RING == true ]]; then
+  case "$FROM->$TO" in
+  edge-\>rc | edge-\>stable) ;;
+  *) print_error "The fast ring follows edge; refusing $FROM -> $TO"; exit 1 ;;
+  esac
+else
+  case "$FROM->$TO" in
+  edge-\>rc | rc-\>stable) ;;
+  *) print_error "Channels move edge -> rc -> stable; refusing $FROM -> $TO"; exit 1 ;;
+  esac
+fi
+[[ $BATCH_BYTES =~ ^[0-9]+$ ]] || { print_error "--batch-bytes must be a number"; exit 1; }
+
+SRC="$REMOTE/${PREFIX:+$PREFIX/}$FROM/$ARCH"
+DEST="$REMOTE/${PREFIX:+$PREFIX/}$TO/$ARCH"
+WORK=$(mktemp -d)
+trap 'rm -rf "$WORK"' EXIT
+print_header "Promote $SRC -> $DEST"
+
+record() { jq -nc "$@" >> "$RECORD"; }
+
+# --- 1. pull both databases -------------------------------------------------
+# One line per package: name, version, base, filename, sha256, csize.
+read_db() { # read_db <remote dir> <out.tsv>
+  local dir="$1" out="$2" db="$WORK/$(basename "$2" .tsv).db.tar.zst" listing
+  # List first, then match: under pipefail, grep -q leaving early would
+  # SIGPIPE a remote listing still streaming in and read as "no database".
+  listing=$(rclone lsf "$dir/" --s3-no-head 2>/dev/null || true)
+  if ! grep -qx 'omarchy.db.tar.zst' <<<"$listing"; then
+    : > "$out"
+    return 1
+  fi
+  rclone copyto "$dir/omarchy.db.tar.zst" "$db" --s3-no-head
+  mkdir -p "$db.d"
+  bsdtar -xf "$db" -C "$db.d" --include '*/desc'
+  # One desc per entry; a new file starts a new record.
+  find "$db.d" -name desc -print0 | xargs -0r awk '
+    function flush() { if (name != "") print name "\t" ver "\t" base "\t" file "\t" sum "\t" size; name = ver = base = file = sum = size = "" }
+    FNR == 1 { flush() }
+    /^%NAME%$/ { getline name }
+    /^%VERSION%$/ { getline ver }
+    /^%BASE%$/ { getline base }
+    /^%FILENAME%$/ { getline file }
+    /^%SHA256SUM%$/ { getline sum }
+    /^%CSIZE%$/ { getline size }
+    END { flush() }' | sort > "$out"
+}
+read_db "$SRC" "$WORK/src.tsv" || { print_error "No database at $SRC"; exit 1; }
+read_db "$DEST" "$WORK/dest.tsv" || print_warning "No database at $DEST yet; everything eligible is new there"
+print_info "$FROM/$ARCH has $(wc -l < "$WORK/src.tsv") packages, $TO/$ARCH has $(wc -l < "$WORK/dest.tsv")"
+
+# --- 2. plan ----------------------------------------------------------------
+declare -A DEST_VER=()
+while IFS=$'\t' read -r name ver _; do DEST_VER[$name]=$ver; done < "$WORK/dest.tsv"
+
+# Recipes by the pkgbase they build, which is not always the directory name.
+declare -A RECIPE=()
+while IFS= read -r pkgdir; do
+  RECIPE[$(package_pkgbase "$pkgdir" "$ARCH")]=$pkgdir
+done < <(package_dirs)
+
+mapfile -t BASES < <(cut -f3 "$WORK/src.tsv" | sort -u)
+declare -A IN_SOURCE=()
+for b in "${BASES[@]}"; do IN_SOURCE[$b]=1; done
+if (( ${#ONLY[@]} )); then
+  # A name this architecture lacks is skipped, so one list serves both; a
+  # name that is neither published nor a recipe is a typo.
+  named=()
+  for b in "${ONLY[@]}"; do
+    if [[ -n ${IN_SOURCE[$b]:-} ]]; then
+      named+=("$b")
+    elif [[ -n ${RECIPE[$b]:-} ]]; then
+      print_warning "$b is not in $FROM/$ARCH; skipping it for $ARCH"
+    else
+      print_error "$b is not a pkgbase in $FROM/$ARCH or a recipe on this checkout"
+      exit 1
+    fi
+  done
+  BASES=("${named[@]}")
+fi
+
+# Why a pkgbase stays where it is, or "" when it moves.
+hold_reason() { # hold_reason <pkgbase>
+  local pkgdir=${RECIPE[$1]:-}
+  [[ -n $pkgdir ]] || { echo "no recipe on this checkout"; return; }
+  package_supports_arch "$pkgdir" "$ARCH" || { echo "its recipe no longer builds for $ARCH"; return; }
+  if [[ $FAST_RING == true ]]; then
+    package_is_fast_ring "$pkgdir" || echo "not on the fast ring"
+    return
+  fi
+  if ! package_moves_to_channel "$pkgdir" "$TO"; then
+    if package_is_pinned "$pkgdir"; then echo "pinned: reaches $TO through a release"
+    elif package_is_fast_ring "$pkgdir"; then echo "fast ring: published to $TO at merge"
+    else echo "built for $TO directly"
+    fi
+  fi
+}
+
+: > "$WORK/promote.tsv"
+: > "$WORK/promote-names.tsv"
+promoted=0 held=0 current=0
+for base in "${BASES[@]}"; do
+  rows=$(awk -F'\t' -v b="$base" '$3==b' "$WORK/src.tsv")
+  reason=$(hold_reason "$base")
+  if [[ -z $reason ]]; then
+    # The destination ahead on any package of this base: leave it whole.
+    while IFS=$'\t' read -r name ver _; do
+      have=${DEST_VER[$name]:-}
+      if [[ -n $have ]] && (( $(vercmp "$ver" "$have") < 0 )); then
+        reason="$TO is ahead ($name $have, $FROM has $ver)"
+        break
+      fi
+    done <<<"$rows"
+  fi
+  while IFS=$'\t' read -r name ver _ file _ size; do
+    have=${DEST_VER[$name]:-}
+    if [[ -n $reason ]]; then
+      action=hold; why=$reason; held=$((held + 1))
+    elif [[ -n $have ]] && (( $(vercmp "$ver" "$have") == 0 )); then
+      action=current; why="$TO already has $ver"; current=$((current + 1))
+    else
+      action=promote; why=""; promoted=$((promoted + 1))
+      printf '%s\t%s\n' "$base" "$file" >> "$WORK/promote.tsv"
+      printf '%s\t%s\n' "$name" "$ver" >> "$WORK/promote-names.tsv"
+    fi
+    [[ $action == current ]] || print_step "$action $name ${have:-(none)} -> $ver${why:+ — $why}"
+    record --arg arch "$ARCH" --arg base "$base" --arg name "$name" --arg from "$ver" --arg to "$have" \
+      --arg file "$file" --arg action "$action" --arg reason "$why" --argjson size "${size:-0}" \
+      '{type:"plan", arch:$arch, base:$base, name:$name, from_version:$from, to_version:(if $to=="" then null else $to end), file:$file, size:$size, action:$action, reason:(if $reason=="" then null else $reason end)}'
+  done <<<"$rows"
+done
+print_info "Plan for $ARCH: $promoted to promote, $held held back, $current already current"
+
+# --- 2b. the Mac package set ------------------------------------------------
+# The destination as this plan would leave it, against the qualified Mac set
+# (bin/check-mac-set), inside the publish lock the plan was made in.
+# Every step checks its own status: inside an `if` condition set -e is off.
+mac_after_view() {
+  mkdir -p "$WORK/dest.db.tar.zst.d" "$WORK/after" || return 1
+  cp -R "$WORK/dest.db.tar.zst.d/." "$WORK/after/" || return 1
+  while IFS=$'\t' read -r name ver; do
+    if [[ -n ${DEST_VER[$name]:-} ]]; then rm -rf "$WORK/after/$name-${DEST_VER[$name]}" || return 1; fi
+    cp -R "$WORK/src.db.tar.zst.d/$name-$ver" "$WORK/after/" || return 1
+  done < "$WORK/promote-names.tsv"
+}
+# Fail closed: a plan the check cannot vouch for, because the view could not
+# be built or the check could not run, is refused like one it rejects.
+if ! mac_after_view; then
+  print_error "Could not build $TO/$ARCH as this plan would leave it; refusing to promote $FROM/$ARCH into $TO/$ARCH: nothing published"
+  exit 1
+elif ! "$BUILD_ROOT/bin/check-mac-set" --channel "$TO" --arch "$ARCH" \
+  --before "$WORK/dest.db.tar.zst.d" --after "$WORK/after" --record "$RECORD"; then
+  print_error "Refusing to promote $FROM/$ARCH into $TO/$ARCH: nothing published"
+  exit 1
+fi
+
+if [[ $DRY_RUN == true ]]; then
+  print_success "Dry run: nothing published"
+  exit 0
+fi
+(( promoted )) || { print_success "$TO/$ARCH is already up to date with $FROM"; exit 0; }
+
+# --- 3. copy, verify, publish in batches -------------------------------------
+# Batches break between pkgbases, never inside one.
+publish_batch() { # publish_batch <file...>
+  local f expected got files=() status=published
+  mkdir -p "$WORK/files"
+  printf '%s\n' "$@" > "$WORK/files.list"
+  rclone copy "$SRC" "$WORK/files" --s3-no-head --files-from "$WORK/files.list"
+  for f in "$@"; do
+    expected=$(awk -F'\t' -v f="$f" '$4==f {print $5}' "$WORK/src.tsv")
+    got=$(sha256sum "$WORK/files/$f" 2>/dev/null | awk '{print $1}')
+    if [[ -z $got || $got != "$expected" ]]; then
+      print_error "$f in $FROM does not match its database entry (want ${expected:-?}, got ${got:-missing})"
+      status=failed
+    fi
+    files+=("$WORK/files/$f")
+  done
+  if [[ $status == published ]] && ! "$BUILD_ROOT/bin/publish-artifact" --remote "$REMOTE" --mirror "$TO" --arch "$ARCH" "${files[@]}"; then
+    status=failed
+  fi
+  record --arg mirror "$TO" --arg arch "$ARCH" --arg status "$status" --args \
+    '{type:"slot", mirror:$mirror, arch:$arch, status:$status, packages:[$ARGS.positional[] | sub("\\.pkg\\.tar\\.[^.]+$";"")]}' "$@"
+  rm -rf "$WORK/files"
+  [[ $status == published ]]
+}
+
+batch=() batch_bytes=0 last_base=""
+while IFS=$'\t' read -r base file; do
+  size=$(awk -F'\t' -v f="$file" '$4==f {print $6}' "$WORK/src.tsv")
+  if (( ${#batch[@]} )) && [[ $base != "$last_base" ]] && (( batch_bytes + ${size:-0} > BATCH_BYTES )); then
+    publish_batch "${batch[@]}" || exit 1
+    batch=() batch_bytes=0
+  fi
+  batch+=("$file"); batch_bytes=$((batch_bytes + ${size:-0})); last_base=$base
+done < "$WORK/promote.tsv"
+publish_batch "${batch[@]}" || exit 1
+print_success "Promoted $promoted package(s) from $FROM/$ARCH to $TO/$ARCH"

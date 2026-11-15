@@ -1,0 +1,334 @@
+From ac830c4bff5b90700ea62d557173cdcabe8a31ba Mon Sep 17 00:00:00 2001
+From: Ryan Hughes <ryan@heyoodle.com>
+Date: Fri, 2 Oct 2026 20:17:48 -0400
+Subject: [PATCH 1077/1078] thunderbolt: add a driver for USB4 host interfaces
+ described by ACPI
+
+The NVIDIA N1x has no PCIe NHI. Its USB4 host interfaces are platform
+devices (ACPI0015, _HID NVDA8100), one per USB-C port, each with the
+USB4 host interface registers in its first memory window and one
+level-triggered interrupt for every ring. With nothing to bind them,
+no connection manager runs and USB4 and Thunderbolt devices only get
+their USB 2.0 functions.
+
+Add glue that maps the registers, powers the host router, services the
+interrupt from a thread through nhi_handle_interrupts() and hands the
+host interface to the NHI core. The N1x powers its host routers through
+the SSPM, which stops answering for them once power_wrap releases the
+USB4 resources, so refuse to probe in that case rather than hang it.
+
+Runtime PM stays forbidden until a wake interrupt is wired up, since a
+runtime suspended host router would not notice a device being plugged
+in.
+---
+ drivers/thunderbolt/Kconfig        |  11 ++
+ drivers/thunderbolt/Makefile       |   3 +
+ drivers/thunderbolt/nhi_platform.c | 260 +++++++++++++++++++++++++++++
+ 3 files changed, 274 insertions(+)
+ create mode 100644 drivers/thunderbolt/nhi_platform.c
+
+diff --git a/drivers/thunderbolt/Kconfig b/drivers/thunderbolt/Kconfig
+index 294b3227a5..eb500f013f 100644
+--- a/drivers/thunderbolt/Kconfig
++++ b/drivers/thunderbolt/Kconfig
+@@ -51,6 +51,17 @@ config USB4_KUNIT_TEST
+ 	depends on USB4 && KUNIT=y
+ 	default KUNIT_ALL_TESTS
+ 
++config USB4_PLATFORM_NHI
++	tristate "USB4 host interfaces described by ACPI"
++	depends on ACPI
++	help
++	  Support for USB4 host interfaces that are memory-mapped platform
++	  devices described by ACPI rather than PCIe devices, such as those
++	  of the NVIDIA N1x.
++
++	  To compile this driver as a module, choose M here. The module will
++	  be called thunderbolt_platform.
++
+ config USB4_DMA_TEST
+ 	tristate "DMA traffic test driver"
+ 	depends on DEBUG_FS
+diff --git a/drivers/thunderbolt/Makefile b/drivers/thunderbolt/Makefile
+index beb054c312..9aee28769c 100644
+--- a/drivers/thunderbolt/Makefile
++++ b/drivers/thunderbolt/Makefile
+@@ -11,6 +11,9 @@ thunderbolt-$(CONFIG_USB4_CONFIGFS) += configfs.o
+ thunderbolt-${CONFIG_USB4_KUNIT_TEST} += test.o
+ CFLAGS_test.o += $(DISABLE_STRUCTLEAK_PLUGIN)
+ 
++thunderbolt_platform-y := nhi_platform.o
++obj-$(CONFIG_USB4_PLATFORM_NHI) += thunderbolt_platform.o
++
+ thunderbolt_dma_test-${CONFIG_USB4_DMA_TEST} += dma_test.o
+ obj-$(CONFIG_USB4_DMA_TEST) += thunderbolt_dma_test.o
+ 
+diff --git a/drivers/thunderbolt/nhi_platform.c b/drivers/thunderbolt/nhi_platform.c
+new file mode 100644
+index 0000000000..62743ec450
+--- /dev/null
++++ b/drivers/thunderbolt/nhi_platform.c
+@@ -0,0 +1,260 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Thunderbolt driver - USB4 host interfaces described by ACPI
++ *
++ * Some Arm SoCs expose their USB4 host interfaces as memory-mapped platform
++ * devices (ACPI0015) with a wired interrupt, rather than as PCIe NHIs. The
++ * registers follow the USB4 specification, so the NHI core drives them; this
++ * glue maps them, powers the host router and services the interrupt.
++ */
++
++#include <linux/acpi.h>
++#include <linux/interrupt.h>
++#include <linux/io.h>
++#include <linux/module.h>
++#include <linux/platform_device.h>
++#include <linux/pm_runtime.h>
++#include <linux/slab.h>
++#include <linux/soc/mediatek/mtk-pwrap.h>
++
++#include "nhi.h"
++#include "nhi_regs.h"
++#include "tb.h"
++
++/*
++ * Three status bits per path start at REG_RING_NOTIFY_BASE, and the 64 bits
++ * there end where REG_RING_INT_CLEAR begins.
++ */
++#define NHI_PLAT_MAX_PATHS	21
++
++struct nhi_plat;
++
++/**
++ * struct nhi_plat_data - Platform specific host router handling
++ * @power_on: Power the host router before its registers are accessed
++ * @power_off: Power the host router down again
++ */
++struct nhi_plat_data {
++	int (*power_on)(struct nhi_plat *np);
++	void (*power_off)(struct nhi_plat *np);
++};
++
++/**
++ * struct nhi_plat - USB4 host interface described by ACPI
++ * @nhi: NHI device
++ * @data: Platform specific handling
++ * @irq: The interrupt every ring is signalled through
++ * @irq_requested: @irq is currently requested
++ * @pwrap: SSPM power control handle (NVIDIA N1x)
++ */
++struct nhi_plat {
++	struct tb_nhi nhi;
++	const struct nhi_plat_data *data;
++	int irq;
++	bool irq_requested;
++	void *pwrap;
++};
++
++static inline struct nhi_plat *nhi_to_plat(struct tb_nhi *nhi)
++{
++	return container_of(nhi, struct nhi_plat, nhi);
++}
++
++static irqreturn_t nhi_plat_irq_thread(int irq, void *data)
++{
++	struct tb_nhi *nhi = data;
++
++	return nhi_handle_interrupts(nhi) ? IRQ_HANDLED : IRQ_NONE;
++}
++
++/*
++ * The interrupt is level-triggered and stays asserted until the notification
++ * registers are read, so keep it masked until the thread has read them.
++ */
++static int nhi_plat_init_interrupts(struct tb_nhi *nhi)
++{
++	struct nhi_plat *np = nhi_to_plat(nhi);
++	int ret;
++
++	ret = devm_request_threaded_irq(nhi->dev, np->irq, NULL,
++					nhi_plat_irq_thread,
++					IRQF_ONESHOT | IRQF_NO_SUSPEND,
++					dev_name(nhi->dev), nhi);
++	if (!ret)
++		np->irq_requested = true;
++
++	return ret;
++}
++
++/* Called before the host router is powered down, so nothing reads it after */
++static void nhi_plat_shutdown(struct tb_nhi *nhi)
++{
++	struct nhi_plat *np = nhi_to_plat(nhi);
++
++	if (np->irq_requested) {
++		devm_free_irq(nhi->dev, np->irq, nhi);
++		np->irq_requested = false;
++	}
++}
++
++static const struct tb_nhi_ops nhi_plat_ops = {
++	.init_interrupts = nhi_plat_init_interrupts,
++	.shutdown = nhi_plat_shutdown,
++};
++
++/*
++ * NVIDIA N1x: the host routers are powered through the SSPM. The firmware
++ * leaves them powered at boot, but power_wrap can release them once xHCI is
++ * up, after which the SSPM stops answering for them altogether. A request
++ * then hangs it and resets the SoC, so refuse to touch them in that case.
++ */
++static int nhi_nvda8100_power_on(struct nhi_plat *np)
++{
++	struct device *dev = np->nhi.dev;
++	struct acpi_buffer path = { ACPI_ALLOCATE_BUFFER, NULL };
++	int ret;
++
++	if (mtk_pwrap_usb4_released())
++		return dev_err_probe(dev, -ENODEV,
++				     "USB4 resources are released, boot with power_wrap_drv.usb4_release=0\n");
++
++	if (!np->pwrap) {
++		if (ACPI_FAILURE(acpi_get_name(ACPI_HANDLE(dev), ACPI_FULL_PATHNAME,
++					       &path)))
++			return -ENODEV;
++		np->pwrap = mtk_pwrap_dev_probe(path.pointer);
++		kfree(path.pointer);
++		if (!np->pwrap)
++			return dev_err_probe(dev, -ENODEV,
++					     "no SSPM power control for the host router\n");
++	}
++
++	ret = mtk_pwrap_dev_resume(np->pwrap, 0);
++	if (ret)
++		return dev_err_probe(dev, ret, "cannot power the host router\n");
++
++	return 0;
++}
++
++static void nhi_nvda8100_power_off(struct nhi_plat *np)
++{
++	int ret;
++
++	ret = mtk_pwrap_dev_suspend(np->pwrap, 0);
++	if (ret)
++		dev_warn(np->nhi.dev, "cannot power the host router down: %d\n", ret);
++}
++
++static const struct nhi_plat_data nhi_nvda8100_data = {
++	.power_on = nhi_nvda8100_power_on,
++	.power_off = nhi_nvda8100_power_off,
++};
++
++static void nhi_plat_power_off(struct nhi_plat *np)
++{
++	if (np->data->power_off)
++		np->data->power_off(np);
++}
++
++static int nhi_plat_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct resource *res;
++	struct nhi_plat *np;
++	struct tb_nhi *nhi;
++	u32 caps, paths;
++	int ret;
++
++	np = devm_kzalloc(dev, sizeof(*np), GFP_KERNEL);
++	if (!np)
++		return -ENOMEM;
++
++	np->data = device_get_match_data(dev);
++	nhi = &np->nhi;
++	nhi->dev = dev;
++	nhi->ops = &nhi_plat_ops;
++
++	nhi->iobase = devm_platform_get_and_ioremap_resource(pdev, 0, &res);
++	if (IS_ERR(nhi->iobase))
++		return dev_err_probe(dev, PTR_ERR(nhi->iobase),
++				     "cannot map the host interface registers\n");
++	if (resource_size(res) < REG_RESET + 4)
++		return dev_err_probe(dev, -ENODEV,
++				     "host interface register window too small\n");
++
++	np->irq = platform_get_irq(pdev, 0);
++	if (np->irq < 0)
++		return np->irq;
++
++	if (np->data->power_on) {
++		ret = np->data->power_on(np);
++		if (ret)
++			return ret;
++	}
++
++	/* nhi_probe() sizes everything from the path count; check it first */
++	caps = ioread32(nhi->iobase + REG_CAPS);
++	paths = caps & 0x3ff;
++	if (!paths || paths > NHI_PLAT_MAX_PATHS) {
++		ret = dev_err_probe(dev, -ENODEV,
++				    "unexpected host interface capabilities %#x\n", caps);
++		goto err_power_off;
++	}
++
++	pm_runtime_set_active(dev);
++	pm_runtime_get_noresume(dev);
++	ret = devm_pm_runtime_enable(dev);
++	if (ret)
++		goto err_put;
++
++	ret = nhi_probe(nhi);
++	if (ret)
++		goto err_put;
++
++	/*
++	 * Nothing would notice a device being plugged in while the host router
++	 * is runtime suspended, as there is no wake interrupt support yet.
++	 */
++	pm_runtime_forbid(dev);
++
++	return 0;
++
++err_put:
++	pm_runtime_put_noidle(dev);
++	nhi_plat_shutdown(nhi);
++err_power_off:
++	nhi_plat_power_off(np);
++	return ret;
++}
++
++static void nhi_plat_remove(struct platform_device *pdev)
++{
++	struct tb *tb = platform_get_drvdata(pdev);
++	struct nhi_plat *np = nhi_to_plat(tb->nhi);
++
++	nhi_remove(tb->nhi);
++	nhi_plat_power_off(np);
++}
++
++static const struct acpi_device_id nhi_plat_acpi_ids[] = {
++	{ "NVDA8100", (kernel_ulong_t)&nhi_nvda8100_data },
++	{ }
++};
++MODULE_DEVICE_TABLE(acpi, nhi_plat_acpi_ids);
++
++static struct platform_driver nhi_plat_driver = {
++	.driver = {
++		.name = "thunderbolt-platform",
++		.acpi_match_table = nhi_plat_acpi_ids,
++		.pm = &nhi_pm_ops,
++		.probe_type = PROBE_PREFER_ASYNCHRONOUS,
++	},
++	.probe = nhi_plat_probe,
++	.remove = nhi_plat_remove,
++	.shutdown = nhi_plat_remove,
++};
++module_platform_driver(nhi_plat_driver);
++
++MODULE_IMPORT_NS("THUNDERBOLT_NHI");
++MODULE_DESCRIPTION("USB4 host interfaces described by ACPI");
++MODULE_LICENSE("GPL");
+-- 
+2.56.0
+

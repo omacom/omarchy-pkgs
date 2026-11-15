@@ -1,0 +1,220 @@
+diff --git a/libfprint/drivers/aurora/aurora.c b/libfprint/drivers/aurora/aurora.c
+index ea09de74..be044609 100644
+--- a/libfprint/drivers/aurora/aurora.c
++++ b/libfprint/drivers/aurora/aurora.c
+@@ -23,6 +23,20 @@
+ #include <unistd.h>
+ #include <glib-unix.h>
+ 
++/* Why the kernel ended an enrol or verify, in a poll's 'status'. Headers from
++ * before these were named carry the same numbers; those kernels never report
++ * RETRY while an enrolment is running, nor REJECTED at all. */
++#ifndef AURORA_BIO_STATUS_REJECTED
++#define AURORA_BIO_STATUS_NONE     0
++#define AURORA_BIO_STATUS_SENSOR   1
++#define AURORA_BIO_STATUS_ENCLAVE  2
++#define AURORA_BIO_STATUS_TOO_MANY 3
++#define AURORA_BIO_STATUS_TIMEOUT  4
++#define AURORA_BIO_STATUS_RETRY    5
++#define AURORA_BIO_STATUS_UNFILED  6
++#define AURORA_BIO_STATUS_REJECTED 7
++#endif
++
+ struct _FpiDeviceAurora
+ {
+   FpDevice  parent;
+@@ -90,6 +104,65 @@ aurora_ioctl (FpiDeviceAurora *self, unsigned long req, void *arg, GError **erro
+   return TRUE;
+ }
+ 
++static const gchar *
++aurora_status_reason (guint32 status)
++{
++  switch (status)
++    {
++    case AURORA_BIO_STATUS_NONE:
++      return "it was cancelled or ended by the system";
++
++    case AURORA_BIO_STATUS_SENSOR:
++      return "the fingerprint sensor failed";
++
++    case AURORA_BIO_STATUS_ENCLAVE:
++      return "the secure enclave refused a step";
++
++    case AURORA_BIO_STATUS_TOO_MANY:
++      return "the enclave did not complete the enrolment within its captures";
++
++    case AURORA_BIO_STATUS_TIMEOUT:
++      return "no finger was placed on the sensor in time";
++
++    case AURORA_BIO_STATUS_RETRY:
++      return "the capture was not usable";
++
++    case AURORA_BIO_STATUS_UNFILED:
++      return "the fingerprint was enrolled but could not be recorded";
++
++    case AURORA_BIO_STATUS_REJECTED:
++      return "too many captures in a row were not usable; "
++             "rest more of the finger flat on the sensor and enrol again";
++
++    default:
++      return NULL;
++    }
++}
++
++static GError *
++aurora_failure_new (const gchar *operation, guint32 status)
++{
++  const gchar *reason = aurora_status_reason (status);
++
++  if (reason == NULL)
++    return fpi_device_error_new_msg (FP_DEVICE_ERROR_GENERAL,
++                                     "%s failed, driver status 0x%x",
++                                     operation, status);
++
++  return fpi_device_error_new_msg (FP_DEVICE_ERROR_GENERAL,
++                                   "%s failed: %s (driver status %u)",
++                                   operation, reason, status);
++}
++
++/* The kernel reports an unusable capture without saying why it was unusable,
++ * so the general retry is the most specific code that is always true. */
++static GError *
++aurora_retry_new (void)
++{
++  return fpi_device_retry_new_msg (FP_DEVICE_RETRY_GENERAL,
++                                   "the capture was not usable; touch the sensor again");
++}
++
+ /* The label is how the host recognises its own records in the device's list.
+  * libfprint already has an encoding for exactly this -- it carries the enroll
+  * date, the finger and the username -- so use it rather than inventing one. */
+@@ -397,16 +470,23 @@ aurora_enrol_ready (gint fd, GIOCondition condition, gpointer user_data)
+   switch (poll_res.state)
+     {
+     case AURORA_BIO_STATE_PENDING:
+-      return G_SOURCE_CONTINUE;
+-
+     case AURORA_BIO_STATE_PROGRESS:
+       /* fprintd calls this "enroll-stage-passed". A guidance wakeup or an
+        * initial stage-zero event must not masquerade as a captured sample. */
+-      if (poll_res.stage > self->enroll_last_reported_stage)
++      if (poll_res.state == AURORA_BIO_STATE_PROGRESS &&
++          poll_res.stage > self->enroll_last_reported_stage)
+         {
+           self->enroll_last_reported_stage = poll_res.stage;
+           fpi_device_enroll_progress (device, poll_res.stage, NULL, NULL);
+         }
++
++      /* The latest capture did not count, and the enrolment goes on. The
++       * kernel reports each rejection in one poll only, and an accepted
++       * capture clears it, so a rejection that shares a poll with a new stage
++       * came after that stage. */
++      if (poll_res.status == AURORA_BIO_STATUS_RETRY)
++        fpi_device_enroll_progress (device, self->enroll_last_reported_stage,
++                                    NULL, aurora_retry_new ());
+       return G_SOURCE_CONTINUE;
+ 
+     case AURORA_BIO_STATE_DONE:
+@@ -429,12 +509,17 @@ aurora_enrol_ready (gint fd, GIOCondition condition, gpointer user_data)
+       return G_SOURCE_REMOVE;
+ 
+     case AURORA_BIO_STATE_FAILED:
++      self->watch_id = 0;
++      fpi_device_enroll_complete (device, NULL,
++                                  aurora_failure_new ("enrolment", poll_res.status));
++      return G_SOURCE_REMOVE;
++
+     default:
+       self->watch_id = 0;
+       fpi_device_enroll_complete (device, NULL,
+                                   fpi_device_error_new_msg (FP_DEVICE_ERROR_GENERAL,
+-                                                            "enrolment failed, driver status 0x%x",
+-                                                            poll_res.status));
++                                                            "enrolment failed, state %u, driver status 0x%x",
++                                                            poll_res.state, poll_res.status));
+       return G_SOURCE_REMOVE;
+     }
+ }
+@@ -521,6 +606,17 @@ aurora_result_is_match (FpiDeviceAurora                *self,
+   return TRUE;
+ }
+ 
++/* A verify that ended without a comparison. When the kernel says why, pass
++ * that on: otherwise the log shows only an unspecified error. */
++static GError *
++aurora_not_compared_new (const struct aurora_bio_verify_poll *res)
++{
++  if (res->state == AURORA_BIO_STATE_FAILED)
++    return aurora_failure_new ("verification", res->status);
++
++  return fpi_device_error_new (FP_DEVICE_ERROR_GENERAL);
++}
++
+ static gboolean
+ aurora_verify_ready (gint fd, GIOCondition condition, gpointer user_data)
+ {
+@@ -534,6 +630,7 @@ aurora_verify_ready (gint fd, GIOCondition condition, gpointer user_data)
+    * reference under libfprint's feet, and it frees the print again when the
+    * match completes. */
+   FpPrint *matched = NULL;
++  GError *retry = NULL;
+ 
+   if (!aurora_ioctl (self, AURORA_BIO_VERIFY_POLL, &res, &error))
+     {
+@@ -562,7 +659,12 @@ aurora_verify_ready (gint fd, GIOCondition condition, gpointer user_data)
+ 
+   if (aurora_result_is_match (self, &res))
+     matched = aurora_print_from_uuid (self, res.uuid, NULL);
+-
++  /* The capture was not usable, so nothing was compared. A retry tells the
++   * caller to ask for another touch: fprintd starts the match again on its
++   * own, where a failure would end the authentication attempt. */
++  else if (res.state == AURORA_BIO_STATE_FAILED &&
++           res.status == AURORA_BIO_STATUS_RETRY)
++    retry = aurora_retry_new ();
+ 
+   if (action == FPI_DEVICE_ACTION_VERIFY)
+     {
+@@ -570,7 +672,12 @@ aurora_verify_ready (gint fd, GIOCondition condition, gpointer user_data)
+ 
+       fpi_device_get_verify_data (device, &expected);
+ 
+-      if (matched != NULL && aurora_print_has_uuid (expected, res.uuid))
++      if (retry != NULL)
++        {
++          fpi_device_verify_report (device, FPI_MATCH_ERROR, NULL, retry);
++          fpi_device_verify_complete (device, NULL);
++        }
++      else if (matched != NULL && aurora_print_has_uuid (expected, res.uuid))
+         {
+           fpi_device_verify_report (device, FPI_MATCH_SUCCESS, matched, NULL);
+           fpi_device_verify_complete (device, NULL);
+@@ -580,8 +687,7 @@ aurora_verify_ready (gint fd, GIOCondition condition, gpointer user_data)
+           /* No comparison happened, so there is no verdict to report. Saying
+            * FAIL here would tell the user their finger was rejected when it
+            * was never examined. */
+-          fpi_device_verify_complete (device,
+-                                      fpi_device_error_new (FP_DEVICE_ERROR_GENERAL));
++          fpi_device_verify_complete (device, aurora_not_compared_new (&res));
+         }
+       else
+         {
+@@ -612,10 +718,14 @@ aurora_verify_ready (gint fd, GIOCondition condition, gpointer user_data)
+             }
+         }
+ 
+-      if (matched == NULL && res.result == AURORA_BIO_NOT_COMPARED)
++      if (retry != NULL)
++        {
++          fpi_device_identify_report (device, NULL, NULL, retry);
++          fpi_device_identify_complete (device, NULL);
++        }
++      else if (matched == NULL && res.result == AURORA_BIO_NOT_COMPARED)
+         {
+-          fpi_device_identify_complete (device,
+-                                        fpi_device_error_new (FP_DEVICE_ERROR_GENERAL));
++          fpi_device_identify_complete (device, aurora_not_compared_new (&res));
+         }
+       else
+         {

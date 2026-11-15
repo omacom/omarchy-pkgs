@@ -1,0 +1,535 @@
+From 0c3577584a35c682bbad4c64f53a211d1581f8cb Mon Sep 17 00:00:00 2001
+From: Daaboulex <39669593+Daaboulex@users.noreply.github.com>
+Date: Thu, 8 Oct 2026 12:49:02 +0200
+Subject: [PATCH] feat(cpufreq): add a generic cpufreq boost driver
+
+Machines whose cpufreq scaling driver has no energy performance
+preference interface only get the placeholder driver today, so the
+CPU ignores the selected profile and there is no performance profile.
+On Apple Silicon (apple-cpufreq) the global boost switch gates the
+turbo frequencies, see "Frequency Boost Support" in
+https://docs.kernel.org/admin-guide/pm/cpufreq.html
+
+Add a CPU driver that turns boost off in power-saver and on in
+balanced and performance; a failed write restores the previous value.
+It only claims a machine when every cpufreq policy whose scaling
+driver can be read runs one on an explicit list, currently only
+apple-cpufreq, so every other machine, including every x86 one, keeps
+the driver it uses today. A policy that cannot be read is skipped,
+since only one cpufreq driver can be registered at a time. The probe
+opens the boost switch for writing without writing to it. Like the
+boost handling in amd_pstate, the switch does not depend on the power
+source, so there is no power_changed handler.
+
+Integration tests cover the boost switching, the scaling drivers it
+leaves alone, unreadable policies, a read-only boost switch, and
+yielding to amd_pstate.
+
+This follows up !117 (apple-cpufreq), closed for inactivity, whose
+review asked for a generic driver with integration tests.
+
+Test: meson test with --werror and pylint, 138/139 (the pylint check
+of powerprofilesctl fails the same on unpatched main); ASan and UBSan
+137/137; the new tests fail with the fixes reverted; on an M1 Max
+power-saver caps the P-cores at 3036 MHz, balanced and performance
+return them to 3228 MHz
+---
+ README.md                   |  29 +++++
+ docs/meson.build            |   1 +
+ src/meson.build             |   1 +
+ src/power-profiles-daemon.c |   4 +-
+ src/ppd-driver-cpufreq.c    | 207 ++++++++++++++++++++++++++++++++++++
+ src/ppd-driver-cpufreq.h    |  15 +++
+ tests/integration_test.py   | 150 ++++++++++++++++++++++++++
+ 7 files changed, 406 insertions(+), 1 deletion(-)
+ create mode 100644 src/ppd-driver-cpufreq.c
+ create mode 100644 src/ppd-driver-cpufreq.h
+
+diff --git a/README.md b/README.md
+index aa4b079..0aebff6 100644
+--- a/README.md
++++ b/README.md
+@@ -229,6 +229,35 @@ enabled using `powerprofilesctl`:
+ powerprofilesctl configure-action amdgpu_dpm --enable
+ ```
+ 
++## Operations on other machines
++
++On Apple Silicon machines, which use the `apple-cpufreq` scaling driver, the
++"driver" for making the CPU act on the user-selected power profile is based on
++the [frequency boost switch](https://docs.kernel.org/admin-guide/pm/cpufreq.html#frequency-boost-support)
++of the CPU frequency scaling subsystem.
++
++It is only used if every CPU frequency policy uses a scaling driver where
++turning boost off is known to cap the CPU at its sustainable frequency,
++currently only `apple-cpufreq`, and the boost switch exists and can be written:
++
++```sh
++$ cat /sys/devices/system/cpu/cpufreq/policy*/scaling_driver
++apple-cpufreq
++apple-cpufreq
++apple-cpufreq
++$ cat /sys/devices/system/cpu/cpufreq/boost
++1
++```
++
++Any other machine, including every x86 machine, keeps the driver it uses
++today.
++
++The "power-saver" profile turns boost off, which keeps the CPU at or below its
++highest sustainable frequency. The "balanced" and "performance" profiles turn
++it on. The scaling governor is not changed. The boost switch has no setting
++that depends on the power source, so it follows the selected profile on
++battery and on AC alike.
++
+ ## Multiple driver and multiple action operations
+ 
+ Power-profiles daemon will load all supported drivers and actions by default.
+diff --git a/docs/meson.build b/docs/meson.build
+index ead4574..1fb63c3 100644
+--- a/docs/meson.build
++++ b/docs/meson.build
+@@ -25,6 +25,7 @@ private_headers = [
+   'ppd-driver-fake.h',
+   'ppd-driver-intel-pstate.h',
+   'ppd-driver-amd-pstate.h',
++  'ppd-driver-cpufreq.h',
+   'ppd-driver-placeholder.h',
+   'ppd-driver-platform-profile.h',
+   'ppd-utils.h',
+diff --git a/src/meson.build b/src/meson.build
+index 713312c..92020e5 100644
+--- a/src/meson.build
++++ b/src/meson.build
+@@ -96,6 +96,7 @@ sources += [
+   'ppd-driver-intel-pstate.c',
+   'ppd-driver-amd-pstate.c',
+   'ppd-driver-nvidia-rtx-spark.c',
++  'ppd-driver-cpufreq.c',
+   'ppd-driver-platform-profile.c',
+   'ppd-driver-placeholder.c',
+   'ppd-driver-fake.c',
+diff --git a/src/power-profiles-daemon.c b/src/power-profiles-daemon.c
+index ec6e9f8..3618276 100644
+--- a/src/power-profiles-daemon.c
++++ b/src/power-profiles-daemon.c
+@@ -145,6 +145,7 @@ static void upower_battery_set_power_changed_reason (PpdApp *, PpdPowerChangedRe
+ #include "ppd-driver-intel-pstate.h"
+ #include "ppd-driver-amd-pstate.h"
+ #include "ppd-driver-nvidia-rtx-spark.h"
++#include "ppd-driver-cpufreq.h"
+ #include "ppd-driver-fake.h"
+ 
+ typedef GType (*GTypeGetFunc) (void);
+@@ -157,7 +158,8 @@ static GTypeGetFunc objects[] = {
+   ppd_driver_intel_pstate_get_type,
+   ppd_driver_amd_pstate_get_type,
+ 
+-  /* Generic profile driver */
++  /* Generic profile drivers */
++  ppd_driver_cpufreq_get_type,
+   ppd_driver_placeholder_get_type,
+ 
+   /* Actions */
+diff --git a/src/ppd-driver-cpufreq.c b/src/ppd-driver-cpufreq.c
+new file mode 100644
+index 0000000..d285178
+--- /dev/null
++++ b/src/ppd-driver-cpufreq.c
+@@ -0,0 +1,207 @@
++/*
++ * Copyright (c) 2026 Daaboulex
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License version 3 as published by
++ * the Free Software Foundation.
++ *
++ */
++
++/*
++ * Generic cpufreq CPU driver, for cpufreq scaling drivers that have no
++ * energy performance preference interface. It only uses the global boost
++ * switch, see "Frequency Boost Support" in
++ * https://docs.kernel.org/admin-guide/pm/cpufreq.html
++ *
++ * It is only used when every cpufreq policy runs a scaling driver listed in
++ * boost_scaling_drivers, where turning boost off is known to cap the CPU at
++ * its sustainable frequency. Any other system keeps its current driver.
++ *
++ * There is no power_changed handler: the boost switch has no setting that
++ * depends on the power source, so the selected profile alone decides it,
++ * on battery and on AC alike.
++ */
++
++#define G_LOG_DOMAIN "CpuDriver"
++
++#include <errno.h>
++#include <fcntl.h>
++#include <glib/gstdio.h>
++#include <upower.h>
++
++#include "ppd-utils.h"
++#include "ppd-driver-cpufreq.h"
++
++#define CPUFREQ_POLICY_DIR "/sys/devices/system/cpu/cpufreq/"
++#define CPUFREQ_BOOST_PATH "/sys/devices/system/cpu/cpufreq/boost"
++
++static const char * const boost_scaling_drivers[] = {
++  "apple-cpufreq",
++  NULL
++};
++
++struct _PpdDriverCpufreq
++{
++  PpdDriverCpu  parent_instance;
++
++  PpdProfile activated_profile;
++  char *boost_path;
++};
++
++G_DEFINE_TYPE (PpdDriverCpufreq, ppd_driver_cpufreq, PPD_TYPE_DRIVER_CPU)
++
++static GObject*
++ppd_driver_cpufreq_constructor (GType                  type,
++                                guint                  n_construct_params,
++                                GObjectConstructParam *construct_params)
++{
++  GObject *object;
++
++  object = G_OBJECT_CLASS (ppd_driver_cpufreq_parent_class)->constructor (type,
++                                                                          n_construct_params,
++                                                                          construct_params);
++  g_object_set (object,
++                "driver-name", "cpufreq",
++                "profiles", PPD_PROFILE_PERFORMANCE | PPD_PROFILE_BALANCED | PPD_PROFILE_POWER_SAVER,
++                NULL);
++
++  return object;
++}
++
++static gboolean
++scaling_drivers_use_boost (void)
++{
++  g_autoptr(GDir) dir = NULL;
++  g_autofree char *policy_dir = NULL;
++  const char *dirname;
++  guint policies = 0;
++
++  policy_dir = ppd_utils_get_sysfs_path (CPUFREQ_POLICY_DIR);
++  dir = g_dir_open (policy_dir, 0, NULL);
++  if (!dir) {
++    g_debug ("Could not open %s", policy_dir);
++    return FALSE;
++  }
++
++  while ((dirname = g_dir_read_name (dir)) != NULL) {
++    g_autofree char *path = NULL;
++    g_autofree char *contents = NULL;
++    g_autoptr(GError) error = NULL;
++
++    if (!g_str_has_prefix (dirname, "policy"))
++      continue;
++
++    path = g_build_filename (policy_dir,
++                             dirname,
++                             "scaling_driver",
++                             NULL);
++    if (!g_file_get_contents (path, &contents, NULL, &error)) {
++      g_debug ("Failed to read %s: %s", path, error->message);
++      continue;
++    }
++
++    if (!g_strv_contains (boost_scaling_drivers, g_strchomp (contents))) {
++      g_debug ("%s uses scaling driver %s, which this driver does not handle",
++               dirname, contents);
++      return FALSE;
++    }
++
++    policies++;
++  }
++
++  return policies > 0;
++}
++
++static PpdProbeResult
++ppd_driver_cpufreq_probe (PpdDriver *driver)
++{
++  PpdDriverCpufreq *cpufreq = PPD_DRIVER_CPUFREQ (driver);
++  int fd;
++
++  if (!scaling_drivers_use_boost ())
++    return PPD_PROBE_RESULT_FAIL;
++
++  cpufreq->boost_path = ppd_utils_get_sysfs_path (CPUFREQ_BOOST_PATH);
++  fd = g_open (cpufreq->boost_path, O_WRONLY);
++  if (fd == -1) {
++    g_debug ("Could not open the cpufreq boost switch %s for writing: %s",
++             cpufreq->boost_path, g_strerror (errno));
++    return PPD_PROBE_RESULT_FAIL;
++  }
++  g_close (fd, NULL);
++
++  g_debug ("Found cpufreq boost switch at %s", cpufreq->boost_path);
++  return PPD_PROBE_RESULT_SUCCESS;
++}
++
++static const char *
++profile_to_boost (PpdProfile profile)
++{
++  switch (profile) {
++  case PPD_PROFILE_POWER_SAVER:
++    return "0";
++  case PPD_PROFILE_BALANCED:
++  case PPD_PROFILE_PERFORMANCE:
++    return "1";
++  }
++
++  g_return_val_if_reached (NULL);
++}
++
++static gboolean
++ppd_driver_cpufreq_activate_profile (PpdDriver                   *driver,
++                                     PpdProfile                   profile,
++                                     PpdProfileActivationReason   reason,
++                                     GError                     **error)
++{
++  PpdDriverCpufreq *cpufreq = PPD_DRIVER_CPUFREQ (driver);
++
++  g_return_val_if_fail (cpufreq->boost_path != NULL, FALSE);
++
++  if (profile == PPD_PROFILE_UNSET)
++    return TRUE;
++
++  if (!ppd_utils_write (cpufreq->boost_path, profile_to_boost (profile), error)) {
++    if (cpufreq->activated_profile != PPD_PROFILE_UNSET) {
++      g_autoptr(GError) error_local = NULL;
++
++      if (!ppd_utils_write (cpufreq->boost_path,
++                            profile_to_boost (cpufreq->activated_profile),
++                            &error_local))
++        g_warning ("failed to restore previous profile: %s", error_local->message);
++    }
++    return FALSE;
++  }
++
++  cpufreq->activated_profile = profile;
++  return TRUE;
++}
++
++static void
++ppd_driver_cpufreq_finalize (GObject *object)
++{
++  PpdDriverCpufreq *cpufreq = PPD_DRIVER_CPUFREQ (object);
++
++  g_clear_pointer (&cpufreq->boost_path, g_free);
++  G_OBJECT_CLASS (ppd_driver_cpufreq_parent_class)->finalize (object);
++}
++
++static void
++ppd_driver_cpufreq_class_init (PpdDriverCpufreqClass *klass)
++{
++  GObjectClass *object_class;
++  PpdDriverClass *driver_class;
++
++  object_class = G_OBJECT_CLASS (klass);
++  object_class->constructor = ppd_driver_cpufreq_constructor;
++  object_class->finalize = ppd_driver_cpufreq_finalize;
++
++  driver_class = PPD_DRIVER_CLASS (klass);
++  driver_class->probe = ppd_driver_cpufreq_probe;
++  driver_class->activate_profile = ppd_driver_cpufreq_activate_profile;
++}
++
++static void
++ppd_driver_cpufreq_init (PpdDriverCpufreq *self)
++{
++}
+diff --git a/src/ppd-driver-cpufreq.h b/src/ppd-driver-cpufreq.h
+new file mode 100644
+index 0000000..35da49b
+--- /dev/null
++++ b/src/ppd-driver-cpufreq.h
+@@ -0,0 +1,15 @@
++/*
++ * Copyright (c) 2026 Daaboulex
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License version 3 as published by
++ * the Free Software Foundation.
++ *
++ */
++
++#pragma once
++
++#include "ppd-driver-cpu.h"
++
++#define PPD_TYPE_DRIVER_CPUFREQ (ppd_driver_cpufreq_get_type ())
++G_DECLARE_FINAL_TYPE (PpdDriverCpufreq, ppd_driver_cpufreq, PPD, DRIVER_CPUFREQ, PpdDriverCpu)
+diff --git a/tests/integration_test.py b/tests/integration_test.py
+index 7a52814..8c37bc2 100644
+--- a/tests/integration_test.py
++++ b/tests/integration_test.py
+@@ -21,6 +21,7 @@
+ # GNU General Public License for more details.
+ 
+ import os
++import shutil
+ import subprocess
+ import signal
+ import sys
+@@ -1534,6 +1535,155 @@ class Tests(dbusmock.DBusTestCase):
+         self.assert_file_eventually_contains(scaling_governor, "powersave")
+         self.assert_file_eventually_contains(boost, "0")
+ 
++    def create_cpufreq_boost(self, *scaling_drivers):
++        cpufreq_dir = os.path.join(
++            self.testbed.get_root_dir(), "sys/devices/system/cpu/cpufreq/"
++        )
++        os.makedirs(cpufreq_dir, exist_ok=True)
++        for index, scaling_driver in enumerate(scaling_drivers):
++            policy = os.path.join(cpufreq_dir, f"policy{index}")
++            os.makedirs(policy, exist_ok=True)
++            if scaling_driver is None:
++                # A directory cannot be read as a file, even by root
++                os.makedirs(os.path.join(policy, "scaling_driver"))
++                continue
++            self.write_file_contents(
++                os.path.join(policy, "scaling_driver"), scaling_driver + "\n"
++            )
++        boost = os.path.join(cpufreq_dir, "boost")
++        self.write_file_contents(boost, "1\n")
++        return boost
++
++    def test_cpufreq_boost(self):
++        """Generic cpufreq driver switches the global boost per profile"""
++
++        boost = self.create_cpufreq_boost(
++            "apple-cpufreq", "apple-cpufreq", "apple-cpufreq"
++        )
++
++        self.start_daemon()
++
++        profiles = self.get_dbus_property("Profiles")
++        self.assertEqual(len(profiles), 3)
++        self.assertEqual(profiles[0]["Profile"], "power-saver")
++        self.assertEqual(profiles[0]["CpuDriver"], "cpufreq")
++        self.assertEqual(profiles[0]["PlatformDriver"], "placeholder")
++        self.assertEqual(profiles[0]["Driver"], "multiple")
++        self.assertEqual(profiles[2]["Profile"], "performance")
++        self.assertEqual(profiles[2]["Driver"], "cpufreq")
++
++        self.assert_file_eventually_contains(boost, "1")
++
++        self.set_dbus_property("ActiveProfile", GLib.Variant.new_string("power-saver"))
++        self.assertEqual(self.get_dbus_property("ActiveProfile"), "power-saver")
++        self.assert_file_eventually_contains(boost, "0")
++
++        self.set_dbus_property("ActiveProfile", GLib.Variant.new_string("performance"))
++        self.assertEqual(self.get_dbus_property("ActiveProfile"), "performance")
++        self.assert_file_eventually_contains(boost, "1")
++
++        self.set_dbus_property("ActiveProfile", GLib.Variant.new_string("power-saver"))
++        self.assert_file_eventually_contains(boost, "0")
++        self.set_dbus_property("ActiveProfile", GLib.Variant.new_string("balanced"))
++        self.assertEqual(self.get_dbus_property("ActiveProfile"), "balanced")
++        self.assert_file_eventually_contains(boost, "1")
++
++    def test_cpufreq_ignores_other_scaling_drivers(self):
++        """Generic cpufreq driver leaves other scaling drivers to the placeholder"""
++
++        cases = {
++            "acpi-cpufreq": ("acpi-cpufreq",),
++            "intel_cpufreq": ("intel_cpufreq",),
++            "amd-pstate passive": ("amd-pstate",),
++            "mixed policies": ("apple-cpufreq", "acpi-cpufreq"),
++            "unreadable policy and another driver": (None, "acpi-cpufreq"),
++            "only unreadable policies": (None,),
++            "no policies": (),
++        }
++        cpufreq_dir = os.path.join(
++            self.testbed.get_root_dir(), "sys/devices/system/cpu/cpufreq/"
++        )
++        for case, scaling_drivers in cases.items():
++            with self.subTest(case=case):
++                shutil.rmtree(cpufreq_dir, ignore_errors=True)
++                boost = self.create_cpufreq_boost(*scaling_drivers)
++
++                self.start_daemon()
++
++                profiles = self.get_dbus_property("Profiles")
++                self.assertEqual(len(profiles), 2)
++                self.assertEqual(profiles[0]["Driver"], "placeholder")
++
++                self.set_dbus_property(
++                    "ActiveProfile", GLib.Variant.new_string("power-saver")
++                )
++                self.assertEqual(self.get_dbus_property("ActiveProfile"), "power-saver")
++                with open(boost, "rb") as f:
++                    self.assertEqual(f.read(), b"1\n")
++
++                self.stop_daemon(delete_profile=True)
++
++    def test_cpufreq_skips_unreadable_policy(self):
++        """Generic cpufreq driver skips a policy whose scaling driver cannot be read"""
++
++        boost = self.create_cpufreq_boost("apple-cpufreq", None, "apple-cpufreq")
++
++        self.start_daemon()
++
++        profiles = self.get_dbus_property("Profiles")
++        self.assertEqual(len(profiles), 3)
++        self.assertEqual(profiles[0]["CpuDriver"], "cpufreq")
++
++        self.set_dbus_property("ActiveProfile", GLib.Variant.new_string("power-saver"))
++        self.assert_file_eventually_contains(boost, "0")
++
++    def test_cpufreq_read_only_boost(self):
++        """Generic cpufreq driver is not used when the boost switch cannot be written"""
++
++        boost = self.create_cpufreq_boost("apple-cpufreq")
++        self.change_immutable(boost, True)
++
++        self.start_daemon()
++
++        profiles = self.get_dbus_property("Profiles")
++        self.assertEqual(len(profiles), 2)
++        self.assertEqual(profiles[0]["Driver"], "placeholder")
++        with open(boost, "rb") as f:
++            self.assertEqual(f.read(), b"1\n")
++
++    def test_cpufreq_yields_to_amd_pstate(self):
++        """A hardware-specific CPU driver wins over the generic cpufreq driver"""
++
++        boost = self.create_cpufreq_boost()
++        policy = os.path.join(
++            self.testbed.get_root_dir(), "sys/devices/system/cpu/cpufreq/policy0/"
++        )
++        os.makedirs(policy)
++        self.write_file_contents(
++            os.path.join(policy, "scaling_governor"), "powersave\n"
++        )
++        self.write_file_contents(
++            os.path.join(policy, "energy_performance_preference"), "performance\n"
++        )
++        pstate_dir = os.path.join(
++            self.testbed.get_root_dir(), "sys/devices/system/cpu/amd_pstate"
++        )
++        os.makedirs(pstate_dir)
++        self.write_file_contents(os.path.join(pstate_dir, "status"), "active\n")
++
++        self.start_daemon()
++
++        profiles = self.get_dbus_property("Profiles")
++        self.assertEqual(len(profiles), 3)
++        self.assertEqual(profiles[0]["CpuDriver"], "amd_pstate")
++
++        self.set_dbus_property("ActiveProfile", GLib.Variant.new_string("power-saver"))
++        self.assert_file_eventually_contains(
++            os.path.join(policy, "energy_performance_preference"), "power"
++        )
++        with open(boost, "rb") as f:
++            self.assertEqual(f.read(), b"1\n")
++
+     def test_amd_pstate_balance(self):
+         """AMD P-State driver (balance)"""
+ 

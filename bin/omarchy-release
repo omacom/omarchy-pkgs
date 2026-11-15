@@ -2,8 +2,11 @@
 # omarchy-release — the front door for cutting Omarchy releases.
 #
 # A release train has three human moments, each one command:
-#   start  open the train: release branch + staging PR (+ advance edge -> rc)
-#   rc     cut a candidate: pin PKGBUILDs to the branch head, publish to rc
+#   start  open the train: a patch gets a release branch + staging PR; a
+#          minor/major advances edge -> rc (all, some or none of it) and cuts
+#          its first candidate
+#   rc     cut a candidate: pin PKGBUILDs to the train's head, publish to rc
+#          and edge
 #   ship   make it official: final pins, promote rc -> stable, tag, GH release,
 #          ISO, website
 #
@@ -11,8 +14,12 @@
 # pins, published channels, tags) and offers the correct next step. Every
 # subcommand is idempotent — a re-run checks what is already done and skips it.
 #
-# Versions are inferred from branch names: branch v4-0-2 -> RCs 4.0.2rcN ->
-# tag v4.0.2. `start` is the only place a version is typed.
+# Two kinds of train. A patch (4.0.2) cherry-picks onto release branch v4-0-2
+# and pins untagged 4.0.2rcN candidates from it. A minor/major (4.5.0) takes
+# everything, so it follows the dev branch itself: each candidate tags its tip
+# v4.5.0-rcN, and those tags are what mark the train open. Either way shipping
+# tags v4.0.2 / v4.5.0, which closes it. `start` is the only place a version is
+# typed.
 
 set -e
 
@@ -20,20 +27,26 @@ BUILD_ROOT=$(realpath "${BASH_SOURCE[0]%/*}/..")
 source "$BUILD_ROOT/helpers/message-helpers.sh"
 source "$BUILD_ROOT/helpers/docker-helpers.sh"
 source "$BUILD_ROOT/helpers/paths.sh"
-source "$BUILD_ROOT/helpers/host-helpers.sh"
 
-UPSTREAM_URL="${OMARCHY_UPSTREAM_URL:-https://github.com/basecamp/omarchy.git}"
-UPSTREAM_REPO="${OMARCHY_UPSTREAM_REPO:-basecamp/omarchy}"
-SITE_REPO="${OMARCHY_SITE_REPO:-omacom-io/omarchy-site}"
-ISO_REPO="${OMARCHY_ISO_REPO:-omacom-io/omarchy-iso}"
+UPSTREAM_URL="${OMARCHY_UPSTREAM_URL:-https://github.com/omacom/omarchy.git}"
+UPSTREAM_REPO="${OMARCHY_UPSTREAM_REPO:-omacom/omarchy}"
+PKGS_REPO="${OMARCHY_PKGS_REPO:-omacom/omarchy-pkgs}"
+SITE_REPO="${OMARCHY_SITE_REPO:-omacom/omarchy-site}"
+ISO_REPO="${OMARCHY_ISO_REPO:-omacom/omarchy-iso}"
 DEV_BRANCH="${OMARCHY_DEV_BRANCH:-quattro}"
 
 PKGS_DB_BASE="${OMARCHY_PKGS_DB_BASE:-https://pkgs.omarchy.org}"
-# The first published architecture supplies the version-ordering floor when
-# cutting pins. Readiness checks below still verify every published
-# architecture before an RC or final release can move forward.
+# The first CI architecture supplies the version-ordering floor when cutting
+# pins. Readiness checks below still verify every architecture CI publishes
+# before an RC or final release can move forward.
 OBSERVED_ARCH=$(reference_arch)
 RC_DB_URL="$PKGS_DB_BASE/rc/$OBSERVED_ARCH/omarchy.db.tar.zst"
+# The Arch mirrors rc and stable packages are built and run against: Arch's
+# for x86_64, Arch Linux ARM's for aarch64.
+RC_ARCH_MIRROR="${OMARCHY_RC_ARCH_MIRROR:-https://rc-mirror.omarchy.org}"
+STABLE_ARCH_MIRROR="${OMARCHY_STABLE_ARCH_MIRROR:-https://stable-mirror.omarchy.org}"
+RC_ARM_MIRROR="${OMARCHY_RC_ARM_MIRROR:-https://arm-rc-mirror.omarchy.org}"
+STABLE_ARM_MIRROR="${OMARCHY_STABLE_ARM_MIRROR:-https://arm-stable-mirror.omarchy.org}"
 
 SRCDEST_DIR="$BUILD_ROOT/.srcdest"
 MIRROR_CLONE="$SRCDEST_DIR/omarchy"          # bare mirror (shared with bin/omarchy-pkgs)
@@ -41,7 +54,6 @@ WORK_CLONE="$SRCDEST_DIR/omarchy-work"       # working clone for pick/cherry-pic
 RC_WORKTREE="$BUILD_ROOT/.worktrees/rc"      # pkgs repo rc branch worktree
 
 ASSUME_YES=false
-REPO_HOST_OVERRIDE=""
 
 show_usage() {
   cat <<EOF
@@ -50,24 +62,31 @@ Usage: $0 [command] [options]
 Run with no command to be shepherded through whatever the next step is.
 
 Commands:
-  start [X.Y.Z]      Open a release train: create branch v X-Y-Z on $UPSTREAM_REPO
-                     (from the previous tag for a patch, from $DEV_BRANCH for a
-                     minor/major), open the release-notes staging PR, and for a
-                     minor/major advance edge -> rc on the build host
-  pick [pr#|sha ...] Cherry-pick merged PRs onto the release branch; with no
-                     args, choose from a list of merged $DEV_BRANCH PRs
-  rc                 Cut the next X.Y.ZrcN into the rc channel
-  ship               Tag, final pins, promote rc -> stable, draft GitHub release,
-                     ISO (prompted), website bump
+  start [X.Y.Z]      Open a release train. A patch creates branch vX-Y-Z on
+                     $UPSTREAM_REPO from the previous tag and opens the
+                     release-notes staging PR. A minor/major asks whether to
+                     promote edge -> rc (promote.yml), then cuts its first
+                     candidate from $DEV_BRANCH
+  pick [pr#|sha ...] (patch) Cherry-pick merged PRs onto the release branch; with
+                     no args, choose from a list of merged $DEV_BRANCH PRs
+  rc                 Cut the next X.Y.ZrcN, build it into rc and carry it to edge
+                     (release-rc.yml). A minor/major tags $DEV_BRANCH's tip
+                     vX.Y.Z-rcN first
+  ship               Tag, final pins, promote rc -> stable (promote.yml), draft
+                     GitHub release, ISO (prompted), website bump
   status             Show where the train stands (read-only)
   doctor             Verify every credential and connection the flow needs
   self-test          Run helper unit tests
 
 Options:
   --yes              Skip confirmation prompts (for scripting/CI)
-  --host <host>      Build host ssh destination (else \$OMARCHY_REPO_HOST or .repo-host)
   --iso / --no-iso   (rc, ship) Build the ISO without asking / skip it
   --no-wait          (rc, ship) Do not poll for the published build
+  --promote-edge[="PKGBASE ..."]
+                     (start, minor/major) Carry edge into rc without asking:
+                     everything, or only the listed pkgbases. --yes alone
+                     carries everything
+  --no-promote-edge  (start, minor/major) Keep rc's packages; carry nothing
   -h, --help         Show this help
 EOF
 }
@@ -117,27 +136,52 @@ resolve_tag_commit() {
   echo "${peeled:-$sha}"
 }
 
-# Newest v*-*-* release branch, optionally only untagged ones. Shipping tags
-# the version, so "tag exists" is what closes a train — but ship itself also
-# needs to find a tagged train whose remaining steps (release, ISO, website)
-# didn't finish, so it can resume.
-newest_release_branch() { # newest_release_branch [--untagged]
+upstream_tags() { ls_remote --tags 'refs/tags/v*' | awk -F/ '!/\^\{\}$/{print $3}'; }
+
+rc_tag() { echo "v$1-rc$2"; } # 4.5.0 3 -> v4.5.0-rc3
+
+# Reads tag names on stdin. Versions with at least one vX.Y.Z-rcN tag: the
+# minor/major trains that have cut a candidate.
+rc_tag_versions() {
+  sed -nE 's/^v([0-9]+\.[0-9]+\.[0-9]+)-rc[0-9]+$/\1/p' | sort -u
+}
+
+# Reads tag names on stdin. The highest N among v<version>-rcN; empty when the
+# train has none yet.
+newest_rc_number() { # newest_rc_number <version>
+  sed -nE "s/^v${1//./\\.}-rc([0-9]+)\$/\\1/p" | sort -n | tail -1
+}
+
+# The newest release train as "<version> <ref>", optionally only untagged
+# ones. <ref> is the release branch vX-Y-Z for a patch train and $DEV_BRANCH
+# for a minor/major one. Shipping tags the version, so "tag exists" is what
+# closes a train — but ship itself also needs to find a tagged train whose
+# remaining steps (release, ISO, website) didn't finish, so it can resume.
+newest_train() { # newest_train [--untagged]
   local untagged_only=false
   [[ "${1:-}" == "--untagged" ]] && untagged_only=true
-  local branch best_ver="" best_branch="" ver
-  while IFS= read -r branch; do
-    ver=$(branch_to_version "$branch") || continue
-    if [[ "$untagged_only" == true ]] && tag_exists "v$ver"; then
+  local tags branch ver ref best_ver="" best_ref=""
+  tags=$(upstream_tags)
+  while read -r ver ref; do
+    [[ -n "$ver" ]] || continue
+    if [[ "$untagged_only" == true ]] && grep -Fxq "v$ver" <<<"$tags"; then
       continue
     fi
     if [[ -z "$best_ver" ]] || [[ $(vercmp "$ver" "$best_ver") -gt 0 ]]; then
-      best_ver="$ver" best_branch="$branch"
+      best_ver="$ver" best_ref="$ref"
     fi
-  done < <(ls_remote 'refs/heads/v*' | awk -F/ '{print $3}')
-  [[ -n "$best_branch" ]] && echo "$best_branch"
+  done < <(
+    while IFS= read -r branch; do
+      ver=$(branch_to_version "$branch") && echo "$ver $branch"
+    done < <(ls_remote 'refs/heads/v*' | awk -F/ '{print $3}')
+    rc_tag_versions <<<"$tags" | sed "s|\$| $DEV_BRANCH|"
+  )
+  [[ -n "$best_ver" ]] && echo "$best_ver $best_ref"
 }
 
-open_train_branch() { newest_release_branch --untagged; }
+open_train() { newest_train --untagged; }
+
+follows_dev_branch() { [[ "$1" == "$DEV_BRANCH" ]]; } # follows_dev_branch <ref>
 
 # Reads go over anonymous HTTPS; pushes go over SSH like every checkout the
 # operator owns. Pushing over HTTPS would drag in git's credential-helper
@@ -154,6 +198,9 @@ UPSTREAM_PUSH_URL="${OMARCHY_UPSTREAM_PUSH_URL:-$(ssh_push_url "$UPSTREAM_URL")}
 
 ensure_mirror_clone() {
   if [[ -d "$MIRROR_CLONE" ]]; then
+    # A clone from before the repository moved still names its old URL, and
+    # makepkg refuses a source whose cached clone points elsewhere.
+    git -C "$MIRROR_CLONE" remote set-url origin "$UPSTREAM_URL"
     git -C "$MIRROR_CLONE" fetch --quiet origin
   else
     mkdir -p "$SRCDEST_DIR"
@@ -172,6 +219,7 @@ push_upstream_ref() { # push_upstream_ref <source-sha> <destination-ref>
 
 ensure_work_clone() {
   if [[ -d "$WORK_CLONE" ]]; then
+    git -C "$WORK_CLONE" remote set-url origin "$UPSTREAM_URL"
     git -C "$WORK_CLONE" fetch --quiet origin
   else
     mkdir -p "$SRCDEST_DIR"
@@ -182,6 +230,66 @@ ensure_work_clone() {
 }
 
 # --- published channel state -------------------------------------------------
+
+# The Arch snapshot a mirror serves: its lastsync stamp. Returns 2 when the
+# mirror cannot be read.
+mirror_lastsync() {
+  local stamp
+  stamp=$(curl -sf "$1/lastsync?$(date +%s%N)") || return 2
+  [[ $stamp =~ ^[0-9]+$ ]] || return 2
+  echo "$stamp"
+}
+
+# A channel's Arch mirror for an architecture: arch_mirror rc|stable <arch>.
+arch_mirror() {
+  local channel="$1" arch="$2"
+  if [[ $arch == "aarch64" ]]; then
+    if [[ $channel == "rc" ]]; then echo "$RC_ARM_MIRROR"; else echo "$STABLE_ARM_MIRROR"; fi
+  else
+    if [[ $channel == "rc" ]]; then echo "$RC_ARCH_MIRROR"; else echo "$STABLE_ARCH_MIRROR"; fi
+  fi
+}
+
+# Stable packages were built and tested against rc's Arch snapshot. Promoted
+# while the stable mirror still serves an older one, they install against
+# libraries they were not built for (omarchy#15785). The mirror goes first, on
+# every architecture CI publishes: omarchy-mirror-sync-stable-from-rc on the
+# mirror host copies rc's x86_64 snapshot, lastsync included, to stable, and
+# omarchy-mirror-promote-arm on the ARM mirror host Arch Linux ARM's. With an
+# architecture, only that one's mirrors are compared.
+stable_mirror_matches_rc() {
+  local arch rc stable status=0
+  for arch in ${1:-$(ci_arches)}; do
+    rc=$(mirror_lastsync "$(arch_mirror rc "$arch")") || return 2
+    stable=$(mirror_lastsync "$(arch_mirror stable "$arch")") || return 2
+    [[ $rc == "$stable" ]] || status=1
+  done
+  return $status
+}
+
+# What to run on an architecture's mirror host when the stamps differ:
+# mirror_sync_hint <rc stamp> <stable stamp> [arch]. Normally stable is
+# behind and takes rc's snapshot. Stable newer than rc means something synced
+# it from upstream, which omarchy-mirror no longer does (omarchy-mirror#13);
+# copying rc over it would roll stable users' Arch packages back, so the hint
+# gives rc stable's snapshot by hand instead. An unreadable stamp suggests no
+# copy at all.
+mirror_sync_hint() {
+  local rc="$1" stable="$2" arch="${3:-x86_64}"
+  if [[ ! $rc =~ ^[0-9]+$ || ! $stable =~ ^[0-9]+$ ]]; then
+    echo "Check that $(arch_mirror rc "$arch") and $(arch_mirror stable "$arch") both answer /lastsync, then ship again"
+  elif ((stable > rc)); then
+    if [[ $arch == "aarch64" ]]; then
+      echo "Stable is newer than rc, so copying rc to stable would roll it back; find what synced stable from upstream. On the ARM mirror host, give rc stable's snapshot with omarchy-mirror-promote-arm --from omarchy:omarchy-mirror-arm-stable --to omarchy:omarchy-mirror-arm-rc, test rc on it, then ship again"
+    else
+      echo "Stable is newer than rc, so copying rc to stable would roll it back; find what synced stable from upstream. On the mirror host, give rc stable's snapshot with omarchy-mirror-copy-stage --from /mnt/arch-mirror-stable/ --to /mnt/arch-mirror-rc/ --r2 omarchy:omarchy-mirror-rc, test rc on it, then ship again"
+    fi
+  elif [[ $arch == "aarch64" ]]; then
+    echo "On the ARM mirror host, run omarchy-mirror-promote-arm --from omarchy:omarchy-mirror-arm-rc --to omarchy:omarchy-mirror-arm-stable, then ship again"
+  else
+    echo "Run omarchy-mirror-sync-stable-from-rc on the mirror host, then ship again"
+  fi
+}
 
 # Prints omarchy's published version in a channel; empty when absent, rc 2 when
 # the database cannot be read (callers must not mistake an outage for absence).
@@ -214,7 +322,7 @@ published_version() {
 
 all_arches_at_version() { # all_arches_at_version <channel> <pkgver>
   local channel="$1" want="$2" arch got
-  for arch in $(published_arches); do
+  for arch in $(ci_arches); do
     got=$(published_version "$channel" "$arch" 2>/dev/null) || return 1
     [[ "${got%-*}" == "$want" ]] || return 1
   done
@@ -232,83 +340,71 @@ rc_branch_pin() { # prints "pkgver commit", empty when no rc branch
   [[ -n "$pkgver" ]] && echo "$pkgver $commit"
 }
 
-# --- build host --------------------------------------------------------------
+# --- package workflows -------------------------------------------------------
 #
-# Every command runs from anywhere: when this machine IS the build host
-# (on_repo_host — the published database lives here), host operations execute
-# locally; otherwise they go over ssh to the configured destination. The
-# destination is anything ssh accepts — root@<ip>, root@<hostname>, or an
-# ~/.ssh/config Host alias — from --host, $OMARCHY_REPO_HOST, or .repo-host.
+# The pair is built and channels move in GitHub Actions, on the bucket itself:
+# release-rc.yml builds the rc branch's pins into rc and carries them to edge,
+# and promote.yml carries one channel into the next. Each run records who
+# started it and what moved.
 
-repo_host() { resolve_repo_host "$REPO_HOST_OVERRIDE"; }
-
-print_no_host_help() { # print_no_host_help <what> <script>
-  print_warning "Not on the build host, and none configured (--host, OMARCHY_REPO_HOST, or $BUILD_ROOT/.repo-host — any ssh destination, e.g. root@<host> or an ssh-config alias)"
-  echo "Run this on the build host to $1:" >&2
-  echo "$2" >&2
-}
-
-# Builds the pinned release pair for the rc channel from the rc branch's own
-# worktree, creating it on first use. OMARCHY_RC_PINS marks this as the one
-# build allowed to set those packages' rc versions; OMARCHY_REPO_ROOT points
-# the worktree at the primary checkout's channel tree so all three channels
-# stay in one place. Fast-ring packages are not built here — the scheduled rc
-# release covers those from master.
-RC_TRIGGER_SCRIPT='
-set -e
-git -C /root/omarchy-pkgs fetch origin rc
-if [ ! -d /root/omarchy-pkgs-rc ]; then
-  git -C /root/omarchy-pkgs worktree add /root/omarchy-pkgs-rc rc 2>/dev/null ||
-    git -C /root/omarchy-pkgs worktree add --track -b rc /root/omarchy-pkgs-rc origin/rc
-fi
-git -C /root/omarchy-pkgs-rc fetch origin rc
-git -C /root/omarchy-pkgs-rc reset --hard origin/rc
-cd /root/omarchy-pkgs-rc
-# The pair is built once per published architecture (helpers/paths.sh on the
-# host decides which), so every architecture'"'"'s rc channel carries the pins.
-for arch in $(BUILD_ROOT=/root/omarchy-pkgs-rc bash -c "source helpers/paths.sh; published_arches"); do
-  OMARCHY_RC_PINS=1 OMARCHY_REPO_ROOT=/root/omarchy-pkgs/pkgs.omarchy.org \
-    bin/repo release --mirror rc --arch "$arch" --package omarchy omarchy-settings --skip-prod-check
-done
-'
-
-trigger_rc_build() {
-  local host
-  if host=$(repo_host); then
-    print_info "Building the RC on $host (this takes a while)..."
-    ssh "$host" "source /root/.omarchy/build-credentials 2>/dev/null; $RC_TRIGGER_SCRIPT"
-  elif on_repo_host; then
-    print_info "Building the RC locally (this is the build host)..."
-    bash -c "$RC_TRIGGER_SCRIPT"
-  else
-    print_no_host_help "build the release candidate" "$RC_TRIGGER_SCRIPT"
+# Starts a workflow on this repo's master and prints its run. With --wait it
+# follows the run to the end and fails when the run does.
+dispatch_workflow() { # dispatch_workflow [--wait] <workflow file> [-f key=value ...]
+  local wait=false file since run=""
+  [[ "$1" == "--wait" ]] && { wait=true; shift; }
+  file="$1"
+  shift
+  since=$(date -u -d '-10 seconds' +%Y-%m-%dT%H:%M:%SZ)
+  gh workflow run "$file" -R "$PKGS_REPO" --ref master "$@" || return 1
+  # The dispatch returns before the run exists; find it by when it started.
+  local tries
+  for ((tries = 0; tries < 30; tries++)); do
+    run=$(gh run list -R "$PKGS_REPO" --workflow "$file" --event workflow_dispatch --limit 10 \
+      --json databaseId,createdAt --jq "[.[] | select(.createdAt >= \"$since\")] | last | .databaseId // empty" 2>/dev/null) || run=""
+    [[ -n "$run" ]] && break
+    sleep 2
+  done
+  if [[ -z "$run" ]]; then
+    print_error "Started $file but could not find its run: https://github.com/$PKGS_REPO/actions/workflows/$file"
     return 1
   fi
+  print_info "$file: https://github.com/$PKGS_REPO/actions/runs/$run"
+  [[ "$wait" == true ]] || return 0
+  gh run watch "$run" -R "$PKGS_REPO" --exit-status --interval 30
 }
 
-host_advance() { # host_advance <from> <to> [extra args...]
-  local from="$1" to="$2"
-  shift 2
-  # bin/repo is the remote control: with a host configured it forwards this
-  # over ssh itself; on the host it runs locally. Only the "neither" case —
-  # a workstation with no host — must be refused here, because running it
-  # against this machine's (likely stale) local tree would be wrong.
-  if ! resolve_repo_host "$REPO_HOST_OVERRIDE" >/dev/null && ! on_repo_host; then
-    print_no_host_help "advance $from -> $to" \
-      "  cd /root/omarchy-pkgs && bin/repo advance --from $from --to $to --arch all --skip-prod-check $*"
-    return 1
-  fi
-  # --arch all: the host advances every architecture it publishes, so a train
-  # never moves a channel for one architecture and not another.
-  "$BUILD_ROOT/bin/repo" advance --from "$from" --to "$to" --arch all --skip-prod-check "$@"
+# Builds the pinned release pair from the rc branch into rc, then edge
+# (release-rc.yml).
+trigger_rc_build() { # trigger_rc_build [--wait]
+  print_info "Building the release candidate in GitHub Actions..."
+  dispatch_workflow "$@" release-rc.yml
+}
+
+# Carries <from> into <to> on every architecture (promote.yml), and waits for
+# it. With pkgbases, only those move.
+promote_channel() { # promote_channel <from> <to> [pkgbases]
+  print_info "Promoting $1 -> $2${3:+ (only $3)} in GitHub Actions..."
+  dispatch_workflow --wait promote.yml -f direction="$1 -> $2" ${3:+-f packages="$3"}
+}
+
+# What start does with edge for a minor/major: "all", "none", or the pkgbases
+# to carry. Reads an interactive reply; empty when it has to ask again.
+edge_promotion_choice() { # edge_promotion_choice <reply>
+  local reply
+  reply=$(xargs <<<"$1")
+  case "$reply" in
+    a | all) echo all ;;
+    n | none) echo none ;;
+    *) echo "$reply" ;;
+  esac
 }
 
 wait_for_published() { # wait_for_published <channel> <version> [timeout-seconds]
   local channel="$1" want="$2" timeout="${3:-3600}" waited=0 arch got pending
-  print_info "Waiting for $want in $channel for: $(published_arches | tr '\n' ' ')"
+  print_info "Waiting for $want in $channel for: $(ci_arches | tr '\n' ' ')"
   while ((waited < timeout)); do
     pending=""
-    for arch in $(published_arches); do
+    for arch in $(ci_arches); do
       got=$(published_version "$channel" "$arch" 2>/dev/null) || got=""
       [[ "${got%-*}" == "$want" ]] || pending+=" $arch=${got:-unreachable}"
     done
@@ -329,7 +425,7 @@ wait_for_published() { # wait_for_published <channel> <version> [timeout-seconds
 # --- pkgs rc branch (pin commits) --------------------------------------------
 
 # The rc branch is rebuilt as origin/master + pin commit(s) for each cut and
-# force-pushed; the build host follows with reset --hard. History on it is
+# force-pushed; release-rc.yml takes the pins from it. History on it is
 # disposable — the pins fully describe the release.
 prepare_rc_worktree() {
   git -C "$BUILD_ROOT" fetch --quiet origin
@@ -347,7 +443,8 @@ cut_pins() { # cut_pins <omarchy-pkgs release args...>
   # The pin engine's "edge DB" is the ordering floor and rc auto-numbering
   # source; in the pipeline model that floor is the rc channel.
   (cd "$RC_WORKTREE" &&
-    OMARCHY_EDGE_DB_URL="$RC_DB_URL" bin/omarchy-pkgs release "$@" --no-push --yes)
+    OMARCHY_EDGE_DB_URL="$RC_DB_URL" OMARCHY_RELEASE_CHANNELS="rc + edge via release-rc.yml (stable only by promotion in ship)" \
+      bin/omarchy-pkgs release "$@" --no-push --yes)
   git -C "$RC_WORKTREE" push --force-with-lease origin rc
 }
 
@@ -364,6 +461,7 @@ iso_checkout() { # prints a usable omarchy-iso checkout, cloning to tmp if neede
   fi
   local tmp="$SRCDEST_DIR/omarchy-iso"
   if [[ -d "$tmp" ]]; then
+    git -C "$tmp" remote set-url origin "https://github.com/$ISO_REPO.git"
     git -C "$tmp" pull --ff-only --quiet || true
   else
     print_info "Cloning $ISO_REPO..." >&2
@@ -372,16 +470,29 @@ iso_checkout() { # prints a usable omarchy-iso checkout, cloning to tmp if neede
   echo "$tmp"
 }
 
+# The ISO builds natively for the machine this runs on: built for the other
+# architecture it would run emulated, slowly and fragile. Each architecture is
+# released from a machine of its own; x86_64 needs no --arch, so it works with
+# an omarchy-iso that predates the option.
+iso_release_command() { # iso_release_command <arch> <version> [--rc]
+  echo "bin/omarchy-iso-release ${3:+$3 }$([[ $1 == x86_64 ]] || echo "--arch $1 ")$2"
+}
+
 build_iso() { # build_iso <version> [--rc]
-  local version="$1" rc_flag="${2:-}" dir
+  local version="$1" rc_flag="${2:-}" dir arch other
+  arch=$(uname -m)
+  other=x86_64
+  [[ $arch == x86_64 ]] && other=aarch64
   dir=$(iso_checkout) || return 1
   if [[ -z "$CONTAINER_ENGINE" ]] || ! "$CONTAINER_ENGINE" info >/dev/null 2>&1; then
     print_warning "No container engine is available — cannot build the ISO here. Run on a Docker or Podman machine:"
-    echo "  cd $dir && bin/omarchy-iso-release ${rc_flag:+$rc_flag }$version"
+    echo "  cd $dir && $(iso_release_command "$arch" "$version" "$rc_flag")"
     return 1
   fi
-  print_info "Building ${rc_flag:+RC }ISO $version (this takes a while)..."
-  (cd "$dir" && PATH="$dir/bin:$PATH" bin/omarchy-iso-release ${rc_flag:+"$rc_flag"} "$version")
+  print_info "Building ${rc_flag:+RC }$arch ISO $version (this takes a while)..."
+  print_info "The $other ISO builds on a $other machine: cd omarchy-iso && $(iso_release_command "$other" "$version" "$rc_flag")"
+  # shellcheck disable=SC2046 # the command is split into its arguments on purpose
+  (cd "$dir" && PATH="$dir/bin:$PATH" $(iso_release_command "$arch" "$version" "$rc_flag"))
 }
 
 maybe_iso() { # maybe_iso <version> <rc|final> <iso_mode: ask|yes|no>
@@ -391,7 +502,7 @@ maybe_iso() { # maybe_iso <version> <rc|final> <iso_mode: ask|yes|no>
   no) return 0 ;;
   yes) build_iso "$version" "$rc_flag" ;;
   ask)
-    if confirm "Build and upload the ${kind} ISO for $version?"; then
+    if confirm "Build and upload the ${kind} $(uname -m) ISO for $version on this machine?"; then
       build_iso "$version" "$rc_flag"
     fi
     ;;
@@ -457,26 +568,24 @@ cmd_start() {
     exit 1
   fi
 
-  # Base: previous tag for a patch, dev branch head for a minor/major.
-  local base_ref base_sha kind
-  if version_is_patch "$version"; then
-    kind="patch"
-    base_ref=$(previous_patch_tag "$version")
-    if ! tag_exists "$base_ref"; then
-      print_error "Base tag $base_ref not found on $UPSTREAM_REPO"
-      exit 1
-    fi
-    base_sha=$(resolve_tag_commit "$base_ref")
-  else
-    kind="minor/major"
-    base_ref="$DEV_BRANCH"
-    base_sha=$(branch_head "$DEV_BRANCH")
+  if ! version_is_patch "$version"; then
+    start_dev_train "$version"
+    return
   fi
+
+  # A patch branches from the previous tag and takes fixes by cherry-pick.
+  local base_ref base_sha
+  base_ref=$(previous_patch_tag "$version")
+  if ! tag_exists "$base_ref"; then
+    print_error "Base tag $base_ref not found on $UPSTREAM_REPO"
+    exit 1
+  fi
+  base_sha=$(resolve_tag_commit "$base_ref")
 
   if [[ -n "$(branch_head "$branch")" ]]; then
     print_success "Release branch $branch already exists — adopting it"
   else
-    print_info "Release type: $kind — branching $branch from $base_ref (${base_sha:0:12})"
+    print_info "Release type: patch — branching $branch from $base_ref (${base_sha:0:12})"
     confirm "Create branch $branch on $UPSTREAM_REPO?" || exit 1
     ensure_mirror_clone
     push_upstream_ref "$base_sha" "refs/heads/$branch"
@@ -495,33 +604,86 @@ cmd_start() {
     fi
   fi
 
-  # Minor/major trains ship new edge packages: carry edge forward into rc so
-  # RC testing runs against the set stable users will get. A failed advance
-  # must not pass silently — RCs would test against the previous rc set.
-  if [[ "$kind" != "patch" ]]; then
-    if ! host_advance edge rc; then
-      print_error "edge → rc advance did not complete — the train is NOT fully open"
-      echo "Fix the advance (it is idempotent), then re-run: omarchy-release start $version"
-      echo "start is idempotent too — the branch and PR above are kept."
-      exit 1
-    fi
-  else
-    print_info "Patch train: rc already mirrors stable — nothing to advance"
-  fi
-
+  print_info "Patch train: rc already mirrors stable — nothing to advance"
   echo ""
   print_success "Train $version is open"
   print_info "Next: omarchy-release pick   (cherry-pick fixes), then omarchy-release rc"
 }
 
+# A minor/major takes everything on the dev branch, so it has no branch of its
+# own: it is open once its first v<version>-rc1 tag exists, which this cuts.
+start_dev_train() { # start_dev_train <version>
+  local version="$1" open
+  open=$(open_train) || open=""
+  if [[ "$open" == "$version $DEV_BRANCH" ]]; then
+    print_success "Train $version is already open on $DEV_BRANCH"
+    print_info "Next: omarchy-release rc   (tags $DEV_BRANCH's tip as the next candidate)"
+    return 0
+  fi
+  # Opening this one advances rc's whole package set under the other.
+  if [[ -n "$open" ]]; then
+    print_error "Train ${open% *} is still open on ${open#* } — ship it before starting $version"
+    exit 1
+  fi
+  print_info "Release type: minor/major — candidates are tagged on $DEV_BRANCH as $(rc_tag "$version" N)"
+
+  # A feature rc tests against a fresh Arch snapshot. rc and stable still
+  # sharing one means rc has not taken it since the last ship.
+  local arch
+  for arch in $(ci_arches); do
+    stable_mirror_matches_rc "$arch" || continue
+    print_warning "rc's $arch Arch mirror still serves stable's snapshot"
+    if [[ $arch == "aarch64" ]]; then
+      echo "A minor/major train tests against a fresh one: run omarchy-mirror-promote-arm --from omarchy:omarchy-mirror-arm --to omarchy:omarchy-mirror-arm-rc on the ARM mirror host first."
+    else
+      echo "A minor/major train tests against a fresh one: run omarchy-mirror-sync-rc on the mirror host first."
+    fi
+    confirm "Open the train on the current snapshot anyway?" || exit 1
+  done
+
+  # A minor/major usually ships what has collected on edge, so RC testing
+  # runs against it: carry edge forward into rc, since shipping promotes all
+  # of rc to stable. Holding some or all of it back keeps rc at what it serves
+  # now, say right after a promotion, so new edge packages stay out of the
+  # RCs. A failed advance must not pass silently — RCs would test against a
+  # set nobody chose.
+  local promote="$PROMOTE_EDGE"
+  if [[ -z "$promote" && "$ASSUME_YES" == true ]]; then
+    promote=all
+  fi
+  while [[ -z "$promote" ]]; do
+    echo "Carry edge's newer packages into rc for this train? Shipping takes rc to stable."
+    echo "  Preview: gh workflow run promote.yml -R $PKGS_REPO -f direction=\"edge -> rc\" -f dry_run=true"
+    local reply
+    read -r -p "[a]ll, [n]one, or the pkgbases to carry: " reply
+    promote=$(edge_promotion_choice "$reply")
+  done
+  local only=""
+  [[ "$promote" == all ]] || only="$promote"
+  if [[ "$promote" == none ]]; then
+    print_info "Holding edge back — rc keeps its current packages"
+  elif ! promote_channel edge rc "$only"; then
+    print_error "edge → rc advance did not complete — the train is NOT open"
+    echo "Fix the advance (it is idempotent), then re-run: omarchy-release start $version"
+    exit 1
+  fi
+
+  cmd_rc "$ISO_MODE" "$WAIT" "$version"
+}
+
 cmd_pick() {
-  local branch version
-  branch=$(open_train_branch) || true
-  if [[ -z "$branch" ]]; then
+  local train branch version
+  train=$(open_train) || true
+  if [[ -z "$train" ]]; then
     print_error "No open release train — run: omarchy-release start"
     exit 1
   fi
-  version=$(branch_to_version "$branch")
+  version="${train% *}" branch="${train#* }"
+  if follows_dev_branch "$branch"; then
+    print_error "$version follows $DEV_BRANCH and takes everything on it — there is nothing to pick"
+    echo "Merge the change to $DEV_BRANCH, then cut the next candidate: omarchy-release rc"
+    exit 1
+  fi
   print_header "Pick changes onto $branch ($version)"
 
   ensure_work_clone
@@ -663,22 +825,25 @@ cmd_pick() {
   print_info "Next: omarchy-release rc"
 }
 
-cmd_rc() {
-  local iso_mode="$1" wait="$2"
-  local branch version
-  branch=$(open_train_branch) || true
-  if [[ -z "$branch" ]]; then
-    print_error "No open release train — run: omarchy-release start"
-    exit 1
+cmd_rc() { # cmd_rc <iso_mode> <wait> [version]  (version: start opening a minor/major)
+  local iso_mode="$1" wait="$2" train ref version
+  if [[ -n "${3:-}" ]]; then
+    version="$3" ref="$DEV_BRANCH"
+  else
+    train=$(open_train) || true
+    if [[ -z "$train" ]]; then
+      print_error "No open release train — run: omarchy-release start"
+      exit 1
+    fi
+    version="${train% *}" ref="${train#* }"
   fi
-  version=$(branch_to_version "$branch")
   print_header "Cut RC for train $version"
 
   local head
-  head=$(branch_head "$branch")
-  print_info "Branch $branch head: ${head:0:12}"
+  head=$(branch_head "$ref")
+  print_info "$ref head: ${head:0:12}"
 
-  # Idempotence: if the current rc pin already matches the branch head and is
+  # Idempotence: if the current rc pin already matches the head and is
   # published, there is nothing to cut.
   local pin
   pin=$(rc_branch_pin)
@@ -691,44 +856,76 @@ cmd_rc() {
         return 0
       fi
       print_info "$pin_ver is pinned from this head but not published yet — re-triggering the build"
-      trigger_rc_build || return 1
-      [[ "$wait" == true ]] && wait_for_published rc "$pin_ver"
+      if [[ "$wait" == true ]]; then
+        trigger_rc_build --wait || return 1
+        wait_for_published rc "$pin_ver" || return 1
+      else
+        trigger_rc_build || return 1
+      fi
       maybe_iso "$pin_ver" rc "$iso_mode"
       return 0
     fi
   fi
 
-  confirm "Pin omarchy + omarchy-settings to $branch@${head:0:12} as the next ${version}rcN and publish to rc?" || exit 1
-
-  cut_pins rc --base "$version" --ref "$branch"
+  if follows_dev_branch "$ref"; then
+    # The tag is the candidate: pin from it so the PKGBUILDs record it. A
+    # newest tag already on this head is a cut that stopped before pinning.
+    local tags n tag
+    tags=$(upstream_tags)
+    n=$(newest_rc_number "$version" <<<"$tags")
+    if [[ -n "$n" && "$(resolve_tag_commit "$(rc_tag "$version" "$n")")" == "$head" ]]; then
+      tag=$(rc_tag "$version" "$n")
+      print_info "$tag already tags this head — pinning it"
+    else
+      tag=$(rc_tag "$version" "$((${n:-0} + 1))")
+      confirm "Tag $DEV_BRANCH@${head:0:12} as $tag on $UPSTREAM_REPO, pin omarchy + omarchy-settings to it and publish to rc + edge?" || exit 1
+      ensure_mirror_clone
+      push_upstream_ref "$head" "refs/tags/$tag"
+      if [[ "$(resolve_tag_commit "$tag")" != "$head" ]]; then
+        print_error "Tag push completed but $tag does not resolve to ${head:0:12}"
+        exit 1
+      fi
+      print_success "Tagged $tag at ${head:0:12}"
+    fi
+    cut_pins "$tag"
+  else
+    confirm "Pin omarchy + omarchy-settings to $ref@${head:0:12} as the next ${version}rcN and publish to rc + edge?" || exit 1
+    cut_pins rc --base "$version" --ref "$ref"
+  fi
 
   local new_pin new_ver
   new_pin=$(rc_branch_pin)
   new_ver="${new_pin%% *}"
   print_success "Pinned $new_ver (rc branch pushed)"
 
-  trigger_rc_build || return 1
   if [[ "$wait" == true ]]; then
+    trigger_rc_build --wait || return 1
     wait_for_published rc "$new_ver" || return 1
+  else
+    trigger_rc_build || return 1
   fi
   maybe_iso "$new_ver" rc "$iso_mode"
   echo ""
-  print_info "Test the candidate, then: omarchy-release ship  (or pick + rc again)"
+  if follows_dev_branch "$ref"; then
+    print_info "Test the candidate, then: omarchy-release ship  (or rc again to take $DEV_BRANCH's newer commits)"
+  else
+    print_info "Test the candidate, then: omarchy-release ship  (or pick + rc again)"
+  fi
 }
 
 cmd_ship() {
   local iso_mode="$1" wait="$2"
-  local branch version
-  branch=$(open_train_branch) || true
-  if [[ -z "$branch" ]]; then
+  local train branch version
+  train=$(open_train) || true
+  if [[ -z "$train" ]]; then
     # A tagged train whose later steps (release, ISO, website) failed is
-    # invisible to open_train_branch — find it so a re-run can resume.
-    branch=$(newest_release_branch) || true
-    if [[ -z "$branch" ]]; then
+    # invisible to open_train — find it so a re-run can resume.
+    train=$(newest_train) || true
+    if [[ -z "$train" ]]; then
       print_error "No release train found — nothing to ship"
       exit 1
     fi
-    version=$(branch_to_version "$branch")
+    version="${train% *}" branch="${train#* }"
     if all_arches_at_version stable "$version" &&
       gh release view "v$version" --repo "$UPSTREAM_REPO" >/dev/null 2>&1; then
       print_success "Nothing to ship — $version is tagged, released, and live on stable"
@@ -736,7 +933,7 @@ cmd_ship() {
     fi
     print_info "Resuming tagged-but-incomplete train $version"
   else
-    version=$(branch_to_version "$branch")
+    version="${train% *}" branch="${train#* }"
   fi
   print_header "Ship $version"
 
@@ -747,7 +944,9 @@ cmd_ship() {
   pin_commit="${pin##* }"
 
   # The ship guard: only the exact commit an RC was cut from may ship. There
-  # is no override — a moved branch means an untested tree; cut another rc.
+  # is no override — a moved release branch means an untested tree; cut
+  # another rc. The dev branch moves on by design, so a minor/major ships its
+  # newest candidate: that rc tag's commit must be the one pinned.
   if [[ -z "$pin" ]]; then
     print_error "No RC has been cut for $version — run: omarchy-release rc"
     exit 1
@@ -755,7 +954,7 @@ cmd_ship() {
   if [[ "$pin_ver" == "$version" ]]; then
     # Final already pinned (resume path). The artifacts come from pin_commit;
     # a branch that moved afterwards changes nothing already built or tagged.
-    if [[ -n "$head" && "$head" != "$pin_commit" ]]; then
+    if [[ -n "$head" && "$head" != "$pin_commit" ]] && ! follows_dev_branch "$branch"; then
       print_warning "$branch moved after the final was pinned — shipping the pinned ${pin_commit:0:12}; newer commits need the next patch train"
     fi
   else
@@ -763,7 +962,19 @@ cmd_ship() {
       print_error "No RC has been cut for $version (rc branch pins $pin_ver) — run: omarchy-release rc"
       exit 1
     fi
-    if [[ "$pin_commit" != "$head" ]]; then
+    if follows_dev_branch "$branch"; then
+      local n newest_tag
+      n=$(upstream_tags | newest_rc_number "$version")
+      newest_tag=$(rc_tag "$version" "${n:-0}")
+      if [[ -z "$n" || "$pin_ver" != "${version}rc$n" || "$(resolve_tag_commit "$newest_tag")" != "$pin_commit" ]]; then
+        print_error "The rc branch pins $pin_ver from ${pin_commit:0:12}, which is not the newest candidate ${n:+$newest_tag}"
+        echo "Pin and publish the newest candidate first: omarchy-release rc"
+        exit 1
+      fi
+      if [[ "$pin_commit" != "$head" ]]; then
+        print_info "$DEV_BRANCH has moved on since $newest_tag — shipping the tested ${pin_commit:0:12}; newer commits wait for the next train"
+      fi
+    elif [[ "$pin_commit" != "$head" ]]; then
       local behind
       behind=$(git -C "$WORK_CLONE" rev-list --count "$pin_commit..origin/$branch" 2>/dev/null || echo "?")
       print_error "$branch has moved since $pin_ver was cut ($behind commit(s) untested)"
@@ -781,10 +992,15 @@ cmd_ship() {
   echo ""
   print_info "This will, in order (steps already done are skipped):"
   echo "  1. Tag v$version at the tested $branch@${pin_commit:0:12} on $UPSTREAM_REPO"
-  echo "  2. Pin the final $version from that tag and publish it to rc"
-  echo "  3. Promote the rc channel to stable (packages + signatures + db)"
-  echo "  4. Merge the final pins to master (edge overlap + record)"
-  echo "  5. Create a draft GitHub release from the staging PR body"
+  echo "  2. Pin the final $version from that tag and publish it to rc + edge"
+  echo "  3. Promote the rc channel to stable (packages + signatures + db), once the"
+  echo "     stable Arch mirror serves rc's snapshot"
+  echo "  4. Merge the final pins to master (the repo record)"
+  if follows_dev_branch "$branch"; then
+    echo "  5. Create a draft GitHub release with notes generated from the merged PRs"
+  else
+    echo "  5. Create a draft GitHub release from the staging PR body"
+  fi
   echo "  6. Build + upload the final ISO (${iso_mode})"
   echo "  7. Point the website at the new ISO"
   echo ""
@@ -826,7 +1042,7 @@ cmd_ship() {
     else
       print_info "2/7 Final $version pinned — re-triggering build"
     fi
-    trigger_rc_build || exit 1
+    trigger_rc_build --wait || exit 1
     wait_for_published rc "$version" || exit 1
   fi
 
@@ -834,7 +1050,18 @@ cmd_ship() {
   if all_arches_at_version stable "$version"; then
     print_success "3/7 Stable already serves $version on every architecture"
   else
-    host_advance rc stable || exit 1
+    local arch rc_sync stable_sync behind=0
+    for arch in $(ci_arches); do
+      stable_mirror_matches_rc "$arch" && continue
+      rc_sync=$(mirror_lastsync "$(arch_mirror rc "$arch")") || rc_sync=unreadable
+      stable_sync=$(mirror_lastsync "$(arch_mirror stable "$arch")") || stable_sync=unreadable
+      print_error "3/7 The stable $arch Arch mirror does not serve rc's snapshot yet (lastsync: rc $rc_sync, stable $stable_sync)"
+      print_info "$(mirror_sync_hint "$rc_sync" "$stable_sync" "$arch")"
+      behind=1
+    done
+    ((behind == 0)) || exit 1
+    print_success "3/7 The stable Arch mirrors serve rc's snapshot: $(ci_arches | paste -sd' ')"
+    promote_channel rc stable || exit 1
     if ! all_arches_at_version stable "$version"; then
       print_error "Promotion ran but stable does not serve $version on every architecture"
       exit 1
@@ -843,7 +1070,8 @@ cmd_ship() {
     print_success "3/7 Promoted to stable: omarchy $stable_pub on every architecture"
   fi
 
-  # 4. Final pins onto master (keeps edge overlap publishing and the repo record)
+  # 4. Final pins onto master: the repo record. Edge already serves the final
+  # from step 2, so the merge's publish finds nothing to build.
   local master_ver
   master_ver=$(git -C "$BUILD_ROOT" show origin/master:pkgbuilds/omarchy/PKGBUILD 2>/dev/null | grep -E '^pkgver=' | head -1 | cut -d= -f2)
   if [[ "$master_ver" == "$version" ]]; then
@@ -867,20 +1095,27 @@ cmd_ship() {
     fi
   fi
 
-  # 5. Draft GitHub release from the staging PR body. Requiring the tag makes
-  # this fail closed if step 1 did not finish instead of letting gh create the
-  # tag from the default branch.
+  # 5. Draft GitHub release from the staging PR body, or for a minor/major,
+  # which has no staging PR, from GitHub's notes for the PRs since the last
+  # release. Requiring the tag makes this fail closed if step 1 did not finish
+  # instead of letting gh create the tag from the default branch.
   if gh release view "v$version" --repo "$UPSTREAM_REPO" >/dev/null 2>&1; then
     print_success "5/7 GitHub release v$version already exists"
   else
-    local notes
-    notes=$(gh pr view "$branch" --repo "$UPSTREAM_REPO" --json body --jq '.body' 2>/dev/null) || notes=""
-    if [[ -z "$notes" || "$notes" == "null" ]]; then
-      notes="Omarchy $version"
-      print_warning "No staging PR body found — using a bare title; edit the release afterwards"
+    local -a notes_args
+    if follows_dev_branch "$branch"; then
+      notes_args=(--generate-notes)
+    else
+      local notes
+      notes=$(gh pr view "$branch" --repo "$UPSTREAM_REPO" --json body --jq '.body' 2>/dev/null) || notes=""
+      if [[ -z "$notes" || "$notes" == "null" ]]; then
+        notes="Omarchy $version"
+        print_warning "No staging PR body found — using a bare title; edit the release afterwards"
+      fi
+      notes_args=(--notes "$notes")
     fi
     gh release create "v$version" --repo "$UPSTREAM_REPO" --title "v$version" \
-      --notes "$notes" --draft --verify-tag
+      "${notes_args[@]}" --draft --verify-tag
     print_success "5/7 Draft GitHub release v$version created"
   fi
 
@@ -896,7 +1131,9 @@ cmd_ship() {
 
   echo ""
   print_success "Shipped $version — rc and stable are in parity for the next patch train"
-  print_info "Close the loop: merge or close the staging PR for $branch on $UPSTREAM_REPO"
+  if ! follows_dev_branch "$branch"; then
+    print_info "Close the loop: merge or close the staging PR for $branch on $UPSTREAM_REPO"
+  fi
 }
 
 # --- status / shepherd -------------------------------------------------------
@@ -905,12 +1142,14 @@ gather_status() {
   EDGE_VER=$(published_version edge 2>/dev/null) || EDGE_VER="<unreachable>"
   RC_VER=$(published_version rc 2>/dev/null) || RC_VER="<unreachable>"
   STABLE_VER=$(published_version stable 2>/dev/null) || STABLE_VER="<unreachable>"
-  TRAIN=$(open_train_branch 2>/dev/null) || TRAIN=""
+  local train
+  train=$(open_train 2>/dev/null) || train=""
+  TRAIN=""
   TRAIN_VER=""
   TRAIN_HEAD=""
   PIN=""
-  if [[ -n "$TRAIN" ]]; then
-    TRAIN_VER=$(branch_to_version "$TRAIN")
+  if [[ -n "$train" ]]; then
+    TRAIN_VER="${train% *}" TRAIN="${train#* }"
     TRAIN_HEAD=$(branch_head "$TRAIN")
     PIN=$(rc_branch_pin)
   fi
@@ -920,9 +1159,9 @@ next_step() { # prints "<command>|<description>"
   if [[ -z "$TRAIN" ]]; then
     # A tagged train may still have unfinished ship steps (release/ISO/site).
     local last last_ver
-    last=$(newest_release_branch 2>/dev/null) || last=""
+    last=$(newest_train 2>/dev/null) || last=""
     if [[ -n "$last" && "$STABLE_VER" != "<unreachable>" ]]; then
-      last_ver=$(branch_to_version "$last")
+      last_ver="${last% *}"
       if ! all_arches_at_version stable "$last_ver" ||
         { command -v gh >/dev/null && ! gh release view "v$last_ver" --repo "$UPSTREAM_REPO" >/dev/null 2>&1; }; then
         echo "ship|$last_ver is tagged but not fully shipped — resume ship"
@@ -937,10 +1176,13 @@ next_step() { # prints "<command>|<description>"
     echo "rc|Cut the first candidate for $TRAIN_VER"
   elif [[ "$pin_ver" == "$TRAIN_VER" ]]; then
     echo "ship|Final $TRAIN_VER is pinned — finish shipping (re-runs are safe)"
-  elif [[ "$pin_commit" != "$TRAIN_HEAD" ]]; then
+  elif [[ "$pin_commit" != "$TRAIN_HEAD" ]] && ! follows_dev_branch "$TRAIN"; then
     echo "rc|$TRAIN has commits newer than $pin_ver — cut the next candidate"
   elif ! all_arches_at_version rc "$pin_ver"; then
     echo "rc|$pin_ver is pinned but not published — re-run rc to re-trigger/wait"
+  elif [[ "$pin_commit" != "$TRAIN_HEAD" ]]; then
+    # The dev branch never stops moving; whether to take it is a judgment call.
+    echo "ship|$pin_ver is published to rc — test it, then ship (or rc again to take $TRAIN's newer commits)"
   else
     echo "ship|$pin_ver is published to rc — test it, then ship"
   fi
@@ -956,7 +1198,11 @@ print_status() {
   if [[ -z "$TRAIN" ]]; then
     echo "  No open release train."
   else
-    echo "  Open train: $TRAIN_VER (branch $TRAIN @ ${TRAIN_HEAD:0:12})"
+    if follows_dev_branch "$TRAIN"; then
+      echo "  Open train: $TRAIN_VER (follows $TRAIN @ ${TRAIN_HEAD:0:12})"
+    else
+      echo "  Open train: $TRAIN_VER (branch $TRAIN @ ${TRAIN_HEAD:0:12})"
+    fi
     if [[ -n "$PIN" ]]; then
       echo "  Current pin: ${PIN%% *} from commit ${PIN##* }"
     else
@@ -1005,13 +1251,15 @@ cmd_doctor() {
   check "gh authenticated" gh auth status
   check "gh can see $UPSTREAM_REPO" gh repo view "$UPSTREAM_REPO"
   check "gh can see $SITE_REPO" gh repo view "$SITE_REPO"
+  check "gh can run release-rc.yml on $PKGS_REPO" gh workflow view release-rc.yml -R "$PKGS_REPO"
+  check "gh can run promote.yml on $PKGS_REPO" gh workflow view promote.yml -R "$PKGS_REPO"
   check "vercmp available (pacman)" command -v vercmp
   check "makepkg available (checksums)" command -v makepkg
   check "curl available" command -v curl
   check "upstream reachable ($UPSTREAM_URL)" git ls-remote "$UPSTREAM_URL" HEAD
   local ch arch
-  for ch in edge stable; do
-    for arch in $(published_arches); do
+  for ch in edge rc stable; do
+    for arch in $(ci_arches); do
       if published_version "$ch" "$arch" >/dev/null 2>&1; then
         print_success "$ch/$arch channel db readable"
       else
@@ -1020,21 +1268,6 @@ cmd_doctor() {
       fi
     done
   done
-  for arch in $(published_arches); do
-    if published_version rc "$arch" >/dev/null 2>&1; then
-      print_success "rc/$arch channel db readable"
-    else
-      print_warning "rc/$arch channel db not readable — bootstrap it first: bin/repo bootstrap-rc (on the build host)"
-    fi
-  done
-  local host
-  if host=$(repo_host); then
-    check "build host ssh ($host)" ssh -o ConnectTimeout=10 "$host" true
-  elif on_repo_host; then
-    print_success "this machine IS the build host — host operations run locally"
-  else
-    print_warning "no build host configured — set OMARCHY_REPO_HOST, --host, or write an ssh destination (root@<host> or an ssh-config alias) to $BUILD_ROOT/.repo-host; until then builds trigger on the 6h timer only"
-  fi
   if [[ -n "$CONTAINER_ENGINE" ]] && "$CONTAINER_ENGINE" info >/dev/null 2>&1; then
     print_success "$CONTAINER_ENGINE available (ISO builds possible here)"
   else
@@ -1073,6 +1306,41 @@ cmd_self_test() {
   expect "version_is_patch 5.0.0" "$(version_is_patch 5.0.0 && echo yes || echo no)" "no"
   expect "previous_patch_tag 4.0.2" "$(previous_patch_tag 4.0.2)" "v4.0.1"
   expect "previous_patch_tag 4.0.10" "$(previous_patch_tag 4.0.10)" "v4.0.9"
+  expect "rc_tag 4.5.0 3" "$(rc_tag 4.5.0 3)" "v4.5.0-rc3"
+  expect "x86_64 ISO needs no --arch" "$(iso_release_command x86_64 4.5.0rc1 --rc)" "bin/omarchy-iso-release --rc 4.5.0rc1"
+  expect "aarch64 ISO names its arch" "$(iso_release_command aarch64 4.5.0rc1 --rc)" "bin/omarchy-iso-release --rc --arch aarch64 4.5.0rc1"
+  expect "final aarch64 ISO" "$(iso_release_command aarch64 4.5.0)" "bin/omarchy-iso-release --arch aarch64 4.5.0"
+  expect "edge_promotion_choice a" "$(edge_promotion_choice a)" "all"
+  expect "edge_promotion_choice none" "$(edge_promotion_choice ' none ')" "none"
+  expect "edge_promotion_choice pkgbases" "$(edge_promotion_choice '  omakade   omacharts ')" "omakade omacharts"
+  expect "edge_promotion_choice empty asks again" "$(edge_promotion_choice '   ')" ""
+
+  # Minor/major trains are found by their rc tags on the dev branch; patch
+  # trains by their release branches. This replaces the network reader for
+  # this process; self-test exits immediately afterwards.
+  TEST_TAGS=$'v4.0.0-beta3\nv4.0.0\nv4.0.5\nv4.0.6\nv4.5.0-rc1\nv4.5.0-rc2\nv4.5.0-rc10\nv4.50.0-rc7\nv4.6.0-rc1x'
+  TEST_BRANCHES=$'v4-0-5\nv4-0-6\nvoxtype-cohere-vulkan'
+  ls_remote() {
+    case "$*" in
+      "--tags refs/tags/v*") sed 's|^|0000000000000000000000000000000000000000\trefs/tags/|' <<<"$TEST_TAGS" ;;
+      "refs/heads/v*") sed 's|^|0000000000000000000000000000000000000000\trefs/heads/|' <<<"$TEST_BRANCHES" ;;
+    esac
+  }
+  expect "rc_tag_versions ignores betas and malformed tags" "$(rc_tag_versions <<<"$TEST_TAGS" | tr '\n' ' ')" "4.5.0 4.50.0 "
+  expect "newest_rc_number orders numerically" "$(newest_rc_number 4.5.0 <<<"$TEST_TAGS")" "10"
+  expect "newest_rc_number does not match a longer version" "$(newest_rc_number 4.5.0 <<<"v4.50.0-rc7")" ""
+  expect "newest_rc_number with no candidates" "$(newest_rc_number 4.7.0 <<<"$TEST_TAGS")" ""
+  TEST_TAGS=$'v4.0.5\nv4.0.6\nv4.5.0-rc1\nv4.5.0-rc2'
+  expect "an rc-tagged minor is an open train on the dev branch" "$(open_train)" "4.5.0 $DEV_BRANCH"
+  TEST_TAGS+=$'\nv4.5.0'
+  expect "the final tag closes a minor train" "$(open_train || echo none)" "none"
+  expect "a shipped minor stays findable for resume" "$(newest_train)" "4.5.0 $DEV_BRANCH"
+  TEST_BRANCHES+=$'\nv4-5-1'
+  expect "a patch train after it follows its branch" "$(open_train)" "4.5.1 v4-5-1"
+  TEST_TAGS=$'v4.0.5' TEST_BRANCHES=$'v4-0-5\nv4-0-6'
+  expect "an untagged patch branch is the open train" "$(open_train)" "4.0.6 v4-0-6"
+  expect "follows_dev_branch $DEV_BRANCH" "$(follows_dev_branch "$DEV_BRANCH" && echo yes || echo no)" "yes"
+  expect "follows_dev_branch v4-0-6" "$(follows_dev_branch v4-0-6 && echo yes || echo no)" "no"
 
   # Keep release readiness fail-closed when only one architecture has reached
   # the requested version. This replaces the network reader for this process;
@@ -1083,15 +1351,48 @@ cmd_self_test() {
       aarch64) echo "${TEST_ARM_VERSION:-4.0.2-1}" ;;
     esac
   }
-  PUBLISHED_ARCHES=x86_64
+  CI_ARCHES=x86_64
   expect "x86-only readiness" "$(all_arches_at_version rc 4.0.2 && echo ready || echo blocked)" "ready"
-  PUBLISHED_ARCHES=aarch64
+  CI_ARCHES=aarch64
   expect "ARM-only readiness" "$(all_arches_at_version rc 4.0.2 && echo ready || echo blocked)" "ready"
-  PUBLISHED_ARCHES="x86_64 aarch64"
+  CI_ARCHES="x86_64 aarch64"
   TEST_ARM_VERSION=4.0.1-1
   expect "mixed versions block release" "$(all_arches_at_version rc 4.0.2 && echo ready || echo blocked)" "blocked"
   TEST_ARM_VERSION=4.0.2-1
   expect "both architectures ready" "$(all_arches_at_version rc 4.0.2 && echo ready || echo blocked)" "ready"
+
+  # Ship promotes packages only once stable's Arch mirror serves rc's snapshot,
+  # on every architecture.
+  mirror_lastsync() {
+    case "$1" in
+      "$RC_ARCH_MIRROR") [[ ${TEST_RC_SYNC-1792185002} ]] && echo "${TEST_RC_SYNC-1792185002}" || return 2 ;;
+      "$STABLE_ARCH_MIRROR") [[ ${TEST_STABLE_SYNC-1792185002} ]] && echo "${TEST_STABLE_SYNC-1792185002}" || return 2 ;;
+      "$RC_ARM_MIRROR") [[ ${TEST_ARM_RC_SYNC-1792494243} ]] && echo "${TEST_ARM_RC_SYNC-1792494243}" || return 2 ;;
+      "$STABLE_ARM_MIRROR") [[ ${TEST_ARM_STABLE_SYNC-1792494243} ]] && echo "${TEST_ARM_STABLE_SYNC-1792494243}" || return 2 ;;
+      *) return 2 ;;
+    esac
+  }
+  expect "mirror on rc's snapshot" "$(stable_mirror_matches_rc && echo ready || echo blocked)" "ready"
+  TEST_STABLE_SYNC=1792286001
+  expect "mirror on another snapshot blocks" "$(stable_mirror_matches_rc && echo ready || echo blocked)" "blocked"
+  TEST_STABLE_SYNC=""
+  expect "unreadable mirror blocks" "$(stable_mirror_matches_rc && echo ready || echo blocked)" "blocked"
+  expect "stable ahead of rc is not rolled back" "$(mirror_sync_hint 1792185002 1792286001 | grep -o 'omarchy-mirror-[a-z-]*' | head -1) $(mirror_sync_hint 1792185002 1792286001 | grep -o 'to /mnt/arch-mirror-[a-z]*')" "omarchy-mirror-copy-stage to /mnt/arch-mirror-rc"
+  expect "an unreadable mirror suggests no copy" "$(mirror_sync_hint 1792185002 unreadable | grep -o 'omarchy-mirror-sync-[a-z-]*' || echo none)" "none"
+  expect "stable behind rc takes rc's snapshot" "$(mirror_sync_hint 1792286001 1792185002 | grep -o 'omarchy-mirror-sync-[a-z-]*')" "omarchy-mirror-sync-stable-from-rc"
+  TEST_STABLE_SYNC=1792185002
+  TEST_ARM_STABLE_SYNC=1791398870
+  expect "an ARM mirror on another snapshot blocks" "$(stable_mirror_matches_rc && echo ready || echo blocked)" "blocked"
+  expect "x86_64 alone is on rc's snapshot" "$(stable_mirror_matches_rc x86_64 && echo ready || echo blocked)" "ready"
+  expect "aarch64 alone is not" "$(stable_mirror_matches_rc aarch64 && echo ready || echo blocked)" "blocked"
+  TEST_ARM_STABLE_SYNC=""
+  expect "an unreadable ARM mirror blocks" "$(stable_mirror_matches_rc && echo ready || echo blocked)" "blocked"
+  CI_ARCHES=x86_64
+  expect "an x86_64-only release does not read the ARM mirrors" "$(stable_mirror_matches_rc && echo ready || echo blocked)" "ready"
+  CI_ARCHES="x86_64 aarch64"
+  expect "ARM stable behind rc takes rc's snapshot" "$(mirror_sync_hint 1792494243 1791398870 aarch64 | grep -o 'omarchy-mirror-promote-arm --from [^ ]* --to [^ ,]*')" "omarchy-mirror-promote-arm --from omarchy:omarchy-mirror-arm-rc --to omarchy:omarchy-mirror-arm-stable"
+  expect "ARM stable ahead of rc is not rolled back" "$(mirror_sync_hint 1791398870 1792494243 aarch64 | grep -o 'omarchy-mirror-promote-arm --from [^ ]* --to [^ ,]*')" "omarchy-mirror-promote-arm --from omarchy:omarchy-mirror-arm-stable --to omarchy:omarchy-mirror-arm-rc"
+  expect "an unreadable ARM mirror names its hosts" "$(mirror_sync_hint 1792494243 unreadable aarch64 | grep -o 'https://arm-[a-z]*-mirror.omarchy.org' | paste -sd' ')" "https://arm-rc-mirror.omarchy.org https://arm-stable-mirror.omarchy.org"
   echo ""
   if ((failures == 0)); then
     print_success "Self-test passed"
@@ -1106,18 +1407,17 @@ cmd_self_test() {
 COMMAND=""
 ISO_MODE="ask"
 WAIT=true
+PROMOTE_EDGE=""
 ARGS=()
 while [[ $# -gt 0 ]]; do
   case $1 in
   --yes) ASSUME_YES=true; shift ;;
-  --host)
-    REPO_HOST_OVERRIDE="$2"
-    export OMARCHY_REPO_HOST="$2" # child bin/repo invocations forward to it too
-    shift 2
-    ;;
   --iso) ISO_MODE="yes"; shift ;;
   --no-iso) ISO_MODE="no"; shift ;;
   --no-wait) WAIT=false; shift ;;
+  --promote-edge) PROMOTE_EDGE=all; shift ;;
+  --promote-edge=*) PROMOTE_EDGE=$(edge_promotion_choice "${1#*=}"); shift ;;
+  --no-promote-edge) PROMOTE_EDGE=none; shift ;;
   -h | --help) show_usage; exit 0 ;;
   start | pick | rc | ship | status | doctor | self-test)
     COMMAND="$1"; shift ;;

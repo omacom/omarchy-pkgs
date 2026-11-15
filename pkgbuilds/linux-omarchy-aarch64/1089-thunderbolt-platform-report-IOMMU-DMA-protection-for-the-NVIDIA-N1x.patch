@@ -1,0 +1,126 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ryan Hughes <ryan@heyoodle.com>
+Date: Thu, 15 Oct 2026 21:46:35 -0400
+Subject: [PATCH] thunderbolt: platform: report IOMMU DMA protection for the
+ NVIDIA N1x
+
+The PCI glue reports IOMMU DMA protection when a Root Port of the NHI's
+segment is external facing and the IOMMU has pre-boot protection. The
+platform glue never set it, so the N1x reported none, and Bolt left
+every new dock unauthorized: its display tunnel came up, while its USB
+controller and Ethernet never appeared until someone ran
+"boltctl enroll".
+
+Check the Root Ports whose "usb4-host-interface" property names this
+host interface instead. When each is external facing and behind an
+IOMMU, what is plugged in below is untrusted and translated. Arm SMMUs
+do not report pre-boot protection, but on the N1x there is nothing for
+it to cover: the firmware has no connection manager and the OS powers
+the host router, so no PCIe tunnel exists before this driver creates
+one. Bolt then enrolls and authorizes new docks on its own, as it does
+on Intel and AMD laptops.
+---
+ drivers/thunderbolt/nhi_platform.c | 57 ++++++++++++++++++++++++++++++
+ 1 file changed, 57 insertions(+)
+
+diff --git a/drivers/thunderbolt/nhi_platform.c b/drivers/thunderbolt/nhi_platform.c
+index 0466801..c50fb62 100644
+--- a/drivers/thunderbolt/nhi_platform.c
++++ b/drivers/thunderbolt/nhi_platform.c
+@@ -11,10 +11,13 @@
+ #include <linux/acpi.h>
+ #include <linux/interrupt.h>
+ #include <linux/io.h>
++#include <linux/iommu.h>
+ #include <linux/module.h>
++#include <linux/pci.h>
+ #include <linux/platform_device.h>
+ #include <linux/pm_runtime.h>
+ #include <linux/slab.h>
++#include <linux/string_choices.h>
+ #include <linux/soc/mediatek/mtk-pwrap.h>
+ 
+ #include "nhi.h"
+@@ -32,9 +35,12 @@ struct nhi_plat;
+ /**
+  * struct nhi_plat_data - Platform specific host router handling
+  * @power_on: Power the host router before its registers are accessed
++ * @no_firmware_tunnels: The firmware has no connection manager, so no PCIe
++ *			 tunnel exists before this driver creates one
+  */
+ struct nhi_plat_data {
+ 	int (*power_on)(struct nhi_plat *np);
++	bool no_firmware_tunnels;
+ };
+ 
+ /**
+@@ -140,8 +146,57 @@ static int nhi_nvda8100_power_on(struct nhi_plat *np)
+ 
+ static const struct nhi_plat_data nhi_nvda8100_data = {
+ 	.power_on = nhi_nvda8100_power_on,
++	.no_firmware_tunnels = true,
+ };
+ 
++/*
++ * The PCIe ports this host interface tunnels through point back at it with
++ * "usb4-host-interface". DMA from what is plugged in is contained when every
++ * such Root Port is external facing and behind an IOMMU: the devices below
++ * are then untrusted, and the IOMMU core translates the port's group, which
++ * they join when the port has no ACS.
++ *
++ * The PCI glue also wants IOMMU_CAP_PRE_BOOT_PROTECTION, which no Arm SMMU
++ * reports. It covers devices the firmware tunneled before the OS set up the
++ * IOMMU, which cannot exist when the firmware has no connection manager.
++ */
++static void nhi_plat_check_iommu(struct nhi_plat *np)
++{
++	struct tb_nhi *nhi = &np->nhi;
++	struct pci_dev *pdev = NULL;
++	struct fwnode_handle *fwnode;
++	bool found = false, port_ok = true;
++
++	if (!np->data->no_firmware_tunnels)
++		return;
++
++	for_each_pci_dev(pdev) {
++		if (!pci_is_pcie(pdev) ||
++		    pci_pcie_type(pdev) != PCI_EXP_TYPE_ROOT_PORT)
++			continue;
++
++		fwnode = fwnode_find_reference(dev_fwnode(&pdev->dev),
++					       "usb4-host-interface", 0);
++		if (IS_ERR(fwnode))
++			continue;
++
++		if (fwnode == dev_fwnode(nhi->dev)) {
++			found = true;
++			if (!pdev->external_facing ||
++			    !device_iommu_mapped(&pdev->dev)) {
++				dev_dbg(nhi->dev, "%s is not protected\n",
++					pci_name(pdev));
++				port_ok = false;
++			}
++		}
++		fwnode_handle_put(fwnode);
++	}
++
++	nhi->iommu_dma_protection = found && port_ok;
++	dev_dbg(nhi->dev, "IOMMU DMA protection is %s\n",
++		str_enabled_disabled(nhi->iommu_dma_protection));
++}
++
+ static int nhi_plat_probe(struct platform_device *pdev)
+ {
+ 	struct device *dev = &pdev->dev;
+@@ -185,6 +240,8 @@ static int nhi_plat_probe(struct platform_device *pdev)
+ 		return dev_err_probe(dev, -ENODEV,
+ 				     "unexpected host interface capabilities %#x\n", caps);
+ 
++	nhi_plat_check_iommu(np);
++
+ 	pm_runtime_set_active(dev);
+ 	pm_runtime_get_noresume(dev);
+ 	ret = devm_pm_runtime_enable(dev);
+-- 
+2.56.0
+
