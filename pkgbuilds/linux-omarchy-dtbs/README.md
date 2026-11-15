@@ -60,3 +60,9 @@ Hardware IDs for eight of the machines `0013` to `0019` added, so systemd-stub p
 - `kalambo-lenovo-thinkbook-14-gen9.json`, `x126100-lenovo-ideapad-vibe-14q8x12.json` and `-15q8x12.json`: `LENOVO` with the machine types `22BB`, `84A9` and `84AA`, which Lenovo reports as the product name on its laptops. No unit of these has reported yet.
 - `x1p42100-dynabook-xd5.json`: `Dynabook Inc.`, `dynabook XD5`, board `DBIFXN00`. The direct-sale `dynabook XD/ZA` on the same board, sometimes with the X1E-78-100, reports another product name and doesn't match.
 
+`0023` adds the 2025 HP OmniBook X 14 (14-kr0) and X 16 (16-cp0) with the Snapdragon X Plus X1P-42-100, on board 8F45 (`x1p42100-hp-omnibook-x14-kr0`, `x1p42100-hp-omnibook-x16-cp0`). The ACPI tables in the BIOS capsule of HP's driver pack sp172628 match the OmniBook 5 14-he0's board (8E33) in every device resource, power vote and wake pin, so the board file builds on that tree and only names its own firmware folder, `qcom/x1p42100/hp/omnibook-x16-cp0`, which `hp-omnibook-x16-cp0-firmware` fills. The two sizes differ in the tables only by values the firmware fills in at boot.
+
+`0024` adds the 2026 HP OmniBook 5 14 (14-he1) with the 6-core X2P-42-100 on `0012`'s Kalambo (`kalambo-hp-omnibook-5-14-he1xxx`). HP builds it on the OmniBook 5 16-bf1's mainboard, 8F47, whose BIOS in sp173974 both run, so its board file carries the 16-bf1's nodes over unchanged and loads the 16-bf1's firmware folder. The 16-bf1's board file can't be included on `kalambo.dtsi`, since both pull in `mahua.dtsi`.
+
+`x1p42100-hp-omnibook-x14-kr0.json`, `x1p42100-hp-omnibook-x16-cp0.json` and `kalambo-hp-omnibook-5-14-he1xxx.json` carry the manufacturer and product, and manufacturer, product and board CHIDs, from units that ran Geekbench: `HP OmniBook X Laptop 14-kr0xxx` and `16-cp0xxx` on board `8F45`, and `HP OmniBook 5 Laptop 14-he1xxx` on `8F47`.
+
