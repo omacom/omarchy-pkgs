@@ -239,7 +239,7 @@ These packages were already excluded from automatic AUR updates. The migration p
 
 `cua-driver-bin` is a deliberate hold: Omarchy bumps it by hand, so a Cua release ships only when a maintainer has verified it. It keeps its `.omarchy/upstream.sh` hook and `min_release_age`, so lifting the hold means removing `"sync": false`. `cua-hyprland-plugin` declares no upstream source, so no automation updates it either.
 
-`omarchy-mlx` is a deliberate hold: its wheel's filename carries a per-build stamp (`mlx_omarchy-0.32.4.dev202610050725+5c15fba-…`) that a tag watch cannot derive, so the maintainer repins `_wheel`, the vendor tar, and the checksums together. It keeps its watch, so lifting the hold means removing `"sync": false` once the wheel's name follows the release version.
+`omarchy-mlx` follows its GitHub release tags. Every source URL derives from `pkgver` alone: the tag tarball, the vendor wheel tar `omarchy-mlx-vendor-wheels-v$pkgver-cp314-aarch64.tar`, and a fixed-name copy of the aarch64 wheel (`omarchy-mlx-wheel-cp314-aarch64.whl`, byte-identical to the stamped wheel inside the vendor tar; `prepare()` compares them). The watch rewrites `pkgver` and the three checksums; the Mesa commit pin stays a hand edit in the recipe. Its history: it was held out of the sync from #1055 until the releases carried the fixed-name wheel.
 
 ## Package-specific boundaries
 
