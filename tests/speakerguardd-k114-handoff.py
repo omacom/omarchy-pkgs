@@ -36,6 +36,7 @@ esac
                 if line.startswith("ExecStartPre=") and "systemctl" in line]
     # shortcut: models only this command's prefix/$$ escaping; use a real unit for integration proof.
     ignore_failure = command.startswith("-")
+    self.assertNotIn("$", command.replace("$$", ""))  # every shell $ is systemd-escaped as $$
     args = shlex.split(command.removeprefix("-").replace("$$", "$"))
     args = [arg.replace("/usr/bin/systemctl", str(self.systemctl)) for arg in args]
     result = subprocess.run(args, check=False, capture_output=True, text=True,
