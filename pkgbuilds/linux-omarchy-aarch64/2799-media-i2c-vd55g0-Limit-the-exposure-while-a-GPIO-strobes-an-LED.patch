@@ -1,4 +1,4 @@
-From 2b0e8a34afca1fca0a6ebb92bdbd624d1a348f06 Mon Sep 17 00:00:00 2001
+From 970120b11749a0df1d73b93e5ac4a1ecb4d307e0 Mon Sep 17 00:00:00 2001
 From: Felipe Infante de Castro <18445184+fidecastro@users.noreply.github.com>
 Date: Sun, 15 Nov 2026 21:20:51 -0500
 Subject: [PATCH] media: i2c: vd55g0: Limit the exposure while a GPIO strobes
@@ -28,7 +28,9 @@ only after the limited settings are written. When the control is switched
 on mid-stream the limits are written first and the GPIO follows two frame
 periods later, since a frame already exposing keeps its old timing;
 switching off does the reverse. The controls keep their values and apply
-again once the strobe is off. The effective timing is logged.
+again once the strobe is off. The limits are only given up once the GPIO
+is known to be off: if the write that switches the strobe off fails, they
+stay in force. The effective timing is logged.
 
 Nothing changes for a sensor without "st,leds", which is every tree in
 this kernel today, or while the flash LED mode control is off.
@@ -40,11 +42,11 @@ the frames are lit by the emitter; with it off they are not.
 Assisted-by: Claude Fable 5.2
 Signed-off-by: Felipe Infante de Castro <18445184+fidecastro@users.noreply.github.com>
 ---
- drivers/media/i2c/vd55g0.c | 125 +++++++++++++++++++++++++++++++++----
- 1 file changed, 114 insertions(+), 11 deletions(-)
+ drivers/media/i2c/vd55g0.c | 148 +++++++++++++++++++++++++++++++++----
+ 1 file changed, 134 insertions(+), 14 deletions(-)
 
 diff --git a/drivers/media/i2c/vd55g0.c b/drivers/media/i2c/vd55g0.c
-index a62a99f..ed4618b 100644
+index a62a99f..41efd1f 100644
 --- a/drivers/media/i2c/vd55g0.c
 +++ b/drivers/media/i2c/vd55g0.c
 @@ -512,6 +512,46 @@ static int vd55g0_set_gpios_array(struct vd55g0_dev *sensor, u32 *array,
@@ -104,7 +106,34 @@ index a62a99f..ed4618b 100644
  	return vd55g0_write_reg(sensor, VD55G0_REG_EXP_MODE, exp, NULL);
  }
  
-@@ -630,7 +673,7 @@ static int vd55g0_get_temp_stream_enable(struct vd55g0_dev *sensor, int *temp)
+@@ -564,18 +607,22 @@ static int vd55g0_apply_patgen(struct vd55g0_dev *sensor)
+ 	return vd55g0_write_reg(sensor, VD55G0_REG_PATGEN_CTRL, reg, NULL);
+ }
+ 
+-static int vd55g0_apply_flash(struct vd55g0_dev *sensor)
++static int vd55g0_set_strobe(struct vd55g0_dev *sensor, bool on)
+ {
+ 	struct vd55g0_gpios *gpios = &sensor->gpios;
+ 
+-	enum vd55g0_gpio_modes mode = sensor->flash_en ?
+-				      VD55G0_GPIO_MODE_STROBE :
+-				      VD55G0_GPIO_MODE_DISABLED;
++	enum vd55g0_gpio_modes mode = on ? VD55G0_GPIO_MODE_STROBE :
++					   VD55G0_GPIO_MODE_DISABLED;
+ 
+ 	return vd55g0_set_gpios_array(sensor, gpios->leds,
+ 				      ARRAY_SIZE(gpios->leds), mode);
+ }
+ 
++static int vd55g0_apply_flash(struct vd55g0_dev *sensor)
++{
++	return vd55g0_set_strobe(sensor, sensor->flash_en);
++}
++
+ static int vd55g0_update_exposure_auto(struct vd55g0_dev *sensor, u32 index)
+ {
+ 	switch (index) {
+@@ -630,7 +677,7 @@ static int vd55g0_get_temp_stream_enable(struct vd55g0_dev *sensor, int *temp)
  static int vd55g0_apply_framelength(struct vd55g0_dev *sensor)
  {
  	return vd55g0_write_reg(sensor, VD55G0_REG_FRAME_LENGTH,
@@ -113,7 +142,7 @@ index a62a99f..ed4618b 100644
  }
  
  static int vd55g0_update_vblank(struct vd55g0_dev *sensor, u16 vblank)
-@@ -697,7 +740,7 @@ static int vd55g0_update_exposure(struct vd55g0_dev *sensor, int expo_ms)
+@@ -697,7 +744,7 @@ static int vd55g0_update_exposure(struct vd55g0_dev *sensor, int expo_ms)
  	if (sensor->streaming)
  		return vd55g0_write_reg(sensor,
  					VD55G0_REG_MANUAL_COARSE_EXPOSURE,
@@ -122,7 +151,7 @@ index a62a99f..ed4618b 100644
  
  	return 0;
  }
-@@ -731,13 +774,64 @@ static int vd55g0_update_exposure_target(struct vd55g0_dev *sensor, int index)
+@@ -731,12 +778,76 @@ static int vd55g0_update_exposure_target(struct vd55g0_dev *sensor, int index)
  	return 0;
  }
  
@@ -150,7 +179,6 @@ index a62a99f..ed4618b 100644
 +	struct i2c_client *client = v4l2_get_subdevdata(&sensor->sd);
 +	int ret;
  
--	return 0;
 +	if (!sensor->streaming) {
 +		/* Stream start applies the limits before the strobe output. */
 +		sensor->flash_en = flash_en;
@@ -158,11 +186,15 @@ index a62a99f..ed4618b 100644
 +	}
 +
 +	if (!flash_en) {
-+		/* Strobe output off first, then the controls' own timing. */
-+		sensor->flash_en = false;
-+		ret = vd55g0_apply_flash(sensor);
++		/*
++		 * Strobe output off first, then the controls' own timing.
++		 * The limits stay in force unless the output is known to be
++		 * off: if that write fails a GPIO may still be strobing.
++		 */
++		ret = vd55g0_set_strobe(sensor, false);
 +		if (ret)
 +			return ret;
++		sensor->flash_en = false;
 +		return vd55g0_apply_strobe_limits(sensor);
 +	}
 +
@@ -179,19 +211,27 @@ index a62a99f..ed4618b 100644
 +	}
 +	msleep(10 + 2 * vd55g0_frame_length_to_apply(sensor) * 16 / 1000);
 +
-+	ret = vd55g0_apply_flash(sensor);
-+	if (ret)
-+		sensor->flash_en = false;
-+	else
-+		dev_info(&client->dev,
-+			 "IR strobe limited to %u exposure lines in %u\n",
-+			 vd55g0_expo_to_apply(sensor),
-+			 vd55g0_frame_length_to_apply(sensor));
-+	return ret;
++	ret = vd55g0_set_strobe(sensor, true);
++	if (ret) {
++		/*
++		 * With several LED GPIOs some may be strobing already. Give
++		 * the limits up only if they can all be switched off again.
++		 */
++		if (!vd55g0_set_strobe(sensor, false)) {
++			sensor->flash_en = false;
++			vd55g0_apply_strobe_limits(sensor);
++		}
++		return ret;
++	}
++
++	dev_info(&client->dev,
++		 "IR strobe limited to %u exposure lines in %u\n",
++		 vd55g0_expo_to_apply(sensor),
++		 vd55g0_frame_length_to_apply(sensor));
+ 	return 0;
  }
  
- static void vd55g0_apply_reset(struct vd55g0_dev *sensor)
-@@ -818,7 +912,7 @@ static int vd55g0_apply_settings(struct vd55g0_dev *sensor)
+@@ -818,7 +929,7 @@ static int vd55g0_apply_settings(struct vd55g0_dev *sensor)
  		return ret;
  
  	vd55g0_write_reg(sensor, VD55G0_REG_MANUAL_COARSE_EXPOSURE,
@@ -200,7 +240,7 @@ index a62a99f..ed4618b 100644
  	vd55g0_write_reg(sensor, VD55G0_REG_MANUAL_ANALOG_GAIN,
  			 sensor->analog_gain, &ret);
  	vd55g0_write_reg(sensor, VD55G0_REG_MANUAL_DIGITAL_GAIN,
-@@ -896,10 +990,6 @@ static int vd55g0_set_gpios(struct vd55g0_dev *sensor)
+@@ -896,10 +1007,6 @@ static int vd55g0_set_gpios(struct vd55g0_dev *sensor)
  			return ret;
  	}
  
@@ -211,7 +251,7 @@ index a62a99f..ed4618b 100644
  	ret = vd55g0_set_gpios_array(sensor, gpios->out_sync,
  				     ARRAY_SIZE(gpios->out_sync),
  				     VD55G0_GPIO_MODE_VSYNC_OUT_0);
-@@ -952,6 +1042,19 @@ static int vd55g0_stream_enable(struct vd55g0_dev *sensor)
+@@ -952,6 +1059,19 @@ static int vd55g0_stream_enable(struct vd55g0_dev *sensor)
  	if (ret)
  		goto err_rpm_put;
  
