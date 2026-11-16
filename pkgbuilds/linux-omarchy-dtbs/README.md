@@ -10,6 +10,8 @@ Every tree gets the symbols an overlay needs (`-@`). Kbuild adds them only to th
 
 `.omarchy/package.json` rebuilds this package (`rebuild_on`) once a new `linux-omarchy-aarch64` is on edge, so the trees follow the kernel's tree patches within a sync. The package's description names the kernel the trees were built from (`pacman -Qi linux-omarchy-dtbs`), which shows trees that trail their kernel.
 
+From `7.3-43` the package depends on `systemd-stub-omarchy`. A UKI holds each tree as a PE section of its own, and since `7.3-42` there are more trees than Arch Linux ARM's systemd stub has header room for (about 119), so ukify stops with "Not enough header space". `systemd-stub-omarchy` is the same systemd release's stub with room for 1024, which Omarchy's boot image builds use once it is installed; as a dependency it arrives in the same transaction as the trees, before any boot image is built with them.
+
 ## Adding a laptop
 
 - A tree, or a fix to one the kernel ships: a patch in kernel format (`git format-patch` against the kernel's tree), added to `source` and `b2sums`. It can only touch files under `arch/arm64/boot/dts/` or `include/dt-bindings/`, so a posted patch loses its `Makefile` and binding hunks first. Every `qcom/*.dts` is built, so a new tree needs no `Makefile` line. Patches apply in the order of `source`.
