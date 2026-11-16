@@ -1,0 +1,246 @@
+#!/usr/bin/python3
+# One guarded AOP + speaker-DAI module load per boot, MacBook Pro 14-inch (M5 Max, K114c).
+# Run by aop-boot-guard.service as a root oneshot. Every trust check is
+# fail-closed - root, exact model compatible, the one-kernel manifest pin,
+# hash and vermagic match, root-owned files and resolved parents, daemon
+# package pinned - and the atomic /run/aop-boot-guard-once marker prevents
+# another attempt this boot. The durable /var/lib/aop-boot-guard/inflight
+# latch clears only after a zero runner exit; every nonzero status blocks
+# later boots for manual review. The card is handed to the existing udev
+# rule; no daemon is started here and the blacklist stays untouched.
+import hashlib
+import json
+import os
+import re
+import stat
+import subprocess
+import sys
+import time
+
+MANIFEST = "/usr/lib/aop-boot-guard/manifests/" + os.uname().release + "/manifest.json"
+RUNNER = "/usr/lib/aop-boot-guard/wdt-run"
+RUNNER_SHA = "d4a3bf7cf1dabd936446d1ba37e5d878bcaf25bb59ef641941dc8542b47a3f74"
+COMPAT = "apple,k114c"
+COMPAT_FILE = "/proc/device-tree/compatible"
+MARKER = "/run/aop-boot-guard-once"
+LATCH_DIR = "/var/lib/aop-boot-guard"
+LATCH = LATCH_DIR + "/inflight"
+INSMOD = "/usr/bin/insmod"
+PACMAN = "/usr/bin/pacman"
+PKG = "speakerguardd-k114"
+PKG_VERSION = PKG + " 0.1.12-4"
+WDT_TIMEOUT = "90"  # calibrated hardware value; see the runner
+SETTLE_S = 20
+RELEASE_RE = re.compile(r"[0-9A-Za-z][0-9A-Za-z._-]*\Z")
+SHA_RE = re.compile(r"[0-9a-f]{64}\Z")
+
+
+def refuse(msg):
+    print("aop-boot-guard: refusing: %s" % msg, file=sys.stderr)
+    sys.exit(1)
+
+
+def note(msg):
+    print("aop-boot-guard: %s" % msg)
+
+
+def sha256_file(path):
+    digest = hashlib.sha256()
+    try:
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(65536), b""):
+                digest.update(chunk)
+    except OSError as e:
+        refuse("cannot read %s: %s" % (path, e))
+    return digest.hexdigest()
+
+
+def secure_parents(directory):
+    """Every parent of a resolved path must be root, a directory, not g/o-writable."""
+    seen = set()
+    while directory not in seen:
+        seen.add(directory)
+        try:
+            st = os.stat(directory)
+        except OSError as e:
+            refuse("cannot stat parent %s: %s" % (directory, e))
+        if st.st_uid != 0:
+            refuse("parent %s is not root-owned" % directory)
+        if not stat.S_ISDIR(st.st_mode):
+            refuse("parent %s is not a directory" % directory)
+        if stat.S_IMODE(st.st_mode) & 0o022:
+            refuse("parent %s is group/other-writable" % directory)
+        parent = os.path.dirname(directory)
+        if parent == directory:
+            return
+        directory = parent
+
+
+def secure_file(path):
+    """Root-owned regular file with a fully secure resolved parent chain."""
+    real = os.path.realpath(path)
+    try:
+        st = os.stat(real)
+    except OSError as e:
+        refuse("cannot stat %s: %s" % (path, e))
+    if st.st_uid != 0:
+        refuse("%s is not root-owned" % path)
+    if not stat.S_ISREG(st.st_mode):
+        refuse("%s is not a regular file" % path)
+    if stat.S_IMODE(st.st_mode) & 0o022:
+        refuse("%s is group/other-writable" % path)
+    secure_parents(os.path.dirname(real))
+
+
+def load_manifest():
+    """Parse and validate the static pin; refuse anything but the running release."""
+    try:
+        with open(MANIFEST, "rb") as f:
+            doc = json.loads(f.read().decode("utf-8"))
+    except (OSError, UnicodeDecodeError, ValueError) as e:
+        refuse("manifest %s unreadable: %s" % (MANIFEST, e))
+    if not isinstance(doc, dict) or set(doc) != {"release", "aop_sha256", "dai_sha256"}:
+        refuse("manifest must hold exactly release, aop_sha256, dai_sha256")
+    release, aop_sha, dai_sha = doc["release"], doc["aop_sha256"], doc["dai_sha256"]
+    for name, value, shape in (("release", release, RELEASE_RE),
+                               ("aop_sha256", aop_sha, SHA_RE),
+                               ("dai_sha256", dai_sha, SHA_RE)):
+        if not isinstance(value, str) or not shape.fullmatch(value):
+            refuse("unsafe %s shape in manifest: %r" % (name, value))
+    running = os.uname().release
+    if release != running:
+        refuse("manifest pins %s but %s is running; refusing on unknown kernels" % (release, running))
+    secure_file(MANIFEST)
+    return release, aop_sha, dai_sha
+
+
+def verify_module(path, want_sha, name, running):
+    """One stock module: secure, hash pinned by the manifest, vermagic for this kernel."""
+    secure_file(path)
+    if sha256_file(path) != want_sha:
+        refuse("%s module %s does not match the pinned manifest hash" % (name, path))
+    try:
+        with open(path, "rb") as f:
+            blob = f.read()
+    except OSError as e:
+        refuse("cannot read %s: %s" % (path, e))
+    if b"vermagic=" + running.encode() + b" " not in blob:
+        refuse("%s module vermagic is not %s" % (name, running))
+
+
+def package_precheck():
+    """The daemon package must be installed at the pinned version."""
+    pkg = subprocess.run([PACMAN, "-Q", PKG], capture_output=True, text=True)
+    installed = pkg.stdout.strip()
+    if pkg.returncode != 0 or installed != PKG_VERSION:
+        refuse("speaker protection daemon %r, need %s" % (installed, PKG_VERSION))
+
+
+def require_executable(path):
+    """One trust decision: secure_file, plus the execute bit on top."""
+    real = os.path.realpath(path)
+    secure_file(real)
+    if not stat.S_IMODE(os.stat(real).st_mode) & 0o111:
+        refuse("%s is not executable" % path)
+
+
+def latch_take():
+    """Durably create the inflight latch before a module action (O_EXCL)."""
+    secure_parents(os.path.realpath(LATCH_DIR))
+    try:
+        fd = os.open(LATCH, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_TRUNC, 0o600)
+    except OSError as e:
+        refuse("cannot create the inflight latch %s: %s" % (LATCH, e))
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    dfd = os.open(LATCH_DIR, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(dfd)
+    finally:
+        os.close(dfd)
+
+
+def latch_clear():
+    """Durably remove the latch after a normal subprocess exit (any rc >= 0)."""
+    os.remove(LATCH)
+    dfd = os.open(LATCH_DIR, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(dfd)
+    finally:
+        os.close(dfd)
+
+def guarded_insmod(ko, name):
+    note("%s under the %s s watchdog" % (ko, WDT_TIMEOUT))
+    latch_take()
+    try:
+        result = subprocess.run([RUNNER, WDT_TIMEOUT, INSMOD, ko])
+    except OSError as e:
+        # Latch deliberately kept: an interrupted run must block the next boot.
+        refuse("cannot execute the watchdog runner: %s" % e)
+    if result.returncode < 0:
+        # A runner killed by a signal cannot confirm watchdog cleanup.
+        refuse("%s watchdog runner killed by signal %d; inflight latch kept" %
+               (name, -result.returncode))
+    if result.returncode != 0:
+        # Positive runner status may still mean cleanup failed before magic-close V.
+        refuse("%s load failed (watchdog runner rc %d); %s kept, no retry before "
+               "the next boot; inflight latch kept" % (name, result.returncode, MARKER))
+    latch_clear()
+
+
+def load_once(aop, dai):
+    """Atomic once-marker, then the single guarded load sequence; never retried."""
+    secure_parents(os.path.dirname(MARKER))
+    try:
+        os.mkdir(MARKER, 0o700)
+    except FileExistsError:
+        note("%s present: this boot already attempted the load; no action" % MARKER)
+        return
+    if not os.path.isdir("/sys/module/aop"):
+        guarded_insmod(aop, "aop")
+        time.sleep(SETTLE_S)
+    else:
+        note("aop already loaded; skipping")
+    if not os.path.isdir("/sys/module/snd_soc_t8152_aop_audio"):
+        guarded_insmod(dai, "speaker DAI")
+    else:
+        note("speaker DAI already loaded; skipping")
+    note("loaded; the card is handed to the existing udev rule and speakerguardd-k114")
+
+
+def main():
+    if os.geteuid() != 0:
+        refuse("must run as root")
+    if os.path.lexists(LATCH):
+        refuse("inflight latch present: %s; a previous run never returned" % LATCH)
+    require_executable(RUNNER)
+    require_executable(INSMOD)
+    if os.path.lexists(MARKER):
+        note("%s present: this boot already attempted the load; no action" % MARKER)
+        return 0
+    try:
+        with open(COMPAT_FILE, "rb") as f:
+            names = f.read().split(b"\x00")
+    except OSError as e:
+        refuse("cannot read the device tree: %s" % e)
+    if COMPAT.encode() not in names:
+        refuse("device-tree compatible %r is not this model (%s)" % (names, COMPAT))
+
+    release, aop_sha, dai_sha = load_manifest()
+    aop = "/lib/modules/%s/kernel/drivers/soc/apple/aop.ko" % release
+    dai = "/lib/modules/%s/kernel/sound/soc/apple/snd-soc-t8152-aop-audio.ko" % release
+    secure_file(RUNNER)
+    if sha256_file(RUNNER) != RUNNER_SHA:
+        refuse("watchdog runner %s is not the proven build" % RUNNER)
+    verify_module(aop, aop_sha, "aop", release)
+    verify_module(dai, dai_sha, "speaker DAI", release)
+
+    package_precheck()
+    load_once(aop, dai)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
