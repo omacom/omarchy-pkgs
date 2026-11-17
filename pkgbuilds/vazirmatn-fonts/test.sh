@@ -4,33 +4,57 @@ set -euo pipefail
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 recipe="$repo_root/pkgbuilds/vazirmatn-fonts"
 workdir=$(mktemp -d)
-trap 'rm -f /etc/fonts/conf.d/50-omarchy.conf; fc-cache --force >/dev/null 2>&1 || true; rm -rf "$workdir"' EXIT
+omarchy_conf=/etc/fonts/conf.d/50-omarchy.conf
+had_omarchy_conf=false
+
+restore_test_environment() {
+  if [[ "$had_omarchy_conf" == true ]]; then
+    rm -f "$omarchy_conf"
+    cp -a "$workdir/50-omarchy.conf.backup" "$omarchy_conf"
+  else
+    rm -f "$omarchy_conf"
+  fi
+  fc-cache --force >/dev/null 2>&1 || true
+  rm -rf "$workdir"
+}
+trap restore_test_environment EXIT
 
 if [[ $EUID -ne 0 ]]; then
   echo "Run this test as root (the package test workflow does)." >&2
   exit 1
 fi
 
-command -v makepkg >/dev/null
 command -v pacman >/dev/null
-command -v fc-match >/dev/null
-command -v curl >/dev/null
-
 pacman -S --needed --noconfirm fontconfig git base-devel curl
 
-# Build as an unprivileged user; makepkg refuses to run as root.
+command -v makepkg >/dev/null
+command -v fc-match >/dev/null
+command -v curl >/dev/null
+command -v runuser >/dev/null
+
+# The build runs as nobody, so it must be able to traverse the temporary
+# parent directory as well as read and write its own build and HOME dirs.
+chmod 755 "$workdir"
 install -d -o nobody -g nobody "$workdir/build" "$workdir/home"
 cp "$recipe/PKGBUILD" "$workdir/build/"
-chown -R nobody:nobody "$workdir/build" "$workdir/home"
+chown nobody:nobody "$workdir/build/PKGBUILD"
+
 runuser -u nobody -- env HOME="$workdir/home" bash -c 'cd "$1" && makepkg --nodeps --noconfirm --clean' _ "$workdir/build"
 
 package=$(find "$workdir/build" -maxdepth 1 -type f -name 'vazirmatn-fonts-*.pkg.tar.*' ! -name '*.sig' -print -quit)
 [[ -n $package ]] || { echo "Package build did not produce an installable archive" >&2; exit 1; }
 
 pacman -U --noconfirm "$package"
+
+# Preserve an existing Omarchy rule if the test is run on a real installation.
+if [[ -e "$omarchy_conf" || -L "$omarchy_conf" ]]; then
+  cp -a "$omarchy_conf" "$workdir/50-omarchy.conf.backup"
+  had_omarchy_conf=true
+fi
+
 # Exercise the same system-ui -> Liberation Sans mapping used by Omarchy.
 curl -fsSL "https://raw.githubusercontent.com/omacom/omarchy/a948d8a6871f446b335258c827648ac5f4e9428b/default/fontconfig/conf.avail/50-omarchy.conf" \
-  -o /etc/fonts/conf.d/50-omarchy.conf
+  -o "$omarchy_conf"
 fc-cache --force
 
 match_family() {
