@@ -241,6 +241,26 @@ in `origin` and has no effect on release selection.
 | `yay` | github | [Jguer/yay](https://github.com/Jguer/yay) |
 | `yt6801-dkms` | archive | [https://www.motor-comm.com/Cn/Skippower/downloadFile.html?id=1817](https://www.motor-comm.com/Cn/Skippower/downloadFile.html?id=1817) |
 
+## Apple Silicon imports from asahi-alarm
+
+These replace asahi-alarm's packages for Omarchy Mac. Each watches its upstream's tags with `"review": true`, so every bump opens as a draft PR for the owner (see [Reviewed updates](#reviewed-updates)). The reference recipe stays asahi-alarm's [PKGBUILDs](https://github.com/asahi-alarm/PKGBUILDs). Before marking a bump ready, compare its directory there for new patches, dependencies or install steps. A watch moves only `pkgver`, `pkgrel`, declared variables and source checksums.
+
+| Package | Provider | Upstream | asahi-alarm recipe |
+|---|---|---|---|
+| `aurora-scripts` | git_tags (review) | [asahi-alarm/asahi-scripts](https://github.com/asahi-alarm/asahi-scripts) | [asahi-scripts](https://github.com/asahi-alarm/PKGBUILDs/tree/main/asahi-scripts) |
+| `aurora-fwextract` | git_tags (review) | [asahi-alarm/asahi-alarm-installer](https://github.com/asahi-alarm/asahi-alarm-installer) `v` tags | [asahi-fwextract](https://github.com/asahi-alarm/PKGBUILDs/tree/main/asahi-fwextract) |
+| `lzfse` | git_tags (review) | [lzfse/lzfse](https://github.com/lzfse/lzfse) `lzfse-` tags | [lzfse](https://github.com/asahi-alarm/PKGBUILDs/tree/main/lzfse) |
+| `speakersafetyd` | git_tags (review) | [AsahiLinux/speakersafetyd](https://github.com/AsahiLinux/speakersafetyd) | [speakersafetyd](https://github.com/asahi-alarm/PKGBUILDs/tree/main/speakersafetyd) |
+| `bankstown` | git_tags (review) | [chadmed/bankstown](https://github.com/chadmed/bankstown) | [bankstown](https://github.com/asahi-alarm/PKGBUILDs/tree/main/bankstown) |
+| `triforce-lv2` | git_tags (review) | [chadmed/triforce](https://github.com/chadmed/triforce) | [triforce-lv2](https://github.com/asahi-alarm/PKGBUILDs/tree/main/triforce-lv2) |
+| `muvm` | git_tags (review) | [AsahiLinux/muvm](https://github.com/AsahiLinux/muvm) `muvm-` tags | [muvm](https://github.com/asahi-alarm/PKGBUILDs/tree/main/muvm) |
+| `fex-emu` | git_tags (review) | [FEX-Emu/FEX](https://github.com/FEX-Emu/FEX) `FEX-` tags | [FEX-Emu](https://github.com/asahi-alarm/PKGBUILDs/tree/main/FEX-Emu) |
+| `widevine` | regex (review) | asahi-alarm's [widevine/PKGBUILD](https://github.com/asahi-alarm/PKGBUILDs/blob/main/widevine/PKGBUILD) | the same file |
+
+- `widevine` has no upstream of its own that we can follow: Google's CDM comes from a Lacros image that asahi-alarm picks. The watch reads asahi-alarm's `pkgver`, `_lacros_version` and first `sha256sums_aarch64` entry into our `pkgver`, `_lacros_version` and `_lacros_sha256`. `_lacros_revision` is the Lacros version as one number (`120.0.6098.0` is `1200060980000`), declared as the watch's revision. So when asahi-alarm moves to a newer Lacros without a new `pkgver`, the PR bumps `pkgrel`. If they change only the sha256, or go back to an older Lacros, the watch fails, so the change is never skipped quietly. A change to their `widevine_fixup.py` isn't picked up: compare it when reviewing.
+- `speakersafetyd` carries asahi-alarm's J504 patch. A release that already includes it fails to patch: drop the patch on the PR branch.
+- The Aurora recipes (`linux-aurora`, `m1n1-aurora`, `uboot-aurora` and the rest) stay pinned by hand.
+
 ## Existing manual holds
 
 `libfprint-git`, `libretro-cap32-git`, `libretro-database-git`, `libretro-fbneo-git`, `libretro-uae-git`, `libretro-vice-git`, `quickshell-git`, `supergfxctl`.
