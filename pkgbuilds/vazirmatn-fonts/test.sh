@@ -29,7 +29,7 @@ package=$(find "$workdir/build" -maxdepth 1 -type f -name 'vazirmatn-fonts-*.pkg
 
 pacman -U --noconfirm "$package"
 # Exercise the same system-ui -> Liberation Sans mapping used by Omarchy.
-curl -fsSL "https://raw.githubusercontent.com/omacom/omarchy/a948d8a6871f446b335258c827648ac5f4e9428b/default/fontconfig/conf.avail/50-omarchy.conf" \\
+curl -fsSL "https://raw.githubusercontent.com/omacom/omarchy/a948d8a6871f446b335258c827648ac5f4e9428b/default/fontconfig/conf.avail/50-omarchy.conf" \
   -o /etc/fonts/conf.d/50-omarchy.conf
 fc-cache --force
 
