@@ -44,13 +44,13 @@ runuser -u nobody -- env HOME="$workdir/home" bash -c 'cd "$1" && makepkg --node
 package=$(find "$workdir/build" -maxdepth 1 -type f -name 'vazirmatn-fonts-*.pkg.tar.*' ! -name '*.sig' -print -quit)
 [[ -n $package ]] || { echo "Package build did not produce an installable archive" >&2; exit 1; }
 
-pacman -U --noconfirm "$package"
-
 # Preserve an existing Omarchy rule if the test is run on a real installation.
 if [[ -e "$omarchy_conf" || -L "$omarchy_conf" ]]; then
   cp -a "$omarchy_conf" "$workdir/50-omarchy.conf.backup"
   had_omarchy_conf=true
 fi
+
+pacman -U --noconfirm "$package"
 
 # Exercise the same system-ui -> Liberation Sans mapping used by Omarchy.
 curl -fsSL "https://raw.githubusercontent.com/omacom/omarchy/a948d8a6871f446b335258c827648ac5f4e9428b/default/fontconfig/conf.avail/50-omarchy.conf" \
