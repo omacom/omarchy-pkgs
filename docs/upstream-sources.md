@@ -96,6 +96,18 @@ if one of them fails to update, the run restores the others and reports the grou
 targeted sync includes the other packages watching that branch, so requesting
 only `omarchy-dev` also updates `omarchy-settings-dev`.
 
+### Reviewed updates
+
+`"review": true` keeps a package's update PRs for a maintainer. The PR opens as
+a draft, `package-prs.yml` does not arm auto-merge, and `auto-merge-pr.yml`
+skips drafts, so nothing lands on its own. CI still builds it. Read the bump,
+fix the recipe on the PR branch if its build fails, and mark it **Ready for
+review**: `auto-merge-pr.yml` then arms auto-merge and the PR lands once
+`result`, `self-tests` and `build-isolation` pass. A later run that finds a
+newer release updates the same PR and leaves it as it is, draft or ready.
+`review` cannot be combined with `auto_merge`, and needs an upstream watch,
+provider or hook.
+
 ### Enable unattended branch updates
 
 The builder controller box dispatches both groups on systemd timers
