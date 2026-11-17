@@ -1,0 +1,1160 @@
+From 0ef9f5ef0a947c47b0c07db5df826cc28849ccde Mon Sep 17 00:00:00 2001
+From: MarkPronkin <109197080+MarkPronkin@users.noreply.github.com>
+Date: Fri, 6 Nov 2026 17:47:54 +0200
+Subject: [PATCH] Add opt-in host session D-Bus forwarding
+
+Downstream Omarchy patch, developed with substantial LLM assistance.
+The upstream submission was closed under Asahi Linux's LLM policy:
+https://github.com/AsahiLinux/muvm/pull/251
+
+Signed-off-by: MarkPronkin <109197080+MarkPronkin@users.noreply.github.com>
+---
+ README.md                               |   9 +
+ crates/muvm/src/atspi.rs                |  16 +-
+ crates/muvm/src/bin/muvm.rs             |  30 ++
+ crates/muvm/src/cli_options.rs          |  16 +
+ crates/muvm/src/guest/atspi.rs          | 340 -------------------
+ crates/muvm/src/guest/bin/muvm-guest.rs |  20 +-
+ crates/muvm/src/guest/dbus.rs           | 421 ++++++++++++++++++++++++
+ crates/muvm/src/guest/mod.rs            |   2 +-
+ crates/muvm/src/lib.rs                  |   1 +
+ crates/muvm/src/session_bus.rs          |  61 ++++
+ crates/muvm/src/utils/launch.rs         |   3 +
+ 11 files changed, 566 insertions(+), 353 deletions(-)
+ delete mode 100644 crates/muvm/src/guest/atspi.rs
+ create mode 100644 crates/muvm/src/guest/dbus.rs
+ create mode 100644 crates/muvm/src/session_bus.rs
+
+diff --git a/README.md b/README.md
+index 73c71bf..cf7b3ca 100644
+--- a/README.md
++++ b/README.md
+@@ -66,6 +66,15 @@ If `DISPLAY` is set, `muvm` uses X11 forwarding to allow you to run graphical ap
+ 
+ GPU acceleration is also enabled on systems supporting [DRM native context](https://indico.freedesktop.org/event/2/contributions/53/attachments/76/121/XDC2022_%20virtgpu%20drm%20native%20context.pdf) (freedreno, amdgpu, asahi).
+ 
++Use `muvm --session-bus -- COMMAND` when starting a new VM to let applications
++use the host's session D-Bus, for example to register Steam's tray icon. This
++grants guest applications access to the host user's session services. It supports
++a single `unix:path` address in `DBUS_SESSION_BUS_ADDRESS`, falling back to
++`$XDG_RUNTIME_DIR/bus` when that variable is unset. The guest gets its own socket
++at `/run/user/<uid>/bus`; file descriptor passing is disabled because vsock cannot
++carry descriptors. The system D-Bus is not forwarded. Restart an existing VM to
++change whether the session bus is forwarded.
++
+ ## Running x86/x86_64 on aarch64
+ 
+ If [FEX-Emu](https://fex-emu.com/) is installed in your system, `muvm` will configure `binfmt_misc` inside the microVM so x86/x86_64 programs can be run transparently on it.
+diff --git a/crates/muvm/src/atspi.rs b/crates/muvm/src/atspi.rs
+index e7d1a42..22be9e8 100644
+--- a/crates/muvm/src/atspi.rs
++++ b/crates/muvm/src/atspi.rs
+@@ -20,7 +20,7 @@ pub struct HostBus {
+ }
+ 
+ impl HostBus {
+-    fn new(path: PathBuf, runtime_dir: &Path) -> Result<Self> {
++    pub(crate) fn new(path: PathBuf, runtime_dir: &Path, alias_name: &str) -> Result<Self> {
+         if path.to_str().is_some() {
+             return Ok(Self { path, alias: false });
+         }
+@@ -29,14 +29,14 @@ impl HostBus {
+         // Its normal shutdown uses _exit, so reuse one runtime-directory alias
+         // under the launcher's VM lock instead of leaking a temporary directory.
+         let dir = runtime_dir.join("krun");
+-        let alias_path = dir.join("atspi");
++        let alias_path = dir.join(alias_name);
+         if alias_path.to_str().is_none() {
+-            bail!("AT-SPI host alias path is not UTF-8");
++            bail!("D-Bus host alias path is not UTF-8");
+         }
+         fs::create_dir_all(dir)?;
+         match fs::symlink_metadata(&alias_path) {
+             Ok(meta) if meta.file_type().is_symlink() => fs::remove_file(&alias_path)?,
+-            Ok(_) => bail!("AT-SPI host alias {alias_path:?} already exists and is not a symlink"),
++            Ok(_) => bail!("D-Bus host alias {alias_path:?} already exists and is not a symlink"),
+             Err(err) if err.kind() == ErrorKind::NotFound => {},
+             Err(err) => return Err(err.into()),
+         }
+@@ -62,7 +62,7 @@ impl Drop for HostBus {
+     }
+ }
+ 
+-fn parse_unix_path_address(address: &str) -> Option<PathBuf> {
++pub(crate) fn parse_unix_path_address(address: &str) -> Option<PathBuf> {
+     if address.contains(';') {
+         return None;
+     }
+@@ -134,7 +134,7 @@ pub fn configure_guest_env(env: &mut HashMap<String, String>, guest_path: &Path)
+         .or_insert_with(|| "1".to_owned());
+ }
+ 
+-fn can_connect(path: &Path) -> bool {
++pub(crate) fn can_connect(path: &Path) -> bool {
+     // A full listen queue must not block startup.
+     let result = UnixAddr::new(path).and_then(|address| {
+         let fd = socket(
+@@ -146,7 +146,7 @@ fn can_connect(path: &Path) -> bool {
+         connect(fd.as_raw_fd(), &address)
+     });
+     if let Err(err) = result {
+-        debug!(path:?, err:?; "AT-SPI bus socket is unavailable");
++        debug!(path:?, err:?; "D-Bus socket is unavailable");
+     }
+     result.is_ok()
+ }
+@@ -201,7 +201,7 @@ pub fn discover_host_bus(runtime_dir: &Path) -> Option<HostBus> {
+         },
+     };
+     let path = path_from_address(source, &address).filter(|path| can_connect(path))?;
+-    HostBus::new(path, runtime_dir)
++    HostBus::new(path, runtime_dir, "atspi")
+         .inspect_err(|err| {
+             eprintln!(
+                 "Failed to prepare host AT-SPI socket, accessibility bridge disabled: {err:#}"
+diff --git a/crates/muvm/src/bin/muvm.rs b/crates/muvm/src/bin/muvm.rs
+index d865abe..2b9b57e 100644
+--- a/crates/muvm/src/bin/muvm.rs
++++ b/crates/muvm/src/bin/muvm.rs
+@@ -25,9 +25,11 @@ use muvm::hidpipe_server::spawn_hidpipe_server;
+ use muvm::launch::{launch_or_lock, LaunchResult, DYNAMIC_PORT_RANGE};
+ use muvm::monitor::spawn_monitor;
+ use muvm::net::{connect_to_passt, start_passt};
++use muvm::session_bus;
+ use muvm::types::MiB;
+ use muvm::utils::launch::{
+     GuestConfiguration, Launch, ATSPI_SOCKET, HIDPIPE_SOCKET, MUVM_GUEST_SOCKET, PULSE_SOCKET,
++    SESSION_BUS_SOCKET,
+ };
+ use nix::sys::sysinfo::sysinfo;
+ use nix::unistd::User;
+@@ -409,6 +411,33 @@ fn main() -> Result<ExitCode> {
+ 
+     let uid = getuid().as_raw();
+ 
++    // Keep the host socket alias alive for the lifetime of the VM. Session-bus
++    // access is opt-in: applications can call services running on the host.
++    let session_bus = if options.session_bus {
++        let runtime_dir = xdg_runtime_dir
++            .as_deref()
++            .context("--session-bus requires XDG_RUNTIME_DIR")?;
++        Some(session_bus::discover_host_bus(Path::new(runtime_dir))?)
++    } else {
++        None
++    };
++    let session_bus_socket = if let Some(bus) = &session_bus {
++        let path = CString::new(bus.path().as_os_str().as_bytes())?;
++        // SAFETY: path is a CString with a lifetime exceeding the call.
++        let err = unsafe { krun_add_vsock_port(ctx_id, SESSION_BUS_SOCKET, path.as_ptr()) };
++        if err < 0 {
++            return Err(Errno::from_raw_os_error(-err))
++                .context("Failed to configure vsock for session D-Bus");
++        }
++        env.insert(
++            "DBUS_SESSION_BUS_ADDRESS".to_owned(),
++            session_bus::guest_address(uid),
++        );
++        Some(session_bus::guest_socket_path(uid))
++    } else {
++        None
++    };
++
+     // Retain any host socket alias until the VM exits.
+     let host_bus = xdg_runtime_dir
+         .as_deref()
+@@ -483,6 +512,7 @@ fn main() -> Result<ExitCode> {
+         init_commands,
+         user_init_commands: options.user_init_commands,
+         atspi_socket,
++        session_bus_socket,
+     };
+     let mut muvm_config_file = NamedTempFile::new()
+         .context("Failed to create a temporary file to store the muvm guest config")?;
+diff --git a/crates/muvm/src/cli_options.rs b/crates/muvm/src/cli_options.rs
+index fc3ccf7..882a86f 100644
+--- a/crates/muvm/src/cli_options.rs
++++ b/crates/muvm/src/cli_options.rs
+@@ -43,6 +43,7 @@ pub struct Options {
+     pub interactive: bool,
+     pub tty: bool,
+     pub privileged: bool,
++    pub session_bus: bool,
+     pub gpu_mode: Option<GpuMode>,
+     pub publish_ports: Vec<String>,
+     pub emulator: Option<Emulator>,
+@@ -163,6 +164,9 @@ pub fn options() -> OptionParser<Options> {
+         .help("Use the given GPU virtualization method")
+         .argument::<GpuMode>("drm|venus|software")
+         .optional();
++    let session_bus = long("session-bus")
++        .help("Forward the host session D-Bus into a newly started VM (without file descriptor passing)")
++        .switch();
+     let publish_ports = long("publish")
+         .short('p')
+         .help(
+@@ -208,6 +212,7 @@ pub fn options() -> OptionParser<Options> {
+         interactive,
+         tty,
+         privileged,
++        session_bus,
+         gpu_mode,
+         publish_ports,
+         emulator,
+@@ -228,4 +233,15 @@ mod tests {
+     fn check_options() {
+         options().check_invariants(false)
+     }
++
++    #[test]
++    fn session_bus_is_opt_in_and_preserves_command_arguments() {
++        let args = options()
++            .run_inner(&["--session-bus", "--", "true", "argument with spaces"])
++            .unwrap();
++        assert!(args.session_bus);
++        assert_eq!(args.command, PathBuf::from("true"));
++        assert_eq!(args.command_args, ["argument with spaces"]);
++        assert!(!options().run_inner(&["true"]).unwrap().session_bus);
++    }
+ }
+diff --git a/crates/muvm/src/guest/atspi.rs b/crates/muvm/src/guest/atspi.rs
+deleted file mode 100644
+index 05b55dd..0000000
+--- a/crates/muvm/src/guest/atspi.rs
++++ /dev/null
+@@ -1,340 +0,0 @@
+-use std::collections::VecDeque;
+-use std::fmt::Write as _;
+-use std::fs;
+-use std::io::ErrorKind;
+-use std::os::fd::AsRawFd;
+-use std::os::unix::fs::DirBuilderExt as _;
+-use std::os::unix::net::{UnixListener as StdUnixListener, UnixStream as StdUnixStream};
+-use std::path::Path;
+-use std::time::Duration;
+-
+-use anyhow::{anyhow, Context, Result};
+-use log::debug;
+-use nix::libc::VMADDR_CID_HOST;
+-use nix::sys::socket::{connect, socket, AddressFamily, SockFlag, SockType, VsockAddr};
+-use nix::unistd::getuid;
+-use tokio::io::{copy_bidirectional, AsyncReadExt as _, AsyncWriteExt as _};
+-use tokio::net::{UnixListener, UnixStream};
+-
+-use crate::utils::launch::ATSPI_SOCKET;
+-
+-#[derive(Default)]
+-struct SaslOutput {
+-    to_server: Vec<u8>,
+-    to_client: Vec<u8>,
+-}
+-
+-#[derive(PartialEq, Eq)]
+-enum ClientState {
+-    Nul,
+-    Lines,
+-    Done,
+-}
+-
+-#[derive(PartialEq, Eq)]
+-enum Reply {
+-    FromServer,
+-    LocalError,
+-}
+-
+-// vsock cannot pass file descriptors. Reject NEGOTIATE_UNIX_FD locally,
+-// keeping replies ordered for clients that pipeline SASL commands.
+-// Each command gets one reply, except BEGIN.
+-struct SaslFilter {
+-    external_identity: Vec<u8>,
+-    authenticating_external: bool,
+-    client_state: ClientState,
+-    client_pending: Vec<u8>,
+-    server_pending: Vec<u8>,
+-    replies: VecDeque<Reply>,
+-}
+-
+-impl SaslFilter {
+-    const MAX_LINE: usize = 16 * 1024;
+-
+-    fn new(uid: u32) -> Self {
+-        let mut external_identity = String::new();
+-        for b in uid.to_string().bytes() {
+-            write!(external_identity, "{b:02X}").unwrap();
+-        }
+-        SaslFilter {
+-            external_identity: external_identity.into_bytes(),
+-            authenticating_external: false,
+-            client_state: ClientState::Nul,
+-            client_pending: Vec::new(),
+-            server_pending: Vec::new(),
+-            replies: VecDeque::new(),
+-        }
+-    }
+-
+-    fn done(&self) -> bool {
+-        self.client_state == ClientState::Done && self.replies.is_empty()
+-    }
+-
+-    fn drain_local_replies(&mut self, to_client: &mut Vec<u8>) {
+-        while self.replies.front() == Some(&Reply::LocalError) {
+-            self.replies.pop_front();
+-            to_client.extend_from_slice(b"ERROR\r\n");
+-        }
+-        if self.done() {
+-            // The last read may also contain D-Bus messages.
+-            to_client.append(&mut self.server_pending);
+-        }
+-    }
+-
+-    fn feed_client(&mut self, mut input: &[u8]) -> Result<SaslOutput> {
+-        let mut out = SaslOutput::default();
+-        if self.client_state == ClientState::Nul {
+-            let Some((&first, rest)) = input.split_first() else {
+-                return Ok(out);
+-            };
+-            if first != 0 {
+-                return Err(anyhow!("D-Bus client did not start with a NUL byte"));
+-            }
+-            out.to_server.push(0);
+-            self.client_state = ClientState::Lines;
+-            input = rest;
+-        }
+-        if self.client_state == ClientState::Done {
+-            out.to_server.extend_from_slice(input);
+-            return Ok(out);
+-        }
+-        self.client_pending.extend_from_slice(input);
+-        while let Some(end) = find_crlf(&self.client_pending) {
+-            if end > Self::MAX_LINE {
+-                return Err(anyhow!("D-Bus SASL line too long"));
+-            }
+-            let rest = self.client_pending.split_off(end + 2);
+-            let line = std::mem::replace(&mut self.client_pending, rest);
+-            if !line[..end]
+-                .iter()
+-                .all(|&b| b.is_ascii_graphic() || b == b' ' || b == b'\t')
+-            {
+-                return Err(anyhow!("Invalid byte in D-Bus SASL line"));
+-            }
+-            match sasl_command(&line[..end]) {
+-                b"AUTH" => {
+-                    let response = external_auth_response(&line[..end]);
+-                    self.authenticating_external = response.is_some();
+-                    if response.is_some_and(|r| !r.is_empty()) {
+-                        // The host sees the VM owner's credentials, including
+-                        // for privileged guest apps.
+-                        out.to_server.extend_from_slice(b"AUTH EXTERNAL ");
+-                        out.to_server.extend_from_slice(&self.external_identity);
+-                        out.to_server.extend_from_slice(b"\r\n");
+-                    } else if response.is_some() {
+-                        // GDBus clients without an initial response expect a
+-                        // DATA challenge; preserve that exchange.
+-                        out.to_server.extend_from_slice(b"AUTH EXTERNAL\r\n");
+-                    } else {
+-                        out.to_server.extend_from_slice(&line);
+-                    }
+-                    self.replies.push_back(Reply::FromServer);
+-                },
+-                b"DATA"
+-                    if self.authenticating_external && sasl_response(&line[4..end]).is_some() =>
+-                {
+-                    out.to_server.extend_from_slice(b"DATA ");
+-                    out.to_server.extend_from_slice(&self.external_identity);
+-                    out.to_server.extend_from_slice(b"\r\n");
+-                    self.replies.push_back(Reply::FromServer);
+-                },
+-                b"NEGOTIATE_UNIX_FD" => self.replies.push_back(Reply::LocalError),
+-                b"BEGIN" => {
+-                    // Invalid BEGIN leaves the server in SASL mode.
+-                    if !line[b"BEGIN".len()..end]
+-                        .iter()
+-                        .all(|&b| b == b' ' || b == b'\t')
+-                    {
+-                        return Err(anyhow!("D-Bus SASL BEGIN has arguments"));
+-                    }
+-                    // dbus-broker does not accept tab separators.
+-                    out.to_server.extend_from_slice(b"BEGIN\r\n");
+-                    self.client_state = ClientState::Done;
+-                    out.to_server.append(&mut self.client_pending);
+-                    break;
+-                },
+-                _ => {
+-                    if sasl_command(&line[..end]) == b"CANCEL" {
+-                        self.authenticating_external = false;
+-                    }
+-                    out.to_server.extend_from_slice(&line);
+-                    self.replies.push_back(Reply::FromServer);
+-                },
+-            }
+-        }
+-        if self.client_pending.len() > Self::MAX_LINE {
+-            return Err(anyhow!("D-Bus SASL line too long"));
+-        }
+-        self.drain_local_replies(&mut out.to_client);
+-        Ok(out)
+-    }
+-
+-    fn feed_server(&mut self, input: &[u8]) -> Result<Vec<u8>> {
+-        let mut to_client = Vec::new();
+-        if self.done() {
+-            to_client.extend_from_slice(input);
+-            return Ok(to_client);
+-        }
+-        self.server_pending.extend_from_slice(input);
+-        while !self.done() {
+-            let Some(end) = find_crlf(&self.server_pending) else {
+-                break;
+-            };
+-            if end > Self::MAX_LINE {
+-                return Err(anyhow!("D-Bus SASL line too long"));
+-            }
+-            let rest = self.server_pending.split_off(end + 2);
+-            let line = std::mem::replace(&mut self.server_pending, rest);
+-            if sasl_command(&line[..end]) == b"AGREE_UNIX_FD" {
+-                return Err(anyhow!("D-Bus server agreed to unix fd passing"));
+-            }
+-            to_client.extend_from_slice(&line);
+-            match self.replies.pop_front() {
+-                Some(Reply::FromServer) => {},
+-                Some(Reply::LocalError) => {
+-                    return Err(anyhow!("D-Bus SASL reply queue out of order"))
+-                },
+-                None => return Err(anyhow!("D-Bus server sent an unexpected SASL line")),
+-            }
+-            self.drain_local_replies(&mut to_client);
+-        }
+-        if self.server_pending.len() > Self::MAX_LINE {
+-            return Err(anyhow!("D-Bus SASL line too long"));
+-        }
+-        Ok(to_client)
+-    }
+-}
+-
+-fn find_crlf(buf: &[u8]) -> Option<usize> {
+-    buf.windows(2).position(|w| w == b"\r\n")
+-}
+-
+-fn sasl_command(line: &[u8]) -> &[u8] {
+-    // dbus-daemon also accepts tab separators.
+-    line.split(|&b| b == b' ' || b == b'\t')
+-        .next()
+-        .unwrap_or(line)
+-}
+-
+-fn external_auth_response(line: &[u8]) -> Option<&[u8]> {
+-    let mut args = line
+-        .split(|&b| b == b' ' || b == b'\t')
+-        .filter(|arg| !arg.is_empty());
+-    if args.next() != Some(b"AUTH") || args.next() != Some(b"EXTERNAL") {
+-        return None;
+-    }
+-    let response = args.next().unwrap_or_default();
+-    if args.next().is_some() {
+-        return None;
+-    }
+-    sasl_response(response)
+-}
+-
+-fn sasl_response(response: &[u8]) -> Option<&[u8]> {
+-    let response = response.trim_ascii();
+-    (response.len() % 2 == 0 && response.iter().all(u8::is_ascii_hexdigit)).then_some(response)
+-}
+-
+-pub fn bind_atspi_socket(path: &Path) -> Result<StdUnixListener> {
+-    let dir = path
+-        .parent()
+-        .ok_or_else(|| anyhow!("AT-SPI socket path {path:?} has no parent directory"))?;
+-    fs::DirBuilder::new()
+-        .recursive(true)
+-        .mode(0o700)
+-        .create(dir)
+-        .with_context(|| format!("Failed to create {dir:?}"))?;
+-    // /run is a guest tmpfs, so this cannot unlink the host socket.
+-    match fs::remove_file(path) {
+-        Ok(()) => {},
+-        Err(err) if err.kind() == ErrorKind::NotFound => {},
+-        Err(err) => return Err(err).with_context(|| format!("Failed to remove stale {path:?}")),
+-    }
+-    let listener =
+-        StdUnixListener::bind(path).with_context(|| format!("Failed to bind {path:?}"))?;
+-    listener
+-        .set_nonblocking(true)
+-        .context("Failed to set AT-SPI listener nonblocking")?;
+-    Ok(listener)
+-}
+-
+-fn connect_host() -> Result<StdUnixStream> {
+-    let fd = socket(
+-        AddressFamily::Vsock,
+-        SockType::Stream,
+-        SockFlag::SOCK_CLOEXEC,
+-        None,
+-    )
+-    .context("Failed to create vsock socket")?;
+-    connect(
+-        fd.as_raw_fd(),
+-        &VsockAddr::new(VMADDR_CID_HOST, ATSPI_SOCKET),
+-    )
+-    .context("Failed to connect to host AT-SPI bus over vsock")?;
+-    let stream = StdUnixStream::from(fd);
+-    stream
+-        .set_nonblocking(true)
+-        .context("Failed to set vsock stream nonblocking")?;
+-    Ok(stream)
+-}
+-
+-async fn proxy_connection(mut client: UnixStream) -> Result<()> {
+-    let server = tokio::task::spawn_blocking(connect_host)
+-        .await
+-        .context("vsock connect task failed")??;
+-    let mut server = UnixStream::from_std(server)?;
+-
+-    let mut filter = SaslFilter::new(getuid().as_raw());
+-    let mut client_buf = [0u8; 4096];
+-    let mut server_buf = [0u8; 4096];
+-    while !filter.done() {
+-        tokio::select! {
+-            n = client.read(&mut client_buf) => {
+-                let n = n?;
+-                if n == 0 {
+-                    return Ok(());
+-                }
+-                let out = filter.feed_client(&client_buf[..n])?;
+-                server.write_all(&out.to_server).await?;
+-                client.write_all(&out.to_client).await?;
+-            },
+-            n = server.read(&mut server_buf) => {
+-                let n = n?;
+-                if n == 0 {
+-                    return Ok(());
+-                }
+-                let to_client = filter.feed_server(&server_buf[..n])?;
+-                client.write_all(&to_client).await?;
+-            },
+-        }
+-    }
+-    copy_bidirectional(&mut client, &mut server).await?;
+-    Ok(())
+-}
+-
+-pub async fn run_atspi_bridge(listener: StdUnixListener) {
+-    let listener = match UnixListener::from_std(listener) {
+-        Ok(listener) => listener,
+-        Err(err) => {
+-            eprintln!("AT-SPI bridge: failed to register listener: {err}");
+-            return;
+-        },
+-    };
+-    loop {
+-        match listener.accept().await {
+-            Ok((client, _)) => {
+-                tokio::spawn(async move {
+-                    if let Err(err) = proxy_connection(client).await {
+-                        debug!(err:? = err; "AT-SPI bridge connection closed");
+-                    }
+-                });
+-            },
+-            Err(err) => {
+-                eprintln!("AT-SPI bridge: failed to accept incoming connection: {err}");
+-                // Back off on temporary errors such as EMFILE.
+-                tokio::time::sleep(Duration::from_secs(1)).await;
+-            },
+-        }
+-    }
+-}
+diff --git a/crates/muvm/src/guest/bin/muvm-guest.rs b/crates/muvm/src/guest/bin/muvm-guest.rs
+index eeba224..421089e 100644
+--- a/crates/muvm/src/guest/bin/muvm-guest.rs
++++ b/crates/muvm/src/guest/bin/muvm-guest.rs
+@@ -6,10 +6,10 @@ use std::process::{Command, ExitCode};
+ use std::{cmp, env, fs, thread};
+ 
+ use anyhow::{anyhow, Context, Result};
+-use muvm::guest::atspi::{bind_atspi_socket, run_atspi_bridge};
+ use muvm::guest::box64::setup_box;
+ use muvm::guest::bridge::pipewire::start_pwbridge;
+ use muvm::guest::bridge::x11::start_x11bridge;
++use muvm::guest::dbus::{bind_dbus_socket, run_dbus_bridge};
+ use muvm::guest::fex::setup_fex;
+ use muvm::guest::hidpipe::start_hidpipe;
+ use muvm::guest::mount::mount_filesystems;
+@@ -19,7 +19,9 @@ use muvm::guest::socket::setup_socket_proxy;
+ use muvm::guest::user::setup_user;
+ use muvm::guest::x11::setup_x11_forwarding;
+ use muvm::utils::env::get_var_if_exists;
+-use muvm::utils::launch::{Emulator, GuestConfiguration, PULSE_SOCKET};
++use muvm::utils::launch::{
++    Emulator, GuestConfiguration, ATSPI_SOCKET, PULSE_SOCKET, SESSION_BUS_SOCKET,
++};
+ use nix::unistd::{Gid, Uid};
+ use rustix::process::{getrlimit, setrlimit, Resource};
+ 
+@@ -129,13 +131,20 @@ fn main() -> Result<ExitCode> {
+     };
+ 
+     let atspi_listener = options.atspi_socket.as_deref().and_then(|path| {
+-        bind_atspi_socket(path)
++        bind_dbus_socket(path)
+             .inspect_err(|err| {
+                 eprintln!("Failed to set up AT-SPI bridge, accessibility will not work: {err:#}");
+             })
+             .ok()
+     });
+ 
++    let session_bus_listener = options
++        .session_bus_socket
++        .as_deref()
++        .map(bind_dbus_socket)
++        .transpose()
++        .context("Failed to set up session D-Bus bridge")?;
++
+     let pulse_path = run_path.join("pulse");
+     std::fs::create_dir(&pulse_path)
+         .context("Failed to create `pulse` directory in `XDG_RUNTIME_DIR`")?;
+@@ -161,7 +170,10 @@ fn main() -> Result<ExitCode> {
+ 
+     let rt = tokio::runtime::Runtime::new().unwrap();
+     if let Some(listener) = atspi_listener {
+-        rt.spawn(run_atspi_bridge(listener));
++        rt.spawn(run_dbus_bridge(listener, ATSPI_SOCKET));
++    }
++    if let Some(listener) = session_bus_listener {
++        rt.spawn(run_dbus_bridge(listener, SESSION_BUS_SOCKET));
+     }
+ 
+     // Init commands may connect to AT-SPI before the guest server starts.
+diff --git a/crates/muvm/src/guest/dbus.rs b/crates/muvm/src/guest/dbus.rs
+new file mode 100644
+index 0000000..555baf9
+--- /dev/null
++++ b/crates/muvm/src/guest/dbus.rs
+@@ -0,0 +1,421 @@
++use std::collections::VecDeque;
++use std::fmt::Write as _;
++use std::fs;
++use std::io::ErrorKind;
++use std::os::fd::AsRawFd;
++use std::os::unix::fs::DirBuilderExt as _;
++use std::os::unix::net::{UnixListener as StdUnixListener, UnixStream as StdUnixStream};
++use std::path::Path;
++use std::time::Duration;
++
++use anyhow::{anyhow, Context, Result};
++use log::debug;
++use nix::libc::VMADDR_CID_HOST;
++use nix::sys::socket::{connect, socket, AddressFamily, SockFlag, SockType, VsockAddr};
++use nix::unistd::getuid;
++use tokio::io::{copy_bidirectional, AsyncReadExt as _, AsyncWriteExt as _};
++use tokio::net::{UnixListener, UnixStream};
++
++#[derive(Default)]
++struct SaslOutput {
++    to_server: Vec<u8>,
++    to_client: Vec<u8>,
++}
++
++#[derive(PartialEq, Eq)]
++enum ClientState {
++    Nul,
++    Lines,
++    Done,
++}
++
++#[derive(PartialEq, Eq)]
++enum Reply {
++    FromServer,
++    LocalError,
++}
++
++// vsock cannot pass file descriptors. Reject NEGOTIATE_UNIX_FD locally,
++// keeping replies ordered for clients that pipeline SASL commands.
++// Each command gets one reply, except BEGIN.
++struct SaslFilter {
++    external_identity: Vec<u8>,
++    authenticating_external: bool,
++    client_state: ClientState,
++    client_pending: Vec<u8>,
++    server_pending: Vec<u8>,
++    replies: VecDeque<Reply>,
++}
++
++impl SaslFilter {
++    const MAX_LINE: usize = 16 * 1024;
++
++    fn new(uid: u32) -> Self {
++        let mut external_identity = String::new();
++        for b in uid.to_string().bytes() {
++            write!(external_identity, "{b:02X}").unwrap();
++        }
++        SaslFilter {
++            external_identity: external_identity.into_bytes(),
++            authenticating_external: false,
++            client_state: ClientState::Nul,
++            client_pending: Vec::new(),
++            server_pending: Vec::new(),
++            replies: VecDeque::new(),
++        }
++    }
++
++    fn done(&self) -> bool {
++        self.client_state == ClientState::Done && self.replies.is_empty()
++    }
++
++    fn drain_local_replies(&mut self, to_client: &mut Vec<u8>) {
++        while self.replies.front() == Some(&Reply::LocalError) {
++            self.replies.pop_front();
++            to_client.extend_from_slice(b"ERROR\r\n");
++        }
++        if self.done() {
++            // The last read may also contain D-Bus messages.
++            to_client.append(&mut self.server_pending);
++        }
++    }
++
++    fn feed_client(&mut self, mut input: &[u8]) -> Result<SaslOutput> {
++        let mut out = SaslOutput::default();
++        if self.client_state == ClientState::Nul {
++            let Some((&first, rest)) = input.split_first() else {
++                return Ok(out);
++            };
++            if first != 0 {
++                return Err(anyhow!("D-Bus client did not start with a NUL byte"));
++            }
++            out.to_server.push(0);
++            self.client_state = ClientState::Lines;
++            input = rest;
++        }
++        if self.client_state == ClientState::Done {
++            out.to_server.extend_from_slice(input);
++            return Ok(out);
++        }
++        self.client_pending.extend_from_slice(input);
++        while let Some(end) = find_crlf(&self.client_pending) {
++            if end > Self::MAX_LINE {
++                return Err(anyhow!("D-Bus SASL line too long"));
++            }
++            let rest = self.client_pending.split_off(end + 2);
++            let line = std::mem::replace(&mut self.client_pending, rest);
++            if !line[..end]
++                .iter()
++                .all(|&b| b.is_ascii_graphic() || b == b' ' || b == b'\t')
++            {
++                return Err(anyhow!("Invalid byte in D-Bus SASL line"));
++            }
++            match sasl_command(&line[..end]) {
++                b"AUTH" => {
++                    let response = external_auth_response(&line[..end]);
++                    self.authenticating_external = response.is_some();
++                    if response.is_some_and(|r| !r.is_empty()) {
++                        // The host sees the VM owner's credentials, including
++                        // for privileged guest apps.
++                        out.to_server.extend_from_slice(b"AUTH EXTERNAL ");
++                        out.to_server.extend_from_slice(&self.external_identity);
++                        out.to_server.extend_from_slice(b"\r\n");
++                    } else if response.is_some() {
++                        // GDBus clients without an initial response expect a
++                        // DATA challenge; preserve that exchange.
++                        out.to_server.extend_from_slice(b"AUTH EXTERNAL\r\n");
++                    } else {
++                        out.to_server.extend_from_slice(&line);
++                    }
++                    self.replies.push_back(Reply::FromServer);
++                },
++                b"DATA"
++                    if self.authenticating_external && sasl_response(&line[4..end]).is_some() =>
++                {
++                    out.to_server.extend_from_slice(b"DATA ");
++                    out.to_server.extend_from_slice(&self.external_identity);
++                    out.to_server.extend_from_slice(b"\r\n");
++                    self.replies.push_back(Reply::FromServer);
++                },
++                b"NEGOTIATE_UNIX_FD" => self.replies.push_back(Reply::LocalError),
++                b"BEGIN" => {
++                    // Invalid BEGIN leaves the server in SASL mode.
++                    if !line[b"BEGIN".len()..end]
++                        .iter()
++                        .all(|&b| b == b' ' || b == b'\t')
++                    {
++                        return Err(anyhow!("D-Bus SASL BEGIN has arguments"));
++                    }
++                    // dbus-broker does not accept tab separators.
++                    out.to_server.extend_from_slice(b"BEGIN\r\n");
++                    self.client_state = ClientState::Done;
++                    out.to_server.append(&mut self.client_pending);
++                    break;
++                },
++                _ => {
++                    if sasl_command(&line[..end]) == b"CANCEL" {
++                        self.authenticating_external = false;
++                    }
++                    out.to_server.extend_from_slice(&line);
++                    self.replies.push_back(Reply::FromServer);
++                },
++            }
++        }
++        if self.client_pending.len() > Self::MAX_LINE {
++            return Err(anyhow!("D-Bus SASL line too long"));
++        }
++        self.drain_local_replies(&mut out.to_client);
++        Ok(out)
++    }
++
++    fn feed_server(&mut self, input: &[u8]) -> Result<Vec<u8>> {
++        let mut to_client = Vec::new();
++        if self.done() {
++            to_client.extend_from_slice(input);
++            return Ok(to_client);
++        }
++        self.server_pending.extend_from_slice(input);
++        while !self.done() {
++            let Some(end) = find_crlf(&self.server_pending) else {
++                break;
++            };
++            if end > Self::MAX_LINE {
++                return Err(anyhow!("D-Bus SASL line too long"));
++            }
++            let rest = self.server_pending.split_off(end + 2);
++            let line = std::mem::replace(&mut self.server_pending, rest);
++            if sasl_command(&line[..end]) == b"AGREE_UNIX_FD" {
++                return Err(anyhow!("D-Bus server agreed to unix fd passing"));
++            }
++            to_client.extend_from_slice(&line);
++            match self.replies.pop_front() {
++                Some(Reply::FromServer) => {},
++                Some(Reply::LocalError) => {
++                    return Err(anyhow!("D-Bus SASL reply queue out of order"))
++                },
++                None => return Err(anyhow!("D-Bus server sent an unexpected SASL line")),
++            }
++            self.drain_local_replies(&mut to_client);
++        }
++        if self.server_pending.len() > Self::MAX_LINE {
++            return Err(anyhow!("D-Bus SASL line too long"));
++        }
++        Ok(to_client)
++    }
++}
++
++fn find_crlf(buf: &[u8]) -> Option<usize> {
++    buf.windows(2).position(|w| w == b"\r\n")
++}
++
++fn sasl_command(line: &[u8]) -> &[u8] {
++    // dbus-daemon also accepts tab separators.
++    line.split(|&b| b == b' ' || b == b'\t')
++        .next()
++        .unwrap_or(line)
++}
++
++fn external_auth_response(line: &[u8]) -> Option<&[u8]> {
++    let mut args = line
++        .split(|&b| b == b' ' || b == b'\t')
++        .filter(|arg| !arg.is_empty());
++    if args.next() != Some(b"AUTH") || args.next() != Some(b"EXTERNAL") {
++        return None;
++    }
++    let response = args.next().unwrap_or_default();
++    if args.next().is_some() {
++        return None;
++    }
++    sasl_response(response)
++}
++
++fn sasl_response(response: &[u8]) -> Option<&[u8]> {
++    let response = response.trim_ascii();
++    (response.len() % 2 == 0 && response.iter().all(u8::is_ascii_hexdigit)).then_some(response)
++}
++
++pub fn bind_dbus_socket(path: &Path) -> Result<StdUnixListener> {
++    let dir = path
++        .parent()
++        .ok_or_else(|| anyhow!("D-Bus socket path {path:?} has no parent directory"))?;
++    fs::DirBuilder::new()
++        .recursive(true)
++        .mode(0o700)
++        .create(dir)
++        .with_context(|| format!("Failed to create {dir:?}"))?;
++    // /run is a guest tmpfs, so this cannot unlink the host socket.
++    match fs::remove_file(path) {
++        Ok(()) => {},
++        Err(err) if err.kind() == ErrorKind::NotFound => {},
++        Err(err) => return Err(err).with_context(|| format!("Failed to remove stale {path:?}")),
++    }
++    let listener =
++        StdUnixListener::bind(path).with_context(|| format!("Failed to bind {path:?}"))?;
++    listener
++        .set_nonblocking(true)
++        .context("Failed to set D-Bus listener nonblocking")?;
++    Ok(listener)
++}
++
++fn connect_host(port: u32) -> Result<StdUnixStream> {
++    let fd = socket(
++        AddressFamily::Vsock,
++        SockType::Stream,
++        SockFlag::SOCK_CLOEXEC,
++        None,
++    )
++    .context("Failed to create vsock socket")?;
++    connect(fd.as_raw_fd(), &VsockAddr::new(VMADDR_CID_HOST, port))
++        .context("Failed to connect to host D-Bus bus over vsock")?;
++    let stream = StdUnixStream::from(fd);
++    stream
++        .set_nonblocking(true)
++        .context("Failed to set vsock stream nonblocking")?;
++    Ok(stream)
++}
++
++async fn proxy_connection(mut client: UnixStream, port: u32) -> Result<()> {
++    let server = tokio::task::spawn_blocking(move || connect_host(port))
++        .await
++        .context("vsock connect task failed")??;
++    let mut server = UnixStream::from_std(server)?;
++
++    let mut filter = SaslFilter::new(getuid().as_raw());
++    let mut client_buf = [0u8; 4096];
++    let mut server_buf = [0u8; 4096];
++    while !filter.done() {
++        tokio::select! {
++            n = client.read(&mut client_buf) => {
++                let n = n?;
++                if n == 0 {
++                    return Ok(());
++                }
++                let out = filter.feed_client(&client_buf[..n])?;
++                server.write_all(&out.to_server).await?;
++                client.write_all(&out.to_client).await?;
++            },
++            n = server.read(&mut server_buf) => {
++                let n = n?;
++                if n == 0 {
++                    return Ok(());
++                }
++                let to_client = filter.feed_server(&server_buf[..n])?;
++                client.write_all(&to_client).await?;
++            },
++        }
++    }
++    copy_bidirectional(&mut client, &mut server).await?;
++    Ok(())
++}
++
++pub async fn run_dbus_bridge(listener: StdUnixListener, port: u32) {
++    let listener = match UnixListener::from_std(listener) {
++        Ok(listener) => listener,
++        Err(err) => {
++            eprintln!("D-Bus bridge: failed to register listener: {err}");
++            return;
++        },
++    };
++    loop {
++        match listener.accept().await {
++            Ok((client, _)) => {
++                tokio::spawn(async move {
++                    if let Err(err) = proxy_connection(client, port).await {
++                        debug!(err:? = err; "D-Bus bridge connection closed");
++                    }
++                });
++            },
++            Err(err) => {
++                eprintln!("D-Bus bridge: failed to accept incoming connection: {err}");
++                // Back off on temporary errors such as EMFILE.
++                tokio::time::sleep(Duration::from_secs(1)).await;
++            },
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn pipelined_fd_negotiation_is_rejected_in_reply_order() {
++        let mut filter = SaslFilter::new(1000);
++        let out = filter
++            .feed_client(b"\0AUTH EXTERNAL 30\r\nNEGOTIATE_UNIX_FD\r\nBEGIN\r\nmessage")
++            .unwrap();
++        assert_eq!(
++            out.to_server,
++            b"\0AUTH EXTERNAL 31303030\r\nBEGIN\r\nmessage"
++        );
++        assert!(out.to_client.is_empty());
++        assert!(!filter.done());
++        assert_eq!(
++            filter.feed_server(b"OK guid\r\nreply").unwrap(),
++            b"OK guid\r\nERROR\r\nreply"
++        );
++        assert!(filter.done());
++    }
++
++    #[test]
++    fn external_auth_without_initial_response_preserves_challenge() {
++        let mut filter = SaslFilter::new(1000);
++        assert_eq!(
++            filter
++                .feed_client(b"\0AUTH EXTERNAL\r\n")
++                .unwrap()
++                .to_server,
++            b"\0AUTH EXTERNAL\r\n"
++        );
++        assert_eq!(filter.feed_server(b"DATA\r\n").unwrap(), b"DATA\r\n");
++        assert_eq!(
++            filter.feed_client(b"DATA 30\r\n").unwrap().to_server,
++            b"DATA 31303030\r\n"
++        );
++        assert_eq!(filter.feed_server(b"OK guid\r\n").unwrap(), b"OK guid\r\n");
++        assert_eq!(
++            filter
++                .feed_client(b"NEGOTIATE_UNIX_FD\r\n")
++                .unwrap()
++                .to_client,
++            b"ERROR\r\n"
++        );
++        assert_eq!(
++            filter.feed_client(b"BEGIN\r\n").unwrap().to_server,
++            b"BEGIN\r\n"
++        );
++        assert!(filter.done());
++    }
++
++    #[test]
++    fn fragmented_authentication_and_binary_messages_are_preserved() {
++        let mut filter = SaslFilter::new(1000);
++        assert_eq!(filter.feed_client(b"\0AU").unwrap().to_server, b"\0");
++        assert_eq!(
++            filter
++                .feed_client(b"TH EXTERNAL 31303030\r\n")
++                .unwrap()
++                .to_server,
++            b"AUTH EXTERNAL 31303030\r\n"
++        );
++        assert!(filter.feed_server(b"OK guid\r").unwrap().is_empty());
++        assert_eq!(filter.feed_server(b"\n").unwrap(), b"OK guid\r\n");
++        assert_eq!(
++            filter.feed_client(b"BEGIN\r\n\0\xff").unwrap().to_server,
++            b"BEGIN\r\n\0\xff"
++        );
++        assert_eq!(filter.feed_server(b"\0\xff").unwrap(), b"\0\xff");
++    }
++
++    #[test]
++    fn malformed_and_unbounded_authentication_is_rejected() {
++        assert!(SaslFilter::new(1000)
++            .feed_client(b"AUTH EXTERNAL\r\n")
++            .is_err());
++        let mut filter = SaslFilter::new(1000);
++        filter.feed_client(b"\0").unwrap();
++        assert!(filter
++            .feed_client(&vec![b'A'; SaslFilter::MAX_LINE + 1])
++            .is_err());
++    }
++}
+diff --git a/crates/muvm/src/guest/mod.rs b/crates/muvm/src/guest/mod.rs
+index 5987c9d..d003b03 100644
+--- a/crates/muvm/src/guest/mod.rs
++++ b/crates/muvm/src/guest/mod.rs
+@@ -1,6 +1,6 @@
+-pub mod atspi;
+ pub mod box64;
+ pub mod bridge;
++pub mod dbus;
+ pub mod fex;
+ pub mod hidpipe;
+ pub mod mount;
+diff --git a/crates/muvm/src/lib.rs b/crates/muvm/src/lib.rs
+index acd432a..206d380 100644
+--- a/crates/muvm/src/lib.rs
++++ b/crates/muvm/src/lib.rs
+@@ -8,6 +8,7 @@ pub mod hidpipe_server;
+ pub mod launch;
+ pub mod monitor;
+ pub mod net;
++pub mod session_bus;
+ pub mod types;
+ 
+ pub mod guest;
+diff --git a/crates/muvm/src/session_bus.rs b/crates/muvm/src/session_bus.rs
+new file mode 100644
+index 0000000..5ef3c77
+--- /dev/null
++++ b/crates/muvm/src/session_bus.rs
+@@ -0,0 +1,61 @@
++use std::env;
++use std::path::{Path, PathBuf};
++
++use anyhow::{bail, Context, Result};
++
++use crate::atspi::{can_connect, parse_unix_path_address, percent_encode, HostBus};
++
++pub fn discover_host_bus(runtime_dir: &Path) -> Result<HostBus> {
++    let address = env::var("DBUS_SESSION_BUS_ADDRESS")
++        .ok()
++        .filter(|address| !address.is_empty())
++        .unwrap_or_else(|| format!("unix:path={}", percent_encode(&runtime_dir.join("bus"))));
++    let path = parse_unix_path_address(&address)
++        .context("--session-bus requires a single unix:path D-Bus address")?;
++    if !path.is_absolute() {
++        bail!("--session-bus requires an absolute session bus socket path");
++    }
++    if !can_connect(&path) {
++        bail!("Cannot connect to host session bus at {path:?}");
++    }
++    HostBus::new(path, runtime_dir, "session-bus")
++}
++
++pub fn guest_socket_path(uid: u32) -> PathBuf {
++    PathBuf::from(format!("/run/user/{uid}/bus"))
++}
++
++pub fn guest_address(uid: u32) -> String {
++    format!("unix:path={}", percent_encode(&guest_socket_path(uid)))
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn guest_bus_lives_in_guest_runtime_directory() {
++        assert_eq!(guest_address(1000), "unix:path=/run/user/1000/bus");
++        assert_eq!(guest_address(42), "unix:path=/run/user/42/bus");
++    }
++
++    #[test]
++    fn host_address_decodes_escaped_paths() {
++        assert_eq!(
++            parse_unix_path_address("unix:path=/tmp/a%20b/bus,guid=abc"),
++            Some(PathBuf::from("/tmp/a b/bus"))
++        );
++    }
++
++    #[test]
++    fn unsupported_addresses_are_not_treated_as_paths() {
++        for address in [
++            "unix:abstract=/tmp/bus",
++            "tcp:host=localhost,port=1234",
++            "unix:path=/tmp/bus;unix:path=/tmp/other",
++            "unix:path=/tmp/%XX",
++        ] {
++            assert_eq!(parse_unix_path_address(address), None, "{address}");
++        }
++    }
++}
+diff --git a/crates/muvm/src/utils/launch.rs b/crates/muvm/src/utils/launch.rs
+index 562068b..48086d2 100644
+--- a/crates/muvm/src/utils/launch.rs
++++ b/crates/muvm/src/utils/launch.rs
+@@ -47,9 +47,12 @@ pub struct GuestConfiguration {
+     pub init_commands: Vec<PathBuf>,
+     pub user_init_commands: Vec<PathBuf>,
+     pub atspi_socket: Option<PathBuf>,
++    #[serde(default)]
++    pub session_bus_socket: Option<PathBuf>,
+ }
+ 
+ pub const PULSE_SOCKET: u32 = 3333;
+ pub const HIDPIPE_SOCKET: u32 = PULSE_SOCKET + 1;
+ pub const MUVM_GUEST_SOCKET: u32 = HIDPIPE_SOCKET + 1;
+ pub const ATSPI_SOCKET: u32 = MUVM_GUEST_SOCKET + 1;
++pub const SESSION_BUS_SOCKET: u32 = ATSPI_SOCKET + 1;
