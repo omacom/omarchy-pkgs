@@ -2,7 +2,8 @@
 # Every package's .omarchy/package.json passes validate_package_metadata,
 # a fast-ring package that declares rebuild_on is refused (the fast ring
 # ships one edge build to every channel, so nothing rebuilds it when a
-# dependency moves), and so is the retired channels key.
+# dependency moves), and so is the retired channels key. "review" is a
+# boolean for a package with an upstream watch, and never with auto_merge.
 set -euo pipefail
 ROOT=$(realpath "${BASH_SOURCE[0]%/*}/..")
 source "$ROOT/helpers/package-metadata.sh"
@@ -31,3 +32,17 @@ mkdir -p "$T/channels/.omarchy"
 echo '{"source": "local", "channels": ["edge"]}' > "$T/channels/.omarchy/package.json"
 out=$(validate_package_metadata "$T/channels" 2>&1) && fail "a channels key was accepted"
 [[ $out == *"channels is gone"* ]] && pass "a channels key is refused" || fail "unexpected message: $out"
+
+watch='"upstream": {"watch": {"git_tags": "https://example.com/x.git", "pattern": "v(?P<version>[0-9.]+)"}}'
+review() { # review <name> <json>: validate a package declaring it
+  mkdir -p "$T/$1/.omarchy"; echo "$2" > "$T/$1/.omarchy/package.json"
+  validate_package_metadata "$T/$1" 2>&1
+}
+review reviewed "{\"source\": \"local\", \"review\": true, $watch}" >/dev/null &&
+  pass "review with an upstream watch is fine" || fail "review with a watch refused"
+out=$(review review-string "{\"source\": \"local\", \"review\": \"yes\", $watch}") && fail "a string review accepted"
+[[ $out == *"review"*"must be boolean"* ]] && pass "review must be boolean" || fail "unexpected message: $out"
+out=$(review review-auto "{\"source\": \"local\", \"review\": true, \"auto_merge\": true, $watch}") && fail "review with auto_merge accepted"
+[[ $out == *"cannot also set auto_merge"* ]] && pass "review with auto_merge is refused" || fail "unexpected message: $out"
+out=$(review review-nowatch '{"source": "local", "review": true}') && fail "review without a watch accepted"
+[[ $out == *"only an upstream watch"* ]] && pass "review without a watch is refused" || fail "unexpected message: $out"
