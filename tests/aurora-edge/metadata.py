@@ -11,10 +11,11 @@ import unittest
 ROOT = Path(__file__).resolve().parents[2]
 NAMES = ['linux-aurora', 'mesa-aurora', 'aura', 'm1n1-aurora', 'uboot-aurora', 'aurora-bless',
          'speakerguardd', 'aurora-audio', 'alsa-ucm-conf-aurora', 'omarchy-aurora-firmware',
-         'speakersafetyd', 'bankstown', 'triforce-lv2', 'lzfse', 'aurora-scripts', 'aurora-fwextract']
+         'speakersafetyd', 'bankstown', 'triforce-lv2', 'lzfse', 'aurora-scripts', 'aurora-fwextract',
+         'muvm', 'FEX-Emu']
 # Same-name imports from asahi-alarm, with the version each replaces on installed Macs.
 ASAHI_ALARM_IMPORTS = {'speakersafetyd': '2.0.1-1', 'bankstown': '1.1.0-2', 'triforce-lv2': '0.3.2-1',
-                       'lzfse': '1.0-1'}
+                       'lzfse': '1.0-1', 'muvm': '0.7.0-1', 'FEX-Emu': '2604-1'}
 
 
 def srcinfo(name):
@@ -42,6 +43,7 @@ class EdgeMetadataTests(unittest.TestCase):
             'aura': ['aurora-scripts>=20260127.1', 'uboot-aurora'],
             'm1n1-aurora': ['aurora-scripts>=20260127.1', 'uboot-asahi'],
             'aurora-fwextract': ['python', 'aurora-scripts', 'lzfse'],
+            'omarchy-steam-fex': ['bash', 'coreutils', 'python', 'steam', 'muvm', 'FEX-Emu'],
             'aurora-audio': ['alsa-ucm-conf-aurora', 'pipewire-audio', 'wireplumber',
                              'bankstown', 'lsp-plugins-lv2', 'triforce-lv2>=0.2.0',
                              'speakersafetyd', 'speakerguardd'],
