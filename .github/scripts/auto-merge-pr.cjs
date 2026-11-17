@@ -82,10 +82,13 @@ function decide({ pr, files, vouchStatus, repository, owners }) {
 // auto-merge through later pushes by anyone with write access, so a PR that
 // qualified and then added a change outside packages, or to the approved
 // list of release/owners.json, would still merge by itself. A failed author
-// lookup is no answer, so it withdraws nothing.
-function withdraw(decision, vouchStatus) {
+// lookup is no answer about the author, so on its own it withdraws nothing.
+// But the files can still say no: contentQualifies is the decision for the
+// same PR from a trusted author, and a no there withdraws whatever the
+// lookup said.
+function withdraw(decision, vouchStatus, contentQualifies = true) {
   const known = ['bot', 'collaborator', 'vouched', 'unknown', 'denounced'];
-  return !decision.enable && known.includes(vouchStatus);
+  return !decision.enable && (known.includes(vouchStatus) || !contentQualifies);
 }
 
 module.exports = async function autoMerge({ github, context, core, number, vouchStatus }) {
@@ -105,7 +108,10 @@ module.exports = async function autoMerge({ github, context, core, number, vouch
   });
   core.info(`#${number}: ${decision.enable ? 'auto-merge' : 'leave for a maintainer'} (${decision.reason})`);
   core.setOutput('enable', String(decision.enable));
-  core.setOutput('withdraw', String(withdraw(decision, vouchStatus)));
+  const asTrusted = decide({
+    pr, files, vouchStatus: 'collaborator', repository: `${context.repo.owner}/${context.repo.repo}`, owners,
+  });
+  core.setOutput('withdraw', String(withdraw(decision, vouchStatus, asTrusted.enable)));
   core.setOutput('head_sha', pr.head.sha);
   return decision;
 };

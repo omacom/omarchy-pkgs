@@ -499,15 +499,19 @@ test('auto-merge accepts regenerated owners.json directories, never a change to 
   assert.equal(decide({ pr: mergeable(), files: [...packageFiles, file], vouchStatus: 'collaborator', repository }).enable, false);
 });
 
-test('auto-merge is withdrawn when a later push no longer qualifies, not on a failed lookup', () => {
+test('auto-merge is withdrawn when the PR no longer qualifies, and on a failed lookup only when its files do not', () => {
   const { withdraw } = require('../.github/scripts/auto-merge-pr.cjs');
   const no = { enable: false }, yes = { enable: true };
   for (const status of ['bot', 'collaborator', 'vouched', 'unknown', 'denounced']) {
     assert.equal(withdraw(no, status), true, status);
     assert.equal(withdraw(yes, status), false, status);
   }
-  // The vouch lookup failed: no answer, so auto-merge stays as it is.
-  for (const status of ['', undefined, 'error']) assert.equal(withdraw(no, status), false, String(status));
+  // The vouch lookup failed: no answer about the author, so auto-merge
+  // stays as it is while the files still qualify, and goes when they do not.
+  for (const status of ['', undefined, 'error']) {
+    assert.equal(withdraw(no, status, true), false, String(status));
+    assert.equal(withdraw(no, status, false), true, String(status));
+  }
   const text = readFileSync(join(__dirname, '../.github/workflows/auto-merge-pr.yml'), 'utf8');
   assert.match(text, /types: \[opened, reopened, synchronize,/);
   assert.match(text, /if: steps\.decide\.outputs\.withdraw == 'true'/);
