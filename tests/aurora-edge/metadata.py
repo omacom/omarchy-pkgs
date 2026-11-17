@@ -10,7 +10,10 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
 NAMES = ['linux-aurora', 'mesa-aurora', 'aura', 'm1n1-aurora', 'uboot-aurora', 'aurora-bless',
-         'speakerguardd', 'aurora-audio', 'alsa-ucm-conf-aurora', 'omarchy-aurora-firmware']
+         'speakerguardd', 'aurora-audio', 'alsa-ucm-conf-aurora', 'omarchy-aurora-firmware',
+         'speakersafetyd', 'bankstown', 'triforce-lv2']
+# Same-name imports from asahi-alarm, with the version each replaces on installed Macs.
+ASAHI_ALARM_IMPORTS = {'speakersafetyd': '2.0.1-1', 'bankstown': '1.1.0-2', 'triforce-lv2': '0.3.2-1'}
 
 
 def srcinfo(name):
@@ -96,6 +99,28 @@ class EdgeMetadataTests(unittest.TestCase):
             self.assertNotIn(old, package.get('replaces', []))
             if old != 'm1n1-aurora':
                 self.assertTrue(any(p.startswith(old + '=') for p in package['provides']))
+
+    def test_asahi_alarm_imports_upgrade_in_place(self):
+        # The [omarchy] build must win by version alone: same name, same pkgver,
+        # higher pkgrel, and no relations that would touch other machines.
+        for name, old in ASAHI_ALARM_IMPORTS.items():
+            with self.subTest(package=name):
+                package = srcinfo(name)[name]
+                self.assertNotIn('epoch', package)
+                self.assertEqual(package['pkgver'][0], old.split('-')[0])
+                new = package['pkgver'][0] + '-' + package['pkgrel'][0]
+                self.assertGreater(int(subprocess.check_output(['vercmp', new, old], text=True)), 0)
+                for field in ['provides', 'conflicts', 'replaces']:
+                    self.assertNotIn(field, package)
+        triforce = srcinfo('triforce-lv2')['triforce-lv2']['pkgver'][0]
+        self.assertGreaterEqual(int(subprocess.check_output(['vercmp', triforce, '0.2.0'], text=True)), 0)
+
+    def test_speakersafetyd_unit_stays_where_its_drop_in_and_preset_expect(self):
+        # speakerguardd's drop-in and omarchy-mac's preset name this unit path.
+        recipe = (ROOT / 'pkgbuilds' / 'speakersafetyd' / 'PKGBUILD').read_text()
+        self.assertIn('UNITDIR=/usr/lib/systemd/system', recipe)
+        guard = (ROOT / 'pkgbuilds' / 'speakerguardd' / 'PKGBUILD').read_text()
+        self.assertIn('"$pkgdir/usr/lib/systemd/system/speakersafetyd.service.d/50-j700-guard.conf"', guard)
 
     def test_kernel_replaces_nothing(self):
         # linux-aurora sets its relations inside generated package functions,
