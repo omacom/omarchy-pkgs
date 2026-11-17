@@ -36,3 +36,11 @@ omacom/omarchy.
 - A recipe change does not rebuild without a `pkgver` or `pkgrel` bump.
 - A non-draft PR that only touches `pkgbuilds/` merges and publishes itself
   once green. Open it as a draft to keep control.
+- A recipe that adds or changes a `pkgname`, `pkgbase`, `provides`,
+  `replaces` or `arch` needs its line in `release/owners.json`. Run
+  `bin/release-owners <package>` on Arch and commit the result; never edit
+  the directory lines by hand. `self-tests` fails until they match.
+- Never add an `approved` line on your own. It lets a directory provide
+  another directory's package or replace a name that is not its own, which
+  `pacman -Syu` offers to every machine. A maintainer decides; say in the PR
+  why it is an intended alternative or a migration.
