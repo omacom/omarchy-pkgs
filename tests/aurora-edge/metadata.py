@@ -120,6 +120,9 @@ class EdgeMetadataTests(unittest.TestCase):
                 depends = srcinfo(name)[name]['depends']
                 self.assertIn('aurora-scripts>=20260127.1', depends)
                 self.assertFalse([d for d in depends if d.startswith('asahi-scripts')])
+        for name in ('omarchy-mac', 'omarchy-mac-boot'):
+            with self.subTest(package=name):
+                self.assertNotIn('asahi-alarm-keyring', srcinfo(name)[name]['depends'])
         for name in ('aurora-scripts', 'aurora-fwextract', 'lzfse'):
             with self.subTest(package=name):
                 self.assertIn('install -Dm644', (ROOT / 'pkgbuilds' / name / 'PKGBUILD').read_text())
