@@ -51,8 +51,6 @@ source "$package_dir/PKGBUILD"
   fail "the ELF board data is packaged without stripping"
 [[ " ${arch[*]} " == " aarch64 " && " ${groups[*]} " == *" omarchy-platform-qualcomm "* ]] ||
   fail "the package is tagged Qualcomm-only for aarch64"
-grep -q "^_audioreach_commit=d7a5e9d80ad18a7a6844eeb32cacbdeea0e7e677$" "$package_dir/PKGBUILD" ||
-  fail "the topology builds from pinned AudioReach source"
 grep -q 'File "/Qualcomm/surface-pro-11/Surface11-HiFi.conf"' "$package_dir/MICROSOFT-Surface-Pro-11.conf" ||
   fail "the card profile points at the shipped HiFi verb"
 

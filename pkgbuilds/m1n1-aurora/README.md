@@ -34,8 +34,8 @@ provides it. Depending on `uboot-aurora` by name would make every legacy
 upgrade hit its conflict with `uboot-asahi`, which `--noconfirm` refuses, and
 then ask the user to swap U-Boot. Images select `uboot-aurora` explicitly.
 
-Stage 2 remains `/usr/lib/asahi-boot/m1n1.bin`. The existing asahi-scripts hook
-rebuilds `m1n1/boot.bin` on the selected system ESP from the loader, kernel DTBs
+Stage 2 remains `/usr/lib/asahi-boot/m1n1.bin`. The aurora-scripts hook (which
+provides `asahi-scripts`) rebuilds `m1n1/boot.bin` on the selected system ESP from the loader, kernel DTBs
 and U-Boot. This package adds no install script, Recovery command or ESP rename.
 `/etc/default/update-m1n1` overrides are left alone.
 

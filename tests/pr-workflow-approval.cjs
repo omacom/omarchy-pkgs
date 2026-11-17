@@ -382,6 +382,9 @@ test('every bot lane opens its PRs per package through package-prs.yml', () => {
   assert.doesNotMatch(prs, /secrets\.GITHUB_TOKEN/);
   assert.match(prs, /gh pr merge --auto --merge "\$PR"/);
   assert.match(prs, /fail-fast: false/);
+  // A reviewed group opens as a draft and is never armed.
+  assert.match(prs, /draft: \$\{\{ matrix\.group\.review == true \}\}/);
+  assert.match(prs, /- name: Enable auto-merge\n +id: merge\n +if: \$\{\{ [^\n]*&& matrix\.group\.review != true \}\}/);
   assert.doesNotMatch(prs, /^ +(contents|pull-requests|actions): write$/m);
 });
 
@@ -393,21 +396,22 @@ test('package PRs split per package and keep branch siblings together', () => {
   try {
     const git = (...args) => execFileSync('git', ['-C', dir, '-c', 'user.name=T', '-c', 'user.email=t@t', ...args]);
     git('init', '-q');
-    const write = (name, watch) => {
+    const write = (name, watch, extra = {}) => {
       const pkg = join(dir, 'pkgbuilds', name);
       mkdirSync(join(pkg, '.omarchy'), { recursive: true });
       writeFileSync(join(pkg, 'PKGBUILD'), `pkgname=${name}\npkgver=1\npkgrel=1\n`);
-      writeFileSync(join(pkg, '.omarchy/package.json'), JSON.stringify({ upstream: { watch } }));
+      writeFileSync(join(pkg, '.omarchy/package.json'), JSON.stringify({ ...extra, upstream: { watch } }));
     };
     const branch = { git_branch: 'https://github.com/omacom/omarchy.git', branch: 'quattro' };
     write('omarchy-dev', branch);
     write('omarchy-settings-dev', branch);
     write('omasnap-git', { git_branch: 'https://github.com/omacom/omasnap.git', branch: 'main' });
     write('zed', { github: 'zed-industries/zed' });
+    write('speakersafetyd', { git_tags: 'https://github.com/AsahiLinux/speakersafetyd.git' }, { review: true });
     write('untouched', { github: 'x/y' });
     git('add', '.');
     git('commit', '-qm', 'base');
-    for (const name of ['omarchy-dev', 'omarchy-settings-dev', 'omasnap-git', 'zed']) {
+    for (const name of ['omarchy-dev', 'omarchy-settings-dev', 'omasnap-git', 'zed', 'speakersafetyd']) {
       writeFileSync(join(dir, 'pkgbuilds', name, 'PKGBUILD'), `pkgname=${name}\npkgver=2\npkgrel=1\n`);
     }
     const patch = join(dir, 'pins.patch');
@@ -415,6 +419,7 @@ test('package PRs split per package and keep branch siblings together', () => {
     assert.deepEqual(groups, [
       { branch: 'auto/track-branches-omarchy-dev-omarchy-settings-dev', packages: 'omarchy-dev omarchy-settings-dev' },
       { branch: 'auto/track-branches-omasnap-git', packages: 'omasnap-git' },
+      { branch: 'auto/track-branches-speakersafetyd', packages: 'speakersafetyd', review: true },
       { branch: 'auto/track-branches-zed', packages: 'zed' },
     ]);
     assert.match(readFileSync(patch, 'utf8'), /pkgbuilds\/zed\/PKGBUILD/);

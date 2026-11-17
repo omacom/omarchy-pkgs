@@ -16,7 +16,7 @@ access are required. To work locally you need:
 - `git`, `bash`, `jq`, `curl` and a `tar` that reads zstd
 - Docker or Podman that your user can run, to build. With Docker, a build
   calls `sudo` to fix the ownership of its output.
-- on Arch, to check an upstream declaration: Python 3.11+, `vercmp`, `bsdtar`
+- on Arch, to check an upstream declaration: Python 3.14+, `vercmp`, `bsdtar`
 
 Questions and problems: open an issue on this repository.
 
