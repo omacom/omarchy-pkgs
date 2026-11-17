@@ -11,9 +11,10 @@ import unittest
 ROOT = Path(__file__).resolve().parents[2]
 NAMES = ['linux-aurora', 'mesa-aurora', 'aura', 'm1n1-aurora', 'uboot-aurora', 'aurora-bless',
          'speakerguardd', 'aurora-audio', 'alsa-ucm-conf-aurora', 'omarchy-aurora-firmware',
-         'speakersafetyd', 'bankstown', 'triforce-lv2']
+         'speakersafetyd', 'bankstown', 'triforce-lv2', 'lzfse', 'aurora-scripts', 'aurora-fwextract']
 # Same-name imports from asahi-alarm, with the version each replaces on installed Macs.
-ASAHI_ALARM_IMPORTS = {'speakersafetyd': '2.0.1-1', 'bankstown': '1.1.0-2', 'triforce-lv2': '0.3.2-1'}
+ASAHI_ALARM_IMPORTS = {'speakersafetyd': '2.0.1-1', 'bankstown': '1.1.0-2', 'triforce-lv2': '0.3.2-1',
+                       'lzfse': '1.0-1'}
 
 
 def srcinfo(name):
@@ -38,8 +39,9 @@ def srcinfo(name):
 class EdgeMetadataTests(unittest.TestCase):
     def test_runtime_only_dependencies_remain_in_packages_not_build_environments(self):
         expected = {
-            'aura': ['asahi-scripts>=20260127.1', 'uboot-aurora'],
-            'm1n1-aurora': ['asahi-scripts>=20260127.1', 'uboot-asahi'],
+            'aura': ['aurora-scripts>=20260127.1', 'uboot-aurora'],
+            'm1n1-aurora': ['aurora-scripts>=20260127.1', 'uboot-asahi'],
+            'aurora-fwextract': ['python', 'aurora-scripts', 'lzfse'],
             'aurora-audio': ['alsa-ucm-conf-aurora', 'pipewire-audio', 'wireplumber',
                              'bankstown', 'lsp-plugins-lv2', 'triforce-lv2>=0.2.0',
                              'speakersafetyd', 'speakerguardd'],
@@ -84,6 +86,29 @@ class EdgeMetadataTests(unittest.TestCase):
                 self.assertFalse(value['sync'])
                 self.assertEqual(value['source'], 'local')
                 self.assertNotIn('release_ring', value)
+
+    def test_asahi_alarm_imports_take_over_installed_packages(self):
+        # [omarchy] is listed first, so a renamed import replaces the asahi-alarm package.
+        for new, old in [('aurora-scripts', 'asahi-scripts'), ('aurora-fwextract', 'asahi-fwextract')]:
+            with self.subTest(package=new):
+                package = srcinfo(new)[new]
+                self.assertIn(old + '=' + package['pkgver'][0], package['provides'])
+                self.assertEqual(package['conflicts'], [old])
+                self.assertEqual(package['replaces'], [old])
+        for name, asahi_alarm in [('aurora-scripts', '20261023-1'), ('aurora-fwextract', '0.9.2-1')]:
+            with self.subTest(package=name):
+                package = srcinfo(name)[name]
+                new = package['pkgver'][0] + '-' + package['pkgrel'][0]
+                self.assertGreaterEqual(int(subprocess.check_output(['vercmp', new, asahi_alarm], text=True)), 0)
+        for name in ('aura', 'm1n1-aurora', 'omarchy-mac-boot'):
+            with self.subTest(package=name):
+                depends = srcinfo(name)[name]['depends']
+                self.assertIn('aurora-scripts>=20260127.1', depends)
+                self.assertFalse([d for d in depends if d.startswith('asahi-scripts')])
+        for name in ('aurora-scripts', 'aurora-fwextract', 'lzfse'):
+            with self.subTest(package=name):
+                self.assertIn('install -Dm644', (ROOT / 'pkgbuilds' / name / 'PKGBUILD').read_text())
+                self.assertIn('/usr/share/licenses/$pkgname/LICENSE', (ROOT / 'pkgbuilds' / name / 'PKGBUILD').read_text())
 
     def test_stock_names_are_provided_but_never_replaced(self):
         # A replaces= on a stock name swaps it on every machine using [omarchy],
