@@ -11,10 +11,11 @@ import unittest
 ROOT = Path(__file__).resolve().parents[2]
 NAMES = ['linux-aurora', 'mesa-aurora', 'aura', 'm1n1-aurora', 'uboot-aurora', 'aurora-bless',
          'speakerguardd', 'aurora-audio', 'alsa-ucm-conf-aurora', 'omarchy-aurora-firmware',
-         'speakersafetyd', 'bankstown', 'triforce-lv2', 'lzfse', 'aurora-scripts', 'aurora-fwextract']
+         'speakersafetyd', 'bankstown', 'triforce-lv2', 'lzfse', 'aurora-scripts', 'aurora-fwextract',
+         'muvm', 'fex-emu']
 # Same-name imports from asahi-alarm, with the version each replaces on installed Macs.
 ASAHI_ALARM_IMPORTS = {'speakersafetyd': '2.0.1-1', 'bankstown': '1.1.0-2', 'triforce-lv2': '0.3.2-1',
-                       'lzfse': '1.0-1'}
+                       'lzfse': '1.0-1', 'muvm': '0.7.0-1'}
 
 
 def srcinfo(name):
@@ -42,6 +43,7 @@ class EdgeMetadataTests(unittest.TestCase):
             'aura': ['aurora-scripts>=20260127.1', 'uboot-aurora'],
             'm1n1-aurora': ['aurora-scripts>=20260127.1', 'uboot-asahi'],
             'aurora-fwextract': ['python', 'aurora-scripts', 'lzfse'],
+            'omarchy-steam-fex': ['bash', 'coreutils', 'python', 'steam', 'muvm', 'FEX-Emu'],
             'aurora-audio': ['alsa-ucm-conf-aurora', 'pipewire-audio', 'wireplumber',
                              'bankstown', 'lsp-plugins-lv2', 'triforce-lv2>=0.2.0',
                              'speakersafetyd', 'speakerguardd'],
@@ -89,13 +91,16 @@ class EdgeMetadataTests(unittest.TestCase):
 
     def test_asahi_alarm_imports_take_over_installed_packages(self):
         # [omarchy] is listed first, so a renamed import replaces the asahi-alarm package.
-        for new, old in [('aurora-scripts', 'asahi-scripts'), ('aurora-fwextract', 'asahi-fwextract')]:
+        # fex-emu is renamed only because package names here are lower case.
+        for new, old in [('aurora-scripts', 'asahi-scripts'), ('aurora-fwextract', 'asahi-fwextract'),
+                         ('fex-emu', 'FEX-Emu')]:
             with self.subTest(package=new):
                 package = srcinfo(new)[new]
                 self.assertIn(old + '=' + package['pkgver'][0], package['provides'])
                 self.assertEqual(package['conflicts'], [old])
                 self.assertEqual(package['replaces'], [old])
-        for name, asahi_alarm in [('aurora-scripts', '20261023-1'), ('aurora-fwextract', '0.9.2-1')]:
+        for name, asahi_alarm in [('aurora-scripts', '20261023-1'), ('aurora-fwextract', '0.9.2-1'),
+                                  ('fex-emu', '2604-1')]:
             with self.subTest(package=name):
                 package = srcinfo(name)[name]
                 new = package['pkgver'][0] + '-' + package['pkgrel'][0]
