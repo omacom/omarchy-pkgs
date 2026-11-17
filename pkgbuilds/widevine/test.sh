@@ -19,7 +19,7 @@ done
 [[ $(type -t build) != function && $(type -t prepare) != function ]] ||
   fail "widevine has no build or prepare step"
 (( $(vercmp "$pkgver-$pkgrel" 4.10.2891.0-1) > 0 )) || fail "widevine upgrades asahi-alarm's 4.10.2891.0-1"
-[[ $pkgver == 4.10.2891.0 ]] || fail "widevine keeps asahi-alarm's pkgver"
+(( $(vercmp "$pkgver" 4.10.2891.0) >= 0 )) || fail "widevine keeps at least asahi-alarm's pkgver"
 
 srcdir="$scratch/src"
 pkgdir="$scratch/pkg"

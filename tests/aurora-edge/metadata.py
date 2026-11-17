@@ -14,8 +14,10 @@ NAMES = ['linux-aurora', 'mesa-aurora', 'aura', 'm1n1-aurora', 'uboot-aurora', '
          'speakersafetyd', 'bankstown', 'triforce-lv2', 'lzfse', 'aurora-scripts', 'aurora-fwextract',
          'muvm', 'fex-emu', 'widevine']
 # Same-name imports from asahi-alarm, with the version each replaces on installed Macs.
+# Each tracks its upstream through a reviewed watch (docs/upstream-sources.md).
 ASAHI_ALARM_IMPORTS = {'speakersafetyd': '2.0.1-1', 'bankstown': '1.1.0-2', 'triforce-lv2': '0.3.2-1',
                        'lzfse': '1.0-1', 'muvm': '0.7.0-1'}
+REVIEWED = [*ASAHI_ALARM_IMPORTS, 'aurora-scripts', 'aurora-fwextract', 'fex-emu', 'widevine']
 
 
 def srcinfo(name):
@@ -82,12 +84,20 @@ class EdgeMetadataTests(unittest.TestCase):
             self.assertTrue(any(p.startswith(old + '=') for p in package['provides']))
 
     def test_no_automatic_source_tracking(self):
+        # Aurora's own recipes are pinned by hand. The asahi-alarm imports follow
+        # their upstreams, but every bump waits for the owner as a draft PR.
         for name in NAMES:
             with self.subTest(name=name):
                 value = json.loads((ROOT / 'pkgbuilds' / name / '.omarchy/package.json').read_text())
-                self.assertFalse(value['sync'])
                 self.assertEqual(value['source'], 'local')
                 self.assertNotIn('release_ring', value)
+                self.assertNotIn('auto_merge', value)
+                if name in REVIEWED:
+                    self.assertNotIn('sync', value)
+                    self.assertIs(value['review'], True)
+                    self.assertIn('watch', value['upstream'])
+                else:
+                    self.assertFalse(value['sync'])
 
     def test_asahi_alarm_imports_take_over_installed_packages(self):
         # [omarchy] is listed first, so a renamed import replaces the asahi-alarm package.
@@ -137,7 +147,8 @@ class EdgeMetadataTests(unittest.TestCase):
             with self.subTest(package=name):
                 package = srcinfo(name)[name]
                 self.assertNotIn('epoch', package)
-                self.assertEqual(package['pkgver'][0], old.split('-')[0])
+                # At least asahi-alarm's pkgver: a reviewed bump may move past it.
+                self.assertGreaterEqual(int(subprocess.check_output(['vercmp', package['pkgver'][0], old.split('-')[0]], text=True)), 0)
                 new = package['pkgver'][0] + '-' + package['pkgrel'][0]
                 self.assertGreater(int(subprocess.check_output(['vercmp', new, old], text=True)), 0)
                 for field in ['provides', 'conflicts', 'replaces']:
