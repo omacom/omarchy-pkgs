@@ -12,7 +12,7 @@ ROOT = Path(__file__).resolve().parents[2]
 NAMES = ['linux-aurora', 'mesa-aurora', 'aura', 'm1n1-aurora', 'uboot-aurora', 'aurora-bless',
          'speakerguardd', 'aurora-audio', 'alsa-ucm-conf-aurora', 'omarchy-aurora-firmware',
          'speakersafetyd', 'bankstown', 'triforce-lv2', 'lzfse', 'aurora-scripts', 'aurora-fwextract',
-         'muvm', 'fex-emu']
+         'muvm', 'fex-emu', 'widevine']
 # Same-name imports from asahi-alarm, with the version each replaces on installed Macs.
 ASAHI_ALARM_IMPORTS = {'speakersafetyd': '2.0.1-1', 'bankstown': '1.1.0-2', 'triforce-lv2': '0.3.2-1',
                        'lzfse': '1.0-1', 'muvm': '0.7.0-1'}
