@@ -162,6 +162,9 @@ class EdgeMetadataTests(unittest.TestCase):
         self.assertIn('UNITDIR=/usr/lib/systemd/system', recipe)
         guard = (ROOT / 'pkgbuilds' / 'speakerguardd' / 'PKGBUILD').read_text()
         self.assertIn('"$pkgdir/usr/lib/systemd/system/speakersafetyd.service.d/50-j700-guard.conf"', guard)
+        # speakerguardd-k114 installs the same shape of drop-in for the K114 card.
+        k114 = (ROOT / 'pkgbuilds' / 'speakerguardd-k114' / 'PKGBUILD').read_text()
+        self.assertIn('"$pkgdir/usr/lib/systemd/system/speakersafetyd.service.d/50-k114-guard.conf"', k114)
 
     def test_kernel_replaces_nothing(self):
         # linux-aurora sets its relations inside generated package functions,
