@@ -11,6 +11,7 @@ not depend on `fmt`.
 Package names here are lower case, so it is `fex-emu`, providing, conflicting
 with and replacing asahi-alarm's `FEX-Emu`. `omarchy-steam-fex` and `steam`
 depend on `FEX-Emu` and resolve to this package; installed Macs swap at the
-next `pacman -Syu`, since `[omarchy]` is listed first. Its other dependencies come from Arch Linux ARM. The x86 root filesystem
-(`fex-emu-rootfs-arch`) and Mesa overlays are separate packages and are not
-built here.
+next `pacman -Syu`, since `[omarchy]` is listed first. Its other dependencies come from Arch Linux ARM. `xxhash` is a runtime
+dependency, since every FEX tool but `FEXBash`, `FEXGetConfig` and `FEXpidof`
+links `libxxhash.so.0`. FEXConfig, the Qt Quick configuration GUI, needs
+`qt6-declarative`, an optional dependency so the command-line tools stay light.
