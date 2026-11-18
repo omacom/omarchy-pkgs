@@ -1,0 +1,387 @@
+From 9d6a845d37c054ee2eb83a8401f54a2c6fbe4b55 Mon Sep 17 00:00:00 2001
+From: David Heinemeier Hansson <david@hey.com>
+Date: Fri, 13 Nov 2026 12:42:46 +0100
+Subject: [PATCH] cpufreq: keep Snapdragon X on schedutil and uncapped outside
+ power-saver
+
+The performance governor held every core at full clock, idle ones
+included: on a Zenbook A16 (X2 Elite) it drew 2W more at idle, and the
+machine reset itself under load on battery. Omarchy gives the session's
+processes a utilisation clamp floor that follows the profile instead,
+which scored 42 in balanced and 45 in performance on Speedometer 3.1,
+against 22 and 47 before. A 75% cap in balanced cost 6 of those points,
+so only power-saver is capped now. Apple Silicon keeps the performance
+governor in performance.
+---
+ README.md                 | 40 +++++++++++++-----------
+ src/ppd-driver-cpufreq.c  | 64 ++++++++++++++++++++++-----------------
+ tests/integration_test.py | 49 ++++++++++++++----------------
+ 3 files changed, 81 insertions(+), 72 deletions(-)
+
+diff --git a/README.md b/README.md
+index bc7b8f7..a995970 100644
+--- a/README.md
++++ b/README.md
+@@ -256,9 +256,9 @@ today.
+ 
+ The "power-saver" profile turns boost off, which keeps the CPU at or below its
+ highest sustainable frequency. The "balanced" and "performance" profiles turn
+-it on. The scaling governor follows the profile as with the caps below:
+-`performance` in "performance", and `schedutil` otherwise, set back to
+-`schedutil` when the daemon stops. The boost switch has no setting that
++it on. The scaling governor follows the profile: `performance` in
++"performance", and `schedutil` otherwise, set back to `schedutil` when the
++daemon stops. The boost switch has no setting that
+ depends on the power source, so it follows the selected profile on battery and
+ on AC alike.
+ 
+@@ -270,17 +270,18 @@ the kernel refuses to turn it on, or does not exist. There the driver caps
+ uncapped, the same split as with the boost switch. The boost switch is left
+ alone, so it need not be writable, but every policy needs a
+ `scaling_available_frequencies` table, as with the caps below. The scaling
+-governor follows the profile as described below: on a MacBook Neo (A18 Pro),
+-Speedometer 3.1 scored 28.8 under `schedutil` and 34.4 under `performance`.
++governor follows the profile as with the boost switch: on a MacBook Neo (A18
++Pro), Speedometer 3.1 scored 28.8 under `schedutil` and 34.4 under
++`performance`.
+ 
+ On machines whose CPU frequency is managed by Arm SCMI or Qualcomm firmware,
+ such as the Qualcomm Snapdragon X series, the same driver caps each policy's
+ `scaling_max_freq` instead, at a share of the policy's highest non-boost
+-frequency rounded to the nearest supported frequency: 60% in "power-saver" and
+-75% in "balanced", on battery and on AC alike. Boost is off by default on these
+-machines, so on its own it can't tell the profiles apart. The boost switch is
+-left alone: "performance", which is uncapped, allows the boost frequencies, so
+-whether they are used stays up to the switch. This is used if every CPU
++frequency rounded to the nearest supported frequency: 60% in "power-saver", on
++battery and on AC alike. "balanced" and "performance" are uncapped. Boost is
++off by default on these machines, so on its own it can't tell the profiles
++apart. The boost switch is left alone: the uncapped profiles allow the boost
++frequencies, so whether they are used stays up to the switch. This is used if every CPU
+ frequency policy uses the `scmi` or `qcom-cpufreq-hw` scaling driver and none
+ offers an energy-performance preference:
+ 
+@@ -291,13 +292,18 @@ scmi
+ scmi
+ ```
+ 
+-The scaling governor follows the profile: `performance` in "performance", and
+-`schedutil` in "balanced" and "power-saver", on policies that offer both.
+-`schedutil` raises the frequency only as a task's tracked utilisation grows,
+-over tens of milliseconds, so bursty work such as a web browser runs most of
+-its bursts at low clocks: on a Snapdragon X2 Elite, Speedometer 3.1 scored 23.1
+-under `schedutil` and 45.4 under `performance`. The minimum frequency is not
+-changed. The caps and the governor are re-applied after resume. When the
++The scaling governor is `schedutil` in every profile, on policies that offer
++both `schedutil` and `performance`. `schedutil` raises the frequency only as a
++task's tracked utilisation grows, over tens of milliseconds, so bursty work
++such as a web browser runs most of its bursts at low clocks: on a Snapdragon X2
++Elite, Speedometer 3.1 scored 22 under `schedutil` and 47 under `performance`.
++But `performance` holds every core at full clock, idle ones included, which
++drew 2W more at idle, and the machine reset itself under load on battery.
++Omarchy instead gives the session's processes a utilisation clamp floor
++(`uclamp.min`) that follows the profile, 75% in "balanced" and 100% in
++"performance", which runs a core at least at the floor only while such a task
++is runnable: Speedometer 3.1 then scored 42 and 45. The minimum frequency is
++not changed. The caps and the governor are re-applied after resume. When the
+ daemon stops, the caps are lifted to the hardware maximum and the governor is
+ set back to `schedutil`, so another tool's lower `scaling_max_freq` or other
+ governor is not preserved (see [Conflicts](#conflicts)).
+diff --git a/src/ppd-driver-cpufreq.c b/src/ppd-driver-cpufreq.c
+index 3940c73..b465455 100644
+--- a/src/ppd-driver-cpufreq.c
++++ b/src/ppd-driver-cpufreq.c
+@@ -18,25 +18,36 @@
+  *   Used where turning boost off is known to cap the CPU at its sustainable
+  *   frequency. The governor follows the profile as with the caps below.
+  *
+- * - caps: each policy's scaling_max_freq, capped at a share of the policy's
+- *   highest non-boost frequency, the way Windows' processor power management
+- *   caps maximum performance per power mode. Used where boost is off by
+- *   default or absent, so it can't tell the profiles apart. The boost switch
+- *   is left alone: performance, which is uncapped, allows the boost
+- *   frequencies, so whether they are used stays up to the switch. Their
+- *   governor follows the profile too: performance in performance, and
+- *   schedutil otherwise. schedutil raises the frequency only as a task's
+- *   tracked utilisation grows, over tens of milliseconds, so bursty work such
+- *   as a browser's runs most of its bursts at low clocks: Speedometer 3.1
+- *   scored 23.1 under schedutil and 45.4 under performance on a Snapdragon X2
+- *   Elite (Zenbook A16), against 48 on Windows.
++ * - caps: each policy's scaling_max_freq, capped in power-saver at a share
++ *   of the policy's highest non-boost frequency, the way Windows' processor
++ *   power management caps maximum performance per power mode. Used where
++ *   boost is off by default or absent, so it can't tell the profiles apart.
++ *   The boost switch is left alone: balanced and performance, which are
++ *   uncapped, allow the boost frequencies, so whether they are used stays up
++ *   to the switch.
++ *
++ *   Snapdragon X stays on schedutil in every profile. schedutil raises the
++ *   frequency only as a task's tracked utilisation grows, over tens of
++ *   milliseconds, so bursty work such as a browser's runs most of its bursts
++ *   at low clocks: Speedometer 3.1 scored 22 in balanced on a Snapdragon X2
++ *   Elite (Zenbook A16), against 47 with the performance governor. But that
++ *   governor holds every core at full clock, idle ones included: it drew 2W
++ *   more at idle, and the machine reset itself under load on battery. Omarchy
++ *   instead gives the session's processes a utilisation clamp floor that
++ *   follows the profile (omarchy-powerprofiles-floor), which runs a core at
++ *   least at the floor only while such a task is runnable: Speedometer 3.1
++ *   scored 42 in balanced with a 75% floor and 45 in performance with a 100%
++ *   floor. A 75% cap in balanced cost 6 of those points, so balanced is
++ *   uncapped too, and only the floor sets it apart from performance.
+  *
+  * An apple-cpufreq machine whose frequency table has no boost frequencies,
+  * such as the M3 Max, has a boost switch the kernel refuses to turn on, or
+  * none, so it uses the caps method instead. Only power-saver is capped there, which
+  * keeps the boost method's split: balanced and performance run uncapped. Its
+  * governor follows the profile as with any caps: on a MacBook Neo (A18 Pro),
+- * Speedometer 3.1 scored 28.8 under schedutil and 34.4 under performance.
++ * Speedometer 3.1 scored 28.8 under schedutil and 34.4 under performance,
++ * so the performance governor stays in performance there, as with the boost
++ * method.
+  *
+  * It is only used when every cpufreq policy runs one of the scaling drivers
+  * in the table below. Any other system keeps its current driver.
+@@ -60,11 +71,10 @@
+ #define CPUFREQ_POLICY_DIR "/sys/devices/system/cpu/cpufreq/"
+ #define CPUFREQ_BOOST_PATH "/sys/devices/system/cpu/cpufreq/boost"
+ 
+-/* Share of each policy's maximum frequency allowed per profile with the caps
+- * method. Measured on a Snapdragon X Elite, 75% costs ~16% of sustained
+- * throughput for ~39% less energy, and 60% ~37% for ~50% less. */
++/* Share of each policy's maximum frequency allowed in power-saver with the
++ * caps method. Measured on a Snapdragon X Elite, 60% costs ~37% of sustained
++ * throughput for ~50% less energy. */
+ #define POWER_SAVER_PERCENT        60
+-#define BALANCED_PERCENT           75
+ #define UNCAPPED_PERCENT           100
+ 
+ #define PERFORMANCE_GOVERNOR       "performance"
+@@ -101,7 +111,7 @@ struct _PpdDriverCpufreq
+ 
+   PpdProfile activated_profile;
+   CpufreqMethod method;
+-  guint balanced_percent; /* with the caps method */
++  gboolean performance_governor; /* in the performance profile */
+   char *boost_path;
+   GPtrArray *policies; /* of Policy, with the caps method */
+ };
+@@ -423,17 +433,16 @@ ppd_driver_cpufreq_probe (PpdDriver *driver)
+   case CPUFREQ_METHOD_NONE:
+     return PPD_PROBE_RESULT_FAIL;
+   case CPUFREQ_METHOD_BOOST:
++    cpufreq->performance_governor = TRUE;
+     if (boost_can_be_enabled (policy_dirs)) {
+       ret = probe_boost (cpufreq);
+       break;
+     }
+     g_debug ("No boost frequencies to switch, capping power-saver instead");
+     cpufreq->method = CPUFREQ_METHOD_CAPS;
+-    cpufreq->balanced_percent = UNCAPPED_PERCENT;
+     ret = probe_caps (cpufreq, policy_dirs);
+     break;
+   case CPUFREQ_METHOD_CAPS:
+-    cpufreq->balanced_percent = BALANCED_PERCENT;
+     ret = probe_caps (cpufreq, policy_dirs);
+     break;
+   }
+@@ -456,14 +465,12 @@ profile_to_boost (PpdProfile profile)
+ }
+ 
+ static guint
+-profile_to_percent (PpdDriverCpufreq *cpufreq,
+-                    PpdProfile        profile)
++profile_to_percent (PpdProfile profile)
+ {
+   switch (profile) {
+   case PPD_PROFILE_POWER_SAVER:
+     return POWER_SAVER_PERCENT;
+   case PPD_PROFILE_BALANCED:
+-    return cpufreq->balanced_percent;
+   case PPD_PROFILE_PERFORMANCE:
+     return UNCAPPED_PERCENT;
+   }
+@@ -517,14 +524,15 @@ write_cap (Policy   *policy,
+ }
+ 
+ static const char *
+-profile_to_governor (PpdProfile profile)
++profile_to_governor (PpdDriverCpufreq *cpufreq,
++                     PpdProfile        profile)
+ {
+   switch (profile) {
+   case PPD_PROFILE_POWER_SAVER:
+   case PPD_PROFILE_BALANCED:
+     return DEFAULT_GOVERNOR;
+   case PPD_PROFILE_PERFORMANCE:
+-    return PERFORMANCE_GOVERNOR;
++    return cpufreq->performance_governor ? PERFORMANCE_GOVERNOR : DEFAULT_GOVERNOR;
+   }
+ 
+   g_return_val_if_reached (DEFAULT_GOVERNOR);
+@@ -624,7 +632,7 @@ apply_caps (PpdDriverCpufreq  *cpufreq,
+ 
+   pick_up_new_policies (cpufreq);
+ 
+-  percent = profile_to_percent (cpufreq, profile);
++  percent = profile_to_percent (profile);
+   for (guint i = 0; i < policies->len;) {
+     Policy *policy = g_ptr_array_index (policies, i);
+     guint64 cap = policy_cap (policy, percent);
+@@ -654,7 +662,7 @@ apply_caps (PpdDriverCpufreq  *cpufreq,
+       i++;
+       continue;
+     }
+-    write_governor (policy->dir, profile_to_governor (profile));
++    write_governor (policy->dir, profile_to_governor (cpufreq, profile));
+     written++;
+     i++;
+   }
+@@ -688,7 +696,7 @@ apply_boost (PpdDriverCpufreq  *cpufreq,
+   if (!ppd_utils_write (cpufreq->boost_path, profile_to_boost (profile), error))
+     return FALSE;
+ 
+-  write_governors (profile_to_governor (profile));
++  write_governors (profile_to_governor (cpufreq, profile));
+   return TRUE;
+ }
+ 
+diff --git a/tests/integration_test.py b/tests/integration_test.py
+index 2bd362f..b6b7a47 100644
+--- a/tests/integration_test.py
++++ b/tests/integration_test.py
+@@ -1884,9 +1884,9 @@ class Tests(dbusmock.DBusTestCase):
+         self.assertEqual(len(profiles), 3)
+         self.assertEqual(profiles[0]["CpuDriver"], "cpufreq")
+         self.assertEqual(self.get_dbus_property("ActiveProfile"), "balanced")
+-        self.assert_file_eventually_contains(max0, "2515200")
+-        self.assert_file_eventually_contains(max4, "2515200")
+-        self.assert_file_eventually_contains(small, "1500000")
++        self.assert_file_eventually_contains(max0, "3417600")
++        self.assert_file_eventually_contains(max4, "3417600")
++        self.assert_file_eventually_contains(small, "2000000")
+ 
+         self.set_dbus_property("ActiveProfile", GLib.Variant.new_string("power-saver"))
+         self.assert_file_eventually_contains(max0, "1920000")
+@@ -1897,14 +1897,15 @@ class Tests(dbusmock.DBusTestCase):
+         self.assert_file_eventually_contains(small, "2000000")
+ 
+         self.set_dbus_property("ActiveProfile", GLib.Variant.new_string("balanced"))
+-        self.assert_file_eventually_contains(max0, "2515200")
++        self.assert_file_eventually_contains(max0, "3417600")
+ 
+         # The boost switch is never touched
+         self.assertEqual(self.read_file_contents(boost), b"0\n")
+ 
+-        # Balanced is capped on AC too
++        # Power-saver is capped on AC too
++        self.set_dbus_property("ActiveProfile", GLib.Variant.new_string("power-saver"))
+         upowerd.Set("org.freedesktop.UPower", "OnBattery", False)
+-        self.assert_file_eventually_contains(max0, "2515200", keep_checking=200)
++        self.assert_file_eventually_contains(max0, "1920000", keep_checking=200)
+ 
+     def test_cpufreq_caps_replace_existing_cap(self):
+         """A cap left behind by something else is replaced"""
+@@ -1913,7 +1914,7 @@ class Tests(dbusmock.DBusTestCase):
+ 
+         self.start_daemon()
+         self.assertEqual(self.get_dbus_property("ActiveProfile"), "balanced")
+-        self.assert_file_eventually_contains(max0, "2515200")
++        self.assert_file_eventually_contains(max0, "3417600")
+         self.set_dbus_property("ActiveProfile", GLib.Variant.new_string("power-saver"))
+         self.assert_file_eventually_contains(max0, "1920000")
+ 
+@@ -1946,7 +1947,7 @@ class Tests(dbusmock.DBusTestCase):
+         self.set_dbus_property("ActiveProfile", GLib.Variant.new_string("power-saver"))
+         self.assert_file_eventually_contains(max0, "1920000")
+         self.set_dbus_property("ActiveProfile", GLib.Variant.new_string("balanced"))
+-        self.assert_file_eventually_contains(max0, "2515200")
++        self.assert_file_eventually_contains(max0, "3417600")
+         self.assertTrue(self.have_text_in_log("disappeared"))
+         self.assertFalse(self.have_text_in_log("Could not cap"))
+ 
+@@ -1958,9 +1959,6 @@ class Tests(dbusmock.DBusTestCase):
+         max4 = self.create_cpufreq_policy("policy4", "scmi", "500000 700000 1000000")
+ 
+         self.start_daemon()
+-        # 75% is 750000: 800000 is nearer than 650000
+-        self.assert_file_eventually_contains(max0, "800000")
+-        self.assert_file_eventually_contains(max4, "700000")
+         # 60% is 600000: 650000 is nearer than 400000, and on policy4
+         # 500000 and 700000 are equally near
+         self.set_dbus_property("ActiveProfile", GLib.Variant.new_string("power-saver"))
+@@ -2003,7 +2001,7 @@ class Tests(dbusmock.DBusTestCase):
+         self.write_file_contents(boost, "0\n")
+ 
+         self.start_daemon()
+-        self.assert_file_eventually_contains(max4, "2515200")
++        self.assert_file_eventually_contains(max4, "4012800")
+         self.set_dbus_property("ActiveProfile", GLib.Variant.new_string("power-saver"))
+         self.assert_file_eventually_contains(max4, "1920000")
+         self.set_dbus_property("ActiveProfile", GLib.Variant.new_string("performance"))
+@@ -2023,7 +2021,8 @@ class Tests(dbusmock.DBusTestCase):
+         self.write_file_contents(boost, "0\n")
+ 
+         self.start_daemon()
+-        self.assert_file_eventually_contains(max4, "2515200")
++        self.set_dbus_property("ActiveProfile", GLib.Variant.new_string("power-saver"))
++        self.assert_file_eventually_contains(max4, "1920000")
+ 
+         # Something turns boost on, and the kernel raises cpuinfo_max_freq
+         self.write_file_contents(boost, "1\n")
+@@ -2125,8 +2124,8 @@ class Tests(dbusmock.DBusTestCase):
+         self.assertEqual(self.read_file_contents(boost), b"0\n")
+ 
+     def test_cpufreq_caps_governor(self):
+-        """Performance switches the governor to performance, the others to
+-        schedutil, and stopping sets schedutil back"""
++        """Snapdragon stays on schedutil in every profile, even when something
++        else left the performance governor on"""
+         governors = "conservative ondemand userspace powersave performance schedutil"
+         max0 = self.create_cpufreq_policy(
+             "policy0", "scmi", self.X1E_FREQS, governors=governors
+@@ -2137,26 +2136,22 @@ class Tests(dbusmock.DBusTestCase):
+         gov0 = self.cpufreq_governor_path(max0)
+         gov4 = self.cpufreq_governor_path(max4)
+ 
++        self.write_file_contents(gov4, "performance\n")
++
+         self.start_daemon()
+         self.assertEqual(self.get_dbus_property("ActiveProfile"), "balanced")
+-        self.assert_file_eventually_contains(max0, "2515200")
++        self.assert_file_eventually_contains(max0, "3417600")
++        self.assert_file_eventually_contains(gov4, "schedutil")
+         self.assertEqual(self.read_file_contents(gov0), b"schedutil\n")
+ 
+         self.set_dbus_property("ActiveProfile", GLib.Variant.new_string("performance"))
+-        self.assert_file_eventually_contains(gov0, "performance")
+-        self.assert_file_eventually_contains(gov4, "performance")
+         self.assert_file_eventually_contains(max0, "3417600")
++        self.assert_file_eventually_contains(gov0, "schedutil\n", keep_checking=100)
++        self.assert_file_eventually_contains(gov4, "schedutil", keep_checking=100)
+ 
+         self.set_dbus_property("ActiveProfile", GLib.Variant.new_string("power-saver"))
+-        self.assert_file_eventually_contains(gov0, "schedutil")
+-        self.assert_file_eventually_contains(gov4, "schedutil")
+         self.assert_file_eventually_contains(max0, "1920000")
+-
+-        self.set_dbus_property("ActiveProfile", GLib.Variant.new_string("performance"))
+-        self.assert_file_eventually_contains(gov0, "performance")
+-        self.stop_daemon()
+-        self.assertEqual(self.read_file_contents(gov0), b"schedutil")
+-        self.assertEqual(self.read_file_contents(gov4), b"schedutil")
++        self.assertEqual(self.read_file_contents(gov0), b"schedutil\n")
+ 
+     def test_cpufreq_caps_governor_unavailable(self):
+         """A policy without both governors keeps its own"""
+@@ -2203,7 +2198,7 @@ class Tests(dbusmock.DBusTestCase):
+         os.rmdir(driver4)
+         self.write_file_contents(driver4, "scmi\n")
+         self.set_dbus_property("ActiveProfile", GLib.Variant.new_string("balanced"))
+-        self.assert_file_eventually_contains(max4, "2515200")
++        self.assert_file_eventually_contains(max4, "3417600")
+         self.set_dbus_property("ActiveProfile", GLib.Variant.new_string("power-saver"))
+         self.assert_file_eventually_contains(max4, "1920000")
+ 
+-- 
+2.56.0
+

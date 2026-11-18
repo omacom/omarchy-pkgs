@@ -1,0 +1,161 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jim Martin <jimmartin@gmail.com>
+Date: Thu, 8 Oct 2026 13:49:10 -0500
+Subject: [PATCH] drm/msm: Let a USB4 DP provider hold the modeset state across
+ system sleep
+
+A DisplayPort stream tunnelled over USB4 depends on the USB4 router,
+which is stopped completely for system sleep and only starts again, and
+rebuilds its tunnels, some time after the devices have resumed. msm's
+own PM callbacks save the modeset state in .prepare and restore it in
+.complete. The router driver releases the DP link from its system-sleep
+notifier, which runs before any .prepare callback, so the display has to
+be stopped before that point; and .complete would restore the
+tunnelled output before the router can carry it again.
+
+Add msm_kms_usb4_sleep_prepare() and msm_kms_usb4_sleep_complete(), for
+the DP driver to call on behalf of the USB4 router driver from the
+router's system-sleep notifier, before the router releases the DP link
+and after it has resumed:
+- prepare saves the state with drm_mode_config_helper_suspend() and marks
+  it as owned by the USB4 provider;
+- while it is owned, msm_atomic_check() returns -EBUSY for commits from
+  any task but the one saving or restoring the state, so that a desktop
+  that is not frozen cannot change it in between;
+- msm_kms_pm_prepare() and msm_kms_pm_complete() leave an owned state
+  alone;
+- complete restores it with drm_mode_config_helper_resume() and drops
+  the ownership.
+
+Without a USB4 provider nothing calls these functions and the PM
+callbacks behave as before.
+
+Assisted-by: Opus 5.5
+Signed-off-by: Jim Martin <jimmartin@gmail.com>
+---
+ drivers/gpu/drm/msm/msm_atomic.c |  3 ++
+ drivers/gpu/drm/msm/msm_kms.c    | 55 ++++++++++++++++++++++++++++++++
+ drivers/gpu/drm/msm/msm_kms.h    |  6 ++++
+ 3 files changed, 64 insertions(+)
+
+diff --git a/drivers/gpu/drm/msm/msm_atomic.c b/drivers/gpu/drm/msm/msm_atomic.c
+index a8babf1dbe0..95c8c14bf0e 100644
+--- a/drivers/gpu/drm/msm/msm_atomic.c
++++ b/drivers/gpu/drm/msm/msm_atomic.c
+@@ -189,6 +189,9 @@ int msm_atomic_check(struct drm_device *dev, struct drm_atomic_commit *state)
+ 	struct drm_crtc *crtc;
+ 	int i, ret = 0;
+ 
++	if (kms && msm_kms_usb4_sleep_blocked(kms))
++		return -EBUSY;
++
+ 	/*
+ 	 * FIXME: stop setting allow_modeset and move this check to the DPU
+ 	 * driver.
+diff --git a/drivers/gpu/drm/msm/msm_kms.c b/drivers/gpu/drm/msm/msm_kms.c
+index e5d0ea62944..0f57524626f 100644
+--- a/drivers/gpu/drm/msm/msm_kms.c
++++ b/drivers/gpu/drm/msm/msm_kms.c
+@@ -339,6 +339,57 @@ int msm_drm_kms_init(struct device *dev, const struct drm_driver *drv)
+ 	return ret;
+ }
+ 
++/*
++ * The USB4 router that provides a tunnelled DP link is stopped completely
++ * for system sleep. Its driver saves the modeset state and stops
++ * modesetting before it releases the DP link, and restores the state only
++ * after the router is running again after resume. Calls are serialized by
++ * the system-sleep notifier chain. The ordinary device PM callbacks must
++ * neither overwrite this state nor restore it early.
++ */
++bool msm_kms_usb4_sleep_blocked(struct msm_kms *kms)
++{
++	return READ_ONCE(kms->usb4_sleep_owned) &&
++	       READ_ONCE(kms->usb4_sleep_task) != current;
++}
++
++int msm_kms_usb4_sleep_prepare(struct drm_device *ddev)
++{
++	struct msm_drm_private *priv = ddev->dev_private;
++	int ret;
++
++	if (!priv || !priv->kms)
++		return -ENODEV;
++	if (priv->kms->usb4_sleep_owned || ddev->mode_config.suspend_state)
++		return -EBUSY;
++	/*
++	 * Block new commits while taking the snapshot, including from a desktop
++	 * that was not frozen by the caller of suspend. Our own atomic helper
++	 * calls remain allowed; pre-existing commits are drained by DRM.
++	 */
++	WRITE_ONCE(priv->kms->usb4_sleep_task, current);
++	WRITE_ONCE(priv->kms->usb4_sleep_owned, true);
++	ret = drm_mode_config_helper_suspend(ddev);
++	if (ret)
++		WRITE_ONCE(priv->kms->usb4_sleep_owned, false);
++	WRITE_ONCE(priv->kms->usb4_sleep_task, NULL);
++	return ret;
++}
++
++int msm_kms_usb4_sleep_complete(struct drm_device *ddev)
++{
++	struct msm_drm_private *priv = ddev->dev_private;
++	int ret;
++
++	if (!priv || !priv->kms || !priv->kms->usb4_sleep_owned)
++		return 0;
++	WRITE_ONCE(priv->kms->usb4_sleep_task, current);
++	ret = drm_mode_config_helper_resume(ddev);
++	WRITE_ONCE(priv->kms->usb4_sleep_owned, false);
++	WRITE_ONCE(priv->kms->usb4_sleep_task, NULL);
++	return ret;
++}
++
+ int msm_kms_pm_prepare(struct device *dev)
+ {
+ 	struct msm_drm_private *priv = dev_get_drvdata(dev);
+@@ -346,6 +397,8 @@ int msm_kms_pm_prepare(struct device *dev)
+ 
+ 	if (!priv || !priv->kms)
+ 		return 0;
++	if (priv->kms->usb4_sleep_owned)
++		return 0;
+ 
+ 	return drm_mode_config_helper_suspend(ddev);
+ }
+@@ -357,6 +410,8 @@ void msm_kms_pm_complete(struct device *dev)
+ 
+ 	if (!priv || !priv->kms)
+ 		return;
++	if (priv->kms->usb4_sleep_owned)
++		return;
+ 
+ 	drm_mode_config_helper_resume(ddev);
+ }
+diff --git a/drivers/gpu/drm/msm/msm_kms.h b/drivers/gpu/drm/msm/msm_kms.h
+index 8a939766d5f..baf91ce4b16 100644
+--- a/drivers/gpu/drm/msm/msm_kms.h
++++ b/drivers/gpu/drm/msm/msm_kms.h
+@@ -140,6 +140,9 @@ struct msm_drm_thread {
+ struct msm_kms {
+ 	const struct msm_kms_funcs *funcs;
+ 	struct drm_device *dev;
++	/* USB4 owns the saved modeset state until its provider is back. */
++	bool usb4_sleep_owned;
++	struct task_struct *usb4_sleep_task;
+ 
+ 	struct hdmi *hdmi;
+ 
+@@ -217,6 +220,9 @@ static inline void msm_kms_destroy(struct msm_kms *kms)
+ 		for_each_if (drm_crtc_mask(crtc) & (crtc_mask))
+ 
+ int msm_drm_kms_init(struct device *dev, const struct drm_driver *drv);
++bool msm_kms_usb4_sleep_blocked(struct msm_kms *kms);
++int msm_kms_usb4_sleep_prepare(struct drm_device *dev);
++int msm_kms_usb4_sleep_complete(struct drm_device *dev);
+ void msm_drm_kms_post_init(struct device *dev);
+ void msm_drm_kms_unregister(struct device *dev);
+ void msm_drm_kms_uninit(struct device *dev);
+-- 
+2.56.0
+

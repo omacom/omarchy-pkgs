@@ -1,0 +1,315 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ryan Hughes <ryan@heyoodle.com>
+Date: Mon, 26 Oct 2026 21:37:57 -0400
+Subject: [PATCH] thunderbolt: platform: keep the N1x tunnel Root Ports awake
+ for PCIe tunnels
+
+The N1x tunnel Root Ports (10de:22cf) cannot wake for a hotplug: they
+have no _PRW, and pciehp turns a port's hotplug interrupt off when it
+runtime suspends. Their _S0W allows D3cold and they have ACPI power
+resources, so the PCI core lets them suspend whenever nothing is
+plugged in. A dock plugged in after that got its display and USB
+tunnels, but its Root Port never noticed the PCIe link come up, and the
+dock's PCIe devices (the Ethernet controller on a CalDigit TS4) never
+appeared until something resumed the port. Omarchy works around it on
+the ASUS ProArt P14 with a udev rule that keeps all three ports in D0.
+
+Have the connection manager tell the NHI glue when a PCIe tunnel is
+created and when it is freed, and have thunderbolt_platform hold a
+runtime PM reference on the Root Ports that name its host interface for
+as long as one exists. Resuming a port has pciehp check its slot, so a
+link it missed is still found. With nothing plugged in, the ports
+runtime suspend again.
+
+The Root Port lookup that the DMA protection check did is now shared:
+the ports are found once at probe and kept.
+---
+ drivers/thunderbolt/nhi.h          |   5 ++
+ drivers/thunderbolt/nhi_platform.c | 116 +++++++++++++++++++++++------
+ drivers/thunderbolt/tunnel.c       |  28 +++++++
+ 3 files changed, 125 insertions(+), 24 deletions(-)
+
+diff --git a/drivers/thunderbolt/nhi.h b/drivers/thunderbolt/nhi.h
+index 6babd71e4..e0c044b99 100644
+--- a/drivers/thunderbolt/nhi.h
++++ b/drivers/thunderbolt/nhi.h
+@@ -54,6 +54,9 @@ extern const struct dev_pm_ops nhi_pm_ops;
+  * @release_ring_irq: NHI specific interrupt release hook
+  * @is_present: Whether the device is currently present on the parent bus
+  * @init_interrupts: NHI specific interrupt initialization hook
++ * @pcie_tunnel_get: A PCIe tunnel was created. Keep the PCIe ports it runs
++ *		     through powered if they cannot wake for a hotplug.
++ * @pcie_tunnel_put: A PCIe tunnel is gone. Balances @pcie_tunnel_get.
+  */
+ struct tb_nhi_ops {
+ 	int (*init)(struct tb_nhi *nhi);
+@@ -68,6 +71,8 @@ struct tb_nhi_ops {
+ 	void (*release_ring_irq)(struct tb_ring *ring);
+ 	bool (*is_present)(struct tb_nhi *nhi);
+ 	int (*init_interrupts)(struct tb_nhi *nhi);
++	void (*pcie_tunnel_get)(struct tb_nhi *nhi);
++	void (*pcie_tunnel_put)(struct tb_nhi *nhi);
+ };
+ 
+ /*
+diff --git a/drivers/thunderbolt/nhi_platform.c b/drivers/thunderbolt/nhi_platform.c
+index c50fb62d6..a371c5231 100644
+--- a/drivers/thunderbolt/nhi_platform.c
++++ b/drivers/thunderbolt/nhi_platform.c
+@@ -30,6 +30,8 @@
+  */
+ #define NHI_PLAT_MAX_PATHS	21
+ 
++#define NHI_PLAT_MAX_PORTS	4
++
+ struct nhi_plat;
+ 
+ /**
+@@ -37,10 +39,13 @@ struct nhi_plat;
+  * @power_on: Power the host router before its registers are accessed
+  * @no_firmware_tunnels: The firmware has no connection manager, so no PCIe
+  *			 tunnel exists before this driver creates one
++ * @ports_cannot_wake: The Root Ports cannot signal a hotplug from D3hot or
++ *		       D3cold, so keep them in D0 while a PCIe tunnel exists
+  */
+ struct nhi_plat_data {
+ 	int (*power_on)(struct nhi_plat *np);
+ 	bool no_firmware_tunnels;
++	bool ports_cannot_wake;
+ };
+ 
+ /**
+@@ -50,6 +55,8 @@ struct nhi_plat_data {
+  * @irq: The interrupt every ring is signalled through
+  * @irq_requested: @irq is currently requested
+  * @pwrap: SSPM power control handle (NVIDIA N1x)
++ * @ports: The PCIe Root Ports this host interface tunnels through
++ * @nports: Number of @ports
+  */
+ struct nhi_plat {
+ 	struct tb_nhi nhi;
+@@ -57,6 +64,8 @@ struct nhi_plat {
+ 	int irq;
+ 	bool irq_requested;
+ 	void *pwrap;
++	struct pci_dev *ports[NHI_PLAT_MAX_PORTS];
++	unsigned int nports;
+ };
+ 
+ static inline struct nhi_plat *nhi_to_plat(struct tb_nhi *nhi)
+@@ -101,9 +110,42 @@ static void nhi_plat_shutdown(struct tb_nhi *nhi)
+ 	}
+ }
+ 
++/*
++ * pciehp turns a Root Port's hotplug interrupt off when the port runtime
++ * suspends, and relies on a wake to bring it back. Ports that cannot wake
++ * never notice the link of a PCIe tunnel coming up behind them, so the
++ * devices behind it never appear. Keep them in D0 while a tunnel exists;
++ * resuming one has pciehp check the slot for a link it missed.
++ */
++static void nhi_plat_pcie_tunnel_get(struct tb_nhi *nhi)
++{
++	struct nhi_plat *np = nhi_to_plat(nhi);
++	unsigned int i;
++
++	if (!np->data->ports_cannot_wake)
++		return;
++
++	for (i = 0; i < np->nports; i++)
++		pm_runtime_get_sync(&np->ports[i]->dev);
++}
++
++static void nhi_plat_pcie_tunnel_put(struct tb_nhi *nhi)
++{
++	struct nhi_plat *np = nhi_to_plat(nhi);
++	unsigned int i;
++
++	if (!np->data->ports_cannot_wake)
++		return;
++
++	for (i = 0; i < np->nports; i++)
++		pm_runtime_put_autosuspend(&np->ports[i]->dev);
++}
++
+ static const struct tb_nhi_ops nhi_plat_ops = {
+ 	.init_interrupts = nhi_plat_init_interrupts,
+ 	.shutdown = nhi_plat_shutdown,
++	.pcie_tunnel_get = nhi_plat_pcie_tunnel_get,
++	.pcie_tunnel_put = nhi_plat_pcie_tunnel_put,
+ };
+ 
+ /*
+@@ -147,28 +189,15 @@ static int nhi_nvda8100_power_on(struct nhi_plat *np)
+ static const struct nhi_plat_data nhi_nvda8100_data = {
+ 	.power_on = nhi_nvda8100_power_on,
+ 	.no_firmware_tunnels = true,
++	.ports_cannot_wake = true,
+ };
+ 
+-/*
+- * The PCIe ports this host interface tunnels through point back at it with
+- * "usb4-host-interface". DMA from what is plugged in is contained when every
+- * such Root Port is external facing and behind an IOMMU: the devices below
+- * are then untrusted, and the IOMMU core translates the port's group, which
+- * they join when the port has no ACS.
+- *
+- * The PCI glue also wants IOMMU_CAP_PRE_BOOT_PROTECTION, which no Arm SMMU
+- * reports. It covers devices the firmware tunneled before the OS set up the
+- * IOMMU, which cannot exist when the firmware has no connection manager.
+- */
+-static void nhi_plat_check_iommu(struct nhi_plat *np)
++/* The PCIe ports this host interface tunnels through point back at it */
++static void nhi_plat_find_ports(struct nhi_plat *np)
+ {
+ 	struct tb_nhi *nhi = &np->nhi;
+ 	struct pci_dev *pdev = NULL;
+ 	struct fwnode_handle *fwnode;
+-	bool found = false, port_ok = true;
+-
+-	if (!np->data->no_firmware_tunnels)
+-		return;
+ 
+ 	for_each_pci_dev(pdev) {
+ 		if (!pci_is_pcie(pdev) ||
+@@ -181,18 +210,53 @@ static void nhi_plat_check_iommu(struct nhi_plat *np)
+ 			continue;
+ 
+ 		if (fwnode == dev_fwnode(nhi->dev)) {
+-			found = true;
+-			if (!pdev->external_facing ||
+-			    !device_iommu_mapped(&pdev->dev)) {
+-				dev_dbg(nhi->dev, "%s is not protected\n",
+-					pci_name(pdev));
+-				port_ok = false;
+-			}
++			if (np->nports < ARRAY_SIZE(np->ports))
++				np->ports[np->nports++] = pci_dev_get(pdev);
++			else
++				dev_warn(nhi->dev, "ignoring Root Port %s\n",
++					 pci_name(pdev));
+ 		}
+ 		fwnode_handle_put(fwnode);
+ 	}
++}
+ 
+-	nhi->iommu_dma_protection = found && port_ok;
++static void nhi_plat_put_ports(struct nhi_plat *np)
++{
++	while (np->nports)
++		pci_dev_put(np->ports[--np->nports]);
++}
++
++/*
++ * DMA from what is plugged in is contained when every Root Port this host
++ * interface tunnels through is external facing and behind an IOMMU: the
++ * devices below are then untrusted, and the IOMMU core translates the port's
++ * group, which they join when the port has no ACS.
++ *
++ * The PCI glue also wants IOMMU_CAP_PRE_BOOT_PROTECTION, which no Arm SMMU
++ * reports. It covers devices the firmware tunneled before the OS set up the
++ * IOMMU, which cannot exist when the firmware has no connection manager.
++ */
++static void nhi_plat_check_iommu(struct nhi_plat *np)
++{
++	struct tb_nhi *nhi = &np->nhi;
++	bool protected = np->nports;
++	unsigned int i;
++
++	if (!np->data->no_firmware_tunnels)
++		return;
++
++	for (i = 0; i < np->nports; i++) {
++		struct pci_dev *pdev = np->ports[i];
++
++		if (!pdev->external_facing ||
++		    !device_iommu_mapped(&pdev->dev)) {
++			dev_dbg(nhi->dev, "%s is not protected\n",
++				pci_name(pdev));
++			protected = false;
++		}
++	}
++
++	nhi->iommu_dma_protection = protected;
+ 	dev_dbg(nhi->dev, "IOMMU DMA protection is %s\n",
+ 		str_enabled_disabled(nhi->iommu_dma_protection));
+ }
+@@ -240,6 +304,7 @@ static int nhi_plat_probe(struct platform_device *pdev)
+ 		return dev_err_probe(dev, -ENODEV,
+ 				     "unexpected host interface capabilities %#x\n", caps);
+ 
++	nhi_plat_find_ports(np);
+ 	nhi_plat_check_iommu(np);
+ 
+ 	pm_runtime_set_active(dev);
+@@ -263,14 +328,17 @@ static int nhi_plat_probe(struct platform_device *pdev)
+ err_put:
+ 	pm_runtime_put_noidle(dev);
+ 	nhi_plat_shutdown(nhi);
++	nhi_plat_put_ports(np);
+ 	return ret;
+ }
+ 
+ static void nhi_plat_remove(struct platform_device *pdev)
+ {
+ 	struct tb *tb = platform_get_drvdata(pdev);
++	struct nhi_plat *np = nhi_to_plat(tb->nhi);
+ 
+ 	nhi_remove(tb->nhi);
++	nhi_plat_put_ports(np);
+ }
+ 
+ static const struct acpi_device_id nhi_plat_acpi_ids[] = {
+diff --git a/drivers/thunderbolt/tunnel.c b/drivers/thunderbolt/tunnel.c
+index ffd2d04b3..b1794c557 100644
+--- a/drivers/thunderbolt/tunnel.c
++++ b/drivers/thunderbolt/tunnel.c
+@@ -361,6 +361,32 @@ static int tb_pci_set_ext_encapsulation(struct tb_tunnel *tunnel, bool enable)
+ 	return 0;
+ }
+ 
++static void tb_pci_destroy(struct tb_tunnel *tunnel)
++{
++	struct tb_nhi *nhi = tunnel->tb->nhi;
++
++	if (nhi->ops->pcie_tunnel_put)
++		nhi->ops->pcie_tunnel_put(nhi);
++}
++
++/*
++ * Some hosts' PCIe ports cannot signal a hotplug once they have runtime
++ * suspended, so the link of a tunnel that comes up behind one goes unnoticed.
++ * Let the NHI glue keep them powered for as long as the tunnel exists.
++ */
++static void tb_pci_hold_ports(struct tb_tunnel *tunnel)
++{
++	struct tb_nhi *nhi;
++
++	if (!tunnel->tb)
++		return;
++
++	nhi = tunnel->tb->nhi;
++	if (nhi->ops->pcie_tunnel_get)
++		nhi->ops->pcie_tunnel_get(nhi);
++	tunnel->destroy = tb_pci_destroy;
++}
++
+ static int tb_pci_activate(struct tb_tunnel *tunnel, bool activate)
+ {
+ 	int res;
+@@ -467,6 +493,7 @@ struct tb_tunnel *tb_tunnel_discover_pci(struct tb *tb, struct tb_port *down,
+ 
+ 	tunnel->activate = tb_pci_activate;
+ 	tunnel->src_port = down;
++	tb_pci_hold_ports(tunnel);
+ 
+ 	/*
+ 	 * Discover both paths even if they are not complete. We will
+@@ -547,6 +574,7 @@ struct tb_tunnel *tb_tunnel_alloc_pci(struct tb *tb, struct tb_port *up,
+ 	tunnel->activate = tb_pci_activate;
+ 	tunnel->src_port = down;
+ 	tunnel->dst_port = up;
++	tb_pci_hold_ports(tunnel);
+ 
+ 	path = tb_path_alloc(tb, down, TB_PCI_HOPID, up, TB_PCI_HOPID, 0,
+ 			     "PCIe Down");

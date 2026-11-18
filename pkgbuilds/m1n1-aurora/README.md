@@ -1,17 +1,29 @@
 # m1n1-aurora
 
 Build the canonical Aurora bootloader package from an immutable omacom/m1n1
-commit. The current candidate is f5a82fdb6264edd2fb0c02e2d0f750bf33380854
-(merged source PRs #6, #7, #8, #10, #12, #13 and #14), with Clang/lld, Rust 1.89.0 and
-`-Os`. The package's existing 48/128/256 artwork is unchanged. The former USB4
-alias patch is already in the source; the APFS preboot UUID handoff proposed in
-omarchy-pkgs #1485 is also present upstream, so neither needs a local patch.
+commit. The current candidate is ba130ffbeeadaa35215ed88b07ebcee3199d0be7
+(integration/aurora after omacom/m1n1 #44). Since the previous candidate
+(bc79acc4) it adds #20 (T8122 powered GPU identity on 25G83), #25 (J504
+display and GPU defaults), #31 (J514C
+display and GPU defaults), #32 (J514M display and GPU defaults), #42 (J516M
+display and GPU defaults, and the T6031 device-tree allowance for T6034 boards)
+and #44 (J613 external display by default, only when the kernel's device tree
+has `apple,dma-range` on `apple,t8122-display-subsystem`, i.e. aurora15 or
+newer). Built with Clang/lld, Rust 1.89.0 and `-Os`. The package's existing
+48/128/256 artwork is unchanged.
+
+The J514M and J516M GPU defaults need mesa-aurora
+1:26.3.0_devel.20261107.231485.b7b03c5b3b8-1 (omacom/mesa #33) or newer on the
+same channel: older Mesa refuses the T6034 GPU and the desktop stays black.
+J613's external display is chosen from the device trees `update-m1n1` puts in
+`boot.bin`, not the booted kernel's, so a Limine snapshot of an older kernel
+still gets it; `chosen.asahi,t8122-dcpext=0` in `/etc/m1n1.conf` turns it off.
 
 ## Existing installations
 
 The package replaces the downstream `aura` and `m1n1-neo` packages and conflicts
 with the stock `m1n1`; it never automatically replaces the stock package.
-It provides `m1n1=1.6.1.aurora20` for the kernel dependency. An installed
+It provides `m1n1` at its own `pkgver` for the kernel dependency. An installed
 `m1n1-aurora` upgrades normally; an `aura` installation accepts pacman's named
 replacement transaction. `aura` is removed in the same transaction, leaving
 exactly one provider for the boot checker merged in omarchy-mac-pkgs #52.
@@ -22,8 +34,8 @@ provides it. Depending on `uboot-aurora` by name would make every legacy
 upgrade hit its conflict with `uboot-asahi`, which `--noconfirm` refuses, and
 then ask the user to swap U-Boot. Images select `uboot-aurora` explicitly.
 
-Stage 2 remains `/usr/lib/asahi-boot/m1n1.bin`. The existing asahi-scripts hook
-rebuilds `m1n1/boot.bin` on the selected system ESP from the loader, kernel DTBs
+Stage 2 remains `/usr/lib/asahi-boot/m1n1.bin`. The aurora-scripts hook (which
+provides `asahi-scripts`) rebuilds `m1n1/boot.bin` on the selected system ESP from the loader, kernel DTBs
 and U-Boot. This package adds no install script, Recovery command or ESP rename.
 `/etc/default/update-m1n1` overrides are left alone.
 
@@ -49,6 +61,11 @@ its first `pacman -Syu` (`--noconfirm` accepts the default-yes replacement).
 This source and provider change also requires explicit maintainer approval.
 
 ## Qualification
+
+This exact pin has not been natively built as a package or booted. A local
+build of integration/aurora + #42 (47820c81, which differs from this pin only
+by #44) booted a J514M to the GPU desktop with the matching kernel and Mesa in
+the lab. That result does not replace qualification of this package.
 
 Edge is the qualification channel. `package()` uses `--build-only`, so merging
 this PR allows the normal build/publish workflow to publish an edge candidate;

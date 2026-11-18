@@ -10,7 +10,14 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
 NAMES = ['linux-aurora', 'mesa-aurora', 'aura', 'm1n1-aurora', 'uboot-aurora', 'aurora-bless',
-         'speakerguardd', 'aurora-audio', 'alsa-ucm-conf-aurora', 'omarchy-aurora-firmware']
+         'speakerguardd', 'aurora-audio', 'alsa-ucm-conf-aurora', 'omarchy-aurora-firmware',
+         'speakersafetyd', 'bankstown', 'triforce-lv2', 'lzfse', 'aurora-scripts', 'aurora-fwextract',
+         'muvm', 'fex-emu', 'widevine']
+# Same-name imports from asahi-alarm, with the version each replaces on installed Macs.
+# Each tracks its upstream through a reviewed watch (docs/upstream-sources.md).
+ASAHI_ALARM_IMPORTS = {'speakersafetyd': '2.0.1-1', 'bankstown': '1.1.0-2', 'triforce-lv2': '0.3.2-1',
+                       'lzfse': '1.0-1', 'muvm': '0.7.0-1'}
+REVIEWED = [*ASAHI_ALARM_IMPORTS, 'aurora-scripts', 'aurora-fwextract', 'fex-emu', 'widevine']
 
 
 def srcinfo(name):
@@ -35,8 +42,10 @@ def srcinfo(name):
 class EdgeMetadataTests(unittest.TestCase):
     def test_runtime_only_dependencies_remain_in_packages_not_build_environments(self):
         expected = {
-            'aura': ['asahi-scripts>=20260127.1', 'uboot-aurora'],
-            'm1n1-aurora': ['asahi-scripts>=20260127.1', 'uboot-asahi'],
+            'aura': ['aurora-scripts>=20260127.1', 'uboot-aurora'],
+            'm1n1-aurora': ['aurora-scripts>=20260127.1', 'uboot-asahi'],
+            'aurora-fwextract': ['python', 'aurora-scripts', 'lzfse'],
+            'omarchy-steam-fex': ['bash', 'coreutils', 'python', 'steam', 'muvm', 'FEX-Emu'],
             'aurora-audio': ['alsa-ucm-conf-aurora', 'pipewire-audio', 'wireplumber',
                              'bankstown', 'lsp-plugins-lv2', 'triforce-lv2>=0.2.0',
                              'speakersafetyd', 'speakerguardd'],
@@ -75,12 +84,52 @@ class EdgeMetadataTests(unittest.TestCase):
             self.assertTrue(any(p.startswith(old + '=') for p in package['provides']))
 
     def test_no_automatic_source_tracking(self):
+        # Aurora's own recipes are pinned by hand. The asahi-alarm imports follow
+        # their upstreams, but every bump waits for the owner as a draft PR.
         for name in NAMES:
             with self.subTest(name=name):
                 value = json.loads((ROOT / 'pkgbuilds' / name / '.omarchy/package.json').read_text())
-                self.assertFalse(value['sync'])
                 self.assertEqual(value['source'], 'local')
                 self.assertNotIn('release_ring', value)
+                self.assertNotIn('auto_merge', value)
+                if name in REVIEWED:
+                    self.assertNotIn('sync', value)
+                    self.assertIs(value['review'], True)
+                    self.assertIn('watch', value['upstream'])
+                else:
+                    self.assertFalse(value['sync'])
+
+    def test_asahi_alarm_imports_take_over_installed_packages(self):
+        # [omarchy] is listed first, so a renamed import replaces the asahi-alarm package.
+        # fex-emu is renamed only because package names here are lower case.
+        for new, old in [('aurora-scripts', 'asahi-scripts'), ('aurora-fwextract', 'asahi-fwextract'),
+                         ('fex-emu', 'FEX-Emu')]:
+            with self.subTest(package=new):
+                package = srcinfo(new)[new]
+                self.assertIn(old + '=' + package['pkgver'][0], package['provides'])
+                self.assertEqual(package['conflicts'], [old])
+                self.assertEqual(package['replaces'], [old])
+        for name, asahi_alarm in [('aurora-scripts', '20261023-1'), ('aurora-fwextract', '0.9.2-1'),
+                                  ('fex-emu', '2604-1')]:
+            with self.subTest(package=name):
+                package = srcinfo(name)[name]
+                new = package['pkgver'][0] + '-' + package['pkgrel'][0]
+                self.assertGreaterEqual(int(subprocess.check_output(['vercmp', new, asahi_alarm], text=True)), 0)
+        for name in ('aura', 'm1n1-aurora', 'omarchy-mac-boot'):
+            with self.subTest(package=name):
+                depends = srcinfo(name)[name]['depends']
+                self.assertIn('aurora-scripts>=20260127.1', depends)
+                self.assertFalse([d for d in depends if d.startswith('asahi-scripts')])
+        for name in ('aurora-scripts', 'aurora-fwextract', 'lzfse'):
+            with self.subTest(package=name):
+                self.assertIn('install -Dm644', (ROOT / 'pkgbuilds' / name / 'PKGBUILD').read_text())
+                self.assertIn('/usr/share/licenses/$pkgname/LICENSE', (ROOT / 'pkgbuilds' / name / 'PKGBUILD').read_text())
+
+    def test_fex_emu_declares_the_libraries_its_tools_link(self):
+        package = srcinfo('fex-emu')['fex-emu']
+        self.assertIn('xxhash', package['depends'])
+        self.assertNotIn('qt6-declarative', package['depends'])
+        self.assertTrue(any(o.startswith('qt6-declarative: FEXConfig') for o in package['optdepends']))
 
     def test_stock_names_are_provided_but_never_replaced(self):
         # A replaces= on a stock name swaps it on every machine using [omarchy],
@@ -96,6 +145,29 @@ class EdgeMetadataTests(unittest.TestCase):
             self.assertNotIn(old, package.get('replaces', []))
             if old != 'm1n1-aurora':
                 self.assertTrue(any(p.startswith(old + '=') for p in package['provides']))
+
+    def test_asahi_alarm_imports_upgrade_in_place(self):
+        # The [omarchy] build must win by version alone: same name, same pkgver,
+        # higher pkgrel, and no relations that would touch other machines.
+        for name, old in ASAHI_ALARM_IMPORTS.items():
+            with self.subTest(package=name):
+                package = srcinfo(name)[name]
+                self.assertNotIn('epoch', package)
+                # At least asahi-alarm's pkgver: a reviewed bump may move past it.
+                self.assertGreaterEqual(int(subprocess.check_output(['vercmp', package['pkgver'][0], old.split('-')[0]], text=True)), 0)
+                new = package['pkgver'][0] + '-' + package['pkgrel'][0]
+                self.assertGreater(int(subprocess.check_output(['vercmp', new, old], text=True)), 0)
+                for field in ['provides', 'conflicts', 'replaces']:
+                    self.assertNotIn(field, package)
+        triforce = srcinfo('triforce-lv2')['triforce-lv2']['pkgver'][0]
+        self.assertGreaterEqual(int(subprocess.check_output(['vercmp', triforce, '0.2.0'], text=True)), 0)
+
+    def test_speakersafetyd_unit_stays_where_its_drop_in_and_preset_expect(self):
+        # speakerguardd's drop-in and omarchy-mac's preset name this unit path.
+        recipe = (ROOT / 'pkgbuilds' / 'speakersafetyd' / 'PKGBUILD').read_text()
+        self.assertIn('UNITDIR=/usr/lib/systemd/system', recipe)
+        guard = (ROOT / 'pkgbuilds' / 'speakerguardd' / 'PKGBUILD').read_text()
+        self.assertIn('"$pkgdir/usr/lib/systemd/system/speakersafetyd.service.d/50-j700-guard.conf"', guard)
 
     def test_kernel_replaces_nothing(self):
         # linux-aurora sets its relations inside generated package functions,
@@ -118,10 +190,17 @@ class EdgeMetadataTests(unittest.TestCase):
             for package in srcinfo(name).values():
                 self.assertEqual(package['groups'], ['omarchy-platform-apple-silicon'])
 
-    def test_mesa_follows_neither_llvm_nor_spirv_tools(self):
-        for package in srcinfo('mesa-aurora').values():
-            for dependency in ['llvm-libs', 'spirv-tools']:
-                self.assertNotIn(dependency, package['depends'])
+    def test_mesa_follows_llvm_by_soname_and_never_spirv_tools(self):
+        # llvmpipe links the system LLVM. mesa-aurora depends on 'libLLVM.so',
+        # which makepkg versions from libgallium's NEEDED soname, so an LLVM
+        # major bump blocks the upgrade instead of breaking libgallium.
+        packages = srcinfo('mesa-aurora')
+        for package in packages.values():
+            self.assertNotIn('spirv-tools', package['depends'])
+            self.assertNotIn('llvm-libs', package['depends'])
+        self.assertEqual([d for d in packages['mesa-aurora']['depends'] if d.startswith('libLLVM')],
+                         ['libLLVM.so'])
+        self.assertFalse([d for d in packages['vulkan-aurora']['depends'] if d.startswith('libLLVM')])
 
     def test_mesa_epoch_and_existing_neo_versions_upgrade(self):
         installed = {'mesa-aurora': '1:26.3.0_devel-932.a0bcbcb28528',
@@ -140,7 +219,9 @@ class EdgeMetadataTests(unittest.TestCase):
     def test_omacom_loader_migrates_only_downstream_providers(self):
         package = srcinfo('m1n1-aurora')['m1n1-aurora']
         self.assertEqual(package['replaces'], ['aura', 'm1n1-neo'])
-        self.assertEqual(package['conflicts'], ['m1n1', 'aura', 'm1n1-neo'])
+        self.assertEqual(package['conflicts'], ['m1n1', 'aura', 'm1n1-neo', 'linux-aurora<7.2.11.aurora16'])
+        # The kernel floor is a conflict: linux-aurora depends on m1n1, so a dependency would loop.
+        self.assertFalse(any(d.startswith('linux-aurora') for d in package['depends']))
         self.assertNotIn('install', package)
         version = package['pkgver'][0]
         self.assertGreater(int(subprocess.check_output(['vercmp', version, '1.6.1.aurora1'], text=True)), 0)

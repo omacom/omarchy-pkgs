@@ -12,6 +12,7 @@
 #   { "source": "local", "upstream": { "watch": { "github": "owner/repo", "pattern": "v(?P<version>[0-9.]+)" } } }
 #   { "source": "local", "min_release_age": "24h" }
 #   { "source": "local", "auto_merge": true, "upstream": { "watch": { "git_branch": "...", "branch": "main" } } }
+#   { "source": "local", "review": true, "upstream": { "watch": { "git_tags": "https://example/repo.git", "pattern": "v(?P<version>[0-9.]+)" } } }
 #   { "source": "local", "upstream": { "github": "owner/repo", "checksums": "SHASUMS256.txt", "assets": { "x86_64": ["name-{tag}-x64.tar.xz"] } } }
 #   { "source": "local", "upstream": { "github": "owner/repo", "digests": true, "assets": { "x86_64": "name-{tag}-x64.tar.xz" } } }
 #   { "source": "local", "upstream": { "git_tags": "https://example/repo.git", "tag_pattern": "v{pkgver}", "sources": { "any": ["https://example/archive/{tag}.tar.gz"] } } }
@@ -313,6 +314,16 @@ package_auto_merge() {
   [[ "$(jq -r 'if has("auto_merge") then .auto_merge else false end' "$metadata")" == "true" ]]
 }
 
+# "review": true holds a package's update PRs for a maintainer: they open as
+# drafts and nothing arms auto-merge. Marking one ready for review hands it to
+# auto-merge-pr.yml, which lands it once CI passes.
+package_review_bumps() {
+  local pkgdir="$1" metadata
+  metadata=$(metadata_file_for_dir "$pkgdir")
+  [[ -f "$metadata" ]] || return 1
+  [[ "$(jq -r 'if has("review") then .review else false end' "$metadata")" == "true" ]]
+}
+
 # package_in_lane <pkgdir> <reviewed|auto-merge|all>
 package_in_lane() {
   local pkgdir="$1" lane="$2"
@@ -497,6 +508,19 @@ validate_package_metadata() {
   fi
   if package_auto_merge "$pkgdir" && ! package_has_upstream_provider "$pkgdir" && ! package_has_upstream_hook "$pkgdir"; then
     echo "invalid auto_merge for $(basename "$pkgdir"): only an upstream watch, provider, or hook can be auto-merged"
+    return 1
+  fi
+
+  if ! jq -e 'if has("review") | not then true else (.review | type) == "boolean" end' "$metadata" >/dev/null; then
+    echo "invalid review for $(basename "$pkgdir"): must be boolean"
+    return 1
+  fi
+  if package_review_bumps "$pkgdir" && package_auto_merge "$pkgdir"; then
+    echo "invalid review for $(basename "$pkgdir"): a reviewed package cannot also set auto_merge"
+    return 1
+  fi
+  if package_review_bumps "$pkgdir" && ! package_has_upstream_provider "$pkgdir" && ! package_has_upstream_hook "$pkgdir"; then
+    echo "invalid review for $(basename "$pkgdir"): only an upstream watch, provider, or hook opens update PRs"
     return 1
   fi
 

@@ -19,8 +19,11 @@ only those on internal disks. A DSP device-tree image the device tree calls
 `*_dtb.mbn` is also found under its Windows name, `*_dtbs.elf`, when the exact
 name is missing. If Windows carries several variants and linux-firmware has a
 companion image from the same device-tree node, the sibling image's hash
-selects the compatible variant. Identical duplicates are accepted; differing
-variants without a unique companion match are skipped. The result is
+selects the compatible variant. When no file of the node is installed yet,
+as on a first install after Windows updated a driver and kept the older
+package, every file of the node comes from the one driver package whose INF
+`DriverVer` Windows ranks first (date, then version). Identical duplicates are
+accepted; other differing variants are skipped. The result is
 installed under `/usr/lib/firmware/updates/<name>`. The GPU zap shader is
 added to the initramfs through `/etc/mkinitcpio.conf.d/qcom-firmware.conf`;
 the DSP images are loaded from the root filesystem. What was installed, from
@@ -84,8 +87,30 @@ BitLocker volumes cannot be read; turn BitLocker off in Windows first.
 ## Retirement
 
 When linux-firmware ships a machine's vendor directory, the tool copies nothing
-and still configures its GPU firmware for early display. When every supported
-machine is covered, drop the package and prune the `/usr/lib/firmware/updates`
-entries listed in the manifest.
+and still configures its GPU firmware for early display.
+
+Copies from Windows load before packaged firmware, so once linux-firmware ships
+a file that was copied, the copy would keep loading. `qcom-firmware-extract
+--retire` removes such copies. A DSP image and its device-tree image have to
+come from the same release, so a device-tree node's copies go together and
+only once packages ship every file the node names (a name a board lists in
+`provided.d` with no file, such as one the boot firmware loads, does not hold a
+node back). They go only if every copy in the node is one the manifest records,
+unchanged since, a plain file in `/usr/lib/firmware/updates` itself, and not
+listed in `provided.d`; otherwise the node keeps all of its copies, with a
+warning. Nodes that share a name are tied: when one keeps its copies, every
+node linked to it through shared names keeps them too. Without the
+kernel's configuration only an uncompressed packaged file counts. The manifest
+stops recording a copy before it is removed, and the GPU zap shader's initramfs
+entry follows to the packaged file.
+
+Two pacman hooks run it. `80-qcom-firmware-retire.hook` runs on any change to
+packaged Qualcomm firmware, before mkinitcpio's own hook rebuilds the boot image
+for that change. `81-qcom-firmware-retire-on-upgrade.hook` runs when this package
+is installed or upgraded, for firmware packaged before `--retire` existed, and
+rebuilds the boot image itself if it retired anything.
+
+When every supported machine is covered, drop the package; by then `--retire`
+has removed every copy the manifest recorded.
 
 Derived from Canonical's `qcom-firmware-extract` (GPL-2+).

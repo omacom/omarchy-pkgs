@@ -1,6 +1,6 @@
-# NVIDIA ARM open kernel modules for N1x
+# NVIDIA open kernel modules (DKMS)
 
-ARM-only edge package of NVIDIA's open kernel modules 615.78.08 with N1x display fixes. Based on
+NVIDIA's open kernel modules 615.78.08 as DKMS sources, for aarch64 and x86_64, with N1x display fixes on ARM. Machines on `linux-omarchy` get these modules prebuilt from the kernel recipe as `linux-omarchy-nvidia-open` instead; this package is for any other kernel, `linux-omarchy-eevdf` and `linux-omarchy-muqss` included. Based on
 [Arch's DKMS recipe](https://gitlab.archlinux.org/archlinux/packaging/packages/nvidia-utils/-/commit/f9ae10b379f8b1d0832ec92bca1c12072aa123e9).
 It used to carry Martin Stark's
 [NVIDIA PR #1359](https://github.com/NVIDIA/open-gpu-kernel-modules/pull/1359)
@@ -55,9 +55,6 @@ leaked a small slab object per frame while anything on screen moved, gigabytes
 of unreclaimable memory over a few days of uptime. nvkms now frees the record
 on that path. Keep it until NVIDIA merges the fix.
 
-Requires `[omarchy]` before `[extra]` and matching `nvidia-utils=615.78.08`.
-Update both NVIDIA packages together; automatic version tracking is disabled.
+The patches are carried for ARM only (`source_aarch64`); x86_64 builds NVIDIA's sources as Arch does.
 
-Remove this recipe and the published package/database entry once a fixed
-Arch Linux ARM driver is validated. A stale package in the earlier repository
-can block driver updates.
+Requires `[omarchy]` before `[extra]` and matching `nvidia-utils=615.78.08`. Omarchy carries the driver on both architectures; `nvidia-utils`'s README says why and what a driver update changes. Both `linux-omarchy` recipes build the same driver into their prebuilt modules, and `linux-omarchy-aarch64` copies these patches with an `nvidia-` prefix: update them in the same change (`tests/nvidia-open-lockstep.sh` checks them).

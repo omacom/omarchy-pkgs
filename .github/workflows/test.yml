@@ -12,7 +12,7 @@ jobs:
   build-isolation:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Prepare fixture builder
@@ -23,14 +23,68 @@ jobs:
           TEST_BUILDER_IMAGE: omarchy-build-isolation-test
         run: tests/build-isolation.sh
 
+  # namcap reads one PKGBUILD at a time, so this lints the recipes a PR
+  # changes and fails on errors that are new against the base branch: the tree
+  # already carries 23, and nobody touching omarchy-nvim should inherit them.
+  # The split-makedepends rule is printed but never gates: it fires on any
+  # split package whose parts depend on each other (19 of the 23).
+  recipes:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Fail on namcap errors the base branch did not have
+        run: |
+          set -euo pipefail
+          base="${{ github.event.pull_request.base.sha }}"
+          if [[ -z "$base" ]]; then echo "not a pull request: nothing to compare"; exit 0; fi
+          mapfile -t dirs < <(git diff --name-only "$base"...HEAD -- 'pkgbuilds/*/PKGBUILD' | xargs -r -n1 dirname | sort -u)
+          (( ${#dirs[@]} )) || { echo "no recipe changed"; exit 0; }
+          base_tree=$(mktemp -d); trap 'rm -rf "$base_tree"' EXIT
+          for d in "${dirs[@]}"; do
+            mkdir -p "$base_tree/$d"
+            git show "$base:$d/PKGBUILD" >"$base_tree/$d/PKGBUILD" 2>/dev/null || rm -rf "${base_tree:?}/$d"
+          done
+          docker run --rm -e DIRS="${dirs[*]}" -v "$PWD:/w:ro" -v "$base_tree:/base:ro" -w /w \
+            ghcr.io/archlinux/archlinux:base-devel bash -lc '
+              pacman -Sy --noconfirm namcap >/dev/null
+              gate=" E: "
+              skip="Split PKGBUILD needs additional makedepends"
+              status=0
+              for d in $DIRS; do
+                now=$(namcap -i "$d/PKGBUILD" 2>&1; true)
+                printf "%s\n" "$now" | grep -E " (E|W): " | sed "s#^#$d #" || true
+                was=""
+                [[ -f /base/$d/PKGBUILD ]] && was=$(namcap -i "/base/$d/PKGBUILD" 2>&1; true)
+                new=$(comm -23 <(printf "%s\n" "$now" | grep "$gate" | grep -v "$skip" | sort) \
+                                 <(printf "%s\n" "$was" | grep "$gate" | grep -v "$skip" | sort) || true)
+                if [[ -n "$new" ]]; then
+                  printf "%s\n" "$new" | sed "s#^#::error file=$d/PKGBUILD::#"
+                  status=1
+                fi
+              done
+              exit $status'
+
   self-tests:
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          # The merge commit and its base, for bin/release-owners --base.
+          fetch-depth: 2
+
+      # tests/promotion-regression.sh compares promotions against the tooling
+      # of master before the Mac package-set check.
+      - name: Fetch the promotion baseline
+        run: git fetch --no-tags --depth=1 origin be8ab9bda3e53b163153944395f1912ac6d7f44f
 
       - name: Test PR workflow approval
         run: node --test tests/pr-workflow-approval.cjs
@@ -43,14 +97,24 @@ jobs:
 
       # An Arch container for vercmp: version ordering has to be decided by
       # the same comparator pacman uses on users' machines.
+      #
+      # release/owners.json lists which directory makes which package
+      # names. A pull request that changes only recipes reads only those,
+      # and takes every other entry from the merge commit's base; any other
+      # change reads them all. The tool reads recipes as nobody
+      # (bin/release-owners).
       - name: Run self-tests
+        env:
+          BASE: ${{ github.event_name == 'pull_request' && 'HEAD^1' || '' }}
         run: |
-          docker run --rm \
+          docker run --rm -e BASE \
             -v "$PWD:/workspace:ro" \
             -w /workspace \
             ghcr.io/archlinux/archlinux:base-devel bash -lc '
               set -euo pipefail
-              pacman -Syu --noconfirm git jq python libarchive neovim tmux
+              pacman -Syu --noconfirm git jq python python-yaml libarchive neovim tmux
+              bin/release-owners --self-test
+              bin/release-owners --check ${BASE:+--base "$BASE"}
               python tests/owe-package-restart.py
               python tests/oma-service-removal.py
               python tests/passwordless-package-lifecycle.py
@@ -62,6 +126,7 @@ jobs:
               bash tests/ipu7-headers.sh
               ./bin/sync-upstream self-test
               ./tests/upstream-github-fetch.sh
+              ./tests/upstream-github-netrc.sh
               ./bin/sync-rebuilds --self-test
               ./bin/omarchy-pkgs self-test
               ./bin/omarchy-release self-test
@@ -69,14 +134,20 @@ jobs:
               python tests/neovim-clipboard-tmux.py
               ./tests/published-build-plan.sh
               ./tests/settings-boot-config.sh
+              ./tests/settings-etc-overrides.sh
               ./tests/settings-runtime-profile.sh
               ./tests/passwordless-package-files.sh
               ./tests/pinned-sources.sh
               ./tests/package-metadata.sh
+              ./tests/package-owners.sh
+              ./tests/pkgname-unique.sh
+              ./tests/pgp-keys-vendored.sh
+              ./tests/nvidia-open-lockstep.sh
               ./tests/unpublish-plan.sh
               ./tests/fast-ring-check.sh
               ./tests/controller.sh
               ./tests/artifact-helpers.sh
+              python tests/workflow-helpers-sourced.py
               ./tests/build-matrix.sh
               ./tests/mac-installer-dispatch.sh
               ./tests/limine-mkinitcpio-hook.sh
@@ -86,8 +157,70 @@ jobs:
               pacman -S --noconfirm --quiet rclone >/dev/null
               ./tests/publish-artifact.sh
               ./tests/promote-channel.sh
+              ./tests/mac-package-set.sh
+              BASELINE_REF=be8ab9bda3e53b163153944395f1912ac6d7f44f ./tests/promotion-regression.sh
               shopt -s nullglob
               for test in pkgbuilds/*/test.sh; do
                 bash "$test"
               done
             '
+
+  # jactionlint over every workflow and dependabot.yml, with shellcheck over
+  # each run: block, and shellcheck over the scripts in .github/scripts. It
+  # lives here, not in a workflow of its own, so build-approved releases it
+  # with the other tests on a fork PR (.github/scripts/approve-pr-workflows.cjs).
+  lint-workflows:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read # to check out the repository
+    # bash -eo pipefail, not the default bash -e: a failing git ls-files fails
+    # the shellcheck step instead of leaving it nothing to check.
+    defaults:
+      run:
+        shell: bash
+    # Release binaries pinned by version and sha256, shellcheck included: the
+    # runner image's own shellcheck changes with the image, and with it what
+    # jactionlint reports. To update one, change its version and take the new
+    # sha256 from the release's assets. jdx/jactionlint's own action is not
+    # used: its download checks no checksum.
+    env:
+      JACTIONLINT_VERSION: 2.4.0
+      JACTIONLINT_SHA256: 26ddba81db28fffc51163175c070ee1a9d1150260de4b5232f01d9b749f32d8e
+      SHELLCHECK_VERSION: 0.11.0
+      SHELLCHECK_SHA256: b7af85e41cc99489dcc21d66c6d5f3685138f06d34651e6d34b42ec6d54fe6f6
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install jactionlint and shellcheck
+        id: tools
+        run: |
+          set -euo pipefail
+          bin=$RUNNER_TEMP/lint-tools
+          mkdir -p "$bin"
+          fetch() {
+            curl -fsSL --retry 3 -o "$RUNNER_TEMP/$3" "$1"
+            echo "$2  $RUNNER_TEMP/$3" | sha256sum --check --strict
+          }
+          fetch "https://github.com/jdx/jactionlint/releases/download/v$JACTIONLINT_VERSION/jactionlint_${JACTIONLINT_VERSION}_linux_amd64.tar.gz" \
+            "$JACTIONLINT_SHA256" jactionlint.tar.gz
+          tar -xzf "$RUNNER_TEMP/jactionlint.tar.gz" -C "$bin" jactionlint
+          fetch "https://github.com/koalaman/shellcheck/releases/download/v$SHELLCHECK_VERSION/shellcheck-v$SHELLCHECK_VERSION.linux.x86_64.tar.gz" \
+            "$SHELLCHECK_SHA256" shellcheck.tar.gz
+          tar -xzf "$RUNNER_TEMP/shellcheck.tar.gz" -C "$bin" --strip-components=1 "shellcheck-v$SHELLCHECK_VERSION/shellcheck"
+          echo "$bin" >> "$GITHUB_PATH"
+
+      # Reads .github/jactionlint.yaml for the profile and the self-hosted
+      # runner labels. Each finding is an error annotation on its line; a
+      # shellcheck finding sits on the script line it is about.
+      - name: Run jactionlint
+        run: jactionlint --format github
+
+      # Runs even when jactionlint failed, so one run reports every problem.
+      - name: Run shellcheck on .github/scripts
+        if: ${{ !cancelled() && steps.tools.outcome == 'success' }}
+        run: git ls-files -z '.github/scripts/*.sh' | xargs -0 -r shellcheck
