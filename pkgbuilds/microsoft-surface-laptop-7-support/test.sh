@@ -69,3 +69,106 @@ report=$(SL7_BATTERY_OUT="$scratch/out/none" SL7_BATTERY_SYSFS="$scratch/sysfs" 
   fail "without a reading the command still reports what Linux knows"
 
 echo "ok - Surface Laptop 7 battery reader and command"
+
+# The sound card check. WirePlumber's view is a pw-dump fixture that a fake
+# restart swaps for the next one; UCM's device list is the one alsaucm prints.
+checker="$package_dir/surface-laptop-7-audio-profiles"
+
+card() {
+  local profiles='{"name": "off"}, {"name": "pro-audio"}' name
+  for name in "$@"; do
+    profiles+=", {\"name\": \"$name\"}"
+  done
+  cat <<EOF_CARD
+[{"type": "PipeWire:Interface:Node", "info": {"props": {"node.name": "other"}}},
+ {"type": "PipeWire:Interface:Device",
+  "info": {"props": {"device.name": "alsa_card.platform-sound", "api.alsa.path": "hw:3"},
+           "params": {"EnumProfile": [$profiles]}}}]
+EOF_CARD
+}
+
+cat >"$scratch/ucm" <<'EOF_UCM'
+  0: Speaker
+    Speaker playback
+  1: Headphones
+    Headphones playback
+  2: Headset
+    Headset microphone
+  3: Mic
+    Internal microphones
+  4: HDMI0
+    USB/DisplayPort 0 playback
+  5: HDMI1
+    USB/DisplayPort 1 playback
+EOF_UCM
+
+card 'HiFi (HDMI1, Headset, Mic, Speaker)' 'HiFi (HDMI0, Headset, Mic, Speaker)' \
+  'HiFi (Headphones, Headset, Mic, Speaker)' >"$scratch/card.whole"
+card >"$scratch/card.bare"
+card 'HiFi (HDMI0, Headset, Mic, Speaker)' >"$scratch/card.reduced"
+
+# check <compatible> <view before any restart> [view after each restart...]
+check() {
+  local compatible=$1
+  shift
+  rm -f "$scratch"/view.* "$scratch/restarts" "$scratch/asked"
+  local n=0 view
+  for view in "$@"; do
+    cp "$scratch/card.$view" "$scratch/view.$n"
+    n=$((n + 1))
+  done
+  SL7_AUDIO_COMPATIBLE="$scratch/$compatible" SL7_AUDIO_WAIT=1 SL7_AUDIO_SETTLE=0 \
+    SL7_AUDIO_PW_DUMP="cat '$scratch'/view.\$(cat '$scratch/restarts' 2>/dev/null | wc -l)" \
+    SL7_AUDIO_UCM_DEVICES="echo {card} >>'$scratch/asked'; cat '$scratch/ucm'" \
+    SL7_AUDIO_RESTART="echo restart >>'$scratch/restarts'" \
+    python "$checker" >"$scratch/said" 2>&1
+}
+
+restarts() {
+  if [[ -e $scratch/restarts ]]; then
+    wc -l <"$scratch/restarts"
+  else
+    echo 0
+  fi
+}
+
+check romulus15 whole || fail "a card with every device is accepted"
+[[ $(restarts) == 0 ]] || fail "a card with every device restarts nothing"
+grep -qx 'hw:3' "$scratch/asked" || fail "UCM is asked about the card WirePlumber names"
+
+check romulus15 bare whole || fail "a card left with Off and Pro Audio is repaired"
+[[ $(restarts) == 1 ]] || fail "one restart repairs a card that then has every device"
+grep -q 'without HDMI0, HDMI1, Headphones, Headset, Mic, Speaker' "$scratch/said" ||
+  fail "the missing devices are named"
+
+check romulus15 reduced whole || fail "a card missing some outputs is repaired"
+grep -q 'without HDMI1, Headphones;' "$scratch/said" || fail "only the missing outputs are named"
+
+check romulus15 bare reduced whole || fail "a second restart is tried"
+[[ $(restarts) == 2 ]] || fail "a card repaired by the second restart took two"
+
+if check romulus15 bare bare bare bare; then
+  fail "a card that stays broken is reported as a failure"
+fi
+[[ $(restarts) == 2 ]] || fail "WirePlumber is restarted at most twice"
+
+rm -f "$scratch"/view.* "$scratch/restarts"
+if SL7_AUDIO_COMPATIBLE="$scratch/romulus15" SL7_AUDIO_WAIT=1 SL7_AUDIO_PW_DUMP="echo '[]'" \
+  SL7_AUDIO_UCM_DEVICES="cat '$scratch/ucm'" SL7_AUDIO_RESTART="echo restart >>'$scratch/restarts'" \
+  python "$checker" 2>/dev/null; then
+  fail "a card that never appears is reported as a failure"
+fi
+[[ $(restarts) == 0 ]] || fail "nothing is restarted for a card that never appears"
+
+cp "$scratch/card.whole" "$scratch/view.0"
+if SL7_AUDIO_COMPATIBLE="$scratch/romulus15" SL7_AUDIO_WAIT=1 SL7_AUDIO_PW_DUMP="cat '$scratch/view.0'" \
+  SL7_AUDIO_UCM_DEVICES="false" SL7_AUDIO_RESTART="echo restart >>'$scratch/restarts'" \
+  python "$checker" 2>/dev/null; then
+  fail "a card UCM cannot open is reported as a failure"
+fi
+[[ $(restarts) == 0 ]] || fail "nothing is restarted while UCM cannot open the card"
+
+check romulus13 bare || fail "another laptop is left alone without an error"
+[[ $(restarts) == 0 && ! -e $scratch/asked ]] || fail "nothing is checked on another laptop"
+
+echo "ok - Surface Laptop 7 sound card check"
