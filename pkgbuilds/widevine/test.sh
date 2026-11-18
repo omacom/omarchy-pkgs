@@ -21,6 +21,11 @@ done
   fail "widevine has no build or prepare step"
 (( $(vercmp "$pkgver-$pkgrel" 4.10.2891.0-1) > 0 )) || fail "widevine upgrades asahi-alarm's 4.10.2891.0-1"
 (( $(vercmp "$pkgver" 4.10.2891.0) >= 0 )) || fail "widevine keeps at least asahi-alarm's pkgver"
+(( ${#source[@]} == ${#sha256sums[@]} )) || fail "every source has a checksum"
+for i in "${!source[@]}"; do
+  [[ $(sha256sum "$package_dir/${source[i]}" | cut -d' ' -f1) == "${sha256sums[i]}" ]] ||
+    fail "${source[i]} matches its sha256sums entry"
+done
 
 srcdir="$scratch/src"
 pkgdir="$scratch/pkg"
