@@ -385,6 +385,12 @@ test('every bot lane opens its PRs per package through package-prs.yml', () => {
   // A reviewed group opens as a draft and is never armed.
   assert.match(prs, /draft: \$\{\{ matrix\.group\.review == true \}\}/);
   assert.match(prs, /- name: Enable auto-merge\n +id: merge\n +if: \$\{\{ [^\n]*&& matrix\.group\.review != true \}\}/);
+  // A newer update to a reviewed PR re-drafts it first, and nothing is pushed if that fails.
+  const hold = prs.indexOf('- name: Hold an existing reviewed PR as a draft');
+  assert.ok(hold > 0 && hold < prs.indexOf('- name: Open or update the PR'), 'hold runs before the push');
+  assert.match(prs, /id: hold\n +if: \$\{\{ steps\.apply\.outcome == 'success' && matrix\.group\.review == true \}\}/);
+  assert.match(prs, /\.github\/scripts\/hold-reviewed-pr\.sh "\$BRANCH" "\$\{packages\[@\]\}"/);
+  assert.match(prs, /id: pr\n +if: \$\{\{ steps\.apply\.outcome == 'success' && steps\.hold\.outcome != 'failure' \}\}/);
   assert.doesNotMatch(prs, /^ +(contents|pull-requests|actions): write$/m);
 });
 
@@ -428,6 +434,87 @@ test('package PRs split per package and keep branch siblings together', () => {
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+// hold-reviewed-pr.sh against a fake gh: a recorded log of calls, and a PR
+// state file the fake's mutations change unless `stuck` pins it.
+const holdScript = join(__dirname, '../.github/scripts/hold-reviewed-pr.sh');
+function holdFixture({ pr = '41', draft = false, armed = true, stuck = false, sameContent = false } = {}) {
+  const dir = mkdtempSync(join(tmpdir(), 'hold-reviewed-pr-'));
+  const git = (cwd, ...args) => execFileSync('git', ['-C', cwd, '-c', 'user.name=T', '-c', 'user.email=t@t', ...args]);
+  const origin = join(dir, 'origin.git');
+  const work = join(dir, 'work');
+  execFileSync('git', ['init', '-q', '--bare', origin]);
+  mkdirSync(join(work, 'pkgbuilds/speakersafetyd'), { recursive: true });
+  git(work, 'init', '-q');
+  git(work, 'remote', 'add', 'origin', origin);
+  writeFileSync(join(work, 'pkgbuilds/speakersafetyd/PKGBUILD'), 'pkgver=3.0.0\n');
+  git(work, 'add', '.');
+  git(work, 'commit', '-qm', 'reviewed update');
+  git(work, 'push', '-q', 'origin', 'HEAD:refs/heads/auto/sync-upstream-speakersafetyd');
+  if (!sameContent) writeFileSync(join(work, 'pkgbuilds/speakersafetyd/PKGBUILD'), 'pkgver=3.0.1\n');
+  const bin = join(dir, 'bin');
+  mkdirSync(bin);
+  const stateFile = join(dir, 'state');
+  writeFileSync(stateFile, `${draft} ${armed}\n`);
+  writeFileSync(join(bin, 'gh'), `#!/bin/bash
+echo "$*" >> "${join(dir, 'calls')}"
+read -r draft armed < "${stateFile}"
+case "$1 $2" in
+  "pr list") echo "${pr}" ;;
+  "pr view") echo "$draft $armed" ;;
+  "pr merge") ${stuck ? 'true' : `echo "$draft false" > "${stateFile}"`} ;;
+  "pr ready") ${stuck ? 'true' : `echo "true $armed" > "${stateFile}"`} ;;
+esac
+`, { mode: 0o755 });
+  const run = () => spawnSync(holdScript, ['auto/sync-upstream-speakersafetyd', 'speakersafetyd'], {
+    cwd: work, encoding: 'utf8',
+    env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, GITHUB_REPOSITORY: 'omacom/omarchy-pkgs' },
+  });
+  const calls = () => { try { return readFileSync(join(dir, 'calls'), 'utf8').trim().split('\n'); } catch { return []; } };
+  return { run, calls, cleanup: () => rmSync(dir, { recursive: true, force: true }) };
+}
+const mutations = calls => calls.filter(call => /^pr (merge|ready)/.test(call));
+
+test('a newer update re-drafts a ready, armed reviewed PR and checks both before the push', () => {
+  const f = holdFixture();
+  try {
+    const result = f.run();
+    assert.equal(result.status, 0, result.stdout + result.stderr);
+    assert.deepEqual(mutations(f.calls()), ['pr merge --disable-auto 41 -R omacom/omarchy-pkgs', 'pr ready --undo 41 -R omacom/omarchy-pkgs']);
+    assert.match(f.calls().at(-1), /^pr view 41 /, 'the state is read back after the change');
+    assert.match(result.stdout, /#41 is back to a draft with auto-merge off/);
+  } finally { f.cleanup(); }
+});
+
+test('a reviewed PR that stays ready or armed stops the push', () => {
+  const f = holdFixture({ stuck: true });
+  try {
+    const result = f.run();
+    assert.equal(result.status, 1);
+    assert.match(result.stdout, /#41 is still draft=false auto-merge=true: not pushing/);
+  } finally { f.cleanup(); }
+});
+
+test('a reviewed PR already carrying the same update, or no PR at all, is left alone', () => {
+  for (const options of [{ sameContent: true }, { pr: '' }]) {
+    const f = holdFixture(options);
+    try {
+      const result = f.run();
+      assert.equal(result.status, 0, result.stdout + result.stderr);
+      assert.deepEqual(mutations(f.calls()), [], JSON.stringify(options));
+    } finally { f.cleanup(); }
+  }
+});
+
+test('a draft without auto-merge needs no change but is still checked', () => {
+  const f = holdFixture({ draft: true, armed: false });
+  try {
+    const result = f.run();
+    assert.equal(result.status, 0, result.stdout + result.stderr);
+    assert.deepEqual(mutations(f.calls()), []);
+    assert.equal(f.calls().filter(call => call.startsWith('pr view')).length, 2);
+  } finally { f.cleanup(); }
 });
 
 const { decide } = require('../.github/scripts/auto-merge-pr.cjs');
