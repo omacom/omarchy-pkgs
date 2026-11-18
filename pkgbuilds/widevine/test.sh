@@ -1,6 +1,7 @@
 #!/bin/bash
 # The package carries only our own bytes: no Google library or image, nothing
-# fetched at build or install time, and a fetch that refuses to run in a chroot.
+# fetched at build or install time or on a schedule, and a fetch that refuses to
+# run in a chroot or without a terminal to accept Google's licence in.
 set -euo pipefail
 
 package_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
@@ -46,18 +47,29 @@ cdm=/opt/WidevineCdm/chromium/_platform_specific/linux_arm64/libwidevinecdm.so
 grep -qF 'ln -sfn ../../../chromium/_platform_specific/linux_arm64/libwidevinecdm.so "$GMP_LINK"' "$pkgdir/usr/bin/widevine-fetch" ||
   fail "the fetch links Firefox's GMP directory to the library"
 [[ $(readlink "$pkgdir/usr/lib/chromium/WidevineCdm") == /opt/WidevineCdm/chromium ]] || fail "Chromium's WidevineCdm link"
-[[ $(readlink "$pkgdir/usr/lib/systemd/system/timers.target.wants/widevine-fetch.timer") == ../widevine-fetch.timer ]] ||
-  fail "the fetch timer is enabled by the package"
+[[ ! -e $pkgdir/usr/lib/systemd ]] || fail "the package ships no systemd units: nothing fetches on its own"
+grep -qF "read -r -p \"Type 'accept'" "$pkgdir/usr/bin/widevine-fetch" || fail "the fetch asks for acceptance"
 grep -qxF "LACROS_SHA256=$_lacros_sha256" "$pkgdir/usr/lib/widevine/source" || fail "the fetch is pinned to the recipe's sha256"
 grep -qF "\"version\": \"$pkgver\"" "$pkgdir/opt/WidevineCdm/chromium/manifest.json" || fail "the manifest names pkgver"
 
-# The scriptlet may start the timer, never fetch.
-! grep -qE 'widevine-fetch( |$)|curl|unsquashfs|widevine_fixup' "$package_dir/widevine.install" ||
-  fail "the install scriptlet fetches"
+# The scriptlet only tells the user what to run: it never fetches or starts anything.
+! grep -vE '^\s*(#|echo )' "$package_dir/widevine.install" | grep -qE 'widevine-fetch( |$)|curl|unsquashfs|widevine_fixup|systemctl (--no-block )?(start|enable|restart)' ||
+  fail "the install scriptlet fetches or starts a fetch"
+grep -qF "Run 'sudo widevine-fetch'" "$package_dir/widevine.install" || fail "the install message names sudo widevine-fetch"
 grep -qF "${cdm%/*/*}" "$package_dir/widevine.install" || fail "removal deletes the fetched library"
 
 # Off a booted system (a container or an image build chroot) the fetch does nothing and succeeds.
 out=$(bash "$pkgdir/usr/bin/widevine-fetch" 2>&1) || fail "widevine-fetch fails off a booted system: $out"
 [[ $out == *"not on a booted system"* ]] || fail "widevine-fetch refuses off a booted system: $out"
+
+# On a booted system without a terminal (a timer, a script, pacman), it refuses before doing anything.
+sed -e 's#^if \[\[ ! -d /run/systemd/system \]\] || systemd-detect-virt --quiet --chroot; then#if false; then#' \
+  -e "s#^source /usr/lib/widevine/source#source $pkgdir/usr/lib/widevine/source#" \
+  "$pkgdir/usr/bin/widevine-fetch" > "$scratch/widevine-fetch"
+grep -qxF 'if false; then' "$scratch/widevine-fetch" || fail "the test could bypass the booted-system guard"
+status=0; out=$(bash "$scratch/widevine-fetch" </dev/null 2>&1) || status=$?
+(( status == 1 )) && [[ $out == *"must be accepted in a terminal"* ]] ||
+  fail "widevine-fetch refuses without a terminal (exit $status): $out"
+[[ ! -e /var/cache/widevine/lacros-$_lacros_version.squashfs.part ]] || fail "a refused run downloads nothing"
 
 echo "ok - widevine"
