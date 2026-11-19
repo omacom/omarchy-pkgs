@@ -1,0 +1,337 @@
+diff --git a/src/config/lua/bindings/LuaBindingsDispatchers.cpp b/src/config/lua/bindings/LuaBindingsDispatchers.cpp
+index c277716..748495a 100644
+--- i/src/config/lua/bindings/LuaBindingsDispatchers.cpp
++++ b/src/config/lua/bindings/LuaBindingsDispatchers.cpp
+@@ -2,6 +2,8 @@
+
+ #include <lua.h>
+ #include <hyprutils/utils/ScopeGuard.hpp>
++#include <map>
++#include <tuple>
+
+ #include "Check.hpp"
+
+@@ -412,18 +414,42 @@ static int dsp_sendKeyState(lua_State* L) {
+     const std::string key      = lua_tostring(L, lua_upvalueindex(2));
+     const uint32_t    keyState = (uint32_t)lua_tonumber(L, lua_upvalueindex(3));
+
+-    auto              keycodeResult = Keybinds::resolver()->resolveKeycode(key);
+-    if (!keycodeResult)
+-        return Internal::dispatcherError(L, std::format("send_key_state: {}", keycodeResult.error()), ERR, C_INVARG);
+-
+-    PHLWINDOW window = nullptr;
+-    if (!lua_isnil(L, lua_upvalueindex(4))) {
+-        window = Desktop::viewState()->query().selector(lua_tostring(L, lua_upvalueindex(4))).runWindow();
++    const char*       windowSelector = lua_tostring(L, lua_upvalueindex(4));
++    PHLWINDOW         window         = nullptr;
++    if (windowSelector) {
++        window = Desktop::viewState()->query().selector(windowSelector).runWindow();
+         if (!window)
+             return Internal::dispatcherError(L, "send_key_state: window not found", WARN, C_NOTFOUND);
+     }
+
+-    return Internal::checkResult(L, CA::sendKeyState(modMask, *keycodeResult, keyState, window));
++    // A keymap or Lua reload can happen between separate down and up calls.
++    // Track the code actually sent until the matching release.
++    using Chord = std::tuple<Input::eKeyboardModifiers, std::string, std::string>;
++    static std::map<Chord, uint32_t> pressed;
++
++    const Chord                      chord{modMask.value(), key, windowSelector ? windowSelector : ""};
++    const auto                       found = pressed.find(chord);
++    const auto code = keyState != 1 && found != pressed.end() ? std::expected<uint32_t, std::string>{found->second} : Keybinds::resolver()->resolveKeycode(key);
++    if (!code)
++        return Internal::dispatcherError(L, std::format("send_key_state: {}", code.error()), ERR, C_INVARG);
++
++    // A reload can also cancel a delayed release. End the old press before
++    // a fresh down on a different keycode replaces it.
++    if (keyState == 1 && found != pressed.end() && found->second != *code) {
++        const auto release = CA::sendKeyState(modMask, found->second, 0, window);
++        if (!release)
++            return Internal::checkResult(L, release);
++        pressed.erase(found);
++    }
++
++    const auto result = CA::sendKeyState(modMask, *code, keyState, window);
++    if (result) {
++        if (keyState == 0)
++            pressed.erase(chord);
++        else
++            pressed.insert_or_assign(chord, *code);
++    }
++    return Internal::checkResult(L, result);
+ }
+
+ static int hlSendShortcut(lua_State* L) {
+diff --git a/src/config/shared/actions/ConfigActions.cpp b/src/config/shared/actions/ConfigActions.cpp
+index 69adc22..a568cc9 100644
+--- i/src/config/shared/actions/ConfigActions.cpp
++++ b/src/config/shared/actions/ConfigActions.cpp
+@@ -1608,7 +1608,7 @@ ActionResult Actions::pass(Input::ModifierMask modMask, uint32_t key, std::optio
+             window = nullptr;
+     }
+
+-    g_pSeatManager->sendKeyboardMods(g_pSeatManager->m_keyboard ? g_pInputManager->hyprlandModsToXkb(g_pSeatManager->m_keyboard.lock(), modMask) : 0, 0, 0, 0);
++    g_pSeatManager->sendKeyboardMods(g_pSeatManager->m_keyboard ? g_pInputManager->hyprlandModsToXkb(g_pSeatManager->m_keyboard.lock(), modMask) : 0, 0, 0, 0, true);
+
+     if (S.m_passPressed == 1) {
+         if (!isMouse)
+@@ -1630,7 +1630,7 @@ ActionResult Actions::pass(Input::ModifierMask modMask, uint32_t key, std::optio
+         }
+     }
+
+-    g_pSeatManager->sendKeyboardMods(0, 0, 0, 0);
++    g_pSeatManager->restoreKeyboardMods();
+
+     if (!window)
+         return {};
+diff --git a/src/devices/IKeyboard.cpp b/src/devices/IKeyboard.cpp
+index ab78bce..e12bad4 100644
+--- i/src/devices/IKeyboard.cpp
++++ b/src/devices/IKeyboard.cpp
+@@ -6,6 +6,7 @@
+ #include "../helpers/MiscFunctions.hpp"
+ #include "../errorOverlay/Overlay.hpp"
+ #include "../keybinds/Key.hpp"
++#include "../keybinds/Resolver.hpp"
+ #include <sys/mman.h>
+ #include <aquamarine/input/Input.hpp>
+ #include <hyprutils/string/VarList.hpp>
+@@ -198,6 +199,8 @@ void IKeyboard::updateKeymapFD() {
+ }
+
+ void IKeyboard::updateXKBTranslationState(xkb_keymap* const keymap) {
++    // Both configured devices and virtual keyboards rebuild their XKB state here.
++    Keybinds::resolver()->clearKeycodeCache(this);
+
+     if (m_xkbStaticState)
+         xkb_state_unref(m_xkbStaticState);
+diff --git a/src/keybinds/Resolver.cpp b/src/keybinds/Resolver.cpp
+index 3263acd..b2b6957 100644
+--- i/src/keybinds/Resolver.cpp
++++ b/src/keybinds/Resolver.cpp
+@@ -61,9 +61,9 @@ std::expected<uint32_t, std::string> CResolver::resolveKeycode(const std::string
+     if (!KB)
+         return std::unexpected("no keyboard");
+
+-    const auto KEYPAIRSTRING = std::format("{}{}", rc<uintptr_t>(KB.get()), key);
++    auto& cache = m_keyToCodeCache[KB.get()];
+
+-    if (const auto IT = m_keyToCodeCache.find(KEYPAIRSTRING); IT != m_keyToCodeCache.end())
++    if (const auto IT = cache.find(key); IT != cache.end())
+         return IT->second;
+
+     xkb_keymap*   km          = KB->m_xkbKeymap;
+@@ -74,20 +74,32 @@ std::expected<uint32_t, std::string> CResolver::resolveKeycode(const std::string
+
+     for (xkb_keycode_t kc = keycode_min; kc <= keycode_max; ++kc) {
+         xkb_keysym_t sym = xkb_state_key_get_one_sym(ks, kc);
+-        if (sym == KEYSYM) {
+-            keycode                         = kc;
+-            m_keyToCodeCache[KEYPAIRSTRING] = keycode;
++        if (sym == KEYSYM)
++            keycode = kc;
++    }
++
++    // Synthetic shortcuts are delivered in group 0. Try its base level when
++    // the active layout lacks the requested symbol.
++    if (!keycode) {
++        for (xkb_keycode_t kc = keycode_min; kc <= keycode_max; ++kc) {
++            const xkb_keysym_t* syms = nullptr;
++            if (xkb_keymap_key_get_syms_by_level(km, kc, 0, 0, &syms) == 1 && syms[0] == KEYSYM)
++                keycode = kc;
+         }
+     }
+
+     if (!keycode)
+         return std::unexpected("key not found");
+
++    // Follow the same per-keyboard cache policy for both matches so a
++    // layout-group change between down and up cannot change the code.
++    cache[key] = keycode;
++
+     return keycode;
+ }
+
+-void CResolver::clearKeycodeCache() {
+-    m_keyToCodeCache.clear();
++void CResolver::clearKeycodeCache(const IKeyboard* keyboard) {
++    m_keyToCodeCache.erase(keyboard);
+ }
+
+ UP<CResolver>& Keybinds::resolver() {
+diff --git a/src/keybinds/Resolver.hpp b/src/keybinds/Resolver.hpp
+index 08056a6..7deb76a 100644
+--- i/src/keybinds/Resolver.hpp
++++ b/src/keybinds/Resolver.hpp
+@@ -7,6 +7,8 @@
+ #include <string_view>
+ #include <unordered_map>
+
++class IKeyboard;
++
+ namespace Keybinds {
+
+     std::optional<Input::eKeyboardModifiers> modifierFromString(std::string_view modifier);
+@@ -15,10 +17,10 @@ namespace Keybinds {
+     class CResolver {
+       public:
+         std::expected<uint32_t, std::string> resolveKeycode(const std::string& key);
+-        void                                 clearKeycodeCache();
++        void                                 clearKeycodeCache(const IKeyboard* keyboard);
+
+       private:
+-        std::unordered_map<std::string, xkb_keycode_t> m_keyToCodeCache;
++        std::unordered_map<const IKeyboard*, std::unordered_map<std::string, xkb_keycode_t>> m_keyToCodeCache;
+     };
+
+     UP<CResolver>& resolver();
+diff --git a/src/managers/SeatManager.cpp b/src/managers/SeatManager.cpp
+index 8e91638..88a82cd 100644
+--- i/src/managers/SeatManager.cpp
++++ b/src/managers/SeatManager.cpp
+@@ -327,7 +327,7 @@ void CSeatManager::sendKeyboardKey(uint32_t timeMs, uint32_t key, wl_keyboard_ke
+     }
+ }
+
+-void CSeatManager::sendKeyboardMods(uint32_t depressed, uint32_t latched, uint32_t locked, uint32_t group) {
++void CSeatManager::sendKeyboardMods(uint32_t depressed, uint32_t latched, uint32_t locked, uint32_t group, bool temporary) {
+     if (!m_state.keyboardFocusResource)
+         return;
+
+@@ -339,7 +339,22 @@ void CSeatManager::sendKeyboardMods(uint32_t depressed, uint32_t latched, uint32
+             if (!k)
+                 continue;
+
+-            k->sendMods(depressed, latched, locked, group);
++            k->sendMods(depressed, latched, locked, group, temporary);
++        }
++    }
++}
++
++void CSeatManager::restoreKeyboardMods() {
++    if (!m_state.keyboardFocusResource)
++        return;
++
++    for (const auto& seat : m_seatResources) {
++        if (seat->resource->client() != m_state.keyboardFocusResource->client())
++            continue;
++
++        for (const auto& keyboard : seat->resource->m_keyboards) {
++            if (keyboard)
++                keyboard->restoreMods();
+         }
+     }
+ }
+diff --git a/src/managers/SeatManager.hpp b/src/managers/SeatManager.hpp
+index b7a9e7e..ec9be81 100644
+--- i/src/managers/SeatManager.hpp
++++ b/src/managers/SeatManager.hpp
+@@ -82,7 +82,8 @@ class CSeatManager {
+
+     void                       setKeyboardFocus(SP<CWLSurfaceResource> surf);
+     void                       sendKeyboardKey(uint32_t timeMs, uint32_t key, wl_keyboard_key_state state);
+-    void                       sendKeyboardMods(uint32_t depressed, uint32_t latched, uint32_t locked, uint32_t group);
++    void                       sendKeyboardMods(uint32_t depressed, uint32_t latched, uint32_t locked, uint32_t group, bool temporary = false);
++    void                       restoreKeyboardMods();
+
+     CKeyboardEventHandlerStack m_keyboardEventHandlers;
+
+diff --git a/src/managers/input/InputManager.cpp b/src/managers/input/InputManager.cpp
+index b39f439..13db758 100644
+--- i/src/managers/input/InputManager.cpp
++++ b/src/managers/input/InputManager.cpp
+@@ -1183,10 +1183,8 @@ void CInputManager::setupKeyboard(SP<IKeyboard> keeb) {
+         auto       PKEEB  = keeb->m_self.lock();
+         const auto LAYOUT = PKEEB->getActiveLayout();
+
+-        if (PKEEB == g_pSeatManager->m_keyboard) {
++        if (PKEEB == g_pSeatManager->m_keyboard)
+             g_pSeatManager->updateActiveKeyboardData();
+-            Keybinds::resolver()->clearKeycodeCache();
+-        }
+
+         IPC::Socket2::sock()->postEvent({"activelayout", std::format("{},{}", PKEEB->m_hlName, LAYOUT)});
+         Event::bus()->m_events.input.keyboard.layout.emit(PKEEB, LAYOUT);
+@@ -1542,6 +1540,7 @@ bool CInputManager::anyHidHasCap(eHIDCapabilityType type) {
+ void CInputManager::destroyKeyboard(SP<IKeyboard> pKeyboard) {
+     LOG(Log::DEBUG, "Keyboard at {:x} removed", rc<uintptr_t>(pKeyboard.get()));
+
++    Keybinds::resolver()->clearKeycodeCache(pKeyboard.get());
+     Keybinds::mgr()->onDeviceRemoved(pKeyboard);
+     g_pSeatManager->m_keyboardEventHandlers.onKeyboardRemoved(pKeyboard);
+     std::erase_if(m_keyboards, [pKeyboard](const auto& other) { return other == pKeyboard; });
+diff --git a/src/protocols/core/Seat.cpp b/src/protocols/core/Seat.cpp
+index 9ad5dca..7145a1f 100644
+--- i/src/protocols/core/Seat.cpp
++++ b/src/protocols/core/Seat.cpp
+@@ -380,6 +380,7 @@ void CWLKeyboardResource::sendKeymap(SP<IKeyboard> keyboard) {
+         return;
+
+     m_lastKeymap = keymap;
++    m_lastMods   = {};
+
+     const wl_keyboard_keymap_format format = keyboard ? WL_KEYBOARD_KEYMAP_FORMAT_XKB_V1 : WL_KEYBOARD_KEYMAP_FORMAT_NO_KEYMAP;
+
+@@ -418,6 +419,7 @@ void CWLKeyboardResource::sendLeave() {
+     m_resource->sendLeave(g_pSeatManager->nextSerial(m_owner.lock()), m_currentSurface->getResource().get());
+     m_currentSurface.reset();
+     m_listeners.destroySurface.reset();
++    m_lastMods = {};
+ }
+
+ void CWLKeyboardResource::sendKey(uint32_t timeMs, uint32_t key, wl_keyboard_key_state state) {
+@@ -430,16 +432,25 @@ void CWLKeyboardResource::sendKey(uint32_t timeMs, uint32_t key, wl_keyboard_key
+     m_resource->sendKey(g_pSeatManager->nextSerial(m_owner.lock()), timeMs, key, state);
+ }
+
+-void CWLKeyboardResource::sendMods(uint32_t depressed, uint32_t latched, uint32_t locked, uint32_t group) {
++void CWLKeyboardResource::sendMods(uint32_t depressed, uint32_t latched, uint32_t locked, uint32_t group, bool temporary) {
+     if (!m_owner || !m_currentSurface)
+         return;
+
+     if (!(PROTO::seat->m_currentCaps & eHIDCapabilityType::HID_INPUT_CAPABILITY_KEYBOARD))
+         return;
+
++    // A synthetic chord borrows the resource's modifiers without replacing
++    // the state that was actually sent to this client.
++    if (!temporary)
++        m_lastMods = {depressed, latched, locked, group};
++
+     m_resource->sendModifiers(g_pSeatManager->nextSerial(m_owner.lock()), depressed, latched, locked, group);
+ }
+
++void CWLKeyboardResource::restoreMods() {
++    sendMods(m_lastMods.depressed, m_lastMods.latched, m_lastMods.locked, m_lastMods.group);
++}
++
+ void CWLKeyboardResource::repeatInfo(uint32_t rate, uint32_t delayMs) {
+     if (!m_owner || m_resource->version() < 4 || (rate == m_lastRate && delayMs == m_lastDelayMs))
+         return;
+diff --git a/src/protocols/core/Seat.hpp b/src/protocols/core/Seat.hpp
+index 6b3dac4..da2bde7 100644
+--- i/src/protocols/core/Seat.hpp
++++ b/src/protocols/core/Seat.hpp
+@@ -121,7 +121,8 @@ class CWLKeyboardResource {
+     void                sendEnter(SP<CWLSurfaceResource> surface, wl_array* keys);
+     void                sendLeave();
+     void                sendKey(uint32_t timeMs, uint32_t key, wl_keyboard_key_state state);
+-    void                sendMods(uint32_t depressed, uint32_t latched, uint32_t locked, uint32_t group);
++    void                sendMods(uint32_t depressed, uint32_t latched, uint32_t locked, uint32_t group, bool temporary = false);
++    void                restoreMods();
+     void                repeatInfo(uint32_t rate, uint32_t delayMs);
+
+     WP<CWLSeatResource> m_owner;
+@@ -134,6 +135,13 @@ class CWLKeyboardResource {
+         CHyprSignalListener destroySurface;
+     } m_listeners;
+
++    struct {
++        uint32_t depressed = 0;
++        uint32_t latched   = 0;
++        uint32_t locked    = 0;
++        uint32_t group     = 0;
++    } m_lastMods;
++
+     std::string m_lastKeymap  = "<none>";
+     uint32_t    m_lastRate    = 0;
+     uint32_t    m_lastDelayMs = 0;
