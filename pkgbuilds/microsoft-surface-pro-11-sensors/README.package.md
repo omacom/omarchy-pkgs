@@ -1,6 +1,6 @@
 # microsoft-surface-pro-11-sensors
 
-Ambient light for the Microsoft Surface Pro 11 with Snapdragon X Elite. The AMS TCS3430 colour sensor is run by the Qualcomm sensor core on the ADSP, which needs its configuration served from the host before it reports anything:
+Ambient light for the Microsoft Surface Pro 11, with Snapdragon X Elite (OLED) or X Plus (LCD). The AMS TCS3430 colour sensor is run by the Qualcomm sensor core on the ADSP, which needs its configuration served from the host before it reports anything:
 
 ```
 TCS3430 -> sensor core on the ADSP <- hexagonrpcd (serves config and registry)
@@ -11,7 +11,7 @@ TCS3430 -> sensor core on the ADSP <- hexagonrpcd (serves config and registry)
 
 - `hexagonrpcd` and `libhexagonrpc` from `linux-msm/hexagonrpc`, pinned, with a patch that lets the daemon write the registry the DSP generates.
 - `libssc` from `DylanVanAssche/libssc`, pinned, with a patch that reads illuminance from Microsoft's `color` sensor, because the standard `ambient_light` sensor reports zero on this model. It is installed privately under `/usr/lib/surface-pro-11-sensors/` and used only by iio-sensor-proxy, through a drop-in.
-- `surface-pro-11-sensors.service`, which runs hexagonrpcd sandboxed against `/var/lib/surface-pro-11-sensors/root`. It starts when the ADSP's FastRPC device appears, so a missing or failed DSP never holds up boot, and it runs only on the `microsoft,denali-oled` device tree.
+- `surface-pro-11-sensors.service`, which runs hexagonrpcd sandboxed against `/var/lib/surface-pro-11-sensors/root`. It starts when the ADSP's FastRPC device appears, so a missing or failed DSP never holds up boot, and it runs only on the Surface Pro 11's device trees (`microsoft,denali`, which the OLED and LCD trees both carry).
 - A sleep hook that stops iio-sensor-proxy across suspend: an open light stream otherwise wakes the SoC shortly into every deep suspend.
 - `surface-pro-11-sensors-extract`.
 

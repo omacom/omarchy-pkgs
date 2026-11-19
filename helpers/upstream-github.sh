@@ -77,6 +77,28 @@ github_fetch_releases() {
   fi
 }
 
+# Hooks (.omarchy/upstream.sh) fetch from the API with their own plain curl,
+# so without this they run at the anonymous 60 an hour and fail with a 403
+# whenever other jobs on the runner's IP spent it. A curlrc in CURL_HOME
+# points every curl in this run at a netrc that holds the token for
+# api.github.com only. curl matches netrc entries by host name, so no other
+# host gets it, redirects included, and an explicit Authorization header,
+# such as github_fetch_releases' Bearer, still replaces it.
+github_api_netrc() {
+  local dir="$1"
+
+  if [[ -z ${UPSTREAM_GITHUB_TOKEN:-} ]]; then
+    return 0
+  fi
+
+  (
+    umask 077
+    printf 'machine api.github.com\nlogin x-access-token\npassword %s\n' "$UPSTREAM_GITHUB_TOKEN" > "$dir/netrc"
+    printf 'netrc-optional\nnetrc-file = "%s"\n' "$dir/netrc" > "$dir/.curlrc"
+  )
+  export CURL_HOME="$dir"
+}
+
 github_fetch_checksums() {
   local repo="$1" tag="$2" asset="$3"
   github_curl "https://github.com/$repo/releases/download/$tag/$asset"

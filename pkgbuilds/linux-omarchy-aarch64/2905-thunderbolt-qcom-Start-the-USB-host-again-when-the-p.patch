@@ -1,0 +1,173 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jim Martin <jimmartin@gmail.com>
+Date: Sat, 14 Nov 2026 20:55:55 -0600
+Subject: [PATCH] thunderbolt: qcom: Start the USB host again when the port
+ returns to native USB
+
+The SuperSpeed port of the USB controller that a host router tunnels has
+one PIPE interface. A TCSR bit routes it to the router or to the native
+USB3 side of the PHY. When a partner leaves USB4 but stays attached, for
+example an NVMe enclosure that was given no PCIe tunnel and falls back to
+USB 3, the router is stopped: the PHY is initialised again for the native
+mode and the route is switched back, under a running xHCI.
+
+The xHCI's SuperSpeed port can come out of that unable to detect a
+receiver. Its PORTSC stays in RxDetect while the partner keeps waiting on
+SuperSpeed, the PHY's registers read as they do on an idle port, and
+neither switching the port's power off and on nor a runtime suspend and
+resume of the controller brings the port back. A reset of the host
+controller does, within about 100 ms. On a Surface Laptop 8 with the
+controller kept awake, as it is before udev allows it to runtime suspend,
+the enclosure stayed missing after six of seven hand-backs, three of them
+at boot.
+
+The platform's Windows drivers do not switch the interface under a
+running host: they start the host afresh on every plug, once the PHY is
+set up, and start USB4 only after that.
+
+Take the host away before the hand-back and let it start again
+afterwards, through the controller's USB role switch, which is how the
+host comes and goes with a plug. The router does not decide the role.
+It holds the switch in the device role, asked for by name since a
+controller may take "none" to mean host, and releases it after the
+hand-back. The switch then takes the role the Type-C driver asked for
+last: the host again for a partner that fell back to plain USB, and no
+host for a partner that was unplugged or took the host role itself
+meanwhile. While the switch is held the Type-C driver cannot start a
+host that would run across the hand-back.
+
+The switch is held whatever role the controller is in at the time. The
+controller changes its role from a work item, so one that reports no
+host may be about to start the host it was asked for a moment ago. The
+hold returns once the controller has left the host role, so there is no
+wait with a time limit after which the hand-back would go ahead under a
+running host. A controller that has no host, as after an unplug, is not
+asked to do anything.
+
+A router stopped for system sleep is left alone: the partner has not
+left USB4 then and the router is started again at resume.
+
+Assisted-by: Claude Fable 5.2
+Signed-off-by: Jim Martin <jimmartin@gmail.com>
+---
+ drivers/thunderbolt/Kconfig          |  1 +
+ drivers/thunderbolt/qcom-usb4-host.c | 78 ++++++++++++++++++++++++++++
+ 2 files changed, 79 insertions(+)
+
+diff --git a/drivers/thunderbolt/Kconfig b/drivers/thunderbolt/Kconfig
+index 13e1f7d57..62c43c62d 100644
+--- a/drivers/thunderbolt/Kconfig
++++ b/drivers/thunderbolt/Kconfig
+@@ -94,6 +94,7 @@ config USB4_QCOM
+ 	depends on CLK_GLYMUR_GCC
+ 	depends on DRM_MSM
+ 	depends on TYPEC
++	depends on USB_ROLE_SWITCH || !USB_ROLE_SWITCH
+ 	depends on RESET_CONTROLLER
+ 	select DRM_DISPLAY_HELPER
+ 	help
+diff --git a/drivers/thunderbolt/qcom-usb4-host.c b/drivers/thunderbolt/qcom-usb4-host.c
+index cf331221b..a9ecf8438 100644
+--- a/drivers/thunderbolt/qcom-usb4-host.c
++++ b/drivers/thunderbolt/qcom-usb4-host.c
+@@ -39,6 +39,7 @@
+ #include <linux/soc/qcom/glymur-usb4.h>
+ #include <linux/soc/qcom/smem.h>
+ #include <linux/soc/qcom/socinfo.h>
++#include <linux/usb/role.h>
+ #include <linux/usb/typec.h>
+ #include <linux/usb/typec_mux.h>
+ #include <linux/usb/typec_tbt.h>
+@@ -1144,12 +1145,89 @@ static void qcom_usb4_host_stop_all(struct qcom_usb4_host *host)
+ 	qcom_usb4_host_power_off(host);
+ }
+ 
++/*
++ * The SuperSpeed port of the controller named by "usb4-host-interface" has
++ * one PIPE interface, which a TCSR bit routes either to the router, for the
++ * USB3 tunnel, or to the PHY's native USB3 side. Stopping the router
++ * initialises the PHY again for the native mode and switches the route back.
++ * An xHCI that runs across that can be left with a SuperSpeed port that
++ * detects no receiver until the host controller is reset, so a partner that
++ * fell back from USB4 to plain USB never appears. The firmware's own drivers
++ * never switch the interface under a running host either: they start the host
++ * afresh on every plug, once the PHY is set up, and USB4 only after that.
++ *
++ * So take the host away before the hand-back and let it start again
++ * afterwards, through the controller's role switch, which is how the host
++ * comes and goes with a plug. The router does not decide the role: the switch
++ * is held in the device role for the hand-back, and takes the role the Type-C
++ * driver asked for last when it is released. That is the host again for a
++ * partner that fell back to plain USB, and no host for one that was unplugged
++ * or took the host role itself meanwhile.
++ *
++ * The switch is held whatever its role is at the time: the controller changes
++ * its role from a work item, so a host that was asked for a moment ago may not
++ * be there yet. The hold returns once the controller has done what it was
++ * asked, and no host is started until the release.
++ */
++static struct usb_role_switch *qcom_usb4_host_usb_host_leave(struct qcom_usb4_host *host)
++{
++	struct usb_role_switch *sw;
++	int ret;
++
++	if (!host->tunnel_ctrl)
++		return NULL;
++	sw = usb_role_switch_find_by_fwnode(dev_fwnode(host->tunnel_ctrl));
++	if (!sw) {
++		dev_warn_once(host->dev, "%s has no USB role switch, its host stays across a hand-back\n",
++			      dev_name(host->tunnel_ctrl));
++		return NULL;
++	}
++	/* Not "none": a controller may be told to be a host by default. */
++	ret = usb_role_switch_hold(sw, USB_ROLE_DEVICE);
++	if (ret) {
++		dev_warn(host->dev, "%s: USB role not held for the hand-back: %d\n",
++			 dev_name(host->tunnel_ctrl), ret);
++		usb_role_switch_put(sw);
++		return NULL;
++	}
++	/* Held, but the controller did not do as it was asked */
++	if (usb_role_switch_get_role(sw) == USB_ROLE_HOST)
++		dev_warn(host->dev, "%s kept its USB host into the hand-back\n",
++			 dev_name(host->tunnel_ctrl));
++	return sw;
++}
++
++static void qcom_usb4_host_usb_host_return(struct qcom_usb4_host *host,
++					   struct usb_role_switch *sw)
++{
++	int ret;
++
++	if (!sw)
++		return;
++	ret = usb_role_switch_unhold(sw);
++	if (ret)
++		dev_warn(host->dev, "%s: USB role not set after the hand-back: %d\n",
++			 dev_name(host->tunnel_ctrl), ret);
++	usb_role_switch_put(sw);
++}
++
+ static void qcom_usb4_host_release(struct qcom_usb4_host *host)
+ {
++	struct usb_role_switch *sw = NULL;
++
+ 	dev_dbg(host->dev, "%s: stopping USB4 host router %u\n",
+ 		host->suspending ? "system sleep" : "no USB4 partner", host->port);
++	/*
++	 * Not for system sleep: the partner has not left USB4 then, and the
++	 * router is started again at resume. The hold must not be taken then
++	 * either: it waits for the controller's role work, which is on a
++	 * freezable workqueue.
++	 */
++	if (!host->suspending)
++		sw = qcom_usb4_host_usb_host_leave(host);
+ 	qcom_usb4_host_stop_all(host);
+ 	host->released = true;
++	qcom_usb4_host_usb_host_return(host, sw);
+ }
+ 
+ static int qcom_usb4_host_acquire(struct qcom_usb4_host *host)
+-- 
+2.56.1
+
