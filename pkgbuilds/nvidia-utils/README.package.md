@@ -1,6 +1,6 @@
 # nvidia-utils
 
-Arch Linux's `nvidia-utils` recipe at [f9ae10b379f8b1d0832ec92bca1c12072aa123e9](https://gitlab.archlinux.org/archlinux/packaging/packages/nvidia-utils/-/commit/f9ae10b379f8b1d0832ec92bca1c12072aa123e9), for aarch64 and x86_64, building `nvidia-utils` and `opencl-nvidia`. Upstream contributor credits, packaging license and support files are retained. Its `nvidia-open-dkms` output is the `nvidia-open-dkms` recipe here, which carries the N1x patches on ARM.
+Arch Linux's `nvidia-utils` recipe at [96abcdf4e6bbcdd6da35dde3ee999b1fce1c2a06](https://gitlab.archlinux.org/archlinux/packaging/packages/nvidia-utils/-/commit/96abcdf4e6bbcdd6da35dde3ee999b1fce1c2a06), for aarch64 and x86_64, building `nvidia-utils` and `opencl-nvidia`. Upstream contributor credits, packaging license and support files are retained. Its `nvidia-open-dkms` output is the `nvidia-open-dkms` recipe here, which carries the N1x patches on ARM.
 
 ## Why Omarchy carries the driver
 
@@ -10,4 +10,4 @@ There is deliberately no automatic version watcher. A driver update is one chang
 
 ## ARM correction
 
-NVIDIA 615.71.09's ARM EGL/GLX libraries require `libnvidia-rmapi-tegra.so.615.71.09`. NVIDIA includes it in its archive, but the Arch recipe omits it. Adding that library and its generated symlink fixes Hyprland's EGL initialization failure on DGX Spark. No rendering overrides are installed. The correction passed package installation, normal desktop login and reboot on a Spark running kernel 7.2.6 with NVIDIA 615.71.09. The upstream Arch submission is pending account approval; drop the correction once Arch ships the library.
+NVIDIA 615.71.09's ARM EGL/GLX libraries require `libnvidia-rmapi-tegra.so.615.71.09`. NVIDIA includes it in its archive, but the Arch recipe omits it. Adding that library and its generated symlink fixes Hyprland's EGL initialization failure on DGX Spark. No rendering overrides are installed. The correction passed package installation, normal desktop login and reboot on a Spark running kernel 7.2.6 with NVIDIA 615.71.09. 620.70.06's `libnvidia-eglcore`, `libnvidia-glcore` and `libnvidia-glsi` still link to it and Arch's 620.70.06 recipe still omits it, so the correction stays. The upstream Arch submission is pending account approval; drop the correction once Arch ships the library.
