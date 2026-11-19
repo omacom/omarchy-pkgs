@@ -1,0 +1,106 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jim Martin <jimmartin@gmail.com>
+Date: Sat, 14 Nov 2026 18:07:37 -0600
+Subject: [PATCH] usb: dwc3: qcom: Pass a wakeup from the PHYs on to the root
+ hubs
+
+With runtime PM enabled for the controller and for xHCI, a SuperSpeed
+device that attaches while the controller is runtime-suspended is not
+found. The wakeup interrupt of the SuperSpeed PHY is raised when the PHY
+detects the device's receiver, before the link is trained. The handler
+resumes the xHCI device; xhci_resume() resumes the root hubs only for a
+port event that is already pending, finds none, and with nothing holding
+it the xHCI device suspends again straight away. The link never comes
+up and the device waits until something else resumes the root hub.
+
+Seen on a Surface Laptop 8 with an NVMe enclosure that drops from USB4
+to USB 3 without being plugged in again, so that no Type-C event starts
+the host anew: with the controller suspended the drive did not appear
+for 54 s, and appeared at SuperSpeed Plus within a second of the
+SuperSpeed root hub being resumed through sysfs.
+
+A wakeup from the PHYs is a wakeup request from a root hub port, so
+pass it on with usb_hcd_resume_root_hub(), as a host controller driver
+does for its own port events. The hub driver holds a resumed SuperSpeed
+root hub awake for 120 ms, and xHCI holds a bus suspend off, for a
+bounded time, while one of its ports is polling.
+
+The handler does both with the mutex held that the role changes under: a
+role change that waited for the controller to resume would otherwise take
+the host away between the two.
+
+Assisted-by: Claude Fable 5.2
+Signed-off-by: Jim Martin <jimmartin@gmail.com>
+---
+ drivers/usb/dwc3/dwc3-qcom.c | 46 +++++++++++++++++++++++++++++++++---
+ 1 file changed, 43 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/usb/dwc3/dwc3-qcom.c b/drivers/usb/dwc3/dwc3-qcom.c
+index 1d433c543..d3bb5b472 100644
+--- a/drivers/usb/dwc3/dwc3-qcom.c
++++ b/drivers/usb/dwc3/dwc3-qcom.c
+@@ -428,6 +428,37 @@ static int dwc3_qcom_resume(struct dwc3_qcom *qcom, bool wakeup)
+ 	return 0;
+ }
+ 
++/*
++ * The PHYs signal a wakeup when they see a device on the lines, which is
++ * before the port has anything to report: a SuperSpeed link still has to be
++ * trained. xHCI resumes its root hubs only for a port event that is already
++ * pending, finds none and suspends again, and the device is never seen.
++ * Pass the wakeup request on to the root hubs, as a host controller does for
++ * a wakeup from one of its ports. The hub driver keeps a resumed SuperSpeed
++ * root hub awake for 120 ms, and xHCI holds a bus suspend off for a port that
++ * is polling, for up to ten polling periods. A port that is still detecting
++ * the receiver after that gets the next wakeup, at the next suspend.
++ *
++ * The caller holds the mutex the role changes under.
++ */
++static void dwc3_qcom_resume_root_hubs(struct dwc3_qcom *qcom)
++{
++	struct usb_hcd __maybe_unused *hcd;
++
++	/*
++	 * FIXME: Fix this layering violation.
++	 */
++	hcd = platform_get_drvdata(qcom->dwc.xhci);
++	if (!hcd)
++		return;
++
++#ifdef CONFIG_USB
++	if (hcd->shared_hcd)
++		usb_hcd_resume_root_hub(hcd->shared_hcd);
++	usb_hcd_resume_root_hub(hcd);
++#endif
++}
++
+ static irqreturn_t qcom_dwc3_resume_irq(int irq, void *data)
+ {
+ 	struct dwc3_qcom *qcom = data;
+@@ -438,11 +469,20 @@ static irqreturn_t qcom_dwc3_resume_irq(int irq, void *data)
+ 		return IRQ_HANDLED;
+ 
+ 	/*
+-	 * This is safe as role switching is done from a freezable workqueue
+-	 * and the wakeup interrupts are disabled as part of resume.
++	 * A role change that waits for the controller to resume takes the
++	 * host away as soon as the resume below lets it run. Hold the mutex
++	 * the role changes under, so that the host stays until its root hubs
++	 * have been told. The wakeup interrupts are disabled without waiting
++	 * for this handler when the controller resumes, so a role change,
++	 * which resumes the controller with the mutex held, does not wait
++	 * for the handler in turn.
+ 	 */
+-	if (dwc3_qcom_is_host(qcom))
++	mutex_lock(&dwc->mutex);
++	if (dwc3_qcom_is_host(qcom)) {
+ 		pm_runtime_resume(&dwc->xhci->dev);
++		dwc3_qcom_resume_root_hubs(qcom);
++	}
++	mutex_unlock(&dwc->mutex);
+ 
+ 	return IRQ_HANDLED;
+ }
+-- 
+2.56.1
+

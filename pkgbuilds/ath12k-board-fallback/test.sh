@@ -166,3 +166,17 @@ echo "ok - covers ath11k cards with ath11k's board-2.bin"
 ATH12K_BOARD_CARDS="$package_dir/cards" ATH12K_BOARD_SYSFS="$scratch/none" "$tool" --check >/dev/null ||
   fail "reads the card list it ships"
 echo "ok - reads the card list it ships"
+
+# With the card list it ships, ASUS's WCN6855 gets the generic NFA765 record and Lenovo's the
+# nfa765a family's.
+e0ce="vendor=17cb,device=1103,subsystem-vendor=105b,subsystem-device=e0ce,qmi-chip-id=18,qmi-board-id=255"
+for want in "105b e130 NFA765-DATA" "17aa e12a NFA765A-DATA"; do
+  read -r vendor device data <<<"$want"
+  rm -rf "$scratch/sys" "$scratch/fw/updates" "$ATH12K_BOARD_STATE"
+  card 17cb 1103 "$vendor" "$device"
+  MAGIC=QCA-ATH11K-BOARD board2 "$wcn/board-2.bin" "$e105=NFA765A-DATA" "$e0ce=NFA765-DATA"
+  ATH12K_BOARD_CARDS="$package_dir/cards" "$tool" >/dev/null
+  [[ $(<"$scratch/fw/updates/ath11k/WCN6855/hw2.1/board.bin") == "$data" ]] ||
+    fail "gives the $vendor:$device card the record the card list names"
+done
+echo "ok - the card list it ships gives ASUS's and Lenovo's WCN6855 board data"

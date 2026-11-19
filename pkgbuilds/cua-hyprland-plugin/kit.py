@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Derive the profile kit for the installed Hyprland from Cua's published kit, the way its profile_bundle.py builds one."""
+"""Derive the profile kit for the installed Hyprland and ABI packages from Cua's published kit, the way its profile_bundle.py builds one."""
 
 import argparse
 import hashlib
@@ -56,13 +56,17 @@ def load_verifier(path, source):
 
 
 def measure(verify):
-    # Omarchy builds its own Hyprland, so the build it compiles against is read here, never taken from the kit.
-    return {"package_version": verify.run("pacman", "-Q", "hyprland").split()[1],
-            "sha256": verify.digest(Path("/usr/bin/Hyprland")),
-            "headers_sha256": verify.header_inventory_sha256()}
+    # Omarchy builds its own Hyprland and Arch moves the ABI packages when it likes, so what the module
+    # compiles against is read here, never taken from the kit.
+    def version(name):
+        return verify.run("pacman", "-Q", name).split()[1]
+    return {"hyprland": {"package_version": version("hyprland"),
+                         "sha256": verify.digest(Path("/usr/bin/Hyprland")),
+                         "headers_sha256": verify.header_inventory_sha256()},
+            "packages": {name: version(name) for name in ABI_RUNTIME}}
 
 
-def derive(payload, profile_data, verify, hyprland, release):
+def derive(payload, profile_data, verify, measured, release):
     upstream = verify.read_json(payload["PROFILE.json"])
     provenance = verify.read_json(payload["KIT-PROVENANCE.json"])
     require(payload["KIT-PROVENANCE.json"] == verify.json_bytes(provenance) and
@@ -70,20 +74,23 @@ def derive(payload, profile_data, verify, hyprland, release):
     profile = verify.validate_profile(verify.read_json(profile_data))
     require(profile_data == verify.json_bytes(profile), "profile is not in the kit's canonical form")
     require(set(ABI_RUNTIME) <= set(upstream["runtime"]["packages"]), "upstream profile lacks an ABI runtime package")
-    # Versions may follow Omarchy's own profile_measure.py run; everything else stays Cua's measurement,
-    # so a new GCC or libstdc++ still needs a new kit.
-    packages = profile["runtime"]["packages"]
+    # The checked-in profile is Cua's, scoped to the ABI packages under its own ID. The versions built
+    # against are measured; the compiler and libstdc++ identities stay Cua's, so a new one needs a new kit.
+    scoped = {name: upstream["runtime"]["packages"][name] for name in ABI_RUNTIME}
     expected = dict(upstream, profile_id=profile["profile_id"], package_release=profile["package_release"],
-                    runtime=dict(upstream["runtime"], packages=packages))
-    require(set(packages) == set(ABI_RUNTIME) and profile == expected,
-            "profile changes more than its ID, release and ABI package versions")
+                    runtime=dict(upstream["runtime"], packages=scoped))
+    require(profile == expected, "profile changes more than its ID, release and runtime scope")
+    require(set(measured) == {"hyprland", "packages"}, "measurement is incomplete")
+    hyprland, packages = measured["hyprland"], measured["packages"]
     # A rebuild of the Hyprland release the kit was qualified on is Omarchy's to follow; another release is Cua's.
     require(set(hyprland) == {"package_version", "sha256", "headers_sha256"} and
             hyprland["package_version"].rpartition("-")[0] == upstream["hyprland"]["header_version"],
             "installed Hyprland is not a build of the release this kit supports")
+    require(set(packages) == set(ABI_RUNTIME), "measured packages are not the ABI packages")
     require(re.fullmatch(r"[0-9]+", release), "pkgrel must be a whole number")
     profile = verify.validate_profile(
-        dict(profile, package_release=int(release), hyprland=dict(profile["hyprland"], **hyprland)))
+        dict(profile, package_release=int(release), hyprland=dict(profile["hyprland"], **hyprland),
+             runtime=dict(profile["runtime"], packages=packages)))
     profile_data = verify.json_bytes(profile)
     provenance["profile_sha256"] = sha256(profile_data)
     derived = {name: data for name, data in payload.items() if name != "SHA256SUMS"}

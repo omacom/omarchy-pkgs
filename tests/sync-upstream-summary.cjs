@@ -103,7 +103,7 @@ test('the workflow records failed outcomes despite successful conclusions and ke
   const keys = readFileSync(outputPath, 'utf8').trim().split('\n').map(line => line.slice('key='.length));
   assert.equal(keys[0], keys[1]);
   const record = JSON.parse(readFileSync(join(f.resultsPath, 'package-pr-results', `${keys[0]}.json`), 'utf8'));
-  assert.deepEqual(record, { ...f.groups[0], apply: 'success', pr: 'failure', merge: 'skipped', number: '' });
+  assert.deepEqual(record, { ...f.groups[0], apply: 'success', hold: 'skipped', pr: 'failure', merge: 'skipped', number: '' });
   const result = await f.invoke({ resultsPath: join(f.resultsPath, 'package-pr-results') });
   assert.equal(result.succeeded, true);
   assert.equal(result.updates.failing, 1);
@@ -118,6 +118,14 @@ test('apply and auto-merge errors are package results even when all packages fai
   assert.equal(result.updates.failing, 2);
   assert.match(result.content, /Could not apply the package update/);
   assert.match(result.content, /Could not enable auto-merge/);
+});
+
+test('a reviewed PR that could not be held as a draft is a package failure', async t => {
+  const f = fixture(t, 1);
+  Object.assign(f.results[0], { hold: 'failure', pr: 'skipped', merge: 'skipped' });
+  const result = await f.invoke();
+  assert.equal(result.updates.failing, 1);
+  assert.match(result.content, /Could not turn the reviewed PR back into a draft/);
 });
 
 test('unregistered and running checks are pending, never counted as passing', async t => {

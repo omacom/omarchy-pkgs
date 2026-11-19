@@ -8,7 +8,13 @@ Upstream's udev rule runs `iptsd-check-device` on every hidraw device and starts
 
 The packaged udev rule also runs on "change" events. Upstream's runs only on "add", so the udev reload pacman performs whenever a package ships udev rules stopped iptsd until the next boot (linux-surface/iptsd issue 163).
 
-On the Surface Laptop 7 15" (Snapdragon X Elite), the touchpad needs iptsd for two-finger scroll, pinch and two-finger tap. It resets during resume and comes back in its mouse mode, and a running iptsd doesn't notice, so `iptsd-romulus15-resume.service` restarts iptsd after a suspend. It does nothing on any other machine. Press to click doesn't register under iptsd yet.
+On the Surface Laptop 7 15" (Snapdragon X Elite), the touchpad needs iptsd for two-finger scroll, pinch and two-finger tap. It resets during resume and comes back in its mouse mode, and a running iptsd doesn't notice, so `iptsd-romulus15-resume.service` restarts iptsd after a suspend. It does nothing on any other machine.
+
+On some boots of the same laptop the pad stops answering for a few seconds just as its HID device is re-bound to hid-multitouch. iptsd's udev rule then finds it silent and never starts iptsd, so the pad stays in its mouse mode until the rule runs again. `iptsd-romulus15-boot.service` waits, checks whether iptsd runs for the touchpad and re-runs the rule until it does. Seen on 3 of 7 boots on one laptop. It does nothing on any other machine.
+
+That touchpad has no moving parts: it measures force and reports its click in a report (type `0x96`) upstream iptsd does not read, so pressing it did nothing. `0001-ipts-Handle-the-button-report-of-force-touchpads.patch` reads it, which brings back press to click, press and drag, and two-finger press for a right click. Sent upstream as linux-surface/iptsd#237; drop the patch when the pinned commit includes it.
+
+Its touchscreen took light taps for drags: the reported position of a tap shifts by up to 2 mm while the finger lands, about as far as applications allow before a touch becomes a drag. `0002-contacts-Add-a-position-slop-for-new-contacts.patch` adds a `PositionSlop` option that keeps a new contact where it first appeared until it has moved that far, and `surface-laptop-7-15.conf`, installed to `/usr/share/iptsd`, sets it to 2.5 mm for that touchscreen only (HID `045E:0C6F`). No other device is affected. Upstream has no tests, so `check()` runs `test-position-slop.cpp` against the patched stabilizer. Sent upstream as linux-surface/iptsd#238; drop the patch and the test when the pinned commit includes it.
 
 ## Retirement
 
