@@ -250,7 +250,7 @@ class EdgeMetadataTests(unittest.TestCase):
         # aura has no monitor without the 7.3 kernel's CONFIG_ARM64_CTXR_EXECMEM.
         self.assertEqual(package['replaces'], ['m1n1-aurora', 'm1n1-neo'])
         self.assertIn('linux-aurora<7.3.0', package['conflicts'])
-        self.assertNotIn('m1n1-aurora', srcinfo('m1n1-aurora')['m1n1-aurora']['replaces'])
+        self.assertNotIn('aura', srcinfo('m1n1-aurora')['m1n1-aurora']['replaces'])
 
 
 if __name__ == '__main__':
