@@ -16,7 +16,7 @@ access are required. To work locally you need:
 - `git`, `bash`, `jq`, `curl` and a `tar` that reads zstd
 - Docker or Podman that your user can run, to build. With Docker, a build
   calls `sudo` to fix the ownership of its output.
-- on Arch, to check an upstream declaration: Python 3.11+, `vercmp`, `bsdtar`
+- on Arch, to check an upstream declaration: Python 3.14+, `vercmp`, `bsdtar`
 
 Questions and problems: open an issue on this repository.
 
@@ -31,6 +31,11 @@ Questions and problems: open an issue on this repository.
    ```
 
    An imported recipe is Omarchy's from then on; there is no AUR sync.
+   On Arch, `bin/add-package` also adds the package to
+   `release/owners.json`. Elsewhere, or when you later change a recipe's
+   `pkgname`, `provides`, `replaces` or `arch`, run
+   `bin/release-owners my-package` on Arch, or let the `self-tests` check
+   show you the lines to commit.
 3. Write `pkgbuilds/my-package/PKGBUILD` to Arch packaging standards.
    - List every architecture it supports in `arch=()`: `x86_64`, `aarch64`,
      or `any`. CI builds each one.
@@ -39,6 +44,23 @@ Questions and problems: open an issue on this repository.
    - Fill the checksums: run `updpkgsums` (from `pacman-contrib`) in the
      package directory. For a git source it leaves a clone of the source
      there; delete it before committing.
+   - If upstream signs its releases, list the key's full fingerprint in
+     `validpgpkeys=()` and ship the key as
+     `pkgbuilds/my-package/keys/pgp/<FINGERPRINT>.asc`, the way Arch does.
+     Builds never ask a keyserver, so a key that is not in the file fails
+     the build; `tests/pgp-keys-vendored.sh` checks it locally. Take the
+     key from its owner (their site or WKD), and check that its fingerprint
+     matches what upstream publishes:
+
+     ```bash
+     gpg --auto-key-locate clear,nodefault,wkd --locate-external-keys dev@example.org
+     gpg --armor --export-options export-minimal --export <FINGERPRINT> \
+       > pkgbuilds/my-package/keys/pgp/<FINGERPRINT>.asc
+     ```
+   - Extract a vendor archive in `package()` with `bsdtar --no-same-owner`.
+     pacman installs the numeric owners a package records, so every file
+     must be owned by root. The build fails on any other owner, or on a
+     group other than root, tty, ftp or games.
 4. Declare where new releases come from in
    `pkgbuilds/my-package/.omarchy/package.json`, so updates arrive without
    another PR. See [docs/upstream-sources.md](docs/upstream-sources.md).
@@ -118,6 +140,8 @@ hand:
 - anything under `pkgbuilds/`
 - a new test under `tests/`, and the one line in `.github/workflows/test.yml`
   that runs it
+- the directory lines `bin/release-owners` writes in `release/owners.json`.
+  An `approved` line always needs a maintainer.
 
 Changes to `bin/`, `helpers/`, `build/` or the workflows go in a separate PR,
 first: a PR's packages are built with `master`'s tooling, not its own.
@@ -615,6 +639,25 @@ Both can also be run from the Actions tab. Read
   with a dispatch.
 - **Check after a manual publish.** Confirm the package and version are in
   the channel database for each architecture it ships to.
+- **No network for keys in a build.** Source signatures verify against the
+  keys in each recipe's `keys/pgp/` only. A build that asks a keyserver
+  waits on someone else's uptime: on 11 November 2026 keyserver.ubuntu.com
+  went down, builds hung on `gpg --receive-keys` for up to two hours and
+  held every builder. `refresh-pgp-keys.yml` brings revocations and new
+  expiry dates in once a day; when it goes red, apply its
+  `refreshed-keys.patch` artifact, or run `bin/refresh-pgp-keys`, and open
+  a PR.
+
+- **One package name, one directory.** `release/owners.json` lists which
+  directory makes which package names on each architecture, from the
+  recipes. `bin/release-owners --check` fails when two directories make one
+  name on one architecture, or when a recipe provides another directory's
+  package or replaces anything but its own names without a line in
+  `approved`. No recipe may make, provide or replace `omarchy-keyring`. A
+  maintainer adds an `approved` line only for an intended alternative, such
+  as `omarchy-dev` providing `omarchy`, or a migration, such as
+  `omarchy-mac-boot` replacing `omarchy-apple-boot`: `pacman -Syu` offers
+  every replacement, and yes is its default.
 
 ## Layout
 
@@ -625,6 +668,7 @@ build/                         Builder image and the in-container build script
 helpers/                       Shell and Python shared by bin/ and the workflows
 ci/                            x86_64 builder pool: controller and runner setup
 tests/                         Tests; test.yml runs them on every PR
+release/owners.json            Which directory makes which package names (bin/release-owners)
 docs/                          Reference
 .github/workflows/             The pipeline
 .github/VOUCHED.td             Authors trusted to build
@@ -633,7 +677,7 @@ docs/                          Reference
 | Workflow | Trigger | Does |
 |---|---|---|
 | `build-pr.yml` | PR, dispatch | Builds changed packages; reports `result` |
-| `test.yml` | PR, dispatch | `self-tests` and `build-isolation` |
+| `test.yml` | PR, dispatch | `self-tests`, `build-isolation`, `recipes` and `lint-workflows` (jactionlint and shellcheck over the workflows and `.github/scripts`) |
 | `publish.yml` | push to `master`, dispatch | Signs and publishes; brings `rc` and `stable` in line with `edge` for the fast ring |
 | `promote.yml` | dispatch | Promote channel: `edge` → `rc`, `rc` → `stable` |
 | `release-rc.yml` | dispatch | Build release candidate: the `rc` branch's pins into `rc`, then `edge` |
@@ -644,6 +688,7 @@ docs/                          Reference
 | `sync-rebuilds.yml` | every 6 hours, dispatch | Dependency rebuild PR |
 | `package-prs.yml` | called by the sync workflows | Opens, updates and closes their PRs |
 | `builder-images.yml` | daily, changes to the image's inputs (push and PR), dispatch | Builds and tests the builder image; publishes it from `master` |
+| `refresh-pgp-keys.yml` | daily, dispatch | Merges revocations and new expiry dates into the shipped source-signing keys; fails with a patch when any changed |
 
 Secrets: the `publish` environment (usable from `master` only) holds the
 signing key and bucket credentials: `GPG_PRIVATE_KEY`, `GPG_PASSPHRASE`,
