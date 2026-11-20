@@ -705,11 +705,11 @@ class T3CodeHookTest(unittest.TestCase):
         self.recipe = self.root / "PKGBUILD"
         self.recipe.write_text("pkgver=0.0.41\n")
         self.feed = self.root / "latest-linux.yml"
-        self.feed.write_text("version: 0.0.42\npath: T3-Code-0.0.42-x86_64.AppImage\n")
+        self.feed.write_text("version: 0.0.42\npath: T3-Code-x86_64.AppImage\n")
         self.arm_feed = self.root / "latest-linux-arm64.yml"
-        self.arm_feed.write_text("version: 0.0.42\npath: T3-Code-0.0.42-arm64.AppImage\n")
+        self.arm_feed.write_text("version: 0.0.42\npath: T3-Code-arm64.AppImage\n")
         for arch in ("x86_64", "arm64"):
-            (self.root / f"T3-Code-0.0.42-{arch}.AppImage").write_text(arch)
+            (self.root / f"T3-Code-{arch}.AppImage").write_text(arch)
         # Serve only fixture assets, and record the requested release URLs.
         curl = self.root / "curl"
         curl.write_text('#!/bin/bash\nurl="${@: -1}"\nprintf "%s\\n" "$url" >> requests\ncat "${url##*/}"\n')
@@ -728,7 +728,7 @@ class T3CodeHookTest(unittest.TestCase):
         self.assertEqual(json.loads(result.stdout), {
             'pkgver': '0.0.42',
             'sha256sums': {
-                arch: [w.hash_file(self.root / f'T3-Code-0.0.42-{asset_arch}.AppImage', 'sha256')]
+                arch: [w.hash_file(self.root / f'T3-Code-{asset_arch}.AppImage', 'sha256')]
                 for arch, asset_arch in [('x86_64', 'x86_64'), ('aarch64', 'arm64')]
             },
         })
@@ -742,7 +742,7 @@ class T3CodeHookTest(unittest.TestCase):
         self.assertEqual(len((self.root / 'requests').read_text().splitlines()), 1)
 
     def test_incomplete_or_mismatched_arm_release_reports_no_update(self):
-        for bad_feed in ('', 'version: 0.0.43\npath: T3-Code-0.0.42-arm64.AppImage\n',
+        for bad_feed in ('', 'version: 0.0.43\npath: T3-Code-arm64.AppImage\n',
                          'version: 0.0.42\npath: renamed.AppImage\n'):
             with self.subTest(feed=bad_feed):
                 self.arm_feed.write_text(bad_feed)
@@ -755,7 +755,7 @@ class T3CodeHookTest(unittest.TestCase):
         self.assertEqual(result.stdout, '')
 
     def test_missing_arm_asset_reports_no_update(self):
-        (self.root / 'T3-Code-0.0.42-arm64.AppImage').unlink()
+        (self.root / 'T3-Code-arm64.AppImage').unlink()
         result = self.run_hook()
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(result.stdout, '')

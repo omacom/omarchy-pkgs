@@ -119,6 +119,9 @@ if promote nosuch; then fail "an unknown pkgbase should refuse"; else grep -q 'n
 recipe elsewhere '{"source": "local"}'
 promote elsewhere && grep -q 'not in edge/x86_64; skipping' "$T/out" \
   && pass "a recipe this architecture has not published is skipped, not refused" || fail "other-arch recipe"
+recipe armonly '{"source": "local"}' "" aarch64
+promote armonly && grep -q 'armonly does not build for x86_64; skipping it' "$T/out" && ! grep -q 'armonly is not in' "$T/out" \
+  && pass "a recipe that does not build this architecture is skipped without a warning" || fail "arch-only recipe"
 
 # A source file that does not match its database entry is never published.
 f="$REMOTE/edge/x86_64/big-1.0-3-x86_64.pkg.tar.zst"
