@@ -54,7 +54,7 @@ post_install || fail "a missing sandbox failed the install hook"
 
 # The recipe's own depends cover what the deb lists and ldd does not show.
 recipe=$(cat "$ROOT/pkgbuilds/antigravity/PKGBUILD")
-for dep in libxss libxtst util-linux-libs hicolor-icon-theme; do
+for dep in libxss libxtst util-linux hicolor-icon-theme; do
   grep -Fq "'$dep'" <<<"$recipe" || fail "PKGBUILD does not depend on $dep"
 done
 grep -Fq 'chmod 0755 opt/Antigravity/chrome-sandbox' <<<"$recipe" \
