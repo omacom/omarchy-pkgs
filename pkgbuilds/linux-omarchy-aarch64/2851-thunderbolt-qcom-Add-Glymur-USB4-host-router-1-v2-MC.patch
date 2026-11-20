@@ -1,0 +1,715 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jim Martin <jimmartin@gmail.com>
+Date: Thu, 12 Nov 2026 20:27:07 -0600
+Subject: [PATCH 2851/2856] thunderbolt: qcom: Add Glymur USB4 host router 1 (v2 MCU
+ layout)
+
+The second USB-C port of the Surface Laptop 8 is served by host router
+1, which the driver rejected. Router 1 has the v2 microcontroller
+layout: the control registers at 0x14000 instead of 0x22000, the RAM at
+0x1e000 instead of 0x13000, the DROM 0x2000 higher, and its own
+firmware image. The MCU helper already knows the offsets.
+
+Describe the routers in a table (layout, start-up profile, RAM size,
+lane status register) and use it where router 0's values were built in:
+the MCU interrupt registers, the event ring bounds and the lane status
+polled after sleep.
+
+Add the router 1 start-up profile. It is the cold start of router 0
+with the differences of the v2 layout:
+
+- CBCR_FORCE_MEM_CORE_ON on the microcontroller clock after the
+  firmware upload;
+- adapter bits 21, 20 and 19 instead of 23, 22 and 21 on a cold start;
+  the warm restart clears 23, 22 and 21 on both layouts;
+- a set-up routine of 17 register updates before the MCU starts, cold
+  and warm;
+- the router index in the DROM;
+- on MCU event 6, bits 7:6 of the two lane adapter registers cleared.
+
+The set-up routine reaches registers that need a second power domain,
+the one of the PCIe controller the router tunnels. On the Surface
+Laptop 8 a read of router register 0xe030 with that domain off resets
+the SoC; with it on the whole routine runs. Attach every power domain
+of a router that has more than one, link them to its runtime PM, keep
+them on the wakeup path with the router, and refuse to probe router 1
+without the second one. The platform's ACPI tables list that domain
+for router 0 too; router 0's start-up does not touch those registers
+and its node is left as it is.
+
+Router 1 gets no DisplayPort owner here: the DP IN handling is tied to
+router 0 and DisplayPort controller 0, so a dock on router 1 tunnels
+USB3 but no display.
+
+The sequence follows the platform's Windows driver. On the Surface
+Laptop 8 a Thunderbolt 4 dock on the second port comes up at two lanes
+of 20 Gb/s with its USB3 tunnel, in both plug orientations, after an
+unplug and replug, after system sleep and at boot.
+
+Seen once each in those runs and not explained: the dock's USB2 hub
+failed to enumerate after a flipped plug-in (one of about eight
+plug-ins), and the dock's Ethernet adapter received nothing after one
+of two sleeps until it was re-attached.
+
+Assisted-by: Claude Fable 5.2
+Signed-off-by: Jim Martin <jimmartin@gmail.com>
+---
+ drivers/thunderbolt/qcom-usb4-host.c    | 136 +++++++++++++++++-----
+ drivers/thunderbolt/qcom-usb4-mcu.c     |   1 +
+ drivers/thunderbolt/qcom-usb4-mcu.h     |   1 +
+ drivers/thunderbolt/qcom-usb4-startup.c | 145 +++++++++++++++++++++---
+ drivers/thunderbolt/qcom-usb4-startup.h |   7 ++
+ 5 files changed, 247 insertions(+), 43 deletions(-)
+
+diff --git a/drivers/thunderbolt/qcom-usb4-host.c b/drivers/thunderbolt/qcom-usb4-host.c
+index 8eb4c3212..c30de0f37 100644
+--- a/drivers/thunderbolt/qcom-usb4-host.c
++++ b/drivers/thunderbolt/qcom-usb4-host.c
+@@ -2,8 +2,9 @@
+ /*
+  * Qualcomm Glymur USB4 host router platform frontend.
+  *
+- * Experimental. Only router 0 has a startup profile, tested only on the
+- * Surface Laptop 8. The driver connects the cold-start sequence, the MCU
++ * Experimental. Routers 0 and 1 have startup profiles, for the Surface
++ * Laptop 8 only; router 1 has no DisplayPort owner yet, so it tunnels USB3
++ * but no display. The driver connects the cold-start sequence, the MCU
+  * firmware/mailbox helpers and the line-interrupt NHI adapter to the common
+  * Thunderbolt/USB4 core, and takes Type-C tunnelling requests from the
+  * platform's alternate-mode driver.
+@@ -30,6 +31,7 @@
+ #include <linux/phy/phy.h>
+ #include <linux/pinctrl/consumer.h>
+ #include <linux/platform_device.h>
++#include <linux/pm_domain.h>
+ #include <linux/pm_runtime.h>
+ #include <linux/suspend.h>
+ #include <linux/regmap.h>
+@@ -55,10 +57,14 @@
+ 
+ #define QCOM_USB4_ROUTER_SIZE		0x100000
+ #define QCOM_USB4_NHI_OFFSET		0x3f000
+-#define QCOM_USB4_MCU_RAM_OFFSET	0x13000
+-#define QCOM_USB4_MCU_RAM_SIZE		0xf000
+-#define QCOM_USB4_MCU_IRQ_ACK		0x22018
+-#define QCOM_USB4_MCU_IRQ_ENABLE	0x2201c
++/* Relative to the MCU control register, on both layouts. */
++#define QCOM_USB4_MCU_IRQ_ACK		0x18
++#define QCOM_USB4_MCU_IRQ_ENABLE	0x1c
++/* Lane adapter registers the v2 router clears bits 7:6 of on MCU event 6. */
++#define QCOM_USB4_V2_LANE0_CONFIG	0x2058
++#define QCOM_USB4_V2_LANE1_CONFIG	0x3058
++#define QCOM_USB4_V2_LANE_CONFIG_MASK	GENMASK(7, 6)
++#define QCOM_USB4_MCU_EVENT_V2_LANE	6
+ #define QCOM_USB4_ROUTER_STOP_FLAG	0x81018
+ #define QCOM_USB4_TCSR_ROUTE		0xb004
+ #define QCOM_USB4_MCU_STOP_COMMAND	4
+@@ -66,7 +72,6 @@
+ /* Router state saved before the MCU is halted for sleep. */
+ #define QCOM_USB4_ROUTER_SLEEP_SAVE	0x81014
+ #define QCOM_USB4_WAKE_STATUS		0x20a4
+-#define QCOM_USB4_LANE0_STATUS		0x2050
+ #define QCOM_USB4_LANE_STATE		GENMASK(29, 26)
+ #define QCOM_USB4_LANE_STATE_ACTIVE	2
+ #define QCOM_USB4_LINK_RESUME_TIMEOUT_MS	5000
+@@ -84,6 +89,42 @@
+ #define QCOM_USB4_SLEEP_STOP_MS		5000
+ #define QCOM_USB4_MAX_ROUTERS		3
+ 
++/*
++ * What differs between the host routers. Router 1 has the v2 MCU layout; its
++ * MCU RAM size is not established beyond the end of its DROM and only bounds
++ * the event ring here.
++ */
++struct qcom_usb4_router_desc {
++	enum qcom_usb4_mcu_layout layout;
++	enum qcom_usb4_start_profile profile;
++	size_t ram_size;
++	u32 lane0_status;
++	/* Only router 0's DisplayPort IN adapters have a display owner. */
++	bool display;
++	/*
++	 * The start-up touches router registers (0xe030 and after) that reset
++	 * the SoC unless the tunnelled PCIe power domain is on as well.
++	 */
++	bool pcie_tunnel_domain;
++};
++
++static const struct qcom_usb4_router_desc qcom_usb4_routers[] = {
++	[0] = {
++		.layout = QCOM_USB4_MCU_LEGACY,
++		.profile = QCOM_USB4_START_SURFACE_A8_PORT0,
++		.ram_size = 0xf000,
++		.lane0_status = 0x2050,
++		.display = true,
++	},
++	[1] = {
++		.layout = QCOM_USB4_MCU_V2,
++		.profile = QCOM_USB4_START_SURFACE_A8_PORT1,
++		.ram_size = 0x11000,
++		.lane0_status = 0x2058,
++		.pcie_tunnel_domain = true,
++	},
++};
++
+ /* Verified board facts: PS8830 board retimer on every Surface Laptop 8 port. */
+ #define QCOM_USB4_SURFACE_BOARD_RETIMER	1
+ 
+@@ -118,6 +159,7 @@ enum qcom_usb4_link_request {
+ struct qcom_usb4_host {
+ 	struct device *dev;
+ 	unsigned int port;
++	const struct qcom_usb4_router_desc *desc;
+ 	void __iomem *router;
+ 
+ 	struct qcom_usb4_nhi qnhi;
+@@ -135,6 +177,8 @@ struct qcom_usb4_host {
+ 	struct pinctrl_state *pins[QCOM_USB4_PIN_COUNT];
+ 	struct regmap *tcsr;
+ 	struct phy *phy;
++	/* The power domains of a router with more than one, else NULL. */
++	struct dev_pm_domain_list *pds;
+ 	struct icc_path *icc_ddr;
+ 	struct icc_path *icc_apps;
+ 	const struct firmware *fw;
+@@ -340,6 +384,8 @@ static int qcom_usb4_host_provider(void *ctx, enum qcom_usb4_start_step step,
+ 		return glymur_gcc_usb4_ctrl_bit(host->port, false);
+ 	case QCOM_USB4_START_SYS_MEMORY_FORCE:
+ 		return glymur_gcc_usb4_sys_force_mem(host->port, true);
++	case QCOM_USB4_START_UC_HRR_MEMORY_FORCE:
++		return glymur_gcc_usb4_uc_hrr_force_mem(host->port, true);
+ 	case QCOM_USB4_START_TCSR_ROUTE:
+ 		return regmap_update_bits(host->tcsr, QCOM_USB4_TCSR_ROUTE,
+ 					  BIT(host->port), BIT(host->port));
+@@ -378,6 +424,11 @@ static const struct qcom_usb4_start_ops qcom_usb4_host_start_ops = {
+ 	.delay_us = qcom_usb4_host_delay_us,
+ };
+ 
++static u32 qcom_usb4_host_mcu_irq_enable(struct qcom_usb4_host *host)
++{
++	return host->mcu.control_offset + QCOM_USB4_MCU_IRQ_ENABLE;
++}
++
+ /* MCU event notification interrupt (third router interrupt). */
+ 
+ static irqreturn_t qcom_usb4_host_mcu_irq(int irq, void *data)
+@@ -388,22 +439,23 @@ static irqreturn_t qcom_usb4_host_mcu_irq(int irq, void *data)
+ 	u32 layout, capacity, stride, producer, aux;
+ 	size_t need, avail;
+ 	unsigned int i, j;
++	bool lane_event = false;
+ 	u8 *snapshot;
+ 	int ret;
+ 
+ 	if (!READ_ONCE(host->mcu_irq_enabled))
+ 		return IRQ_HANDLED;
+ 
+-	shared = host->router + QCOM_USB4_MCU_RAM_OFFSET + host->start_state.shared_offset;
++	shared = host->router + host->mcu.ram_offset + host->start_state.shared_offset;
+ 	producer = readl(shared + 4);
+ 	aux = readl(shared + 8);
+ 	/* Read the producer state, then acknowledge, then drain. */
+-	writel(1, host->router + QCOM_USB4_MCU_IRQ_ACK);
++	writel(1, host->router + host->mcu.control_offset + QCOM_USB4_MCU_IRQ_ACK);
+ 
+ 	layout = readl(shared);
+ 	capacity = layout & 0xffff;
+ 	stride = layout >> 16;
+-	avail = QCOM_USB4_MCU_RAM_SIZE - host->start_state.shared_offset;
++	avail = host->mcu.ram_size - host->start_state.shared_offset;
+ 	if (!capacity || !stride || capacity > (avail - 16) / stride) {
+ 		dev_warn_ratelimited(host->dev, "MCU event ring geometry invalid: %#x\n", layout);
+ 		return IRQ_HANDLED;
+@@ -426,6 +478,8 @@ static irqreturn_t qcom_usb4_host_mcu_irq(int irq, void *data)
+ 		for (j = 0; j < events.spans[i].count; j++) {
+ 			const u8 *rec = events.spans[i].data + (size_t)j * stride;
+ 
++			if (rec[0] == QCOM_USB4_MCU_EVENT_V2_LANE)
++				lane_event = true;
+ 			if (rec[0] == 1 && stride > 2)
+ 				dev_dbg(host->dev, "MCU event type 1: %c %.*s\n", rec[1],
+ 					(int)stride - 2, rec + 2);
+@@ -435,6 +489,13 @@ static irqreturn_t qcom_usb4_host_mcu_irq(int irq, void *data)
+ 		}
+ 	}
+ 	host->event_consumer = events.producer;
++	/* The v2 router wants two lane adapter bits cleared on this event. */
++	if (lane_event && host->mcu.layout == QCOM_USB4_MCU_V2) {
++		qcom_usb4_host_update_router(host, QCOM_USB4_V2_LANE0_CONFIG,
++					     QCOM_USB4_V2_LANE_CONFIG_MASK, 0);
++		qcom_usb4_host_update_router(host, QCOM_USB4_V2_LANE1_CONFIG,
++					     QCOM_USB4_V2_LANE_CONFIG_MASK, 0);
++	}
+ 	if (events.type4_records)
+ 		complete(&host->stop_event);
+ out:
+@@ -693,7 +754,7 @@ static void qcom_usb4_host_stop_hardware(struct qcom_usb4_host *host)
+ 		qcom_usb4_mcu_stop(&host->mcu);
+ 	}
+ 	if (host->mcu_irq_enabled) {
+-		qcom_usb4_host_update_router(host, QCOM_USB4_MCU_IRQ_ENABLE, BIT(0), 0);
++		qcom_usb4_host_update_router(host, qcom_usb4_host_mcu_irq_enable(host), BIT(0), 0);
+ 		WRITE_ONCE(host->mcu_irq_enabled, false);
+ 		/* A handler past its check may still read MCU RAM: let it finish. */
+ 		synchronize_irq(host->mcu_irq);
+@@ -847,12 +908,26 @@ static int qcom_usb4_host_get_resources(struct qcom_usb4_host *host)
+ 	if (IS_ERR(host->icc_apps))
+ 		return dev_err_probe(dev, PTR_ERR(host->icc_apps), "apps-usb4 interconnect\n");
+ 
++	/*
++	 * The driver core attaches a single power domain itself. A router with
++	 * several gets them here, each linked to the router's runtime PM.
++	 */
++	if (!dev->pm_domain) {
++		ret = devm_pm_domain_attach_list(dev, NULL, &host->pds);
++		if (ret < 0)
++			return dev_err_probe(dev, ret, "power domains\n");
++	}
++	if (host->desc->pcie_tunnel_domain && (!host->pds || host->pds->num_pds < 2))
++		return dev_err_probe(dev, -EINVAL,
++				     "router %u needs its PCIe tunnel power domain\n",
++				     host->port);
++
+ 	ret = qcom_usb4_host_get_serial(host);
+ 	if (ret)
+ 		return ret;
+ 
+ 	ret = qcom_usb4_mcu_init(&host->mcu, host->router, QCOM_USB4_ROUTER_SIZE,
+-				 QCOM_USB4_MCU_RAM_SIZE, QCOM_USB4_MCU_LEGACY);
++				 host->desc->ram_size, host->desc->layout);
+ 	if (ret)
+ 		return dev_err_probe(dev, ret, "MCU layout\n");
+ 
+@@ -939,7 +1014,7 @@ static void qcom_usb4_host_start_config(struct qcom_usb4_host *host,
+ 					struct qcom_usb4_start_config *cfg)
+ {
+ 	*cfg = (struct qcom_usb4_start_config) {
+-		.profile = QCOM_USB4_START_SURFACE_A8_PORT0,
++		.profile = host->desc->profile,
+ 		.pcie_policy = QCOM_USB4_START_PCIE_ENABLE,
+ 		.mcu = &host->mcu,
+ 		.firmware = host->fw->data,
+@@ -1061,7 +1136,7 @@ static int qcom_usb4_host_acquire(struct qcom_usb4_host *host)
+ 
+ 	host->event_consumer = 0;
+ 	WRITE_ONCE(host->mcu_irq_enabled, true);
+-	qcom_usb4_host_update_router(host, QCOM_USB4_MCU_IRQ_ENABLE, BIT(0), BIT(0));
++	qcom_usb4_host_update_router(host, qcom_usb4_host_mcu_irq_enable(host), BIT(0), BIT(0));
+ 	qcom_usb4_dp_restart(host->dp);
+ 
+ 	ret = qcom_usb4_host_probe_nhi(host);
+@@ -1313,7 +1388,7 @@ static int qcom_usb4_host_halt(struct qcom_usb4_host *host)
+ 	if (ret)
+ 		goto out;
+ 	host->start_state.sleep_81014 = save;
+-	qcom_usb4_host_update_router(host, QCOM_USB4_MCU_IRQ_ENABLE, BIT(0), 0);
++	qcom_usb4_host_update_router(host, qcom_usb4_host_mcu_irq_enable(host), BIT(0), 0);
+ 	WRITE_ONCE(host->mcu_irq_enabled, false);
+ 	synchronize_irq(host->mcu_irq);
+ 	qcom_usb4_host_update_router(host, QCOM_USB4_ROUTER_STOP_FLAG, BIT(0), 0);
+@@ -1343,7 +1418,7 @@ static bool qcom_usb4_host_link_resumed(struct qcom_usb4_host *host, unsigned in
+ 					      QCOM_USB4_COMMAND_TIMEOUT_US);
+ 	timeout = jiffies + msecs_to_jiffies(QCOM_USB4_LINK_RESUME_TIMEOUT_MS);
+ 	for (;;) {
+-		if (qcom_usb4_host_read_router(host, QCOM_USB4_LANE0_STATUS, &lane))
++		if (qcom_usb4_host_read_router(host, host->desc->lane0_status, &lane))
+ 			return false;
+ 		if (FIELD_GET(QCOM_USB4_LANE_STATE, lane) == QCOM_USB4_LANE_STATE_ACTIVE)
+ 			return true;
+@@ -1412,7 +1487,7 @@ static int qcom_usb4_host_warm_start(struct qcom_usb4_host *host)
+ 	}
+ 	host->mcu_halted = false;
+ 	WRITE_ONCE(host->mcu_irq_enabled, true);
+-	qcom_usb4_host_update_router(host, QCOM_USB4_MCU_IRQ_ENABLE, BIT(0), BIT(0));
++	qcom_usb4_host_update_router(host, qcom_usb4_host_mcu_irq_enable(host), BIT(0), BIT(0));
+ 	ret = qcom_usb4_host_resume_link(host);
+ 	if (ret)
+ 		dev_err(host->dev, "router link resume failed: %d\n", ret);
+@@ -1429,6 +1504,7 @@ static int qcom_usb4_host_warm_start(struct qcom_usb4_host *host)
+ static int qcom_usb4_host_suspend(struct device *dev)
+ {
+ 	struct qcom_usb4_host *host = qcom_usb4_host_from_dev(dev);
++	unsigned int i;
+ 	int ret;
+ 
+ 	if (!host || !host->kept)
+@@ -1447,6 +1523,8 @@ static int qcom_usb4_host_suspend(struct device *dev)
+ 		return ret;
+ 	}
+ 	device_set_awake_path(dev);
++	for (i = 0; host->pds && i < host->pds->num_pds; i++)
++		device_set_awake_path(host->pds->pd_devs[i]);
+ 	if (host->phy->dev.parent)
+ 		device_set_awake_path(host->phy->dev.parent);
+ 	return 0;
+@@ -1560,9 +1638,10 @@ static int qcom_usb4_host_probe(struct platform_device *pdev)
+ 	ret = of_property_read_u32(dev->of_node, "qcom,router-index", &host->port);
+ 	if (ret && ret != -EINVAL)
+ 		return ret;
+-	if (host->port != 0)
++	if (host->port >= ARRAY_SIZE(qcom_usb4_routers))
+ 		return dev_err_probe(dev, -EINVAL,
+-				     "only router 0 has a verified startup profile\n");
++				     "router %u has no startup profile\n", host->port);
++	host->desc = &qcom_usb4_routers[host->port];
+ 
+ 	ret = of_property_read_string(dev->of_node, "firmware-name", &fw_name);
+ 	if (ret)
+@@ -1574,9 +1653,11 @@ static int qcom_usb4_host_probe(struct platform_device *pdev)
+ 	ret = qcom_usb4_host_link_controller(host);
+ 	if (ret)
+ 		return ret;
+-	host->dp = qcom_usb4_dp_create(dev, host->router);
+-	if (IS_ERR(host->dp))
+-		return PTR_ERR(host->dp);
++	if (host->desc->display) {
++		host->dp = qcom_usb4_dp_create(dev, host->router);
++		if (IS_ERR(host->dp))
++			return PTR_ERR(host->dp);
++	}
+ 
+ 	mutex_lock(&qcom_usb4_hosts_lock);
+ 	for (i = 0; i < QCOM_USB4_MAX_ROUTERS; i++) {
+@@ -1595,10 +1676,10 @@ static int qcom_usb4_host_probe(struct platform_device *pdev)
+ 		goto err_unlist;
+ 
+ 	/*
+-	 * genpd switched the domain on and applied the required-opps vote when
+-	 * it attached the device, so start active: the runtime suspend that
+-	 * follows probe releases both until the first start
+-	 * (qcom_usb4_host_power_on()).
++	 * genpd applied the required-opps vote when it attached the device,
++	 * and switched a single domain on (several are switched on here, as
++	 * suppliers), so start active: the runtime suspend that follows probe
++	 * releases both until the first start (qcom_usb4_host_power_on()).
+ 	 */
+ 	ret = pm_runtime_set_active(dev);
+ 	if (ret)
+@@ -1700,8 +1781,9 @@ static const struct of_device_id qcom_usb4_host_of_match[] = {
+ 	{ }
+ };
+ MODULE_DEVICE_TABLE(of, qcom_usb4_host_of_match);
+-/* Router image named by the Surface Laptop 8 device tree, for initramfs tools. */
++/* Router images named by the Surface Laptop 8 device tree, for initramfs tools. */
+ MODULE_FIRMWARE("qcom/glymur/surface-laptop8/usb4-router-legacy.bin");
++MODULE_FIRMWARE("qcom/glymur/surface-laptop8/usb4-router-v2.bin");
+ 
+ static struct platform_driver qcom_usb4_host_driver = {
+ 	.probe = qcom_usb4_host_probe,
+diff --git a/drivers/thunderbolt/qcom-usb4-mcu.c b/drivers/thunderbolt/qcom-usb4-mcu.c
+index 9deaf93ed..bcaefc64e 100644
+--- a/drivers/thunderbolt/qcom-usb4-mcu.c
++++ b/drivers/thunderbolt/qcom-usb4-mcu.c
+@@ -55,6 +55,7 @@ int qcom_usb4_mcu_init(struct qcom_usb4_mcu *mcu, void __iomem *base,
+ 		return -EINVAL;
+ 
+ 	mcu->base = base;
++	mcu->layout = layout;
+ 	mcu->ram_size = ram_size;
+ 	mcu->ram_offset = ram;
+ 	mcu->control_offset = control;
+diff --git a/drivers/thunderbolt/qcom-usb4-mcu.h b/drivers/thunderbolt/qcom-usb4-mcu.h
+index ad48cd34c..531e297da 100644
+--- a/drivers/thunderbolt/qcom-usb4-mcu.h
++++ b/drivers/thunderbolt/qcom-usb4-mcu.h
+@@ -12,6 +12,7 @@ enum qcom_usb4_mcu_layout {
+ 
+ struct qcom_usb4_mcu {
+ 	void __iomem *base;
++	enum qcom_usb4_mcu_layout layout;
+ 	size_t ram_size;
+ 	u32 ram_offset;
+ 	u32 control_offset;
+diff --git a/drivers/thunderbolt/qcom-usb4-startup.c b/drivers/thunderbolt/qcom-usb4-startup.c
+index 40fa95e0f..0fbdd2ee4 100644
+--- a/drivers/thunderbolt/qcom-usb4-startup.c
++++ b/drivers/thunderbolt/qcom-usb4-startup.c
+@@ -1,7 +1,16 @@
+ // SPDX-License-Identifier: GPL-2.0-only
+ /*
+- * Cold-start and warm-restart sequences of Glymur USB4 host router 0 with the
+- * legacy MCU layout. Only the Surface Laptop 8 profile is defined.
++ * Cold-start and warm-restart sequences of the Glymur USB4 host routers:
++ * router 0 with the legacy MCU layout and router 1 with the v2 layout. Only
++ * the Surface Laptop 8 profiles are defined.
++ *
++ * The v2 router differs in four places: a memory-force bit on its
++ * microcontroller clock after the firmware upload, three other adapter bits
++ * on a cold start, a set-up routine before the MCU starts, and the router
++ * index in its DROM. The set-up routine's registers from 0xe030 on can only
++ * be accessed with the router's tunnelled PCIe power domain on: without it the
++ * access resets the SoC. The adapter bits and the set-up routine stay after
++ * PHY_COMPOSITE, where the platform's Windows driver has them.
+  */
+ 
+ #include <linux/array_size.h>
+@@ -19,24 +28,68 @@ enum start_kind {
+ 	START_CLEAR_1200C,
+ 	START_UPLOAD,
+ 	START_DROM,
++	START_V2_SETUP,
+ 	START_MCU,
+ 	START_PRESET,
+ 	START_PCIE,
+ 	START_RESTORE_81010,
+ };
+ 
++/* Which MCU layout an operation applies to. */
++enum start_variant {
++	START_ANY,
++	START_LEGACY,
++	START_V2,
++};
++
+ struct start_operation {
+ 	enum qcom_usb4_start_step step;
+ 	enum start_kind kind;
+ 	u32 offset;
+ 	u32 mask;
+ 	u32 value;
++	enum start_variant variant;
+ };
+ 
+ #define PROVIDER(s) { .step = QCOM_USB4_START_##s, .kind = START_PROVIDER }
++#define PROVIDER_V2(s) \
++	{ .step = QCOM_USB4_START_##s, .kind = START_PROVIDER, .variant = START_V2 }
+ #define UPDATE(s, o, m, v) { QCOM_USB4_START_##s, START_UPDATE, o, m, v }
++#define UPDATE_LEGACY(s, o, m, v) \
++	{ QCOM_USB4_START_##s, START_UPDATE, o, m, v, START_LEGACY }
++#define UPDATE_V2(s, o, m, v) { QCOM_USB4_START_##s, START_UPDATE, o, m, v, START_V2 }
+ #define DELAY(s, us) { QCOM_USB4_START_##s, START_DELAY, 0, 0, us }
+ #define SPECIAL(s, k) { .step = QCOM_USB4_START_##s, .kind = k }
++#define SPECIAL_V2(s, k) { .step = QCOM_USB4_START_##s, .kind = k, .variant = START_V2 }
++
++/*
++ * The v2 router's set-up before its MCU starts, as the platform's Windows
++ * driver writes it by default (no Gen 4 speed). The register meanings are
++ * not known.
++ */
++static const struct {
++	u32 offset;
++	u32 mask;
++	u32 value;
++} start_v2_setup[] = {
++	{ 0x8010, 0xff000000, 0x20000000 },
++	{ 0x8018, 0x00100000, 0 },
++	{ 0x9304, 0x00ff0000, 0 },
++	{ 0x9290, 0x00500000, 0 },
++	{ 0xd000, 0x0c0e7800, 0x6000 },
++	{ 0xe030, 0x00500000, 0 },
++	{ 0xf030, 0x00500000, 0 },
++	{ 0x84058, 0x00500000, 0 },
++	{ 0x84070, 0x000e000f, 4 },
++	{ 0x87058, 0x00500000, 0 },
++	{ 0x87070, 0x000e000f, 4 },
++	{ 0x2058, 0x000000c0, 0 },
++	{ 0x3058, 0x000000c0, 0 },
++	{ 0x82008, 0x00000006, 0 },
++	{ 0xd000, 0x00007800, 0x6000 },
++	{ 0x2058, 0x0000000f, 0xc },
++	{ 0x3058, 0x0000000f, 0xc },
++};
+ 
+ static const struct start_operation start_operations[] = {
+ 	PROVIDER(RX_PAD_PREPARE),
+@@ -69,7 +122,8 @@ static const struct start_operation start_operations[] = {
+ 	UPDATE(ROUTER_81000_CLEAR, 0x81000, BIT(0), 0),
+ 	SPECIAL(FIRMWARE_UPLOAD, START_UPLOAD),
+ 	PROVIDER(SYS_MEMORY_FORCE),
+-	/* The board extension (PHYC) step is empty for the supported profile. */
++	PROVIDER_V2(UC_HRR_MEMORY_FORCE),
++	/* The board extension (PHYC) step is empty for the supported profiles. */
+ 	SPECIAL(DROM, START_DROM),
+ 	PROVIDER(TCSR_ROUTE),
+ 	PROVIDER(PIPE_HWCG_OFF),
+@@ -79,9 +133,13 @@ static const struct start_operation start_operations[] = {
+ 	UPDATE(TIMER_8148, 0x8148, 0xffffffff, 250000),
+ 	UPDATE(TIMER_8144, 0x8144, 0xffffffff, 4000),
+ 	PROVIDER(PHY_COMPOSITE),
+-	UPDATE(ADAPTER_BIT23, 0xd000, BIT(23), 0),
+-	UPDATE(ADAPTER_BIT22, 0xd000, BIT(22), 0),
+-	UPDATE(ADAPTER_BIT21, 0xd000, BIT(21), 0),
++	UPDATE_LEGACY(ADAPTER_BIT23, 0xd000, BIT(23), 0),
++	UPDATE_LEGACY(ADAPTER_BIT22, 0xd000, BIT(22), 0),
++	UPDATE_LEGACY(ADAPTER_BIT21, 0xd000, BIT(21), 0),
++	UPDATE_V2(ADAPTER_BIT21, 0xd000, BIT(21), 0),
++	UPDATE_V2(ADAPTER_BIT20, 0xd000, BIT(20), 0),
++	UPDATE_V2(ADAPTER_BIT19, 0xd000, BIT(19), 0),
++	SPECIAL_V2(V2_SETUP, START_V2_SETUP),
+ 	SPECIAL(MCU, START_MCU),
+ 	SPECIAL(PRESET, START_PRESET),
+ 	SPECIAL(PCIE_POLICY, START_PCIE),
+@@ -105,25 +163,54 @@ static const struct start_operation resume_operations[] = {
+ 	DELAY(CONTROL_DEASSERT_SETTLE, 100),
+ 	UPDATE(ROUTER_81000_CLEAR, 0x81000, BIT(0), 0),
+ 	SPECIAL(ROUTER_81010_RESTORE, START_RESTORE_81010),
++	/* The warm restart clears these three bits on both layouts. */
+ 	UPDATE(ADAPTER_BIT23, 0xd000, BIT(23), 0),
+ 	UPDATE(ADAPTER_BIT22, 0xd000, BIT(22), 0),
+ 	UPDATE(ADAPTER_BIT21, 0xd000, BIT(21), 0),
++	SPECIAL_V2(V2_SETUP, START_V2_SETUP),
+ 	SPECIAL(MCU, START_MCU),
+ 	SPECIAL(PCIE_POLICY, START_PCIE),
+ };
+ 
++/* The hardware router index of a profile, as written into the DROM. */
++static int start_router(const struct qcom_usb4_start_config *cfg)
++{
++	switch (cfg->profile) {
++	case QCOM_USB4_START_SURFACE_A8_PORT0:
++		return 0;
++	case QCOM_USB4_START_SURFACE_A8_PORT1:
++		return 1;
++	default:
++		return -EINVAL;
++	}
++}
++
++static bool start_applies(const struct start_operation *op,
++			  const struct qcom_usb4_start_config *cfg)
++{
++	switch (op->variant) {
++	case START_LEGACY:
++		return cfg->mcu->layout == QCOM_USB4_MCU_LEGACY;
++	case START_V2:
++		return cfg->mcu->layout == QCOM_USB4_MCU_V2;
++	default:
++		return true;
++	}
++}
++
+ static int start_validate(const struct qcom_usb4_start_config *cfg,
+ 			  const struct qcom_usb4_start_ops *ops)
+ {
+ 	const struct qcom_usb4_mcu *mcu;
+ 	u8 drom[QCOM_USB4_DROM_SIZE];
+ 	u32 command;
+-	int ret;
++	int ret, router;
+ 
+ 	if (!cfg || !ops || !ops->owner_check || !ops->provider ||
+ 	    !ops->read_router || !ops->update_router || !ops->delay_us)
+ 		return -EINVAL;
+-	if (cfg->profile != QCOM_USB4_START_SURFACE_A8_PORT0 ||
++	router = start_router(cfg);
++	if (router < 0 ||
+ 	    (cfg->pcie_policy != QCOM_USB4_START_PCIE_SKIP &&
+ 	     cfg->pcie_policy != QCOM_USB4_START_PCIE_ENABLE))
+ 		return -EINVAL;
+@@ -131,15 +218,29 @@ static int start_validate(const struct qcom_usb4_start_config *cfg,
+ 	    cfg->command_timeout_us > 1000000 || cfg->connection.board_retimer != 1)
+ 		return -EINVAL;
+ 	mcu = cfg->mcu;
+-	if (!mcu || !mcu->base || (unsigned long)mcu->base % sizeof(u32) ||
+-	    mcu->ram_offset != 0x13000 || mcu->control_offset != 0x22000 ||
+-	    mcu->shared_offset_reg != 0x22010 || mcu->drom_offset != 0xdf20 ||
+-	    mcu->ram_size < 0xdf20 + sizeof(drom) || mcu->ram_size > 0xf000)
++	if (!mcu || !mcu->base || (unsigned long)mcu->base % sizeof(u32))
+ 		return -EINVAL;
++	switch (router) {
++	case 0:
++		if (mcu->layout != QCOM_USB4_MCU_LEGACY ||
++		    mcu->ram_offset != 0x13000 || mcu->control_offset != 0x22000 ||
++		    mcu->shared_offset_reg != 0x22010 || mcu->drom_offset != 0xdf20 ||
++		    mcu->ram_size < 0xdf20 + sizeof(drom) || mcu->ram_size > 0xf000)
++			return -EINVAL;
++		break;
++	case 1:
++		/* The RAM size is not established beyond the DROM's end. */
++		if (mcu->layout != QCOM_USB4_MCU_V2 ||
++		    mcu->ram_offset != 0x1e000 || mcu->control_offset != 0x14000 ||
++		    mcu->shared_offset_reg != 0x14010 || mcu->drom_offset != 0xff20 ||
++		    mcu->ram_size < 0xff20 + sizeof(drom) || mcu->ram_size > 0x11000)
++			return -EINVAL;
++		break;
++	}
+ 	ret = qcom_usb4_typec_connect_command(&cfg->connection, &command);
+ 	if (ret)
+ 		return ret;
+-	ret = qcom_usb4_drom_build(drom, sizeof(drom), cfg->serial, 0);
++	ret = qcom_usb4_drom_build(drom, sizeof(drom), cfg->serial, router);
+ 	if (ret)
+ 		return ret;
+ 	return qcom_usb4_fw_validate(cfg->firmware, cfg->firmware_size, mcu->ram_size);
+@@ -175,6 +276,7 @@ static int start_execute(const struct start_operation *op,
+ 			 const struct qcom_usb4_start_config *cfg,
+ 			 const struct qcom_usb4_start_ops *ops, void *ctx)
+ {
++	unsigned int i;
+ 	u32 command;
+ 	int ret;
+ 
+@@ -191,7 +293,16 @@ static int start_execute(const struct start_operation *op,
+ 	case START_UPLOAD:
+ 		return qcom_usb4_mcu_upload(cfg->mcu, cfg->firmware, cfg->firmware_size);
+ 	case START_DROM:
+-		return qcom_usb4_mcu_write_drom(cfg->mcu, cfg->serial, 0);
++		return qcom_usb4_mcu_write_drom(cfg->mcu, cfg->serial, start_router(cfg));
++	case START_V2_SETUP:
++		for (i = 0; i < ARRAY_SIZE(start_v2_setup); i++) {
++			ret = ops->update_router(ctx, start_v2_setup[i].offset,
++						 start_v2_setup[i].mask,
++						 start_v2_setup[i].value);
++			if (ret)
++				return ret;
++		}
++		return 0;
+ 	case START_MCU:
+ 		return qcom_usb4_mcu_start(cfg->mcu, &state->shared_offset);
+ 	case START_PRESET:
+@@ -219,6 +330,8 @@ static int start_run_table(struct qcom_usb4_start_state *state,
+ 	int ret;
+ 
+ 	for (i = 0; i < count; i++) {
++		if (!start_applies(&table[i], cfg))
++			continue;
+ 		state->active_step = table[i].step;
+ 		ret = start_execute(&table[i], state, cfg, ops, context);
+ 		if (ret) {
+@@ -271,8 +384,8 @@ int qcom_usb4_startup_resume(struct qcom_usb4_start_state *state,
+ 			     const struct qcom_usb4_start_config *cfg,
+ 			     const struct qcom_usb4_start_ops *ops, void *context)
+ {
+-	if (!state || !cfg || !cfg->mcu || !ops || !ops->provider ||
+-	    !ops->update_router || !ops->delay_us)
++	if (!state || !cfg || !cfg->mcu || start_router(cfg) < 0 || !ops ||
++	    !ops->provider || !ops->update_router || !ops->delay_us)
+ 		return -EINVAL;
+ 	if (state->phase != QCOM_USB4_START_COMPLETE)
+ 		return -EINVAL;
+diff --git a/drivers/thunderbolt/qcom-usb4-startup.h b/drivers/thunderbolt/qcom-usb4-startup.h
+index 642f74940..45dd8dad8 100644
+--- a/drivers/thunderbolt/qcom-usb4-startup.h
++++ b/drivers/thunderbolt/qcom-usb4-startup.h
+@@ -7,7 +7,10 @@
+ 
+ enum qcom_usb4_start_profile {
+ 	QCOM_USB4_START_PROFILE_UNSET,
++	/* Router 0, legacy MCU layout. */
+ 	QCOM_USB4_START_SURFACE_A8_PORT0,
++	/* Router 1, v2 MCU layout. */
++	QCOM_USB4_START_SURFACE_A8_PORT1,
+ };
+ 
+ enum qcom_usb4_start_pcie_policy {
+@@ -57,6 +60,7 @@ enum qcom_usb4_start_step {
+ 	QCOM_USB4_START_ROUTER_81000_CLEAR,
+ 	QCOM_USB4_START_FIRMWARE_UPLOAD,
+ 	QCOM_USB4_START_SYS_MEMORY_FORCE,
++	QCOM_USB4_START_UC_HRR_MEMORY_FORCE,
+ 	QCOM_USB4_START_DROM,
+ 	QCOM_USB4_START_TCSR_ROUTE,
+ 	QCOM_USB4_START_PIPE_HWCG_OFF,
+@@ -69,6 +73,9 @@ enum qcom_usb4_start_step {
+ 	QCOM_USB4_START_ADAPTER_BIT23,
+ 	QCOM_USB4_START_ADAPTER_BIT22,
+ 	QCOM_USB4_START_ADAPTER_BIT21,
++	QCOM_USB4_START_ADAPTER_BIT20,
++	QCOM_USB4_START_ADAPTER_BIT19,
++	QCOM_USB4_START_V2_SETUP,
+ 	QCOM_USB4_START_MCU,
+ 	QCOM_USB4_START_PRESET,
+ 	QCOM_USB4_START_PCIE_POLICY,
+-- 
+2.56.0
+

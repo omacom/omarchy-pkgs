@@ -1,0 +1,978 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jim Martin <jimmartin@gmail.com>
+Date: Fri, 13 Nov 2026 20:16:54 -0600
+Subject: [PATCH] PCI: qcom: Add the Glymur root complexes behind the USB4 host
+ routers
+
+Each USB4 host router of Glymur has a DesignWare root complex of its
+own in the SoC, separate from the ones with a PHY. Its only link is the
+PCIe tunnel that router carries, so it has no PHY and no PERST# pin:
+the router's PCIe adapter stands in for the PHY, and PERST# is a
+request the router passes down the tunnel. Nothing drives these
+controllers, so the PCIe devices of USB4 and Thunderbolt docks and
+drive enclosures never appear.
+
+Add a driver for them. Such a root complex is described as a child of
+its host router and is a device only while a tunnel exists; the router
+driver creates and removes it. Probing therefore resets and configures
+the controller, waits for the router to present the tunnel in the
+slot, releases PERST# through the router, starts link training and
+enumerates, and removal takes all of it down again. The router
+provides two resets for this, the hold on its side of the pipe and
+PERST#.
+
+What is plugged into a USB4 port is not trusted. The driver does not
+start unless the controller is mapped to an IOMMU and its root port is
+described as external facing, which has the PCI core treat the devices
+below as untrusted and the IOMMU core give them translated, strict
+mappings.
+
+The root port is a hot-plug slot whose card is the tunnel, as Windows
+declares it: hot-plug capable and removable without notice. The other
+slot features the controller announces by default (attention button,
+power controller, latch, indicators, interlock) do not exist and are
+cleared. The hot-plug handling of the port removes devices under the
+rescan lock from the port's interrupt thread, and the removal of the
+root bus takes that lock and waits for that thread, so the port is
+unbound before the root bus is removed.
+
+Across system suspend the devices behind the tunnel stay. The router
+above this device is halted for the sleep and the link with it, so the
+link is taken down in the noirq suspend callback, after the PCI core
+has saved and powered down the devices, and the controller is started
+again as at probe in the noirq resume callback, when the router has
+restored the tunnel and before the PCI core restores the devices. If
+the tunnel does not come back (an unplug during sleep) or the link
+does not train, accesses below the root port complete without reaching
+the link, the hot-plug handling of the port finds its device gone, and
+the device is given up as below once the system is awake.
+
+A link that goes down has the controller's outbound address space
+blocked at once from the interrupt, so that an access to a device that
+was just unplugged completes instead of faulting. The interrupt is in
+place before the link is started and until the root bus is gone.
+
+The controller does not train a link again once it went down, until it
+is reset: after a hot reset from the root port the link stayed down
+with the tunnel in place. Nothing may use the controller while it is
+reset, and the Windows driver resets it only between hiding the root
+bridge and announcing it again. So when the link is lost the driver
+unbinds from the device, from a work item of its own, and the router
+driver creates a new device if the tunnel still exists; the devices
+come back as after a plug. For the same reason the root port is marked
+as having no reset of the bus below it.
+
+The bus bandwidth requested is the one in the platform's firmware
+tables; the link speed the controller reports is of no use for it,
+because the link is a tunnel.
+
+pcie-qcom is left alone: it wants a PHY and a PERST# GPIO per port,
+keeps its controllers for the life of the system, and has no remove
+path.
+
+The sequence and the register values are those of the platform's
+Windows driver for these controllers. A few registers it writes are
+not documented anywhere I could find and are named by offset.
+
+Assisted-by: Claude Fable 5.2
+Signed-off-by: Jim Martin <jimmartin@gmail.com>
+---
+ drivers/pci/controller/dwc/Kconfig          |  12 +
+ drivers/pci/controller/dwc/Makefile         |   1 +
+ drivers/pci/controller/dwc/pcie-qcom-usb4.c | 849 ++++++++++++++++++++
+ 3 files changed, 862 insertions(+)
+ create mode 100644 drivers/pci/controller/dwc/pcie-qcom-usb4.c
+
+diff --git a/drivers/pci/controller/dwc/Kconfig b/drivers/pci/controller/dwc/Kconfig
+index dcfbe7e22..34fd41967 100644
+--- a/drivers/pci/controller/dwc/Kconfig
++++ b/drivers/pci/controller/dwc/Kconfig
+@@ -330,6 +330,18 @@ config PCIE_QCOM
+ 	  PCIe controller uses the DesignWare core plus Qualcomm-specific
+ 	  hardware wrappers.
+ 
++config PCIE_QCOM_USB4
++	bool "Qualcomm PCIe root complex behind a USB4 host router"
++	depends on OF && (ARCH_QCOM || COMPILE_TEST)
++	depends on PCI_MSI
++	select PCIE_DW_HOST
++	help
++	  Say Y here to support the PCIe root complexes of Qualcomm Glymur
++	  that carry the PCIe tunnels of its USB4 host routers. They are
++	  started and stopped by the USB4 host router driver as devices are
++	  plugged in, and are needed for the PCIe devices of USB4 and
++	  Thunderbolt docks, drive enclosures and graphics enclosures.
++
+ config PCIE_QCOM_EP
+ 	tristate "Qualcomm PCIe controller (endpoint mode)"
+ 	depends on OF && (ARCH_QCOM || COMPILE_TEST)
+diff --git a/drivers/pci/controller/dwc/Makefile b/drivers/pci/controller/dwc/Makefile
+index d4f88cfc6..a6f515d65 100644
+--- a/drivers/pci/controller/dwc/Makefile
++++ b/drivers/pci/controller/dwc/Makefile
+@@ -22,6 +22,7 @@ obj-$(CONFIG_PCI_LAYERSCAPE_EP) += pci-layerscape-ep.o
+ obj-$(CONFIG_PCIE_QCOM_COMMON) += pcie-qcom-common.o
+ obj-$(CONFIG_PCIE_QCOM) += pcie-qcom.o
+ obj-$(CONFIG_PCIE_QCOM_EP) += pcie-qcom-ep.o
++obj-$(CONFIG_PCIE_QCOM_USB4) += pcie-qcom-usb4.o
+ obj-$(CONFIG_PCIE_ARMADA_8K) += pcie-armada8k.o
+ obj-$(CONFIG_PCIE_ARTPEC6) += pcie-artpec6.o
+ obj-$(CONFIG_PCIE_ROCKCHIP_DW) += pcie-dw-rockchip.o
+diff --git a/drivers/pci/controller/dwc/pcie-qcom-usb4.c b/drivers/pci/controller/dwc/pcie-qcom-usb4.c
+new file mode 100644
+index 000000000..d43d83325
+--- /dev/null
++++ b/drivers/pci/controller/dwc/pcie-qcom-usb4.c
+@@ -0,0 +1,849 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Qualcomm PCIe root complex behind a USB4 host router
++ *
++ * Each USB4 host router of the Glymur SoC has a DesignWare root complex of
++ * its own, whose only link is the PCIe tunnel that router carries. It has no
++ * PHY and no PERST# pin: the router's PCIe adapter stands where the PHY would
++ * be, and PERST# is a request the router passes on to the tunnel.
++ *
++ * The device exists only while a tunnel does. The USB4 host router driver
++ * creates it, from the router's child node, once the connection manager has
++ * set the tunnel up and the router reports it, and removes it before the
++ * router stops. Probing therefore brings the link up and enumerates what is
++ * behind it, and nothing here touches the controller without a tunnel.
++ *
++ * What is plugged into a USB4 port is not trusted. The root port's node must
++ * say so ("external-facing") and the controller must be behind an IOMMU, or
++ * the driver refuses to start: the devices below are then confined to their
++ * own translated mappings before any of their drivers runs.
++ *
++ * The root port is a hot-plug slot, as on Windows. A link that went down is
++ * not trained again by the controller until the controller is reset, and
++ * nothing may use the controller while it is: the Windows driver resets it
++ * only between hiding the root bridge and announcing it again. So when the
++ * link drops the driver gives the device up, and the router driver creates a
++ * new one if the tunnel is still there. For the same reason the root port
++ * offers no reset of the bus below it.
++ *
++ * The order of operations and the register values follow the Windows driver
++ * for these controllers (qcppx8480.sys); registers it writes whose meaning is
++ * not established are named by their offset.
++ */
++
++#include <linux/bitfield.h>
++#include <linux/clk.h>
++#include <linux/delay.h>
++#include <linux/interconnect.h>
++#include <linux/interrupt.h>
++#include <linux/iopoll.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/pci.h>
++#include <linux/platform_device.h>
++#include <linux/pm_runtime.h>
++#include <linux/reset.h>
++#include <linux/slab.h>
++#include <linux/spinlock.h>
++#include <linux/workqueue.h>
++
++#include "../../pci.h"
++#include "pcie-designware.h"
++
++/* PARF registers */
++#define PARF_SYS_CTRL				0x00
++#define PARF_ECAM_BLOCKER_EN			BIT(26)
++#define PARF_PM_CTRL				0x20
++#define PARF_REQ_NOT_ENTR_L1			BIT(5)
++#define PARF_LTSSM				0x1b0
++#define PARF_LTSSM_EN				BIT(8)
++#define PARF_LTSSM_STATE			GENMASK(5, 0)
++#define PARF_SLV_DBI_ELBI			0x1b4
++#define PARF_SLV_DBI_ELBI_OFFSET		GENMASK(11, 0)
++#define PARF_INT_ALL_STATUS			0x224
++#define PARF_INT_ALL_CLEAR			0x228
++#define PARF_INT_ALL_MASK			0x22c
++#define PARF_INT_ALL_LINK_DOWN			BIT(1)
++#define PARF_DBI_BASE_ADDR_V2			0x350
++#define PARF_DBI_BASE_ADDR_V2_HI		0x354
++#define PARF_SLV_ADDR_SPACE_SIZE_V2		0x358
++#define PARF_SLV_ADDR_SPACE_SIZE_V2_HI		0x35c
++#define PARF_BLOCK_SLV_AXI_WR_BASE		0x360
++#define PARF_BLOCK_SLV_AXI_WR_BASE_HI		0x364
++#define PARF_BLOCK_SLV_AXI_WR_LIMIT		0x368
++#define PARF_BLOCK_SLV_AXI_WR_LIMIT_HI		0x36c
++#define PARF_BLOCK_SLV_AXI_RD_BASE		0x370
++#define PARF_BLOCK_SLV_AXI_RD_BASE_HI		0x374
++#define PARF_BLOCK_SLV_AXI_RD_LIMIT		0x378
++#define PARF_BLOCK_SLV_AXI_RD_LIMIT_HI		0x37c
++#define PARF_494				0x494
++#define PARF_4A0				0x4a0
++#define PARF_ATU_BASE_ADDR			0x634
++#define PARF_ATU_BASE_ADDR_HI			0x638
++#define PARF_64C				0x64c
++#define PARF_650				0x650
++#define PARF_DEVICE_TYPE			0x1000
++#define PARF_DEVICE_TYPE_MASK			GENMASK(3, 0)
++#define PARF_DEVICE_TYPE_RC			0x4
++
++/* The size Windows gives the controller's address space: 2 TiB */
++#define PARF_SLV_ADDR_SPACE_SIZE_HI_VAL		0x200
++
++/* ELBI registers */
++#define ELBI_SYS_STTS				0x08
++#define ELBI_SYS_STTS_XMLH_LINK_UP		BIT(10)
++#define ELBI_CS2_ENABLE				0xa4
++
++/* Port logic and vendor registers in the DBI space */
++#define DBI_644					0x644
++#define DBI_TIMER_CTRL_MAX_FUNC_NUM		0x718
++#define DBI_TIMER_MOD_ACK_NAK			GENMASK(18, 14)
++#define DBI_SYMBOL_TIMER_FILTER_1		0x71c
++#define DBI_FILTER_MASK_1			GENMASK(31, 16)
++#define DBI_FILTER_MASK_1_VAL			0x0400
++#define DBI_B4C					0xb4c
++#define DBI_B4C_FIELD				GENMASK(11, 8)
++#define DBI_B4C_VAL				4
++#define DBI_B90					0xb90
++
++/*
++ * Bus bandwidth, from the platform's firmware tables (the same for both
++ * controllers): 2 GB/s average and 4 GB/s peak towards memory, 75 MB/s peak
++ * for register access. The link speed the controller reports says nothing
++ * here, since the link is a USB4 tunnel.
++ */
++#define QCOM_USB4_PCIE_MEM_AVG_BW		MBps_to_icc(2000)
++#define QCOM_USB4_PCIE_MEM_PEAK_BW		MBps_to_icc(4000)
++#define QCOM_USB4_PCIE_CFG_PEAK_BW		MBps_to_icc(75)
++
++#define QCOM_USB4_PCIE_RESET_US			5000
++#define QCOM_USB4_PCIE_PRESENCE_US		5000
++#define QCOM_USB4_PCIE_PERST_US			1000
++#define QCOM_USB4_PCIE_PERST_SETTLE_MS		20
++#define QCOM_USB4_PCIE_LINK_TIMEOUT_US		150000
++#define QCOM_USB4_PCIE_LTSSM_L0			0x11
++
++/*
++ * Ack/Nak latency timer modifier by host router: router 0 (the earlier MCU
++ * layout) and router 1 (v2).
++ */
++static const u8 qcom_usb4_pcie_ack_nak_mod[] = { 0x1f, 0x04 };
++
++struct qcom_usb4_pcie {
++	struct dw_pcie pci;
++	void __iomem *parf;
++	struct clk_bulk_data *clks;
++	int num_clks;
++	struct reset_control *core_reset;
++	struct reset_control *pipe_reset;
++	struct reset_control *perst;
++	struct icc_path *icc_mem;
++	struct icc_path *icc_cpu;
++	u32 elbi_offset;
++	int global_irq;
++	u8 ack_nak_mod;
++	bool powered;
++	/* Serialises the outbound block between the interrupt and the rest. */
++	spinlock_t block_lock;
++	bool blocked;
++	struct qcom_usb4_pcie_lost *lost;
++};
++
++/*
++ * Gives the device up after its link is lost. It unbinds the driver, so it
++ * cannot be part of what the driver frees when it is unbound.
++ */
++struct qcom_usb4_pcie_lost {
++	struct work_struct work;
++	struct device *dev;
++};
++
++#define to_qcom_usb4_pcie(x)	container_of(x, struct qcom_usb4_pcie, pci)
++
++/*
++ * Keep accesses off a link that is down: with the whole of the controller's
++ * outbound address space blocked, an access to a device that has just been
++ * unplugged completes instead of faulting. The controller's own registers
++ * stay reachable.
++ */
++static void qcom_usb4_pcie_block_slave(struct qcom_usb4_pcie *pcie, bool block)
++{
++	unsigned long flags;
++	u32 val;
++
++	spin_lock_irqsave(&pcie->block_lock, flags);
++	val = readl(pcie->parf + PARF_SYS_CTRL);
++	if (block) {
++		writel(0, pcie->parf + PARF_BLOCK_SLV_AXI_WR_BASE);
++		writel(0, pcie->parf + PARF_BLOCK_SLV_AXI_WR_BASE_HI);
++		writel(0, pcie->parf + PARF_BLOCK_SLV_AXI_RD_BASE);
++		writel(0, pcie->parf + PARF_BLOCK_SLV_AXI_RD_BASE_HI);
++		writel(U32_MAX, pcie->parf + PARF_BLOCK_SLV_AXI_WR_LIMIT);
++		writel(U32_MAX, pcie->parf + PARF_BLOCK_SLV_AXI_WR_LIMIT_HI);
++		writel(U32_MAX, pcie->parf + PARF_BLOCK_SLV_AXI_RD_LIMIT);
++		writel(U32_MAX, pcie->parf + PARF_BLOCK_SLV_AXI_RD_LIMIT_HI);
++		val |= PARF_ECAM_BLOCKER_EN;
++	} else {
++		val &= ~PARF_ECAM_BLOCKER_EN;
++	}
++	writel(val, pcie->parf + PARF_SYS_CTRL);
++	WRITE_ONCE(pcie->blocked, block);
++	spin_unlock_irqrestore(&pcie->block_lock, flags);
++}
++
++static void qcom_usb4_pcie_lost_work(struct work_struct *work)
++{
++	struct qcom_usb4_pcie_lost *lost =
++		container_of(work, struct qcom_usb4_pcie_lost, work);
++
++	/* Nothing to do if the router driver removed the device meanwhile. */
++	device_release_driver(lost->dev);
++	put_device(lost->dev);
++	kfree(lost);
++}
++
++/*
++ * The link is lost and only a new start of the controller trains it again:
++ * unbind, once and from a work item of its own. The router driver creates the
++ * device anew while the tunnel exists. Not while the system sleeps or wakes.
++ */
++static void qcom_usb4_pcie_give_up(struct qcom_usb4_pcie *pcie)
++{
++	struct qcom_usb4_pcie_lost *lost = xchg(&pcie->lost, NULL);
++
++	if (lost)
++		queue_work(system_freezable_wq, &lost->work);
++}
++
++static void qcom_usb4_pcie_free_lost(void *data)
++{
++	struct qcom_usb4_pcie *pcie = data;
++	struct qcom_usb4_pcie_lost *lost = xchg(&pcie->lost, NULL);
++
++	if (lost) {
++		put_device(lost->dev);
++		kfree(lost);
++	}
++}
++
++static int qcom_usb4_pcie_alloc_lost(struct qcom_usb4_pcie *pcie)
++{
++	struct device *dev = pcie->pci.dev;
++	struct qcom_usb4_pcie_lost *lost;
++
++	lost = kzalloc_obj(*lost);
++	if (!lost)
++		return -ENOMEM;
++	INIT_WORK(&lost->work, qcom_usb4_pcie_lost_work);
++	lost->dev = get_device(dev);
++	pcie->lost = lost;
++	return devm_add_action_or_reset(dev, qcom_usb4_pcie_free_lost, pcie);
++}
++
++/*
++ * The link went down: the tunnel is gone (the router driver then removes this
++ * device), or the device behind it dropped the link. Block the address space
++ * at once, so that an access to what was there completes instead of
++ * faulting; the root port's hot-plug handling removes the devices. Then give
++ * the device up, see above.
++ *
++ * Requested before the link is started and freed after the root bus is gone,
++ * so it covers enumeration and removal.
++ */
++static irqreturn_t qcom_usb4_pcie_global_irq(int irq, void *data)
++{
++	struct qcom_usb4_pcie *pcie = data;
++	u32 status = readl(pcie->parf + PARF_INT_ALL_STATUS);
++
++	writel(status, pcie->parf + PARF_INT_ALL_CLEAR);
++	if (!(status & PARF_INT_ALL_LINK_DOWN))
++		return status ? IRQ_HANDLED : IRQ_NONE;
++
++	qcom_usb4_pcie_block_slave(pcie, true);
++	qcom_usb4_pcie_give_up(pcie);
++	dev_dbg(pcie->pci.dev, "link down, address space blocked\n");
++	return IRQ_HANDLED;
++}
++
++static bool qcom_usb4_pcie_link_up(struct dw_pcie *pci)
++{
++	struct qcom_usb4_pcie *pcie = to_qcom_usb4_pcie(pci);
++
++	if (!pcie->powered || READ_ONCE(pcie->blocked))
++		return false;
++	return readl(pci->elbi_base + ELBI_SYS_STTS) & ELBI_SYS_STTS_XMLH_LINK_UP;
++}
++
++static enum dw_pcie_ltssm qcom_usb4_pcie_get_ltssm(struct dw_pcie *pci)
++{
++	struct qcom_usb4_pcie *pcie = to_qcom_usb4_pcie(pci);
++
++	return (enum dw_pcie_ltssm)FIELD_GET(PARF_LTSSM_STATE,
++					     readl(pcie->parf + PARF_LTSSM));
++}
++
++static void qcom_usb4_pcie_ltssm(struct qcom_usb4_pcie *pcie, bool enable)
++{
++	u32 val = readl(pcie->parf + PARF_LTSSM);
++
++	if (enable)
++		val |= PARF_LTSSM_EN;
++	else
++		val &= ~PARF_LTSSM_EN;
++	writel(val, pcie->parf + PARF_LTSSM);
++}
++
++static int qcom_usb4_pcie_start_link(struct dw_pcie *pci)
++{
++	struct qcom_usb4_pcie *pcie = to_qcom_usb4_pcie(pci);
++	struct device *dev = pci->dev;
++	u16 exp = dw_pcie_find_capability(pci, PCI_CAP_ID_EXP);
++	u32 val;
++	int ret;
++
++	/*
++	 * The router presents the tunnel as a card in the slot. Without one
++	 * there is nothing to reset or train.
++	 */
++	ret = read_poll_timeout(dw_pcie_readw_dbi, val, val & PCI_EXP_SLTSTA_PDS,
++				500, QCOM_USB4_PCIE_PRESENCE_US, false, pci,
++				exp + PCI_EXP_SLTSTA);
++	if (ret) {
++		dev_dbg(dev, "no tunnel present at the root port\n");
++		return -ENODEV;
++	}
++
++	/* PERST# through the router: assert, hold, release, let it settle. */
++	ret = reset_control_assert(pcie->perst);
++	if (ret)
++		return dev_err_probe(dev, ret, "PERST# assert\n");
++	usleep_range(QCOM_USB4_PCIE_PERST_US, QCOM_USB4_PCIE_PERST_US + 500);
++	ret = reset_control_deassert(pcie->perst);
++	if (ret)
++		return dev_err_probe(dev, ret, "PERST# release\n");
++	msleep(QCOM_USB4_PCIE_PERST_SETTLE_MS);
++
++	writel(0, pcie->parf + PARF_494);
++	writel(2, pcie->parf + PARF_494);
++	writel(0, pcie->parf + PARF_494);
++	writel(5, pcie->parf + PARF_494);
++	qcom_usb4_pcie_ltssm(pcie, true);
++
++	ret = readl_poll_timeout(pci->elbi_base + ELBI_SYS_STTS, val,
++				 val & ELBI_SYS_STTS_XMLH_LINK_UP, 1000,
++				 QCOM_USB4_PCIE_LINK_TIMEOUT_US);
++	writel(0, pcie->parf + PARF_494);
++	if (!ret)
++		ret = readl_poll_timeout(pcie->parf + PARF_LTSSM, val,
++					 FIELD_GET(PARF_LTSSM_STATE, val) ==
++					 QCOM_USB4_PCIE_LTSSM_L0, 1000,
++					 QCOM_USB4_PCIE_LINK_TIMEOUT_US);
++	if (ret)
++		dev_warn(dev, "tunnelled link did not train (LTSSM %#x)\n",
++			 readl(pcie->parf + PARF_LTSSM));
++	/*
++	 * Not an error: the core waits for the link itself, and a slot whose
++	 * link is not up yet is an empty hot-plug slot.
++	 */
++	return 0;
++}
++
++static void qcom_usb4_pcie_stop_link(struct dw_pcie *pci)
++{
++	struct qcom_usb4_pcie *pcie = to_qcom_usb4_pcie(pci);
++
++	if (pcie->powered)
++		qcom_usb4_pcie_ltssm(pcie, false);
++}
++
++static const struct dw_pcie_ops qcom_usb4_pcie_dw_ops = {
++	.link_up = qcom_usb4_pcie_link_up,
++	.start_link = qcom_usb4_pcie_start_link,
++	.stop_link = qcom_usb4_pcie_stop_link,
++	.get_ltssm = qcom_usb4_pcie_get_ltssm,
++};
++
++/* Bus bandwidth and clocks; the power domain is the caller's matter. */
++static int qcom_usb4_pcie_clocks_on(struct qcom_usb4_pcie *pcie)
++{
++	int ret;
++
++	ret = icc_set_bw(pcie->icc_cpu, 0, QCOM_USB4_PCIE_CFG_PEAK_BW);
++	if (ret)
++		return ret;
++	ret = icc_set_bw(pcie->icc_mem, QCOM_USB4_PCIE_MEM_AVG_BW,
++			 QCOM_USB4_PCIE_MEM_PEAK_BW);
++	if (ret)
++		goto err_cpu;
++	ret = clk_bulk_prepare_enable(pcie->num_clks, pcie->clks);
++	if (ret)
++		goto err_mem;
++	pcie->powered = true;
++	return 0;
++
++err_mem:
++	icc_set_bw(pcie->icc_mem, 0, 0);
++err_cpu:
++	icc_set_bw(pcie->icc_cpu, 0, 0);
++	return ret;
++}
++
++static void qcom_usb4_pcie_clocks_off(struct qcom_usb4_pcie *pcie)
++{
++	pcie->powered = false;
++	clk_bulk_disable_unprepare(pcie->num_clks, pcie->clks);
++	icc_set_bw(pcie->icc_mem, 0, 0);
++	icc_set_bw(pcie->icc_cpu, 0, 0);
++}
++
++static int qcom_usb4_pcie_power_on(struct qcom_usb4_pcie *pcie)
++{
++	struct device *dev = pcie->pci.dev;
++	int ret;
++
++	ret = pm_runtime_resume_and_get(dev);
++	if (ret)
++		return ret;
++	ret = qcom_usb4_pcie_clocks_on(pcie);
++	if (ret)
++		pm_runtime_put_sync(dev);
++	return ret;
++}
++
++static void qcom_usb4_pcie_power_off(struct qcom_usb4_pcie *pcie)
++{
++	if (!pcie->powered)
++		return;
++	qcom_usb4_pcie_clocks_off(pcie);
++	pm_runtime_put_sync(pcie->pci.dev);
++}
++
++/* Reset the controller with the router's side of the pipe held. */
++static int qcom_usb4_pcie_reset(struct qcom_usb4_pcie *pcie)
++{
++	struct device *dev = pcie->pci.dev;
++	u32 val;
++	int ret;
++
++	qcom_usb4_pcie_ltssm(pcie, false);
++
++	ret = reset_control_assert(pcie->pipe_reset);
++	if (ret)
++		return dev_err_probe(dev, ret, "router pipe hold\n");
++	ret = reset_control_assert(pcie->core_reset);
++	if (ret) {
++		dev_err_probe(dev, ret, "core reset\n");
++		goto err_pipe;
++	}
++	usleep_range(QCOM_USB4_PCIE_RESET_US, QCOM_USB4_PCIE_RESET_US + 500);
++	ret = reset_control_deassert(pcie->core_reset);
++	if (ret) {
++		dev_err_probe(dev, ret, "core reset release\n");
++		goto err_pipe;
++	}
++	usleep_range(QCOM_USB4_PCIE_RESET_US, QCOM_USB4_PCIE_RESET_US + 500);
++
++	val = readl(pcie->parf + PARF_DEVICE_TYPE);
++	val &= ~PARF_DEVICE_TYPE_MASK;
++	writel(val | PARF_DEVICE_TYPE_RC, pcie->parf + PARF_DEVICE_TYPE);
++
++	ret = reset_control_deassert(pcie->pipe_reset);
++	if (ret)
++		return dev_err_probe(dev, ret, "router pipe release\n");
++	return 0;
++
++err_pipe:
++	/* Leave the router's side as it was found; the caller powers off. */
++	reset_control_deassert(pcie->pipe_reset);
++	return ret;
++}
++
++static void qcom_usb4_pcie_dbi_update(struct dw_pcie *pci, u32 reg, u32 mask, u32 val)
++{
++	dw_pcie_writel_dbi(pci, reg, (dw_pcie_readl_dbi(pci, reg) & ~mask) | val);
++}
++
++static void qcom_usb4_pcie_configure(struct qcom_usb4_pcie *pcie)
++{
++	struct dw_pcie *pci = &pcie->pci;
++	u16 exp;
++	u32 val;
++
++	/* Where the controller finds its own registers, in CPU addresses. */
++	writel(lower_32_bits(pci->dbi_phys_addr), pcie->parf + PARF_DBI_BASE_ADDR_V2);
++	writel(upper_32_bits(pci->dbi_phys_addr), pcie->parf + PARF_DBI_BASE_ADDR_V2_HI);
++	val = readl(pcie->parf + PARF_SLV_DBI_ELBI);
++	val &= ~PARF_SLV_DBI_ELBI_OFFSET;
++	writel(val | FIELD_PREP(PARF_SLV_DBI_ELBI_OFFSET, pcie->elbi_offset),
++	       pcie->parf + PARF_SLV_DBI_ELBI);
++	writel(lower_32_bits(pci->atu_phys_addr), pcie->parf + PARF_ATU_BASE_ADDR);
++	writel(upper_32_bits(pci->atu_phys_addr), pcie->parf + PARF_ATU_BASE_ADDR_HI);
++	writel(U32_MAX, pcie->parf + PARF_64C);
++	writel(U32_MAX, pcie->parf + PARF_650);
++	writel(0, pcie->parf + PARF_SLV_ADDR_SPACE_SIZE_V2);
++	writel(PARF_SLV_ADDR_SPACE_SIZE_HI_VAL, pcie->parf + PARF_SLV_ADDR_SPACE_SIZE_V2_HI);
++
++	qcom_usb4_pcie_block_slave(pcie, false);
++
++	/* Allow L1 */
++	writel(readl(pcie->parf + PARF_PM_CTRL) & ~PARF_REQ_NOT_ENTR_L1,
++	       pcie->parf + PARF_PM_CTRL);
++
++	qcom_usb4_pcie_dbi_update(pci, DBI_644, BIT(0), 0);
++	qcom_usb4_pcie_dbi_update(pci, DBI_B90, BIT(8), BIT(8));
++	qcom_usb4_pcie_dbi_update(pci, DBI_B4C, DBI_B4C_FIELD,
++				  FIELD_PREP(DBI_B4C_FIELD, DBI_B4C_VAL));
++	qcom_usb4_pcie_dbi_update(pci, DBI_TIMER_CTRL_MAX_FUNC_NUM, DBI_TIMER_MOD_ACK_NAK,
++				  FIELD_PREP(DBI_TIMER_MOD_ACK_NAK, pcie->ack_nak_mod));
++	qcom_usb4_pcie_dbi_update(pci, DBI_SYMBOL_TIMER_FILTER_1, DBI_FILTER_MASK_1,
++				  FIELD_PREP(DBI_FILTER_MASK_1, DBI_FILTER_MASK_1_VAL));
++
++	/*
++	 * The root port is a slot whose card is the tunnel: hot-plug capable
++	 * and removable without notice, as Windows declares it. The controller
++	 * also announces an attention button, a power controller, a latch,
++	 * indicators and an interlock by default; a tunnel has none of them.
++	 */
++	exp = dw_pcie_find_capability(pci, PCI_CAP_ID_EXP);
++	dw_pcie_dbi_ro_wr_en(pci);
++	val = dw_pcie_readl_dbi(pci, exp + PCI_EXP_SLTCAP);
++	val &= ~(PCI_EXP_SLTCAP_ABP | PCI_EXP_SLTCAP_PCP | PCI_EXP_SLTCAP_MRLSP |
++		 PCI_EXP_SLTCAP_AIP | PCI_EXP_SLTCAP_PIP | PCI_EXP_SLTCAP_EIP);
++	val |= PCI_EXP_SLTCAP_HPS | PCI_EXP_SLTCAP_HPC | PCI_EXP_SLTCAP_NCCS;
++	dw_pcie_writel_dbi(pci, exp + PCI_EXP_SLTCAP, val);
++	val = dw_pcie_readw_dbi(pci, exp + PCI_EXP_FLAGS);
++	dw_pcie_writew_dbi(pci, exp + PCI_EXP_FLAGS, val | PCI_EXP_FLAGS_SLOT);
++	dw_pcie_dbi_ro_wr_dis(pci);
++
++	/* The root port has no memory of its own: size its BARs to nothing. */
++	writel(1, pci->elbi_base + ELBI_CS2_ENABLE);
++	dw_pcie_writel_dbi(pci, PCI_BASE_ADDRESS_0, 0);
++	dw_pcie_writel_dbi(pci, PCI_BASE_ADDRESS_1, 0);
++	writel(0, pci->elbi_base + ELBI_CS2_ENABLE);
++
++	writel(PARF_INT_ALL_LINK_DOWN, pcie->parf + PARF_INT_ALL_MASK);
++	writel(readl(pcie->parf + PARF_4A0) & ~BIT(0), pcie->parf + PARF_4A0);
++}
++
++static int qcom_usb4_pcie_host_init(struct dw_pcie_rp *pp)
++{
++	struct dw_pcie *pci = to_dw_pcie_from_pp(pp);
++	struct qcom_usb4_pcie *pcie = to_qcom_usb4_pcie(pci);
++	int ret;
++
++	ret = qcom_usb4_pcie_power_on(pcie);
++	if (ret)
++		return ret;
++	ret = qcom_usb4_pcie_reset(pcie);
++	if (ret)
++		goto err_power;
++	/* The reset left every interrupt source masked. */
++	ret = request_irq(pcie->global_irq, qcom_usb4_pcie_global_irq, 0,
++			  dev_name(pci->dev), pcie);
++	if (ret) {
++		dev_err_probe(pci->dev, ret, "global interrupt\n");
++		goto err_power;
++	}
++	qcom_usb4_pcie_configure(pcie);
++	return 0;
++
++err_power:
++	qcom_usb4_pcie_power_off(pcie);
++	return ret;
++}
++
++/* Take the link down and keep everything off it. */
++static void qcom_usb4_pcie_quiesce(struct qcom_usb4_pcie *pcie)
++{
++	qcom_usb4_pcie_block_slave(pcie, true);
++	qcom_usb4_pcie_ltssm(pcie, false);
++	/* A tunnel that is already gone does not acknowledge; that is fine. */
++	reset_control_assert(pcie->perst);
++}
++
++static void qcom_usb4_pcie_host_deinit(struct dw_pcie_rp *pp)
++{
++	struct dw_pcie *pci = to_dw_pcie_from_pp(pp);
++	struct qcom_usb4_pcie *pcie = to_qcom_usb4_pcie(pci);
++
++	if (!pcie->powered)
++		return;
++	/* The root bus is gone; the handler reads the controller. */
++	writel(0, pcie->parf + PARF_INT_ALL_MASK);
++	free_irq(pcie->global_irq, pcie);
++	qcom_usb4_pcie_quiesce(pcie);
++	qcom_usb4_pcie_power_off(pcie);
++}
++
++static void qcom_usb4_pcie_host_post_init(struct dw_pcie_rp *pp)
++{
++	/*
++	 * The tunnelled link is taken down for system sleep and trained
++	 * again afterwards, so a device behind it must not count on keeping
++	 * its state.
++	 */
++	pp->bridge->broken_l1ss_resume = true;
++}
++
++static const struct dw_pcie_host_ops qcom_usb4_pcie_host_ops = {
++	.init = qcom_usb4_pcie_host_init,
++	.deinit = qcom_usb4_pcie_host_deinit,
++	.post_init = qcom_usb4_pcie_host_post_init,
++};
++
++/*
++ * What the device tree must say for the devices behind the tunnel to be
++ * confined: the controller's requesters are mapped to an IOMMU, and the root
++ * port is external facing, which makes the PCI core treat everything below
++ * as untrusted and the IOMMU core give it translated, strict mappings.
++ */
++static bool qcom_usb4_pcie_node_contained(struct device_node *np)
++{
++	struct device_node *port;
++	bool external;
++
++	if (!of_property_present(np, "iommu-map"))
++		return false;
++	port = of_get_next_available_child(np, NULL);
++	external = port && of_property_read_bool(port, "external-facing");
++	of_node_put(port);
++	return external;
++}
++
++/* The same, of the root port as the PCI and IOMMU cores set it up. */
++static bool qcom_usb4_pcie_port_contained(struct qcom_usb4_pcie *pcie)
++{
++	struct pci_dev *port = pci_get_slot(pcie->pci.pp.bridge->bus, 0);
++	bool contained;
++
++	contained = port && port->external_facing && device_iommu_mapped(&port->dev);
++	pci_dev_put(port);
++	return contained;
++}
++
++static void qcom_usb4_pcie_remove(struct platform_device *pdev)
++{
++	struct qcom_usb4_pcie *pcie = platform_get_drvdata(pdev);
++	struct pci_bus *bus = pcie->pci.pp.bridge->bus;
++	struct pci_dev *port = pci_get_slot(bus, 0);
++
++	/* Taking the link down below is not a link that was lost. */
++	qcom_usb4_pcie_free_lost(pcie);
++
++	/*
++	 * The root port's hot-plug handling removes the devices of a link
++	 * that went down, under the rescan lock and from the port's interrupt
++	 * thread. The removal of the root bus below takes that lock and then
++	 * waits for that thread when it unbinds the port. Unbind the port
++	 * first, so its thread has finished before the lock is taken.
++	 */
++	if (port) {
++		device_release_driver(&port->dev);
++		pci_dev_put(port);
++	}
++	/* An unplug or a tunnel taken down: nothing below answers any more. */
++	if (!qcom_usb4_pcie_link_up(&pcie->pci))
++		pci_walk_bus(bus, pci_dev_set_disconnected, NULL);
++	dw_pcie_host_deinit(&pcie->pci.pp);
++}
++
++static int qcom_usb4_pcie_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct resource *dbi, *elbi;
++	struct qcom_usb4_pcie *pcie;
++	struct dw_pcie *pci;
++	u32 router;
++	int ret;
++
++	pcie = devm_kzalloc(dev, sizeof(*pcie), GFP_KERNEL);
++	if (!pcie)
++		return -ENOMEM;
++	pci = &pcie->pci;
++	pci->dev = dev;
++	pci->ops = &qcom_usb4_pcie_dw_ops;
++	pci->pp.ops = &qcom_usb4_pcie_host_ops;
++	spin_lock_init(&pcie->block_lock);
++	platform_set_drvdata(pdev, pcie);
++
++	/* The node is a child of its USB4 host router. */
++	if (!dev->parent || !dev->parent->of_node ||
++	    of_property_read_u32(dev->parent->of_node, "qcom,router-index", &router) ||
++	    router >= ARRAY_SIZE(qcom_usb4_pcie_ack_nak_mod))
++		return dev_err_probe(dev, -EINVAL, "no USB4 host router above\n");
++	pcie->ack_nak_mod = qcom_usb4_pcie_ack_nak_mod[router];
++
++	pcie->parf = devm_platform_ioremap_resource_byname(pdev, "parf");
++	if (IS_ERR(pcie->parf))
++		return PTR_ERR(pcie->parf);
++	dbi = platform_get_resource_byname(pdev, IORESOURCE_MEM, "dbi");
++	elbi = platform_get_resource_byname(pdev, IORESOURCE_MEM, "elbi");
++	if (!dbi || !elbi || elbi->start < dbi->start ||
++	    elbi->start - dbi->start > FIELD_MAX(PARF_SLV_DBI_ELBI_OFFSET))
++		return dev_err_probe(dev, -EINVAL, "dbi and elbi regions\n");
++	pcie->elbi_offset = elbi->start - dbi->start;
++
++	pcie->num_clks = devm_clk_bulk_get_all(dev, &pcie->clks);
++	if (pcie->num_clks < 0)
++		return dev_err_probe(dev, pcie->num_clks, "clocks\n");
++	pcie->core_reset = devm_reset_control_get_exclusive(dev, "pci");
++	if (IS_ERR(pcie->core_reset))
++		return dev_err_probe(dev, PTR_ERR(pcie->core_reset), "core reset\n");
++	pcie->pipe_reset = devm_reset_control_get_exclusive(dev, "pipe");
++	if (IS_ERR(pcie->pipe_reset))
++		return dev_err_probe(dev, PTR_ERR(pcie->pipe_reset), "router pipe hold\n");
++	pcie->perst = devm_reset_control_get_exclusive(dev, "perst");
++	if (IS_ERR(pcie->perst))
++		return dev_err_probe(dev, PTR_ERR(pcie->perst), "router PERST#\n");
++	pcie->icc_mem = devm_of_icc_get(dev, "pcie-mem");
++	if (IS_ERR(pcie->icc_mem))
++		return dev_err_probe(dev, PTR_ERR(pcie->icc_mem), "pcie-mem interconnect\n");
++	pcie->icc_cpu = devm_of_icc_get(dev, "cpu-pcie");
++	if (IS_ERR(pcie->icc_cpu))
++		return dev_err_probe(dev, PTR_ERR(pcie->icc_cpu), "cpu-pcie interconnect\n");
++
++	pcie->global_irq = platform_get_irq_byname(pdev, "global");
++	if (pcie->global_irq < 0)
++		return pcie->global_irq;
++
++	if (!qcom_usb4_pcie_node_contained(dev->of_node))
++		return dev_err_probe(dev, -EPERM,
++				     "no IOMMU or no external-facing root port: not started\n");
++
++	ret = qcom_usb4_pcie_alloc_lost(pcie);
++	if (ret)
++		return ret;
++
++	ret = devm_pm_runtime_enable(dev);
++	if (ret)
++		return ret;
++
++	ret = dw_pcie_host_init(&pci->pp);
++	/* No tunnel at the root port (yet, or any more) is not a failure. */
++	if (ret == -ENODEV)
++		return ret;
++	if (ret)
++		return dev_err_probe(dev, ret, "cannot start the tunnelled root complex\n");
++
++	if (!qcom_usb4_pcie_port_contained(pcie)) {
++		/* Not reachable with the node checked above; do not run open. */
++		dev_err(dev, "root port is not behind the IOMMU as an external port\n");
++		qcom_usb4_pcie_remove(pdev);
++		return -EPERM;
++	}
++	return 0;
++}
++
++/*
++ * System suspend, with a router that is kept across it. This device is a
++ * child of the router: it is suspended before the router is halted, with the
++ * devices below already saved and powered down by the PCI core, and resumed
++ * after the router has restored the tunnel, before the PCI core restores
++ * them. The link does not survive the router's halt, so it is taken down
++ * here and the controller is started again as at probe.
++ *
++ * The interrupt stays requested; the PM core keeps it disabled across the
++ * noirq phase.
++ */
++static int qcom_usb4_pcie_suspend_noirq(struct device *dev)
++{
++	struct qcom_usb4_pcie *pcie = dev_get_drvdata(dev);
++
++	if (!pcie->powered)
++		return 0;
++	writel(0, pcie->parf + PARF_INT_ALL_MASK);
++	qcom_usb4_pcie_quiesce(pcie);
++	qcom_usb4_pcie_clocks_off(pcie);
++	return 0;
++}
++
++static int qcom_usb4_pcie_resume_noirq(struct device *dev)
++{
++	struct qcom_usb4_pcie *pcie = dev_get_drvdata(dev);
++	struct dw_pcie *pci = &pcie->pci;
++	struct pci_dev *port;
++	int ret;
++
++	/*
++	 * The root port's registers are read and written from here on, so
++	 * the clocks come back whatever happens to the link.
++	 */
++	ret = qcom_usb4_pcie_clocks_on(pcie);
++	if (ret)
++		return ret;
++	ret = qcom_usb4_pcie_reset(pcie);
++	if (ret)
++		goto err_block;
++	qcom_usb4_pcie_configure(pcie);
++	ret = dw_pcie_setup_rc(&pci->pp);
++	if (ret)
++		goto err_block;
++	ret = qcom_usb4_pcie_start_link(pci);
++	if (!ret)
++		ret = dw_pcie_wait_for_link(pci);
++	if (ret)
++		goto err_block;
++
++	/* What is below was reset with the link: give it the time it may take. */
++	port = pci_get_slot(pci->pp.bridge->bus, 0);
++	if (port) {
++		pci_bridge_wait_for_secondary_bus(port, "resume");
++		pci_dev_put(port);
++	}
++	return 0;
++
++err_block:
++	/*
++	 * The router did not come back, or the tunnel is gone (an unplug
++	 * during sleep), or the link did not train. Nothing below answers:
++	 * accesses to it complete without reaching the link. Give the device
++	 * up once the system is awake; the router's driver removes it, and
++	 * creates a new one if the tunnel is still there.
++	 */
++	if (ret == -ENODEV)
++		dev_dbg(dev, "tunnel gone after sleep\n");
++	else
++		dev_info(dev, "tunnelled link not restored after sleep (%d)\n", ret);
++	qcom_usb4_pcie_block_slave(pcie, true);
++	qcom_usb4_pcie_give_up(pcie);
++	return 0;
++}
++
++static const struct dev_pm_ops qcom_usb4_pcie_pm_ops = {
++	NOIRQ_SYSTEM_SLEEP_PM_OPS(qcom_usb4_pcie_suspend_noirq,
++				  qcom_usb4_pcie_resume_noirq)
++};
++
++static const struct of_device_id qcom_usb4_pcie_of_match[] = {
++	{ .compatible = "qcom,glymur-pcie-usb4" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, qcom_usb4_pcie_of_match);
++
++static struct platform_driver qcom_usb4_pcie_driver = {
++	.probe = qcom_usb4_pcie_probe,
++	.remove = qcom_usb4_pcie_remove,
++	.driver = {
++		.name = "qcom-pcie-usb4",
++		.of_match_table = qcom_usb4_pcie_of_match,
++		.pm = pm_sleep_ptr(&qcom_usb4_pcie_pm_ops),
++		/* Bound and unbound by the USB4 host router driver only. */
++		.suppress_bind_attrs = true,
++	},
++};
++builtin_platform_driver(qcom_usb4_pcie_driver);
++
++/*
++ * A hot reset takes the link down like any other loss of it, and the link
++ * does not come back by itself (see the top of the file): the bus below the
++ * root port cannot be reset on its own.
++ */
++static void qcom_usb4_pcie_no_bus_reset(struct pci_dev *dev)
++{
++	struct device *host = pci_find_host_bridge(dev->bus)->dev.parent;
++
++	if (pci_is_root_bus(dev->bus) && host &&
++	    host->driver == &qcom_usb4_pcie_driver.driver)
++		dev->dev_flags |= PCI_DEV_FLAGS_NO_BUS_RESET;
++}
++DECLARE_PCI_FIXUP_HEADER(PCI_VENDOR_ID_QCOM, PCI_ANY_ID, qcom_usb4_pcie_no_bus_reset);
+-- 
+2.56.1
+

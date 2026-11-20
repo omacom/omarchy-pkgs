@@ -39,7 +39,8 @@ card() {
 board2() {
   python3 - "$@" <<'PY'
 import struct, sys
-out = bytearray(b"QCA-ATH12K-BOARD\0" + b"\0" * 3)
+import os
+out = bytearray(os.environ.get("MAGIC", "QCA-ATH12K-BOARD").encode() + b"\0" * 4)
 def ie(kind, payload):
     return struct.pack("<II", kind, len(payload)) + payload + b"\0" * (-len(payload) % 4)
 path, records = sys.argv[1], sys.argv[2:]
@@ -139,7 +140,43 @@ board2 "$qcc/board-2.bin" "$e15a=NCM820A-DATA"
 [[ ! -e $copy ]] || fail "--remove removes its copies"
 echo "ok - --check changes nothing and --remove removes its copies"
 
+# An ath11k card reads ath11k's board-2.bin, magic included, and gets its copy in ath11k's folder.
+rm -rf "$scratch/sys" "$scratch/fw" "$ATH12K_BOARD_STATE"
+wcn="$scratch/fw/ath11k/WCN6855/hw2.1"
+mkdir -p "$wcn"
+cat >>"$ATH12K_BOARD_CARDS" <<'CARDS'
+record nfa765a bus=pci,vendor=17cb,device=1103,subsystem-vendor=105b,subsystem-device=e105,qmi-chip-id=18,qmi-board-id=255
+card 17cb:1103 105b:e108 nfa765a
+CARDS
+e105="vendor=17cb,device=1103,subsystem-vendor=105b,subsystem-device=e105,qmi-chip-id=18,qmi-board-id=255"
+card 17cb 1103 105b e108
+MAGIC=QCA-ATH11K-BOARD board2 "$wcn/board-2.bin" "$e105=NFA765A-DATA"
+"$tool" >/dev/null
+[[ $(<"$scratch/fw/updates/ath11k/WCN6855/hw2.1/board.bin") == NFA765A-DATA ]] ||
+  fail "installs the family's record as board.bin for an ath11k card linux-firmware does not list"
+# An ath12k magic in ath11k's folder is not ath11k's file.
+rm -rf "$scratch/fw/updates" "$ATH12K_BOARD_STATE"
+board2 "$wcn/board-2.bin" "$e105=NFA765A-DATA"
+out=$("$tool")
+[[ ! -e $scratch/fw/updates/ath11k/WCN6855/hw2.1/board.bin && $out == *"not an ath11k board-2.bin"* ]] ||
+  fail "reads ath11k's board-2.bin only with ath11k's magic"
+echo "ok - covers ath11k cards with ath11k's board-2.bin"
+
 # The card list it ships reads, and names a record for every card.
 ATH12K_BOARD_CARDS="$package_dir/cards" ATH12K_BOARD_SYSFS="$scratch/none" "$tool" --check >/dev/null ||
   fail "reads the card list it ships"
 echo "ok - reads the card list it ships"
+
+# With the card list it ships, ASUS's WCN6855 gets the generic NFA765 record and Lenovo's the
+# nfa765a family's.
+e0ce="vendor=17cb,device=1103,subsystem-vendor=105b,subsystem-device=e0ce,qmi-chip-id=18,qmi-board-id=255"
+for want in "105b e130 NFA765-DATA" "17aa e12a NFA765A-DATA"; do
+  read -r vendor device data <<<"$want"
+  rm -rf "$scratch/sys" "$scratch/fw/updates" "$ATH12K_BOARD_STATE"
+  card 17cb 1103 "$vendor" "$device"
+  MAGIC=QCA-ATH11K-BOARD board2 "$wcn/board-2.bin" "$e105=NFA765A-DATA" "$e0ce=NFA765-DATA"
+  ATH12K_BOARD_CARDS="$package_dir/cards" "$tool" >/dev/null
+  [[ $(<"$scratch/fw/updates/ath11k/WCN6855/hw2.1/board.bin") == "$data" ]] ||
+    fail "gives the $vendor:$device card the record the card list names"
+done
+echo "ok - the card list it ships gives ASUS's and Lenovo's WCN6855 board data"
