@@ -125,6 +125,12 @@ class EdgeMetadataTests(unittest.TestCase):
                 self.assertIn('install -Dm644', (ROOT / 'pkgbuilds' / name / 'PKGBUILD').read_text())
                 self.assertIn('/usr/share/licenses/$pkgname/LICENSE', (ROOT / 'pkgbuilds' / name / 'PKGBUILD').read_text())
 
+    def test_fex_emu_declares_the_libraries_its_tools_link(self):
+        package = srcinfo('fex-emu')['fex-emu']
+        self.assertIn('xxhash', package['depends'])
+        self.assertNotIn('qt6-declarative', package['depends'])
+        self.assertTrue(any(o.startswith('qt6-declarative: FEXConfig') for o in package['optdepends']))
+
     def test_stock_names_are_provided_but_never_replaced(self):
         # A replaces= on a stock name swaps it on every machine using [omarchy],
         # including Qualcomm and generic aarch64 ones, at their next update.
