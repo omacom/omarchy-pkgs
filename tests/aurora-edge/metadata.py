@@ -10,7 +10,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
 NAMES = ['linux-aurora', 'mesa-aurora', 'aura', 'm1n1-aurora', 'uboot-aurora', 'aurora-bless',
-         'speakerguardd', 'aurora-audio', 'alsa-ucm-conf-aurora', 'omarchy-aurora-firmware',
+         'speakerguardd', 'speakerguardd-k114', 'aurora-audio', 'alsa-ucm-conf-aurora', 'omarchy-aurora-firmware',
          'speakersafetyd', 'bankstown', 'triforce-lv2', 'lzfse', 'aurora-scripts', 'aurora-fwextract',
          'muvm', 'fex-emu', 'widevine']
 # Same-name imports from asahi-alarm, with the version each replaces on installed Macs.
@@ -48,7 +48,7 @@ class EdgeMetadataTests(unittest.TestCase):
             'omarchy-steam-fex': ['bash', 'coreutils', 'python', 'steam', 'muvm', 'FEX-Emu'],
             'aurora-audio': ['alsa-ucm-conf-aurora', 'pipewire-audio', 'wireplumber',
                              'bankstown', 'lsp-plugins-lv2', 'triforce-lv2>=0.2.0',
-                             'speakersafetyd', 'speakerguardd'],
+                             'speakersafetyd', 'speakerguardd', 'speakerguardd-k114'],
             'omarchy-aurora-firmware': ['bash', 'iw', 'kmod', 'omarchy-mac-boot',
                                        'wireless-regdb', 'linux-aurora>=7.1.12.aurora5'],
         }
@@ -168,6 +168,9 @@ class EdgeMetadataTests(unittest.TestCase):
         self.assertIn('UNITDIR=/usr/lib/systemd/system', recipe)
         guard = (ROOT / 'pkgbuilds' / 'speakerguardd' / 'PKGBUILD').read_text()
         self.assertIn('"$pkgdir/usr/lib/systemd/system/speakersafetyd.service.d/50-j700-guard.conf"', guard)
+        # speakerguardd-k114 installs the same shape of drop-in for the K114 card.
+        k114 = (ROOT / 'pkgbuilds' / 'speakerguardd-k114' / 'PKGBUILD').read_text()
+        self.assertIn('"$pkgdir/usr/lib/systemd/system/speakersafetyd.service.d/50-k114-guard.conf"', k114)
 
     def test_kernel_replaces_nothing(self):
         # linux-aurora sets its relations inside generated package functions,
