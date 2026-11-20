@@ -1,0 +1,104 @@
+Subject: [PATCH] platform-profile: Cache the value written when emulating power-saver
+
+When the platform choices contain only balanced and performance, power-saver
+is emulated by writing balanced. Caching the requested power-saver profile
+makes a delayed file-monitor notification look like an external switch to
+balanced, which also resets the CPU's energy preference. A direct switch
+from performance therefore reverts, while switching via balanced avoids the
+write and works.
+
+Cache the mapped platform value instead. A readback that maps to the cached
+profile, as the one from our own write now does, is ignored; a readback that
+maps to another profile still propagates as an external change. Exercise both
+transition paths, CPU energy preferences and external changes in the
+integration test, under both D-Bus names.
+
+This is an upstream power-profiles-daemon 0.30 bug, also present on upstream
+main at 1a151cc. The class-interface fallback patch does not change it.
+---
+diff --git i/src/ppd-driver-platform-profile.c w/src/ppd-driver-platform-profile.c
+index c1a54f7..d98352a 100644
+--- i/src/ppd-driver-platform-profile.c
++++ w/src/ppd-driver-platform-profile.c
+@@ -272,7 +272,10 @@ ppd_driver_platform_profile_activate_profile (PpdDriver                   *drive
+   g_signal_handler_unblock (G_OBJECT (self->acpi_platform_profile_mon), self->acpi_platform_profile_changed_id);
+ 
+   g_debug ("Successfully switched to profile %s", ppd_profile_to_str (profile));
+-  self->acpi_platform_profile = profile;
++  /* Cache the platform value, which can differ from the requested profile
++   * when power-saver is emulated with balanced. Monitor events are delivered
++   * after the handler is unblocked and must not undo CPU power saving. */
++  self->acpi_platform_profile = acpi_platform_profile_value_to_profile (platform_profile_value);
+   return TRUE;
+ }
+ 
+diff --git i/tests/integration_test.py w/tests/integration_test.py
+index b6b7a47..b07cf24 100644
+--- i/tests/integration_test.py
++++ w/tests/integration_test.py
+@@ -2839,6 +2839,65 @@ class Tests(dbusmock.DBusTestCase):
+         profiles = self.get_dbus_property("Profiles")
+         self.assertEqual(profiles[0]["PlatformDriver"], "placeholder")
+ 
++    def test_platform_profile_emulated_power_saver(self):
++        """A balanced-only platform must not undo CPU power saving on readback"""
++        self.create_platform_profile()
++        acpi_dir = os.path.join(self.testbed.get_root_dir(), "sys/firmware/acpi")
++        self.write_file_contents(
++            os.path.join(acpi_dir, "platform_profile_choices"),
++            "balanced performance\n",
++        )
++        platform_profile = os.path.join(acpi_dir, "platform_profile")
++        policy = os.path.join(
++            self.testbed.get_root_dir(), "sys/devices/system/cpu/cpufreq/policy0"
++        )
++        os.makedirs(policy)
++        self.write_file_contents(os.path.join(policy, "scaling_governor"), "powersave\n")
++        epp = os.path.join(policy, "energy_performance_preference")
++        self.write_file_contents(epp, "performance\n")
++        pstate = os.path.join(
++            self.testbed.get_root_dir(), "sys/devices/system/cpu/intel_pstate"
++        )
++        os.makedirs(pstate)
++        self.write_file_contents(os.path.join(pstate, "status"), "active\n")
++        self.write_file_contents(os.path.join(pstate, "no_turbo"), "0\n")
++        self.write_file_contents(os.path.join(pstate, "turbo_pct"), "1\n")
++        self.start_daemon()
++        profiles = self.get_dbus_property("Profiles")
++        self.assertEqual(profiles[0]["CpuDriver"], "intel_pstate")
++        self.assertEqual(profiles[0]["PlatformDriver"], "platform_profile")
++
++        # From balanced no platform write is needed, so emulation already works.
++        self.set_dbus_property("ActiveProfile", GLib.Variant.new_string("power-saver"))
++        self.assert_dbus_property_eventually_is(
++            "ActiveProfile", "power-saver", keep_checking=1000
++        )
++        self.assert_file_eventually_contains(epp, "power")
++
++        self.set_dbus_property("ActiveProfile", GLib.Variant.new_string("performance"))
++        self.assert_dbus_property_eventually_is(
++            "ActiveProfile", "performance", keep_checking=1000
++        )
++        self.assert_file_eventually_contains(platform_profile, "performance")
++
++        # This writes balanced and queues a monitor event after activation returns.
++        # See the write land first, so the second of checking that follows covers
++        # the event's delivery.
++        self.set_dbus_property("ActiveProfile", GLib.Variant.new_string("power-saver"))
++        self.assert_file_eventually_contains(platform_profile, "balanced")
++        self.assert_dbus_property_eventually_is(
++            "ActiveProfile", "power-saver", keep_checking=1000
++        )
++        self.assert_file_eventually_contains(epp, "power")
++
++        # Real external changes must still propagate to the CPU and D-Bus.
++        self.write_file_contents(platform_profile, "performance\n")
++        self.assert_dbus_property_eventually_is("ActiveProfile", "performance")
++        self.assert_file_eventually_contains(epp, "performance")
++        self.write_file_contents(platform_profile, "balanced\n")
++        self.assert_dbus_property_eventually_is("ActiveProfile", "balanced")
++        self.assert_file_eventually_contains(epp, "balance_performance")
++
+     def test_hp_wmi(self):
+         # Uses cool instead of low-power
+         acpi_dir = os.path.join(self.testbed.get_root_dir(), "sys/firmware/acpi/")
