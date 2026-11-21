@@ -1,0 +1,158 @@
+#!/usr/bin/python3 -I
+# SPDX-License-Identifier: GPL-2.0-only
+"""Inspect T1 USB/HID identity and ownership without changing device state."""
+
+import argparse
+import json
+from pathlib import Path
+import re
+import stat
+import sys
+
+
+EXIT_STATUS = {"checks-passed": 0, "refused": 1, "unavailable": 2, "not-applicable": 3}
+MODULES = ("apple_ibridge", "apple_touchbar", "apple_ib_tb", "apple_ib_als",
+           "apple_dfr_cfgsel", "t1_cfgsel")
+LEGACY_MODULES = set(MODULES[2:])
+GENERIC_OWNERS = {None, "hid-generic", "hid-sensor-hub"}
+
+
+class InspectionError(Exception):
+    pass
+
+
+def read(path):
+    return path.read_text().strip()
+
+
+def owner(node):
+    link = node / "driver"
+    try:
+        mode = link.lstat().st_mode
+    except FileNotFoundError:
+        # An absent owner is valid only while the HID device still exists.
+        node.stat()
+        return None
+    if not stat.S_ISLNK(mode):
+        raise InspectionError(f"Not a driver symlink: {link}")
+    return link.resolve(strict=True).name
+
+
+def snapshot(root):
+    """Read required attributes; missing/inaccessible state is not a negative."""
+    devices = []
+    for path in sorted((root / "bus/usb/devices").iterdir()):
+        if ":" in path.name:  # USB interfaces have no device idVendor/idProduct.
+            continue
+        vendor = read(path / "idVendor").lower()
+        if not re.fullmatch(r"[0-9a-f]{4}", vendor):
+            raise InspectionError(f"Invalid USB vendor ID: {path}")
+        if vendor != "05ac":
+            continue
+        product = read(path / "idProduct").lower()
+        if not re.fullmatch(r"[0-9a-f]{4}", product):
+            raise InspectionError(f"Invalid USB product ID: {path}")
+        if product not in {"8600", "1281"}:
+            continue
+        real = path.resolve(strict=True)
+        devnum = read(path / "devnum")
+        if not devnum.isdecimal() or int(devnum) < 1:
+            raise InspectionError(f"Invalid USB device number: {path}")
+        devices.append({"path": str(real.relative_to(root.resolve())),
+                        "entry": path.name, "inode": real.stat().st_ino,
+                        "devnum": devnum, "id": f"05ac:{product}",
+                        "configuration": read(path / "bConfigurationValue")})
+
+    loaded = sorted(p.name for p in (root / "module").iterdir() if p.name in MODULES)
+    skip_power = read(root / "module/apple_ibridge/parameters/skip_acpi_power") \
+        if "apple_ibridge" in loaded else None
+    hid = []
+    targets = [root / d["path"] for d in devices if d["id"] == "05ac:8600"]
+    # Enumerate even without a target: an inaccessible HID bus is not "no HID".
+    for path in sorted((root / "bus/hid/devices").iterdir()):
+        name = path.name.upper()
+        if name.startswith("0003:05AC:8600."):
+            kind, expected = "physical", "apple-ibridge-hid"
+        elif name.startswith("0003:1D6B:0301."):
+            kind, expected = "virtual", "apple-touchbar"
+        else:
+            continue
+        real = path.resolve(strict=True)
+        for target in targets:
+            if target in real.parents:
+                hid.append({"path": str(real.relative_to(root.resolve())),
+                            "usb": str(target.relative_to(root.resolve())),
+                            "kind": kind, "expected_owner": expected,
+                            "owner": owner(real), "inode": real.stat().st_ino})
+                break
+    return {"usb": devices, "hid": hid, "loaded_modules": loaded,
+            "skip_acpi_power": skip_power}
+
+
+def refusals(state):
+    reasons = []
+    production = [d for d in state["usb"] if d["id"] == "05ac:8600"]
+    if any(d["id"] == "05ac:1281" for d in state["usb"]):
+        reasons.append("Apple recovery candidate present; USB ID alone does not identify T1 firmware health")
+    if len(production) > 1:
+        reasons.append("Multiple production T1 candidates; target is ambiguous")
+    for dev in production:
+        if dev["configuration"] != "1":
+            reasons.append(f"{dev['entry']}: configuration {dev['configuration']!r} is not 1")
+    if LEGACY_MODULES.intersection(state["loaded_modules"]):
+        reasons.append("Another T1 driver stack is loaded")
+    if state["skip_acpi_power"] not in {None, "1", "Y"}:
+        reasons.append("Loaded apple_ibridge does not report skip_acpi_power enabled")
+    physical = [Path(d["path"]) for d in state["hid"] if d["kind"] == "physical"]
+    if production and not physical:
+        reasons.append("No physical T1 HID descendants found")
+    for dev in state["hid"]:
+        if dev["owner"] not in GENERIC_OWNERS | {dev["expected_owner"]}:
+            reasons.append(f"{dev['path']}: unexpected owner {dev['owner']!r}")
+        if dev["kind"] == "virtual" and not any(p in Path(dev["path"]).parents for p in physical):
+            reasons.append(f"{dev['path']}: virtual HID is not below a physical T1 HID")
+    return reasons
+
+
+def inspect(root=Path("/sys")):
+    report = {"schema_version": 1, "status": "unavailable", "reasons": [],
+              "model": None, "model_observation": "unavailable",
+              "note": "Read-only snapshot; does not gate automatic loading, authorize a handover, or prove working hardware."}
+    try:
+        report["model"] = read(root / "class/dmi/id/product_name")
+        report["model_observation"] = "read"
+    except OSError as error:
+        # Model is informational; USB/HID identity is used for these checks.
+        report["model_observation"] = type(error).__name__
+    try:
+        first = snapshot(root)
+        second = snapshot(root)
+        report.update(second)
+        if first != second:
+            raise InspectionError("USB/HID identity, ownership or module state changed during inspection; inspect again")
+        reasons = refusals(second)
+        if not second["usb"]:
+            report["status"] = "not-applicable"
+            report["reasons"] = ["No production or recovery USB candidate observed"]
+        elif reasons:
+            report["status"], report["reasons"] = "refused", reasons
+        else:
+            report["status"] = "checks-passed"
+    except (OSError, ValueError, RuntimeError, InspectionError) as error:
+        report["status"] = "unavailable"
+        report["reasons"] = [f"{type(error).__name__}: {error}"]
+    return report
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__, epilog=
+        "Exit codes: 0 checks passed, 1 refused, 2 unavailable/changed state, 3 no candidate. "
+        "No root privileges required; no module loading, bind/unbind or policy writes.")
+    parser.parse_args(argv)
+    report = inspect()
+    print(json.dumps(report, indent=2))
+    return EXIT_STATUS[report["status"]]
+
+
+if __name__ == "__main__":
+    sys.exit(main())
