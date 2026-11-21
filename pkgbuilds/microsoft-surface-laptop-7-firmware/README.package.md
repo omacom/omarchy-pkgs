@@ -1,6 +1,6 @@
 # microsoft-surface-laptop-7-firmware
 
-Audio DSP, compute DSP, GPU and video firmware for the Microsoft Surface Laptop 7, from Microsoft's own Windows driver download.
+Audio DSP, compute DSP, GPU and video firmware and Wi-Fi board data for the Microsoft Surface Laptop 7, from Microsoft's own Windows driver download.
 
 The firmware only runs if Microsoft signed it for this board, so linux-firmware cannot carry it until Microsoft submits it. The package holds no firmware itself. Its recipe downloads the driver cabinets below when the package is built, unpacks them without running anything, checks every file against the SHA-256 it was matched to and installs it under the name the device tree asks for, compressed with xz.
 
@@ -13,6 +13,7 @@ The firmware only runs if Microsoft signed it for this board, so linux-firmware 
 
 | File | SHA-256 | From |
 | --- | --- | --- |
+| `ath12k/WCN7850/hw2.0/board.bin` | `b24438910ff0383d299798a997d3ef3484be624ac013aec2ce7939ec32900c4f` | Surface Laptop 7th Edition, `SurfaceUpdate/qcwlanhmt8380/bdwlan.elf` |
 | `qcom/x1e80100/microsoft/Romulus/adsp_dtbs.elf` | `b03f066e2645dbe35a33a08a91312842f5cee3676cac3e111f1f3dabd1cf4e9e` | Surface Laptop 7th Edition, `SurfaceUpdate/proextadsp8380/adsp_dtbs.elf` |
 | `qcom/x1e80100/microsoft/Romulus/adspr.jsn` | `e9ba7199626b0c03f2ec02822d744f678ad567fe0625a28fe5f5908b7281e9db` | Surface Laptop 7th Edition, `SurfaceUpdate/proextadsp8380/adspr.jsn` |
 | `qcom/x1e80100/microsoft/Romulus/adsps.jsn` | `19b1396b5e2c0d14fb8a4eb8e47181df7f62989f4af519b439cf0ee45a46f76e` | Surface Laptop 7th Edition, `SurfaceUpdate/proextadsp8380/adsps.jsn` |
