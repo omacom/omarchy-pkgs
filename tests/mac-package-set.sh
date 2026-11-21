@@ -8,6 +8,10 @@ set -euo pipefail
 ROOT=$(realpath "${BASH_SOURCE[0]%/*}/..")
 T=$(mktemp -d); chmod 755 "$T"; trap 'rm -rf "$T"' EXIT
 REMOTE="$T/r2"; mkdir -p "$REMOTE"
+# The Arch snapshot the promotions resolve against: the fixtures need only
+# bash from it. Filled once mkpkg exists below; promote-channel would fetch
+# the channel's otherwise.
+export OMARCHY_ARCH_SNAPSHOT="$T/arch"; mkdir -p "$OMARCHY_ARCH_SNAPSHOT"
 
 export GNUPGHOME="$T/g"; mkdir -m700 "$GNUPGHOME"
 gpg --batch --quiet --passphrase '' --quick-gen-key 'Test <t@t>' ed25519 sign 0 2>/dev/null
@@ -18,7 +22,7 @@ unset GNUPGHOME
 BIN="$T/root/bin"
 mkdir -p "$BIN" "$T/root/release"
 cp -r "$ROOT/helpers" "$T/root/"
-cp "$ROOT/bin/promote-channel" "$ROOT/bin/publish-artifact" "$ROOT/bin/check-mac-set" "$BIN/"
+cp "$ROOT/bin/promote-channel" "$ROOT/bin/publish-artifact" "$ROOT/bin/check-mac-set" "$ROOT/bin/check-channel-deps" "$BIN/"
 PKGBUILDS_DIR="$T/root/pkgbuilds"
 recipe() { # recipe <dir> <metadata json> <arch...>
   local dir=$1 meta=$2; shift 2
@@ -66,6 +70,7 @@ mkpkg() { # mkpkg <name>[@pkgbase] <pkgrel> <arch> [dep|+provide...]
   ls "$d"/*.pkg.tar.zst
 }
 
+repo-add -q "$OMARCHY_ARCH_SNAPSHOT/extra.db.tar.gz" $(mkpkg bash 1 any) >/dev/null 2>&1
 pub() { # pub <mirror> <arch> <files...>
   local mirror=$1 arch=$2; shift 2
   "$BIN/publish-artifact" --remote "$REMOTE" --mirror "$mirror" --arch "$arch" "$@" >"$T/out" 2>&1 || { cat "$T/out"; exit 1; }
@@ -83,8 +88,11 @@ pass() { echo "PASS: $1"; }
 fail() { echo "FAIL: $1"; cat "$T/out"; cat "$T/record" 2>/dev/null; exit 1; }
 
 # rc before the candidate: a shared library the Mac set links, a shared
-# fast-ring tool it uses, and one x86 package.
-pub rc aarch64 $(mkpkg alpha 1 aarch64) $(mkpkg shared-lib 1 aarch64 +libshared.so=1) $(mkpkg fast-tool 1 aarch64 +tool-api=1)
+# fast-ring tool it uses, and one x86 package. The merge published the
+# fast-ring tool to stable too.
+FAST1=$(mkpkg fast-tool 1 aarch64 +tool-api=1)
+pub rc aarch64 $(mkpkg alpha 1 aarch64) $(mkpkg shared-lib 1 aarch64 +libshared.so=1) "$FAST1"
+pub stable aarch64 "$FAST1"
 # edge carries the candidate, which matches the inventory.
 AUDIO1=$(mkpkg mac-audio 1 any)
 pub edge aarch64 $(mkpkg mac-kernel 1 aarch64 'mac-boot>=1.0') $(mkpkg mac-boot 1 aarch64 'shared-lib>=1.0' libshared.so=1 tool-api=1 bash) \
@@ -257,3 +265,14 @@ if promote edge rc aarch64 alpha; then fail "a crashing check should refuse"; fi
 grep -q 'Refusing to promote edge/aarch64 into rc/aarch64: nothing published' "$T/out" && [[ "$(entries rc aarch64)" == "$rc_before" ]] \
   && pass "a check that cannot run refuses and publishes nothing" || fail "check crash: $(entries rc aarch64)"
 cp "$T/check-mac-set" "$BIN/check-mac-set"
+
+# The check resolves against the repositories an ARM machine has: [omarchy],
+# core, extra and alarm. Arch Linux ARM's aur is mirrored but no machine
+# lists it, so a dependency only it provides refuses the promotion.
+recipe aur-user '{"source": "local"}' aarch64
+repo-add -q "$OMARCHY_ARCH_SNAPSHOT/aur.db.tar.gz" $(mkpkg aur-only 1 aarch64) >/dev/null 2>&1
+pub edge aarch64 $(mkpkg aur-user 1 aarch64 aur-only)
+rc_before=$(entries rc aarch64)
+if promote edge rc aarch64 aur-user; then fail "a package needing what only Arch Linux ARM's aur has should refuse"; fi
+grep -q "aur-user: unable to satisfy dependency 'aur-only' required by aur-user" "$T/out" && [[ "$(entries rc aarch64)" == "$rc_before" ]] \
+  && pass "a dependency only Arch Linux ARM's aur provides is not installable on an ARM machine" || fail "aur: $(cat "$T/out")"

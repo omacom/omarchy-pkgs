@@ -16,6 +16,8 @@
 set -euo pipefail
 ROOT=$(realpath "${BASH_SOURCE[0]%/*}/..")
 T=$(mktemp -d); chmod 755 "$T"; trap 'rm -rf "$T"' EXIT
+# No Arch snapshot: promote-channel would fetch the channel's otherwise.
+export OMARCHY_ARCH_SNAPSHOT=
 
 pass() { echo "PASS: $1"; }
 fail() { echo "FAIL: $1"; exit 1; }
