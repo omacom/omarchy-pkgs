@@ -1,0 +1,123 @@
+#!/usr/bin/python
+"""Candidate admission and checked NPU lifecycle. Never used by package hooks."""
+import json
+import os
+from pathlib import Path
+import re
+import stat
+import subprocess
+import sys
+
+MODULE = "n1x_npu_bootstrap"
+def admitted():
+    if os.uname().machine != "aarch64":
+        return False
+    try:
+        dla, sroot = endpoint("NVDA200A"), endpoint("NVDA8600")
+        domains(dla, sroot)
+        return True
+    except (OSError, RuntimeError):
+        return False
+
+
+def endpoint(hid, sysroot=Path("/sys")):
+    found = []
+    for path in (sysroot / "bus/platform/devices").glob("*"):
+        try:
+            if (path / "firmware_node/hid").read_text().strip() == hid:
+                found.append(path)
+        except OSError:
+            continue
+    if len(found) != 1:
+        raise RuntimeError(f"Expected one {hid} platform endpoint; found {len(found)}")
+    return found[0]
+
+
+def domains(dla, sroot, sysroot=Path("/sys")):
+    controls = []
+    for device in (dla, sroot):
+        if not (device / "iommu").is_dir():
+            raise RuntimeError("IOMMU supplier missing")
+        group = (device / "iommu_group").resolve(strict=True)
+        if group.parent != sysroot / "kernel/iommu_groups":
+            raise RuntimeError("Invalid IOMMU group")
+        members = list((group / "devices").iterdir())
+        if len(members) != 1 or members[0].resolve(strict=True) != device.resolve(strict=True):
+            raise RuntimeError("Shared or mismatched IOMMU group")
+        control = group / "type"
+        if control.read_text().strip() not in ("identity", "DMA", "DMA-FQ"):
+            raise RuntimeError("Unsupported IOMMU domain")
+        controls.append(control)
+    return controls
+
+
+def fields(path):
+    return dict(re.findall(r"(?:^|\s)([a-zA-Z0-9_]+)=([^\s;]+)", path.read_text()))
+
+
+def require_fields(path, ones=(), zeros=()):
+    data = fields(path)
+    if any(data.get(k) != "1" for k in ones) or any(data.get(k) != "0" for k in zeros):
+        raise RuntimeError(f"Incomplete or failed hardware state: {path}")
+
+
+def verify(dla, sysroot=Path("/sys"), devroot=Path("/dev")):
+    if (dla / "driver").resolve(strict=True).name != "n1x-npu-bootstrap":
+        raise RuntimeError("Wrong NPU driver")
+    debug = sysroot / "kernel/debug/n1x-npu-bootstrap"
+    require_fields(debug / "status", ("dla_bound", "sroot_bound", "idle_observed", "ping_verified",
+                   "region5_registered", "config_valid", "config_apply_accepted", "lpwr_accepted", "task_verified"),
+                   ("error", "queue_poisoned"))
+    require_fields(debug / "hfrp_status", ("power_accepted",), ("error",))
+    if not (sysroot / "module" / MODULE).is_dir():
+        raise RuntimeError("Experimental provider module missing")
+    for node in (sysroot / "class/accel").glob("accel*"):
+        if (node / "device").resolve() == dla.resolve() and (devroot / "accel" / node.name).is_char_device():
+            return
+    raise RuntimeError("NPU accelerator device missing")
+
+
+def main():
+    action = sys.argv[1] if len(sys.argv) == 2 else ""
+    if action not in ("--check-host", "--prepare", "--verify", "--stop"):
+        raise RuntimeError("Usage: n1x-npu --check-host|--prepare|--verify|--stop")
+    # Cleanup remains available if endpoint admission changes after startup.
+    if action == "--stop" and not Path("/sys/module", MODULE).is_dir():
+        return 0
+    if action != "--stop" and not admitted():
+        print("NPU skipped: ARM64 N1X endpoints and isolated IOMMU groups required", file=sys.stderr)
+        return 1
+    if action == "--check-host":
+        return 0
+    dla, sroot = endpoint("NVDA200A"), endpoint("NVDA8600")
+    if action == "--verify":
+        verify(dla)
+    elif action == "--stop":
+        if (dla / "driver").resolve(strict=True).name != "n1x-npu-bootstrap":
+            raise RuntimeError("Wrong driver; refusing shutdown")
+        (dla / "shutdown").write_text("stop\n")
+        require_fields(Path("/sys/kernel/debug/n1x-npu-bootstrap/shutdown_status"),
+                       ("hardware_off", "released"), ("error", "hfrp_held", "upload_held"))
+        subprocess.run(["/usr/bin/modprobe", "-r", MODULE], check=True)
+    else:
+        bound = sum((p / "driver").exists() for p in (dla, sroot))
+        if bound == 2:
+            verify(dla)
+        elif bound:
+            raise RuntimeError("Partially bound NPU; refusing domain changes")
+        else:
+            # Validate both groups before the first mutation. A failed transition
+            # leaves the service failed without loading the provider or retrying.
+            for control in domains(dla, sroot):
+                if control.read_text().strip() == "identity":
+                    control.write_text("DMA\n")
+                if control.read_text().strip() not in ("DMA", "DMA-FQ"):
+                    raise RuntimeError("DMA domain selection failed")
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+        sys.exit(f"n1x-npu: {exc}; module retained after any unsafe shutdown")
