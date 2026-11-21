@@ -1,0 +1,307 @@
+From e5da26f75402e17a91bddaf22e9f736ada04a77e Mon Sep 17 00:00:00 2001
+From: fidecastro <18445184+fidecastro@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 16:17:52 -0500
+Subject: [PATCH] fix(import): accept NV12/P010 DMA-BUFs whose chroma plane is
+ off the row grid
+
+import_prime() required the chroma offset to be a whole number of luma
+rows after the luma offset, because Memory describes chroma as
+data_offset + stride * storage_height. Mesa's freedreno places the
+chroma plane of a linear NV12 buffer at the next page boundary after
+luma (fdl6_layout_multiplanar_image: align64(y_layout->size, 4096)).
+For 1920x1080 that is offset 2076672, 1081.6 rows, so vaCreateSurfaces
+failed with "unsupported DMA-BUF plane layout" and Chromium's VA-API
+encoder, which allocates its input through GBM, could not encode 1080p.
+1280x720 and 640x480 only worked because their luma size is already a
+multiple of the page size.
+
+Give Memory a chroma_skew, the bytes between the last whole row slot
+and the chroma plane, and a chroma() accessor, and use it wherever the
+chroma position was computed. A skewed buffer never takes the direct
+encoder path; it is staged like any other import whose layout differs
+from the encoder's.
+
+Tested on a Surface Laptop 7 15-inch (X1E80100, kernel 7.3) with a
+program that imports a DMA-BUF with a chosen chroma offset, fills it
+through vaDeriveImage and encodes one H.264 High IDR frame: the
+1920x1080 page-aligned layout was refused before and now encodes to the
+same bytes as the 1088-row and 1080-row layouts (49.3 dB luma PSNR
+against the source); 1280x720 output is unchanged. tests/decoder/
+prime-import gains a skewed case; it needs the DMA heap and was only
+compiled here.
+
+Assisted-by: Claude Fable 5.2
+---
+ src/backend.cpp                | 14 +++++++-------
+ src/encoder.cpp                |  2 +-
+ src/gpu-copy.cpp               |  9 +++++----
+ src/internal.hpp               |  7 +++++++
+ src/surface-copy.cpp           | 11 ++++-------
+ src/vpp.cpp                    | 12 +++++-------
+ tests/decoder/prime-import.cpp | 11 +++++++++--
+ 7 files changed, 38 insertions(+), 28 deletions(-)
+
+diff --git a/src/backend.cpp b/src/backend.cpp
+index 56fc3e6..430f085 100644
+--- a/src/backend.cpp
++++ b/src/backend.cpp
+@@ -491,7 +491,7 @@ static std::shared_ptr<Memory> import_prime(const VADRMPRIMESurfaceDescriptor &d
+     unsigned row_bytes = ((width + 1) & ~1u) * sample_bytes;
+     check(rgb || (pitches[0] >= row_bytes && pitches[0] == pitches[1] &&
+                   pitches[0] % sample_bytes == 0 && offsets[0] % sample_bytes == 0 &&
+-                  offsets[1] >= offsets[0] && (offsets[1] - offsets[0]) % pitches[0] == 0 &&
++                  offsets[1] >= offsets[0] && (offsets[1] - offsets[0]) % sample_bytes == 0 &&
+                   (offsets[1] - offsets[0]) / pitches[0] >= height &&
+                   uint64_t(offsets[1]) + uint64_t((height + 1) / 2 - 1) * pitches[1] + row_bytes <=
+                       desc.objects[0].size),
+@@ -510,6 +510,7 @@ static std::shared_ptr<Memory> import_prime(const VADRMPRIMESurfaceDescriptor &d
+     m->height = height;
+     m->stride = pitches[0];
+     m->storage_height = rgb ? height : (offsets[1] - offsets[0]) / pitches[0];
++    m->chroma_skew = rgb ? 0 : (offsets[1] - offsets[0]) % pitches[0];
+     m->data_offset = offsets[0];
+     m->origin = MemoryOrigin::Imported;
+     return m;
+@@ -976,7 +977,7 @@ API(
+     result.format = image_format(m->fourcc); result.width = s->width; result.height = s->height;
+     result.data_size = m->size; result.num_planes = is_rgb(m->fourcc) ? 1 : 2;
+     result.pitches[0] = result.pitches[1] = m->stride; result.offsets[0] = m->data_offset;
+-    result.offsets[1] = m->data_offset + m->stride * m->storage_height; if (is_rgb(m->fourcc)) {
++    result.offsets[1] = m->chroma(); if (is_rgb(m->fourcc)) {
+         result.pitches[1] = 0;
+         result.offsets[1] = 0;
+     } auto b = std::make_shared<Buffer>();
+@@ -1018,8 +1019,7 @@ API(
+                     source.data + image.offsets[0] + (sy + row) * image.pitches[0] + sx * bytes,
+                     sw *bytes);
+     for (unsigned row = 0; !is_rgb(s->fourcc) && row < sh / 2; ++row) {
+-        auto uv = destination.data + m->data_offset +
+-                  (m->storage_height + dy / 2 + row) * m->stride + dx * bytes;
++        auto uv = destination.data + m->chroma() + (dy / 2 + row) * m->stride + dx * bytes;
+         if (image.format.fourcc == VA_FOURCC_I420) {
+             for (unsigned col = 0; col < sw / 2; ++col) {
+                 uv[2 * col] =
+@@ -1089,7 +1089,7 @@ API(
+     for (unsigned row = 0; row < h; ++row)
+         std::memcpy(destination.data + image.offsets[0] + row * image.pitches[0],
+                     base + (y + row) * m->stride + x * bytes_per_sample, w *bytes_per_sample);
+-    uint8_t *uv = base + m->stride * m->storage_height + (y / 2) * m->stride + x * bytes_per_sample;
++    uint8_t *uv = m->map() + m->chroma() + (y / 2) * m->stride + x * bytes_per_sample;
+     for (unsigned row = 0; !is_rgb(m->fourcc) && row < (h + 1) / 2; ++row) {
+         if (image.format.fourcc != VA_FOURCC_I420)
+             std::memcpy(destination.data + image.offsets[1] + row * image.pitches[1],
+@@ -1145,7 +1145,7 @@ API(
+         for (unsigned i = 0; i < 2; ++i) {
+             desc.layers[i].num_planes = 1;
+             desc.layers[i].pitch[0] = m->stride;
+-            desc.layers[i].offset[0] = m->data_offset + (i ? m->stride * m->storage_height : 0);
++            desc.layers[i].offset[0] = i ? m->chroma() : m->data_offset;
+         }
+     } else {
+         desc.num_layers = 1;
+@@ -1153,7 +1153,7 @@ API(
+         desc.layers[0].num_planes = 2;
+         desc.layers[0].pitch[0] = desc.layers[0].pitch[1] = m->stride;
+         desc.layers[0].offset[0] = m->data_offset;
+-        desc.layers[0].offset[1] = m->data_offset + m->stride * m->storage_height;
++        desc.layers[0].offset[1] = m->chroma();
+     } return VA_STATUS_SUCCESS;)
+ 
+ API(
+diff --git a/src/encoder.cpp b/src/encoder.cpp
+index 2ab6bc4..42789db 100644
+--- a/src/encoder.cpp
++++ b/src/encoder.cpp
+@@ -813,7 +813,7 @@ std::shared_ptr<EncodeTask> Encoder::encode(const EncodeSettings &s, const Encod
+             (memory->origin == MemoryOrigin::MsmCoherent || memory->origin == MemoryOrigin::Iris ||
+              memory->origin == MemoryOrigin::DmaHeap) &&
+             memory->stride == e.stride && memory->storage_height == e.storage_height &&
+-            !memory->data_offset && memory->size >= e.input_size;
++            !memory->data_offset && !memory->chroma_skew && memory->size >= e.input_size;
+         if (!e.import) {
+             auto raw = e.raw[index];
+             copy_surface(*raw, *memory, e.width, e.height);
+diff --git a/src/gpu-copy.cpp b/src/gpu-copy.cpp
+index 1120d3a..2b7d6d8 100644
+--- a/src/gpu-copy.cpp
++++ b/src/gpu-copy.cpp
+@@ -28,13 +28,14 @@ class GpuCopy {
+     struct View {
+         GpuCopy &owner;
+         std::weak_ptr<Memory> memory;
+-        unsigned width, height, stride, storage_height, offset, fourcc;
++        unsigned width, height, stride, storage_height, offset, skew, fourcc;
+         EGLImageKHR images[2] = {EGL_NO_IMAGE_KHR, EGL_NO_IMAGE_KHR};
+         GLuint textures[2] = {};
+         unsigned columns[2] = {}, rows[2] = {};
+         View(GpuCopy &gpu, const std::shared_ptr<Memory> &m, unsigned w, unsigned h)
+             : owner(gpu), memory(m), width(w), height(h), stride(m->stride),
+-              storage_height(m->storage_height), offset(m->data_offset), fourcc(m->fourcc) {}
++              storage_height(m->storage_height), offset(m->data_offset), skew(m->chroma_skew),
++              fourcc(m->fourcc) {}
+         ~View() {
+             glDeleteTextures(2, textures);
+             for (auto image : images)
+@@ -44,7 +45,7 @@ class GpuCopy {
+         bool matches(const std::shared_ptr<Memory> &m, unsigned w, unsigned h) const {
+             return memory.lock() == m && width == w && height == h && stride == m->stride &&
+                    storage_height == m->storage_height && offset == m->data_offset &&
+-                   fourcc == m->fourcc;
++                   skew == m->chroma_skew && fourcc == m->fourcc;
+         }
+     };
+     // Weak ownership is essential: retaining CAPTURE Memory would prevent requeue().
+@@ -80,7 +81,7 @@ class GpuCopy {
+             // RGBA8 views transport four raw bytes per texel; no YUV conversion.
+             uint64_t row_bytes = uint64_t(p ? ((w + 1) & ~1u) : w) * bytes;
+             unsigned columns = (row_bytes + 3) / 4, rows = p ? (h + 1) / 2 : h;
+-            uint64_t offset = m->data_offset + (p ? uint64_t(m->stride) * m->storage_height : 0);
++            uint64_t offset = p ? uint64_t(m->chroma()) : m->data_offset;
+             check(uint64_t(columns) * 4 <= m->stride && offset <= INT_MAX &&
+                       offset + uint64_t(rows - 1) * m->stride + uint64_t(columns) * 4 <= m->size,
+                   "GPU copy packed plane exceeds buffer");
+diff --git a/src/internal.hpp b/src/internal.hpp
+index 1744f55..6ccc99f 100644
+--- a/src/internal.hpp
++++ b/src/internal.hpp
+@@ -58,11 +58,18 @@ struct Memory {
+     size_t size = 0;
+     unsigned index = 0, stride = 0, storage_height = 0, width = 0, height = 0;
+     unsigned data_offset = 0, fourcc = VA_FOURCC_NV12;
++    // Bytes between the end of the last whole luma row slot and the chroma
++    // plane. Zero for storage this driver or V4L2 lays out; an imported
++    // DMA-BUF may place chroma anywhere after luma, for instance on a page
++    // boundary (Mesa's freedreno does for linear NV12).
++    unsigned chroma_skew = 0;
+     bool queued = false;
+     std::shared_ptr<void> vpp_registration;
+     std::shared_ptr<void> vulkan_registration;
+     ~Memory();
+     uint8_t *map();
++    // Byte offset of the chroma plane from the start of the buffer.
++    size_t chroma() const { return size_t(data_offset) + size_t(stride) * storage_height + chroma_skew; }
+ };
+ class Decoder;
+ class SurfaceCopier {
+diff --git a/src/surface-copy.cpp b/src/surface-copy.cpp
+index a4d6df3..8629b82 100644
+--- a/src/surface-copy.cpp
++++ b/src/surface-copy.cpp
+@@ -56,7 +56,7 @@ struct CpuAccess {
+     }
+ };
+ void validate(const Memory &m, unsigned width, unsigned height, unsigned bytes) {
+-    const uint64_t chroma_offset = uint64_t(m.data_offset) + uint64_t(m.stride) * m.storage_height;
++    const uint64_t chroma_offset = m.chroma();
+     const uint64_t chroma_rows = (height + 1) / 2;
+     const uint64_t row_bytes = uint64_t((width + 1) & ~1u) * bytes;
+     check(width && height && width <= m.width && height <= m.height && height <= m.storage_height &&
+@@ -100,8 +100,7 @@ void fill_neutral_surface(Memory &memory, unsigned width, unsigned height) {
+     // range. P010 stores its ten significant bits in the high bits of a word.
+     const uint16_t gray = 512u << 6;
+     for (unsigned plane = 0; plane < 2; ++plane) {
+-        size_t offset =
+-            memory.data_offset + (plane ? size_t(memory.stride) * memory.storage_height : 0);
++        size_t offset = plane ? memory.chroma() : memory.data_offset;
+         unsigned rows = plane ? (height + 1) / 2 : height;
+         unsigned samples = plane ? ((width + 1) & ~1u) : width;
+         for (unsigned row = 0; row < rows; ++row) {
+@@ -129,10 +128,8 @@ void copy_surface(Memory &destination, Memory &source, unsigned width, unsigned
+     CpuAccess read(source, DMA_BUF_SYNC_READ);
+     CpuAccess write(destination, DMA_BUF_SYNC_WRITE);
+     for (unsigned plane = 0; plane < 2; ++plane) {
+-        size_t src_offset =
+-            source.data_offset + (plane ? size_t(source.stride) * source.storage_height : 0);
+-        size_t dst_offset = destination.data_offset +
+-                            (plane ? size_t(destination.stride) * destination.storage_height : 0);
++        size_t src_offset = plane ? source.chroma() : source.data_offset;
++        size_t dst_offset = plane ? destination.chroma() : destination.data_offset;
+         unsigned rows = plane ? (height + 1) / 2 : height;
+         unsigned row_bytes = (plane ? ((width + 1) & ~1u) : width) * bytes;
+         for (unsigned row = 0; row < rows; ++row)
+diff --git a/src/vpp.cpp b/src/vpp.cpp
+index 2feff2c..039bb49 100644
+--- a/src/vpp.cpp
++++ b/src/vpp.cpp
+@@ -286,11 +286,9 @@ cdsp_vpp_frame import_vpp_frame(Memory &memory, const Surface &surface,
+     check(memory.fd >= 0 && memory.fourcc == surface.fourcc && memory.size <= INT_MAX &&
+               memory.width >= surface.width && memory.height >= surface.height &&
+               memory.stride >= row_bytes && memory.storage_height >= surface.height &&
+-              uint64_t(memory.data_offset) +
++              (is_rgb(surface.fourcc) ? uint64_t(memory.data_offset) : uint64_t(memory.chroma())) +
+                       uint64_t(memory.stride) *
+-                          (is_rgb(surface.fourcc)
+-                               ? surface.height - 1
+-                               : uint64_t(memory.storage_height) + surface.height / 2 - 1) +
++                          (is_rgb(surface.fourcc) ? surface.height - 1 : surface.height / 2 - 1) +
+                       row_bytes <=
+                   memory.size,
+           "unsupported CDSP DMA-BUF layout", VA_STATUS_ERROR_INVALID_SURFACE);
+@@ -308,7 +306,7 @@ cdsp_vpp_frame import_vpp_frame(Memory &memory, const Surface &surface,
+             surface.height,
+             memory.stride,
+             memory.data_offset,
+-            memory.data_offset + size_t(memory.stride) * memory.storage_height};
++            memory.chroma()};
+ }
+ #endif
+ } // namespace
+@@ -480,10 +478,10 @@ OverlayParams overlay_parameters(const VppPicture &layer, const Surface &base,
+     p.height = target.height;
+     p.src_stride = src.stride;
+     p.src_y = src.data_offset;
+-    p.src_uv = src.data_offset + src.stride * src.storage_height;
++    p.src_uv = src.chroma();
+     p.dst_stride = dst.stride;
+     p.dst_y = dst.data_offset;
+-    p.dst_uv = dst.data_offset + dst.stride * dst.storage_height;
++    p.dst_uv = dst.chroma();
+     p.rgb_stride = rgb.stride;
+     p.rgb_offset = rgb.data_offset + r.y * rgb.stride + r.x * 4;
+     p.rgb_width = r.width;
+diff --git a/tests/decoder/prime-import.cpp b/tests/decoder/prime-import.cpp
+index a9724e9..38f3f92 100644
+--- a/tests/decoder/prime-import.cpp
++++ b/tests/decoder/prime-import.cpp
+@@ -39,7 +39,7 @@ static VAStatus import_surface(VADisplay display, unsigned format, unsigned memo
+     attrs[1].value.value.i = memory_type;
+     return vaCreateSurfaces(display, format, 128, 128, surface, 1, attrs, 2);
+ }
+-static void test_format(VADisplay display, unsigned format) {
++static void test_format(VADisplay display, unsigned format, unsigned chroma_skew = 0) {
+     bool p010 = format == VA_RT_FORMAT_YUV420_10;
+     unsigned bytes = p010 ? 2 : 1;
+     VASurfaceAttribExternalBuffers desc{};
+@@ -49,7 +49,9 @@ static void test_format(VADisplay display, unsigned format) {
+     desc.pitches[0] = desc.pitches[1] = 256 * bytes;
+     // Exercise padded rows, padded storage height, and a nonzero base offset.
+     desc.offsets[0] = 128;
+-    desc.offsets[1] = desc.offsets[0] + desc.pitches[0] * 160;
++    // chroma_skew places chroma off the row grid, as an allocator that pads
++    // luma to a page boundary does (Mesa's freedreno for linear NV12).
++    desc.offsets[1] = desc.offsets[0] + desc.pitches[0] * 160 + chroma_skew;
+     desc.data_size = (desc.offsets[1] + desc.pitches[1] * 64 + 4095) & ~4095u;
+     int heap = open("/dev/dma_heap/system", O_RDONLY | O_CLOEXEC);
+     require(heap >= 0, "open DMA heap");
+@@ -116,6 +118,9 @@ static void test_format(VADisplay display, unsigned format) {
+         ++bad.offsets[0];
+         ++bad.offsets[1];
+         rejected(bad);
++        bad = desc;
++        ++bad.offsets[1]; // Chroma must stay aligned to a sample.
++        rejected(bad);
+     }
+ 
+     expect(import_surface(display, format, VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME, &desc, &surface));
+@@ -189,6 +194,8 @@ int main() {
+     }
+     test_format(display, VA_RT_FORMAT_YUV420);
+     test_format(display, VA_RT_FORMAT_YUV420_10);
++    test_format(display, VA_RT_FORMAT_YUV420, 96);
++    test_format(display, VA_RT_FORMAT_YUV420_10, 96);
+     expect(vaTerminate(display));
+     close(fd);
+     std::puts("PRIME1/PRIME2 NV12/P010 import tests passed");
+-- 
+2.56.1
+
