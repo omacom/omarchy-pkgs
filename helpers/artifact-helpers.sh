@@ -6,8 +6,33 @@
 # own names untouched: pacman clients and bin/publish-artifact both rely on
 # the filename matching PKGINFO.
 #
-# Both functions run under the workflow's `bash -e`: nothing in them may
+# These functions run under the workflow's `bash -e`: nothing in them may
 # return non-zero except the final failure.
+
+# build_contract_key [repo]: bind a package artifact to the base-branch tools
+# that produced and qualified it. A package tree alone is not enough: after a
+# build or check fix, bytes made under the previous contract must be rebuilt.
+# Keep this narrower than the whole commit so unrelated changes retain reuse.
+build_contract_key() {
+  local root=${1:-.} objects
+  objects=$(git -C "$root" rev-parse \
+    HEAD:bin/build HEAD:bin/build-matrix HEAD:bin/builder-image \
+    HEAD:bin/check-fast-ring HEAD:build \
+    HEAD:helpers/artifact-helpers.sh HEAD:helpers/docker-helpers.sh \
+    HEAD:helpers/fast-ring-check.sh HEAD:helpers/message-helpers.sh \
+    HEAD:helpers/package-metadata.sh HEAD:helpers/package-owners.sh \
+    HEAD:helpers/paths.sh \
+    HEAD:.github/workflows/build-pr.yml) || return
+  printf 'v1-%s\n' "$(printf '%s\n' "$objects" | sha256sum | cut -d' ' -f1)"
+}
+
+# build_artifact_label <package> <arch> <package tree> [repo]: the one label
+# every build, reuse lookup and publish lookup must agree on.
+build_artifact_label() {
+  local package=$1 arch=$2 tree=$3 root=${4:-.} contract
+  contract=$(build_contract_key "$root") || return
+  printf '%s-%s-%s-%s\n' "$package" "$arch" "$tree" "$contract"
+}
 
 # package_files <dir>: the *.pkg.tar.zst directly in <dir>, one per line.
 # Signatures and the scratch database next to them are not packages.
