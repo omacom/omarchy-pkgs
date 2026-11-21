@@ -1,0 +1,105 @@
+#!/usr/bin/env python3
+"""Give the built-in sound card its profiles back when a login left it without.
+
+On the Surface Laptop 7 15" the sound card appears about ten seconds into
+boot, and WirePlumber, started at login half a second later, sometimes looks
+at it before it can be opened. It does not look again. The card is then left
+with only "Off" and "Pro Audio", so there are no speakers and no internal
+microphone, or with one profile that lacks the headphone and one DisplayPort
+output, until WirePlumber is restarted.
+
+This runs once after WirePlumber starts. It waits until the card's use-case
+configuration (UCM) opens, then compares the devices UCM defines for the card
+with the devices named in the profiles WirePlumber offers. If one is missing
+it restarts WirePlumber, at most twice. A healthy login costs two commands and
+no restart. surface-laptop-7-audio-profiles.service runs it, as the user.
+"""
+import json, os, re, subprocess, sys, time
+
+COMPATIBLE = os.environ.get("SL7_AUDIO_COMPATIBLE", "/proc/device-tree/compatible")
+CARD = "alsa_card.platform-sound"
+VERB = "HiFi"
+# Each is a shell command, so the test can stand in for them.
+PW_DUMP = os.environ.get("SL7_AUDIO_PW_DUMP", "pw-dump")
+UCM_DEVICES = os.environ.get("SL7_AUDIO_UCM_DEVICES", "alsaucm -c {card} list _devices/" + VERB)
+RESTART = os.environ.get("SL7_AUDIO_RESTART", "systemctl --user restart wireplumber.service")
+WAIT = float(os.environ.get("SL7_AUDIO_WAIT", "30"))      # seconds to wait for the card
+SETTLE = float(os.environ.get("SL7_AUDIO_SETTLE", "2"))   # seconds before a restart
+RESTARTS = 2
+
+def on_this_laptop():
+    try:
+        return b"microsoft,romulus15" in open(COMPATIBLE, "rb").read().split(b"\0")
+    except OSError:
+        return False
+
+def run(command):
+    done = subprocess.run(command, shell=True, capture_output=True, text=True)
+    return done.stdout if done.returncode == 0 else None
+
+def offered():
+    """The card's ALSA name and the devices its profiles name, as WirePlumber has them."""
+    try:
+        objects = json.loads(run(PW_DUMP) or "[]")
+    except ValueError:
+        return None
+    for item in objects:
+        info = item.get("info") or {}
+        props = info.get("props") or {}
+        if item.get("type") != "PipeWire:Interface:Device" or props.get("device.name") != CARD:
+            continue
+        devices = set()
+        for profile in (info.get("params") or {}).get("EnumProfile", []):
+            # "HiFi (Headphones, Headset, Mic, Speaker)"
+            named = re.fullmatch(re.escape(VERB) + r" \((.*)\)", profile.get("name", ""))
+            if named:
+                devices.update(name.strip() for name in named.group(1).split(","))
+        return props.get("api.alsa.path", "hw:0"), devices
+    return None
+
+def defined(card):
+    """The devices UCM defines for the card, or None while UCM cannot open it."""
+    listing = run(UCM_DEVICES.format(card=card))
+    if listing is None:
+        return None
+    # "  0: Speaker" then an indented comment line.
+    return set(re.findall(r"^\s*\d+:\s*(\S+)\s*$", listing, re.MULTILINE))
+
+def missing():
+    """Devices UCM defines that no profile offers; None if the card is not ready in time."""
+    deadline = time.monotonic() + WAIT
+    while True:
+        card = offered()
+        if card:
+            wanted = defined(card[0])
+            if wanted:
+                return sorted(wanted - card[1])
+        if time.monotonic() >= deadline:
+            return None
+        time.sleep(0.5)
+
+def main():
+    if not on_this_laptop():
+        return 0
+    for attempt in range(RESTARTS + 1):
+        absent = missing()
+        if absent is None:
+            print("The built-in sound card did not become ready; nothing done.", file=sys.stderr)
+            return 1
+        if not absent:
+            if attempt:
+                print("The built-in sound card has all its profiles after restarting WirePlumber.", flush=True)
+            return 0
+        if attempt == RESTARTS:
+            break
+        print("The built-in sound card is offered without " + ", ".join(absent) + "; restarting WirePlumber.", flush=True)
+        time.sleep(SETTLE)
+        if run(RESTART) is None:
+            print("WirePlumber could not be restarted.", file=sys.stderr)
+            return 1
+    print("The built-in sound card is still offered without " + ", ".join(absent) +
+          f" after {RESTARTS} restarts of WirePlumber.", file=sys.stderr)
+    return 1
+
+if __name__ == "__main__":
+    sys.exit(main())
