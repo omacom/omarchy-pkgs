@@ -16,6 +16,8 @@ files+=(
   bin/omarchy-update
   default/libalpm/hooks/00-omarchy-update-guard.hook
   default/libalpm/hooks/10-omarchy-hyprland-reload-pause.hook
+  default/libalpm/hooks/20-omarchy-shell-reload-pause.hook
+  default/libalpm/hooks/80-omarchy-shell-reload-resume.hook
   default/libalpm/hooks/90-omarchy-hyprland-reload-resume.hook
   install/omarchy-base.packages
   themes/fixture/colors.toml
@@ -93,6 +95,9 @@ for pair in omarchy-dev:omarchy-settings-dev omarchy:omarchy-settings; do
       fail "$target_arch: $settings_recipe does not ship /$boot_cleanup"
     [[ -x $runtime/usr/bin/omarchy-update && -f $runtime/usr/share/libalpm/hooks/00-omarchy-update-guard.hook ]] ||
       fail "$target_arch: $runtime_recipe lost its own commands or hooks"
+    [[ -f $runtime/usr/share/libalpm/hooks/20-omarchy-shell-reload-pause.hook &&
+      -f $runtime/usr/share/libalpm/hooks/80-omarchy-shell-reload-resume.hook ]] ||
+      fail "$target_arch: $runtime_recipe does not ship the shell reload hooks"
     grep -Fxq omarchy-security-functions "$runtime.depends" ||
       fail "$target_arch: the $runtime_recipe package does not require omarchy-security-functions"
     grep -Fxq omarchy-security-functions "$settings.provides" ||
@@ -109,7 +114,9 @@ done
 legacy=$scratch/legacy/omarchy
 mkdir -p "$(dirname "$legacy")"
 cp -a "$fixture" "$legacy"
-rm "$legacy/bin/omarchy-security-functions" "$legacy/default/libalpm/hooks/05-omarchy-passwordless-revoke.hook"
+rm "$legacy/bin/omarchy-security-functions" "$legacy/default/libalpm/hooks/05-omarchy-passwordless-revoke.hook" \
+  "$legacy/default/libalpm/hooks/20-omarchy-shell-reload-pause.hook" \
+  "$legacy/default/libalpm/hooks/80-omarchy-shell-reload-resume.hook"
 for target_arch in x86_64 aarch64; do
   for recipe in omarchy omarchy-settings; do
     build_recipe "$recipe" "$target_arch" "$legacy" "legacy-$recipe-$target_arch"
@@ -121,6 +128,9 @@ for target_arch in x86_64 aarch64; do
     fail "$target_arch: omarchy dropped omarchy-sudo-passwordless for a source that predates the hook"
   [[ ! -e $settings/usr/bin/omarchy-sudo-passwordless && ! -e $settings/$hook ]] ||
     fail "$target_arch: omarchy-settings took over the grant command from a source that predates the hook"
+  [[ ! -e $runtime/usr/share/libalpm/hooks/20-omarchy-shell-reload-pause.hook &&
+    ! -e $runtime/usr/share/libalpm/hooks/80-omarchy-shell-reload-resume.hook ]] ||
+    fail "$target_arch: omarchy installed shell reload hooks a pinned source does not ship"
   ! grep -Fxq omarchy-security-functions "$runtime.depends" ||
     fail "$target_arch: omarchy requires omarchy-security-functions from a source that does not ship it"
   ! grep -Fxq omarchy-security-functions "$settings.provides" ||
