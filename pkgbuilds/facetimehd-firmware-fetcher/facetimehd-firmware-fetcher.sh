@@ -111,10 +111,13 @@ flock -w 120 9 || fail "another fetch is still running"
 mkdir -p "$state"
 
 sleep_in_progress() {
+  local states
   [[ -e $module_run/facetimehd.sleeping ]] || return 1
-  # A marker left by a guard that never finished is stale once no hibernating sleep is running.
-  systemctl show -p ActiveState --value systemd-hibernate.service systemd-hybrid-sleep.service \
-    systemd-suspend-then-hibernate.service 2>/dev/null | grep -qxE 'activating|active|deactivating'
+  # A marker left by a guard that never finished is stale once no hibernating sleep is running, which only an answer
+  # from systemd can say: without one, loading could put the driver back before the freeze.
+  states=$(systemctl show -p ActiveState --value systemd-hibernate.service systemd-hybrid-sleep.service \
+    systemd-suspend-then-hibernate.service) || fail "cannot tell whether the Mac is hibernating; retrying later"
+  grep -qxE 'activating|active|deactivating' <<<"$states"
 }
 
 # The camera works once its PCI function is bound to facetimehd and has registered a video device; the module loading
