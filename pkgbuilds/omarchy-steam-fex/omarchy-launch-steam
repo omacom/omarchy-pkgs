@@ -27,6 +27,31 @@ MimeType=x-scheme-handler/steam;x-scheme-handler/steamlink;
 EOF
 }
 
+write_fex_appconfig() {
+  # Under FEX, steamwebhelper renderers crash every few minutes, and Steam
+  # rebuilds its whole UI each time. FEX's Multiblock JIT mode triggers it;
+  # turning it off for steamwebhelper only stops the crashes.
+  #
+  # FEX reads this user AppConfig on top of its packaged one, so other
+  # settings in the packaged file stay in effect. Use the directory FEX picks
+  # inside the VM: muvm forwards neither XDG_CONFIG_HOME nor FEX_* variables,
+  # so it is the legacy ~/.fex-emu when present, else ~/.config/fex-emu.
+  # Create it once; an existing file is the user's and is left alone.
+  local dir="$HOME/.config/fex-emu"
+  [[ -d $HOME/.fex-emu ]] && dir="$HOME/.fex-emu"
+  local config="$dir/AppConfig/steamwebhelper.json"
+  [[ -e $config || -L $config ]] && return 0
+  mkdir -p "$dir/AppConfig"
+  cat >"$config" <<'EOF'
+{
+  "Comment": "Created by omarchy-launch-steam: Multiblock makes steamwebhelper renderers crash, which reloads the Steam UI",
+  "Config": {
+    "Multiblock": "0"
+  }
+}
+EOF
+}
+
 steam_client_ready() {
   [[ -d $steam_root/steamui ]] && compgen -G "$steam_root/*/steamui.so" >/dev/null
 }
@@ -35,7 +60,68 @@ launch_fex_steam() {
   local launcher="$1"
   shift
 
-  exec muvm -- FEXBash -c 'exec "$@"' omarchy-steam "$launcher" "$@"
+  # muvm starts the guest with a clean environment, so pass the X11 UI scale
+  # and cursor through or Steam renders at 1x with an oversized cursor.
+  local muvm_args=() extra_args=() var
+  for var in GDK_SCALE XCURSOR_SIZE XCURSOR_THEME; do
+    if [[ -n ${!var:-} ]]; then
+      muvm_args+=(-e "$var")
+    fi
+  done
+
+  # Extra muvm options, split on whitespace without globbing or quote
+  # handling, e.g. OMARCHY_STEAM_MUVM_ARGS="-p 9757 -p 9757/udp" for WiVRn.
+  # muvm only applies port publishing when it starts the VM, so these take
+  # effect on the launch that boots it.
+  read -ra extra_args <<<"${OMARCHY_STEAM_MUVM_ARGS:-}"
+  muvm_args+=("${extra_args[@]}")
+
+  local cmd=(muvm "${muvm_args[@]}" -- FEXBash -c 'exec "$@"' omarchy-steam "$launcher")
+
+  if [[ " $* " == *" -shutdown "* ]]; then
+    # Nothing to shut down without a VM; don't boot one just for this.
+    vm_running || exit 0
+    # Return only once the VM is gone, so a launch right after this starts a
+    # fresh Steam instead of reaching the one that is quitting.
+    "${cmd[@]}" "$@" || exit
+    wait_for_vm_exit 60
+    exit 0
+  fi
+
+  if vm_running; then
+    # muvm runs this in the existing VM. If that VM is already shutting down,
+    # muvm can't reach it ("could not connect to muvm server"), so start a
+    # fresh one once it's gone.
+    local rc=0
+    "${cmd[@]}" "$@" || rc=$?
+    if ((rc != 0)); then
+      wait_for_vm_exit "${OMARCHY_STEAM_HANDOFF_TIMEOUT:-20}" && exec "${cmd[@]}" "$@"
+      exit "$rc"
+    fi
+    # In the VM, Steam forwards a plain launch to the running client and
+    # exits. A client that is already quitting accepts it and drops it, then
+    # its VM exits. Start a fresh one in that case.
+    if ((user_arg_count == 0)) && wait_for_vm_exit "${OMARCHY_STEAM_HANDOFF_TIMEOUT:-20}"; then
+      exec "${cmd[@]}" "$@"
+    fi
+    exit 0
+  fi
+
+  exec "${cmd[@]}" "$@"
+}
+
+vm_running() {
+  [[ -n ${XDG_RUNTIME_DIR:-} && -e $XDG_RUNTIME_DIR/muvm.lock ]] || return 1
+  # The muvm VM holds this lock for as long as it runs.
+  ! { flock -n 9; } 9<"$XDG_RUNTIME_DIR/muvm.lock"
+}
+
+wait_for_vm_exit() {
+  local deadline=$((SECONDS + $1))
+  while vm_running; do
+    ((SECONDS < deadline)) || return 1
+    sleep 0.5
+  done
 }
 
 patch_steam_ui() {
@@ -81,6 +167,7 @@ PY
 prepare_asahi() {
   [[ $(uname -m) == aarch64 ]] || return 0
   write_steam_desktop
+  write_fex_appconfig
   patch_steam_ui
 }
 
@@ -101,8 +188,10 @@ if [[ $(uname -m) == aarch64 ]] && command -v muvm >/dev/null && command -v FEXB
       prepare_asahi
     else
       write_steam_desktop
+      write_fex_appconfig
     fi
 
+    user_arg_count=$#
     launch_fex_steam "$launcher" "${steam_args[@]}" "$@"
   fi
 fi
