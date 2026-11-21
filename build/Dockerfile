@@ -6,7 +6,7 @@
 # ------------------------------------------------------------------------------
 # Stage 1: Bootstrap - Create base Arch/ALARM system from scratch
 # ------------------------------------------------------------------------------
-FROM docker.io/alpine:3.21 AS bootstrapper
+FROM docker.io/alpine:3.24 AS bootstrapper
 
 ARG TARGETARCH
 ARG BUILDPLATFORM
