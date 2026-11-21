@@ -133,9 +133,23 @@ camera_ready() {
   [[ -n $found ]]
 }
 
+# A probe still finishing gets a moment before it counts as failed.
+wait_for_camera() {
+  for _ in {1..15}; do
+    camera_ready && return 0
+    sleep 1
+  done
+  camera_ready
+}
+
 # A driver that probed before the firmware existed stays unbound until it loads again, and one DKMS built after boot
-# found the camera never loaded at all. Anything short of a working camera leaves activation pending for a retry.
+# found the camera never loaded at all. A camera already working is left alone, and anything short of one working
+# leaves activation pending for the service's retry.
 activate_driver() {
+  if [[ -d /sys/module/facetimehd ]] && wait_for_camera; then
+    rm -f "$activate"
+    return 0
+  fi
   exec 8>>"$module_run/facetimehd.lock"
   flock -w 120 8 || fail "the camera driver is busy; retrying later"
   if sleep_in_progress; then
@@ -147,11 +161,9 @@ activate_driver() {
   else
     modprobe facetimehd || fail "could not load the camera driver; retrying later"
   fi
-  for _ in {1..15}; do
-    camera_ready && break
-    sleep 1
-  done
-  camera_ready || fail "the camera driver loaded but the camera did not come up (see the kernel log); retrying later"
+  # The wait changes nothing, so it does not hold up a sleep's guard behind the lock.
+  exec 8>&-
+  wait_for_camera || fail "the camera driver loaded but the camera did not come up (see the kernel log); retrying later"
   rm -f "$activate"
 }
 
