@@ -43,7 +43,62 @@ on:
         default: false
 
 jobs:
+  # Where the promotion reads and writes the channels. OMARCHY_PUBLISH_PREFIX
+  # is a variable of the publish environment (README), and only a job in
+  # that environment can read it. This one reads it once, for the DKMS check,
+  # the comparison under the lock and the promotion itself, so a change to
+  # the variable during a run cannot split them. It uses no secret, checks
+  # nothing out and runs nothing from the repository.
+  prefix:
+    runs-on: ubuntu-latest
+    environment: publish
+    permissions: {}
+    timeout-minutes: 5
+    outputs:
+      prefix: ${{ steps.base.outputs.prefix }}
+      pkgs_base: ${{ steps.base.outputs.pkgs_base }}
+    steps:
+      - name: Find where the channels are read
+        id: base
+        env:
+          PREFIX: ${{ vars.OMARCHY_PUBLISH_PREFIX }}
+        run: |
+          set -euo pipefail
+          base=https://pkgs.omarchy.org
+          if [[ -n $PREFIX ]]; then
+            [[ $PREFIX =~ ^[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*$ && $PREFIX != *..* ]] ||
+              { echo "::error::OMARCHY_PUBLISH_PREFIX is not a plain bucket path: $PREFIX"; exit 1; }
+            base=$base/$PREFIX
+          fi
+          {
+            echo "prefix=$PREFIX"
+            echo "pkgs_base=$base"
+          } >>"$GITHUB_OUTPUT"
+          echo "The DKMS check reads the channels from $base"
+
+  # Every kernel and DKMS module that moves is built against the other half
+  # first (bin/check-dkms): a kernel that breaks an out-of-tree module, or a
+  # module that no longer builds, stops here instead of reaching the channel.
+  # The check runs on the target as the promotion leaves it: a kernel that
+  # moves alone is built against the target's modules, not the source's.
+  dkms:
+    needs: prefix
+    # dkms-matrix.yml reads Actions data in its other modes, so it asks for it.
+    permissions:
+      contents: read
+      actions: read
+    uses: ./.github/workflows/dkms-matrix.yml
+    with:
+      channel: ${{ startsWith(github.event.inputs.direction, 'edge') && 'rc' || 'stable' }}
+      from: ${{ startsWith(github.event.inputs.direction, 'edge') && 'edge' || 'rc' }}
+      packages: ${{ github.event.inputs.packages }}
+      # A proof run promotes inside its scratch prefix, so the check reads
+      # the channels there too. A prefix that is not served fails the plan.
+      # It never falls back to the live channels.
+      pkgs_base: ${{ needs.prefix.outputs.pkgs_base }}
+
   promote:
+    needs: [prefix, dkms]
     runs-on: ubuntu-latest
     environment: publish
     # A first promotion into a sparse channel moves gigabytes.
@@ -59,6 +114,21 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+
+      # The prefix job always outputs a base. GitHub drops an output that
+      # looks like a secret and still passes the job, which would leave the
+      # checks and the promotion on the live channels in a proof run. So a
+      # missing base, or one that does not match the prefix, stops here.
+      - name: Check where the checks read and the promotion writes
+        env:
+          PREFIX: ${{ needs.prefix.outputs.prefix }}
+          BASE: ${{ needs.prefix.outputs.pkgs_base }}
+        run: |
+          set -euo pipefail
+          if [[ $BASE != "https://pkgs.omarchy.org${PREFIX:+/$PREFIX}" ]]; then
+            echo "::error::The prefix job's outputs are missing or disagree: base '$BASE', prefix '$PREFIX'"
+            exit 1
+          fi
 
       - name: Check inputs
         id: inputs
@@ -76,6 +146,41 @@ jobs:
             [[ $p =~ ^[a-z0-9@._+-]+$ ]] || { echo "::error::Not a package name: $p"; exit 1; }
           done
 
+      # The DKMS check ran before this job took the publish lock. A publish in
+      # between can move the source's kernel or the target's modules, and
+      # promote-channel reads the channels again. So plan the same legs now,
+      # under the lock, and stop if they are not the pairs that were built.
+      # It reads the channels where promote-channel does, in the proof
+      # prefix when one is set, and past the CDN's cache (bin/check-dkms
+      # fetch_db).
+      - name: Check that the channels still hold what the DKMS check built
+        env:
+          FROM: ${{ steps.inputs.outputs.from }}
+          TO: ${{ steps.inputs.outputs.to }}
+          PACKAGES: ${{ github.event.inputs.packages }}
+          CHECKED: ${{ needs.dkms.outputs.legs }}
+          OMARCHY_PKGS_BASE: ${{ needs.prefix.outputs.pkgs_base }}
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends libarchive-tools >/dev/null
+          args=(--channel "$TO" --from "$FROM")
+          if [[ -n $PACKAGES ]]; then
+            args+=(--packages "$PACKAGES")
+          fi
+          x86_64=$(bin/check-dkms matrix --arch x86_64 "${args[@]}")
+          aarch64=$(bin/check-dkms matrix --arch aarch64 "${args[@]}")
+          now=$(jq -cn --argjson a "$x86_64" --argjson b "$aarch64" '$a + $b | sort')
+          built=$(jq -c 'sort' <<<"${CHECKED:-[]}")
+          if [[ $now != "$built" ]]; then
+            echo "Built by the DKMS check:"
+            jq -r '.[] | "  \(.arch)  \(.kernel)  \(.module)"' <<<"$built"
+            echo "In the channels now:"
+            jq -r '.[] | "  \(.arch)  \(.kernel)  \(.module)"' <<<"$now"
+            echo "::error title=DKMS check::$FROM or $TO changed after the DKMS check; run the promotion again"
+            exit 1
+          fi
+          echo "$TO and $FROM still hold the $(jq length <<<"$now") pair(s) the DKMS check built"
+
       - name: Promote
         id: promote
         env:
@@ -91,7 +196,7 @@ jobs:
           RCLONE_CONFIG_R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           RCLONE_CONFIG_R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           RCLONE_CONFIG_R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
-          OMARCHY_PUBLISH_PREFIX: ${{ vars.OMARCHY_PUBLISH_PREFIX }}
+          OMARCHY_PUBLISH_PREFIX: ${{ needs.prefix.outputs.prefix }}
         run: |
           set -euo pipefail
           # repo-add, gpg, bsdtar and vercmp are Arch tools: run in the tested
@@ -149,7 +254,7 @@ jobs:
           PACKAGES: ${{ github.event.inputs.packages }}
           OUTCOME: ${{ steps.promote.outcome }}
           ACTOR: ${{ github.triggering_actor }}
-          OMARCHY_PUBLISH_PREFIX: ${{ vars.OMARCHY_PUBLISH_PREFIX }}
+          OMARCHY_PUBLISH_PREFIX: ${{ needs.prefix.outputs.prefix }}
         run: |
           set -euo pipefail
           touch "$RUNNER_TEMP/promote/record.jsonl"
