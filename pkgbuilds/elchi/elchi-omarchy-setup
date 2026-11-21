@@ -1,0 +1,213 @@
+#!/bin/bash
+# elchi-omarchy-setup: bind a dictation key for Elchi in Hyprland (Omarchy >= 4).
+#
+# Elchi's in-app global shortcut is X11-only, so on Hyprland the compositor
+# runs `elchi --toggle-transcription` instead. Hold mode binds the key on
+# press and on release (toggle twice = hold-to-talk); toggle mode binds press only.
+set -euo pipefail
+
+# Default key, in this order (see README): the Fn key when the keyboard reports
+# one (most laptops handle Fn in firmware and never do), the ROG key on ASUS
+# laptops, otherwise CTRL + SPACE, Elchi's own default. --key overrides.
+key=""
+label=""
+mode=hold
+remove=0
+file=$HOME/.config/hypr/bindings.lua
+
+running() { pgrep -u "$UID" -x elchi >/dev/null; }
+
+detect_key() {
+  python3 - <<'PY'
+import re
+fn = rog = False
+for block in open("/proc/bus/input/devices").read().strip().split("\n\n"):
+    keys = re.search(r"B: KEY=(.*)", block)
+    name = re.search(r'N: Name="(.*)"', block)
+    if not keys:
+        continue
+    bits = 0
+    for word in keys.group(1).split():
+        bits = (bits << 64) | int(word, 16)
+    if bits >> 464 & 1:                                   # KEY_FN
+        fn = True
+    if bits >> 148 & 1 and name and "ASUS" in name.group(1).upper():   # KEY_PROG1 = ROG key
+        rog = True
+print("fn" if fn else "rog" if rog else "none")
+PY
+}
+
+usage() {
+  cat <<USAGE
+usage: elchi-omarchy-setup [--key KEY] [--mode hold|toggle] [--remove]
+
+  --key KEY     Hyprland key name. Default: XF86Fn when the keyboard reports an
+                Fn key, XF86Launch1 (ROG key) on ASUS laptops, else "CTRL + SPACE".
+                Other keys Omarchy leaves free: Pause, Menu, "SUPER + ALT + V".
+                (Caps_Lock is Omarchy's compose key; F9 belongs to voxtype;
+                CTRL + SPACE is also fcitx5's input-method toggle.)
+  --mode hold   press = start, release = stop (default)
+  --mode toggle press toggles recording on/off
+  --remove      remove the Elchi block from $file
+
+Edits $file (backup kept next to it), then reloads Hyprland.
+USAGE
+}
+
+while (($#)); do
+  case $1 in
+    --key) key=${2:?--key needs a value}; shift 2 ;;
+    --mode) mode=${2:?--mode needs hold or toggle}; shift 2 ;;
+    --remove) remove=1; shift ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
+  esac
+done
+[[ $mode == hold || $mode == toggle ]] || { echo "--mode must be hold or toggle" >&2; exit 2; }
+
+if [[ -z $key ]]; then
+  case $(detect_key) in
+    fn)  key=XF86Fn;      label="Fn" ;;
+    rog) key=XF86Launch1; label="ROG" ;;
+    *)   key="CTRL + SPACE"; label="Ctrl + Space" ;;
+  esac
+else
+  label=$key
+fi
+
+# Only toggle a running Elchi: a cold `elchi --toggle-transcription` would
+# start the app instead, and in hold mode the release would then start a
+# recording nobody stops. Autostart (seeded below) keeps it running.
+cmd='pgrep -u $UID -x elchi >/dev/null && elchi --toggle-transcription'
+
+if [[ ! -f $file ]]; then
+  # ponytail: Omarchy >= 4 Lua config only; older .conf setups paste these lines.
+  echo "$file not found. Add these lines to your Hyprland config instead:" >&2
+  echo "  bind = , $key, exec, $cmd"
+  [[ $mode == hold ]] && echo "  bindr = , $key, exec, $cmd"
+  exit 1
+fi
+
+hypr_up=1
+hyprctl version >/dev/null 2>&1 || hypr_up=0
+errors_before=""
+if (( hypr_up )); then errors_before=$(hyprctl configerrors 2>/dev/null || true); fi
+
+backup="$file.bak.$(date +%s)"
+cp "$file" "$backup"
+sed -i '/^-- elchi:begin/,/^-- elchi:end/d' "$file"
+
+if (( ! remove )); then
+  [[ -z $(tail -c1 "$file") ]] || echo >> "$file"   # end the file with a newline first
+  {
+    echo "-- elchi:begin (managed by elchi-omarchy-setup; re-run it to change the key)"
+    echo 'if o.cmd_present("elchi") then'
+    if [[ $mode == hold ]]; then
+      echo "  o.bind(\"$key\", \"Elchi: dictate (hold)\", \"$cmd\")"
+      echo "  o.bind(\"$key\", \"Elchi: dictate (release)\", \"$cmd\", { release = true })"
+    else
+      echo "  o.bind(\"$key\", \"Elchi: dictate (toggle)\", \"$cmd\")"
+    fi
+    echo "end"
+    echo "-- elchi:end"
+  } >> "$file"
+fi
+
+if (( ! hypr_up )); then
+  echo "Hyprland is not running; the binding applies at the next login."
+else
+  hyprctl reload >/dev/null
+  errors_after=$(hyprctl configerrors 2>/dev/null || true)
+  if [[ $errors_after != "$errors_before" ]]; then
+    echo "Hyprland rejected the config; restoring $backup" >&2
+    echo "$errors_after" >&2
+    cp "$backup" "$file"
+    hyprctl reload >/dev/null
+    exit 1
+  fi
+fi
+
+if (( remove )); then
+  if running; then pkill -u "$UID" -x elchi || true; sleep 1; fi
+  store=${XDG_DATA_HOME:-$HOME/.local/share}/com.elchi.app/settings_store.json
+  [[ -f $store ]] && python3 - "$store" <<'PY'
+import json, sys
+p = sys.argv[1]; d = json.load(open(p))
+d.setdefault("settings", {}).pop("external_shortcut", None)
+json.dump(d, open(p, "w"), indent=2, ensure_ascii=False)
+PY
+  echo "Elchi key binding removed (start Elchi again yourself)."
+  exit 0
+fi
+
+# Elchi owns its settings store while it runs: stop it before editing, start
+# it again below. The store is read once at startup.
+restarted=0
+if running; then
+  pkill -u "$UID" -x elchi || true
+  for _ in 1 2 3 4 5 6 7 8 9 10; do running || break; sleep 0.3; done
+  restarted=1
+fi
+
+# Store edits: the key label Elchi's shortcut setting shows (external_shortcut),
+# and, until the first run is finished (nothing in the store is the user's own
+# choice yet): the recording overlay on (Linux hides it by default), "Start at
+# login", and this version's What's New marked seen. AppSettings is #[serde(default)].
+data_dir=${XDG_DATA_HOME:-$HOME/.local/share}/com.elchi.app
+store=$data_dir/settings_store.json
+version=$(pacman -Q elchi 2>/dev/null | awk '{print $2}'); version=${version%-*}   # 1.0.2-1 -> 1.0.2
+mkdir -p "$data_dir"
+seeded=0
+if python3 - "$store" "$version" "$label" "$mode" <<'PY'
+import json, os, sys
+p, version, label, mode = sys.argv[1:5]
+d = json.load(open(p)) if os.path.exists(p) else {}
+s = d.setdefault("settings", {})
+s["external_shortcut"] = label + (" (hold)" if mode == "hold" else "")
+seeded = not s.get("onboarding_completed")
+if seeded:
+    s["overlay_style"] = "live"
+    s["overlay_idle_line"] = True      # the thin line between recordings (Omarchy default)
+    s["autostart_enabled"] = True
+    if version:
+        s.setdefault("whats_new_last_seen_version", version)
+json.dump(d, open(p, "w"), indent=2, ensure_ascii=False)
+sys.exit(0 if seeded else 1)
+PY
+then seeded=1; fi
+
+# pacman owns updates. environment.d covers the next login; for this session
+# set it on the user manager, which is where uwsm-app launches from.
+systemctl --user set-environment HANDY_DISABLE_UPDATER=1 2>/dev/null || true
+
+if ! running; then
+  # Detached: uwsm-app can stay in the foreground for the app's lifetime.
+  if command -v uwsm-app >/dev/null; then
+    setsid uwsm-app -- elchi >/dev/null 2>&1 </dev/null &
+  else
+    HANDY_DISABLE_UPDATER=1 setsid elchi >/dev/null 2>&1 </dev/null &
+  fi
+  if (( restarted )); then
+    echo "Elchi restarted so Settings shows the new key."
+  else
+    echo "Elchi started: finish the welcome screen; Duyu-small (56 MB) downloads in the background."
+  fi
+fi
+
+# Lua binds show up in `hyprctl binds` as callback ids, so match the description.
+if (( hypr_up )) && ! hyprctl binds | grep -q 'Elchi: dictate'; then
+  echo "Binding not registered by Hyprland; check $file" >&2
+  exit 1
+fi
+
+cat <<DONE
+Dictation key: $label  [$key, $mode]. Elchi must be running (it now starts at login).
+Change it any time: elchi-omarchy-setup --key "SUPER + ALT + V"
+  hold:   press and speak, release to type   (a missed release leaves it recording; press once more)
+  toggle: press to start, press to stop
+DONE
+if (( seeded )); then
+  echo 'Recording overlay and "Start at login" are on. Optional: Settings > Advanced > "Start hidden".'
+else
+  echo 'Existing settings kept. Overlay: Settings > Overlay. Login: Settings > Advanced > "Start at login".'
+fi
