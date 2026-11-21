@@ -1,0 +1,85 @@
+#!/bin/bash
+# Colour Synology Drive's tray icon to match the Omarchy bar.
+#
+# Synology sends its tray icon as a picture, so the bar cannot recolour it the
+# way it does symbolic icons. This paints the white line art of Synology's own
+# dark-panel icon set in the theme's bar text colour (status badges keep their
+# colours), writes the result into the copy of the client the user runs from
+# (~/.SynologyDrive/SynologyDrive.app), and restarts a running client so the
+# tray picks it up. It runs at login, when the theme changes and when the
+# client refreshes its copy after an upgrade (synology-drive-theme-tray.path).
+#
+# Usage: synology-drive-theme-tray [--no-restart]
+
+set -euo pipefail
+
+SOURCE=/opt/Synology/SynologyDrive/package/cloudstation/images/tray/win-linux-black
+TARGET="$HOME/.SynologyDrive/SynologyDrive.app/images/tray/normal"
+THEME="$HOME/.local/state/omarchy/current/theme"
+STAMP="$HOME/.SynologyDrive/omarchy-tray-color"
+
+restart=1
+[[ ${1:-} == --no-restart ]] && restart=0
+
+# The client has not been set up for this user yet; its first start copies
+# the white icons from /opt, and the next login colours them.
+[[ -d $TARGET && -d $SOURCE ]] || exit 0
+
+# Read `key = "#rrggbb"` from one [section] of a TOML file.
+toml_color() {
+  local file=$1 section=$2 key=$3
+  [[ -r $file ]] || return 1
+  awk -v section="[$section]" -v key="$key" '
+    /^[[:space:]]*\[/ { in_section = ($1 == section); next }
+    in_section && $1 == key {
+      if (match($0, /#[0-9A-Fa-f]{6}/)) { print substr($0, RSTART, 7); exit }
+    }' "$file" | grep .
+}
+
+color=$(toml_color "$THEME/shell.toml" bar text ||
+        sed -n 's/^foreground[[:space:]]*=[[:space:]]*"\(#[0-9A-Fa-f]\{6\}\)".*/\1/p' "$THEME/colors.toml" 2>/dev/null | grep . ||
+        echo "#ffffff")
+
+# Nothing to do when the icons already carry this colour, so a theme change
+# that keeps the bar text colour does not restart syncing.
+if [[ -f $STAMP && $(<"$STAMP") == "$color" ]] && cmp -s "$TARGET/uptodate.png" "$TARGET/.omarchy-uptodate.png" 2>/dev/null; then
+  exit 0
+fi
+
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+
+r=$((16#${color:1:2})) g=$((16#${color:3:2})) b=$((16#${color:5:2}))
+
+for src in "$SOURCE"/*.png; do
+  name=${src##*/}
+  # Synology's dark-panel icons are white line art over a translucent black
+  # fill, with status badges: blue (syncing), red (error), grey (paused).
+  # Badge mask: the coloured or flat-grey badge pixels, closed so it also
+  # covers the white symbol drawn inside each badge.
+  magick "$src" -fx '
+      mx = max(r, max(g, b)); mn = min(r, min(g, b));
+      a > 0.5 && (mx - mn > 0.25 || (abs(mx - 0.725) < 0.06 && mx - mn < 0.05 && a > 0.9)) ? 1 : 0' \
+    -alpha off -morphology Close Disk:6 "$work/mask-$name"
+  # Inside a badge: unchanged. Elsewhere: the fill disappears and the line
+  # art takes the bar colour, its brightness becoming its opacity so the
+  # anti-aliased edges stay smooth.
+  magick "$src" "$work/mask-$name" -channel RGBA -fx "
+      mx = max(u.r, max(u.g, u.b)); mn = min(u.r, min(u.g, u.b));
+      level = clamp(((mx + mn) / 2 - 0.3) / 0.6);
+      v.r > 0.5 || mx - mn > 0.25 ? u :
+      channel($r/255, $g/255, $b/255, 0, u.a * level)" \
+    "$work/$name"
+  rm -f "$work/mask-$name"
+done
+
+cp -f "$work"/*.png "$TARGET"/
+cp -f "$TARGET/uptodate.png" "$TARGET/.omarchy-uptodate.png"
+printf '%s\n' "$color" >"$STAMP"
+
+if (( restart )) && pgrep -u "$UID" -f 'SynologyDrive.app/bin/cloud-drive-ui' >/dev/null; then
+  # This runs from a oneshot user service, and systemd stops everything left
+  # in a oneshot's cgroup when it exits, so the restarted client gets a scope
+  # of its own and outlives this script.
+  systemd-run --user --scope --quiet --collect -- synology-drive restart >/dev/null 2>&1 || true
+fi
