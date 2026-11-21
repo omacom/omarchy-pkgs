@@ -1,0 +1,156 @@
+diff --git c/espanso/src/cli/daemon/keyboard_layout_watcher.rs w/espanso/src/cli/daemon/keyboard_layout_watcher.rs
+index b8513ae..4789fd8 100644
+--- c/espanso/src/cli/daemon/keyboard_layout_watcher.rs
++++ w/espanso/src/cli/daemon/keyboard_layout_watcher.rs
+@@ -39,7 +39,7 @@ pub fn initialize_and_spawn(watcher_notify: Sender<()>) -> Result<()> {
+ }
+ 
+ fn watcher_main(watcher_notify: &Sender<()>) {
+-    let mut layout = espanso_detect::get_active_layout();
++    let mut layout = crate::keyboard_layout::active().map(|config| config.to_string());
+ 
+     if layout.is_none() {
+         warn!("keyboard layout watcher couldn't determine active layout.");
+@@ -48,7 +48,7 @@ fn watcher_main(watcher_notify: &Sender<()>) {
+     loop {
+         std::thread::sleep(std::time::Duration::from_millis(WATCHER_INTERVAL));
+ 
+-        let current_layout = espanso_detect::get_active_layout();
++        let current_layout = crate::keyboard_layout::active().map(|config| config.to_string());
+         if current_layout != layout {
+             debug!(
+                 "detected keyboard layout change: from '{}' to '{}'",
+diff --git c/espanso/src/cli/worker/engine/keyboard_layout_util.rs w/espanso/src/cli/worker/engine/keyboard_layout_util.rs
+index 8f8f760..563dc77 100644
+--- c/espanso/src/cli/worker/engine/keyboard_layout_util.rs
++++ w/espanso/src/cli/worker/engine/keyboard_layout_util.rs
+@@ -33,11 +33,8 @@ fn generate_rmlvo_config(config: &dyn Config) -> Option<RMLVOConfig> {
+ 
+     if let Some(keyboard_config) = config.keyboard_layout() {
+         Some(keyboard_config)
+-    } else if let Some(active_layout) = espanso_detect::get_active_layout() {
+-        Some(RMLVOConfig {
+-            layout: Some(active_layout),
+-            ..Default::default()
+-        })
++    } else if let Some(active_layout) = crate::keyboard_layout::active() {
++        Some(active_layout)
+     } else {
+         warn!("unable to determine keyboard layout automatically, please explicitly specify it in the configuration.");
+         None
+diff --git c/espanso/src/main.rs w/espanso/src/main.rs
+index 19d5de1..9234f8a 100644
+--- c/espanso/src/main.rs
++++ w/espanso/src/main.rs
+@@ -48,6 +48,7 @@ mod exit_code;
+ mod gui;
+ mod icon;
+ mod ipc;
++mod keyboard_layout;
+ mod lock;
+ #[macro_use]
+ mod logging;
+diff --git 1/espanso/src/keyboard_layout.rs 2/espanso/src/keyboard_layout.rs
+new file mode 100644
+index 0000000..af85b90
+--- /dev/null
++++ 2/espanso/src/keyboard_layout.rs
+@@ -0,0 +1,98 @@
++use espanso_config::config::RMLVOConfig;
++
++pub fn active() -> Option<RMLVOConfig> {
++    #[cfg(all(target_os = "linux", feature = "wayland"))]
++    if std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE").is_some() {
++        let output = std::process::Command::new("hyprctl")
++            .args(["-j", "devices"])
++            .output()
++            .ok()?;
++        if !output.status.success() {
++            return None;
++        }
++        return from_hyprland(&output.stdout);
++    }
++
++    espanso_detect::get_active_layout().map(|layout| RMLVOConfig {
++        layout: Some(layout),
++        ..Default::default()
++    })
++}
++
++#[cfg(all(target_os = "linux", feature = "wayland"))]
++fn from_hyprland(bytes: &[u8]) -> Option<RMLVOConfig> {
++    let value: serde_json::Value = serde_json::from_slice(bytes).ok()?;
++    let keyboards = value.get("keyboards")?.as_array()?;
++    // Hyprland identifies the seat's main keyboard, including input-method keyboards.
++    let keyboard = keyboards
++        .iter()
++        .find(|k| k.get("main").and_then(serde_json::Value::as_bool) == Some(true))?;
++    let index = usize::try_from(keyboard.get("active_layout_index")?.as_u64()?).ok()?;
++    let field = |name: &str| keyboard.get(name).and_then(serde_json::Value::as_str);
++    let layout = field("layout")?.split(',').nth(index)?.trim();
++    if layout.is_empty() {
++        return None;
++    }
++    let optional = |name: &str| field(name).filter(|v| !v.is_empty()).map(str::to_owned);
++    // Preserve empty variant slots: "latin," associates the second layout with
++    // its default variant, rather than incorrectly reusing Serbian Latin.
++    let variant = field("variant")
++        .unwrap_or_default()
++        .split(',')
++        .nth(index)
++        .unwrap_or_default()
++        .trim()
++        .to_owned();
++    Some(RMLVOConfig {
++        rules: optional("rules"),
++        model: optional("model"),
++        layout: Some(layout.to_owned()),
++        variant: Some(variant),
++        options: optional("options"),
++    })
++}
++
++#[cfg(all(test, target_os = "linux", feature = "wayland"))]
++mod tests {
++    use super::from_hyprland;
++    use serde_json::json;
++
++    fn devices(index: u64) -> Vec<u8> {
++        serde_json::to_vec(&json!({"keyboards": [
++            {"main": false, "layout": "de", "active_layout_index": 0},
++            {"main": true, "layout": "rs,us", "variant": "latin,",
++             "rules": "", "model": "", "options": "lv3:ralt_switch",
++             "active_layout_index": index}
++        ]}))
++        .unwrap()
++    }
++
++    #[test]
++    fn selects_main_keyboard_and_serbian_variant() {
++        let config = from_hyprland(&devices(0)).unwrap();
++        assert_eq!(config.layout.as_deref(), Some("rs"));
++        assert_eq!(config.variant.as_deref(), Some("latin"));
++        assert_eq!(config.options.as_deref(), Some("lv3:ralt_switch"));
++        assert!(config.rules.is_none());
++    }
++
++    #[test]
++    fn switching_to_us_clears_the_variant() {
++        let config = from_hyprland(&devices(1)).unwrap();
++        assert_eq!(config.layout.as_deref(), Some("us"));
++        assert_eq!(config.variant.as_deref(), Some(""));
++    }
++
++    #[test]
++    fn rejects_invalid_or_ambiguous_device_state() {
++        for bytes in [
++            b"invalid".as_slice(),
++            b"{}",
++            b"{\"keyboards\": []}",
++            b"{\"keyboards\": [{\"main\": true, \"layout\": \"us\"}]}",
++        ] {
++            assert!(from_hyprland(bytes).is_none());
++        }
++        assert!(from_hyprland(&devices(9)).is_none());
++    }
++}
