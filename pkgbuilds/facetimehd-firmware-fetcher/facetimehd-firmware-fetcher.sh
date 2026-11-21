@@ -8,6 +8,12 @@ set -euo pipefail
 
 dest=${FACETIMEHD_FIRMWARE_DIR:-/usr/lib/firmware/facetimehd}
 state=${FACETIMEHD_FETCHER_STATE:-/var/lib/facetimehd-firmware-fetcher}
+fetch_lock=${FACETIMEHD_FETCHER_LOCK:-/run/lock/facetimehd-firmware-fetcher.lock}
+removing=${FACETIMEHD_FETCHER_REMOVING:-/run/facetimehd-firmware-fetcher.removing}
+# Shared with Omarchy's hibernation guard, which unloads the driver for a hibernating sleep under this lock and leaves
+# this marker until it loads the driver again: a reload in between would put back the driver that hangs hibernation.
+module_lock=${FACETIMEHD_MODULE_LOCK:-/run/lock/facetimehd.lock}
+sleep_marker=${FACETIMEHD_SLEEP_MARKER:-/run/facetimehd-unloaded-for-sleep}
 retries=${FACETIMEHD_FETCH_RETRIES:-2}
 
 # Each range is one complete xz stream of the macOS 10.12.6 combo update's pbzx payload, decompressing to a 16 MiB chunk.
@@ -97,9 +103,10 @@ fi
 
 (( EUID == 0 )) || fail "run it as root"
 
-mkdir -p "$state"
-exec 9>"$state/lock"
+exec 9>>"$fetch_lock"
 flock -w 120 9 || fail "another fetch is still running"
+[[ ! -e $removing ]] || fail "the package is being removed"
+mkdir -p "$state"
 
 mapfile -t missing < <(wanted)
 if (( ${#missing[@]} == 0 )); then
@@ -141,14 +148,24 @@ for entry in "${calibration[@]}"; do
   matches "$work/$name" "$sha" || mismatch "$name is not the calibration expected"
 done
 
-# Only what was missing is written and recorded, so removal leaves a copy put there by hand.
+# Only what was missing is written, so removal leaves a copy put there by hand. Each is recorded before it is written,
+# so a fetch stopped in between leaves nothing unrecorded.
 for name in "${missing[@]}"; do
-  install -Dm644 "$work/$name" "$dest/$name"
   grep -qxF "$name" "$state/installed-files" 2>/dev/null || echo "$name" >>"$state/installed-files"
+  install -Dm644 "$work/$name" "$dest/$name"
 done
 echo "FaceTime HD firmware and calibration are installed in $dest"
 
-# A driver that probed before the firmware existed stays unbound until it loads again.
-if [[ ${1:-} == --reload && -d /sys/module/facetimehd ]]; then
-  modprobe -r facetimehd && modprobe facetimehd || echo "facetimehd-firmware-fetcher: reboot to load the camera driver" >&2
+# A driver that probed before the firmware existed stays unbound until it loads again, and one DKMS built after boot
+# found the camera never loaded at all.
+if [[ ${1:-} == --reload ]]; then
+  exec 8>>"$module_lock"
+  flock -w 120 8 || fail "the camera driver is busy; it loads at the next boot"
+  if [[ -e $sleep_marker ]]; then
+    echo "The camera driver loads again when the Mac wakes"
+  elif [[ -d /sys/module/facetimehd ]]; then
+    modprobe -r facetimehd && modprobe facetimehd || echo "facetimehd-firmware-fetcher: reboot to load the camera driver" >&2
+  else
+    modprobe facetimehd || echo "facetimehd-firmware-fetcher: reboot to load the camera driver" >&2
+  fi
 fi
