@@ -1,0 +1,208 @@
+--- a/spbm.c
++++ b/spbm.c
+@@ -37,6 +37,8 @@
+ #include <linux/platform_device.h>
+ #include <linux/list.h>
+ #include <linux/uuid.h>
++#include <linux/dmi.h>
++#include <linux/units.h>
+ 
+ #define DRIVER_NAME	"spbm"
+ #define SPBM_SIZE	0x1000
+@@ -551,6 +553,178 @@
+ 	return resolved;
+ }
+ 
++#include "n1x-acpi.h"
++#include "n1x-p16-readonly.h"
++
++/* Power units are interpreted only for this exact ASUS P16 model. */
++static const struct dmi_system_id n1x_power_units[] = {
++	{
++		.matches = {
++			DMI_EXACT_MATCH(DMI_SYS_VENDOR, "ASUS"),
++			DMI_EXACT_MATCH(DMI_PRODUCT_NAME, "ProArt P16 H7607BA"),
++		},
++	},
++	{ }
++};
++
++struct n1x_channel {
++	const char *path;
++	const char *label;
++};
++
++static const struct n1x_channel n1x_power[] = {
++	{ "\\_TZ.PSYS", "sys_total" },
++	{ "\\_TZ.PSOC", "soc_pkg" },
++};
++
++static const struct n1x_channel n1x_temp[] = {
++	{ "\\_TZ.TSOC", "soc" },
++	{ "\\_TZ.TS0E", "cpu_e_clu0" },
++	{ "\\_TZ.TS0P", "cpu_p_clu0" },
++	{ "\\_TZ.TS1E", "cpu_e_clu1" },
++	{ "\\_TZ.TS1P", "cpu_p_clu1" },
++	{ "\\_TZ.TGPU", "gpu" },
++	{ "\\_TZ.TDLA", "dla" },
++	{ "\\_TZ.TUNC", "uncore" },
++};
++
++/* MMIO extensions are enabled only for the independently validated firmware. */
++struct n1x_priv {
++	void __iomem *base;
++	acpi_handle power[ARRAY_SIZE(n1x_power)];
++	acpi_handle temp[ARRAY_SIZE(n1x_temp)];
++};
++
++#include "n1x-mmio.h"
++
++static umode_t n1x_visible(const void *data, enum hwmon_sensor_types type,
++			 u32 attr, int ch)
++{
++	const struct n1x_priv *p = data;
++
++	if (type == hwmon_power && ch >= ARRAY_SIZE(n1x_power))
++		return n1x_mmio_visible(p, attr, ch - ARRAY_SIZE(n1x_power));
++	if (type == hwmon_power && ch < ARRAY_SIZE(n1x_power) &&
++	    p->power[ch] && (attr == hwmon_power_input || attr == hwmon_power_label))
++		return 0444;
++	if (type == hwmon_temp && ch < ARRAY_SIZE(n1x_temp) &&
++	    p->temp[ch] && (attr == hwmon_temp_input || attr == hwmon_temp_label))
++		return 0444;
++	return 0;
++}
++
++static int n1x_read(struct device *dev, enum hwmon_sensor_types type,
++		    u32 attr, int ch, long *val)
++{
++	struct n1x_priv *p = dev_get_drvdata(dev);
++	unsigned long long raw;
++	acpi_handle handle;
++
++	if (type == hwmon_power && ch >= ARRAY_SIZE(n1x_power))
++		return n1x_mmio_read(p, attr, ch - ARRAY_SIZE(n1x_power), val);
++	if (type == hwmon_power && attr == hwmon_power_input && ch < ARRAY_SIZE(n1x_power))
++		handle = p->power[ch];
++	else if (type == hwmon_temp && attr == hwmon_temp_input && ch < ARRAY_SIZE(n1x_temp))
++		handle = p->temp[ch];
++	else
++		return -EOPNOTSUPP;
++	if (!handle || ACPI_FAILURE(acpi_evaluate_integer(handle, "_TMP", NULL, &raw)))
++		return -EIO;
++	if (type == hwmon_power) {
++		/* Reject firmware sentinels and values outside a laptop's range. */
++		if (raw > U32_MAX || !n1x_p16_power_value(raw, val))
++			return -ENODATA;
++	} else {
++		if (raw < 2000 || raw > 4500)
++			return -ENODATA;
++		*val = deci_kelvin_to_millicelsius(raw);
++	}
++	return 0;
++}
++
++static int n1x_read_string(struct device *dev, enum hwmon_sensor_types type,
++			   u32 attr, int ch, const char **str)
++{
++	if (type == hwmon_power && attr == hwmon_power_label &&
++	    ch >= ARRAY_SIZE(n1x_power) && ch < ARRAY_SIZE(n1x_power) + ARRAY_SIZE(n1x_mmio_power)) {
++		*str = n1x_mmio_power[ch - ARRAY_SIZE(n1x_power)].label;
++		return 0;
++	}
++	if (type == hwmon_power && attr == hwmon_power_label && ch < ARRAY_SIZE(n1x_power))
++		*str = n1x_power[ch].label;
++	else if (type == hwmon_temp && attr == hwmon_temp_label && ch < ARRAY_SIZE(n1x_temp))
++		*str = n1x_temp[ch].label;
++	else
++		return -EOPNOTSUPP;
++	return 0;
++}
++
++static const struct hwmon_ops n1x_ops = {
++	.is_visible = n1x_visible,
++	.read = n1x_read,
++	.read_string = n1x_read_string,
++};
++
++static const struct hwmon_channel_info * const n1x_info[] = {
++	HWMON_CHANNEL_INFO(power, HWMON_P_INPUT | HWMON_P_LABEL,
++			   HWMON_P_INPUT | HWMON_P_LABEL,
++		HWMON_P_INPUT | HWMON_P_LABEL, HWMON_P_INPUT | HWMON_P_LABEL,
++		HWMON_P_INPUT | HWMON_P_LABEL, HWMON_P_INPUT | HWMON_P_LABEL,
++		HWMON_P_INPUT | HWMON_P_LABEL, HWMON_P_INPUT | HWMON_P_LABEL,
++		HWMON_P_INPUT | HWMON_P_LABEL, HWMON_P_INPUT | HWMON_P_LABEL,
++		HWMON_P_INPUT | HWMON_P_LABEL,
++		N1X_LIMIT_CONFIG, N1X_LIMIT_CONFIG, N1X_LIMIT_CONFIG, N1X_LIMIT_CONFIG),
++	HWMON_CHANNEL_INFO(temp, HWMON_T_INPUT | HWMON_T_LABEL,
++		HWMON_T_INPUT | HWMON_T_LABEL, HWMON_T_INPUT | HWMON_T_LABEL,
++		HWMON_T_INPUT | HWMON_T_LABEL, HWMON_T_INPUT | HWMON_T_LABEL,
++		HWMON_T_INPUT | HWMON_T_LABEL, HWMON_T_INPUT | HWMON_T_LABEL,
++		HWMON_T_INPUT | HWMON_T_LABEL),
++	NULL
++};
++
++static const struct hwmon_chip_info n1x_chip = {
++	.ops = &n1x_ops,
++	.info = n1x_info,
++};
++
++
++static int n1x_add(struct device *dev, struct acpi_device *adev)
++{
++	struct device *hwdev;
++	struct n1x_priv *p;
++	int i, power = 0, temp = 0, mmio_ret = -ENODEV;
++	bool power_units_known = dmi_check_system(n1x_power_units);
++
++	if (!n1x_supported_schema(adev->handle))
++		return dev_err_probe(dev, -ENODEV, "unsupported RTX Spark MTEL schema\n");
++	p = devm_kzalloc(dev, sizeof(*p), GFP_KERNEL);
++	if (!p)
++		return -ENOMEM;
++	for (i = 0; i < ARRAY_SIZE(n1x_power); i++) {
++		p->power[i] = n1x_find_sensor(n1x_power[i].path, true, power_units_known);
++		if (p->power[i])
++			power++;
++	}
++	for (i = 0; i < ARRAY_SIZE(n1x_temp); i++) {
++		p->temp[i] = n1x_find_sensor(n1x_temp[i].path, false, power_units_known);
++		if (p->temp[i])
++			temp++;
++	}
++	if (power_units_known)
++		mmio_ret = n1x_mmio_init(dev, p, adev->handle);
++	if (!n1x_p16_probe_has_sensors(power > 0, temp > 0, !mmio_ret))
++		return dev_err_probe(dev, mmio_ret ? mmio_ret : -ENODEV,
++				     "no supported RTX Spark sensors found\n");
++	hwdev = devm_hwmon_device_register_with_info(dev, "spbm_n1x", p, &n1x_chip,
++						 p->base ? n1x_raw_groups : NULL);
++	if (IS_ERR(hwdev))
++		return PTR_ERR(hwdev);
++	dev_info(dev, "registered %d ACPI power + %d temperature channels; MMIO %s\n",
++		 power, temp, p->base ? "enabled" : "unavailable");
++	return 0;
++}
++
++
+ /* Platform driver (ACPI-enumerated) */
+ 
+ static int spbm_probe(struct platform_device *pdev)
+@@ -566,6 +740,9 @@
+ 
+ 	if (!adev)
+ 		return -ENODEV;
++
++	if (!strcmp(acpi_device_hid(adev), "NVDA8810"))
++		return n1x_add(dev, adev);
+ 
+ 	p = devm_kzalloc(dev, sizeof(*p), GFP_KERNEL);
+ 	if (!p)
+@@ -760,6 +937,7 @@
+ 
+ static const struct acpi_device_id spbm_acpi_ids[] = {
+ 	{ "NVDA8800", 0 },
++	{ "NVDA8810", 0 },
+ 	{ }
+ };
+ MODULE_DEVICE_TABLE(acpi, spbm_acpi_ids);
