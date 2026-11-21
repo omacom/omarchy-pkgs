@@ -1,0 +1,247 @@
+#!/bin/bash
+# Omarchy's pacman.conf lists [omarchy] above [core], [extra] and [multilib], and
+# pacman takes the first repository carrying a name without comparing versions
+# across the rest. So a package here that falls behind Arch is not dead weight:
+# -Syu stops offering the newer official build, and the -Syyuu in
+# omarchy-refresh-pacman downgrades to ours. Publishing a name Arch also ships is
+# a promise to stay ahead of it.
+#
+# Arch's repositories in the container are x86_64, so only recipes that build for
+# x86_64 (or any) are compared. An aarch64-only recipe replaces nothing here.
+#
+# Every shadow is a decision, so release/shadowed-packages.txt lists each one
+# with its reason. A shadow it does not list fails, and so does a listed name
+# that no longer shadows anything.
+#
+# With package directory names as arguments, only those recipes are checked:
+# a pull request answers for its own packages, not for one elsewhere that Arch
+# has since passed. The daily run checks the whole tree.
+#
+# It exits 1 on a finding and 2 when it could not check at all, so the daily run
+# alerts on the first and not on a missing tool or an unreachable mirror.
+#
+# This reads the PKGBUILDs, which is what a pull request changes. It says nothing
+# about what the mirror currently serves -- a build that never published leaves an
+# older package in the repository than the PKGBUILD here claims.
+set -euo pipefail
+
+BUILD_ROOT=$(realpath "${BASH_SOURCE[0]%/*}/..")
+source "$BUILD_ROOT/helpers/message-helpers.sh"
+source "$BUILD_ROOT/helpers/paths.sh"
+source "$BUILD_ROOT/helpers/package-metadata.sh"
+
+# Loaded in pacman's own resolution order, so the first repository carrying a name
+# is the one that answers for it.
+SHADOWED_REPOS=(core extra multilib)
+TARGET_ARCH=x86_64
+SHADOW_LIST="$BUILD_ROOT/release/shadowed-packages.txt"
+
+print_header "Shadowed Package Check"
+
+for tool in pacman vercmp; do
+  command -v "$tool" >/dev/null || {
+    print_error "$tool is required; run this on Arch or in the archlinux container"
+    exit 2
+  }
+done
+
+declare -A official_repo official_version
+
+load_repo() {
+  local repo="$1" listing name version rest
+
+  # Not `|| true`: a listing that fails after emitting some rows would leave a
+  # partial repository behind and check fewer names while reporting success.
+  if ! listing=$(pacman -Sl "$repo" 2>/dev/null); then
+    print_error "[$repo] could not be listed; enable it and sync the package databases first"
+    exit 2
+  fi
+
+  if [[ -z $listing ]]; then
+    print_error "[$repo] lists no packages; enable it and sync the package databases first"
+    exit 2
+  fi
+
+  while read -r _ name version rest; do
+    [[ -n $name ]] || continue
+    [[ -n ${official_repo[$name]:-} ]] && continue
+    official_repo[$name]="$repo"
+    official_version[$name]="$version"
+  done <<<"$listing"
+}
+
+for repo in "${SHADOWED_REPOS[@]}"; do
+  load_repo "$repo"
+done
+
+declare -A declared
+
+if [[ ! -r $SHADOW_LIST ]]; then
+  print_error "${SHADOW_LIST#"$BUILD_ROOT/"} is missing"
+  exit 1
+fi
+
+while read -r name reason; do
+  [[ -z $name || $name == \#* ]] && continue
+  if [[ -z $reason ]]; then
+    print_error "${SHADOW_LIST#"$BUILD_ROOT/"}: $name has no reason"
+    exit 1
+  fi
+  declared[$name]="$reason"
+done <"$SHADOW_LIST"
+
+# The PKGBUILD is the only place pkgname and epoch are recorded, and makepkg
+# sources it too, so read it the same way rather than parsing it by hand. That
+# means supplying the variables makepkg exports: three PKGBUILDs here read CARCH
+# or SRCDEST at the top level.
+#
+# It runs in a fresh bash with nothing of this script's own, which a PKGBUILD
+# could test for to declare a different arch=() here than in a build. Its stdin
+# is empty: the loop below reads the recipes from stdin, and a PKGBUILD that
+# reads would swallow the ones after it.
+#
+# shellcheck disable=SC2016 # expanded by the inner bash
+read_pkgbuild='
+  cd "$1" || exit 1
+  CARCH="$2" SRCDEST="$PWD" startdir="$PWD" srcdir="$PWD/src" pkgdir="$PWD/pkg"
+
+  source PKGBUILD 2>/dev/null
+  status=$?
+
+  # A PKGBUILD that failed partway can leave a stale pkgver assigned from the
+  # lines that did run, so the status decides this rather than the variables.
+  [[ $status -eq 0 ]] || exit 1
+  [[ -n "${pkgname:-}" && -n "${pkgver:-}" && -n "${pkgrel:-}" ]] || exit 1
+
+  # A recipe that does not build for this architecture publishes nothing that
+  # could replace the build Arch ships here. It says so, because empty output
+  # means the PKGBUILD could not be read.
+  if [[ " ${arch[*]:-} " != *" $2 "* && " ${arch[*]:-} " != *" any "* ]]; then
+    echo "-"
+    exit 0
+  fi
+
+  version="${pkgver}-${pkgrel}"
+  [[ -n "${epoch:-}" ]] && version="${epoch}:${version}"
+
+  for name in "${pkgname[@]}"; do
+    echo "$name $version"
+  done
+'
+
+package_versions() {
+  env -i PATH="$PATH" HOME="$HOME" bash -c "$read_pkgbuild" read-pkgbuild "$1" "$TARGET_ARCH" </dev/null
+}
+
+declare -A seen
+
+pkgdirs=()
+if (($#)); then
+  for package in "$@"; do
+    if [[ ! $package =~ ^[a-z0-9@._+-]+$ ]]; then
+      print_error "Not a package directory name: $package"
+      exit 1
+    fi
+    # A pull request that deletes a recipe leaves nothing here to check.
+    [[ -f $PKGBUILDS_DIR/$package/PKGBUILD ]] && pkgdirs+=("$PKGBUILDS_DIR/$package")
+  done
+  if ((${#pkgdirs[@]} == 0)); then
+    print_success "None of the named packages has a recipe left to check"
+    exit 0
+  fi
+else
+  mapfile -t pkgdirs < <(package_dirs)
+fi
+
+examined=0
+names=0
+shadowed=0
+stale=0
+undeclared=0
+unused=0
+unreadable=0
+
+while IFS= read -r pkgdir; do
+  package=$(basename "$pkgdir")
+
+  # Empty output counts as unreadable too: a PKGBUILD that calls exit at the top
+  # level ends the subshell successfully without ever naming a package, and
+  # skipping it quietly is how one drifts behind Arch unnoticed.
+  if ! versions=$(package_versions "$pkgdir") || [[ -z $versions ]]; then
+    print_error "$package: could not read pkgname and pkgver from its PKGBUILD"
+    unreadable=$((unreadable + 1))
+    continue
+  fi
+  [[ $versions == "-" ]] && continue
+
+  examined=$((examined + 1))
+
+  while read -r name ours; do
+    [[ -n $name ]] || continue
+    names=$((names + 1))
+
+    repo="${official_repo[$name]:-}"
+    [[ -n $repo ]] || continue
+
+    theirs="${official_version[$name]}"
+    shadowed=$((shadowed + 1))
+    seen[$name]=1
+
+    if [[ -z ${declared[$name]:-} ]]; then
+      print_error "$name shadows $repo/$name, and ${SHADOW_LIST#"$BUILD_ROOT/"} does not list it"
+      undeclared=$((undeclared + 1))
+    elif [[ "$(vercmp "$theirs" "$ours")" -gt 0 ]]; then
+      print_error "$name shadows $repo/$name with an older build: ours $ours, $repo $theirs"
+      stale=$((stale + 1))
+    else
+      print_info "$name shadows $repo/$name (ours $ours, $repo $theirs)"
+    fi
+  done <<<"$versions"
+done < <(printf '%s\n' "${pkgdirs[@]}")
+
+echo
+
+if ((unreadable > 0)); then
+  print_error "$unreadable PKGBUILD(s) could not be read, so they went unchecked"
+  exit 1
+fi
+
+# Nothing examined in the whole tree means the tree was not found, not that it
+# is clean. A check that passes when it compared nothing is worse than no
+# check at all. Named packages may all be aarch64-only, which is fine.
+if (($# == 0 && examined == 0)); then
+  print_error "No packages were examined; expected PKGBUILDs under $PKGBUILDS_DIR"
+  exit 1
+fi
+
+# Only the whole tree shows which listed names still shadow something.
+for name in "${!declared[@]}"; do
+  if (($# == 0)) && [[ -z ${seen[$name]:-} ]]; then
+    print_error "${SHADOW_LIST#"$BUILD_ROOT/"} lists $name, which shadows nothing"
+    unused=$((unused + 1))
+  fi
+done
+
+failed=0
+
+if ((undeclared > 0)); then
+  print_error "$undeclared shadowed name(s) are not in ${SHADOW_LIST#"$BUILD_ROOT/"}"
+  echo "Build them for aarch64 only, or list them with the reason Omarchy carries its own build."
+  failed=1
+fi
+
+if ((stale > 0)); then
+  print_error "$stale of $shadowed shadowed package(s) are behind the official repositories"
+  echo "Either update them, or drop them so pacman resolves the official build."
+  failed=1
+fi
+
+if ((unused > 0)); then
+  print_error "$unused name(s) in ${SHADOW_LIST#"$BUILD_ROOT/"} shadow nothing; remove them"
+  failed=1
+fi
+
+((failed)) && exit 1
+
+print_success "Checked $examined package(s) ($names $TARGET_ARCH names) against ${SHADOWED_REPOS[*]}: $shadowed shadowed, none behind"
+exit 0

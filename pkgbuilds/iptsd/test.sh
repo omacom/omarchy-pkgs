@@ -32,4 +32,34 @@ done
 grep -q "sed -i 's/ACTION==\"add\"/ACTION!=\"remove\"/'" "$package_dir/PKGBUILD" ||
   fail "a udev change event, such as pacman's rule reload, keeps iptsd running"
 
+grep -q 'ConditionFirmware=device-tree-compatible(microsoft,romulus15)' \
+  "$package_dir/iptsd-romulus15-resume.service" ||
+  fail "the resume restart stays off every machine but the Surface Laptop 7 15"
+grep -q 'suspend.target.wants/iptsd-romulus15-resume.service' "$package_dir/PKGBUILD" ||
+  fail "the resume restart is enabled by the package"
+
+grep -q 'ConditionFirmware=device-tree-compatible(microsoft,romulus15)' \
+  "$package_dir/iptsd-romulus15-boot.service" ||
+  fail "the boot-time start stays off every machine but the Surface Laptop 7 15\""
+grep -q 'multi-user.target.wants/iptsd-romulus15-boot.service' "$package_dir/PKGBUILD" ||
+  fail "the boot-time start is enabled by the package"
+bash -n "$package_dir/iptsd-romulus15-boot" ||
+  fail "the boot-time start script has valid syntax"
+
+grep -q 'ForceButton = 0x96' "$package_dir/0001-ipts-Handle-the-button-report-of-force-touchpads.patch" ||
+  fail "the force touchpad's button report is read"
+grep -q 'patch -d iptsd -Np1 -i ../0001-ipts-Handle-the-button-report-of-force-touchpads.patch' "$package_dir/PKGBUILD" ||
+  fail "the force touchpad patch is applied"
+
+grep -q 'patch -d iptsd -Np1 -i ../0002-contacts-Add-a-position-slop-for-new-contacts.patch' "$package_dir/PKGBUILD" ||
+  fail "the position slop patch is applied"
+grep -q '^Product = 0x0C6F$' "$package_dir/surface-laptop-7-15.conf" ||
+  fail "the position slop is limited to the Surface Laptop 7 15\" touchscreen"
+grep -q '^PositionSlop = 0.25$' "$package_dir/surface-laptop-7-15.conf" ||
+  fail "a tap on the Surface Laptop 7 15\" touchscreen stays in place"
+grep -q '^  ./test-position-slop$' "$package_dir/PKGBUILD" ||
+  fail "the position slop is checked against contacts that land, move and lift"
+grep -q 'install -Dm644 surface-laptop-7-15.conf -t "$pkgdir/usr/share/iptsd"' "$package_dir/PKGBUILD" ||
+  fail "the Surface Laptop 7 15\" preset is installed where iptsd reads presets"
+
 echo "ok - iptsd builds pinned upstream source against Arch libraries"

@@ -45,13 +45,29 @@ if (args[0] === 'image' && args[1] === 'inspect') console.log('ghcr.io/omacom/om
   return { directory, env, run, key, calls };
 }
 
-test('image keys are stable across checkout location and timestamp changes', t => {
-  const a = fixture(t);
-  const b = fixture(t);
+test('image keys are stable across checkout location, timestamps and umask', t => {
+  // The modes a umask 022 checkout gives, set explicitly: the fixtures are
+  // created under this process's umask, and under 002 every fixture would
+  // be group-writable and the umask check below would compare like with like.
+  const umask022 = f => {
+    chmodSync(join(f.directory, 'build'), 0o755);
+    chmodSync(join(f.directory, 'build/Dockerfile'), 0o644);
+    chmodSync(join(f.directory, 'build/input'), 0o644);
+    return f;
+  };
+  const a = umask022(fixture(t));
+  const b = umask022(fixture(t));
   const key = a.key();
   assert.match(key, /^v1-x86_64-edge-[a-f0-9]{64}$/);
   utimesSync(join(b.directory, 'build/input'), new Date(0), new Date(0));
   assert.equal(b.key(), key);
+  // A umask 002 checkout (the droplet runners') makes files and directories
+  // group-writable; only the executable bits belong in the key.
+  const c = fixture(t);
+  chmodSync(join(c.directory, 'build'), 0o775);
+  chmodSync(join(c.directory, 'build/Dockerfile'), 0o664);
+  chmodSync(join(c.directory, 'build/input'), 0o664);
+  assert.equal(c.key(), key);
 });
 
 test('image keys separate architectures, mirrors, content, modes and symlink targets', t => {
