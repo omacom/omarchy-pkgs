@@ -1,7 +1,8 @@
 #!/bin/bash
 
 # Installs the FaceTime HD (Broadcom 1570) camera's firmware and sensor calibration files on the Mac it runs on.
-# Apple's license forbids redistributing them, so each Mac fetches only the byte ranges it needs from Apple's own downloads.
+# Apple's license forbids redistributing them, so each Mac fetches only the byte ranges it needs from Apple's own download.
+# The ranges, offsets and hashes are patjak/facetimehd-firmware's for firmware 5.60.0, which the 12-inch MacBook needs.
 
 set -euo pipefail
 
@@ -9,29 +10,40 @@ dest=${FACETIMEHD_FIRMWARE_DIR:-/usr/lib/firmware/facetimehd}
 state=${FACETIMEHD_FETCHER_STATE:-/var/lib/facetimehd-firmware-fetcher}
 retries=${FACETIMEHD_FETCH_RETRIES:-2}
 
-# The firmware is gzipped inside the AppleCameraInterface driver of OS X 10.11.5, which this range of the update holds.
-firmware_url=https://updates.cdn-apple.com/2019/cert/041-88431-20191011-e7ee7d98-2878-4cd9-bc0a-d98b3a1e24b1/OSXUpd10.11.5.dmg
-firmware_range=204909802-207733123
-firmware_range_sha256=61b60ba96202f8be0e78ecc25e2ae07528005984e3131ee6b7eaee8c20cd0c69
-driver_path=System/Library/Extensions/AppleCameraInterface.kext/Contents/MacOS/AppleCameraInterface
-driver_sha256=f56e68a880b65767335071531a1c75f3cfd4958adc6d871adf8dbf3b788e8ee1
+# Each range is one complete xz stream of the macOS 10.12.6 combo update's pbzx payload, decompressing to a 16 MiB chunk.
+url=https://updates.cdn-apple.com/2019/cert/041-90765-20191011-837e856d-b522-4865-b64c-641048ed77c4/macOSUpdCombo10.12.6.dmg
+
+# name range sha256: the AppleCameraInterface driver spans the end of the first chunk and the start of the second.
+ranges=(
+  "driver-1 699186570-703316225 d9431f0fa8a2b5d2a31037cfe12c4f0abcb0a597739d925a0b8c834ddb6cb647"
+  "driver-2 703316242-707986973 562c8b86a69e59ef4cc2eed45ba380b8572908a8232e91c258a45e13f6a2c127"
+  "assistant 430282546-439105037 4c9c26a7ce607d749351428aee698e4fd487972392cc7ad06b69e2501dfe215a"
+)
+driver_tail=249719
+driver_head=507353
+driver_sha256=e959244db1e0561f6d5590c8e5000a36816c592e2820bafe89af0bea75556aca
 firmware_offset=81920
-firmware_size=603715
-firmware_sha256=e3e6034a67dfdaa27672dd547698bbc5b33f47f1fc7f5572a2fb68ea09d32d3d
+firmware_size=602903
+firmware_sha256=240ef2e991f1d089d8228ce11d92b66bfa4b3d7289ec4fee228b64a713024330
 
-# The calibration files sit inside AppleCamera.sys, in the one zip entry of Boot Camp 5.1 that holds AppleCamera64.exe.
-data_url=https://download.info.apple.com/Mac_OS_X/031-30890-20150812-ea191174-4130-11e5-a125-930911ba098f/bootcamp5.1.5769.zip
-data_entry_offset=2337987
-data_entry_length=1154522
-data_entry_sha256=73745c1948da9d37121cbd8d38e97daddac445364b8f5edb8b8eb1d6f7ac1c2a
-installer_sha256=dcfb6205c54d66bf8a5ad32f5a6b461b3d537c6beb50a4a3d5f8f2e65c9b0e49
+# The calibration files are in AppleCameraAssistant, the userspace camera plugin's helper, not in the kext.
+assistant_skip=7477241
+assistant_size=515632
+assistant_sha256=af6a9de00472657e925f546753c818f9e33636030892b14ca96a1b4817ea58c7
 
-# name offset size sha256, offsets into AppleCamera.sys
+# name offset size sha256, offsets into AppleCameraAssistant
 calibration=(
-  "9112_01XX.dat 1663920 33060 4dd756fa8460d8dc3d78d0d76944b2f92275d1fe9c83181bbc8292c81c005f1a"
-  "1771_01XX.dat 1644880 19040 756c2bb7c5e55b395449e43a0be1cb7c40c37dfc6c2b5abfaffb8ae70ff0fc4b"
-  "1871_01XX.dat 1606800 19040 bf36fbde0668ab7e44368b584f9fa64b5945b01003d04c6e3c6f22c0be0fd5f3"
-  "1874_01XX.dat 1625840 19040 ffde89e7819ac16a9eb1c8f0bc6dba0e980b508b2022507679d901c190f7cef8"
+  "9112_01XX.dat 217088 33060 4dd756fa8460d8dc3d78d0d76944b2f92275d1fe9c83181bbc8292c81c005f1a"
+  "1771_01XX.dat 253952 19040 756c2bb7c5e55b395449e43a0be1cb7c40c37dfc6c2b5abfaffb8ae70ff0fc4b"
+  "1871_01XX.dat 274432 19040 bf36fbde0668ab7e44368b584f9fa64b5945b01003d04c6e3c6f22c0be0fd5f3"
+  "1874_01XX.dat 294912 19040 ffde89e7819ac16a9eb1c8f0bc6dba0e980b508b2022507679d901c190f7cef8"
+  "1222_01XX.dat 315392 20076 04a6aa0d67c0353505a56187c573b27dfdef703dfb4b98329b1ee74f59e4ba7e"
+  "8221_01XX.dat 335872 30240 2e041686cf2484345b08b18207266abe725f41f8869e04d427aa092071d9edde"
+  "1571_01XX.dat 368640 18652 0f73f550b65121115fe0b999f016fb3be3d109057597863df9fe01fd4678c300"
+  "1575_01XX.dat 389120 18652 31068eab65ba25a480fd4d0463e86f8e2807828a2e251a20b6f107499e0f7936"
+  "1674_01XX.dat 409600 18044 32377ac603d764f33f1466b5e4a7e3e08780d7becc50ad5b00292e29e2dd0374"
+  "1675_01XX.dat 430080 18044 b7a38aef2755721bb28c92d84a15654b17e9fb3b0a0f088a384a981fc8fe16d6"
+  "1671_01XX.dat 450560 18044 0b90133936bf0bbcdde4b85df8d3fc18722b58d2f8a1afc2564c6c242b6c57fa"
 )
 
 fail() {
@@ -45,18 +57,11 @@ mismatch() {
   exit 3
 }
 
-# A range of the wrong length came from the network, such as a captive portal, and is worth retrying; one of the
-# right length that hashes differently is Apple's file changing.
-range_matches() {
-  [[ $(stat -c %s "$1") == "$2" ]] || fail "the download of ${1##*/} was cut short or replaced; retrying later"
-  matches "$1" "$3"
-}
-
 matches() {
   [[ -f $1 ]] && sha256sum --status -c <<<"$2  $1"
 }
 
-# Byte offsets with full-size reads, where the recipes' bs=1 reads one byte at a time.
+# Byte offsets with full-size reads, rather than one byte at a time.
 slice() {
   dd if="$1" bs=64K iflag=skip_bytes,count_bytes skip="$2" count="$3" status=none
 }
@@ -70,12 +75,17 @@ camera_present() {
   return 1
 }
 
+# A file another package installed, such as the AUR facetimehd-data's calibration, is that package's to manage.
+owned_elsewhere() {
+  pacman -Qqo "$1" &>/dev/null
+}
+
 wanted() {
   local entry name sha
-  matches "$dest/firmware.bin" "$firmware_sha256" || echo firmware.bin
+  matches "$dest/firmware.bin" "$firmware_sha256" || owned_elsewhere "$dest/firmware.bin" || echo firmware.bin
   for entry in "${calibration[@]}"; do
     read -r name _ _ sha <<<"$entry"
-    matches "$dest/$name" "$sha" || echo "$name"
+    matches "$dest/$name" "$sha" || owned_elsewhere "$dest/$name" || echo "$name"
   done
 }
 
@@ -100,44 +110,34 @@ fi
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 
-# Each range is a few MB; the size cap stops a server that ignores Range from sending a whole download.
+# Each range is a few MB; the size cap stops a server that ignores Range from sending the whole update.
 fetch() {
   curl -fsSL --proto =https --proto-redir =https --connect-timeout 20 --speed-limit 1024 --speed-time 60 \
     --max-time 300 --max-filesize 16M --retry "$retries" --retry-delay 5 --retry-all-errors "$@"
 }
 
-# The range is a truncated xz stream, so cpio complains at the end after writing the one file asked for.
-echo "Fetching the FaceTime HD firmware from Apple"
-fetch -r "$firmware_range" "$firmware_url" -o "$work/update.part" || fail "could not download the OS X 10.11.5 update range"
-# Checked before anything parses it, so only the bytes these pins describe ever reach xz and cpio.
-range_matches "$work/update.part" 2823322 "$firmware_range_sha256" || mismatch "the OS X 10.11.5 update range is not the one expected"
-(cd "$work" && xzcat -qq -Q update.part | cpio --quiet --format odc -i -d "./$driver_path" 2>/dev/null) || true
-matches "$work/$driver_path" "$driver_sha256" || mismatch "AppleCameraInterface is not the driver expected"
-slice "$work/$driver_path" "$firmware_offset" "$firmware_size" | gunzip >"$work/firmware.bin"
+# A range of the wrong length came from the network, such as a captive portal, and is worth retrying; one of the
+# right length that hashes differently is Apple's file changing. Nothing parses a range before it matches.
+echo "Fetching the FaceTime HD firmware and calibration from Apple"
+for entry in "${ranges[@]}"; do
+  read -r name range sha <<<"$entry"
+  fetch -r "$range" "$url" -o "$work/$name.xz" || fail "could not download the macOS 10.12.6 update range $range"
+  [[ $(stat -c %s "$work/$name.xz") == $(( ${range#*-} - ${range%-*} + 1 )) ]] ||
+    fail "the download of range $range was cut short or replaced; retrying later"
+  matches "$work/$name.xz" "$sha" || mismatch "the macOS 10.12.6 update range $range is not the one expected"
+  xz -dcq "$work/$name.xz" >"$work/$name" || fail "could not decompress range $range"
+done
+
+{ tail -c "$driver_tail" "$work/driver-1"; head -c "$driver_head" "$work/driver-2"; } >"$work/AppleCameraInterface"
+matches "$work/AppleCameraInterface" "$driver_sha256" || mismatch "AppleCameraInterface is not the driver expected"
+slice "$work/AppleCameraInterface" "$firmware_offset" "$firmware_size" | gunzip >"$work/firmware.bin"
 matches "$work/firmware.bin" "$firmware_sha256" || mismatch "the extracted firmware is not the one expected"
 
-echo "Fetching the FaceTime HD sensor calibration from Apple"
-fetch -r "$data_entry_offset-$((data_entry_offset + data_entry_length - 1))" "$data_url" -o "$work/entry.zip" ||
-  fail "could not download AppleCamera64.exe from Boot Camp 5.1"
-range_matches "$work/entry.zip" "$data_entry_length" "$data_entry_sha256" || mismatch "the Boot Camp 5.1 range is not the one expected"
-python3 -I - "$work/entry.zip" "$work/AppleCamera64.exe" <<'PY' || fail "could not unpack AppleCamera64.exe"
-import struct, sys, zlib
-data = open(sys.argv[1], "rb").read()
-sig, method, crc, size, name_len, extra_len = struct.unpack("<I4xH4xIIxxxxHH", data[:30])
-if sig != 0x04034B50 or method != 8:
-    sys.exit("not a deflated zip entry")
-start = 30 + name_len + extra_len
-out = zlib.decompressobj(-15).decompress(data[start:start + size])
-if zlib.crc32(out) != crc:
-    sys.exit("CRC mismatch")
-open(sys.argv[2], "wb").write(out)
-PY
-matches "$work/AppleCamera64.exe" "$installer_sha256" || mismatch "AppleCamera64.exe is not the installer expected"
-7z x -y -o"$work/installer" "$work/AppleCamera64.exe" >/dev/null || fail "could not unpack AppleCamera.sys"
-
+slice "$work/assistant" "$assistant_skip" "$assistant_size" >"$work/AppleCameraAssistant"
+matches "$work/AppleCameraAssistant" "$assistant_sha256" || mismatch "AppleCameraAssistant is not the one expected"
 for entry in "${calibration[@]}"; do
   read -r name offset size sha <<<"$entry"
-  slice "$work/installer/AppleCamera.sys" "$offset" "$size" >"$work/$name"
+  slice "$work/AppleCameraAssistant" "$offset" "$size" >"$work/$name"
   matches "$work/$name" "$sha" || mismatch "$name is not the calibration expected"
 done
 
