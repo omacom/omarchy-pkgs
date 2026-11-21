@@ -1,0 +1,170 @@
+From f06079e092cb58eb28a847e8d7128f004db03d31 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sat, 14 Nov 2026 13:06:05 +0000
+Subject: [PATCH] cpufreq: Cap only the fastest cluster in power-saver on Apple
+ Silicon
+
+On Apple Silicon without boost frequencies the caps method held every
+cluster at 60% in power-saver. macOS's Low Power mode does something
+else. On a MacBook Pro M4 (J604, macOS 27.2), measured with
+powermetrics under a ten-thread load, one thread and idle, on AC:
+
+- performance cluster: held at 2088 of 4464 MHz (47%), against up to
+  4464 MHz in Automatic
+- efficiency cluster: not capped, 2892 MHz top in both modes
+- CPU power at ten threads: 3.2 W against 6.6 W in Automatic
+
+The 60% caps gave that machine the opposite split: the performance
+cluster at 2616 MHz, above what macOS allows, and the efficiency
+cluster at 1860 MHz, which macOS leaves alone.
+
+Cap only the policy with the highest maximum frequency in power-saver,
+at 47%, and leave the others uncapped. On the M3 Max table in the
+tests that is 1884 MHz for the performance cluster and an uncapped
+2568 MHz for the efficiency cluster. Balanced and performance are
+unchanged, and so are the boost method and the Snapdragon caps.
+
+Test: meson test, 187 OK, 8 skipped, 0 failed.
+---
+ README.md                 |  7 +++++--
+ src/ppd-driver-cpufreq.c  | 30 +++++++++++++++++++++++++++---
+ tests/integration_test.py | 10 +++++-----
+ 3 files changed, 37 insertions(+), 10 deletions(-)
+
+diff --git a/README.md b/README.md
+index a995970..6662eb0 100644
+--- a/README.md
++++ b/README.md
+@@ -265,8 +265,11 @@ on AC alike.
+ Some Apple Silicon machines, such as the M3 Max, have no boost frequencies:
+ `scaling_boost_frequencies` is empty or missing, and `boost` reads 0, where
+ the kernel refuses to turn it on, or does not exist. There the driver caps
+-`scaling_max_freq` like on the machines below, but only in "power-saver", at
+-60% of each policy's highest frequency. "balanced" and "performance" are
++`scaling_max_freq` like on the machines below, but only in "power-saver", and
++only on the cluster with the highest maximum frequency, at 47% of it, as
++macOS's Low Power mode does (on a MacBook Pro M4 it holds the performance
++cluster at 2088 of 4464 MHz and leaves the efficiency cluster at its top).
++The other clusters stay uncapped. "balanced" and "performance" are
+ uncapped, the same split as with the boost switch. The boost switch is left
+ alone, so it need not be writable, but every policy needs a
+ `scaling_available_frequencies` table, as with the caps below. The scaling
+diff --git a/src/ppd-driver-cpufreq.c b/src/ppd-driver-cpufreq.c
+index b465455..1d4ceb1 100644
+--- a/src/ppd-driver-cpufreq.c
++++ b/src/ppd-driver-cpufreq.c
+@@ -43,7 +43,9 @@
+  * An apple-cpufreq machine whose frequency table has no boost frequencies,
+  * such as the M3 Max, has a boost switch the kernel refuses to turn on, or
+  * none, so it uses the caps method instead. Only power-saver is capped there, which
+- * keeps the boost method's split: balanced and performance run uncapped. Its
++ * keeps the boost method's split: balanced and performance run uncapped. As
++ * macOS's Low Power mode does, power-saver caps only the fastest cluster
++ * there, at 47%, and leaves the efficiency cluster uncapped. Its
+  * governor follows the profile as with any caps: on a MacBook Neo (A18 Pro),
+  * Speedometer 3.1 scored 28.8 under schedutil and 34.4 under performance,
+  * so the performance governor stays in performance there, as with the boost
+@@ -75,6 +77,13 @@
+  * caps method. Measured on a Snapdragon X Elite, 60% costs ~37% of sustained
+  * throughput for ~50% less energy. */
+ #define POWER_SAVER_PERCENT        60
++/* Apple Silicon on the caps method, in power-saver: the share left to the
++ * cluster with the highest maximum frequency, and none taken from the
++ * others. macOS's Low Power mode on a MacBook Pro M4 (J604) holds the
++ * performance cluster at 2088 of 4464 MHz and leaves the efficiency cluster
++ * at its 2892 MHz top, which halves the CPU's power at ten threads (3.2
++ * against 6.6 W). */
++#define APPLE_POWER_SAVER_PERCENT  47
+ #define UNCAPPED_PERCENT           100
+ 
+ #define PERFORMANCE_GOVERNOR       "performance"
+@@ -112,6 +121,7 @@ struct _PpdDriverCpufreq
+   PpdProfile activated_profile;
+   CpufreqMethod method;
+   gboolean performance_governor; /* in the performance profile */
++  gboolean apple_caps; /* apple-cpufreq on the caps method */
+   char *boost_path;
+   GPtrArray *policies; /* of Policy, with the caps method */
+ };
+@@ -440,6 +450,7 @@ ppd_driver_cpufreq_probe (PpdDriver *driver)
+     }
+     g_debug ("No boost frequencies to switch, capping power-saver instead");
+     cpufreq->method = CPUFREQ_METHOD_CAPS;
++    cpufreq->apple_caps = TRUE;
+     ret = probe_caps (cpufreq, policy_dirs);
+     break;
+   case CPUFREQ_METHOD_CAPS:
+@@ -629,18 +640,31 @@ apply_caps (PpdDriverCpufreq  *cpufreq,
+   g_autoptr(GError) last_error = NULL;
+   guint percent;
+   guint written = 0;
++  guint64 fastest = 0;
+ 
+   pick_up_new_policies (cpufreq);
+ 
+   percent = profile_to_percent (profile);
++  for (guint i = 0; i < policies->len; i++) {
++    Policy *policy = g_ptr_array_index (policies, i);
++
++    fastest = MAX (fastest, policy->max_freq);
++  }
+   for (guint i = 0; i < policies->len;) {
+     Policy *policy = g_ptr_array_index (policies, i);
+-    guint64 cap = policy_cap (policy, percent);
++    guint policy_percent = percent;
++    guint64 cap;
++
++    /* Apple Silicon: only the fastest cluster is held back, as macOS does */
++    if (cpufreq->apple_caps && percent < 100)
++      policy_percent = policy->max_freq >= fastest ?
++                       APPLE_POWER_SAVER_PERCENT : UNCAPPED_PERCENT;
++    cap = policy_cap (policy, policy_percent);
+ 
+     /* Kernels without scaling_boost_frequencies only reveal the boost
+      * frequencies in cpuinfo_max_freq once boost is on. Allowing them
+      * leaves the choice to the boost switch. */
+-    if (percent >= 100) {
++    if (policy_percent >= 100) {
+       guint64 freq;
+ 
+       if (read_freq (policy->dir, "cpuinfo_max_freq", &freq))
+diff --git a/tests/integration_test.py b/tests/integration_test.py
+index b6b7a47..ecc3eb2 100644
+--- a/tests/integration_test.py
++++ b/tests/integration_test.py
+@@ -1790,11 +1790,11 @@ class Tests(dbusmock.DBusTestCase):
+         self.assert_file_eventually_contains(max0, "4056000")
+         self.assert_file_eventually_contains(max1, "2568000")
+ 
+-        # 60% of 4056000 is 2433600, and of 2568000 is 1540800
++        # Only the fastest cluster is capped: 47% of 4056000 is 1906320
+         self.set_dbus_property("ActiveProfile", GLib.Variant.new_string("power-saver"))
+         self.assertEqual(self.get_dbus_property("ActiveProfile"), "power-saver")
+-        self.assert_file_eventually_contains(max0, "2424000")
+-        self.assert_file_eventually_contains(max1, "1704000")
++        self.assert_file_eventually_contains(max0, "1884000")
++        self.assert_file_eventually_contains(max1, "2568000")
+ 
+         self.set_dbus_property("ActiveProfile", GLib.Variant.new_string("performance"))
+         self.assertEqual(self.get_dbus_property("ActiveProfile"), "performance")
+@@ -1802,7 +1802,7 @@ class Tests(dbusmock.DBusTestCase):
+         self.assert_file_eventually_contains(max1, "2568000")
+ 
+         self.set_dbus_property("ActiveProfile", GLib.Variant.new_string("power-saver"))
+-        self.assert_file_eventually_contains(max0, "2424000")
++        self.assert_file_eventually_contains(max0, "1884000")
+         self.set_dbus_property("ActiveProfile", GLib.Variant.new_string("balanced"))
+         self.assertEqual(self.get_dbus_property("ActiveProfile"), "balanced")
+         self.assert_file_eventually_contains(max0, "4056000")
+@@ -1834,7 +1834,7 @@ class Tests(dbusmock.DBusTestCase):
+ 
+         self.start_daemon()
+         self.set_dbus_property("ActiveProfile", GLib.Variant.new_string("power-saver"))
+-        self.assert_file_eventually_contains(max0, "2424000")
++        self.assert_file_eventually_contains(max0, "1884000")
+         self.stop_daemon()
+         self.assertEqual(self.read_file_contents(max0), b"4056000")
+         self.assertEqual(self.read_file_contents(max1), b"2568000")
+-- 
+2.43.0
+
