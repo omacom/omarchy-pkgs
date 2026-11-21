@@ -10,11 +10,11 @@ dest=${FACETIMEHD_FIRMWARE_DIR:-/usr/lib/firmware/facetimehd}
 state=${FACETIMEHD_FETCHER_STATE:-/var/lib/facetimehd-firmware-fetcher}
 fetch_lock=${FACETIMEHD_FETCHER_LOCK:-/run/lock/facetimehd-firmware-fetcher.lock}
 removing=${FACETIMEHD_FETCHER_REMOVING:-/run/facetimehd-firmware-fetcher.removing}
-# Until the driver has loaded with the files in place; /run, so a boot, which loads it fresh, clears it.
-activate=${FACETIMEHD_FETCHER_ACTIVATE:-/run/lock/facetimehd-firmware-fetcher.activate}
-# Shared with Omarchy's hibernation guard, which marks a hibernating sleep in progress under this lock: loading the
-# driver then would put back the driver that hangs hibernation, so the load is requested for the guard to make on wake.
+# Shared with Omarchy's hibernation guard, which marks a hibernating sleep in progress under the lock: loading the driver
+# then would put back the driver that hangs hibernation, so activation waits, and the guard starts this service on wake.
+# Activation stays pending until the camera works; /run, so a boot, which loads the driver fresh, clears it.
 module_run=${FACETIMEHD_MODULE_RUN:-/run/lock}
+activate=$module_run/facetimehd-firmware-fetcher.activate
 retries=${FACETIMEHD_FETCH_RETRIES:-2}
 
 # Each range is one complete xz stream of the macOS 10.12.6 combo update's pbzx payload, decompressing to a 16 MiB chunk.
@@ -73,6 +73,7 @@ slice() {
   dd if="$1" bs=64K iflag=skip_bytes,count_bytes skip="$2" count="$3" status=none
 }
 
+# For testing on a machine without the camera: 1 treats it as present and working, present as present only.
 camera_present() {
   local device
   [[ -n ${FACETIMEHD_FETCH_ANY_HARDWARE:-} ]] && return 0
@@ -109,19 +110,45 @@ flock -w 120 9 || fail "another fetch is still running"
 [[ ! -e $removing ]] || fail "the package is being removed"
 mkdir -p "$state"
 
+sleep_in_progress() {
+  [[ -e $module_run/facetimehd.sleeping ]] || return 1
+  # A marker left by a guard that never finished is stale once no hibernating sleep is running.
+  systemctl show -p ActiveState --value systemd-hibernate.service systemd-hybrid-sleep.service \
+    systemd-suspend-then-hibernate.service 2>/dev/null | grep -qxE 'activating|active|deactivating'
+}
+
+# The camera works once its PCI function is bound to facetimehd and has registered a video device; the module loading
+# proves neither, since the kernel keeps a module whose device failed to probe.
+camera_ready() {
+  local device found=
+  [[ ${FACETIMEHD_FETCH_ANY_HARDWARE:-} == 1 ]] && return 0
+  for device in /sys/bus/pci/devices/*; do
+    [[ $(<"$device/vendor") == 0x14e4 && $(<"$device/device") == 0x1570 ]] || continue
+    [[ $(readlink "$device/driver") == */facetimehd ]] && compgen -G "$device/video4linux/video*" >/dev/null || return 1
+    found=1
+  done 2>/dev/null
+  [[ -n $found ]]
+}
+
 # A driver that probed before the firmware existed stays unbound until it loads again, and one DKMS built after boot
-# found the camera never loaded at all. Failing leaves the activation pending, so the service's retry makes it.
+# found the camera never loaded at all. Anything short of a working camera leaves activation pending for a retry.
 activate_driver() {
   exec 8>>"$module_run/facetimehd.lock"
   flock -w 120 8 || fail "the camera driver is busy; retrying later"
-  if [[ -e $module_run/facetimehd.sleeping ]]; then
-    touch "$module_run/facetimehd.load"
+  if sleep_in_progress; then
     echo "The camera driver loads when the Mac wakes"
-  elif [[ -d /sys/module/facetimehd ]]; then
+    return 0
+  fi
+  if [[ -d /sys/module/facetimehd ]]; then
     { modprobe -r facetimehd && modprobe facetimehd; } || fail "could not load the camera driver; retrying later"
   else
     modprobe facetimehd || fail "could not load the camera driver; retrying later"
   fi
+  for _ in {1..15}; do
+    camera_ready && break
+    sleep 1
+  done
+  camera_ready || fail "the camera driver loaded but the camera did not come up (see the kernel log); retrying later"
   rm -f "$activate"
 }
 
