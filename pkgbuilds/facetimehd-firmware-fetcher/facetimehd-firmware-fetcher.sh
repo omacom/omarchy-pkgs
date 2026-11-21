@@ -145,17 +145,26 @@ wait_for_camera() {
 # A driver that probed before the firmware existed stays unbound until it loads again, and one DKMS built after boot
 # found the camera never loaded at all. A camera already working is left alone, and anything short of one working
 # leaves activation pending for the service's retry.
+# Under the lock, so a request the guard renewed after a failed restore is never cleared on an older reading.
+acknowledge() {
+  exec 8>>"$module_run/facetimehd.lock"
+  flock -w 120 8 || fail "the camera driver is busy; retrying later"
+  ! sleep_in_progress || fail "the Mac is hibernating; the camera driver loads after it wakes"
+  camera_ready || fail "the camera is not up; retrying later"
+  rm -f "$activate"
+  exec 8>&-
+}
+
 activate_driver() {
   if [[ -d /sys/module/facetimehd ]] && wait_for_camera; then
-    rm -f "$activate"
+    acknowledge
     return 0
   fi
   exec 8>>"$module_run/facetimehd.lock"
   flock -w 120 8 || fail "the camera driver is busy; retrying later"
-  if sleep_in_progress; then
-    echo "The camera driver loads when the Mac wakes"
-    return 0
-  fi
+  # Failing rather than returning keeps the service's retry, which a start request from the guard's wake step can miss
+  # while this run is still going.
+  ! sleep_in_progress || fail "the Mac is hibernating; the camera driver loads after it wakes"
   if [[ -d /sys/module/facetimehd ]]; then
     { modprobe -r facetimehd && modprobe facetimehd; } || fail "could not load the camera driver; retrying later"
   else
@@ -164,7 +173,7 @@ activate_driver() {
   # The wait changes nothing, so it does not hold up a sleep's guard behind the lock.
   exec 8>&-
   wait_for_camera || fail "the camera driver loaded but the camera did not come up (see the kernel log); retrying later"
-  rm -f "$activate"
+  acknowledge
 }
 
 mapfile -t missing < <(wanted)
