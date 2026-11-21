@@ -4,6 +4,13 @@
 # staged Mesa tree can carry either spelling (Ryan 2026-11-20).
 set -euo pipefail
 ROOT=$(realpath "${BASH_SOURCE[0]%/*}/..")
+# One helper copy must stay byte-identical to the other: both PKGBUILDs
+# source their own file, so drift here means the packages disagree.
+if ! cmp -s "$ROOT/pkgbuilds/omarchy-mlx/vulkan-driver-names.sh" \
+            "$ROOT/pkgbuilds/mesa-aurora/vulkan-driver-names.sh"; then
+  echo "FAIL: pkgbuilds/omarchy-mlx/vulkan-driver-names.sh and pkgbuilds/mesa-aurora/vulkan-driver-names.sh differ" >&2
+  exit 1
+fi
 # shellcheck source=pkgbuilds/omarchy-mlx/vulkan-driver-names.sh
 source "$ROOT/pkgbuilds/omarchy-mlx/vulkan-driver-names.sh"
 pass() { echo "PASS: $1"; }
