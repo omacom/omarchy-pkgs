@@ -1,0 +1,106 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Brandon Williams <turbine.bmw@gmail.com>
+Date: Fri, 24 Jul 2026 18:27:54 -0400
+Subject: [PATCH] power: supply: qcom_battmgr: preserve charge limits
+
+Charge-control setters currently report success even when the PMIC
+GLINK request fails. Return the request status and keep threshold
+calculation and cache updates under the request lock.
+
+The remote battery-manager service can also lose its active
+charge-control state across a restart while the driver retains the
+requested thresholds. Reapply that cached window after notification
+registration when the service comes back.
+
+Signed-off-by: Brandon Williams <turbine.bmw@gmail.com>
+---
+ drivers/power/supply/qcom_battmgr.c | 38 +++++++++++++++++++++++------
+ 1 file changed, 31 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/power/supply/qcom_battmgr.c b/drivers/power/supply/qcom_battmgr.c
+index 91cf39b0083a..e84633278943 100644
+--- a/drivers/power/supply/qcom_battmgr.c
++++ b/drivers/power/supply/qcom_battmgr.c
+@@ -681,6 +681,8 @@ static int qcom_battmgr_set_charge_start_threshold(struct qcom_battmgr *battmgr,
+ 
+ 	start_soc = clamp(start_soc, CHARGE_CTRL_START_THR_MIN, CHARGE_CTRL_START_THR_MAX);
+ 
++	mutex_lock(&battmgr->lock);
++
+ 	/*
+ 	 * If the new start threshold is larger than the old end threshold,
+ 	 * move the end threshold one step (DELTA_SOC) after the new start
+@@ -696,15 +698,14 @@ static int qcom_battmgr_set_charge_start_threshold(struct qcom_battmgr *battmgr,
+ 		delta_soc = battmgr->info.charge_ctrl_end - start_soc;
+ 	}
+ 
+-	mutex_lock(&battmgr->lock);
+ 	ret = qcom_battmgr_set_charge_control(battmgr, target_soc, delta_soc);
+-	mutex_unlock(&battmgr->lock);
+ 	if (!ret) {
+ 		battmgr->info.charge_ctrl_start = start_soc;
+ 		battmgr->info.charge_ctrl_end = target_soc;
+ 	}
++	mutex_unlock(&battmgr->lock);
+ 
+-	return 0;
++	return ret;
+ }
+ 
+ static int qcom_battmgr_set_charge_end_threshold(struct qcom_battmgr *battmgr, int end_soc)
+@@ -714,18 +715,19 @@ static int qcom_battmgr_set_charge_end_threshold(struct qcom_battmgr *battmgr, i
+ 
+ 	end_soc = clamp(end_soc, CHARGE_CTRL_END_THR_MIN, CHARGE_CTRL_END_THR_MAX);
+ 
++	mutex_lock(&battmgr->lock);
++
+ 	if (battmgr->info.charge_ctrl_start && end_soc > battmgr->info.charge_ctrl_start)
+ 		delta_soc = end_soc - battmgr->info.charge_ctrl_start;
+ 
+-	mutex_lock(&battmgr->lock);
+ 	ret = qcom_battmgr_set_charge_control(battmgr, end_soc, delta_soc);
+-	mutex_unlock(&battmgr->lock);
+ 	if (!ret) {
+ 		battmgr->info.charge_ctrl_start = end_soc - delta_soc;
+ 		battmgr->info.charge_ctrl_end = end_soc;
+ 	}
++	mutex_unlock(&battmgr->lock);
+ 
+-	return 0;
++	return ret;
+ }
+ 
+ static int qcom_battmgr_charge_control_thresholds_init(struct qcom_battmgr *battmgr)
+@@ -1594,9 +1596,31 @@ static void qcom_battmgr_enable_worker(struct work_struct *work)
+ 	};
+ 	int ret;
+ 
++	mutex_lock(&battmgr->lock);
+ 	ret = qcom_battmgr_request(battmgr, &req, sizeof(req));
+-	if (ret)
++	if (ret) {
+ 		dev_err(battmgr->dev, "failed to request power notifications\n");
++		goto out_unlock;
++	}
++
++	/*
++	 * The remote service can lose its charge-control state across a
++	 * restart, while the thresholds cached in this driver remain valid.
++	 */
++	if (battmgr->info.charge_ctrl_end) {
++		u32 delta_soc = battmgr->info.charge_ctrl_end -
++				battmgr->info.charge_ctrl_start;
++
++		ret = qcom_battmgr_set_charge_control(battmgr,
++						      battmgr->info.charge_ctrl_end,
++						      delta_soc);
++		if (ret)
++			dev_err(battmgr->dev,
++				"failed to restore battery charge thresholds\n");
++	}
++
++out_unlock:
++	mutex_unlock(&battmgr->lock);
+ }
+ 
+ static void qcom_battmgr_pdr_notify(void *priv, int state)

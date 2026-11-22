@@ -45,7 +45,13 @@ RUN if [ "${TARGETARCH}" = "amd64" ]; then \
             printf 'Server = https://mirror.omarchy.org/$repo/os/$arch\n' > /etc/pacman.d/mirrorlist; \
         fi; \
     else \
-        printf 'Server = https://fl.us.mirror.archlinuxarm.org/aarch64/$repo\n' > /etc/pacman.d/mirrorlist; \
+        if [ "${MIRROR}" = "stable" ]; then \
+            printf 'Server = https://arm-stable-mirror.omarchy.org/$arch/$repo\n' > /etc/pacman.d/mirrorlist; \
+        elif [ "${MIRROR}" = "rc" ]; then \
+            printf 'Server = https://arm-rc-mirror.omarchy.org/$arch/$repo\n' > /etc/pacman.d/mirrorlist; \
+        else \
+            printf 'Server = https://arm-mirror.omarchy.org/$arch/$repo\n' > /etc/pacman.d/mirrorlist; \
+        fi; \
     fi
 
 # Bootstrap keyrings (required before pacstrap can verify packages)
@@ -112,9 +118,19 @@ RUN ln -sf /usr/lib/os-release /etc/os-release && \
 # anything. Bootstrapping from the target's own tree would make the first
 # aarch64 build depend on an aarch64 repository that only that build can
 # create.
+#
+# The key comes from Omarchy's own WKD for pkgs@omarchy.org, never a public
+# keyserver. Only the pinned fingerprint is exported, so a different key
+# there leaves the export empty and fails the build.
 ARG MIRROR=edge
-RUN pacman-key --recv-keys 40DFB630FF42BCFFB047046CF0134EE680CAC571 --keyserver keys.openpgp.org && \
-    pacman-key --lsign-key 40DFB630FF42BCFFB047046CF0134EE680CAC571 && \
+ARG OMARCHY_KEY=40DFB630FF42BCFFB047046CF0134EE680CAC571
+RUN export GNUPGHOME="$(mktemp -d)" && \
+    gpg --batch --auto-key-locate clear,nodefault,wkd --locate-external-keys pkgs@omarchy.org && \
+    gpg --batch --export "${OMARCHY_KEY}" > /tmp/omarchy.gpg && \
+    test -s /tmp/omarchy.gpg && \
+    pacman-key --add /tmp/omarchy.gpg && \
+    rm -rf "${GNUPGHOME}" /tmp/omarchy.gpg && \
+    pacman-key --lsign-key "${OMARCHY_KEY}" && \
     printf '\n[omarchy]\nSigLevel = Optional\nServer = https://pkgs.omarchy.org/%s/x86_64\n' "${MIRROR}" >> /etc/pacman.conf && \
     pacman -Sy --noconfirm && \
     pacman -S --noconfirm omarchy-keyring && \
@@ -142,9 +158,10 @@ RUN useradd -m -G wheel -s /bin/bash builder && \
     chown -R builder:builder /home/builder
 
 # Arch Linux ARM's makepkg.conf still defaults PKGEXT to .pkg.tar.xz; every
-# tool downstream of the build (sign.sh, push-build, sync-rebuilds, the
-# notifier) expects .pkg.tar.zst, so an aarch64 package would build and then
-# be skipped at signing. Pin the extension so both architectures match.
+# tool downstream of the build (artifact packing, publish-artifact,
+# sync-rebuilds) expects .pkg.tar.zst, so an aarch64 package would build and
+# then be left out of its artifact. Pin the extension so both architectures
+# match.
 RUN sed -i 's/^#MAKEFLAGS=.*/MAKEFLAGS="-j$(nproc)"/' /etc/makepkg.conf && \
     sed -i 's/^COMPRESSZST=.*/COMPRESSZST=(zstd -c -z -q --threads=0 -)/' /etc/makepkg.conf && \
     sed -i "s|^PKGEXT=.*|PKGEXT='.pkg.tar.zst'|" /etc/makepkg.conf && \

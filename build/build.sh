@@ -25,11 +25,11 @@ SRC_DIR=${SRC_DIR:-/src}
 DEFER_RUNTIME_DEPS=${DEFER_RUNTIME_DEPS:-false}
 
 source "$HELPERS_DIR/package-metadata.sh"
+source "$HELPERS_DIR/package-owners.sh"
 
-# Where the channel's published database is read from for planning. On the
-# repository host it is the published tree itself. Anywhere else (a CI runner,
-# a fresh clone) that tree is absent, so the database is fetched from the
-# public channel and the same URL serves as pacman's dependency repository.
+# Where the channel's published database is read from for planning: a local
+# copy when one is mounted (the build-plan test uses one), otherwise the public
+# channel, whose URL then also serves as pacman's dependency repository.
 # Set OMARCHY_PUBLISHED_REPO_URL= (empty) to disable the remote fallback.
 PUBLISHED_REPO_URL=${OMARCHY_PUBLISHED_REPO_URL-https://pkgs.omarchy.org}
 PUBLISHED_DB_DIR="$FINAL_OUTPUT_DIR"
@@ -83,10 +83,12 @@ if [[ "$DRY_RUN" != true ]]; then
     echo "Package is not in the build plan: $BUILD_PACKAGE" >&2
     exit 1
   fi
-  # Import GPG keys
-  /build/import-gpg-keys.sh || exit 1
 
   mkdir -p "$BUILD_OUTPUT_DIR" "$FINAL_OUTPUT_DIR"
+
+  # The image drops pacman's private signing key. Keyring upgrades need a
+  # container-local key to sign newly trusted keys.
+  sudo pacman-key --init || exit 1
 
   # Bring the container up to date before any makedepends are installed. The
   # image is layer-cached, so its glibc drifts behind the mirror while makepkg
@@ -233,6 +235,28 @@ get_local_version() {
   fi
 }
 
+# package_version_is_published for a plan read from the public channel: its
+# retained archives are only reachable there, so a version the database no
+# longer indexes (master's stable pin once edge indexes the next RC) would
+# otherwise read as unpublished and be rebuilt. The four candidate names are
+# asked in parallel: a HEAD is never cached at the edge, so each answer takes
+# about 160 ms, and a version that needs building misses all four.
+remote_version_is_published() {
+  local package="$1" version="$2" target ext
+  local -a requests=()
+  [[ -n "$PUBLISHED_REPO_SERVER" ]] || return 1
+  for target in "$ARCH" any; do
+    for ext in zst xz; do
+      requests+=(-o /dev/null "$PUBLISHED_REPO_SERVER/$package-$version-$target.pkg.tar.$ext")
+    done
+  done
+  # What `curl -f` accepted when the names were tried in turn: the transfer
+  # itself succeeded, and the status is below 400. All four are awaited, so
+  # each gets a time limit: one name that never answers must not hold up an
+  # archive another name already found.
+  curl -sI --parallel --max-time 10 -w '%{exitcode} %{http_code}\n' "${requests[@]}" | awk '$1 == 0 && $2 >= 200 && $2 < 400 { found = 1 } END { exit !found }'
+}
+
 # Check if package should be built for current architecture
 # Returns 0 (success) if should build, 1 if should skip
 should_build_for_arch() {
@@ -364,14 +388,8 @@ build_package() {
     echo "    New package (version: $pkgbuild_version)"
   fi
 
-  # Import PGP keys from PKGBUILD validpgpkeys and keys/pgp/ directory
-  local pgp_keys=$(bash -c 'source PKGBUILD 2>/dev/null; echo "${validpgpkeys[@]}"')
-  if [[ -n "$pgp_keys" ]]; then
-    echo "    Importing PGP keys from validpgpkeys..."
-    for key in $pgp_keys; do
-      gpg --receive-keys "$key" 2>/dev/null && echo "      Received $key" || echo "      Failed to receive $key"
-    done
-  fi
+  # The keys a recipe trusts ship with it (tests/pgp-keys-vendored.sh), so no
+  # build waits on a keyserver.
   if [[ -d "keys/pgp" ]]; then
     echo "    Importing package-specific PGP keys..."
     for keyfile in keys/pgp/*.asc; do
@@ -426,6 +444,10 @@ build_package() {
         echo "    Expected package file was not produced: $pkg_file"
         return 1
       fi
+
+      # pacman installs the owners a package records, so a package with a
+      # file a local user would own never leaves the build.
+      check_package_owners "$pkg_file" || return 1
 
       cp "$pkg_file" "$BUILD_OUTPUT_DIR/" || return 1
       new_pkgs+=("$pkg_file")
@@ -561,10 +583,11 @@ check_needs_build() {
     return 1  # Already up to date
   fi
 
-  # Match check-versions: a retained archive is already published even when
-  # the DB now indexes a newer release (for example, 4.0.4rc1 vs 4.0.3).
+  # A retained archive is already published even when the DB now indexes a
+  # newer release (for example, 4.0.4rc1 vs 4.0.3).
   # Rebuilding it would produce different bytes under an immutable filename.
-  if package_version_is_published "$FINAL_OUTPUT_DIR" "$pkg" "$pkgbuild_version" "$ARCH"; then
+  if package_version_is_published "$FINAL_OUTPUT_DIR" "$pkg" "$pkgbuild_version" "$ARCH" ||
+    remote_version_is_published "$pkg" "$pkgbuild_version"; then
     echo "  + $pkg $pkgbuild_version - archive already published; skipping rebuild"
     return 1
   fi

@@ -1,0 +1,102 @@
+From 5ad67692f07f46de90dff79ed567c7eeb88b7ece Mon Sep 17 00:00:00 2001
+From: Ryan Hughes <ryan@heyoodle.com>
+Date: Mon, 12 Oct 2026 18:26:36 -0400
+Subject: [PATCH] thunderbolt: keep the tunnels of routers kept awake in system
+ sleep
+
+With QUIRK_NO_SYSTEM_SLEEP the N1x routers stay awake through suspend to
+idle and keep their configuration, but suspend and resume still treat
+them as reset. Resume discovers the tunnels it finds in the hardware,
+which are its own, tears them down and builds them again. With a dock
+connected that dropped the dock's USB devices; the USB3 tunnel did not
+get its bandwidth back and the xHCI behind it stopped responding 15 s
+later:
+
+  thunderbolt-platform NVDA8100:00: 0:4 <-> 1:16 (USB3): failed to allocate bandwidth
+  xhci-hcd NVDA8000:00: xHCI host controller not responding, assume dead
+
+The DP tunnels, torn down for every system sleep, never came back
+either. They return through the plug events of routers that were reset,
+and routers kept awake send none, so the dock's displays stayed dark
+until the dock was replugged.
+
+When the routers are kept awake, keep all their tunnels, the DP ones
+included, through system sleep, as runtime suspend keeps the PCIe and
+USB3 ones. The monitors then see the display turned off, as they do
+when the screen blanks, and the GPU finds them where it left them on
+resume.
+---
+ drivers/thunderbolt/tb.c | 29 ++++++++++++++++++++++++++++-
+ 1 file changed, 28 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/thunderbolt/tb.c b/drivers/thunderbolt/tb.c
+index 7b97bfa70..68a192db3 100644
+--- a/drivers/thunderbolt/tb.c
++++ b/drivers/thunderbolt/tb.c
+@@ -70,6 +70,9 @@ struct tb_pci_rescan {
+  * @remove_work: Work used to remove any unplugged routers after
+  *		 runtime resume
+  * @groups: Bandwidth groups used in this domain.
++ * @kept_awake: The routers stayed awake through the current system sleep
++ *		(%QUIRK_NO_SYSTEM_SLEEP), so they kept their configuration
++ *		and their tunnels.
+  */
+ struct tb_cm {
+ 	struct list_head tunnel_list;
+@@ -78,6 +81,7 @@ struct tb_cm {
+ 	struct delayed_work remove_work;
+ 	struct tb_bandwidth_group groups[MAX_GROUPS];
+ 	struct tb_pci_rescan *pci_rescan;
++	bool kept_awake;
+ };
+ 
+ static struct workqueue_struct *tb_pci_rescan_wq;
+@@ -3231,7 +3235,15 @@ static int tb_suspend_noirq(struct tb *tb)
+ 	struct tb_cm *tcm = tb_priv(tb);
+ 
+ 	tb_dbg(tb, "suspending...\n");
+-	tb_disconnect_and_release_dp(tb);
++	tcm->kept_awake = tb->root_switch->quirks & QUIRK_NO_SYSTEM_SLEEP;
++	/*
++	 * The DP tunnels come back through the plug events of routers
++	 * that were reset. Routers kept awake send none, so keep their
++	 * DP tunnels too: the monitors then see the display turned off,
++	 * as they do when the screen blanks.
++	 */
++	if (!tcm->kept_awake)
++		tb_disconnect_and_release_dp(tb);
+ 	tb_switch_exit_redrive(tb->root_switch);
+ 	tb_switch_suspend(tb->root_switch, false);
+ 	tcm->hotplug_active = false; /* signal tb_handle_hotplug to quit */
+@@ -3312,6 +3324,20 @@ static int tb_resume_noirq(struct tb *tb)
+ 	tb_free_unplugged_xdomains(tb->root_switch);
+ 	tb_restore_children(tb->root_switch);
+ 
++	/*
++	 * Routers kept awake still carry the paths of all our tunnels,
++	 * and the devices behind them stayed connected. Tearing
++	 * the tunnels down and building them again here only drops those
++	 * devices: the USB3 tunnel then fails to get its bandwidth back
++	 * and the xHCI behind it stops responding. Keep them, as runtime
++	 * resume does.
++	 */
++	if (tcm->kept_awake) {
++		tcm->kept_awake = false;
++		tb_dbg(tb, "routers stayed awake, keeping tunnels\n");
++		goto out;
++	}
++
+ 	/*
+ 	 * If we get here from suspend to disk the boot firmware or the
+ 	 * restore kernel might have created tunnels of its own. Since
+@@ -3344,6 +3370,7 @@ static int tb_resume_noirq(struct tb *tb)
+ 		tb_dbg(tb, "tunnels restarted, sleeping for 100ms\n");
+ 		msleep(100);
+ 	}
++out:
+ 	tb_switch_enter_redrive(tb->root_switch);
+ 	 /* Allow tb_handle_hotplug to progress events */
+ 	tcm->hotplug_active = true;
+-- 
+2.56.0
+

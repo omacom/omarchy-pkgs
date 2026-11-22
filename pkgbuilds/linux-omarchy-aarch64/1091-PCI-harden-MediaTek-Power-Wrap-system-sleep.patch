@@ -1,0 +1,723 @@
+From 464c44cc8974c2b868938f6266cfb5e3c1c587ec Mon Sep 17 00:00:00 2001
+From: Bharat Dintakurti <bdintakurti@nvidia.com>
+Date: Sat, 26 Sep 2026 10:39:20 -0700
+Subject: [PATCH 2/6] NVIDIA: SAUCE: PCI: harden MediaTek Power Wrap system
+ sleep
+
+BugLink: https://bugs.launchpad.net/bugs/2167887
+
+MediaTek Power Wrap removes configuration and MMIO access for a complete
+PCI host segment. Restrict that coordination to system sleep, where PCI
+devices and native port services can be quiesced as a unit. Runtime host
+gating cannot safely contain a failed D0 restore while drivers, BAR users,
+hotplug, and configuration-space interfaces remain active.
+
+Track all Root Ports belonging to a host and issue the D3 request only
+after every direct root-bus function is a managed Root Port in D3cold. Veto
+host gating for wake paths, unsafe hotplug configurations, or any untracked
+function. Serialize final-port aggregation across hosts and revalidate the
+complete hierarchy while holding the PCI topology locks.
+
+Run PCIe port-service suspend callbacks for managed ports. Quiesce pending
+PME work and prevent the shared PME IRQ from touching configuration space
+after its no-IRQ state is set. Restore the host to D0 before the first PCI
+resume access. If a D3 timeout leaves host state ambiguous, or D0 cannot be
+confirmed, stop execution instead of returning to PCI with potentially
+inaccessible configuration space and BARs.
+
+This folds the PCI fixes identified during NV-Kernels review.
+
+Co-developed-by: Jieyy Yang <jieyy.yang@mediatek.com>
+Signed-off-by: Jieyy Yang <jieyy.yang@mediatek.com>
+Co-developed-by: Housong Zhang <housong.zhang@mediatek.com>
+Signed-off-by: Housong Zhang <housong.zhang@mediatek.com>
+Signed-off-by: Bharat Dintakurti <bdintakurti@nvidia.com>
+Signed-off-by: Abhishek Sahu <abhsahu@nvidia.com>
+Acked-by: Carol L Soto <csoto@nvidia.com>
+Acked-by: Jamie Nguyen <jamien@nvidia.com>
+Acked-by: Nirmoy Das <nirmoyd@nvidia.com>
+Signed-off-by: Brad Figg <bfigg@nvidia.com>
+[rh: backported to 7.2.5 on top of our power_wrap USB4 patches; mtk-pwrap.h context]
+---
+ drivers/pci/Makefile                         |   1 +
+ drivers/pci/hotplug/pciehp_core.c            |  33 ++
+ drivers/pci/pci-driver.c                     |   5 +
+ drivers/pci/pci-mtk-pwrap.c                  | 444 +++++++++++++++++++
+ drivers/pci/pci.h                            |  25 ++
+ drivers/pci/pcie/pme.c                       |   6 +
+ drivers/pci/pcie/portdrv.c                   |  10 +-
+ drivers/soc/mediatek/power_wrap/power_wrap.c |   8 +
+ include/linux/soc/mediatek/mtk-pwrap.h       |   6 +
+ 9 files changed, 536 insertions(+), 2 deletions(-)
+ create mode 100644 drivers/pci/pci-mtk-pwrap.c
+
+diff --git a/drivers/pci/Makefile b/drivers/pci/Makefile
+index 41ebc3b..c128af9 100644
+--- a/drivers/pci/Makefile
++++ b/drivers/pci/Makefile
+@@ -12,6 +12,7 @@ obj-$(CONFIG_PCI)		+= pcie/
+ obj-$(CONFIG_PCI)		+= pwrctrl/
+ 
+ ifdef CONFIG_PCI
++obj-$(CONFIG_MTK_POWER_WRAP)	+= pci-mtk-pwrap.o
+ obj-$(CONFIG_PROC_FS)		+= proc.o
+ obj-$(CONFIG_SYSFS)		+= pci-sysfs.o slot.o
+ obj-$(CONFIG_ACPI)		+= pci-acpi.o
+diff --git a/drivers/pci/hotplug/pciehp_core.c b/drivers/pci/hotplug/pciehp_core.c
+index 2cafd3b..57a0126 100644
+--- a/drivers/pci/hotplug/pciehp_core.c
++++ b/drivers/pci/hotplug/pciehp_core.c
+@@ -350,6 +350,39 @@ static int pciehp_runtime_resume(struct pcie_device *dev)
+ }
+ #endif /* PM */
+ 
++/*
++ * A caller which removes config-space access for the complete host may only
++ * do so after pciehp's system-suspend callback and the PM core have quiesced
++ * the IRQ.  A polling controller or Attention Button delayed work can still
++ * access the port independently, so those configurations are not safe.
++ * Use the controller's cached state because the port may already be D3cold.
++ */
++bool pciehp_is_safe_for_poweroff(struct pci_dev *pdev)
++{
++	struct pci_host_bridge *host;
++	struct pcie_device *pcie;
++	struct controller *ctrl;
++	struct device *dev;
++
++	if (!pdev->is_hotplug_bridge)
++		return true;
++	if (!pdev->is_pciehp)
++		return false;
++
++	host = pci_find_host_bridge(pdev->bus);
++	if (!host || (!pcie_ports_native && !host->native_pme))
++		return false;
++
++	dev = pcie_port_find_device(pdev, PCIE_PORT_SERVICE_HP);
++	if (!dev)
++		return false;
++
++	pcie = to_pcie_device(dev);
++	ctrl = get_service_data(pcie);
++
++	return ctrl && !ctrl->poll_thread && !ATTN_BUTTN(ctrl);
++}
++
+ static struct pcie_port_service_driver hpdriver_portdrv = {
+ 	.name		= "pciehp",
+ 	.port_type	= PCIE_ANY_PORT,
+diff --git a/drivers/pci/pci-driver.c b/drivers/pci/pci-driver.c
+index f36778e..7634908 100644
+--- a/drivers/pci/pci-driver.c
++++ b/drivers/pci/pci-driver.c
+@@ -973,6 +973,8 @@ Fixup:
+ 	if (device_can_wakeup(dev) && !device_may_wakeup(dev))
+ 		dev->power.may_skip_resume = false;
+ 
++	/* Gate only after every PCI configuration-space access is complete. */
++	mtk_pci_pwrap_suspend_noirq(pci_dev);
+ 	return 0;
+ }
+ 
+@@ -983,6 +985,9 @@ static int pci_pm_resume_noirq(struct device *dev)
+ 	pci_power_t prev_state = pci_dev->current_state;
+ 	bool skip_bus_pm = pci_dev->skip_bus_pm;
+ 
++	/* Restore host config and MMIO access before the first PCI access. */
++	mtk_pci_pwrap_resume_noirq(pci_dev);
++
+ 	if (dev_pm_skip_resume(dev))
+ 		return 0;
+ 
+diff --git a/drivers/pci/pci-mtk-pwrap.c b/drivers/pci/pci-mtk-pwrap.c
+new file mode 100644
+index 0000000..3496a20
+--- /dev/null
++++ b/drivers/pci/pci-mtk-pwrap.c
+@@ -0,0 +1,444 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * MediaTek Power Wrap coordination for PCIe system suspend.
++ *
++ * Copyright (c) 2026 MediaTek Inc.
++ */
++
++#include <linux/acpi.h>
++#include <linux/err.h>
++#include <linux/errno.h>
++#include <linux/kernel.h>
++#include <linux/list.h>
++#include <linux/mutex.h>
++#include <linux/pci.h>
++#include <linux/pm_wakeup.h>
++#include <linux/reboot.h>
++#include <linux/slab.h>
++#include <linux/soc/mediatek/mtk-pwrap.h>
++#include <linux/string.h>
++
++#include "pci.h"
++
++struct mtk_pci_pwrap_ctrl {
++	void *dev_ctrl;
++	char *acpi_path;
++	struct pci_bus *root_bus;
++	unsigned int port_count;
++	unsigned int ready_count;
++	enum mtk_pwrap_dev_state dstate;
++	struct list_head list;
++};
++
++struct mtk_pci_pwrap_port {
++	struct pci_dev *pdev;
++	struct mtk_pci_pwrap_ctrl *ctrl;
++	struct list_head list;
++	bool system_ready;
++};
++
++static DEFINE_MUTEX(mtk_pci_pwrap_lock);
++static DEFINE_MUTEX(mtk_pci_pwrap_gate_lock);
++static LIST_HEAD(mtk_pci_pwrap_ctrls);
++static LIST_HEAD(mtk_pci_pwrap_ports);
++
++static bool mtk_pci_pwrap_is_root_port(struct pci_dev *pdev)
++{
++	return pci_is_pcie(pdev) &&
++	       pci_pcie_type(pdev) == PCI_EXP_TYPE_ROOT_PORT;
++}
++
++static bool mtk_pci_pwrap_port_can_gate(struct pci_dev *pdev)
++{
++	/*
++	 * PCI config space remains accessible through D3hot.  Only extend an
++	 * already config-inaccessible D3cold hierarchy to whole-host gating.
++	 */
++	return !pdev->skip_bus_pm && pdev->current_state == PCI_D3cold &&
++	       !device_may_wakeup(&pdev->dev) &&
++	       !device_wakeup_path(&pdev->dev);
++}
++
++/* Called with pci_bus_sem held for reading. */
++static bool mtk_pci_pwrap_bus_can_gate(struct pci_bus *bus)
++{
++	struct pci_dev *pdev;
++
++	list_for_each_entry(pdev, &bus->devices, bus_list) {
++		if (device_may_wakeup(&pdev->dev) ||
++		    device_wakeup_path(&pdev->dev) ||
++		    !pciehp_is_safe_for_poweroff(pdev))
++			return false;
++
++		if (pdev->subordinate &&
++		    !mtk_pci_pwrap_bus_can_gate(pdev->subordinate))
++			return false;
++	}
++
++	return true;
++}
++
++static char *mtk_pci_pwrap_get_host_path(struct pci_dev *pdev,
++					 struct pci_bus **root_bus)
++{
++	struct pci_host_bridge *host;
++	struct acpi_buffer buf = { ACPI_ALLOCATE_BUFFER, NULL };
++	acpi_handle handle;
++	acpi_status status;
++
++	host = pci_find_host_bridge(pdev->bus);
++	if (!host || !host->bus)
++		return ERR_PTR(-ENODEV);
++
++	/*
++	 * A controller driver may access its registers outside the child PCI
++	 * callbacks.  Only firmware-created root buses have no such parent and
++	 * can be safely bracketed here.
++	 */
++	if (host->dev.parent)
++		return ERR_PTR(-EOPNOTSUPP);
++
++	handle = ACPI_HANDLE(&host->dev);
++	if (!handle)
++		return ERR_PTR(-ENODEV);
++
++	status = acpi_get_name(handle, ACPI_FULL_PATHNAME, &buf);
++	if (ACPI_FAILURE(status))
++		return ERR_PTR(-ENODEV);
++
++	*root_bus = host->bus;
++	return buf.pointer;
++}
++
++static struct mtk_pci_pwrap_port *
++mtk_pci_pwrap_find_port_locked(struct pci_dev *pdev)
++{
++	struct mtk_pci_pwrap_port *port;
++
++	list_for_each_entry(port, &mtk_pci_pwrap_ports, list) {
++		if (port->pdev == pdev)
++			return port;
++	}
++
++	return NULL;
++}
++
++static struct mtk_pci_pwrap_ctrl *
++mtk_pci_pwrap_find_ctrl_locked(const char *path)
++{
++	struct mtk_pci_pwrap_ctrl *ctrl;
++
++	list_for_each_entry(ctrl, &mtk_pci_pwrap_ctrls, list) {
++		if (!strcmp(ctrl->acpi_path, path))
++			return ctrl;
++	}
++
++	return NULL;
++}
++
++static void mtk_pci_pwrap_clear_ready_locked(struct mtk_pci_pwrap_ctrl *ctrl)
++{
++	struct mtk_pci_pwrap_port *port;
++
++	list_for_each_entry(port, &mtk_pci_pwrap_ports, list) {
++		if (port->ctrl == ctrl)
++			port->system_ready = false;
++	}
++	ctrl->ready_count = 0;
++}
++
++/*
++ * Power Wrap removes config and MMIO access for the complete host segment.
++ * Every function directly on the root bus must therefore be a tracked Root
++ * Port that has finished its PCI noirq suspend work.
++ */
++static bool
++mtk_pci_pwrap_host_ready_locked(struct mtk_pci_pwrap_ctrl *ctrl)
++{
++	struct mtk_pci_pwrap_port *port;
++	struct pci_dev *child;
++	unsigned int count = 0;
++
++	list_for_each_entry(child, &ctrl->root_bus->devices, bus_list) {
++		port = mtk_pci_pwrap_find_port_locked(child);
++		if (!port || port->ctrl != ctrl || !port->system_ready ||
++		    !mtk_pci_pwrap_port_can_gate(child))
++			return false;
++		count++;
++	}
++
++	return count && count == ctrl->port_count &&
++	       ctrl->ready_count == ctrl->port_count &&
++	       mtk_pci_pwrap_bus_can_gate(ctrl->root_bus);
++}
++
++static void mtk_pci_pwrap_free_ctrl_locked(struct mtk_pci_pwrap_ctrl *ctrl)
++{
++	list_del(&ctrl->list);
++	ACPI_FREE(ctrl->acpi_path);
++	kfree(ctrl);
++}
++
++static void mtk_pci_pwrap_put_ctrl_locked(struct mtk_pci_pwrap_ctrl *ctrl,
++					  struct device *dev)
++{
++	int ret;
++
++	if (--ctrl->port_count)
++		return;
++
++	ret = mtk_pwrap_dev_remove(ctrl->dev_ctrl);
++	if (ret)
++		dev_warn(dev, "pwrap remove failed: %d\n", ret);
++
++	mtk_pci_pwrap_free_ctrl_locked(ctrl);
++}
++
++static void mtk_pci_pwrap_release_port(void *data)
++{
++	struct mtk_pci_pwrap_port *port = data;
++	struct mtk_pci_pwrap_ctrl *ctrl = port->ctrl;
++
++	mutex_lock(&mtk_pci_pwrap_lock);
++	if (port->system_ready && ctrl->ready_count)
++		ctrl->ready_count--;
++	list_del(&port->list);
++	mtk_pci_pwrap_put_ctrl_locked(ctrl, &port->pdev->dev);
++	mutex_unlock(&mtk_pci_pwrap_lock);
++}
++
++void mtk_pci_pwrap_init(struct pci_dev *pdev)
++{
++	struct mtk_pci_pwrap_ctrl *ctrl;
++	struct mtk_pci_pwrap_port *port;
++	struct pci_bus *root_bus;
++	char *path;
++	int ret;
++
++	if (!mtk_pci_pwrap_is_root_port(pdev))
++		return;
++
++	path = mtk_pci_pwrap_get_host_path(pdev, &root_bus);
++	if (IS_ERR(path)) {
++		dev_dbg(&pdev->dev, "unsupported pwrap host: %ld\n",
++			PTR_ERR(path));
++		return;
++	}
++
++	port = devm_kzalloc(&pdev->dev, sizeof(*port), GFP_KERNEL);
++	if (!port)
++		goto out_free_path;
++
++	mutex_lock(&mtk_pci_pwrap_lock);
++	if (mtk_pci_pwrap_find_port_locked(pdev))
++		goto out_unlock;
++
++	ctrl = mtk_pci_pwrap_find_ctrl_locked(path);
++	if (ctrl && ctrl->root_bus != root_bus) {
++		dev_warn(&pdev->dev, "pwrap path %s belongs to another host\n",
++			 path);
++		goto out_unlock;
++	}
++
++	if (!ctrl) {
++		ctrl = kzalloc_obj(*ctrl);
++		if (!ctrl)
++			goto out_unlock;
++
++		ctrl->acpi_path = path;
++		path = NULL;
++		ctrl->root_bus = root_bus;
++		ctrl->dev_ctrl = mtk_pwrap_dev_probe(ctrl->acpi_path);
++		if (!mtk_pwrap_dev_supports_state_control(ctrl->dev_ctrl)) {
++			dev_dbg(&pdev->dev, "no pwrap state control for %s\n",
++				ctrl->acpi_path);
++			ACPI_FREE(ctrl->acpi_path);
++			kfree(ctrl);
++			goto out_unlock;
++		}
++
++		ctrl->dstate = DEV_STA_D0;
++		list_add(&ctrl->list, &mtk_pci_pwrap_ctrls);
++	}
++
++	port->pdev = pdev;
++	port->ctrl = ctrl;
++	list_add(&port->list, &mtk_pci_pwrap_ports);
++	ctrl->port_count++;
++
++	ret = devm_add_action(&pdev->dev, mtk_pci_pwrap_release_port, port);
++	if (ret) {
++		list_del(&port->list);
++		mtk_pci_pwrap_put_ctrl_locked(ctrl, &pdev->dev);
++		dev_warn(&pdev->dev,
++			 "pwrap cleanup registration failed: %d\n", ret);
++	}
++
++out_unlock:
++	mutex_unlock(&mtk_pci_pwrap_lock);
++out_free_path:
++	ACPI_FREE(path);
++}
++
++bool mtk_pci_pwrap_is_managed(struct pci_dev *pdev)
++{
++	bool managed;
++
++	if (!mtk_pci_pwrap_is_root_port(pdev))
++		return false;
++
++	mutex_lock(&mtk_pci_pwrap_lock);
++	managed = !!mtk_pci_pwrap_find_port_locked(pdev);
++	mutex_unlock(&mtk_pci_pwrap_lock);
++
++	return managed;
++}
++
++static void __noreturn mtk_pci_pwrap_fail_stop(void)
++{
++	/*
++	 * Do not return to PCI when host accessibility is unknown.  Avoid the
++	 * panic and restart paths because their dump, notifier, and reset
++	 * handlers may touch a device below the host.  MTK_POWER_WRAP is arm64
++	 * only, where machine_halt() disables local IRQs and stops other CPUs.
++	 */
++	machine_halt();
++	for (;;)
++		cpu_relax();
++}
++
++void mtk_pci_pwrap_suspend_noirq(struct pci_dev *pdev)
++{
++	struct mtk_pci_pwrap_ctrl *ctrl;
++	struct mtk_pci_pwrap_port *port;
++	bool fatal = false;
++	int ret;
++
++	if (!mtk_pci_pwrap_is_root_port(pdev))
++		return;
++
++	if (!mtk_pci_pwrap_port_can_gate(pdev))
++		return;
++
++	mutex_lock(&mtk_pci_pwrap_lock);
++	port = mtk_pci_pwrap_find_port_locked(pdev);
++	if (!port || port->system_ready)
++		goto out_ready;
++
++	ctrl = port->ctrl;
++	if (ctrl->dstate != DEV_STA_D0)
++		goto out_ready;
++
++	port->system_ready = true;
++	ctrl->ready_count++;
++	if (ctrl->ready_count != ctrl->port_count)
++		goto out_ready;
++	mutex_unlock(&mtk_pci_pwrap_lock);
++
++	/*
++	 * PCI devices suspend asynchronously.  Only the final ready port may
++	 * compete for the topology locks.  Serialize final ports from different
++	 * hosts so one Power Wrap operation cannot make another host miss its
++	 * only gating opportunity on the global rescan lock.
++	 *
++	 * Contention with a real topology operation means the host is not stable
++	 * enough to remove ECAM.  Clear the ready set and leave it in D0.
++	 */
++	mutex_lock(&mtk_pci_pwrap_gate_lock);
++	if (!mutex_trylock(&pci_rescan_remove_lock))
++		goto clear_ready_gate;
++	if (!down_read_trylock(&pci_bus_sem))
++		goto clear_ready_rescan;
++
++	mutex_lock(&mtk_pci_pwrap_lock);
++	port = mtk_pci_pwrap_find_port_locked(pdev);
++	if (!port || !port->system_ready)
++		goto out_unlock;
++
++	ctrl = port->ctrl;
++	if (ctrl->dstate != DEV_STA_D0) {
++		mtk_pci_pwrap_clear_ready_locked(ctrl);
++		goto out_unlock;
++	}
++
++	if (!mtk_pci_pwrap_host_ready_locked(ctrl)) {
++		mtk_pci_pwrap_clear_ready_locked(ctrl);
++		goto out_unlock;
++	}
++
++	ret = mtk_pwrap_dev_suspend(ctrl->dev_ctrl, true);
++	if (ret == -ETIMEDOUT) {
++		/*
++		 * The command may have completed after the transport timed out, so
++		 * neither PM unwind nor a later uncorrelated D0 acknowledgment can
++		 * prove the host accessible.  Fail-stop after dropping PCI topology
++		 * locks, without logging through a possibly inaccessible device.
++		 */
++		ctrl->dstate = DEV_STA_UNKNOWN;
++		fatal = true;
++	} else if (ret) {
++		dev_warn(&pdev->dev, "pwrap D3 failed: %d\n", ret);
++		/* The host stayed in D0; keep PM unwind callbacks balanced. */
++		mtk_pci_pwrap_clear_ready_locked(ctrl);
++	} else {
++		ctrl->dstate = DEV_STA_D3;
++	}
++
++out_unlock:
++	mutex_unlock(&mtk_pci_pwrap_lock);
++	up_read(&pci_bus_sem);
++	mutex_unlock(&pci_rescan_remove_lock);
++	if (fatal)
++		mtk_pci_pwrap_fail_stop();
++	mutex_unlock(&mtk_pci_pwrap_gate_lock);
++	return;
++
++clear_ready_rescan:
++	mutex_unlock(&pci_rescan_remove_lock);
++clear_ready_gate:
++	mutex_unlock(&mtk_pci_pwrap_gate_lock);
++	mutex_lock(&mtk_pci_pwrap_lock);
++	port = mtk_pci_pwrap_find_port_locked(pdev);
++	if (port && port->system_ready)
++		mtk_pci_pwrap_clear_ready_locked(port->ctrl);
++out_ready:
++	mutex_unlock(&mtk_pci_pwrap_lock);
++}
++
++void mtk_pci_pwrap_resume_noirq(struct pci_dev *pdev)
++{
++	struct mtk_pci_pwrap_ctrl *ctrl;
++	struct mtk_pci_pwrap_port *port;
++	int ret = 0;
++
++	if (!mtk_pci_pwrap_is_root_port(pdev))
++		return;
++
++	mutex_lock(&mtk_pci_pwrap_lock);
++	port = mtk_pci_pwrap_find_port_locked(pdev);
++	if (!port)
++		goto out_unlock;
++
++	ctrl = port->ctrl;
++	if (ctrl->dstate == DEV_STA_UNKNOWN) {
++		ret = -EIO;
++		goto out_unlock;
++	}
++
++	if (ctrl->dstate != DEV_STA_D0) {
++		ret = mtk_pwrap_dev_resume(ctrl->dev_ctrl, true);
++		if (ret) {
++			/* Prevent an asynchronous sibling from retrying D0. */
++			ctrl->dstate = DEV_STA_UNKNOWN;
++			goto out_unlock;
++		}
++		ctrl->dstate = DEV_STA_D0;
++	}
++
++	mtk_pci_pwrap_clear_ready_locked(ctrl);
++
++out_unlock:
++	mutex_unlock(&mtk_pci_pwrap_lock);
++	if (ret)
++		mtk_pci_pwrap_fail_stop();
++}
+diff --git a/drivers/pci/pci.h b/drivers/pci/pci.h
+index 4469e1a..9d8b1f1 100644
+--- a/drivers/pci/pci.h
++++ b/drivers/pci/pci.h
+@@ -269,6 +269,31 @@ int pci_finish_runtime_suspend(struct pci_dev *dev);
+ void pcie_clear_device_status(struct pci_dev *dev);
+ void pcie_clear_root_pme_status(struct pci_dev *dev);
+ bool pci_check_pme_status(struct pci_dev *dev);
++#ifdef CONFIG_HOTPLUG_PCI_PCIE
++bool pciehp_is_safe_for_poweroff(struct pci_dev *dev);
++#else
++static inline bool pciehp_is_safe_for_poweroff(struct pci_dev *dev)
++{
++	return !dev->is_hotplug_bridge;
++}
++#endif
++#ifdef CONFIG_MTK_POWER_WRAP
++void mtk_pci_pwrap_init(struct pci_dev *dev);
++bool mtk_pci_pwrap_is_managed(struct pci_dev *dev);
++void mtk_pci_pwrap_suspend_noirq(struct pci_dev *dev);
++void mtk_pci_pwrap_resume_noirq(struct pci_dev *dev);
++#else
++static inline void mtk_pci_pwrap_init(struct pci_dev *dev) { }
++
++static inline bool mtk_pci_pwrap_is_managed(struct pci_dev *dev)
++{
++	return false;
++}
++
++static inline void mtk_pci_pwrap_suspend_noirq(struct pci_dev *dev) { }
++
++static inline void mtk_pci_pwrap_resume_noirq(struct pci_dev *dev) { }
++#endif
+ void pci_pme_wakeup_bus(struct pci_bus *bus);
+ void pci_pme_restore(struct pci_dev *dev);
+ bool pci_dev_need_resume(struct pci_dev *dev);
+diff --git a/drivers/pci/pcie/pme.c b/drivers/pci/pcie/pme.c
+index 4996cc4..11b10f8 100644
+--- a/drivers/pci/pcie/pme.c
++++ b/drivers/pci/pcie/pme.c
+@@ -274,6 +274,11 @@ static irqreturn_t pcie_pme_irq(int irq, void *context)
+ 	data = get_service_data((struct pcie_device *)context);
+ 
+ 	spin_lock_irqsave(&data->lock, flags);
++	if (data->noirq) {
++		spin_unlock_irqrestore(&data->lock, flags);
++		return IRQ_NONE;
++	}
++
+ 	pcie_capability_read_dword(port, PCI_EXP_RTSTA, &rtsta);
+ 
+ 	if (PCI_POSSIBLE_ERROR(rtsta) || !(rtsta & PCI_EXP_RTSTA_PME)) {
+@@ -412,6 +417,7 @@ static int pcie_pme_suspend(struct pcie_device *srv)
+ 	pcie_pme_disable_interrupt(port, data);
+ 
+ 	synchronize_irq(srv->irq);
++	cancel_work_sync(&data->work);
+ 
+ 	return 0;
+ }
+diff --git a/drivers/pci/pcie/portdrv.c b/drivers/pci/pcie/portdrv.c
+index 2d6aa48..fe67eaa 100644
+--- a/drivers/pci/pcie/portdrv.c
++++ b/drivers/pci/pcie/portdrv.c
+@@ -338,6 +338,8 @@ static int pcie_port_device_register(struct pci_dev *dev)
+ 	if (status)
+ 		return status;
+ 
++	mtk_pci_pwrap_init(dev);
++
+ 	/* Get and check PCI Express port services */
+ 	capabilities = get_port_device_capability(dev);
+ 	if (!capabilities)
+@@ -686,6 +688,7 @@ static int pcie_portdrv_probe(struct pci_dev *dev,
+ 					const struct pci_device_id *id)
+ {
+ 	int type = pci_pcie_type(dev);
++	u32 pm_flags = DPM_FLAG_NO_DIRECT_COMPLETE;
+ 	int status;
+ 
+ 	if (!pci_is_pcie(dev) ||
+@@ -704,8 +707,11 @@ static int pcie_portdrv_probe(struct pci_dev *dev,
+ 
+ 	pci_save_state(dev);
+ 
+-	dev_pm_set_driver_flags(&dev->dev, DPM_FLAG_NO_DIRECT_COMPLETE |
+-					   DPM_FLAG_SMART_SUSPEND);
++	/* Managed ports must run their PCIe service suspend callbacks. */
++	if (!mtk_pci_pwrap_is_managed(dev))
++		pm_flags |= DPM_FLAG_SMART_SUSPEND;
++
++	dev_pm_set_driver_flags(&dev->dev, pm_flags);
+ 
+ 	if (pci_bridge_d3_possible(dev)) {
+ 		/*
+diff --git a/drivers/soc/mediatek/power_wrap/power_wrap.c b/drivers/soc/mediatek/power_wrap/power_wrap.c
+index 33445cd..7fce9d3 100644
+--- a/drivers/soc/mediatek/power_wrap/power_wrap.c
++++ b/drivers/soc/mediatek/power_wrap/power_wrap.c
+@@ -441,6 +441,14 @@ void *mtk_pwrap_dev_probe(const char *acpi_path)
+ }
+ EXPORT_SYMBOL_GPL(mtk_pwrap_dev_probe);
+ 
++bool mtk_pwrap_dev_supports_state_control(void *dev_ctrl)
++{
++	struct pwrap_dev_config *cfg = dev_ctrl;
++
++	return cfg && cfg->control_type == CTRL_BY_SCMI;
++}
++EXPORT_SYMBOL_GPL(mtk_pwrap_dev_supports_state_control);
++
+ static int pwrap_config_resource(struct platform_device *pdev, kernel_ulong_t driver_data)
+ {
+ 	enum mtk_pwrap_type type;
+diff --git a/include/linux/soc/mediatek/mtk-pwrap.h b/include/linux/soc/mediatek/mtk-pwrap.h
+index a655c71..bb29c41 100644
+--- a/include/linux/soc/mediatek/mtk-pwrap.h
++++ b/include/linux/soc/mediatek/mtk-pwrap.h
+@@ -77,6 +77,7 @@ int mtk_pwrap_com_idle(void *dev_ctrl, u8 com_idx);
+ int mtk_pwrap_com_active(void *dev_ctrl, u8 com_idx);
+ void *mtk_pwrap_dev_probe(const char *acpi_path);
+ bool mtk_pwrap_usb4_released(void);
++bool mtk_pwrap_dev_supports_state_control(void *dev_ctrl);
+ #else
+ static inline int mtk_send_power_control_req(struct _power_cntrl_request *pwrctlreq)
+ {
+@@ -122,6 +123,11 @@ static inline bool mtk_pwrap_usb4_released(void)
+ {
+ 	return false;
+ }
++
++static inline bool mtk_pwrap_dev_supports_state_control(void *dev_ctrl)
++{
++	return false;
++}
+ #endif /* CONFIG_MTK_POWER_WRAP */
+ 
+ #endif
+-- 
+2.56.0
+

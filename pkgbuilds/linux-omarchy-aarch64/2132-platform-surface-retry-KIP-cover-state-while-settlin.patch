@@ -1,0 +1,201 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Brandon Williams <turbine.bmw@gmail.com>
+Date: Wed, 22 Jul 2026 06:05:04 -0400
+Subject: [PATCH] platform/surface: retry KIP cover state while settling
+
+The KIP cover-state query can transiently return zero while the Flex
+Keyboard devices are being re-enumerated. Zero is outside the documented
+posture range, and caching it can leave SW_TABLET_MODE asserted after
+the keyboard has been reattached.
+
+Treat out-of-range states as not ready and perform bounded delayed queries
+after KIP connection changes. Stop the sequence as soon as the controller
+returns a valid posture, while retaining the existing delayed post-resume
+check. If the cover is still settling at probe, bind with an empty state
+and start the same retry sequence instead of failing the probe.
+
+Signed-off-by: Brandon Williams <turbine.bmw@gmail.com>
+---
+ .../surface/surface_aggregator_tabletsw.c     | 62 ++++++++++++++++---
+ 1 file changed, 52 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/platform/surface/surface_aggregator_tabletsw.c b/drivers/platform/surface/surface_aggregator_tabletsw.c
+index d4604eb8aeda..4ee64d6c2cfc 100644
+--- a/drivers/platform/surface/surface_aggregator_tabletsw.c
++++ b/drivers/platform/surface/surface_aggregator_tabletsw.c
+@@ -5,6 +5,7 @@
+  * Copyright (C) 2022 Maximilian Luz <luzmaximilian@gmail.com>
+  */
+ 
++#include <linux/atomic.h>
+ #include <linux/unaligned.h>
+ #include <linux/input.h>
+ #include <linux/kernel.h>
+@@ -39,12 +40,16 @@ struct ssam_tablet_sw {
+ 	struct ssam_tablet_sw_state state;
+ 	struct work_struct update_work;
+ 	struct delayed_work delayed_update_work;
++	atomic_t delayed_update_count;
+ 	struct input_dev *mode_switch;
+ 
+ 	struct ssam_tablet_sw_ops ops;
+ 	struct ssam_event_notifier notif;
+ };
+ 
++#define SSAM_TABLET_SW_UPDATE_DELAY_MS	2000
++#define SSAM_KIP_UPDATE_COUNT		15
++
+ struct ssam_tablet_sw_desc {
+ 	struct {
+ 		const char *name;
+@@ -97,13 +102,18 @@ static void ssam_tablet_sw_update_workfn(struct work_struct *work)
+ 		return;
+ 
+ 	if (sw->state.source == state.source && sw->state.state == state.state)
+-		return;
++		goto out;
+ 	sw->state = state;
+ 
+ 	/* Send SW_TABLET_MODE event. */
+ 	tablet = sw->ops.state_is_tablet_mode(sw, &state);
+ 	input_report_switch(sw->mode_switch, SW_TABLET_MODE, tablet);
+ 	input_sync(sw->mode_switch);
++
++out:
++	/* A settled KIP response ends a connection-change retry sequence. */
++	if (atomic_read(&sw->delayed_update_count) > 1)
++		atomic_set(&sw->delayed_update_count, 0);
+ }
+ 
+ static void ssam_tablet_sw_delayed_update_workfn(struct work_struct *work)
+@@ -112,14 +122,30 @@ static void ssam_tablet_sw_delayed_update_workfn(struct work_struct *work)
+ 						  struct ssam_tablet_sw,
+ 						  delayed_update_work);
+ 
++	if (atomic_read(&sw->delayed_update_count) <= 0)
++		return;
++
+ 	/* Serialize the delayed re-query through the normal update work. */
+ 	schedule_work(&sw->update_work);
++
++	if (atomic_dec_if_positive(&sw->delayed_update_count) > 0)
++		mod_delayed_work(system_percpu_wq, &sw->delayed_update_work,
++				 msecs_to_jiffies(SSAM_TABLET_SW_UPDATE_DELAY_MS));
++}
++
++static void ssam_tablet_sw_schedule_delayed_updates(struct ssam_tablet_sw *sw,
++						    unsigned int count)
++{
++	atomic_set(&sw->delayed_update_count, count);
++	mod_delayed_work(system_percpu_wq, &sw->delayed_update_work,
++			 msecs_to_jiffies(SSAM_TABLET_SW_UPDATE_DELAY_MS));
+ }
+ 
+ static int __maybe_unused ssam_tablet_sw_suspend(struct device *dev)
+ {
+ 	struct ssam_tablet_sw *sw = dev_get_drvdata(dev);
+ 
++	atomic_set(&sw->delayed_update_count, 0);
+ 	cancel_delayed_work_sync(&sw->delayed_update_work);
+ 	return 0;
+ }
+@@ -134,7 +160,7 @@ static int __maybe_unused ssam_tablet_sw_resume(struct device *dev)
+ 	 * retain the early state if the corresponding notification is missed.
+ 	 */
+ 	schedule_work(&sw->update_work);
+-	mod_delayed_work(system_wq, &sw->delayed_update_work, msecs_to_jiffies(2000));
++	ssam_tablet_sw_schedule_delayed_updates(sw, 1);
+ 	return 0;
+ }
+ 
+@@ -145,6 +171,7 @@ static int ssam_tablet_sw_probe(struct ssam_device *sdev)
+ {
+ 	const struct ssam_tablet_sw_desc *desc;
+ 	struct ssam_tablet_sw *sw;
++	bool settling;
+ 	int tablet, status;
+ 
+ 	desc = ssam_device_get_match_data(sdev);
+@@ -165,12 +192,19 @@ static int ssam_tablet_sw_probe(struct ssam_device *sdev)
+ 
+ 	INIT_WORK(&sw->update_work, ssam_tablet_sw_update_workfn);
+ 	INIT_DELAYED_WORK(&sw->delayed_update_work, ssam_tablet_sw_delayed_update_workfn);
++	atomic_set(&sw->delayed_update_count, 0);
+ 
+ 	ssam_device_set_drvdata(sdev, sw);
+ 
+-	/* Get initial state. */
++	/*
++	 * Get initial state. A KIP cover can still be settling here; start
++	 * from an empty state and re-query until it reports a valid one.
++	 */
+ 	status = sw->ops.get_state(sw, &sw->state);
+-	if (status)
++	settling = status == -EAGAIN;
++	if (settling)
++		sw->state = (struct ssam_tablet_sw_state) { };
++	else if (status)
+ 		return status;
+ 
+ 	/* Set up tablet mode switch. */
+@@ -183,7 +217,7 @@ static int ssam_tablet_sw_probe(struct ssam_device *sdev)
+ 	sw->mode_switch->id.bustype = BUS_HOST;
+ 	sw->mode_switch->dev.parent = &sdev->dev;
+ 
+-	tablet = sw->ops.state_is_tablet_mode(sw, &sw->state);
++	tablet = settling || sw->ops.state_is_tablet_mode(sw, &sw->state);
+ 	input_set_capability(sw->mode_switch, EV_SW, SW_TABLET_MODE);
+ 	input_report_switch(sw->mode_switch, SW_TABLET_MODE, tablet);
+ 
+@@ -208,11 +242,14 @@ static int ssam_tablet_sw_probe(struct ssam_device *sdev)
+ 		goto err;
+ 
+ 	/* We might have missed events during setup, so check again. */
++	if (settling)
++		ssam_tablet_sw_schedule_delayed_updates(sw, SSAM_KIP_UPDATE_COUNT);
+ 	schedule_work(&sw->update_work);
+ 	return 0;
+ 
+ err:
+ 	ssam_device_notifier_unregister(sdev, &sw->notif);
++	atomic_set(&sw->delayed_update_count, 0);
+ 	cancel_delayed_work_sync(&sw->delayed_update_work);
+ 	cancel_work_sync(&sw->update_work);
+ 	return status;
+@@ -225,6 +262,7 @@ static void ssam_tablet_sw_remove(struct ssam_device *sdev)
+ 	sysfs_remove_group(&sdev->dev.kobj, &ssam_tablet_sw_group);
+ 
+ 	ssam_device_notifier_unregister(sdev, &sw->notif);
++	atomic_set(&sw->delayed_update_count, 0);
+ 	cancel_delayed_work_sync(&sw->delayed_update_work);
+ 	cancel_work_sync(&sw->update_work);
+ }
+@@ -310,6 +348,11 @@ static int ssam_kip_get_cover_state(struct ssam_tablet_sw *sw, struct ssam_table
+ 		return status;
+ 	}
+ 
++	if (raw < SSAM_KIP_COVER_STATE_DISCONNECTED || raw > SSAM_KIP_COVER_STATE_BOOK) {
++		dev_dbg(&sw->sdev->dev, "KIP cover state not ready: %u\n", raw);
++		return -EAGAIN;
++	}
++
+ 	state->source = 0;	/* Unused for KIP switch. */
+ 	state->state = raw;
+ 	return 0;
+@@ -331,12 +374,11 @@ static u32 ssam_kip_sw_notif(struct ssam_event_notifier *nf, const struct ssam_e
+ 	case SSAM_EVENT_KIP_CID_CONNECTION_CHANGED:
+ 		/*
+ 		 * Cover-state notifications can be lost while the KIP devices are
+-		 * being re-enumerated. Re-query once the controller and devices have
+-		 * had time to settle so that the input switch cannot remain stale.
+-		 * The subsystem hub remains the primary handler for this event.
++		 * being re-enumerated. Re-query for a bounded period while the
++		 * controller and devices settle so that the input switch cannot remain
++		 * stale. The subsystem hub remains the primary handler for this event.
+ 		 */
+-		mod_delayed_work(system_wq, &sw->delayed_update_work,
+-				 msecs_to_jiffies(2000));
++		ssam_tablet_sw_schedule_delayed_updates(sw, SSAM_KIP_UPDATE_COUNT);
+ 		return 0;
+ 
+ 	default:

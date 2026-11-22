@@ -1,0 +1,87 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Brandon Williams <turbine.bmw@gmail.com>
+Date: Sat, 29 Aug 2026 20:44:12 -0400
+Subject: [PATCH] drm/msm/dpu: re-program colour-processing blocks on the
+ commit after a modeset
+
+On a modeset (resume, DPMS on, mode change) _dpu_crtc_setup_cp_blocks()
+programs the DSPP before the first flush has activated it.  The plain
+register writes (GC_EN, LUT_SWAP, PCC) stick, but the writes into the
+SRAM-backed GC LUT through the index/data ports are lost.  The result on
+a dual-LM panel with a GAMMA_LUT user (Hyprland + wlsunset) is gamma
+enabled over uninitialised SRAM: a random colour tint / artifacts on one
+half of the panel after every resume or DPMS off/on, cleared by any later
+colour-management commit.
+
+Register evidence on x1e80100 (DPU 9.2) eDP-1: bad vs good dumps of
+dri/0/kms are identical except the GC block at dspp+0x17c0, where GC_EN=1
+and the LUT data ports return garbage.
+
+Remember that the CP blocks were programmed during a modeset and repeat
+the programming on the next commit, once the pipeline is running.
+Verified on Surface Pro 11: DPMS off/on 10/10 clean, previously defective
+every cycle.
+
+Signed-off-by: Brandon Williams <turbine.bmw@gmail.com>
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+---
+ drivers/gpu/drm/msm/disp/dpu1/dpu_crtc.c | 15 ++++++++++++++-
+ drivers/gpu/drm/msm/disp/dpu1/dpu_crtc.h |  7 +++++++
+ 2 files changed, 21 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_crtc.c b/drivers/gpu/drm/msm/disp/dpu1/dpu_crtc.c
+index 42d0a529b4d5..3d1c138bfde8 100644
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_crtc.c
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_crtc.c
+@@ -853,12 +853,24 @@ static void _dpu_crtc_setup_cp_blocks(struct drm_crtc *crtc)
+ 	struct dpu_hw_gc_lut *gc_lut;
+ 	struct dpu_hw_ctl *ctl;
+ 	struct dpu_hw_dspp *dspp;
++	struct dpu_crtc *dpu_crtc = to_dpu_crtc(crtc);
++	bool modeset = drm_atomic_crtc_needs_modeset(state);
+ 	int i;
+ 
+ 
+-	if (!state->color_mgmt_changed && !drm_atomic_crtc_needs_modeset(state))
++	if (!state->color_mgmt_changed && !modeset &&
++	    !dpu_crtc->cp_reprogram_pending)
+ 		return;
+ 
++	/*
++	 * During a modeset the DSPP is programmed before the first flush
++	 * activates it, and writes into SRAM-backed sub-blocks (the GC LUT)
++	 * are lost while the enable bit sticks -- leaving the block enabled
++	 * over uninitialised SRAM.  Repeat the programming on the next commit,
++	 * once the pipeline is running.
++	 */
++	dpu_crtc->cp_reprogram_pending = modeset;
++
+ 	for (i = 0; i < cstate->num_mixers; i++) {
+ 		ctl = mixer[i].lm_ctl;
+ 		dspp = mixer[i].hw_dspp;
+@@ -1240,6 +1252,7 @@ static void dpu_crtc_disable(struct drm_crtc *crtc,
+ 				atomic_read(&dpu_crtc->frame_pending));
+ 
+ 	trace_dpu_crtc_disable(DRMID(crtc), false, dpu_crtc);
++	dpu_crtc->cp_reprogram_pending = false;
+ 	dpu_crtc->enabled = false;
+ 
+ 	if (atomic_read(&dpu_crtc->frame_pending)) {
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_crtc.h b/drivers/gpu/drm/msm/disp/dpu1/dpu_crtc.h
+index 6eaba5696e8e..12c25bc860d3 100644
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_crtc.h
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_crtc.h
+@@ -165,6 +165,13 @@ struct dpu_crtc {
+ 	ktime_t vblank_cb_time;
+ 	bool enabled;
+ 
++	/*
++	 * Colour-processing blocks were programmed during a modeset, before
++	 * the DSPP was active; SRAM-backed sub-blocks (GC LUT) must be written
++	 * again on the next commit.
++	 */
++	bool cp_reprogram_pending;
++
+ 	struct list_head feature_list;
+ 	struct list_head active_list;
+ 	struct list_head dirty_list;

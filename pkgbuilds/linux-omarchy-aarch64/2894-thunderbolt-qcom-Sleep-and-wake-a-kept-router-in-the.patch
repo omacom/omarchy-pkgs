@@ -1,0 +1,141 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jim Martin <jimmartin@gmail.com>
+Date: Fri, 13 Nov 2026 20:16:53 -0600
+Subject: [PATCH] thunderbolt: qcom: Sleep and wake a kept router in the noirq
+ phase
+
+A router kept across system suspend had the connection manager put
+the routers to sleep, and its MCU halted, in the normal suspend phase,
+and the reverse in the normal resume phase. That was chosen for the
+USB controller of the tunnelled USB3 port, which sleeps and wakes in
+the normal phase: re-activating the USB3 tunnel before that
+controller's clocks are back kills its port.
+
+It does not work for PCIe. The PCI core saves the state of the devices
+behind a tunnel and powers them down in the noirq phase, after the
+router was halted, and restores them in the noirq phase on the way
+back, before the router has restored the tunnel.
+
+Sleep and wake the router in the noirq phase, as the other host
+interfaces do, and leave only the USB3 tunnel for the normal phase:
+the connection manager skips it in the noirq resume and the router
+re-activates it from its normal resume callback, which the device
+links already place after the USB controller's and before the xHCI's.
+The MCU's interrupt is no longer suspended, since the halt waits for
+the MCU's stop event.
+
+Assisted-by: Claude Fable 5.2
+Signed-off-by: Jim Martin <jimmartin@gmail.com>
+---
+ drivers/thunderbolt/qcom-usb4-host.c | 55 ++++++++++++++++++++++++----
+ 1 file changed, 47 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/thunderbolt/qcom-usb4-host.c b/drivers/thunderbolt/qcom-usb4-host.c
+index ed574d38c..c27784838 100644
+--- a/drivers/thunderbolt/qcom-usb4-host.c
++++ b/drivers/thunderbolt/qcom-usb4-host.c
+@@ -1079,6 +1079,15 @@ static int qcom_usb4_host_probe_nhi(struct qcom_usb4_host *host)
+ 	if (ret)
+ 		return dev_err_probe(host->dev, ret, "NHI adapter preparation\n");
+ 
++	/*
++	 * The xHCI of the tunnelled USB3 port is linked to this device as a
++	 * consumer, so it resumes after the router. The USB3 tunnel is
++	 * re-activated from qcom_usb4_host_resume(), once the USB controller
++	 * runs again.
++	 */
++	nhi->native_ports_ordered = true;
++	nhi->usb3_resume_deferred = true;
++
+ 	/* nhi_probe() drops one runtime reference; balance it here. */
+ 	pm_runtime_get_noresume(host->dev);
+ 	ret = nhi_probe(nhi);
+@@ -1367,8 +1376,9 @@ static int qcom_usb4_host_pm_notify(struct notifier_block *nb, unsigned long act
+ /*
+  * Standby, after the connection manager has put the routers to sleep:
+  * stop the firmware, halt the MCU with its RAM retained and park the RX
+- * clocks on the reference. The PHY clamps its USB4 outputs in its own suspend
+- * callback, which runs after this one.
++ * clocks on the reference. The PHY clamps its USB4 outputs in its own noirq
++ * suspend callback, which runs after this one. Runs in the noirq phase: the
++ * MCU's interrupt is not suspended, for the stop event.
+  */
+ static int qcom_usb4_host_halt(struct qcom_usb4_host *host)
+ {
+@@ -1500,11 +1510,24 @@ static int qcom_usb4_host_warm_start(struct qcom_usb4_host *host)
+ }
+ 
+ /*
++ * System suspend of a router kept across it.
++ *
++ * The router sleeps and wakes in the noirq phase, as the other host
++ * interfaces do: the PCI core saves the state of devices behind a PCIe tunnel
++ * and powers them down in that phase, and restores them in it on the way
++ * back, so a tunnel has to live until after the first and again before the
++ * second.
++ *
++ * The USB controller of the tunnelled USB3 port sleeps and wakes in the
++ * normal phase. Its tunnel is therefore not re-activated with the others in
++ * the noirq phase, when that controller's clocks are still off, but in
++ * qcom_usb4_host_resume(): after the controller's resume and before the
++ * xHCI's, both by device link.
++ *
+  * The router and PHY power domains stay on while their devices are on the
+- * wakeup path; the halted router keeps its configuration there. Ordering
+- * against the tunnelled ports' controller and xHCI comes from device links.
++ * wakeup path; the halted router keeps its configuration there.
+  */
+-static int qcom_usb4_host_suspend(struct device *dev)
++static int qcom_usb4_host_suspend_noirq(struct device *dev)
+ {
+ 	struct qcom_usb4_host *host = qcom_usb4_host_from_dev(dev);
+ 	unsigned int i;
+@@ -1533,7 +1556,7 @@ static int qcom_usb4_host_suspend(struct device *dev)
+ 	return 0;
+ }
+ 
+-static int qcom_usb4_host_resume(struct device *dev)
++static int qcom_usb4_host_resume_noirq(struct device *dev)
+ {
+ 	struct qcom_usb4_host *host = qcom_usb4_host_from_dev(dev);
+ 	int ret;
+@@ -1549,9 +1572,24 @@ static int qcom_usb4_host_resume(struct device *dev)
+ 	return ret;
+ }
+ 
++/* The USB3 tunnel, now that the USB controller it leads to runs again. */
++static int qcom_usb4_host_resume(struct device *dev)
++{
++	struct qcom_usb4_host *host = qcom_usb4_host_from_dev(dev);
++	int ret;
++
++	if (!host || !host->kept || host->sleep_failed)
++		return 0;
++	ret = tb_domain_resume_usb3(dev_get_drvdata(dev));
++	if (ret)
++		dev_warn(dev, "USB3 tunnel not restored after sleep: %d\n", ret);
++	return 0;
++}
++
+ /* Suspend only: hibernation stops the router in the PM notifier. */
+ static const struct dev_pm_ops qcom_usb4_host_pm_ops = {
+-	.suspend = pm_sleep_ptr(qcom_usb4_host_suspend),
++	.suspend_noirq = pm_sleep_ptr(qcom_usb4_host_suspend_noirq),
++	.resume_noirq = pm_sleep_ptr(qcom_usb4_host_resume_noirq),
+ 	.resume = pm_sleep_ptr(qcom_usb4_host_resume),
+ };
+ 
+@@ -1700,8 +1738,9 @@ static int qcom_usb4_host_probe(struct platform_device *pdev)
+ 	dev_dbg(dev, "router firmware %s: %zu bytes, SoC serial %#x\n", fw_name,
+ 		host->fw->size, host->serial);
+ 
++	/* Not suspended: the router is halted and warm-started in the noirq phase. */
+ 	ret = devm_request_threaded_irq(dev, host->mcu_irq, NULL, qcom_usb4_host_mcu_irq,
+-					IRQF_ONESHOT, "qcom-usb4-mcu", host);
++					IRQF_ONESHOT | IRQF_NO_SUSPEND, "qcom-usb4-mcu", host);
+ 	if (ret) {
+ 		dev_err(dev, "MCU interrupt request failed: %d\n", ret);
+ 		goto out_stopped;
+-- 
+2.56.1
+

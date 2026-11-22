@@ -1,0 +1,257 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jim Martin <jimmartin@gmail.com>
+Date: Thu, 8 Oct 2026 13:42:15 -0500
+Subject: [PATCH] clk: qcom: gcc-glymur: Add USB4 host router startup
+ operations
+
+Starting the Glymur USB4 host router takes GCC register operations that
+neither the clock nor the reset framework expresses: both RX clock muxes
+are moved to TCXO with their branch gates cycled around the router
+reset and moved back to the PHY afterwards, the router SYS branch must
+be polled until its clock runs, its memory-force bit and the USB PIPE
+branch hardware clock gating are changed at fixed points of the
+sequence, and one control bit with no known signal name is pulsed. The
+values match what the platform's Windows driver programs on this laptop.
+
+Add these as narrow operations owned by the GCC driver and declared in
+<linux/soc/qcom/glymur-usb4.h>, for USB4 ports 0 and 1. The driver keeps
+its regmap in a global after a successful probe; the operations return
+-ENODEV before that or for another port.
+
+This is an interim interface for the experimental router driver. A
+global regmap shared through exported functions does not support more
+than one GCC instance and bypasses the clock and reset frameworks; the
+operations are to be expressed through the reset and clock APIs before
+the router driver is proposed upstream.
+
+Assisted-by: Opus 5.5
+Signed-off-by: Jim Martin <jimmartin@gmail.com>
+---
+ drivers/clk/qcom/gcc-glymur.c        | 138 ++++++++++++++++++++++++++-
+ include/linux/soc/qcom/glymur-usb4.h |  56 +++++++++++
+ 2 files changed, 193 insertions(+), 1 deletion(-)
+ create mode 100644 include/linux/soc/qcom/glymur-usb4.h
+
+diff --git a/drivers/clk/qcom/gcc-glymur.c b/drivers/clk/qcom/gcc-glymur.c
+index 84fc47f507f..aa9dc9f1b8b 100644
+--- a/drivers/clk/qcom/gcc-glymur.c
++++ b/drivers/clk/qcom/gcc-glymur.c
+@@ -7,6 +7,7 @@
+ #include <linux/module.h>
+ #include <linux/platform_device.h>
+ #include <linux/regmap.h>
++#include <linux/soc/qcom/glymur-usb4.h>
+ 
+ #include <dt-bindings/clock/qcom,glymur-gcc.h>
+ 
+@@ -8432,9 +8433,144 @@ static const struct of_device_id gcc_glymur_match_table[] = {
+ };
+ MODULE_DEVICE_TABLE(of, gcc_glymur_match_table);
+ 
++/*
++ * USB4 host router startup operations. The router frontend cannot express
++ * these through clock or reset consumers: the RX muxes must run from TCXO
++ * with their gates enabled across the router reset, the memory-force and
++ * clock-gating bits are toggled at fixed points of the startup sequence,
++ * and the opaque control bit has no verified signal name.
++ */
++struct glymur_usb4_gcc_regs {
++	u32 ctrl;
++	u32 sys;
++	u32 pipe;
++	u32 rx_gate[2];
++	u32 rx_mux[2];
++};
++
++static const struct glymur_usb4_gcc_regs glymur_usb4_gcc_regs[] = {
++	[0] = {
++		.ctrl = 0x600c0,
++		.sys = 0x2b05c,
++		.pipe = 0x2b0bc,
++		.rx_gate = { 0x2b0c4, 0x2b0d8 },
++		.rx_mux = { 0x2b0c0, 0x2b0d4 },
++	},
++	[1] = {
++		.ctrl = 0x600ac,
++		.sys = 0x2d05c,
++		.pipe = 0x2d0e0,
++		.rx_gate = { 0x2d0e8, 0x2d0fc },
++		.rx_mux = { 0x2d0e4, 0x2d0f8 },
++	},
++};
++
++#define GLYMUR_USB4_RX_MUX_MASK		GENMASK(1, 0)
++#define GLYMUR_USB4_RX_MUX_PHY		0
++#define GLYMUR_USB4_RX_MUX_TCXO		2
++#define GLYMUR_USB4_CTRL_BIT		BIT(3)
++#define GLYMUR_USB4_PIPE_HWCG_BIT	BIT(1)
++
++static struct regmap *glymur_gcc_regmap;
++
++static const struct glymur_usb4_gcc_regs *glymur_usb4_regs(unsigned int port)
++{
++	if (!glymur_gcc_regmap || port >= ARRAY_SIZE(glymur_usb4_gcc_regs))
++		return NULL;
++	return &glymur_usb4_gcc_regs[port];
++}
++
++int glymur_gcc_usb4_rx_select(unsigned int port, bool phy)
++{
++	const struct glymur_usb4_gcc_regs *r = glymur_usb4_regs(port);
++	u32 want = phy ? GLYMUR_USB4_RX_MUX_PHY : GLYMUR_USB4_RX_MUX_TCXO;
++	u32 cur[2];
++	int i, ret;
++
++	if (!r)
++		return -ENODEV;
++	for (i = 0; i < 2; i++) {
++		ret = regmap_read(glymur_gcc_regmap, r->rx_mux[i], &cur[i]);
++		if (ret)
++			return ret;
++	}
++	if ((cur[0] & GLYMUR_USB4_RX_MUX_MASK) == want &&
++	    (cur[1] & GLYMUR_USB4_RX_MUX_MASK) == want)
++		return 0;
++	for (i = 0; i < 2; i++) {
++		ret = regmap_update_bits(glymur_gcc_regmap, r->rx_gate[i], BIT(0), 0);
++		if (ret)
++			return ret;
++	}
++	for (i = 0; i < 2; i++) {
++		ret = regmap_update_bits(glymur_gcc_regmap, r->rx_mux[i],
++					 GLYMUR_USB4_RX_MUX_MASK, want);
++		if (ret)
++			return ret;
++	}
++	for (i = 0; i < 2; i++) {
++		ret = regmap_update_bits(glymur_gcc_regmap, r->rx_gate[i], BIT(0), BIT(0));
++		if (ret)
++			return ret;
++	}
++	return 0;
++}
++EXPORT_SYMBOL_GPL(glymur_gcc_usb4_rx_select);
++
++int glymur_gcc_usb4_ctrl_bit(unsigned int port, bool set)
++{
++	const struct glymur_usb4_gcc_regs *r = glymur_usb4_regs(port);
++
++	if (!r)
++		return -ENODEV;
++	return regmap_update_bits(glymur_gcc_regmap, r->ctrl, GLYMUR_USB4_CTRL_BIT,
++				  set ? GLYMUR_USB4_CTRL_BIT : 0);
++}
++EXPORT_SYMBOL_GPL(glymur_gcc_usb4_ctrl_bit);
++
++int glymur_gcc_usb4_sys_force_mem(unsigned int port, bool on)
++{
++	const struct glymur_usb4_gcc_regs *r = glymur_usb4_regs(port);
++
++	if (!r)
++		return -ENODEV;
++	return regmap_update_bits(glymur_gcc_regmap, r->sys, CBCR_FORCE_MEM_CORE_ON,
++				  on ? CBCR_FORCE_MEM_CORE_ON : 0);
++}
++EXPORT_SYMBOL_GPL(glymur_gcc_usb4_sys_force_mem);
++
++int glymur_gcc_usb4_pipe_hwcg(unsigned int port, bool enable)
++{
++	const struct glymur_usb4_gcc_regs *r = glymur_usb4_regs(port);
++
++	if (!r)
++		return -ENODEV;
++	return regmap_update_bits(glymur_gcc_regmap, r->pipe, GLYMUR_USB4_PIPE_HWCG_BIT,
++				  enable ? GLYMUR_USB4_PIPE_HWCG_BIT : 0);
++}
++EXPORT_SYMBOL_GPL(glymur_gcc_usb4_pipe_hwcg);
++
++int glymur_gcc_usb4_sys_ready(unsigned int port, unsigned int timeout_us)
++{
++	const struct glymur_usb4_gcc_regs *r = glymur_usb4_regs(port);
++	u32 val;
++
++	if (!r)
++		return -ENODEV;
++	return regmap_read_poll_timeout(glymur_gcc_regmap, r->sys, val,
++					!(val & CBCR_CLK_OFF), 10, timeout_us);
++}
++EXPORT_SYMBOL_GPL(glymur_gcc_usb4_sys_ready);
++
+ static int gcc_glymur_probe(struct platform_device *pdev)
+ {
+-	return qcom_cc_probe(pdev, &gcc_glymur_desc);
++	int ret;
++
++	ret = qcom_cc_probe(pdev, &gcc_glymur_desc);
++	if (ret)
++		return ret;
++	glymur_gcc_regmap = dev_get_regmap(&pdev->dev, NULL);
++	return 0;
+ }
+ 
+ static struct platform_driver gcc_glymur_driver = {
+diff --git a/include/linux/soc/qcom/glymur-usb4.h b/include/linux/soc/qcom/glymur-usb4.h
+new file mode 100644
+index 00000000000..1a7fc952a99
+--- /dev/null
++++ b/include/linux/soc/qcom/glymur-usb4.h
+@@ -0,0 +1,56 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/*
++ * Glymur GCC operations required by the USB4 host router startup sequence.
++ *
++ * These registers belong to the global clock controller but are not ordinary
++ * clock enables: the router startup sequence toggles them at fixed points
++ * between resets, firmware upload and PHY initialization. They are exposed as
++ * narrow checked operations owned by the GCC driver, not as fake clocks or
++ * resets. Only USB4 ports 0 and 1 are described.
++ */
++#ifndef __LINUX_SOC_QCOM_GLYMUR_USB4_H
++#define __LINUX_SOC_QCOM_GLYMUR_USB4_H
++
++#include <linux/errno.h>
++#include <linux/types.h>
++
++#if IS_ENABLED(CONFIG_CLK_GLYMUR_GCC)
++/* Switch both RX clock muxes: gates off, selectors to PHY (true) or TCXO, gates on. */
++int glymur_gcc_usb4_rx_select(unsigned int port, bool phy);
++/* Set or clear the unnamed control bit pulsed during router startup. */
++int glymur_gcc_usb4_ctrl_bit(unsigned int port, bool set);
++/* CBCR_FORCE_MEM_CORE_ON on the router SYS branch, after firmware upload. */
++int glymur_gcc_usb4_sys_force_mem(unsigned int port, bool on);
++/* Hardware clock gating bit of the USB PIPE branch. */
++int glymur_gcc_usb4_pipe_hwcg(unsigned int port, bool enable);
++/* Poll the SYS branch CLK_OFF status clear after reset deassert. */
++int glymur_gcc_usb4_sys_ready(unsigned int port, unsigned int timeout_us);
++#else
++static inline int glymur_gcc_usb4_rx_select(unsigned int port, bool phy)
++{
++	return -ENODEV;
++}
++
++static inline int glymur_gcc_usb4_ctrl_bit(unsigned int port, bool set)
++{
++	return -ENODEV;
++}
++
++static inline int glymur_gcc_usb4_sys_force_mem(unsigned int port, bool on)
++{
++	return -ENODEV;
++}
++
++static inline int glymur_gcc_usb4_pipe_hwcg(unsigned int port, bool enable)
++{
++	return -ENODEV;
++}
++
++static inline int glymur_gcc_usb4_sys_ready(unsigned int port,
++					    unsigned int timeout_us)
++{
++	return -ENODEV;
++}
++#endif
++
++#endif
+-- 
+2.56.0
+

@@ -1,0 +1,86 @@
+#!/bin/bash
+# Decide what "Unpublish retired packages" may take out, per channel and
+# architecture.
+#
+#   unpublish-plan --channels "<edge rc stable>" <pkgbase...>
+#
+# An entry can go from a channel and architecture no recipe on this checkout
+# publishes it to: its recipe is gone, or it no longer builds for that
+# architecture (pinta is aarch64-only). Every recipe publishes to every
+# channel, edge first and the rest by promotion. One a recipe still publishes
+# there would come back on its next publish, so it is
+# kept, and a package kept everywhere it was asked for is refused: that keeps
+# a typo from pulling a live package out of every channel.
+#
+# A pkgbase is matched to its recipe through the pkgbase the recipe builds,
+# which is not always its directory's name (yaru-icon-theme builds yaru), as
+# promote-channel does.
+#
+# Prints one RETIRE_<CHANNEL>_<ARCH>="<pkgbase...>" line per channel and
+# architecture, for $GITHUB_ENV; refusals go to stderr as GitHub errors.
+# OMARCHY_PKGBUILDS names another recipe directory (tests).
+set -euo pipefail
+ROOT=$(realpath "${BASH_SOURCE[0]%/*}/..")
+source "$ROOT/helpers/package-metadata.sh"
+PKGBUILDS_DIR=${OMARCHY_PKGBUILDS:-$ROOT/pkgbuilds}
+ARCHES=(x86_64 aarch64)
+
+channels=""
+if [[ ${1:-} == --channels ]]; then
+  channels=${2:-}
+  shift $(( $# > 1 ? 2 : 1 ))
+fi
+[[ -n $channels && $# -gt 0 ]] || { echo "::error::usage: unpublish-plan --channels \"<edge rc stable>\" <pkgbase...>" >&2; exit 1; }
+for c in $channels; do
+  [[ $c == edge || $c == rc || $c == stable ]] || { echo "::error::Unknown channel: $c" >&2; exit 1; }
+done
+
+# The pkgbase a recipe builds for an architecture. Unlike package_pkgbase, a
+# PKGBUILD that fails to source is an error rather than its directory's name:
+# a recipe missing from the lookup would read as gone and be retired.
+recipe_pkgbase() { # recipe_pkgbase <pkgdir> <arch>
+  (cd "$1" && env -u OMARCHY_SRC CARCH="$2" bash -c '
+    source PKGBUILD >/dev/null 2>&1 || exit 1
+    base=${pkgbase:-${pkgname[0]:-}}
+    [[ -n $base ]] && printf "%s\n" "$base"
+  ')
+}
+
+# Recipes by the pkgbase they build on each architecture.
+declare -A RECIPE=()
+for arch in "${ARCHES[@]}"; do
+  while IFS= read -r pkgdir; do
+    base=$(recipe_pkgbase "$pkgdir" "$arch") || { echo "::error::Cannot read pkgbuilds/${pkgdir##*/}/PKGBUILD for $arch; not planning anything" >&2; exit 1; }
+    RECIPE[$arch/$base]=$pkgdir
+  done < <(package_dirs)
+done
+
+declare -A retire=()
+for p in "$@"; do
+  [[ $p =~ ^[a-z0-9@._+-]+$ ]] || { echo "::error::Not a package name: $p" >&2; exit 1; }
+  kept=0 asked=0
+  for c in $channels; do
+    for arch in "${ARCHES[@]}"; do
+      asked=$((asked + 1))
+      pkgdir=${RECIPE[$arch/$p]:-}
+      [[ -n $pkgdir || ! -e $PKGBUILDS_DIR/$p ]] || pkgdir=$PKGBUILDS_DIR/$p
+      if [[ -n $pkgdir ]] && package_supports_arch "$pkgdir" "$arch"; then
+        echo "Keeping $p in $c/$arch: pkgbuilds/${pkgdir##*/} still publishes it there" >&2
+        kept=$((kept + 1))
+      else
+        retire[$c/$arch]+=" $p"
+      fi
+    done
+  done
+  if (( kept == asked )); then
+    echo "::error::$p is still published to every channel and architecture asked for; remove its recipe or drop the architecture first" >&2
+    exit 1
+  fi
+done
+
+for c in edge rc stable; do
+  for arch in "${ARCHES[@]}"; do
+    list=${retire[$c/$arch]:-}
+    echo "RETIRE_${c^^}_${arch^^}=${list# }"
+  done
+done

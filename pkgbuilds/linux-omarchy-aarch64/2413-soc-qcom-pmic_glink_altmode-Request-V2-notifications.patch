@@ -1,0 +1,121 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jim Martin <jimmartin@gmail.com>
+Date: Thu, 8 Oct 2026 15:50:58 -0500
+Subject: [PATCH] soc: qcom: pmic_glink_altmode: Request V2 notifications on
+ Glymur USB4 boards
+
+The PAN_EN request that enables pin-assignment notifications takes an
+argument. Bits 0-2 select the notification version (1 for "V2") and
+bits 3-6 an environment field (1 for an installed operating system).
+The driver always sends 0, the legacy format.
+
+With the legacy argument the Glymur firmware on the Surface Laptop 8
+never reports the tunneling mux state, so a USB4 or Thunderbolt partner
+is never entered and the port stays in USB3 or DisplayPort alternate
+mode. With the V2 argument it reports the tunneling state and the TBT3
+and USB4 notifications.
+
+Send the V2 argument on "qcom,glymur-pmic-glink" when the board
+describes an enabled Glymur USB4 host router and its driver is built,
+and keep 0 otherwise, so that boards without a USB4 connection manager
+keep their USB3 and DisplayPort fallback. Decode the V2 fields of the
+orientation and mux bytes only when V2 was requested; the legacy
+notifications are read as before. The value matches what the platform's
+Windows driver sends on this laptop.
+
+Tested only on the Surface Laptop 8.
+
+Assisted-by: Opus 5.5
+Signed-off-by: Jim Martin <jimmartin@gmail.com>
+---
+ drivers/soc/qcom/pmic_glink_altmode.c | 45 ++++++++++++++++++++++-----
+ 1 file changed, 38 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/soc/qcom/pmic_glink_altmode.c b/drivers/soc/qcom/pmic_glink_altmode.c
+index c4b378144dc..c1caea6527c 100644
+--- a/drivers/soc/qcom/pmic_glink_altmode.c
++++ b/drivers/soc/qcom/pmic_glink_altmode.c
+@@ -32,6 +32,14 @@
+ #define ALTMODE_PAN_EN		0x10
+ #define ALTMODE_PAN_ACK		0x11
+ 
++/*
++ * PAN_EN argument for Glymur: bits 0-2 select the pin-assignment notification
++ * version (1 = "V2"), bits 3-6 an environment field (1 for an installed
++ * operating system). With the legacy argument 0 the firmware of the Surface
++ * Laptop 8 never reports the tunneling mux state, so USB4 is never negotiated.
++ */
++#define ALTMODE_PAN_EN_V2_ARG	(1 | (1 << 3))
++
+ struct usbc_write_req {
+ 	struct pmic_glink_hdr   hdr;
+ 	__le32 cmd;
+@@ -129,6 +137,7 @@ struct pmic_glink_altmode {
+ 	struct device *dev;
+ 
+ 	unsigned int owner_id;
++	u32 pan_en_arg;
+ 
+ 	/* To synchronize WRITE_REQ acks */
+ 	struct mutex lock;
+@@ -507,13 +516,19 @@ static void pmic_glink_altmode_sc8280xp_notify(struct pmic_glink_altmode *altmod
+ 	 * V2 pin-assignment notifications (PAN_EN argument with version 1) pack
+ 	 * a protocol version into bits 5-7 of the orientation byte and a reset
+ 	 * request into bits 5-7 of the mux byte; the DSDT's PBUF layout (BORI,
+-	 * BVER, BMUX, BRST) documents the fields. Mask them off so a V2 message
+-	 * does not read as an unknown orientation.
++	 * BVER, BMUX, BRST) documents the fields. When V2 was requested, mask
++	 * them off so a V2 message does not read as an unknown orientation.
+ 	 */
+-	orientation = notify->orientation & 0x3;
+-	version = notify->orientation >> 5;
+-	mux_ctrl = notify->mux_ctrl & 0xf;
+-	reset = notify->mux_ctrl >> 5;
++	orientation = notify->orientation;
++	mux_ctrl = notify->mux_ctrl;
++	version = 0;
++	reset = 0;
++	if (altmode->pan_en_arg) {
++		orientation &= 0x3;
++		version = notify->orientation >> 5;
++		mux_ctrl &= 0xf;
++		reset = notify->mux_ctrl >> 5;
++	}
+ 
+ 	dev_dbg(altmode->dev,
+ 		"PAN port %u orientation %u version %u mux %u reset %u vid %#x svid %#x ext %*ph\n",
+@@ -589,7 +604,9 @@ static void pmic_glink_altmode_enable_worker(struct work_struct *work)
+ 	struct pmic_glink_altmode *altmode = work_to_altmode(work);
+ 	int ret;
+ 
+-	ret = pmic_glink_altmode_request(altmode, ALTMODE_PAN_EN, 0);
++	dev_dbg(altmode->dev, "enabling pin-assignment notifications, PAN_EN arg %#x\n",
++		altmode->pan_en_arg);
++	ret = pmic_glink_altmode_request(altmode, ALTMODE_PAN_EN, altmode->pan_en_arg);
+ 	if (ret)
+ 		dev_err(altmode->dev, "failed to request altmode notifications: %d\n", ret);
+ }
+@@ -630,6 +647,20 @@ static int pmic_glink_altmode_probe(struct auxiliary_device *adev,
+ 	else
+ 		altmode->owner_id = PMIC_GLINK_OWNER_USBC_PAN;
+ 
++	/*
++	 * Ask for V2 notifications only where a USB4 host router driver can
++	 * take the USB4/TBT modes they negotiate. Other Glymur boards keep the
++	 * legacy notifications and their USB3/DP fallback.
++	 */
++	if (IS_ENABLED(CONFIG_USB4_QCOM) &&
++	    of_device_is_compatible(dev->parent->of_node, "qcom,glymur-pmic-glink")) {
++		struct device_node *usb4 __free(device_node) =
++			of_find_compatible_node(NULL, NULL, "qcom,glymur-usb4");
++
++		if (usb4 && of_device_is_available(usb4))
++			altmode->pan_en_arg = ALTMODE_PAN_EN_V2_ARG;
++	}
++
+ 	INIT_WORK(&altmode->enable_work, pmic_glink_altmode_enable_worker);
+ 	init_completion(&altmode->pan_ack);
+ 	mutex_init(&altmode->lock);
+-- 
+2.56.0
+

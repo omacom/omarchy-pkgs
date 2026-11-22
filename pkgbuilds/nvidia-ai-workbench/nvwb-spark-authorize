@@ -1,0 +1,91 @@
+#!/usr/bin/python3
+"""Authorize the invoking desktop user for the packaged Workbench service."""
+import json
+import os
+from pathlib import Path
+import pwd
+import re
+import subprocess
+import sys
+import tempfile
+
+# The GB10 superchip's GPU (DGX Spark and other GB10 systems), as
+# omarchy-hw-platform identifies the platform.
+GB10_GPU = ('0x10de', '0x2e12')
+PCI_DEVICES = Path('/sys/bus/pci/devices')
+
+
+def gb10_present(devices=PCI_DEVICES):
+    for device in devices.iterdir():
+        try:
+            ids = tuple((device / name).read_text().strip() for name in ('vendor', 'device'))
+        except OSError:
+            continue
+        if ids == GB10_GPU:
+            return True
+    return False
+
+
+def configure_docker():
+    """Register NVIDIA's runtime with Docker and restart a running daemon that lacks it.
+
+    The running daemon is asked rather than the file compared, so a retry after
+    an interrupted restart still restarts. A stopped daemon reads the file when
+    it starts, and asking it would start it through its socket. The query names
+    the local socket so that a Docker context root has selected cannot answer
+    for docker.service.
+    """
+    subprocess.run(['/usr/bin/nvidia-ctk', 'runtime', 'configure', '--runtime=docker'], check=True)
+    if subprocess.run(['/usr/bin/systemctl', 'is-active', '--quiet', 'docker.service']).returncode != 0:
+        return
+    info = subprocess.run(['/usr/bin/docker', '--host', 'unix:///run/docker.sock', 'info', '--format', '{{json .Runtimes}}'],
+                          capture_output=True, text=True, check=True)
+    if 'nvidia' not in json.loads(info.stdout):
+        subprocess.run(['/usr/bin/systemctl', 'restart', 'docker.service'], check=True)
+
+
+def account(environ):
+    user = environ.get('SUDO_USER', '')
+    if not re.fullmatch(r'[a-z_][a-z0-9_-]*', user):
+        raise ValueError('run this helper through sudo as your desktop user')
+    entry = pwd.getpwnam(user)
+    if entry.pw_uid == 0 or str(entry.pw_uid) != environ.get('SUDO_UID'):
+        raise ValueError('invalid invoking user')
+    if entry.pw_dir != '/home/' + user:
+        raise ValueError('Workbench requires a /home/<username> home directory')
+    return entry
+
+
+def policy(user):
+    unit = f'nvwb-spark@{user}.service'
+    commands = ', '.join(f'/usr/bin/systemctl {verb} {unit}' for verb in ('enable', 'start', 'stop'))
+    return f'{user} ALL=(root) NOPASSWD: {commands}\n'
+
+
+def main():
+    if os.geteuid() != 0 or len(sys.argv) != 1:
+        raise SystemExit('Run sudo /usr/lib/nvwb-spark/authorize without arguments.')
+    if not gb10_present():
+        raise SystemExit('This Workbench package supports only NVIDIA GB10 systems such as the DGX Spark.')
+    try:
+        entry = account(os.environ)
+    except (ValueError, KeyError) as error:
+        raise SystemExit(str(error))
+    user = entry.pw_name
+    directory = Path('/etc/sudoers.d')
+    fd, temporary = tempfile.mkstemp(prefix='.nvwb-', dir=directory)
+    try:
+        with os.fdopen(fd, 'w') as stream:
+            stream.write(policy(user))
+        os.chmod(temporary, 0o440)
+        subprocess.run(['/usr/bin/visudo', '-cf', temporary], check=True)
+        configure_docker()
+        subprocess.run(['/usr/bin/usermod', '-aG', 'docker', user], check=True)
+        os.replace(temporary, directory / ('nvwb-spark-' + user))
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+if __name__ == '__main__':
+    main()

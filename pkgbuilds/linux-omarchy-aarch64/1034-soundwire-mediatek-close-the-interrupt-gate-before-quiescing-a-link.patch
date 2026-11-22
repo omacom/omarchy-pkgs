@@ -1,0 +1,132 @@
+From: Ryan Hughes <ryan@heyoodle.com>
+Date: Sat, 10 Oct 2026 21:30:00 -0400
+Subject: [PATCH] soundwire: mediatek: close the interrupt gate before
+ quiescing a link
+
+mtk_sdw_enable_irq(false) cleared interrupt_enabled, then waited for a
+running status work in cancel_delayed_work_sync(), and only then cleared
+MCP_INT_IRQ. Until then the line stayed live, and the status work it was
+waiting for re-enables the slave interrupts as it finishes. A slave
+interrupt in that window reached the handler with interrupt_enabled
+false, which clears the status but neither masks it nor schedules the
+status work. A peripheral sitting at Dev0 raises its attach status again
+as soon as it is cleared, so the handler ran back to back, printing a
+line every time.
+
+On the ASUS ProArt P14 the attach check (2 s after the link comes up)
+hit that window on every boot of one kernel build. The level interrupt
+is handled on CPU0, where the status work was also queued, so the work
+never finished, the cancel never returned and the gate stayed open:
+"[1]slave attached int IntStatus:0x80002000" about every 100 us, a
+million times per boot, "ClearStatus 0x80002000" showing the flag was
+off, and the boot never got past Plymouth. The same build in the
+fallback entry was still storming nine minutes in. Earlier builds hit
+the window too but escaped after a few hundred interrupts.
+
+Close the gate first when disabling, so nothing can arrive once the
+flag is cleared, and open it last when enabling, as before. Mask the
+slave interrupts in the handler whenever it sees one, not only when
+interrupt processing is on: at probe and during a reset nothing handles
+them, and mtk_sdw_enable_irq(true) unmasks them again. Rate-limit the
+handler's slave status messages, so a storm from any other cause cannot
+also flood the console.
+---
+ drivers/soundwire/mediatek/mtk-sdw-core.c | 59 ++++++++++++++++++++---------
+ 1 file changed, 39 insertions(+), 20 deletions(-)
+
+diff --git a/drivers/soundwire/mediatek/mtk-sdw-core.c b/drivers/soundwire/mediatek/mtk-sdw-core.c
+--- a/drivers/soundwire/mediatek/mtk-sdw-core.c
++++ b/drivers/soundwire/mediatek/mtk-sdw-core.c
+@@ -692,6 +692,19 @@
+ 
+ void mtk_sdw_enable_irq(struct mtk_sdw_core *core, bool enable)
+ {
++	/*
++	 * Close the interrupt gate first when disabling. While it is open,
++	 * a slave interrupt that arrives once interrupt_enabled is false is
++	 * cleared but neither masked nor handed to the status work, and the
++	 * status work cancelled below re-enables the slave interrupts as it
++	 * finishes. A peripheral sitting at Dev0 raises its attach status
++	 * again as soon as it is cleared, so the window became an interrupt
++	 * storm on the CPU that had to finish the status work, the cancel
++	 * never returned and the gate stayed open for good.
++	 */
++	if (!enable)
++		mtk_sdw_update_intmask(core, MCP_INT_IRQ, 0);
++
+ 	if (enable) {
+ 		core_writel(core, MCP_SLAVEINTMASK0, MCP_SLAVE_INTMASK0_MASK);
+ 		core_writel(core, MCP_SLAVEINTMASK1, MCP_SLAVE_INTMASK1_MASK);
+@@ -724,7 +737,8 @@
+ 		cancel_delayed_work_sync(&core->status_work);
+ 	}
+ 
+-	mtk_sdw_update_intmask(core, MCP_INT_IRQ, enable ? MCP_INT_IRQ : 0);
++	if (enable)
++		mtk_sdw_update_intmask(core, MCP_INT_IRQ, MCP_INT_IRQ);
+ }
+ 
+ void mtk_sdw_enable_slave_irq(struct mtk_sdw_core *core, bool enable)
+@@ -1152,37 +1166,42 @@
+ 
+ 	if (intstat & MCP_INT_SLV_MASK) {
+ 		if (intstat & MCP_INT_SLV_RESERVED) {
+-			dev_info(core->dev, "[%u]slave reserved int IntStatus:0x%x\n",
+-				 bus->link_id, intstat);
++			dev_info_ratelimited(core->dev,
++					     "[%u]slave reserved int IntStatus:0x%x\n",
++					     bus->link_id, intstat);
+ 		}
+ 
+ 		if (intstat & MCP_INT_SLV_ALERT) {
+-			dev_info(core->dev,
+-				 "[%u]slave alert int IntStatus:0x%x\n",
+-				 bus->link_id, intstat);
++			dev_info_ratelimited(core->dev,
++					     "[%u]slave alert int IntStatus:0x%x\n",
++					     bus->link_id, intstat);
+ 		}
+ 
+ 		if (intstat & MCP_INT_SLV_ATTACHED) {
+-			dev_info(core->dev,
+-				 "[%u]slave attached int IntStatus:0x%x\n",
+-				 bus->link_id, intstat);
++			dev_info_ratelimited(core->dev,
++					     "[%u]slave attached int IntStatus:0x%x\n",
++					     bus->link_id, intstat);
+ 		}
+ 
+ 		if (intstat & MCP_INT_SLV_NOT_ATTACH) {
+-			dev_info(core->dev,
+-				 "[%u]slave not attached int IntStatus:0x%x\n",
+-				 bus->link_id, intstat);
++			dev_info_ratelimited(core->dev,
++					     "[%u]slave not attached int IntStatus:0x%x\n",
++					     bus->link_id, intstat);
+ 		}
++		/*
++		 * Mask before scheduling: the work re-enables the slave
++		 * interrupt when it finishes, so masking after
++		 * schedule_delayed_work() races a work that completes on
++		 * another CPU first and leaves the interrupt masked forever
++		 * (all subsequent attach/detach transitions are then lost).
++		 *
++		 * Mask while interrupt processing is off too (at probe, or
++		 * while a reset quiesces the link): nothing handles the
++		 * status then, and a peripheral at Dev0 raises it again as
++		 * fast as it is cleared. mtk_sdw_enable_irq(true) unmasks it.
++		 */
++		mtk_sdw_enable_slave_irq(core, false);
+ 		if (core->interrupt_enabled) {
+-			/*
+-			 * Mask before scheduling: the work re-enables the
+-			 * slave interrupt when it finishes, so masking after
+-			 * schedule_delayed_work() races a work that completes
+-			 * on another CPU first and leaves the interrupt
+-			 * masked forever (all subsequent attach/detach
+-			 * transitions are then lost).
+-			 */
+-			mtk_sdw_enable_slave_irq(core, false);
+ 			schedule_delayed_work(&core->status_work, 0);
+ 			clearstat &= ~MCP_INT_SLV_MASK;
+ 		}
