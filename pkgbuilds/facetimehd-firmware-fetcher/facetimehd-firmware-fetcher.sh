@@ -176,10 +176,20 @@ activate_driver() {
   acknowledge
 }
 
+# A camera that is present but not working gets activated too, even with nothing to fetch: a driver DKMS built after
+# boot had found the camera never loads on its own. One blacklisted on purpose stays out.
+needs_activation() {
+  [[ -e $activate ]] && return 0
+  modprobe -c 2>/dev/null | grep -x 'blacklist facetimehd' >/dev/null && return 1
+  ! camera_ready
+}
+
 mapfile -t missing < <(wanted)
 if (( ${#missing[@]} == 0 )); then
   echo "FaceTime HD firmware and calibration are installed in $dest"
-  [[ ${1:-} == --reload && -e $activate ]] && activate_driver
+  if [[ ${1:-} == --reload ]] && needs_activation; then
+    activate_driver
+  fi
   exit 0
 fi
 
@@ -221,6 +231,11 @@ done
 # so a fetch stopped in between leaves nothing unrecorded, and renamed into place, so the kernel never reads half a file.
 touch "$activate"
 for name in "${missing[@]}"; do
+  # A package can install the file while this downloads, and then it is that package's.
+  if owned_elsewhere "$dest/$name"; then
+    echo "Leaving $name to the package that now installs it"
+    continue
+  fi
   grep -qxF "$name" "$state/installed-files" 2>/dev/null || echo "$name" >>"$state/installed-files"
   install -Dm644 "$work/$name" "$dest/.$name.new"
   mv -f "$dest/.$name.new" "$dest/$name"
