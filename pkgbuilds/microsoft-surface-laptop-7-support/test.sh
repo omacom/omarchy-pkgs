@@ -68,4 +68,44 @@ report=$(SL7_BATTERY_OUT="$scratch/out/none" SL7_BATTERY_SYSFS="$scratch/sysfs" 
 [[ $report == *'not read yet'* && $report == *'Charge limit    start below 75%, stop at 80%'* ]] ||
   fail "without a reading the command still reports what Linux knows"
 
-echo "ok - Surface Laptop 7 battery reader and command"
+# The front camera relay.
+bash -n "$package_dir/surface-laptop-7-camera-gain" || fail "the camera gain helper has valid syntax"
+mkdir -p "$scratch/v4l/v4l-subdev3" "$scratch/v4l/v4l-subdev7"
+echo 'ov02c10 12-0036' >"$scratch/v4l/v4l-subdev3/name"
+echo 'vd55g0 11-0010' >"$scratch/v4l/v4l-subdev7/name"
+printf '#!/bin/sh\necho "$@" >>"%s/ctl.log"\n' "$scratch" >"$scratch/v4l2-ctl"
+chmod +x "$scratch/v4l2-ctl"
+SL7_CAMERA_SYSFS="$scratch/v4l" SL7_CAMERA_V4L2_CTL="$scratch/v4l2-ctl" sh "$package_dir/surface-laptop-7-camera-gain" 2048
+[[ $(<"$scratch/ctl.log") == '-d /dev/v4l-subdev3 -c digital_gain=2048' ]] ||
+  fail "only the OV02C10 gets the digital gain"
+mkdir -p "$scratch/none"
+SL7_CAMERA_SYSFS="$scratch/none" SL7_CAMERA_V4L2_CTL=false sh "$package_dir/surface-laptop-7-camera-gain" ||
+  fail "the gain helper leaves a machine without the sensor alone"
+
+dropin="$package_dir/v4l2-relayd-surface-laptop-7.service.conf"
+for model in romulus13 romulus15; do
+  grep -qx "ConditionFirmware=|device-tree-compatible(microsoft,$model)" "$dropin" ||
+    fail "the relay runs on the Surface Laptop 7 ($model)"
+done
+(( $(grep -c '^ConditionFirmware=' "$dropin") == 2 )) || fail "the relay runs on no other machine"
+grep -qx 'DeviceAllow=char-dma_heap rw' "$dropin" || fail "the software ISP can allocate its buffers"
+! grep -q '^DeviceAllow=$' "$dropin" || fail "the relay keeps its own device list"
+
+relay="$package_dir/v4l2-relayd-surface-laptop-7.conf"
+(
+  source "$relay"
+  [[ $VIDEOSRC == 'libcamerasrc camera-name=/base/soc@0/cci@ac16000/i2c-bus@1/camera@36 '* ]] ||
+    fail "the relay opens the front camera by its device tree path"
+  [[ $VIDEOSRC == *"width=${WIDTH},height=${HEIGHT}"* ]] || fail "the relay's source and output sizes agree"
+  [[ $CARD_LABEL == 'Front Camera' ]] || fail "the relay fills the Front Camera device"
+)
+grep -q 'card_label="Front Camera"' "$package_dir/surface-laptop-7-camera-modprobe.conf" ||
+  fail "the loopback device is the one the relay fills"
+grep -q 'blackLevel: 4096' "$package_dir/ov02c10.yaml" || fail "the tuning gives the sensor's black level"
+
+cameras="$package_dir/50-surface-laptop-7-cameras.conf"
+grep -q 'api.libcamera.path = "/base/soc@0/cci@ac16000/i2c-bus@1/camera@36"' "$cameras" ||
+  fail "pickers don't offer the camera the relay owns"
+grep -q 'device.bus-path = "platform-acb7000.isp"' "$cameras" || fail "pickers don't offer the raw camera nodes"
+
+echo "ok - Surface Laptop 7 battery reader, command and front camera relay"
