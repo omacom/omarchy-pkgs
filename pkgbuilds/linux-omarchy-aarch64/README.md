@@ -474,6 +474,8 @@ USB-C charging is the gap. The laptop's Samsung S2MM006 PD controller agrees on 
 
 `2790` adds the compatible to the board binding, and `2786` already covers it for QSEECOM as an X1P42100. systemd doesn't list the laptop, so the package installs `x1p42100-samsung-galaxy-book4-edge-15.json` with the two hardware IDs anatase-org carries for it. Samsung puts the keyboard's country in the board name, so units sold elsewhere may report IDs these don't cover.
 
+The tree describes one touchpad, the Zinitix part at 0x40 on `i2c13`, and Samsung fits other touchpads in this chassis. `linux-omarchy-dtbs`'s `0070` adds the Elan one an NP750XQB has, at 0x15 with its HID descriptor at 0x1.
+
 The Galaxy Book5 Edge 5G (NP755XRA, X1-26-100) is the same board with a 5G modem. Samsung's Windows Update bundle for it (System Hardware Update 200.0.11.0) installs its audio extension, `qcaudminiportNX15M5G`, on `SUBSYS_CA09144D`, which Samsung's own INF comments call NX15, and the audio and compute DSP board trees in its `adsp_dtbs.elf` and `cdsp_dtbs.elf` are byte for byte the ones `samsung-galaxy-book4-edge-15-firmware` installs. So it boots this tree with that firmware, and `x1p42100-samsung-galaxy-book5-edge-5g.json` in `linux-omarchy-dtbs` points its hardware IDs at this compatible. The manufacturer, family and product name (`SAMSUNG ELECTRONICS CO., LTD.`, `Galaxy Book5 Edge 5G` for both) come from the laptop's Geekbench results, and its SKU, `GALAXY A5A5-PALD`, from Windows Update, which publishes Samsung's bundle under the ID made of all four. The file has that ID and the one without the SKU. The tree doesn't describe the modem. Not booted on the laptop yet.
 
 ### ASUS Vivobook S14
