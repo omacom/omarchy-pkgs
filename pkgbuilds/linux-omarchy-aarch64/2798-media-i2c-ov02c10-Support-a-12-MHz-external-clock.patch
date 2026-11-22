@@ -1,0 +1,149 @@
+From f72a4cc4e398c837a40eacff69d30343800b789d Mon Sep 17 00:00:00 2001
+From: Chris McLaughlin <19711592+qBitnaut@users.noreply.github.com>
+Date: Thu, 8 Oct 2026 13:16:56 -0500
+Subject: [PATCH] media: i2c: ov02c10: Support a 12 MHz external clock
+
+The Microsoft Surface Laptop 7 drives its OV02C10 from a fixed 12 MHz
+clock, not the 19.2 MHz the driver insists on, as reported on linux-media
+by Ryan Thomas Cragun on 2026-07-02. Sakari Ailus replied that the driver
+should support 12 MHz and derive the pixel rate from the external clock.
+
+The register settings are unchanged. Run from a 12 MHz reference they
+generate a 250 MHz link frequency (500 Mb/s per lane) instead of 400 MHz,
+and the horizontal timing stays at 2280 sensor clocks, so the pixel rate
+is 250 MHz * 2 * lanes / 10 = 100 MHz for two lanes. The unmodified
+driver on a Surface Laptop 7 streams at 18.8 fps (30 * 12 / 19.2 = 18.75)
+and 30 fps is reached by lowering the frame length to 1462 lines.
+
+Add the 250 MHz link frequency and accept a 12 MHz clock in probe. The
+clock and the link-frequencies property must agree: 19.2 MHz with 400 MHz
+and 12 MHz with 250 MHz, anything else is refused. The pixel rate control
+already follows the selected link frequency.
+
+The default frame length was the minimum frame length times the lane
+count, which is 30 fps only at 400 MHz. Scale it with the link frequency
+in one helper used both when creating the controls and when setting the
+format, so that the default stays at about 30 fps (2328 lines at 400 MHz,
+1455 lines at 250 MHz). Behaviour with a 19.2 MHz clock is unchanged.
+
+Reported-by: Ryan Thomas Cragun
+Signed-off-by: Chris McLaughlin <19711592+qBitnaut@users.noreply.github.com>
+Link: https://github.com/qBitnaut/omarchy-dragon-sl7/blob/de20e9ba631c44fa9ca218bd94fd5888a08d427c/pkgs/linux-sl7/patches/0099-media-i2c-ov02c10-Support-a-12-MHz-external-clock.patch
+[Felipe: make the link frequency control report the selected entry. Its
+ default index was 0, so with a 12 MHz clock it still read 400 MHz, and
+ CAMSS takes the CSIPHY timing from that control. Tested on a Surface
+ Laptop 7 15": 30.00 fps where the unpatched driver gave 18.78.]
+Signed-off-by: Felipe Infante de Castro <18445184+fidecastro@users.noreply.github.com>
+Assisted-by: Claude Fable 5.2
+---
+ drivers/media/i2c/ov02c10.c | 46 +++++++++++++++++++++++++++++++++----
+ 1 file changed, 41 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/media/i2c/ov02c10.c b/drivers/media/i2c/ov02c10.c
+index cf93d36..644785e 100644
+--- a/drivers/media/i2c/ov02c10.c
++++ b/drivers/media/i2c/ov02c10.c
+@@ -15,7 +15,9 @@
+ #include <media/v4l2-fwnode.h>
+ 
+ #define OV02C10_LINK_FREQ_400MHZ	400000000ULL
++#define OV02C10_LINK_FREQ_250MHZ	250000000ULL
+ #define OV02C10_MCLK			19200000
++#define OV02C10_MCLK_12MHZ		12000000
+ #define OV02C10_RGB_DEPTH		10
+ 
+ #define OV02C10_REG_CHIP_ID		CCI_REG16(0x300a)
+@@ -340,6 +342,7 @@ static const char * const ov02c10_test_pattern_menu[] = {
+ 
+ static const s64 link_freq_menu_items[] = {
+ 	OV02C10_LINK_FREQ_400MHZ,
++	OV02C10_LINK_FREQ_250MHZ,
+ };
+ 
+ static const struct ov02c10_mode supported_modes[] = {
+@@ -486,6 +489,23 @@ static const struct v4l2_ctrl_ops ov02c10_ctrl_ops = {
+ 	.s_ctrl = ov02c10_set_ctrl,
+ };
+ 
++/*
++ * The mode timings are specified for the 400 MHz link frequency. Scale the
++ * default frame length with the link frequency so that the default frame
++ * rate stays at 30 fps for the 250 MHz link used with a 12 MHz clock. The
++ * frame length is also multiplied by the lane count, see the comment in
++ * ov02c10_init_controls().
++ */
++static u32 ov02c10_default_vts(const struct ov02c10 *ov02c10,
++			       const struct ov02c10_mode *mode)
++{
++	u64 vts = (u64)mode->vts_min * ov02c10->mipi_lanes;
++
++	vts *= link_freq_menu_items[ov02c10->link_freq_index];
++
++	return div_u64(vts, OV02C10_LINK_FREQ_400MHZ);
++}
++
+ static int ov02c10_init_controls(struct ov02c10 *ov02c10)
+ {
+ 	struct v4l2_ctrl_handler *ctrl_hdlr = &ov02c10->ctrl_handler;
+@@ -500,7 +520,8 @@ static int ov02c10_init_controls(struct ov02c10 *ov02c10)
+ 	ov02c10->link_freq = v4l2_ctrl_new_int_menu(ctrl_hdlr,
+ 						    &ov02c10_ctrl_ops,
+ 						    V4L2_CID_LINK_FREQ,
+-						    ov02c10->link_freq_index, 0,
++						    ov02c10->link_freq_index,
++						    ov02c10->link_freq_index,
+ 						    link_freq_menu_items);
+ 	if (ov02c10->link_freq)
+ 		ov02c10->link_freq->flags |= V4L2_CTRL_FLAG_READ_ONLY;
+@@ -517,7 +538,7 @@ static int ov02c10_init_controls(struct ov02c10 *ov02c10)
+ 	 * For default multiple min by number of lanes to keep the default
+ 	 * FPS the same indepenedent of the lane count.
+ 	 */
+-	vts_def = mode->vts_min * ov02c10->mipi_lanes;
++	vts_def = ov02c10_default_vts(ov02c10, mode);
+ 
+ 	vblank_min = mode->vts_min - mode->height;
+ 	vblank_max = OV02C10_VTS_MAX - mode->height;
+@@ -715,7 +736,7 @@ static int ov02c10_set_format(struct v4l2_subdev *sd,
+ 		return 0;
+ 
+ 	/* Update limits and set FPS to default */
+-	vblank_def = mode->vts_min * ov02c10->mipi_lanes - mode->height;
++	vblank_def = ov02c10_default_vts(ov02c10, mode) - mode->height;
+ 	__v4l2_ctrl_modify_range(ov02c10->vblank, mode->vts_min - mode->height,
+ 				 OV02C10_VTS_MAX - mode->height, 1, vblank_def);
+ 	__v4l2_ctrl_s_ctrl(ov02c10->vblank, vblank_def);
+@@ -892,9 +913,9 @@ static int ov02c10_probe(struct i2c_client *client)
+ 				     "failed to get imaging clock\n");
+ 
+ 	freq = clk_get_rate(ov02c10->img_clk);
+-	if (freq != OV02C10_MCLK)
++	if (freq != OV02C10_MCLK && freq != OV02C10_MCLK_12MHZ)
+ 		return dev_err_probe(ov02c10->dev, -EINVAL,
+-				     "external clock %lu is not supported",
++				     "external clock %lu is not supported\n",
+ 				     freq);
+ 
+ 	v4l2_i2c_subdev_init(&ov02c10->sd, client, &ov02c10_subdev_ops);
+@@ -904,6 +925,21 @@ static int ov02c10_probe(struct i2c_client *client)
+ 	if (ret)
+ 		return ret;
+ 
++	/*
++	 * The register settings generate a 400 MHz link from a 19.2 MHz clock
++	 * and a 250 MHz link from a 12 MHz clock.
++	 */
++	if ((freq == OV02C10_MCLK &&
++	     link_freq_menu_items[ov02c10->link_freq_index] !=
++	     OV02C10_LINK_FREQ_400MHZ) ||
++	    (freq == OV02C10_MCLK_12MHZ &&
++	     link_freq_menu_items[ov02c10->link_freq_index] !=
++	     OV02C10_LINK_FREQ_250MHZ))
++		return dev_err_probe(ov02c10->dev, -EINVAL,
++				     "link frequency %lld Hz does not match external clock %lu Hz\n",
++				     link_freq_menu_items[ov02c10->link_freq_index],
++				     freq);
++
+ 	ret = ov02c10_get_pm_resources(ov02c10->dev);
+ 	if (ret)
+ 		return ret;

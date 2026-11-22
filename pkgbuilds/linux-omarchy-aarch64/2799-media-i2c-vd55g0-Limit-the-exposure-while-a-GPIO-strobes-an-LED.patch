@@ -1,0 +1,273 @@
+From 970120b11749a0df1d73b93e5ac4a1ecb4d307e0 Mon Sep 17 00:00:00 2001
+From: Felipe Infante de Castro <18445184+fidecastro@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 21:20:51 -0500
+Subject: [PATCH] media: i2c: vd55g0: Limit the exposure while a GPIO strobes
+ an LED
+
+A sensor GPIO named by "st,leds" is high for the exposure of every frame
+while the flash LED mode control is on. On the Microsoft Surface Laptop 7
+sensor GPIO 1 switches the infrared emitter directly, with no
+current-limited flash driver in between (Windows writes 0x02, strobe, to
+register 0x0468 for this module). The exposure is then the emitter's
+on-time and the frame length its period, and the driver follows whatever
+the controls ask for: auto exposure, the default, can reach nearly the
+whole frame in a dark room. That is an eye and thermal safety matter.
+
+While the strobe is on, whatever the controls say:
+
+ - exposure is manual and at most 100 lines;
+ - the frame is at least 1750 lines long.
+
+These are the values Windows programs for this module (0x044e = 100,
+0x0458 = 1750). At the driver's 1200-pixel line that is an on-time of
+about 1.5 ms and a duty of at most 5.7 %.
+
+Every write of the exposure mode, the manual exposure and the frame length
+goes through the limit. At stream start the GPIO becomes a strobe output
+only after the limited settings are written. When the control is switched
+on mid-stream the limits are written first and the GPIO follows two frame
+periods later, since a frame already exposing keeps its old timing;
+switching off does the reverse. The controls keep their values and apply
+again once the strobe is off. The limits are only given up once the GPIO
+is known to be off: if the write that switches the strobe off fails, they
+stay in force. The effective timing is logged.
+
+Nothing changes for a sensor without "st,leds", which is every tree in
+this kernel today, or while the flash LED mode control is off.
+
+Tested on a Surface Laptop 7 15" with "st,leds = <1>": with the control
+on, the log shows "IR strobe limited to 100 exposure lines in 1860" and
+the frames are lit by the emitter; with it off they are not.
+
+Assisted-by: Claude Fable 5.2
+Signed-off-by: Felipe Infante de Castro <18445184+fidecastro@users.noreply.github.com>
+---
+ drivers/media/i2c/vd55g0.c | 148 +++++++++++++++++++++++++++++++++----
+ 1 file changed, 134 insertions(+), 14 deletions(-)
+
+diff --git a/drivers/media/i2c/vd55g0.c b/drivers/media/i2c/vd55g0.c
+index a62a99f..41efd1f 100644
+--- a/drivers/media/i2c/vd55g0.c
++++ b/drivers/media/i2c/vd55g0.c
+@@ -512,6 +512,46 @@ static int vd55g0_set_gpios_array(struct vd55g0_dev *sensor, u32 *array,
+ 	return 0;
+ }
+ 
++/*
++ * IR strobe limits.
++ *
++ * A sensor GPIO named by "st,leds" is high for the exposure of every frame
++ * while the flash LED mode control is on. Where that GPIO switches an
++ * infrared emitter directly (Surface Laptop 7: GPIO 1, no current-limited
++ * flash driver in between), the exposure is the emitter's on-time and the
++ * frame length its period, so both are an eye and thermal safety matter.
++ *
++ * While the strobe is on, whatever the controls say:
++ *  - exposure is manual (auto exposure has no known ceiling) and at most
++ *    100 lines;
++ *  - the frame is at least 1750 lines long.
++ * These are the values Windows programs for this module (0x044e = 100,
++ * 0x0458 = 1750): an on-time of about 1.5 ms and a duty of at most 5.7 %.
++ * The controls keep their values and apply again once the strobe is off.
++ */
++#define VD55G0_STROBE_MAX_EXPO				100
++#define VD55G0_STROBE_MIN_FRAME_LENGTH			1750
++
++static bool vd55g0_strobe_armed(struct vd55g0_dev *sensor)
++{
++	return sensor->flash_en && sensor->gpios.leds[0] != ~0;
++}
++
++static u16 vd55g0_frame_length_to_apply(struct vd55g0_dev *sensor)
++{
++	if (vd55g0_strobe_armed(sensor))
++		return max_t(u16, sensor->frame_length,
++			     VD55G0_STROBE_MIN_FRAME_LENGTH);
++	return sensor->frame_length;
++}
++
++static u16 vd55g0_expo_to_apply(struct vd55g0_dev *sensor)
++{
++	if (vd55g0_strobe_armed(sensor))
++		return min_t(u16, sensor->manual_expo, VD55G0_STROBE_MAX_EXPO);
++	return sensor->manual_expo;
++}
++
+ static int vd55g0_apply_exposure_auto(struct vd55g0_dev *sensor)
+ {
+ 	enum vd55g0_expo_state exp = sensor->expo_state;
+@@ -519,6 +559,9 @@ static int vd55g0_apply_exposure_auto(struct vd55g0_dev *sensor)
+ 	if (sensor->ae_frozen && sensor->expo_state == VD55G0_EXP_AUTO)
+ 		exp = VD55G0_EXP_FREEZE;
+ 
++	if (vd55g0_strobe_armed(sensor))
++		exp = VD55G0_EXP_MANUAL;
++
+ 	return vd55g0_write_reg(sensor, VD55G0_REG_EXP_MODE, exp, NULL);
+ }
+ 
+@@ -564,18 +607,22 @@ static int vd55g0_apply_patgen(struct vd55g0_dev *sensor)
+ 	return vd55g0_write_reg(sensor, VD55G0_REG_PATGEN_CTRL, reg, NULL);
+ }
+ 
+-static int vd55g0_apply_flash(struct vd55g0_dev *sensor)
++static int vd55g0_set_strobe(struct vd55g0_dev *sensor, bool on)
+ {
+ 	struct vd55g0_gpios *gpios = &sensor->gpios;
+ 
+-	enum vd55g0_gpio_modes mode = sensor->flash_en ?
+-				      VD55G0_GPIO_MODE_STROBE :
+-				      VD55G0_GPIO_MODE_DISABLED;
++	enum vd55g0_gpio_modes mode = on ? VD55G0_GPIO_MODE_STROBE :
++					   VD55G0_GPIO_MODE_DISABLED;
+ 
+ 	return vd55g0_set_gpios_array(sensor, gpios->leds,
+ 				      ARRAY_SIZE(gpios->leds), mode);
+ }
+ 
++static int vd55g0_apply_flash(struct vd55g0_dev *sensor)
++{
++	return vd55g0_set_strobe(sensor, sensor->flash_en);
++}
++
+ static int vd55g0_update_exposure_auto(struct vd55g0_dev *sensor, u32 index)
+ {
+ 	switch (index) {
+@@ -630,7 +677,7 @@ static int vd55g0_get_temp_stream_enable(struct vd55g0_dev *sensor, int *temp)
+ static int vd55g0_apply_framelength(struct vd55g0_dev *sensor)
+ {
+ 	return vd55g0_write_reg(sensor, VD55G0_REG_FRAME_LENGTH,
+-				sensor->frame_length, NULL);
++				vd55g0_frame_length_to_apply(sensor), NULL);
+ }
+ 
+ static int vd55g0_update_vblank(struct vd55g0_dev *sensor, u16 vblank)
+@@ -697,7 +744,7 @@ static int vd55g0_update_exposure(struct vd55g0_dev *sensor, int expo_ms)
+ 	if (sensor->streaming)
+ 		return vd55g0_write_reg(sensor,
+ 					VD55G0_REG_MANUAL_COARSE_EXPOSURE,
+-					sensor->manual_expo, NULL);
++					vd55g0_expo_to_apply(sensor), NULL);
+ 
+ 	return 0;
+ }
+@@ -731,12 +778,76 @@ static int vd55g0_update_exposure_target(struct vd55g0_dev *sensor, int index)
+ 	return 0;
+ }
+ 
++static int vd55g0_apply_strobe_limits(struct vd55g0_dev *sensor)
++{
++	int ret;
++
++	ret = vd55g0_apply_framelength(sensor);
++	if (ret)
++		return ret;
++
++	ret = vd55g0_apply_exposure_auto(sensor);
++	if (ret)
++		return ret;
++
++	return vd55g0_write_reg(sensor, VD55G0_REG_MANUAL_COARSE_EXPOSURE,
++				vd55g0_expo_to_apply(sensor), NULL);
++}
++
+ static int vd55g0_update_flash(struct vd55g0_dev *sensor, int flash_en)
+ {
+-	sensor->flash_en = flash_en;
+-	if (sensor->streaming)
+-		return vd55g0_apply_flash(sensor);
++	struct i2c_client *client = v4l2_get_subdevdata(&sensor->sd);
++	int ret;
+ 
++	if (!sensor->streaming) {
++		/* Stream start applies the limits before the strobe output. */
++		sensor->flash_en = flash_en;
++		return 0;
++	}
++
++	if (!flash_en) {
++		/*
++		 * Strobe output off first, then the controls' own timing.
++		 * The limits stay in force unless the output is known to be
++		 * off: if that write fails a GPIO may still be strobing.
++		 */
++		ret = vd55g0_set_strobe(sensor, false);
++		if (ret)
++			return ret;
++		sensor->flash_en = false;
++		return vd55g0_apply_strobe_limits(sensor);
++	}
++
++	/*
++	 * Limits first. A frame already exposing keeps its old timing, so
++	 * wait two frame periods (about 16 us a line) before the GPIO becomes
++	 * a strobe output.
++	 */
++	sensor->flash_en = true;
++	ret = vd55g0_apply_strobe_limits(sensor);
++	if (ret) {
++		sensor->flash_en = false;
++		return ret;
++	}
++	msleep(10 + 2 * vd55g0_frame_length_to_apply(sensor) * 16 / 1000);
++
++	ret = vd55g0_set_strobe(sensor, true);
++	if (ret) {
++		/*
++		 * With several LED GPIOs some may be strobing already. Give
++		 * the limits up only if they can all be switched off again.
++		 */
++		if (!vd55g0_set_strobe(sensor, false)) {
++			sensor->flash_en = false;
++			vd55g0_apply_strobe_limits(sensor);
++		}
++		return ret;
++	}
++
++	dev_info(&client->dev,
++		 "IR strobe limited to %u exposure lines in %u\n",
++		 vd55g0_expo_to_apply(sensor),
++		 vd55g0_frame_length_to_apply(sensor));
+ 	return 0;
+ }
+ 
+@@ -818,7 +929,7 @@ static int vd55g0_apply_settings(struct vd55g0_dev *sensor)
+ 		return ret;
+ 
+ 	vd55g0_write_reg(sensor, VD55G0_REG_MANUAL_COARSE_EXPOSURE,
+-			 sensor->manual_expo, &ret);
++			 vd55g0_expo_to_apply(sensor), &ret);
+ 	vd55g0_write_reg(sensor, VD55G0_REG_MANUAL_ANALOG_GAIN,
+ 			 sensor->analog_gain, &ret);
+ 	vd55g0_write_reg(sensor, VD55G0_REG_MANUAL_DIGITAL_GAIN,
+@@ -896,10 +1007,6 @@ static int vd55g0_set_gpios(struct vd55g0_dev *sensor)
+ 			return ret;
+ 	}
+ 
+-	ret = vd55g0_apply_flash(sensor);
+-	if (ret)
+-		return ret;
+-
+ 	ret = vd55g0_set_gpios_array(sensor, gpios->out_sync,
+ 				     ARRAY_SIZE(gpios->out_sync),
+ 				     VD55G0_GPIO_MODE_VSYNC_OUT_0);
+@@ -952,6 +1059,19 @@ static int vd55g0_stream_enable(struct vd55g0_dev *sensor)
+ 	if (ret)
+ 		goto err_rpm_put;
+ 
++	/*
++	 * Strobe output last, once frame length and exposure (limited while
++	 * the strobe is on) have been written.
++	 */
++	ret = vd55g0_apply_flash(sensor);
++	if (ret)
++		goto err_rpm_put;
++	if (vd55g0_strobe_armed(sensor))
++		dev_info(&client->dev,
++			 "IR strobe limited to %u exposure lines in %u\n",
++			 vd55g0_expo_to_apply(sensor),
++			 vd55g0_frame_length_to_apply(sensor));
++
+ 	ret = vd55g0_write_reg(sensor, VD55G0_REG_SW_STBY,
+ 			       VD55G0_SW_STBY_START_STREAM, NULL);
+ 	if (ret)
