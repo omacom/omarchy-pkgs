@@ -182,7 +182,13 @@ async function prepareHyprWindow(client) {
 
 async function tick() {
   const current = session;
-  if (!current || current.busy || !current.win || current.win.isDestroyed()) return;
+  if (!current) return;
+  // Returning here leaves the 20 ms timer and the input fds open.
+  if (!current.win || current.win.isDestroyed()) {
+    finishDrag();
+    return;
+  }
+  if (current.busy) return;
   if (buttonReleased()) {
     finishDrag();
     return;
