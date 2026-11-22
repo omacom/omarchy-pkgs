@@ -28,7 +28,7 @@ The package contains no Microsoft or Qualcomm firmware; `microsoft-surface-lapto
   - On a 13.8", indoors: the darkest tenth of the picture went from 53 to 32 of 255 with the black level, and average brightness from 73 to 128 with the digital gain, at 18.8 fps throughout. The 15" has the same camera on the same bus and hasn't been tested.
 - **Camera pickers**: a WirePlumber rule that leaves "Front Camera" as the only camera. It hides the monochrome infrared sensor (ST VD55G0, 15"), the front camera's own libcamera entry, which the relay owns, and the camera subsystem's 16 raw `qcom-camss` nodes (bus path `platform-acb7000.isp`), none of them a usable camera. The libcamera rules name the sensors by their device tree paths, so they do nothing on a tree without them.
 
-The battery timer and its service check for the `microsoft,romulus15` device tree and do nothing elsewhere. The 13.8" model has the same controller and most likely the same placeholder battery data, but it hasn't been tested, so it isn't included.
+The battery timer and its service check for the `microsoft,romulus13` or `microsoft,romulus15` device tree and do nothing elsewhere. Tested on a 13.8": 69 cycles, 94% health, same placeholder battery data as the 15".
 
 ## Retirement
 

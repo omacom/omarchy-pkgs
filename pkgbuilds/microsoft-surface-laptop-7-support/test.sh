@@ -27,6 +27,7 @@ EOF_PY
 
 printf 'microsoft,romulus15\0qcom,x1e80100\0' >"$scratch/romulus15"
 printf 'microsoft,romulus13\0qcom,x1e80100\0' >"$scratch/romulus13"
+printf 'microsoft,denali\0qcom,x1e80100\0' >"$scratch/other-surface"
 
 read_pack() {
   SL7_BATTERY_COMPATIBLE="$scratch/$1" SL7_BATTERY_RESPONSE="$scratch/$2" \
@@ -47,8 +48,20 @@ fi
 read_pack romulus15 bix.mah mah || fail "a response in mAh is read"
 ! grep -q capacity "$scratch/out/mah" || fail "capacities in mAh are not published as mWh"
 
-read_pack romulus13 bix other || fail "another laptop is left alone without an error"
+read_pack romulus13 bix romulus13-out || fail "the 13.8\" is read"
+grep -qx 'cycle_count=204' "$scratch/out/romulus13-out" || fail "the 13.8\" cycle count is published"
+
+read_pack other-surface bix other || fail "another laptop is left alone without an error"
 [[ ! -e $scratch/out/other ]] || fail "nothing is read on another laptop"
+
+for unit in service timer; do
+  f="$package_dir/surface-laptop-7-battery-info.$unit"
+  for model in romulus13 romulus15; do
+    grep -qx "ConditionFirmware=|device-tree-compatible(microsoft,$model)" "$f" ||
+      fail "the battery $unit runs on the Surface Laptop 7 ($model)"
+  done
+  (( $(grep -c '^ConditionFirmware=' "$f") == 2 )) || fail "the battery $unit runs on no other machine"
+done
 
 # The command, on a fixture battery at 66% with a 75/80 limit.
 mkdir -p "$scratch/sysfs"
