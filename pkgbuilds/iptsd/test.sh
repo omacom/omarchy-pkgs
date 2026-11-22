@@ -73,7 +73,10 @@ grep -q '^PositionSlop = 0.25$' "$package_dir/surface-laptop-7-15.conf" ||
   fail "a tap on the Surface Laptop 7 15\" touchscreen stays in place"
 grep -q '^  ./test-position-slop$' "$package_dir/PKGBUILD" ||
   fail "the position slop is checked against contacts that land, move and lift"
-grep -q 'install -Dm644 surface-laptop-7-15.conf -t "$pkgdir/usr/share/iptsd"' "$package_dir/PKGBUILD" ||
-  fail "the Surface Laptop 7 15\" preset is installed where iptsd reads presets"
+grep -q 'install -Dm644 surface-laptop-7-15.conf surface-laptop-7-13.conf -t "$pkgdir/usr/share/iptsd"' "$package_dir/PKGBUILD" ||
+  fail "the Surface Laptop 7 15\" and 13.8\" presets are installed where iptsd reads presets"
+grep -qx 'Product = 0x0C6E' "$package_dir/surface-laptop-7-13.conf" &&
+  grep -qx 'PositionSlop = 0.25' "$package_dir/surface-laptop-7-13.conf" ||
+  fail "the position slop covers the Surface Laptop 7 13.8\" touchscreen"
 
 echo "ok - iptsd builds pinned upstream source against Arch libraries"
