@@ -49,6 +49,8 @@ grep -q 'suspend.target.wants/iptsd-romulus15-resume.service' "$package_dir/PKGB
 
 grep -q 'multi-user.target.wants/iptsd-romulus15-boot.service' "$package_dir/PKGBUILD" ||
   fail "the boot-time start is enabled by the package"
+grep -qx 'Type=exec' "$package_dir/iptsd-romulus15-boot.service" ||
+  fail "the boot-time start doesn't hold up multi-user.target"
 bash -n "$package_dir/iptsd-romulus15-boot" ||
   fail "the boot-time start script has valid syntax"
 
