@@ -1,6 +1,6 @@
 # microsoft-surface-laptop-7-support
 
-Hardware support for the Microsoft Surface Laptop 7 15" with Snapdragon X Elite (`microsoft,romulus15`) that no upstream package carries yet. Omarchy's Surface Laptop 7 hardware setup (`install/hardware/microsoft/surface-laptop-7.sh`) installs it.
+Hardware support for the Microsoft Surface Laptop 7 with Snapdragon X Elite, 15" (`microsoft,romulus15`) and 13.8" (`microsoft,romulus13`), that no upstream package carries yet. Omarchy's Surface Laptop 7 hardware setup (`install/hardware/microsoft/surface-laptop-7.sh`) installs it.
 
 The package contains no Microsoft or Qualcomm firmware; `microsoft-surface-laptop-7-firmware` carries that.
 
@@ -19,11 +19,19 @@ The package contains no Microsoft or Qualcomm firmware; `microsoft-surface-lapto
     ```
 
   UPower and the bar's battery tooltip still show 0 cycles, because they read the kernel. Fixing that there takes a change in both `qcom_battmgr` and the Surface drivers: a power-supply extension can't supply a property the battery already has.
-- **Cameras**: a WirePlumber rule that hides the monochrome infrared sensor (ST VD55G0) from camera pickers, so apps see only the front camera. It names the sensor by its device tree path, so it does nothing until the laptop's tree describes the sensor.
+- **Front camera as a webcam.** The front camera (OmniVision OV02C10) is a raw sensor that only libcamera can run, through its simple pipeline and software ISP. Apps that read only V4L2 cameras, such as Monologue and anything built on Qt Multimedia's FFmpeg backend, found no camera. As Omarchy's IPU7 camera does with icamerasrc, the package relays it to a regular V4L2 device:
+  - `v4l2loopback-dkms` builds the module on the machine, so the running kernel needs its headers: `linux-omarchy-headers` on the Omarchy kernel, which Omarchy's installer provides. The kernel package lists them as optional, and no package here depends on them, as `intel-ipu7-camera` doesn't. Without them DKMS can't build the module and the camera has no V4L2 device.
+  - `v4l2loopback` creates `/dev/video50`, "Front Camera" (`/usr/lib/modprobe.d/surface-laptop-7-camera.conf`).
+  - `v4l2-relayd@surface-laptop-7`, enabled by the package, fills it from `libcamerasrc` while an app has it open. The pipeline is in `/etc/v4l2-relayd.d/surface-laptop-7.conf`. 1080p is scaled to 720p, which averages out much of the software ISP's noise, a 5-pixel median takes out the speckle left, and contrast 1.25 and saturation 1.4 make up for the untuned sensor's flat picture. Its drop-in runs it only on the two Surface Laptop 7 trees, and adds the DMA heap and udmabuf devices the software ISP allocates its buffers from, which the relay's sandbox doesn't list.
+  - `/usr/share/libcamera/ipa/simple/ov02c10.yaml` gives the software ISP the sensor's black level (64 at 10 bits). Without it libcamera guessed one and the picture came out grey. It also runs an identity colour matrix, so the Saturation control takes effect.
+  - Indoors, auto-exposure runs out of exposure (33 ms at 30 fps) and analogue gain (15.5x), and libcamera 0.7's simple pipeline neither lengthens frames nor uses the sensor's digital gain. So the picture stays dark. `surface-laptop-7-camera-gain` sets a fixed 2x digital gain before the relay starts; in bright light auto-exposure lowers the analogue gain to match.
+  - On a 13.8", indoors: the darkest tenth of the picture went from 53 to 32 of 255 with the black level, and average brightness from 73 to 128 with the digital gain, at 18.8 fps throughout. The 15" has the same camera on the same bus and hasn't been tested.
+- **Camera pickers**: a WirePlumber rule that leaves "Front Camera" as the only camera. It hides the monochrome infrared sensor (ST VD55G0, 15"), the front camera's own libcamera entry, which the relay owns, and the camera subsystem's 16 raw `qcom-camss` nodes (bus path `platform-acb7000.isp`), none of them a usable camera. The libcamera rules name the sensors by their device tree paths, so they do nothing on a tree without them.
 
-The timer and its service check for the `microsoft,romulus15` device tree and do nothing elsewhere. The 13.8" model (`microsoft,romulus13`) has the same controller and most likely the same placeholder battery data, but it hasn't been tested, so it isn't included.
+The battery timer and its service check for the `microsoft,romulus13` or `microsoft,romulus15` device tree and do nothing elsewhere. Tested on a 13.8": 69 cycles, 94% health, same placeholder battery data as the 15".
 
 ## Retirement
 
 - Battery: drop once the kernel's battery reports the pack's cycle count and identity.
-- Cameras: keep while the laptop's tree describes the infrared sensor.
+- Camera relay: drop once the apps Omarchy ships read cameras through PipeWire or libcamera. Drop the digital gain once libcamera's simple pipeline uses it, or lengthens frames, and the tuning file once libcamera ships one for the OV02C10.
+- Camera pickers: keep while the laptop's tree describes the infrared sensor, and while the relay owns the front camera.
