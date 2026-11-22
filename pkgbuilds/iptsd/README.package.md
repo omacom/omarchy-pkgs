@@ -18,6 +18,8 @@ That touchpad has no moving parts: it measures force and reports its click in a 
 
 Its touchscreen took light taps for drags: the reported position of a tap shifts by up to 2 mm while the finger lands, about as far as applications allow before a touch becomes a drag. `0002-contacts-Add-a-position-slop-for-new-contacts.patch` adds a `PositionSlop` option that keeps a new contact where it first appeared until it has moved that far, and `surface-laptop-7-15.conf`, installed to `/usr/share/iptsd`, sets it to 2.5 mm for that touchscreen only (HID `045E:0C6F`). No other device is affected. Upstream has no tests, so `check()` runs `test-position-slop.cpp` against the patched stabilizer. Sent upstream as linux-surface/iptsd#238; drop the patch and the test when the pinned commit includes it.
 
+The touchpad (`045E:0C77`, both sizes) stuttered and then jumped on fast swipes. iptsd marks a contact unstable, and skips its frame, when its orientation changes by more than `OrientationThresholdMax` (15 degrees) between frames. A fingertip on this pad is nearly round, so its orientation flips between 0 (aspect below 1.1) and about 110 degrees, and in a fast swipe a frame was dropped and the next one moved twice as far, which pointer acceleration then threw further. `surface-laptop-7-touchpad.conf`, installed to `/usr/share/iptsd`, raises that threshold to 180 for this touchpad only, since the pointer doesn't use orientation. On a 13.8", held frames inside fast motion went from 27 in 1656 to 2 in 643.
+
 ## Retirement
 
 Drop once Arch Linux ARM packages iptsd, or once the Surface Pro 11's pen and the Surface Laptop 7's touchpad work through the kernel alone.

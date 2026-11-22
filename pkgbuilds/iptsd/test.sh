@@ -52,6 +52,12 @@ grep -q 'multi-user.target.wants/iptsd-romulus15-boot.service' "$package_dir/PKG
 bash -n "$package_dir/iptsd-romulus15-boot" ||
   fail "the boot-time start script has valid syntax"
 
+grep -qx 'Product = 0x0C77' "$package_dir/surface-laptop-7-touchpad.conf" &&
+  grep -qx 'OrientationThresholdMax = 180' "$package_dir/surface-laptop-7-touchpad.conf" ||
+  fail "the Surface Laptop 7 touchpad keeps contacts whose orientation flips"
+grep -q 'install -Dm644 surface-laptop-7-touchpad.conf -t "$pkgdir/usr/share/iptsd"' "$package_dir/PKGBUILD" ||
+  fail "the touchpad config is installed"
+
 grep -q 'ForceButton = 0x96' "$package_dir/0001-ipts-Handle-the-button-report-of-force-touchpads.patch" ||
   fail "the force touchpad's button report is read"
 grep -q 'patch -d iptsd -Np1 -i ../0001-ipts-Handle-the-button-report-of-force-touchpads.patch' "$package_dir/PKGBUILD" ||
