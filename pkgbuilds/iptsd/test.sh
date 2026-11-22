@@ -32,15 +32,21 @@ done
 grep -q "sed -i 's/ACTION==\"add\"/ACTION!=\"remove\"/'" "$package_dir/PKGBUILD" ||
   fail "a udev change event, such as pacman's rule reload, keeps iptsd running"
 
-grep -q 'ConditionFirmware=device-tree-compatible(microsoft,romulus15)' \
-  "$package_dir/iptsd-romulus15-resume.service" ||
-  fail "the resume restart stays off every machine but the Surface Laptop 7 15"
+for model in romulus15 romulus13; do
+  grep -qx "ConditionFirmware=|device-tree-compatible(microsoft,$model)" \
+    "$package_dir/iptsd-romulus15-resume.service" ||
+    fail "the resume restart runs on the Surface Laptop 7 ($model)"
+  grep -qx "ConditionFirmware=|device-tree-compatible(microsoft,$model)" \
+    "$package_dir/iptsd-romulus15-boot.service" ||
+    fail "the boot-time start runs on the Surface Laptop 7 ($model)"
+done
+(( $(grep -c '^ConditionFirmware=' "$package_dir/iptsd-romulus15-resume.service") == 2 )) ||
+  fail "the resume restart stays off every machine but the Surface Laptop 7"
+(( $(grep -c '^ConditionFirmware=' "$package_dir/iptsd-romulus15-boot.service") == 2 )) ||
+  fail "the boot-time start stays off every machine but the Surface Laptop 7"
 grep -q 'suspend.target.wants/iptsd-romulus15-resume.service' "$package_dir/PKGBUILD" ||
   fail "the resume restart is enabled by the package"
 
-grep -q 'ConditionFirmware=device-tree-compatible(microsoft,romulus15)' \
-  "$package_dir/iptsd-romulus15-boot.service" ||
-  fail "the boot-time start stays off every machine but the Surface Laptop 7 15\""
 grep -q 'multi-user.target.wants/iptsd-romulus15-boot.service' "$package_dir/PKGBUILD" ||
   fail "the boot-time start is enabled by the package"
 bash -n "$package_dir/iptsd-romulus15-boot" ||
