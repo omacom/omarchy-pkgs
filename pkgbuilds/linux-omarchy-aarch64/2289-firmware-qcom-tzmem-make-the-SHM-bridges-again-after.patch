@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Birk Skyum <birk.skyum@pm.me>
 Date: Mon, 23 Nov 2026 11:22:24 +0100
-Subject: [PATCH 10/19] firmware: qcom: tzmem: make the SHM bridges again after
+Subject: [PATCH] firmware: qcom: tzmem: make the SHM bridges again after
  hibernation
 
 A hibernation image is restored after a power cycle. The secure world then
@@ -18,22 +18,26 @@ or loading kernel, and on restore in the restored kernel. Export
 qcom_tzmem_bridges_suspended() so code that may run in between can skip its
 secure-world calls.
 
+A bridge that can't be created again is logged, its area is tried again at
+the next thaw or restore, and the error goes back through the PM callback.
+Until every area has its bridge, qcom_tzmem_bridges_suspended() stays true.
+
 Bridges created directly with qcom_tzmem_shm_bridge_create() by other
 drivers (qcomtee) are not covered.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
- drivers/firmware/qcom/qcom_scm.c         |  25 ++++++
- drivers/firmware/qcom/qcom_tzmem.c       | 107 ++++++++++++++++++++++-
+ drivers/firmware/qcom/qcom_scm.c         |  24 +++++
+ drivers/firmware/qcom/qcom_tzmem.c       | 121 ++++++++++++++++++++++-
  drivers/firmware/qcom/qcom_tzmem.h       |   2 +
  include/linux/firmware/qcom/qcom_tzmem.h |   1 +
- 4 files changed, 134 insertions(+), 1 deletion(-)
+ 4 files changed, 147 insertions(+), 1 deletion(-)
 
 diff --git a/drivers/firmware/qcom/qcom_scm.c b/drivers/firmware/qcom/qcom_scm.c
-index a41a0beb0..222f7f683 100644
+index a41a0beb0..8a20cfffe 100644
 --- a/drivers/firmware/qcom/qcom_scm.c
 +++ b/drivers/firmware/qcom/qcom_scm.c
-@@ -2996,11 +2996,36 @@ static const struct of_device_id qcom_scm_dt_match[] = {
+@@ -2996,11 +2996,35 @@ static const struct of_device_id qcom_scm_dt_match[] = {
  };
  MODULE_DEVICE_TABLE(of, qcom_scm_dt_match);
  
@@ -51,8 +55,7 @@ index a41a0beb0..222f7f683 100644
 +
 +static int qcom_scm_thaw_early(struct device *dev)
 +{
-+	qcom_tzmem_hibernate_reclaim();
-+	return 0;
++	return qcom_tzmem_hibernate_reclaim();
 +}
 +
 +static const struct dev_pm_ops qcom_scm_pm_ops = {
@@ -71,7 +74,7 @@ index a41a0beb0..222f7f683 100644
  	.probe = qcom_scm_probe,
  	.shutdown = qcom_scm_shutdown,
 diff --git a/drivers/firmware/qcom/qcom_tzmem.c b/drivers/firmware/qcom/qcom_tzmem.c
-index f926c1f64..0a64b5145 100644
+index f926c1f64..f4e2641d2 100644
 --- a/drivers/firmware/qcom/qcom_tzmem.c
 +++ b/drivers/firmware/qcom/qcom_tzmem.c
 @@ -30,9 +30,11 @@ struct qcom_tzmem_area {
@@ -105,7 +108,7 @@ index f926c1f64..0a64b5145 100644
  
  	return 0;
  }
-@@ -186,12 +193,104 @@ static void qcom_tzmem_cleanup_area(struct qcom_tzmem_area *area)
+@@ -186,12 +193,118 @@ static void qcom_tzmem_cleanup_area(struct qcom_tzmem_area *area)
  {
  	u64 *handle = area->priv;
  
@@ -143,14 +146,14 @@ index f926c1f64..0a64b5145 100644
 +	}
 +}
 +
-+static void qcom_tzmem_bridges_reclaim(void)
++static int qcom_tzmem_bridges_reclaim(void)
 +{
 +	struct qcom_tzmem_pool *pool;
 +	struct qcom_tzmem_area *area;
-+	int ret;
++	int ret, err = 0;
 +
 +	if (!qcom_tzmem_using_shm_bridge)
-+		return;
++		return 0;
 +
 +	guard(mutex)(&qcom_tzmem_pools_lock);
 +	list_for_each_entry(pool, &qcom_tzmem_pools, node) {
@@ -163,12 +166,20 @@ index f926c1f64..0a64b5145 100644
 +				dev_err(qcom_tzmem_dev,
 +					"SHM bridge for %pad+%zu not restored: %d\n",
 +					&area->paddr, area->size, ret);
++				if (!err)
++					err = ret;
 +				continue;
 +			}
 +			area->bridged = true;
 +		}
 +	}
-+	WRITE_ONCE(qcom_tzmem_bridges_down, false);
++	/*
++	 * An area left without its bridge is tried again at the next thaw or
++	 * restore; until then the bridges count as down.
++	 */
++	if (!err)
++		WRITE_ONCE(qcom_tzmem_bridges_down, false);
++	return err;
 +}
 +
  #endif /* CONFIG_QCOM_TZMEM_MODE_SHMBRIDGE */
@@ -186,11 +197,17 @@ index f926c1f64..0a64b5145 100644
 +
 +/**
 + * qcom_tzmem_hibernate_reclaim() - Create the SHM bridges again afterwards.
++ *
++ * Return: 0, or the first error of an area whose bridge could not be created.
++ * Such an area is tried again at the next call, and until then
++ * qcom_tzmem_bridges_suspended() stays true.
 + */
-+void qcom_tzmem_hibernate_reclaim(void)
++int qcom_tzmem_hibernate_reclaim(void)
 +{
 +#if IS_ENABLED(CONFIG_QCOM_TZMEM_MODE_SHMBRIDGE)
-+	qcom_tzmem_bridges_reclaim();
++	return qcom_tzmem_bridges_reclaim();
++#else
++	return 0;
 +#endif
 +}
 +
@@ -211,7 +228,7 @@ index f926c1f64..0a64b5145 100644
  static int qcom_tzmem_pool_add_memory(struct qcom_tzmem_pool *pool,
  				      size_t size, gfp_t gfp)
  {
-@@ -287,6 +386,9 @@ qcom_tzmem_pool_new(const struct qcom_tzmem_pool_config *config)
+@@ -287,6 +400,9 @@ qcom_tzmem_pool_new(const struct qcom_tzmem_pool_config *config)
  		}
  	}
  
@@ -221,7 +238,7 @@ index f926c1f64..0a64b5145 100644
  	return_ptr(pool);
  }
  EXPORT_SYMBOL_GPL(qcom_tzmem_pool_new);
-@@ -311,6 +413,9 @@ void qcom_tzmem_pool_free(struct qcom_tzmem_pool *pool)
+@@ -311,6 +427,9 @@ void qcom_tzmem_pool_free(struct qcom_tzmem_pool *pool)
  	if (!pool)
  		return;
  
@@ -232,7 +249,7 @@ index f926c1f64..0a64b5145 100644
  		radix_tree_for_each_slot(slot, &qcom_tzmem_chunks, &iter, 0) {
  			chunk = radix_tree_deref_slot_protected(slot,
 diff --git a/drivers/firmware/qcom/qcom_tzmem.h b/drivers/firmware/qcom/qcom_tzmem.h
-index 8fa8a3eb9..d1c554cba 100644
+index 8fa8a3eb9..d9e28254d 100644
 --- a/drivers/firmware/qcom/qcom_tzmem.h
 +++ b/drivers/firmware/qcom/qcom_tzmem.h
 @@ -9,5 +9,7 @@
@@ -240,7 +257,7 @@ index 8fa8a3eb9..d1c554cba 100644
  
  int qcom_tzmem_enable(struct device *dev);
 +void qcom_tzmem_hibernate_release(void);
-+void qcom_tzmem_hibernate_reclaim(void);
++int qcom_tzmem_hibernate_reclaim(void);
  
  #endif /* __QCOM_TZMEM_PRIV_H */
 diff --git a/include/linux/firmware/qcom/qcom_tzmem.h b/include/linux/firmware/qcom/qcom_tzmem.h
