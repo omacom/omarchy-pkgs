@@ -103,7 +103,7 @@ test('the workflow records failed outcomes despite successful conclusions and ke
   const keys = readFileSync(outputPath, 'utf8').trim().split('\n').map(line => line.slice('key='.length));
   assert.equal(keys[0], keys[1]);
   const record = JSON.parse(readFileSync(join(f.resultsPath, 'package-pr-results', `${keys[0]}.json`), 'utf8'));
-  assert.deepEqual(record, { ...f.groups[0], apply: 'success', pr: 'failure', merge: 'skipped', number: '' });
+  assert.deepEqual(record, { ...f.groups[0], apply: 'success', hold: 'skipped', pr: 'failure', merge: 'skipped', number: '' });
   const result = await f.invoke({ resultsPath: join(f.resultsPath, 'package-pr-results') });
   assert.equal(result.succeeded, true);
   assert.equal(result.updates.failing, 1);
@@ -118,6 +118,14 @@ test('apply and auto-merge errors are package results even when all packages fai
   assert.equal(result.updates.failing, 2);
   assert.match(result.content, /Could not apply the package update/);
   assert.match(result.content, /Could not enable auto-merge/);
+});
+
+test('a reviewed PR that could not be held as a draft is a package failure', async t => {
+  const f = fixture(t, 1);
+  Object.assign(f.results[0], { hold: 'failure', pr: 'skipped', merge: 'skipped' });
+  const result = await f.invoke();
+  assert.equal(result.updates.failing, 1);
+  assert.match(result.content, /Could not turn the reviewed PR back into a draft/);
 });
 
 test('unregistered and running checks are pending, never counted as passing', async t => {
@@ -249,10 +257,6 @@ const runNameExpression = upstreamWorkflow.match(/run-name: Sync upstream \(\$\{
 const evaluate = (expression, github, inputs) => new Function('github', 'inputs', `return (${expression})`)(github, inputs);
 
 for (const [name, event, inputs, expected] of [
-  ['hourly schedule', { schedule: '35 * * * *' }, {},
-    { cadence: 'hourly', lane: 'auto-merge', prefix: 'auto/track-branches', concurrency: 'track-branches' }],
-  ['six-hourly schedule', { schedule: '20 */6 * * *' }, {},
-    { cadence: 'six-hourly', lane: 'reviewed', prefix: 'auto/sync-upstream', concurrency: 'sync-upstream' }],
   ['manual hourly run', {}, { cadence: 'hourly' },
     { cadence: 'hourly', lane: 'auto-merge', prefix: 'auto/track-branches', concurrency: 'track-branches' }],
   ['manual six-hourly run', {}, { cadence: 'six-hourly' },
@@ -286,9 +290,11 @@ test('invalid cadence fails before selecting packages or PR branches', t => {
   assert.equal(existsSync(outputPath), false);
 });
 
-test('both original schedules have one shared workflow and the duplicate tracker is removed', () => {
-  assert.deepEqual([...upstreamWorkflow.matchAll(/- cron: '([^']+)'/g)].map(match => match[1]).sort(),
-    ['20 */6 * * *', '35 * * * *']);
+test('the controller box dispatches both cadences and GitHub schedules neither', () => {
+  assert.doesNotMatch(upstreamWorkflow, /^\s*schedule:/m);
+  const dispatch = readFileSync(join(__dirname, '../ci/dispatch.sh'), 'utf8');
+  assert.deepEqual([...dispatch.matchAll(/workflow=sync-upstream\.yml +inputs='\{"cadence":"([^"]+)"\}'/g)]
+    .map(match => match[1]).sort(), ['hourly', 'six-hourly']);
   assert.equal(existsSync(join(__dirname, '../.github/workflows/track-branches.yml')), false);
 });
 

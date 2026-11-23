@@ -1,0 +1,157 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jim Martin <jimmartin@gmail.com>
+Date: Thu, 8 Oct 2026 13:55:29 -0500
+Subject: [PATCH] phy: qcom: qmp-combo: Track whether the common block is
+ powered
+
+The Type-C orientation and mode switches reprogram a PHY that is in use
+by powering the common block down and up again with forced
+qmp_combo_com_exit() and qmp_combo_com_init() calls.
+qmp_combo_reconfigure_phy() ignores the result of both the common
+initialisation and the USB power-on. When the forced initialisation
+fails, it has already undone its regulator, reset and clock setup, but
+init_count still says that the block is in use:
+
+- qmp_combo_usb_power_on() and dp_aux_init() go on to write PHY
+  registers with no clocks running;
+- the next qmp_combo_usb_power_off(), qmp_combo_dp_power_off() or mode
+  switch writes registers of the unclocked block as well;
+- the last qmp_combo_com_exit() disables clocks and regulators that are
+  not enabled;
+- a later qmp_combo_com_init() from another user, or a mux event for
+  the same mode, sees a block in use and returns without powering it.
+
+Record whether the common block is actually powered. Skip the power-down
+register writes and the clock and regulator release when it is not, let
+the next qmp_combo_com_init() or mux event for the current mode power it
+up again, and propagate errors from qmp_combo_reconfigure_phy(). When the USB PHY
+does not start, the error is logged and returned but the common block
+stays powered, since DisplayPort may still be using it and its
+operations do not check that the block is powered.
+
+Assisted-by: Opus 5.5
+Signed-off-by: Jim Martin <jimmartin@gmail.com>
+---
+ drivers/phy/qualcomm/phy-qcom-qmp-combo.c | 37 ++++++++++++++++++-----
+ 1 file changed, 29 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/phy/qualcomm/phy-qcom-qmp-combo.c b/drivers/phy/qualcomm/phy-qcom-qmp-combo.c
+index 912939cfbd8..d70f9936c4e 100644
+--- a/drivers/phy/qualcomm/phy-qcom-qmp-combo.c
++++ b/drivers/phy/qualcomm/phy-qcom-qmp-combo.c
+@@ -2684,6 +2684,7 @@ struct qmp_combo {
+ 	struct phy *usb4_phy;
+ 	enum tbt_phy_submode usb4_phy_submode;
+ 	unsigned int usb4_init_count;
++	bool com_powered_on;
+ 
+ 	struct clk_fixed_rate pipe_clk_fixed;
+ 	struct clk_hw dp_link_hw;
+@@ -4273,7 +4274,7 @@ static int qmp_combo_com_init(struct qmp_combo *qmp, bool force)
+ 	int ret;
+ 	u32 val;
+ 
+-	if (!force && qmp->init_count++)
++	if (!force && qmp->init_count++ && qmp->com_powered_on)
+ 		return 0;
+ 
+ 	if (qmp->aon_toggle)
+@@ -4393,6 +4394,7 @@ static int qmp_combo_com_init(struct qmp_combo *qmp, bool force)
+ 	qphy_setbits(pcs, cfg->regs[QPHY_PCS_POWER_DOWN_CONTROL],
+ 			SW_PWRDN);
+ 
++	qmp->com_powered_on = true;
+ 	return 0;
+ 
+ err_disable_clocks:
+@@ -4415,6 +4417,10 @@ static int qmp_combo_com_exit(struct qmp_combo *qmp, bool force)
+ 	if (!force && --qmp->init_count)
+ 		return 0;
+ 
++	if (!qmp->com_powered_on)
++		return 0;
++	qmp->com_powered_on = false;
++
+ 	reset_control_bulk_assert(cfg->num_resets, qmp->resets);
+ 
+ 	clk_disable_unprepare(qmp->pipe_clk);
+@@ -4507,7 +4513,8 @@ static int qmp_combo_dp_power_off(struct phy *phy)
+ 	mutex_lock(&qmp->phy_mutex);
+ 
+ 	/* Assert DP PHY power down */
+-	writel(DP_PHY_PD_CTL_PSR_PWRDN, qmp->dp_dp_phy + QSERDES_DP_PHY_PD_CTL);
++	if (qmp->com_powered_on)
++		writel(DP_PHY_PD_CTL_PSR_PWRDN, qmp->dp_dp_phy + QSERDES_DP_PHY_PD_CTL);
+ 
+ 	qmp->dp_powered_on = false;
+ 
+@@ -4609,6 +4616,9 @@ static int qmp_combo_usb_power_off(struct phy *phy)
+ 	const struct qmp_phy_cfg *cfg = qmp->cfg;
+ 	void __iomem *pcs = qmp->pcs;
+ 
++	if (!qmp->com_powered_on)
++		return 0;
++
+ 	if (qmp->usb4_init_count)
+ 		pcs = qmp->usb4_pcs;
+ 
+@@ -4693,13 +4703,15 @@ static int qmp_combo_usb_set_mode(struct phy *phy, enum phy_mode mode, int submo
+ 
+ static int qmp_combo_reconfigure_phy(struct qmp_combo *qmp, enum qmpphy_mode new_mode)
+ {
++	int ret;
++
+ 	dev_dbg(qmp->dev, "qmp_combo_reconfigure_phy: switching from qmpphy mode %d to %d\n",
+ 		qmp->qmpphy_mode, new_mode);
+ 
+ 	if (qmp->usb_init_count || qmp->usb4_init_count)
+ 		qmp_combo_usb_power_off(qmp->usb_phy);
+ 
+-	if (qmp->dp_init_count)
++	if (qmp->dp_init_count && qmp->com_powered_on)
+ 		writel(DP_PHY_PD_CTL_PSR_PWRDN, qmp->dp_dp_phy + QSERDES_DP_PHY_PD_CTL);
+ 
+ 	qmp_combo_com_exit(qmp, true);
+@@ -4707,17 +4719,26 @@ static int qmp_combo_reconfigure_phy(struct qmp_combo *qmp, enum qmpphy_mode new
+ 	qmp->qmpphy_mode = new_mode;
+ 
+ 	/* Now everything's powered down, power up the right PHYs */
+-	qmp_combo_com_init(qmp, true);
++	ret = qmp_combo_com_init(qmp, true);
++	if (ret)
++		return ret;
+ 
+ 	if ((qmp->usb_init_count || qmp->usb4_init_count) &&
+-	    new_mode != QMPPHY_MODE_DP_ONLY)
+-		qmp_combo_usb_power_on(qmp->usb_phy);
++	    new_mode != QMPPHY_MODE_DP_ONLY) {
++		/*
++		 * Keep the common block up: DP may still hold it, and none of
++		 * the DP operations checks that it is powered.
++		 */
++		ret = qmp_combo_usb_power_on(qmp->usb_phy);
++		if (ret)
++			dev_err(qmp->dev, "USB PHY power-on failed: %d\n", ret);
++	}
+ 
+ 	if ((new_mode == QMPPHY_MODE_USB3DP || new_mode == QMPPHY_MODE_DP_ONLY) &&
+ 	    qmp->dp_init_count)
+ 		qmp->cfg->dp_aux_init(qmp);
+ 
+-	return 0;
++	return ret;
+ }
+ 
+ static int qmp_combo_usb4_init(struct phy *phy)
+@@ -5344,7 +5365,7 @@ static int qmp_combo_typec_mux_set(struct typec_mux_dev *mux, struct typec_mux_s
+ 		new_mode = QMPPHY_MODE_USB3_ONLY;
+ 	}
+ 
+-	if (new_mode == qmp->qmpphy_mode) {
++	if (new_mode == qmp->qmpphy_mode && qmp->com_powered_on) {
+ 		dev_dbg(qmp->dev, "typec_mux_set: same qmpphy mode, bail out\n");
+ 		return 0;
+ 	}
+-- 
+2.56.0
+

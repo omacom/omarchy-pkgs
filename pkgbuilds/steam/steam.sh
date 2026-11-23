@@ -27,6 +27,41 @@ if [[ -z $steamroot || ! -x $steamroot/steamrtarm64/steam ]]; then
   fi
 fi
 
+# The client sets Steam Play to the x86 Proton Experimental, which runs all of
+# Wine under FEX, though Valve ships Proton Experimental (ARM64) beside it.
+# Make that the default before the client first saves its settings. Steam keeps
+# a config it finds, so a later choice in Settings > Compatibility stays.
+config=$steamroot/config/config.vdf
+if [[ ! -e $config ]]; then
+  (
+    umask 077
+    mkdir -p "${config%/*}"
+    cat >"$config" <<'VDF'
+"InstallConfigStore"
+{
+  "Software"
+  {
+    "Valve"
+    {
+      "Steam"
+      {
+        "CompatToolMapping"
+        {
+          "0"
+          {
+            "name" "proton-experimental-arm64"
+            "config" ""
+            "priority" "75"
+          }
+        }
+      }
+    }
+  }
+}
+VDF
+  )
+fi
+
 mkdir -p "$HOME/.steam"
 ln -sfn "$steamroot" "$HOME/.steam/steam"
 ln -sfn "$steamroot" "$HOME/.steam/root"

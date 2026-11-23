@@ -15,6 +15,7 @@
 # Environment:
 #   DIGITALOCEAN_TOKEN   DO API token for the account that pays for droplets
 #   GITHUB_TOKEN         fine-grained PAT: Actions read, Administration write
+#                        (dispatch.sh, on the same box, also needs Actions write)
 #   REPO                 owner/name
 set -euo pipefail
 
