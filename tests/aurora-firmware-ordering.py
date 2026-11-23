@@ -77,6 +77,15 @@ class AdmissionTests(unittest.TestCase):
     def test_other_macs_keep_their_existing_admission(self):
         self.assertEqual(self.probe(root=True, model='apple,j414s'), (0, ['aop']))
 
+    def test_root_dropin_does_not_block_display_manager(self):
+        unit = configparser.ConfigParser()
+        unit.read(PACKAGE / '20-aurora-vendor-order.conf')
+        before = set(unit['Unit'].get('Before', '').split())
+        self.assertIn('NetworkManager.service', before)
+        self.assertIn('iwd.service', before)
+        self.assertIn('bluetooth.service', before)
+        self.assertNotIn('display-manager.service', before)
+
 
 if __name__ == '__main__':
     unittest.main()
