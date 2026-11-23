@@ -174,6 +174,23 @@ class EdgeMetadataTests(unittest.TestCase):
         recipe = (ROOT / 'pkgbuilds' / 'linux-aurora' / 'PKGBUILD').read_text()
         self.assertNotIn('replaces=', recipe)
 
+    def test_kernel_and_platform_hold_mesa_to_the_aurora_gpu_driver(self):
+        # The 7.3 kernel names its GPU driver "aurora": stock mesa and older
+        # mesa-aurora have no aurora_dri.so and leave a black screen.
+        mesa = srcinfo('mesa-aurora')['mesa-aurora']
+        built = mesa['epoch'][0] + ':' + mesa['pkgver'][0]
+        recipe = (ROOT / 'pkgbuilds' / 'linux-aurora' / 'PKGBUILD').read_text()
+        floor = next(line.split('=', 1)[1] for line in recipe.splitlines()
+                     if line.startswith('_mesa_version='))
+        self.assertGreaterEqual(int(subprocess.check_output(['vercmp', built, floor], text=True)), 0)
+        # A floor as a conflict, so a headless install does not pull Mesa in.
+        self.assertIn('"mesa-aurora<$_mesa_version" "vulkan-aurora<$_mesa_version"', recipe)
+        self.assertNotIn('mesa-aurora', ''.join(l for l in recipe.splitlines() if 'depends=' in l))
+        depends = srcinfo('omarchy-mac')['omarchy-mac']['depends']
+        self.assertIn('mesa-aurora>=' + floor, depends)
+        self.assertIn('vulkan-aurora>=' + floor, depends)
+        self.assertNotIn('vulkan-asahi', depends)
+
     def test_kernel_ships_the_calibration_extractor_beside_aurora_touchid(self):
         # The extractor is installed from the kernel's own tree. Its path must stay
         # clear of aurora-touchid's copy so both packages can be installed at once.
