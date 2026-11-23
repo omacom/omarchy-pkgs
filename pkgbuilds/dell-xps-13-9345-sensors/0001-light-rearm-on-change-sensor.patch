@@ -1,0 +1,151 @@
+Subject: [PATCH] light: re-arm the on-change sensor every two seconds
+
+The XPS 13 9345's TCS3530 is configured without a data-ready interrupt
+(is_dri=0): it advertises on-change reporting, but sends one sample per
+enable. Disable and enable it again every two seconds while it is open.
+
+A close cancels the timer. A queued measurement now holds a reference to its
+sensor, and the report handler ID is cleared, so repeated closes are safe.
+---
+diff --git i/src/libssc-sensor-light.c w/src/libssc-sensor-light.c
+index d6426da..11ea002 100644
+--- i/src/libssc-sensor-light.c
++++ w/src/libssc-sensor-light.c
+@@ -22,6 +22,9 @@
+ #include "ssc-sensor-light.pb-c.h"
+ #include "libssc-sensor-light.h"
+ 
++/* The TCS3530 without a data-ready interrupt sends one sample per enable */
++#define REARM_INTERVAL_MS 2000
++
+ enum {
+ 	SIGNAL_MEASUREMENT,
+ 	N_SIGNALS
+@@ -29,7 +32,9 @@ enum {
+ static guint signals[N_SIGNALS];
+ 
+ typedef struct _SSCSensorLightPrivate {
+-	guint report_id;
++	gulong report_id;
++	guint rearm_id;
++	gboolean active;
+ } SSCSensorLightPrivate;
+ 
+ G_DEFINE_TYPE_WITH_CODE (SSCSensorLight, ssc_sensor_light, SSC_TYPE_SENSOR,
+@@ -43,6 +48,7 @@ typedef struct {
+ static void
+ signal_context_free (SignalContext *ctx)
+ {
++	g_object_unref (ctx->sensor);
+ 	g_slice_free (SignalContext, ctx);
+ }
+ 
+@@ -87,7 +93,7 @@ report_received (SSCClient *self, guint32 msg_id, guint64 uid_high, guint64 uid_
+ 			/* Emit signal in main context instead of thread's context if intensity is positive */
+ 			if (intensity >= 0.0) {
+ 				ctx = g_slice_new0 (SignalContext);
+-				ctx->sensor = sensor;
++				ctx->sensor = g_object_ref (sensor);
+ 				ctx->intensity = intensity;
+ 				g_idle_add_full (G_PRIORITY_DEFAULT_IDLE, emit_signal, ctx, (GDestroyNotify)signal_context_free);
+ 			}
+@@ -99,6 +105,41 @@ report_received (SSCClient *self, guint32 msg_id, guint64 uid_high, guint64 uid_
+ 
+ /*****************************************************************************/
+ 
++static gboolean
++rearm (gpointer user_data)
++{
++	SSCSensorLight *self = SSC_SENSOR_LIGHT (user_data);
++	g_autoptr (SSCClient) client = NULL;
++	guint64 uid_high;
++	guint64 uid_low;
++
++	g_object_get (self,
++		      SSC_SENSOR_CLIENT, &client,
++		      SSC_SENSOR_UID_HIGH, &uid_high,
++		      SSC_SENSOR_UID_LOW, &uid_low,
++		      NULL);
++
++	/*
++	 * Queue both requests at once: a close can then only follow the enable,
++	 * never land between the two and leave the sensor running.
++	 */
++	ssc_client_send (client, uid_high, uid_low, SSC_MSG_REQUEST_DISABLE_REPORT,
++			 NULL, NULL, NULL, NULL);
++	ssc_client_send (client, uid_high, uid_low, SSC_MSG_REQUEST_ENABLE_REPORT_ON_CHANGE,
++			 NULL, NULL, NULL, NULL);
++
++	return G_SOURCE_CONTINUE;
++}
++
++static void
++stop_rearming (SSCSensorLight *self)
++{
++	SSCSensorLightPrivate *priv = ssc_sensor_light_get_instance_private (self);
++
++	priv->active = FALSE;
++	g_clear_handle_id (&priv->rearm_id, g_source_remove);
++}
++
+ static void
+ light_close_ready (SSCSensor *sensor, GAsyncResult *result, gpointer user_data)
+ {
+@@ -131,14 +172,14 @@ ssc_sensor_light_close (SSCSensorLight *self, GCancellable *cancellable, GAsyncR
+ 
+ 	task = g_task_new (self, cancellable, callback, user_data);
+ 	priv = ssc_sensor_light_get_instance_private (self);
++	stop_rearming (self);
+ 
+ 	/* Stop listening for reports */
+ 	g_object_get (SSC_SENSOR (self),
+ 		      SSC_SENSOR_CLIENT, &client,
+ 		      NULL);
+ 
+-	if (priv->report_id)
+-		g_signal_handler_disconnect (client, priv->report_id);
++	g_clear_signal_handler (&priv->report_id, client);
+ 
+ 	/* Close sensor */
+ 	SSC_SENSOR_CLASS (ssc_sensor_light_parent_class)->close (SSC_SENSOR (self), cancellable, (GAsyncReadyCallback)light_close_ready, task);
+@@ -174,6 +215,11 @@ light_open_ready (SSCSensor *sensor, GAsyncResult *result, gpointer user_data)
+ 		return;
+ 	}
+ 
++	SSCSensorLightPrivate *priv = ssc_sensor_light_get_instance_private (SSC_SENSOR_LIGHT (sensor));
++
++	if (priv->active && !priv->rearm_id)
++		priv->rearm_id = g_timeout_add (REARM_INTERVAL_MS, rearm, sensor);
++
+ 	g_task_return_boolean (task, TRUE);
+ }
+ 
+@@ -206,6 +252,8 @@ ssc_sensor_light_open (SSCSensorLight *self, GCancellable *cancellable, GAsyncRe
+ 					    G_CALLBACK (report_received),
+ 					    self);
+ 
++	priv->active = TRUE;
++
+ 	/* Open sensor */
+ 	SSC_SENSOR_CLASS (ssc_sensor_light_parent_class)->open (SSC_SENSOR (self), cancellable, (GAsyncReadyCallback)light_open_ready, task);
+ }
+@@ -227,9 +275,19 @@ ssc_sensor_light_open_sync (SSCSensorLight *self, GCancellable *cancellable, GEr
+ 
+ /*****************************************************************************/
+ 
++static void
++light_dispose (GObject *object)
++{
++	stop_rearming (SSC_SENSOR_LIGHT (object));
++
++	G_OBJECT_CLASS (ssc_sensor_light_parent_class)->dispose (object);
++}
++
+ static void
+ ssc_sensor_light_class_init (SSCSensorLightClass *klass)
+ {
++	G_OBJECT_CLASS (klass)->dispose = light_dispose;
++
+ 	signals[SIGNAL_MEASUREMENT] = g_signal_new ("measurement",
+ 		G_TYPE_FROM_CLASS (klass),
+ 		G_SIGNAL_RUN_FIRST,

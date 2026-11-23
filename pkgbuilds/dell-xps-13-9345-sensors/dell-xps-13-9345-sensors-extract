@@ -1,0 +1,187 @@
+#!/bin/bash
+# Build the XPS 13 9345 sensor configuration root from the machine's own
+# Windows installation. The files are Dell and Qualcomm configuration: they
+# are copied locally and never downloaded or redistributed.
+
+set -euo pipefail
+
+NAME=dell-xps-13-9345-sensors
+ROOT=${XPS9345_SENSORS_ROOT:-/var/lib/$NAME/root}
+SOC=${XPS9345_SENSORS_SOC:-/sys/devices/soc0}
+COMPATIBLE=${XPS9345_SENSORS_COMPATIBLE:-/proc/device-tree/compatible}
+CONFIG_GLOB="Windows/System32/DriverStore/FileRepository/qcsensorsconfigcrd8380.inf_arm64_*"
+DRIVER_DATA="Windows/System32/drivers/DriverData"
+REGISTRY_PATH="fastRPC/persist/sensors/registry"
+
+# The combination qualified on hardware. Newer Windows driver releases are
+# accepted with a warning.
+declare -A KNOWN=(
+  [json.lst]=1f1023dd66413a06f2901305d3818b4283f4ee03503d06989d273b7ae77e9fec
+  [8380_tcs3530_0.json]=5a172a5a8d86db0f8b450f873c8ca2a886e3747aa10aaa5a611a700f4814b152
+)
+REQUIRED=(json.lst 8380_tcs3530_0.json sns_reg_config
+  hw_platform platform_subtype platform_subtype_id platform_version)
+
+log() { printf '%s-extract: %s\n' "$NAME" "$*"; }
+warn() { log "$*" >&2; }
+
+usage() {
+  cat <<EOF
+Usage: $NAME-extract [-d DIR]
+
+Copy the XPS 13 9345 sensor configuration from Windows into $ROOT.
+  -d DIR   use DIR instead of scanning NTFS partitions: either a mounted
+           Windows volume, or a saved copy holding config/ and registry/
+EOF
+}
+
+source_dir=""
+while (($#)); do
+  case $1 in
+    -d) source_dir=${2:?-d requires a directory}; shift 2 ;;
+    -h | --help) usage; exit 0 ;;
+    *) usage >&2; exit 2 ;;
+  esac
+done
+
+if ! { [[ -r $COMPATIBLE ]] && tr '\0' '\n' <"$COMPATIBLE" | grep -qx 'dell,xps13-9345'; }; then
+  log "not an XPS 13 9345; nothing to do"
+  exit 0
+fi
+
+if (( EUID != 0 )) && [[ -z ${XPS9345_SENSORS_ROOT:-} ]]; then
+  warn "must run as root to read Windows partitions and write $ROOT"
+  exit 1
+fi
+
+mounts=()
+stage=""
+cleanup() {
+  local mount
+  for mount in "${mounts[@]}"; do
+    umount "$mount" 2>/dev/null && rmdir "$mount"
+  done
+  if [[ -n $stage ]]; then
+    rm -rf "$stage"
+  fi
+}
+trap cleanup EXIT
+
+config=""
+registry=""
+
+# Set config, and registry where Windows saved one, from a volume or saved copy.
+find_source() {
+  local base=$1 candidate vendor
+  local -a found=()
+
+  if [[ -f $base/config/json.lst ]]; then
+    config=$base/config
+    if [[ -d $base/registry/registry ]]; then
+      registry=$base/registry
+    fi
+    return 0
+  fi
+
+  for candidate in "$base"/$CONFIG_GLOB; do
+    if [[ -f $candidate/json.lst ]]; then
+      found+=("$candidate")
+    fi
+  done
+  ((${#found[@]})) || return 1
+  # Several driver versions can coexist; the most recently installed wins.
+  config=$(ls -1dt "${found[@]}" | head -n1)
+
+  # ntfs3 is case-sensitive, and the vendor directory's case varies.
+  for vendor in QUALCOMM Qualcomm; do
+    if [[ -d $base/$DRIVER_DATA/$vendor/$REGISTRY_PATH/registry ]]; then
+      registry=$base/$DRIVER_DATA/$vendor/$REGISTRY_PATH
+      break
+    fi
+  done
+}
+
+if [[ -n $source_dir ]]; then
+  find_source "$source_dir" || { warn "no sensor configuration under $source_dir"; exit 1; }
+else
+  while read -r device fstype mountpoint; do
+    [[ $fstype == "ntfs" ]] || continue
+    # A partition that is already mounted cannot be mounted again read-only.
+    mountpoint=$(printf '%b' "$mountpoint")
+    if [[ -z $mountpoint ]]; then
+      mountpoint=$(mktemp -d "/run/$NAME.XXXXXX")
+      if mount -o ro,noexec,nosuid,nodev -t ntfs3 "$device" "$mountpoint" 2>/dev/null; then
+        mounts+=("$mountpoint")
+      else
+        rmdir "$mountpoint"
+        continue
+      fi
+    fi
+    if find_source "$mountpoint"; then
+      log "Windows driver store found on $device"
+      break
+    fi
+  done < <(lsblk -rno PATH,FSTYPE,MOUNTPOINT)
+  if [[ -z $config ]]; then
+    warn "no Windows installation with the XPS sensor configuration found"
+    warn "(BitLocker volumes cannot be read; see -d)"
+    exit 1
+  fi
+fi
+
+for file in "${REQUIRED[@]}"; do
+  [[ -s $config/$file ]] || { warn "missing $file in $config"; exit 1; }
+done
+for file in "${!KNOWN[@]}"; do
+  if [[ $(sha256sum "$config/$file" | cut -d' ' -f1) != "${KNOWN[$file]}" ]]; then
+    warn "$file differs from the qualified version; continuing with the Windows copy"
+  fi
+done
+for file in soc_id revision; do
+  [[ -s $SOC/$file ]] || { warn "missing $SOC/$file"; exit 1; }
+done
+
+mkdir -p "$(dirname "$ROOT")"
+stage=$(mktemp -d "$(dirname "$ROOT")/.root.XXXXXX")
+install -d -m0755 "$stage/sensors/config" "$stage/sensors/persist/registry" "$stage/socinfo"
+find "$config" -maxdepth 1 -type f \( -name '*.json' -o -name 'json.lst' -o -name '*.pb' \) \
+  -exec install -m0644 -t "$stage/sensors/config" {} +
+tr -d '\r' <"$config/sns_reg_config" >"$stage/sensors/sns_reg.conf"
+
+# The ADSP accepts the CRD sensor profile only with the running SoC's ID and
+# revision; the platform fields come from the Windows configuration.
+for file in hw_platform platform_subtype platform_subtype_id platform_version; do
+  printf '%s\n' "$(tr -d '\r\n' <"$config/$file")" >"$stage/socinfo/$file"
+done
+for file in soc_id revision; do
+  printf '%s\n' "$(tr -d '\n' <"$SOC/$file")" >"$stage/socinfo/$file"
+done
+
+if [[ -d $ROOT/sensors/persist ]]; then
+  cp -a "$ROOT/sensors/persist/." "$stage/sensors/persist/"
+fi
+
+if [[ -n $registry ]]; then
+  # Regular files only: a link on the Windows volume must not be followed as root.
+  install -d -m0755 "$stage/windows-registry/registry"
+  find "$registry" -maxdepth 1 -type f -exec install -m0644 -t "$stage/windows-registry" {} +
+  find "$registry/registry" -maxdepth 1 -type f -exec install -m0644 -t "$stage/windows-registry/registry" {} +
+elif [[ -d $ROOT/windows-registry ]]; then
+  cp -a "$ROOT/windows-registry" "$stage/windows-registry"
+else
+  warn "Windows saved no parsed sensor registry; the sensor is untested without one"
+fi
+
+find "$stage" -type d -exec chmod 0755 {} +
+find "$stage" -type f -exec chmod 0644 {} +
+
+rm -rf "$ROOT.old"
+if [[ -e $ROOT ]]; then
+  mv "$ROOT" "$ROOT.old"
+fi
+mv "$stage" "$ROOT"
+stage=""
+rm -rf "$ROOT.old"
+
+log "installed the sensor configuration from $config into $ROOT"
+log "enable $NAME.service and reboot to use it"
