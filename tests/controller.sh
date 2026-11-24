@@ -97,7 +97,10 @@ grep -F '"size":"g5-64vcpu-128gb-80gb"' "$CALLS_FILE" | jq -e '.tags == ["omarch
 DROPLETS="1 active $NOW omarchy-builder-large" QUEUED=1 QUEUED_LARGE=0; run; check_large "an idle large droplet does not absorb an ordinary job" 1 0
 DROPLETS="1 active $NOW" QUEUED=0 QUEUED_LARGE=1; run; check_large "an idle ordinary droplet does not absorb a large job" 1 1
 DROPLETS="1 active $NOW omarchy-builder-large" QUEUED=0 QUEUED_LARGE=1; run; check_large "an idle large droplet takes the large job" 0 0
-DROPLETS="1 active $NOW" QUEUED=1 QUEUED_LARGE=2 BUSY=1 MAX_DROPLETS=3; run; check_large "one cap for both pools, the large pool first" 2 2
+DROPLETS="1 active $NOW" QUEUED=2 QUEUED_LARGE=2 BUSY=1 MAX_DROPLETS=2; run; check_large "each pool has its own cap: one ordinary and one large" 2 1
+DROPLETS=$'1 active '"$NOW"$'\n2 active '"$NOW" QUEUED=0 QUEUED_LARGE=1 BUSY=0 MAX_DROPLETS=2; run; check_large "idle ordinary droplets at their cap do not hold back chromium" 1 1
+DROPLETS="1 active $NOW omarchy-builder-large" QUEUED=1 QUEUED_LARGE=1 BUSY_LARGE=1 MAX_DROPLETS=6; run; check_large "a busy large builder at its cap leaves ordinary jobs alone" 1 0
+BUSY_LARGE=0
 DROPLETS="" QUEUED=1 QUEUED_LARGE=1 BUSY=0 MAX_DROPLETS=6; run
 [[ $(grep -c 'runs?status=queued' "$CALLS_FILE") == 1 ]] && echo "PASS: one queue scan per tick serves both pools" \
   || { echo "FAIL: queue scanned more than once"; grep 'runs?status' "$CALLS_FILE"; exit 1; }

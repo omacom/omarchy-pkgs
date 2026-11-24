@@ -28,12 +28,15 @@ TAG=${TAG:-omarchy-builder}
 # 422 and the next region, then the next size, is tried. REGIONS only orders
 # the regions tried first. SIZE and REGION, if set, are one-item lists.
 SIZES=${SIZES:-${SIZE:-g5-32vcpu-64gb-50gb g5-32vcpu-128gb-50gb}}
-# The large pool: jobs that ask for LARGE_LABEL get droplets of LARGE_SIZES.
-# package_runner sends chromium* there; its build was killed for memory on a
-# 64 GB builder. Large droplets carry LARGE_LABEL as a second tag, and
-# MAX_DROPLETS caps both pools together.
-LARGE_LABEL=${LARGE_LABEL:-omarchy-builder-large}
+# The large pool: jobs that ask for LARGE_LABEL get droplets of LARGE_SIZES,
+# at most MAX_LARGE_DROPLETS at once. package_runner sends chromium* there,
+# because its build was killed for memory on a 64 GB builder. The label is
+# fixed, since package_runner names it too. Large droplets carry it as a
+# second tag. Each pool has its own cap, so idle droplets of one pool never
+# hold back the other's jobs.
+LARGE_LABEL=omarchy-builder-large
 LARGE_SIZES=${LARGE_SIZES:-g5-64vcpu-128gb-80gb}
+MAX_LARGE_DROPLETS=${MAX_LARGE_DROPLETS:-1}
 REGIONS=${REGIONS:-${REGION:-}}
 IMAGE=${IMAGE:-ubuntu-24-04-x64}
 MAX_DROPLETS=${MAX_DROPLETS:-4}
@@ -126,16 +129,16 @@ queued_jobs() {
   jq -s --arg l "$LABEL" '[.[] | select(.labels | index($l))] | length' <<< "$jobs"
 }
 
-# Droplets alive: all of them with no argument, or one pool's. A droplet
-# tagged LARGE_LABEL is in the large pool; every other one, including those
-# created before the large pool existed, is in the default pool.
-live_droplets() { # live_droplets [label]
+# One pool's droplets alive. A droplet tagged LARGE_LABEL is in the large
+# pool; every other one, including those created before the large pool
+# existed, is in the default pool.
+live_droplets() { # live_droplets <label>
   # Not the ones reap() just deleted: DigitalOcean can list them for a while.
   do_api "droplets?tag_name=$TAG&per_page=200" | jq --argjson boot "$MAX_BOOT_MINUTES" \
-    --arg large "$LARGE_LABEL" --arg label "${1-}" --argjson all "$(( $# == 0 ))" '
+    --arg large "$LARGE_LABEL" --arg label "$1" '
     [.droplets[] | select(.status != "off")
       | select(.status != "new" or (now - (.created_at | fromdateiso8601)) / 60 <= $boot)
-      | select($all == 1 or ((.tags // [] | index($large)) != null) == ($label == $large))] | length'
+      | select(((.tags // [] | index($large)) != null) == ($label == $large))] | length'
 }
 
 busy_runners() {
@@ -204,8 +207,8 @@ create_droplet() {
 # functions it calls see this pool's values. It returns 1 when a query or a
 # create failed. controller_tick calls it in an || list, where errexit is
 # off, so every failure is checked here.
-pool_tick() { # pool_tick <label> <sizes>
-  local LABEL=$1 SIZES=$2 CANDIDATES=""
+pool_tick() { # pool_tick <label> <sizes> <max droplets>
+  local LABEL=$1 SIZES=$2 max=$3 CANDIDATES=""
   local queued live busy available need room
   queued=$(queued_jobs) || return 1
   (( queued > 0 )) || return 0
@@ -216,29 +219,24 @@ pool_tick() { # pool_tick <label> <sizes>
   available=$(( live - busy )); (( available < 0 )) && available=0
   need=$(( queued - available ))
   (( need > 0 )) || return 0
-  room=$(( MAX_DROPLETS - ALL_LIVE ))
+  room=$(( max - live ))
   (( need > room )) && need=$room
   if (( need <= 0 )); then
-    log "at cap ($ALL_LIVE/$MAX_DROPLETS) with $queued queued for $LABEL ($busy busy)"
+    log "at cap ($live/$max, $busy busy) with $queued queued for $LABEL"
     return 0
   fi
   local i
-  for (( i = 0; i < need; i++ )); do
-    create_droplet || return 1
-    ALL_LIVE=$(( ALL_LIVE + 1 ))
-  done
+  for (( i = 0; i < need; i++ )); do create_droplet || return 1; done
 }
 
-# The large pool goes first: its jobs are few, and the default pool's queue
-# can be long enough to take every free slot. Both pools are tried even when
-# the first fails, and the tick fails after, so the unit shows it.
+# Both pools are tried even when the first fails, and the tick fails after,
+# so the unit shows it.
 controller_tick() {
-  local failed=0 TICK_QUEUE ALL_LIVE
+  local failed=0 TICK_QUEUE
   reap
-  ALL_LIVE=$(live_droplets)
   TICK_QUEUE=$(queued_job_labels)
-  pool_tick "$LARGE_LABEL" "$LARGE_SIZES" || failed=1
-  pool_tick "$LABEL" "$SIZES" || failed=1
+  pool_tick "$LARGE_LABEL" "$LARGE_SIZES" "$MAX_LARGE_DROPLETS" || failed=1
+  pool_tick "$LABEL" "$SIZES" "$MAX_DROPLETS" || failed=1
   return "$failed"
 }
 
