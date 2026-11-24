@@ -173,6 +173,21 @@ run_extractor --install --no-rebuild -d "$driver_store"
 grep -Fq "updates/$zap" "$config"
 echo "ok - plain firmware is preferred before compressed directory overrides"
 
+# mkinitcpio sources the file and stops on a FILES entry that is gone. A copy
+# moved away by hand gives way to what the kernel would load instead.
+initramfs_files() { bash -uc 'FILES=(); . "$1" || exit 1; printf "%s\n" "${FILES[@]}"' _ "$config"; }
+[[ $(initramfs_files) == "$firmware_root/updates/$zap" ]]
+mv "$firmware_root/updates/$zap" "$scratch/moved-update"
+[[ $(initramfs_files) == "$firmware_root/$zap" ]]
+mv "$firmware_root/$zap" "$scratch/moved-packaged"
+[[ $(initramfs_files) == "$firmware_root/updates/$zap.zst" ]]
+mv "$firmware_root/updates/$zap.zst" "$scratch/moved-zst"
+[[ -z $(initramfs_files) ]]
+mv "$scratch/moved-zst" "$firmware_root/updates/$zap.zst"
+mv "$scratch/moved-packaged" "$firmware_root/$zap"
+mv "$scratch/moved-update" "$firmware_root/updates/$zap"
+echo "ok - a zap shader moved away after the configuration was written does not stop the initramfs"
+
 limine-update() { printf 'rebuild\n' >>"$QCOM_FW_ROOT/rebuilds"; }
 export -f limine-update
 run_extractor --install -d "$driver_store"

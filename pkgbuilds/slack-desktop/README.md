@@ -4,7 +4,7 @@ Slack publishes Linux builds for x86_64 only. On x86_64 this package installs th
 
 ## Electron version
 
-`_electronver` must equal the Electron version inside Slack's `.deb` (`usr/lib/slack/version`). `prepare()` refuses to build when they differ and prints the version to set. A Slack release that moves to a new Electron therefore fails its sync PR build until `_electronver` and the Electron checksum are updated; the upstream watch only tracks Slack's version.
+`_electronver` must equal the Electron version inside Slack's `.deb` (`usr/lib/slack/version`). The upstream watch reads that file from each new `.deb` (`source_variables` in `.omarchy/package.json`), writes it to `_electronver` and hashes the matching Electron download, so a Slack release that moves to a new Electron needs no hand edit. `prepare()` still refuses to build when the two differ, which catches a recipe edited by hand.
 
 ## Native modules
 

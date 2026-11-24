@@ -156,6 +156,43 @@ OMARCHY_DEFER_RUNTIME_DEPS=true run_build omarchy-dev omarchy-settings-dev > "$T
 compgen -G "$TEST_ROOT/build-output/edge/$TEST_ARCH/omarchy-dev-1-1-*.pkg.tar.zst" >/dev/null
 printf 'PASS: deferred pair mode works across isolated containers\n'
 
+# Compilers write their temporaries to /tmp, so it lives in memory rather
+# than on the builder's disk, and configure scripts must still be able to run
+# the test programs they build there.
+fixture scratch ''
+cat >> "$TEST_ROOT/pkgbuilds/scratch/PKGBUILD" <<'EOF'
+check() {
+  # The filesystem type and superblock options of a tmpfs mounted at $1 in
+  # its own right. A bind mount of a host directory that happens to sit on
+  # tmpfs has that directory, not /, as its root, so it prints nothing.
+  own_mount() {
+    awk -v target="$1" '$4 == "/" && $5 == target { sub(/.* - /, ""); print }' /proc/self/mountinfo
+  }
+  # Configure scripts and build systems run the programs they compile both
+  # in /tmp and in the source tree.
+  exec_probe() {
+    printf '#!/bin/sh\nexit 0\n' > "$1/omarchy-exec-probe"
+    chmod +x "$1/omarchy-exec-probe"
+    "$1/omarchy-exec-probe"
+  }
+  [[ $(own_mount /tmp) == "tmpfs "*"size=16777216k"* ]]
+  exec_probe /tmp
+  [[ $srcdir == /src/* ]]
+  exec_probe "$srcdir"
+  # The source tree moves to memory only where a kernel tree fits.
+  if (( $(awk '/^MemTotal:/ { print $2 }' /proc/meminfo) >= 56 * 1024 * 1024 )); then
+    [[ $(own_mount /src) == "tmpfs "*"size=41943040k"* ]]
+  else
+    [[ $(own_mount /src) != tmpfs\ * ]]
+  fi
+}
+EOF
+run_build scratch > "$TEST_ROOT/scratch.log" 2>&1 || {
+  cat "$TEST_ROOT/scratch.log"
+  exit 1
+}
+printf 'PASS: /tmp, and /src on large hosts, are executable tmpfs mounts\n'
+
 # pacman installs the owners a package records, so a file left owned by a
 # build machine's uid must stop the build before it reaches the output.
 fixture runner-owned ''

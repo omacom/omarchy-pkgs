@@ -16,7 +16,7 @@ access are required. To work locally you need:
 - `git`, `bash`, `jq`, `curl` and a `tar` that reads zstd
 - Docker or Podman that your user can run, to build. With Docker, a build
   calls `sudo` to fix the ownership of its output.
-- on Arch, to check an upstream declaration: Python 3.11+, `vercmp`, `bsdtar`
+- on Arch, to check an upstream declaration: Python 3.14+, `vercmp`, `bsdtar`
 
 Questions and problems: open an issue on this repository.
 
@@ -31,6 +31,11 @@ Questions and problems: open an issue on this repository.
    ```
 
    An imported recipe is Omarchy's from then on; there is no AUR sync.
+   On Arch, `bin/add-package` also adds the package to
+   `release/owners.json`. Elsewhere, or when you later change a recipe's
+   `pkgname`, `provides`, `replaces` or `arch`, run
+   `bin/release-owners my-package` on Arch, or let the `self-tests` check
+   show you the lines to commit.
 3. Write `pkgbuilds/my-package/PKGBUILD` to Arch packaging standards.
    - List every architecture it supports in `arch=()`: `x86_64`, `aarch64`,
      or `any`. CI builds each one.
@@ -135,6 +140,8 @@ hand:
 - anything under `pkgbuilds/`
 - a new test under `tests/`, and the one line in `.github/workflows/test.yml`
   that runs it
+- the directory lines `bin/release-owners` writes in `release/owners.json`.
+  An `approved` line always needs a maintainer.
 
 Changes to `bin/`, `helpers/`, `build/` or the workflows go in a separate PR,
 first: a PR's packages are built with `master`'s tooling, not its own.
@@ -641,6 +648,17 @@ Both can also be run from the Actions tab. Read
   `refreshed-keys.patch` artifact, or run `bin/refresh-pgp-keys`, and open
   a PR.
 
+- **One package name, one directory.** `release/owners.json` lists which
+  directory makes which package names on each architecture, from the
+  recipes. `bin/release-owners --check` fails when two directories make one
+  name on one architecture, or when a recipe provides another directory's
+  package or replaces anything but its own names without a line in
+  `approved`. No recipe may make, provide or replace `omarchy-keyring`. A
+  maintainer adds an `approved` line only for an intended alternative, such
+  as `omarchy-dev` providing `omarchy`, or a migration, such as
+  `omarchy-mac-boot` replacing `omarchy-apple-boot`: `pacman -Syu` offers
+  every replacement, and yes is its default.
+
 ## Layout
 
 ```
@@ -650,6 +668,7 @@ build/                         Builder image and the in-container build script
 helpers/                       Shell and Python shared by bin/ and the workflows
 ci/                            x86_64 builder pool: controller and runner setup
 tests/                         Tests; test.yml runs them on every PR
+release/owners.json            Which directory makes which package names (bin/release-owners)
 docs/                          Reference
 .github/workflows/             The pipeline
 .github/VOUCHED.td             Authors trusted to build
@@ -658,7 +677,7 @@ docs/                          Reference
 | Workflow | Trigger | Does |
 |---|---|---|
 | `build-pr.yml` | PR, dispatch | Builds changed packages; reports `result` |
-| `test.yml` | PR, dispatch | `self-tests` and `build-isolation` |
+| `test.yml` | PR, dispatch | `self-tests`, `build-isolation`, `recipes` and `lint-workflows` (jactionlint and shellcheck over the workflows and `.github/scripts`) |
 | `publish.yml` | push to `master`, dispatch | Signs and publishes; brings `rc` and `stable` in line with `edge` for the fast ring |
 | `promote.yml` | dispatch | Promote channel: `edge` → `rc`, `rc` → `stable` |
 | `release-rc.yml` | dispatch | Build release candidate: the `rc` branch's pins into `rc`, then `edge` |
