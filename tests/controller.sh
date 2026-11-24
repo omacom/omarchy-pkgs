@@ -112,6 +112,10 @@ check_large "no registration token: no droplet, and the tick fails" 0 0
 : >"$CALLS_FILE"
 if LARGE_SIZES=sold-out controller_tick >/dev/null; then echo "FAIL: a refused large pool passed the tick"; exit 1; fi
 check_large "a refused large pool still lets the default pool create, and the tick fails" 1 0
+DROPLETS="" QUEUED=1 QUEUED_LARGE=1; run
+[[ $(grep '^{"name"' "$CALLS_FILE" | jq -r .size | paste -sd' ') == "g5-32vcpu-64gb-50gb g5-64vcpu-128gb-80gb" ]] \
+  && echo "PASS: the default pool creates before the large pool" \
+  || { echo "FAIL: pool order"; grep '^{"name"' "$CALLS_FILE" | jq -r .size; exit 1; }
 
 # A large in-progress matrix has no waiting jobs on page one. The queued
 # workflow is on page two of the run listing; the same run can appear in

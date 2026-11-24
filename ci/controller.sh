@@ -229,14 +229,15 @@ pool_tick() { # pool_tick <label> <sizes> <max droplets>
   for (( i = 0; i < need; i++ )); do create_droplet || return 1; done
 }
 
-# Both pools are tried even when the first fails, and the tick fails after,
-# so the unit shows it.
+# The default pool goes first, so a slow or failing large create never
+# delays ordinary builds. Both pools are tried even when the first fails, and
+# the tick fails after, so the unit shows it.
 controller_tick() {
   local failed=0 TICK_QUEUE
   reap
   TICK_QUEUE=$(queued_job_labels)
-  pool_tick "$LARGE_LABEL" "$LARGE_SIZES" "$MAX_LARGE_DROPLETS" || failed=1
   pool_tick "$LABEL" "$SIZES" "$MAX_DROPLETS" || failed=1
+  pool_tick "$LARGE_LABEL" "$LARGE_SIZES" "$MAX_LARGE_DROPLETS" || failed=1
   return "$failed"
 }
 
