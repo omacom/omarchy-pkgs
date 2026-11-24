@@ -643,11 +643,17 @@ validate_package_metadata() {
 # the whole job takes 24. Its cores are the fast ones: the 32-core AmpereOne
 # runner took 66. A kernel is a package named linux-*; the firmware and pkgbase
 # shim packages share the prefix and build in seconds, so they stay put.
+# On x86_64, chromium* goes to the large pool (64 vCPU, 128 GB): on a 64 GB
+# builder its build was killed for memory at step 23,398 of 58,051
+# (omarchy-pkgs #3426).
 package_runner() {
   local name="$1" arch="$2"
 
   if [[ $arch != aarch64 ]]; then
-    echo '["self-hosted","omarchy-builder"]'
+    case "$name" in
+    chromium*) echo '["self-hosted","omarchy-builder-large"]' ;;
+    *) echo '["self-hosted","omarchy-builder"]' ;;
+    esac
     return
   fi
   case "$name" in

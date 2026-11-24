@@ -9,6 +9,10 @@ kernels on Namespace's Apple-backed runners (`package_runner` in
 
 - **Jobs ask for a runner labelled `omarchy-builder`.** `build-pr.yml` builds
   x86_64 packages there, and so does the `rebuild` job in `publish.yml`.
+  `chromium*` asks for `omarchy-builder-large` instead (`package_runner`), and
+  gets a droplet of `LARGE_SIZES`: 64 vCPU and 128 GB, because its build was
+  killed for memory on a 64 GB builder. Each label is its own pool: a large
+  droplet never takes an ordinary job, and the reverse.
 - **A controller creates one droplet per queued job.** `controller.sh` runs
   from a systemd timer every minute on a small always-on droplet (tag
   `omarchy-controller`). It polls GitHub for queued jobs with the label and
@@ -73,6 +77,7 @@ Edit `/etc/omarchy-controller.env` on the box. The next tick reads it.
 |---|---|---|
 | `MAX_DROPLETS` | 6 | Builders alive at once. The DigitalOcean account's droplet limit also applies |
 | `SIZES` | `g5-32vcpu-64gb-50gb g5-32vcpu-128gb-50gb` | Tried in order |
+| `LARGE_SIZES` | `g5-64vcpu-128gb-80gb` | Sizes for jobs labelled `LARGE_LABEL` (`omarchy-builder-large`), tried in order. `MAX_DROPLETS` counts both pools together |
 | `REGIONS` | empty | Regions to try first; empty means any |
 | `MAX_AGE_MINUTES` | 200 | Delete a droplet older than this |
 | `MAX_BOOT_MINUTES` | 10 | Delete a droplet still provisioning after this |

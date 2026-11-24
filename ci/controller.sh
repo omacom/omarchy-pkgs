@@ -28,6 +28,12 @@ TAG=${TAG:-omarchy-builder}
 # 422 and the next region, then the next size, is tried. REGIONS only orders
 # the regions tried first. SIZE and REGION, if set, are one-item lists.
 SIZES=${SIZES:-${SIZE:-g5-32vcpu-64gb-50gb g5-32vcpu-128gb-50gb}}
+# The large pool: jobs that ask for LARGE_LABEL get droplets of LARGE_SIZES.
+# package_runner sends chromium* there; its build was killed for memory on a
+# 64 GB builder. Large droplets carry LARGE_LABEL as a second tag, and
+# MAX_DROPLETS caps both pools together.
+LARGE_LABEL=${LARGE_LABEL:-omarchy-builder-large}
+LARGE_SIZES=${LARGE_SIZES:-g5-64vcpu-128gb-80gb}
 REGIONS=${REGIONS:-${REGION:-}}
 IMAGE=${IMAGE:-ubuntu-24-04-x64}
 MAX_DROPLETS=${MAX_DROPLETS:-4}
@@ -111,11 +117,16 @@ queued_jobs() {
   done | sort -u | wc -l
 }
 
-live_droplets() {
+# Droplets alive: all of them with no argument, or one pool's. A droplet's
+# pool is its tags besides TAG: none for the default pool, LARGE_LABEL for
+# the large one.
+live_droplets() { # live_droplets [label]
   # Not the ones reap() just deleted: DigitalOcean can list them for a while.
-  do_api "droplets?tag_name=$TAG&per_page=200" | jq --argjson boot "$MAX_BOOT_MINUTES" '
+  do_api "droplets?tag_name=$TAG&per_page=200" | jq --argjson boot "$MAX_BOOT_MINUTES" \
+    --arg tag "$TAG" --arg label "${1-}" --argjson all "$(( $# == 0 ))" '
     [.droplets[] | select(.status != "off")
-      | select(.status != "new" or (now - (.created_at | fromdateiso8601)) / 60 <= $boot)] | length'
+      | select(.status != "new" or (now - (.created_at | fromdateiso8601)) / 60 <= $boot)
+      | select($all == 1 or ((.tags // []) - [$tag]) == ([$label] - [$tag]))] | length'
 }
 
 busy_runners() {
@@ -160,7 +171,8 @@ create_droplet() {
     [[ -n $size ]] || continue
     body=$(jq -n --arg name "$name" --arg region "$region" --arg size "$size" --arg image "$IMAGE" \
       --arg tag "$TAG" --arg ud "$userdata" --argjson keys "$DO_SSH_KEYS" \
-      '{name:$name, region:$region, size:$size, image:$image, tags:[$tag], user_data:$ud, ssh_keys:$keys, monitoring:false}')
+      --arg label "$LABEL" \
+      '{name:$name, region:$region, size:$size, image:$image, tags:([$tag, $label] | unique), user_data:$ud, ssh_keys:$keys, monitoring:false}')
     log "creating $name ($size in $region)"
     if response=$(do_api droplets -X POST -d "$body"); then
       jq -r '"created droplet \(.droplet.id)"' <<< "$response"
@@ -174,26 +186,38 @@ create_droplet() {
   return 1
 }
 
-controller_tick() {
-  CANDIDATES=""
-  reap
+# One pool's tick. LABEL, SIZES and CANDIDATES are local here, so the
+# functions it calls see this pool's values.
+pool_tick() { # pool_tick <label> <sizes>
+  local LABEL=$1 SIZES=$2 CANDIDATES=""
   local queued live busy available need room
   queued=$(queued_jobs)
-  live=$(live_droplets)
+  (( queued > 0 )) || return 0
+  live=$(live_droplets "$LABEL")
   busy=$(busy_runners)
   # A live droplet whose runner is busy is spoken for. Only droplets still
   # booting or listening can absorb a queued job.
   available=$(( live - busy )); (( available < 0 )) && available=0
   need=$(( queued - available ))
   (( need > 0 )) || return 0
-  room=$(( MAX_DROPLETS - live ))
+  room=$(( MAX_DROPLETS - ALL_LIVE ))
   (( need > room )) && need=$room
   if (( need <= 0 )); then
-    log "at cap ($live/$MAX_DROPLETS, $busy busy) with $queued queued"
+    log "at cap ($ALL_LIVE/$MAX_DROPLETS) with $queued queued for $LABEL ($busy busy)"
     return 0
   fi
   local i
-  for (( i = 0; i < need; i++ )); do create_droplet; done
+  for (( i = 0; i < need; i++ )); do
+    create_droplet || break
+    ALL_LIVE=$(( ALL_LIVE + 1 ))
+  done
+}
+
+controller_tick() {
+  reap
+  ALL_LIVE=$(live_droplets)
+  pool_tick "$LABEL" "$SIZES"
+  pool_tick "$LARGE_LABEL" "$LARGE_SIZES"
 }
 
 if [[ "${CONTROLLER_LIBRARY_ONLY:-}" != 1 ]]; then
