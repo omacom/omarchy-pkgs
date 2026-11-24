@@ -50,4 +50,16 @@ _ensure_user_config test-user "$home"
 [[ $(cat "$config_path") == 'INTENSITY=100' ]]
 grep -q '^--user test-user -- /usr/bin/env ' "$runuser_call"
 
-echo 'PASS: user config creation drops privileges and never chowns symlink targets'
+runtime_calls="$TEST_ROOT/runtime-calls"
+_in_chroot() { return 0; }
+systemctl() { printf 'systemctl %s\n' "$*" >>"$runtime_calls"; }
+udevadm() { printf 'udevadm %s\n' "$*" >>"$runtime_calls"; }
+omarchy-restart-trackpad() { printf 'restart-trackpad\n' >>"$runtime_calls"; }
+
+_reload_runtime_state
+_reset_trackpad
+start_output=$(_start_service_if_possible)
+[[ ! -e $runtime_calls ]]
+[[ $start_output == *"will start on next boot"* ]]
+
+echo 'PASS: user config creation drops privileges, never chowns symlinks, and skips runtime calls in chroot'
