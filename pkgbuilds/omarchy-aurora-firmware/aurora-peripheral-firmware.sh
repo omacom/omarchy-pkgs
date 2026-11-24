@@ -11,10 +11,14 @@ has_firmware() {
 }
 
 neo=false
+aop_pid=
 if grep -aq 'apple,j700' "$compatible"; then
   neo=true
   if has_firmware apple/j700-aop-als-cal.bin; then
-    "$modprobe_command" aop
+    # AOP (audio/ALS) has no dependency on the MediaTek radios; probe it in
+    # parallel so its init overlaps with mt7932-fullmac and mt7932_bt_pcie.
+    "$modprobe_command" aop &
+    aop_pid=$!
   else
     echo 'Aurora: ALS calibration missing; Neo AOP probe deferred' >&2
   fi
@@ -39,16 +43,28 @@ if grep -aq 'apple,j700' "$compatible"; then
   done
 fi
 
+status=0
 if "$neo"; then
   if "$radio_ready"; then
-    "$modprobe_command" mt7932-fullmac
-    # Only the root firmware unit opts in. The initrd keeps Bluetooth out so
-    # its Wi-Fi module dependency cannot probe before firmware extraction.
-    if [ "${AURORA_ADMIT_BLUETOOTH:-0}" = 1 ]; then
-      "$modprobe_command" mt7932_bt_pcie
+    if "$modprobe_command" mt7932-fullmac; then
+      # Only the root firmware unit opts in. The initrd keeps Bluetooth out so
+      # its Wi-Fi module dependency cannot probe before firmware extraction.
+      if [ "${AURORA_ADMIT_BLUETOOTH:-0}" = 1 ]; then
+        "$modprobe_command" mt7932_bt_pcie || status=$?
+      fi
+    else
+      status=$?
+    fi
+  fi
+  if [ -n "$aop_pid" ]; then
+    aop_status=0
+    wait "$aop_pid" || aop_status=$?
+    if [ "$status" -eq 0 ] && [ "$aop_status" -ne 0 ]; then
+      status=$aop_status
     fi
   fi
 else
   # Preserve ordinary non-Neo admission even if vendor extraction failed.
   "$modprobe_command" aop
 fi
+exit "$status"
