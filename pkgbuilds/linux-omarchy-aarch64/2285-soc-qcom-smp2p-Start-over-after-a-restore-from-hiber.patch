@@ -1,0 +1,132 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Birk Skyum <birk.skyum@pm.me>
+Date: Fri, 9 Oct 2026 21:27:54 +0000
+Subject: [PATCH] soc: qcom: smp2p: Start over after a restore from hibernation
+
+smp2p remembers what it has negotiated with the remote processor: where
+the remote's item is, which of its entries are matched, that version
+and features are agreed, and whether the remote's last restart has been
+acknowledged.
+
+None of that holds when a hibernation image is restored. The machine
+has been through a power cycle, shared memory has been set up again,
+the kernel that loaded the image has created a fresh item for us, and
+the remote starts from nothing.
+
+On a Lenovo Yoga Slim 7x (X1E80100) a remote processor that is started
+after a resume from hibernation never comes up:
+
+  remoteproc remoteproc0: Booting fw image qcom/x1e80100/LENOVO/83ED/qcadsp8380.mbn, size 21592504
+  qcom_q6v5_pas 6800000.remoteproc: start timed out
+  remoteproc remoteproc0: can't start rproc adsp: -110
+
+For the ADSP the driver still has ssr_ack set while the fresh item has
+RESTART_ACK clear. When the remote sets RESTART_DONE,
+qcom_smp2p_check_ssr() sees no restart, and the acknowledgement the
+remote waits for is never written. For the CDSP the driver believes the
+negotiation is done, so the fresh item is left at version 2 while the
+remote uses version 1.
+
+Forget all of it in restore_noirq and build our item again, the way
+probe does. If the remote is still running, as after test_resume,
+qcom_smp2p_start_in() finds its item again and the next interrupt
+redoes the negotiation.
+
+Signed-off-by: Birk Skyum <birk.skyum@pm.me>
+
+[Omarchy: adapted to 7.3, which keeps the outbound SMP2P value behind a
+ regular pointer.]
+
+Link: https://lore.kernel.org/r/179158127177.70185.5691100900886332545@pm.me
+---
+ drivers/soc/qcom/smp2p.c | 53 +++++++++++++++++++++++++++++++++++++---
+ 1 file changed, 50 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/soc/qcom/smp2p.c b/drivers/soc/qcom/smp2p.c
+index 89e242f4d..0352ecd3b 100644
+--- a/drivers/soc/qcom/smp2p.c
++++ b/drivers/soc/qcom/smp2p.c
+@@ -519,9 +519,8 @@ static const struct qcom_smem_state_ops smp2p_state_ops = {
+ 	.update_bits = smp2p_update_bits,
+ };
+ 
+-static int qcom_smp2p_outbound_entry(struct qcom_smp2p *smp2p,
+-				     struct smp2p_entry *entry,
+-				     struct device_node *node)
++static void qcom_smp2p_claim_outbound_entry(struct qcom_smp2p *smp2p,
++					    struct smp2p_entry *entry)
+ {
+ 	struct smp2p_smem_item *out = smp2p->out;
+ 	char buf[SMP2P_MAX_ENTRY_NAME] = {};
+@@ -534,6 +533,13 @@ static int qcom_smp2p_outbound_entry(struct qcom_smp2p *smp2p,
+ 	entry->value = &out->entries[out->valid_entries].value;
+ 
+ 	out->valid_entries++;
++}
++
++static int qcom_smp2p_outbound_entry(struct qcom_smp2p *smp2p,
++				     struct smp2p_entry *entry,
++				     struct device_node *node)
++{
++	qcom_smp2p_claim_outbound_entry(smp2p, entry);
+ 
+ 	entry->state = qcom_smem_state_register(node, &smp2p_state_ops, entry);
+ 	if (IS_ERR(entry->state)) {
+@@ -785,6 +791,46 @@ static void qcom_smp2p_remove(struct platform_device *pdev)
+ 	smp2p->out->valid_entries = 0;
+ }
+ 
++/*
++ * A hibernation image is restored after a power cycle. Shared memory has been
++ * set up anew since and the remote starts from nothing, so forget what was
++ * negotiated with it and build our item again.
++ */
++static int qcom_smp2p_restore_noirq(struct device *dev)
++{
++	struct qcom_smp2p *smp2p = dev_get_drvdata(dev);
++	struct smp2p_entry *entry;
++	int ret;
++
++	smp2p->in = NULL;
++	smp2p->valid_entries = 0;
++	smp2p->negotiation_done = false;
++	smp2p->ssr_ack_enabled = false;
++	smp2p->ssr_ack = false;
++
++	list_for_each_entry(entry, &smp2p->inbound, node) {
++		entry->value = NULL;
++		entry->last_value = 0;
++	}
++
++	ret = qcom_smp2p_alloc_outbound_item(smp2p);
++	if (ret < 0)
++		return ret;
++
++	/* Entries were added at the head of the list, so walk it backwards. */
++	list_for_each_entry_reverse(entry, &smp2p->outbound, node)
++		qcom_smp2p_claim_outbound_entry(smp2p, entry);
++
++	qcom_smp2p_start_in(smp2p);
++	qcom_smp2p_kick(smp2p);
++
++	return 0;
++}
++
++static const struct dev_pm_ops qcom_smp2p_pm_ops = {
++	.restore_noirq = pm_sleep_ptr(qcom_smp2p_restore_noirq),
++};
++
+ static const struct of_device_id qcom_smp2p_of_match[] = {
+ 	{ .compatible = "qcom,smp2p" },
+ 	{}
+@@ -797,6 +843,7 @@ static struct platform_driver qcom_smp2p_driver = {
+ 	.driver  = {
+ 		.name  = "qcom_smp2p",
+ 		.of_match_table = qcom_smp2p_of_match,
++		.pm = &qcom_smp2p_pm_ops,
+ 	},
+ };
+ module_platform_driver(qcom_smp2p_driver);
+-- 
+2.56.1
+
