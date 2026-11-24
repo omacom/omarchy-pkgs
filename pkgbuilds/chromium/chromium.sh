@@ -5,10 +5,13 @@
 flags=()
 conf="${XDG_CONFIG_HOME:-$HOME/.config}/chromium-flags.conf"
 
+# Split as a shell would, quotes included, but expand nothing: as the launcher does
 if [[ -f $conf ]]; then
-  while IFS= read -r line; do
-    [[ $line =~ ^[[:space:]]*(#|$) ]] || flags+=("$line")
-  done <"$conf"
+  mapfile -d '' flags < <(grep -vE '^[[:space:]]*(#|$)' "$conf" | tr -d '\r' | xargs -r printf '%s\0')
+fi
+
+if [[ -n ${CHROMIUM_USER_FLAGS:-} ]]; then
+  mapfile -d '' -O "${#flags[@]}" flags < <(xargs -r printf '%s\0' <<<"$CHROMIUM_USER_FLAGS")
 fi
 
 export CHROME_WRAPPER=/usr/bin/chromium
