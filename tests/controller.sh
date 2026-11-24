@@ -110,6 +110,9 @@ DROPLETS="1 active $NOW ops,omarchy-builder-large" QUEUED=0 QUEUED_LARGE=1; run;
 if NO_TOKEN=1 controller_tick >/dev/null; then echo "FAIL: a missing token passed the tick"; exit 1; fi
 check_large "no registration token: no droplet, and the tick fails" 0 0
 : >"$CALLS_FILE"
+if CLOUD_INIT=/nonexistent controller_tick >/dev/null 2>&1; then echo "FAIL: an unreadable cloud-init passed the tick"; exit 1; fi
+check_large "unreadable cloud-init: no droplet, and the tick fails" 0 0
+: >"$CALLS_FILE"
 if LARGE_SIZES=sold-out controller_tick >/dev/null; then echo "FAIL: a refused large pool passed the tick"; exit 1; fi
 check_large "a refused large pool still lets the default pool create, and the tick fails" 1 0
 DROPLETS="" QUEUED=1 QUEUED_LARGE=1; run
