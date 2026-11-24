@@ -1,0 +1,710 @@
+From 8939d8b5fd804a765ab14b07f3e1f5af30286ffe Mon Sep 17 00:00:00 2001
+From: nickkostik <161902345+nickkostik@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 15:55:37 -0600
+Subject: [PATCH] backends: Embed pen ink in saved PDF pages
+
+Save freehand ink as vector page content when a PDF has ordinary pen
+annotations. Viewers and print paths that omit annotations can then
+render a handwritten signature alongside the rest of the page.
+
+Preserve special-purpose ink and other annotations. Keep the standard
+save path for encrypted and certificate-signed documents.
+---
+ help/C/annotations-save.page           |  15 +-
+ libdocument/backend/pdf/meson.build    |   9 +
+ libdocument/backend/pdf/pps-pdf-ink.cc | 293 +++++++++++++++++++++++++
+ libdocument/backend/pdf/pps-pdf-ink.h  |  11 +
+ libdocument/backend/pdf/pps-poppler.c  |   5 +
+ libview/pps-jobs.c                     |   1 +
+ libview/tests/meson.build              |  11 +
+ libview/tests/test-pps-ink-save.cc     | 237 ++++++++++++++++++++
+ meson.build                            |   3 +-
+ 9 files changed, 579 insertions(+), 6 deletions(-)
+ create mode 100644 libdocument/backend/pdf/pps-pdf-ink.cc
+ create mode 100644 libdocument/backend/pdf/pps-pdf-ink.h
+ create mode 100644 libview/tests/test-pps-ink-save.cc
+
+diff --git a/help/C/annotations-save.page b/help/C/annotations-save.page
+index bb78dbe..65cec5b 100644
+--- a/help/C/annotations-save.page
++++ b/help/C/annotations-save.page
+@@ -22,9 +22,7 @@
+ </info>
+ <title>Save a copy of an annotated PDF</title>
+  <p>
+-  To save a copy of your annotated PDF for future viewing using the
+-  <app>Document Viewer</app> or any other PDF viewer
+-  <em>that supports annotations</em>:
++  Use <app>Document Viewer</app> to save a copy of your PDF edits.
+  </p>
+   <steps>
+    <item>
+@@ -40,8 +38,15 @@
+     </item>
+    </steps>
+    <p>
+-   Annotations are added according to the PDF specification. Therefore, most PDF
+-   readers should be able to read them. Adobe Reader is known to work.
++   When you save a PDF with plain pen strokes, the strokes become part of
++   the page so they remain visible in other viewers and when printed. To keep
++   the original page, save to a new file. Once you open the saved copy, you
++   can no longer erase those strokes with the annotation tools.
++   </p>
++   <p>
++   Password-protected PDFs and PDFs with certificate signatures keep their
++   editable annotations. Other annotations require a viewer that supports
++   them.
+    </p>
+ 
+ </page>
+diff --git a/libdocument/backend/pdf/meson.build b/libdocument/backend/pdf/meson.build
+index 72e9092..ff81e9d 100644
+--- a/libdocument/backend/pdf/meson.build
++++ b/libdocument/backend/pdf/meson.build
+@@ -1,7 +1,16 @@
++qpdf_dep = dependency('libqpdf', version: '>= 11.0')
++ink_bake_lib = static_library(
++  'pps-pdf-ink',
++  'pps-pdf-ink.cc',
++  dependencies: [glib_dep, qpdf_dep],
++  gnu_symbol_visibility: 'hidden',
++)
++
+ backend_deps = backends_common_deps + [
+   cairo_pdf_dep,
+   cairo_ps_dep,
+   poppler_glib_dep,
++  declare_dependency(link_with: ink_bake_lib),
+ ]
+ 
+ backend_sources = files('pps-poppler.c')
+diff --git a/libdocument/backend/pdf/pps-pdf-ink.cc b/libdocument/backend/pdf/pps-pdf-ink.cc
+new file mode 100644
+index 0000000..b31e498
+--- /dev/null
++++ b/libdocument/backend/pdf/pps-pdf-ink.cc
+@@ -0,0 +1,293 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++#include "pps-pdf-ink.h"
++
++#include <glib/gstdio.h>
++#include <qpdf/Constants.h>
++#include <qpdf/QPDF.hh>
++#include <qpdf/QPDFAcroFormDocumentHelper.hh>
++#include <qpdf/QPDFPageDocumentHelper.hh>
++#include <qpdf/QPDFWriter.hh>
++
++#include <cerrno>
++#include <cmath>
++#include <iomanip>
++#include <locale>
++#include <set>
++#include <sstream>
++#include <vector>
++
++namespace
++{
++std::vector<double>
++read_numbers (QPDFObjectHandle array)
++{
++	if (!array.isArray ())
++		return {};
++
++	std::vector<double> values;
++	for (auto item : array.aitems ()) {
++		if (!item.isNumber () || !std::isfinite (item.getNumericValue ()))
++			return {};
++
++		values.push_back (item.getNumericValue ());
++	}
++	return values;
++}
++
++bool
++get_ink_width (QPDFObjectHandle annot, double &width)
++{
++	auto style = annot.getKey ("/BS");
++	if (style.isDictionary ()) {
++		if (style.hasKey ("/S") && !style.getKey ("/S").isNameAndEquals ("/S"))
++			return false;
++
++		auto width_obj = style.getKey ("/W");
++		return width_obj.isNull () || width_obj.getValueAsNumber (width);
++	}
++	if (!style.isNull ())
++		return false;
++
++	// Poppler writes the Draw tool's width as a legacy border array.
++	auto border = annot.getKey ("/Border");
++	if (border.isNull ())
++		return true;
++
++	auto values = read_numbers (border);
++	if (values.size () != 3)
++		return false;
++
++	width = values[2];
++	return true;
++}
++
++bool
++write_ink_path (QPDFObjectHandle annot, std::ostringstream &drawing, double &opacity)
++{
++	// A stored appearance can contain custom artwork or the highlighter's
++	// multiply blend mode. Keep it as well as ink with display or review semantics.
++	if (!annot.isDictionary () || !annot.getKey ("/Subtype").isNameAndEquals ("/Ink") ||
++	    annot.hasKey ("/AP") || annot.hasKey ("/OC") || annot.hasKey ("/Popup") ||
++	    annot.hasKey ("/IRT") || annot.hasKey ("/StructParent") || annot.hasKey ("/AF"))
++		return false;
++
++	auto flags = annot.getKey ("/F");
++	auto contents = annot.getKey ("/Contents");
++	long long value;
++	std::string text;
++	if ((!flags.isNull () && (!flags.getValueAsInt (value) || (value & ~an_print))) ||
++	    (!contents.isNull () && (!contents.getValueAsString (text) || !text.empty ())))
++		return false;
++
++	auto ink_list = annot.getKey ("/InkList");
++	if (!ink_list.isArray ())
++		return false;
++
++	double width = 1.0;
++	if (!get_ink_width (annot, width) || !std::isfinite (width) || width < 0)
++		return false;
++
++	auto alpha = annot.getKey ("/CA");
++	opacity = 1.0;
++	if ((!alpha.isNull () && !alpha.getValueAsNumber (opacity)) ||
++	    !std::isfinite (opacity) || opacity <= 0 || opacity > 1)
++		return false;
++
++	auto color = annot.getKey ("/C");
++	const auto components = color.isNull () ? std::vector<double>{ 0.0 } : read_numbers (color);
++	const auto count = components.size ();
++	if (count != 1 && count != 3 && count != 4)
++		return false;
++
++	drawing.imbue (std::locale::classic ());
++	drawing << std::fixed << std::setprecision (5);
++	for (auto value : components) {
++		if (value < 0 || value > 1)
++			return false;
++
++		drawing << value << ' ';
++	}
++	const char *color_operator = "G";
++	if (count == 3)
++		color_operator = "RG";
++	else if (count == 4)
++		color_operator = "K";
++
++	drawing << color_operator << '\n';
++	drawing << width << " w\n";
++
++	bool has_stroke = false;
++	for (auto path : ink_list.aitems ()) {
++		const auto points = read_numbers (path);
++		if (points.size () < 2 || points.size () % 2 != 0)
++			return false;
++		if (points.size () == 2)
++			continue;
++
++		for (size_t i = 0; i < points.size (); i += 2)
++			drawing << points[i] << ' ' << points[i + 1] << (i == 0 ? " m\n" : " l\n");
++		drawing << "S\n";
++		has_stroke = true;
++	}
++	return has_stroke;
++}
++
++bool
++bake_page (QPDF &pdf, QPDFPageObjectHelper &page, bool &has_transparency)
++{
++	auto page_obj = page.getObjectHandle ();
++	auto annots = page_obj.getKey ("/Annots");
++	if (!annots.isArray ())
++		return false;
++
++	std::set<QPDFObjGen> targets;
++	for (auto annot : annots.aitems ()) {
++		if (!annot.isDictionary ())
++			continue;
++
++		auto in_reply_to = annot.getKey ("/IRT");
++		auto popup_parent = annot.getKey ("/Parent");
++		if (in_reply_to.isIndirect ())
++			targets.insert (in_reply_to.getObjGen ());
++		if (popup_parent.isIndirect () && annot.getKey ("/Subtype").isNameAndEquals ("/Popup"))
++			targets.insert (popup_parent.getObjGen ());
++	}
++
++	std::string overlay;
++	std::vector<QPDFObjectHandle> retained;
++	QPDFObjectHandle resources;
++	QPDFObjectHandle states;
++	int resource_id = 1;
++	for (auto annot : annots.aitems ()) {
++		std::ostringstream drawing;
++		double opacity;
++		if ((annot.isIndirect () && targets.contains (annot.getObjGen ())) ||
++		    !write_ink_path (annot, drawing, opacity)) {
++			retained.push_back (annot);
++			continue;
++		}
++
++		overlay += "q\n";
++		if (opacity < 1) {
++			if (!states.isInitialized ()) {
++				resources = page.getAttribute ("/Resources", true);
++				if (!resources.isDictionary ()) {
++					resources = QPDFObjectHandle::newDictionary ();
++					page_obj.replaceKey ("/Resources", resources);
++				}
++
++				states = resources.getKey ("/ExtGState");
++				states = states.isDictionary () ? states.shallowCopy () : QPDFObjectHandle::newDictionary ();
++				resources.replaceKey ("/ExtGState", states);
++			}
++
++			auto name = resources.getUniqueResourceName ("/PpsInk", resource_id);
++			auto state = QPDFObjectHandle::newDictionary ();
++			state.replaceKey ("/CA", QPDFObjectHandle::newReal (opacity, 8));
++			states.replaceKey (name, state);
++			overlay += name + " gs\n";
++			has_transparency = true;
++		}
++		overlay += drawing.str ();
++		overlay += "Q\n";
++	}
++
++	if (overlay.empty ())
++		return false;
++
++	// Isolate the original page's graphics state before painting in default PDF
++	// user space. Crop boxes and page rotation then apply to the ink and page alike.
++	page.addPageContents (pdf.newStream ("q\n"), true);
++	page.addPageContents (pdf.newStream ("\nQ\nn\n" + overlay), false);
++	if (retained.empty ())
++		page_obj.removeKey ("/Annots");
++	else
++		page_obj.replaceKey ("/Annots", QPDFObjectHandle::newArray (retained));
++	return true;
++}
++
++bool
++has_certificate_signature (QPDF &pdf, int signature_fields)
++{
++	auto permissions = pdf.getRoot ().getKey ("/Perms");
++	if (permissions.isDictionary () &&
++	    (permissions.hasKey ("/DocMDP") || permissions.hasKey ("/UR") || permissions.hasKey ("/UR3")))
++		return true;
++
++	if (signature_fields == 0)
++		return false;
++
++	int empty_fields = 0;
++	for (auto &field : QPDFAcroFormDocumentHelper (pdf).getFormFields ()) {
++		if (field.getFieldType () != "/Sig")
++			continue;
++		if (!field.getValue ().isNull ())
++			return true;
++		++empty_fields;
++	}
++
++	// Poppler also finds some orphaned signature widgets. Keep the original
++	// save path if we could not account for every field as unsigned.
++	return empty_fields < signature_fields;
++}
++
++bool
++save_baked_ink (const char *filename, const char *password, int signature_fields, GError **error)
++{
++	QPDF pdf;
++	pdf.processFile (filename, password);
++	if (pdf.isEncrypted () || has_certificate_signature (pdf, signature_fields))
++		return true;
++
++	bool changed = false;
++	bool has_transparency = false;
++	for (auto &page : QPDFPageDocumentHelper (pdf).getAllPages ())
++		changed |= bake_page (pdf, page, has_transparency);
++
++	if (!changed)
++		return true;
++
++	g_autofree char *temporary = g_strconcat (filename, ".ink.XXXXXX", nullptr);
++	int fd = g_mkstemp (temporary);
++	if (fd < 0) {
++		int saved_errno = errno;
++		g_set_error_literal (error, G_FILE_ERROR, g_file_error_from_errno (saved_errno), g_strerror (saved_errno));
++		return false;
++	}
++	g_close (fd, nullptr);
++
++	try {
++		QPDFWriter writer (pdf, temporary);
++		if (has_transparency)
++			writer.setMinimumPDFVersion ("1.4");
++		writer.write ();
++	} catch (...) {
++		g_unlink (temporary);
++		throw;
++	}
++
++	if (g_rename (temporary, filename) == 0)
++		return true;
++
++	int saved_errno = errno;
++	g_unlink (temporary);
++	g_set_error_literal (error, G_FILE_ERROR, g_file_error_from_errno (saved_errno), g_strerror (saved_errno));
++	return false;
++}
++} // namespace
++
++gboolean
++pps_pdf_bake_ink (const char *uri, const char *password, int signature_fields, GError **error)
++{
++	g_autofree char *filename = g_filename_from_uri (uri, nullptr, error);
++	if (!filename)
++		return FALSE;
++
++	try {
++		return save_baked_ink (filename, password, signature_fields, error);
++	} catch (const std::exception &exception) {
++		g_set_error_literal (error, G_FILE_ERROR, G_FILE_ERROR_FAILED, exception.what ());
++		return FALSE;
++	}
++}
+diff --git a/libdocument/backend/pdf/pps-pdf-ink.h b/libdocument/backend/pdf/pps-pdf-ink.h
+new file mode 100644
+index 0000000..faca17c
+--- /dev/null
++++ b/libdocument/backend/pdf/pps-pdf-ink.h
+@@ -0,0 +1,11 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++
++#pragma once
++
++#include <glib.h>
++
++G_BEGIN_DECLS
++
++gboolean pps_pdf_bake_ink (const char *uri, const char *password, int signature_fields, GError **error);
++
++G_END_DECLS
+diff --git a/libdocument/backend/pdf/pps-poppler.c b/libdocument/backend/pdf/pps-poppler.c
+index 60df04f..9c9cec7 100644
+--- a/libdocument/backend/pdf/pps-poppler.c
++++ b/libdocument/backend/pdf/pps-poppler.c
+@@ -44,6 +44,7 @@
+ #include "pps-media.h"
+ #include "pps-poppler.h"
+ #include "pps-selection.h"
++#include "pps-pdf-ink.h"
+ #include "pps-signature.h"
+ #include "pps-transition-effect.h"
+ 
+@@ -270,6 +271,10 @@ pdf_document_save (PpsDocument *document,
+ 
+ 	retval = poppler_document_save (self->document,
+ 	                                uri, &poppler_error);
++	if (retval)
++		retval = pps_pdf_bake_ink (uri, self->password,
++		                          poppler_document_get_n_signatures (self->document), error);
++
+ 	if (retval) {
+ 		self->forms_modified = FALSE;
+ 		self->annots_modified = FALSE;
+diff --git a/libview/pps-jobs.c b/libview/pps-jobs.c
+index 13f87bd..0dd9fb9 100644
+--- a/libview/pps-jobs.c
++++ b/libview/pps-jobs.c
+@@ -1128,6 +1128,7 @@ pps_job_save_run (PpsJob *job)
+ 	}
+ 
+ 	if (error) {
++		g_unlink (tmp_filename);
+ 		pps_job_failed_from_error (job, error);
+ 		return;
+ 	}
+diff --git a/libview/tests/meson.build b/libview/tests/meson.build
+index 73b652e..05012ea 100644
+--- a/libview/tests/meson.build
++++ b/libview/tests/meson.build
+@@ -13,3 +13,14 @@ test_executable = executable(
+ )
+ 
+ test('pps-jobs-test', test_executable, env: backend_env)
++
++if enable_pdf
++  ink_save_test = executable(
++    'test-pps-ink-save',
++    'test-pps-ink-save.cc',
++    include_directories: [top_inc],
++    dependencies: [libppsview_dep, poppler_glib_dep, qpdf_dep],
++    cpp_args: cflags + ['-DI_KNOW_THE_PAPERS_LIBS_ARE_UNSTABLE_AND_HAVE_TALKED_WITH_THE_AUTHORS'],
++  )
++  test('pps-ink-save-test', ink_save_test, env: backend_env)
++endif
+diff --git a/libview/tests/test-pps-ink-save.cc b/libview/tests/test-pps-ink-save.cc
+new file mode 100644
+index 0000000..fdb5dcc
+--- /dev/null
++++ b/libview/tests/test-pps-ink-save.cc
+@@ -0,0 +1,237 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++#include <glib/gstdio.h>
++#include <poppler.h>
++#include <pps-document-annotations.h>
++#include <pps-document-factory.h>
++#include <pps-document-security.h>
++#include <pps-init.h>
++#include <pps-jobs.h>
++#include <qpdf/Constants.h>
++#include <qpdf/QPDF.hh>
++#include <qpdf/QPDFPageDocumentHelper.hh>
++#include <qpdf/QPDFWriter.hh>
++
++namespace
++{
++void
++create_input (const char *filename, bool encrypted = false)
++{
++	QPDF pdf;
++	pdf.emptyPDF ();
++	auto page = pdf.makeIndirectObject (QPDFObjectHandle::parse (
++	    "<< /Type /Page /MediaBox [0 0 240 200] /CropBox [12 18 230 180] /Rotate 90 /Resources <<>> >>"));
++	// The original page leaves a transform active. The ink must still use page coordinates.
++	page.replaceKey ("/Contents", pdf.newStream ("0 g 28 28 8 8 re f 1 0 0 1 120 40 cm\n"));
++	auto link = pdf.makeIndirectObject (QPDFObjectHandle::parse (
++	    "<< /Type /Annot /Subtype /Link /Rect [140 120 180 140] /A << /S /URI /URI (https://example.org) >> >>"));
++	auto widget = pdf.makeIndirectObject (QPDFObjectHandle::parse (
++	    "<< /Type /Annot /Subtype /Widget /FT /Tx /T (name) /V (Sample) /Rect [130 25 200 45] >>"));
++	widget.replaceKey ("/P", page);
++	auto signature_field = pdf.makeIndirectObject (QPDFObjectHandle::parse (
++	    "<< /Type /Annot /Subtype /Widget /FT /Sig /T (sign-here) /Rect [130 50 200 70] >>"));
++	signature_field.replaceKey ("/P", page);
++
++	auto legacy_ink = pdf.makeIndirectObject (QPDFObjectHandle::parse (
++	    "<< /Type /Annot /Subtype /Ink /Rect [30 67 87 90] "
++	    "/InkList [[36 76 55 86 80 76]] /C [1 0 0] /F 0 /CA 0.5 /Border [0 0 5] >>"));
++	auto hidden_ink = pdf.makeIndirectObject (QPDFObjectHandle::parse (
++	    "<< /Type /Annot /Subtype /Ink /Rect [30 100 87 120] "
++	    "/InkList [[35 105 57 108 80 116]] /C [0 1 0] /F 2 /Border [0 0 5] >>"));
++	auto styled_ink = pdf.makeIndirectObject (QPDFObjectHandle::parse (
++	    "<< /Type /Annot /Subtype /Ink /Rect [150 80 180 100] /InkList [[153 85 177 95]] >>"));
++	auto appearance = pdf.newStream ("1 1 0 RG 4 w 3 5 m 27 15 l S\n");
++	appearance.getDict ().replaceKey ("/Subtype", QPDFObjectHandle::newName ("/Form"));
++	appearance.getDict ().replaceKey ("/BBox", QPDFObjectHandle::parse ("[0 0 30 20]"));
++	auto appearances = QPDFObjectHandle::newDictionary ();
++	appearances.replaceKey ("/N", appearance);
++	styled_ink.replaceKey ("/AP", appearances);
++
++	page.replaceKey ("/Annots", QPDFObjectHandle::newArray ({ link, widget, signature_field, legacy_ink, hidden_ink, styled_ink }));
++	QPDFPageDocumentHelper (pdf).addPage (page, false);
++	auto form = QPDFObjectHandle::newDictionary ();
++	form.replaceKey ("/Fields", QPDFObjectHandle::newArray ({ widget, signature_field }));
++	pdf.getRoot ().replaceKey ("/AcroForm", form);
++	QPDFWriter writer (pdf, filename);
++	if (encrypted)
++		writer.setR6EncryptionParameters ("test-password", "test-owner", true, true, true,
++		                                  true, true, true, qpdf_r3p_full, true);
++	writer.write ();
++}
++
++void
++draw_pen_stroke (PpsDocument *document)
++{
++	g_autoptr (PpsPage) page = pps_document_get_page (document, 0);
++	g_autoptr (PpsAnnotation) annot = pps_annotation_ink_new (page);
++	const PpsRectangle area{ 25.0, 40.0, 100.0, 95.0 };
++	const GdkRGBA color{ 0, 0, 1, 1 };
++	const PpsPoint points[] = { { 28.0, 43.0 }, { 55.0, 76.0 }, { 98.0, 58.0 } };
++	PpsPath *path = pps_path_new_for_array (points, G_N_ELEMENTS (points));
++	const PpsPath *paths[] = { path };
++	PpsInkList *ink = pps_ink_list_new_for_array (paths, G_N_ELEMENTS (paths));
++
++	pps_annotation_set_area (annot, &area);
++	pps_annotation_set_rgba (annot, &color);
++	pps_annotation_set_border_width (annot, 4.0);
++	pps_annotation_ink_set_ink_list (PPS_ANNOTATION_INK (annot), ink);
++	pps_document_annotations_add_annotation (PPS_DOCUMENT_ANNOTATIONS (document), annot);
++
++	pps_path_free (path);
++}
++
++void
++save_document (PpsDocument *document, const char *target, const char *original)
++{
++	g_autoptr (GError) error = nullptr;
++	g_autoptr (PpsJob) job = pps_job_save_new (document, target, original);
++	pps_job_run (job);
++	g_assert_true (pps_job_is_succeeded (job, &error));
++	g_assert_no_error (error);
++}
++
++void
++check_page_contents (const char *filename)
++{
++	QPDF pdf;
++	pdf.processFile (filename);
++	auto page = QPDFPageDocumentHelper (pdf).getAllPages ().front ();
++	auto annots = page.getObjectHandle ().getKey ("/Annots");
++	g_assert_cmpint (annots.getArrayNItems (), ==, 5);
++	g_assert_true (annots.getArrayItem (0).getKey ("/Subtype").isNameAndEquals ("/Link"));
++	g_assert_true (annots.getArrayItem (1).getKey ("/Subtype").isNameAndEquals ("/Widget"));
++	g_assert_true (annots.getArrayItem (2).getKey ("/FT").isNameAndEquals ("/Sig"));
++	g_assert_cmpint (annots.getArrayItem (3).getKey ("/F").getIntValue (), ==, 2);
++	g_assert_true (annots.getArrayItem (4).getKey ("/AP").getKey ("/N").isStream ());
++	auto fields = pdf.getRoot ().getKey ("/AcroForm").getKey ("/Fields");
++	g_assert_true (fields.getArrayItem (0).getKey ("/V").getStringValue () == "Sample");
++	g_assert_true (fields.getArrayItem (1).getKey ("/FT").isNameAndEquals ("/Sig"));
++	g_assert_true (fields.getArrayItem (1).getKey ("/V").isNull ());
++	g_assert_cmpuint (page.getPageContents ().size (), ==, 3);
++
++	g_autoptr (GError) error = nullptr;
++	g_autofree char *uri = g_filename_to_uri (filename, nullptr, &error);
++	g_assert_no_error (error);
++	g_autoptr (PopplerDocument) doc = poppler_document_new_from_file (uri, nullptr, &error);
++	g_assert_no_error (error);
++	g_autoptr (PopplerPage) print_page = poppler_document_get_page (doc, 0);
++	double width, height;
++	poppler_page_get_size (print_page, &width, &height);
++
++	auto surface = cairo_image_surface_create (CAIRO_FORMAT_RGB24, width, height);
++	auto cr = cairo_create (surface);
++	cairo_set_source_rgb (cr, 1, 1, 1);
++	cairo_paint (cr);
++	G_GNUC_BEGIN_IGNORE_DEPRECATIONS
++	poppler_page_render_for_printing_with_options (print_page, cr, POPPLER_PRINT_DOCUMENT);
++	G_GNUC_END_IGNORE_DEPRECATIONS
++	cairo_destroy (cr);
++	cairo_surface_flush (surface);
++
++	unsigned red = 0;
++	unsigned blue = 0;
++	unsigned black = 0;
++	auto data = cairo_image_surface_get_data (surface);
++	auto stride = cairo_image_surface_get_stride (surface);
++	for (int y = 0; y < height; ++y) {
++		auto row = reinterpret_cast<const guint32 *> (data + y * stride);
++		for (int x = 0; x < width; ++x) {
++			auto r = (row[x] >> 16) & 255;
++			auto g = (row[x] >> 8) & 255;
++			auto b = row[x] & 255;
++			if (r >= 245 && g > 115 && g < 140 && b == g)
++				++red;
++			if (b >= 245 && r < 15 && g < 15)
++				++blue;
++			if (r < 15 && g < 15 && b < 15)
++				++black;
++		}
++	}
++	cairo_surface_destroy (surface);
++
++	g_assert_cmpuint (red, >, 30);
++	g_assert_cmpuint (blue, >, 30);
++	g_assert_cmpuint (black, >, 30);
++}
++
++void
++test_ink_save ()
++{
++	g_autoptr (GError) error = nullptr;
++	g_autofree char *directory = g_dir_make_tmp ("papers-ink-save.XXXXXX", &error);
++	g_assert_no_error (error);
++	g_autofree char *input = g_build_filename (directory, "input.pdf", nullptr);
++	g_autofree char *output = g_build_filename (directory, "output.pdf", nullptr);
++	g_autofree char *input_uri = g_filename_to_uri (input, nullptr, nullptr);
++	g_autofree char *output_uri = g_filename_to_uri (output, nullptr, nullptr);
++
++	create_input (input);
++	g_autoptr (PpsDocument) document = pps_document_factory_get_document (input_uri, &error);
++	g_assert_no_error (error);
++	g_assert_nonnull (document);
++	g_assert_true (pps_document_load (document, input_uri, &error));
++	g_assert_no_error (error);
++	draw_pen_stroke (document);
++	save_document (document, output_uri, input_uri);
++	check_page_contents (output);
++
++	// An overwrite save of the reopened PDF must not append another copy of the ink.
++	g_autoptr (PpsDocument) reopened = pps_document_factory_get_document (output_uri, &error);
++	g_assert_no_error (error);
++	g_assert_nonnull (reopened);
++	g_assert_true (pps_document_load (reopened, output_uri, &error));
++	g_assert_no_error (error);
++	save_document (reopened, output_uri, output_uri);
++	check_page_contents (output);
++
++	g_unlink (input);
++	g_unlink (output);
++	g_rmdir (directory);
++}
++
++void
++test_encrypted_ink_save ()
++{
++	g_autoptr (GError) error = nullptr;
++	g_autofree char *directory = g_dir_make_tmp ("papers-encrypted-ink-save.XXXXXX", &error);
++	g_assert_no_error (error);
++	g_autofree char *input = g_build_filename (directory, "input.pdf", nullptr);
++	g_autofree char *output = g_build_filename (directory, "output.pdf", nullptr);
++	g_autofree char *input_uri = g_filename_to_uri (input, nullptr, nullptr);
++	g_autofree char *output_uri = g_filename_to_uri (output, nullptr, nullptr);
++
++	create_input (input, true);
++	g_autoptr (PpsDocument) document = pps_document_factory_get_document (input_uri, &error);
++	g_assert_no_error (error);
++	g_assert_nonnull (document);
++	pps_document_security_set_password (PPS_DOCUMENT_SECURITY (document), "test-password");
++	g_assert_true (pps_document_load (document, input_uri, &error));
++	g_assert_no_error (error);
++	draw_pen_stroke (document);
++	save_document (document, output_uri, input_uri);
++
++	QPDF pdf;
++	pdf.processFile (output, "test-password");
++	g_assert_true (pdf.isEncrypted ());
++	auto page = QPDFPageDocumentHelper (pdf).getAllPages ().front ();
++	auto annots = page.getObjectHandle ().getKey ("/Annots");
++	g_assert_cmpint (annots.getArrayNItems (), ==, 7);
++	auto saved_ink = annots.getArrayItem (6);
++	g_assert_true (saved_ink.getKey ("/Subtype").isNameAndEquals ("/Ink"));
++	g_assert_cmpint (saved_ink.getKey ("/F").getIntValue (), ==, an_print);
++
++	g_unlink (input);
++	g_unlink (output);
++	g_rmdir (directory);
++}
++} // namespace
++
++int
++main (int argc, char **argv)
++{
++	g_test_init (&argc, &argv, nullptr);
++	g_assert_true (pps_init ());
++	g_test_add_func ("/libview-jobs/save-pen-ink", test_ink_save);
++	g_test_add_func ("/libview-jobs/save-pen-ink-encrypted", test_encrypted_ink_save);
++	return g_test_run ();
++}
+diff --git a/meson.build b/meson.build
+index f468a9a..90b0e6f 100644
+--- a/meson.build
++++ b/meson.build
+@@ -1,10 +1,11 @@
+ project(
+-  'papers', ['c'],
++  'papers', ['c', 'cpp'],
+   version: '51.1',
+   license: 'GPL-2.0-or-later',
+   meson_version: '>= 1.8.0',
+   default_options: [
+     'buildtype=debugoptimized',
++    'cpp_std=c++20',
+   ]
+ )
+ 
