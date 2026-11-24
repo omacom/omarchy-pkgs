@@ -102,7 +102,8 @@ gh_items() {
   done
 }
 
-queued_jobs() {
+# Every queued job, once: one line per job, its id and labels as JSON.
+queued_job_labels() {
   local status runs run
   # A workflow can be in progress while most of its matrix is still queued.
   runs=$(
@@ -113,20 +114,28 @@ queued_jobs() {
   jq -r '.id' <<< "$runs" | sort -u |
   while read -r run; do
     gh_items "repos/$REPO/actions/runs/$run/jobs" jobs |
-      jq -r --arg l "$LABEL" 'select(.status=="queued") | select(.labels | index($l)) | .id' || return 1
-  done | sort -u | wc -l
+      jq -c 'select(.status=="queued") | {id, labels}' || return 1
+  done | sort -u
 }
 
-# Droplets alive: all of them with no argument, or one pool's. A droplet's
-# pool is its tags besides TAG: none for the default pool, LARGE_LABEL for
-# the large one.
+# Queued jobs that want LABEL. A tick scans GitHub once (TICK_QUEUE, local to
+# controller_tick) and counts each pool from it. Outside a tick, scan now.
+queued_jobs() {
+  local jobs
+  if [[ -n ${TICK_QUEUE+set} ]]; then jobs=$TICK_QUEUE; else jobs=$(queued_job_labels) || return 1; fi
+  jq -s --arg l "$LABEL" '[.[] | select(.labels | index($l))] | length' <<< "$jobs"
+}
+
+# Droplets alive: all of them with no argument, or one pool's. A droplet
+# tagged LARGE_LABEL is in the large pool; every other one, including those
+# created before the large pool existed, is in the default pool.
 live_droplets() { # live_droplets [label]
   # Not the ones reap() just deleted: DigitalOcean can list them for a while.
   do_api "droplets?tag_name=$TAG&per_page=200" | jq --argjson boot "$MAX_BOOT_MINUTES" \
-    --arg tag "$TAG" --arg label "${1-}" --argjson all "$(( $# == 0 ))" '
+    --arg large "$LARGE_LABEL" --arg label "${1-}" --argjson all "$(( $# == 0 ))" '
     [.droplets[] | select(.status != "off")
       | select(.status != "new" or (now - (.created_at | fromdateiso8601)) / 60 <= $boot)
-      | select($all == 1 or ((.tags // []) - [$tag]) == ([$label] - [$tag]))] | length'
+      | select($all == 1 or ((.tags // [] | index($large)) != null) == ($label == $large))] | length'
 }
 
 busy_runners() {
@@ -162,10 +171,15 @@ CANDIDATES=""
 create_droplet() {
   local token userdata name size region body response
   [[ -n $CANDIDATES ]] || CANDIDATES=$(candidates) || return 1
-  token=$(gh_api "repos/$REPO/actions/runners/registration-token" -X POST | jq -r .token)
+  # Checked here, not left to errexit: pool_tick calls this in an || list,
+  # where errexit is off, and a droplet without a token never registers.
+  if ! token=$(gh_api "repos/$REPO/actions/runners/registration-token" -X POST | jq -er '.token | select(length > 0)'); then
+    log "no runner registration token from GitHub, so no droplet is created"
+    return 1
+  fi
   userdata=$(sed -e "s|__REPO__|$REPO|g" -e "s|__RUNNER_TOKEN__|$token|g" \
                  -e "s|__RUNNER_LABELS__|$LABEL|g" -e "s|__RUNNER_VERSION__|$RUNNER_VERSION|g" \
-                 -e "s|__SSH_KEYS_JSON__|$SSH_KEYS_JSON|" "$CLOUD_INIT")
+                 -e "s|__SSH_KEYS_JSON__|$SSH_KEYS_JSON|" "$CLOUD_INIT") || return 1
   name="$TAG-$(date +%s)-$RANDOM"
   while read -r size region; do
     [[ -n $size ]] || continue
@@ -187,14 +201,16 @@ create_droplet() {
 }
 
 # One pool's tick. LABEL, SIZES and CANDIDATES are local here, so the
-# functions it calls see this pool's values.
+# functions it calls see this pool's values. It returns 1 when a query or a
+# create failed. controller_tick calls it in an || list, where errexit is
+# off, so every failure is checked here.
 pool_tick() { # pool_tick <label> <sizes>
   local LABEL=$1 SIZES=$2 CANDIDATES=""
   local queued live busy available need room
-  queued=$(queued_jobs)
+  queued=$(queued_jobs) || return 1
   (( queued > 0 )) || return 0
-  live=$(live_droplets "$LABEL")
-  busy=$(busy_runners)
+  live=$(live_droplets "$LABEL") || return 1
+  busy=$(busy_runners) || return 1
   # A live droplet whose runner is busy is spoken for. Only droplets still
   # booting or listening can absorb a queued job.
   available=$(( live - busy )); (( available < 0 )) && available=0
@@ -208,16 +224,22 @@ pool_tick() { # pool_tick <label> <sizes>
   fi
   local i
   for (( i = 0; i < need; i++ )); do
-    create_droplet || break
+    create_droplet || return 1
     ALL_LIVE=$(( ALL_LIVE + 1 ))
   done
 }
 
+# The large pool goes first: its jobs are few, and the default pool's queue
+# can be long enough to take every free slot. Both pools are tried even when
+# the first fails, and the tick fails after, so the unit shows it.
 controller_tick() {
+  local failed=0 TICK_QUEUE ALL_LIVE
   reap
   ALL_LIVE=$(live_droplets)
-  pool_tick "$LABEL" "$SIZES"
-  pool_tick "$LARGE_LABEL" "$LARGE_SIZES"
+  TICK_QUEUE=$(queued_job_labels)
+  pool_tick "$LARGE_LABEL" "$LARGE_SIZES" || failed=1
+  pool_tick "$LABEL" "$SIZES" || failed=1
+  return "$failed"
 }
 
 if [[ "${CONTROLLER_LIBRARY_ONLY:-}" != 1 ]]; then
