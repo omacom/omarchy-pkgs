@@ -3,10 +3,10 @@
 #
 # mirror.omarchy.org follows Arch every hour, so edge machines get a new Qt
 # (or anything else a package names in rebuild_on) within the hour, while the
-# six-hourly sync-rebuilds could leave a Qt private-API consumer like
-# quickshell built against the old one for hours. The mirror stamps lastsync
+# hourly sync-rebuilds could still leave a Qt private-API consumer like
+# quickshell built against the old one until its next run. The mirror stamps lastsync
 # when an upload finishes; a new stamp starts sync-rebuilds, which bumps what
-# moved and does nothing otherwise. The six-hourly timer stays as the backstop,
+# moved and does nothing otherwise. The hourly timer stays as the backstop,
 # and for aarch64, whose versions come from Arch Linux ARM, not this mirror.
 #
 # Environment: GITHUB_TOKEN and REPO for dispatch.sh, STATE_DIRECTORY from systemd.

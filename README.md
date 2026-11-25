@@ -559,7 +559,7 @@ on named packages.
 | `sync-upstream.yml` | every 6 hours | `auto/sync-upstream-<package>` | upstream updates for packages without `"auto_merge": true` |
 | `sync-upstream.yml` | hourly | `auto/track-branches-<package>` | `"auto_merge": true` packages: the newest upstream release or branch tip |
 | `sync-upstream.yml` | every 5 minutes | `auto/track-branches-<package>` | `"sync_cadence": "five-minute"` packages: `omarchy-dev` and `omarchy-settings-dev` |
-| `sync-rebuilds.yml` | every 6 hours | `auto/sync-rebuilds-<package>` | a `pkgrel` bump where a `rebuild_on` dependency moved |
+| `sync-rebuilds.yml` | every hour | `auto/sync-rebuilds-<package>` | a `pkgrel` bump where a `rebuild_on` dependency moved |
 
 For a manual upstream run, choose the `five-minute`, `hourly` or `six-hourly` package group
 with the `cadence` input (default: `six-hourly`). The historical PR branch
@@ -696,7 +696,7 @@ docs/                          Reference
 | `auto-merge-pr.yml` | PR events, dispatch | Enables auto-merge on trusted package PRs |
 | `approve-pr.yml` | PR events | Releases GitHub's hold on a `build-approved` PR's runs |
 | `sync-upstream.yml` | every 5 minutes, hourly and every 6 hours, dispatch | Upstream release and branch-tip PRs, with a result notification for either package group |
-| `sync-rebuilds.yml` | every 6 hours, dispatch | Dependency rebuild PR |
+| `sync-rebuilds.yml` | every hour, dispatch | Dependency rebuild PR |
 | `package-prs.yml` | called by the sync workflows | Opens, updates and closes their PRs |
 | `builder-images.yml` | daily, changes to the image's inputs (push and PR), dispatch | Builds and tests the builder image; publishes it from `master` |
 | `refresh-pgp-keys.yml` | daily, dispatch | Merges revocations and new expiry dates into the shipped source-signing keys; fails with a patch when any changed |
