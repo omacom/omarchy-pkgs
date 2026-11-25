@@ -54,8 +54,9 @@ Questions and problems: open an issue on this repository.
 
      ```bash
      gpg --auto-key-locate clear,nodefault,wkd --locate-external-keys dev@example.org
-     gpg --armor --export-options export-minimal --export <FINGERPRINT> \
+     gpg --armor --export-options export-clean --export <FINGERPRINT> \
        > pkgbuilds/my-package/keys/pgp/<FINGERPRINT>.asc
+     bin/refresh-pgp-keys pkgbuilds/my-package/keys/pgp/<FINGERPRINT>.asc
      ```
    - Extract a vendor archive in `package()` with `bsdtar --no-same-owner`.
      pacman installs the numeric owners a package records, so every file
@@ -643,7 +644,9 @@ Both can also be run from the Actions tab. Read
   keys in each recipe's `keys/pgp/` only. A build that asks a keyserver
   waits on someone else's uptime: on 11 November 2026 keyserver.ubuntu.com
   went down, builds hung on `gpg --receive-keys` for up to two hours and
-  held every builder. `refresh-pgp-keys.yml` brings revocations and new
+  held every builder. `Tests/self-tests` runs `bin/refresh-pgp-keys --check`
+  on any key a PR adds or modifies so trimmed, stale, or revoked keys are
+  caught before merge. `refresh-pgp-keys.yml` also brings revocations and new
   expiry dates in once a day; when it goes red, apply its
   `refreshed-keys.patch` artifact, or run `bin/refresh-pgp-keys`, and open
   a PR.
