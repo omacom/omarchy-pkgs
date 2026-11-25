@@ -397,7 +397,7 @@ test('every bot lane opens its PRs per package through package-prs.yml', () => {
 // One PR per package, except packages pinned from the same upstream branch,
 // which move in lockstep and so share one.
 const groupsScript = join(__dirname, '../.github/scripts/package-pr-groups.sh');
-test('package PRs split per package and keep branch siblings together', () => {
+test('package PRs split per package and keep branch siblings and lockstep groups together', () => {
   const dir = mkdtempSync(join(tmpdir(), 'package-pr-groups-'));
   try {
     const git = (...args) => execFileSync('git', ['-C', dir, '-c', 'user.name=T', '-c', 'user.email=t@t', ...args]);
@@ -415,14 +415,17 @@ test('package PRs split per package and keep branch siblings together', () => {
     write('zed', { github: 'zed-industries/zed' });
     write('speakersafetyd', { git_tags: 'https://github.com/AsahiLinux/speakersafetyd.git' }, { review: true });
     write('untouched', { github: 'x/y' });
+    write('nvidia-utils', undefined, { lockstep: 'nvidia' });
+    write('linux-omarchy', undefined, { lockstep: 'nvidia' });
     git('add', '.');
     git('commit', '-qm', 'base');
-    for (const name of ['omarchy-dev', 'omarchy-settings-dev', 'omasnap-git', 'zed', 'speakersafetyd']) {
+    for (const name of ['omarchy-dev', 'omarchy-settings-dev', 'omasnap-git', 'zed', 'speakersafetyd', 'nvidia-utils', 'linux-omarchy']) {
       writeFileSync(join(dir, 'pkgbuilds', name, 'PKGBUILD'), `pkgname=${name}\npkgver=2\npkgrel=1\n`);
     }
     const patch = join(dir, 'pins.patch');
     const groups = JSON.parse(execFileSync(groupsScript, ['auto/track-branches', patch], { cwd: dir, encoding: 'utf8' }));
     assert.deepEqual(groups, [
+      { branch: 'auto/track-branches-linux-omarchy-nvidia-utils', packages: 'linux-omarchy nvidia-utils' },
       { branch: 'auto/track-branches-omarchy-dev-omarchy-settings-dev', packages: 'omarchy-dev omarchy-settings-dev' },
       { branch: 'auto/track-branches-omasnap-git', packages: 'omasnap-git' },
       { branch: 'auto/track-branches-speakersafetyd', packages: 'speakersafetyd', review: true },
