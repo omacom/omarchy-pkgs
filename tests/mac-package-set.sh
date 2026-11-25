@@ -82,13 +82,26 @@ says() { jq -e --arg re "$1" 'select(.type=="mac-set") | any(.problems[]; .probl
 pass() { echo "PASS: $1"; }
 fail() { echo "FAIL: $1"; cat "$T/out"; cat "$T/record" 2>/dev/null; exit 1; }
 
+if (( EUID == 0 )); then
+  id -u fixture >/dev/null 2>&1 || useradd -m fixture
+  mkdir -p "$T/src"; chmod 755 "$T/src"
+fi
+pkgf() { ls "$T/src/$1-$2-$3"/*.pkg.tar.zst; }
+( mkpkg alpha 1 aarch64 >/dev/null ) & m1=$!
+( mkpkg shared-lib 1 aarch64 +libshared.so=1 >/dev/null ) & m2=$!
+( mkpkg fast-tool 1 aarch64 +tool-api=1 >/dev/null ) & m3=$!
+( mkpkg mac-audio 1 any >/dev/null ) & m4=$!
+( mkpkg mac-kernel 1 aarch64 'mac-boot>=1.0' >/dev/null ) & m5=$!
+( mkpkg mac-boot 1 aarch64 'shared-lib>=1.0' libshared.so=1 tool-api=1 bash >/dev/null ) & m6=$!
+( mkpkg alpha 2 aarch64 >/dev/null ) & m7=$!
+for p in "$m1" "$m2" "$m3" "$m4" "$m5" "$m6" "$m7"; do wait "$p"; done
 # rc before the candidate: a shared library the Mac set links, a shared
 # fast-ring tool it uses, and one x86 package.
-pub rc aarch64 $(mkpkg alpha 1 aarch64) $(mkpkg shared-lib 1 aarch64 +libshared.so=1) $(mkpkg fast-tool 1 aarch64 +tool-api=1)
+pub rc aarch64 $(pkgf alpha 1 aarch64) $(pkgf shared-lib 1 aarch64) $(pkgf fast-tool 1 aarch64)
 # edge carries the candidate, which matches the inventory.
-AUDIO1=$(mkpkg mac-audio 1 any)
-pub edge aarch64 $(mkpkg mac-kernel 1 aarch64 'mac-boot>=1.0') $(mkpkg mac-boot 1 aarch64 'shared-lib>=1.0' libshared.so=1 tool-api=1 bash) \
-  "$AUDIO1" $(mkpkg alpha 2 aarch64)
+AUDIO1=$(pkgf mac-audio 1 any)
+pub edge aarch64 $(pkgf mac-kernel 1 aarch64) $(pkgf mac-boot 1 aarch64) \
+  "$AUDIO1" $(pkgf alpha 2 aarch64)
 pub edge x86_64 "$AUDIO1"
 
 # --- a matching set ----------------------------------------------------------

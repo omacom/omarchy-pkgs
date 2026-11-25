@@ -59,6 +59,10 @@ export GPG_PRIVATE_KEY=$(gpg --batch --armor --export-secret-keys 'Test <t@t>') 
 unset GNUPGHOME
 
 # --- identical package files for both --------------------------------------------
+if (( EUID == 0 )); then
+  id -u fixture >/dev/null 2>&1 || useradd -m fixture
+  mkdir -p "$T/src"; chmod 755 "$T/src"
+fi
 mkpkg() { # mkpkg <name> <pkgrel> <arch> [second pkgname] [depends...]
   local name=$1 rel=$2 arch=$3 extra=${4:-} d="$T/src/$1-$2-$3" carch=$3
   shift 3; (( $# )) && shift
@@ -86,16 +90,46 @@ mkpkg() { # mkpkg <name> <pkgrel> <arch> [second pkgname] [depends...]
   cd "$ROOT"
   ls "$d"/*.pkg.tar.zst
 }
+# Build all unique fixture packages in parallel (one directory per spec; deduplicated).
+build_fixtures() {
+  local specs=(
+    "alpha|1|x86_64" "shared-lib|1|x86_64" "fast|1|x86_64" "pinned|1|x86_64" "docs|1|any"
+    "alpha|2|x86_64" "x86-split|1|x86_64|x86-split-extra" "shared-lib|2|x86_64" "fast|2|x86_64" "pinned|2|x86_64" "docs|2|any"
+    "arm-tool|1|aarch64" "shared-lib|1|aarch64" "fast|1|aarch64" "arm-ahead|3|aarch64"
+    "arm-tool|2|aarch64" "shared-lib|2|aarch64" "fast|2|aarch64" "arm-ahead|2|aarch64"
+    "linux-aurora|1|aarch64" "omarchy-mac|1|aarch64||shared-lib>=1.0"
+    "linux-aurora|2|aarch64" "omarchy-mac|2|aarch64||shared-lib>=1.0"
+  )
+  local workers=4
+  if [[ -r /sys/fs/cgroup/cpu.max ]]; then
+    read -r q per < /sys/fs/cgroup/cpu.max || true
+    [[ "${q:-max}" != "max" && -n "${per:-}" && "$per" -gt 0 ]] && workers=$(( (q + per - 1) / per ))
+  fi
+  (( workers < 1 )) && workers=1
+  local w i pids=() p
+  for (( w = 0; w < workers; w++ )); do
+    (
+      for (( i = w; i < ${#specs[@]}; i += workers )); do
+        IFS='|' read -ra args <<<"${specs[i]}"
+        mkpkg "${args[@]}" >/dev/null
+      done
+    ) &
+    pids+=($!)
+  done
+  for p in "${pids[@]}"; do wait "$p"; done
+}
+build_fixtures
+pkg_files() { ls "$T/src/$1-$2-$3"/*.pkg.tar.zst; }
 # x86_64: what an x86-only promotion sees.
-X86_RC=$(mkpkg alpha 1 x86_64; mkpkg shared-lib 1 x86_64; mkpkg fast 1 x86_64; mkpkg pinned 1 x86_64; mkpkg docs 1 any)
-X86_EDGE=$(mkpkg alpha 2 x86_64; mkpkg x86-split 1 x86_64 x86-split-extra; mkpkg shared-lib 2 x86_64;
-  mkpkg fast 2 x86_64; mkpkg pinned 2 x86_64; mkpkg docs 2 any)
+X86_RC=$(pkg_files alpha 1 x86_64; pkg_files shared-lib 1 x86_64; pkg_files fast 1 x86_64; pkg_files pinned 1 x86_64; pkg_files docs 1 any)
+X86_EDGE=$(pkg_files alpha 2 x86_64; pkg_files x86-split 1 x86_64; pkg_files shared-lib 2 x86_64;
+  pkg_files fast 2 x86_64; pkg_files pinned 2 x86_64; pkg_files docs 2 any)
 # aarch64 without Mac packages.
-ARM_RC=$(mkpkg arm-tool 1 aarch64; mkpkg shared-lib 1 aarch64; mkpkg fast 1 aarch64; mkpkg arm-ahead 3 aarch64; mkpkg docs 1 any)
-ARM_EDGE=$(mkpkg arm-tool 2 aarch64; mkpkg shared-lib 2 aarch64; mkpkg fast 2 aarch64; mkpkg arm-ahead 2 aarch64; mkpkg docs 2 any)
+ARM_RC=$(pkg_files arm-tool 1 aarch64; pkg_files shared-lib 1 aarch64; pkg_files fast 1 aarch64; pkg_files arm-ahead 3 aarch64; pkg_files docs 1 any)
+ARM_EDGE=$(pkg_files arm-tool 2 aarch64; pkg_files shared-lib 2 aarch64; pkg_files fast 2 aarch64; pkg_files arm-ahead 2 aarch64; pkg_files docs 2 any)
 # aarch64 with a Mac stack on edge ahead of rc's.
-MAC_RC=$(mkpkg linux-aurora 1 aarch64; mkpkg omarchy-mac 1 aarch64 "" 'shared-lib>=1.0'; mkpkg shared-lib 1 aarch64; mkpkg arm-tool 1 aarch64)
-MAC_EDGE=$(mkpkg linux-aurora 2 aarch64; mkpkg omarchy-mac 2 aarch64 "" 'shared-lib>=1.0'; mkpkg shared-lib 2 aarch64; mkpkg arm-tool 2 aarch64)
+MAC_RC=$(pkg_files linux-aurora 1 aarch64; pkg_files omarchy-mac 1 aarch64; pkg_files shared-lib 1 aarch64; pkg_files arm-tool 1 aarch64)
+MAC_EDGE=$(pkg_files linux-aurora 2 aarch64; pkg_files omarchy-mac 2 aarch64; pkg_files shared-lib 2 aarch64; pkg_files arm-tool 2 aarch64)
 
 # --- run the same promotions with each -----------------------------------------
 # One line per step: the step, the exit code, then the plan, the publishes
@@ -140,8 +174,12 @@ run_side() { # run_side <before|after>
   pub edge aarch64 $MAC_EDGE
   step "aarch64 named non-Mac edge -> rc, Mac stack ahead on edge" --from edge --to rc --arch aarch64 arm-tool
 }
-run_side before
-run_side after
+run_side before & pid_before=$!
+run_side after & pid_after=$!
+rc_before=0 rc_after=0
+wait "$pid_before" || rc_before=$?
+wait "$pid_after" || rc_after=$?
+(( rc_before == 0 && rc_after == 0 )) || exit 1
 cat "$T/after.result"
 
 if diff -u "$T/before.result" "$T/after.result" > "$T/diff"; then
