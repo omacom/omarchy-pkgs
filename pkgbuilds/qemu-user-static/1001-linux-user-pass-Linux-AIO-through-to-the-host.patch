@@ -1,0 +1,107 @@
+From 38c79ec78a3ff6446e4ddb6383f82e335df78d5e Mon Sep 17 00:00:00 2001
+From: Allan Clempe <allan.clempe@gmail.com>
+Date: Wed, 25 Nov 2026 14:37:56 +1000
+Subject: [PATCH 2/3] linux-user: pass Linux AIO through to the host
+
+qemu-user implements none of io_setup, io_destroy, io_submit, io_cancel
+or io_getevents, so programs that use the kernel AIO interface fail
+with ENOSYS; SQL Server 2022 stops with "Unable to create a new
+asynchronous I/O context".
+
+A 64-bit guest and host of the same endianness share aio_context_t,
+struct iocb, struct io_event and struct timespec byte for byte, and
+with guest_base 0 a guest pointer inside them is the host pointer, so
+the host kernel can take them unchanged.  Pass the five calls through
+in that case; anything else keeps returning ENOSYS.
+
+Signed-off-by: Allan Clempe <allan.clempe@gmail.com>
+---
+ linux-user/syscall.c | 65 ++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 65 insertions(+)
+
+diff --git a/linux-user/syscall.c b/linux-user/syscall.c
+index 9f45450..905ba6a 100644
+--- a/linux-user/syscall.c
++++ b/linux-user/syscall.c
+@@ -691,6 +691,21 @@ static type safe_##name(type1 arg1, type2 arg2, type3 arg3, type4 arg4, \
+ }
+ 
+ safe_syscall3(ssize_t, read, int, fd, void *, buff, size_t, count)
++
++/*
++ * Linux AIO passthrough. Every 64-bit guest and host of the same endianness
++ * (x86-64 on arm64 among them) share aio_context_t, struct iocb, struct
++ * io_event and struct timespec byte for byte, and with guest_base 0 a guest
++ * pointer inside them is the host pointer, so the host kernel can take them
++ * as they are. Anything else keeps the old -ENOSYS.
++ */
++#if defined(TARGET_NR_io_setup) && defined(__NR_io_setup) && \
++    TARGET_ABI_BITS == 64 && HOST_LONG_BITS == 64 && \
++    HOST_BIG_ENDIAN == TARGET_BIG_ENDIAN
++#define QEMU_LINUX_AIO_PASSTHROUGH 1
++safe_syscall5(int, io_getevents, unsigned long, ctx_id, long, min_nr,
++              long, nr, void *, events, struct timespec *, timeout)
++#endif
+ safe_syscall3(ssize_t, write, int, fd, const void *, buff, size_t, count)
+ safe_syscall4(int, openat, int, dirfd, const char *, pathname, \
+               int, flags, mode_t, mode)
+@@ -13976,6 +13991,56 @@ static abi_long do_syscall1(CPUArchState *cpu_env, int num, abi_long arg1,
+         return get_errno(epoll_ctl(arg1, arg2, arg3, epp));
+     }
+ 
++#ifdef QEMU_LINUX_AIO_PASSTHROUGH
++    case TARGET_NR_io_setup:
++        if (guest_base) {
++            return -TARGET_ENOSYS;
++        }
++        if (!access_ok(cpu, VERIFY_WRITE, arg2, sizeof(abi_ulong))) {
++            return -TARGET_EFAULT;
++        }
++        return get_errno(syscall(__NR_io_setup, (unsigned int)arg1,
++                                 g2h_untagged(arg2)));
++    case TARGET_NR_io_destroy:
++        if (guest_base) {
++            return -TARGET_ENOSYS;
++        }
++        return get_errno(syscall(__NR_io_destroy, (unsigned long)arg1));
++    case TARGET_NR_io_submit:
++        if (guest_base) {
++            return -TARGET_ENOSYS;
++        }
++        return get_errno(syscall(__NR_io_submit, (unsigned long)arg1,
++                                 (long)arg2, g2h_untagged(arg3)));
++    case TARGET_NR_io_cancel:
++        if (guest_base) {
++            return -TARGET_ENOSYS;
++        }
++        return get_errno(syscall(__NR_io_cancel, (unsigned long)arg1,
++                                 g2h_untagged(arg2), g2h_untagged(arg3)));
++    case TARGET_NR_io_getevents:
++    {
++        struct timespec ts, *pts = NULL;
++
++        if (guest_base) {
++            return -TARGET_ENOSYS;
++        }
++        if (arg5) {
++            struct target_timespec *tts;
++
++            if (!lock_user_struct(VERIFY_READ, tts, arg5, 1)) {
++                return -TARGET_EFAULT;
++            }
++            __get_user(ts.tv_sec, &tts->tv_sec);
++            __get_user(ts.tv_nsec, &tts->tv_nsec);
++            unlock_user_struct(tts, arg5, 0);
++            pts = &ts;
++        }
++        return get_errno(safe_io_getevents(arg1, arg2, arg3,
++                                           g2h_untagged(arg4), pts));
++    }
++#endif
++
+ #if defined(TARGET_NR_epoll_wait)
+     case TARGET_NR_epoll_wait:
+ #endif
+-- 
+2.56.1
+

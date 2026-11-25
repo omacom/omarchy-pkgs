@@ -1,0 +1,124 @@
+From e1cc37b2ca9aba9addb5067564a955e5e78a1bf0 Mon Sep 17 00:00:00 2001
+From: Allan Clempe <allan.clempe@gmail.com>
+Date: Wed, 25 Nov 2026 14:37:56 +1000
+Subject: [PATCH 1/3] linux-user: keep 64-bit guest mappings inside the guest
+ address space
+
+Without reserved_va, guest_addr_max admits every host address, so a
+mapping the guest did not place can land wherever the host puts it.
+When host and guest page sizes match, mmap_h_eq_g() passes the host a
+NULL hint and the kernel places the mapping top-down from the top of
+its own address space.  On an arm64 host with 48-bit user addresses an
+x86-64 guest then gets mappings above 2^47, which x86-64 programs take
+for kernel addresses: SQL Server 2022 sign-extends such pointers from
+bit 47 and faults.
+
+For 64-bit guests with at most 47 address bits, cap the addresses
+mmap_find_vma() accepts at the guest address space, place non-fixed
+mappings through it as reserved_va does, and start the search at 3/4
+of that space, where the guest kernel default top-down layout would
+put them: SQL Server also refuses mappings below 2^46, which it takes
+for the legacy layout.
+
+Signed-off-by: Allan Clempe <allan.clempe@gmail.com>
+---
+ linux-user/main.c | 15 +++++++++++++++
+ linux-user/mmap.c | 42 +++++++++++++++++++++++++++++++++++++++++-
+ 2 files changed, 56 insertions(+), 1 deletion(-)
+
+diff --git a/linux-user/main.c b/linux-user/main.c
+index 60a695b..99b545f 100644
+--- a/linux-user/main.c
++++ b/linux-user/main.c
+@@ -879,6 +879,21 @@ int main(int argc, char **argv, char **envp)
+     }
+     mmap_next_start = task_unmapped_base;
+ 
++#if TARGET_ABI_BITS == 64 && HOST_LONG_BITS == 64 && \
++    TARGET_VIRT_ADDR_SPACE_BITS <= 47
++    /*
++     * With no reserved_va, mmap.c keeps such a guest's mappings inside its
++     * own address space (guest_mmap_max). Search from high in that space,
++     * as the guest kernel's default top-down layout would place them:
++     * SQL Server's PAL refuses mappings below 2^46, which it takes for the
++     * legacy layout. 3/4 of the space leaves 32 TiB on x86-64.
++     */
++    if (!reserved_va) {
++        mmap_next_start = TARGET_PAGE_ALIGN(
++            ((abi_ulong)1 << TARGET_VIRT_ADDR_SPACE_BITS) / 4 * 3);
++    }
++#endif
++
+     /* Similarly for elf_et_dyn_base. */
+     if (reserved_va) {
+         if (ELF_ET_DYN_BASE < reserved_va) {
+diff --git a/linux-user/mmap.c b/linux-user/mmap.c
+index cc0c2ee..0544da3 100644
+--- a/linux-user/mmap.c
++++ b/linux-user/mmap.c
+@@ -417,6 +417,27 @@ abi_ulong task_unmapped_base;
+ abi_ulong elf_et_dyn_base;
+ abi_ulong mmap_next_start;
+ 
++/*
++ * The highest guest address for a mapping the guest didn't place itself.
++ * Without reserved_va, guest_addr_max admits every host address. A 64-bit
++ * guest with a smaller address space than the host's must still not be
++ * handed addresses past its own: on an arm64 host with 48-bit user
++ * addresses, an x86-64 guest would get mappings above 2^47, which x86-64
++ * programs take for kernel addresses (SQL Server's PAL sign-extends them
++ * from bit 47 and faults).
++ */
++static abi_ulong guest_mmap_max(void)
++{
++#if TARGET_ABI_BITS == 64 && HOST_LONG_BITS == 64 && \
++    TARGET_VIRT_ADDR_SPACE_BITS <= 47
++    if (!reserved_va) {
++        return MIN(guest_addr_max,
++                   ((abi_ulong)1 << TARGET_VIRT_ADDR_SPACE_BITS) - 1);
++    }
++#endif
++    return guest_addr_max;
++}
++
+ /*
+  * Subroutine of mmap_find_vma, used when we have pre-allocated
+  * a chunk of guest address space.
+@@ -492,7 +513,8 @@ abi_ulong mmap_find_vma(abi_ulong start, abi_ulong size, abi_ulong align)
+          */
+         repeat = (ptr == prev ? repeat + 1 : 0);
+ 
+-        if (h2g_valid(ptr + size - 1)) {
++        if (h2g_valid(ptr + size - 1) &&
++            h2g(ptr + size - 1) <= guest_mmap_max()) {
+             addr = h2g(ptr);
+ 
+             if ((addr & (align - 1)) == 0) {
+@@ -944,6 +966,24 @@ static abi_long target_mmap__locked(abi_ulong start, abi_ulong len,
+             start += offset - host_offset;
+             flags |= MAP_FIXED;
+         }
++    } else if (!(flags & (MAP_FIXED | MAP_FIXED_NOREPLACE)) &&
++               guest_mmap_max() < guest_addr_max) {
++        /*
++         * As for reserved_va, place the mapping inside the guest's address
++         * space ourselves: the host would put it top-down, past the end.
++         */
++        abi_ulong real_start = start & -host_page_size;
++        off_t host_offset = offset & -host_page_size;
++        size_t real_len = len + offset - host_offset;
++        abi_ulong align = MAX(host_page_size, TARGET_PAGE_SIZE);
++
++        start = mmap_find_vma(real_start, real_len, align);
++        if (start == (abi_ulong)-1) {
++            errno = ENOMEM;
++            return -1;
++        }
++        start += offset - host_offset;
++        flags |= MAP_FIXED;
+     }
+ 
+     host_prot = target_to_host_prot(target_prot);
+-- 
+2.56.1
+
