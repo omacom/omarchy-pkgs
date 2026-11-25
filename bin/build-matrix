@@ -28,30 +28,142 @@ for a in $ARCHES; do require_valid_arch "$a"; done
 
 if (( $# )); then names=("$@"); else mapfile -t names; fi
 
-entries=()
+valid_names=()
+meta_files=()
 for name in "${names[@]}"; do
   [[ -n "$name" ]] || continue
   pkgdir="$PKGBUILDS_DIR/$name"
-  [[ -d "$pkgdir" ]] || continue
-  # skip_build packages still build on their own PR (explicit --package
-  # semantics); only an unscoped local bin/build skips them.
-  channels=""
-  for mirror in $VALID_MIRRORS; do
-    package_builds_for_mirror "$pkgdir" "$mirror" && channels="$channels $mirror"
-  done
-  channels=${channels# }
-  [[ -n "$channels" ]] || continue
-  # An arch=any package produces one architecture-independent file, so it
-  # builds once, on the first architecture, and that file serves every
-  # channel database of every architecture.
-  if [[ " $(package_arches "$pkgdir" "${ARCHES%% *}") " == *" any "* ]]; then
-    entries+=("$(jq -nc --arg p "$name" --arg a "${ARCHES%% *}" --arg c "$channels" --arg pa "$ARCHES" --arg r "$(package_runner "$name" "${ARCHES%% *}")" --arg h "$(package_build_host "$name" "${ARCHES%% *}")" '{package:$p, arch:$a, channels:$c, publish_arches:$pa, runner:$r, builder_arch:$h}')")
-    continue
-  fi
-  for arch in $ARCHES; do
-    package_supports_arch "$pkgdir" "$arch" || continue
-    entries+=("$(jq -nc --arg p "$name" --arg a "$arch" --arg c "$channels" --arg r "$(package_runner "$name" "$arch")" --arg h "$(package_build_host "$name" "$arch")" '{package:$p, arch:$a, channels:$c, publish_arches:$a, runner:$r, builder_arch:$h}')")
-  done
+  [[ -d "$pkgdir" && -f "$pkgdir/PKGBUILD" && -f "$pkgdir/.omarchy/package.json" ]] || continue
+  valid_names+=("$name")
+  meta_files+=("$pkgdir/.omarchy/package.json")
 done
 
-printf '%s\n' "${entries[@]}" | jq -sc '{include: .}'
+if (( ${#valid_names[@]} == 0 )); then
+  echo '{"include":[]}'
+  exit 0
+fi
+
+# Key metadata by input_filename so an empty or multi-document file cannot
+# shift subsequent packages' channels.
+declare -A META_PINNED=() META_RING=() META_SEEN=()
+while IFS=$'\t' read -r mfile pinned ring; do
+  if [[ -n "${META_SEEN[$mfile]:-}" ]]; then
+    echo "build-matrix: multiple JSON documents in $mfile" >&2
+    exit 1
+  fi
+  META_SEEN[$mfile]=1
+  META_PINNED[$mfile]=$pinned
+  META_RING[$mfile]=$ring
+done < <(jq -r '[input_filename, (.pinned // false), (.release_ring // "")] | @tsv' "${meta_files[@]}")
+
+for mfile in "${meta_files[@]}"; do
+  if [[ -z "${META_SEEN[$mfile]:-}" ]]; then
+    echo "build-matrix: empty or unreadable metadata file $mfile" >&2
+    exit 1
+  fi
+done
+
+_cpu_limit() {
+  local n
+  n=$(nproc 2>/dev/null || echo 1)
+  if [[ -r /sys/fs/cgroup/cpu.max ]]; then
+    local quota period q
+    read -r quota period < /sys/fs/cgroup/cpu.max || true
+    if [[ "$quota" != "max" && -n "$period" && "$period" -gt 0 ]]; then
+      q=$(( (quota + period - 1) / period ))
+      (( q < 1 )) && q=1
+      (( q < n )) && n=$q
+    fi
+  fi
+  echo "$n"
+}
+
+first_arch="${ARCHES%% *}"
+
+read_pkg_arches() {
+  local idx="$1" name="$2" pkgdir="$PKGBUILDS_DIR/$2"
+  local first_arches arch_list="" arch_varies=0
+  first_arches=$(package_arches "$pkgdir" "$first_arch" 2>/dev/null || true)
+  if [[ " $first_arches " == *" any "* ]]; then
+    printf '%s\tany\n' "$idx"
+    return 0
+  fi
+  grep -qE 'CARCH|(^|[[:space:];&(])(source|\.)[[:space:]]' "$pkgdir/PKGBUILD" 2>/dev/null && arch_varies=1
+  local a a_arches
+  for a in $ARCHES; do
+    if [[ "$a" == "$first_arch" || "$arch_varies" -eq 0 ]]; then
+      a_arches="$first_arches"
+    else
+      a_arches=$(package_arches "$pkgdir" "$a" 2>/dev/null || true)
+    fi
+    case " $a_arches " in
+      *" any "* | *" $a "*) arch_list="$arch_list $a" ;;
+    esac
+  done
+  printf '%s\t%s\n' "$idx" "${arch_list# }"
+}
+
+declare -a pkg_arch_res=()
+if (( ${#valid_names[@]} > 8 )); then
+  workers=$(_cpu_limit)
+  tmpdir=$(mktemp -d)
+  trap 'rm -rf "$tmpdir"' EXIT
+  pids=()
+  for (( w = 0; w < workers; w++ )); do
+    (
+      for (( i = w; i < ${#valid_names[@]}; i += workers )); do
+        read_pkg_arches "$i" "${valid_names[i]}"
+      done
+    ) > "$tmpdir/w$w.tsv" &
+    pids+=($!)
+  done
+  for p in "${pids[@]}"; do wait "$p"; done
+  while IFS=$'\t' read -r idx val; do
+    pkg_arch_res[idx]="$val"
+  done < <(cat "$tmpdir"/w*.tsv)
+else
+  for (( i = 0; i < ${#valid_names[@]}; i++ )); do
+    IFS=$'\t' read -r _ val < <(read_pkg_arches "$i" "${valid_names[i]}")
+    pkg_arch_res[i]="$val"
+  done
+fi
+
+{
+  for (( i = 0; i < ${#valid_names[@]}; i++ )); do
+    name="${valid_names[i]}"
+    mfile="${meta_files[i]}"
+    pinned="${META_PINNED[$mfile]}"
+    ring="${META_RING[$mfile]}"
+    channels="edge"
+    if [[ "$pinned" == "true" ]]; then
+      [[ -n "${OMARCHY_RC_PINS:-}" ]] && channels="$channels rc"
+    elif [[ "$ring" == "fast" ]]; then
+      channels="$channels rc stable"
+    fi
+
+    sup="${pkg_arch_res[i]:-}"
+    [[ -n "$sup" ]] || continue
+    if [[ "$sup" == "any" ]]; then
+      printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "$name" "$first_arch" "$channels" "$ARCHES" \
+        "$(package_runner "$name" "$first_arch")" \
+        "$(package_build_host "$name" "$first_arch")"
+    else
+      for arch in $sup; do
+        printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+          "$name" "$arch" "$channels" "$arch" \
+          "$(package_runner "$name" "$arch")" \
+          "$(package_build_host "$name" "$arch")"
+      done
+    fi
+  done
+} | jq -Rsc '
+  split("\n") | map(select(length > 0) | split("\t") | {
+    package: .[0],
+    arch: .[1],
+    channels: .[2],
+    publish_arches: .[3],
+    runner: .[4],
+    builder_arch: .[5]
+  }) | {include: .}
+'
