@@ -1,0 +1,249 @@
+#!/bin/bash
+# Check with pacman that a promotion leaves what the destination channel
+# serves installable, for one architecture.
+#
+#   check-channel-deps --channel <rc|stable> --arch <arch> \
+#     --before <db|dir> --after <db|dir> [--arch-db <repo>.db]... [--record FILE]
+#
+# The destination before the promotion and as it would leave it come as
+# package databases (omarchy.db.tar.zst, or the directory it unpacks to).
+# Each --arch-db is one repository of the Arch snapshot the channel serves,
+# named <repo>.db (core.db, extra.db and so on), in the order pacman.conf
+# lists them after [omarchy].
+#
+# For each view the check writes a pacman.conf with [omarchy] serving that
+# view and the snapshot's repositories after it, as a machine on the channel
+# has them, less the Arch packages Omarchy serves a package of the same name
+# for: a machine that has one installed follows [omarchy] for it on every
+# update, so a dependency pinned to Arch's version breaks once Omarchy's
+# differs, though pacman on an empty system would install Arch's. It then
+# asks pacman (-Sp, against an empty system) to resolve:
+#   - every Omarchy package the promotion moves, and
+#   - every package that depends on a name a moved package provides, before
+#     or after: Omarchy's, and Arch's unless Omarchy serves its name, since
+#     an Omarchy build can break an Arch package that links it.
+# A target that pacman resolves before the promotion, or that did not exist
+# before, and fails after it is a problem, and pacman's own reason is the
+# message. A target that already failed before, for every reason it fails
+# after, is reported but not held against the promotion, so one old problem
+# does not block every promotion after it. One that gains a reason is a
+# problem, named by the reasons it gained.
+#
+# Exit status: 0 passes, 1 refuses and names every new problem, 2 on a usage
+# error or when pacman fails for any reason other than a dependency it cannot
+# satisfy or a target it cannot find: a pacman that cannot run must refuse,
+# not pass with every target already broken. --record appends one JSON line:
+# {"type":"deps", arch, channel, result: "pass"|"refused",
+#  problems: [{package, problem}], existing: [...]}.
+set -euo pipefail
+# The C locale for sort, which must keep a package's desc and depends files
+# together, and for pacman, whose messages the check matches in English.
+export LC_ALL=C
+BUILD_ROOT=$(realpath "${BASH_SOURCE[0]%/*}/..")
+source "$BUILD_ROOT/helpers/message-helpers.sh"
+
+RECORD=/dev/null
+BEFORE="" AFTER="" ARCH_DBS=()
+while [[ $# -gt 0 ]]; do
+  case $1 in
+  --channel) CHANNEL=$2; shift 2 ;;
+  --arch) ARCH=$2; shift 2 ;;
+  --before) BEFORE=$2; shift 2 ;;
+  --after) AFTER=$2; shift 2 ;;
+  --arch-db) ARCH_DBS+=("$2"); shift 2 ;;
+  --record) RECORD=$2; shift 2 ;;
+  -h|--help) sed -n '2,37p' "$0"; exit 0 ;;
+  *) print_error "Unknown argument: $1"; exit 2 ;;
+  esac
+done
+usage() { print_error "$1"; exit 2; }
+[[ -n ${CHANNEL:-} && -n ${ARCH:-} ]] || usage "--channel and --arch are required"
+[[ -n $AFTER ]] || usage "--after is required"
+
+WORK=$(mktemp -d)
+trap 'rm -rf "$WORK"' EXIT
+
+unpack() { # unpack <db|dir|""> <dir>: a database's entries as <dir>/<name-version>/...
+  mkdir -p "$2"
+  if [[ -d $1 ]]; then
+    cp -R "$1/." "$2/"
+  elif [[ -f $1 ]]; then
+    bsdtar -xf "$1" -C "$2"
+  elif [[ -n $1 ]]; then
+    usage "No database at $1"
+  fi
+}
+# One line per package: name|version|depends|provides, the lists
+# space-separated and without versions. Newer databases keep everything in
+# desc; older ones, as Arch Linux ARM's, put depends and provides in a
+# depends file beside it. One awk reads every file, named on stdin rather
+# than on its command line, so a package's two files are never split.
+entries() { # entries <dir>
+  find "$1" -mindepth 2 -maxdepth 2 \( -name desc -o -name depends \) | sort | awk '
+    function flush() { if (name != "") print name "|" ver "|" deps "|" provs; name = ver = deps = provs = "" }
+    function bare(s) { sub(/(>=|<=|=|<|>).*/, "", s); return s }
+    {
+      file = $0; dir = file; sub(/\/[^\/]*$/, "", dir)
+      if (dir != last) flush()
+      last = dir; section = ""
+      while ((getline line < file) > 0) {
+        if (line ~ /^%[A-Z0-9]+%$/) { section = line; continue }
+        if (line == "") { section = ""; continue }
+        if (section == "%NAME%") name = line
+        else if (section == "%VERSION%") ver = line
+        else if (section == "%DEPENDS%") deps = deps " " bare(line)
+        else if (section == "%PROVIDES%") provs = provs " " bare(line)
+      }
+      close(file)
+    }
+    END { flush() }'
+}
+
+# The awk programs below tell their files apart by FILENAME, not NR == FNR,
+# which holds through the second file when the first is empty (an empty
+# destination), and take their variables with -v, since an assignment
+# among the arguments would be ARGV[1].
+
+# --- the two views, as pacman sees them ----------------------------------------
+REPOS=()
+: > "$WORK/arch.tsv"
+for db in "${ARCH_DBS[@]}"; do
+  [[ -f $db ]] || usage "No Arch repository database at $db"
+  r=$(basename "$db" .db)
+  REPOS+=("$r")
+  unpack "$db" "$WORK/arch-$r"
+  entries "$WORK/arch-$r" | sed "s/^/$r|/" >> "$WORK/arch.tsv"
+  # <entry directory>\t<name>, to leave entries out by name.
+  find "$WORK/arch-$r" -mindepth 2 -maxdepth 2 -name desc | awk '
+    { file = $0; dir = file; sub(/\/desc$/, "", dir); sub(/.*\//, "", dir)
+      while ((getline line < file) > 0) { if (line == "%NAME%") { getline line < file; print dir "\t" line; break } }
+      close(file) }' > "$WORK/arch-$r.dirs"
+done
+for view in before after; do
+  dir=${view^^}
+  unpack "${!dir}" "$WORK/$view"
+  entries "$WORK/$view" | sort > "$WORK/$view.tsv"
+  mkdir -p "$WORK/db-$view/sync"
+  # An empty view still needs a database pacman can read.
+  if compgen -G "$WORK/$view/*/desc" >/dev/null; then
+    (cd "$WORK/$view" && bsdtar -czf "$WORK/db-$view/sync/omarchy.db" -- */)
+  else
+    bsdtar -czf "$WORK/db-$view/sync/omarchy.db" --files-from /dev/null
+  fi
+  for r in "${REPOS[@]}"; do
+    awk -F'\t' 'FILENAME == ARGV[1] { split($0, f, "|"); omarchy[f[1]] = 1; next } !($2 in omarchy) { print $1 }' \
+      "$WORK/$view.tsv" "$WORK/arch-$r.dirs" > "$WORK/$view-$r.keep"
+    if [[ -s $WORK/$view-$r.keep ]]; then
+      (cd "$WORK/arch-$r" && bsdtar -czf "$WORK/db-$view/sync/$r.db" -T "$WORK/$view-$r.keep")
+    else
+      bsdtar -czf "$WORK/db-$view/sync/$r.db" --files-from /dev/null
+    fi
+  done
+  {
+    printf '[options]\nArchitecture = %s\nSigLevel = Never\n\n[omarchy]\nServer = file:///nonexistent\n' "$ARCH"
+    for r in "${REPOS[@]}"; do printf '\n[%s]\nServer = file:///nonexistent\n' "$r"; done
+  } > "$WORK/$view.conf"
+done
+
+# --- what to resolve -------------------------------------------------------------
+# Moved: an Omarchy package whose version after is not the one before. Its
+# names: what it is and provides, before and after.
+awk -F'|' -v moved="$WORK/moved" -v names="$WORK/names.raw" 'FILENAME == ARGV[1] { before[$1] = $2; bp[$1] = $4; next }
+  before[$1] != $2 { print "omarchy/" $1 > moved; n = split($1 " " $4 " " bp[$1], w, " "); for (i = 1; i <= n; i++) print w[i] > names }' \
+  "$WORK/before.tsv" "$WORK/after.tsv"
+touch "$WORK/moved" "$WORK/names.raw"
+sort -u "$WORK/names.raw" > "$WORK/names"
+# Dependents: packages, in either view or in Arch, depending on one of those
+# names. An Arch package Omarchy serves the name of is never installed.
+awk -F'|' -v out="$WORK/dependents.raw" '
+  FILENAME == ARGV[1] { name[$0] = 1; next }
+  FILENAME == ARGV[2] || FILENAME == ARGV[3] { omarchy[$1] = 1
+    n = split($3, d, " "); for (i = 1; i <= n; i++) if (d[i] in name) { print "omarchy/" $1 > out; break }
+    next }
+  !($2 in omarchy) && !seen[$2]++ {
+    n = split($4, d, " "); for (i = 1; i <= n; i++) if (d[i] in name) { print $1 "/" $2 > out; break } }' \
+  "$WORK/names" "$WORK/before.tsv" "$WORK/after.tsv" "$WORK/arch.tsv"
+touch "$WORK/dependents.raw"
+sort -u "$WORK/moved" "$WORK/dependents.raw" > "$WORK/targets"
+
+# --- resolve -----------------------------------------------------------------------
+# joined: stdin's lines as one, separated by "; ". Reasons stay one per line
+# until then: a version may hold a semicolon, so a joined list cannot be split
+# back into the reasons it came from.
+joined() { awk 'NR > 1 { printf "; " } { printf "%s", $0 } END { print "" }'; }
+# resolve <view> <repo/name>: 0 when pacman resolves it, 1 when a dependency
+# cannot be satisfied (its reasons on stdout, one per line), 3 when the view
+# has no such package, 2 when pacman fails any other way (its first lines on
+# stdout, joined).
+resolve() {
+  local out other
+  if out=$(pacman --config "$WORK/$1.conf" --dbpath "$WORK/db-$1" --noconfirm -Sp --print-format '%r/%n' "$2" 2>&1); then
+    return 0
+  fi
+  # Only these lines say a dependency or a target is missing. Any other line,
+  # such as a database pacman cannot parse, makes the verdict untrustworthy.
+  other=$(grep -vE -e '^warning: cannot resolve ".*", a dependency of ".*"$' \
+    -e '^error: failed to prepare transaction \(could not satisfy dependencies\)$' \
+    -e "^:: unable to satisfy dependency '.*' required by .*$" \
+    -e '^error: target not found: .*$' -e '^$' <<<"$out" || true)
+  if [[ -z $other ]] && grep -qx 'error: failed to prepare transaction (could not satisfy dependencies)' <<<"$out"; then
+    grep -E '^(::|error:)' <<<"$out" | grep -v 'failed to prepare transaction' | sed -E 's/^(:: |error: )//' \
+      | awk '!seen[$0]++'
+    return 1
+  fi
+  if [[ -z $other ]] && grep -q '^error: target not found: ' <<<"$out"; then
+    return 3
+  fi
+  head -n 20 <<<"$out" | joined
+  return 2
+}
+pacman_failed() { # pacman_failed <view> <repo/name> <output>
+  print_error "pacman could not check ${2#*/} against $CHANNEL/$ARCH ($1 this promotion): $3"
+  exit 2
+}
+: > "$WORK/new.txt"
+: > "$WORK/old.txt"
+checked=0
+while IFS= read -r target; do
+  checked=$((checked + 1))
+  status=0
+  why=$(resolve after "$target") || status=$?
+  (( status == 2 )) && pacman_failed after "$target" "$why"
+  (( status == 0 )) && continue
+  (( status == 3 )) && continue
+  before_status=0
+  before_why=$(resolve before "$target") || before_status=$?
+  (( before_status == 2 )) && pacman_failed before "$target" "$before_why"
+  if (( before_status == 1 )); then
+    # The reasons pacman gives after the promotion and not before it.
+    gained=$(grep -vxF -f <(printf '%s\n' "$before_why") <<<"$why" || true)
+    if [[ -z $gained ]]; then
+      printf '%s\t%s\n' "${target#*/}" "$(joined <<<"$why")" >> "$WORK/old.txt"
+    else
+      printf '%s\t%s\n' "${target#*/}" "$(joined <<<"$gained")" >> "$WORK/new.txt"
+    fi
+  else
+    printf '%s\t%s\n' "${target#*/}" "$(joined <<<"$why")" >> "$WORK/new.txt"
+  fi
+done < "$WORK/targets"
+
+finish() { # finish <result>
+  jq -nc --arg arch "$ARCH" --arg channel "$CHANNEL" --arg result "$1" \
+    --rawfile new "$WORK/new.txt" --rawfile old "$WORK/old.txt" '
+    def rows: split("\n") | map(select(length > 0) | split("\t") | {package: .[0], problem: .[1]});
+    {type:"deps", arch:$arch, channel:$channel, result:$result, problems: ($new | rows), existing: ($old | rows)}' >> "$RECORD"
+}
+say() { while IFS=$'\t' read -r name why; do print_step "$name: $why"; done < "$1"; }
+
+if [[ -s $WORK/old.txt ]]; then
+  print_warning "Already not installable in $CHANNEL/$ARCH before this promotion, so not held against it:"
+  say "$WORK/old.txt"
+fi
+if [[ -s $WORK/new.txt ]]; then
+  print_error "Refusing: after this promotion pacman could not install these from $CHANNEL/$ARCH"
+  say "$WORK/new.txt"
+  finish refused
+  exit 1
+fi
+print_success "Dependencies: pacman resolves the $checked package(s) this promotion moves or touches in $CHANNEL/$ARCH"
+finish pass
