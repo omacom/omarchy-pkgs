@@ -701,7 +701,7 @@ docs/                          Reference
 | `approve-pr.yml` | PR events | Releases GitHub's hold on a `build-approved` PR's runs |
 | `sync-upstream.yml` | every 5 minutes, hourly and every 6 hours, dispatch | Upstream release and branch-tip PRs, with a result notification for either package group |
 | `sync-rebuilds.yml` | every hour, dispatch | Dependency rebuild PR |
-| `package-prs.yml` | called by the sync workflows | Opens, updates and closes their PRs |
+| `package-prs.yml` | called by the sync workflows | Opens, updates and closes their PRs, with a description from `helpers/sync-pr-body.py` |
 | `builder-images.yml` | daily, changes to the image's inputs (push and PR), dispatch | Builds and tests the builder image; publishes it from `master` |
 | `refresh-pgp-keys.yml` | daily, dispatch | Merges revocations and new expiry dates into the shipped source-signing keys; fails with a patch when any changed |
 

@@ -36,7 +36,7 @@ on:
         required: true
         type: string
       body:
-        description: 'PR body'
+        description: 'PR body used when the generated description cannot be written'
         required: true
         type: string
       report-package-failures:
@@ -56,8 +56,68 @@ permissions:
   contents: read
 
 jobs:
-  pr:
+  # Writes each PR's description with helpers/sync-pr-body.py. Reading a
+  # recipe means sourcing it in bash, so that happens here, in a job that holds
+  # nothing able to write: the jobs that push, open PRs and arm auto-merge never
+  # run recipe code. A failure or a timeout here only costs the descriptions.
+  describe:
     if: ${{ inputs.groups != '[]' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    continue-on-error: true
+    permissions:
+      contents: read
+    outputs:
+      artifact-id: ${{ steps.upload.outputs.artifact-id }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Fetch the pins
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: package-pins
+          path: ${{ runner.temp }}
+
+      # One description per PR, keyed like the result records below. The
+      # read-only token is for GitHub's API (release notes); the script gives
+      # recipes an empty environment. A group that fails costs only its own
+      # description.
+      - name: Write each PR's description
+        env:
+          GROUPS_JSON: ${{ inputs.groups }}
+          UPSTREAM_GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/pr-descriptions"
+          while IFS=$'\t' read -r branch packages review; do
+            read -r -a names <<<"$packages"
+            key=$(printf '%s\n' "$branch" | sha256sum | cut -d' ' -f1)
+            args=()
+            [[ $review == true ]] && args+=(--review)
+            # shellcheck disable=SC2046 # one --include argument per package
+            if ! { git apply $(printf -- '--include=pkgbuilds/%s/* ' "${names[@]}") "$RUNNER_TEMP/pins.patch" &&
+                timeout 120 python3 helpers/sync-pr-body.py "${args[@]}" "${names[@]}" > "$RUNNER_TEMP/pr-descriptions/$key.md"; }; then
+              echo "::warning::No description for $branch; it opens with the plain one"
+              rm -f "$RUNNER_TEMP/pr-descriptions/$key.md"
+            fi
+            git checkout -q -- pkgbuilds || true
+            git clean -qfd -- pkgbuilds || true
+          done < <(jq -r '.[] | [.branch, .packages, (.review == true | tostring)] | @tsv' <<<"$GROUPS_JSON")
+
+      - name: Upload the descriptions
+        id: upload
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: pr-descriptions
+          path: ${{ runner.temp }}/pr-descriptions/*.md
+          if-no-files-found: ignore
+          retention-days: 1
+
+  pr:
+    needs: describe
+    if: ${{ !cancelled() && inputs.groups != '[]' }}
     runs-on: ubuntu-latest
     environment:
       name: bot-sync
@@ -101,6 +161,36 @@ jobs:
           echo "title=$title" >> "$GITHUB_OUTPUT"
           echo "- $title" >> "$GITHUB_STEP_SUMMARY"
 
+      # The description comes from this run's describe job, by artifact ID.
+      # Without a clean download of it, the PR opens with the caller's body.
+      - name: Fetch the PR descriptions
+        id: descriptions
+        if: ${{ steps.apply.outcome == 'success' && needs.describe.outputs.artifact-id != '' }}
+        continue-on-error: true
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          artifact-ids: ${{ needs.describe.outputs.artifact-id }}
+          # Without it, a download by ID lands in a subdirectory named after
+          # the artifact, where the next step would not find the file.
+          merge-multiple: true
+          path: ${{ runner.temp }}/pr-descriptions
+
+      - name: Choose this PR's description
+        if: ${{ steps.apply.outcome == 'success' }}
+        env:
+          BRANCH: ${{ matrix.group.branch }}
+          FALLBACK: ${{ inputs.body }}
+          DOWNLOADED: ${{ steps.descriptions.outcome == 'success' }}
+        run: |
+          key=$(printf '%s\n' "$BRANCH" | sha256sum | cut -d' ' -f1)
+          described="$RUNNER_TEMP/pr-descriptions/$key.md"
+          if [[ $DOWNLOADED == true && -s $described ]]; then
+            cp "$described" "$RUNNER_TEMP/pr-body.md"
+          else
+            echo "::warning::No generated description for $BRANCH; using the plain one"
+            printf '%s\n' "$FALLBACK" > "$RUNNER_TEMP/pr-body.md"
+          fi
+
       # One token per job, valid for an hour and revoked when the job ends.
       # A failure here is a setup failure, not a package's, so it fails the job.
       - name: Get the sync App's token
@@ -138,7 +228,7 @@ jobs:
           committer: omarchy-pkgs-sync[bot] <361282032+omarchy-pkgs-sync[bot]@users.noreply.github.com>
           commit-message: ${{ steps.apply.outputs.title }}
           title: ${{ steps.apply.outputs.title }}
-          body: ${{ inputs.body }}
+          body-path: ${{ runner.temp }}/pr-body.md
           branch: ${{ matrix.group.branch }}
           delete-branch: true
           labels: automated

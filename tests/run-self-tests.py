@@ -63,6 +63,7 @@ def build_test_list():
         ("sync-upstream self-test", ["./bin/sync-upstream", "self-test"], {}),
         ("pinned-sources", ["./tests/pinned-sources.sh"], {}),
         ("upstream-watch", ["python", "tests/upstream-watch.py"], {}),
+        ("sync-pr-body", ["python", "tests/sync-pr-body.py"], {}),
         ("package-metadata", ["./tests/package-metadata.sh"], {}),
         ("settings-boot-config", ["./tests/settings-boot-config.sh"], {}),
         ("controller", ["./tests/controller.sh"], {}),
