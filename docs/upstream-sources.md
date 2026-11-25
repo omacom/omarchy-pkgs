@@ -128,9 +128,9 @@ neither.
    key there.
 2. Use a fine-grained PAT with access to **omacom/omarchy-pkgs** and repository
    **Contents: Read and write** and **Pull requests: Read and write** permissions.
-   Its owner must be trusted by the build workflow (for example, a collaborator).
-   The existing controller PAT can be reused when it has these permissions.
-   In the repository's
+   It only arms auto-merge, so the merge, and the publish it starts, run as
+   its owner. The existing controller PAT can be reused when it has these
+   permissions. In the repository's
    [Actions secrets](https://github.com/omacom/omarchy-pkgs/settings/secrets/actions),
    save the PAT as `PKGS_BOT_TOKEN`. Update this secret when the token is rotated
    or expires.

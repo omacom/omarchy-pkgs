@@ -586,12 +586,12 @@ prefixes remain unchanged so existing PRs keep receiving updates. The separate
 - The omarchy-pkgs-sync GitHub App pushes the sync branches and opens,
   updates and closes their PRs, so their builds start without an approval
   hold. It has Contents and Pull requests write access to this repository
-  only, and it never merges.
+  only. The workflows never merge with it.
 - Arming auto-merge (both workflows and `auto-merge-pr.yml`) needs the
   `PKGS_BOT_TOKEN` secret: a personal access token with Contents and Pull
-  requests write access to this repository, owned by an account trusted to
-  build. GitHub merges as whoever armed auto-merge, and a merge made with
-  the built-in `GITHUB_TOKEN` does not start `publish.yml`.
+  requests write access to this repository. GitHub merges as whoever armed
+  auto-merge, and a merge made with the built-in `GITHUB_TOKEN` does not
+  start `publish.yml`.
 
 Details: [docs/upstream-sources.md](docs/upstream-sources.md),
 [docs/rebuild-triggers.md](docs/rebuild-triggers.md).

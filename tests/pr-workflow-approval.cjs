@@ -390,6 +390,16 @@ test('every bot lane opens its PRs per package through package-prs.yml', () => {
     assert.match(body, /private-key: \$\{\{ secrets\.PKGS_SYNC_APP_KEY \}\}/, job);
     assert.match(body, /permission-contents: write\n +permission-pull-requests: write\n/, job);
   }
+  // Every step that writes through the App takes the token minted in its own job.
+  const step = name => {
+    const start = prs.indexOf(`- name: ${name}\n`);
+    assert.ok(start > 0, name);
+    const end = prs.indexOf('\n      - name: ', start + 1);
+    return prs.slice(start, end < 0 ? undefined : end);
+  };
+  assert.match(step('Hold an existing reviewed PR as a draft'), /\n +GH_TOKEN: \$\{\{ steps\.app\.outputs\.token \}\}\n/);
+  assert.match(step('Open or update the PR'), /\n +token: \$\{\{ steps\.app\.outputs\.token \}\}\n/);
+  assert.match(step('Close superseded PRs'), /\n +GH_TOKEN: \$\{\{ steps\.app\.outputs\.token \}\}\n/);
   // Only arming auto-merge still uses the PAT: GitHub merges as whoever armed it.
   const pat = [...prs.matchAll(/^ +(?:GH_TOKEN|token): \$\{\{ secrets\.PKGS_BOT_TOKEN \}\}$/gm)];
   assert.equal(pat.length, 1);
