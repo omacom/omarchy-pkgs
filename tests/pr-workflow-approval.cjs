@@ -375,11 +375,15 @@ test('every bot lane opens its PRs per package through package-prs.yml', () => {
     assert.match(text, /uses: \.\/\.github\/workflows\/package-prs\.yml/, file);
     assert.match(text, /prefix: (?:\$\{\{ needs.sync.outputs.prefix \}\}|auto\/sync-rebuilds)\n/, file);
     assert.match(text, /PKGS_BOT_TOKEN: \$\{\{ secrets\.PKGS_BOT_TOKEN \}\}/, file);
+    // An environment secret is empty in a called workflow unless the caller
+    // passes it by name, even though the called job names the environment.
+    assert.match(text, /\n      PKGS_SYNC_APP_KEY: \$\{\{ secrets\.PKGS_SYNC_APP_KEY \}\}\n/, file);
     assert.doesNotMatch(text, /create-pull-request|build-approved|\n  approve:\n/, file);
     assert.doesNotMatch(text, /^ +(contents|pull-requests|actions): write$/m, file);
   }
   const prs = readFileSync(join(__dirname, '../.github/workflows/package-prs.yml'), 'utf8');
   assert.match(prs, /token: \$\{\{ steps\.app\.outputs\.token \}\}/);
+  assert.match(prs, /\n      PKGS_SYNC_APP_KEY:\n        required: true\n/);
   assert.doesNotMatch(prs, /secrets\.GITHUB_TOKEN/);
   // Both jobs that push or close take the sync App's key from bot-sync, which
   // only master can use, and mint a token limited to contents and PRs.
