@@ -666,10 +666,24 @@ validate_package_metadata() {
 # On x86_64, chromium* goes to the large pool (64 vCPU, 128 GB): on a 64 GB
 # builder its build was killed for memory at step 23,398 of 58,051
 # (omarchy-pkgs #3426).
+# The architecture a package's build runs on for a target architecture.
+# Usually the target itself, natively or under QEMU. Chromium's DEPS pins its
+# clang, Rust and Node for x64 hosts only, so its aarch64 build cross-compiles
+# on x86_64, as Google builds Chrome for Linux arm64. bin/build then runs the
+# builder image of this architecture and build/build.sh cross-builds.
+package_build_host() {
+  local name="$1" arch="$2"
+
+  case "$name:$arch" in
+  chromium:aarch64) echo x86_64 ;;
+  *) echo "$arch" ;;
+  esac
+}
+
 package_runner() {
   local name="$1" arch="$2"
 
-  if [[ $arch != aarch64 ]]; then
+  if [[ $(package_build_host "$name" "$arch") != aarch64 ]]; then
     case "$name" in
     chromium*) echo '["self-hosted","omarchy-builder-large"]' ;;
     *) echo '["self-hosted","omarchy-builder"]' ;;

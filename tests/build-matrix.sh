@@ -1,8 +1,9 @@
 #!/bin/bash
 # Self-test for the runner each build gets (package_runner, and the "runner"
 # field bin/build-matrix puts on every entry): aarch64 kernels on the large
-# arm64 machine, x86_64 chromium* on the large droplet pool, everything else
-# where it was.
+# arm64 machine, chromium* on the large droplet pool for both architectures
+# (aarch64 cross-compiles there, package_build_host), everything else where
+# it was.
 set -euo pipefail
 ROOT=$(realpath "${BASH_SOURCE[0]%/*}/..")
 BUILD_ROOT="$ROOT"
@@ -37,9 +38,16 @@ check "$GITHUB_ARM" linux-firmware-cirrus-dx13260 aarch64
 pass "a linux-* package that is no kernel stays on GitHub's arm64 runner"
 
 check "$LARGE" chromium x86_64
-check "$GITHUB_ARM" chromium aarch64
+check "$LARGE" chromium aarch64
 check "$DROPLET" omarchy-chromium-bin x86_64
-pass "x86_64 chromium builds on the large droplet pool, and only chromium*"
+pass "chromium builds on the large droplet pool for both architectures, and only chromium*"
+
+[[ $(package_build_host chromium aarch64) == x86_64 ]] || fail "chromium for aarch64 builds on $(package_build_host chromium aarch64)"
+[[ $(package_build_host chromium x86_64) == x86_64 ]] || fail "chromium for x86_64 builds on $(package_build_host chromium x86_64)"
+for package in omarchy-settings hyprland linux-aurora chromium-widevine; do
+  [[ $(package_build_host "$package" aarch64) == aarch64 ]] || fail "$package for aarch64 builds on $(package_build_host "$package" aarch64)"
+done
+pass "only chromium cross-compiles: its aarch64 build runs on an x86_64 builder"
 
 for package in omarchy-settings gliff hyprland nvidia-open-dkms alinux; do
   check "$GITHUB_ARM" "$package" aarch64
@@ -62,3 +70,10 @@ while read -r package arch runner; do
 done < <(jq -r '.include[] | "\(.package) \(.arch) \(.runner)"' <<<"$matrix")
 [[ $(jq -r '.include[] | select(.package == "linux-aurora") | .runner' <<<"$matrix") == "$KERNEL_ARM" ]] || fail "linux-aurora in the matrix: $matrix"
 pass "bin/build-matrix puts the runner on every entry"
+
+# Every entry names the builder image it runs in: its own architecture, or
+# the cross builder package_build_host gives.
+while read -r package arch builder; do
+  [[ $builder == "$(package_build_host "$package" "$arch")" ]] || fail "matrix entry $package $arch has builder_arch $builder"
+done < <(jq -r '.include[] | "\(.package) \(.arch) \(.builder_arch)"' <<<"$matrix")
+pass "bin/build-matrix puts the builder architecture on every entry"
