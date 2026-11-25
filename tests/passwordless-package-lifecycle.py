@@ -86,6 +86,7 @@ fixture_rm() {
   done
 }
 _etc_overrides_apply() { :; }
+_docker_defaults_retire() { :; }
 '''
 
 
