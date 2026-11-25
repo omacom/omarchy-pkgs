@@ -1,7 +1,8 @@
 #!/bin/bash
 # Self-test for the runner each build gets (package_runner, and the "runner"
 # field bin/build-matrix puts on every entry): aarch64 kernels on the large
-# arm64 machine, everything else where it was.
+# arm64 machine, x86_64 chromium* on the large droplet pool, everything else
+# where it was.
 set -euo pipefail
 ROOT=$(realpath "${BASH_SOURCE[0]%/*}/..")
 BUILD_ROOT="$ROOT"
@@ -13,6 +14,7 @@ fail() { echo "FAIL: $1"; exit 1; }
 DROPLET='["self-hosted","omarchy-builder"]'
 GITHUB_ARM='["ubuntu-24.04-arm"]'
 KERNEL_ARM='["namespace-profile-arm64-linux-apple-12x32"]'
+LARGE='["self-hosted","omarchy-builder-large"]'
 
 check() {
   local want="$1" name="$2" arch="$3" got
@@ -34,6 +36,11 @@ check "$GITHUB_ARM" linux-aarch64-pkgbase-shim aarch64
 check "$GITHUB_ARM" linux-firmware-cirrus-dx13260 aarch64
 pass "a linux-* package that is no kernel stays on GitHub's arm64 runner"
 
+check "$LARGE" chromium x86_64
+check "$GITHUB_ARM" chromium aarch64
+check "$DROPLET" omarchy-chromium-bin x86_64
+pass "x86_64 chromium builds on the large droplet pool, and only chromium*"
+
 for package in omarchy-settings gliff hyprland nvidia-open-dkms alinux; do
   check "$GITHUB_ARM" "$package" aarch64
   check "$DROPLET" "$package" x86_64
@@ -41,7 +48,7 @@ done
 pass "every other package builds where it did"
 
 # Each value has to be what runs-on takes: a JSON list of labels.
-for runner in "$DROPLET" "$GITHUB_ARM" "$KERNEL_ARM"; do
+for runner in "$DROPLET" "$GITHUB_ARM" "$KERNEL_ARM" "$LARGE"; do
   jq -e 'type == "array" and length > 0 and all(type == "string")' <<<"$runner" >/dev/null || fail "not a list of labels: $runner"
 done
 pass "every runner is a JSON list of labels"

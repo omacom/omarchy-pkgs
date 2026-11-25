@@ -314,6 +314,16 @@ package_auto_merge() {
   [[ "$(jq -r 'if has("auto_merge") then .auto_merge else false end' "$metadata")" == "true" ]]
 }
 
+# "sync_cadence": "five-minute" moves an auto-merged package out of the hourly
+# group into one checked every five minutes: the dev packages that follow
+# omarchy's quattro branch, so a merge there reaches dev installs in minutes.
+package_five_minute() {
+  local pkgdir="$1" metadata
+  metadata=$(metadata_file_for_dir "$pkgdir")
+  [[ -f "$metadata" ]] || return 1
+  [[ "$(jq -r '.sync_cadence // ""' "$metadata")" == "five-minute" ]]
+}
+
 # "review": true holds a package's update PRs for a maintainer: they open as
 # drafts and nothing arms auto-merge. Marking one ready for review hands it to
 # auto-merge-pr.yml, which lands it once CI passes.
@@ -324,14 +334,15 @@ package_review_bumps() {
   [[ "$(jq -r 'if has("review") then .review else false end' "$metadata")" == "true" ]]
 }
 
-# package_in_lane <pkgdir> <reviewed|auto-merge|all>
+# package_in_lane <pkgdir> <reviewed|auto-merge|five-minute|all>
 package_in_lane() {
   local pkgdir="$1" lane="$2"
   case "$lane" in
     all | "") return 0 ;;
-    auto-merge) package_auto_merge "$pkgdir" ;;
+    auto-merge) package_auto_merge "$pkgdir" && ! package_five_minute "$pkgdir" ;;
+    five-minute) package_five_minute "$pkgdir" ;;
     reviewed) ! package_auto_merge "$pkgdir" ;;
-    *) echo "invalid lane: $lane (expected reviewed, auto-merge, or all)" >&2; return 2 ;;
+    *) echo "invalid lane: $lane (expected reviewed, auto-merge, five-minute, or all)" >&2; return 2 ;;
   esac
 }
 
@@ -511,6 +522,15 @@ validate_package_metadata() {
     return 1
   fi
 
+  if ! jq -e 'if has("sync_cadence") | not then true else .sync_cadence == "five-minute" end' "$metadata" >/dev/null; then
+    echo "invalid sync_cadence for $(basename "$pkgdir"): the only cadence is \"five-minute\""
+    return 1
+  fi
+  if package_five_minute "$pkgdir" && ! package_auto_merge "$pkgdir"; then
+    echo "invalid sync_cadence for $(basename "$pkgdir"): only an auto-merged package syncs every five minutes"
+    return 1
+  fi
+
   if ! jq -e 'if has("review") | not then true else (.review | type) == "boolean" end' "$metadata" >/dev/null; then
     echo "invalid review for $(basename "$pkgdir"): must be boolean"
     return 1
@@ -643,11 +663,17 @@ validate_package_metadata() {
 # the whole job takes 24. Its cores are the fast ones: the 32-core AmpereOne
 # runner took 66. A kernel is a package named linux-*; the firmware and pkgbase
 # shim packages share the prefix and build in seconds, so they stay put.
+# On x86_64, chromium* goes to the large pool (64 vCPU, 128 GB): on a 64 GB
+# builder its build was killed for memory at step 23,398 of 58,051
+# (omarchy-pkgs #3426).
 package_runner() {
   local name="$1" arch="$2"
 
   if [[ $arch != aarch64 ]]; then
-    echo '["self-hosted","omarchy-builder"]'
+    case "$name" in
+    chromium*) echo '["self-hosted","omarchy-builder-large"]' ;;
+    *) echo '["self-hosted","omarchy-builder"]' ;;
+    esac
     return
   fi
   case "$name" in
