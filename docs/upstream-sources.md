@@ -113,9 +113,9 @@ provider or hook.
 The builder controller box dispatches both groups on systemd timers
 (`ci/dispatch.sh`), because GitHub's own schedule ran them hours late.
 The omarchy-pkgs-sync GitHub App pushes the branches and opens the PRs, so
-they build without an approval hold. A personal access token arms auto-merge,
-so the merges start publishing. The built-in Actions `GITHUB_TOKEN` can do
-neither.
+they build without an approval hold. The omarchy-pkgs-merge GitHub App arms
+auto-merge, so the merges start publishing. The built-in Actions `GITHUB_TOKEN`
+can do neither.
 
 1. The omarchy-pkgs-sync App is owned by the omacom organization, has no
    webhook, and has repository **Contents: Read and write** and **Pull
@@ -298,7 +298,9 @@ sync once, split the changed recipes into one PR per package with
 `.github/scripts/package-pr-groups.sh`, and hand them to `package-prs.yml`. That
 pushes each PR as the omarchy-pkgs-sync App, so its builds start without an
 approval hold. Its `arm` job then arms auto-merge as the omarchy-pkgs-merge
-App, in a job of its own, since a job has one environment. A push to an `auto/sync-*` or
+App, in a job of its own, since a job has one environment. It arms only the PR
+number and head commit each PR job reported, after it checks that the PR is
+still open, ready, into `master` and from this repository. A push to an `auto/sync-*` or
 `auto/track-branches-*` branch does not cancel the PR's build in flight: the new
 build waits, then reuses every artifact the finished one uploaded.
 

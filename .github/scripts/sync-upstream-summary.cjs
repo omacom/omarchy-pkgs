@@ -23,7 +23,8 @@ function updateFailure(result) {
   if (result.token === 'failure') return 'Could not get the sync App token';
   if (result.hold === 'failure') return 'Could not turn the reviewed PR back into a draft';
   if (result.pr !== 'success') return 'Could not push or update the PR';
-  if (!['success', 'skipped'].includes(result.merge)) return 'Could not enable auto-merge';
+  if (result.merge === 'missing') return 'Auto-merge result missing';
+  if (!['success', 'skipped', undefined].includes(result.merge)) return 'Could not enable auto-merge';
   return '';
 }
 
@@ -83,15 +84,20 @@ module.exports = async function summarize({ github, context, core, groups,
   } catch (error) {
     problems.push(`Could not read package results: ${error.message}`);
   }
-  // The arm job arms auto-merge after the PR jobs and records its outcome
-  // per branch; that outcome is the package's auto-merge result.
+  // The arm job arms auto-merge after the PR jobs and records an outcome per
+  // branch and PR number; that outcome is the package's auto-merge result.
+  // A PR that should have been armed and has no outcome for its own number
+  // is not called passing.
+  let armed = {};
   try {
-    const armed = JSON.parse(readFileSync(join(resultsPath, 'armed.outcomes'), 'utf8'));
-    for (const result of results) {
-      if (result && typeof armed[result.branch] === 'string') result.merge = armed[result.branch];
-    }
+    armed = JSON.parse(readFileSync(join(resultsPath, 'armed.outcomes'), 'utf8'));
   } catch (error) {
     if (error.code !== 'ENOENT') problems.push(`Could not read auto-merge outcomes: ${error.message}`);
+  }
+  for (const result of results) {
+    if (!result || result.pr !== 'success' || !result.number || result.review === true) continue;
+    const outcome = armed[result.branch];
+    result.merge = outcome && String(outcome.number) === String(result.number) ? outcome.outcome : 'missing';
   }
 
   const updates = { passing: 0, failing: 0, unknown: 0 };

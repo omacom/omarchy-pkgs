@@ -446,9 +446,14 @@ test('every bot lane opens its PRs per package through package-prs.yml', () => {
   assert.match(arm, /client-id: \$\{\{ vars\.PKGS_MERGE_APP_CLIENT_ID \}\}/);
   assert.match(arm, /permission-contents: write\n +permission-pull-requests: write\n/);
   assert.doesNotMatch(arm, /actions\/checkout|PKGS_SYNC_APP_KEY|python3|git apply/);
-  assert.match(arm, /gh pr merge --auto --merge "\$number"/);
-  // A reviewed group stays a draft and is never armed here.
-  assert.match(arm, /\[\[ \$review == true \]\] && continue/);
+  assert.match(arm, /gh pr merge --auto --merge --match-head-commit "\$sha" "\$number"/);
+  // Each leg asks for its own PR at its own head; a reviewed group never asks.
+  const ask = step('Ask for auto-merge');
+  assert.match(ask, /if: \$\{\{ steps\.pr\.outcome == 'success' && steps\.pr\.outputs\.pull-request-number != '' && matrix\.group\.review != true \}\}/);
+  assert.match(ask, /HEAD_SHA: \$\{\{ steps\.pr\.outputs\.pull-request-head-sha \}\}/);
+  assert.match(prs, /name: package-pr-arm-\$\{\{ steps\.ask\.outputs\.key \}\}/);
+  assert.match(arm, /pattern: package-pr-arm-\*/);
+  assert.match(arm, /REPORT: \$\{\{ inputs\.report-package-failures \}\}/);
   assert.match(prs, /\n      PKGS_MERGE_APP_KEY:\n        required: true\n/);
   assert.match(prs, /fail-fast: false/);
   assert.match(prs, /draft: \$\{\{ matrix\.group\.review == true \}\}/);
@@ -459,6 +464,109 @@ test('every bot lane opens its PRs per package through package-prs.yml', () => {
   assert.match(prs, /\.github\/scripts\/hold-reviewed-pr\.sh "\$BRANCH" "\$\{packages\[@\]\}"/);
   assert.match(prs, /id: pr\n +if: \$\{\{ steps\.apply\.outcome == 'success' && steps\.hold\.outcome != 'failure' \}\}/);
   assert.doesNotMatch(prs, /^ +(contents|pull-requests|actions): write$/m);
+});
+
+// The shell a workflow step runs, read from the YAML, so a test runs the
+// exact block the runner would.
+function runBlock(file, step) {
+  const text = readFileSync(join(__dirname, '../.github/workflows', file), 'utf8');
+  const lines = text.split('\n');
+  const at = lines.findIndex(line => line.trim() === `- name: ${step}`);
+  assert.ok(at >= 0, step);
+  const run = lines.findIndex((line, i) => i > at && /^\s+run: \|$/.test(line));
+  const indent = lines[run].search(/\S/) + 2;
+  const body = [];
+  for (const line of lines.slice(run + 1)) {
+    if (line.trim() && line.search(/\S/) < indent) break;
+    body.push(line.slice(indent));
+  }
+  return body.join('\n');
+}
+
+// A fake gh for the merge App's steps: PR facts from a JSON file, every call
+// logged, and gh pr merge arming the PR unless it is listed as failing.
+function armFixture(prs, { failMerge = [], failView = [] } = {}) {
+  const dir = mkdtempSync(join(tmpdir(), 'arm-'));
+  const bin = join(dir, 'bin');
+  mkdirSync(bin);
+  const state = join(dir, 'prs.json');
+  writeFileSync(state, JSON.stringify(prs));
+  writeFileSync(join(bin, 'gh'), `#!/usr/bin/env node
+const fs = require('fs');
+fs.appendFileSync(${JSON.stringify(join(dir, 'calls'))}, process.argv.slice(2).join(' ') + '\\n');
+const prs = JSON.parse(fs.readFileSync(${JSON.stringify(state)}, 'utf8'));
+const [cmd, sub, number] = process.argv.slice(2);
+const pr = prs[number];
+if (${JSON.stringify(failView)}.includes(number) && sub === 'view') process.exit(1);
+if (cmd === 'pr' && sub === 'view') {
+  const jq = process.argv[process.argv.indexOf('--jq') + 1];
+  if (jq.includes('autoMergeRequest')) { console.log(pr.armed ? 'true' : 'false'); process.exit(0); }
+  console.log([pr.state, pr.isDraft, pr.base, pr.head, pr.sha, pr.repo].join(' '));
+} else if (cmd === 'pr' && sub === 'merge') {
+  const n = process.argv.slice(2).find(a => /^[0-9]+$/.test(a));
+  if (process.argv.includes('--disable-auto')) { prs[n].armed = false; }
+  else if (${JSON.stringify(failMerge)}.includes(n)) process.exit(1);
+  else prs[n].armed = true;
+  fs.writeFileSync(${JSON.stringify(state)}, JSON.stringify(prs));
+}
+`, { mode: 0o755 });
+  const requests = join(dir, 'arm-requests');
+  mkdirSync(requests);
+  const request = (branch, number, head_sha) =>
+    writeFileSync(join(requests, `${branch.replace(/\W/g, '_')}.json`), JSON.stringify({ branch, number, head_sha }));
+  const run = (script, env = {}) => spawnSync('bash', ['-eo', 'pipefail', '-c', script], {
+    encoding: 'utf8',
+    env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, RUNNER_TEMP: dir, GITHUB_REPOSITORY: 'omacom/omarchy-pkgs', ...env },
+  });
+  const calls = () => { try { return readFileSync(join(dir, 'calls'), 'utf8').trim().split('\n'); } catch { return []; } };
+  const outcomes = () => JSON.parse(readFileSync(join(dir, 'armed/armed.outcomes'), 'utf8'));
+  return { request, run, calls, outcomes, cleanup: () => rmSync(dir, { recursive: true, force: true }) };
+}
+
+const good = (overrides = {}) => ({ state: 'OPEN', isDraft: false, base: 'master', head: 'auto/sync-upstream-a',
+  sha: 'a'.repeat(40), repo: 'omacom/omarchy-pkgs', armed: false, ...overrides });
+
+test('the arm job arms exactly the PR and head each leg reported, and nothing else', () => {
+  const f = armFixture({
+    101: good(),
+    102: good({ head: 'auto/sync-upstream-b', sha: 'b'.repeat(40), base: 'rc' }),
+    103: good({ head: 'auto/sync-upstream-c', sha: 'c'.repeat(40), repo: 'someone/omarchy-pkgs' }),
+    104: good({ head: 'auto/sync-upstream-d', sha: 'e'.repeat(40) }),
+    105: good({ head: 'auto/sync-upstream-e', sha: 'f'.repeat(40), isDraft: true }),
+  });
+  try {
+    f.request('auto/sync-upstream-a', '101', 'a'.repeat(40));
+    f.request('auto/sync-upstream-b', '102', 'b'.repeat(40));
+    f.request('auto/sync-upstream-c', '103', 'c'.repeat(40));
+    f.request('auto/sync-upstream-d', '104', 'd'.repeat(40)); // its head moved on
+    f.request('auto/sync-upstream-e', '105', 'f'.repeat(40));
+    const result = f.run(runBlock('package-prs.yml', 'Arm auto-merge on each PR'), { REPORT: 'true' });
+    assert.equal(result.status, 0, result.stdout + result.stderr);
+    const merges = f.calls().filter(call => call.startsWith('pr merge'));
+    assert.deepEqual(merges, [`pr merge --auto --merge --match-head-commit ${'a'.repeat(40)} 101 -R omacom/omarchy-pkgs`]);
+    const outcomes = f.outcomes();
+    assert.deepEqual(outcomes['auto/sync-upstream-a'], { number: '101', outcome: 'success' });
+    for (const branch of ['b', 'c', 'd', 'e']) assert.equal(outcomes[`auto/sync-upstream-${branch}`].outcome, 'skipped', branch);
+  } finally { f.cleanup(); }
+});
+
+test('one PR that cannot be armed does not stop the others, and fails the job without a report', () => {
+  for (const report of ['true', 'false']) {
+    const f = armFixture({ 101: good(), 102: good({ head: 'auto/sync-upstream-b', sha: 'b'.repeat(40) }),
+      103: good({ head: 'auto/sync-upstream-c', sha: 'c'.repeat(40) }) }, { failMerge: ['101'], failView: ['102'] });
+    try {
+      f.request('auto/sync-upstream-a', '101', 'a'.repeat(40));
+      f.request('auto/sync-upstream-b', '102', 'b'.repeat(40));
+      f.request('auto/sync-upstream-c', '103', 'c'.repeat(40));
+      const result = f.run(runBlock('package-prs.yml', 'Arm auto-merge on each PR'), { REPORT: report });
+      assert.equal(result.status, report === 'true' ? 0 : 1, report + result.stdout + result.stderr);
+      const outcomes = f.outcomes();
+      assert.equal(outcomes['auto/sync-upstream-a'].outcome, 'failure');
+      assert.equal(outcomes['auto/sync-upstream-b'].outcome, 'failure');
+      assert.equal(outcomes['auto/sync-upstream-c'].outcome, 'success');
+      assert.match(result.stdout, /::warning::Could not enable auto-merge on #101/);
+    } finally { f.cleanup(); }
+  }
 });
 
 // One PR per package, except packages pinned from the same upstream branch,
