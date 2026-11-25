@@ -77,3 +77,22 @@ while read -r package arch builder; do
   [[ $builder == "$(package_build_host "$package" "$arch")" ]] || fail "matrix entry $package $arch has builder_arch $builder"
 done < <(jq -r '.include[] | "\(.package) \(.arch) \(.builder_arch)"' <<<"$matrix")
 pass "bin/build-matrix puts the builder architecture on every entry"
+
+# The cross-build entry itself, from a copy of the tooling whose pkgbuilds/
+# holds a chromium that builds for both architectures.
+T=$(mktemp -d)
+trap 'rm -rf "$T"' EXIT
+mkdir -p "$T/root/bin"
+cp -r "$ROOT/helpers" "$T/root/"
+cp "$ROOT/bin/build-matrix" "$T/root/bin/"
+for dir in chromium plain-tool; do
+  mkdir -p "$T/root/pkgbuilds/$dir/.omarchy"
+  printf 'pkgname=%s\narch=(x86_64 aarch64)\n' "$dir" > "$T/root/pkgbuilds/$dir/PKGBUILD"
+  echo '{"source": "local", "release_ring": "fast"}' > "$T/root/pkgbuilds/$dir/.omarchy/package.json"
+done
+matrix=$("$T/root/bin/build-matrix" chromium plain-tool)
+entry() { jq -c --arg p "$1" --arg a "$2" '.include[] | select(.package == $p and .arch == $a) | {builder_arch, runner}' <<<"$matrix"; }
+[[ $(entry chromium aarch64) == "$(jq -nc --arg r "$LARGE" '{builder_arch: "x86_64", runner: $r}')" ]] || fail "chromium aarch64 entry: $(entry chromium aarch64)"
+[[ $(entry chromium x86_64) == "$(jq -nc --arg r "$LARGE" '{builder_arch: "x86_64", runner: $r}')" ]] || fail "chromium x86_64 entry: $(entry chromium x86_64)"
+[[ $(entry plain-tool aarch64) == "$(jq -nc --arg r "$GITHUB_ARM" '{builder_arch: "aarch64", runner: $r}')" ]] || fail "plain-tool aarch64 entry: $(entry plain-tool aarch64)"
+pass "bin/build-matrix gives chromium's aarch64 entry the x86_64 builder and the large pool"
