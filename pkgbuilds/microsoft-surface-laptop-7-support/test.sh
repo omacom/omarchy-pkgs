@@ -121,4 +121,22 @@ grep -q 'api.libcamera.path = "/base/soc@0/cci@ac16000/i2c-bus@1/camera@36"' "$c
   fail "pickers don't offer the camera the relay owns"
 grep -q 'device.bus-path = "platform-acb7000.isp"' "$cameras" || fail "pickers don't offer the raw camera nodes"
 
-echo "ok - Surface Laptop 7 battery reader, command and front camera relay"
+# The camera guard.
+guard="$package_dir/surface-laptop-7-camera-guard"
+bash -n "$guard" || fail "the camera guard has valid syntax"
+grep -q '^unit=v4l2-relayd@surface-laptop-7.service$' "$guard" || fail "the guard watches the relay the package enables"
+for error in 'Failed to start streaming' 'allocation failure'; do
+  grep -qF "*\"$error\"*" "$guard" || fail "the guard restarts the relay on \"$error\""
+done
+unit="$package_dir/surface-laptop-7-camera-guard.service"
+for model in romulus13 romulus15; do
+  grep -qx "ConditionFirmware=|device-tree-compatible(microsoft,$model)" "$unit" ||
+    fail "the camera guard runs on the Surface Laptop 7 ($model)"
+done
+(( $(grep -c '^ConditionFirmware=' "$unit") == 2 )) || fail "the camera guard runs on no other machine"
+grep -qx 'ExecStart=/usr/lib/microsoft-surface-laptop-7-support/surface-laptop-7-camera-guard' "$unit" ||
+  fail "the camera guard unit runs the installed script"
+grep -qx 'ExecCondition=/usr/lib/microsoft-surface-laptop-7-support/surface-laptop-7-camera-guard --needed' "$unit" ||
+  fail "the camera guard stands down once libcamera 0.8.0 is installed"
+
+echo "ok - Surface Laptop 7 battery reader, command, front camera relay and its guard"
