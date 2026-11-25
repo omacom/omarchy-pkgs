@@ -31,6 +31,8 @@ The package contains no Microsoft or Qualcomm firmware; `microsoft-surface-lapto
     - when no app is streaming and leaked frame buffers are left over (it counts the `frame-N` buffers in `/sys/kernel/debug/dma_buf/bufinfo`; a stream holds 4). The restart takes 0.3 s and nothing is streaming then;
     - mid-stream only when three or more buffers have leaked and less than 20 MB of CMA is left.
 
+    A failure logged in the 4 s after a restart is held and restarts the relay once those 4 s are over. Lines from a relay that was already restarted are ignored. Once libcamera 0.8.0 is installed the guard stands down: its unit's `ExecCondition=` skips it.
+
     Measured on a 13.8": 12 of 12 quick camera on/off cycles with 1-3 s gaps got frames, against a failure after five to eight before. Opening the camera during a restart works. A forced allocation failure was recovered within the same open. It survives a restart and a deep suspend. Idle, it uses about 0.1 s of CPU a minute.
 - **Camera pickers**: a WirePlumber rule that leaves "Front Camera" as the only camera. It hides the monochrome infrared sensor (ST VD55G0, 15"), the front camera's own libcamera entry, which the relay owns, and the camera subsystem's 16 raw `qcom-camss` nodes (bus path `platform-acb7000.isp`), none of them a usable camera. The libcamera rules name the sensors by their device tree paths, so they do nothing on a tree without them.
 
@@ -39,6 +41,6 @@ The battery timer and its service check for the `microsoft,romulus13` or `micros
 ## Retirement
 
 - Battery: drop once the kernel's battery reports the pack's cycle count and identity.
-- Camera guard: drop once libcamera 0.8.0 is installed. It fixes both faults: `a00a4ca2` "debayer_egl: Avoid EGL context leaks" and `0f045015`, which skips stop when the ISP worker has not started.
+- Camera guard: drop once libcamera 0.8.0 is in the repositories; it stands down by itself where 0.8.0 is installed. 0.8.0 fixes both faults: `a00a4ca2` "debayer_egl: Avoid EGL context leaks" and `0f045015`, which skips stop when the ISP worker has not started.
 - Camera relay: drop once the apps Omarchy ships read cameras through PipeWire or libcamera. Drop the digital gain once libcamera's simple pipeline uses it, or lengthens frames, and the tuning file once libcamera ships one for the OV02C10.
 - Camera pickers: keep while the laptop's tree describes the infrared sensor, and while the relay owns the front camera.

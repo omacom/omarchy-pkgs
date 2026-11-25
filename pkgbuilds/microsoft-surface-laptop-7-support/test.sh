@@ -136,5 +136,7 @@ done
 (( $(grep -c '^ConditionFirmware=' "$unit") == 2 )) || fail "the camera guard runs on no other machine"
 grep -qx 'ExecStart=/usr/lib/microsoft-surface-laptop-7-support/surface-laptop-7-camera-guard' "$unit" ||
   fail "the camera guard unit runs the installed script"
+grep -qx 'ExecCondition=/usr/lib/microsoft-surface-laptop-7-support/surface-laptop-7-camera-guard --needed' "$unit" ||
+  fail "the camera guard stands down once libcamera 0.8.0 is installed"
 
 echo "ok - Surface Laptop 7 battery reader, command, front camera relay and its guard"

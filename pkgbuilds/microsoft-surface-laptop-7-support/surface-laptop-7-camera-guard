@@ -12,7 +12,8 @@
 #     (0.3 s, nothing is streaming then);
 #  3. only if CMA is about to run out while an app streams, restarts it then (short pause).
 # Root causes are fixed in libcamera 0.8.0 (a00a4ca2 EGL context leak, 0f045015 stop
-# deadlock); drop this service once that version is installed.
+# deadlock). The unit's ExecCondition runs this with --needed, so the guard stands down
+# once that version is installed: the unit is skipped, not failed or restarted.
 # The 2 s checks use only file reads and bash built-ins (no programs started), so it
 # costs next to nothing while idle.
 set -u
@@ -21,8 +22,15 @@ procs="/sys/fs/cgroup/system.slice/system-v4l2\\x2drelayd.slice/$unit/cgroup.pro
 ACTIVE=4           # frame buffers a running stream holds; any more (or any while idle) leaked
 INUSE_LEAKED=3     # leaked buffers that, with CMA nearly gone, justify a restart mid-stream
 INUSE_CMA_KB=20000 # ... "nearly gone"
-COOLDOWN=4         # s after a restart in which new log lines and checks are ignored
+COOLDOWN=4         # s after a restart in which no other restart runs; an error then is
+                   # held and restarts the relay once the cooldown ends
 log() { echo "camera-guard: $*"; }
+
+if [[ ${1-} == --needed ]]; then
+  v=$(pacman -Q libcamera 2>/dev/null) && (( $(vercmp "${v#* }" 0.8.0) >= 0 )) &&
+    { log "libcamera ${v#* } fixes both faults; standing down"; exit 1; }
+  exit 0
+fi
 
 CMA=0 RELAY= INUSE=0 FRAMES=0
 read_cma() { local k v r; while read -r k v r; do [[ $k == CmaFree: ]] && { CMA=$v; return; }; done </proc/meminfo; }
@@ -49,9 +57,10 @@ read_inuse() {
   done
 }
 
-last_restart=0 check_idle=3
+last_restart=0 check_idle=3 pending=
 restart() {
-  (( EPOCHSECONDS - last_restart < COOLDOWN )) && return
+  (( EPOCHSECONDS - last_restart < COOLDOWN )) && { pending=$1; return; }
+  pending=
   read_cma
   log "restarting relay: $1 (CmaFree $CMA kB)"
   systemctl restart "$unit"
@@ -59,11 +68,12 @@ restart() {
 }
 
 # 1. Errors, read from the relay's log as they come.
-fifo=$(mktemp -u); mkfifo "$fifo"
-trap 'rm -f "$fifo"; kill 0' EXIT
-journalctl -f -n0 -o cat -u "$unit" >"$fifo" 2>/dev/null &
+dir=$(mktemp -d) || { log "can't make a folder for the log reader's FIFO"; exit 1; }
+trap 'rm -rf "$dir"; kill 0' EXIT
+mkfifo "$dir/log" || { log "can't make a FIFO for the log reader"; exit 1; }
+journalctl -f -n0 -o short -u "$unit" >"$dir/log" 2>/dev/null &
 jpid=$!
-exec 3<"$fifo"
+exec 3<"$dir/log"
 
 while :; do
   # If the log reader ever dies, reads hit EOF at once; exit so systemd starts us afresh.
@@ -73,11 +83,14 @@ while :; do
     case $line in
       *"configuring streams"*) ;;
       *"Failed to start streaming"*|*"allocation failure"*|*"Unable to create buffer"*|*"Failed to start camera"*|*"Failed to configure"*)
-        restart "${line##*] }" ;;
+        # A line from a relay that has since been restarted was dealt with by that restart.
+        read_relay
+        [[ $line =~ \[([0-9]+)\]:\  && ${BASH_REMATCH[1]} != "$RELAY" ]] || restart "${line##*] }" ;;
     esac
     read -r -t 0 <&3 || break
   done
   (( EPOCHSECONDS - last_restart < COOLDOWN )) && continue
+  [[ -n $pending ]] && { restart "$pending (held over the cooldown)"; continue; }
   read_relay
   [[ -n $RELAY ]] || continue
   # The buffer list is costly to read, so it is read only when it can matter: for a few
