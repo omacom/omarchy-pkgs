@@ -18,7 +18,7 @@ BIN="$T/root/bin"
 mkdir -p "$BIN"
 cp -r "$ROOT/helpers" "$T/root/"
 cp -r "$ROOT/release" "$T/root/"
-cp "$ROOT/bin/promote-channel" "$ROOT/bin/publish-artifact" "$ROOT/bin/check-mac-set" "$BIN/"
+cp "$ROOT/bin/promote-channel" "$ROOT/bin/publish-artifact" "$BIN/"
 PKGBUILDS_DIR="$T/root/pkgbuilds"
 recipe() { # recipe <dir> <metadata json> [pkgbase] [arch]
   mkdir -p "$PKGBUILDS_DIR/$1/.omarchy"

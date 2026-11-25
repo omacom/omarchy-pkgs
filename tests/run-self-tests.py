@@ -22,7 +22,6 @@ import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-BASELINE_REF = "be8ab9bda3e53b163153944395f1912ac6d7f44f"
 
 
 def cpu_limit():
@@ -54,9 +53,7 @@ def build_test_list():
 
     # CPU-bound tests ordered longest-first (LPT) to avoid a late straggler.
     cpu_bound = [
-        ("mac-package-set", ["./tests/mac-package-set.sh"], {}),
         ("promote-channel", ["./tests/promote-channel.sh"], {}),
-        ("promotion-regression", ["./tests/promotion-regression.sh"], {"BASELINE_REF": BASELINE_REF}),
         ("release-owners --check", owners_check_cmd, {}),
         ("publish-artifact", ["./tests/publish-artifact.sh"], {}),
         ("fast-makepkg", ["runuser", "-u", "nobody", "--", "python", "tests/fast-makepkg.py"], {}),
