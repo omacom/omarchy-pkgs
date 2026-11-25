@@ -96,3 +96,11 @@ entry() { jq -c --arg p "$1" --arg a "$2" '.include[] | select(.package == $p an
 [[ $(entry chromium x86_64) == "$(jq -nc --arg r "$LARGE" '{builder_arch: "x86_64", runner: $r}')" ]] || fail "chromium x86_64 entry: $(entry chromium x86_64)"
 [[ $(entry plain-tool aarch64) == "$(jq -nc --arg r "$GITHUB_ARM" '{builder_arch: "aarch64", runner: $r}')" ]] || fail "plain-tool aarch64 entry: $(entry plain-tool aarch64)"
 pass "bin/build-matrix gives chromium's aarch64 entry the x86_64 builder and the large pool"
+
+# Repeated package selections are deduplicated instead of failing metadata loading.
+dup_matrix=$("$ROOT/bin/build-matrix" omarchy-settings omarchy-settings)
+single_matrix=$("$ROOT/bin/build-matrix" omarchy-settings)
+[[ "$dup_matrix" == "$single_matrix" ]] || fail "repeated package names changed matrix: $dup_matrix vs $single_matrix"
+stdin_dup_matrix=$(printf "omarchy-settings\nomarchy-settings\n" | "$ROOT/bin/build-matrix")
+[[ "$stdin_dup_matrix" == "$single_matrix" ]] || fail "repeated stdin package names changed matrix: $stdin_dup_matrix vs $single_matrix"
+pass "bin/build-matrix deduplicates repeated package arguments"

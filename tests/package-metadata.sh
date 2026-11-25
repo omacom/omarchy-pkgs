@@ -11,10 +11,29 @@ T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
 pass() { echo "PASS: $1"; }
 fail() { echo "FAIL: $1"; exit 1; }
 
-invalid=()
-for pkgdir in "$ROOT"/pkgbuilds/*/; do
-  out=$(validate_package_metadata "${pkgdir%/}" 2>&1) || invalid+=("$out")
+workers=$(nproc 2>/dev/null || echo 1)
+if [[ -r /sys/fs/cgroup/cpu.max ]]; then
+  read -r quota period < /sys/fs/cgroup/cpu.max || true
+  if [[ "${quota:-max}" != "max" && -n "${period:-}" && "$period" -gt 0 ]]; then
+    q=$(( (quota + period - 1) / period ))
+    (( q < 1 )) && q=1
+    (( q < workers )) && workers=$q
+  fi
+fi
+pkgdirs=("$ROOT"/pkgbuilds/*/)
+pids=()
+for (( w = 0; w < workers; w++ )); do
+  (
+    for (( i = w; i < ${#pkgdirs[@]}; i += workers )); do
+      if ! out=$(validate_package_metadata "${pkgdirs[i]%/}" 2>&1); then
+        printf '%s\n' "${out:-${pkgdirs[i]%/}: validation failed}"
+      fi
+    done
+  ) > "$T/invalid-$w" &
+  pids+=($!)
 done
+for p in "${pids[@]}"; do wait "$p"; done
+mapfile -t invalid < <(cat "$T"/invalid-* | sed '/^$/d')
 (( ${#invalid[@]} == 0 )) && pass "every package's metadata is valid" || fail "$(printf '%s; ' "${invalid[@]}")"
 
 mkdir -p "$T/fast-rebuild/.omarchy"
