@@ -304,6 +304,25 @@ approval hold, and arms auto-merge with the PAT in `PKGS_BOT_TOKEN`. A push to a
 `auto/track-branches-*` branch does not cancel the PR's build in flight: the new
 build waits, then reuses every artifact the finished one uploaded.
 
+Each PR's description comes from `helpers/sync-pr-body.py`, which compares the
+group's recipes and `.omarchy/package.json` with `master`. It works the same for
+every source type, hooks and rebuilds included, and shows:
+
+- each package's old and new version, with the kind of jump for dotted versions;
+- the source: the GitHub repository, tag or branch, the npm or PyPI package, or
+  the feed URL;
+- the pinned variables the sync rewrote, and each source whose URL or checksum
+  changed, per architecture;
+- for a rebuild, the dependencies in `rebuilt_against` that moved;
+- the architectures, and the channels the package ships to on merge;
+- how the new bytes were checked: against GitHub's asset digests, by the
+  recorded checksums, and by `validpgpkeys`.
+
+When a source is a tag on GitHub, the description links the release and the
+compare view, and shows the release notes. The notes sit in a code fence, cut
+to 40 lines, so they render as plain text. A hidden comment at the end repeats
+the facts as JSON. If the script fails, the PR still opens with the plain body.
+
 A red PR stays open for a maintainer and holds back only its own package. A
 later run updates it if upstream moves again, and closes it once it conflicts
 with `master`. A run started by hand with `packages` updates the same

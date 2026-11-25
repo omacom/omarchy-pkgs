@@ -404,6 +404,16 @@ test('every bot lane opens its PRs per package through package-prs.yml', () => {
   assert.match(step('Hold an existing reviewed PR as a draft'), /\n +GH_TOKEN: \$\{\{ steps\.app\.outputs\.token \}\}\n/);
   assert.match(step('Open or update the PR'), /\n +token: \$\{\{ steps\.app\.outputs\.token \}\}\n/);
   assert.match(step('Close superseded PRs'), /\n +GH_TOKEN: \$\{\{ steps\.app\.outputs\.token \}\}\n/);
+  // The description is generated from the change, before the App token
+  // exists, and falls back to the caller's body so a PR always opens.
+  const describe = step('Write the PR description');
+  assert.match(describe, /python3 helpers\/sync-pr-body\.py "\$\{args\[@\]\}" "\$\{packages\[@\]\}" > "\$RUNNER_TEMP\/pr-body\.md"/);
+  assert.match(describe, /printf '%s\\n' "\$FALLBACK" > "\$RUNNER_TEMP\/pr-body\.md"/);
+  assert.match(describe, /FALLBACK: \$\{\{ inputs\.body \}\}/);
+  assert.doesNotMatch(describe, /steps\.app\.outputs\.token|secrets\./);
+  assert.ok(prs.indexOf('- name: Write the PR description') < prs.indexOf("- name: Get the sync App's token"), 'the description is written before the App token exists');
+  assert.match(step('Open or update the PR'), /\n +body-path: \$\{\{ runner\.temp \}\}\/pr-body\.md\n/);
+  assert.doesNotMatch(step('Open or update the PR'), /\n +body: /);
   // Only arming auto-merge still uses the PAT: GitHub merges as whoever armed it.
   const pat = [...prs.matchAll(/^ +(?:GH_TOKEN|token): \$\{\{ secrets\.PKGS_BOT_TOKEN \}\}$/gm)];
   assert.equal(pat.length, 1);
