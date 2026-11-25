@@ -112,17 +112,28 @@ provider or hook.
 
 The builder controller box dispatches both groups on systemd timers
 (`ci/dispatch.sh`), because GitHub's own schedule ran them hours late.
-It uses a personal access token so its PRs trigger builds and its merges trigger
-publishing without manual approval. No GitHub App is required.
+The omarchy-pkgs-sync GitHub App pushes the branches and opens the PRs, so
+they build without an approval hold. A personal access token arms auto-merge,
+so the merges start publishing. The built-in Actions `GITHUB_TOKEN` can do
+neither.
 
-1. Use a fine-grained PAT with access to **omacom/omarchy-pkgs** and repository
+1. The omarchy-pkgs-sync App is owned by the omacom organization, has no
+   webhook, and has repository **Contents: Read and write** and **Pull
+   requests: Read and write** permissions, with Workflows left at no access.
+   It is installed on **omacom/omarchy-pkgs** only. Its client ID is the
+   repository variable `PKGS_SYNC_APP_CLIENT_ID`. Its private key is the
+   secret `PKGS_SYNC_APP_KEY` in the `bot-sync` environment, whose
+   deployment branches are limited to `master`. To rotate the key, generate
+   a new one in the App's settings, replace the secret, then delete the old
+   key there.
+2. Use a fine-grained PAT with access to **omacom/omarchy-pkgs** and repository
    **Contents: Read and write** and **Pull requests: Read and write** permissions.
    Its owner must be trusted by the build workflow (for example, a collaborator).
    The existing controller PAT can be reused when it has these permissions.
-2. In the repository's
+   In the repository's
    [Actions secrets](https://github.com/omacom/omarchy-pkgs/settings/secrets/actions),
    save the PAT as `PKGS_BOT_TOKEN`. Update this secret when the token is rotated
-   or expires. The built-in Actions `GITHUB_TOKEN` cannot run this unattended chain.
+   or expires.
 3. Keep **Allow auto-merge** enabled and require `result`, `self-tests`, and
    `build-isolation` on `master`; the updater does not request a protection bypass.
 4. Run **Sync Upstream** once from Actions with `cadence: hourly`
@@ -288,8 +299,8 @@ These packages were already excluded from automatic AUR updates. The migration p
 `sync-upstream.yml` (both package groups) and `sync-rebuilds.yml` each run their
 sync once, split the changed recipes into one PR per package with
 `.github/scripts/package-pr-groups.sh`, and hand them to `package-prs.yml`. That
-pushes each PR with the PAT in `PKGS_BOT_TOKEN`, so its builds start without an
-approval hold, and arms auto-merge. A push to an `auto/sync-*` or
+pushes each PR as the omarchy-pkgs-sync App, so its builds start without an
+approval hold, and arms auto-merge with the PAT in `PKGS_BOT_TOKEN`. A push to an `auto/sync-*` or
 `auto/track-branches-*` branch does not cancel the PR's build in flight: the new
 build waits, then reuses every artifact the finished one uploaded.
 
