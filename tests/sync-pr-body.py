@@ -149,8 +149,8 @@ class BodyTest(unittest.TestCase):
         self.assertIn("| Release | [v1.3.0](https://github.com/owner/tool/releases/tag/v1.3.0), published 2026-11-19 |", body)
         self.assertIn("| Changes | [`v1.2.0...v1.3.0`](https://github.com/owner/tool/compare/v1.2.0...v1.3.0) |", body)
         self.assertIn("| Verification | sha256 of each changed checksum matches the digest GitHub lists for its asset |", body)
-        self.assertIn("| x86_64 | `tool-1.3.0-x64.tar.gz` | sha256 `aaaaaaaa…` → `cccccccc…` |", body)
-        self.assertIn("| aarch64 | `tool-1.3.0-arm64.tar.gz` | sha256 `bbbbbbbb…` → `dddddddd…` |", body)
+        self.assertIn("| x86_64 | [`tool-1.3.0-x64.tar.gz`](https://github.com/owner/tool/releases/download/v1.3.0/tool-1.3.0-x64.tar.gz) | sha256 `aaaaaaaa…` → `cccccccc…` |", body)
+        self.assertIn("| aarch64 | [`tool-1.3.0-arm64.tar.gz`](https://github.com/owner/tool/releases/download/v1.3.0/tool-1.3.0-arm64.tar.gz) | sha256 `bbbbbbbb…` → `dddddddd…` |", body)
         self.assertIn("<summary>Release notes for v1.3.0</summary>", body)
         self.assertIn("\n    ## Fixes\n    - a fix\n", body)
         self.assertEqual(fetch.calls, ["https://api.github.com/repos/owner/tool/releases/tags/v1.3.0"])
@@ -213,7 +213,7 @@ class BodyTest(unittest.TestCase):
         fetch = FakeGitHub()
         body = self.body("tool", fetch=fetch)
         self.assertIn("| Source | Tags of [gitlab.freedesktop.org/x/tool](https://gitlab.freedesktop.org/x/tool.git) |", body)
-        self.assertIn("| all | `tool-v1.1.tar.gz` | sha256 `aaaaaaaa…` → `bbbbbbbb…` |", body)
+        self.assertIn("| all | [`tool-v1.1.tar.gz`](https://gitlab.freedesktop.org/x/tool/-/archive/v1.1/tool-v1.1.tar.gz) | sha256 `aaaaaaaa…` → `bbbbbbbb…` |", body)
         self.assertNotIn("| Changes |", body)
         self.assertEqual(fetch.calls, [])
 
@@ -294,7 +294,7 @@ class BodyTest(unittest.TestCase):
         body = self.body("cua", fetch=FakeGitHub())
         self.assertIn("Updates **cua** from `1.0-1` to `1.1-1` (minor).", body)
         self.assertIn("| Source | Custom check in `.omarchy/upstream.sh` |", body)
-        self.assertIn("| all | `cua-1.1.zip` | sha256 `aaaaaaaa…` → `bbbbbbbb…` |", body)
+        self.assertIn("| all | [`cua-1.1.zip`](https://cua.test/cua-1.1.zip) | sha256 `aaaaaaaa…` → `bbbbbbbb…` |", body)
 
     def test_a_rebuild_names_the_dependencies_that_moved(self):
         meta = {"source": "local", "rebuild_on": ["hyprland", "aquamarine"],
@@ -347,7 +347,7 @@ class BodyTest(unittest.TestCase):
                                                      "sha256sums=('" + SHA["b"] + "' 'SKIP')\nvalidpgpkeys=('AAAA' 'BBBB')\n"))
         body = self.body("tool")
         self.assertIn("| Verification | checksums recorded by the sync; `validpgpkeys` pins 2 keys for the signed sources makepkg checks |", body)
-        self.assertIn("| all | `t-1.1.tar.gz.sig` | sha256 `SKIP` |", body)
+        self.assertIn("| all | [`t-1.1.tar.gz.sig`](https://example.test/t-1.1.tar.gz.sig) | sha256 `SKIP` |", body)
 
     def test_pinned_variables_and_the_hidden_record(self):
         self.repo.write("ag", recipe("2.35.1", body="_build=4615540875067392\n" + f"source=(\"https://dl.test/$_build/a.deb\")\nsha256sums=('{SHA['a']}')\n"),
@@ -426,8 +426,8 @@ class BodyTest(unittest.TestCase):
         self.repo.commit()
         self.repo.write("tool", recipe("1.1", body=text.format(a=SHA["c"], b=SHA["d"])))
         body = self.body("tool")
-        self.assertIn("| x86_64 | `t-1.1-x64.tar.gz` | sha256 `aaaaaaaa…` → `cccccccc…` |", body)
-        self.assertIn("| aarch64 | `t-1.1-arm.tar.gz` | sha256 `bbbbbbbb…` → `dddddddd…` |", body)
+        self.assertIn("| x86_64 | [`t-1.1-x64.tar.gz`](https://dl.test/t-1.1-x64.tar.gz) | sha256 `aaaaaaaa…` → `cccccccc…` |", body)
+        self.assertIn("| aarch64 | [`t-1.1-arm.tar.gz`](https://dl.test/t-1.1-arm.tar.gz) | sha256 `bbbbbbbb…` → `dddddddd…` |", body)
         self.assertNotIn("| all |", body)
 
     def test_a_removed_source_is_listed(self):
@@ -489,7 +489,7 @@ class BodyTest(unittest.TestCase):
         self.repo.write("tool", recipe("1.1", body=text.format(urls='"https://dl.test/t-$pkgver.tar.gz"', sums=f"'{SHA['c']}'")))
         body = self.body("tool")
         self.assertIn("| all | `old.patch` | removed |", body)
-        self.assertIn("| all | `t-1.1.tar.gz` | sha256 `bbbbbbbb…` → `cccccccc…` |", body)
+        self.assertIn("| all | [`t-1.1.tar.gz`](https://dl.test/t-1.1.tar.gz) | sha256 `bbbbbbbb…` → `cccccccc…` |", body)
 
     def test_a_checksum_that_becomes_skip_is_a_change(self):
         self.repo.write("tool", recipe("1.0", body=f"source=(\"https://dl.test/t-$pkgver.tar.gz\")\nsha256sums=('{SHA['a']}')\n"),
@@ -497,7 +497,7 @@ class BodyTest(unittest.TestCase):
         self.repo.commit()
         self.repo.write("tool", recipe("1.1", body="source=(\"https://dl.test/t-$pkgver.tar.gz\")\nsha256sums=('SKIP')\n"))
         body = self.body("tool")
-        self.assertIn("| all | `t-1.1.tar.gz` | sha256 `aaaaaaaa…` → `SKIP` |", body)
+        self.assertIn("| all | [`t-1.1.tar.gz`](https://dl.test/t-1.1.tar.gz) | sha256 `aaaaaaaa…` → `SKIP` |", body)
         self.assertIn("| Verification | checksums recorded by the sync; 1 changed source is not hashed (`SKIP`) |", body)
 
     def test_upstream_text_in_labels_and_code_stays_text(self):
@@ -530,7 +530,7 @@ class BodyTest(unittest.TestCase):
         self.repo.commit()
         self.repo.write("tool", recipe("1.1", body=text.format(urls='"https://dl.test/tool-$pkgver.tar.gz" "extra.patch"', sums=f"'{SHA['c']}' '{SHA['d']}'")))
         body = self.body("tool")
-        self.assertIn("| all | `tool-1.1.tar.gz` | sha256 `bbbbbbbb…` → `cccccccc…` |", body)
+        self.assertIn("| all | [`tool-1.1.tar.gz`](https://dl.test/tool-1.1.tar.gz) | sha256 `bbbbbbbb…` → `cccccccc…` |", body)
         self.assertIn("| all | `fix.patch` | removed |", body)
         self.assertIn("| all | `extra.patch` | sha256 `dddddddd…` |", body)
 
@@ -564,6 +564,17 @@ class BodyTest(unittest.TestCase):
     def test_declared_tags_for_declarative_providers(self):
         self.assertEqual(m.declared_tags({"upstream": {"git_tags": "https://github.com/hyprwm/Hyprland.git", "tag_pattern": "v{pkgver}"}},
                                          ["0.57.2"], None), {"0.57.2": "v0.57.2"})
+
+    def test_each_download_links_to_where_its_bytes_come_from(self):
+        self.repo.write("tool", recipe("1.0", body='source=("t-$pkgver.tar.gz::https://mirror-a.test/x/t.tar.gz" "fix.patch")\n'
+                                                     f"sha256sums=('{SHA['a']}' '{SHA['b']}')\n"),
+                        {"source": "local"}, files={".omarchy/upstream.sh": "echo {}\n", "fix.patch": ""})
+        self.repo.commit()
+        self.repo.write("tool", recipe("1.1", body='source=("t-$pkgver.tar.gz::https://mirror-b.test/y/t.tar.gz" "fix.patch")\n'
+                                                     f"sha256sums=('{SHA['c']}' '{SHA['d']}')\n"), files={"fix.patch": "changed"})
+        body = self.body("tool")
+        self.assertIn("| all | [`t-1.1.tar.gz`](https://mirror-b.test/y/t.tar.gz) | sha256 `aaaaaaaa…` → `cccccccc…` |", body)
+        self.assertIn("| all | `fix.patch` | sha256 `bbbbbbbb…` → `dddddddd…` |", body)
 
     def test_table_cells_cannot_break_the_table(self):
         self.assertEqual(m.cell("a|b\nc"), "a\\|b c")

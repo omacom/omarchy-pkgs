@@ -370,6 +370,14 @@ def source_rows(old, new):
     return rows
 
 
+def source_cell(url, name):
+    """The file name, linked to where its bytes come from when that is a download."""
+    target = url.removeprefix("git+")
+    if urlsplit(target).scheme in ("https", "http"):
+        return f"[{code(name)}]({destination(target)})"
+    return code(name)
+
+
 def checksum_text(checksums):
     if checksums is None:
         return "removed"
@@ -598,7 +606,7 @@ def package_section(root, base, package, fetch_json):
 
     summary = "| | |\n|---|---|\n" + "\n".join(f"| {name} | {value} |" for name, value in table)
     sources = ("**Sources**\n\n| Arch | File | Checksum |\n|---|---|---|\n"
-               + "\n".join(f"| {label} | {code(name)} | {checksum_text(checksums)} |" for label, _, name, checksums in rows)) if rows else ""
+               + "\n".join(f"| {label} | {source_cell(url, name)} | {checksum_text(checksums)} |" for label, url, name, checksums in rows)) if rows else ""
     record = {"name": package, "before": before, "after": after, "source": source_kind(meta, new["hook"]),
               "github": github, "arches": arches, "ships_to": ships_to(meta)}
     return {"name": package, "before": before, "after": after, "lead": lead, "summary": summary,
