@@ -13,13 +13,34 @@
 # Exit 0: nothing changed. 1: key files changed (review and commit them).
 # 2: a key is revoked; the recipes that trust it must stop until upstream
 # says what replaces it. An unreachable source is reported, not an error.
+#
+# Usage: bin/refresh-pgp-keys [--check] [key-file-or-fingerprint ...]
+#   --check   Report outdated or revoked keys without modifying files.
+#   args      Restrict lookups to the named key files or fingerprints (all
+#             shipped copies of each named fingerprint are still checked).
 set -uo pipefail
-ROOT=$(realpath "${BASH_SOURCE[0]%/*}/..")
+ROOT=${REFRESH_ROOT:-$(realpath "${BASH_SOURCE[0]%/*}/..")}
 TIMEOUT=${REFRESH_TIMEOUT:-20}
+OFFLINE=${REFRESH_OFFLINE:-0}
 # Not keyserver.ubuntu.com: it went down with the rest of Canonical on
 # 11 November 2026, and it syncs only with Canonical's own servers. Owners
 # publish their updates by WKD or to keys.openpgp.org.
 KEYSERVERS=(hkps://keys.openpgp.org)
+
+check_only=0
+requested=()
+while (($#)); do
+  case "$1" in
+    --check) check_only=1 ;;
+    --) shift; requested+=("$@"); break ;;
+    -*)
+      echo "usage: ${0##*/} [--check] [key-file-or-fingerprint ...]" >&2
+      exit 64
+      ;;
+    *) requested+=("$1") ;;
+  esac
+  shift
+done
 
 # What a refresh can change: per primary key and subkey, its validity
 # (r = revoked), expiry and capabilities; per user ID, its validity, keyed
@@ -69,7 +90,26 @@ while IFS= read -r -d '' file; do
 done < <(find "$ROOT/pkgbuilds" -path '*/keys/pgp/*.asc' -print0 | sort -z)
 
 status=0
-for fpr in $(printf '%s\n' "${!files[@]}" | sort); do
+targets=()
+if ((${#requested[@]})); then
+  declare -A want
+  for arg in "${requested[@]}"; do
+    fpr=$(basename "$arg" .asc)
+    if [[ -z ${files[$fpr]+x} ]]; then
+      echo "MISSING  $fpr: no shipped key matches $arg"
+      status=1
+      continue
+    fi
+    want[$fpr]=1
+  done
+  if ((${#want[@]})); then
+    mapfile -t targets < <(printf '%s\n' "${!want[@]}" | sort)
+  fi
+elif ((${#files[@]})); then
+  mapfile -t targets < <(printf '%s\n' "${!files[@]}" | sort)
+fi
+
+for fpr in "${targets[@]}"; do
   mapfile -t paths < <(printf '%s' "${files[$fpr]}")
   GNUPGHOME=$(mktemp -d)
   export GNUPGHOME
@@ -87,26 +127,28 @@ for fpr in $(printf '%s\n' "${!files[@]}" | sort); do
   # Every lookup runs at once, each in a keyring seeded with the shipped key
   # (keys.openpgp.org serves updates without user IDs, which gpg merges only
   # into a key it already has). One key then costs at most one timeout.
-  work=$(mktemp -d)
-  gpg --batch --export "$fpr" >"$work/base.gpg"
-  n=0
-  for address in $(gpg --with-colons --list-keys "$fpr" | awk -F: '$1 == "uid" && $2 != "r" { print $10 }' |
-    grep -oE '<[^>]+@[^>]+>' | tr -d '<>' | sort -u); do
-    n=$((n + 1))
-    lookup "$n" "wkd:$address" --auto-key-locate clear,nodefault,wkd --locate-external-keys "$address" &
-  done
-  for server in "${KEYSERVERS[@]}"; do
-    n=$((n + 1))
-    lookup "$n" "${server#hkps://}" --keyserver "$server" --recv-keys "$fpr" &
-  done
-  wait
   reached=()
-  for result in "$work"/*.gpg; do
-    [[ $result == */base.gpg ]] && continue
-    gpg -q --batch --import "$result" 2>/dev/null
-    reached+=("$(<"${result%.gpg}.source")")
-  done
-  rm -rf "$work"
+  if ((OFFLINE == 0)); then
+    work=$(mktemp -d)
+    gpg --batch --export "$fpr" >"$work/base.gpg"
+    n=0
+    for address in $(gpg --with-colons --list-keys "$fpr" | awk -F: '$1 == "uid" && $2 != "r" { print $10 }' |
+      grep -oE '<[^>]+@[^>]+>' | tr -d '<>' | sort -u); do
+      n=$((n + 1))
+      lookup "$n" "wkd:$address" --auto-key-locate clear,nodefault,wkd --locate-external-keys "$address" &
+    done
+    for server in "${KEYSERVERS[@]}"; do
+      n=$((n + 1))
+      lookup "$n" "${server#hkps://}" --keyserver "$server" --recv-keys "$fpr" &
+    done
+    wait
+    for result in "$work"/*.gpg; do
+      [[ $result == */base.gpg ]] && continue
+      gpg -q --batch --import "$result" 2>/dev/null
+      reached+=("$(<"${result%.gpg}.source")")
+    done
+    rm -rf "$work"
+  fi
   merged=$(state "$fpr")
 
   # Export once and check it before any shipped file is touched.
@@ -120,16 +162,19 @@ for fpr in $(printf '%s\n' "${!files[@]}" | sort); do
   fi
 
   # Compare each file with the merged key on its own, so every stale copy is
-  # rewritten. A revoked key is written back too: makepkg then refuses it.
+  # rewritten (or reported in --check mode). A revoked key is written back too:
+  # makepkg then refuses it.
   changed=()
   for path in "${paths[@]}"; do
     if [[ $(file_state "$path" "$fpr") != "$merged" ]]; then
-      cp "$export_file" "$path"
+      ((check_only)) || cp "$export_file" "$path"
       changed+=("${path#"$ROOT"/}")
     fi
   done
   if ((${#changed[@]})); then
-    echo "UPDATED  $fpr from ${reached[*]:-nowhere}: ${changed[*]}"
+    verb=UPDATED
+    ((check_only)) && verb=OUTDATED
+    echo "$verb  $fpr from ${reached[*]:-nowhere}: ${changed[*]}"
     while IFS= read -r line; do echo "        now: $line"; done <<<"$merged"
     status=$((status > 1 ? status : 1))
   else
