@@ -100,6 +100,8 @@ class GitHubRefTest(unittest.TestCase):
             "git+https://github.com/o/r#commit=" + "b" * 40: ("o/r", "commit", "b" * 40),
             "https://codeload.github.com/o/r/tar.gz/refs/tags/v2": ("o/r", "tag", "v2"),
             "CHANGELOG.md::https://raw.githubusercontent.com/o/r/v1.0.116/changelog.md": ("o/r", "tag", "v1.0.116"),
+            "https://github.com/o/r/raw/" + "d" * 40 + "/fonts/x.ttf": ("o/r", "commit", "d" * 40),
+            "https://github.com/o/r/raw/v2.0/fonts/x.ttf": ("o/r", "tag", "v2.0"),
         }
         for url, expected in cases.items():
             with self.subTest(url=url):
@@ -111,6 +113,7 @@ class GitHubRefTest(unittest.TestCase):
 
     def test_ignores_sources_that_are_not_github_refs(self):
         for url in ["https://github.com/o/r/archive/refs/heads/main.tar.gz",
+                    "https://github.com/o/r/raw/refs/heads/main/x.ttf",
                     "https://codeload.github.com/o/r/tar.gz/refs/heads/main","https://example.test/tool.tar.gz", "local.patch",
                     "https://github.com/o/r/releases/latest/download/tool.tar.gz",
                     "https://gitlab.com/o/r/-/archive/v1/r-v1.tar.gz"]:
@@ -519,6 +522,48 @@ class BodyTest(unittest.TestCase):
         body = m.assemble_body(sections, review=False)
         self.assertLessEqual(len(body.encode("utf-16-le")) // 2, 65000)
         self.assertEqual([p["name"] for p in hidden(body)["packages"]], [f"p{i:04d}" for i in range(200)])
+
+    def test_reordered_sources_pair_by_name_not_position(self):
+        text = "source=({urls})\nsha256sums=({sums})\n"
+        self.repo.write("tool", recipe("1.0", body=text.format(urls='"fix.patch" "https://dl.test/tool-$pkgver.tar.gz"', sums=f"'{SHA['a']}' '{SHA['b']}'")),
+                        {"source": "local", "upstream": {"watch": {"regex": "https://dl.test/", "pattern": "x"}}}, files={"fix.patch": "", "extra.patch": ""})
+        self.repo.commit()
+        self.repo.write("tool", recipe("1.1", body=text.format(urls='"https://dl.test/tool-$pkgver.tar.gz" "extra.patch"', sums=f"'{SHA['c']}' '{SHA['d']}'")))
+        body = self.body("tool")
+        self.assertIn("| all | `tool-1.1.tar.gz` | sha256 `bbbbbbbb…` → `cccccccc…` |", body)
+        self.assertIn("| all | `fix.patch` | removed |", body)
+        self.assertIn("| all | `extra.patch` | sha256 `dddddddd…` |", body)
+
+    def test_a_release_pinned_by_commit_is_found_by_the_declared_tag_pattern(self):
+        source = 'source=("sunshine-$_commit.tar.gz::https://github.com/LizardByte/Sunshine/archive/$_commit.tar.gz")\n'
+        meta = {"source": "local", "upstream": {"watch": {"github": "LizardByte/Sunshine", "pattern": r"v(?P<version>[0-9]+(?:\.[0-9]+)*)",
+                                                          "variables": {"_commit": "{commit}"}}}}
+        self.repo.write("sunshine", recipe("2025.1", body=f"_commit={'1' * 40}\n{source}sha256sums=('{SHA['a']}')\n"), meta)
+        self.repo.commit()
+        self.repo.write("sunshine", recipe("2025.2", body=f"_commit={'2' * 40}\n{source}sha256sums=('{SHA['b']}')\n"))
+        listing = {"https://api.github.com/repos/LizardByte/Sunshine/releases?per_page=100": [
+            {"tag_name": "v2025.2", "draft": False}, {"tag_name": "nightly", "draft": False}, {"tag_name": "v2025.1", "draft": False}]}
+        fetch = FakeGitHub({**listing, **release("LizardByte/Sunshine", "v2025.2")})
+        body = self.body("sunshine", fetch=fetch)
+        self.assertIn("| Release | [v2025.2](https://github.com/LizardByte/Sunshine/releases/tag/v2025.2), published 2026-11-19 |", body)
+        self.assertIn("| Changes | [`v2025.1...v2025.2`](https://github.com/LizardByte/Sunshine/compare/v2025.1...v2025.2) |", body)
+        offline = self.body("sunshine")
+        self.assertIn(f"| Changes | [`{'1' * 12}...{'2' * 12}`](https://github.com/LizardByte/Sunshine/compare/{'1' * 40}...{'2' * 40}) |", offline)
+
+    def test_git_tags_on_github_with_a_cdn_tarball_still_link_the_tags(self):
+        source = 'source=("https://release.files.ghostty.org/$pkgver/ghostty-$pkgver.tar.gz")\n'
+        meta = {"source": "local", "upstream": {"watch": {"git_tags": "https://github.com/ghostty-org/ghostty.git", "pattern": r"v(?P<version>[0-9]+(?:\.[0-9]+)*)"}}}
+        self.repo.write("ghostty", recipe("1.1.0", body=f"{source}sha256sums=('{SHA['a']}')\n"), meta)
+        self.repo.commit()
+        self.repo.write("ghostty", recipe("1.2.0", body=f"{source}sha256sums=('{SHA['b']}')\n"))
+        fetch = FakeGitHub({"https://api.github.com/repos/ghostty-org/ghostty/tags?per_page=100": [{"name": "tip"}, {"name": "v1.2.0"}, {"name": "v1.1.0"}]})
+        body = self.body("ghostty", fetch=fetch)
+        self.assertIn("| Tag | [`v1.2.0`](https://github.com/ghostty-org/ghostty/tree/v1.2.0) |", body)
+        self.assertIn("| Changes | [`v1.1.0...v1.2.0`](https://github.com/ghostty-org/ghostty/compare/v1.1.0...v1.2.0) |", body)
+
+    def test_declared_tags_for_declarative_providers(self):
+        self.assertEqual(m.declared_tags({"upstream": {"git_tags": "https://github.com/hyprwm/Hyprland.git", "tag_pattern": "v{pkgver}"}},
+                                         ["0.57.2"], None), {"0.57.2": "v0.57.2"})
 
     def test_table_cells_cannot_break_the_table(self):
         self.assertEqual(m.cell("a|b\nc"), "a\\|b c")

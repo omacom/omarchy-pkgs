@@ -128,9 +128,9 @@ def github_ref(source):
         found = re.fullmatch(r"/([^/]+)/([^/]+)/releases/download/([^/]+)/[^/]+", path)
         if found:
             return (f"{found[1]}/{found[2]}", "tag", unquote(found[3]))
-        if re.fullmatch(rf"/[^/]+/[^/]+/archive/refs/heads/.+{ARCHIVE}", path):
+        if re.fullmatch(rf"/[^/]+/[^/]+/archive/refs/heads/.+{ARCHIVE}", path) or re.fullmatch(r"/[^/]+/[^/]+/raw/refs/heads/.+", path):
             return None
-        found = (re.fullmatch(rf"/([^/]+)/([^/]+)/archive/refs/tags/(.+?){ARCHIVE}", path)
+        found = (re.fullmatch(r"/([^/]+)/([^/]+)/raw/(?:refs/tags/)?([^/]+)/.+", path) or re.fullmatch(rf"/([^/]+)/([^/]+)/archive/refs/tags/(.+?){ARCHIVE}", path)
                  or re.fullmatch(rf"/([^/]+)/([^/]+)/archive/(.+?){ARCHIVE}", path))
     elif host == "codeload.github.com":
         if re.fullmatch(r"/[^/]+/[^/]+/(?:tar\.gz|zip|legacy\.tar\.gz)/refs/heads/.+", path):
@@ -302,10 +302,9 @@ def align(old_sources, new_sources, old_pkgver, new_pkgver):
     """Pairs (old index or None, new index or None), matching sources by name.
 
     A version bump renames each source, so names are compared with the old
-    version swapped for the new one. Equal lists pair by position.
+    version swapped for the new one. Sources whose names still differ pair
+    by position within the run of changes, as a bump that renames a file does.
     """
-    if len(old_sources) == len(new_sources):
-        return [(index, index) for index in range(len(new_sources))]
     def name(source, version):
         text = source_name(source)
         return text.replace(version, new_pkgver) if version else text
@@ -396,9 +395,14 @@ def package_github(old, new):
     candidates = []
     for arch, recipe in new["recipes"].items():
         before = (old["recipes"].get(arch) or old["first"]) if old else {}
+        old_pkgver = watch.scalar(before, "pkgver")
         for key in ("source", f"source_{arch}"):
             previous_sources = before.get(key, [])
-            for index, source in enumerate(recipe.get(key, [])):
+            pairs = align(previous_sources, recipe.get(key, []), old_pkgver, pkgver)
+            for i, index in pairs:
+                if index is None:
+                    continue
+                source = recipe[key][index]
                 after = github_ref(source)
                 if not after:
                     continue
@@ -407,7 +411,7 @@ def package_github(old, new):
                         continue
                 elif not (after[1] == "tag" and carries_version(after[2], pkgver)):
                     continue
-                previous = previous_sources[index] if index < len(previous_sources) else None
+                previous = previous_sources[i] if i is not None else None
                 before_ref = github_ref(previous) if previous else None
                 moved = bool(before_ref) and before_ref[0] == after[0] and before_ref[2] != after[2]
                 candidates.append((not moved, "/releases/download/" not in source, after, before_ref if moved else None))
@@ -421,6 +425,43 @@ def carries_version(tag, pkgver):
     """Whether a tag names this exact version: v1.2 and rust-v1.2 do, v11.2 and 1.2.3 do not."""
     pattern = rf"(?:(?<![0-9A-Za-z.])|(?<![0-9A-Za-z])[vV]){re.escape(pkgver)}(?![0-9A-Za-z]|\.[0-9A-Za-z])"
     return bool(pkgver) and re.search(pattern, tag) is not None
+
+
+def declared_tags(meta, versions, fetch_json):
+    """The tags the upstream declaration maps these versions to, found the way the sync finds them.
+
+    A recipe that pins a release by commit, or downloads it from a CDN, names
+    no tag in its sources; the declaration still says which tag a version is.
+    """
+    kind, spec, declarative = upstream_spec(meta)
+    found = {}
+    if kind == "git_tags" and declarative and "{pkgver}" in spec.get("tag_pattern", ""):
+        return {version: spec["tag_pattern"].replace("{pkgver}", version) for version in versions}
+    repo = declared_repo(meta)
+    if not repo or fetch_json is None or kind not in ("github", "git_tags"):
+        return found
+    try:
+        if kind == "github":
+            names = [r.get("tag_name") for r in fetch_json(f"https://api.github.com/repos/{repo}/releases?per_page=100") if not r.get("draft")]
+        else:
+            names = [t.get("name") for t in fetch_json(f"https://api.github.com/repos/{repo}/tags?per_page=100")]
+    except Exception:
+        return found
+    for name in names:
+        if not isinstance(name, str):
+            continue
+        if declarative:
+            version = name[1:] if name[:1] in "vV" else name
+            if version in versions:
+                found.setdefault(version, name)
+            continue
+        try:
+            for item in watch.matches(spec, name, {"tag": name}, full=True):
+                if item["pkgver"] in versions:
+                    found.setdefault(item["pkgver"], name)
+        except (ValueError, KeyError, IndexError, re.error):
+            continue
+    return found
 
 
 def fetch_release(github, fetch_json):
@@ -513,16 +554,21 @@ def package_section(root, base, package, fetch_json):
     after = version(new["first"])
     rows = source_rows(old, new)
     github = package_github(old, new)
-    same_version = bool(old) and watch.scalar(old["first"], "pkgver") == watch.scalar(new["first"], "pkgver")
+    old_pkgver = watch.scalar(old["first"], "pkgver") if old else ""
+    new_pkgver = watch.scalar(new["first"], "pkgver")
+    same_version = bool(old) and old_pkgver == new_pkgver
     if same_version and not (github and github["old"]):
         github = None
+    elif not same_version and declared_repo(meta) and not (github and github["kind"] == "tag" and github["old"]):
+        tags = declared_tags(meta, [v for v in (new_pkgver, old_pkgver) if v], fetch_json)
+        if new_pkgver in tags:
+            github = {"repo": declared_repo(meta), "kind": "tag", "new": tags[new_pkgver], "old": tags.get(old_pkgver)}
     release = fetch_release(github, fetch_json)
     rebuilt = rebuilt_rows(old["meta"] if old else {}, meta)
     if same_version:
         lead = f"Rebuilds **{package}** from `{before}` to `{after}`" + (" against updated dependencies." if rebuilt else ".")
     else:
-        old_pkgver = watch.scalar(old["first"], "pkgver") if old else ""
-        lead = f"Updates **{package}** from `{before}` to `{after}`{change_label(old_pkgver, watch.scalar(new['first'], 'pkgver'))}."
+        lead = f"Updates **{package}** from `{before}` to `{after}`{change_label(old_pkgver, new_pkgver)}."
 
     table = [("Source", source_label(meta, new["hook"]))]
     if release:
