@@ -1,0 +1,114 @@
+#!/bin/bash
+# Keeps the Surface Laptop 7 front camera relay (v4l2-relayd@surface-laptop-7) healthy.
+# Two faults in libcamera 0.7.2 with v4l2-relayd 0.2.0 stop the camera mid-call:
+#  - every stream start leaks one 8 MB frame buffer from the 128 MB CMA pool (GPU debayer
+#    EGL context never destroyed), so after a few camera reopens the next start fails;
+#  - a failed start (also seen once from the sensor: "ov02c10 failed to set mode") leaves
+#    the relay deadlocked: no frames until it is restarted.
+# Restarting the relay frees the leak and clears the deadlock, and an app that has the
+# camera open keeps it and gets frames again after a short pause (tested). So this:
+#  1. restarts the relay at once when it logs a start or buffer failure;
+#  2. when no app streams and leaked frame buffers exist, restarts it right away
+#     (0.3 s, nothing is streaming then);
+#  3. only if CMA is about to run out while an app streams, restarts it then (short pause).
+# Root causes are fixed in libcamera 0.8.0 (a00a4ca2 EGL context leak, 0f045015 stop
+# deadlock). The unit's ExecCondition runs this with --needed, so the guard stands down
+# once that version is installed: the unit is skipped, not failed or restarted.
+# The 2 s checks use only file reads and bash built-ins (no programs started), so it
+# costs next to nothing while idle.
+set -u
+unit=v4l2-relayd@surface-laptop-7.service
+procs="/sys/fs/cgroup/system.slice/system-v4l2\\x2drelayd.slice/$unit/cgroup.procs"
+ACTIVE=4           # frame buffers a running stream holds; any more (or any while idle) leaked
+INUSE_LEAKED=3     # leaked buffers that, with CMA nearly gone, justify a restart mid-stream
+INUSE_CMA_KB=20000 # ... "nearly gone"
+COOLDOWN=4         # s after a restart in which no other restart runs; an error then is
+                   # held and restarts the relay once the cooldown ends
+log() { echo "camera-guard: $*"; }
+
+if [[ ${1-} == --needed ]]; then
+  v=$(pacman -Q libcamera 2>/dev/null) && (( $(vercmp "${v#* }" 0.8.0) >= 0 )) &&
+    { log "libcamera ${v#* } fixes both faults; standing down"; exit 1; }
+  exit 0
+fi
+
+CMA=0 RELAY= INUSE=0 FRAMES=0
+read_cma() { local k v r; while read -r k v r; do [[ $k == CmaFree: ]] && { CMA=$v; return; }; done </proc/meminfo; }
+# The camera's frame buffers: dma-bufs named frame-N from the linux,cma heap. Counting them
+# measures the leak itself; total CmaFree also moves with the display and video decoders.
+bufinfo=/sys/kernel/debug/dma_buf/bufinfo
+read_frames() {
+  local size flags mode count exp ino name; FRAMES=0
+  while read -r size flags mode count exp ino name; do
+    [[ $exp == linux,cma && $name == frame-* ]] && (( FRAMES++ ))
+  done <"$bufinfo"
+}
+read_relay() { RELAY=; [[ -r $procs ]] && read -r RELAY <"$procs" 2>/dev/null; }
+# In use while the relay streams for an app: only then does it hold the camera's media
+# device open (its source pipeline is NULL, every camera fd closed, when idle).
+# [[ -ef ]] stats both paths (an fd link resolves to the open file), no program started.
+read_inuse() {
+  local f m; INUSE=0
+  [[ -n $RELAY ]] || return
+  for f in /proc/"$RELAY"/fd/*; do
+    for m in /dev/media*; do
+      [[ $f -ef $m ]] && { INUSE=1; return; }
+    done
+  done
+}
+
+last_restart=0 check_idle=3 pending=
+restart() {
+  (( EPOCHSECONDS - last_restart < COOLDOWN )) && { pending=$1; return; }
+  pending=
+  read_cma
+  log "restarting relay: $1 (CmaFree $CMA kB)"
+  systemctl restart "$unit"
+  last_restart=$EPOCHSECONDS
+}
+
+# 1. Errors, read from the relay's log as they come.
+dir=$(mktemp -d) || { log "can't make a folder for the log reader's FIFO"; exit 1; }
+trap 'rm -rf "$dir"; kill 0' EXIT
+mkfifo "$dir/log" || { log "can't make a FIFO for the log reader"; exit 1; }
+journalctl -f -n0 -o short -u "$unit" >"$dir/log" 2>/dev/null &
+jpid=$!
+exec 3<"$dir/log"
+
+while :; do
+  # If the log reader ever dies, reads hit EOF at once; exit so systemd starts us afresh.
+  kill -0 "$jpid" 2>/dev/null || { log "log reader stopped; exiting to be restarted"; exit 1; }
+  # Wait up to 2 s for log lines, handle all of them, then do the periodic checks.
+  while IFS= read -r -t 2 line <&3; do
+    case $line in
+      *"configuring streams"*) ;;
+      *"Failed to start streaming"*|*"allocation failure"*|*"Unable to create buffer"*|*"Failed to start camera"*|*"Failed to configure"*)
+        # A line from a relay that has since been restarted was dealt with by that restart.
+        read_relay
+        [[ $line =~ \[([0-9]+)\]:\  && ${BASH_REMATCH[1]} != "$RELAY" ]] || restart "${line##*] }" ;;
+    esac
+    read -r -t 0 <&3 || break
+  done
+  (( EPOCHSECONDS - last_restart < COOLDOWN )) && continue
+  [[ -n $pending ]] && { restart "$pending (held over the cooldown)"; continue; }
+  read_relay
+  [[ -n $RELAY ]] || continue
+  # The buffer list is costly to read, so it is read only when it can matter: for a few
+  # checks after the camera is released (and at start), or mid-stream once CMA is low.
+  read_inuse
+  if (( INUSE )); then
+    check_idle=3
+    # 3. Several leaked and CMA about to run out while streaming: restart now (short
+    #    pause) rather than fail at the next start. Rare: 2. normally gets there first.
+    read_cma
+    if (( CMA < INUSE_CMA_KB )); then
+      read_frames
+      (( FRAMES - ACTIVE >= INUSE_LEAKED )) && restart "$(( FRAMES - ACTIVE )) leaked, CMA nearly gone, in use"
+    fi
+  elif (( check_idle > 0 )); then
+    (( check_idle-- ))
+    # 2. Released and buffers leaked: give them back now (0.3 s, nothing is streaming).
+    read_frames
+    (( FRAMES > 0 )) && { restart "released, $FRAMES leaked buffers"; check_idle=3; }
+  fi
+done
