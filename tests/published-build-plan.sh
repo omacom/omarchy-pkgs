@@ -70,6 +70,26 @@ for arch in x86_64 aarch64; do
   printf 'PASS: %s explicit and unscoped plans skip retained archives, allow new versions and releases\n' "$arch"
 done
 
+# A package that cross-compiles (package_build_host: chromium for aarch64)
+# builds only in its own builder image. An unscoped aarch64 plan in the
+# aarch64 image leaves it out; in the x86_64 image it is the only package.
+fixture chromium 1 1
+for builder in aarch64 x86_64; do
+  rm -rf "$TEST_ROOT/plan"
+  ARCH=aarch64 BUILDER_ARCH="$builder" MIRROR=edge DRY_RUN=true PACKAGES='' \
+    PKGBUILDS_DIR="$TEST_ROOT/pkgbuilds" HELPERS_DIR="$TEST_ROOT/helpers" \
+    FINAL_OUTPUT_DIR="$TEST_ROOT/pkgs.omarchy.org/edge/aarch64" BUILD_PLAN_DIR="$TEST_ROOT/plan" \
+    "$TEST_ROOT/build/build.sh" > "$TEST_ROOT/plan.log" 2>&1
+  sort "$TEST_ROOT/plan/packages" > "$TEST_ROOT/planned"
+  if [[ $builder == aarch64 ]]; then
+    diff -u "$TEST_ROOT/expected" "$TEST_ROOT/planned"
+  else
+    diff -u <(echo chromium) "$TEST_ROOT/planned"
+  fi
+done
+rm -rf "$TEST_ROOT/pkgbuilds/chromium"
+printf 'PASS: an unscoped aarch64 plan builds chromium only in the x86_64 builder image\n'
+
 # CI has no local published tree: build.sh reads the public channel's
 # database, and a retained archive is only there to see over HTTP. Serve the
 # same channels and plan against them with nothing mounted. broken-response's

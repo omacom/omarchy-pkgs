@@ -137,8 +137,7 @@ class EdgeMetadataTests(unittest.TestCase):
         for new, old in [('mesa-aurora', 'mesa'), ('vulkan-aurora', 'vulkan-asahi'),
                          ('aurora-bless', 'asahi-bless'), ('uboot-aurora', 'uboot-asahi'),
                          ('aurora-audio', 'asahi-audio'),
-                         ('alsa-ucm-conf-aurora', 'alsa-ucm-conf-asahi'), ('aura', 'm1n1'),
-                         ('aura', 'm1n1-aurora')]:
+                         ('alsa-ucm-conf-aurora', 'alsa-ucm-conf-asahi'), ('aura', 'm1n1')]:
             base = 'mesa-aurora' if new.startswith('vulkan-') else new
             package = srcinfo(base)[new]
             self.assertIn(old, package['conflicts'])
@@ -174,6 +173,23 @@ class EdgeMetadataTests(unittest.TestCase):
         # which --printsrcinfo does not see.
         recipe = (ROOT / 'pkgbuilds' / 'linux-aurora' / 'PKGBUILD').read_text()
         self.assertNotIn('replaces=', recipe)
+
+    def test_kernel_and_platform_hold_mesa_to_the_aurora_gpu_driver(self):
+        # The 7.3 kernel names its GPU driver "aurora": stock mesa and older
+        # mesa-aurora have no aurora_dri.so and leave a black screen.
+        mesa = srcinfo('mesa-aurora')['mesa-aurora']
+        built = mesa['epoch'][0] + ':' + mesa['pkgver'][0]
+        recipe = (ROOT / 'pkgbuilds' / 'linux-aurora' / 'PKGBUILD').read_text()
+        floor = next(line.split('=', 1)[1] for line in recipe.splitlines()
+                     if line.startswith('_mesa_version='))
+        self.assertGreaterEqual(int(subprocess.check_output(['vercmp', built, floor], text=True)), 0)
+        # A floor as a conflict, so a headless install does not pull Mesa in.
+        self.assertIn('"mesa-aurora<$_mesa_version" "vulkan-aurora<$_mesa_version"', recipe)
+        self.assertNotIn('mesa-aurora', ''.join(l for l in recipe.splitlines() if 'depends=' in l))
+        depends = srcinfo('omarchy-mac')['omarchy-mac']['depends']
+        self.assertIn('mesa-aurora>=' + floor, depends)
+        self.assertIn('vulkan-aurora>=' + floor, depends)
+        self.assertNotIn('vulkan-asahi', depends)
 
     def test_kernel_ships_the_calibration_extractor_beside_aurora_touchid(self):
         # The extractor is installed from the kernel's own tree. Its path must stay
@@ -218,7 +234,8 @@ class EdgeMetadataTests(unittest.TestCase):
 
     def test_omacom_loader_migrates_only_downstream_providers(self):
         package = srcinfo('m1n1-aurora')['m1n1-aurora']
-        self.assertEqual(package['replaces'], ['aura', 'm1n1-neo'])
+        # On edge, aura replaces m1n1-aurora; replacing it back would swap on every update.
+        self.assertEqual(package['replaces'], ['m1n1-neo'])
         self.assertEqual(package['conflicts'], ['m1n1', 'aura', 'm1n1-neo', 'linux-aurora<7.2.11.aurora16'])
         # The kernel floor is a conflict: linux-aurora depends on m1n1, so a dependency would loop.
         self.assertFalse(any(d.startswith('linux-aurora') for d in package['depends']))
@@ -246,7 +263,11 @@ class EdgeMetadataTests(unittest.TestCase):
         self.assertGreaterEqual(int(subprocess.check_output(['vercmp', compatibility, '1.6.1.aurora19'], text=True)), 0)
         for old in ['m1n1', 'm1n1-aurora', 'm1n1-neo']:
             self.assertIn(old, package['conflicts'])
-        self.assertEqual(package['replaces'], ['m1n1-neo'])
+        # The edge boot loader: a system update moves m1n1-aurora Macs to aura, and
+        # aura has no monitor without the 7.3 kernel's CONFIG_ARM64_CTXR_EXECMEM.
+        self.assertEqual(package['replaces'], ['m1n1-aurora', 'm1n1-neo'])
+        self.assertIn('linux-aurora<7.3.0', package['conflicts'])
+        self.assertNotIn('aura', srcinfo('m1n1-aurora')['m1n1-aurora']['replaces'])
 
 
 if __name__ == '__main__':

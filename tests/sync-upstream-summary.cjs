@@ -259,6 +259,8 @@ const evaluate = (expression, github, inputs) => new Function('github', 'inputs'
 for (const [name, event, inputs, expected] of [
   ['manual hourly run', {}, { cadence: 'hourly' },
     { cadence: 'hourly', lane: 'auto-merge', prefix: 'auto/track-branches', concurrency: 'track-branches' }],
+  ['manual five-minute run', {}, { cadence: 'five-minute' },
+    { cadence: 'five-minute', lane: 'five-minute', prefix: 'auto/track-branches', concurrency: 'track-branches-five-minute' }],
   ['manual six-hourly run', {}, { cadence: 'six-hourly' },
     { cadence: 'six-hourly', lane: 'reviewed', prefix: 'auto/sync-upstream', concurrency: 'sync-upstream' }],
   ['legacy manual run without a cadence', {}, {},
@@ -290,11 +292,11 @@ test('invalid cadence fails before selecting packages or PR branches', t => {
   assert.equal(existsSync(outputPath), false);
 });
 
-test('the controller box dispatches both cadences and GitHub schedules neither', () => {
+test('the controller box dispatches every cadence and GitHub schedules none', () => {
   assert.doesNotMatch(upstreamWorkflow, /^\s*schedule:/m);
   const dispatch = readFileSync(join(__dirname, '../ci/dispatch.sh'), 'utf8');
   assert.deepEqual([...dispatch.matchAll(/workflow=sync-upstream\.yml +inputs='\{"cadence":"([^"]+)"\}'/g)]
-    .map(match => match[1]).sort(), ['hourly', 'six-hourly']);
+    .map(match => match[1]).sort(), ['five-minute', 'hourly', 'six-hourly']);
   assert.equal(existsSync(join(__dirname, '../.github/workflows/track-branches.yml')), false);
 });
 

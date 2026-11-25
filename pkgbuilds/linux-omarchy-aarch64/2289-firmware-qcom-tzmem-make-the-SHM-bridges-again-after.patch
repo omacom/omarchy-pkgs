@@ -1,0 +1,277 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Birk Skyum <birk.skyum@pm.me>
+Date: Mon, 23 Nov 2026 11:22:24 +0100
+Subject: [PATCH] firmware: qcom: tzmem: make the SHM bridges again after
+ hibernation
+
+A hibernation image is restored after a power cycle. The secure world then
+knows only the SHM bridges created by the kernel that loaded the image, not
+the ones recorded in the image. The restored kernel keeps handing TZ memory
+from its pools to the secure world, which on the Yoga Slim 7x (X1E80100)
+reset the SoC as soon as the restored kernel booted its DSPs and made its
+EFI variable service fail.
+
+Keep all pools on a list. When the SCM device freezes late (also in the
+quiesce before the jump to the restored kernel) drop every pool area's
+bridge, and create them again early on the way back: on thaw in the saving
+or loading kernel, and on restore in the restored kernel. Export
+qcom_tzmem_bridges_suspended() so code that may run in between can skip its
+secure-world calls.
+
+A bridge that can't be created again is logged, its area is tried again at
+the next thaw or restore, and the error goes back through the PM callback.
+Until every area has its bridge, qcom_tzmem_bridges_suspended() stays true.
+
+Bridges created directly with qcom_tzmem_shm_bridge_create() by other
+drivers (qcomtee) are not covered.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/firmware/qcom/qcom_scm.c         |  24 +++++
+ drivers/firmware/qcom/qcom_tzmem.c       | 121 ++++++++++++++++++++++-
+ drivers/firmware/qcom/qcom_tzmem.h       |   2 +
+ include/linux/firmware/qcom/qcom_tzmem.h |   1 +
+ 4 files changed, 147 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/firmware/qcom/qcom_scm.c b/drivers/firmware/qcom/qcom_scm.c
+index a41a0beb0..8a20cfffe 100644
+--- a/drivers/firmware/qcom/qcom_scm.c
++++ b/drivers/firmware/qcom/qcom_scm.c
+@@ -2996,11 +2996,35 @@ static const struct of_device_id qcom_scm_dt_match[] = {
+ };
+ MODULE_DEVICE_TABLE(of, qcom_scm_dt_match);
+ 
++/*
++ * Hibernation: the secure world forgets the SHM bridges over the power cycle
++ * between saving and restoring an image. Drop them late in the freeze (and in
++ * the quiesce before the jump to the restored kernel), after the TZ memory
++ * users below this device, and create them again early on the way back.
++ */
++static int qcom_scm_freeze_late(struct device *dev)
++{
++	qcom_tzmem_hibernate_release();
++	return 0;
++}
++
++static int qcom_scm_thaw_early(struct device *dev)
++{
++	return qcom_tzmem_hibernate_reclaim();
++}
++
++static const struct dev_pm_ops qcom_scm_pm_ops = {
++	.freeze_late = pm_sleep_ptr(qcom_scm_freeze_late),
++	.thaw_early = pm_sleep_ptr(qcom_scm_thaw_early),
++	.restore_early = pm_sleep_ptr(qcom_scm_thaw_early),
++};
++
+ static struct platform_driver qcom_scm_driver = {
+ 	.driver = {
+ 		.name	= "qcom_scm",
+ 		.of_match_table = qcom_scm_dt_match,
+ 		.suppress_bind_attrs = true,
++		.pm = pm_sleep_ptr(&qcom_scm_pm_ops),
+ 	},
+ 	.probe = qcom_scm_probe,
+ 	.shutdown = qcom_scm_shutdown,
+diff --git a/drivers/firmware/qcom/qcom_tzmem.c b/drivers/firmware/qcom/qcom_tzmem.c
+index f926c1f64..f4e2641d2 100644
+--- a/drivers/firmware/qcom/qcom_tzmem.c
++++ b/drivers/firmware/qcom/qcom_tzmem.c
+@@ -30,9 +30,11 @@ struct qcom_tzmem_area {
+ 	dma_addr_t paddr;
+ 	size_t size;
+ 	void *priv;
++	bool bridged;
+ };
+ 
+ struct qcom_tzmem_pool {
++	struct list_head node;
+ 	struct gen_pool *genpool;
+ 	struct list_head areas;
+ 	enum qcom_tzmem_policy policy;
+@@ -47,6 +49,10 @@ struct qcom_tzmem_chunk {
+ };
+ 
+ static struct device *qcom_tzmem_dev;
++/* All pools, so their SHM bridges can be dropped and made again around hibernation. */
++static LIST_HEAD(qcom_tzmem_pools);
++static DEFINE_MUTEX(qcom_tzmem_pools_lock);
++static bool qcom_tzmem_bridges_down;
+ static RADIX_TREE(qcom_tzmem_chunks, GFP_ATOMIC);
+ static DEFINE_SPINLOCK(qcom_tzmem_chunks_lock);
+ 
+@@ -178,6 +184,7 @@ static int qcom_tzmem_init_area(struct qcom_tzmem_area *area)
+ 		return ret;
+ 
+ 	area->priv = no_free_ptr(handle);
++	area->bridged = true;
+ 
+ 	return 0;
+ }
+@@ -186,12 +193,118 @@ static void qcom_tzmem_cleanup_area(struct qcom_tzmem_area *area)
+ {
+ 	u64 *handle = area->priv;
+ 
+-	qcom_tzmem_shm_bridge_delete(*handle);
++	if (area->bridged)
++		qcom_tzmem_shm_bridge_delete(*handle);
+ 	kfree(handle);
+ }
+ 
++/*
++ * A hibernation image is restored after a power cycle. The secure world then
++ * knows only the SHM bridges the kernel that loaded the image created, not
++ * the ones recorded in the image, and handing it memory from a pool without
++ * a bridge can take the whole SoC down. Drop every pool's bridges before the
++ * snapshot is taken or the restored kernel is jumped to, and create them
++ * again when the kernel runs on.
++ */
++static void qcom_tzmem_bridges_release(void)
++{
++	struct qcom_tzmem_pool *pool;
++	struct qcom_tzmem_area *area;
++
++	if (!qcom_tzmem_using_shm_bridge)
++		return;
++
++	guard(mutex)(&qcom_tzmem_pools_lock);
++	WRITE_ONCE(qcom_tzmem_bridges_down, true);
++	list_for_each_entry(pool, &qcom_tzmem_pools, node) {
++		list_for_each_entry(area, &pool->areas, list) {
++			if (!area->bridged)
++				continue;
++			qcom_tzmem_shm_bridge_delete(*(u64 *)area->priv);
++			area->bridged = false;
++		}
++	}
++}
++
++static int qcom_tzmem_bridges_reclaim(void)
++{
++	struct qcom_tzmem_pool *pool;
++	struct qcom_tzmem_area *area;
++	int ret, err = 0;
++
++	if (!qcom_tzmem_using_shm_bridge)
++		return 0;
++
++	guard(mutex)(&qcom_tzmem_pools_lock);
++	list_for_each_entry(pool, &qcom_tzmem_pools, node) {
++		list_for_each_entry(area, &pool->areas, list) {
++			if (area->bridged)
++				continue;
++			ret = qcom_tzmem_shm_bridge_create(area->paddr, area->size,
++							   area->priv);
++			if (ret) {
++				dev_err(qcom_tzmem_dev,
++					"SHM bridge for %pad+%zu not restored: %d\n",
++					&area->paddr, area->size, ret);
++				if (!err)
++					err = ret;
++				continue;
++			}
++			area->bridged = true;
++		}
++	}
++	/*
++	 * An area left without its bridge is tried again at the next thaw or
++	 * restore; until then the bridges count as down.
++	 */
++	if (!err)
++		WRITE_ONCE(qcom_tzmem_bridges_down, false);
++	return err;
++}
++
+ #endif /* CONFIG_QCOM_TZMEM_MODE_SHMBRIDGE */
+ 
++/**
++ * qcom_tzmem_hibernate_release() - Drop all SHM bridges before a snapshot or
++ *				    the jump to a restored kernel.
++ */
++void qcom_tzmem_hibernate_release(void)
++{
++#if IS_ENABLED(CONFIG_QCOM_TZMEM_MODE_SHMBRIDGE)
++	qcom_tzmem_bridges_release();
++#endif
++}
++
++/**
++ * qcom_tzmem_hibernate_reclaim() - Create the SHM bridges again afterwards.
++ *
++ * Return: 0, or the first error of an area whose bridge could not be created.
++ * Such an area is tried again at the next call, and until then
++ * qcom_tzmem_bridges_suspended() stays true.
++ */
++int qcom_tzmem_hibernate_reclaim(void)
++{
++#if IS_ENABLED(CONFIG_QCOM_TZMEM_MODE_SHMBRIDGE)
++	return qcom_tzmem_bridges_reclaim();
++#else
++	return 0;
++#endif
++}
++
++/**
++ * qcom_tzmem_bridges_suspended() - Whether TZ memory may not be handed to the
++ *				    secure world right now.
++ *
++ * True between qcom_tzmem_hibernate_release() and
++ * qcom_tzmem_hibernate_reclaim(). Callers that may run in that window, such
++ * as diagnostics during a hibernation transition, should skip their call.
++ */
++bool qcom_tzmem_bridges_suspended(void)
++{
++	return READ_ONCE(qcom_tzmem_bridges_down);
++}
++EXPORT_SYMBOL_GPL(qcom_tzmem_bridges_suspended);
++
+ static int qcom_tzmem_pool_add_memory(struct qcom_tzmem_pool *pool,
+ 				      size_t size, gfp_t gfp)
+ {
+@@ -287,6 +400,9 @@ qcom_tzmem_pool_new(const struct qcom_tzmem_pool_config *config)
+ 		}
+ 	}
+ 
++	scoped_guard(mutex, &qcom_tzmem_pools_lock)
++		list_add_tail(&pool->node, &qcom_tzmem_pools);
++
+ 	return_ptr(pool);
+ }
+ EXPORT_SYMBOL_GPL(qcom_tzmem_pool_new);
+@@ -311,6 +427,9 @@ void qcom_tzmem_pool_free(struct qcom_tzmem_pool *pool)
+ 	if (!pool)
+ 		return;
+ 
++	scoped_guard(mutex, &qcom_tzmem_pools_lock)
++		list_del(&pool->node);
++
+ 	scoped_guard(spinlock_irqsave, &qcom_tzmem_chunks_lock) {
+ 		radix_tree_for_each_slot(slot, &qcom_tzmem_chunks, &iter, 0) {
+ 			chunk = radix_tree_deref_slot_protected(slot,
+diff --git a/drivers/firmware/qcom/qcom_tzmem.h b/drivers/firmware/qcom/qcom_tzmem.h
+index 8fa8a3eb9..d9e28254d 100644
+--- a/drivers/firmware/qcom/qcom_tzmem.h
++++ b/drivers/firmware/qcom/qcom_tzmem.h
+@@ -9,5 +9,7 @@
+ struct device;
+ 
+ int qcom_tzmem_enable(struct device *dev);
++void qcom_tzmem_hibernate_release(void);
++int qcom_tzmem_hibernate_reclaim(void);
+ 
+ #endif /* __QCOM_TZMEM_PRIV_H */
+diff --git a/include/linux/firmware/qcom/qcom_tzmem.h b/include/linux/firmware/qcom/qcom_tzmem.h
+index 23173e0c3..a797b4965 100644
+--- a/include/linux/firmware/qcom/qcom_tzmem.h
++++ b/include/linux/firmware/qcom/qcom_tzmem.h
+@@ -61,6 +61,7 @@ void qcom_tzmem_free(void *ptr);
+ DEFINE_FREE(qcom_tzmem, void *, if (_T) qcom_tzmem_free(_T))
+ 
+ phys_addr_t qcom_tzmem_to_phys(void *ptr);
++bool qcom_tzmem_bridges_suspended(void);
+ 
+ #if IS_ENABLED(CONFIG_QCOM_TZMEM_MODE_SHMBRIDGE)
+ int qcom_tzmem_shm_bridge_create(phys_addr_t paddr, size_t size, u64 *handle);
+-- 
+2.56.1
+

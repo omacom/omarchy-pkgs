@@ -8,7 +8,10 @@ asahi-alarm repository. The recipe and install script are asahi-alarm/PKGBUILDs'
 It ships `asahi-fwextract` and the `asahi_firmware` Python module that
 `asahi-fwupdate` (from aurora-scripts) runs to rebuild the vendor firmware
 archive. The install script runs `asahi-fwupdate` on install and upgrade, as
-before.
+before. When it fails, as when the EFI system partition has no room for the new
+copy, the script records it in `/var/lib/omarchy/mac-boot/firmware-pending`, and
+omarchy-mac-boot's update verification finishes the firmware update once the
+partition has room.
 
 ## Existing installations
 
