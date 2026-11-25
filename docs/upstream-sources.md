@@ -104,7 +104,9 @@ skips drafts, so nothing lands on its own. CI still builds it. Read the bump,
 fix the recipe on the PR branch if its build fails, and mark it **Ready for
 review**: `auto-merge-pr.yml` then arms auto-merge and the PR lands once
 `result`, `self-tests` and `build-isolation` pass. A later run that finds a
-newer release updates the same PR and leaves it as it is, draft or ready.
+newer release turns a ready PR back into a draft and takes auto-merge off
+before it pushes the update (`hold-reviewed-pr.sh`), so the new release gets
+its own review.
 `review` cannot be combined with `auto_merge`, and needs an upstream watch,
 provider or hook.
 
