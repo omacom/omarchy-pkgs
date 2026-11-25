@@ -1,0 +1,122 @@
+From 3656d88e57e3b111d269213730cde950a959cdc8 Mon Sep 17 00:00:00 2001
+From: "Caleb E." <158400752+FoxesRCool1@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 22:13:52 +0800
+Subject: [PATCH 1/2] dspqueue: drive Queue Monitor DSP firmware through
+ dspqueue_rpc method 9
+
+Some CDSP firmware builds run imported dspqueues in "Queue Monitor" mode
+(made for the Windows MCDM scheduler). The shell then starts no DSP-side
+consumer thread; packets on the request ring are only processed inside a
+host-issued invoke of dspqueue_rpc method 9 (queue_monitor). This library
+never makes that call, so the first dspqueue_write is never consumed and
+clients such as llama.cpp's ggml-hexagon backend hang in dspqueue_read.
+Seen on X1E80100 CDSP.HT.2.9.c1-00078-HAMOA-1 and X2 Elite
+CDSP.HT.3.3-00304-GLYMUR-1.
+
+Add the method 9 stub and, when DSPQUEUE_QUEUE_MONITOR=1 is set in the
+environment, call it after each packet is published and the queue mutex
+is dropped. Without the variable nothing changes: the environment is read
+once per process and the new path returns before any DSP call.
+
+Based on the proof of concept by Derek Parks in qualcomm/fastrpc#377,
+with the environment read once, only "1" accepted, and logging reduced
+to the first result and failures (the PoC logged every write at ALWAYS
+level, which goes to syslog).
+
+Link: https://github.com/qualcomm/fastrpc/issues/377
+---
+ inc/dspqueue_rpc.h               |  1 +
+ src/dspqueue/dspqueue_cpu.c      | 40 ++++++++++++++++++++++++++++++++
+ src/dspqueue/dspqueue_rpc_stub.c |  6 +++++
+ 3 files changed, 47 insertions(+)
+
+diff --git a/inc/dspqueue_rpc.h b/inc/dspqueue_rpc.h
+index b346b2a..470895c 100644
+--- a/inc/dspqueue_rpc.h
++++ b/inc/dspqueue_rpc.h
+@@ -70,6 +70,7 @@ __QAIC_HEADER_EXPORT AEEResult __QAIC_HEADER(dspqueue_rpc_is_imported)(remote_ha
+ __QAIC_HEADER_EXPORT AEEResult __QAIC_HEADER(dspqueue_rpc_wait_signal)(remote_handle64 _h, int32_t* signal) __QAIC_HEADER_ATTRIBUTE;
+ __QAIC_HEADER_EXPORT AEEResult __QAIC_HEADER(dspqueue_rpc_cancel_wait_signal)(remote_handle64 _h) __QAIC_HEADER_ATTRIBUTE;
+ __QAIC_HEADER_EXPORT AEEResult __QAIC_HEADER(dspqueue_rpc_signal)(remote_handle64 _h) __QAIC_HEADER_ATTRIBUTE;
++__QAIC_HEADER_EXPORT AEEResult __QAIC_HEADER(dspqueue_rpc_queue_monitor)(remote_handle64 _h, uint64_t queue_id, int32_t* num_read) __QAIC_HEADER_ATTRIBUTE;
+ #ifndef dspqueue_rpc_URI
+ #define dspqueue_rpc_URI "file:///libdspqueue_rpc_skel.so?dspqueue_rpc_skel_handle_invoke&_modver=1.0"
+ #endif /*dspqueue_rpc_URI*/
+diff --git a/src/dspqueue/dspqueue_cpu.c b/src/dspqueue/dspqueue_cpu.c
+index 29a0c98..e9162ae 100644
+--- a/src/dspqueue/dspqueue_cpu.c
++++ b/src/dspqueue/dspqueue_cpu.c
+@@ -1408,6 +1408,42 @@ bail:
+ 	return nErr;
+ }
+ 
++/*
++ * Queue Monitor firmware (for example CDSP.HT.2.9.c1-00078 on X1E80100 and
++ * CDSP.HT.3.3-00304 on X2 Elite, built for the Windows MCDM scheduler) starts
++ * no DSP-side consumer thread for an imported queue: packets are only taken
++ * off the request ring inside a host-issued dspqueue_rpc method 9 invoke.
++ * Opt in with DSPQUEUE_QUEUE_MONITOR=1; unset (or any other value) keeps the
++ * existing behaviour. See qualcomm/fastrpc#377.
++ */
++static pthread_once_t queue_monitor_once = PTHREAD_ONCE_INIT;
++static int queue_monitor_enabled;
++static atomic_int queue_monitor_logged;
++
++static void queue_monitor_init(void) {
++  const char *v = getenv("DSPQUEUE_QUEUE_MONITOR");
++  queue_monitor_enabled = (v != NULL && v[0] == '1' && v[1] == '\0');
++}
++
++static void queue_monitor_pump(struct dspqueue *q,
++                               struct dspqueue_domain_queues *dq) {
++  int32_t num_read = 0;
++  AEEResult mErr;
++
++  pthread_once(&queue_monitor_once, queue_monitor_init);
++  if (!queue_monitor_enabled)
++    return;
++  mErr = dspqueue_rpc_queue_monitor(dq->dsp_handle, q->dsp_id, &num_read);
++  if (mErr != AEE_SUCCESS) {
++    FARF(ERROR, "%s: queue_monitor(0x%llx) failed 0x%x", __func__,
++         (unsigned long long)q->dsp_id, mErr);
++  } else if (atomic_exchange(&queue_monitor_logged, 1) == 0) {
++    FARF(ALWAYS, "%s: DSPQUEUE_QUEUE_MONITOR active, first queue_monitor(0x%llx) "
++         "read %d packet(s)", __func__, (unsigned long long)q->dsp_id,
++         (int)num_read);
++  }
++}
++
+ AEEResult dspqueue_write_noblock(dspqueue_t queue, uint32_t flags,
+                                  uint32_t num_buffers,
+                                  struct dspqueue_buffer *buffers,
+@@ -1588,6 +1624,10 @@ AEEResult dspqueue_write_noblock(dspqueue_t queue, uint32_t flags,
+ 
+   pthread_mutex_unlock(&q->mutex);
+   locked = 0;
++
++  // After dropping the queue mutex: this invoke blocks while the DSP runs the
++  // queue's packet callback.
++  queue_monitor_pump(q, dq);
+   return 0;
+ 
+ bail:
+diff --git a/src/dspqueue/dspqueue_rpc_stub.c b/src/dspqueue/dspqueue_rpc_stub.c
+index 9c84a16..95345ae 100644
+--- a/src/dspqueue/dspqueue_rpc_stub.c
++++ b/src/dspqueue/dspqueue_rpc_stub.c
+@@ -528,6 +528,12 @@ __QAIC_STUB_EXPORT AEEResult __QAIC_STUB(dspqueue_rpc_is_imported)(remote_handle
+    uint32_t _mid = 5;
+    return _stub_method_3(_handle, _mid, (uint64_t*)&queue_id, (uint32_t*)imported);
+ }
++/* Method 9 in the CDSP.HT.3.3 (glymur) dspqueue_rpc skel: run the DSP-side
++ * queue monitor (packet callback) for queue_id in this invoke's context. */
++__QAIC_STUB_EXPORT AEEResult __QAIC_STUB(dspqueue_rpc_queue_monitor)(remote_handle64 _handle, uint64_t queue_id, int32_t* num_read) __QAIC_STUB_ATTRIBUTE {
++   uint32_t _mid = 9;
++   return _stub_method_3(_handle, _mid, (uint64_t*)&queue_id, (uint32_t*)num_read);
++}
+ static __inline int _stub_method_4(remote_handle64 _handle, uint32_t _mid, uint32_t _rout0[1]) {
+    int _numIn[1] = {0};
+    remote_arg _pra[1] = {0};
+-- 
+2.56.1
+
