@@ -553,9 +553,10 @@ on named packages.
 |---|---|---|---|
 | `sync-upstream.yml` | every 6 hours | `auto/sync-upstream-<package>` | upstream updates for packages without `"auto_merge": true` |
 | `sync-upstream.yml` | hourly | `auto/track-branches-<package>` | `"auto_merge": true` packages: the newest upstream release or branch tip |
+| `sync-upstream.yml` | every 5 minutes | `auto/track-branches-<package>` | `"sync_cadence": "five-minute"` packages: `omarchy-dev` and `omarchy-settings-dev` |
 | `sync-rebuilds.yml` | every 6 hours | `auto/sync-rebuilds-<package>` | a `pkgrel` bump where a `rebuild_on` dependency moved |
 
-For a manual upstream run, choose the `hourly` or `six-hourly` package group
+For a manual upstream run, choose the `five-minute`, `hourly` or `six-hourly` package group
 with the `cadence` input (default: `six-hourly`). The historical PR branch
 prefixes remain unchanged so existing PRs keep receiving updates. The separate
 `track-branches.yml` workflow has been retired.
@@ -602,6 +603,7 @@ Details: [docs/upstream-sources.md](docs/upstream-sources.md),
 | `upstream` | Where releases come from. Mutually exclusive with an `.omarchy/upstream.sh` hook. |
 | `min_release_age` | Hold a new upstream release back this long (`"24h"`, `"2d"`). A release whose age cannot be proven fails the sync. |
 | `auto_merge` | `true` selects the hourly group in `sync-upstream.yml`; other packages are checked every 6 hours. Both groups auto-merge passing PRs. For packages that follow a moving branch, and for feeds worth shipping within the hour. Needs an upstream declaration. |
+| `sync_cadence` | `"five-minute"` moves an `auto_merge` package from the hourly group to one checked every 5 minutes. For the dev packages that follow omarchy's `quattro`, so a merge reaches dev installs within minutes. |
 | `release_ring` | `fast`: publish to `rc` and `stable` on merge, not only `edge`. Only for packages that run on any channel's libraries: see [What can be on the fast ring](#what-can-be-on-the-fast-ring). Takes effect with the package's next version: bump `pkgrel` in the same PR. |
 | `pinned` | Version is set per release on the `rc` branch. Used by `omarchy` and `omarchy-settings`. |
 | `rebuild_on` | Packages whose version change forces a rebuild of this one. |
@@ -687,7 +689,7 @@ docs/                          Reference
 | `unpublish.yml` | dispatch | Removes retired packages from channel databases |
 | `auto-merge-pr.yml` | PR events, dispatch | Enables auto-merge on trusted package PRs |
 | `approve-pr.yml` | PR events | Releases GitHub's hold on a `build-approved` PR's runs |
-| `sync-upstream.yml` | hourly and every 6 hours, dispatch | Upstream release and branch-tip PRs, with a result notification for either package group |
+| `sync-upstream.yml` | every 5 minutes, hourly and every 6 hours, dispatch | Upstream release and branch-tip PRs, with a result notification for either package group |
 | `sync-rebuilds.yml` | every 6 hours, dispatch | Dependency rebuild PR |
 | `package-prs.yml` | called by the sync workflows | Opens, updates and closes their PRs |
 | `builder-images.yml` | daily, changes to the image's inputs (push and PR), dispatch | Builds and tests the builder image; publishes it from `master` |
