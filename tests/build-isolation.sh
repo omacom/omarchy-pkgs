@@ -9,38 +9,42 @@ source "$BUILD_ROOT/helpers/docker-helpers.sh"
 check_engine
 TEST_ARCH=$(docker_native_arch)
 TEST_BUILDER_IMAGE=${TEST_BUILDER_IMAGE:-omarchy-pkg-builder:latest-$TEST_ARCH-edge}
+TEST_ENGINE=$(command -v "$CONTAINER_ENGINE")
+TEST_RUN_ID="build-isolation-$$"
 TEST_ROOT=$(mktemp -d)
 PIDS=()
 cleanup() {
-  local pid
-  for pid in "${PIDS[@]}"; do
-    kill "$pid" 2>/dev/null || true
-  done
+  if (( ${#PIDS[@]} )); then
+    local pid cid
+    for pid in "${PIDS[@]}"; do
+      pkill -TERM -P "$pid" 2>/dev/null || true
+      kill "$pid" 2>/dev/null || true
+    done
+    while IFS= read -r cid; do
+      [[ -n "$cid" ]] && "$TEST_ENGINE" rm -f "$cid" >/dev/null 2>&1 || true
+    done < <("$TEST_ENGINE" ps -q --filter "label=omarchy.test.run=$TEST_RUN_ID" 2>/dev/null || true)
+    for pid in "${PIDS[@]}"; do
+      wait "$pid" 2>/dev/null || true
+    done
+  fi
   rm -rf "$TEST_ROOT"
 }
+trap 'exit 130' INT
+trap 'exit 143' TERM
 trap cleanup EXIT
 
-# Prepare a host-owned fast libmakepkg overlay and single-threaded zstd config
-# once against the test image so fixture builds avoid per-attribute makepkg
-# fork storms and multi-threaded zstd contention across parallel workers.
-TEST_ENGINE=$(command -v "$CONTAINER_ENGINE")
-TEST_FAST_MAKEPKG_DIR=""
+# Prepare a host-owned fast libmakepkg overlay once against the test image so
+# fixture builds avoid per-attribute makepkg fork storms. Falls back cleanly to
+# stock makepkg if the helper declines to patch the image's libmakepkg.
+TEST_FAST_MAKEPKG_LIB=""
 if [[ -f "$BUILD_ROOT/helpers/fast-makepkg.sh" ]]; then
-  mkdir -p "$TEST_ROOT/fastpack"
+  mkdir -p "$TEST_ROOT/fastlib"
   if "$TEST_ENGINE" run "${CONTAINER_RUN_ARGS[@]}" --rm \
       -v "$BUILD_ROOT/helpers:/helpers:ro" \
       "$TEST_BUILDER_IMAGE" \
-      bash -lc '
-        set -euo pipefail
-        mkdir -p /tmp/fastpack/libmakepkg
-        out=$(bash /helpers/fast-makepkg.sh /tmp/fastpack/libmakepkg)
-        if [[ "$out" == /tmp/fastpack/libmakepkg ]]; then
-          touch /tmp/fastpack/has-fast-lib
-        fi
-        sed -e "s/zstd -c -T0/zstd -c -T1 -1/" -e "s/--threads=0/-T1 -1/" /etc/makepkg.conf > /tmp/fastpack/makepkg.conf
-        tar -C /tmp/fastpack -cf - .
-      ' | tar -C "$TEST_ROOT/fastpack" -xf -; then
-    TEST_FAST_MAKEPKG_DIR="$TEST_ROOT/fastpack"
+      bash -lc 'out=$(bash /helpers/fast-makepkg.sh /tmp/fastlib) && [[ "$out" == /tmp/fastlib ]] && tar -C "$out" -cf - .' \
+      | tar -C "$TEST_ROOT/fastlib" -xf -; then
+    TEST_FAST_MAKEPKG_LIB="$TEST_ROOT/fastlib"
   fi
 fi
 
@@ -55,22 +59,17 @@ for index in "${!args[@]}"; do
     args[$index]="$TEST_BUILDER_IMAGE"
   fi
 done
-if [[ "${args[0]:-}" == "run" && -n "${TEST_FAST_MAKEPKG_DIR:-}" ]]; then
-  extra=()
-  if [[ -f "$TEST_FAST_MAKEPKG_DIR/has-fast-lib" ]]; then
-    extra+=(-v "$TEST_FAST_MAKEPKG_DIR/libmakepkg:/fast-libmakepkg:ro" -e MAKEPKG_LIBRARY=/fast-libmakepkg)
+if [[ "${args[0]:-}" == "run" ]]; then
+  extra=(--label "omarchy.test.run=$TEST_RUN_ID")
+  if [[ -n "${TEST_FAST_MAKEPKG_LIB:-}" ]]; then
+    extra+=(-v "$TEST_FAST_MAKEPKG_LIB:/fast-libmakepkg:ro" -e MAKEPKG_LIBRARY=/fast-libmakepkg)
   fi
-  if [[ -f "$TEST_FAST_MAKEPKG_DIR/makepkg.conf" ]]; then
-    extra+=(-v "$TEST_FAST_MAKEPKG_DIR/makepkg.conf:/fast-makepkg.conf:ro" -e MAKEPKG_CONF=/fast-makepkg.conf)
-  fi
-  if (( ${#extra[@]} )); then
-    exec "$TEST_ENGINE" run "${extra[@]}" "${args[@]:1}"
-  fi
+  exec "$TEST_ENGINE" run "${extra[@]}" "${args[@]:1}"
 fi
 exec "$TEST_ENGINE" "${args[@]}"
 ENGINE
 chmod +x "$TEST_ROOT/engine/$CONTAINER_ENGINE"
-export TEST_ENGINE TEST_BUILDER_IMAGE TEST_FAST_MAKEPKG_DIR
+export TEST_ENGINE TEST_BUILDER_IMAGE TEST_FAST_MAKEPKG_LIB TEST_RUN_ID
 export PATH="$TEST_ROOT/engine:$PATH"
 export OMARCHY_SKIP_BUILDER_IMAGE=1
 # Offline fixtures never publish to or resolve from the live channel.
