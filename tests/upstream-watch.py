@@ -369,6 +369,38 @@ os.execv(os.environ['REAL_GIT'], ['git', *args])
         self.assertIn('Updated: 0', result.stdout)
         self.assertEqual(before, {p: p.read_bytes() for p in before})
 
+    def test_branch_pair_waits_together_and_each_package_is_reported_once(self):
+        report = self.root / 'report.jsonl'
+        with patch.dict(os.environ, {'SYNC_UPSTREAM_REPORT': str(report)}):
+            packages, tip, sync = self.branch_sync_fixture()
+        late = packages / 'settings-dev/PKGBUILD'
+        late.write_text(late.read_text()
+                        .replace('#commit=${_commit}")', '#commit=${_commit}" "https://example.test/sidecar-$pkgver")')
+                        .replace("sha256sums=('old')", "sha256sums=('old' 'old2')"))
+        curl = self.root / 'stub/curl'
+        curl.write_text("#!/usr/bin/env python3\nimport sys\nprint('404', end='')\nsys.exit(22)\n")
+        curl.chmod(0o755)
+        before = {p: p.read_bytes() for p in packages.glob('*/PKGBUILD')}
+        result = sync('--lane', 'auto-merge', 'dev')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('Updated: 0', result.stdout)
+        self.assertIn('Waiting: 2', result.stdout)
+        self.assertIn('Failed: 0', result.stdout)
+        self.assertEqual(before, {p: p.read_bytes() for p in before})
+        entries = [json.loads(line) for line in report.read_text().splitlines()]
+        self.assertEqual(sorted((e['package'], e['status']) for e in entries),
+                         [('dev', 'waiting'), ('settings-dev', 'waiting')])
+
+        # A sibling that fails is reported once, with its own error.
+        report.unlink()
+        late.write_text(late.read_text().replace("sha256sums=('old' 'old2')", 'sha256sums=()'))
+        result = sync('--lane', 'auto-merge', 'dev')
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        entries = [json.loads(line) for line in report.read_text().splitlines()]
+        self.assertEqual(sorted((e['package'], e['status']) for e in entries),
+                         [('dev', 'failed'), ('settings-dev', 'failed')])
+        self.assertNotIn('pins a different commit', next(e['reason'] for e in entries if e['package'] == 'settings-dev'))
+
     def test_reviewed_lane_leaves_auto_merge_packages_untouched(self):
         packages, tip, sync = self.branch_sync_fixture()
         before = {p: p.read_bytes() for p in packages.glob('*/PKGBUILD')}
@@ -655,6 +687,86 @@ Path(sys.argv[sys.argv.index('-o') + 1]).write_text('2.0' if url.endswith('/feed
         self.assertEqual(w.scalar(w.read_recipe(self.root / 'pkgbuilds/held/PKGBUILD'), 'pkgver'), '1.0')
         self.assertIn('Updated: 1', result.stdout)
         self.assertIn('Failed: 1', result.stdout)
+
+    def test_unpublished_source_waits_and_preserves_recipe(self):
+        original = self.recipe.read_bytes()
+        def fetch(url):
+            if url.endswith('arm64'):
+                raise w.HTTPStatusError(url, 404)
+            return self.fake_file(url)
+        result = self.sync_release(self.release(), fetch)
+        self.assertEqual(result['status'], 'waiting')
+        self.assertEqual(result['available'], '2.0')
+        self.assertIn('https://example.test/tool-2.0-arm64', result['reason'])
+        self.assertIn('404', result['reason'])
+        self.assertEqual(self.recipe.read_bytes(), original)
+        self.assertFalse(self.recipe.with_name('PKGBUILD.sync-upstream').exists())
+
+    def test_only_a_missing_file_waits(self):
+        # A server error on a source, and a missing release feed, stay failures.
+        def fetch(url):
+            raise w.HTTPStatusError(url, 500)
+        with self.assertRaisesRegex(ValueError, 'HTTP 500'):
+            self.sync_release(self.release(), fetch)
+        with patch.object(w, 'discover', side_effect=w.HTTPStatusError('https://example.test/feed', 404)):
+            with self.assertRaisesRegex(ValueError, 'HTTP 404'):
+                w.sync(self.package, self.fetch)
+
+    def test_fetch_reports_the_http_status_curl_printed(self):
+        def run(command, **kwargs):
+            raise subprocess.CalledProcessError(22, command, output=self.status)
+        with patch.object(w.subprocess, 'run', side_effect=run):
+            self.status = '403'
+            with self.assertRaises(w.HTTPStatusError) as raised:
+                self.fetch.file('https://download.example.test/NOTICES')
+            self.assertEqual(raised.exception.status, 403)
+            self.status = ''
+            with self.assertRaises(subprocess.CalledProcessError):
+                self.fetch.file('https://download.example.test/other')
+
+    def test_cli_names_failed_and_waiting_packages_in_its_report(self):
+        for directory in ['bin', 'helpers']:
+            shutil.copytree(ROOT / directory, self.root / directory)
+        for name in ['bad', 'good', 'late']:
+            pkg = self.root / 'pkgbuilds' / name
+            shutil.copytree(self.package, pkg)
+            (pkg / '.omarchy/package.json').write_text(json.dumps({'source': 'local', 'upstream': {'watch': {
+                'regex': f'https://example.test/{name}-feed', 'pattern': '(?P<version>[0-9.]+)'}}}))
+            path = pkg / 'PKGBUILD'
+            path.write_text(path.read_text().replace('example.test/tool-', f'example.test/{name}-'))
+        stub = self.root / 'stub'
+        stub.mkdir()
+        curl = stub / 'curl'
+        curl.write_text('''#!/usr/bin/env python3
+import sys
+from pathlib import Path
+url = sys.argv[-1]
+if 'late-2.0-arm64' in url:
+    print('404', end='')
+    sys.exit(22)
+Path(sys.argv[sys.argv.index('-o') + 1]).write_text('no version here' if url.endswith('/bad-feed') else '2.0' if url.endswith('-feed') else url)
+''')
+        curl.chmod(0o755)
+        report = self.root / 'report.jsonl'
+        late = self.root / 'pkgbuilds/late/PKGBUILD'
+        original = late.read_bytes()
+        env = {**os.environ, 'PATH': str(stub) + os.pathsep + os.environ['PATH'], 'SYNC_UPSTREAM_REPORT': str(report)}
+
+        result = subprocess.run([str(self.root / 'bin/sync-upstream'), 'good', 'late'], env=env, text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('Waiting: 1', result.stdout)
+        self.assertEqual(late.read_bytes(), original)
+        entries = [json.loads(line) for line in report.read_text().splitlines()]
+        self.assertEqual([(e['package'], e['status']) for e in entries], [('late', 'waiting')])
+        self.assertIn('https://example.test/late-2.0-arm64', entries[0]['reason'])
+
+        report.unlink()
+        result = subprocess.run([str(self.root / 'bin/sync-upstream'), 'bad', 'late'], env=env, text=True, capture_output=True)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        entries = {e['package']: e for e in map(json.loads, report.read_text().splitlines())}
+        self.assertEqual(entries['bad']['status'], 'failed')
+        self.assertIn('no matching releases in https://example.test/bad-feed', entries['bad']['reason'])
+        self.assertEqual(entries['late']['status'], 'waiting')
 
     def test_aur_import_is_once_only_and_records_local_ownership(self):
         for directory in ['bin', 'helpers']:
