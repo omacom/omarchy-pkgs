@@ -46,3 +46,12 @@ out=$(review review-auto "{\"source\": \"local\", \"review\": true, \"auto_merge
 [[ $out == *"cannot also set auto_merge"* ]] && pass "review with auto_merge is refused" || fail "unexpected message: $out"
 out=$(review review-nowatch '{"source": "local", "review": true}') && fail "review without a watch accepted"
 [[ $out == *"only an upstream watch"* ]] && pass "review without a watch is refused" || fail "unexpected message: $out"
+
+# A five-minute package leaves the hourly group, which would otherwise push the
+# same auto/track-branches PR from a second, concurrent run.
+mkdir -p "$T/five/.omarchy"
+echo "{\"source\": \"local\", \"auto_merge\": true, \"sync_cadence\": \"five-minute\", $watch}" > "$T/five/.omarchy/package.json"
+package_in_lane "$T/five" five-minute && ! package_in_lane "$T/five" auto-merge &&
+  pass "a five-minute package syncs only in the five-minute group" || fail "a five-minute package is in the hourly group"
+out=$(review five-reviewed "{\"source\": \"local\", \"sync_cadence\": \"five-minute\", $watch}") && fail "five-minute without auto_merge accepted"
+[[ $out == *"only an auto-merged package"* ]] && pass "five-minute without auto_merge is refused" || fail "unexpected message: $out"
