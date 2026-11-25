@@ -1,0 +1,154 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Caleb E. <158400752+FoxesRCool1@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 15:30:00 +0800
+Subject: [PATCH] rpmsg: qcom_glink_smem: Let an edge's wakeup be switched off
+
+The edge interrupt is requested with IRQF_NO_SUSPEND, so every message from
+the remote wakes the system from deep sleep. On X1E80100 laptops the ADSP's
+charger firmware sends pmic_glink notifications (battery manager, UCSI and
+altmode) every few seconds while a USB-C charger is connected, so a suspended
+laptop on its charger wakes within one to three seconds. The kernel records no
+wakeup IRQ for it (/sys/power/pm_wakeup_irq is empty), and the altmode worker
+then runs in the early resume window, before its I2C retimer is resumed
+("i2c i2c-7: Transfer while suspended").
+
+Make the edge device wakeup-capable, enabled by default so nothing changes
+unless userspace asks. With wakeup switched off, mask the interrupt at the
+IPCC for the noirq phase (IRQ_DISABLE_UNLAZY, so it is really masked and not
+only marked disabled), and read the FIFO once when it is unmasked, so
+messages that arrived during sleep are handled at resume.
+
+Switch the wakeup source off again before the edge is torn down:
+qcom_glink_native_remove() unregisters every child of the edge device, and
+the wakeup source's sysfs device is one of them, so device_del() would
+otherwise unregister it a second time (NULL dereference in klist_put() when
+the remoteproc stops).
+
+Tested on a Microsoft Surface Laptop 7 13.8" (X1E80100, romulus13) on a USB-C
+PD charger, with the ADSP edge's power/wakeup set to disabled: deep suspend
+lasts until the power key or lid instead of 1-3 s. On battery nothing changes.
+
+Signed-off-by: Caleb E. <158400752+FoxesRCool1@users.noreply.github.com>
+---
+ drivers/rpmsg/qcom_glink_smem.c | 64 +++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 64 insertions(+)
+
+diff --git a/drivers/rpmsg/qcom_glink_smem.c b/drivers/rpmsg/qcom_glink_smem.c
+--- a/drivers/rpmsg/qcom_glink_smem.c
++++ b/drivers/rpmsg/qcom_glink_smem.c
+@@ -9,7 +9,10 @@
+ #include <linux/of_address.h>
+ #include <linux/of_irq.h>
+ #include <linux/interrupt.h>
++#include <linux/irq.h>
+ #include <linux/platform_device.h>
++#include <linux/pm.h>
++#include <linux/pm_wakeup.h>
+ #include <linux/mailbox_client.h>
+ #include <linux/mfd/syscon.h>
+ #include <linux/slab.h>
+@@ -39,6 +42,7 @@
+ 	struct device dev;
+ 
+ 	int irq;
++	bool irq_masked;
+ 	struct qcom_glink *glink;
+ 
+ 	struct mbox_client mbox_client;
+@@ -224,6 +228,54 @@
+ 	kfree(smem);
+ }
+ 
++/*
++ * The edge interrupt is IRQF_NO_SUSPEND, so by default any message from the
++ * remote wakes the system. Where the remote talks without anything to wake
++ * for (the ADSP's charger firmware sends pmic_glink notifications every few
++ * seconds while a charger is connected), userspace can switch the edge's
++ * wakeup off. The interrupt is then masked at the IPCC for the noirq phase,
++ * where it can no longer wake the SoC, and messages that arrived in the
++ * meantime are handled when it is unmasked again.
++ */
++static int qcom_glink_smem_suspend_noirq(struct device *dev)
++{
++	struct qcom_glink_smem *smem = container_of(dev, struct qcom_glink_smem, dev);
++
++	if (device_may_wakeup(dev))
++		return 0;
++
++	disable_irq(smem->irq);
++	smem->irq_masked = true;
++
++	return 0;
++}
++
++static int qcom_glink_smem_resume_noirq(struct device *dev)
++{
++	struct qcom_glink_smem *smem = container_of(dev, struct qcom_glink_smem, dev);
++
++	if (smem->irq_masked) {
++		smem->irq_masked = false;
++		enable_irq(smem->irq);
++		/*
++		 * Read whatever the remote queued while masked, in case the
++		 * IPCC dropped the signal instead of holding it pending.
++		 */
++		generic_handle_irq_safe(smem->irq);
++	}
++
++	return 0;
++}
++
++static const struct dev_pm_ops qcom_glink_smem_pm_ops = {
++	NOIRQ_SYSTEM_SLEEP_PM_OPS(qcom_glink_smem_suspend_noirq,
++				  qcom_glink_smem_resume_noirq)
++};
++
++static const struct device_type qcom_glink_smem_type = {
++	.pm = &qcom_glink_smem_pm_ops,
++};
++
+ struct qcom_glink_smem *qcom_glink_smem_register(struct device *parent,
+ 						 struct device_node *node)
+ {
+@@ -246,6 +298,7 @@
+ 	dev->parent = parent;
+ 	dev->of_node = node;
+ 	dev->release = qcom_glink_smem_release;
++	dev->type = &qcom_glink_smem_type;
+ 	dev_set_name(dev, "%s:%pOFn", dev_name(parent->parent), node);
+ 	ret = device_register(dev);
+ 	if (ret) {
+@@ -320,6 +373,9 @@
+ 		goto err_put_dev;
+ 	}
+ 
++	/* Mask at the IPCC on disable, or the edge still wakes the SoC */
++	irq_set_status_flags(smem->irq, IRQ_DISABLE_UNLAZY);
++
+ 	smem->mbox_client.dev = &smem->dev;
+ 	smem->mbox_client.knows_txdone = true;
+ 	smem->mbox_chan = mbox_request_channel(&smem->mbox_client, 0);
+@@ -353,6 +409,7 @@
+ 
+ 	smem->glink = glink;
+ 
++	device_init_wakeup(dev, true);
+ 	enable_irq(smem->irq);
+ 
+ 	return smem;
+@@ -373,6 +430,13 @@
+ 
+ 	disable_irq(smem->irq);
+ 
++	/*
++	 * qcom_glink_native_remove() unregisters every child of the edge
++	 * device, which would take the wakeup source's sysfs device with it
++	 * and leave device_del() to unregister it a second time.
++	 */
++	device_init_wakeup(&smem->dev, false);
++
+ 	qcom_glink_native_remove(glink);
+ 
+ 	mbox_free_channel(smem->mbox_chan);
+-- 
+2.53.0
