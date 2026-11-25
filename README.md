@@ -213,6 +213,11 @@ It also decides where each build runs (`package_runner` in
 | x86_64 | the droplet pool |
 | aarch64 | GitHub's `ubuntu-24.04-arm` (4 vCPU) |
 | aarch64 kernel (`linux-*`) | `namespace-profile-arm64-linux-apple-12x32` (Linux on Apple Silicon, 12 vCPU) |
+| chromium, both architectures | the large droplet pool (64 vCPU, 128 GB) |
+
+Chromium's aarch64 build cross-compiles on an x86_64 builder, as Google builds
+Chrome for Linux arm64: its pinned toolchain runs on x64 hosts only
+(`package_build_host`). Its fast-ring check then runs the package under QEMU.
 
 A build that has to be repeated at merge runs on the same runner.
 
