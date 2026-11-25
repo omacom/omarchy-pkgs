@@ -522,6 +522,11 @@ validate_package_metadata() {
     return 1
   fi
 
+  if ! jq -e 'if has("lockstep") | not then true else (.lockstep | type == "string" and test("\\A[a-z0-9-]+\\z")) end' "$metadata" >/dev/null; then
+    echo "invalid lockstep for $(basename "$pkgdir"): must name a group in lowercase letters, digits and dashes"
+    return 1
+  fi
+
   if ! jq -e 'if has("sync_cadence") | not then true else .sync_cadence == "five-minute" end' "$metadata" >/dev/null; then
     echo "invalid sync_cadence for $(basename "$pkgdir"): the only cadence is \"five-minute\""
     return 1
