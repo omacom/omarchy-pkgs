@@ -1,0 +1,323 @@
+From be017bb753b0e71661469e5168ab28a8ed126ab7 Mon Sep 17 00:00:00 2001
+From: "Caleb E." <158400752+FoxesRCool1@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 16:56:16 +0800
+Subject: [PATCH] contacts: Add a speed-adaptive position filter
+
+The position of a contact on the Surface Laptop 7 touchpad (045E:0C77)
+jitters by about 0.05 mm on each axis from frame to frame. A finger
+moving at 5 mm/s moves 0.04 mm per frame, so slow movements step back
+and forth: with PositionThresholdMin = 0, 29% of the x steps and 42% of
+the y steps between 1 and 30 mm/s go the wrong way. The position
+threshold hides this by holding the contact until it has moved 0.33 mm
+sideways or 0.22 mm up or down on that pad, so slow movements step in
+visible jumps instead.
+
+Add a 1 Euro filter (Casiez et al., CHI 2012) to the stabilizer: an
+exponential low-pass on the position whose cutoff frequency rises with
+the speed of the contact, so slow movements are averaged over many
+frames and fast ones over almost none. The speed is measured in
+physical units, and the frame rate is measured from the frames. A new
+contact starts where it appeared. It is configured by the options
+PositionFilterMinCutoff, PositionFilterBeta and PositionFilterSpeedCutoff
+in the Contacts section; the default of zero for the first keeps the
+current behaviour.
+---
+ etc/iptsd.conf                        |  22 +++++
+ src/contacts/stability/config.hpp     |  21 +++++
+ src/contacts/stability/stabilizer.hpp | 120 ++++++++++++++++++++++++++
+ src/core/generic/config.hpp           |  11 +++
+ src/core/linux/config-loader.hpp      |   9 ++
+ 5 files changed, 183 insertions(+)
+
+diff --git a/etc/iptsd.conf b/etc/iptsd.conf
+index 6dea830..73a353d 100644
+--- a/etc/iptsd.conf
++++ b/etc/iptsd.conf
+@@ -127,6 +127,28 @@
+ ##
+ # PositionSlop = 0
+ 
++##
++## The position of a contact can be smoothed with a filter that averages over many frames
++## while the contact moves slowly, and over almost none while it moves fast. This removes
++## the jitter of slow movements without delaying fast ones.
++##
++## The cutoff frequency (in Hz) of the filter while the contact does not move.
++## Lower values smooth more. Setting this value to zero disables the filter.
++##
++# PositionFilterMinCutoff = 0
++
++##
++## How many Hz the cutoff frequency rises per centimeter per second of speed.
++## Higher values delay fast movements less.
++##
++# PositionFilterBeta = 0
++
++##
++## The cutoff frequency (in Hz) of the filter on the speed of a contact,
++## which keeps the jitter from opening the position filter.
++##
++# PositionFilterSpeedCutoff = 5
++
+ ##
+ ## How many degrees the orientation of a contact must change before the change is considered stable.
+ ## Changes below this threshold are ignored.
+diff --git a/src/contacts/stability/config.hpp b/src/contacts/stability/config.hpp
+index 65b77d8..7425f84 100644
+--- a/src/contacts/stability/config.hpp
++++ b/src/contacts/stability/config.hpp
+@@ -37,6 +37,27 @@ public:
+ 	 * position starts to change, on each axis. Until then it stays where it appeared.
+ 	 */
+ 	std::optional<Vector2<T>> position_slop = std::nullopt;
++
++	/*
++	 * The cutoff frequency in Hz of the low-pass filter on the position of a contact that
++	 * does not move. The filter opens up as the contact moves faster.
++	 */
++	std::optional<T> position_filter_min_cutoff = std::nullopt;
++
++	/*
++	 * How many Hz the cutoff frequency of the position filter rises per unit of speed.
++	 */
++	T position_filter_beta = 0;
++
++	/*
++	 * The cutoff frequency in Hz of the low-pass filter on the speed of a contact.
++	 */
++	T position_filter_speed_cutoff = 0;
++
++	/*
++	 * The physical size of the normalized coordinate space, for measuring the speed.
++	 */
++	Vector2<T> position_filter_scale = Vector2<T>::Ones();
+ };
+ 
+ } // namespace iptsd::contacts::stability
+diff --git a/src/contacts/stability/stabilizer.hpp b/src/contacts/stability/stabilizer.hpp
+index 0c1ddb1..29fc4f2 100644
+--- a/src/contacts/stability/stabilizer.hpp
++++ b/src/contacts/stability/stabilizer.hpp
+@@ -12,8 +12,11 @@
+ #include <gsl/gsl>
+ 
+ #include <algorithm>
++#include <chrono>
++#include <cmath>
+ #include <iterator>
+ #include <map>
++#include <optional>
+ #include <type_traits>
+ #include <vector>
+ 
+@@ -24,6 +27,19 @@ class Stabilizer {
+ public:
+ 	static_assert(std::is_floating_point_v<T>);
+ 
++	using clock = std::chrono::steady_clock;
++
++private:
++	// The filtered position and speed of a contact.
++	struct Filtered {
++		Vector2<T> position;
++		Vector2<T> speed;
++	};
++
++	// Intervals between frames that are taken into account when measuring the frame rate.
++	constexpr static T PERIOD_MIN = casts::to<T>(0.002);
++	constexpr static T PERIOD_MAX = casts::to<T>(0.05);
++
+ private:
+ 	Config<T> m_config;
+ 
+@@ -33,6 +49,15 @@ private:
+ 	// Where the contacts that have not left their slop yet first appeared, by index.
+ 	std::map<usize, Vector2<T>> m_anchors {};
+ 
++	// The filtered positions of the contacts in the last frame, by index.
++	std::map<usize, Filtered> m_filtered {};
++
++	// When the last frame arrived.
++	std::optional<clock::time_point> m_time = std::nullopt;
++
++	// The time between two frames, in seconds.
++	T m_period = casts::to<T>(1) / casts::to<T>(120);
++
+ public:
+ 	Stabilizer(Config<T> config) : m_config {std::move(config)} {};
+ 
+@@ -43,6 +68,8 @@ public:
+ 	{
+ 		m_last.clear();
+ 		m_anchors.clear();
++		m_filtered.clear();
++		m_time.reset();
+ 	}
+ 
+ 	/*!
+@@ -51,6 +78,17 @@ public:
+ 	 * @param[in,out] frame The list of contacts to stabilize.
+ 	 */
+ 	void stabilize(std::vector<Contact<T>> &frame)
++	{
++		this->stabilize(frame, clock::now());
++	}
++
++	/*!
++	 * Stabilizes all contacts of a frame.
++	 *
++	 * @param[in,out] frame The list of contacts to stabilize.
++	 * @param[in] time When the frame arrived.
++	 */
++	void stabilize(std::vector<Contact<T>> &frame, const clock::time_point time)
+ 	{
+ 		// Stabilize contacts
+ 		for (Contact<T> &contact : frame)
+@@ -59,6 +97,9 @@ public:
+ 		if (m_config.position_slop.has_value())
+ 			this->apply_slop(frame);
+ 
++		if (m_config.position_filter_min_cutoff.has_value())
++			this->apply_filter(frame, time);
++
+ 		m_last.clear();
+ 
+ 		// Save a copy of the new data
+@@ -110,6 +151,85 @@ private:
+ 		}
+ 	}
+ 
++	/*!
++	 * Smooths the position of the contacts with a speed-adaptive low-pass filter.
++	 *
++	 * The position of a contact jitters by a few hundredths of a millimeter from frame to
++	 * frame. While the contact moves slowly, that is as much as it moves, so it steps back
++	 * and forth. The filter averages over many frames while the contact moves slowly and
++	 * over almost none while it moves fast, so that fast movements are not delayed
++	 * (Casiez et al., "1€ Filter", CHI 2012). A new contact starts where it appeared.
++	 *
++	 * @param[in,out] frame The list of contacts to stabilize.
++	 * @param[in] time When the frame arrived.
++	 */
++	void apply_filter(std::vector<Contact<T>> &frame, const clock::time_point time)
++	{
++		const T min_cutoff = m_config.position_filter_min_cutoff.value();
++		const T beta = m_config.position_filter_beta;
++		const T speed_cutoff = m_config.position_filter_speed_cutoff;
++		const Vector2<T> scale = m_config.position_filter_scale;
++
++		// Follow the frame rate, but not across pauses or frames that were read together.
++		if (m_time.has_value()) {
++			const T interval = std::chrono::duration<T>(time - m_time.value()).count();
++
++			if (interval >= PERIOD_MIN && interval <= PERIOD_MAX)
++				m_period += (interval - m_period) / 16;
++		}
++
++		m_time = time;
++
++		// Forget the contacts that are gone.
++		for (auto it = m_filtered.begin(); it != m_filtered.end();) {
++			if (Contact<T>::find_in_frame(it->first, frame).has_value())
++				++it;
++			else
++				it = m_filtered.erase(it);
++		}
++
++		for (Contact<T> &contact : frame) {
++			if (!contact.index.has_value())
++				continue;
++
++			const usize index = contact.index.value();
++			const auto it = m_filtered.find(index);
++
++			// A contact that was not in the last frame is new.
++			if (it == m_filtered.end()) {
++				m_filtered.insert_or_assign(index, Filtered {contact.mean, Vector2<T>::Zero()});
++				continue;
++			}
++
++			Filtered &filtered = it->second;
++
++			const Vector2<T> delta = contact.mean - filtered.position;
++			const Vector2<T> speed = delta.cwiseProduct(scale) / m_period;
++
++			filtered.speed += this->alpha(speed_cutoff) * (speed - filtered.speed);
++
++			const T cutoff = min_cutoff + beta * filtered.speed.norm();
++
++			filtered.position += this->alpha(cutoff) * delta;
++			contact.mean = filtered.position;
++		}
++	}
++
++	/*!
++	 * The smoothing factor of an exponential low-pass filter at the current frame rate.
++	 *
++	 * @param[in] cutoff The cutoff frequency in Hz. Zero or less disables the filter.
++	 * @return How much of the new value is taken into the filtered value.
++	 */
++	[[nodiscard]] T alpha(const T cutoff) const
++	{
++		if (cutoff <= 0)
++			return 1;
++
++		const T tau = 1 / (2 * gsl::narrow_cast<T>(M_PI) * cutoff);
++		return 1 / (1 + tau / m_period);
++	}
++
+ 	/*!
+ 	 * Stabilize a single contact.
+ 	 *
+diff --git a/src/core/generic/config.hpp b/src/core/generic/config.hpp
+index 26a3816..e69dac5 100644
+--- a/src/core/generic/config.hpp
++++ b/src/core/generic/config.hpp
+@@ -45,6 +45,9 @@ public:
+ 	f64 contacts_position_thresh_min = 0.04;
+ 	f64 contacts_position_thresh_max = 2;
+ 	f64 contacts_position_slop = 0;
++	f64 contacts_position_filter_min_cutoff = 0;
++	f64 contacts_position_filter_beta = 0;
++	f64 contacts_position_filter_speed_cutoff = 5;
+ 	f64 contacts_orientation_thresh_min = 1;
+ 	f64 contacts_orientation_thresh_max = 15;
+ 	f64 contacts_size_min = 0.2;
+@@ -132,6 +135,14 @@ public:
+ 				this->contacts_position_slop / this->height,
+ 			};
+ 		}
++		if (this->contacts_position_filter_min_cutoff > 0) {
++			config.stability.position_filter_min_cutoff =
++				this->contacts_position_filter_min_cutoff;
++			config.stability.position_filter_beta = this->contacts_position_filter_beta;
++			config.stability.position_filter_speed_cutoff =
++				this->contacts_position_filter_speed_cutoff;
++			config.stability.position_filter_scale = Vector2<f64> {this->width, this->height};
++		}
+ 		config.stability.orientation_threshold = Vector2<f64> {
+ 			this->contacts_orientation_thresh_min / 180,
+ 			this->contacts_orientation_thresh_max / 180,
+diff --git a/src/core/linux/config-loader.hpp b/src/core/linux/config-loader.hpp
+index 6578534..b7f1e3d 100644
+--- a/src/core/linux/config-loader.hpp
++++ b/src/core/linux/config-loader.hpp
+@@ -170,6 +170,15 @@ private:
+ 		this->get(ini, "Contacts", "PositionThresholdMin", m_config.contacts_position_thresh_min);
+ 		this->get(ini, "Contacts", "PositionThresholdMax", m_config.contacts_position_thresh_max);
+ 		this->get(ini, "Contacts", "PositionSlop", m_config.contacts_position_slop);
++		this->get(ini,
++		          "Contacts",
++		          "PositionFilterMinCutoff",
++		          m_config.contacts_position_filter_min_cutoff);
++		this->get(ini, "Contacts", "PositionFilterBeta", m_config.contacts_position_filter_beta);
++		this->get(ini,
++		          "Contacts",
++		          "PositionFilterSpeedCutoff",
++		          m_config.contacts_position_filter_speed_cutoff);
+ 		this->get(ini, "Contacts", "OrientationThresholdMin", m_config.contacts_orientation_thresh_min);
+ 		this->get(ini, "Contacts", "OrientationThresholdMax", m_config.contacts_orientation_thresh_max);
+ 		this->get(ini, "Contacts", "SizeMin", m_config.contacts_size_min);
+-- 
+2.56.1
+
