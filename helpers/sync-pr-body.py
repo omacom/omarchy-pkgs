@@ -1,21 +1,27 @@
 #!/usr/bin/env python3
 """Write the description of a sync PR from the change it carries.
 
-package-prs.yml runs this after it applies one group's recipes to the working
-tree. For each package it compares the recipe and .omarchy/package.json at
---base with the working tree, and prints Markdown: what moved, where it came
-from, what was checked, and where it ships. Every source type gets the same
-facts, because they come from the change itself. Where a source is a tag on
-GitHub, the release's link, date, notes and asset digests come from GitHub's
-API, unless --offline is given or the lookup fails.
+package-prs.yml runs this in a job of its own, with no credential that can
+write, after it applies one group's recipes to the working tree. For each
+package it compares the recipe and .omarchy/package.json at --base with the
+working tree, and prints Markdown: what moved, where it came from, what was
+recorded, and where it ships. Every source type gets the same facts, because
+they come from the change itself.
 
-Release notes are upstream's text: they go inside a code fence longer than any
-backtick run in them, so they render as inert text, mention nobody and run no
-HTML. A hidden comment at the end repeats the facts as JSON for tools.
+Reading a recipe means sourcing it in bash, so recipes run with a bare
+environment: no token, no runner variables. Where the package's own upstream
+is a tag on GitHub, the release's link, date, notes and asset digests come from
+GitHub's API, unless --offline is given or the lookup fails.
+
+Release notes are upstream's text: they go into an indented code block, which
+nothing in them can close, so they render as inert text, mention nobody and
+run no HTML. A hidden comment at the end repeats the facts as JSON.
 """
 import argparse
+import html
 import importlib.util
 import json
+import os
 from pathlib import Path
 import re
 import subprocess
@@ -31,13 +37,22 @@ _spec.loader.exec_module(watch)
 ARCHES = ("x86_64", "aarch64")
 NOTES_LINES = 40
 NOTES_CHARS = 4000
-BODY_LIMIT = 60000
+# GitHub refuses a PR body over 65,536 UTF-16 code units, and the PR action
+# truncates at that length. Stay under it so the record at the end survives.
+BODY_LIMIT = 65000
+RECIPE_TIMEOUT = 30
 COMMIT = re.compile(r"[0-9a-f]{40}")
 ARCHIVE = r"\.(?:tar\.gz|tar\.bz2|tar\.xz|tar\.zst|tgz|zip)"
+TOKENS = ("UPSTREAM_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN")
 AUTO_MERGE = ("Auto-merges once `result`, `self-tests` and `build-isolation` pass. "
               "A failing build leaves it open for a maintainer without holding back any other package.")
 REVIEW = ("Opened as a draft: a package in it is marked `review`. "
           "A maintainer reads it and marks it ready, and it lands once green.")
+DUMP = watch.DUMP
+
+
+def utf16(text):
+    return len(text.encode("utf-16-le")) // 2
 
 
 def cell(text):
@@ -49,6 +64,18 @@ def code(text):
     text = cell(text)
     fence = "``" if "`" in text else "`"
     return f"{fence}{text}{fence}"
+
+
+def destination(url):
+    """A link target that cannot end the link, the cell or the line early."""
+    for char, encoded in (("|", "%7C"), (" ", "%20"), ("(", "%28"), (")", "%29"), ("<", "%3C"), (">", "%3E"),
+                          ("\n", ""), ("\r", "")):
+        url = url.replace(char, encoded)
+    return url
+
+
+def link(text, url):
+    return f"[{cell(text)}]({destination(url)})"
 
 
 def short(value):
@@ -71,29 +98,35 @@ def github_repo(url):
     return f"{found[1]}/{found[2]}" if found else None
 
 
-def link(text, url):
-    return f"[{cell(text)}]({url})"
-
-
 def github_ref(source):
     """(owner/repo, "tag" or "commit", ref) for a source on GitHub, else None."""
     url = source.split("::", 1)[1] if "::" in source else source
     url = url.removeprefix("git+")
     parts = urlsplit(url)
     host, path = parts.hostname or "", parts.path
-    found = None
     if host == "github.com":
         repo = re.fullmatch(r"/([^/]+)/([^/]+?)(?:\.git)?/?", path)
         if repo and parts.fragment:
             kind, _, ref = parts.fragment.partition("=")
             return (f"{repo[1]}/{repo[2]}", kind, unquote(ref)) if kind in ("tag", "commit") and ref else None
-        found = (re.fullmatch(r"/([^/]+)/([^/]+)/releases/download/([^/]+)/[^/]+", path)
-                 or re.fullmatch(rf"/([^/]+)/([^/]+)/archive/refs/tags/(.+?){ARCHIVE}", path)
+        # A release asset always names a tag, however its name looks.
+        found = re.fullmatch(r"/([^/]+)/([^/]+)/releases/download/([^/]+)/[^/]+", path)
+        if found:
+            return (f"{found[1]}/{found[2]}", "tag", unquote(found[3]))
+        if re.fullmatch(rf"/[^/]+/[^/]+/archive/refs/heads/.+{ARCHIVE}", path):
+            return None
+        found = (re.fullmatch(rf"/([^/]+)/([^/]+)/archive/refs/tags/(.+?){ARCHIVE}", path)
                  or re.fullmatch(rf"/([^/]+)/([^/]+)/archive/(.+?){ARCHIVE}", path))
     elif host == "codeload.github.com":
+        if re.fullmatch(r"/[^/]+/[^/]+/(?:tar\.gz|zip|legacy\.tar\.gz)/refs/heads/.+", path):
+            return None
         found = re.fullmatch(r"/([^/]+)/([^/]+)/(?:tar\.gz|zip|legacy\.tar\.gz)/(?:refs/tags/)?(.+)", path)
     elif host == "raw.githubusercontent.com":
+        if "/refs/heads/" in path:
+            return None
         found = re.fullmatch(r"/([^/]+)/([^/]+)/(?:refs/tags/)?([^/]+)/.+", path)
+    else:
+        return None
     if not found:
         return None
     ref = unquote(found[3])
@@ -111,15 +144,31 @@ def change_label(old, new):
     return ""
 
 
-def source_label(meta, has_hook):
+def upstream_spec(meta):
+    """The provider name, its settings, and whether it is declared directly."""
     upstream = meta.get("upstream")
     if isinstance(upstream, dict) and isinstance(upstream.get("watch"), dict):
         spec, declarative = upstream["watch"], False
     elif isinstance(upstream, dict):
         spec, declarative = upstream, True
     else:
-        spec, declarative = {}, False
+        return None, {}, False
     kind = next((name for name in sorted(watch.PROVIDERS) if name in spec), None)
+    return kind, spec, declarative
+
+
+def declared_repo(meta):
+    """The GitHub repository the package's upstream declaration names, if any."""
+    kind, spec, _ = upstream_spec(meta)
+    if kind == "github":
+        return spec["github"]
+    if kind in ("git_tags", "git_branch"):
+        return github_repo(spec[kind])
+    return None
+
+
+def source_label(meta, has_hook):
+    kind, spec, _ = upstream_spec(meta)
     if kind == "github":
         repo = spec["github"]
         return f"GitHub releases of {link(repo, 'https://github.com/' + repo + '/releases')}"
@@ -153,12 +202,9 @@ def source_label(meta, has_hook):
 
 
 def source_kind(meta, has_hook):
-    upstream = meta.get("upstream")
-    spec = upstream.get("watch") if isinstance(upstream, dict) and isinstance(upstream.get("watch"), dict) else upstream
-    if isinstance(spec, dict):
-        kind = next((name for name in sorted(watch.PROVIDERS) if name in spec), None)
-        if kind:
-            return {"kind": kind, "declarative": "watch" not in upstream}
+    kind, _, declarative = upstream_spec(meta)
+    if kind:
+        return {"kind": kind, "declarative": declarative}
     return {"kind": "hook" if has_hook else "rebuild" if meta.get("rebuild_on") else "none", "declarative": False}
 
 
@@ -170,29 +216,42 @@ def ships_to(meta):
     return "edge; rc and stable by promotion"
 
 
+def run_recipe(script, directory, arch, *args):
+    """Source a recipe in bash with nothing from this process's environment."""
+    with tempfile.TemporaryDirectory(prefix="recipe-read-") as work:
+        env = {"PATH": "/usr/local/bin:/usr/bin:/bin", "HOME": work, "LANG": "C.UTF-8", "CARCH": arch,
+               "SRCDEST": work, "srcdir": work, "pkgdir": work}
+        return subprocess.run(["bash", "-c", script, "_", str((directory / "PKGBUILD").resolve()), *args],
+                              cwd=directory, env=env, capture_output=True, check=True, timeout=RECIPE_TIMEOUT).stdout
+
+
+def read_recipe(directory, arch="x86_64"):
+    data = run_recipe(DUMP, directory, arch).decode().split("\0")
+    result, index = {}, 0
+    while index < len(data) - 1:
+        name, size = data[index:index + 2]
+        index += 2
+        result[name] = data[index:index + int(size)]
+        index += int(size)
+    return result
+
+
 def pgp_key_count(directory):
-    """How many keys validpgpkeys pins; makepkg checks each .sig source against them."""
     script = 'source "$1" >/dev/null || exit 1; printf %s "${#validpgpkeys[@]}"'
-    with tempfile.TemporaryDirectory(prefix="recipe-keys-") as work:
-        env = {"PATH": "/usr/bin:/bin", "CARCH": "x86_64", "SRCDEST": work, "srcdir": work, "pkgdir": work}
-        return int(watch.run(["bash", "-c", script, "_", str((directory / "PKGBUILD").resolve())],
-                             cwd=directory, env=env, text=True) or 0)
+    return int(run_recipe(script, directory, "x86_64").decode() or 0)
 
 
 def assignments(directory):
     """Literal `_name=value` lines: the scalars the sync rewrites in place."""
-    path = directory / "PKGBUILD"
-    if not path.is_file():
-        return {}
-    found = re.findall(r"^(_[A-Za-z0-9_]+)=([^\n]*)$", path.read_text(), re.M)
+    found = re.findall(r"^(_[A-Za-z0-9_]+)=([^\n]*)$", (directory / "PKGBUILD").read_text(), re.M)
     return {name: value.strip().strip("\"'") for name, value in found}
 
 
 def read_package(directory):
     """Recipe values per architecture, and the package metadata."""
-    first = watch.read_recipe(directory / "PKGBUILD")
+    first = read_recipe(directory)
     arches = first.get("arch") or ["x86_64"]
-    recipes = {arch: watch.read_recipe(directory / "PKGBUILD", "x86_64" if arch == "any" else arch) for arch in arches}
+    recipes = {arch: read_recipe(directory, "x86_64" if arch == "any" else arch) for arch in arches}
     meta_path = directory / ".omarchy/package.json"
     meta = json.loads(meta_path.read_text()) if meta_path.is_file() else {}
     return {"arches": arches, "recipes": recipes, "first": recipes[arches[0]], "meta": meta,
@@ -224,38 +283,59 @@ def source_name(source):
     return Path(urlsplit(url).path).name or url
 
 
-def arch_keys(arch, recipe):
-    """The source arrays a build for this architecture uses."""
-    return [key for key in ("source", f"source_{arch}") if key in recipe]
+def arch_entries(arch, recipe, before):
+    """Changed sources of one build: {key: [(url, name, checksums or None for removed)]}."""
+    result = {}
+    for key in ("source", f"source_{arch}"):
+        if key not in recipe and key not in before:
+            continue
+        suffix = key.removeprefix("source")
+        sums = sorted({name for name in list(recipe) + list(before)
+                       if watch.SUM.fullmatch(name) and (watch.SUM.fullmatch(name)[2] or "") == suffix})
+        new_sources, old_sources = recipe.get(key, []), before.get(key, [])
+        entries = []
+        for index in range(max(len(new_sources), len(old_sources))):
+            if index >= len(new_sources):
+                old = old_sources[index]
+                entries.append((old.split("::", 1)[-1], source_name(old), None))
+                continue
+            source = new_sources[index]
+            old_source = old_sources[index] if index < len(old_sources) else None
+            checksums = []
+            for name in sums:
+                after = recipe.get(name, [])
+                previous = before.get(name, [])
+                checksums.append((watch.SUM.fullmatch(name)[1], previous[index] if index < len(previous) else "",
+                                  after[index] if index < len(after) else ""))
+            if source != old_source or any(b != a for _, b, a in checksums):
+                entries.append((source.split("::", 1)[1] if "::" in source else source, source_name(source), checksums))
+        if entries:
+            result[key] = entries
+    return result
 
 
 def source_rows(old, new):
-    """Each source whose URL or checksum changed: (arch label, url, name, [(algorithm, before, after)])."""
-    rows, seen = [], set()
+    """(label, url, name, checksums or None) for each changed or removed source."""
+    per_arch = {}
     for arch, recipe in new["recipes"].items():
         before = (old["recipes"].get(arch) or old["first"]) if old else {}
-        for key in arch_keys(arch, recipe):
-            if key in seen:
-                continue
-            seen.add(key)
-            suffix = key.removeprefix("source")
-            label = "all" if key == "source" else arch
-            sums = [name for name in recipe if watch.SUM.fullmatch(name) and (watch.SUM.fullmatch(name)[2] or "") == suffix]
-            previous_sources = before.get(key, [])
-            for index, source in enumerate(recipe[key]):
-                old_source = previous_sources[index] if index < len(previous_sources) else None
-                checksums = []
-                for name in sums:
-                    after = recipe[name][index] if index < len(recipe[name]) else ""
-                    previous = before.get(name, [])
-                    checksums.append((watch.SUM.fullmatch(name)[1], previous[index] if index < len(previous) else "", after))
-                if source != old_source or any(b != a for _, b, a in checksums):
-                    url = source.split("::", 1)[1] if "::" in source else source
-                    rows.append((label, url, source_name(source), checksums))
+        per_arch[arch] = arch_entries("x86_64" if arch == "any" else arch, recipe, before)
+    rows = []
+    common = [entries.get("source", []) for entries in per_arch.values()]
+    shared = all(entries == common[0] for entries in common)
+    if shared:
+        rows += [("all", *entry) for entry in common[0]]
+    for arch, entries in per_arch.items():
+        label = "all" if arch == "any" else arch
+        if not shared:
+            rows += [(label, *entry) for entry in entries.get("source", [])]
+        rows += [(label, *entry) for key, items in entries.items() if key != "source" for entry in items]
     return rows
 
 
 def checksum_text(checksums):
+    if checksums is None:
+        return "removed"
     parts = []
     for algorithm, before, after in checksums:
         if before and before != after:
@@ -266,21 +346,34 @@ def checksum_text(checksums):
 
 
 def package_github(old, new):
-    """The GitHub repository and the refs the sources moved between."""
-    pairs = []
+    """The upstream's GitHub repository and the refs its sources moved between.
+
+    Only a ref in the repository the upstream declaration names counts, or,
+    without one, a tag that carries the new version: a recipe may also pin a
+    GitHub release of another project, such as Electron, which is not this
+    package's release.
+    """
+    repo_named = declared_repo(new["meta"])
+    pkgver = watch.scalar(new["first"], "pkgver")
+    carries_version = re.compile(rf"(?<![0-9A-Za-z]){re.escape(pkgver)}(?![0-9A-Za-z])") if pkgver else None
+    candidates = []
     for arch, recipe in new["recipes"].items():
         before = (old["recipes"].get(arch) or old["first"]) if old else {}
-        for key in arch_keys(arch, recipe):
-            previous = before.get(key, [])
-            pairs += [(previous[i] if i < len(previous) else None, source) for i, source in enumerate(recipe[key])]
-    candidates = []
-    for previous, source in pairs:
-        after = github_ref(source)
-        if not after:
-            continue
-        before_ref = github_ref(previous) if previous else None
-        moved = before_ref and before_ref[0] == after[0] and before_ref[2] != after[2]
-        candidates.append((not moved, "/releases/download/" not in source, after, before_ref if moved else None))
+        for key in ("source", f"source_{arch}"):
+            previous_sources = before.get(key, [])
+            for index, source in enumerate(recipe.get(key, [])):
+                after = github_ref(source)
+                if not after:
+                    continue
+                if repo_named:
+                    if after[0].lower() != repo_named.lower():
+                        continue
+                elif not (after[1] == "tag" and carries_version and carries_version.search(after[2])):
+                    continue
+                previous = previous_sources[index] if index < len(previous_sources) else None
+                before_ref = github_ref(previous) if previous else None
+                moved = bool(before_ref) and before_ref[0] == after[0] and before_ref[2] != after[2]
+                candidates.append((not moved, "/releases/download/" not in source, after, before_ref if moved else None))
     if not candidates:
         return None
     _, _, after, before_ref = sorted(candidates, key=lambda item: item[:2])[0]
@@ -299,21 +392,31 @@ def fetch_release(github, fetch_json):
     return data
 
 
+def per_arch(record):
+    """rebuilt_against by architecture; the flat form predates it and meant x86_64."""
+    if not isinstance(record, dict):
+        return {}
+    if record and all(isinstance(value, str) for value in record.values()):
+        return {"x86_64": record}
+    return {arch: deps for arch, deps in record.items() if isinstance(deps, dict)}
+
+
 def rebuilt_rows(old_meta, new_meta):
     moved = {}
-    before = old_meta.get("rebuilt_against") or {}
-    for arch, deps in (new_meta.get("rebuilt_against") or {}).items():
+    before = per_arch(old_meta.get("rebuilt_against"))
+    for arch, deps in per_arch(new_meta.get("rebuilt_against")).items():
         for dep, value in deps.items():
             previous = (before.get(arch) or {}).get(dep)
             if previous != value:
-                moved.setdefault((dep, previous or "none", value), []).append(arch)
+                moved.setdefault((dep, previous or "unrecorded", value), []).append(arch)
     order = {arch: index for index, arch in enumerate(ARCHES)}
     return [f"{code(dep)} {code(a)} → {code(b)} ({', '.join(sorted(arches, key=lambda x: order.get(x, 9)))})"
             for (dep, a, b), arches in sorted(moved.items())]
 
 
 def verification(rows, release, new):
-    changed = [(url, algorithm, after) for _, url, _, checksums in rows
+    """What the recorded change says about the new bytes, and nothing more."""
+    changed = [(url, algorithm, after) for _, url, _, checksums in rows if checksums
                for algorithm, before, after in checksums if after != "SKIP" and before != after]
     if not rows:
         parts = ["same sources and checksums as before"]
@@ -326,29 +429,32 @@ def verification(rows, release, new):
             if digest.startswith("sha256:"):
                 digests[asset.get("browser_download_url")] = digest[7:]
         if digests and all(algorithm == "sha256" and digests.get(url) == after for url, algorithm, after in changed):
-            parts = ["sha256 of every new source matches the digest GitHub lists for it"]
+            parts = ["sha256 of each changed checksum matches the digest GitHub lists for its asset"]
         else:
-            parts = ["checksums recorded by the sync from the downloaded files"]
+            parts = ["checksums recorded by the sync"]
     keys = new["pgp_keys"]
     if keys:
-        parts.append(f"PGP signature checked by makepkg against {keys} pinned key{'s' if keys != 1 else ''}")
+        parts.append(f"`validpgpkeys` pins {keys} key{'s' if keys != 1 else ''} for the signed sources makepkg checks")
     return "; ".join(parts)
 
 
 def notes_block(release):
-    text = (release.get("body") or "").replace("\r\n", "\n").strip()
+    text = (release.get("body") or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", text)
     if not text:
         return ""
     lines = text.split("\n")
     cut = len(lines) > NOTES_LINES or len(text) > NOTES_CHARS
     text = "\n".join(lines[:NOTES_LINES])
     if len(text) > NOTES_CHARS:
-        text = text[:NOTES_CHARS].rsplit("\n", 1)[0] if "\n" in text[:NOTES_CHARS] else text[:NOTES_CHARS]
-    longest = max((len(run) for run in re.findall(r"`+", text)), default=0)
-    fence = "`" * max(3, longest + 1)
+        head = text[:NOTES_CHARS]
+        text = head.rsplit("\n", 1)[0] if "\n" in head else head
+    # An indented code block: every line starts with four spaces, so no line
+    # of the notes can end it, open a fence, or start HTML.
+    block = "\n".join("    " + line if line.strip() else "" for line in text.split("\n"))
     more = f"\n\n{link('Full release notes', release['html_url'])}" if cut else ""
-    return (f"<details>\n<summary>Release notes for {cell(release.get('tag_name', ''))}</summary>\n\n"
-            f"{fence}text\n{text}\n{fence}{more}\n</details>")
+    return (f"<details>\n<summary>Release notes for {html.escape(str(release.get('tag_name', '')))}</summary>\n\n"
+            f"{block}{more}\n\n</details>")
 
 
 def package_section(root, base, package, fetch_json):
@@ -376,10 +482,11 @@ def package_section(root, base, package, fetch_json):
         published = (release.get("published_at") or "")[:10]
         table.append(("Release", link(release.get("tag_name") or github["new"], release["html_url"]) + (f", published {published}" if published else "")))
     elif github and github["kind"] == "tag":
-        table.append(("Tag", f"[{code(github['new'])}](https://github.com/{github['repo']}/tree/{quote(github['new'], safe='/')})"))
+        table.append(("Tag", f"[{code(github['new'])}]({destination('https://github.com/' + github['repo'] + '/tree/' + quote(github['new'], safe='/'))})"))
     if github and github["old"]:
         shown = f"{short(github['old'])}...{short(github['new'])}"
-        table.append(("Changes", f"[{code(shown)}](https://github.com/{github['repo']}/compare/{quote(github['old'], safe='/')}...{quote(github['new'], safe='/')})"))
+        compare = f"https://github.com/{github['repo']}/compare/{quote(github['old'], safe='/')}...{quote(github['new'], safe='/')}"
+        table.append(("Changes", f"[{code(shown)}]({destination(compare)})"))
     # Only lines the sync rewrote. A variable built from others (a download
     # URL from ${pkgver}) changes value too, but its line does not.
     pinned = [f"{code(name)} {code(short(old['assignments'][name]))} → {code(short(value))}"
@@ -396,39 +503,57 @@ def package_section(root, base, package, fetch_json):
         table.append(("Minimum release age", cell(meta["min_release_age"])))
     table.append(("Verification", verification(rows, release, new)))
 
-    parts = [lead, "| | |\n|---|---|\n" + "\n".join(f"| {name} | {value} |" for name, value in table)]
-    if rows:
-        parts.append("**Sources**\n\n| Arch | File | Checksum |\n|---|---|---|\n"
-                     + "\n".join(f"| {label} | {code(name)} | {checksum_text(checksums)} |" for label, _, name, checksums in rows))
-    notes = notes_block(release) if release else ""
+    summary = "| | |\n|---|---|\n" + "\n".join(f"| {name} | {value} |" for name, value in table)
+    sources = ("**Sources**\n\n| Arch | File | Checksum |\n|---|---|---|\n"
+               + "\n".join(f"| {label} | {code(name)} | {checksum_text(checksums)} |" for label, _, name, checksums in rows)) if rows else ""
     record = {"name": package, "before": before, "after": after, "source": source_kind(meta, new["hook"]),
               "github": github, "arches": arches, "ships_to": ships_to(meta)}
-    return {"name": package, "before": before, "after": after, "parts": parts, "notes": notes, "record": record}
+    return {"name": package, "before": before, "after": after, "lead": lead, "summary": summary,
+            "sources": sources, "notes": notes_block(release) if release else "", "record": record}
 
 
 def build_body(root, packages, base="HEAD", review=False, fetch_json=None):
     sections = [package_section(root, base, package, fetch_json) for package in packages]
+    record = json.dumps({"packages": [s["record"] for s in sections], "review": bool(review)},
+                        separators=(",", ":"), sort_keys=True).replace("--", "\\u002d\\u002d")
+    tail = [REVIEW if review else AUTO_MERGE, f"<!-- omarchy-sync-pr {record} -->"]
 
-    def assemble(with_notes):
+    def assemble(parts_of):
         out = []
         if len(sections) == 1:
-            section = sections[0]
-            out += section["parts"] + ([section["notes"]] if with_notes and section["notes"] else [])
+            out += parts_of(sections[0])
         else:
             out.append(f"Updates {len(sections)} packages together.")
             out.append("| Package | From | To |\n|---|---|---|\n"
                        + "\n".join(f"| {s['name']} | `{s['before']}` | `{s['after']}` |" for s in sections))
             for section in sections:
-                out.append(f"### {section['name']}")
-                out += section["parts"] + ([section["notes"]] if with_notes and section["notes"] else [])
-        out.append(REVIEW if review else AUTO_MERGE)
-        record = json.dumps({"packages": [s["record"] for s in sections], "review": bool(review)},
-                            separators=(",", ":"), sort_keys=True).replace("--", "\\u002d\\u002d")
-        out.append(f"<!-- omarchy-sync-pr {record} -->")
-        return "\n\n".join(out) + "\n"
+                out += [f"### {section['name']}"] + parts_of(section)
+        return "\n\n".join([part for part in out if part] + tail) + "\n"
 
-    body = assemble(True)
-    return body if len(body) <= BODY_LIMIT else assemble(False)
+    # Give up the longest parts first, so the body fits and its record stays whole.
+    for parts_of in (lambda s: [s["lead"], s["summary"], s["sources"], s["notes"]],
+                     lambda s: [s["lead"], s["summary"], s["sources"]],
+                     lambda s: [s["lead"], s["summary"]],
+                     lambda s: [s["lead"]]):
+        body = assemble(parts_of)
+        if utf16(body) <= BODY_LIMIT:
+            return body
+    return "\n\n".join([f"Updates {len(sections)} packages together."] + tail) + "\n"
+
+
+def fetch_github_json(token):
+    """GET a GitHub API URL with a short timeout; the token goes only to the API."""
+    def fetch(url):
+        if urlsplit(url).hostname != "api.github.com":
+            raise ValueError(f"not a GitHub API URL: {url}")
+        command = ["curl", "--http1.1", "--proto", "=https", "-fsSL", "--connect-timeout", "10", "--max-time", "20",
+                   "-H", "Accept: application/vnd.github+json"]
+        config = f'header = "Authorization: Bearer {token}"\n' if token else ""
+        if config:
+            command += ["--config", "-"]
+        result = subprocess.run(command + [url], input=config, capture_output=True, text=True, check=True, timeout=30)
+        return json.loads(result.stdout)
+    return fetch
 
 
 def main(argv=None):
@@ -438,10 +563,12 @@ def main(argv=None):
     parser.add_argument("--review", action="store_true", help="the group opens as a draft for review")
     parser.add_argument("--offline", action="store_true", help="do not look up GitHub releases")
     args = parser.parse_args(argv)
+    token = None
+    for name in TOKENS:
+        token = os.environ.pop(name, None) or token
     root = subprocess.run(["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True, check=True).stdout.strip()
-    with tempfile.TemporaryDirectory(prefix="sync-pr-body-cache-") as cache:
-        fetch_json = None if args.offline else watch.Fetcher(cache).json
-        sys.stdout.write(build_body(root, args.packages, args.base, args.review, fetch_json))
+    fetch_json = None if args.offline else fetch_github_json(token)
+    sys.stdout.write(build_body(root, args.packages, args.base, args.review, fetch_json))
 
 
 if __name__ == "__main__":

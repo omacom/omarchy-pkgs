@@ -105,8 +105,13 @@ class GitHubRefTest(unittest.TestCase):
             with self.subTest(url=url):
                 self.assertEqual(m.github_ref(url), expected)
 
+    def test_a_release_asset_is_a_tag_even_when_it_looks_like_a_commit(self):
+        hexa = "c" * 40
+        self.assertEqual(m.github_ref(f"https://github.com/o/r/releases/download/{hexa}/r.tar.gz"), ("o/r", "tag", hexa))
+
     def test_ignores_sources_that_are_not_github_refs(self):
-        for url in ["https://example.test/tool.tar.gz", "local.patch",
+        for url in ["https://github.com/o/r/archive/refs/heads/main.tar.gz",
+                    "https://codeload.github.com/o/r/tar.gz/refs/heads/main","https://example.test/tool.tar.gz", "local.patch",
                     "https://github.com/o/r/releases/latest/download/tool.tar.gz",
                     "https://gitlab.com/o/r/-/archive/v1/r-v1.tar.gz"]:
             with self.subTest(url=url):
@@ -140,11 +145,11 @@ class BodyTest(unittest.TestCase):
         self.assertIn("| Source | GitHub releases of [owner/tool](https://github.com/owner/tool/releases) |", body)
         self.assertIn("| Release | [v1.3.0](https://github.com/owner/tool/releases/tag/v1.3.0), published 2026-11-19 |", body)
         self.assertIn("| Changes | [`v1.2.0...v1.3.0`](https://github.com/owner/tool/compare/v1.2.0...v1.3.0) |", body)
-        self.assertIn("| Verification | sha256 of every new source matches the digest GitHub lists for it |", body)
+        self.assertIn("| Verification | sha256 of each changed checksum matches the digest GitHub lists for its asset |", body)
         self.assertIn("| x86_64 | `tool-1.3.0-x64.tar.gz` | sha256 `aaaaaaaa…` → `cccccccc…` |", body)
         self.assertIn("| aarch64 | `tool-1.3.0-arm64.tar.gz` | sha256 `bbbbbbbb…` → `dddddddd…` |", body)
         self.assertIn("<summary>Release notes for v1.3.0</summary>", body)
-        self.assertIn("## Fixes\n- a fix", body)
+        self.assertIn("\n    ## Fixes\n    - a fix\n", body)
         self.assertEqual(fetch.calls, ["https://api.github.com/repos/owner/tool/releases/tags/v1.3.0"])
 
     def test_a_digest_that_differs_or_is_missing_is_not_called_verified(self):
@@ -153,7 +158,7 @@ class BodyTest(unittest.TestCase):
             "https://github.com/owner/tool/releases/download/v1.3.0/tool-1.3.0-x64.tar.gz": SHA["e"],
         }))
         body = self.body("tool", fetch=fetch)
-        self.assertIn("| Verification | checksums recorded by the sync from the downloaded files |", body)
+        self.assertIn("| Verification | checksums recorded by the sync |", body)
         self.assertNotIn("matches the digest", body)
 
     def test_without_the_network_the_offline_facts_still_render(self):
@@ -168,14 +173,24 @@ class BodyTest(unittest.TestCase):
 
     def test_release_notes_are_inert_text_and_cut_short(self):
         self.github_tool("1.2.0", "1.3.0")
-        notes = "Thanks @someone <img src=x onerror=alert(1)>\n`````\nbreakout\n" + "\n".join(f"line {i}" for i in range(100))
+        notes = ("Thanks @someone <img src=x onerror=alert(1)>\n" + "`" * 300 + "\n# not a heading\n"
+                 + "\n".join(f"line {i}" for i in range(100)))
         body = self.body("tool", fetch=FakeGitHub(release("owner/tool", "v1.3.0", body=notes)))
         block = body.split("<summary>Release notes for v1.3.0</summary>", 1)[1].split("</details>", 1)[0]
-        fence = re.search(r"^(`{3,})text$", block, re.M).group(1)
-        self.assertEqual(len(fence), 6, "the fence must be longer than any backtick run in the notes")
-        self.assertIn("@someone <img src=x onerror=alert(1)>", block.split(fence + "text", 1)[1].split("\n" + fence + "\n", 1)[0])
+        code = [line for line in block.split("\n") if line.startswith("    ")]
+        self.assertEqual(code[0], "    Thanks @someone <img src=x onerror=alert(1)>")
+        self.assertEqual(code[1], "    " + "`" * 300, "a backtick run stays inside the indented block")
+        self.assertEqual(code[2], "    # not a heading")
+        self.assertNotIn("```", block.replace("`" * 300, ""), "no fence that notes could close")
         self.assertNotIn("line 99", block)
         self.assertIn("[Full release notes](https://github.com/owner/tool/releases/tag/v1.3.0)", block)
+
+    def test_release_tags_are_escaped_in_the_summary(self):
+        self.github_tool("1.2.0", "1.3.0")
+        data = release("owner/tool", "v1.3.0", body="notes")
+        next(iter(data.values()))["tag_name"] = "<b>v1.3.0</b>"
+        body = self.body("tool", fetch=FakeGitHub(data))
+        self.assertIn("<summary>Release notes for &lt;b&gt;v1.3.0&lt;/b&gt;</summary>", body)
 
     def test_semver_jumps_are_labelled_and_other_versions_are_not(self):
         cases = [("1.2.0", "2.0.0", " (major)"), ("1.2.0", "1.3.0", " (minor)"), ("1.2.0", "1.2.1", " (patch)"),
@@ -328,7 +343,7 @@ class BodyTest(unittest.TestCase):
         self.repo.write("tool", recipe("1.1", body='source=("https://example.test/t-$pkgver.tar.gz" "https://example.test/t-$pkgver.tar.gz.sig")\n'
                                                      "sha256sums=('" + SHA["b"] + "' 'SKIP')\nvalidpgpkeys=('AAAA' 'BBBB')\n"))
         body = self.body("tool")
-        self.assertIn("| Verification | checksums recorded by the sync from the downloaded files; PGP signature checked by makepkg against 2 pinned keys |", body)
+        self.assertIn("| Verification | checksums recorded by the sync; `validpgpkeys` pins 2 keys for the signed sources makepkg checks |", body)
         self.assertIn("| all | `t-1.1.tar.gz.sig` | sha256 `SKIP` |", body)
 
     def test_pinned_variables_and_the_hidden_record(self):
@@ -373,8 +388,8 @@ class BodyTest(unittest.TestCase):
         self.github_tool("1.2.0", "1.3.0")
         notes = "\n".join(f"{i:03d} " + "x" * 300 for i in range(30))
         body = self.body("tool", fetch=FakeGitHub(release("owner/tool", "v1.3.0", body=notes)))
-        shown = body.split("```text\n", 1)[1].split("\n```", 1)[0].split("\n")
-        self.assertTrue(all(len(line) == 304 for line in shown), "every line shown is whole")
+        shown = [line[4:] for line in body.split("\n") if line.startswith("    ")]
+        self.assertTrue(shown and all(len(line) == 304 for line in shown), "every line shown is whole")
         self.assertLess(sum(len(line) + 1 for line in shown), 4001)
 
     def test_release_notes_cannot_spoof_the_record(self):
@@ -383,6 +398,71 @@ class BodyTest(unittest.TestCase):
         body = self.body("tool", fetch=FakeGitHub(release("owner/tool", "v1.3.0", body=fake)))
         self.assertEqual(hidden(body)["packages"][0]["name"], "tool")
         self.assertTrue(body.rstrip().endswith("-->"))
+
+    def test_a_github_source_of_another_project_is_not_shown_as_the_release(self):
+        text = ('_electronver={e}\nsource=("https://slack.test/slack-$pkgver.deb"\n'
+                '"https://github.com/electron/electron/releases/download/v$_electronver/electron-v$_electronver-linux-x64.zip")\n'
+                "sha256sums=('{a}' '{b}')\n")
+        self.repo.write("slack", recipe("4.40.0", arch="('x86_64')", body=text.format(e="38.0.0", a=SHA["a"], b=SHA["b"])),
+                        {"source": "local", "upstream": {"watch": {"regex": "https://slack.test/", "pattern": "x"}}})
+        self.repo.commit()
+        self.repo.write("slack", recipe("4.41.0", arch="('x86_64')", body=text.format(e="38.1.0", a=SHA["c"], b=SHA["d"])))
+        fetch = FakeGitHub()
+        body = self.body("slack", fetch=fetch)
+        self.assertNotIn("electron/electron/compare", body)
+        self.assertNotIn("| Release |", body)
+        self.assertNotIn("| Tag |", body)
+        self.assertEqual(fetch.calls, [])
+        self.assertIn("| Pinned | `_electronver` `38.0.0` → `38.1.0` |", body)
+
+    def test_a_source_that_differs_per_arch_is_listed_per_arch(self):
+        text = ('if [[ $CARCH == aarch64 ]]; then source=("https://dl.test/t-$pkgver-arm.tar.gz"); sha256sums=(\'{b}\');\n'
+                'else source=("https://dl.test/t-$pkgver-x64.tar.gz"); sha256sums=(\'{a}\'); fi\n')
+        self.repo.write("tool", recipe("1.0", body=text.format(a=SHA["a"], b=SHA["b"])),
+                        {"source": "local", "upstream": {"watch": {"regex": "https://dl.test/", "pattern": "x"}}})
+        self.repo.commit()
+        self.repo.write("tool", recipe("1.1", body=text.format(a=SHA["c"], b=SHA["d"])))
+        body = self.body("tool")
+        self.assertIn("| x86_64 | `t-1.1-x64.tar.gz` | sha256 `aaaaaaaa…` → `cccccccc…` |", body)
+        self.assertIn("| aarch64 | `t-1.1-arm.tar.gz` | sha256 `bbbbbbbb…` → `dddddddd…` |", body)
+        self.assertNotIn("| all |", body)
+
+    def test_a_removed_source_is_listed(self):
+        self.repo.write("tool", recipe("1.0", body=f"source=(\"https://dl.test/t-$pkgver.tar.gz\" \"fix.patch\")\nsha256sums=('{SHA['a']}' '{SHA['b']}')\n"),
+                        {"source": "local", "upstream": {"watch": {"regex": "https://dl.test/", "pattern": "x"}}}, files={"fix.patch": ""})
+        self.repo.commit()
+        self.repo.write("tool", recipe("1.1", body=f"source=(\"https://dl.test/t-$pkgver.tar.gz\")\nsha256sums=('{SHA['c']}')\n"))
+        self.assertIn("| all | `fix.patch` | removed |", self.body("tool"))
+
+    def test_a_flat_rebuilt_against_reads_as_x86_64(self):
+        self.repo.write("plug", recipe("1.0", pkgrel="1", arch="('x86_64' 'aarch64')", body=f"source=(\"x\")\nsha256sums=('{SHA['a']}')\n"),
+                        {"source": "local", "rebuild_on": ["hyprland"], "rebuilt_against": {"hyprland": "0.57.2-4"}}, files={"x": ""})
+        self.repo.commit()
+        self.repo.write("plug", recipe("1.0", pkgrel="2", arch="('x86_64' 'aarch64')", body=f"source=(\"x\")\nsha256sums=('{SHA['a']}')\n"),
+                        {"source": "local", "rebuild_on": ["hyprland"],
+                         "rebuilt_against": {"x86_64": {"hyprland": "0.57.2-5"}, "aarch64": {"hyprland": "0.57.2-5"}}})
+        body = self.body("plug")
+        self.assertIn("`hyprland` `0.57.2-4` → `0.57.2-5` (x86_64)", body)
+        self.assertIn("`hyprland` `unrecorded` → `0.57.2-5` (aarch64)", body)
+        self.repo.write("plug", metadata={"source": "local", "rebuild_on": ["hyprland"], "rebuilt_against": {"hyprland": "0.57.2-6"}})
+        self.assertIn("`hyprland` `0.57.2-4` → `0.57.2-6` (x86_64)", self.body("plug"))
+
+    def test_link_targets_cannot_break_the_link_or_the_table(self):
+        self.assertEqual(m.link("a|b", "https://x.test/a|b c)d"), "[a\\|b](https://x.test/a%7Cb%20c%29d)")
+
+    def test_a_huge_group_stays_under_githubs_limit_and_keeps_its_record(self):
+        names = [f"kernel-{i:02d}" for i in range(40)]
+        for name in names:
+            self.repo.write(name, recipe("1.0", body="".join(f'source_x86_64+=("https://dl.test/{name}-$pkgver-{j}.tar.gz")\n' for j in range(40))
+                                         + "sha256sums_x86_64=(" + " ".join(f"'{SHA['a']}'" for _ in range(40)) + ")\n"),
+                            {"source": "local", "upstream": {"watch": {"regex": "https://dl.test/", "pattern": "x"}}})
+        self.repo.commit()
+        for name in names:
+            self.repo.write(name, recipe("1.1", body="".join(f'source_x86_64+=("https://dl.test/{name}-$pkgver-{j}.tar.gz")\n' for j in range(40))
+                                         + "sha256sums_x86_64=(" + " ".join(f"'{SHA['b']}'" for _ in range(40)) + ")\n"))
+        body = self.body(*names)
+        self.assertLessEqual(len(body.encode("utf-16-le")) // 2, 65000)
+        self.assertEqual([p["name"] for p in hidden(body)["packages"]], names)
 
     def test_table_cells_cannot_break_the_table(self):
         self.assertEqual(m.cell("a|b\nc"), "a\\|b c")
@@ -398,6 +478,18 @@ class CliTest(unittest.TestCase):
         result = subprocess.run([sys.executable, str(SCRIPT), "--offline", "tool"], cwd=repo.root, capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("Updates **tool** from `1.0-1` to `1.1-1` (minor).", result.stdout)
+
+    def test_recipes_never_see_the_token(self):
+        repo = Repo(self)
+        leak = "printf %s \"${UPSTREAM_GITHUB_TOKEN-}${GH_TOKEN-}\" >> \"$PWD/leak\"\n"
+        repo.write("tool", recipe("1.0", body=leak + f"source=(\"https://example.test/t-$pkgver.tar.gz\")\nsha256sums=('{SHA['a']}')\n"),
+                   {"source": "local", "upstream": {"watch": {"regex": "https://example.test/", "pattern": "x"}}})
+        repo.commit()
+        repo.write("tool", recipe("1.1", body=leak + f"source=(\"https://example.test/t-$pkgver.tar.gz\")\nsha256sums=('{SHA['b']}')\n"))
+        env = {"PATH": "/usr/bin:/bin", "UPSTREAM_GITHUB_TOKEN": "secret-token", "GH_TOKEN": "other-token"}
+        result = subprocess.run([sys.executable, str(SCRIPT), "--offline", "tool"], cwd=repo.root, capture_output=True, text=True, env=env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("token", (repo.root / "pkgbuilds/tool/leak").read_text())
 
     def test_fails_without_packages(self):
         result = subprocess.run([sys.executable, str(SCRIPT), "--offline"], capture_output=True, text=True)

@@ -404,16 +404,27 @@ test('every bot lane opens its PRs per package through package-prs.yml', () => {
   assert.match(step('Hold an existing reviewed PR as a draft'), /\n +GH_TOKEN: \$\{\{ steps\.app\.outputs\.token \}\}\n/);
   assert.match(step('Open or update the PR'), /\n +token: \$\{\{ steps\.app\.outputs\.token \}\}\n/);
   assert.match(step('Close superseded PRs'), /\n +GH_TOKEN: \$\{\{ steps\.app\.outputs\.token \}\}\n/);
-  // The description is generated from the change, before the App token
-  // exists, and falls back to the caller's body so a PR always opens.
-  const describe = step('Write the PR description');
-  assert.match(describe, /python3 helpers\/sync-pr-body\.py "\$\{args\[@\]\}" "\$\{packages\[@\]\}" > "\$RUNNER_TEMP\/pr-body\.md"/);
-  assert.match(describe, /printf '%s\\n' "\$FALLBACK" > "\$RUNNER_TEMP\/pr-body\.md"/);
-  assert.match(describe, /FALLBACK: \$\{\{ inputs\.body \}\}/);
-  assert.doesNotMatch(describe, /steps\.app\.outputs\.token|secrets\./);
-  assert.ok(prs.indexOf('- name: Write the PR description') < prs.indexOf("- name: Get the sync App's token"), 'the description is written before the App token exists');
+  // Recipes run only in the describe job, which can write nothing; the PR job
+  // takes its text, or the caller's body when there is none.
+  const job = name => prs.split(new RegExp(`\\n  ${name}:\\n`))[1].split(/\n  [a-z-]+:\n/)[0];
+  const describe = job('describe');
+  assert.match(describe, /\n    permissions:\n      contents: read\n/);
+  assert.match(describe, /\n    continue-on-error: true\n/);
+  assert.match(describe, /\n    timeout-minutes: \d+\n/);
+  assert.match(describe, /timeout \d+ python3 helpers\/sync-pr-body\.py "\$\{args\[@\]\}" "\$\{names\[@\]\}"/);
+  assert.doesNotMatch(describe, /secrets\.|create-github-app-token|environment:/);
+  assert.doesNotMatch(job('pr'), /sync-pr-body\.py/);
+  assert.doesNotMatch(job('close-superseded'), /sync-pr-body\.py/);
+  assert.match(job('pr'), /^    needs: describe\n    if: \$\{\{ !cancelled\(\) && inputs\.groups != '\[\]' \}\}\n/);
+  const choose = step("Choose this PR's description");
+  assert.match(choose, /printf '%s\\n' "\$FALLBACK" > "\$RUNNER_TEMP\/pr-body\.md"/);
+  assert.match(choose, /FALLBACK: \$\{\{ inputs\.body \}\}/);
+  assert.match(step('Fetch the PR descriptions'), /\n +continue-on-error: true\n/);
   assert.match(step('Open or update the PR'), /\n +body-path: \$\{\{ runner\.temp \}\}\/pr-body\.md\n/);
   assert.doesNotMatch(step('Open or update the PR'), /\n +body: /);
+  // Both jobs key each PR the same way: the branch name with a newline, hashed.
+  assert.match(describe, /key=\$\(printf '%s\\n' "\$branch" \| sha256sum \| cut -d' ' -f1\)/);
+  assert.match(choose, /key=\$\(printf '%s\\n' "\$BRANCH" \| sha256sum \| cut -d' ' -f1\)/);
   // Only arming auto-merge still uses the PAT: GitHub merges as whoever armed it.
   const pat = [...prs.matchAll(/^ +(?:GH_TOKEN|token): \$\{\{ secrets\.PKGS_BOT_TOKEN \}\}$/gm)];
   assert.equal(pat.length, 1);

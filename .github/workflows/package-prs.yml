@@ -56,8 +56,64 @@ permissions:
   contents: read
 
 jobs:
-  pr:
+  # Writes each PR's description with helpers/sync-pr-body.py. Reading a
+  # recipe means sourcing it in bash, so that happens here, in a job that holds
+  # nothing able to write: the jobs that push, open PRs and arm auto-merge never
+  # run recipe code. A failure or a timeout here only costs the descriptions.
+  describe:
     if: ${{ inputs.groups != '[]' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    continue-on-error: true
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Fetch the pins
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: package-pins
+          path: ${{ runner.temp }}
+
+      # One description per PR, keyed like the result records below. The
+      # read-only token only reaches GitHub's API for release notes; the
+      # script gives recipes an empty environment.
+      - name: Write each PR's description
+        env:
+          GROUPS_JSON: ${{ inputs.groups }}
+          UPSTREAM_GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/pr-descriptions"
+          while IFS=$'\t' read -r branch packages review; do
+            read -r -a names <<<"$packages"
+            # shellcheck disable=SC2046 # one --include argument per package
+            git apply $(printf -- '--include=pkgbuilds/%s/* ' "${names[@]}") "$RUNNER_TEMP/pins.patch"
+            key=$(printf '%s\n' "$branch" | sha256sum | cut -d' ' -f1)
+            args=()
+            [[ $review == true ]] && args+=(--review)
+            if ! timeout 120 python3 helpers/sync-pr-body.py "${args[@]}" "${names[@]}" > "$RUNNER_TEMP/pr-descriptions/$key.md"; then
+              echo "::warning::No description for $branch; it opens with the plain one"
+              rm -f "$RUNNER_TEMP/pr-descriptions/$key.md"
+            fi
+            git checkout -q -- pkgbuilds
+            git clean -qfd -- pkgbuilds
+          done < <(jq -r '.[] | [.branch, .packages, (.review == true | tostring)] | @tsv' <<<"$GROUPS_JSON")
+
+      - name: Upload the descriptions
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: pr-descriptions
+          path: ${{ runner.temp }}/pr-descriptions/*.md
+          if-no-files-found: ignore
+          retention-days: 1
+
+  pr:
+    needs: describe
+    if: ${{ !cancelled() && inputs.groups != '[]' }}
     runs-on: ubuntu-latest
     environment:
       name: bot-sync
@@ -101,25 +157,28 @@ jobs:
           echo "title=$title" >> "$GITHUB_OUTPUT"
           echo "- $title" >> "$GITHUB_STEP_SUMMARY"
 
-      # The description says what moved, where it came from, how its bytes
-      # were checked and where it ships (helpers/sync-pr-body.py). Release
-      # notes and asset digests come from GitHub's API with this job's
-      # read-only token, before the App token exists. If the script fails,
-      # the PR still opens, with the caller's plain body.
-      - name: Write the PR description
-        id: body
+      # The description comes from the describe job; without one, the PR
+      # opens with the caller's plain body.
+      - name: Fetch the PR descriptions
+        if: ${{ steps.apply.outcome == 'success' }}
+        continue-on-error: true
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: pr-descriptions
+          path: ${{ runner.temp }}/pr-descriptions
+
+      - name: Choose this PR's description
         if: ${{ steps.apply.outcome == 'success' }}
         env:
-          PACKAGES: ${{ matrix.group.packages }}
-          REVIEW: ${{ matrix.group.review == true }}
+          BRANCH: ${{ matrix.group.branch }}
           FALLBACK: ${{ inputs.body }}
-          UPSTREAM_GITHUB_TOKEN: ${{ github.token }}
         run: |
-          read -r -a packages <<<"$PACKAGES"
-          args=()
-          [[ $REVIEW == true ]] && args+=(--review)
-          if ! python3 helpers/sync-pr-body.py "${args[@]}" "${packages[@]}" > "$RUNNER_TEMP/pr-body.md"; then
-            echo "::warning::Could not write the PR description; using the plain one"
+          key=$(printf '%s\n' "$BRANCH" | sha256sum | cut -d' ' -f1)
+          described="$RUNNER_TEMP/pr-descriptions/$key.md"
+          if [[ -s $described ]]; then
+            cp "$described" "$RUNNER_TEMP/pr-body.md"
+          else
+            echo "::warning::No generated description for $BRANCH; using the plain one"
             printf '%s\n' "$FALLBACK" > "$RUNNER_TEMP/pr-body.md"
           fi
 
