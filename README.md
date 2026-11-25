@@ -608,6 +608,7 @@ Details: [docs/upstream-sources.md](docs/upstream-sources.md),
 | `upstream` | Where releases come from. Mutually exclusive with an `.omarchy/upstream.sh` hook. |
 | `min_release_age` | Hold a new upstream release back this long (`"24h"`, `"2d"`). A release whose age cannot be proven fails the sync. |
 | `auto_merge` | `true` selects the hourly group in `sync-upstream.yml`; other packages are checked every 6 hours. Both groups auto-merge passing PRs. For packages that follow a moving branch, and for feeds worth shipping within the hour. Needs an upstream declaration. |
+| `lockstep` | Names a group of packages that only ever move together, such as `"nvidia"` for the NVIDIA driver and the kernels that build its modules. Their changes from one sync share a PR. |
 | `sync_cadence` | `"five-minute"` moves an `auto_merge` package from the hourly group to one checked every 5 minutes. For the dev packages that follow omarchy's `quattro`, so a merge reaches dev installs within minutes. |
 | `release_ring` | `fast`: publish to `rc` and `stable` on merge, not only `edge`. Only for packages that run on any channel's libraries: see [What can be on the fast ring](#what-can-be-on-the-fast-ring). Takes effect with the package's next version: bump `pkgrel` in the same PR. |
 | `pinned` | Version is set per release on the `rc` branch. Used by `omarchy` and `omarchy-settings`. |
