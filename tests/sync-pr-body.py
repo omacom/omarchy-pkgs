@@ -464,6 +464,62 @@ class BodyTest(unittest.TestCase):
         self.assertLessEqual(len(body.encode("utf-16-le")) // 2, 65000)
         self.assertEqual([p["name"] for p in hidden(body)["packages"]], names)
 
+    def test_a_tag_that_carries_the_version_after_a_v_counts_and_a_longer_version_does_not(self):
+        self.repo.write("codex", recipe("0.171.0", body='source_x86_64=("https://github.com/openai/codex/releases/download/rust-v$pkgver/codex-x86_64.tar.gz")\n'
+                                                      f"sha256sums_x86_64=('{SHA['a']}')\n"),
+                        {"source": "local", "upstream": {"npm": "@openai/codex", "sources": {}}})
+        self.repo.commit()
+        self.repo.write("codex", recipe("0.172.0", body='source_x86_64=("https://github.com/openai/codex/releases/download/rust-v$pkgver/codex-x86_64.tar.gz")\n'
+                                                      f"sha256sums_x86_64=('{SHA['b']}')\n"))
+        body = self.body("codex", fetch=FakeGitHub(release("openai/codex", "rust-v0.172.0")))
+        self.assertIn("| Release | [rust-v0.172.0](https://github.com/openai/codex/releases/tag/rust-v0.172.0), published 2026-11-19 |", body)
+        self.assertIn("compare/rust-v0.171.0...rust-v0.172.0", body)
+        self.assertTrue(m.carries_version("v1.2", "1.2"))
+        self.assertFalse(m.carries_version("release-1.2.3", "1.2"))
+        self.assertFalse(m.carries_version("v11.2", "1.2"))
+
+    def test_a_source_removed_from_the_middle_is_the_one_listed(self):
+        text = "source=({urls})\nsha256sums=({sums})\n"
+        self.repo.write("tool", recipe("1.0", body=text.format(urls='"old.patch" "https://dl.test/t-$pkgver.tar.gz"', sums=f"'{SHA['a']}' '{SHA['b']}'")),
+                        {"source": "local", "upstream": {"watch": {"regex": "https://dl.test/", "pattern": "x"}}}, files={"old.patch": ""})
+        self.repo.commit()
+        self.repo.write("tool", recipe("1.1", body=text.format(urls='"https://dl.test/t-$pkgver.tar.gz"', sums=f"'{SHA['c']}'")))
+        body = self.body("tool")
+        self.assertIn("| all | `old.patch` | removed |", body)
+        self.assertIn("| all | `t-1.1.tar.gz` | sha256 `bbbbbbbb…` → `cccccccc…` |", body)
+
+    def test_a_checksum_that_becomes_skip_is_a_change(self):
+        self.repo.write("tool", recipe("1.0", body=f"source=(\"https://dl.test/t-$pkgver.tar.gz\")\nsha256sums=('{SHA['a']}')\n"),
+                        {"source": "local", "upstream": {"watch": {"regex": "https://dl.test/", "pattern": "x"}}})
+        self.repo.commit()
+        self.repo.write("tool", recipe("1.1", body="source=(\"https://dl.test/t-$pkgver.tar.gz\")\nsha256sums=('SKIP')\n"))
+        body = self.body("tool")
+        self.assertIn("| all | `t-1.1.tar.gz` | sha256 `aaaaaaaa…` → `SKIP` |", body)
+        self.assertIn("| Verification | checksums recorded by the sync; 1 changed source is not hashed (`SKIP`) |", body)
+
+    def test_upstream_text_in_labels_and_code_stays_text(self):
+        self.assertEqual(m.label("v1](https://evil.test) <b>*x*</b>"), "v1\\](https://evil.test) &lt;b&gt;\\*x\\*&lt;/b&gt;")
+        self.assertEqual(m.code("a``b"), "```a``b```")
+        self.assertEqual(m.code("`a"), "`` `a ``")
+        self.github_tool("1.2.0", "1.3.0")
+        data = release("owner/tool", "v1.3.0")
+        next(iter(data.values()))["tag_name"] = "v1](https://evil.test"
+        body = self.body("tool", fetch=FakeGitHub(data))
+        self.assertIn("| Release | [v1\\](https://evil.test](https://github.com/owner/tool/releases/tag/v1.3.0), published 2026-11-19 |", body)
+
+    def test_the_body_fits_even_when_notes_are_wide_characters(self):
+        self.github_tool("1.2.0", "1.3.0")
+        body = self.body("tool", fetch=FakeGitHub(release("owner/tool", "v1.3.0", body="\n".join("🦀" * 1000 for _ in range(40)))))
+        self.assertLessEqual(len(body.encode("utf-16-le")) // 2, 65000)
+        self.assertEqual(hidden(body)["packages"][0]["name"], "tool")
+
+    def test_a_record_too_large_for_the_limit_keeps_only_names(self):
+        sections = [{"name": f"p{i:04d}", "before": "1-1", "after": "2-1", "lead": "x", "summary": "", "sources": "", "notes": "",
+                     "record": {"name": f"p{i:04d}", "blob": "y" * 500}} for i in range(200)]
+        body = m.assemble_body(sections, review=False)
+        self.assertLessEqual(len(body.encode("utf-16-le")) // 2, 65000)
+        self.assertEqual([p["name"] for p in hidden(body)["packages"]], [f"p{i:04d}" for i in range(200)])
+
     def test_table_cells_cannot_break_the_table(self):
         self.assertEqual(m.cell("a|b\nc"), "a\\|b c")
 

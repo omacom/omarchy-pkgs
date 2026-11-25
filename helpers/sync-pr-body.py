@@ -8,8 +8,9 @@ working tree, and prints Markdown: what moved, where it came from, what was
 recorded, and where it ships. Every source type gets the same facts, because
 they come from the change itself.
 
-Reading a recipe means sourcing it in bash, so recipes run with a bare
-environment: no token, no runner variables. Where the package's own upstream
+Reading a recipe means sourcing it in bash, so recipes run with an empty
+environment, and the job that runs this holds only a read-only token: the jobs
+that push and arm auto-merge never run recipe code. Where the package's own upstream
 is a tag on GitHub, the release's link, date, notes and asset digests come from
 GitHub's API, unless --offline is given or the lookup fails.
 
@@ -18,6 +19,7 @@ nothing in them can close, so they render as inert text, mention nobody and
 run no HTML. A hidden comment at the end repeats the facts as JSON.
 """
 import argparse
+import difflib
 import html
 import importlib.util
 import json
@@ -61,9 +63,22 @@ def cell(text):
 
 
 def code(text):
+    """An inline code span no backtick in the text can close."""
     text = cell(text)
-    fence = "``" if "`" in text else "`"
-    return f"{fence}{text}{fence}"
+    longest = max((len(run) for run in re.findall(r"`+", text)), default=0)
+    fence = "`" * (longest + 1)
+    pad = " " if text.startswith("`") or text.endswith("`") else ""
+    return f"{fence}{pad}{text}{pad}{fence}"
+
+
+def label(text):
+    """Link text from upstream: no brackets, emphasis, code or HTML of its own."""
+    text = cell(str(text).replace("\\", "\\\\"))
+    text = text.replace("<", "&lt;").replace(">", "&gt;")
+    # Brackets end the link, * and ` change its text; _ and ~ only restyle it.
+    for char in "[]*`":
+        text = text.replace(char, "\\" + char)
+    return text
 
 
 def destination(url):
@@ -75,7 +90,7 @@ def destination(url):
 
 
 def link(text, url):
-    return f"[{cell(text)}]({destination(url)})"
+    return f"[{label(text)}]({destination(url)})"
 
 
 def short(value):
@@ -283,9 +298,32 @@ def source_name(source):
     return Path(urlsplit(url).path).name or url
 
 
+def align(old_sources, new_sources, old_pkgver, new_pkgver):
+    """Pairs (old index or None, new index or None), matching sources by name.
+
+    A version bump renames each source, so names are compared with the old
+    version swapped for the new one. Equal lists pair by position.
+    """
+    if len(old_sources) == len(new_sources):
+        return [(index, index) for index in range(len(new_sources))]
+    def name(source, version):
+        text = source_name(source)
+        return text.replace(version, new_pkgver) if version else text
+    olds = [name(source, old_pkgver) for source in old_sources]
+    news = [name(source, None) for source in new_sources]
+    pairs = []
+    for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(None, olds, news, autojunk=False).get_opcodes():
+        common = min(i2 - i1, j2 - j1)
+        pairs += [(i1 + k, j1 + k) for k in range(common)]
+        pairs += [(i, None) for i in range(i1 + common, i2)]
+        pairs += [(None, j) for j in range(j1 + common, j2)]
+    return pairs
+
+
 def arch_entries(arch, recipe, before):
     """Changed sources of one build: {key: [(url, name, checksums or None for removed)]}."""
     result = {}
+    old_pkgver, new_pkgver = watch.scalar(before, "pkgver"), watch.scalar(recipe, "pkgver")
     for key in ("source", f"source_{arch}"):
         if key not in recipe and key not in before:
             continue
@@ -294,19 +332,19 @@ def arch_entries(arch, recipe, before):
                        if watch.SUM.fullmatch(name) and (watch.SUM.fullmatch(name)[2] or "") == suffix})
         new_sources, old_sources = recipe.get(key, []), before.get(key, [])
         entries = []
-        for index in range(max(len(new_sources), len(old_sources))):
-            if index >= len(new_sources):
-                old = old_sources[index]
+        for i, j in align(old_sources, new_sources, old_pkgver, new_pkgver):
+            if j is None:
+                old = old_sources[i]
                 entries.append((old.split("::", 1)[-1], source_name(old), None))
                 continue
-            source = new_sources[index]
-            old_source = old_sources[index] if index < len(old_sources) else None
+            source = new_sources[j]
+            old_source = old_sources[i] if i is not None else None
             checksums = []
             for name in sums:
                 after = recipe.get(name, [])
                 previous = before.get(name, [])
-                checksums.append((watch.SUM.fullmatch(name)[1], previous[index] if index < len(previous) else "",
-                                  after[index] if index < len(after) else ""))
+                checksums.append((watch.SUM.fullmatch(name)[1], previous[i] if i is not None and i < len(previous) else "",
+                                  after[j] if j < len(after) else ""))
             if source != old_source or any(b != a for _, b, a in checksums):
                 entries.append((source.split("::", 1)[1] if "::" in source else source, source_name(source), checksums))
         if entries:
@@ -355,7 +393,6 @@ def package_github(old, new):
     """
     repo_named = declared_repo(new["meta"])
     pkgver = watch.scalar(new["first"], "pkgver")
-    carries_version = re.compile(rf"(?<![0-9A-Za-z]){re.escape(pkgver)}(?![0-9A-Za-z])") if pkgver else None
     candidates = []
     for arch, recipe in new["recipes"].items():
         before = (old["recipes"].get(arch) or old["first"]) if old else {}
@@ -368,7 +405,7 @@ def package_github(old, new):
                 if repo_named:
                     if after[0].lower() != repo_named.lower():
                         continue
-                elif not (after[1] == "tag" and carries_version and carries_version.search(after[2])):
+                elif not (after[1] == "tag" and carries_version(after[2], pkgver)):
                     continue
                 previous = previous_sources[index] if index < len(previous_sources) else None
                 before_ref = github_ref(previous) if previous else None
@@ -378,6 +415,12 @@ def package_github(old, new):
         return None
     _, _, after, before_ref = sorted(candidates, key=lambda item: item[:2])[0]
     return {"repo": after[0], "kind": after[1], "new": after[2], "old": before_ref[2] if before_ref else None}
+
+
+def carries_version(tag, pkgver):
+    """Whether a tag names this exact version: v1.2 and rust-v1.2 do, v11.2 and 1.2.3 do not."""
+    pattern = rf"(?:(?<![0-9A-Za-z.])|(?<![0-9A-Za-z])[vV]){re.escape(pkgver)}(?![0-9A-Za-z]|\.[0-9A-Za-z])"
+    return bool(pkgver) and re.search(pattern, tag) is not None
 
 
 def fetch_release(github, fetch_json):
@@ -416,11 +459,13 @@ def rebuilt_rows(old_meta, new_meta):
 
 def verification(rows, release, new):
     """What the recorded change says about the new bytes, and nothing more."""
-    changed = [(url, algorithm, after) for _, url, _, checksums in rows if checksums
-               for algorithm, before, after in checksums if after != "SKIP" and before != after]
+    transitions = [(url, algorithm, before, after) for _, url, _, checksums in rows if checksums
+                   for algorithm, before, after in checksums if before != after]
+    hashed = [(url, algorithm, after) for url, algorithm, before, after in transitions if after != "SKIP"]
+    skipped = sum(1 for _, _, before, after in transitions if after == "SKIP")
     if not rows:
         parts = ["same sources and checksums as before"]
-    elif not changed:
+    elif not transitions:
         parts = ["no checksum changed"]
     else:
         digests = {}
@@ -428,10 +473,12 @@ def verification(rows, release, new):
             digest = asset.get("digest") or ""
             if digest.startswith("sha256:"):
                 digests[asset.get("browser_download_url")] = digest[7:]
-        if digests and all(algorithm == "sha256" and digests.get(url) == after for url, algorithm, after in changed):
+        if hashed and digests and all(algorithm == "sha256" and digests.get(url) == after for url, algorithm, after in hashed):
             parts = ["sha256 of each changed checksum matches the digest GitHub lists for its asset"]
         else:
             parts = ["checksums recorded by the sync"]
+        if skipped:
+            parts.append(f"{skipped} changed source{'s are' if skipped != 1 else ' is'} not hashed (`SKIP`)")
     keys = new["pgp_keys"]
     if keys:
         parts.append(f"`validpgpkeys` pins {keys} key{'s' if keys != 1 else ''} for the signed sources makepkg checks")
@@ -453,7 +500,7 @@ def notes_block(release):
     # of the notes can end it, open a fence, or start HTML.
     block = "\n".join("    " + line if line.strip() else "" for line in text.split("\n"))
     more = f"\n\n{link('Full release notes', release['html_url'])}" if cut else ""
-    return (f"<details>\n<summary>Release notes for {html.escape(str(release.get('tag_name', '')))}</summary>\n\n"
+    return (f"<details>\n<summary>Release notes for {html.escape(cell(release.get('tag_name', '')))}</summary>\n\n"
             f"{block}{more}\n\n</details>")
 
 
@@ -512,22 +559,24 @@ def package_section(root, base, package, fetch_json):
             "sources": sources, "notes": notes_block(release) if release else "", "record": record}
 
 
-def build_body(root, packages, base="HEAD", review=False, fetch_json=None):
-    sections = [package_section(root, base, package, fetch_json) for package in packages]
-    record = json.dumps({"packages": [s["record"] for s in sections], "review": bool(review)},
-                        separators=(",", ":"), sort_keys=True).replace("--", "\\u002d\\u002d")
-    tail = [REVIEW if review else AUTO_MERGE, f"<!-- omarchy-sync-pr {record} -->"]
+def assemble_body(sections, review=False):
+    def record_comment(entries):
+        data = json.dumps({"packages": entries, "review": bool(review)}, separators=(",", ":"), sort_keys=True)
+        return f"<!-- omarchy-sync-pr {data.replace('--', chr(92) + 'u002d' + chr(92) + 'u002d')} -->"
 
-    def assemble(parts_of):
+    policy = REVIEW if review else AUTO_MERGE
+    tail = [policy, record_comment([s["record"] for s in sections])]
+
+    def assemble(parts_of, tail):
         out = []
         if len(sections) == 1:
             out += parts_of(sections[0])
         else:
             out.append(f"Updates {len(sections)} packages together.")
             out.append("| Package | From | To |\n|---|---|---|\n"
-                       + "\n".join(f"| {s['name']} | `{s['before']}` | `{s['after']}` |" for s in sections))
+                       + "\n".join(f"| {cell(s['name'])} | {code(s['before'])} | {code(s['after'])} |" for s in sections))
             for section in sections:
-                out += [f"### {section['name']}"] + parts_of(section)
+                out += [f"### {cell(section['name'])}"] + parts_of(section)
         return "\n\n".join([part for part in out if part] + tail) + "\n"
 
     # Give up the longest parts first, so the body fits and its record stays whole.
@@ -535,10 +584,16 @@ def build_body(root, packages, base="HEAD", review=False, fetch_json=None):
                      lambda s: [s["lead"], s["summary"], s["sources"]],
                      lambda s: [s["lead"], s["summary"]],
                      lambda s: [s["lead"]]):
-        body = assemble(parts_of)
+        body = assemble(parts_of, tail)
         if utf16(body) <= BODY_LIMIT:
             return body
-    return "\n\n".join([f"Updates {len(sections)} packages together."] + tail) + "\n"
+    # Still too long: the record keeps only names, which tools can look up.
+    names = record_comment([{"name": s["name"]} for s in sections])
+    return "\n\n".join([f"Updates {len(sections)} packages together.", policy, names]) + "\n"
+
+
+def build_body(root, packages, base="HEAD", review=False, fetch_json=None):
+    return assemble_body([package_section(root, base, package, fetch_json) for package in packages], review)
 
 
 def fetch_github_json(token):
@@ -546,7 +601,8 @@ def fetch_github_json(token):
     def fetch(url):
         if urlsplit(url).hostname != "api.github.com":
             raise ValueError(f"not a GitHub API URL: {url}")
-        command = ["curl", "--http1.1", "--proto", "=https", "-fsSL", "--connect-timeout", "10", "--max-time", "20",
+        # --disable first: no ~/.curlrc can add headers, proxies or redirects.
+        command = ["curl", "--disable", "--http1.1", "--proto", "=https", "-fsSL", "--connect-timeout", "10", "--max-time", "20",
                    "-H", "Accept: application/vnd.github+json"]
         config = f'header = "Authorization: Bearer {token}"\n' if token else ""
         if config:

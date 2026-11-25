@@ -420,6 +420,15 @@ test('every bot lane opens its PRs per package through package-prs.yml', () => {
   assert.match(choose, /printf '%s\\n' "\$FALLBACK" > "\$RUNNER_TEMP\/pr-body\.md"/);
   assert.match(choose, /FALLBACK: \$\{\{ inputs\.body \}\}/);
   assert.match(step('Fetch the PR descriptions'), /\n +continue-on-error: true\n/);
+  // Only this run's describe artifact, and only after a clean download.
+  assert.match(step('Fetch the PR descriptions'), /artifact-ids: \$\{\{ needs\.describe\.outputs\.artifact-id \}\}/);
+  assert.match(step('Fetch the PR descriptions'), /\n +merge-multiple: true\n +path: \$\{\{ runner\.temp \}\}\/pr-descriptions\n/);
+  assert.match(describe, /\n    outputs:\n      artifact-id: \$\{\{ steps\.upload\.outputs\.artifact-id \}\}\n/);
+  assert.match(choose, /DOWNLOADED: \$\{\{ steps\.descriptions\.outcome == 'success' \}\}/);
+  assert.match(choose, /if \[\[ \$DOWNLOADED == true && -s \$described \]\]; then/);
+  // One group's failure, in git apply or the script, costs only its own description.
+  assert.match(describe, /if ! \{ git apply [^\n]+ &&\n +timeout \d+ python3 helpers\/sync-pr-body\.py/);
+  assert.match(describe, /git checkout -q -- pkgbuilds \|\| true\n +git clean -qfd -- pkgbuilds \|\| true/);
   assert.match(step('Open or update the PR'), /\n +body-path: \$\{\{ runner\.temp \}\}\/pr-body\.md\n/);
   assert.doesNotMatch(step('Open or update the PR'), /\n +body: /);
   // Both jobs key each PR the same way: the branch name with a newline, hashed.
