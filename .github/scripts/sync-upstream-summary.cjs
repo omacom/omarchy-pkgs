@@ -20,6 +20,7 @@ function readResults(path) {
 
 function updateFailure(result) {
   if (result.apply !== 'success') return 'Could not apply the package update';
+  if (result.token === 'failure') return 'Could not get the sync App token';
   if (result.hold === 'failure') return 'Could not turn the reviewed PR back into a draft';
   if (result.pr !== 'success') return 'Could not push or update the PR';
   if (!['success', 'skipped'].includes(result.merge)) return 'Could not enable auto-merge';
