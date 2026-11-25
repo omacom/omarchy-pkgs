@@ -124,17 +124,23 @@ for _ in {1..50}; do
   curl -fsS -o /dev/null "http://127.0.0.1:$port/" 2>/dev/null && break
   sleep 0.1
 done
+http_pids=()
 for arch in x86_64 aarch64; do
-  mkdir -p "$TEST_ROOT/empty-$arch"
-  rm -rf "$TEST_ROOT/plan"
-  ARCH="$arch" MIRROR=edge DRY_RUN=true PACKAGES='' \
-    OMARCHY_PUBLISHED_REPO_URL="http://127.0.0.1:$port" \
-    PKGBUILDS_DIR="$TEST_ROOT/pkgbuilds" HELPERS_DIR="$TEST_ROOT/helpers" \
-    FINAL_OUTPUT_DIR="$TEST_ROOT/empty-$arch" BUILD_PLAN_DIR="$TEST_ROOT/plan" \
-    timeout 60 "$TEST_ROOT/build/build.sh" > "$TEST_ROOT/plan.log" 2>&1
-  grep -q "planning against http://127.0.0.1:$port/edge/$arch" "$TEST_ROOT/plan.log"
-  sort "$TEST_ROOT/plan/packages" > "$TEST_ROOT/planned"
-  diff -u "$TEST_ROOT/expected" "$TEST_ROOT/planned"
-  grep -q 'omarchy 4.0.3-1 - archive already published' "$TEST_ROOT/plan.log"
+  (
+    mkdir -p "$TEST_ROOT/empty-$arch"
+    ARCH="$arch" MIRROR=edge DRY_RUN=true PACKAGES='' \
+      OMARCHY_PUBLISHED_REPO_URL="http://127.0.0.1:$port" \
+      PKGBUILDS_DIR="$TEST_ROOT/pkgbuilds" HELPERS_DIR="$TEST_ROOT/helpers" \
+      FINAL_OUTPUT_DIR="$TEST_ROOT/empty-$arch" BUILD_PLAN_DIR="$TEST_ROOT/plan-$arch" \
+      timeout 60 "$TEST_ROOT/build/build.sh" > "$TEST_ROOT/plan-$arch.log" 2>&1
+    grep -q "planning against http://127.0.0.1:$port/edge/$arch" "$TEST_ROOT/plan-$arch.log"
+    sort "$TEST_ROOT/plan-$arch/packages" > "$TEST_ROOT/planned-$arch"
+    diff -u "$TEST_ROOT/expected" "$TEST_ROOT/planned-$arch"
+    grep -q 'omarchy 4.0.3-1 - archive already published' "$TEST_ROOT/plan-$arch.log"
+  ) &
+  http_pids+=($!)
+done
+for pid in "${http_pids[@]}"; do wait "$pid"; done
+for arch in x86_64 aarch64; do
   printf 'PASS: %s plans against the public channel skip archives it retains\n' "$arch"
 done
