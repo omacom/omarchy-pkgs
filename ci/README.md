@@ -115,7 +115,7 @@ on `master`.
 |---|---|---|
 | `omarchy-dispatch-sync-hourly` | every hour at :35 | `sync-upstream.yml`, `cadence=hourly` |
 | `omarchy-dispatch-sync-six-hourly` | 00:20, 06:20, 12:20, 18:20 | `sync-upstream.yml`, `cadence=six-hourly` |
-| `omarchy-dispatch-sync-rebuilds` | 00:40, 06:40, 12:40, 18:40 | `sync-rebuilds.yml` |
+| `omarchy-dispatch-sync-rebuilds` | every hour at :50 | `sync-rebuilds.yml` |
 | `omarchy-dispatch-builder-images` | 04:23 | `builder-images.yml` |
 
 ```bash
