@@ -126,14 +126,11 @@ neither.
    deployment branches are limited to `master`. To rotate the key, generate
    a new one in the App's settings, replace the secret, then delete the old
    key there.
-2. Use a fine-grained PAT with access to **omacom/omarchy-pkgs** and repository
-   **Contents: Read and write** and **Pull requests: Read and write** permissions.
-   It only arms auto-merge, so the merge, and the publish it starts, run as
-   its owner. The existing controller PAT can be reused when it has these
-   permissions. In the repository's
-   [Actions secrets](https://github.com/omacom/omarchy-pkgs/settings/secrets/actions),
-   save the PAT as `PKGS_BOT_TOKEN`. Update this secret when the token is rotated
-   or expires.
+2. The omarchy-pkgs-merge App arms auto-merge, so the merge, and the publish
+   it starts, run as it. It is set up the same way, with the same
+   permissions, installed on **omacom/omarchy-pkgs** only. Its client ID is
+   the variable `PKGS_MERGE_APP_CLIENT_ID`, and its private key the secret
+   `PKGS_MERGE_APP_KEY` in the `bot-merge` environment, limited to `master`.
 3. Keep **Allow auto-merge** enabled and require `result`, `self-tests`, and
    `build-isolation` on `master`; the updater does not request a protection bypass.
 4. Run **Sync Upstream** once from Actions with `cadence: hourly`
@@ -300,7 +297,8 @@ These packages were already excluded from automatic AUR updates. The migration p
 sync once, split the changed recipes into one PR per package with
 `.github/scripts/package-pr-groups.sh`, and hand them to `package-prs.yml`. That
 pushes each PR as the omarchy-pkgs-sync App, so its builds start without an
-approval hold, and arms auto-merge with the PAT in `PKGS_BOT_TOKEN`. A push to an `auto/sync-*` or
+approval hold. Its `arm` job then arms auto-merge as the omarchy-pkgs-merge
+App, in a job of its own, since a job has one environment. A push to an `auto/sync-*` or
 `auto/track-branches-*` branch does not cancel the PR's build in flight: the new
 build waits, then reuses every artifact the finished one uploaded.
 

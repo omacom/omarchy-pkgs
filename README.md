@@ -139,8 +139,7 @@ Keep a package PR to these files, or it needs a maintainer to merge it by
 hand:
 
 - anything under `pkgbuilds/`
-- a new test under `tests/`, and the one line in `.github/workflows/test.yml`
-  that runs it
+- a new test under `tests/`
 - the directory lines `bin/release-owners` writes in `release/owners.json`.
   An `approved` line always needs a maintainer.
 
@@ -534,10 +533,11 @@ until one of those applies. An author denounced in `VOUCHED.td` cannot be
 overridden by the label.
 
 A trusted PR also merges itself. `auto-merge-pr.yml` enables auto-merge when
-the PR is open, not a draft, and changes only packages: files under
-`pkgbuilds/`, new files under `tests/`, and `test.yml` lines that only add a
-`./tests/<name>.sh` call. Anything touching workflows, scripts, build tooling
-or an existing test needs a maintainer to merge it.
+the PR targets `master`, is open, is not a draft, and changes only packages:
+files under `pkgbuilds/` and new files under `tests/`. Anything touching
+workflows, `test.yml` included, scripts, build tooling or an existing test
+needs a maintainer to merge it. The omarchy-pkgs-merge GitHub App arms it, so
+the merge starts `publish.yml`.
 
 - Remove `build-approved` to withdraw the auto-merge it armed for an unknown
   author. Runs it already released keep going.
@@ -587,11 +587,11 @@ prefixes remain unchanged so existing PRs keep receiving updates. The separate
   updates and closes their PRs, so their builds start without an approval
   hold. It has Contents and Pull requests write access to this repository
   only. The workflows never merge with it.
-- Arming auto-merge (both workflows and `auto-merge-pr.yml`) needs the
-  `PKGS_BOT_TOKEN` secret: a personal access token with Contents and Pull
-  requests write access to this repository. GitHub merges as whoever armed
+- The omarchy-pkgs-merge GitHub App arms auto-merge, in `package-prs.yml`'s
+  `arm` job and in `auto-merge-pr.yml`. GitHub merges as whoever armed
   auto-merge, and a merge made with the built-in `GITHUB_TOKEN` does not
-  start `publish.yml`.
+  start `publish.yml`. It has Contents and Pull requests write access to
+  this repository only, and no Workflows access.
 
 Details: [docs/upstream-sources.md](docs/upstream-sources.md),
 [docs/rebuild-triggers.md](docs/rebuild-triggers.md).
@@ -711,9 +711,11 @@ signing key and bucket credentials: `GPG_PRIVATE_KEY`, `GPG_PASSPHRASE`,
 `OMARCHY_PUBLISH_PREFIX` redirects every bucket write to a scratch prefix
 in the bucket for a proof run; it must be empty for live publishing.
 The `bot-sync` environment (usable from `master` only) holds
-`PKGS_SYNC_APP_KEY`, the omarchy-pkgs-sync App's private key. The
-repository variable `PKGS_SYNC_APP_CLIENT_ID` is that App's client ID.
-Repository secrets: `PKGS_BOT_TOKEN`, `BASECAMP_CHATBOT_URL`.
+`PKGS_SYNC_APP_KEY`, the omarchy-pkgs-sync App's private key, and
+`bot-merge` holds `PKGS_MERGE_APP_KEY`, the omarchy-pkgs-merge App's. The
+repository variables `PKGS_SYNC_APP_CLIENT_ID` and
+`PKGS_MERGE_APP_CLIENT_ID` are their client IDs.
+Repository secret: `BASECAMP_CHATBOT_URL`.
 
 ## More
 

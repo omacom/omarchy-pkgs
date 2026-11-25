@@ -3,17 +3,21 @@
 // The rule is the build gate's, from build-pr.yml: a PR trusted to build is
 // trusted to ship. Collaborators, vouched authors and bots are trusted; an
 // unknown author is trusted while the PR carries build-approved; a
-// denouncement is absolute. Two limits on top of it:
+// denouncement is absolute. Limits on top of it:
 //
+// - Only PRs into the default branch. Another branch, such as rc, has no
+//   required checks, so an armed PR into it would merge at once, unbuilt.
 // - Only package changes. A PR's workflows, scripts and build tooling never
 //   run in its own build (build-pr.yml overlays only its package directories
 //   onto base tooling), so green checks say nothing about them, and after
 //   merge they run with the publish secrets. Allowed: anything under
-//   pkgbuilds/, plus the test a package PR brings with it, which is a new
-//   file under tests/ and lines in test.yml that only run new tests/*.sh.
-//   test.yml runs on PRs only; an existing test may also run on master
-//   (builder-images.yml runs tests/build-isolation.sh with packages: write),
-//   so editing one still needs a maintainer.
+//   pkgbuilds/, plus a new file under tests/. A change to any workflow,
+//   test.yml included, needs a maintainer, and the merge App that arms
+//   auto-merge has no Workflows permission. An existing test may run on
+//   master (builder-images.yml runs tests/build-isolation.sh with
+//   packages: write), so editing one also needs a maintainer.
+// - Every file the PR changes is read. The API lists at most 3,000, so a
+//   longer PR could hide a change past the cut, and does not qualify.
 // - release/owners.json may change only where bin/release-owners writes it
 //   from the recipes: the self-tests fail unless it matches them. Its
 //   "approved" list lets a directory claim a name that is not its own, so a
@@ -21,18 +25,7 @@
 //   needs a maintainer.
 const PACKAGES = 'pkgbuilds/';
 const TESTS = 'tests/';
-const TEST_WORKFLOW = '.github/workflows/test.yml';
-const TEST_LINE = /^\+\s*\.\/tests\/[A-Za-z0-9._-]+\.sh\s*$/;
 const OWNERS = 'release/owners.json';
-
-// Every changed line adds a ./tests/<name>.sh call; nothing removed. A diff
-// too large for the API has no patch and does not qualify.
-function onlyRunsTests(patch) {
-  if (!patch) return false;
-  const changed = patch.split('\n').filter(line =>
-    /^[+-]/.test(line) && !line.startsWith('+++') && !line.startsWith('---'));
-  return changed.length > 0 && changed.every(line => TEST_LINE.test(line));
-}
 
 // Whether two texts of release/owners.json have the same version and the
 // same approvals. Anything that does not parse does not qualify.
@@ -49,14 +42,23 @@ function packageChange(file, owners) {
   if (file.previous_filename && !file.previous_filename.startsWith(PACKAGES)) return false;
   if (file.filename.startsWith(PACKAGES)) return true;
   if (file.filename.startsWith(TESTS)) return file.status === 'added';
-  if (file.filename === TEST_WORKFLOW) return file.status === 'modified' && onlyRunsTests(file.patch);
   if (file.filename === OWNERS) return file.status === 'modified' && Boolean(owners) && sameApprovals(owners.base, owners.head);
   return false;
+}
+
+// A sync lane's PR lands as a merge commit, as package-prs.yml always armed
+// it; anything else squashes.
+function mergeMethod(pr, repository) {
+  return pr.head?.repo?.full_name === repository && pr.head.ref.startsWith('auto/') ? 'merge' : 'squash';
 }
 
 function decide({ pr, files, vouchStatus, repository, owners }) {
   if (pr.state !== 'open') return { enable: false, reason: 'PR is not open' };
   if (pr.draft) return { enable: false, reason: 'PR is a draft' };
+  const defaultBranch = pr.base?.repo?.default_branch;
+  if (!defaultBranch || pr.base.ref !== defaultBranch) {
+    return { enable: false, reason: `PR targets ${pr.base?.ref || 'an unknown branch'}, not ${defaultBranch || 'the default branch'}` };
+  }
 
   const labelled = pr.labels.some(label => label.name === 'build-approved');
   let trusted;
@@ -70,12 +72,16 @@ function decide({ pr, files, vouchStatus, repository, owners }) {
   }
 
   if (!files.length) return { enable: false, reason: 'PR changes no files' };
+  if (typeof pr.changed_files === 'number' && pr.changed_files > files.length) {
+    return { enable: false, reason: `PR changes ${pr.changed_files} files and the API listed ${files.length}` };
+  }
   const outside = files.filter(file => !packageChange(file, owners));
   if (outside.length) {
     const names = outside.slice(0, 3).map(file => file.filename).join(', ');
     return { enable: false, reason: `changes more than packages, their new tests and their owners.json lines: ${names}${outside.length > 3 ? ', ...' : ''}` };
   }
-  return { enable: true, reason: `${vouchStatus === 'unknown' ? 'build-approved' : vouchStatus} author, package changes only` };
+  return { enable: true, method: mergeMethod(pr, repository),
+    reason: `${vouchStatus === 'unknown' ? 'build-approved' : vouchStatus} author, package changes only` };
 }
 
 // Whether to take back auto-merge an earlier event turned on. GitHub keeps
@@ -113,6 +119,7 @@ module.exports = async function autoMerge({ github, context, core, number, vouch
   });
   core.setOutput('withdraw', String(withdraw(decision, vouchStatus, asTrusted.enable)));
   core.setOutput('head_sha', pr.head.sha);
+  core.setOutput('method', decision.method || 'squash');
   return decision;
 };
 module.exports.decide = decide;

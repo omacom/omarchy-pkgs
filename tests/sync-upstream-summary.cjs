@@ -129,6 +129,15 @@ test('a failed App token is reported as such, not as a failed push', async t => 
   assert.doesNotMatch(result.content, /Could not push or update the PR/);
 });
 
+test("the arm job's outcome decides the auto-merge result", async t => {
+  const f = fixture(t, 2);
+  for (const result of f.results) result.merge = 'skipped';
+  writeFileSync(join(f.resultsPath, 'armed.outcomes'), JSON.stringify({ [f.groups[0].branch]: 'failure', [f.groups[1].branch]: 'success' }));
+  const result = await f.invoke({ resultsPath: f.resultsPath });
+  assert.equal(result.updates.failing, 1);
+  assert.match(result.content, /Could not enable auto-merge/);
+});
+
 test('a reviewed PR that could not be held as a draft is a package failure', async t => {
   const f = fixture(t, 1);
   Object.assign(f.results[0], { hold: 'failure', pr: 'skipped', merge: 'skipped' });

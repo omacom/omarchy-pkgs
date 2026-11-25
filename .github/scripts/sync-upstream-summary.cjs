@@ -83,6 +83,16 @@ module.exports = async function summarize({ github, context, core, groups,
   } catch (error) {
     problems.push(`Could not read package results: ${error.message}`);
   }
+  // The arm job arms auto-merge after the PR jobs and records its outcome
+  // per branch; that outcome is the package's auto-merge result.
+  try {
+    const armed = JSON.parse(readFileSync(join(resultsPath, 'armed.outcomes'), 'utf8'));
+    for (const result of results) {
+      if (result && typeof armed[result.branch] === 'string') result.merge = armed[result.branch];
+    }
+  } catch (error) {
+    if (error.code !== 'ENOENT') problems.push(`Could not read auto-merge outcomes: ${error.message}`);
+  }
 
   const updates = { passing: 0, failing: 0, unknown: 0 };
   const checks = { passing: 0, failing: 0, pending: 0, unknown: 0 };
