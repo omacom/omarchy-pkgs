@@ -551,6 +551,8 @@ test('a newer update re-drafts a ready, armed reviewed PR and checks both before
   try {
     const result = f.run();
     assert.equal(result.status, 0, result.stdout + result.stderr);
+    // Only this repository's PR into master: a fork may use the same branch name.
+    assert.match(f.calls()[0], /^pr list -R omacom\/omarchy-pkgs --head auto\/sync-upstream-speakersafetyd --base master --state open --json number,headRepositoryOwner --jq .*headRepositoryOwner\.login == "omacom"/);
     assert.deepEqual(mutations(f.calls()), ['pr merge --disable-auto 41 -R omacom/omarchy-pkgs', 'pr ready --undo 41 -R omacom/omarchy-pkgs']);
     assert.match(f.calls().at(-1), /^pr view 41 /, 'the state is read back after the change');
     assert.match(result.stdout, /#41 is back to a draft with auto-merge off/);

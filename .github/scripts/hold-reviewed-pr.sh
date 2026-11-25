@@ -18,7 +18,9 @@ shift
 (( $# > 0 )) || { echo "hold-reviewed-pr.sh: packages required" >&2; exit 2; }
 repo=${GITHUB_REPOSITORY:?GITHUB_REPOSITORY required}
 
-pr=$(gh pr list -R "$repo" --head "$branch" --state open --json number --jq '.[0].number // empty')
+# Only this repository's PR into master: a fork may use the same branch name.
+pr=$(gh pr list -R "$repo" --head "$branch" --base master --state open --json number,headRepositoryOwner \
+  --jq "[.[] | select(.headRepositoryOwner.login == \"${repo%%/*}\") | .number][0] // empty")
 if [[ -z $pr ]]; then
   echo "no open PR on $branch: it opens as a draft"
   exit 0
