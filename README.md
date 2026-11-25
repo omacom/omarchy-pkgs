@@ -583,11 +583,15 @@ prefixes remain unchanged so existing PRs keep receiving updates. The separate
   not started yet) are pending, and the sync does not wait for builds.
   Feed-fetch, setup, and missing-result failures still fail the workflow.
   A failed `sync-rebuilds.yml` run also posts to Basecamp.
-- Every self-merging path (both workflows and `auto-merge-pr.yml`) needs
-  the `PKGS_BOT_TOKEN` secret: a personal access token with Contents and Pull
-  requests write access to this repository, owned by an account trusted to
-  build. A merge made with the built-in `GITHUB_TOKEN` does not start
-  `publish.yml`.
+- The omarchy-pkgs-sync GitHub App pushes the sync branches and opens,
+  updates and closes their PRs, so their builds start without an approval
+  hold. It has Contents and Pull requests write access to this repository
+  only. The workflows never merge with it.
+- Arming auto-merge (both workflows and `auto-merge-pr.yml`) needs the
+  `PKGS_BOT_TOKEN` secret: a personal access token with Contents and Pull
+  requests write access to this repository. GitHub merges as whoever armed
+  auto-merge, and a merge made with the built-in `GITHUB_TOKEN` does not
+  start `publish.yml`.
 
 Details: [docs/upstream-sources.md](docs/upstream-sources.md),
 [docs/rebuild-triggers.md](docs/rebuild-triggers.md).
@@ -706,6 +710,9 @@ signing key and bucket credentials: `GPG_PRIVATE_KEY`, `GPG_PASSPHRASE`,
 `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, `R2_ENDPOINT`. Its variable
 `OMARCHY_PUBLISH_PREFIX` redirects every bucket write to a scratch prefix
 in the bucket for a proof run; it must be empty for live publishing.
+The `bot-sync` environment (usable from `master` only) holds
+`PKGS_SYNC_APP_KEY`, the omarchy-pkgs-sync App's private key. The
+repository variable `PKGS_SYNC_APP_CLIENT_ID` is that App's client ID.
 Repository secrets: `PKGS_BOT_TOKEN`, `BASECAMP_CHATBOT_URL`.
 
 ## More

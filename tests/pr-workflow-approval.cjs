@@ -364,9 +364,10 @@ test('scoped branch names reject anything that is not a package name', () => {
   }
 });
 
-// Every bot lane opens one PR per package through package-prs.yml, with the
-// PAT: a GITHUB_TOKEN push would wait for build approval, and a GITHUB_TOKEN
-// merge would not start publish.yml.
+// Every bot lane opens one PR per package through package-prs.yml. The sync
+// App pushes and opens the PRs: a GITHUB_TOKEN push would wait for build
+// approval. The PAT arms auto-merge: a GITHUB_TOKEN merge would not start
+// publish.yml.
 test('every bot lane opens its PRs per package through package-prs.yml', () => {
   for (const file of ['sync-upstream.yml', 'sync-rebuilds.yml']) {
     const text = readFileSync(join(__dirname, '../.github/workflows', file), 'utf8');
@@ -374,12 +375,40 @@ test('every bot lane opens its PRs per package through package-prs.yml', () => {
     assert.match(text, /uses: \.\/\.github\/workflows\/package-prs\.yml/, file);
     assert.match(text, /prefix: (?:\$\{\{ needs.sync.outputs.prefix \}\}|auto\/sync-rebuilds)\n/, file);
     assert.match(text, /PKGS_BOT_TOKEN: \$\{\{ secrets\.PKGS_BOT_TOKEN \}\}/, file);
+    // An environment secret is empty in a called workflow unless the caller
+    // passes it by name, even though the called job names the environment.
+    assert.match(text, /\n      PKGS_SYNC_APP_KEY: \$\{\{ secrets\.PKGS_SYNC_APP_KEY \}\}\n/, file);
     assert.doesNotMatch(text, /create-pull-request|build-approved|\n  approve:\n/, file);
     assert.doesNotMatch(text, /^ +(contents|pull-requests|actions): write$/m, file);
   }
   const prs = readFileSync(join(__dirname, '../.github/workflows/package-prs.yml'), 'utf8');
-  assert.match(prs, /token: \$\{\{ secrets\.PKGS_BOT_TOKEN \}\}/);
+  assert.match(prs, /token: \$\{\{ steps\.app\.outputs\.token \}\}/);
+  assert.match(prs, /\n      PKGS_SYNC_APP_KEY:\n        required: true\n/);
   assert.doesNotMatch(prs, /secrets\.GITHUB_TOKEN/);
+  // Both jobs that push or close take the sync App's key from bot-sync, which
+  // only master can use, and mint a token limited to contents and PRs.
+  for (const job of ['pr', 'close-superseded']) {
+    const body = prs.split(new RegExp(`\\n  ${job}:\\n`))[1].split(/\n  [a-z-]+:\n/)[0];
+    assert.match(body, /\n    environment:\n      name: bot-sync\n      deployment: false\n/, job);
+    assert.match(body, /uses: actions\/create-github-app-token@[0-9a-f]{40} # v/, job);
+    assert.match(body, /private-key: \$\{\{ secrets\.PKGS_SYNC_APP_KEY \}\}/, job);
+    assert.match(body, /permission-contents: write\n +permission-pull-requests: write\n/, job);
+  }
+  // Every step that writes through the App takes the token minted in its own job.
+  const step = name => {
+    const start = prs.indexOf(`- name: ${name}\n`);
+    assert.ok(start > 0, name);
+    const end = prs.indexOf('\n      - name: ', start + 1);
+    return prs.slice(start, end < 0 ? undefined : end);
+  };
+  assert.match(step('Hold an existing reviewed PR as a draft'), /\n +GH_TOKEN: \$\{\{ steps\.app\.outputs\.token \}\}\n/);
+  assert.match(step('Open or update the PR'), /\n +token: \$\{\{ steps\.app\.outputs\.token \}\}\n/);
+  assert.match(step('Close superseded PRs'), /\n +GH_TOKEN: \$\{\{ steps\.app\.outputs\.token \}\}\n/);
+  // Only arming auto-merge still uses the PAT: GitHub merges as whoever armed it.
+  const pat = [...prs.matchAll(/^ +(?:GH_TOKEN|token): \$\{\{ secrets\.PKGS_BOT_TOKEN \}\}$/gm)];
+  assert.equal(pat.length, 1);
+  const before = prs.slice(0, pat[0].index);
+  assert.equal(before.slice(before.lastIndexOf('- name: ')).split('\n')[0], '- name: Enable auto-merge');
   assert.match(prs, /gh pr merge --auto --merge "\$PR"/);
   assert.match(prs, /fail-fast: false/);
   // A reviewed group opens as a draft and is never armed.
