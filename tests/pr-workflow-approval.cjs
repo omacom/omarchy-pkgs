@@ -569,6 +569,28 @@ test('one PR that cannot be armed does not stop the others, and fails the job wi
   }
 });
 
+test('auto-merge acts only when the live state needs it, and withdrawing nothing succeeds', () => {
+  const choose = join(__dirname, '../.github/scripts/auto-merge-action.sh');
+  const cases = [[true, 'true', 'false', 'none'], [false, 'true', 'false', 'enable'],
+    [true, 'false', 'true', 'withdraw'], [false, 'false', 'true', 'none'], [false, 'false', 'false', 'none']];
+  for (const [armed, enable, withdraw, action] of cases) {
+    const f = armFixture({ 7: good({ armed }) });
+    try {
+      const result = f.run(`${choose} 7 ${enable} ${withdraw}`);
+      assert.equal(result.status, 0, result.stderr);
+      assert.equal(result.stdout.trim().split('\n').at(-1), `action=${action}`, JSON.stringify([armed, enable, withdraw]));
+    } finally { f.cleanup(); }
+  }
+  // auto-merge is gone by the time apply runs: withdrawing it is done, not an error.
+  const f = armFixture({ 7: good({ armed: false }) });
+  try {
+    const result = f.run(runBlock('auto-merge-pr.yml', 'Arm or withdraw auto-merge'),
+      { ACTION: 'withdraw', PR: '7', HEAD_SHA: 'a'.repeat(40), METHOD: 'squash' });
+    assert.equal(result.status, 0, result.stdout + result.stderr);
+    assert.deepEqual(f.calls().filter(call => call.startsWith('pr merge')), []);
+  } finally { f.cleanup(); }
+});
+
 // One PR per package, except packages pinned from the same upstream branch,
 // which move in lockstep and so share one.
 const groupsScript = join(__dirname, '../.github/scripts/package-pr-groups.sh');
@@ -751,7 +773,10 @@ test('auto-merge only lands PRs into the default branch', () => {
   assert.match(rc.reason, /targets rc/);
   assert.equal(check(undefined).enable, false);
   const text = readFileSync(join(__dirname, '../.github/workflows/auto-merge-pr.yml'), 'utf8');
-  assert.match(text, /pull_request_target:\n    branches: \[master\]\n/);
+  // Every base triggers the workflow, so a PR moved off master (edited)
+  // loses auto-merge instead of keeping it unseen.
+  assert.match(text, /pull_request_target:\n    types: \[[^\]]*\bedited\b[^\]]*\]\n/);
+  assert.doesNotMatch(text, /pull_request_target:\n    branches:/);
 });
 
 test('auto-merge refuses a PR whose file list the API cut short', () => {
@@ -807,7 +832,7 @@ test('auto-merge is withdrawn when the PR no longer qualifies, and on a failed l
   }
   const text = readFileSync(join(__dirname, '../.github/workflows/auto-merge-pr.yml'), 'utf8');
   assert.match(text, /types: \[opened, reopened, synchronize,/);
-  assert.match(text, /withdraw\) armed && gh pr merge --disable-auto "\$PR"/);
+  assert.match(text, /if armed; then gh pr merge --disable-auto "\$PR"/);
 });
 
 test('auto-merge skips drafts and closed PRs, and arms every bot lane', () => {
@@ -830,17 +855,25 @@ test('auto-merge decides without a write credential and arms with the merge App 
   const decideJob = job('decide');
   assert.match(decideJob, /ref: \$\{\{ github\.event\.repository\.default_branch \}\}/);
   assert.doesNotMatch(decideJob, /environment:|secrets\.(?!GITHUB_TOKEN)|create-github-app-token/);
-  // apply holds the merge App's key, runs only the token action and gh, and
-  // checks out nothing.
+  // apply holds the merge App's key and runs only first-party actions and gh.
+  // It decides again, live, from the event's PR: only the vouch result
+  // crosses from decide, so a stale or tampered decision arms nothing the
+  // rule would not arm now.
   const apply = job('apply');
   assert.match(apply, /^    needs: decide\n    if: \$\{\{ needs\.decide\.outputs\.action == 'enable' \|\| needs\.decide\.outputs\.action == 'withdraw' \}\}\n/);
   assert.match(apply, /\n    environment:\n      name: bot-merge\n      deployment: false\n/);
   assert.match(apply, /private-key: \$\{\{ secrets\.PKGS_MERGE_APP_KEY \}\}/);
   assert.match(apply, /permission-contents: write\n +permission-pull-requests: write\n/);
-  assert.doesNotMatch(apply, /actions\/checkout|mitchellh|github-script/);
+  assert.doesNotMatch(apply, /mitchellh/);
   const uses = [...apply.matchAll(/uses: ([^@\s]+)@/g)].map(match => match[1]);
-  assert.deepEqual(uses, ['actions/create-github-app-token']);
+  assert.deepEqual(uses, ['actions/checkout', 'actions/github-script', 'actions/create-github-app-token']);
+  assert.match(apply, /VOUCH_STATUS: \$\{\{ needs\.decide\.outputs\.vouch \}\}/);
+  assert.doesNotMatch(apply, /needs\.decide\.outputs\.(number|head_sha|method)/);
+  assert.match(apply, /NUMBER: \$\{\{ github\.event\.pull_request\.number \|\| github\.event\.inputs\.pr \}\}/);
+  assert.ok(apply.indexOf('github-script') < apply.indexOf('create-github-app-token'), 'decides before the token exists');
+  assert.match(text, /types: \[opened, reopened, synchronize, ready_for_review, labeled, unlabeled, edited\]/);
   assert.match(apply, /enable\)\n +armed && \{ echo "auto-merge already enabled on #\$PR"; exit 0; \}\n +gh pr merge --auto "--\$METHOD" --match-head-commit "\$HEAD_SHA" "\$PR"/);
+  assert.match(apply, /withdraw\)\n +if armed; then gh pr merge --disable-auto "\$PR"/);
   assert.match(apply, /\[\[ \$METHOD == merge \]\] \|\| METHOD=squash/);
   assert.doesNotMatch(text, /^ +(contents|pull-requests|actions): write$/m);
 });

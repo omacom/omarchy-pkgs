@@ -537,7 +537,9 @@ the PR targets `master`, is open, is not a draft, and changes only packages:
 files under `pkgbuilds/` and new files under `tests/`. Anything touching
 workflows, `test.yml` included, scripts, build tooling or an existing test
 needs a maintainer to merge it. The omarchy-pkgs-merge GitHub App arms it, so
-the merge starts `publish.yml`.
+the merge starts `publish.yml`. Before it writes, the workflow decides again
+from the PR as it is then. A PR that stops qualifying, or moves off `master`,
+loses auto-merge.
 
 - Remove `build-approved` to withdraw the auto-merge it armed for an unknown
   author. Runs it already released keep going.
