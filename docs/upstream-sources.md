@@ -300,9 +300,9 @@ sync once, split the changed recipes into one PR per package with
 `.github/scripts/package-pr-groups.sh`, and hand them to `package-prs.yml`. That
 pushes each PR as the omarchy-pkgs-sync App, so its builds start without an
 approval hold. Its `arm` job then arms auto-merge as the omarchy-pkgs-merge
-App, in a job of its own, since a job has one environment. It arms only the PR
-number and head commit each PR job reported, after it checks that the PR is
-still open, ready, into `master` and from this repository. A push to an `auto/sync-*` or
+App, in a job of its own, since a job has one environment. It finds each
+group's PR from this repository into `master` and judges it by the same rule
+as `auto-merge-pr.yml`, then arms the head it judged. A push to an `auto/sync-*` or
 `auto/track-branches-*` branch does not cancel the PR's build in flight: the new
 build waits, then reuses every artifact the finished one uploaded.
 

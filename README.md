@@ -534,7 +534,8 @@ overridden by the label.
 
 A trusted PR also merges itself. `auto-merge-pr.yml` enables auto-merge when
 the PR targets `master`, is open, is not a draft, and changes only packages:
-files under `pkgbuilds/` and new files under `tests/`. Anything touching
+files under `pkgbuilds/`, new files under `tests/`, and the lines of
+`release/owners.json` that `bin/release-owners` writes. Anything touching
 workflows, `test.yml` included, scripts, build tooling or an existing test
 needs a maintainer to merge it. The omarchy-pkgs-merge GitHub App arms it, so
 the merge starts `publish.yml`. Before it writes, the workflow decides again
@@ -584,6 +585,8 @@ prefixes remain unchanged so existing PRs keep receiving updates. The separate
   current PR check results are counted separately: checks still running (or
   not started yet) are pending, and the sync does not wait for builds.
   Feed-fetch, setup, and missing-result failures still fail the workflow.
+  A sync PR that was not armed, or has no auto-merge result, counts as a
+  failing package update.
   A failed `sync-rebuilds.yml` run also posts to Basecamp.
 - The omarchy-pkgs-sync GitHub App pushes the sync branches and opens,
   updates and closes their PRs, so their builds start without an approval

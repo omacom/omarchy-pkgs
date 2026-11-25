@@ -235,33 +235,6 @@ jobs:
           labels: automated
           draft: ${{ matrix.group.review == true }}
 
-      # The arm job holds the merge App and arms exactly this PR at exactly
-      # this head, so a fork or a later PR on the same branch name is never
-      # armed in its place. A reviewed group never asks.
-      - name: Ask for auto-merge
-        id: ask
-        if: ${{ steps.pr.outcome == 'success' && steps.pr.outputs.pull-request-number != '' && matrix.group.review != true }}
-        env:
-          BRANCH: ${{ matrix.group.branch }}
-          NUMBER: ${{ steps.pr.outputs.pull-request-number }}
-          HEAD_SHA: ${{ steps.pr.outputs.pull-request-head-sha }}
-        run: |
-          mkdir -p "$RUNNER_TEMP/arm"
-          key=$(printf '%s\n' "$BRANCH" | sha256sum | cut -d' ' -f1)
-          echo "key=$key" >> "$GITHUB_OUTPUT"
-          jq -n --arg branch "$BRANCH" --arg number "$NUMBER" --arg head_sha "$HEAD_SHA" \
-            '{branch: $branch, number: $number, head_sha: $head_sha}' > "$RUNNER_TEMP/arm/$key.json"
-
-      - name: Upload the auto-merge request
-        if: ${{ steps.ask.outcome == 'success' }}
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: package-pr-arm-${{ steps.ask.outputs.key }}
-          path: ${{ runner.temp }}/arm/*.json
-          overwrite: true
-          if-no-files-found: error
-          retention-days: 1
-
       # Step outcomes retain failures even when continue-on-error lets the
       # batch finish green. Artifacts preserve every matrix leg's result;
       # a reusable workflow output would retain only the last finisher.
@@ -297,12 +270,17 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
-  # Arms auto-merge on the PRs this run's legs asked for, with the merge App.
-  # Auto-merge, not a direct merge: branch protection still has to see
-  # `result`, `self-tests` and `build-isolation` green. auto-merge-pr.yml may
-  # arm a PR first; either one arming it is the outcome wanted. Each run
-  # re-arms a PR an earlier run left unarmed. A reviewed group stays a draft
-  # and never asks: auto-merge-pr.yml arms it once a maintainer marks it ready.
+  # Arms auto-merge on this run's PRs with the merge App, by the rule
+  # auto-merge-pr.yml uses (.github/scripts/auto-merge-pr.cjs). Auto-merge,
+  # not a direct merge: branch protection still has to see `result`,
+  # `self-tests` and `build-isolation` green. auto-merge-pr.yml may arm a PR
+  # first; either one arming it is the outcome wanted. Each run re-arms a PR
+  # an earlier run left unarmed, and its outcome reaches the sync summary.
+  # A reviewed group stays a draft and is never armed here: auto-merge-pr.yml
+  # arms it once a maintainer marks it ready.
+  #
+  # Nothing from the PR jobs decides what is armed: each group's PR is looked
+  # up and judged again here, from GitHub, with the default branch's code.
   arm:
     needs: pr
     if: ${{ !cancelled() && inputs.groups != '[]' }}
@@ -312,8 +290,39 @@ jobs:
       name: bot-merge
       deployment: false
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+
+      - name: Get a read-only token from the merge App
+        id: read
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ vars.PKGS_MERGE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.PKGS_MERGE_APP_KEY }}
+          permission-contents: read
+          permission-pull-requests: read
+
+      - name: Judge each group's PR
+        id: plan
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          GROUPS_JSON: ${{ inputs.groups }}
+        with:
+          github-token: ${{ steps.read.outputs.token }}
+          script: |
+            const { readFileSync, writeFileSync } = require('fs');
+            const { planArms } = require('./.github/scripts/auto-merge-pr.cjs');
+            const plan = await planArms({ github, context, core,
+              groups: JSON.parse(process.env.GROUPS_JSON),
+              vouched: readFileSync('.github/VOUCHED.td', 'utf8') });
+            writeFileSync(`${process.env.RUNNER_TEMP}/arm-plan.json`, JSON.stringify(plan));
+            core.setOutput('enable', String(plan.some(entry => entry.action === 'enable')));
+
       - name: Get the merge App's token
         id: app
+        if: ${{ steps.plan.outputs.enable == 'true' }}
         uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
         with:
           client-id: ${{ vars.PKGS_MERGE_APP_CLIENT_ID }}
@@ -321,53 +330,44 @@ jobs:
           permission-contents: write
           permission-pull-requests: write
 
-      - name: Fetch the auto-merge requests
-        continue-on-error: true
-        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
-        with:
-          pattern: package-pr-arm-*
-          merge-multiple: true
-          path: ${{ runner.temp }}/arm-requests
-
-      # Each request is checked live before it is armed: still open, not a
-      # draft, into master, from this repository's branch, at the head the leg
-      # pushed. --match-head-commit holds GitHub to that head. A PR that moved
-      # on is skipped; the run that moved it, or auto-merge-pr.yml, arms it.
-      # One PR that cannot be armed does not stop the others. The outcomes go
-      # to the sync summary; without one, a failure fails this job.
+      # --match-head-commit holds GitHub to the head the plan judged. One PR
+      # that cannot be armed does not stop the others, and a failed lookup is
+      # a failure, never "not armed". Anything but success fails this job
+      # when there is no sync summary to report it.
       - name: Arm auto-merge on each PR
         env:
           GH_TOKEN: ${{ steps.app.outputs.token }}
           REPORT: ${{ inputs.report-package-failures }}
         run: |
           mkdir -p "$RUNNER_TEMP/armed"
-          armed() { [[ "$(gh pr view "$1" -R "$GITHUB_REPOSITORY" --json autoMergeRequest --jq '.autoMergeRequest != null')" == true ]]; }
+          rows=$(jq -r '.[] | [.branch, .number, (.action // ""), (.head_sha // ""), (.method // ""), (.outcome // ""), (.reason // "")] | map(tostring | gsub("[\u001f\n]"; " ")) | join("\u001f")' "$RUNNER_TEMP/arm-plan.json")
           outcomes='{}'
           failed=0
-          shopt -s nullglob
-          for request in "$RUNNER_TEMP"/arm-requests/*.json; do
-            IFS=$'\t' read -r branch number sha < <(jq -r '[.branch, .number, .head_sha] | @tsv' "$request")
-            want="OPEN false master $branch $sha $GITHUB_REPOSITORY"
-            if ! [[ $number =~ ^[0-9]+$ && $sha =~ ^[0-9a-f]{40}$ ]]; then
-              echo "::warning::Bad auto-merge request for $branch"
-              outcome=failure
-            elif ! facts=$(gh pr view "$number" -R "$GITHUB_REPOSITORY" --json state,isDraft,baseRefName,headRefName,headRefOid,headRepository,headRepositoryOwner \
-              --jq '"\(.state) \(.isDraft) \(.baseRefName) \(.headRefName) \(.headRefOid) \(.headRepositoryOwner.login)/\(.headRepository.name)"'); then
-              echo "::warning::Could not read #$number ($branch)"
-              outcome=failure
-            elif [[ $facts != "$want" ]]; then
-              echo "#$number is now $facts, not $want: not armed"
-              outcome=skipped
-            elif armed "$number" || gh pr merge --auto --merge --match-head-commit "$sha" "$number" -R "$GITHUB_REPOSITORY" || armed "$number"; then
-              outcome=success
-            else
-              echo "::warning::Could not enable auto-merge on #$number ($branch)"
-              outcome=failure
+          # Fields split on the unit separator, not a tab: bash merges runs of
+          # tabs, which would shift every field after an empty one.
+          while IFS=$'\x1f' read -r branch number action sha method outcome reason; do
+            [[ -n $branch ]] || continue
+            if [[ $action == enable ]]; then
+              [[ $method == merge ]] || method=squash
+              if ! [[ $number =~ ^[1-9][0-9]*$ && $sha =~ ^[0-9a-f]{40}$ ]]; then
+                outcome=failure reason="bad plan entry"
+              elif ! state=$(gh pr view "$number" -R "$GITHUB_REPOSITORY" --json autoMergeRequest --jq '.autoMergeRequest != null'); then
+                outcome=failure reason="could not read auto-merge state"
+              elif [[ $state == true ]] ||
+                gh pr merge --auto "--$method" --match-head-commit "$sha" "$number" -R "$GITHUB_REPOSITORY" ||
+                [[ "$(gh pr view "$number" -R "$GITHUB_REPOSITORY" --json autoMergeRequest --jq '.autoMergeRequest != null' || true)" == true ]]; then
+                outcome=success reason=""
+              else
+                outcome=failure reason="gh pr merge failed"
+              fi
             fi
-            [[ $outcome == failure ]] && failed=1
-            outcomes=$(jq -c --arg branch "$branch" --arg number "$number" --arg outcome "$outcome" \
-              '. + {($branch): {number: $number, outcome: $outcome}}' <<<"$outcomes")
-          done
+            if [[ $outcome != success ]]; then
+              failed=1
+              echo "::warning::Could not enable auto-merge on #$number ($branch): $outcome, $reason"
+            fi
+            outcomes=$(jq -c --arg branch "$branch" --arg number "$number" --arg outcome "$outcome" --arg reason "$reason" \
+              '. + {($branch): {number: $number, outcome: $outcome, reason: $reason}}' <<<"$outcomes")
+          done <<<"$rows"
           printf '%s\n' "$outcomes" > "$RUNNER_TEMP/armed/armed.outcomes"
           if [[ $failed == 1 && $REPORT != true ]]; then exit 1; fi
 

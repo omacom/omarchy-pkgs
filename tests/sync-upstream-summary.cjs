@@ -157,6 +157,25 @@ test("an outcome for another PR on the same branch does not count", async t => {
   assert.match(result.content, /Auto-merge result missing/);
 });
 
+test("a PR the rule refused or that closed fails with its reason, and an outcome without one is missing", async t => {
+  const f = fixture(t, 3);
+  await f.invoke();
+  writeFileSync(join(f.resultsPath, 'armed.outcomes'), JSON.stringify({
+    [f.groups[0].branch]: { number: f.results[0].number, outcome: 'refused', reason: 'PR is a draft' },
+    [f.groups[1].branch]: { number: f.results[1].number, outcome: 'closed', reason: 'PR is closed' },
+    [f.groups[2].branch]: { number: f.results[2].number },
+  }));
+  const result = await summarize({
+    github: f.github, context: { repo: { owner: 'omacom', repo: 'omarchy-pkgs' }, runId: 1 },
+    core: { warning() {}, setFailed() {}, setOutput() {}, summary: { addRaw: () => ({ write: async () => {} }) } },
+    groups: f.groups, resultsPath: f.resultsPath, syncResult: 'success', prsResult: 'success',
+  });
+  assert.equal(result.updates.failing, 3);
+  assert.match(result.content, /Auto-merge refused: PR is a draft/);
+  assert.match(result.content, /PR was closed before auto-merge/);
+  assert.match(result.content, /Auto-merge result missing/);
+});
+
 test("a reviewed group needs no auto-merge outcome", async t => {
   const f = fixture(t, 1);
   Object.assign(f.groups[0], { review: true });

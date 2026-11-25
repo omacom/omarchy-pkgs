@@ -23,8 +23,14 @@ function updateFailure(result) {
   if (result.token === 'failure') return 'Could not get the sync App token';
   if (result.hold === 'failure') return 'Could not turn the reviewed PR back into a draft';
   if (result.pr !== 'success') return 'Could not push or update the PR';
-  if (result.merge === 'missing') return 'Auto-merge result missing';
-  if (!['success', 'skipped', undefined].includes(result.merge)) return 'Could not enable auto-merge';
+  if (!result.armable) return '';
+  switch (result.merge) {
+    case 'success': return '';
+    case 'missing': return 'Auto-merge result missing';
+    case 'refused': return `Auto-merge refused: ${result.mergeReason || 'no reason given'}`;
+    case 'closed': return 'PR was closed before auto-merge';
+    default: return 'Could not enable auto-merge';
+  }
   return '';
 }
 
@@ -97,7 +103,8 @@ module.exports = async function summarize({ github, context, core, groups,
   for (const result of results) {
     if (!result || result.pr !== 'success' || !result.number || result.review === true) continue;
     const outcome = armed[result.branch];
-    result.merge = outcome && String(outcome.number) === String(result.number) ? outcome.outcome : 'missing';
+    const mine = outcome && String(outcome.number) === String(result.number) && typeof outcome.outcome === 'string';
+    Object.assign(result, { armable: true, merge: mine ? outcome.outcome : 'missing', mergeReason: mine ? outcome.reason : '' });
   }
 
   const updates = { passing: 0, failing: 0, unknown: 0 };

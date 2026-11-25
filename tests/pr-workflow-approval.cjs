@@ -444,16 +444,18 @@ test('every bot lane opens its PRs per package through package-prs.yml', () => {
   assert.match(arm, /\n    environment:\n      name: bot-merge\n      deployment: false\n/);
   assert.match(arm, /private-key: \$\{\{ secrets\.PKGS_MERGE_APP_KEY \}\}/);
   assert.match(arm, /client-id: \$\{\{ vars\.PKGS_MERGE_APP_CLIENT_ID \}\}/);
-  assert.match(arm, /permission-contents: write\n +permission-pull-requests: write\n/);
-  assert.doesNotMatch(arm, /actions\/checkout|PKGS_SYNC_APP_KEY|python3|git apply/);
-  assert.match(arm, /gh pr merge --auto --merge --match-head-commit "\$sha" "\$number"/);
-  // Each leg asks for its own PR at its own head; a reviewed group never asks.
-  const ask = step('Ask for auto-merge');
-  assert.match(ask, /if: \$\{\{ steps\.pr\.outcome == 'success' && steps\.pr\.outputs\.pull-request-number != '' && matrix\.group\.review != true \}\}/);
-  assert.match(ask, /HEAD_SHA: \$\{\{ steps\.pr\.outputs\.pull-request-head-sha \}\}/);
-  assert.match(prs, /name: package-pr-arm-\$\{\{ steps\.ask\.outputs\.key \}\}/);
-  assert.match(arm, /pattern: package-pr-arm-\*/);
+  assert.match(arm, /permission-contents: read\n +permission-pull-requests: read\n/);
+  assert.match(arm, /if: \$\{\{ steps\.plan\.outputs\.enable == 'true' \}\}\n[^\n]+create-github-app-token@[^\n]+\n[^\n]+\n[^\n]+\n[^\n]+\n +permission-contents: write\n +permission-pull-requests: write\n/);
+  assert.doesNotMatch(arm, /PKGS_SYNC_APP_KEY|python3|git apply|download-artifact/);
+  assert.match(arm, /ref: \$\{\{ github\.event\.repository\.default_branch \}\}/);
+  assert.match(arm, /planArms\(/);
+  assert.match(arm, /gh pr merge --auto "--\$method" --match-head-commit "\$sha" "\$number"/);
   assert.match(arm, /REPORT: \$\{\{ inputs\.report-package-failures \}\}/);
+  // The PR jobs hand the arm job nothing: it finds and judges each PR itself.
+  const uses = [...arm.matchAll(/uses: ([^@\s]+)@/g)].map(match => match[1]);
+  assert.deepEqual(uses, ['actions/checkout', 'actions/create-github-app-token', 'actions/github-script',
+    'actions/create-github-app-token', 'actions/upload-artifact']);
+  assert.doesNotMatch(prs, /package-pr-arm|pull-request-head-sha/);
   assert.match(prs, /\n      PKGS_MERGE_APP_KEY:\n        required: true\n/);
   assert.match(prs, /fail-fast: false/);
   assert.match(prs, /draft: \$\{\{ matrix\.group\.review == true \}\}/);
@@ -483,9 +485,10 @@ function runBlock(file, step) {
   return body.join('\n');
 }
 
-// A fake gh for the merge App's steps: PR facts from a JSON file, every call
-// logged, and gh pr merge arming the PR unless it is listed as failing.
-function armFixture(prs, { failMerge = [], failView = [] } = {}) {
+// A fake gh for the merge App's steps: each PR's auto-merge state in a JSON
+// file, every call logged, gh pr merge arming the PR unless it is listed as
+// failing, and gh pr view failing for the PRs listed.
+function armFixture(prs, { failMerge = [], failView = [], failDisable = [] } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'arm-'));
   const bin = join(dir, 'bin');
   mkdirSync(bin);
@@ -495,100 +498,132 @@ function armFixture(prs, { failMerge = [], failView = [] } = {}) {
 const fs = require('fs');
 fs.appendFileSync(${JSON.stringify(join(dir, 'calls'))}, process.argv.slice(2).join(' ') + '\\n');
 const prs = JSON.parse(fs.readFileSync(${JSON.stringify(state)}, 'utf8'));
-const [cmd, sub, number] = process.argv.slice(2);
-const pr = prs[number];
-if (${JSON.stringify(failView)}.includes(number) && sub === 'view') process.exit(1);
-if (cmd === 'pr' && sub === 'view') {
-  const jq = process.argv[process.argv.indexOf('--jq') + 1];
-  if (jq.includes('autoMergeRequest')) { console.log(pr.armed ? 'true' : 'false'); process.exit(0); }
-  console.log([pr.state, pr.isDraft, pr.base, pr.head, pr.sha, pr.repo].join(' '));
-} else if (cmd === 'pr' && sub === 'merge') {
-  const n = process.argv.slice(2).find(a => /^[0-9]+$/.test(a));
-  if (process.argv.includes('--disable-auto')) { prs[n].armed = false; }
-  else if (${JSON.stringify(failMerge)}.includes(n)) process.exit(1);
+const args = process.argv.slice(2);
+const n = args.find(a => /^[0-9]+$/.test(a));
+if (args[0] === 'pr' && args[1] === 'view') {
+  if (${JSON.stringify(failView)}.includes(n)) process.exit(1);
+  console.log(prs[n].armed ? 'true' : 'false');
+} else if (args[0] === 'pr' && args[1] === 'merge') {
+  if (args.includes('--disable-auto')) {
+    if (${JSON.stringify(failDisable)}.includes(n)) process.exit(1);
+    prs[n].armed = false;
+  } else if (${JSON.stringify(failMerge)}.includes(n)) process.exit(1);
   else prs[n].armed = true;
   fs.writeFileSync(${JSON.stringify(state)}, JSON.stringify(prs));
 }
 `, { mode: 0o755 });
-  const requests = join(dir, 'arm-requests');
-  mkdirSync(requests);
-  const request = (branch, number, head_sha) =>
-    writeFileSync(join(requests, `${branch.replace(/\W/g, '_')}.json`), JSON.stringify({ branch, number, head_sha }));
+  const plan = entries => writeFileSync(join(dir, 'arm-plan.json'), JSON.stringify(entries));
   const run = (script, env = {}) => spawnSync('bash', ['-eo', 'pipefail', '-c', script], {
     encoding: 'utf8',
     env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, RUNNER_TEMP: dir, GITHUB_REPOSITORY: 'omacom/omarchy-pkgs', ...env },
   });
   const calls = () => { try { return readFileSync(join(dir, 'calls'), 'utf8').trim().split('\n'); } catch { return []; } };
   const outcomes = () => JSON.parse(readFileSync(join(dir, 'armed/armed.outcomes'), 'utf8'));
-  return { request, run, calls, outcomes, cleanup: () => rmSync(dir, { recursive: true, force: true }) };
+  return { plan, run, calls, outcomes, cleanup: () => rmSync(dir, { recursive: true, force: true }) };
 }
 
-const good = (overrides = {}) => ({ state: 'OPEN', isDraft: false, base: 'master', head: 'auto/sync-upstream-a',
-  sha: 'a'.repeat(40), repo: 'omacom/omarchy-pkgs', armed: false, ...overrides });
+const sha = c => c.repeat(40);
+const enable = (branch, number, head, method = 'merge') => ({ branch, number, action: 'enable', head_sha: sha(head), method });
 
-test('the arm job arms exactly the PR and head each leg reported, and nothing else', () => {
-  const f = armFixture({
-    101: good(),
-    102: good({ head: 'auto/sync-upstream-b', sha: 'b'.repeat(40), base: 'rc' }),
-    103: good({ head: 'auto/sync-upstream-c', sha: 'c'.repeat(40), repo: 'someone/omarchy-pkgs' }),
-    104: good({ head: 'auto/sync-upstream-d', sha: 'e'.repeat(40) }),
-    105: good({ head: 'auto/sync-upstream-e', sha: 'f'.repeat(40), isDraft: true }),
-  });
+test('the arm job arms what the plan judged, at the judged head, and reports the rest', () => {
+  const f = armFixture({ 101: {}, 102: { armed: true }, 103: {}, 104: {} });
   try {
-    f.request('auto/sync-upstream-a', '101', 'a'.repeat(40));
-    f.request('auto/sync-upstream-b', '102', 'b'.repeat(40));
-    f.request('auto/sync-upstream-c', '103', 'c'.repeat(40));
-    f.request('auto/sync-upstream-d', '104', 'd'.repeat(40)); // its head moved on
-    f.request('auto/sync-upstream-e', '105', 'f'.repeat(40));
+    f.plan([
+      enable('auto/sync-upstream-a', '101', 'a'),
+      enable('auto/sync-upstream-b', '102', 'b'),
+      { branch: 'auto/sync-upstream-c', number: '103', outcome: 'refused', reason: 'PR is a draft' },
+      { branch: 'auto/sync-upstream-d', number: '104', outcome: 'success', reason: 'already merged' },
+    ]);
     const result = f.run(runBlock('package-prs.yml', 'Arm auto-merge on each PR'), { REPORT: 'true' });
     assert.equal(result.status, 0, result.stdout + result.stderr);
     const merges = f.calls().filter(call => call.startsWith('pr merge'));
-    assert.deepEqual(merges, [`pr merge --auto --merge --match-head-commit ${'a'.repeat(40)} 101 -R omacom/omarchy-pkgs`]);
-    const outcomes = f.outcomes();
-    assert.deepEqual(outcomes['auto/sync-upstream-a'], { number: '101', outcome: 'success' });
-    for (const branch of ['b', 'c', 'd', 'e']) assert.equal(outcomes[`auto/sync-upstream-${branch}`].outcome, 'skipped', branch);
+    assert.deepEqual(merges, [`pr merge --auto --merge --match-head-commit ${sha('a')} 101 -R omacom/omarchy-pkgs`]);
+    assert.deepEqual(f.outcomes(), {
+      'auto/sync-upstream-a': { number: '101', outcome: 'success', reason: '' },
+      'auto/sync-upstream-b': { number: '102', outcome: 'success', reason: '' },
+      'auto/sync-upstream-c': { number: '103', outcome: 'refused', reason: 'PR is a draft' },
+      'auto/sync-upstream-d': { number: '104', outcome: 'success', reason: 'already merged' },
+    });
+    assert.match(result.stdout, /::warning::Could not enable auto-merge on #103 \(auto\/sync-upstream-c\): refused, PR is a draft/);
   } finally { f.cleanup(); }
 });
 
 test('one PR that cannot be armed does not stop the others, and fails the job without a report', () => {
   for (const report of ['true', 'false']) {
-    const f = armFixture({ 101: good(), 102: good({ head: 'auto/sync-upstream-b', sha: 'b'.repeat(40) }),
-      103: good({ head: 'auto/sync-upstream-c', sha: 'c'.repeat(40) }) }, { failMerge: ['101'], failView: ['102'] });
+    const f = armFixture({ 101: {}, 102: {}, 103: {}, 104: {} }, { failMerge: ['101'], failView: ['102'] });
     try {
-      f.request('auto/sync-upstream-a', '101', 'a'.repeat(40));
-      f.request('auto/sync-upstream-b', '102', 'b'.repeat(40));
-      f.request('auto/sync-upstream-c', '103', 'c'.repeat(40));
+      f.plan([
+        enable('auto/sync-upstream-a', '101', 'a'),
+        enable('auto/sync-upstream-b', '102', 'b'),
+        enable('auto/sync-upstream-e', '104', 'g'), // not a SHA
+        enable('auto/sync-upstream-c', '103', 'c'),
+      ]);
       const result = f.run(runBlock('package-prs.yml', 'Arm auto-merge on each PR'), { REPORT: report });
       assert.equal(result.status, report === 'true' ? 0 : 1, report + result.stdout + result.stderr);
       const outcomes = f.outcomes();
-      assert.equal(outcomes['auto/sync-upstream-a'].outcome, 'failure');
-      assert.equal(outcomes['auto/sync-upstream-b'].outcome, 'failure');
-      assert.equal(outcomes['auto/sync-upstream-c'].outcome, 'success');
-      assert.match(result.stdout, /::warning::Could not enable auto-merge on #101/);
+      assert.deepEqual(Object.fromEntries(Object.entries(outcomes).map(([b, o]) => [b, o.outcome])), {
+        'auto/sync-upstream-a': 'failure', 'auto/sync-upstream-b': 'failure',
+        'auto/sync-upstream-e': 'failure', 'auto/sync-upstream-c': 'success',
+      });
+      assert.equal(outcomes['auto/sync-upstream-b'].reason, 'could not read auto-merge state');
+      assert.equal(outcomes['auto/sync-upstream-e'].reason, 'bad plan entry');
+      assert.ok(!f.calls().some(call => call.includes(' 104 ')), 'a bad entry calls nothing');
     } finally { f.cleanup(); }
   }
 });
 
-test('auto-merge acts only when the live state needs it, and withdrawing nothing succeeds', () => {
+test('an empty plan arms nothing and passes', () => {
+  const f = armFixture({});
+  try {
+    f.plan([]);
+    const result = f.run(runBlock('package-prs.yml', 'Arm auto-merge on each PR'), { REPORT: 'false' });
+    assert.equal(result.status, 0, result.stdout + result.stderr);
+    assert.deepEqual(f.outcomes(), {});
+    assert.deepEqual(f.calls(), []);
+  } finally { f.cleanup(); }
+});
+
+test('auto-merge acts only when the live state needs it, and a failed lookup is never "not armed"', () => {
   const choose = join(__dirname, '../.github/scripts/auto-merge-action.sh');
   const cases = [[true, 'true', 'false', 'none'], [false, 'true', 'false', 'enable'],
     [true, 'false', 'true', 'withdraw'], [false, 'false', 'true', 'none'], [false, 'false', 'false', 'none']];
-  for (const [armed, enable, withdraw, action] of cases) {
-    const f = armFixture({ 7: good({ armed }) });
+  for (const [armed, on, off, action] of cases) {
+    const f = armFixture({ 7: { armed } });
     try {
-      const result = f.run(`${choose} 7 ${enable} ${withdraw}`);
+      const result = f.run(`${choose} 7 ${on} ${off}`);
       assert.equal(result.status, 0, result.stderr);
-      assert.equal(result.stdout.trim().split('\n').at(-1), `action=${action}`, JSON.stringify([armed, enable, withdraw]));
+      assert.equal(result.stdout.trim().split('\n').at(-1), `action=${action}`, JSON.stringify([armed, on, off]));
     } finally { f.cleanup(); }
   }
-  // auto-merge is gone by the time apply runs: withdrawing it is done, not an error.
-  const f = armFixture({ 7: good({ armed: false }) });
-  try {
-    const result = f.run(runBlock('auto-merge-pr.yml', 'Arm or withdraw auto-merge'),
-      { ACTION: 'withdraw', PR: '7', HEAD_SHA: 'a'.repeat(40), METHOD: 'squash' });
-    assert.equal(result.status, 0, result.stdout + result.stderr);
-    assert.deepEqual(f.calls().filter(call => call.startsWith('pr merge')), []);
-  } finally { f.cleanup(); }
+  const apply = runBlock('auto-merge-pr.yml', 'Arm or withdraw auto-merge');
+  const env = { PR: '7', HEAD_SHA: sha('a'), METHOD: 'squash' };
+  const scenarios = [
+    // [state, options, action, exit status, what gh pr merge was asked]
+    [false, {}, 'withdraw', 0, []], // already gone: done
+    [true, {}, 'withdraw', 0, ['pr merge --disable-auto 7 -R omacom/omarchy-pkgs']],
+    [true, { failDisable: ['7'] }, 'withdraw', 1, ['pr merge --disable-auto 7 -R omacom/omarchy-pkgs']],
+    [true, { failView: ['7'] }, 'withdraw', 1, []],
+    [false, { failView: ['7'] }, 'enable', 1, []],
+    [false, {}, 'enable', 0, [`pr merge --auto --squash --match-head-commit ${sha('a')} 7 -R omacom/omarchy-pkgs`]],
+    [false, { failMerge: ['7'] }, 'enable', 1, [`pr merge --auto --squash --match-head-commit ${sha('a')} 7 -R omacom/omarchy-pkgs`]],
+  ];
+  for (const [armed, options, action, status, merges] of scenarios) {
+    const f = armFixture({ 7: { armed } }, options);
+    try {
+      const result = f.run(apply, { ...env, ACTION: action });
+      const label = JSON.stringify([armed, options, action]);
+      assert.equal(result.status, status, label + result.stdout + result.stderr);
+      assert.deepEqual(f.calls().filter(call => call.startsWith('pr merge')), merges, label);
+    } finally { f.cleanup(); }
+  }
+  for (const bad of ['1e2', '0x10', '07', 'auto/sync-upstream-a', '']) {
+    const f = armFixture({});
+    try {
+      assert.notEqual(f.run(`${choose} '${bad}' true false`).status, 0, bad);
+      assert.notEqual(f.run(apply, { ...env, PR: bad, ACTION: 'enable' }).status, 0, bad);
+      assert.deepEqual(f.calls(), [], bad);
+    } finally { f.cleanup(); }
+  }
 });
 
 // One PR per package, except packages pinned from the same upstream branch,
@@ -832,7 +867,7 @@ test('auto-merge is withdrawn when the PR no longer qualifies, and on a failed l
   }
   const text = readFileSync(join(__dirname, '../.github/workflows/auto-merge-pr.yml'), 'utf8');
   assert.match(text, /types: \[opened, reopened, synchronize,/);
-  assert.match(text, /if armed; then gh pr merge --disable-auto "\$PR"/);
+  assert.match(text, /gh pr merge --disable-auto "\$PR" -R "\$GITHUB_REPOSITORY" \|\| \[\[ "\$\(armed\)" == false \]\]/);
 });
 
 test('auto-merge skips drafts and closed PRs, and arms every bot lane', () => {
@@ -850,15 +885,19 @@ test('auto-merge decides without a write credential and arms with the merge App 
   const job = name => text.split(new RegExp(`\\n  ${name}:\\n`))[1].split(/\n  [a-z-]+:\n/)[0];
   assert.match(text, /pull_request_target:/);
   assert.doesNotMatch(text, /PKGS_BOT_TOKEN|head\.sha \}\}|head\.ref \}\}|refs\/pull\//);
-  // decide runs third-party actions (vouch installs Nushell), so it holds no
-  // environment and no secret, and checks out only the default branch.
+  // Nothing third-party runs here: the vouch action installs an unpinned
+  // Nushell, and author trust is read by auto-merge-pr.cjs instead.
+  assert.doesNotMatch(text, /mitchellh|setup-nu/);
+  // decide holds no environment and no secret, and checks out only the
+  // default branch.
   const decideJob = job('decide');
   assert.match(decideJob, /ref: \$\{\{ github\.event\.repository\.default_branch \}\}/);
   assert.doesNotMatch(decideJob, /environment:|secrets\.(?!GITHUB_TOKEN)|create-github-app-token/);
+  assert.match(decideJob, /\n    outputs:\n      action: \$\{\{ steps\.action\.outputs\.action \}\}\n    steps:/);
   // apply holds the merge App's key and runs only first-party actions and gh.
-  // It decides again, live, from the event's PR: only the vouch result
-  // crosses from decide, so a stale or tampered decision arms nothing the
-  // rule would not arm now.
+  // It decides again, live, from the event's PR, author trust included:
+  // nothing but the action crosses from decide, so a stale decision arms
+  // nothing the rule would not arm now.
   const apply = job('apply');
   assert.match(apply, /^    needs: decide\n    if: \$\{\{ needs\.decide\.outputs\.action == 'enable' \|\| needs\.decide\.outputs\.action == 'withdraw' \}\}\n/);
   assert.match(apply, /\n    environment:\n      name: bot-merge\n      deployment: false\n/);
@@ -867,13 +906,117 @@ test('auto-merge decides without a write credential and arms with the merge App 
   assert.doesNotMatch(apply, /mitchellh/);
   const uses = [...apply.matchAll(/uses: ([^@\s]+)@/g)].map(match => match[1]);
   assert.deepEqual(uses, ['actions/checkout', 'actions/github-script', 'actions/create-github-app-token']);
-  assert.match(apply, /VOUCH_STATUS: \$\{\{ needs\.decide\.outputs\.vouch \}\}/);
-  assert.doesNotMatch(apply, /needs\.decide\.outputs\.(number|head_sha|method)/);
+  assert.doesNotMatch(apply, /needs\.decide\.outputs\.(?!action)/);
+  assert.match(apply, /vouched: readFileSync\('\.github\/VOUCHED\.td', 'utf8'\)/);
   assert.match(apply, /NUMBER: \$\{\{ github\.event\.pull_request\.number \|\| github\.event\.inputs\.pr \}\}/);
   assert.ok(apply.indexOf('github-script') < apply.indexOf('create-github-app-token'), 'decides before the token exists');
   assert.match(text, /types: \[opened, reopened, synchronize, ready_for_review, labeled, unlabeled, edited\]/);
-  assert.match(apply, /enable\)\n +armed && \{ echo "auto-merge already enabled on #\$PR"; exit 0; \}\n +gh pr merge --auto "--\$METHOD" --match-head-commit "\$HEAD_SHA" "\$PR"/);
-  assert.match(apply, /withdraw\)\n +if armed; then gh pr merge --disable-auto "\$PR"/);
+  assert.match(apply, /gh pr merge --auto "--\$METHOD" --match-head-commit "\$HEAD_SHA" "\$PR"/);
+  assert.match(apply, /PR: \$\{\{ steps\.decide\.outputs\.number \}\}/);
   assert.match(apply, /\[\[ \$METHOD == merge \]\] \|\| METHOD=squash/);
   assert.doesNotMatch(text, /^ +(contents|pull-requests|actions): write$/m);
+});
+
+const { vouchedStatus, authorStatus, prNumber, planArms } = require('../.github/scripts/auto-merge-pr.cjs');
+
+// The vouch action's rule, mitchellh/vouch v1.5.0 (vouch/lib.nu check-user):
+// the first entry for the user decides, ignoring case; a bare name counts for
+// every platform; another platform's entry does not count.
+test('VOUCHED.td is read as the vouch action reads it', () => {
+  const file = [
+    '# Trust list', '', 'github:Alice', '-github:mallory spam', 'bob', 'gitlab:carol',
+    '-github:dave first', 'github:dave later', '  github:erin  # indented with a comment',
+  ].join('\n');
+  const cases = { alice: 'vouched', ALICE: 'vouched', mallory: 'denounced', bob: 'vouched', carol: 'unknown',
+    dave: 'denounced', erin: 'vouched', frank: 'unknown', 'github:alice': 'unknown' };
+  for (const [login, status] of Object.entries(cases)) assert.equal(vouchedStatus(file, login), status, login);
+  // The repository's own file parses: its first entry is vouched.
+  const real = readFileSync(join(__dirname, '../.github/VOUCHED.td'), 'utf8');
+  const first = real.split('\n').find(line => /^github:/.test(line)).slice('github:'.length);
+  assert.equal(vouchedStatus(real, first), 'vouched');
+});
+
+test('author trust: bots, then write access, then VOUCHED.td, as vouch decides it', async () => {
+  const github = permissions => ({ rest: { repos: { getCollaboratorPermissionLevel: async ({ username }) => {
+    if (!(username in permissions)) throw new Error('404');
+    return { data: { permission: permissions[username] } };
+  } } } });
+  const context = { repo: { owner: 'omacom', repo: 'omarchy-pkgs' } };
+  const vouched = 'github:vic\n-github:den\n';
+  const status = (login, permissions = {}) => authorStatus({ github: github(permissions), context, login, vouched });
+  assert.equal(await status('omarchy-pkgs-sync[bot]'), 'bot');
+  assert.equal(await status('ann', { ann: 'admin' }), 'collaborator');
+  assert.equal(await status('wes', { wes: 'write' }), 'collaborator');
+  assert.equal(await status('rea', { rea: 'read' }), 'unknown');
+  assert.equal(await status('vic'), 'vouched');
+  assert.equal(await status('den'), 'denounced');
+  assert.equal(await status('den', { den: 'write' }), 'collaborator', 'vouch checks access before the file');
+});
+
+test('a PR number is taken only as a person types it', () => {
+  assert.equal(prNumber('3562'), 3562);
+  assert.equal(prNumber(3562), 3562);
+  for (const bad of ['1e2', '0x10', '07', ' 7', '7 ', '', undefined, '-1', '1.0', 'auto/sync-upstream-a']) {
+    assert.throws(() => prNumber(bad), /not a PR number/, String(bad));
+  }
+});
+
+// A fake GitHub for planArms: PRs by number, found by owner:branch and base.
+function fakeGitHub(prs) {
+  const calls = [];
+  const rest = {
+    repos: {
+      get: async () => ({ data: { default_branch: 'master' } }),
+      getCollaboratorPermissionLevel: async () => { throw new Error('404'); },
+    },
+    pulls: {
+      list: async query => {
+        calls.push(query);
+        const [owner, branch] = query.head.split(':');
+        return { data: Object.values(prs).filter(pr => pr.head.repo.owner.login === owner && pr.head.ref === branch
+          && pr.base.ref === query.base).sort((a, b) => b.number - a.number).slice(0, query.per_page) };
+      },
+      get: async ({ pull_number }) => ({ data: prs[pull_number] }),
+      listFiles: async () => {},
+    },
+  };
+  return { calls, github: { rest, paginate: async (fn, { pull_number }) => prs[pull_number].files } };
+}
+
+test('the arm plan judges each group PR by the auto-merge rule and never a fork or reviewed group', async () => {
+  const pr = (number, branch, overrides = {}) => ({
+    number, state: 'open', draft: false, merged_at: null, labels: [], user: { login: 'omarchy-pkgs-sync[bot]' },
+    head: { ref: branch, sha: String(number % 10).repeat(40), repo: { full_name: 'omacom/omarchy-pkgs', owner: { login: 'omacom' } } },
+    base: { ref: 'master', sha: 'b'.repeat(40), repo: { default_branch: 'master' } },
+    changed_files: 1, files: [{ filename: `pkgbuilds/${branch.split('-').pop()}/PKGBUILD`, status: 'modified' }],
+    ...overrides,
+  });
+  const { github, calls } = fakeGitHub({
+    1: pr(1, 'auto/sync-upstream-a'),
+    2: pr(2, 'auto/sync-upstream-b', { files: [{ filename: '.github/workflows/publish.yml', status: 'modified' }] }),
+    3: pr(3, 'auto/sync-upstream-c', { merged_at: '2026-11-26T00:00:00Z', state: 'closed' }),
+    4: pr(4, 'auto/sync-upstream-d', { state: 'closed' }),
+    5: pr(5, 'auto/sync-upstream-e', { head: { ref: 'auto/sync-upstream-e', sha: 'f'.repeat(40),
+      repo: { full_name: 'mallory/omarchy-pkgs', owner: { login: 'mallory' } } } }),
+    6: pr(6, 'auto/sync-upstream-f', { draft: true }),
+    7: pr(7, 'auto/sync-upstream-g'),
+  });
+  const groups = ['a', 'b', 'c', 'd', 'e', 'f'].map(x => ({ branch: `auto/sync-upstream-${x}` }))
+    .concat([{ branch: 'auto/sync-upstream-g', review: true }]);
+  const context = { repo: { owner: 'omacom', repo: 'omarchy-pkgs' } };
+  const plan = await planArms({ github, context, core: { info() {} }, groups, vouched: '' });
+  const brief = plan.map(({ branch, number, action, outcome, head_sha, method }) =>
+    [branch.slice(-1), number, action || outcome, head_sha && head_sha[0], method]);
+  assert.deepEqual(brief, [
+    ['a', '1', 'enable', '1', 'merge'],
+    ['b', '2', 'refused', undefined, undefined],
+    ['c', '3', 'success', undefined, undefined],
+    ['d', '4', 'closed', undefined, undefined],
+    ['f', '6', 'refused', undefined, undefined],
+  ]);
+  assert.match(plan[1].reason, /changes more than packages/);
+  assert.equal(plan[4].reason, 'PR is a draft');
+  // Looked up by this repository's branch into the default branch; the
+  // reviewed group is not looked up at all.
+  assert.deepEqual(calls.map(call => [call.head, call.base]), groups.slice(0, 6).map(g => [`omacom:${g.branch}`, 'master']));
 });

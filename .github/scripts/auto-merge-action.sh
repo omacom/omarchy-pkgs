@@ -5,13 +5,17 @@
 # needs, from the PR's live auto-merge state: enable on a PR that qualifies
 # and is not armed, withdraw from one that no longer qualifies and is armed,
 # otherwise none. Prints action=<enable|withdraw|none> last, and appends it to
-# $GITHUB_OUTPUT when set. Needs GH_TOKEN and GITHUB_REPOSITORY.
+# $GITHUB_OUTPUT when set. A failed lookup fails the script, so it never
+# reads as "not armed". Needs GH_TOKEN and GITHUB_REPOSITORY.
 set -euo pipefail
 
 pr=${1:?PR required}
 enable=${2:?ENABLE required}
 withdraw=${3:?WITHDRAW required}
 repo=${GITHUB_REPOSITORY:?GITHUB_REPOSITORY required}
+# Only a PR number exactly as a person types it: gh reads anything else as a
+# branch name.
+[[ $pr =~ ^[1-9][0-9]*$ ]] || { echo "auto-merge-action.sh: not a PR number: $pr" >&2; exit 2; }
 
 armed=$(gh pr view "$pr" -R "$repo" --json autoMergeRequest --jq '.autoMergeRequest != null')
 action=none
