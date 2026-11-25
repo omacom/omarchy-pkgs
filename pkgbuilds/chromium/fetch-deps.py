@@ -3,7 +3,10 @@
 # way gclient would. A Cloud Storage archive is checked against the hash DEPS
 # records; a CIPD package against the SHA-256 that CIPD resolves its version to.
 #
-# Usage: fetch-deps.py <chromium source dir> <path under the source dir>...
+# Usage: fetch-deps.py [--target-cpu <cpu>] <chromium source dir> <path>...
+#
+# The host is always Linux x64. --target-cpu adds a CPU the build targets, as
+# target_cpu in .gclient does, so DEPS entries for it (an arm64 sysroot) apply.
 
 import hashlib
 import json
@@ -20,8 +23,10 @@ HOST = {"host_os": "linux", "host_cpu": "x64", "checkout_linux": True, "checkout
 class Checkout(dict):
     """What a DEPS condition can name: this host, then the file's own vars."""
 
-    def __init__(self, declared):
+    def __init__(self, declared, target_cpus):
         super().__init__(HOST)
+        for cpu in target_cpus:
+            self[f"checkout_{cpu}"] = True
         self.declared = declared
 
     def __missing__(self, name):
@@ -90,12 +95,12 @@ def fetch_cipd(package, version, dest):
     subprocess.run(["rm", "-rf", os.path.join(dest, ".cipdpkg")], check=True)
 
 
-def main(src, paths):
+def main(src, paths, target_cpus):
     # DEPS is Python by design, with these two helpers supplied by its reader.
     scope = {"Var": lambda name: "", "Str": str}
     with open(os.path.join(src, "DEPS")) as deps:
         exec(deps.read(), scope)
-    checkout = Checkout(scope.get("vars", {}))
+    checkout = Checkout(scope.get("vars", {}), target_cpus)
 
     def applies(entry):
         return bool(eval(entry.get("condition", "True"), {"__builtins__": {}}, checkout))
@@ -103,7 +108,7 @@ def main(src, paths):
     for path in paths:
         dep = scope["deps"].get("src/" + path)
         if not isinstance(dep, dict) or dep.get("dep_type") not in ("gcs", "cipd") or not applies(dep):
-            sys.exit(f"{path}: DEPS pins no archive to fetch for a Linux x86_64 host")
+            sys.exit(f"{path}: DEPS pins no archive to fetch for this checkout")
 
         dest = os.path.join(src, path)
         os.makedirs(dest, exist_ok=True)
@@ -124,10 +129,15 @@ def main(src, paths):
                 else:
                     print(f"{path}: skipping {obj['object_name']} ({obj['condition']})", flush=True)
         if not fetched:
-            sys.exit(f"{path}: DEPS pins no archive to fetch for a Linux x86_64 host")
+            sys.exit(f"{path}: DEPS pins no archive to fetch for this checkout")
 
 
 if __name__ == "__main__":
-    if len(sys.argv) < 3:
-        sys.exit("usage: fetch-deps.py <chromium source dir> <path under the source dir>...")
-    main(sys.argv[1], sys.argv[2:])
+    args = sys.argv[1:]
+    target_cpus = []
+    while args[:1] == ["--target-cpu"] and len(args) > 1:
+        target_cpus.append(args[1])
+        args = args[2:]
+    if len(args) < 2:
+        sys.exit("usage: fetch-deps.py [--target-cpu <cpu>] <chromium source dir> <path>...")
+    main(args[0], args[1:], target_cpus)
