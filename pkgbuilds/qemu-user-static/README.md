@@ -4,10 +4,6 @@ This aarch64-only split recipe provides qemu-user-static and qemu-user-static-bi
 
 ## Patches
 
-Three linux-user patches let x86-64 containers run that stock qemu-user can't, such as SQL Server 2022:
-
-- `1000` keeps 64-bit guest mappings inside the guest's address space. With equal host and guest page sizes, qemu passed the host a NULL hint and the kernel placed x86-64 mappings near 2^48, which x86-64 code takes for kernel addresses. Mappings now start at 3/4 of the guest's 47 bits, as the default x86-64 layout places them.
-- `1001` passes Linux AIO (`io_setup`, `io_submit`, `io_getevents`, `io_cancel`, `io_destroy`) through to the host when guest and host share the structure layout; stock qemu-user returns ENOSYS.
 - `1002` is upstream QEMU `586284af4c2c`, carried unchanged: `sigcontext.trapno` carries the real trap number instead of -1. QEMU 11.2 has it; drop the patch then.
 
 ## Updates
