@@ -40,8 +40,15 @@ function fixture(t, count = 1) {
       } } };
     },
   };
-  const invoke = (overrides = {}) => {
+  // The arm job's outcomes, keyed by branch and PR number, as package-prs.yml
+  // writes them; armed: false leaves them out, as when the job never ran.
+  const invoke = ({ armed = true, ...overrides } = {}) => {
     results.forEach((result, i) => writeFileSync(join(resultsPath, `${i}.json`), JSON.stringify(result)));
+    if (armed) {
+      const outcomes = Object.fromEntries(results.filter(r => r && r.pr === 'success' && r.number && r.review !== true)
+        .map(r => [r.branch, { number: r.number, outcome: r.merge }]));
+      writeFileSync(join(resultsPath, 'armed.outcomes'), JSON.stringify(outcomes));
+    }
     return summarize({
       github, context: { repo: { owner: 'omacom', repo: 'omarchy-pkgs' }, runId: 123 },
       core: {
@@ -92,7 +99,6 @@ test('the workflow records failed outcomes despite successful conclusions and ke
   const steps = {
     apply: { outcome: 'success', conclusion: 'success' },
     pr: { outcome: 'failure', conclusion: 'success', outputs: {} },
-    merge: { outcome: 'skipped', conclusion: 'skipped' },
   };
   for (const attempt of ['1', '2']) {
     execFileSync('bash', ['-e', '-o', 'pipefail', '-c', script], {
@@ -103,7 +109,7 @@ test('the workflow records failed outcomes despite successful conclusions and ke
   const keys = readFileSync(outputPath, 'utf8').trim().split('\n').map(line => line.slice('key='.length));
   assert.equal(keys[0], keys[1]);
   const record = JSON.parse(readFileSync(join(f.resultsPath, 'package-pr-results', `${keys[0]}.json`), 'utf8'));
-  assert.deepEqual(record, { ...f.groups[0], apply: 'success', pr: 'failure', merge: 'skipped', number: '' });
+  assert.deepEqual(record, { ...f.groups[0], apply: 'success', token: 'skipped', hold: 'skipped', pr: 'failure', number: '' });
   const result = await f.invoke({ resultsPath: join(f.resultsPath, 'package-pr-results') });
   assert.equal(result.succeeded, true);
   assert.equal(result.updates.failing, 1);
@@ -118,6 +124,72 @@ test('apply and auto-merge errors are package results even when all packages fai
   assert.equal(result.updates.failing, 2);
   assert.match(result.content, /Could not apply the package update/);
   assert.match(result.content, /Could not enable auto-merge/);
+});
+
+test('a failed App token is reported as such, not as a failed push', async t => {
+  const f = fixture(t, 1);
+  Object.assign(f.results[0], { token: 'failure', hold: 'skipped', pr: 'skipped', merge: 'skipped', number: '' });
+  const result = await f.invoke();
+  assert.equal(result.updates.failing, 1);
+  assert.match(result.content, /Could not get the sync App token/);
+  assert.doesNotMatch(result.content, /Could not push or update the PR/);
+});
+
+test("a PR the arm job did not report on is not called passing", async t => {
+  const f = fixture(t, 2);
+  const result = await f.invoke({ armed: false });
+  assert.equal(result.updates.failing, 2);
+  assert.match(result.content, /Auto-merge result missing/);
+});
+
+test("an outcome for another PR on the same branch does not count", async t => {
+  const f = fixture(t, 1);
+  await f.invoke();
+  writeFileSync(join(f.resultsPath, 'armed.outcomes'), JSON.stringify({ [f.groups[0].branch]: { number: '99', outcome: 'success' } }));
+  const results = f.results.map(r => ({ ...r }));
+  const result = await summarize({
+    github: f.github, context: { repo: { owner: 'omacom', repo: 'omarchy-pkgs' }, runId: 1 },
+    core: { warning() {}, setFailed() {}, setOutput() {}, summary: { addRaw: () => ({ write: async () => {} }) } },
+    groups: f.groups, resultsPath: f.resultsPath, syncResult: 'success', prsResult: 'success',
+  });
+  assert.equal(results.length, 1);
+  assert.equal(result.updates.failing, 1);
+  assert.match(result.content, /Auto-merge result missing/);
+});
+
+test("a PR the rule refused or that closed fails with its reason, and an outcome without one is missing", async t => {
+  const f = fixture(t, 3);
+  await f.invoke();
+  writeFileSync(join(f.resultsPath, 'armed.outcomes'), JSON.stringify({
+    [f.groups[0].branch]: { number: f.results[0].number, outcome: 'refused', reason: 'PR is a draft' },
+    [f.groups[1].branch]: { number: f.results[1].number, outcome: 'closed', reason: 'PR is closed' },
+    [f.groups[2].branch]: { number: f.results[2].number },
+  }));
+  const result = await summarize({
+    github: f.github, context: { repo: { owner: 'omacom', repo: 'omarchy-pkgs' }, runId: 1 },
+    core: { warning() {}, setFailed() {}, setOutput() {}, summary: { addRaw: () => ({ write: async () => {} }) } },
+    groups: f.groups, resultsPath: f.resultsPath, syncResult: 'success', prsResult: 'success',
+  });
+  assert.equal(result.updates.failing, 3);
+  assert.match(result.content, /Auto-merge refused: PR is a draft/);
+  assert.match(result.content, /PR was closed before auto-merge/);
+  assert.match(result.content, /Auto-merge result missing/);
+});
+
+test("a reviewed group needs no auto-merge outcome", async t => {
+  const f = fixture(t, 1);
+  Object.assign(f.groups[0], { review: true });
+  Object.assign(f.results[0], { review: true, merge: 'skipped' });
+  const result = await f.invoke({ armed: false });
+  assert.equal(result.updates.failing, 0);
+});
+
+test('a reviewed PR that could not be held as a draft is a package failure', async t => {
+  const f = fixture(t, 1);
+  Object.assign(f.results[0], { hold: 'failure', pr: 'skipped', merge: 'skipped' });
+  const result = await f.invoke();
+  assert.equal(result.updates.failing, 1);
+  assert.match(result.content, /Could not turn the reviewed PR back into a draft/);
 });
 
 test('unregistered and running checks are pending, never counted as passing', async t => {
@@ -251,6 +323,8 @@ const evaluate = (expression, github, inputs) => new Function('github', 'inputs'
 for (const [name, event, inputs, expected] of [
   ['manual hourly run', {}, { cadence: 'hourly' },
     { cadence: 'hourly', lane: 'auto-merge', prefix: 'auto/track-branches', concurrency: 'track-branches' }],
+  ['manual five-minute run', {}, { cadence: 'five-minute' },
+    { cadence: 'five-minute', lane: 'five-minute', prefix: 'auto/track-branches', concurrency: 'track-branches-five-minute' }],
   ['manual six-hourly run', {}, { cadence: 'six-hourly' },
     { cadence: 'six-hourly', lane: 'reviewed', prefix: 'auto/sync-upstream', concurrency: 'sync-upstream' }],
   ['legacy manual run without a cadence', {}, {},
@@ -282,11 +356,11 @@ test('invalid cadence fails before selecting packages or PR branches', t => {
   assert.equal(existsSync(outputPath), false);
 });
 
-test('the controller box dispatches both cadences and GitHub schedules neither', () => {
+test('the controller box dispatches every cadence and GitHub schedules none', () => {
   assert.doesNotMatch(upstreamWorkflow, /^\s*schedule:/m);
   const dispatch = readFileSync(join(__dirname, '../ci/dispatch.sh'), 'utf8');
   assert.deepEqual([...dispatch.matchAll(/workflow=sync-upstream\.yml +inputs='\{"cadence":"([^"]+)"\}'/g)]
-    .map(match => match[1]).sort(), ['hourly', 'six-hourly']);
+    .map(match => match[1]).sort(), ['five-minute', 'hourly', 'six-hourly']);
   assert.equal(existsSync(join(__dirname, '../.github/workflows/track-branches.yml')), false);
 });
 

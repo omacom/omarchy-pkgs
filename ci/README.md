@@ -3,12 +3,19 @@
 x86_64 package builds run on DigitalOcean droplets that exist for one job
 each. aarch64 builds run on GitHub's `ubuntu-24.04-arm` runners, and aarch64
 kernels on Namespace's Apple-backed runners (`package_runner` in
-`helpers/package-metadata.sh`); neither needs anything here.
+`helpers/package-metadata.sh`); neither needs anything here. Chromium is the
+exception: its aarch64 build cross-compiles on a droplet too
+(`package_build_host`).
 
 ## How it works
 
 - **Jobs ask for a runner labelled `omarchy-builder`.** `build-pr.yml` builds
   x86_64 packages there, and so does the `rebuild` job in `publish.yml`.
+  `chromium*` asks for `omarchy-builder-large` instead (`package_runner`), and
+  gets a droplet of `LARGE_SIZES`: 64 vCPU and 128 GB, because its build was
+  killed for memory on a 64 GB builder. Chromium's aarch64 build asks for the
+  same pool and cross-compiles there. Each label is its own pool with its
+  own cap: a large droplet never takes an ordinary job, and the reverse.
 - **A controller creates one droplet per queued job.** `controller.sh` runs
   from a systemd timer every minute on a small always-on droplet (tag
   `omarchy-controller`). It polls GitHub for queued jobs with the label and
@@ -62,8 +69,9 @@ not creating droplets: read its journal. See what is waiting:
 gh run list -R omacom/omarchy-pkgs --workflow build-pr.yml --status queued
 ```
 
-Only x86_64 jobs use this pool. A queued aarch64 job is waiting on GitHub's
-or Namespace's runners.
+Only x86_64 jobs use this pool, plus chromium's aarch64 build, which
+cross-compiles on the large droplets. Any other queued aarch64 job is
+waiting on GitHub's or Namespace's runners.
 
 ### Change settings
 
@@ -71,8 +79,10 @@ Edit `/etc/omarchy-controller.env` on the box. The next tick reads it.
 
 | Setting | Default in `controller-box/controller.env.example` | |
 |---|---|---|
-| `MAX_DROPLETS` | 6 | Builders alive at once. The DigitalOcean account's droplet limit also applies |
+| `MAX_DROPLETS` | 6 | Ordinary builders alive at once. The DigitalOcean account's droplet limit also applies |
 | `SIZES` | `g5-32vcpu-64gb-50gb g5-32vcpu-128gb-50gb` | Tried in order |
+| `LARGE_SIZES` | `g5-64vcpu-128gb-80gb` | Sizes for jobs labelled `omarchy-builder-large`, tried in order |
+| `MAX_LARGE_DROPLETS` | 1 | Large builders alive at once, apart from `MAX_DROPLETS` |
 | `REGIONS` | empty | Regions to try first; empty means any |
 | `MAX_AGE_MINUTES` | 200 | Delete a droplet older than this |
 | `MAX_BOOT_MINUTES` | 10 | Delete a droplet still provisioning after this |
@@ -105,7 +115,7 @@ on `master`.
 |---|---|---|
 | `omarchy-dispatch-sync-hourly` | every hour at :35 | `sync-upstream.yml`, `cadence=hourly` |
 | `omarchy-dispatch-sync-six-hourly` | 00:20, 06:20, 12:20, 18:20 | `sync-upstream.yml`, `cadence=six-hourly` |
-| `omarchy-dispatch-sync-rebuilds` | 00:40, 06:40, 12:40, 18:40 | `sync-rebuilds.yml` |
+| `omarchy-dispatch-sync-rebuilds` | every hour at :50 | `sync-rebuilds.yml` |
 | `omarchy-dispatch-builder-images` | 04:23 | `builder-images.yml` |
 
 ```bash

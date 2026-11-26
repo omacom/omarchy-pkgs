@@ -16,11 +16,12 @@ REPO=${REPO:?owner/name}
 REF=${REF:-master}
 
 case "${1:-}" in
+  sync-five-minute) workflow=sync-upstream.yml inputs='{"cadence":"five-minute"}' ;;
   sync-hourly)     workflow=sync-upstream.yml  inputs='{"cadence":"hourly"}' ;;
   sync-six-hourly) workflow=sync-upstream.yml  inputs='{"cadence":"six-hourly"}' ;;
   sync-rebuilds)   workflow=sync-rebuilds.yml  inputs='{}' ;;
   builder-images)  workflow=builder-images.yml inputs='{}' ;;
-  *) echo "usage: $0 sync-hourly|sync-six-hourly|sync-rebuilds|builder-images" >&2; exit 2 ;;
+  *) echo "usage: $0 sync-five-minute|sync-hourly|sync-six-hourly|sync-rebuilds|builder-images" >&2; exit 2 ;;
 esac
 
 echo "dispatching $workflow on $REF with $inputs"

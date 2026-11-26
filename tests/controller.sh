@@ -61,6 +61,65 @@ DROPLETS=$'1 active '"$NOW"$'\n2 active '"$NOW"$'\n3 active '"$NOW"$'\n4 active 
 DROPLETS=$'1 active '"$NOW"$'\n2 active '"$NOW" QUEUED=5 BUSY=2; MAX_DROPLETS=3; run; check "cap limits creates to remaining room" 1 0
 DROPLETS="1 off $NOW" QUEUED=1 BUSY=0; MAX_DROPLETS=4; run; check "off droplet is not capacity: reaped and replaced" 1 1
 
+# The large pool. A droplet line may carry a fourth field, its tags besides
+# omarchy-builder; queued jobs and busy runners are given per label.
+do_api() {
+  local path=$1; shift
+  echo "do $path $*" >>"$CALLS_FILE"
+  case "$path" in
+    sizes\?*) echo '{"sizes":[{"slug":"g5-32vcpu-64gb-50gb","available":true,"regions":["ric1"]},{"slug":"g5-64vcpu-128gb-80gb","available":true,"regions":["ric1"]}]}' ;;
+    droplets\?*) printf '%s\n' "$DROPLETS" | jq -Rs '{droplets: [split("\n")[] | select(length>0) | split(" ") | {id: .[0]|tonumber, status: .[1], created_at: .[2], tags: (["omarchy-builder"] + (.[3] // "" | split(",") | map(select(length>0))))}]}' ;;
+    droplets) jq -c . <<<"${*: -1}" >>"$CALLS_FILE"; echo '{"droplet":{"id":999}}' ;;
+    droplets/*) echo '{}' ;;
+  esac
+}
+gh_api() {
+  local path=$1; shift
+  echo "gh $path $*" >>"$CALLS_FILE"
+  case "$path" in
+    */actions/runs\?status=in_progress*) echo '{"workflow_runs":[]}' ;;
+    */actions/runs\?*) echo '{"workflow_runs":[{"id":1}]}' ;;
+    */actions/runs/*/jobs\?*) jq -nc --argjson d "$QUEUED" --argjson l "$QUEUED_LARGE" '{jobs: ([range($d) | {id: ., status: "queued", labels: ["self-hosted","omarchy-builder"]}] + [range($l) | {id: (. + 100), status: "queued", labels: ["self-hosted","omarchy-builder-large"]}])}' ;;
+    */actions/runners\?*) jq -nc --argjson d "$BUSY" --argjson l "$BUSY_LARGE" '{runners: ([range($d) | {busy: true, labels: [{name: "omarchy-builder"}]}] + [range($l) | {busy: true, labels: [{name: "omarchy-builder-large"}]}])}' ;;
+    */registration-token) [[ ${NO_TOKEN:-} ]] && echo '{}' || echo '{"token":"T"}' ;;
+  esac
+}
+large_creates() { grep -c '"size":"g5-64vcpu-128gb-80gb"' "$CALLS_FILE" || true; }
+check_large() { # check_large <name> <expected creates> <expected large creates>
+  local c l; c=$(creates); l=$(large_creates)
+  if [[ "$c" == "$2" && "$l" == "$3" ]]; then echo "PASS: $1"; else echo "FAIL: $1 (creates=$c want $2, large=$l want $3)"; cat "$CALLS_FILE"; exit 1; fi
+}
+MAX_DROPLETS=6 BUSY=0 BUSY_LARGE=0
+DROPLETS="" QUEUED=0 QUEUED_LARGE=1; run; check_large "a large job gets one large droplet" 1 1
+grep -F '"size":"g5-64vcpu-128gb-80gb"' "$CALLS_FILE" | jq -e '.tags == ["omarchy-builder","omarchy-builder-large"] and (.user_data | test("--labels \"omarchy-builder-large\""))' >/dev/null \
+  && echo "PASS: a large droplet carries both tags and registers only the large label" \
+  || { echo "FAIL: large create body"; cat "$CALLS_FILE"; exit 1; }
+DROPLETS="1 active $NOW omarchy-builder-large" QUEUED=1 QUEUED_LARGE=0; run; check_large "an idle large droplet does not absorb an ordinary job" 1 0
+DROPLETS="1 active $NOW" QUEUED=0 QUEUED_LARGE=1; run; check_large "an idle ordinary droplet does not absorb a large job" 1 1
+DROPLETS="1 active $NOW omarchy-builder-large" QUEUED=0 QUEUED_LARGE=1; run; check_large "an idle large droplet takes the large job" 0 0
+DROPLETS="1 active $NOW" QUEUED=2 QUEUED_LARGE=2 BUSY=1 MAX_DROPLETS=2; run; check_large "each pool has its own cap: one ordinary and one large" 2 1
+DROPLETS=$'1 active '"$NOW"$'\n2 active '"$NOW" QUEUED=0 QUEUED_LARGE=1 BUSY=0 MAX_DROPLETS=2; run; check_large "idle ordinary droplets at their cap do not hold back chromium" 1 1
+DROPLETS="1 active $NOW omarchy-builder-large" QUEUED=1 QUEUED_LARGE=1 BUSY_LARGE=1 MAX_DROPLETS=6; run; check_large "a busy large builder at its cap leaves ordinary jobs alone" 1 0
+BUSY_LARGE=0
+DROPLETS="" QUEUED=1 QUEUED_LARGE=1 BUSY=0 MAX_DROPLETS=6; run
+[[ $(grep -c 'runs?status=queued' "$CALLS_FILE") == 1 ]] && echo "PASS: one queue scan per tick serves both pools" \
+  || { echo "FAIL: queue scanned more than once"; grep 'runs?status' "$CALLS_FILE"; exit 1; }
+DROPLETS="1 active $NOW ops" QUEUED=1 QUEUED_LARGE=0; run; check_large "an operator tag keeps a droplet in the default pool" 0 0
+DROPLETS="1 active $NOW ops,omarchy-builder-large" QUEUED=0 QUEUED_LARGE=1; run; check_large "a large droplet with an operator tag stays large" 0 0
+: >"$CALLS_FILE"; DROPLETS="" QUEUED=1 QUEUED_LARGE=1
+if NO_TOKEN=1 controller_tick >/dev/null; then echo "FAIL: a missing token passed the tick"; exit 1; fi
+check_large "no registration token: no droplet, and the tick fails" 0 0
+: >"$CALLS_FILE"
+if CLOUD_INIT=/nonexistent controller_tick >/dev/null 2>&1; then echo "FAIL: an unreadable cloud-init passed the tick"; exit 1; fi
+check_large "unreadable cloud-init: no droplet, and the tick fails" 0 0
+: >"$CALLS_FILE"
+if LARGE_SIZES=sold-out controller_tick >/dev/null; then echo "FAIL: a refused large pool passed the tick"; exit 1; fi
+check_large "a refused large pool still lets the default pool create, and the tick fails" 1 0
+DROPLETS="" QUEUED=1 QUEUED_LARGE=1; run
+[[ $(grep '^{"name"' "$CALLS_FILE" | jq -r .size | paste -sd' ') == "g5-32vcpu-64gb-50gb g5-64vcpu-128gb-80gb" ]] \
+  && echo "PASS: the default pool creates before the large pool" \
+  || { echo "FAIL: pool order"; grep '^{"name"' "$CALLS_FILE" | jq -r .size; exit 1; }
+
 # A large in-progress matrix has no waiting jobs on page one. The queued
 # workflow is on page two of the run listing; the same run can appear in
 # both status queries while GitHub updates it, so count its jobs once.

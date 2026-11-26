@@ -1,0 +1,107 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Birk Skyum <birk.skyum@pm.me>
+Date: Mon, 12 Oct 2026 13:12:31 +0000
+Subject: [PATCH] PCI: qcom: Power the controller down when hibernating
+
+qcom_pcie_suspend_noirq() leaves the controller powered when a device
+below it cannot go to D3cold, and qcom_pcie_resume_noirq() then carries
+on with the controller as it was.
+
+That is fine for suspend. The same two functions also run as
+freeze_noirq and restore_noirq for hibernation. Devices are normally
+still in D0 at freeze, so a controller with a device behind it is left
+powered and the image records it as running. That image is resumed
+after a power cycle, by a kernel that may never have brought the
+controller up.
+
+On a Lenovo Yoga Slim 7x (X1E80100) this resets the machine on every
+resume from hibernation. The Wi-Fi card is behind pcie4, whose link
+only comes up once the power sequencing drivers have been loaded from
+the root file system. The kernel that loads the image resumes before
+that, so it never powers pcie4, and the restored kernel then reads the
+DBI registers of that controller:
+
+  qcom_pcie_resume_noirq()
+    qcom_pcie_icc_opp_update()
+      dw_pcie_find_capability()
+        dw_pcie_read_dbi()
+
+The machine resets at that read. pcie6a, which holds the NVMe drive and
+is brought up by both kernels, gets through the same path.
+
+Give the driver a freeze_noirq callback of its own that forces the link
+into L2 and powers the controller down, whatever state the devices
+below it are in. A hibernation image then always holds a controller
+that is down, and thaw_noirq and restore_noirq bring it up through
+dw_pcie_resume_noirq(), like after any other loss of power. Suspend and
+the poweroff phase of hibernation keep the D3cold check.
+
+Suggested-by: Krishna Chaitanya Chundru <krishna.chundru@oss.qualcomm.com>
+Signed-off-by: Birk Skyum <birk.skyum@pm.me>
+Link: https://lore.kernel.org/r/179181074907.22199.10556821368232442334@pm.me
+---
+ drivers/pci/controller/dwc/pcie-qcom.c | 27 +++++++++++++++++++++++---
+ 1 file changed, 24 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/pci/controller/dwc/pcie-qcom.c b/drivers/pci/controller/dwc/pcie-qcom.c
+index 5e44e4c1f..be2e4e196 100644
+--- a/drivers/pci/controller/dwc/pcie-qcom.c
++++ b/drivers/pci/controller/dwc/pcie-qcom.c
+@@ -2374,7 +2374,7 @@ static void qcom_pcie_shutdown(struct platform_device *pdev)
+ 	pm_runtime_disable(&pdev->dev);
+ }
+ 
+-static int qcom_pcie_suspend_noirq(struct device *dev)
++static int qcom_pcie_suspend(struct device *dev, bool force)
+ {
+ 	struct qcom_pcie *pcie;
+ 	int ret = 0;
+@@ -2383,7 +2383,7 @@ static int qcom_pcie_suspend_noirq(struct device *dev)
+ 	if (!pcie)
+ 		return 0;
+ 
+-	ret = dw_pcie_suspend_noirq(pcie->pci, false);
++	ret = dw_pcie_suspend_noirq(pcie->pci, force);
+ 	if (ret)
+ 		return ret;
+ 
+@@ -2432,6 +2432,22 @@ static int qcom_pcie_suspend_noirq(struct device *dev)
+ 	return ret;
+ }
+ 
++static int qcom_pcie_suspend_noirq(struct device *dev)
++{
++	return qcom_pcie_suspend(dev, false);
++}
++
++/*
++ * A hibernation image is resumed after a power cycle, by a kernel that may
++ * not have brought this controller up. Power the controller down even if a
++ * device below it cannot go to D3cold, so that the image never holds a
++ * controller that is running. Thaw and restore bring it up again.
++ */
++static int qcom_pcie_freeze_noirq(struct device *dev)
++{
++	return qcom_pcie_suspend(dev, true);
++}
++
+ static int qcom_pcie_resume_noirq(struct device *dev)
+ {
+ 	struct qcom_pcie *pcie;
+@@ -2544,7 +2560,12 @@ DECLARE_PCI_FIXUP_EARLY(PCI_VENDOR_ID_QCOM, 0x1000, qcom_fixup_class);
+ DECLARE_PCI_FIXUP_EARLY(PCI_VENDOR_ID_QCOM, 0x1001, qcom_fixup_class);
+ 
+ static const struct dev_pm_ops qcom_pcie_pm_ops = {
+-	NOIRQ_SYSTEM_SLEEP_PM_OPS(qcom_pcie_suspend_noirq, qcom_pcie_resume_noirq)
++	.suspend_noirq = pm_sleep_ptr(qcom_pcie_suspend_noirq),
++	.resume_noirq = pm_sleep_ptr(qcom_pcie_resume_noirq),
++	.freeze_noirq = pm_sleep_ptr(qcom_pcie_freeze_noirq),
++	.thaw_noirq = pm_sleep_ptr(qcom_pcie_resume_noirq),
++	.poweroff_noirq = pm_sleep_ptr(qcom_pcie_suspend_noirq),
++	.restore_noirq = pm_sleep_ptr(qcom_pcie_resume_noirq),
+ };
+ 
+ static struct platform_driver qcom_pcie_driver = {
+-- 
+2.56.1
+

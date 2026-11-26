@@ -12,6 +12,7 @@
 #   { "source": "local", "upstream": { "watch": { "github": "owner/repo", "pattern": "v(?P<version>[0-9.]+)" } } }
 #   { "source": "local", "min_release_age": "24h" }
 #   { "source": "local", "auto_merge": true, "upstream": { "watch": { "git_branch": "...", "branch": "main" } } }
+#   { "source": "local", "review": true, "upstream": { "watch": { "git_tags": "https://example/repo.git", "pattern": "v(?P<version>[0-9.]+)" } } }
 #   { "source": "local", "upstream": { "github": "owner/repo", "checksums": "SHASUMS256.txt", "assets": { "x86_64": ["name-{tag}-x64.tar.xz"] } } }
 #   { "source": "local", "upstream": { "github": "owner/repo", "digests": true, "assets": { "x86_64": "name-{tag}-x64.tar.xz" } } }
 #   { "source": "local", "upstream": { "git_tags": "https://example/repo.git", "tag_pattern": "v{pkgver}", "sources": { "any": ["https://example/archive/{tag}.tar.gz"] } } }
@@ -169,9 +170,11 @@ package_pkgbuild_var() {
 # pkgname. Usually the directory's name, but not always
 # (pkgbuilds/yaru-icon-theme builds pkgbase yaru).
 package_pkgbase() {
-  local pkgdir="$1" base
-  base=$(package_pkgbuild_var "$pkgdir" pkgbase "${2:-}" 2>/dev/null || true)
-  [[ -n "$base" ]] || base=$(package_pkgbuild_var "$pkgdir" pkgname "${2:-}" 2>/dev/null || true)
+  local pkgdir="$1" arch="${2:-${ARCH:-x86_64}}" base
+  base=$(cd "$pkgdir" && env -u OMARCHY_SRC CARCH="$arch" bash -c '
+    source PKGBUILD >/dev/null 2>&1 || true
+    printf "%s\n" "${pkgbase:-${pkgname[0]:-}}"
+  ' 2>/dev/null || true)
   echo "${base:-${pkgdir##*/}}"
 }
 
@@ -313,14 +316,35 @@ package_auto_merge() {
   [[ "$(jq -r 'if has("auto_merge") then .auto_merge else false end' "$metadata")" == "true" ]]
 }
 
-# package_in_lane <pkgdir> <reviewed|auto-merge|all>
+# "sync_cadence": "five-minute" moves an auto-merged package out of the hourly
+# group into one checked every five minutes: the dev packages that follow
+# omarchy's quattro branch, so a merge there reaches dev installs in minutes.
+package_five_minute() {
+  local pkgdir="$1" metadata
+  metadata=$(metadata_file_for_dir "$pkgdir")
+  [[ -f "$metadata" ]] || return 1
+  [[ "$(jq -r '.sync_cadence // ""' "$metadata")" == "five-minute" ]]
+}
+
+# "review": true holds a package's update PRs for a maintainer: they open as
+# drafts and nothing arms auto-merge. Marking one ready for review hands it to
+# auto-merge-pr.yml, which lands it once CI passes.
+package_review_bumps() {
+  local pkgdir="$1" metadata
+  metadata=$(metadata_file_for_dir "$pkgdir")
+  [[ -f "$metadata" ]] || return 1
+  [[ "$(jq -r 'if has("review") then .review else false end' "$metadata")" == "true" ]]
+}
+
+# package_in_lane <pkgdir> <reviewed|auto-merge|five-minute|all>
 package_in_lane() {
   local pkgdir="$1" lane="$2"
   case "$lane" in
     all | "") return 0 ;;
-    auto-merge) package_auto_merge "$pkgdir" ;;
+    auto-merge) package_auto_merge "$pkgdir" && ! package_five_minute "$pkgdir" ;;
+    five-minute) package_five_minute "$pkgdir" ;;
     reviewed) ! package_auto_merge "$pkgdir" ;;
-    *) echo "invalid lane: $lane (expected reviewed, auto-merge, or all)" >&2; return 2 ;;
+    *) echo "invalid lane: $lane (expected reviewed, auto-merge, five-minute, or all)" >&2; return 2 ;;
   esac
 }
 
@@ -437,72 +461,13 @@ package_git_upstream_hash() {
 
 validate_package_metadata() {
   local pkgdir="$1"
-  local metadata source sync skip_build aur ring pkgrel_type
-
+  local metadata pkg has_hook=0 res
+  pkg=$(basename "$pkgdir")
   metadata=$(metadata_file_for_dir "$pkgdir")
   [[ -f "$metadata" ]] || { echo "missing metadata: $metadata"; return 1; }
+  [[ -f "$pkgdir/.omarchy/upstream.sh" ]] && has_hook=1
 
-  jq empty "$metadata" >/dev/null || return 1
-
-  source=$(jq -r '.source // ""' "$metadata")
-  case "$source" in
-    aur|local) ;;
-    *) echo "invalid source for $(basename "$pkgdir"): $source"; return 1 ;;
-  esac
-
-  sync=$(jq -r 'if has("sync") then .sync | type else "missing" end' "$metadata")
-  case "$sync" in
-    boolean|missing) ;;
-    *) echo "invalid sync for $(basename "$pkgdir"): must be boolean"; return 1 ;;
-  esac
-
-  skip_build=$(jq -r 'if has("skip_build") then .skip_build | type else "missing" end' "$metadata")
-  case "$skip_build" in
-    boolean|missing) ;;
-    *) echo "invalid skip_build for $(basename "$pkgdir"): must be boolean"; return 1 ;;
-  esac
-
-  aur=$(jq -r 'if has("aur") then .aur | type else "missing" end' "$metadata")
-  case "$aur" in
-    string|missing) ;;
-    *) echo "invalid aur for $(basename "$pkgdir"): must be string"; return 1 ;;
-  esac
-
-  ring=$(jq -r '.release_ring // ""' "$metadata")
-  case "$ring" in
-    ""|fast) ;;
-    *) echo "invalid release_ring for $(basename "$pkgdir"): $ring"; return 1 ;;
-  esac
-
-  if ! jq -e 'if has("pinned") | not then true else (.pinned | type) == "boolean" end' "$metadata" >/dev/null; then
-    echo "invalid pinned for $(basename "$pkgdir"): must be boolean"
-    return 1
-  fi
-
-  # The release ring alone decides where a package publishes. A stale
-  # `channels` key would read as a restriction nothing enforces.
-  if jq -e 'has("channels")' "$metadata" >/dev/null; then
-    echo "invalid channels for $(basename "$pkgdir"): channels is gone; every package publishes to edge and moves on by promotion, or set \"release_ring\": \"fast\""
-    return 1
-  fi
-
-  if ! package_min_release_age_seconds "$pkgdir" >/dev/null; then
-    echo "invalid min_release_age for $(basename "$pkgdir"): must be a number with optional s/m/h/d suffix"
-    return 1
-  fi
-
-  if ! jq -e 'if has("auto_merge") | not then true else (.auto_merge | type) == "boolean" end' "$metadata" >/dev/null; then
-    echo "invalid auto_merge for $(basename "$pkgdir"): must be boolean"
-    return 1
-  fi
-  if package_auto_merge "$pkgdir" && ! package_has_upstream_provider "$pkgdir" && ! package_has_upstream_hook "$pkgdir"; then
-    echo "invalid auto_merge for $(basename "$pkgdir"): only an upstream watch, provider, or hook can be auto-merged"
-    return 1
-  fi
-
-  # `has` rather than `// {}`: jq's // treats false as absent, which would
-  # let "upstream": false slip through as an empty declaration.
-  if ! jq -e '
+  res=$(jq -r --arg pkg "$pkg" --argjson has_hook "$has_hook" '
     def valid_sources:
       type == "object" and length > 0 and (to_entries | all(
         (.key | test("\\A[a-z0-9_]+\\z"))
@@ -516,100 +481,136 @@ validate_package_metadata() {
           or (type == "array" and length > 0 and all(type == "string" and length > 0) and (unique | length) == length)
         )
       ));
-    if has("upstream") | not then true
-    elif (.upstream | type) != "object" then false
-    else .upstream |
-      ([has("github"), has("git_tags"), has("npm"), has("debian"), has("watch")] | map(select(.)) | length) == 1
-      and if has("watch") then (.watch | type == "object")
-      elif has("github") then
-        (.github | type == "string" and test("\\A[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\\z"))
-        and (if has("checksums") then (.checksums | type == "string" and length > 0) else true end)
-        and (if has("digests") then (.digests | type == "boolean") else true end)
-        and (if has("latest_only") then (.latest_only | type == "boolean") else true end)
-        and (has("checksums") != (has("digests") and .digests == true))
-        and (.assets | valid_assets)
-        and (if has("sources") then
-          (.sources | valid_sources)
-          and ((.assets | keys) as $assets | (.sources | keys) as $sources | ($assets - $sources | length) == ($assets | length))
-        else true end)
-      elif has("git_tags") then
-        (.git_tags | type == "string" and test("\\Ahttps://[^[:space:]]+\\.git\\z"))
-        and (.tag_pattern | type == "string" and (split("{pkgver}") | length) == 2)
-        and (.sources | valid_sources)
-      elif has("npm") then
-        (.npm | type == "string" and test("\\A(@[a-z0-9_.-]+/)?[a-z0-9_.-]+\\z"))
-        and ((.dist_tag // "latest") | type == "string" and test("\\A[a-z0-9_.-]+\\z"))
-        and (.sources | valid_sources)
-      else
-        (.debian | type == "string" and test("\\Ahttps://[^[:space:]]+\\z"))
-        and (.package | type == "string" and test("\\A[a-z0-9][a-z0-9+.-]*\\z"))
-        and (.sources | valid_sources)
-      end
-    end
-  ' "$metadata" >/dev/null; then
-    echo "invalid upstream for $(basename "$pkgdir"): configure exactly one valid github, git_tags, npm, debian, or watch provider"
-    return 1
-  fi
-
-  if jq -e '.upstream? | objects | has("watch")' "$metadata" >/dev/null; then
-    python3 "${BASH_SOURCE[0]%/*}/upstream-watch.py" validate "$pkgdir" || return 1
-  fi
-
-  pkgrel_type=$(jq -r 'if has("pkgrel") then .pkgrel | type else "missing" end' "$metadata")
-  case "$pkgrel_type" in
-    object|missing) ;;
-    *) echo "invalid pkgrel for $(basename "$pkgdir"): must be an object with optional suffix/offset"; return 1 ;;
-  esac
-
-  if ! jq -e '(.pkgrel // {}) | type == "object" and ((.suffix // 1) | type == "number" and floor == . and . >= 1) and ((.offset // 0) | type == "number" and floor == . and . >= 0)' "$metadata" >/dev/null; then
-    echo "invalid pkgrel for $(basename "$pkgdir"): must be an object with optional integer suffix >= 1 and offset >= 0"
-    return 1
-  fi
-
-  if ! jq -e '(.upstream_commit // "") | type == "string"' "$metadata" >/dev/null; then
-    echo "invalid upstream_commit for $(basename "$pkgdir"): must be a string"
-    return 1
-  fi
-
-  if ! jq -e '(.rebuild_on // []) | type == "array" and all(type == "string" and length > 0)' "$metadata" >/dev/null; then
-    echo "invalid rebuild_on for $(basename "$pkgdir"): must be an array of package names"
-    return 1
-  fi
-
-  # The fast ring ships one edge build to every channel at once, so nothing
-  # rebuilds it when a channel moves under it: a package that needs those
-  # rebuilds reaches rc and stable with the release instead. The rest of the
-  # rule is checked on the built package (helpers/fast-ring-check.sh).
-  if package_is_fast_ring "$pkgdir" && jq -e '(.rebuild_on // []) | length > 0' "$metadata" >/dev/null; then
-    echo "invalid release_ring for $(basename "$pkgdir"): a package with rebuild_on cannot be on the fast ring"
-    return 1
-  fi
-
-  if ! jq -e '
     def version_map:
       type == "object" and (to_entries | all(.value | type == "string" and length > 0));
-    (.rebuilt_against // {}) as $record |
-    ($record | version_map) or
-      (($record | type) == "object"
-       and ((($record | keys) - ["x86_64", "aarch64"]) | length == 0)
-       and ($record | to_entries | all(.value | version_map)))
-  ' "$metadata" >/dev/null; then
-    echo "invalid rebuilt_against for $(basename "$pkgdir"): must map architectures to package-version maps"
-    return 1
-  fi
+    def min_age_ok:
+      if has("min_release_age") | not then true
+      elif (.min_release_age | type) == "string" or (.min_release_age | type) == "number" then
+        (.min_release_age | tostring) as $s | ($s != "" and ($s | test("\\A[0-9]{1,9}[smhd]?\\z")))
+      else false end;
+    def upstream_ok:
+      if has("upstream") | not then true
+      elif (.upstream | type) != "object" then false
+      else .upstream |
+        ([has("github"), has("git_tags"), has("npm"), has("debian"), has("watch")] | map(select(.)) | length) == 1
+        and if has("watch") then (.watch | type == "object")
+        elif has("github") then
+          (.github | type == "string" and test("\\A[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\\z"))
+          and (if has("checksums") then (.checksums | type == "string" and length > 0) else true end)
+          and (if has("digests") then (.digests | type == "boolean") else true end)
+          and (if has("latest_only") then (.latest_only | type == "boolean") else true end)
+          and (has("checksums") != (has("digests") and .digests == true))
+          and (.assets | valid_assets)
+          and (if has("sources") then
+            (.sources | valid_sources)
+            and ((.assets | keys) as $assets | (.sources | keys) as $sources | ($assets - $sources | length) == ($assets | length))
+          else true end)
+        elif has("git_tags") then
+          (.git_tags | type == "string" and test("\\Ahttps://[^[:space:]]+\\.git\\z"))
+          and (.tag_pattern | type == "string" and (split("{pkgver}") | length) == 2)
+          and (.sources | valid_sources)
+        elif has("npm") then
+          (.npm | type == "string" and test("\\A(@[a-z0-9_.-]+/)?[a-z0-9_.-]+\\z"))
+          and ((.dist_tag // "latest") | type == "string" and test("\\A[a-z0-9_.-]+\\z"))
+          and (.sources | valid_sources)
+        else
+          (.debian | type == "string" and test("\\Ahttps://[^[:space:]]+\\z"))
+          and (.package | type == "string" and test("\\A[a-z0-9][a-z0-9+.-]*\\z"))
+          and (.sources | valid_sources)
+        end
+      end;
+    def rebuilt_against_shape_ok:
+      (.rebuilt_against // {}) as $record |
+      ($record | version_map) or
+        (($record | type) == "object"
+         and ((($record | keys) - ["x86_64", "aarch64"]) | length == 0)
+         and ($record | to_entries | all(.value | version_map)));
+    def rebuilt_against_keys_ok:
+      (.rebuild_on // []) as $triggers |
+      (.rebuilt_against // {}) as $record |
+      if ($record | to_entries | all(.value | type == "string")) then
+        ((($record | keys) - $triggers) | length == 0)
+      else
+        ($record | to_entries | all((((.value | keys) - $triggers) | length) == 0))
+      end;
 
-  if ! jq -e '
-    (.rebuild_on // []) as $triggers |
-    (.rebuilt_against // {}) as $record |
-    if ($record | to_entries | all(.value | type == "string")) then
-      ((($record | keys) - $triggers) | length == 0)
+    (.source // "") as $source |
+    (.release_ring // "") as $ring |
+    ((.auto_merge // false) == true) as $auto_merge |
+    ((.sync_cadence // "") == "five-minute") as $five_min |
+    ((.review // false) == true) as $review |
+    (has("upstream") or $has_hook == 1) as $has_upstream |
+
+    if ($source != "aur" and $source != "local") then
+      "ERR:invalid source for \($pkg): \($source)"
+    elif (has("sync") and (.sync | type) != "boolean") then
+      "ERR:invalid sync for \($pkg): must be boolean"
+    elif (has("skip_build") and (.skip_build | type) != "boolean") then
+      "ERR:invalid skip_build for \($pkg): must be boolean"
+    elif (has("aur") and (.aur | type) != "string") then
+      "ERR:invalid aur for \($pkg): must be string"
+    elif ($ring != "" and $ring != "fast") then
+      "ERR:invalid release_ring for \($pkg): \($ring)"
+    elif (has("pinned") and (.pinned | type) != "boolean") then
+      "ERR:invalid pinned for \($pkg): must be boolean"
+    elif has("channels") then
+      "ERR:invalid channels for \($pkg): channels is gone; every package publishes to edge and moves on by promotion, or set \"release_ring\": \"fast\""
+    elif (min_age_ok | not) then
+      "ERR:invalid min_release_age for \($pkg): must be a number with optional s/m/h/d suffix"
+    elif (has("auto_merge") and (.auto_merge | type) != "boolean") then
+      "ERR:invalid auto_merge for \($pkg): must be boolean"
+    elif ($auto_merge and ($has_upstream | not)) then
+      "ERR:invalid auto_merge for \($pkg): only an upstream watch, provider, or hook can be auto-merged"
+    elif (has("lockstep") and ((.lockstep | type == "string" and test("\\A[a-z0-9-]+\\z")) | not)) then
+      "ERR:invalid lockstep for \($pkg): must name a group in lowercase letters, digits and dashes"
+    elif (has("sync_cadence") and .sync_cadence != "five-minute") then
+      "ERR:invalid sync_cadence for \($pkg): the only cadence is \"five-minute\""
+    elif ($five_min and ($auto_merge | not)) then
+      "ERR:invalid sync_cadence for \($pkg): only an auto-merged package syncs every five minutes"
+    elif (has("review") and (.review | type) != "boolean") then
+      "ERR:invalid review for \($pkg): must be boolean"
+    elif ($review and $auto_merge) then
+      "ERR:invalid review for \($pkg): a reviewed package cannot also set auto_merge"
+    elif ($review and ($has_upstream | not)) then
+      "ERR:invalid review for \($pkg): only an upstream watch, provider, or hook opens update PRs"
+    elif (upstream_ok | not) then
+      "ERR:invalid upstream for \($pkg): configure exactly one valid github, git_tags, npm, debian, or watch provider"
+    elif (has("pkgrel") and (.pkgrel | type) != "object") then
+      "ERR:invalid pkgrel for \($pkg): must be an object with optional suffix/offset"
+    elif (((.pkgrel // {}) | type == "object" and ((.suffix // 1) | type == "number" and floor == . and . >= 1) and ((.offset // 0) | type == "number" and floor == . and . >= 0)) | not) then
+      "ERR:invalid pkgrel for \($pkg): must be an object with optional integer suffix >= 1 and offset >= 0"
+    elif (((.upstream_commit // "") | type == "string") | not) then
+      "ERR:invalid upstream_commit for \($pkg): must be a string"
+    elif (((.rebuild_on // []) | type == "array" and all(type == "string" and length > 0)) | not) then
+      "ERR:invalid rebuild_on for \($pkg): must be an array of package names"
+    elif ($ring == "fast" and ((.rebuild_on // []) | length > 0)) then
+      "ERR:invalid release_ring for \($pkg): a package with rebuild_on cannot be on the fast ring"
+    elif (rebuilt_against_shape_ok | not) then
+      "ERR:invalid rebuilt_against for \($pkg): must map architectures to package-version maps"
+    elif (rebuilt_against_keys_ok | not) then
+      "ERR:invalid rebuilt_against for \($pkg): records a package that rebuild_on does not name"
+    elif ((.upstream // null) | type == "object" and has("watch")) then
+      "WATCH"
     else
-      ($record | to_entries | all((((.value | keys) - $triggers) | length) == 0))
+      "OK"
     end
-  ' "$metadata" >/dev/null; then
-    echo "invalid rebuilt_against for $(basename "$pkgdir"): records a package that rebuild_on does not name"
-    return 1
-  fi
+  ' "$metadata") || return 1
+
+  case "$res" in
+    OK) return 0 ;;
+    WATCH)
+      python3 -S "${BASH_SOURCE[0]%/*}/upstream-watch.py" validate "$pkgdir" || return 1
+      return 0
+      ;;
+    ERR:*)
+      echo "${res#ERR:}"
+      return 1
+      ;;
+    *)
+      echo "invalid metadata for $pkg: empty or non-object JSON"
+      return 1
+      ;;
+  esac
 }
 
 # The runner an entry builds on, as the JSON list runs-on takes. x86_64 builds
@@ -619,11 +620,31 @@ validate_package_metadata() {
 # the whole job takes 24. Its cores are the fast ones: the 32-core AmpereOne
 # runner took 66. A kernel is a package named linux-*; the firmware and pkgbase
 # shim packages share the prefix and build in seconds, so they stay put.
+# On x86_64, chromium* goes to the large pool (64 vCPU, 128 GB): on a 64 GB
+# builder its build was killed for memory at step 23,398 of 58,051
+# (omarchy-pkgs #3426).
+# The architecture a package's build runs on for a target architecture.
+# Usually the target itself, natively or under QEMU. Chromium's DEPS pins its
+# clang, Rust and Node for x64 hosts only, so its aarch64 build cross-compiles
+# on x86_64, as Google builds Chrome for Linux arm64. bin/build then runs the
+# builder image of this architecture and build/build.sh cross-builds.
+package_build_host() {
+  local name="$1" arch="$2"
+
+  case "$name:$arch" in
+  chromium:aarch64) echo x86_64 ;;
+  *) echo "$arch" ;;
+  esac
+}
+
 package_runner() {
   local name="$1" arch="$2"
 
-  if [[ $arch != aarch64 ]]; then
-    echo '["self-hosted","omarchy-builder"]'
+  if [[ $(package_build_host "$name" "$arch") != aarch64 ]]; then
+    case "$name" in
+    chromium*) echo '["self-hosted","omarchy-builder-large"]' ;;
+    *) echo '["self-hosted","omarchy-builder"]' ;;
+    esac
     return
   fi
   case "$name" in
