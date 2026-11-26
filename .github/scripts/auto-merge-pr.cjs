@@ -16,8 +16,11 @@
 //   auto-merge has no Workflows permission. An existing test may run on
 //   master (builder-images.yml runs tests/build-isolation.sh with
 //   packages: write), so editing one also needs a maintainer.
-// - Every file the PR changes is read. The API lists at most 3,000, so a
-//   longer PR could hide a change past the cut, and does not qualify.
+// - Every file the PR changes is read, from the diff of the exact head
+//   commit that gets armed: the default branch...head SHA, so a push between
+//   two reads can't swap the files judged. That diff lists at most 300
+//   files, so a PR with 300 or more could hide a change past the cut, and
+//   does not qualify.
 // - release/owners.json may change only where bin/release-owners writes it
 //   from the recipes: the self-tests fail unless it matches them. Its
 //   "approved" list lets a directory claim a name that is not its own, so a
@@ -153,12 +156,17 @@ function prNumber(value) {
 }
 
 // The decision for one PR as it is now, and whether to take back auto-merge.
-async function evaluate({ github, context, pr, vouched }) {
-  const number = pr.number;
-  const vouchStatus = await authorStatus({ github, context, login: pr.user.login, vouched });
-  const files = await github.paginate(github.rest.pulls.listFiles, {
-    ...context.repo, pull_number: number, per_page: 100,
+const COMPARE_LIMIT = 300;
+async function evaluate({ github, context, pr, vouched, wait }) {
+  const vouchStatus = await authorStatus({ github, context, login: pr.user.login, vouched, wait });
+  const { data: diff } = await github.rest.repos.compareCommitsWithBasehead({
+    ...context.repo, basehead: `${pr.base.ref}...${pr.head.sha}`,
   });
+  const files = diff.files || [];
+  if (files.length >= COMPARE_LIMIT) {
+    return { vouchStatus, withdraw: true,
+      decision: { enable: false, reason: `PR changes ${files.length} or more files, more than can be read` } };
+  }
   // release/owners.json at the base and the head, for its approvals.
   let owners;
   if (files.some(file => file.filename === OWNERS)) {
@@ -182,6 +190,7 @@ module.exports = async function autoMerge({ github, context, core, number, vouch
   core.setOutput('enable', String(decision.enable));
   core.setOutput('withdraw', String(takeBack));
   core.setOutput('head_sha', pr.head.sha);
+  core.setOutput('base', pr.base.ref);
   core.setOutput('method', decision.method || 'squash');
   return decision;
 };
@@ -191,32 +200,43 @@ module.exports = async function autoMerge({ github, context, core, number, vouch
 // default branch, newest first, so a fork's branch of the same name is
 // never seen. Returns one entry per group that has a PR: action "enable"
 // with the head that was judged, or an outcome already known.
-async function planArms({ github, context, core, groups, vouched }) {
+// The open PR comes first; only without one does the newest closed PR say
+// whether the branch already merged. A lookup that fails costs only its
+// own group.
+async function planArms({ github, context, core, groups, vouched, wait }) {
   const { data: repo } = await github.rest.repos.get(context.repo);
+  const base = repo.default_branch;
+  const find = (branch, state) => github.rest.pulls.list({
+    ...context.repo, head: `${context.repo.owner}:${branch}`, base, state, sort: 'created', direction: 'desc', per_page: 1,
+  });
   const plan = [];
   for (const group of groups) {
     if (group.review === true) continue;
-    const { data: prs } = await github.rest.pulls.list({
-      ...context.repo, head: `${context.repo.owner}:${group.branch}`, base: repo.default_branch,
-      state: 'all', sort: 'created', direction: 'desc', per_page: 1,
-    });
-    if (!prs.length) {
-      core.info(`${group.branch}: no PR`);
-      continue;
+    let entry = { branch: group.branch, number: '' };
+    try {
+      let { data: prs } = await find(group.branch, 'open');
+      if (!prs.length) ({ data: prs } = await find(group.branch, 'closed'));
+      if (!prs.length) {
+        core.info(`${group.branch}: no PR`);
+        continue;
+      }
+      const { data: pr } = await github.rest.pulls.get({ ...context.repo, pull_number: prs[0].number });
+      entry.number = String(pr.number);
+      if (pr.merged_at) {
+        entry = { ...entry, outcome: 'success', reason: 'already merged' };
+      } else if (pr.state !== 'open') {
+        entry = { ...entry, outcome: 'closed', reason: 'PR is closed' };
+      } else {
+        const { decision } = await evaluate({ github, context, pr, vouched, wait });
+        entry = decision.enable
+          ? { ...entry, action: 'enable', head_sha: pr.head.sha, base: pr.base.ref, method: decision.method }
+          : { ...entry, outcome: 'refused', reason: decision.reason };
+      }
+    } catch (error) {
+      entry = { ...entry, outcome: 'failure', reason: `lookup failed: ${error.message}` };
     }
-    const { data: pr } = await github.rest.pulls.get({ ...context.repo, pull_number: prs[0].number });
-    const entry = { branch: group.branch, number: String(pr.number) };
-    if (pr.merged_at) {
-      plan.push({ ...entry, outcome: 'success', reason: 'already merged' });
-    } else if (pr.state !== 'open') {
-      plan.push({ ...entry, outcome: 'closed', reason: 'PR is closed' });
-    } else {
-      const { decision } = await evaluate({ github, context, pr, vouched });
-      plan.push(decision.enable
-        ? { ...entry, action: 'enable', head_sha: pr.head.sha, method: decision.method }
-        : { ...entry, outcome: 'refused', reason: decision.reason });
-    }
-    core.info(`${group.branch}: #${pr.number} ${plan.at(-1).action || plan.at(-1).outcome} (${plan.at(-1).reason || 'qualifies'})`);
+    plan.push(entry);
+    core.info(`${group.branch}: #${entry.number} ${entry.action || entry.outcome} (${entry.reason || 'qualifies'})`);
   }
   return plan;
 }

@@ -502,7 +502,11 @@ const args = process.argv.slice(2);
 const n = args.find(a => /^[0-9]+$/.test(a));
 if (args[0] === 'pr' && args[1] === 'view') {
   if (${JSON.stringify(failView)}.includes(n)) process.exit(1);
-  console.log(prs[n].armed ? 'true' : 'false');
+  const pr = prs[n];
+  const jq = args[args.indexOf('--jq') + 1];
+  const facts = jq.includes('headRefOid') ? [pr.state || 'OPEN', pr.isDraft || false, pr.base || 'master', pr.head || ''] : [];
+  if (jq.includes('autoMergeRequest')) facts.push(pr.armed ? 'true' : 'false');
+  console.log(facts.join(' '));
 } else if (args[0] === 'pr' && args[1] === 'merge') {
   if (args.includes('--disable-auto')) {
     if (${JSON.stringify(failDisable)}.includes(n)) process.exit(1);
@@ -523,14 +527,18 @@ if (args[0] === 'pr' && args[1] === 'view') {
 }
 
 const sha = c => c.repeat(40);
-const enable = (branch, number, head, method = 'merge') => ({ branch, number, action: 'enable', head_sha: sha(head), method });
+const enable = (branch, number, head, method = 'merge') => ({ branch, number, action: 'enable', head_sha: sha(head), base: 'master', method });
 
 test('the arm job arms what the plan judged, at the judged head, and reports the rest', () => {
-  const f = armFixture({ 101: {}, 102: { armed: true }, 103: {}, 104: {} });
+  const f = armFixture({ 101: { head: sha('a') }, 102: { armed: true, head: sha('b') }, 103: {}, 104: {},
+    105: { head: sha('e') }, 106: { head: sha('f'), base: 'rc' }, 107: { head: sha('9'), isDraft: true } });
   try {
     f.plan([
       enable('auto/sync-upstream-a', '101', 'a'),
       enable('auto/sync-upstream-b', '102', 'b'),
+      enable('auto/sync-upstream-e', '105', '5'), // pushed since it was judged
+      enable('auto/sync-upstream-f', '106', 'f'), // retargeted since
+      enable('auto/sync-upstream-g', '107', '9'), // drafted since
       { branch: 'auto/sync-upstream-c', number: '103', outcome: 'refused', reason: 'PR is a draft' },
       { branch: 'auto/sync-upstream-d', number: '104', outcome: 'success', reason: 'already merged' },
     ]);
@@ -538,7 +546,13 @@ test('the arm job arms what the plan judged, at the judged head, and reports the
     assert.equal(result.status, 0, result.stdout + result.stderr);
     const merges = f.calls().filter(call => call.startsWith('pr merge'));
     assert.deepEqual(merges, [`pr merge --auto --merge --match-head-commit ${sha('a')} 101 -R omacom/omarchy-pkgs`]);
-    assert.deepEqual(f.outcomes(), {
+    const outcomes = f.outcomes();
+    for (const branch of ['e', 'f', 'g']) {
+      assert.equal(outcomes[`auto/sync-upstream-${branch}`].outcome, 'failure', branch);
+      assert.match(outcomes[`auto/sync-upstream-${branch}`].reason, /^moved since it was judged: /, branch);
+      delete outcomes[`auto/sync-upstream-${branch}`];
+    }
+    assert.deepEqual(outcomes, {
       'auto/sync-upstream-a': { number: '101', outcome: 'success', reason: '' },
       'auto/sync-upstream-b': { number: '102', outcome: 'success', reason: '' },
       'auto/sync-upstream-c': { number: '103', outcome: 'refused', reason: 'PR is a draft' },
@@ -550,7 +564,7 @@ test('the arm job arms what the plan judged, at the judged head, and reports the
 
 test('one PR that cannot be armed does not stop the others, and fails the job without a report', () => {
   for (const report of ['true', 'false']) {
-    const f = armFixture({ 101: {}, 102: {}, 103: {}, 104: {} }, { failMerge: ['101'], failView: ['102'] });
+    const f = armFixture({ 101: { head: sha('a') }, 102: {}, 103: { head: sha('c') }, 104: {} }, { failMerge: ['101'], failView: ['102'] });
     try {
       f.plan([
         enable('auto/sync-upstream-a', '101', 'a'),
@@ -565,7 +579,7 @@ test('one PR that cannot be armed does not stop the others, and fails the job wi
         'auto/sync-upstream-a': 'failure', 'auto/sync-upstream-b': 'failure',
         'auto/sync-upstream-e': 'failure', 'auto/sync-upstream-c': 'success',
       });
-      assert.equal(outcomes['auto/sync-upstream-b'].reason, 'could not read auto-merge state');
+      assert.equal(outcomes['auto/sync-upstream-b'].reason, 'could not read the PR');
       assert.equal(outcomes['auto/sync-upstream-e'].reason, 'bad plan entry');
       assert.ok(!f.calls().some(call => call.includes(' 104 ')), 'a bad entry calls nothing');
     } finally { f.cleanup(); }
@@ -596,7 +610,7 @@ test('auto-merge acts only when the live state needs it, and a failed lookup is 
     } finally { f.cleanup(); }
   }
   const apply = runBlock('auto-merge-pr.yml', 'Arm or withdraw auto-merge');
-  const env = { PR: '7', HEAD_SHA: sha('a'), METHOD: 'squash' };
+  const env = { PR: '7', HEAD_SHA: sha('a'), BASE: 'master', METHOD: 'squash' };
   const scenarios = [
     // [state, options, action, exit status, what gh pr merge was asked]
     [false, {}, 'withdraw', 0, []], // already gone: done
@@ -606,9 +620,13 @@ test('auto-merge acts only when the live state needs it, and a failed lookup is 
     [false, { failView: ['7'] }, 'enable', 1, []],
     [false, {}, 'enable', 0, [`pr merge --auto --squash --match-head-commit ${sha('a')} 7 -R omacom/omarchy-pkgs`]],
     [false, { failMerge: ['7'] }, 'enable', 1, [`pr merge --auto --squash --match-head-commit ${sha('a')} 7 -R omacom/omarchy-pkgs`]],
+    // Moved between the decision and the write: nothing is armed.
+    [false, { pr: { base: 'rc' } }, 'enable', 0, []],
+    [false, { pr: { head: sha('b') } }, 'enable', 0, []],
+    [false, { pr: { isDraft: true } }, 'enable', 0, []],
   ];
-  for (const [armed, options, action, status, merges] of scenarios) {
-    const f = armFixture({ 7: { armed } }, options);
+  for (const [armed, { pr = {}, ...options }, action, status, merges] of scenarios) {
+    const f = armFixture({ 7: { armed, head: sha('a'), ...pr } }, options);
     try {
       const result = f.run(apply, { ...env, ACTION: action });
       const label = JSON.stringify([armed, options, action]);
@@ -885,6 +903,8 @@ test('auto-merge decides without a write credential and arms with the merge App 
   const job = name => text.split(new RegExp(`\\n  ${name}:\\n`))[1].split(/\n  [a-z-]+:\n/)[0];
   assert.match(text, /pull_request_target:/);
   assert.doesNotMatch(text, /PKGS_BOT_TOKEN|head\.sha \}\}|head\.ref \}\}|refs\/pull\//);
+  // Edits to a PR's title or body must not keep cancelling a withdraw.
+  assert.match(text, /\nconcurrency:\n  group: auto-merge-pr-[^\n]+\n  cancel-in-progress: false\n/);
   // Nothing third-party runs here: the vouch action installs an unpinned
   // Nushell, and author trust is read by auto-merge-pr.cjs instead.
   assert.doesNotMatch(text, /mitchellh|setup-nu/);
@@ -989,7 +1009,7 @@ test('a PR number is taken only as a person types it', () => {
 });
 
 // A fake GitHub for planArms: PRs by number, found by owner:branch and base.
-function fakeGitHub(prs) {
+function fakeGitHub(prs, { failCompare = [] } = {}) {
   const calls = [];
   const rest = {
     repos: {
@@ -1001,13 +1021,19 @@ function fakeGitHub(prs) {
         calls.push(query);
         const [owner, branch] = query.head.split(':');
         return { data: Object.values(prs).filter(pr => pr.head.repo.owner.login === owner && pr.head.ref === branch
-          && pr.base.ref === query.base).sort((a, b) => b.number - a.number).slice(0, query.per_page) };
+          && pr.base.ref === query.base && pr.state === query.state).sort((a, b) => b.number - a.number).slice(0, query.per_page) };
       },
       get: async ({ pull_number }) => ({ data: prs[pull_number] }),
-      listFiles: async () => {},
     },
   };
-  return { calls, github: { rest, paginate: async (fn, { pull_number }) => prs[pull_number].files } };
+  // The diff is read by base...head SHA, never by PR number.
+  rest.repos.compareCommitsWithBasehead = async ({ basehead }) => {
+    const [base, head] = basehead.split('...');
+    const pr = Object.values(prs).find(pr => pr.head.sha === head && pr.base.ref === base);
+    if (failCompare.includes(pr.number)) throw new Error('503 Service Unavailable');
+    return { data: { files: pr.files } };
+  };
+  return { calls, github: { rest } };
 }
 
 test('the arm plan judges each group PR by the auto-merge rule and never a fork or reviewed group', async () => {
@@ -1027,9 +1053,14 @@ test('the arm plan judges each group PR by the auto-merge rule and never a fork 
       repo: { full_name: 'mallory/omarchy-pkgs', owner: { login: 'mallory' } } } }),
     6: pr(6, 'auto/sync-upstream-f', { draft: true }),
     7: pr(7, 'auto/sync-upstream-g'),
-  });
+    // An older open PR and a newer closed one on the same branch: the open one counts.
+    8: pr(8, 'auto/sync-upstream-h'),
+    18: pr(18, 'auto/sync-upstream-h', { state: 'closed' }),
+    9: pr(9, 'auto/sync-upstream-i'),
+    10: pr(10, 'auto/sync-upstream-j', { files: Array.from({ length: 300 }, (_, i) => ({ filename: `pkgbuilds/p${i}/PKGBUILD`, status: 'modified' })), changed_files: 300 }),
+  }, { failCompare: [9] });
   const groups = ['a', 'b', 'c', 'd', 'e', 'f'].map(x => ({ branch: `auto/sync-upstream-${x}` }))
-    .concat([{ branch: 'auto/sync-upstream-g', review: true }]);
+    .concat([{ branch: 'auto/sync-upstream-g', review: true }], ['h', 'i', 'j'].map(x => ({ branch: `auto/sync-upstream-${x}` })));
   const context = { repo: { owner: 'omacom', repo: 'omarchy-pkgs' } };
   const plan = await planArms({ github, context, core: { info() {} }, groups, vouched: '' });
   const brief = plan.map(({ branch, number, action, outcome, head_sha, method }) =>
@@ -1040,10 +1071,19 @@ test('the arm plan judges each group PR by the auto-merge rule and never a fork 
     ['c', '3', 'success', undefined, undefined],
     ['d', '4', 'closed', undefined, undefined],
     ['f', '6', 'refused', undefined, undefined],
+    ['h', '8', 'enable', '8', 'merge'],
+    ['i', '9', 'failure', undefined, undefined],
+    ['j', '10', 'refused', undefined, undefined],
   ]);
   assert.match(plan[1].reason, /changes more than packages/);
   assert.equal(plan[4].reason, 'PR is a draft');
-  // Looked up by this repository's branch into the default branch; the
-  // reviewed group is not looked up at all.
-  assert.deepEqual(calls.map(call => [call.head, call.base]), groups.slice(0, 6).map(g => [`omacom:${g.branch}`, 'master']));
+  assert.equal(plan[0].base, 'master');
+  assert.match(plan[6].reason, /^lookup failed: 503/);
+  assert.match(plan[7].reason, /300 or more files/);
+  // Looked up by this repository's branch into the default branch, open
+  // first; the reviewed group is not looked up at all.
+  const looked = groups.filter(g => !g.review).map(g => `omacom:${g.branch}`);
+  assert.deepEqual([...new Set(calls.map(call => call.head))], looked);
+  assert.ok(calls.every(call => call.base === 'master'));
+  assert.deepEqual(calls.filter(call => call.head === 'omacom:auto/sync-upstream-c').map(call => call.state), ['open', 'closed']);
 });
