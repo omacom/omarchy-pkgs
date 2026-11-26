@@ -1,16 +1,17 @@
 #!/bin/bash
 # Keeps the Anduril BlueChip front camera relay (v4l2-relayd@bluechip) healthy.
-# Two faults in libcamera 0.7.2 with v4l2-relayd 0.2.0 stop the camera mid-call:
-#  - every stream start leaks one 8 MB frame buffer from the 128 MB CMA pool (GPU debayer
-#    EGL context never destroyed), so after a few camera reopens the next start fails;
-#  - a failed start (also seen once from the sensor: "ov02c10 failed to set mode") leaves
-#    the relay deadlocked: no frames until it is restarted.
-# Restarting the relay frees the leak and clears the deadlock, and an app that has the
-# camera open keeps it and gets frames again after a short pause (tested). So this:
+# Two faults in libcamera 0.7.2 with v4l2-relayd 0.2.0 degrade or stop the camera:
+#  - every stream stop leaks one 8.3 MB 1080p frame buffer from the system DMA-buf
+#    heap (GPU debayer EGL context never destroyed);
+#  - a failed start (also seen on other Qualcomm sensors such as the Zenbook A16's
+#    ov02c10) leaves the relay deadlocked: no frames until it is restarted.
+# Restarting the relay frees the leaked buffers and clears the deadlock, and an app
+# that has the camera open keeps it and gets frames again after a short pause. So this:
 #  1. restarts the relay at once when it logs a start or buffer failure;
 #  2. when no app streams and leaked frame buffers exist, restarts it right away
-#     (0.3 s, nothing is streaming then);
-#  3. only if CMA is about to run out while an app streams, restarts it then (short pause).
+#     (~0.3 s, nothing is streaming then);
+#  3. if leaked buffers pile up while streaming (e.g. rapid reopens without an idle
+#     gap), caps the leak by restarting once INUSE_LEAKED extra buffers accumulate.
 # Root causes are fixed in libcamera 0.8.0 (a00a4ca2 EGL context leak, 0f045015 stop
 # deadlock). The unit's ExecCondition runs this with --needed, so the guard stands down
 # once that version is installed: the unit is skipped, not failed or restarted.
@@ -19,11 +20,10 @@
 set -u
 unit=v4l2-relayd@bluechip.service
 procs="/sys/fs/cgroup/system.slice/system-v4l2\\x2drelayd.slice/$unit/cgroup.procs"
-ACTIVE=4           # frame buffers a running stream holds; any more (or any while idle) leaked
-INUSE_LEAKED=3     # leaked buffers that, with CMA nearly gone, justify a restart mid-stream
-INUSE_CMA_KB=20000 # ... "nearly gone"
-COOLDOWN=4         # s after a restart in which no other restart runs; an error then is
-                   # held and restarts the relay once the cooldown ends
+ACTIVE=4        # frame buffers a running 1080p stream holds (frame-0..3); any more leaked
+INUSE_LEAKED=12 # leaked buffers (~100 MB) that justify a restart mid-stream
+COOLDOWN=4      # s after a restart in which no other restart runs; an error then is
+                # held and restarts the relay once the cooldown ends
 log() { echo "camera-guard: $*"; }
 
 if [[ ${1-} == --needed ]]; then
@@ -32,15 +32,15 @@ if [[ ${1-} == --needed ]]; then
   exit 0
 fi
 
-CMA=0 RELAY= INUSE=0 FRAMES=0
-read_cma() { local k v r; while read -r k v r; do [[ $k == CmaFree: ]] && { CMA=$v; return; }; done </proc/meminfo; }
-# The camera's frame buffers: dma-bufs named frame-N from the linux,cma heap. Counting them
-# measures the leak itself; total CmaFree also moves with the display and video decoders.
+MEM_AVAIL=0 RELAY= INUSE=0 FRAMES=0
+read_mem_avail() { local k v r; while read -r k v r; do [[ $k == MemAvailable: ]] && { MEM_AVAIL=$v; return; }; done </proc/meminfo; }
+# The camera's frame buffers: dma-bufs named frame-N from the system (or linux,cma)
+# heap. Counting them measures the leak directly regardless of general memory churn.
 bufinfo=/sys/kernel/debug/dma_buf/bufinfo
 read_frames() {
   local size flags mode count exp ino name; FRAMES=0
   while read -r size flags mode count exp ino name; do
-    [[ $exp == linux,cma && $name == frame-* ]] && (( FRAMES++ ))
+    [[ ($exp == system || $exp == linux,cma) && $name == frame-* ]] && (( FRAMES++ ))
   done <"$bufinfo"
 }
 read_relay() { RELAY=; [[ -r $procs ]] && read -r RELAY <"$procs" 2>/dev/null; }
@@ -61,8 +61,8 @@ last_restart=0 check_idle=3 pending=
 restart() {
   (( EPOCHSECONDS - last_restart < COOLDOWN )) && { pending=$1; return; }
   pending=
-  read_cma
-  log "restarting relay: $1 (CmaFree $CMA kB)"
+  read_mem_avail
+  log "restarting relay: $1 (MemAvailable $MEM_AVAIL kB)"
   systemctl restart "$unit"
   last_restart=$EPOCHSECONDS
 }
@@ -94,20 +94,17 @@ while :; do
   read_relay
   [[ -n $RELAY ]] || continue
   # The buffer list is costly to read, so it is read only when it can matter: for a few
-  # checks after the camera is released (and at start), or mid-stream once CMA is low.
+  # checks after the camera is released (and at start), or occasionally while streaming.
   read_inuse
   if (( INUSE )); then
     check_idle=3
-    # 3. Several leaked and CMA about to run out while streaming: restart now (short
-    #    pause) rather than fail at the next start. Rare: 2. normally gets there first.
-    read_cma
-    if (( CMA < INUSE_CMA_KB )); then
-      read_frames
-      (( FRAMES - ACTIVE >= INUSE_LEAKED )) && restart "$(( FRAMES - ACTIVE )) leaked, CMA nearly gone, in use"
-    fi
+    # 3. Many leaked buffers accumulated without an idle window: restart now (short
+    #    pause) to cap memory growth. Rare: 2. normally reclaims leaks as soon as idle.
+    read_frames
+    (( FRAMES - ACTIVE >= INUSE_LEAKED )) && restart "$(( FRAMES - ACTIVE )) leaked buffers while in use"
   elif (( check_idle > 0 )); then
     (( check_idle-- ))
-    # 2. Released and buffers leaked: give them back now (0.3 s, nothing is streaming).
+    # 2. Released and buffers leaked: give them back now (~0.3 s, nothing is streaming).
     read_frames
     (( FRAMES > 0 )) && { restart "released, $FRAMES leaked buffers"; check_idle=3; }
   fi
