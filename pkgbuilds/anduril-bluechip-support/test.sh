@@ -37,13 +37,15 @@ relay="$package_dir/v4l2-relayd-bluechip.conf"
   source "$relay"
   [[ $VIDEOSRC == 'libcamerasrc camera-name=/base/soc@0/cci@ac16000/i2c-bus@1/camera@10 '* ]] ||
     fail "the relay opens the front camera by its device tree path"
+  [[ $VIDEOSRC == *"contrast="* && $VIDEOSRC == *"saturation="* ]] ||
+    fail "the relay tunes contrast and saturation for the software ISP"
   [[ $VIDEOSRC == *"width=${WIDTH},height=${HEIGHT}"* ]] || fail "the relay's source and output sizes agree"
   [[ $CARD_LABEL == 'Front Camera' ]] || fail "the relay fills the Front Camera device"
 )
 grep -q 'card_label="Front Camera"' "$package_dir/bluechip-camera-modprobe.conf" ||
   fail "the loopback device is the one the relay fills"
 grep -q 'blackLevel: 4096' "$package_dir/ov08x40.yaml" || fail "the OV08X40 tuning gives the sensor's black level"
-! grep -q 'Ccm:' "$package_dir/ov08x40.yaml" || fail "the OV08X40 tuning omits an unused CCM stage"
+grep -q 'Ccm:' "$package_dir/ov08x40.yaml" || fail "the OV08X40 tuning enables the CCM stage so Saturation takes effect"
 
 # WirePlumber rules & udev rule
 cameras="$package_dir/50-bluechip-cameras.conf"
