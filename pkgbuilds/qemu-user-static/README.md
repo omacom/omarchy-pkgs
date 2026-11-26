@@ -4,6 +4,7 @@ This aarch64-only split recipe provides qemu-user-static and qemu-user-static-bi
 
 ## Patches
 
+- `1001` passes Linux AIO (`io_setup`, `io_submit`, `io_getevents`, `io_cancel`, `io_destroy`) through to the host when guest and host share the structure layout; stock qemu-user returns ENOSYS. Every iocb, buffer and event array is checked against guest memory first, a read into a page QEMU protected for translated code is redone, and result errnos are translated.
 - `1002` is upstream QEMU `586284af4c2c`, carried unchanged: `sigcontext.trapno` carries the real trap number instead of -1. QEMU 11.2 has it; drop the patch then.
 
 ## Updates
