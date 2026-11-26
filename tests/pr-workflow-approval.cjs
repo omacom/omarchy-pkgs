@@ -531,7 +531,8 @@ const enable = (branch, number, head, method = 'merge') => ({ branch, number, ac
 
 test('the arm job arms what the plan judged, at the judged head, and reports the rest', () => {
   const f = armFixture({ 101: { head: sha('a') }, 102: { armed: true, head: sha('b') }, 103: {}, 104: {},
-    105: { head: sha('e') }, 106: { head: sha('f'), base: 'rc' }, 107: { head: sha('9'), isDraft: true } });
+    105: { head: sha('e') }, 106: { head: sha('f'), base: 'rc' }, 107: { head: sha('9'), isDraft: true },
+    108: { head: sha('8'), state: 'MERGED' } });
   try {
     f.plan([
       enable('auto/sync-upstream-a', '101', 'a'),
@@ -539,6 +540,7 @@ test('the arm job arms what the plan judged, at the judged head, and reports the
       enable('auto/sync-upstream-e', '105', '5'), // pushed since it was judged
       enable('auto/sync-upstream-f', '106', 'f'), // retargeted since
       enable('auto/sync-upstream-g', '107', '9'), // drafted since
+      enable('auto/sync-upstream-h', '108', '8'), // merged since: the update landed
       { branch: 'auto/sync-upstream-c', number: '103', outcome: 'refused', reason: 'PR is a draft' },
       { branch: 'auto/sync-upstream-d', number: '104', outcome: 'success', reason: 'already merged' },
     ]);
@@ -552,6 +554,8 @@ test('the arm job arms what the plan judged, at the judged head, and reports the
       assert.match(outcomes[`auto/sync-upstream-${branch}`].reason, /^moved since it was judged: /, branch);
       delete outcomes[`auto/sync-upstream-${branch}`];
     }
+    assert.deepEqual(outcomes['auto/sync-upstream-h'], { number: '108', outcome: 'success', reason: 'merged' });
+    delete outcomes['auto/sync-upstream-h'];
     assert.deepEqual(outcomes, {
       'auto/sync-upstream-a': { number: '101', outcome: 'success', reason: '' },
       'auto/sync-upstream-b': { number: '102', outcome: 'success', reason: '' },
@@ -961,7 +965,7 @@ test('VOUCHED.td is read as the vouch action reads it', () => {
 
 test('author trust: bots, then write access, then VOUCHED.td, as vouch decides it', async () => {
   const github = permissions => ({ rest: { repos: { getCollaboratorPermissionLevel: async ({ username }) => {
-    if (!(username in permissions)) throw new Error('404');
+    if (!(username in permissions)) throw Object.assign(new Error('404'), { status: 404 });
     return { data: { permission: permissions[username] } };
   } } } });
   const context = { repo: { owner: 'omacom', repo: 'omarchy-pkgs' } };
@@ -1014,7 +1018,7 @@ function fakeGitHub(prs, { failCompare = [] } = {}) {
   const rest = {
     repos: {
       get: async () => ({ data: { default_branch: 'master' } }),
-      getCollaboratorPermissionLevel: async () => { throw new Error('404'); },
+      getCollaboratorPermissionLevel: async () => { throw Object.assign(new Error('404'), { status: 404 }); },
     },
     pulls: {
       list: async query => {
