@@ -246,6 +246,8 @@ systemd doesn't list the laptop yet, and `surface-laptop-8-support` installs its
 
 Outside the board files they touch `glymur.dtsi` on every X2 laptop, and `pmic_glink`, `pcie-qcom`, `pci-pwrctrl-pwrseq` and EFI variable locking more widely. The A16's own DSP firmware and Wi-Fi board data are in `asus-zenbook-a16-firmware`.
 
+`2862` (Jesse Casco, [lore `20261115000021.78869-1-jesse.casco@gmail.com`](https://lore.kernel.org/r/20261115000021.78869-1-jesse.casco@gmail.com)) keeps an eDP panel lit when link training channel equalisation fails and a lane-count or rate fallback would drop below the mode's required bandwidth, retrying at the previous link settings instead (fixes black wakes from DPMS off on the ASUS Zenbook A16; external DP keeps the existing fallback).
+
 ### Acer Aspire 14 AI and 16 AI
 
 `2510`-`2512` bring up the Acer Aspire 14 AI (A14-11M) and Aspire 16 AI (A16-11M), on the Snapdragon X X1-26-100 (`acer,aspire-a14-11m`, `acer,aspire-a16-11m`). The trees are written from the ACPI tables in the two laptops' hardware reports.
