@@ -799,6 +799,18 @@ test('auto-merge follows the build gate: trusted authors, or build-approved for 
   }
 });
 
+test('auto-merge leaves the PRs of an author who merges by hand, and takes back one armed earlier', () => {
+  for (const login of ['emirb', 'EmirB']) {
+    const decision = decide({ pr: mergeable({ user: { login } }), files: packageFiles, vouchStatus: 'collaborator', repository });
+    assert.equal(decision.enable, false, login);
+    assert.match(decision.reason, /merges by hand/);
+  }
+  const { withdraw } = require('../.github/scripts/auto-merge-pr.cjs');
+  const mine = decide({ pr: mergeable({ user: { login: 'emirb' } }), files: packageFiles, vouchStatus: 'collaborator', repository });
+  assert.equal(withdraw(mine, 'collaborator', false), true);
+  assert.equal(decide({ pr: mergeable({ user: { login: 'ryanrhughes' } }), files: packageFiles, vouchStatus: 'collaborator', repository }).enable, true);
+});
+
 test('auto-merge only lands PRs that change nothing outside pkgbuilds/', () => {
   const check = files => decide({ pr: mergeable(), files, vouchStatus: 'collaborator', repository }).enable;
   assert.equal(check(packageFiles), true);
