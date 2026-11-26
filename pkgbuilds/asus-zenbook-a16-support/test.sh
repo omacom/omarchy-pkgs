@@ -72,4 +72,15 @@ grep -qx 'ExecStart=/usr/lib/asus-zenbook-a16-support/zenbook-a16-camera-guard' 
 grep -qx 'ExecCondition=/usr/lib/asus-zenbook-a16-support/zenbook-a16-camera-guard --needed' "$unit" ||
   fail "the camera guard stands down once libcamera 0.8.0 is installed"
 
-echo "ok - ASUS Zenbook A16 front camera relay, tuning, WirePlumber rules and guard"
+# Power management udev rules
+power_rules="$package_dir/90-asus-zenbook-a16-power.rules"
+grep -qx 'ATTR{\[dmi/id\]board_name}!="UX3607OA", GOTO="zenbook_a16_power_end"' "$power_rules" ||
+  fail "the power rules are gated to the ASUS Zenbook A16"
+grep -q 'KERNEL=="ddr|ddr-qos|llcc"' "$power_rules" ||
+  fail "the power rules stop CPUCP memlat polling on older kernels"
+grep -q 'DRIVER=="dwc3-qcom"' "$power_rules" ||
+  fail "the power rules enable runtime PM on dwc3-qcom"
+grep -q 'ATTR{idVendor}=="0bda", ATTR{idProduct}=="0329"' "$power_rules" ||
+  fail "the power rules enable autosuspend on the Realtek SD reader"
+
+echo "ok - ASUS Zenbook A16 front camera relay, tuning, WirePlumber rules, guard and power rules"
