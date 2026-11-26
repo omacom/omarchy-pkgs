@@ -22,4 +22,9 @@ grep -q 'device.bus-path = "platform-acb6000.isp"' "$cameras" || fail "pickers h
 grep -qx 'SUBSYSTEM=="dma_heap", KERNEL=="system", TAG+="uaccess"' "$package_dir/70-bluechip-camera.rules" ||
   fail "udev grants uaccess on the system dma_heap"
 
+sh -n "$package_dir/anduril-bluechip-support.install" ||
+  fail "install scriptlet has valid POSIX sh syntax"
+grep -q 'systemctl stop bluechip-camera-guard.service v4l2-relayd@bluechip.service' "$package_dir/anduril-bluechip-support.install" ||
+  fail "install scriptlet stops retired system camera services on upgrade"
+
 echo "ok - Anduril BlueChip front camera system plumbing (loopback, WirePlumber rules, dma_heap udev)"
