@@ -33,6 +33,10 @@
 // which must not run next to the merge App's key or decide for a job that
 // holds it.
 const PACKAGES = 'pkgbuilds/';
+// Authors who merge their own package PRs by hand. Their PRs build and
+// test like any trusted author's, but auto-merge is never armed on them,
+// and one armed earlier is taken back. Logins in lower case.
+const MERGE_BY_HAND = new Set(['emirb']);
 const TESTS = 'tests/';
 const OWNERS = 'release/owners.json';
 
@@ -64,6 +68,9 @@ function mergeMethod(pr, repository) {
 function decide({ pr, files, vouchStatus, repository, owners }) {
   if (pr.state !== 'open') return { enable: false, reason: 'PR is not open' };
   if (pr.draft) return { enable: false, reason: 'PR is a draft' };
+  if (MERGE_BY_HAND.has(String(pr.user?.login || '').toLowerCase())) {
+    return { enable: false, reason: `${pr.user.login} merges by hand` };
+  }
   const defaultBranch = pr.base?.repo?.default_branch;
   if (!defaultBranch || pr.base.ref !== defaultBranch) {
     return { enable: false, reason: `PR targets ${pr.base?.ref || 'an unknown branch'}, not ${defaultBranch || 'the default branch'}` };
