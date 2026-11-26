@@ -925,10 +925,13 @@ const { vouchedStatus, authorStatus, prNumber, planArms } = require('../.github/
 test('VOUCHED.td is read as the vouch action reads it', () => {
   const file = [
     '# Trust list', '', 'github:Alice', '-github:mallory spam', 'bob', 'gitlab:carol',
-    '-github:dave first', 'github:dave later', '  github:erin  # indented with a comment',
+    '-github:dave first', 'github:dave later', '  github:erin  # details, not a comment',
+    // vouch/file.nu: no inline comments, and only a space ends the handle.
+    'github:gil#note', 'github:hal\treason', '-github:ivy#x', 'github:ivy', '  # github:jo',
   ].join('\n');
   const cases = { alice: 'vouched', ALICE: 'vouched', mallory: 'denounced', bob: 'vouched', carol: 'unknown',
-    dave: 'denounced', erin: 'vouched', frank: 'unknown', 'github:alice': 'unknown' };
+    dave: 'denounced', erin: 'vouched', frank: 'unknown', 'github:alice': 'unknown',
+    gil: 'unknown', 'gil#note': 'vouched', hal: 'unknown', ivy: 'vouched', jo: 'unknown' };
   for (const [login, status] of Object.entries(cases)) assert.equal(vouchedStatus(file, login), status, login);
   // The repository's own file parses: its first entry is vouched.
   const real = readFileSync(join(__dirname, '../.github/VOUCHED.td'), 'utf8');
@@ -951,6 +954,30 @@ test('author trust: bots, then write access, then VOUCHED.td, as vouch decides i
   assert.equal(await status('vic'), 'vouched');
   assert.equal(await status('den'), 'denounced');
   assert.equal(await status('den', { den: 'write' }), 'collaborator', 'vouch checks access before the file');
+});
+
+test('a transient permission error is retried as vouch retries it, a 404 is not', async () => {
+  const context = { repo: { owner: 'omacom', repo: 'omarchy-pkgs' } };
+  const flaky = statuses => {
+    const seen = [];
+    return { seen, github: { rest: { repos: { getCollaboratorPermissionLevel: async () => {
+      const status = statuses[seen.length];
+      seen.push(status ?? 'ok');
+      if (status) throw Object.assign(new Error(String(status)), { status });
+      return { data: { permission: 'write' } };
+    } } } } };
+  };
+  const waits = [];
+  const wait = async ms => { waits.push(ms); };
+  let f = flaky([503, 429, 403]);
+  assert.equal(await authorStatus({ ...f, context, login: 'wes', vouched: '', wait }), 'collaborator');
+  assert.deepEqual(waits, [1000, 2000, 4000]);
+  f = flaky([404]);
+  assert.equal(await authorStatus({ ...f, context, login: 'wes', vouched: 'github:wes', wait }), 'vouched');
+  assert.equal(f.seen.length, 1);
+  f = flaky([500, 500, 500, 500, 500, 500, 500]);
+  assert.equal(await authorStatus({ ...f, context, login: 'wes', vouched: '', wait }), 'unknown');
+  assert.equal(f.seen.length, 6, 'five retries, then the file');
 });
 
 test('a PR number is taken only as a person types it', () => {

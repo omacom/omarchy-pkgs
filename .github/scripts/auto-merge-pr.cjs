@@ -106,13 +106,15 @@ function withdraw(decision, vouchStatus, contentQualifies = true) {
 // A VOUCHED.td entry for login: 'vouched', 'denounced' or 'unknown'. Lines
 // are "github:user" or "-github:user reason"; a bare "user" counts for every
 // platform. The first entry for the user decides, ignoring case.
+// Parsed as vouch/file.nu parse-line does: a comment is a whole line that
+// starts with #, and the handle ends at the first space, nothing else.
 function vouchedStatus(text, login) {
   const user = login.toLowerCase();
   for (const raw of text.split('\n')) {
-    const line = raw.replace(/#.*/, '').trim();
-    if (!line) continue;
+    const line = raw.trim();
+    if (!line || line.startsWith('#')) continue;
     const denounce = line.startsWith('-');
-    const handle = (denounce ? line.slice(1) : line).split(/\s+/)[0];
+    const handle = (denounce ? line.slice(1) : line).split(' ')[0];
     const colon = handle.indexOf(':');
     const platform = colon < 0 ? null : handle.slice(0, colon).toLowerCase();
     const name = (colon < 0 ? handle : handle.slice(colon + 1)).toLowerCase();
@@ -122,14 +124,23 @@ function vouchedStatus(text, login) {
 }
 
 // The vouch status of a PR's author: bot, collaborator (admin or write
-// access), or the VOUCHED.td entry. A failed permission lookup falls
-// through to the file, as in vouch.
-async function authorStatus({ github, context, login, vouched }) {
+// access), or the VOUCHED.td entry. As in vouch's api, a 401, 403, 429 or
+// 5xx is retried five times, 1 s to 16 s apart, and a lookup that still
+// fails falls through to the file.
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+async function authorStatus({ github, context, login, vouched, wait = sleep }) {
   if (login.endsWith('[bot]')) return 'bot';
-  try {
-    const { data } = await github.rest.repos.getCollaboratorPermissionLevel({ ...context.repo, username: login });
-    if (['admin', 'write'].includes(data.permission)) return 'collaborator';
-  } catch {}
+  for (let attempt = 0; ; attempt++) {
+    try {
+      const { data } = await github.rest.repos.getCollaboratorPermissionLevel({ ...context.repo, username: login });
+      if (['admin', 'write'].includes(data.permission)) return 'collaborator';
+      break;
+    } catch (error) {
+      const status = error.status;
+      if (!(status === undefined || [401, 403, 429].includes(status) || status >= 500) || attempt >= 5) break;
+      await wait(1000 * 2 ** attempt);
+    }
+  }
   return vouchedStatus(vouched, login);
 }
 
