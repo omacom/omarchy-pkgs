@@ -320,3 +320,49 @@ for upgrade in unchanged absent; do
   check_macs "$upgrade upgrade" "$etc"
 done
 echo "PASS: pacman upgrades install the guarded hooks file and keep local changes"
+
+# Sources shipping 91-omarchy-initcpio-rebuild.hook place Omarchy's initcpio
+# hooks under /etc/initcpio/ so unchanged settings upgrades skip
+# 90-mkinitcpio-install.hook; older sources keep /usr/lib/initcpio/.
+initcpio_src=$scratch/initcpio/omarchy
+mkdir -p "$initcpio_src/default/initcpio/hooks" "$initcpio_src/default/initcpio/install" \
+  "$initcpio_src/default/libalpm/hooks"
+cp -a "$fixture/." "$initcpio_src/"
+for hook in omarchy-snapshot-overlay omarchy-restore; do
+  printf 'hook %s\n' "$hook" > "$initcpio_src/default/initcpio/hooks/$hook"
+  printf 'install %s\n' "$hook" > "$initcpio_src/default/initcpio/install/$hook"
+done
+
+for recipe in omarchy-settings omarchy-settings-dev; do
+  (
+    export CARCH=x86_64 OMARCHY_SRC=$initcpio_src srcdir=$scratch/initcpio pkgdir=$scratch/initcpio-legacy-$recipe
+    backup=()
+    # shellcheck disable=SC1090
+    source "$BUILD_ROOT/pkgbuilds/$recipe/PKGBUILD"
+    package
+    for hook in omarchy-snapshot-overlay omarchy-restore; do
+      cmp "$initcpio_src/default/initcpio/hooks/$hook" "$pkgdir/usr/lib/initcpio/hooks/$hook"
+      cmp "$initcpio_src/default/initcpio/install/$hook" "$pkgdir/usr/lib/initcpio/install/$hook"
+      [[ ! -e $pkgdir/etc/initcpio/hooks/$hook && ! -e $pkgdir/etc/initcpio/install/$hook ]]
+    done
+  )
+done
+
+printf '[Action]\nExec = /usr/bin/omarchy-boot-sync-initcpio --pacman-hook\n' \
+  > "$initcpio_src/default/libalpm/hooks/91-omarchy-initcpio-rebuild.hook"
+
+for recipe in omarchy-settings omarchy-settings-dev; do
+  (
+    export CARCH=x86_64 OMARCHY_SRC=$initcpio_src srcdir=$scratch/initcpio pkgdir=$scratch/initcpio-etc-$recipe
+    backup=()
+    # shellcheck disable=SC1090
+    source "$BUILD_ROOT/pkgbuilds/$recipe/PKGBUILD"
+    package
+    for hook in omarchy-snapshot-overlay omarchy-restore; do
+      cmp "$initcpio_src/default/initcpio/hooks/$hook" "$pkgdir/etc/initcpio/hooks/$hook"
+      cmp "$initcpio_src/default/initcpio/install/$hook" "$pkgdir/etc/initcpio/install/$hook"
+      [[ ! -e $pkgdir/usr/lib/initcpio/hooks/$hook && ! -e $pkgdir/usr/lib/initcpio/install/$hook ]]
+    done
+  )
+done
+echo "PASS: initcpio hooks move to /etc/initcpio/ when 91-omarchy-initcpio-rebuild.hook is present"
