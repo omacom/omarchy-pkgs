@@ -4,6 +4,7 @@ This aarch64-only split recipe provides qemu-user-static and qemu-user-static-bi
 
 ## Patches
 
+- `1000` keeps 64-bit guest mappings inside the guest's address space. Without it the arm64 kernel places x86-64 mappings near 2^48, which x86-64 code takes for kernel addresses. QEMU now chooses the address, as it does with a reserved address space: it searches the guest page table for a hole below 2^47, claims it with `MAP_FIXED_NOREPLACE`, skips past QEMU's own host mappings, and reuses freed space. `mremap` resizes in place when it can. Mappings start at 3/4 of the guest's 47 bits, as the default x86-64 layout places them.
 - `1002` is upstream QEMU `586284af4c2c`, carried unchanged: `sigcontext.trapno` carries the real trap number instead of -1. QEMU 11.2 has it; drop the patch then.
 
 ## Updates
