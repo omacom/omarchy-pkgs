@@ -16,9 +16,10 @@ name: Open package PRs
 # GITHUB_TOKEN push would get. This workflow never merges with it. Its key is
 # in the bot-sync environment, which only master can use.
 #
-# Arming auto-merge still goes through the PAT in PKGS_BOT_TOKEN: GitHub
-# merges as whoever armed it, and a merge made with the built-in GITHUB_TOKEN
-# would not start publish.yml.
+# The omarchy-pkgs-merge App arms auto-merge, in the arm job: GitHub merges
+# as whoever armed it, and a merge made with the built-in GITHUB_TOKEN would
+# not start publish.yml. Its key is in the bot-merge environment. A job has
+# one environment, so no job here holds both Apps.
 
 on:
   workflow_call:
@@ -44,12 +45,12 @@ on:
         type: boolean
         default: false
     secrets:
-      PKGS_BOT_TOKEN:
-        required: true
       # An environment secret reaches a called workflow only when the caller
       # passes it by name. The jobs here name bot-sync, so they get its value,
       # and only on master. A caller that forgets it fails here, not silently.
       PKGS_SYNC_APP_KEY:
+        required: true
+      PKGS_MERGE_APP_KEY:
         required: true
 
 permissions:
@@ -234,25 +235,6 @@ jobs:
           labels: automated
           draft: ${{ matrix.group.review == true }}
 
-      # Auto-merge, not a direct merge: branch protection still has to see
-      # `result`, `self-tests` and `build-isolation` green. auto-merge-pr.yml
-      # may arm the same PR at the same moment; either one arming it is the
-      # outcome wanted.
-      - name: Enable auto-merge
-        id: merge
-        if: ${{ steps.pr.outcome == 'success' && steps.pr.outputs.pull-request-number != '' && matrix.group.review != true }}
-        continue-on-error: ${{ inputs.report-package-failures }}
-        env:
-          GH_TOKEN: ${{ secrets.PKGS_BOT_TOKEN }}
-          PR: ${{ steps.pr.outputs.pull-request-number }}
-        run: |
-          armed() { [[ "$(gh pr view "$PR" -R "$GITHUB_REPOSITORY" --json autoMergeRequest --jq '.autoMergeRequest != null')" == true ]]; }
-          if armed; then
-            echo "auto-merge already enabled on #$PR"
-            exit 0
-          fi
-          gh pr merge --auto --merge "$PR" -R "$GITHUB_REPOSITORY" || armed
-
       # Step outcomes retain failures even when continue-on-error lets the
       # batch finish green. Artifacts preserve every matrix leg's result;
       # a reusable workflow output would retain only the last finisher.
@@ -274,7 +256,6 @@ jobs:
               token: ($steps.app.outcome // "skipped"),
               hold: ($steps.hold.outcome // "skipped"),
               pr: ($steps.pr.outcome // "skipped"),
-              merge: ($steps.merge.outcome // "skipped"),
               number: ($steps.pr.outputs["pull-request-number"] // "")
             }
           ' > "$RUNNER_TEMP/package-pr-results/$key.json"
@@ -285,6 +266,124 @@ jobs:
         with:
           name: package-pr-result-${{ steps.result.outputs.key }}
           path: ${{ runner.temp }}/package-pr-results/*.json
+          overwrite: true
+          if-no-files-found: error
+          retention-days: 1
+
+  # Arms auto-merge on this run's PRs with the merge App, by the rule
+  # auto-merge-pr.yml uses (.github/scripts/auto-merge-pr.cjs). Auto-merge,
+  # not a direct merge: branch protection still has to see `result`,
+  # `self-tests` and `build-isolation` green. auto-merge-pr.yml may arm a PR
+  # first; either one arming it is the outcome wanted. Each run re-arms a PR
+  # an earlier run left unarmed, and its outcome reaches the sync summary.
+  # A reviewed group stays a draft and is never armed here: auto-merge-pr.yml
+  # arms it once a maintainer marks it ready.
+  #
+  # Nothing from the PR jobs decides what is armed: each group's PR is looked
+  # up and judged again here, from GitHub, with the default branch's code.
+  arm:
+    needs: pr
+    if: ${{ !cancelled() && inputs.groups != '[]' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment:
+      name: bot-merge
+      deployment: false
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+
+      - name: Get a read-only token from the merge App
+        id: read
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ vars.PKGS_MERGE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.PKGS_MERGE_APP_KEY }}
+          permission-contents: read
+          permission-pull-requests: read
+
+      - name: Judge each group's PR
+        id: plan
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          GROUPS_JSON: ${{ inputs.groups }}
+        with:
+          github-token: ${{ steps.read.outputs.token }}
+          script: |
+            const { readFileSync, writeFileSync } = require('fs');
+            const { planArms } = require('./.github/scripts/auto-merge-pr.cjs');
+            const plan = await planArms({ github, context, core,
+              groups: JSON.parse(process.env.GROUPS_JSON),
+              vouched: readFileSync('.github/VOUCHED.td', 'utf8') });
+            writeFileSync(`${process.env.RUNNER_TEMP}/arm-plan.json`, JSON.stringify(plan));
+            core.setOutput('enable', String(plan.some(entry => entry.action === 'enable')));
+
+      - name: Get the merge App's token
+        id: app
+        if: ${{ steps.plan.outputs.enable == 'true' }}
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ vars.PKGS_MERGE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.PKGS_MERGE_APP_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
+
+      # --match-head-commit holds GitHub to the head the plan judged. One PR
+      # that cannot be armed does not stop the others, and a failed lookup is
+      # a failure, never "not armed". Anything but success fails this job
+      # when there is no sync summary to report it.
+      - name: Arm auto-merge on each PR
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          REPORT: ${{ inputs.report-package-failures }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/armed"
+          rows=$(jq -r '.[] | [.branch, .number, (.action // ""), (.head_sha // ""), (.base // ""), (.method // ""), (.outcome // ""), (.reason // "")] | map(tostring | gsub("[\u001f\n]"; " ")) | join("\u001f")' "$RUNNER_TEMP/arm-plan.json")
+          outcomes='{}'
+          failed=0
+          # Fields split on the unit separator, not a tab: bash merges runs of
+          # tabs, which would shift every field after an empty one.
+          while IFS=$'\x1f' read -r branch number action sha base method outcome reason; do
+            [[ -n $branch ]] || continue
+            if [[ $action == enable ]]; then
+              [[ $method == merge ]] || method=squash
+              # The PR as judged, read again right before the write: gh merges
+              # at once a PR that is already green, so nothing may have moved.
+              if ! [[ $number =~ ^[1-9][0-9]*$ && $sha =~ ^[0-9a-f]{40}$ && -n $base ]]; then
+                outcome=failure reason="bad plan entry"
+              elif ! facts=$(gh pr view "$number" -R "$GITHUB_REPOSITORY" --json state,isDraft,baseRefName,headRefOid,autoMergeRequest \
+                --jq '"\(.state) \(.isDraft) \(.baseRefName) \(.headRefOid) \(.autoMergeRequest != null)"'); then
+                outcome=failure reason="could not read the PR"
+              elif [[ ${facts%% *} == MERGED ]]; then
+                outcome=success reason="merged"
+              elif [[ ${facts% *} != "OPEN false $base $sha" ]]; then
+                outcome=failure reason="moved since it was judged: ${facts% *}"
+              elif [[ ${facts##* } == true ]] ||
+                gh pr merge --auto "--$method" --match-head-commit "$sha" "$number" -R "$GITHUB_REPOSITORY" ||
+                [[ "$(gh pr view "$number" -R "$GITHUB_REPOSITORY" --json autoMergeRequest --jq '.autoMergeRequest != null' || true)" == true ]]; then
+                outcome=success reason=""
+              else
+                outcome=failure reason="gh pr merge failed"
+              fi
+            fi
+            if [[ $outcome != success ]]; then
+              failed=1
+              echo "::warning::Could not enable auto-merge on #$number ($branch): $outcome, $reason"
+            fi
+            outcomes=$(jq -c --arg branch "$branch" --arg number "$number" --arg outcome "$outcome" --arg reason "$reason" \
+              '. + {($branch): {number: $number, outcome: $outcome, reason: $reason}}' <<<"$outcomes")
+          done <<<"$rows"
+          printf '%s\n' "$outcomes" > "$RUNNER_TEMP/armed/armed.outcomes"
+          if [[ $failed == 1 && $REPORT != true ]]; then exit 1; fi
+
+      - name: Upload the auto-merge outcomes
+        if: ${{ !cancelled() && inputs.report-package-failures }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: package-pr-result-armed
+          path: ${{ runner.temp }}/armed/armed.outcomes
           overwrite: true
           if-no-files-found: error
           retention-days: 1
