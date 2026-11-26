@@ -1,9 +1,9 @@
 # anduril-bluechip-support
 
-Hardware support for the Anduril BlueChip (Snapdragon X2 Elite / Glymur) not yet carried upstream:
+System plumbing for the Anduril BlueChip (Snapdragon X2 Elite / Glymur) front camera:
 
-- **Front camera as a V4L2 & PipeWire webcam (`Front Camera`, `/dev/video50`):** Relays the OmniVision OV08X40 RGB camera from `libcamera`'s simple pipeline and Adreno X2-90 GPU software ISP via `v4l2-relayd@bluechip` at 1080p NV12 (`30 fps`), and refreshes udev's V4L2 capability state so WirePlumber exposes it as a PipeWire `Video/Source` and `xdg-desktop-portal` camera.
-- **Sensor tuning:** Ships `libcamera` simple IPA black-level tuning for `ov08x40` (64 at 10-bit).
-- **WirePlumber picker cleanup:** Hides the raw OV08X40 `libcamera` entry owned by the relay and the 16 raw `qcom-camss` (`platform-acb6000.isp`) nodes.
-- **DMA heap udev rule:** Grants the active desktop user `uaccess` on `/dev/dma_heap/system` for user-session `libcamera` software ISP buffers.
-- **libcamera 0.7.2 relay guard (`bluechip-camera-guard`):** Restarts the relay on `libcamera 0.7.2` EGL/DMA-buf leaks or start deadlocks, and automatically stands down once `libcamera >= 0.8.0` is installed.
+- **Loopback module options (`bluechip-camera.conf`):** Configures `v4l2loopback` (`video_nr=50`, `card_label="Front Camera"`, `exclusive_caps=1`) and pulls in `v4l2-relayd`, `v4l2loopback-dkms`, `v4l-utils`, and `gst-plugin-libcamera`.
+- **DMA heap udev rule (`70-bluechip-camera.rules`):** Grants the active desktop user `uaccess` on `/dev/dma_heap/system` so `libcamera`'s software ISP and Omarchy's userland camera relay run without root.
+- **WirePlumber picker cleanup (`50-bluechip-cameras.conf`):** Hides the raw OV08X40 `libcamera` entry owned by the relay and the 16 raw `qcom-camss` (`platform-acb6000.isp`) nodes.
+
+The webcam relay, `libcamera` sensor tuning (`ov08x40.yaml`), and `gamma`/`contrast`/`saturation` defaults live in userland via `omarchy-camera-tuning` (`omacom/omarchy`), so tunings can be adjusted without rebuilding this package.
