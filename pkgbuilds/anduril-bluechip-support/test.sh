@@ -58,7 +58,7 @@ guard="$package_dir/bluechip-camera-guard"
 bash -n "$guard" || fail "the camera guard has valid syntax"
 grep -q '^unit=v4l2-relayd@bluechip.service$' "$guard" || fail "the guard watches the relay the package enables"
 grep -q 'exp == system' "$guard" || fail "the guard counts leaked frame buffers on the system dma-buf heap"
-grep -q '! media_in_use' "$guard" || fail "the guard ignores frame buffers owned by direct cam/qcam sessions"
+grep -q 'relay_has_gpu' "$guard" || fail "the guard only restarts when the relay itself holds a leaked GPU context"
 for error in 'Failed to start streaming' 'allocation failure'; do
   grep -qF "*\"$error\"*" "$guard" || fail "the guard restarts the relay on \"$error\""
 done
