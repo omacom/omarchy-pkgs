@@ -37,8 +37,8 @@ relay="$package_dir/v4l2-relayd-bluechip.conf"
   source "$relay"
   [[ $VIDEOSRC == 'libcamerasrc camera-name=/base/soc@0/cci@ac16000/i2c-bus@1/camera@10 '* ]] ||
     fail "the relay opens the front camera by its device tree path"
-  [[ $VIDEOSRC == *"contrast="* && $VIDEOSRC == *"saturation="* ]] ||
-    fail "the relay tunes contrast and saturation for the software ISP"
+  [[ $VIDEOSRC == *"gamma="* && $VIDEOSRC == *"contrast="* && $VIDEOSRC == *"saturation="* ]] ||
+    fail "the relay tunes gamma, contrast, and saturation for the software ISP"
   [[ $VIDEOSRC == *"width=${WIDTH},height=${HEIGHT}"* ]] || fail "the relay's source and output sizes agree"
   [[ $CARD_LABEL == 'Front Camera' ]] || fail "the relay fills the Front Camera device"
 )
