@@ -27,6 +27,7 @@ grep -qx 'ExecStartPost=-+/usr/lib/anduril-bluechip-support/bluechip-camera-anno
 announce="$package_dir/bluechip-camera-announce"
 sh -n "$announce" || fail "the camera announce helper has valid POSIX sh syntax"
 ! grep -q 'video50' "$announce" || fail "the camera announce helper discovers the loopback node by label"
+grep -q 'grep -Flx "\$label"' "$announce" || fail "the camera announce helper matches CARD_LABEL literally"
 grep -q 'ID_V4L_CAPABILITIES=.*:capture:' "$announce" ||
   fail "the camera announce helper skips redundant udev change events when already capture-ready"
 
@@ -57,6 +58,7 @@ guard="$package_dir/bluechip-camera-guard"
 bash -n "$guard" || fail "the camera guard has valid syntax"
 grep -q '^unit=v4l2-relayd@bluechip.service$' "$guard" || fail "the guard watches the relay the package enables"
 grep -q 'exp == system' "$guard" || fail "the guard counts leaked frame buffers on the system dma-buf heap"
+grep -q '! media_in_use' "$guard" || fail "the guard ignores frame buffers owned by direct cam/qcam sessions"
 for error in 'Failed to start streaming' 'allocation failure'; do
   grep -qF "*\"$error\"*" "$guard" || fail "the guard restarts the relay on \"$error\""
 done
