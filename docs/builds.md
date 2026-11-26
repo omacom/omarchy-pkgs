@@ -25,7 +25,7 @@ Flea can install `omarchy` without preventing `omarchy-dev` from installing
 its conflicting settings package in a different container.
 
 Pacman downloads are cached under `cache/pacman/<channel>/<arch>/` across
-containers and runs. The installed package database is never shared. Each
+containers and runs, where `<arch>` is the builder's architecture. The installed package database is never shared. Each
 container updates its base system before resolving build dependencies, so a
 cached builder image cannot cause a partial system upgrade. The existing
 `OMARCHY_KEEP_BUILD_WORKSPACE`, `OMARCHY_SKIP_BUILDER_IMAGE`, and
@@ -83,3 +83,33 @@ no image carries the key yet (a change to `build/` publishes before its image
 refresh has finished). Package build jobs in `build-pr.yml` pull it the same
 way, for their own architecture, and build it only when no image carries the
 key.
+
+## Cross builds
+
+A package builds in the builder image of its target architecture, natively or
+under QEMU. `package_build_host` names the exception: chromium for aarch64
+builds in the x86_64 image, because Chromium pins its clang, Rust and Node for
+x64 hosts only. Google builds Chrome for Linux arm64 the same way.
+
+`bin/build` then runs the x86_64 builder image and passes `BUILDER_ARCH` to
+`build/build.sh`, which differs from `ARCH` only in a cross build:
+
+- makepkg reads a copy of `makepkg.conf` with `CARCH` and `CHOST` for the
+  target, so it names and checks the package for aarch64.
+- makepkg's strip step is off. The builder's GNU strip reads only x86_64
+  objects, so a cross recipe strips with its own toolchain: chromium uses
+  the `llvm-strip` its DEPS pins.
+- `makepkg -s` still installs the recipe's dependencies, in their x86_64
+  builds. Host tools the build runs link them: V8's snapshot generator
+  needs `libxcb`.
+- pacman takes Omarchy's tree or channel for the builder's architecture,
+  never the target's, and never the run's own `omarchy-build` repository:
+  its aarch64 packages cannot run here. A package that needs another package
+  built in the same run cannot cross build.
+- A dry run plans every requested package, whatever builder it needs. A real
+  run uses one builder image, so `bin/build` refuses a selection that mixes
+  builders.
+
+The fast-ring check runs the package in the aarch64 builder image under QEMU.
+`bin/check-fast-ring` builds that image when it is missing: a cross build
+leaves only the x86_64 one.

@@ -382,7 +382,8 @@ loader = importlib.machinery.SourceFileLoader('pen_pair', sys.argv[1])
 spec = importlib.util.spec_from_loader('pen_pair', loader)
 pen_pair = importlib.util.module_from_spec(spec)
 loader.exec_module(pen_pair)
-pen_pair.WAIT = 6
+pen_pair.WAIT = 1.0
+pen_pair.time.sleep = lambda _: None
 sys.exit(pen_pair.main())
 EOF
 pen_reset() { rm -rf "$pen_state"; mkdir -p "$pen_state"; : >"$pen_state/log"; }
