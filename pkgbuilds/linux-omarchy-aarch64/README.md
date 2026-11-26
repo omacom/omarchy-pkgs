@@ -530,6 +530,19 @@ The package installs `x126100-lenovo-thinkcentre-neo-50q-qc.json` with nine hard
 
 The Surface Pro 11 has one SMBIOS identity for its LCD and OLED models, and systemd's list gives it to `microsoft,denali-oled`, so an LCD model got the OLED tree. `x1p64100-microsoft-denali.json` carries the three hardware IDs that include the panel, LG's `LGD077b` from an owner's hardware report, under `microsoft,denali-lcd`. systemd-stub compares those before the others.
 
+### ASUS Zenbook A16 cameras
+
+`2923` to `2957` bring up the ASUS Zenbook A16 (UX3607OA)'s two cameras: the OmniVision OV02C10 RGB camera on CSIPHY4 and the Himax HM1092 IR camera with its IR illuminator on CSIPHY0, adapted from omacom/omarchy-pkgs#2931 (Jesse Casco) and rebased onto 7.3.6 (dropping the two fixes already backported in 7.3.6).
+
+- `2923` to `2936`: 7.4-rc1 backports (`fwnode_graph_for_each_endpoint`, `phy_get_by_of_node` / `devm_phy_get_by_of_node`, `phy-qcom-mipi-csi2` driver and bindings, CAMSS PHY API and Glymur compatible, `ov02c10` chip-ID check, and video-interface DT macros).
+- `2937` to `2939`: Glymur CAMSS, CSIPHY, CCI and MCLK pinctrl device tree nodes from `qcom-laptops`.
+- `2940` to `2946`: PM8010 camera PMIC bindings, regulator and MFD support from `qcom-laptops`.
+- `2947` to `2949` and `2955`: Himax HM1092 monochrome NIR sensor driver, adapted to 7.3's subdev pad operations.
+- `2950` to `2954`: Zenbook A16 board nodes for PM8010, OV02C10 RGB, HM1092 IR, MCLK drive strength, and BOB1 / IR illuminator.
+- `2956` and `2957`: CAMSS fixes for X1E80100/Glymur (Jesse Casco's lite CSID clocks fix posted for review, and Bryan O'Donoghue's FROMLIST CSID2 routing removal). Verified on the UX3607OA: the OV02C10 RGB camera streams 1080p at 30 fps through libcamera's simple pipeline and the HM1092 IR camera probes.
+
+The board's device tree reaches laptops once `linux-omarchy-dtbs` rebuilds against this release's headers.
+
 ### ASUS ProArt PZ14
 
 `2831` is the ASUS ProArt PZ14 (HT7407NA, X2E-88-100, `asus,proart-pz14-ht7407na`), a 14-inch OLED tablet with a keyboard cover, written from an owner's hardware report. Its board is close to the Zenbook A14 (UX3407NA). The two DSDTs' power tables are the same apart from the Zenbook's keyboard bus and one touchscreen pin state, so the tree starts from the Zenbook A14's. `2830` adds the compatible to the board binding.
@@ -581,7 +594,7 @@ Since `7.3-24` it also takes three of `linux-omarchy`'s choices that the NVIDIA 
 
 The Surface Laptop 8 patches add `USB4_QCOM`, built as the `thunderbolt_qcom` module, and `QCOM_SCMI_GENERIC_EXT`, `DEVFREQ_GOV_REMOTE` and `SCMI_QCOM_MEMLAT_DEVFREQ`, built in as on that laptop's own package, and the config builds the Glymur GPU clock controller (`CLK_GLYMUR_GPUCC`), which the X2's GPU needs, and its video clock controller (`CLK_GLYMUR_VIDEOCC`), which `glymur.dtsi` describes, as modules. Since `7.3-67` it builds the driver for the PCIe root complexes behind the Surface Laptop 8's USB4 routers in (`PCIE_QCOM_USB4`); it has no module form, like `PCIE_QCOM`.
 
-The Zenbook A16 patches add its embedded controller driver, built as a module (`EC_ASUS_GLYMUR=m`).
+The Zenbook A16 patches add its embedded controller driver (`EC_ASUS_GLYMUR=m`), the Qualcomm MIPI CSI-2 D-PHY driver (`PHY_QCOM_MIPI_CSI2=m`) and the Himax HM1092 NIR camera sensor driver (`VIDEO_HM1092=m`), all built as modules.
 
 `CONFIG_KEXEC_HANDOVER_ENABLE_DEFAULT` is off since `15`, as in NVIDIA's 63bbd5f0d (LP 2168816). With it on, kexec handover set aside its scratch area as CMA on every boot, about 2.1 GiB on the ProArt P14, and long-term page pins (CUDA host-pinned memory, RDMA registrations) could fail with ENOMEM under memory pressure because pinned pages cannot stay in CMA. Omarchy does not use kexec handover; `kho=on` still turns it on.
 
