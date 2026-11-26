@@ -74,13 +74,31 @@ grep -qx 'ExecCondition=/usr/lib/asus-zenbook-a16-support/zenbook-a16-camera-gua
 
 # Power management udev rules
 power_rules="$package_dir/90-asus-zenbook-a16-power.rules"
-grep -qx 'ATTR{\[dmi/id\]board_name}!="UX3607OA", GOTO="zenbook_a16_power_end"' "$power_rules" ||
-  fail "the power rules are gated to the ASUS Zenbook A16"
-grep -q 'KERNEL=="ddr|ddr-qos|llcc"' "$power_rules" ||
-  fail "the power rules stop CPUCP memlat polling on older kernels"
-grep -q 'DRIVER=="dwc3-qcom"' "$power_rules" ||
-  fail "the power rules enable runtime PM on dwc3-qcom"
-grep -q 'ATTR{idVendor}=="0bda", ATTR{idProduct}=="0329"' "$power_rules" ||
-  fail "the power rules enable autosuspend on the Realtek SD reader"
+if command -v udevadm >/dev/null 2>&1; then
+  udevadm verify --no-style "$power_rules" >/dev/null ||
+    fail "the power rules pass udevadm verify"
+fi
+grep -qx 'ATTR{\[dmi/id\]board_name}=="UX3607OA", GOTO="zenbook_a16_power_start"' "$power_rules" ||
+  fail "the power rules use a positive DMI guard for the ASUS Zenbook A16"
+grep -qx 'GOTO="zenbook_a16_power_end"' "$power_rules" ||
+  fail "the power rules skip non-matching machines"
+awk '
+  /\\$/ { sub(/\\$/, ""); buf = buf $0; next }
+  { print buf $0; buf = "" }
+' "$power_rules" >"$scratch/power.rules"
+grep -q 'SUBSYSTEM=="devfreq", KERNEL=="ddr|ddr-qos|llcc",.*ATTR{polling_interval}="0"' "$scratch/power.rules" ||
+  fail "the devfreq rule sets polling_interval=0"
+grep -q 'DRIVER=="dwc3-qcom",.*ATTR{power/control}="auto", ATTR{power/autosuspend_delay_ms}="200"' "$scratch/power.rules" ||
+  fail "the dwc3-qcom rule enables autosuspend with 200 ms delay"
+grep -q 'DRIVER=="xhci-hcd",.*ATTR{power/control}="auto"' "$scratch/power.rules" ||
+  fail "the xhci-hcd rule enables runtime PM"
+grep -q 'DRIVER=="qcom-qmp-combo-phy|qcom-qmp-usb-phy",.*ATTR{power/control}="auto"' "$scratch/power.rules" ||
+  fail "the QMP PHY rule enables runtime PM"
+grep -q 'SUBSYSTEM=="usb", ATTR{idVendor}=="0bda", ATTR{idProduct}=="0329",.*ATTR{power/control}="auto", ATTR{power/autosuspend_delay_ms}="200"' "$scratch/power.rules" ||
+  fail "the Realtek USB rule enables autosuspend with 200 ms delay"
+grep -q 'SUBSYSTEM=="scsi", ENV{DEVTYPE}=="scsi_device",.*ATTRS{idVendor}=="0bda", ATTRS{idProduct}=="0329",.*ATTR{power/control}="auto", ATTR{power/autosuspend_delay_ms}="200"' "$scratch/power.rules" ||
+  fail "the Realtek SCSI rule scopes to scsi_device and enables autosuspend"
+grep -q 'SUBSYSTEM=="block", ENV{DEVTYPE}=="disk",.*ATTRS{idVendor}=="0bda", ATTRS{idProduct}=="0329",.*ATTR{events_poll_msecs}="15000"' "$scratch/power.rules" ||
+  fail "the Realtek block rule scopes to disk and sets events_poll_msecs=15000"
 
 echo "ok - ASUS Zenbook A16 front camera relay, tuning, WirePlumber rules, guard and power rules"
