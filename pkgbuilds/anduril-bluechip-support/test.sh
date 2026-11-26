@@ -22,9 +22,36 @@ grep -q 'device.bus-path = "platform-acb6000.isp"' "$cameras" || fail "pickers h
 grep -qx 'SUBSYSTEM=="dma_heap", KERNEL=="system", TAG+="uaccess"' "$package_dir/70-bluechip-camera.rules" ||
   fail "udev grants uaccess on the system dma_heap"
 
-sh -n "$package_dir/anduril-bluechip-support.install" ||
-  fail "install scriptlet has valid POSIX sh syntax"
-grep -q 'systemctl stop bluechip-camera-guard.service v4l2-relayd@bluechip.service' "$package_dir/anduril-bluechip-support.install" ||
-  fail "install scriptlet stops retired system camera services on upgrade"
+install_script="$package_dir/anduril-bluechip-support.install"
+sh -n "$install_script" || fail "install scriptlet has valid POSIX sh syntax"
+
+# Exercise pre_upgrade and post_upgrade with a stub systemctl when systemd is present.
+if [[ -d /run/systemd/system ]]; then
+  work=$(mktemp -d)
+  trap 'rm -rf "$work"' EXIT
+  cat >"$work/systemctl" <<'SH'
+#!/bin/sh
+printf '%s\n' "$*" >>"$MOCK_LOG"
+SH
+  chmod +x "$work/systemctl"
+
+  MOCK_LOG="$work/log" PATH="$work:$PATH" sh -c '
+    . "$1"
+    pre_upgrade 1-8 1-6
+    post_upgrade 1-8 1-7
+  ' _ "$install_script"
+  grep -qx 'stop bluechip-camera-guard.service v4l2-relayd@bluechip.service' "$work/log" ||
+    fail "upgrade scriptlet stops retired services when upgrading from < 1-8"
+  grep -qx 'daemon-reload' "$work/log" ||
+    fail "post_upgrade reloads systemd when upgrading from < 1-8"
+
+  : >"$work/log"
+  MOCK_LOG="$work/log" PATH="$work:$PATH" sh -c '
+    . "$1"
+    pre_upgrade 1-9 1-8
+    post_upgrade 1-9 1-8
+  ' _ "$install_script"
+  [[ ! -s $work/log ]] || fail "upgrade scriptlet is a no-op once already on >= 1-8"
+fi
 
 echo "ok - Anduril BlueChip front camera system plumbing (loopback, WirePlumber rules, dma_heap udev)"
