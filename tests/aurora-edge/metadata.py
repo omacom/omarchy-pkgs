@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 """Check the Aurora recipes and their declared compatibility upgrade versions."""
-import json
+import concurrent.futures
+import functools
 import hashlib
+import json
 import os
-import tempfile
-from pathlib import Path
+import shutil
 import subprocess
+import tempfile
 import unittest
+from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 NAMES = ['linux-aurora', 'mesa-aurora', 'aura', 'm1n1-aurora', 'uboot-aurora', 'aurora-bless',
@@ -20,13 +23,49 @@ ASAHI_ALARM_IMPORTS = {'speakersafetyd': '2.0.1-1', 'bankstown': '1.1.0-2', 'tri
 REVIEWED = [*ASAHI_ALARM_IMPORTS, 'aurora-scripts', 'aurora-fwextract', 'fex-emu', 'widevine']
 
 
+_FAST_LIB_DIR = None
+_FAST_LIB_TMP = None
+
+
+def _cpu_limit():
+    n = len(os.sched_getaffinity(0)) if hasattr(os, 'sched_getaffinity') else (os.cpu_count() or 1)
+    try:
+        parts = Path('/sys/fs/cgroup/cpu.max').read_text().split()
+        if len(parts) == 2 and parts[0] != 'max':
+            quota, period = int(parts[0]), int(parts[1])
+            if period > 0:
+                n = min(n, max(1, (quota + period - 1) // period))
+    except OSError:
+        pass
+    return n
+
+
+def _makepkg_library():
+    global _FAST_LIB_DIR, _FAST_LIB_TMP
+    existing = os.environ.get('MAKEPKG_LIBRARY')
+    if existing:
+        return existing
+    if _FAST_LIB_DIR is None:
+        helper = ROOT / 'helpers/fast-makepkg.sh'
+        if helper.is_file():
+            _FAST_LIB_TMP = tempfile.mkdtemp(prefix='aurora-libmakepkg-')
+            _FAST_LIB_DIR = subprocess.check_output(
+                ['bash', str(helper), os.path.join(_FAST_LIB_TMP, 'lib')], text=True).strip()
+    return _FAST_LIB_DIR
+
+
+@functools.lru_cache(maxsize=None)
 def srcinfo(name):
     # The checkout can be read-only in CI; makepkg still requires a writable build directory.
     with tempfile.TemporaryDirectory(prefix='aurora-srcinfo-') as build:
+        env = {**os.environ, 'BUILDDIR': build, 'PKGDEST': build,
+               'SRCDEST': build, 'SRCPKGDEST': build, 'LOGDEST': build}
+        lib = _makepkg_library()
+        if lib:
+            env['MAKEPKG_LIBRARY'] = lib
         output = subprocess.check_output(
             ['makepkg', '--printsrcinfo'], cwd=ROOT / 'pkgbuilds' / name,
-            env={**os.environ, 'BUILDDIR': build, 'PKGDEST': build,
-                 'SRCDEST': build, 'SRCPKGDEST': build, 'LOGDEST': build}, text=True)
+            env=env, text=True)
     base, packages, current = {}, {}, None
     for raw in output.splitlines():
         if ' = ' not in raw:
@@ -37,6 +76,22 @@ def srcinfo(name):
         else:
             (base if current is None else current).setdefault(key, []).append(value)
     return packages
+
+
+def setUpModule():
+    # Pre-warm the read-only .SRCINFO cache in parallel across available CPUs.
+    _makepkg_library()
+    unique = list(dict.fromkeys([*NAMES, 'omarchy-steam-fex', 'omarchy-mac-boot', 'omarchy-mac']))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=_cpu_limit()) as pool:
+        list(pool.map(srcinfo, unique))
+
+
+def tearDownModule():
+    global _FAST_LIB_DIR, _FAST_LIB_TMP
+    if _FAST_LIB_TMP:
+        shutil.rmtree(_FAST_LIB_TMP, ignore_errors=True)
+    _FAST_LIB_DIR = None
+    _FAST_LIB_TMP = None
 
 
 class EdgeMetadataTests(unittest.TestCase):
