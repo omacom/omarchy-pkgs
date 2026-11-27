@@ -165,3 +165,5 @@ The speakers have no driver. The amplifiers are two SoundWire parts (Qualcomm pa
 `0075` drops `wakeup-event-action = <EV_ACT_DEASSERTED>` from `gpio-keys/switch-lid` (TLMM GPIO 92, active low) in `glymur-asus-zenbook-a16-ux3607oa.dts`. Armed for the rising edge only, the lid hall-sensor IRQ fires and immediately wakes the laptop (~0.6 s after suspend) whenever the SoC exits CX collapse with the lid already open, matching the Surface Laptop 8 fix in `2384`. Without `wakeup-event-action`, opening a closed lid still wakes the laptop while open-lid suspend stays asleep in `cxsd`/`aosd`/`ddr`.
 
 `0076` drops `wakeup-event-action` (inherited as `<EV_ACT_DEASSERTED>` from `glymur-crd.dtsi`) from `gpio-keys/switch-lid` in `glymur-anduril-bluechip.dts`, preventing the same spurious open-lid wake on CX collapse exit while preserving lid-open wake from closed-lid sleep.
+
+`0077` drops `wakeup-event-action` (inherited as `<EV_ACT_DEASSERTED>` from `x1-asus-zenbook-a14.dtsi`) from `gpio-keys/switch-lid` in `x1p42100-asus-zenbook-14-ux3480qa.dts`, preventing open-lid `deep` suspend from waking on CX collapse exit while preserving lid-open wake from closed-lid sleep.
