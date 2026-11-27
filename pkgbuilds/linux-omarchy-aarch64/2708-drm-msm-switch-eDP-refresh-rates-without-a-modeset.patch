@@ -1,0 +1,495 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: "Caleb E." <158400752+FoxesRCool1@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 15:10:00 +0800
+Subject: [PATCH] drm/msm: switch eDP refresh rates without a modeset
+
+Some eDP panels list two modes that differ only in vertical blanking. The
+Surface Laptop 7 13.8" (X1E80100, Sharp LQ138P1JX61) has 2304x1536 at 120 Hz
+(vtotal 1579) and at 60 Hz (vtotal 3158), with the same 466.88 MHz pixel clock
+and horizontal timing. The panel sets MSA_TIMING_PAR_IGNORED. Every switch
+between the two modes used to be a full modeset: the DP bridge chain was torn
+down, the link retrained and the backlight cycled, so the panel went black
+each time the desktop dropped to 60 Hz on battery.
+
+Treat such a change as a timing update instead:
+
+- dp: set MSA_TIMING_PAR_IGNORE_EN (DPCD 0x107 bit 7) at link training on eDP
+  sinks that report MSA_TIMING_PAR_IGNORED, and remember it.
+- dp: add msm_dp_vtotal_update_supported() and msm_dp_update_vtotal(), which
+  keep the stored mode and the MSA timing in step without touching the link.
+- dpu: in the CRTC atomic_check, when a lit CRTC driving one video-mode INTF to
+  such a sink gets a mode that differs only in vertical blanking, clear
+  mode_changed and flag a vertical timing update. The CRTC flush waits until
+  the interface is in its active region, rewrites the INTF timing engine and
+  sets the INTF flush bit, so the new vertical total latches at the next frame
+  boundary while the timing engine keeps running.
+
+msm.edp_seamless_vtotal=0 restores the old full modeset. msm.edp_msa_ignore=0
+leaves DPCD 0x107 bit 7 clear.
+
+Tested on the Surface Laptop 7 13.8": DPCD 0x107 reads 0x90 after training
+(0x10 before), switches between 120 and 60 Hz in both directions show no blank
+or glitch, with no underrun or vblank timeout.
+
+---
+diff -ruN a/drivers/gpu/drm/msm/disp/dpu1/dpu_crtc.c b/drivers/gpu/drm/msm/disp/dpu1/dpu_crtc.c
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_crtc.c
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_crtc.c
+@@ -1007,6 +1007,15 @@
+ 		dpu_plane_flush(plane);
+ 	}
+ 
++	/* a vertical blanking change: retime the running interface */
++	if (cstate->vtiming_update) {
++		struct drm_encoder *encoder;
++
++		drm_for_each_encoder_mask(encoder, crtc->dev,
++					  crtc->state->encoder_mask)
++			dpu_encoder_update_vtiming(encoder, &crtc->state->adjusted_mode);
++	}
++
+ 	/* Kickoff will be scheduled by outer layer */
+ }
+ 
+@@ -1182,6 +1191,8 @@
+ 	/* duplicate base helper */
+ 	__drm_atomic_helper_crtc_duplicate_state(crtc, &cstate->base);
+ 
++	cstate->vtiming_update = false;
++
+ 	return &cstate->base;
+ }
+ 
+@@ -1575,6 +1586,62 @@
+ 	return 0;
+ }
+ 
++/*
++ * Two modes that differ only in vertical blanking: same pixel clock, same
++ * horizontal timing, same active height and vsync width.
++ */
++static bool dpu_crtc_modes_differ_in_vblank_only(const struct drm_display_mode *a,
++						 const struct drm_display_mode *b)
++{
++	return a->clock == b->clock &&
++	       a->hdisplay == b->hdisplay &&
++	       a->hsync_start == b->hsync_start &&
++	       a->hsync_end == b->hsync_end &&
++	       a->htotal == b->htotal &&
++	       a->hskew == b->hskew &&
++	       a->vdisplay == b->vdisplay &&
++	       a->vsync_end - a->vsync_start == b->vsync_end - b->vsync_start &&
++	       a->vscan == b->vscan &&
++	       a->flags == b->flags &&
++	       a->vtotal != b->vtotal;
++}
++
++/*
++ * A mode change that only stretches or shrinks the vertical blanking of a
++ * lit eDP panel that ignores the MSA timing does not need a modeset: the
++ * pixel clock, the link and the horizontal timing stay, and the interface
++ * timing engine takes the new vertical total at a frame boundary. The DRM
++ * helpers flag every mode change as a modeset, so undo that here, before
++ * resources are reassigned. Same idea as amdgpu's FreeSync video modes.
++ */
++static bool dpu_crtc_vtiming_only_change(struct drm_crtc *crtc,
++					 struct drm_atomic_commit *state,
++					 struct drm_crtc_state *new_state)
++{
++	struct drm_crtc_state *old_state = drm_atomic_get_old_crtc_state(state, crtc);
++	struct drm_encoder *drm_enc;
++
++	if (!old_state || !new_state->mode_changed ||
++	    new_state->active_changed || new_state->connectors_changed ||
++	    !old_state->enable || !old_state->active ||
++	    !new_state->enable || !new_state->active ||
++	    old_state->self_refresh_active || new_state->self_refresh_active ||
++	    old_state->encoder_mask != new_state->encoder_mask ||
++	    hweight32(new_state->encoder_mask) != 1 ||
++	    drm_crtc_in_clone_mode(new_state))
++		return false;
++
++	if (!dpu_crtc_modes_differ_in_vblank_only(&old_state->adjusted_mode,
++						  &new_state->adjusted_mode))
++		return false;
++
++	drm_for_each_encoder_mask(drm_enc, crtc->dev, new_state->encoder_mask)
++		if (!dpu_encoder_can_update_vtiming(drm_enc))
++			return false;
++
++	return true;
++}
++
+ static int dpu_crtc_atomic_check(struct drm_crtc *crtc,
+ 		struct drm_atomic_commit *state)
+ {
+@@ -1590,6 +1657,15 @@
+ 
+ 	bool needs_dirtyfb = dpu_crtc_needs_dirtyfb(crtc_state);
+ 
++	if (dpu_crtc_vtiming_only_change(crtc, state, crtc_state)) {
++		DRM_DEBUG_ATOMIC("crtc%d: vtotal %d -> %d without a modeset\n",
++				 crtc->base.id,
++				 drm_atomic_get_old_crtc_state(state, crtc)->adjusted_mode.vtotal,
++				 crtc_state->adjusted_mode.vtotal);
++		crtc_state->mode_changed = false;
++		cstate->vtiming_update = true;
++	}
++
+ 	/* don't reallocate resources if only ACTIVE has beeen changed */
+ 	if (crtc_state->mode_changed || crtc_state->connectors_changed ||
+ 	    crtc_state->color_mgmt_changed) {
+diff -ruN a/drivers/gpu/drm/msm/disp/dpu1/dpu_crtc.h b/drivers/gpu/drm/msm/disp/dpu1/dpu_crtc.h
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_crtc.h
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_crtc.h
+@@ -232,6 +232,9 @@
+ 
+ 	enum dpu_crtc_crc_source crc_source;
+ 	int crc_frame_skip_count;
++
++	/* the mode changed only in vertical blanking, applied without a modeset */
++	bool vtiming_update;
+ };
+ 
+ #define to_dpu_crtc_state(x) \
+diff -ruN a/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.c b/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.c
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.c
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.c
+@@ -773,6 +773,70 @@
+ 	return false;
+ }
+ 
++static bool dpu_edp_seamless_vtotal = true;
++module_param_named(edp_seamless_vtotal, dpu_edp_seamless_vtotal, bool, 0644);
++MODULE_PARM_DESC(edp_seamless_vtotal,
++		 "switch eDP modes that differ only in vertical blanking without a modeset (default true)");
++
++static struct msm_dp *dpu_encoder_get_dp(struct dpu_encoder_virt *dpu_enc)
++{
++	struct msm_drm_private *priv = dpu_enc->base.dev->dev_private;
++
++	if (dpu_enc->disp_info.intf_type != INTF_DP)
++		return NULL;
++
++	return priv->kms->dp[dpu_enc->disp_info.h_tile_instance[0]];
++}
++
++/**
++ * dpu_encoder_can_update_vtiming - check if the running encoder can take a
++ *	mode that differs only in vertical blanking without a modeset
++ * @drm_enc: Pointer to drm encoder structure
++ *
++ * Only a single video mode interface feeding an eDP sink that ignores the
++ * MSA timing parameters qualifies.
++ */
++bool dpu_encoder_can_update_vtiming(struct drm_encoder *drm_enc)
++{
++	struct dpu_encoder_virt *dpu_enc = to_dpu_encoder_virt(drm_enc);
++	struct dpu_encoder_phys *phys;
++
++	if (!dpu_edp_seamless_vtotal)
++		return false;
++
++	if (dpu_enc->num_phys_encs != 1 || dpu_enc->dsc ||
++	    dpu_enc->disp_info.is_cmd_mode)
++		return false;
++
++	phys = dpu_enc->phys_encs[0];
++	if (!phys || !phys->ops.update_vtiming || !phys->hw_intf || !phys->hw_ctl ||
++	    phys->hw_cdm || phys->split_role != ENC_ROLE_SOLO ||
++	    phys->enable_state != DPU_ENC_ENABLED)
++		return false;
++
++	return msm_dp_vtotal_update_supported(dpu_encoder_get_dp(dpu_enc));
++}
++
++/**
++ * dpu_encoder_update_vtiming - apply a mode that differs only in vertical
++ *	blanking to the running encoder
++ * @drm_enc: Pointer to drm encoder structure
++ * @mode: the new adjusted mode
++ *
++ * The INTF flush that applies the new timing goes out with the next kickoff.
++ */
++void dpu_encoder_update_vtiming(struct drm_encoder *drm_enc,
++				const struct drm_display_mode *mode)
++{
++	struct dpu_encoder_virt *dpu_enc = to_dpu_encoder_virt(drm_enc);
++	struct dpu_encoder_phys *phys = dpu_enc->phys_encs[0];
++	struct msm_dp *dp = dpu_encoder_get_dp(dpu_enc);
++
++	phys->ops.update_vtiming(phys, mode);
++	if (dp)
++		msm_dp_update_vtotal(dp, mode);
++}
++
+ static void _dpu_encoder_update_vsync_source(struct dpu_encoder_virt *dpu_enc,
+ 			struct msm_display_info *disp_info)
+ {
+diff -ruN a/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.h b/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.h
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.h
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.h
+@@ -89,6 +89,11 @@
+ 
+ bool dpu_encoder_needs_modeset(struct drm_encoder *drm_enc, struct drm_atomic_commit *state);
+ 
++bool dpu_encoder_can_update_vtiming(struct drm_encoder *drm_enc);
++
++void dpu_encoder_update_vtiming(struct drm_encoder *drm_enc,
++				const struct drm_display_mode *mode);
++
+ void dpu_encoder_prepare_wb_job(struct drm_encoder *drm_enc,
+ 		struct drm_writeback_job *job);
+ 
+diff -ruN a/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder_phys.h b/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder_phys.h
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder_phys.h
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder_phys.h
+@@ -90,6 +90,8 @@
+  *                              on idle power collapse prepare
+  * @restore:			Restore all the encoder configs.
+  * @get_line_count:		Obtain current vertical line count
++ * @update_vtiming:		Reprogram a running interface for a mode that
++ *				differs only in vertical blanking
+  */
+ 
+ struct dpu_encoder_phys_ops {
+@@ -113,6 +115,8 @@
+ 	void (*restore)(struct dpu_encoder_phys *phys);
+ 	int (*get_line_count)(struct dpu_encoder_phys *phys);
+ 	int (*get_frame_count)(struct dpu_encoder_phys *phys);
++	void (*update_vtiming)(struct dpu_encoder_phys *phys,
++			       const struct drm_display_mode *mode);
+ 	void (*prepare_wb_job)(struct dpu_encoder_phys *phys_enc,
+ 			struct drm_writeback_job *job);
+ 	void (*cleanup_wb_job)(struct dpu_encoder_phys *phys_enc,
+diff -ruN a/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder_phys_vid.c b/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder_phys_vid.c
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder_phys_vid.c
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder_phys_vid.c
+@@ -766,6 +766,88 @@
+ 	return s.frame_count;
+ }
+ 
++/*
++ * Wait until the running timing engine is in the active region and at least
++ * a few lines away from its end, so the new timing written next is complete
++ * well before the frame boundary at which the flushed registers latch. The
++ * same rule as the downstream SDE driver's porch-based dynamic refresh.
++ */
++static void dpu_encoder_phys_vid_wait_for_active(struct dpu_encoder_phys *phys_enc,
++						 int *line, unsigned int *polls)
++{
++	const struct drm_display_mode *mode = &phys_enc->cached_mode;
++	struct dpu_hw_intf *intf = phys_enc->hw_intf;
++	struct dpu_hw_intf_timing_params t;
++	u32 v_inactive, v_end, frame_us, poll_us, i, max_polls;
++
++	*line = -1;
++	*polls = 0;
++
++	if (!intf->ops.get_line_count || !mode->clock || !mode->htotal || !mode->vtotal)
++		return;
++
++	/* the interface counts lines from the start of vsync */
++	drm_mode_to_intf_timing_params(phys_enc, mode, &t);
++	v_inactive = t.vsync_pulse_width + t.v_back_porch;
++	v_end = v_inactive + t.height;
++	if (v_end > v_inactive + 16)
++		v_end -= 16;
++
++	frame_us = div_u64((u64)mode->htotal * mode->vtotal * 1000, mode->clock);
++	poll_us = clamp_t(u32, frame_us / 64, 100, 1000);
++	max_polls = 2 * frame_us / poll_us + 1;
++
++	for (i = 0; i < max_polls; i++) {
++		*line = intf->ops.get_line_count(intf);
++		*polls = i;
++		if (*line >= v_inactive && *line < v_end)
++			return;
++		usleep_range(poll_us, poll_us + 50);
++	}
++}
++
++/*
++ * dpu_encoder_phys_vid_update_vtiming - reprogram the running timing engine
++ *	for a mode that differs from the current one only in vertical
++ *	blanking. The new timing is applied by the INTF flush of the next
++ *	kickoff, at a frame boundary; the timing engine keeps running.
++ */
++static void dpu_encoder_phys_vid_update_vtiming(struct dpu_encoder_phys *phys_enc,
++						const struct drm_display_mode *mode)
++{
++	struct dpu_hw_intf_timing_params timing_params = { 0 };
++	struct dpu_hw_ctl *ctl = phys_enc->hw_ctl;
++	const struct msm_format *fmt;
++	unsigned long lock_flags;
++	int old_vtotal = phys_enc->cached_mode.vtotal;
++	unsigned int polls;
++	int line;
++
++	if (!phys_enc->hw_intf->ops.setup_timing_gen ||
++	    !ctl->ops.update_pending_flush_intf)
++		return;
++
++	dpu_encoder_phys_vid_wait_for_active(phys_enc, &line, &polls);
++
++	phys_enc->cached_mode = *mode;
++	drm_mode_to_intf_timing_params(phys_enc, &phys_enc->cached_mode, &timing_params);
++
++	fmt = mdp_get_format(&phys_enc->dpu_kms->base,
++			     dpu_encoder_get_drm_fmt(phys_enc), 0);
++
++	spin_lock_irqsave(phys_enc->enc_spinlock, lock_flags);
++	phys_enc->hw_intf->ops.setup_timing_gen(phys_enc->hw_intf,
++						&timing_params, fmt);
++	spin_unlock_irqrestore(phys_enc->enc_spinlock, lock_flags);
++
++	programmable_fetch_config(phys_enc, &timing_params);
++
++	ctl->ops.update_pending_flush_intf(ctl, phys_enc->hw_intf->idx);
++
++	DPU_DEBUG_VIDENC(phys_enc, "vtotal %d -> %d at line %d after %u polls\n",
++			 old_vtotal, mode->vtotal, line, polls);
++}
++
+ static void dpu_encoder_phys_vid_init_ops(struct dpu_encoder_phys_ops *ops)
+ {
+ 	ops->is_master = dpu_encoder_phys_vid_is_master;
+@@ -782,6 +864,7 @@
+ 	ops->needs_single_flush = dpu_encoder_phys_vid_needs_single_flush;
+ 	ops->get_line_count = dpu_encoder_phys_vid_get_line_count;
+ 	ops->get_frame_count = dpu_encoder_phys_vid_get_frame_count;
++	ops->update_vtiming = dpu_encoder_phys_vid_update_vtiming;
+ }
+ 
+ /**
+diff -ruN a/drivers/gpu/drm/msm/dp/dp_ctrl.c b/drivers/gpu/drm/msm/dp/dp_ctrl.c
+--- a/drivers/gpu/drm/msm/dp/dp_ctrl.c
++++ b/drivers/gpu/drm/msm/dp/dp_ctrl.c
+@@ -136,6 +136,11 @@
+ 	u8 tu_size_minus1;
+ };
+ 
++static bool msm_dp_ctrl_edp_msa_ignore = true;
++module_param_named(edp_msa_ignore, msm_dp_ctrl_edp_msa_ignore, bool, 0444);
++MODULE_PARM_DESC(edp_msa_ignore,
++		 "set MSA_TIMING_PAR_IGNORE_EN on eDP sinks that support it (default true)");
++
+ struct msm_dp_ctrl_private {
+ 	struct msm_dp_ctrl msm_dp_ctrl;
+ 	struct drm_device *drm_dev;
+@@ -2060,6 +2065,20 @@
+ 	if (drm_dp_max_downspread(dpcd))
+ 		encoding[0] |= DP_SPREAD_AMP_0_5;
+ 
++	/*
++	 * An eDP sink that can ignore the MSA timing parameters keeps its
++	 * timing while the source stretches the vertical blanking. Asking for
++	 * that lets a mode that differs only in vertical blanking be switched
++	 * to without retraining the link (eDP 1.4b, DPCD 0x107 bit 7).
++	 */
++	ctrl->msm_dp_ctrl.msa_timing_par_ignore_en =
++		msm_dp_ctrl_edp_msa_ignore &&
++		panel->connector &&
++		panel->connector->connector_type == DRM_MODE_CONNECTOR_eDP &&
++		(dpcd[DP_DOWN_STREAM_PORT_COUNT] & DP_MSA_TIMING_PAR_IGNORED);
++	if (ctrl->msm_dp_ctrl.msa_timing_par_ignore_en)
++		encoding[0] |= DP_MSA_TIMING_PAR_IGNORE_EN;
++
+ 	/* config DOWNSPREAD_CTRL and MAIN_LINK_CHANNEL_CODING_SET */
+ 	drm_dp_dpcd_write(ctrl->aux, DP_DOWNSPREAD_CTRL, encoding, 2);
+ 
+diff -ruN a/drivers/gpu/drm/msm/dp/dp_ctrl.h b/drivers/gpu/drm/msm/dp/dp_ctrl.h
+--- a/drivers/gpu/drm/msm/dp/dp_ctrl.h
++++ b/drivers/gpu/drm/msm/dp/dp_ctrl.h
+@@ -12,6 +12,8 @@
+ 
+ struct msm_dp_ctrl {
+ 	bool wide_bus_en;
++	/* the eDP sink was told to ignore the MSA timing (DP_MSA_TIMING_PAR_IGNORE_EN) */
++	bool msa_timing_par_ignore_en;
+ };
+ 
+ struct phy;
+diff -ruN a/drivers/gpu/drm/msm/dp/dp_display.c b/drivers/gpu/drm/msm/dp/dp_display.c
+--- a/drivers/gpu/drm/msm/dp/dp_display.c
++++ b/drivers/gpu/drm/msm/dp/dp_display.c
+@@ -1952,6 +1952,49 @@
+ 	       msm_dp_dsc_enabled_for_mode(msm_dp_display, mode);
+ }
+ 
++/**
++ * msm_dp_vtotal_update_supported() - can the stream take a new vertical total
++ *	without a modeset
++ * @msm_dp_display: the DP display
++ *
++ * True for an eDP stream that is on, uncompressed, without PSR, whose sink
++ * was told to ignore the MSA timing parameters at link training.
++ */
++bool msm_dp_vtotal_update_supported(const struct msm_dp *msm_dp_display)
++{
++	struct msm_dp_display_private *dp;
++
++	if (!msm_dp_display || !msm_dp_display->is_edp ||
++	    !msm_dp_display->power_on || msm_dp_display->psr_supported)
++		return false;
++
++	dp = container_of(msm_dp_display, struct msm_dp_display_private, msm_dp_display);
++
++	return dp->ctrl->msa_timing_par_ignore_en &&
++	       !dp->panel->msm_dp_mode.dsc_en &&
++	       !dp->panel->msm_dp_mode.out_fmt_is_yuv_420;
++}
++
++/**
++ * msm_dp_update_vtotal() - take a mode that differs only in vertical timing
++ * @msm_dp_display: the DP display
++ * @mode: the new adjusted mode
++ *
++ * Keeps the stored mode in step and reprograms the MSA timing. The sink
++ * ignores the MSA timing (msm_dp_vtotal_update_supported()), so this only
++ * keeps the registers truthful; the link is not touched.
++ */
++void msm_dp_update_vtotal(struct msm_dp *msm_dp_display,
++			  const struct drm_display_mode *mode)
++{
++	struct msm_dp_display_private *dp;
++
++	dp = container_of(msm_dp_display, struct msm_dp_display_private, msm_dp_display);
++
++	drm_mode_copy(&dp->panel->msm_dp_mode.drm_mode, mode);
++	msm_dp_panel_timing_cfg(dp->panel, dp->ctrl->wide_bus_en);
++}
++
+ bool msm_dp_wide_bus_available(const struct msm_dp *msm_dp_display)
+ {
+ 	struct msm_dp_display_private *dp;
+diff -ruN a/drivers/gpu/drm/msm/msm_drv.h b/drivers/gpu/drm/msm/msm_drv.h
+--- a/drivers/gpu/drm/msm/msm_drv.h
++++ b/drivers/gpu/drm/msm/msm_drv.h
+@@ -357,6 +357,9 @@
+ bool msm_dp_needs_periph_flush(const struct msm_dp *dp_display,
+ 			       const struct drm_display_mode *mode);
+ bool msm_dp_wide_bus_available(const struct msm_dp *dp_display);
++bool msm_dp_vtotal_update_supported(const struct msm_dp *dp_display);
++void msm_dp_update_vtotal(struct msm_dp *dp_display,
++			  const struct drm_display_mode *mode);
+ 
+ /* Extra interface timing the DP driver derives for a compressed stream */
+ struct msm_dp_dsc_intf_timing {
+@@ -402,6 +405,16 @@
+ 	return false;
+ }
+ 
++static inline bool msm_dp_vtotal_update_supported(const struct msm_dp *dp_display)
++{
++	return false;
++}
++
++static inline void msm_dp_update_vtotal(struct msm_dp *dp_display,
++					const struct drm_display_mode *mode)
++{
++}
++
+ struct msm_dp_dsc_intf_timing;
+ 
+ static inline struct drm_dsc_config *
