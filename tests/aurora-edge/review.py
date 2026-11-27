@@ -176,8 +176,8 @@ class MesaRecipeTests(unittest.TestCase):
         matrix = [case + (f'{case[1].split(" ")[0]} {spirv}', True, True) for case in cases]
         matrix += [(0, llvm23, '', 0, True, expected, needed, executable, icd)
                    for needed, executable, icd, expected in rusticl_cases]
-        for (test_status, gallium, other, reader_status, executable, expected,
-             rusticl, rusticl_executable, icd) in matrix:
+        for index, (test_status, gallium, other, reader_status, executable, expected,
+                    rusticl, rusticl_executable, icd) in enumerate(matrix):
             with self.subTest(tests=test_status, gallium=gallium, other=other, reader=reader_status,
                               executable=executable, rusticl=rusticl,
                               rusticl_executable=rusticl_executable, icd=icd), \
@@ -207,6 +207,9 @@ class MesaRecipeTests(unittest.TestCase):
                                GALLIUM=gallium, OTHER=other, RUSTICL=rusticl,
                                READER_STATUS=str(reader_status)))
                 self.assertEqual(result.returncode, expected, result.stderr)
+                if index < len(cases):
+                    # A libgallium case must fail on libgallium, not on the later Rusticl guard.
+                    self.assertNotIn('libRusticlOpenCL', result.stderr)
                 self.assertIn('test -C build --print-errorlogs', result.stdout)
 
 
