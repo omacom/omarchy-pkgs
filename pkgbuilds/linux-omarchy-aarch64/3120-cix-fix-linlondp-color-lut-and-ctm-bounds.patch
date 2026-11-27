@@ -1,0 +1,283 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Clay Stan <claystan97@gmail.com>
+Date: Wed, 25 Nov 2026 22:25:15 -0500
+Subject: [PATCH] cix: validate linlon-dp color LUT sizes and standard CTM
+ blobs
+
+Fix out-of-bounds reads in the vendor CIX Linlon-DP DRM color management
+paths:
+
+- Require exact LINLONDP_COLOR_LUT_SIZE * sizeof(struct drm_color_lut)
+  blobs when setting PLANE_DEGAMMA_LUT and PLANE_GAMMA_LUT, validate LUT
+  lengths in linlondp_color_validate(), linlondp_crtc_atomic_check(), and
+  linlondp_improc_validate(), and guard drm_lut_to_coeffs() against short
+  blobs before indexing through entry 3968/4032.
+- Dispatch drm_ctm_to_coeffs() on blob length: convert 9-entry standard
+  struct drm_color_ctm blobs into the first 9 hardware coefficients and
+  zero the 3 offset coefficients instead of reading 24 bytes past the end
+  as struct color_ctm_ext; convert all 12 entries only when the blob is
+  sizeof(struct color_ctm_ext). Keep CTM and CTM_EXT property reads
+  distinct by blob size and validate CTM blob lengths in atomic check.
+- Release plane degamma_lut, ctm and gamma_lut blob references in
+  linlondp_plane_atomic_destroy_state() and linlondp_plane_reset().
+
+Signed-off-by: Clay Stan <claystan97@gmail.com>
+---
+ .../drm/cix/linlon-dp/linlondp_color_mgmt.c   | 44 ++++++++++++++++---
+ drivers/gpu/drm/cix/linlon-dp/linlondp_crtc.c | 28 +++++++++++-
+ .../cix/linlon-dp/linlondp_pipeline_state.c   | 30 +++++++++++++
+ .../gpu/drm/cix/linlon-dp/linlondp_plane.c    | 27 +++++++++---
+ 4 files changed, 115 insertions(+), 14 deletions(-)
+
+diff --git a/drivers/gpu/drm/cix/linlon-dp/linlondp_color_mgmt.c b/drivers/gpu/drm/cix/linlon-dp/linlondp_color_mgmt.c
+index 54c0063..4b5b2e8 100644
+--- a/drivers/gpu/drm/cix/linlon-dp/linlondp_color_mgmt.c
++++ b/drivers/gpu/drm/cix/linlon-dp/linlondp_color_mgmt.c
+@@ -187,6 +187,11 @@ void drm_lut_to_coeffs(struct drm_property_blob *lut_blob, u32 *coeffs,
+ 	if (!lut_blob)
+ 		return;
+ 
++	if (lut_blob->length != LINLONDP_COLOR_LUT_SIZE * sizeof(*lut)) {
++		memset(coeffs, 0, sizeof(*coeffs) * LINLONDP_N_GAMMA_COEFFS);
++		return;
++	}
++
+ 	lut = lut_blob->data;
+ 
+ 	sector_tbl = igamma ? igamma_sector_tbl : fgamma_sector_tbl;
+@@ -213,17 +218,28 @@ void drm_lut_to_fgamma_coeffs(struct drm_property_blob *lut_blob, u32 *coeffs)
+ 
+ void drm_ctm_to_coeffs(struct drm_property_blob *ctm_blob, u32 *coeffs)
+ {
+-	struct color_ctm_ext *ctm_ext;
+ 	u32 i;
+ 
+ 	if (!ctm_blob)
+ 		return;
+ 
+-	ctm_ext = ctm_blob->data;
+-
+-	for (i = 0; i < LINLONDP_N_CTM_COEFFS; i++)
+-		coeffs[i] =
+-			drm_color_ctm_s31_32_to_qm_n(ctm_ext->matrix[i], 3, 12);
++	if (ctm_blob->length == sizeof(struct color_ctm_ext)) {
++		struct color_ctm_ext *ctm_ext = ctm_blob->data;
++
++		for (i = 0; i < LINLONDP_N_CTM_COEFFS; i++)
++			coeffs[i] = drm_color_ctm_s31_32_to_qm_n(
++				ctm_ext->matrix[i], 3, 12);
++	} else if (ctm_blob->length == sizeof(struct drm_color_ctm)) {
++		struct drm_color_ctm *ctm = ctm_blob->data;
++
++		for (i = 0; i < ARRAY_SIZE(ctm->matrix); i++)
++			coeffs[i] = drm_color_ctm_s31_32_to_qm_n(
++				ctm->matrix[i], 3, 12);
++		for (; i < LINLONDP_N_CTM_COEFFS; i++)
++			coeffs[i] = 0;
++	} else {
++		memset(coeffs, 0, sizeof(*coeffs) * LINLONDP_N_CTM_COEFFS);
++	}
+ }
+ 
+ void linlondp_color_duplicate_state(struct linlondp_color_state *new,
+@@ -246,6 +262,22 @@ int linlondp_color_validate(struct linlondp_color_manager *mgr,
+ {
+ 	u32 coeffs[LINLONDP_N_GAMMA_COEFFS];
+ 
++	if (igamma_blob &&
++	    igamma_blob->length !=
++	    LINLONDP_COLOR_LUT_SIZE * sizeof(struct drm_color_lut)) {
++		DRM_DEBUG_ATOMIC("invalid igamma LUT size: %zu.\n",
++				 igamma_blob->length);
++		return -EINVAL;
++	}
++
++	if (fgamma_blob &&
++	    fgamma_blob->length !=
++	    LINLONDP_COLOR_LUT_SIZE * sizeof(struct drm_color_lut)) {
++		DRM_DEBUG_ATOMIC("invalid fgamma LUT size: %zu.\n",
++				 fgamma_blob->length);
++		return -EINVAL;
++	}
++
+ 	linlondp_color_cleanup_state(st);
+ 
+ 	if (igamma_blob) {
+diff --git a/drivers/gpu/drm/cix/linlon-dp/linlondp_crtc.c b/drivers/gpu/drm/cix/linlon-dp/linlondp_crtc.c
+index c86c1f8..9c64844 100644
+--- a/drivers/gpu/drm/cix/linlon-dp/linlondp_crtc.c
++++ b/drivers/gpu/drm/cix/linlon-dp/linlondp_crtc.c
+@@ -93,6 +93,30 @@ static int linlondp_crtc_atomic_check(struct drm_crtc *crtc,
+ 	struct linlondp_crtc_state *kcrtc_st = to_kcrtc_st(crtc_state);
+ 	int err;
+ 
++	if (crtc_state->color_mgmt_changed) {
++		if (crtc_state->gamma_lut &&
++		    crtc_state->gamma_lut->length !=
++		    LINLONDP_COLOR_LUT_SIZE * sizeof(struct drm_color_lut)) {
++			DRM_DEBUG_ATOMIC("invalid CRTC gamma LUT size: %zu.\n",
++					 crtc_state->gamma_lut->length);
++			return -EINVAL;
++		}
++		if (crtc_state->degamma_lut &&
++		    crtc_state->degamma_lut->length !=
++		    LINLONDP_COLOR_LUT_SIZE * sizeof(struct drm_color_lut)) {
++			DRM_DEBUG_ATOMIC("invalid CRTC degamma LUT size: %zu.\n",
++					 crtc_state->degamma_lut->length);
++			return -EINVAL;
++		}
++		if (crtc_state->ctm &&
++		    crtc_state->ctm->length != sizeof(struct drm_color_ctm) &&
++		    crtc_state->ctm->length != sizeof(struct color_ctm_ext)) {
++			DRM_DEBUG_ATOMIC("invalid CRTC CTM size: %zu.\n",
++					 crtc_state->ctm->length);
++			return -EINVAL;
++		}
++	}
++
+ 	if (old_crtc_state->vrr_enabled != crtc_state->vrr_enabled)
+ 		crtc_state->mode_changed = true;
+ 
+@@ -847,7 +871,9 @@ static int linlondp_crtc_atomic_get_property(struct drm_crtc *crtc,
+ 	if (property == kcrtc->protected_mode_property)
+ 		*val = kcrtc_st->en_protected_mode;
+ 	else if (property == kcrtc->ctm_ext_property) {
+-		*val = (state->ctm) ? state->ctm->base.id : 0;
++		*val = (state->ctm &&
++			state->ctm->length == sizeof(struct color_ctm_ext)) ?
++		       state->ctm->base.id : 0;
+ 	} else {
+ 		DRM_DEBUG_DRIVER("Unknown property %s\n", property->name);
+ 		return -EINVAL;
+diff --git a/drivers/gpu/drm/cix/linlon-dp/linlondp_pipeline_state.c b/drivers/gpu/drm/cix/linlon-dp/linlondp_pipeline_state.c
+index 379032c..6f3ea97 100644
+--- a/drivers/gpu/drm/cix/linlon-dp/linlondp_pipeline_state.c
++++ b/drivers/gpu/drm/cix/linlon-dp/linlondp_pipeline_state.c
+@@ -8,6 +8,7 @@
+ #include <drm/drm_print.h>
+ #include <linux/clk.h>
+ #include "linlondp_dev.h"
++#include "linlondp_drm.h"
+ #include "linlondp_kms.h"
+ #include "linlondp_pipeline.h"
+ #include "linlondp_framebuffer.h"
+@@ -299,6 +300,14 @@ static int linlondp_validate_plane_color(
+ 	if (!kplane_st->color_mgmt_changed)
+ 		return 0;
+ 
++	if (kplane_st->ctm &&
++	    kplane_st->ctm->length != sizeof(struct drm_color_ctm) &&
++	    kplane_st->ctm->length != sizeof(struct color_ctm_ext)) {
++		DRM_DEBUG_ATOMIC("%s invalid CTM size: %zu.\n",
++				 c->name, kplane_st->ctm->length);
++		return -EINVAL;
++	}
++
+ 	err = linlondp_color_validate(color_mgr, color_st,
+ 				      kplane_st->degamma_lut,
+ 				      kplane_st->gamma_lut);
+@@ -893,6 +902,27 @@ static int linlondp_improc_validate(struct linlondp_improc *improc,
+ 	}
+ 
+ 	if (kcrtc_st->base.color_mgmt_changed) {
++		if (kcrtc_st->base.gamma_lut &&
++		    kcrtc_st->base.gamma_lut->length !=
++		    LINLONDP_COLOR_LUT_SIZE * sizeof(struct drm_color_lut)) {
++			DRM_DEBUG_ATOMIC("invalid CRTC gamma LUT size: %zu.\n",
++					 kcrtc_st->base.gamma_lut->length);
++			return -EINVAL;
++		}
++		if (kcrtc_st->base.degamma_lut &&
++		    kcrtc_st->base.degamma_lut->length !=
++		    LINLONDP_COLOR_LUT_SIZE * sizeof(struct drm_color_lut)) {
++			DRM_DEBUG_ATOMIC("invalid CRTC degamma LUT size: %zu.\n",
++					 kcrtc_st->base.degamma_lut->length);
++			return -EINVAL;
++		}
++		if (kcrtc_st->base.ctm &&
++		    kcrtc_st->base.ctm->length != sizeof(struct drm_color_ctm) &&
++		    kcrtc_st->base.ctm->length != sizeof(struct color_ctm_ext)) {
++			DRM_DEBUG_ATOMIC("invalid CRTC CTM size: %zu.\n",
++					 kcrtc_st->base.ctm->length);
++			return -EINVAL;
++		}
+ 		drm_lut_to_fgamma_coeffs(kcrtc_st->base.gamma_lut,
+ 					 st->fgamma_coeffs);
+ 		drm_ctm_to_coeffs(kcrtc_st->base.ctm, st->ctm_coeffs);
+diff --git a/drivers/gpu/drm/cix/linlon-dp/linlondp_plane.c b/drivers/gpu/drm/cix/linlon-dp/linlondp_plane.c
+index f6d443f..49670a9 100644
+--- a/drivers/gpu/drm/cix/linlon-dp/linlondp_plane.c
++++ b/drivers/gpu/drm/cix/linlon-dp/linlondp_plane.c
+@@ -169,14 +169,16 @@ static void linlondp_plane_destroy(struct drm_plane *plane)
+ 	kfree(to_kplane(plane));
+ }
+ 
++static void linlondp_plane_atomic_destroy_state(struct drm_plane *plane,
++						struct drm_plane_state *state);
++
+ static void linlondp_plane_reset(struct drm_plane *plane)
+ {
+ 	struct linlondp_plane_state *state;
+ 
+ 	if (plane->state)
+-		__drm_atomic_helper_plane_destroy_state(plane->state);
++		linlondp_plane_atomic_destroy_state(plane, plane->state);
+ 
+-	kfree(plane->state);
+ 	plane->state = NULL;
+ 
+ 	state = kzalloc(sizeof(*state), GFP_KERNEL);
+@@ -221,8 +223,13 @@ linlondp_plane_atomic_duplicate_state(struct drm_plane *plane)
+ static void linlondp_plane_atomic_destroy_state(struct drm_plane *plane,
+ 						struct drm_plane_state *state)
+ {
++	struct linlondp_plane_state *kplane_st = to_kplane_st(state);
++
++	drm_property_blob_put(kplane_st->degamma_lut);
++	drm_property_blob_put(kplane_st->ctm);
++	drm_property_blob_put(kplane_st->gamma_lut);
+ 	__drm_atomic_helper_plane_destroy_state(state);
+-	kfree(to_kplane_st(state));
++	kfree(kplane_st);
+ }
+ 
+ static int
+@@ -236,9 +243,13 @@ linlondp_plane_atomic_get_property(struct drm_plane *plane,
+ 	if (property == kplane->degamma_lut_property)
+ 		*val = (st->degamma_lut) ? st->degamma_lut->base.id : 0;
+ 	else if (property == kplane->ctm_property)
+-		*val = (st->ctm) ? st->ctm->base.id : 0;
++		*val = (st->ctm &&
++			st->ctm->length == sizeof(struct drm_color_ctm)) ?
++		       st->ctm->base.id : 0;
+ 	else if (property == kplane->ctm_ext_property)
+-		*val = (st->ctm) ? st->ctm->base.id : 0;
++		*val = (st->ctm &&
++			st->ctm->length == sizeof(struct color_ctm_ext)) ?
++		       st->ctm->base.id : 0;
+ 	else if (property == kplane->gamma_lut_property)
+ 		*val = (st->gamma_lut) ? st->gamma_lut->base.id : 0;
+ 	else if (property == kplane->layer_split_property)
+@@ -289,7 +300,8 @@ static int linlondp_plane_atomic_set_property(struct drm_plane *plane,
+ 
+ 	if (property == kplane->degamma_lut_property) {
+ 		ret = linlondp_atomic_replace_property_blob_from_id(
+-			drm, &kplane_st->degamma_lut, val, -1,
++			drm, &kplane_st->degamma_lut, val,
++			LINLONDP_COLOR_LUT_SIZE * sizeof(struct drm_color_lut),
+ 			sizeof(struct drm_color_lut), &replaced);
+ 		kplane_st->color_mgmt_changed |= replaced;
+ 	} else if (property == kplane->ctm_property) {
+@@ -304,7 +316,8 @@ static int linlondp_plane_atomic_set_property(struct drm_plane *plane,
+ 		kplane_st->color_mgmt_changed |= replaced;
+ 	} else if (property == kplane->gamma_lut_property) {
+ 		ret = linlondp_atomic_replace_property_blob_from_id(
+-			drm, &kplane_st->gamma_lut, val, -1,
++			drm, &kplane_st->gamma_lut, val,
++			LINLONDP_COLOR_LUT_SIZE * sizeof(struct drm_color_lut),
+ 			sizeof(struct drm_color_lut), &replaced);
+ 		kplane_st->color_mgmt_changed |= replaced;
+ 	} else if (property == kplane->layer_split_property) {
+-- 
+2.47.3
+

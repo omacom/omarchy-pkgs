@@ -1,0 +1,156 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Clay Stan <claystan97@gmail.com>
+Date: Fri, 27 Nov 2026 05:34:02 +0000
+Subject: [PATCH] cix: remoteproc: fix probe resource leaks and teardown order
+
+cix_dsp_rproc_probe() allocated rproc with unmanaged rproc_alloc() before
+looking up clocks, syscon regmap, resets, and IRQ, and returned directly
+on error or -EPROBE_DEFER without calling rproc_free(), leaking an rproc
+instance on every deferred probe retry. In addition:
+
+- cix_dsp_rproc_addr_init() used unmanaged memremap(), leaking SDRAM
+  mappings on partial probe failure, rproc_add() failure, and remove().
+- devm_request_irq() ran before dev_set_drvdata() and without
+  IRQF_NO_AUTOEN, leaving a window where a watchdog IRQ could dereference
+  NULL drvdata before disable_irq().
+- cix_dsp_rproc_remove() called pm_runtime_disable() before rproc_del(),
+  preventing rproc_shutdown() -> cix_dsp_rproc_unprepare() from running
+  runtime suspend cleanup on unbind.
+
+Switch to devm_rproc_alloc() and devm_memremap() (checking IS_ERR()), set
+drvdata before requesting the watchdog IRQ with IRQF_NO_AUTOEN, enable
+runtime PM before rproc_add() (unwinding on failure), and order
+cix_dsp_rproc_remove() to call rproc_del() before pm_runtime_disable()
+while letting devres release rproc after devm_request_irq() teardown.
+
+Signed-off-by: Clay Stan <claystan97@gmail.com>
+---
+ drivers/remoteproc/cix_dsp_rproc.c | 55 +++++++++++++++---------------
+ 1 file changed, 28 insertions(+), 27 deletions(-)
+
+diff --git a/drivers/remoteproc/cix_dsp_rproc.c b/drivers/remoteproc/cix_dsp_rproc.c
+index a3826b7..d0f72fc 100644
+--- a/drivers/remoteproc/cix_dsp_rproc.c
++++ b/drivers/remoteproc/cix_dsp_rproc.c
+@@ -643,18 +643,26 @@ static int cix_dsp_rproc_addr_init(struct cix_dsp_rproc *rproc_priv)
+ 		return -ENOMEM;
+ 
+ 	for (i = 0; i < CIX_MEM_REG_NUM; i++) {
+-		if (pfn_is_map_memory(__phys_to_pfn(mem_reg[i].sa)))
+-			p_mem[i].cpu_addr = memremap(mem_reg[i].sa,
+-						     mem_reg[i].len,
+-						     MEMREMAP_WB);
+-		else
++		if (pfn_is_map_memory(__phys_to_pfn(mem_reg[i].sa))) {
++			void *addr;
++
++			addr = devm_memremap(dev, mem_reg[i].sa,
++					     mem_reg[i].len, MEMREMAP_WB);
++			if (IS_ERR(addr)) {
++				dev_err(dev, "failed to remap %#x bytes from %#llx\n",
++					mem_reg[i].len, mem_reg[i].sa);
++				return PTR_ERR(addr);
++			}
++			p_mem[i].cpu_addr = (__force void __iomem *)addr;
++		} else {
+ 			p_mem[i].cpu_addr = devm_ioremap_wc(dev,
+ 							    mem_reg[i].sa,
+ 							    mem_reg[i].len);
+-		if (!p_mem[i].cpu_addr) {
+-			dev_err(dev, "failed to remap %#x bytes from %#llx\n",
+-				mem_reg[i].len, mem_reg[i].sa);
+-			return -ENOMEM;
++			if (!p_mem[i].cpu_addr) {
++				dev_err(dev, "failed to remap %#x bytes from %#llx\n",
++					mem_reg[i].len, mem_reg[i].sa);
++				return -ENOMEM;
++			}
+ 		}
+ 		p_mem[i].bus_addr = mem_reg[i].sa;
+ 		p_mem[i].size = mem_reg[i].len;
+@@ -876,8 +884,8 @@ static int cix_dsp_rproc_probe(struct platform_device *pdev)
+ 		return ret;
+ 	}
+ 
+-	rproc = rproc_alloc(dev, "cix-dsp-rproc", &cix_dsp_rproc_ops, fw_name,
+-			    sizeof(*rproc_priv));
++	rproc = devm_rproc_alloc(dev, "cix-dsp-rproc", &cix_dsp_rproc_ops,
++				 fw_name, sizeof(*rproc_priv));
+ 	if (!rproc)
+ 		return -ENOMEM;
+ 	rproc->keep_vring_contents = true;
+@@ -952,28 +960,25 @@ static int cix_dsp_rproc_probe(struct platform_device *pdev)
+ 	if (irq == -EPROBE_DEFER)
+ 		return -EPROBE_DEFER;
+ 
++	dev_set_drvdata(dev, rproc);
++
+ 	if (irq > 0) {
+-		ret = devm_request_irq(dev, irq, cix_dsp_rproc_wdg, 0,
+-				       dev_name(dev), pdev);
++		ret = devm_request_irq(dev, irq, cix_dsp_rproc_wdg,
++				       IRQF_NO_AUTOEN, dev_name(dev), pdev);
+ 		if (ret) {
+ 			dev_err(dev, "failed to request wdg irq\n");
+-			goto err_irq_req;
++			return ret;
+ 		}
+ 
+ 		rproc_priv->wdg_irq = irq;
+ 
+-		disable_irq(irq);
+-
+ 		dev_info(dev, "wdg irq registered\n");
+ 	}
+ 
+-	dev_set_drvdata(dev, rproc);
+-
+ 	rproc_priv->workqueue = create_workqueue(dev_name(dev));
+ 	if (!rproc_priv->workqueue) {
+ 		dev_err(dev, "cannot create workqueue\n");
+-		ret = -ENOMEM;
+-		goto err_wkq;
++		return -ENOMEM;
+ 	}
+ 
+ 	INIT_WORK(&rproc_priv->rproc_work, cix_dsp_rproc_mbox_vq_work);
+@@ -990,22 +995,19 @@ static int cix_dsp_rproc_probe(struct platform_device *pdev)
+ 	complete_all(&rproc_priv->fw_load_comp);
+ 	mutex_init(&rproc_priv->fw_load_lock);
+ 	rproc->auto_boot = false;
++	pm_runtime_enable(dev);
+ 	ret = rproc_add(rproc);
+ 	if (ret) {
+ 		dev_err(dev, "rproc_add failed\n");
+ 		goto err_rproc_add;
+ 	}
+ 
+-	pm_runtime_enable(dev);
+-
+ 	return 0;
+ 
+ err_rproc_add:
++	pm_runtime_disable(dev);
+ err_addr:
+ 	destroy_workqueue(rproc_priv->workqueue);
+-err_irq_req:
+-err_wkq:
+-	rproc_free(rproc);
+ 
+ 	return ret;
+ }
+@@ -1021,10 +1023,9 @@ static void cix_dsp_rproc_remove(struct platform_device *pdev)
+ 
+ 	wait_for_completion(&rproc_priv->fw_load_comp);
+ 
+-	pm_runtime_disable(&pdev->dev);
+ 	rproc_del(rproc);
++	pm_runtime_disable(&pdev->dev);
+ 	destroy_workqueue(rproc_priv->workqueue);
+-	rproc_free(rproc);
+ }
+ 
+ static int cix_dsp_rproc_runtime_suspend(struct device *dev)
+-- 
+2.43.0
+

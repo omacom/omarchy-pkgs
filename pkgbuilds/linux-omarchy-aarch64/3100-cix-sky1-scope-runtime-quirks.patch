@@ -1,0 +1,790 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Clay Stan <claystan97@gmail.com>
+Date: Tue, 24 Nov 2026 12:00:00 +0800
+Subject: [PATCH] cix: scope ACPI platform quirks at runtime
+
+CONFIG_ARCH_CIX selects support in a multiplatform kernel; it does not
+identify the running SoC. Keep the generic CPPC, SCMI power-domain,
+thermal, SMMUv3 and SBSA watchdog behavior when the Sky1 ACPI SCMI
+controller (CIXHA006) is absent. Select the longer SCMI mailbox timeout
+from the probed transport device itself.
+
+Keep CIX IPA enabled, but select its power callbacks and firmware methods
+only on Sky1 ACPI. Handle a missing SPRG/DPRG method before using its
+result, and propagate SMMU suspend/resume errors.
+
+Signed-off-by: Clay Stan <claystan97@gmail.com>
+---
+ MAINTAINERS                                    |    1 
+ drivers/acpi/processor_thermal.c               |   56 +++++++++++++++---------
+ drivers/acpi/thermal.c                         |   27 ++++++++----
+ drivers/cpufreq/cppc_cpufreq.c                 |   35 +++++++++------
+ drivers/firmware/arm_scmi/transports/mailbox.c |   23 +++++++++-
+ drivers/gpu/drm/panthor/panthor_sky1.c         |    3 +
+ drivers/iommu/arm/arm-smmu-v3/arm-smmu-v3.c    |   17 ++++---
+ drivers/pmdomain/arm/scmi_pm_domain.c          |   56 +++++++++++++++++++-----
+ drivers/thermal/cpufreq_cooling.c              |   27 ++++--------
+ drivers/thermal/devfreq_cooling.c              |   17 ++++---
+ drivers/thermal/gov_power_allocator.c          |   10 +++-
+ drivers/watchdog/sbsa_gwdt.c                   |    8 +++-
+ include/linux/soc/cix/sky1.h                   |   37 ++++++++++++++++
+ 13 files changed, 221 insertions(+), 96 deletions(-)
+
+diff --git a/MAINTAINERS b/MAINTAINERS
+--- a/MAINTAINERS
++++ b/MAINTAINERS
+@@ -2828,6 +2828,7 @@
+ F:	Documentation/devicetree/bindings/mailbox/cix,sky1-mbox.yaml
+ F:	arch/arm64/boot/dts/cix/
+ F:	drivers/mailbox/cix-mailbox.c
++F:	include/linux/soc/cix/sky1.h
+ K:	\bcix\b
+ 
+ ARM/CLKDEV SUPPORT
+diff --git a/drivers/acpi/processor_thermal.c b/drivers/acpi/processor_thermal.c
+--- a/drivers/acpi/processor_thermal.c
++++ b/drivers/acpi/processor_thermal.c
+@@ -17,6 +17,7 @@
+ #include <acpi/processor.h>
+ #include <linux/uaccess.h>
+ #include <linux/cix/cpu_ipa.h>
++#include <linux/soc/cix/sky1.h>
+ #include <linux/energy_model.h>
+ #include <acpi/cppc_acpi.h>
+ #include <asm/cputype.h>
+@@ -45,15 +46,9 @@
+ 
+ static DEFINE_PER_CPU(unsigned int, cpufreq_thermal_reduction_step);
+ 
+-#ifdef CONFIG_ARCH_CIX
+ #define reduction_step(cpu) \
+-	per_cpu(cpufreq_thermal_reduction_step, cpu)
+-#else
+-#define reduction_step(cpu) \
+-	per_cpu(cpufreq_thermal_reduction_step, phys_package_first_cpu(cpu))
+-#endif
+-
+-#ifndef CONFIG_ARCH_CIX
++	per_cpu(cpufreq_thermal_reduction_step, processor_thermal_reduction_cpu(cpu))
++
+ /*
+  * Emulate "per package data" using per cpu data (which should really be
+  * provided elsewhere)
+@@ -71,7 +66,11 @@
+ 			return i;
+ 	return 0;
+ }
+-#endif
++
++static int processor_thermal_reduction_cpu(int cpu)
++{
++	return cix_sky1_acpi() ? cpu : phys_package_first_cpu(cpu);
++}
+ 
+ #ifdef CONFIG_CIX_THERMAL
+ static unsigned int cix_get_static_power(unsigned int cpu)
+@@ -93,7 +92,7 @@
+ 	}
+ 
+ 	status = acpi_evaluate_integer(NULL, "\\_SB.SPRG", &arg_list, &temp);
+-	if (ACPI_FAILURE(status) && status != AE_NOT_FOUND) {
++	if (ACPI_FAILURE(status)) {
+ 		pr_err("failed to evaluate SPRG %s\n",
+ 		       acpi_format_exception(status));
+ 		return 0;
+@@ -121,7 +120,7 @@
+ 	}
+ 
+ 	status = acpi_evaluate_integer(NULL, "\\_SB.DPRG", &arg_list, &temp);
+-	if (ACPI_FAILURE(status) && status != AE_NOT_FOUND) {
++	if (ACPI_FAILURE(status)) {
+ 		pr_err("failed to evaluate DPRG %s\n",
+ 		       acpi_format_exception(status));
+ 		return 0;
+@@ -171,16 +170,14 @@
+ 
+ static int cpufreq_get_max_state(unsigned int cpu)
+ {
+-#ifndef CONFIG_CIX_THERMAL
+-	if (!cpu_has_cpufreq(cpu))
+-		return 0;
+-
+-	return cpufreq_thermal_max_step;
+-#else
+-	struct cpufreq_policy *policy __free(put_cpufreq_policy) =
+-		cpufreq_cpu_get(cpu);
++#ifdef CONFIG_CIX_THERMAL
++	struct cpufreq_policy *policy __free(put_cpufreq_policy) = NULL;
+ 	const struct cppc_cpudata *cpu_data;
+ 
++	if (!cix_sky1_acpi())
++		return cpu_has_cpufreq(cpu) ? cpufreq_thermal_max_step : 0;
++
++	policy = cpufreq_cpu_get(cpu);
+ 	if (!policy)
+ 		return cpufreq_thermal_max_step;
+ 
+@@ -189,6 +186,8 @@
+ 		return cpu_data->opp_level_num - 1;
+ 
+ 	return cpufreq_thermal_max_step;
++#else
++	return cpu_has_cpufreq(cpu) ? cpufreq_thermal_max_step : 0;
+ #endif
+ }
+ 
+@@ -558,12 +557,27 @@
+ 	.get_max_state = processor_get_max_state,
+ 	.get_cur_state = processor_get_cur_state,
+ 	.set_cur_state = processor_set_cur_state,
++};
++
+ #ifdef CONFIG_CIX_THERMAL
++static const struct thermal_cooling_device_ops cix_processor_cooling_ops = {
++	.get_max_state = processor_get_max_state,
++	.get_cur_state = processor_get_cur_state,
++	.set_cur_state = processor_set_cur_state,
+ 	.get_requested_power = processor_get_requested_power,
+ 	.power2state = processor_power2state,
+ 	.state2power = processor_state2power,
++};
+ #endif
+-};
++
++static const struct thermal_cooling_device_ops *processor_get_cooling_ops(void)
++{
++#ifdef CONFIG_CIX_THERMAL
++	if (cix_sky1_acpi())
++		return &cix_processor_cooling_ops;
++#endif
++	return &processor_cooling_ops;
++}
+ 
+ int acpi_processor_thermal_init(struct acpi_processor *pr,
+ 				struct acpi_device *device)
+@@ -571,7 +585,7 @@
+ 	int result = 0;
+ 
+ 	pr->cdev = thermal_cooling_device_register("Processor", device,
+-						   &processor_cooling_ops);
++						   processor_get_cooling_ops());
+ 	if (IS_ERR(pr->cdev)) {
+ 		result = PTR_ERR(pr->cdev);
+ 		return result;
+diff --git a/drivers/acpi/thermal.c b/drivers/acpi/thermal.c
+--- a/drivers/acpi/thermal.c
++++ b/drivers/acpi/thermal.c
+@@ -28,6 +28,7 @@
+ #include <linux/platform_device.h>
+ #include <linux/thermal.h>
+ #include <linux/acpi.h>
++#include <linux/soc/cix/sky1.h>
+ #include <linux/devfreq_cooling.h>
+ #include <linux/workqueue.h>
+ #include <linux/uaccess.h>
+@@ -499,8 +500,10 @@
+ 
+ 	acpi_trip->temp_dk = temp;
+ #ifdef CONFIG_CIX_THERMAL
+-	if (index == ACPI_THERMAL_TRIP_PASSIVE)
++	if (cix_sky1_acpi() && index == ACPI_THERMAL_TRIP_PASSIVE)
+ 		acpi_thermal_init_switch_on_temp(tz, acpi_trip);
++	else
++		acpi_trip->switch_on_temp_dk = THERMAL_TEMP_INVALID;
+ #endif
+ 	return true;
+ 
+@@ -705,21 +708,27 @@
+ 					      int passive_delay)
+ {
+ 	const char *tz_type = acpi_device_bid(tz->device);
++#ifdef CONFIG_CIX_THERMAL
+ 	struct thermal_zone_params tzp = {};
++#endif
++	struct thermal_zone_params *params = NULL;
+ 	int result;
+ 
+ #ifdef CONFIG_CIX_THERMAL
+-	tzp.sustainable_power = tz->sustainable_power;
++	if (cix_sky1_acpi()) {
++		tzp.sustainable_power = tz->sustainable_power;
++		params = &tzp;
++	}
+ #endif
+ 
+ 	if (trip_count)
+ 		tz->thermal_zone = thermal_zone_device_register_with_trips(
+ 					tz_type, trip_table, trip_count, tz,
+-					&acpi_thermal_zone_ops, &tzp, passive_delay,
++					&acpi_thermal_zone_ops, params, passive_delay,
+ 					tz->polling_frequency * 100);
+ 	else
+ 		tz->thermal_zone = thermal_tripless_zone_device_register(
+-					tz_type, tz, &acpi_thermal_zone_ops, &tzp);
++					tz_type, tz, &acpi_thermal_zone_ops, params);
+ 
+ 	if (IS_ERR(tz->thermal_zone))
+ 		return PTR_ERR(tz->thermal_zone);
+@@ -1000,7 +1009,7 @@
+ 
+ #ifdef CONFIG_CIX_THERMAL
+ 	acpi_trip = &tz->trips.passive.trip;
+-	if (acpi_thermal_trip_valid(acpi_trip) &&
++	if (cix_sky1_acpi() && acpi_thermal_trip_valid(acpi_trip) &&
+ 	    acpi_trip->switch_on_temp_dk != THERMAL_TEMP_INVALID &&
+ 	    acpi_trip->switch_on_temp_dk < acpi_trip->temp_dk) {
+ 		trip->type = THERMAL_TRIP_PASSIVE;
+@@ -1015,9 +1024,11 @@
+ 		pr_warn(FW_BUG "No valid trip points!\n");
+ 
+ #ifdef CONFIG_CIX_THERMAL
+-	result = acpi_thermal_get_sustainable_power(tz);
+-	if (result)
+-		return result;
++	if (cix_sky1_acpi()) {
++		result = acpi_thermal_get_sustainable_power(tz);
++		if (result)
++			return result;
++	}
+ #endif
+ 
+ 	result = acpi_thermal_register_thermal_zone(tz, trip_table,
+diff --git a/drivers/cpufreq/cppc_cpufreq.c b/drivers/cpufreq/cppc_cpufreq.c
+--- a/drivers/cpufreq/cppc_cpufreq.c
++++ b/drivers/cpufreq/cppc_cpufreq.c
+@@ -12,6 +12,7 @@
+ 
+ #include <linux/arch_topology.h>
+ #include <linux/kernel.h>
++#include <linux/soc/cix/sky1.h>
+ #include <linux/module.h>
+ #include <linux/delay.h>
+ #include <linux/cpu.h>
+@@ -419,7 +420,6 @@
+ 
+ #if defined(CONFIG_ARM64) && defined(CONFIG_ENERGY_MODEL)
+ 
+-#ifndef CONFIG_CIX_THERMAL
+ static DEFINE_PER_CPU(unsigned int, efficiency_class);
+ 
+ /* Create an artificial performance state every CPPC_EM_CAP_STEP capacity unit. */
+@@ -601,7 +601,8 @@
+ 	}
+ 	cppc_cpufreq_driver.register_em = cppc_cpufreq_register_em;
+ }
+-#else /* CONFIG_CIX_THERMAL */
++
++#ifdef CONFIG_CIX_THERMAL
+ static unsigned int cix_get_perf_level_count(struct cpufreq_policy *policy)
+ {
+ 	struct cppc_cpudata *cpu_data = policy->driver_data;
+@@ -654,7 +655,7 @@
+ 				    cpu_data->shared_cpu_map, 1);
+ }
+ 
+-static void populate_efficiency_class(void)
++static void cix_populate_efficiency_class(void)
+ {
+ 	cppc_cpufreq_driver.register_em = cix_cppc_cpufreq_register_em;
+ }
+@@ -970,7 +971,8 @@
+ 
+ 	cppc_cpufreq_cpu_fie_init(policy);
+ #ifdef CONFIG_CIX_THERMAL
+-	cppc_opp_init(policy);
++	if (cix_sky1_acpi())
++		cppc_opp_init(policy);
+ #endif
+ 	return 0;
+ 
+@@ -1049,7 +1051,6 @@
+ }
+ #endif
+ 
+-#ifndef CONFIG_ARCH_CIX
+ static int cppc_get_perf_ctrs_sample(int cpu,
+ 				     struct cppc_perf_fb_ctrs *fb_ctrs_t0,
+ 				     struct cppc_perf_fb_ctrs *fb_ctrs_t1)
+@@ -1108,7 +1109,6 @@
+ 
+ 	return cppc_perf_to_khz(&cpu_data->perf_caps, delivered_perf);
+ }
+-#endif
+ 
+ static int cppc_cpufreq_set_boost(struct cpufreq_policy *policy, int state)
+ {
+@@ -1308,18 +1308,10 @@
+ };
+ 
+ static struct cpufreq_driver cppc_cpufreq_driver = {
+-	.flags = CPUFREQ_CONST_LOOPS | CPUFREQ_NEED_UPDATE_LIMITS
+-#ifdef CONFIG_CIX_THERMAL
+-		 | CPUFREQ_IS_COOLING_DEV
+-#endif
+-		 ,
++	.flags = CPUFREQ_CONST_LOOPS | CPUFREQ_NEED_UPDATE_LIMITS,
+ 	.verify = cppc_verify_policy,
+ 	.target = cppc_cpufreq_set_target,
+-#ifdef CONFIG_ARCH_CIX
+-	.get = cix_cppc_cpufreq_get_rate,
+-#else
+ 	.get = cppc_cpufreq_get_rate,
+-#endif
+ 	.fast_switch = cppc_cpufreq_fast_switch,
+ 	.init = cppc_cpufreq_cpu_init,
+ 	.exit = cppc_cpufreq_cpu_exit,
+@@ -1336,7 +1328,20 @@
+ 		return -ENODEV;
+ 
+ 	cppc_freq_invariance_init();
++#ifdef CONFIG_ARCH_CIX
++	if (cix_sky1_acpi())
++		cppc_cpufreq_driver.get = cix_cppc_cpufreq_get_rate;
++#endif
++#ifdef CONFIG_CIX_THERMAL
++	if (cix_sky1_acpi()) {
++		cix_populate_efficiency_class();
++		cppc_cpufreq_driver.flags |= CPUFREQ_IS_COOLING_DEV;
++	} else {
++		populate_efficiency_class();
++	}
++#else
+ 	populate_efficiency_class();
++#endif
+ 
+ 	ret = cpufreq_register_driver(&cppc_cpufreq_driver);
+ 	if (ret)
+diff --git a/drivers/firmware/arm_scmi/transports/mailbox.c b/drivers/firmware/arm_scmi/transports/mailbox.c
+--- a/drivers/firmware/arm_scmi/transports/mailbox.c
++++ b/drivers/firmware/arm_scmi/transports/mailbox.c
+@@ -391,10 +391,28 @@
+ 
+ static struct scmi_desc scmi_mailbox_desc = {
+ 	.ops = &scmi_mailbox_ops,
+-	.max_rx_timeout_ms = 300, /* We may increase this if required */
++	.max_rx_timeout_ms = 30, /* We may increase this if required */
+ 	.max_msg = 20, /* Limited by MBOX_TX_QUEUE_LEN */
+ 	.max_msg_size = SCMI_SHMEM_MAX_PAYLOAD_SIZE,
+ };
++
++/* Keep the longer firmware response allowance on this ACPI transport only. */
++static const struct scmi_desc scmi_cix_mailbox_desc = {
++	.ops = &scmi_mailbox_ops,
++	.max_rx_timeout_ms = 300,
++	.max_msg = 20,
++	.max_msg_size = SCMI_SHMEM_MAX_PAYLOAD_SIZE,
++};
++
++static const struct scmi_desc *scmi_mailbox_get_desc(struct device *dev)
++{
++	struct acpi_device *adev = ACPI_COMPANION(dev);
++
++	if (adev && acpi_dev_hid_uid_match(adev, "CIXHA006", NULL))
++		return &scmi_cix_mailbox_desc;
++
++	return &scmi_mailbox_desc;
++}
+ 
+ static const struct of_device_id scmi_of_match[] = {
+ 	{ .compatible = "arm,scmi" },
+@@ -410,7 +428,8 @@
+ MODULE_DEVICE_TABLE(acpi, scmi_acpi_match);
+ 
+ DEFINE_SCMI_TRANSPORT_DRIVER(scmi_mailbox, scmi_mailbox_driver,
+-			     scmi_mailbox_desc, scmi_of_match, scmi_acpi_match, core);
++			     *scmi_mailbox_get_desc(dev), scmi_of_match,
++			     scmi_acpi_match, core);
+ module_platform_driver(scmi_mailbox_driver);
+ 
+ MODULE_AUTHOR("Sudeep Holla <sudeep.holla@arm.com>");
+diff --git a/drivers/gpu/drm/panthor/panthor_sky1.c b/drivers/gpu/drm/panthor/panthor_sky1.c
+--- a/drivers/gpu/drm/panthor/panthor_sky1.c
++++ b/drivers/gpu/drm/panthor/panthor_sky1.c
+@@ -22,7 +22,8 @@
+ {
+ 	struct device *dev = ptdev->base.dev;
+ 
+-	return acpi_dev_hid_uid_match(ACPI_COMPANION(dev), "CIXH5000", NULL);
++	return has_acpi_companion(dev) &&
++		acpi_dev_hid_uid_match(ACPI_COMPANION(dev), "CIXH5000", NULL);
+ }
+ 
+ /*
+diff --git a/drivers/iommu/arm/arm-smmu-v3/arm-smmu-v3.c b/drivers/iommu/arm/arm-smmu-v3/arm-smmu-v3.c
+--- a/drivers/iommu/arm/arm-smmu-v3/arm-smmu-v3.c
++++ b/drivers/iommu/arm/arm-smmu-v3/arm-smmu-v3.c
+@@ -28,6 +28,7 @@
+ #include <linux/pci-ats.h>
+ #include <linux/platform_device.h>
+ #include <linux/sort.h>
++#include <linux/soc/cix/sky1.h>
+ #include <linux/string_choices.h>
+ #include <kunit/visibility.h>
+ #include <uapi/linux/iommufd.h>
+@@ -5527,19 +5528,21 @@
+ {
+ 	struct arm_smmu_device *smmu = dev_get_drvdata(dev);
+ 
+-	/* disable smmu to clear CR0 */
+-	arm_smmu_device_disable(smmu);
+-
+-	return 0;
++	if (!cix_sky1_acpi())
++		return 0;
++
++	/* Preserve the Sky1 firmware's retained-state suspend sequence. */
++	return arm_smmu_device_disable(smmu);
+ }
+ 
+ static int __maybe_unused arm_smmu_resume(struct device *dev)
+ {
+ 	struct arm_smmu_device *smmu = dev_get_drvdata(dev);
+ 
+-	arm_smmu_device_reset(smmu, true);
+-
+-	return 0;
++	if (!cix_sky1_acpi())
++		return 0;
++
++	return arm_smmu_device_reset(smmu, true);
+ }
+ 
+ static int arm_smmu_device_probe(struct platform_device *pdev)
+diff --git a/drivers/pmdomain/arm/scmi_pm_domain.c b/drivers/pmdomain/arm/scmi_pm_domain.c
+--- a/drivers/pmdomain/arm/scmi_pm_domain.c
++++ b/drivers/pmdomain/arm/scmi_pm_domain.c
+@@ -10,6 +10,7 @@
+ #include <linux/module.h>
+ #include <linux/pm_domain.h>
+ #include <linux/scmi_protocol.h>
++#include <linux/soc/cix/sky1.h>
+ 
+ static const struct scmi_power_proto_ops *power_ops;
+ 
+@@ -37,6 +38,9 @@ static int scmi_pd_power(struct generic_pm_domain *domain, u32 state)
+ 		return ret;
+ 	}
+ 
++	if (!cix_sky1_acpi())
++		return 0;
++
+ 	/* Verify state was actually set (like vendor kernel does) */
+ 	ret = power_ops->state_get(pd->ph, pd->domain, &ret_state);
+ 	if (ret) {
+@@ -201,19 +205,49 @@
+ 	.id_table = scmi_id_table,
+ };
+ 
+-/* CIX Sky1 needs early SCMI power domain init so GPU access permissions
+- * are configured before other drivers probe. Vendor kernel uses
+- * subsys_initcall_sync for this purpose.
+- */
+-#ifdef CONFIG_ARCH_CIX
++static bool scmi_power_domain_registered;
++
++static int __init scmi_power_domain_register(void)
++{
++	int ret;
++
++	if (scmi_power_domain_registered)
++		return 0;
++
++	ret = scmi_register(&scmi_power_domain_driver);
++	if (!ret)
++		scmi_power_domain_registered = true;
++
++	return ret;
++}
++
++#ifndef MODULE
++/* Only Sky1 needs the firmware power domains before device init. */
++static int __init scmi_power_domain_init_early(void)
++{
++	if (!cix_sky1_acpi())
++		return 0;
++
++	return scmi_power_domain_register();
++}
++subsys_initcall_sync(scmi_power_domain_init_early);
++#endif
++
+ static int __init scmi_power_domain_init(void)
+ {
+-	return scmi_register(&scmi_power_domain_driver);
+-}
+-subsys_initcall_sync(scmi_power_domain_init);
+-#else
+-module_scmi_driver(scmi_power_domain_driver);
+-#endif
++	/* Also retries a failed Sky1 early registration at the normal stage. */
++	return scmi_power_domain_register();
++}
++module_init(scmi_power_domain_init);
++
++static void __exit scmi_power_domain_exit(void)
++{
++	if (scmi_power_domain_registered) {
++		scmi_unregister(&scmi_power_domain_driver);
++		scmi_power_domain_registered = false;
++	}
++}
++module_exit(scmi_power_domain_exit);
+ 
+ MODULE_AUTHOR("Sudeep Holla <sudeep.holla@arm.com>");
+ MODULE_DESCRIPTION("ARM SCMI power domain driver");
+diff --git a/drivers/thermal/cpufreq_cooling.c b/drivers/thermal/cpufreq_cooling.c
+--- a/drivers/thermal/cpufreq_cooling.c
++++ b/drivers/thermal/cpufreq_cooling.c
+@@ -24,6 +24,7 @@
+ #include <linux/units.h>
+ 
+ #include <linux/cix/cpu_ipa.h>
++#include <linux/soc/cix/sky1.h>
+ 
+ #include "thermal_trace.h"
+ 
+@@ -190,7 +191,6 @@
+ }
+ #endif /* CONFIG_SMP */
+ 
+-#ifndef CONFIG_CIX_THERMAL
+ /**
+  * get_dynamic_power() - calculate the dynamic power
+  * @cpufreq_cdev:	&cpufreq_cooling_device for this cdev
+@@ -207,7 +207,6 @@
+ 	raw_cpu_power = cpu_freq_to_power(cpufreq_cdev, freq);
+ 	return (raw_cpu_power * cpufreq_cdev->last_load) / 100;
+ }
+-#endif
+ 
+ /**
+  * cpufreq_get_requested_power() - get the current power
+@@ -255,12 +254,11 @@
+ 
+ 	cpufreq_cdev->last_load = total_load;
+ 
+-#ifdef CONFIG_CIX_THERMAL
+-	*power = cix_get_static_power_cpus(policy->cpus) +
+-		 cix_get_dynamic_power_cpus(policy->cpus);
+-#else
+-	*power = get_dynamic_power(cpufreq_cdev, freq);
+-#endif
++	if (cix_sky1_thermal())
++		*power = cix_get_static_power_cpus(policy->cpus) +
++			 cix_get_dynamic_power_cpus(policy->cpus);
++	else
++		*power = get_dynamic_power(cpufreq_cdev, freq);
+ 
+ 	trace_thermal_power_cpu_get_power_simple(policy->cpu, *power);
+ 
+@@ -302,9 +300,8 @@
+ 
+ 	*power = cpu_freq_to_power(cpufreq_cdev, freq) * num_cpus;
+ 
+-#ifdef CONFIG_CIX_THERMAL
+-	*power += cix_get_static_power_cpus(cpufreq_cdev->policy->cpus);
+-#endif
++	if (cix_sky1_thermal())
++		*power += cix_get_static_power_cpus(cpufreq_cdev->policy->cpus);
+ 
+ 	return 0;
+ }
+@@ -332,22 +329,18 @@
+ 	struct cpufreq_cooling_device *cpufreq_cdev = cdev->devdata;
+ 	struct cpufreq_policy *policy = cpufreq_cdev->policy;
+ 
+-#ifdef CONFIG_CIX_THERMAL
+-	{
++	if (cix_sky1_thermal()) {
+ 		u32 static_power = cix_get_static_power_cpus(policy->cpus);
+ 
+ 		if (power > static_power)
+ 			normalised_power = power - static_power;
+ 		else
+ 			normalised_power = 0;
+-	}
+-#else
+-	{
++	} else {
+ 		u32 last_load = cpufreq_cdev->last_load ?: 1;
+ 
+ 		normalised_power = (power * 100) / last_load;
+ 	}
+-#endif
+ 	target_freq = cpu_power_to_freq(cpufreq_cdev, normalised_power);
+ 
+ 	*state = get_level(cpufreq_cdev, target_freq);
+diff --git a/drivers/thermal/devfreq_cooling.c b/drivers/thermal/devfreq_cooling.c
+--- a/drivers/thermal/devfreq_cooling.c
++++ b/drivers/thermal/devfreq_cooling.c
+@@ -15,6 +15,7 @@
+ #include <linux/energy_model.h>
+ #include <linux/export.h>
+ #include <linux/slab.h>
++#include <linux/soc/cix/sky1.h>
+ #include <linux/pm_opp.h>
+ #include <linux/pm_qos.h>
+ #include <linux/thermal.h>
+@@ -271,14 +272,14 @@
+ 	freq = status.current_frequency;
+ 
+ 	if (dfc->power_ops && dfc->power_ops->get_real_power) {
+-#ifdef CONFIG_CIX_THERMAL
+-		/* CIX power model already accounts for utilization. */
+-		est_power = power;
+-#else
+-		/* Scale for resource utilization */
+-		est_power = power * dfc->res_util;
+-		est_power /= SCALE_ERROR_MITIGATION;
+-#endif
++		if (cix_sky1_thermal()) {
++			/* CIX power model already accounts for utilization. */
++			est_power = power;
++		} else {
++			/* Scale for resource utilization */
++			est_power = power * dfc->res_util;
++			est_power /= SCALE_ERROR_MITIGATION;
++		}
+ 	} else {
+ 		/* Scale dynamic power for utilization */
+ 		_normalize_load(&status);
+diff --git a/drivers/thermal/gov_power_allocator.c b/drivers/thermal/gov_power_allocator.c
+--- a/drivers/thermal/gov_power_allocator.c
++++ b/drivers/thermal/gov_power_allocator.c
+@@ -9,6 +9,7 @@
+ #define pr_fmt(fmt) "Power allocator: " fmt
+ 
+ #include <linux/slab.h>
++#include <linux/soc/cix/sky1.h>
+ #include <linux/thermal.h>
+ 
+ #define CREATE_TRACE_POINTS
+@@ -99,7 +100,8 @@
+ 
+ static int trip_switch_on_temp(const struct thermal_trip *trip)
+ {
+-	return trip->switch_on_temp > 0 ? trip->switch_on_temp : trip->temperature;
++	return cix_sky1_thermal() && trip->switch_on_temp > 0 ?
++		trip->switch_on_temp : trip->temperature;
+ }
+ 
+ static bool power_actor_is_valid(struct thermal_instance *instance)
+@@ -168,7 +170,7 @@
+ 	if (trip_switch_on) {
+ 		int switch_on_temp = trip_switch_on_temp(trip_switch_on);
+ 
+-		if (switch_on_temp < control_temp)
++		if (!cix_sky1_thermal() || switch_on_temp < control_temp)
+ 			temperature_threshold -= switch_on_temp;
+ 	}
+ 
+@@ -547,7 +549,7 @@
+ 		params->trip_switch_on = first_passive;
+ 		params->trip_max = last_passive;
+ 	} else if (first_passive) {
+-		if (first_passive->switch_on_temp > 0 &&
++		if (cix_sky1_thermal() && first_passive->switch_on_temp > 0 &&
+ 		    first_passive->switch_on_temp < first_passive->temperature)
+ 			params->trip_switch_on = first_passive;
+ 		else
+@@ -563,7 +565,7 @@
+ 	 * switch-on). Swap when the switch-on temperature is hotter than the
+ 	 * control temperature.
+ 	 */
+-	if (params->trip_switch_on && params->trip_max &&
++	if (cix_sky1_thermal() && params->trip_switch_on && params->trip_max &&
+ 	    (trip_switch_on_temp(params->trip_switch_on) >
+ 	     params->trip_max->temperature ||
+ 	     params->trip_switch_on->temperature > params->trip_max->temperature)) {
+diff --git a/drivers/watchdog/sbsa_gwdt.c b/drivers/watchdog/sbsa_gwdt.c
+--- a/drivers/watchdog/sbsa_gwdt.c
++++ b/drivers/watchdog/sbsa_gwdt.c
+@@ -52,6 +52,7 @@
+ #include <linux/suspend.h>
+ #include <linux/uaccess.h>
+ #include <linux/watchdog.h>
++#include <linux/soc/cix/sky1.h>
+ #include <asm/arch_timer.h>
+ 
+ #define DRV_NAME		"sbsa-gwdt"
+@@ -95,10 +96,12 @@
+  * @hw_armed:		The watchdog is logically running (started by firmware,
+  *			early_enable or userspace); the hardware follows it except
+  *			while a system sleep transition is in progress
++ * @wrr_val:		Value written to SBSA_GWDT_WRR to refresh the watchdog
+  */
+ struct sbsa_gwdt {
+ 	struct watchdog_device	wdd;
+ 	u32			clk;
++	u32			wrr_val;
+ 	int			version;
+ 	bool			need_ws0_race_workaround;
+ 	void __iomem		*refresh_base;
+@@ -245,7 +248,7 @@ static int sbsa_gwdt_keepalive(struct watchdog_device *wdd)
+ 	 * Writing WRR for an explicit watchdog refresh.
+ 	 * You can write anyting (like 0).
+ 	 */
+-	writel(1, gwdt->refresh_base + SBSA_GWDT_WRR);
++	writel(gwdt->wrr_val, gwdt->refresh_base + SBSA_GWDT_WRR);
+ 
+ 	return 0;
+ }
+@@ -483,6 +486,7 @@ static int sbsa_gwdt_probe(struct platform_device *pdev)
+ 	gwdt->clk = arch_timer_get_cntfrq();
+ 	gwdt->refresh_base = rf_base;
+ 	gwdt->control_base = cf_base;
++	gwdt->wrr_val = cix_sky1_acpi() ? 1 : 0;
+ 	status = readl(cf_base + SBSA_GWDT_WCS);
+ 
+ 	/*
+@@ -557,7 +561,7 @@ static int sbsa_gwdt_probe(struct platform_device *pdev)
+ 			 * In case there is a pending ws0 interrupt, just ping
+ 			 * the watchdog before registering the interrupt routine
+ 			 */
+-			writel(0, rf_base + SBSA_GWDT_WRR);
++			writel(gwdt->wrr_val, rf_base + SBSA_GWDT_WRR);
+ 			if (devm_request_irq(dev, irq, sbsa_gwdt_interrupt, 0,
+ 					     pdev->name, gwdt)) {
+ 				action = 0;
+diff --git a/include/linux/soc/cix/sky1.h b/include/linux/soc/cix/sky1.h
+new file mode 100644
+--- /dev/null
++++ b/include/linux/soc/cix/sky1.h
+@@ -0,0 +1,37 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef _LINUX_SOC_CIX_SKY1_H
++#define _LINUX_SOC_CIX_SKY1_H
++
++#include <linux/acpi.h>
++
++static inline acpi_status cix_sky1_acpi_match(acpi_handle handle, u32 level,
++					      void *context, void **retval)
++{
++	*(bool *)context = true;
++	return AE_CTRL_TERMINATE;
++}
++
++/*
++ * CIXHA006 is the Sky1 ACPI SCMI controller, not a driver-registration test.
++ * Unlike acpi_dev_present(), this namespace walk also works before the ACPI
++ * device-bus scan. ACPICA is initialized before driver initcalls, and the
++ * walker serializes the namespace and filters matching devices through _STA.
++ * Do not cache an early miss: a later lookup must see a newly loaded table.
++ */
++static inline bool cix_sky1_acpi(void)
++{
++	bool found = false;
++
++	if (acpi_disabled)
++		return false;
++
++	acpi_get_devices("CIXHA006", cix_sky1_acpi_match, &found, NULL);
++	return found;
++}
++
++static inline bool cix_sky1_thermal(void)
++{
++	return IS_ENABLED(CONFIG_CIX_THERMAL) && cix_sky1_acpi();
++}
++
++#endif /* _LINUX_SOC_CIX_SKY1_H */

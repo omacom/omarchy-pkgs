@@ -1,0 +1,132 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Clay Stan <claystan97@gmail.com>
+Date: Tue, 24 Nov 2026 12:06:00 +0800
+Subject: [PATCH] firmware: arm_scmi: honor fwnode errors, availability and lifetimes
+
+A protocol without a private shmem reference must reuse the base
+channel. fwnode_find_reference() returns an error pointer for this
+case, unlike the OF helper it replaced. Validate both mailbox shmem
+references for the same reason, initialize reg_io_width before the DT
+branch, and drop the ACPI shmem reference acquired during setup.
+
+Use the available-child iterators so disabled Device Tree protocol
+nodes remain skipped on non-ACPI platforms while keeping the scoped
+reference cleanup on error. Fall back to the firmware node name when
+setting up debugfs on ACPI controllers without a compatible string,
+and keep SCMI device creation logging at debug level.
+
+Signed-off-by: Clay Stan <claystan97@gmail.com>
+---
+ drivers/firmware/arm_scmi/bus.c                | 2 +-
+ drivers/firmware/arm_scmi/driver.c             | 9 +++++----
+ drivers/firmware/arm_scmi/shmem.c              | 4 +++-
+ drivers/firmware/arm_scmi/transports/mailbox.c | 2 +-
+ drivers/firmware/arm_scmi/transports/smc.c     | 5 +----
+ 5 files changed, 11 insertions(+), 11 deletions(-)
+
+diff --git a/drivers/firmware/arm_scmi/bus.c b/drivers/firmware/arm_scmi/bus.c
+index 6898319..69b8648 100644
+--- a/drivers/firmware/arm_scmi/bus.c
++++ b/drivers/firmware/arm_scmi/bus.c
+@@ -513,7 +513,7 @@ __scmi_device_create(struct fwnode_handle *np, struct device *parent,
+ 	if (retval)
+ 		goto put_dev;
+ 
+-	pr_info("(%s) Created SCMI device '%s' for protocol 0x%x (%s)\n",
++	pr_debug("(%s) Created SCMI device '%s' for protocol 0x%x (%s)\n",
+ 		 fwnode_get_name(parent->fwnode), dev_name(&scmi_dev->dev), protocol, name);
+ 
+ 	return scmi_dev;
+diff --git a/drivers/firmware/arm_scmi/driver.c b/drivers/firmware/arm_scmi/driver.c
+index 41039b3..8b59ed6 100644
+--- a/drivers/firmware/arm_scmi/driver.c
++++ b/drivers/firmware/arm_scmi/driver.c
+@@ -2875,14 +2875,14 @@ scmi_txrx_setup(struct scmi_info *info, struct fwnode_handle *fwnode,
+ static int scmi_channels_setup(struct scmi_info *info)
+ {
+ 	int ret;
+-	struct fwnode_handle *child, *top_np = info->dev->fwnode;
++	struct fwnode_handle *top_np = info->dev->fwnode;
+ 
+ 	/* Initialize a common generic channel at first */
+ 	ret = scmi_txrx_setup(info, top_np, SCMI_PROTOCOL_BASE);
+ 	if (ret)
+ 		return ret;
+ 
+-	fwnode_for_each_child_node(top_np, child) {
++	fwnode_for_each_available_child_node_scoped(top_np, child) {
+ 		u32 prot_id;
+ 
+ 		if (fwnode_property_read_u32(child, "reg", &prot_id))
+@@ -3083,7 +3083,8 @@ static struct scmi_debug_info *scmi_debugfs_common_setup(struct scmi_info *info)
+ 		return NULL;
+ 	}
+ 
+-	fwnode_property_read_string(info->dev->fwnode, "compatible", &c_ptr);
++	if (fwnode_property_read_string(info->dev->fwnode, "compatible", &c_ptr))
++		c_ptr = fwnode_get_name(info->dev->fwnode);
+ 	dbg->type = kstrdup(c_ptr, GFP_KERNEL);
+ 	if (!dbg->type) {
+ 		kfree(dbg->name);
+@@ -3357,7 +3358,7 @@ static int scmi_probe(struct platform_device *pdev)
+ 
+ 	scmi_enable_matching_quirks(info);
+ 
+-	fwnode_for_each_child_node(np, child) {
++	fwnode_for_each_available_child_node(np, child) {
+ 		u32 prot_id;
+ 
+ 		if (fwnode_property_read_u32(child, "reg", &prot_id))
+diff --git a/drivers/firmware/arm_scmi/shmem.c b/drivers/firmware/arm_scmi/shmem.c
+index 4028dfb..4818cee 100644
+--- a/drivers/firmware/arm_scmi/shmem.c
++++ b/drivers/firmware/arm_scmi/shmem.c
+@@ -207,7 +207,7 @@ static void __iomem *shmem_setup_iomap(struct scmi_chan_info *cinfo,
+ 	struct resource lres = {};
+ 	resource_size_t size;
+ 	void __iomem *addr;
+-	u32 reg_io_width;
++	u32 reg_io_width = 0;
+ 
+ 	/* Use a local on-stack as a working area when not provided */
+ 	if (!res)
+@@ -258,8 +258,10 @@ static void __iomem *shmem_setup_iomap(struct scmi_chan_info *cinfo,
+ 		if (!shmdev) {
+ 			dev_err(cdev, "SCMI %s shmem device not found for %pfw\n",
+ 				desc, args.fwnode);
++			fwnode_handle_put(args.fwnode);
+ 			return IOMEM_ERR_PTR(-ENODEV);
+ 		}
++		fwnode_handle_put(args.fwnode);
+ 
+ 		/* Optional sanity check: ACPI provides "compatible"="arm,scmi-shmem" */
+ 		if (device_property_match_string(shmdev, "compatible",
+diff --git a/drivers/firmware/arm_scmi/transports/mailbox.c b/drivers/firmware/arm_scmi/transports/mailbox.c
+index 155d4b4..0c291f9 100644
+--- a/drivers/firmware/arm_scmi/transports/mailbox.c
++++ b/drivers/firmware/arm_scmi/transports/mailbox.c
+@@ -150,7 +150,7 @@ static int mailbox_chan_validate(struct device *cdev, int *a2p_rx_chan,
+ 		struct fwnode_handle *np_rx __free(fwnode_handle) =
+ 					fwnode_find_reference(fwnode, "shmem", 1);
+ 
+-		if (!np_tx || !np_rx || np_tx == np_rx) {
++		if (IS_ERR_OR_NULL(np_tx) || IS_ERR_OR_NULL(np_rx) || np_tx == np_rx) {
+ 			dev_warn(cdev, "Invalid shmem descriptor for '%s'\n", fwnode_get_name(fwnode));
+ 			ret = -EINVAL;
+ 		}
+diff --git a/drivers/firmware/arm_scmi/transports/smc.c b/drivers/firmware/arm_scmi/transports/smc.c
+index f104317..6e79a71 100644
+--- a/drivers/firmware/arm_scmi/transports/smc.c
++++ b/drivers/firmware/arm_scmi/transports/smc.c
+@@ -88,10 +88,7 @@ static bool smc_chan_available(struct fwnode_handle *fwnode, int idx)
+ {
+ 	struct fwnode_handle *np __free(fwnode_handle) =
+ 					fwnode_find_reference(fwnode, "shmem", 0);
+-	if (!np)
+-		return false;
+-
+-	return true;
++	return !IS_ERR_OR_NULL(np);
+ }
+ 
+ static inline void smc_channel_lock_init(struct scmi_smc *scmi_info)

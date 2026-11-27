@@ -1,0 +1,148 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Clay Stan <claystan97@gmail.com>
+Date: Tue, 24 Nov 2026 12:04:00 +0800
+Subject: [PATCH] backlight: pwm: fix ACPI brightness notifications
+
+Remove a successful notification handler before unregistering the
+backlight. Adjust the requested brightness within its registered range
+and use the backlight setter to apply the PWM change under the core's
+locks. Propagate errors from reading the number of firmware levels.
+
+Signed-off-by: Clay Stan <claystan97@gmail.com>
+---
+diff --git a/drivers/video/backlight/pwm_bl.c b/drivers/video/backlight/pwm_bl.c
+--- a/drivers/video/backlight/pwm_bl.c
++++ b/drivers/video/backlight/pwm_bl.c
+@@ -29,6 +29,7 @@
+ 	struct regulator	*power_supply;
+ 	struct gpio_desc	*enable_gpio;
+ 	unsigned int		scale;
++	acpi_handle		brightness_notify_handle;
+ 	unsigned int		post_pwm_on_delay;
+ 	unsigned int		pwm_off_delay;
+ 	int			(*notify)(struct device *,
+@@ -129,14 +130,8 @@
+ 	return 0;
+ }
+ 
+-static int bd_get_brightness(struct backlight_device *bd)
+-{
+-	return bd->props.brightness;
+-}
+-
+ static const struct backlight_ops pwm_backlight_ops = {
+ 	.update_status	= pwm_backlight_update_status,
+-	.get_brightness = bd_get_brightness,
+ };
+ 
+ #ifdef CONFIG_OF
+@@ -252,7 +247,10 @@
+ 	if (!device_property_present(dev, "brightness-levels"))
+ 		return 0;
+ 
+-	num_levels = device_property_count_u32(dev, "brightness-levels");
++	ret = device_property_count_u32(dev, "brightness-levels");
++	if (ret < 0)
++		return ret;
++	num_levels = ret;
+ 
+ 	/* read brightness levels from DT property */
+ 	if (num_levels > 0) {
+@@ -449,39 +447,39 @@
+ 
+ static void acpi_brightness_adjust_notify(acpi_handle handle, u32 event, void *data)
+ {
+-	struct platform_device *pdev = (struct platform_device *)data;
+-	struct backlight_device *bl;
+-	int current_brightness;
+-
+-	if (!pdev)
++	struct backlight_device *bl = data;
++	int brightness = READ_ONCE(bl->props.brightness);
++
++	switch (event) {
++	case ACPI_VIDEO_NOTIFY_INC_BRIGHTNESS:
++		brightness += min(25, bl->props.max_brightness - brightness);
++		break;
++	case ACPI_VIDEO_NOTIFY_DEC_BRIGHTNESS:
++		brightness = max(0, brightness - 25);
++		break;
++	default:
++		acpi_handle_debug(handle, "Unsupported event [0x%x]\n", event);
+ 		return;
+-
+-	bl = (struct backlight_device *)platform_get_drvdata(pdev);
+-
+-	if (!bl)
++	}
++
++	backlight_device_set_brightness(bl, brightness);
++}
++
++static void pwm_backlight_register_acpi_notify(struct pwm_bl_data *pb,
++					       struct backlight_device *bl)
++{
++	acpi_handle handle = ACPI_HANDLE(pb->dev);
++	acpi_status status;
++
++	if (!handle)
+ 		return;
+ 
+-	current_brightness = backlight_get_brightness(bl);
+-	switch (event) {
+-		case ACPI_VIDEO_NOTIFY_INC_BRIGHTNESS:	/* Increase brightness */
+-			current_brightness += 25;
+-			break;
+-		case ACPI_VIDEO_NOTIFY_DEC_BRIGHTNESS:	/* Decrease brightness */
+-			current_brightness -= 25;
+-			break;
+-		default:
+-			acpi_handle_debug(handle, "Unsupported event [0x%x]\n", event);
+-			return;
+-	}
+-
+-	if (current_brightness > 254)
+-		current_brightness = 254;
+-	else if (current_brightness < 0)
+-		current_brightness = 0;
+-
+-	bl->props.brightness = current_brightness;
+-
+-	backlight_force_update(bl, BACKLIGHT_UPDATE_HOTKEY);
++	status = acpi_install_notify_handler(handle, ACPI_DEVICE_NOTIFY,
++					     acpi_brightness_adjust_notify, bl);
++	if (ACPI_FAILURE(status))
++		dev_err(pb->dev, "Error installing notify handler\n");
++	else
++		pb->brightness_notify_handle = handle;
+ }
+ 
+ static int pwm_backlight_probe(struct platform_device *pdev)
+@@ -652,14 +650,7 @@
+ 
+ 	platform_set_drvdata(pdev, bl);
+ 
+-	if (has_acpi_companion(&pdev->dev)) {
+-		acpi_status status = acpi_install_notify_handler(
+-			to_acpi_device_node(pdev->dev.fwnode)->handle,
+-			ACPI_DEVICE_NOTIFY, acpi_brightness_adjust_notify,
+-			pdev);
+-		if (ACPI_FAILURE(status))
+-			dev_err(&pdev->dev, "Error installing notify handler\n");
+-	}
++	pwm_backlight_register_acpi_notify(pb, bl);
+ 
+ 	return 0;
+ 
+@@ -674,6 +665,11 @@
+ 	struct backlight_device *bl = platform_get_drvdata(pdev);
+ 	struct pwm_bl_data *pb = bl_get_data(bl);
+ 	struct pwm_state state;
++
++	if (pb->brightness_notify_handle)
++		acpi_remove_notify_handler(pb->brightness_notify_handle,
++					   ACPI_DEVICE_NOTIFY,
++					   acpi_brightness_adjust_notify);
+ 
+ 	backlight_device_unregister(bl);
+ 	pwm_backlight_power_off(pb);

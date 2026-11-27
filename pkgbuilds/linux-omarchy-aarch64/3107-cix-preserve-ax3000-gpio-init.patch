@@ -1,0 +1,134 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Clay Stan <claystan97@gmail.com>
+Date: Tue, 24 Nov 2026 12:07:00 +0800
+Subject: [PATCH] gpio: cadence: preserve firmware pin state on AX3000
+
+Keep the AX3000 match and skip_init behavior after adding the Sky1
+match and PDC wake support. Skip direction, interrupt and pinmux
+initialization on AX3000 and skip direction rollback if probe did not
+change the register. Use separate match-data flags for these platforms.
+
+Signed-off-by: Clay Stan <claystan97@gmail.com>
+---
+diff --git a/drivers/gpio/gpio-cadence.c b/drivers/gpio/gpio-cadence.c
+--- a/drivers/gpio/gpio-cadence.c
++++ b/drivers/gpio/gpio-cadence.c
+@@ -39,6 +39,19 @@
+ /* Sky1 Power Domain Controller SMC interface */
+ #define SKY1_SIP_GPIO_PDC		0xC2000009
+ #define SKY1_SIP_GPIO_PDC_SET_WAKE	0x02
++
++struct cdns_gpio_quirks {
++	bool skip_init;
++	bool has_sky1_pdc;
++};
++
++static const struct cdns_gpio_quirks ax3000_gpio_quirks = {
++	.skip_init = true,
++};
++
++static const struct cdns_gpio_quirks sky1_gpio_quirks = {
++	.has_sky1_pdc = true,
++};
+ 
+ struct cdns_gpio_saved_regs {
+ 	u32 bypass_mode;
+@@ -309,9 +322,11 @@
+ static int cdns_gpio_probe(struct platform_device *pdev)
+ {
+ 	struct gpio_generic_chip_config config = { };
++	const struct cdns_gpio_quirks *quirks;
+ 	struct cdns_gpio_chip *cgpio;
+ 	int ret, irq;
+-	u32 dir_prev;
++	u32 dir_prev = 0;
++	bool skip_init;
+ 	u32 num_gpios = 32;
+ 	u32 io_mask = 0;
+ 
+@@ -334,8 +349,10 @@
+ 	/* Optional mask of pins that should remain inputs (hardware safety) */
+ 	device_property_read_u32(&pdev->dev, "gpio-io-mask", &io_mask);
+ 
+-	/* Detect Sky1 platform for PDC wake integration */
+-	cgpio->has_sky1_pdc = !!device_get_match_data(&pdev->dev);
++	quirks = device_get_match_data(&pdev->dev);
++	cgpio->has_sky1_pdc = quirks && quirks->has_sky1_pdc;
++	/* AX3000 firmware initializes its pinmux before Linux boots. */
++	skip_init = quirks && quirks->skip_init;
+ 
+ 	/*
+ 	 * Set all pins as inputs by default, otherwise:
+@@ -345,9 +362,11 @@
+ 	 * so it needs to be changed before gpio_generic_chip_init() is called.
+ 	 * Apply io_mask to force certain pins as inputs (hardware safety).
+ 	 */
+-	dir_prev = ioread32(cgpio->regs + CDNS_GPIO_DIRECTION_MODE);
+-	iowrite32(GENMASK(num_gpios - 1, 0) & ~io_mask,
+-		  cgpio->regs + CDNS_GPIO_DIRECTION_MODE);
++	if (!skip_init) {
++		dir_prev = ioread32(cgpio->regs + CDNS_GPIO_DIRECTION_MODE);
++		iowrite32(GENMASK(num_gpios - 1, 0) & ~io_mask,
++			  cgpio->regs + CDNS_GPIO_DIRECTION_MODE);
++	}
+ 
+ 	config.dev = &pdev->dev;
+ 	config.sz = 4;
+@@ -427,8 +446,10 @@
+ 	 * the chip, to prevent IRQ storms through handle_bad_irq before
+ 	 * consumers have configured their IRQ types.
+ 	 */
+-	iowrite32(GENMASK(num_gpios - 1, 0), cgpio->regs + CDNS_GPIO_IRQ_DIS);
+-	ioread32(cgpio->regs + CDNS_GPIO_IRQ_STATUS);
++	if (!skip_init) {
++		iowrite32(GENMASK(num_gpios - 1, 0), cgpio->regs + CDNS_GPIO_IRQ_DIS);
++		ioread32(cgpio->regs + CDNS_GPIO_IRQ_STATUS);
++	}
+ 
+ 	ret = devm_gpiochip_add_data(&pdev->dev, &cgpio->gen_gc.gc, cgpio);
+ 	if (ret < 0) {
+@@ -439,9 +460,10 @@
+ 	cgpio->bypass_orig = ioread32(cgpio->regs + CDNS_GPIO_BYPASS_MODE);
+ 
+ 	/* Enable gpio outputs, ignored for input direction */
+-	iowrite32(GENMASK(num_gpios - 1, 0),
+-		  cgpio->regs + CDNS_GPIO_OUTPUT_EN);
+-	iowrite32(0, cgpio->regs + CDNS_GPIO_BYPASS_MODE);
++	if (!skip_init) {
++		iowrite32(GENMASK(num_gpios - 1, 0), cgpio->regs + CDNS_GPIO_OUTPUT_EN);
++		iowrite32(0, cgpio->regs + CDNS_GPIO_BYPASS_MODE);
++	}
+ 
+ 	platform_set_drvdata(pdev, cgpio);
+ 	return 0;
+@@ -450,7 +472,8 @@
+ 	if (cgpio->pclk)
+ 		clk_disable_unprepare(cgpio->pclk);
+ err_revert_dir:
+-	iowrite32(dir_prev, cgpio->regs + CDNS_GPIO_DIRECTION_MODE);
++	if (!skip_init)
++		iowrite32(dir_prev, cgpio->regs + CDNS_GPIO_DIRECTION_MODE);
+ 
+ 	return ret;
+ }
+@@ -466,16 +489,17 @@
+ }
+ 
+ static const struct of_device_id cdns_of_ids[] = {
++	{ .compatible = "axiado,ax3000-gpio", .data = &ax3000_gpio_quirks },
+ 	{ .compatible = "cdns,gpio-r1p02" },
+-	{ .compatible = "cix,sky1-gpio", .data = (void *)1 },
++	{ .compatible = "cix,sky1-gpio", .data = &sky1_gpio_quirks },
+ 	{ /* sentinel */ },
+ };
+ MODULE_DEVICE_TABLE(of, cdns_of_ids);
+ 
+ #ifdef CONFIG_ACPI
+ static const struct acpi_device_id cdns_acpi_ids[] = {
+-	{ "CIXH1002", 1 },
+-	{ "CIXH1003", 1 },
++	{ "CIXH1002", (kernel_ulong_t)&sky1_gpio_quirks },
++	{ "CIXH1003", (kernel_ulong_t)&sky1_gpio_quirks },
+ 	{ /* sentinel */ },
+ };
+ MODULE_DEVICE_TABLE(acpi, cdns_acpi_ids);

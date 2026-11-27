@@ -1,0 +1,151 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Clay Stan <claystan97@gmail.com>
+Date: Tue, 24 Nov 2026 12:10:00 +0800
+Subject: [PATCH] dmaengine: arm-dma350: fix active descriptor ownership and errors
+
+Keep cyclic and scatter-gather descriptors off the issued list while
+active. The virt-dma completion and termination helpers add their node
+to another list; leaving it issued corrupts both lists when a transfer
+finishes or is terminated.
+
+Return failed noncyclic transfers through the completion path, including
+the error result and residue. Retire failed cyclic transfers without
+inventing a period notification. Drop the active pointer before virt-dma
+can free the descriptor, and leave the channel in DMA_ERROR until the
+client terminates it. Termination then reclaims outstanding descriptors
+once and resets the channel state.
+
+Sample status under the same lock as termination and starting work. Read
+CH_ERRINFO before acknowledging STAT_ERR, which clears it. The Arm
+DMA-350 TRM, document 102482_0000_04_en, specifies in sections 5.6.3
+(page 74) and 6.5.1.2 (page 113) that errors stop the channel and that
+ENABLECMD clears the error/done flags:
+https://documentation-service.arm.com/static/63ebf4d18e13d11599a936f2
+
+The locked error sampling, stopped error state and cyclic-error
+retirement follow the same lifecycle principles as Jelly Jia's November
+5, 2026 v6 slave/cyclic support proposal. This is a focused fix to the
+retained CIX vendor implementation, not a backport of that full driver
+rewrite:
+https://lkml.iu.edu/hypermail/linux/kernel/2611.0/16975.html
+
+Signed-off-by: Clay Stan <claystan97@gmail.com>
+---
+diff --git a/drivers/dma/arm-dma350.c b/drivers/dma/arm-dma350.c
+--- a/drivers/dma/arm-dma350.c
++++ b/drivers/dma/arm-dma350.c
+@@ -660,11 +660,10 @@
+ 	writel_relaxed(0, dch->base + CH_LINKADDRHI);
+ 
+ 	if (dch->desc) {
+-		if (dch->status != DMA_ERROR)
+-			vchan_terminate_vdesc(&dch->desc->vd);
++		vchan_terminate_vdesc(&dch->desc->vd);
+ 		dch->desc = NULL;
+-		dch->status = DMA_COMPLETE;
+-	}
++	}
++	dch->status = DMA_COMPLETE;
+ 	dch->period_idx = 0;
+ 
+ 	vchan_get_all_descriptors(&dch->vc, &list);
+@@ -823,25 +822,24 @@
+ 	if (!dch->desc)
+ 		return;
+ 
++	/* The active descriptor is owned by dch until completion or termination. */
++	list_del(&dch->desc->vd.node);
+ 	dch->status = DMA_IN_PROGRESS;
+ 	dch->cookie = dch->desc->vd.tx.cookie;
+ 
+ 	/* Handle cyclic transfers specially */
+ 	if (dch->desc->cyclic) {
+-		/* Don't remove from list - we need it for callbacks */
+ 		d350_start_cyclic(dch);
+ 		return;
+ 	}
+ 
+ 	/* Handle scatter-gather transfers with command linking */
+ 	if (dch->desc->scatter_gather) {
+-		/* Don't remove from list until complete */
+ 		d350_start_sg(dch);
+ 		return;
+ 	}
+ 
+-	/* Simple transfer: remove from list and program directly */
+-	list_del(&dch->desc->vd.node);
++	/* Simple transfer: program directly. */
+ 	dch->residue = d350_desc_bytes(dch->desc);
+ 
+ 	hdr = dch->desc->command[0];
+@@ -891,7 +889,9 @@
+ 	unsigned long flags;
+ 
+ 	spin_lock_irqsave(&dch->vc.lock, flags);
+-	if (vchan_issue_pending(&dch->vc) && !dch->desc)
++	/* Leave a failed channel stopped until the client terminates it. */
++	if (vchan_issue_pending(&dch->vc) && !dch->desc &&
++	    dch->status != DMA_ERROR)
+ 		d350_start_next(dch);
+ 	spin_unlock_irqrestore(&dch->vc.lock, flags);
+ }
+@@ -900,8 +900,10 @@
+ {
+ 	struct d350_chan *dch = data;
+ 	struct virt_dma_desc *vd;
+-	u32 ch_status, intr_flags;
+-
++	u32 ch_status, intr_flags, errinfo = 0;
++
++	/* Serialize status sampling with termination and starting a new transfer. */
++	spin_lock(&dch->vc.lock);
+ 	ch_status = readl(dch->base + CH_STATUS);
+ 
+ 	/*
+@@ -911,13 +913,17 @@
+ 	 * STAT bits are at (INTR bit position + 16).
+ 	 */
+ 	intr_flags = ch_status & CH_STAT_INTR_MASK;
+-	if (!intr_flags)
++	if (!intr_flags) {
++		spin_unlock(&dch->vc.lock);
+ 		return IRQ_NONE;
++	}
++
++	/* Acknowledging STAT_ERR also clears CH_ERRINFO. */
++	if (intr_flags & CH_STAT_INTR_ERR)
++		errinfo = readl_relaxed(dch->base + CH_ERRINFO);
+ 
+ 	/* Clear status flags to acknowledge interrupts (STAT = INTR << 16) */
+ 	writel_relaxed(intr_flags << 16, dch->base + CH_STATUS);
+-
+-	spin_lock(&dch->vc.lock);
+ 
+ 	if (!dch->desc) {
+ 		spin_unlock(&dch->vc.lock);
+@@ -927,8 +933,6 @@
+ 	vd = &dch->desc->vd;
+ 
+ 	if (intr_flags & CH_STAT_INTR_ERR) {
+-		u32 errinfo = readl_relaxed(dch->base + CH_ERRINFO);
+-
+ 		dev_err(dch->vc.chan.device->dev,
+ 			"DMA error on channel, errinfo=0x%08x\n", errinfo);
+ 
+@@ -943,8 +947,15 @@
+ 		dch->status = DMA_ERROR;
+ 		dch->residue = vd->tx_result.residue;
+ 
+-		/* Stop the channel on error */
++		/* Stop command fetching before handing the failed descriptor back. */
+ 		writel_relaxed(CH_CMD_STOP, dch->base + CH_CMD);
++		writel_relaxed(0, dch->base + CH_LINKADDR);
++		writel_relaxed(0, dch->base + CH_LINKADDRHI);
++		dch->desc = NULL;
++		if (to_d350_desc(vd)->cyclic)
++			vchan_terminate_vdesc(vd);
++		else
++			vchan_cookie_complete(vd);
+ 	} else if (intr_flags & CH_STAT_INTR_DONE) {
+ 		if (dch->desc->cyclic) {
+ 			static ktime_t last_irq;

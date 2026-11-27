@@ -1,0 +1,296 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Clay Stan <claystan97@gmail.com>
+Date: Fri, 27 Nov 2026 06:45:59 +0000
+Subject: [PATCH] cix: usb: cdnsp-sky1: fix address lookup errors, refcounts,
+ and ACPI teardown
+
+sky1_get_addr_by_name() returned NULL when the child device, named memory resource, or mapping was unavailable, and cdnsp_sky1_probe() checked !data->xhci_base / !data->device_base and returned PTR_ERR(NULL) (0). That caused cdnsp_sky1_probe() to return silent success before enabling clocks, running cdnsp_sky1_drd_init(), or attaching platform_data to the child controller, leaving USB uninitialized without probe deferral.
+
+In addition, on ACPI the CIXH2031 child platform device is not created by of_platform_populate(), so of_platform_depopulate() in cdnsp_sky1_remove() left the child driver bound while clocks and drvdata were torn down and left cdev->platform_data populated, causing rebind to fail with -EINVAL.
+
+Fix sky1_of_get_addr_by_name(), sky1_acpi_get_addr_by_name(), cdnsp_sky1_probe(), and cdnsp_sky1_remove():
+
+- Return proper ERR_PTR() negative error codes (-ENODEV when no child node exists, -EPROBE_DEFER when the ACPI child platform device has not been registered yet, -ENXIO / property error for missing resources, and -ENOMEM on mapping failure) and check IS_ERR() in cdnsp_sky1_probe().
+- Use devm_ioremap() (with of_address_to_resource() on DT) so mappings do not leak on deferred/failed probes and drop manual sky1_put_addr() from cdnsp_sky1_remove().
+- Release of_node, fwnode, and platform device references acquired during lookup, and retain a reference to the matched ACPI child device and its allocated platform_data in struct cdnsp_sky1 under device_lock(cdev).
+- On ACPI teardown in cdnsp_sky1_remove(), detach the child driver via device_release_driver() before clearing cdev->platform_data under device_lock(cdev), freeing acpi_pdata, releasing the child device reference, and disabling runtime PM; reattach the ACPI child via device_attach() on probe so unbind/rebind cleanly restores USB.
+- Ensure out-of-range alias IDs return -EINVAL, ACPI child matching returns a negative error (and frees cdns_sky1_pdata / disables clocks) on failure, and post-drd_init probe errors disable enabled USB clocks.
+
+Signed-off-by: Clay Stan <claystan97@gmail.com>
+---
+ drivers/usb/cdns3/cdnsp-sky1.c | 141 ++++++++++++++++++++++++---------
+ drivers/usb/cdns3/cdnsp-sky1.h |   4 +
+ 2 files changed, 108 insertions(+), 37 deletions(-)
+
+diff --git a/drivers/usb/cdns3/cdnsp-sky1.c b/drivers/usb/cdns3/cdnsp-sky1.c
+index 9601ece..8043a92 100644
+--- a/drivers/usb/cdns3/cdnsp-sky1.c
++++ b/drivers/usb/cdns3/cdnsp-sky1.c
+@@ -482,61 +482,79 @@ static int cdns_sky1_platform_reset(struct device *dev)
+  * - USB3 disabling is handled via standard "maximum-speed" DT property
+  */
+ 
+-static void *sky1_of_get_addr_by_name(struct device_node *parent, char *name)
++static void __iomem *sky1_of_get_addr_by_name(struct device *dev,
++					      struct device_node *parent,
++					      const char *name)
+ {
+ 	struct device_node *node;
+-	int index;
++	struct resource res;
++	void __iomem *regs;
++	int index, ret;
+ 
+ 	node = of_get_next_child(parent, NULL);
+-	if (node) {
+-		index = of_property_match_string(node, "reg-names", name);
+-		if (index >= 0)
+-			return of_iomap(node, index);
++	if (!node)
++		return ERR_PTR(-ENODEV);
++
++	index = of_property_match_string(node, "reg-names", name);
++	if (index < 0) {
++		of_node_put(node);
++		return ERR_PTR(index);
+ 	}
+ 
+-	return NULL;
++	ret = of_address_to_resource(node, index, &res);
++	of_node_put(node);
++	if (ret)
++		return ERR_PTR(ret);
++
++	regs = devm_ioremap(dev, res.start, resource_size(&res));
++	if (!regs)
++		return ERR_PTR(-ENOMEM);
++
++	return regs;
+ }
+ 
+-static void *sky1_acpi_get_addr_by_name(struct device *dev, char *name)
++static void __iomem *sky1_acpi_get_addr_by_name(struct device *dev,
++						const char *name)
+ {
+ 	struct fwnode_handle *fwnode;
+ 	struct platform_device *pdev;
+ 	struct device *device;
+ 	struct resource *res;
++	void __iomem *regs;
+ 
+ 	fwnode = device_get_next_child_node(dev, NULL);
+ 	if (!fwnode)
+-		return NULL;
++		return ERR_PTR(-ENODEV);
+ 
+ 	device = bus_find_device_by_fwnode(&platform_bus_type, fwnode);
++	fwnode_handle_put(fwnode);
+ 	if (!device)
+-		return NULL;
++		return ERR_PTR(-EPROBE_DEFER);
+ 
+ 	pdev = to_platform_device(device);
+-	if (!pdev)
+-		return NULL;
+-
+ 	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, name);
+-	if (!res)
+-		return NULL;
++	if (!res) {
++		put_device(device);
++		return ERR_PTR(-ENXIO);
++	}
+ 
+-	return ioremap(res->start, resource_size(res));
++	regs = devm_ioremap(dev, res->start, resource_size(res));
++	put_device(device);
++	if (!regs)
++		return ERR_PTR(-ENOMEM);
++
++	return regs;
+ }
+ 
+-static void *sky1_get_addr_by_name(struct device *dev, char *name)
++static void __iomem *sky1_get_addr_by_name(struct device *dev,
++					   const char *name)
+ {
+ 	if (!ACPI_COMPANION(dev))
+-		return sky1_of_get_addr_by_name(dev->of_node, name);
++		return sky1_of_get_addr_by_name(dev, dev->of_node, name);
+ 	else
+ 		return sky1_acpi_get_addr_by_name(dev, name);
+ }
+ 
+-static void sky1_put_addr(void __iomem *regs)
+-{
+-	if (regs)
+-		iounmap(regs);
+-}
+-
+ static struct of_dev_auxdata cdns_sky1_auxdata[] = {
+ 	{
+ 		.compatible = "cdns,usbssp",
+@@ -651,7 +669,7 @@ static int cdnsp_sky1_probe(struct platform_device *pdev)
+ 	}
+ 	if (ret < 0 || ret > 9) {
+ 		dev_err(dev, "get alias failed.\n");
+-		return ret;
++		return ret < 0 ? ret : -EINVAL;
+ 	}
+ 	data->id = ret;
+ 
+@@ -683,11 +701,11 @@ static int cdnsp_sky1_probe(struct platform_device *pdev)
+ 		data->axi_bmax_value = AXI_BMAX_VALUE_DEFAULT;
+ 
+ 	data->xhci_base = sky1_get_addr_by_name(dev, "xhci");
+-	if (!data->xhci_base)
++	if (IS_ERR(data->xhci_base))
+ 		return PTR_ERR(data->xhci_base);
+ 
+ 	data->device_base = sky1_get_addr_by_name(dev, "dev");
+-	if (!data->device_base)
++	if (IS_ERR(data->device_base))
+ 		return PTR_ERR(data->device_base);
+ 
+ 	/*
+@@ -729,7 +747,7 @@ static int cdnsp_sky1_probe(struct platform_device *pdev)
+ 	if (IS_ERR(data->oc_gpio)) {
+ 		dev_err(data->dev, "[%s:%d] can not get oc_gpio\n", __func__, __LINE__);
+ 		ret = PTR_ERR(data->oc_gpio);
+-		return ret;
++		goto err_clk;
+ 	}
+ 	if (data->oc_gpio) {
+ 		ret = gpiod_direction_input(data->oc_gpio);
+@@ -738,8 +756,10 @@ static int cdnsp_sky1_probe(struct platform_device *pdev)
+ 	}
+ 	//release by platform_device_release
+ 	cdns_sky1_pdata = kzalloc(sizeof(struct cdns3_platform_data), GFP_KERNEL);
+-	if (!cdns_sky1_pdata)
+-		return -ENOMEM;
++	if (!cdns_sky1_pdata) {
++		ret = -ENOMEM;
++		goto err_clk;
++	}
+ 	/* Note: mainline only supports platform_suspend, not platform_reset/platform_u3_disable */
+ 	cdns_sky1_pdata->platform_suspend = cdns_sky1_platform_suspend;
+ 	cdns_sky1_pdata->platform_reset = cdns_sky1_platform_reset;
+@@ -777,6 +797,7 @@ static int cdnsp_sky1_probe(struct platform_device *pdev)
+ 		 * Just set the platform data here.
+ 		 */
+ 		struct fwnode_handle *child;
++		bool matched = false;
+ 
+ 		device_for_each_child_node(dev, child) {
+ 			const struct acpi_device_id *id;
+@@ -788,19 +809,45 @@ static int cdnsp_sky1_probe(struct platform_device *pdev)
+ 				continue;
+ 
+ 			id = acpi_match_device(cdns_sky1_sub_match, cdev);
+-			if (id && !cdev->platform_data)
+-				cdev->platform_data = cdns_sky1_pdata;
+-			else
+-				goto err;
++			if (id) {
++				device_lock(cdev);
++				if (!cdev->platform_data) {
++					cdev->platform_data = cdns_sky1_pdata;
++					data->acpi_child = cdev;
++					data->acpi_pdata = cdns_sky1_pdata;
++					device_unlock(cdev);
++					matched = true;
++					fwnode_handle_put(child);
++					break;
++				}
++				device_unlock(cdev);
++			}
++
++			put_device(cdev);
++			fwnode_handle_put(child);
++			ret = -EINVAL;
++			goto err;
++		}
++
++		if (!matched) {
++			ret = -EPROBE_DEFER;
++			goto err;
+ 		}
+ 	}
+ 
+ 	device_set_wakeup_capable(dev, true);
+ 	pm_runtime_set_active(dev);
+ 	pm_runtime_enable(dev);
++	if (data->acpi_child) {
++		ret = device_attach(data->acpi_child);
++		if (ret < 0)
++			dev_warn(dev, "failed to attach ACPI child: %d\n", ret);
++	}
+ 	return 0;
+ err:
+ 	kfree(cdns_sky1_pdata);
++err_clk:
++	sky1_usb_clk_disable_all(dev);
+ 	return ret;
+ }
+ 
+@@ -810,12 +857,32 @@ static void cdnsp_sky1_remove(struct platform_device *pdev)
+ 	struct cdnsp_sky1 *data = dev_get_drvdata(dev);
+ 
+ 	pm_runtime_get_sync(dev);
+-	of_platform_depopulate(dev);
+-	sky1_put_addr(data->xhci_base);
+-	sky1_put_addr(data->device_base);
++	if (data->acpi_child) {
++		struct device *cdev = data->acpi_child;
++
++		for (;;) {
++			device_lock(cdev);
++			if (!cdev->driver) {
++				if (cdev->platform_data == data->acpi_pdata)
++					cdev->platform_data = NULL;
++				device_unlock(cdev);
++				break;
++			}
++			device_unlock(cdev);
++			device_release_driver(cdev);
++		}
++		kfree(data->acpi_pdata);
++		put_device(cdev);
++		data->acpi_child = NULL;
++		data->acpi_pdata = NULL;
++	} else {
++		of_platform_depopulate(dev);
++	}
+ 	reset_control_deassert(data->reset);
+ 	reset_control_deassert(data->preset);
+ 	sky1_usb_clk_disable_all(dev);
++	pm_runtime_disable(dev);
++	pm_runtime_put_noidle(dev);
+ 	platform_set_drvdata(pdev, NULL);
+ }
+ 
+diff --git a/drivers/usb/cdns3/cdnsp-sky1.h b/drivers/usb/cdns3/cdnsp-sky1.h
+index d6ce4d1..017f1c7 100644
+--- a/drivers/usb/cdns3/cdnsp-sky1.h
++++ b/drivers/usb/cdns3/cdnsp-sky1.h
+@@ -99,6 +99,8 @@
+ #define AXI_CLOCK_VALID			BIT(1)
+ #define AXI_CLOCK_REQ			BIT(2)
+ 
++struct cdns3_platform_data;
++
+ struct cdnsp_sky1 {
+ 	struct device *dev;
+ 	void __iomem *axi_base;
+@@ -107,6 +109,8 @@ struct cdnsp_sky1 {
+ 	void __iomem *xhci_base;
+ 	void __iomem *device_base;
+ 	struct platform_device *cdnsp_pdev;
++	struct device *acpi_child;
++	struct cdns3_platform_data *acpi_pdata;
+ 	struct reset_control *reset;
+ 	struct reset_control *preset;
+ 	struct clk *cix_usb_clks[CIX_USB_CLK_NUM];
+-- 
+2.43.0
+

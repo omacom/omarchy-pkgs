@@ -1,0 +1,476 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Clay Stan <claystan97@gmail.com>
+Date: Tue, 24 Nov 2026 12:11:00 +0800
+Subject: [PATCH] drm: cix: acquire DPTX suppliers before publishing the component
+
+Resolve the firmware-declared PHY during platform probe. The ACPI PHY
+provider publishes a named lookup only after probing; its absence returns
+-ENODEV, which optional_get previously swallowed before caching PHY ops.
+Defer that declared dependency and retain genuinely optional PHY paths.
+Own the ACPI PHY reference in the consumer and propagate PDB GPIO errors.
+
+Return hardware and DRM initialization failures and unwind the resources
+already acquired before component devres rolls back their embedded
+storage. Balance the PHY power reference when initialization fails and
+retain the existing boot-time module-order workaround until board tests
+qualify display-first probing and encrypted-root unlock without it.
+
+Signed-off-by: Clay Stan <claystan97@gmail.com>
+---
+diff --git a/drivers/gpu/drm/cix/dptx/trilin_dptx_cix.c b/drivers/gpu/drm/cix/dptx/trilin_dptx_cix.c
+--- a/drivers/gpu/drm/cix/dptx/trilin_dptx_cix.c
++++ b/drivers/gpu/drm/cix/dptx/trilin_dptx_cix.c
+@@ -54,6 +54,8 @@
+ 	struct trilin_dptx *dptx;
+ 	struct trilin_dpsub dpsub;
+ 	struct gpio_desc *pdb_gpiod;
++	struct phy *phy;
++	struct device *phy_lookup_dev;
+ 	bool dp_to_hdmi;
+ };
+ 
+@@ -169,11 +171,12 @@
+ 
+ 	ret = trilin_dp_probe(dpsub, drm);
+ 	if (ret)
+-		return ret;
+-
++		goto err_clear_dp;
++
++	dpsub->dp->phy.base = cix_dptx->phy;
+ 	ret = trilin_dp_drm_init(dpsub);
+ 	if (ret)
+-		return ret;
++		goto err_clear_dp;
+ 
+ 	/*
+ 	 * consumer=cluster (master), supplier=dptx (comp): resume supplier first
+@@ -184,6 +187,10 @@
+ 	dpsub->link = device_link_add(master, comp, DL_FLAG_STATELESS);
+ 
+ 	return 0;
++
++err_clear_dp:
++	dpsub->dp = NULL;
++	return ret;
+ }
+ 
+ static void trilin_dptx_cix_unbind(struct device *comp, struct device *master,
+@@ -197,6 +204,7 @@
+ 	trilin_dp_hdcp_uninit(dpsub);
+ 
+ 	trilin_dp_remove(dpsub);
++	dpsub->dp = NULL;
+ 
+ 	/* device_link_add() in bind is optional/commented; only delete if created */
+ 	if (dpsub->link)
+@@ -207,6 +215,60 @@
+ 	.bind = trilin_dptx_cix_bind,
+ 	.unbind = trilin_dptx_cix_unbind,
+ };
++
++static void trilin_dptx_put_phy(void *data)
++{
++	struct trilin_dptx_cix_dev *dptx = data;
++
++	phy_put(dptx->phy_lookup_dev, dptx->phy);
++	put_device(dptx->phy_lookup_dev);
++}
++
++static int trilin_dptx_get_phy(struct trilin_dptx_cix_dev *dptx,
++			       struct device *dev)
++{
++	struct fwnode_handle *fwnode;
++	struct acpi_device *adev;
++	const char *phy_name;
++	int ret;
++
++	if (!has_acpi_companion(dev)) {
++		dptx->phy = devm_phy_optional_get(dev, "dp_phy");
++		return PTR_ERR_OR_ZERO(dptx->phy);
++	}
++
++	/*
++	 * An internal eDP PHY has no external PHY reference; Sky1 EDK2 DSDT
++	 * tables encode that absent reference as an empty string "".
++	 */
++	if (!device_property_present(dev, "dp_phy") ||
++	    (!device_property_read_string(dev, "dp_phy", &phy_name) &&
++	     !phy_name[0]))
++		return 0;
++
++	fwnode = fwnode_find_reference(dev_fwnode(dev), "dp_phy", 0);
++	if (IS_ERR(fwnode))
++		return PTR_ERR(fwnode);
++
++	adev = to_acpi_device_node(fwnode);
++	if (!adev || !adev->dev.parent) {
++		fwnode_handle_put(fwnode);
++		return -EINVAL;
++	}
++
++	/* The ACPI provider publishes lookups under its own device name. */
++	dptx->phy_lookup_dev = get_device(adev->dev.parent);
++	dptx->phy = phy_get(dptx->phy_lookup_dev, fwnode_get_name(fwnode));
++	fwnode_handle_put(fwnode);
++	if (IS_ERR(dptx->phy)) {
++		ret = PTR_ERR(dptx->phy);
++		put_device(dptx->phy_lookup_dev);
++		return ret == -ENODEV ? -EPROBE_DEFER : ret;
++	}
++
++	/* Release the reference with the consumer, not the provider. */
++	return devm_add_action_or_reset(dev, trilin_dptx_put_phy, dptx);
++}
+ 
+ static int trilin_dptx_cix_probe(struct platform_device *pdev)
+ {
+@@ -221,15 +283,18 @@
+ 		return -ENOMEM;
+ 
+ 	platform_set_drvdata(pdev, dptx_dev);
++	ret = trilin_dptx_get_phy(dptx_dev, dev);
++	if (ret)
++		return dev_err_probe(dev, ret, "failed to get DP PHY\n");
++
+ 	ret = device_property_read_string(dev, "dp_to_hdmi", &str_prop);
+ 	if (ret >= 0) {
+ 		if (strcmp("yes",str_prop) == 0) {
+ 			dptx_dev->pdb_gpiod = devm_gpiod_get_optional(&pdev->dev, "pdb", GPIOD_OUT_HIGH);
+-			if (IS_ERR(dptx_dev->pdb_gpiod)) {
+-				dev_dbg(&pdev->dev, "failed to pdb gpio ...\n");
+-			} else {
+-				msleep(10);
+-			}
++			if (IS_ERR(dptx_dev->pdb_gpiod))
++				return dev_err_probe(dev, PTR_ERR(dptx_dev->pdb_gpiod),
++						     "failed to get PDB GPIO\n");
++			usleep_range(10000, 11000);
+ 			dptx_dev->dp_to_hdmi = true;
+ 		} else {
+ 			dptx_dev->dp_to_hdmi = false;
+diff --git a/drivers/gpu/drm/cix/dptx/trilin_dptx.c b/drivers/gpu/drm/cix/dptx/trilin_dptx.c
+--- a/drivers/gpu/drm/cix/dptx/trilin_dptx.c
++++ b/drivers/gpu/drm/cix/dptx/trilin_dptx.c
+@@ -2045,7 +2045,7 @@
+ 	//pm_runtime_get_sync(dp->dev);
+ 
+ 	if (!IS_ERR(dp->dpsub->apb_clk))
+-		clk_prepare_enable(dp->dpsub->apb_clk);
++		return clk_prepare_enable(dp->dpsub->apb_clk);
+ 	return 0;
+ }
+ 
+@@ -2509,26 +2509,9 @@
+ static void trilin_dp_register_phy(struct trilin_dp *dp)
+ {
+ 	struct trilin_phy_t *phy = &dp->phy;
+-	struct fwnode_handle *fwnode;
+-
+-	/* register phy here that need power init*/
++
++	/* The external PHY was acquired before publishing the component. */
+ 	if (!phy->phy_ops && dp->platform_id == CIX_PLATFORM_SOC) {
+-		if (has_acpi_companion(dp->dev)) {
+-			fwnode = fwnode_find_reference(dp->dev->fwnode, "dp_phy", 0);
+-			if (!IS_ERR(fwnode)) {
+-				phy->base = devm_phy_optional_get(
+-					to_acpi_device_node(fwnode)->dev.parent,
+-					fwnode_get_name(fwnode));
+-			} else {
+-				phy->base = NULL;
+-			}
+-		} else {
+-			phy->base = devm_phy_optional_get(dp->dev, "dp_phy");
+-		}
+-
+-		if (IS_ERR_OR_NULL(phy->base))
+-			DP_WARN("no dp_phy\n");
+-
+ 		trilin_usbdp_phy_register(dp);
+ 		trilin_edp_phy_register(dp);
+ 	}
+@@ -2587,12 +2570,14 @@
+ 		return rc;
+ 	}
+ 
+-	trilin_dp_core_power_init(dp);
++	rc = trilin_dp_core_power_init(dp);
++	if (rc)
++		return rc;
+ 
+ 	rc = reset_dp_and_reinit(dp);
+ 	if (rc) {
+ 		DP_ERR("reset_dp_and_reinit failed\n");
+-		return rc;
++		goto err_out;
+ 	}
+ 
+ 	rc = trilin_dp_edp_panel_prepare(dp);
+@@ -2606,12 +2591,17 @@
+ err_out:
+ 	if (phy->phy_ops)
+ 		phy->phy_ops->exit(dp);
++	trilin_dp_core_power_deinit(dp);
+ 	return rc;
+ }
+ 
+ static int trilin_dp_host_init_from_bootloader(struct trilin_dp *dp)
+ {
+-	int rc = 0;
++	int rc;
++
++	rc = trilin_dp_core_power_init(dp);
++	if (rc)
++		return rc;
+ 
+ 	trilin_dp_register_phy(dp);
+ 
+@@ -3407,6 +3397,7 @@
+ 
+ int trilin_dp_init_config(struct trilin_dp *dp)
+ {
++	bool aux_registered = false, hdcp_registered = false;
+ 	int rc;
+ 
+ 	DP_DEBUG("enter\n");
+@@ -3421,8 +3412,9 @@
+ 	rc = trilin_dp_aux_register(dp);
+ 	if (rc) {
+ 		DP_DEBUG("failed to register DP aux\n");
+-		goto end1;
+-	}
++		goto err;
++	}
++	aux_registered = true;
+ 
+ 	/* first call host init */
+ 	if (dp->enabled_by_gop) {
+@@ -3436,7 +3428,7 @@
+ 		rc = trilin_dp_host_init(dp);
+ 	if (rc) {
+ 		DP_ERR("host_init Failed");
+-		goto end2;
++		goto err;
+ 	}
+ 
+ 	if (dp->edp_panel && !trilin_dp_get_hpd_state(dp))
+@@ -3445,24 +3437,30 @@
+ 	rc = trilin_dp_hdcp_init(dp->dpsub);
+ 	if (rc) {
+ 		DP_ERR("trilin_dp_hdcp_init Failed");
+-		goto end2;
+-	}
++		goto err;
++	}
++
++	hdcp_registered = true;
+ 
+ 	irq_set_status_flags(dp->irq, IRQ_DISABLE_UNLAZY);
+ 	rc = devm_request_threaded_irq(dp->dev, dp->irq, NULL,
+ 				       trilin_dp_irq_handler, IRQF_ONESHOT,
+ 				       dev_name(dp->dev), dp);
+ 	if (rc < 0)
+-		goto end2;
++		goto err;
+ 
+ 	DP_INFO("init hpd high is %d\n", trilin_dp_get_hpd_state(dp));
+ 	return rc;
+-end2:
+-	trilin_dp_aux_cleanup(dp);
+-end1:
+-	dp->state &= ~DPTX_STATE_CONFIGURED;
++err:
+ 	cancel_delayed_work_sync(&dp->hpd_irq_work);
+ 	cancel_delayed_work_sync(&dp->hpd_event_work);
++	if (hdcp_registered)
++		trilin_dp_hdcp_uninit(dp->dpsub);
++	trilin_dp_host_deinit(dp);
++	if (aux_registered)
++		trilin_dp_aux_cleanup(dp);
++	dp->state &= ~DPTX_STATE_CONFIGURED;
++	mutex_destroy(&dp->session_lock);
+ 	return rc;
+ }
+ 
+@@ -3690,8 +3688,9 @@
+ 
+ 	ret = dptx_register_audio_device(dp);
+ 	if (ret)
+-		DP_INFO("Failed to register dptx audio device\n");
+-
++		return ret;
++
++	ret = devm_add_action_or_reset(dev, dptx_unregister_audio_device, dp);
+ 	DP_INFO("end\n");
+ 	return ret;
+ }
+diff --git a/drivers/gpu/drm/cix/dptx/trilin_drm.c b/drivers/gpu/drm/cix/dptx/trilin_drm.c
+--- a/drivers/gpu/drm/cix/dptx/trilin_drm.c
++++ b/drivers/gpu/drm/cix/dptx/trilin_drm.c
+@@ -1396,7 +1396,7 @@
+ 	struct trilin_connector *conn = &dp->connector;
+ 	struct drm_encoder *encoder = &enc->base;
+ 	struct drm_connector *connector = &conn->base;
+-	int ret;
++	int ret, i;
+ 	int drm_mode_connector = DRM_MODE_CONNECTOR_DisplayPort;
+ 
+ 	DP_INFO("begin\n");
+@@ -1415,8 +1415,10 @@
+ 	DRM_INFO("DP encoder possible_crtcs=0x%x (from %s)\n",
+ 		 encoder->possible_crtcs,
+ 		 (dp->dev && dp->dev->of_node) ? "DT" : "fallback");
+-	drm_encoder_init(dp->drm, encoder, &trilin_dp_enc_funcs,
+-			 DRM_MODE_ENCODER_TMDS, NULL);
++	ret = drm_encoder_init(dp->drm, encoder, &trilin_dp_enc_funcs,
++			       DRM_MODE_ENCODER_TMDS, NULL);
++	if (ret)
++		return ret;
+ 
+ 	drm_encoder_helper_add(encoder, &trilin_dp_encoder_helper_funcs);
+ 
+@@ -1430,14 +1432,20 @@
+ 					 &dp->aux.ddc);
+ 	if (ret) {
+ 		DP_ERR("failed to create the DRM connector\n");
+-		return ret;
++		goto err_encoder;
+ 	}
+ 
+ 	drm_connector_helper_add(connector, &trilin_dp_connector_helper_funcs);
+-	drm_connector_register(connector);
+-	drm_connector_attach_encoder(connector, encoder);
+-
+-	trilin_drm_mst_encoder_init(dp, connector->base.id);
++	ret = drm_connector_register(connector);
++	if (ret)
++		goto err_connector;
++	ret = drm_connector_attach_encoder(connector, encoder);
++	if (ret)
++		goto err_unregister;
++
++	ret = trilin_drm_mst_encoder_init(dp, connector->base.id);
++	if (ret)
++		goto err_unregister;
+ 
+ 	//for sst
+ 	if (!IS_ERR_OR_NULL(dp->rcsu_iomem))
+@@ -1467,6 +1475,18 @@
+ 	drm_atomic_helper_connector_reset(connector);
+ 	trilin_dp_add_properties(dp, connector);
+ 	//dp hardware init now
+-	trilin_dp_init_config(dp);
+-	return 0;
+-}
++	ret = trilin_dp_init_config(dp);
++	if (!ret)
++		return 0;
++
++	trilin_drm_mst_encoder_cleanup(dp);
++	for (i = 0; i < dp->max_mst_encoders; i++)
++		drm_encoder_cleanup(&dp->mst.private_info.mst_encoders[i].base);
++err_unregister:
++	drm_connector_unregister(connector);
++err_connector:
++	drm_connector_cleanup(connector);
++err_encoder:
++	drm_encoder_cleanup(encoder);
++	return ret;
++}
+diff --git a/drivers/gpu/drm/cix/dptx/trilin_drm_mst.c b/drivers/gpu/drm/cix/dptx/trilin_drm_mst.c
+--- a/drivers/gpu/drm/cix/dptx/trilin_drm_mst.c
++++ b/drivers/gpu/drm/cix/dptx/trilin_drm_mst.c
+@@ -914,10 +914,12 @@
+ 			mst_encoder->drm = dp->drm;
+ 			encoder->possible_crtcs = mst_possible_crtcs;
+ 
+-			drm_encoder_init(mst_encoder->drm, encoder,
+-					 &trilin_dp_mst_enc_funcs,
+-					 DRM_MODE_ENCODER_DPMST, "DP-MST %c",
+-					 pipe_name(i));
++			ret = drm_encoder_init(mst_encoder->drm, encoder,
++					       &trilin_dp_mst_enc_funcs,
++					       DRM_MODE_ENCODER_DPMST, "DP-MST %c",
++					       pipe_name(i));
++			if (ret)
++				goto err_encoders;
+ 			drm_encoder_helper_add(encoder,
+ 					       &trilin_dp_encoder_helper_funcs);
+ 			DP_DEBUG("create encoder%d success", i);
+@@ -928,21 +930,27 @@
+ 					   dp->drm, &dp->aux, 16,
+ 					   dp->max_mst_encoders,
+ 					   conn_base_id);
+-	if (ret) {
+-		dp->mst.private_info.mst_mgr.cbs = NULL;
+-		return ret;
+-	}
++	if (ret)
++		goto err_encoders;
+ 
+ 	dp->mst_mgr = &dp->mst.private_info.mst_mgr;
+ 	dp->mst.private_info.mst_initialized = true;
+ 	DP_MST_DEBUG("trilin_dp_mst_encoder_init end: baseid: %d\n",
+ 		     conn_base_id);
+ 	return 0;
++
++err_encoders:
++	while (i--)
++		drm_encoder_cleanup(&dp->mst.private_info.mst_encoders[i].base);
++	dp->mst.private_info.mst_mgr.cbs = NULL;
++	mutex_destroy(&dp->mst.private_info.mst_lock);
++	mutex_destroy(&dp->mst.private_info.poll_irq_lock);
++	return ret;
+ }
+ 
+ void trilin_drm_mst_encoder_cleanup(struct trilin_dp *dp)
+ {
+-	if (!dp->mst_mgr->cbs)
++	if (!dp->mst.private_info.mst_initialized)
+ 		return;
+ 
+ 	drm_dp_mst_topology_mgr_destroy(dp->mst_mgr);
+diff --git a/drivers/gpu/drm/cix/dptx/trilin_usbdp_phy.c b/drivers/gpu/drm/cix/dptx/trilin_usbdp_phy.c
+--- a/drivers/gpu/drm/cix/dptx/trilin_usbdp_phy.c
++++ b/drivers/gpu/drm/cix/dptx/trilin_usbdp_phy.c
+@@ -154,7 +154,7 @@
+ 	if (!IS_ERR_OR_NULL(phy->base)) {
+ 		ret = phy_power_on(phy->base);
+ 		if (ret)
+-			dev_err(dp->dev, "failed to power phy on");
++			return ret;
+ 	}
+ 
+ 	trilin_phy_write(dp, TRILIN_USBDP_PHY_LANE_RSTN_BITS, 0x000f);
+@@ -163,17 +163,30 @@
+ 	trilin_phy_write(dp, TRILIN_USBDP_PHY_CONFIG_RSTN, 0x0001);
+ 
+ 	status = usbdp_phy_cmn_ready_ack(dp, 1, 500);
++	if (status)
++		goto err_power_off;
+ 	trilin_phy_write(dp, TRILIN_USBDP_PHY_LANE_PLLCLK_ENABLE, 0x0001);
+ 	status = usbdp_phy_lane_pll_ack_ready(dp, 1, 500);
++	if (status)
++		goto err_power_off;
+ 
+ 	// bring the power state back up to active
+ 	status = trilin_usbdp_phy_power(dp, trilin_power_a2);
++	if (status)
++		goto err_power_off;
+ 	status = trilin_usbdp_phy_power(dp, trilin_power_a0);
++	if (status)
++		goto err_power_off;
+ 	// set data enable bit
+ 	trilin_phy_write(dp, TRILIN_USBDP_PHY_DATA_ENABLE, 1);
+ 
+ 	phy->state = trilin_phy_power_on;
+ 	DP_DEBUG("end\n");
++	return status;
++
++err_power_off:
++	if (phy->base)
++		phy_power_off(phy->base);
+ 	return status;
+ }
+ 
