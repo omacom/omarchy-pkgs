@@ -110,7 +110,13 @@ Ship the tested rc channel to stable, the release pair included:
 gh workflow run promote.yml -R omacom/omarchy-pkgs -f direction="rc -> stable"
 ```
 
-Add `-f dry_run=true` to see the plan first.
+Add `-f dry_run=true` to see the plan first. To ship the rest of rc while
+some of it stays behind, hold those pkgbases for the run; `ship` takes the
+same list as `--hold="PKGBASE ..."`:
+
+```bash
+gh workflow run promote.yml -R omacom/omarchy-pkgs -f direction="rc -> stable" -f hold="<pkgbase> ..."
+```
 
 ## The pin engine
 

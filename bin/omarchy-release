@@ -87,6 +87,9 @@ Options:
                      everything, or only the listed pkgbases. --yes alone
                      carries everything
   --no-promote-edge  (start, minor/major) Keep rc's packages; carry nothing
+  --hold="PKGBASE ..."
+                     (start, ship) Leave these pkgbases out of the promotion,
+                     this run only: rc -> stable for ship, edge -> rc for start
   -h, --help         Show this help
 EOF
 }
@@ -381,10 +384,22 @@ trigger_rc_build() { # trigger_rc_build [--wait]
 }
 
 # Carries <from> into <to> on every architecture (promote.yml), and waits for
-# it. With pkgbases, only those move.
+# it. With pkgbases, only those move; --hold's pkgbases stay where they are.
 promote_channel() { # promote_channel <from> <to> [pkgbases]
-  print_info "Promoting $1 -> $2${3:+ (only $3)} in GitHub Actions..."
-  dispatch_workflow --wait promote.yml -f direction="$1 -> $2" ${3:+-f packages="$3"}
+  print_info "Promoting $1 -> $2${3:+ (only $3)}${HOLD:+ (holding $HOLD)} in GitHub Actions..."
+  dispatch_workflow --wait promote.yml -f direction="$1 -> $2" ${3:+-f packages="$3"} ${HOLD:+-f hold="$HOLD"}
+}
+
+# What is wrong with a --hold list, or nothing. Checked before any step, so a
+# typo never fails a ship halfway, after the tag. The release pair cannot be
+# held: ship promotes it to stable and checks that it arrived.
+hold_problem() { # hold_problem <pkgbases>
+  local p list
+  read -ra list <<<"$1"
+  for p in "${list[@]}"; do
+    [[ $p =~ ^[a-z0-9@_+][a-z0-9@._+-]*$ ]] || { echo "not a package name: $p"; return; }
+    [[ $p != omarchy && $p != omarchy-settings ]] || { echo "$p is the release pair and always ships"; return; }
+  done
 }
 
 # What start does with edge for a minor/major: "all", "none", or the pkgbases
@@ -653,7 +668,7 @@ start_dev_train() { # start_dev_train <version>
   fi
   while [[ -z "$promote" ]]; do
     echo "Carry edge's newer packages into rc for this train? Shipping takes rc to stable."
-    echo "  Preview: gh workflow run promote.yml -R $PKGS_REPO -f direction=\"edge -> rc\" -f dry_run=true"
+    echo "  Preview: gh workflow run promote.yml -R $PKGS_REPO -f direction=\"edge -> rc\"${HOLD:+ -f hold=\"$HOLD\"} -f dry_run=true"
     local reply
     read -r -p "[a]ll, [n]one, or the pkgbases to carry: " reply
     promote=$(edge_promotion_choice "$reply")
@@ -662,9 +677,10 @@ start_dev_train() { # start_dev_train <version>
   [[ "$promote" == all ]] || only="$promote"
   if [[ "$promote" == none ]]; then
     print_info "Holding edge back — rc keeps its current packages"
+    [[ -z "$HOLD" ]] || print_warning "--hold has nothing to hold: nothing is promoted"
   elif ! promote_channel edge rc "$only"; then
     print_error "edge → rc advance did not complete — the train is NOT open"
-    echo "Fix the advance (it is idempotent), then re-run: omarchy-release start $version"
+    echo "Fix the advance (it is idempotent), then re-run: omarchy-release start $version${HOLD:+ --hold=\"$HOLD\"}"
     exit 1
   fi
 
@@ -995,6 +1011,11 @@ cmd_ship() {
   echo "  2. Pin the final $version from that tag and publish it to rc + edge"
   echo "  3. Promote the rc channel to stable (packages + signatures + db), once the"
   echo "     stable Arch mirror serves rc's snapshot"
+  if [[ -n "$HOLD" ]]; then
+    echo "     holding back: $HOLD"
+  else
+    echo "     everything eligible (nothing held)"
+  fi
   echo "  4. Merge the final pins to master (the repo record)"
   if follows_dev_branch "$branch"; then
     echo "  5. Create a draft GitHub release with notes generated from the merged PRs"
@@ -1059,7 +1080,10 @@ cmd_ship() {
       print_info "$(mirror_sync_hint "$rc_sync" "$stable_sync" "$arch")"
       behind=1
     done
-    ((behind == 0)) || exit 1
+    if ((behind)); then
+      echo "Then re-run: omarchy-release ship${HOLD:+ --hold=\"$HOLD\"}"
+      exit 1
+    fi
     print_success "3/7 The stable Arch mirrors serve rc's snapshot: $(ci_arches | paste -sd' ')"
     promote_channel rc stable || exit 1
     if ! all_arches_at_version stable "$version"; then
@@ -1130,7 +1154,12 @@ cmd_ship() {
   fi
 
   echo ""
-  print_success "Shipped $version — rc and stable are in parity for the next patch train"
+  if [[ -n "$HOLD" ]]; then
+    print_success "Shipped $version"
+    print_warning "rc still carries newer $HOLD: hold them again on the next ship, or promote them by name when they are ready"
+  else
+    print_success "Shipped $version — rc and stable are in parity for the next patch train"
+  fi
   if ! follows_dev_branch "$branch"; then
     print_info "Close the loop: merge or close the staging PR for $branch on $UPSTREAM_REPO"
   fi
@@ -1310,6 +1339,10 @@ cmd_self_test() {
   expect "x86_64 ISO needs no --arch" "$(iso_release_command x86_64 4.5.0rc1 --rc)" "bin/omarchy-iso-release --rc 4.5.0rc1"
   expect "aarch64 ISO names its arch" "$(iso_release_command aarch64 4.5.0rc1 --rc)" "bin/omarchy-iso-release --rc --arch aarch64 4.5.0rc1"
   expect "final aarch64 ISO" "$(iso_release_command aarch64 4.5.0)" "bin/omarchy-iso-release --arch aarch64 4.5.0"
+  expect "hold_problem accepts pkgbases" "$(hold_problem "linux-aurora mesa-aurora")" ""
+  expect "hold_problem refuses the release pair" "$(hold_problem "aura omarchy")" "omarchy is the release pair and always ships"
+  expect "hold_problem refuses a non-name" "$(hold_problem "aura *")" "not a package name: *"
+  expect "hold_problem refuses a flag" "$(hold_problem "--yes")" "not a package name: --yes"
   expect "edge_promotion_choice a" "$(edge_promotion_choice a)" "all"
   expect "edge_promotion_choice none" "$(edge_promotion_choice ' none ')" "none"
   expect "edge_promotion_choice pkgbases" "$(edge_promotion_choice '  omakade   omacharts ')" "omakade omacharts"
@@ -1408,6 +1441,7 @@ COMMAND=""
 ISO_MODE="ask"
 WAIT=true
 PROMOTE_EDGE=""
+HOLD=""
 ARGS=()
 while [[ $# -gt 0 ]]; do
   case $1 in
@@ -1418,6 +1452,10 @@ while [[ $# -gt 0 ]]; do
   --promote-edge) PROMOTE_EDGE=all; shift ;;
   --promote-edge=*) PROMOTE_EDGE=$(edge_promotion_choice "${1#*=}"); shift ;;
   --no-promote-edge) PROMOTE_EDGE=none; shift ;;
+  --hold=*) HOLD=$(xargs <<<"$HOLD ${1#*=}"); shift ;;
+  --hold)
+    [[ $# -ge 2 && $2 != -* ]] || { print_error "--hold needs a list of pkgbases"; exit 1; }
+    HOLD=$(xargs <<<"$HOLD $2"); shift 2 ;;
   -h | --help) show_usage; exit 0 ;;
   start | pick | rc | ship | status | doctor | self-test)
     COMMAND="$1"; shift ;;
@@ -1425,6 +1463,9 @@ while [[ $# -gt 0 ]]; do
     ARGS+=("$1"); shift ;;
   esac
 done
+
+problem=$(hold_problem "$HOLD")
+[[ -z "$problem" ]] || { print_error "--hold: $problem"; exit 1; }
 
 case "$COMMAND" in
 start) cmd_start "${ARGS[@]}" ;;
