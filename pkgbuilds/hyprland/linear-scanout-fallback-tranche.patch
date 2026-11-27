@@ -1,0 +1,171 @@
+diff --git a/src/protocols/LinuxDMABUF.cpp b/src/protocols/LinuxDMABUF.cpp
+index 35bbb4a..5628d0f 100644
+--- a/src/protocols/LinuxDMABUF.cpp
++++ b/src/protocols/LinuxDMABUF.cpp
+@@ -8,6 +8,7 @@
+ #include <xf86drm.h>
+ #include <fcntl.h>
+ #include <sys/stat.h>
++#include <unistd.h>
+ #include "core/Compositor.hpp"
+ #include "render/Renderer.hpp"
+ #include "types/DMABuffer.hpp"
+@@ -623,6 +624,41 @@ void CLinuxDMABufV1Protocol::updateScanoutTranche(SP<CWLSurfaceResource> surface
+     }
+ }
+ 
++static SDMABUFTranche buildLinearScanoutTranche(const CDMABUFFormatTable& table, const SDMABUFTranche& monitorTranche) {
++    SDMABUFTranche linearTranche{
++        .device = monitorTranche.device,
++        .flags  = monitorTranche.flags,
++    };
++
++    if (!table.m_tableFD.isValid() || table.m_tableSize < sizeof(SDMABUFFormatTableEntry))
++        return linearTranche;
++
++    std::vector<SDMABUFFormatTableEntry> entries(table.m_tableSize / sizeof(SDMABUFFormatTableEntry));
++    if (pread(table.m_tableFD.get(), entries.data(), table.m_tableSize, 0) != sc<ssize_t>(table.m_tableSize))
++        return linearTranche;
++
++    std::set<uint16_t> seen;
++    for (auto const& fmt : monitorTranche.formats) {
++        if (NFormatUtils::isFormatYUV(fmt.drmFormat))
++            continue;
++
++        if (std::ranges::none_of(fmt.modifiers, [](uint64_t mod) { return mod == DRM_FORMAT_MOD_LINEAR; }))
++            continue;
++
++        for (const auto idx : table.m_rendererTranche.indices) {
++            if (idx >= entries.size())
++                continue;
++            if (entries[idx].fmt == fmt.drmFormat && entries[idx].modifier == DRM_FORMAT_MOD_LINEAR) {
++                if (seen.insert(idx).second)
++                    linearTranche.indices.push_back(idx);
++                break;
++            }
++        }
++    }
++
++    return linearTranche;
++}
++
+ void CLinuxDMABUFFeedbackResource::sendScanoutFeedback(PHLMONITOR pMonitor) {
+     if (!pMonitor) {
+         LOG(Log::DEBUG, "updateScanoutTranche: resetting feedback");
+@@ -641,6 +677,13 @@ void CLinuxDMABUFFeedbackResource::sendScanoutFeedback(PHLMONITOR pMonitor) {
+     }
+ 
+     auto& monitorTranche = (*monitorTranchePair).second;
++    auto  linearTranche  = buildLinearScanoutTranche(*formatTable, monitorTranche);
++
++    if (monitorTranche.indices.empty() && linearTranche.indices.empty()) {
++        LOG(Log::DEBUG, "updateScanoutTranche: monitor has no usable scanout modifiers");
++        sendDefaultFeedback();
++        return;
++    }
+ 
+     LOG(Log::DEBUG, "updateScanoutTranche: sending a scanout tranche");
+ 
+@@ -651,9 +694,13 @@ void CLinuxDMABUFFeedbackResource::sendScanoutFeedback(PHLMONITOR pMonitor) {
+     };
+     m_resource->sendMainDevice(&deviceArr);
+ 
+-    // prioritize scanout tranche but have renderer fallback tranche
+-    // also yes formats can be duped here because different tranche flags (ds and no ds)
+-    sendTranche(monitorTranche);
++    // Prioritize non-linear scanout modifiers, fall back to linear scanout
++    // for GPUs/displays whose only common scanout modifier is LINEAR, then
++    // fall back to the renderer tranche.
++    if (!monitorTranche.indices.empty())
++        sendTranche(monitorTranche);
++    if (!linearTranche.indices.empty())
++        sendTranche(linearTranche);
+     sendTranche(formatTable->m_rendererTranche);
+ 
+     m_resource->sendDone();
+diff --git a/tests/protocols/DMABUFFeedback.cpp b/tests/protocols/DMABUFFeedback.cpp
+index f7598ee..0db8998 100644
+--- a/tests/protocols/DMABUFFeedback.cpp
++++ b/tests/protocols/DMABUFFeedback.cpp
+@@ -265,6 +265,10 @@ class CDMABUFFeedbackTest : public CDMABUFFormatTableTest {
+         rebuild();
+     }
+ 
++    void setFormatTable(UP<CDMABUFFormatTable> table) {
++        PROTO::linuxDma->m_formatTable = std::move(table);
++    }
++
+     WP<CSignalListener> configListener(CLinuxDMABufV1Protocol& protocol) {
+         return protocol.m_configRefreshed;
+     }
+@@ -447,6 +451,70 @@ TEST_F(CDMABUFFeedbackTest, RemovedScanoutTargetGetsCompleteRendererFallback) {
+     EXPECT_EQ(m_feedback.at(id).doneEvents, 3U);
+ }
+ 
++TEST_F(CDMABUFFeedbackTest, ScanoutFeedbackIncludesLinearFallbackTrancheAfterNonLinear) {
++    SDMABUFTranche renderer{
++        .device = 1,
++        .formats =
++            {
++                {DRM_FORMAT_XRGB8888, {I915_FORMAT_MOD_Y_TILED, DRM_FORMAT_MOD_LINEAR}},
++                {DRM_FORMAT_NV12, {DRM_FORMAT_MOD_LINEAR}},
++            },
++    };
++    std::vector<std::pair<PHLMONITORREF, SDMABUFTranche>> monitors;
++    monitors.emplace_back(m_monitor,
++                          SDMABUFTranche{
++                              .device = 1,
++                              .flags  = ZWP_LINUX_DMABUF_FEEDBACK_V1_TRANCHE_FLAGS_SCANOUT,
++                              .formats =
++                                  {
++                                      {DRM_FORMAT_XRGB8888, {I915_FORMAT_MOD_X_TILED, DRM_FORMAT_MOD_LINEAR}},
++                                      {DRM_FORMAT_ARGB8888, {DRM_FORMAT_MOD_LINEAR}},
++                                      {DRM_FORMAT_NV12, {DRM_FORMAT_MOD_LINEAR}},
++                                  },
++                          });
++    setFormatTable(makeUnique<CDMABUFFormatTable>(renderer, monitors));
++
++    makeWindow();
++    uint32_t id = 0;
++    bindFeedback(id, true);
++    PROTO::linuxDma->updateScanoutTranche(m_surface, m_monitor);
++    readFeedback();
++
++    const std::vector<SFeedbackTranche> expected = {
++        {ZWP_LINUX_DMABUF_FEEDBACK_V1_TRANCHE_FLAGS_SCANOUT, {{DRM_FORMAT_XRGB8888, I915_FORMAT_MOD_X_TILED}}},
++        {ZWP_LINUX_DMABUF_FEEDBACK_V1_TRANCHE_FLAGS_SCANOUT, {{DRM_FORMAT_XRGB8888, DRM_FORMAT_MOD_LINEAR}}},
++        {0, {{DRM_FORMAT_XRGB8888, I915_FORMAT_MOD_Y_TILED}, {DRM_FORMAT_XRGB8888, DRM_FORMAT_MOD_LINEAR}, {DRM_FORMAT_NV12, DRM_FORMAT_MOD_LINEAR}}},
++    };
++    EXPECT_EQ(m_feedback.at(id).tranches, expected);
++}
++
++TEST_F(CDMABUFFeedbackTest, LinearOnlyMonitorEmitsLinearScanoutTrancheWithoutEmptyNonLinearTranche) {
++    SDMABUFTranche renderer{
++        .device  = 1,
++        .formats = {{DRM_FORMAT_XRGB8888, {I915_FORMAT_MOD_Y_TILED, DRM_FORMAT_MOD_LINEAR}}},
++    };
++    std::vector<std::pair<PHLMONITORREF, SDMABUFTranche>> monitors;
++    monitors.emplace_back(m_monitor,
++                          SDMABUFTranche{
++                              .device  = 1,
++                              .flags   = ZWP_LINUX_DMABUF_FEEDBACK_V1_TRANCHE_FLAGS_SCANOUT,
++                              .formats = {{DRM_FORMAT_XRGB8888, {DRM_FORMAT_MOD_LINEAR}}},
++                          });
++    setFormatTable(makeUnique<CDMABUFFormatTable>(renderer, monitors));
++
++    makeWindow();
++    uint32_t id = 0;
++    bindFeedback(id, true);
++    PROTO::linuxDma->updateScanoutTranche(m_surface, m_monitor);
++    readFeedback();
++
++    const std::vector<SFeedbackTranche> expected = {
++        {ZWP_LINUX_DMABUF_FEEDBACK_V1_TRANCHE_FLAGS_SCANOUT, {{DRM_FORMAT_XRGB8888, DRM_FORMAT_MOD_LINEAR}}},
++        {0, {{DRM_FORMAT_XRGB8888, I915_FORMAT_MOD_Y_TILED}, {DRM_FORMAT_XRGB8888, DRM_FORMAT_MOD_LINEAR}}},
++    };
++    EXPECT_EQ(m_feedback.at(id).tranches, expected);
++}
++
+ class CDMABUFConfigFeedbackTest : public CDMABUFFeedbackTest {
+   protected:
+     void SetUp() override {
