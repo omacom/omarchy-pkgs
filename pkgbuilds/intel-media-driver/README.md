@@ -6,12 +6,12 @@ Arch's `extra/intel-media-driver`, rebuilt with one patch. `[omarchy]` comes bef
 
 `decode-destroy-context-status-check-race.patch` is [intel/media-driver#2057](https://github.com/intel/media-driver/pull/2057), unchanged. Without it, `vaSyncSurface` on one thread can read a decode context that `vaDestroyContext` is freeing on another, and the process dies with a segmentation fault. ffmpeg does exactly that at the end of a stream when it downloads hardware-decoded frames (`-hwaccel vaapi -hwaccel_output_format vaapi` with `hwdownload`), because it syncs surfaces on its filter thread while the decoder thread tears down.
 
-It changes only the decode path the driver selects from Meteor Lake on. Older generations use the driver's legacy path: they get this package too, and it behaves there as Arch's does.
+It changes only the decode path the driver selects from Meteor Lake on. Older generations use the driver's legacy path: they get this package too, and it behaves there as Arch's does. That includes the crash: the legacy path has the same unguarded pair of calls, [intel/media-driver#2091](https://github.com/intel/media-driver/issues/2091) reports it on an Arc A380, and this patch does not touch it.
 
 What the patch does not do:
 
-- It covers the two calls running at once. It does not clear the pointer on a surface the decoder has already dropped from its table, as the JPEG decoder does after every picture, so a sync of such a surface after its context is gone still reads the freed context, as it did before. That path did not crash in the runs below.
-- It holds the display's surface mutex while a context is torn down, which includes waiting for that stream's outstanding GPU work. Another stream on the same display that looks up, creates or destroys a surface in that moment waits for it.
+- It covers the two calls running at once. It does not clear the pointer on a surface the decoder has already dropped from its table, so a sync of such a surface after its context is gone still reads the freed context, as it did before. A context drops one when its table of 127 is full and a new surface takes the slot of one no longer in use, which takes far more surfaces in one context than the five-frame samples in the runs below use.
+- It holds the display's surface mutex while a context is torn down, which includes waiting for that stream's outstanding GPU work. Another stream on the same display that looks up, creates or destroys a surface in that moment waits for it. On `xe` the teardown also waits for any wait on GPU work another stream on the display is in the middle of, such as its own `vaSyncSurface`, so one slow stream can hold up the others through a stream that is closing.
 
 ## Evidence
 
