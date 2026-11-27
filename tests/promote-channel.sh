@@ -85,7 +85,7 @@ pkgf() { ls "$T/src/$1-$2"/*.pkg.tar.zst; }
 # rc: what stable users have now. edge: newer builds of most of it.
 mkpkg_par "alpha 1" "fast 1" "pinned 1" "ahead 3" \
   "alpha 2" "split 1 split-extra" "fast 2" "pinned 2" "ahead 2" "big 1" "dropped 1" \
-  "alpha 3" "split 2 split-extra" "big 2" "alpha 4" "big 3" "alpha 5"
+  "alpha 3" "split 2 split-extra" "big 2" "alpha 4" "big 3" "alpha 5" "split 3 split-extra"
 pub rc $(pkgf alpha 1) $(pkgf fast 1) $(pkgf pinned 1) $(pkgf ahead 3)
 pub edge $(pkgf alpha 2) $(pkgf split 1) $(pkgf fast 2) $(pkgf pinned 2) \
   $(pkgf ahead 2) $(pkgf big 1) $(pkgf dropped 1)
@@ -156,6 +156,11 @@ promote --dry-run --hold fast --hold ahead --hold alpha \
   && jq -e 'select(.name=="ahead") | .reason | test("rc is ahead")' "$T/record" >/dev/null \
   && [[ $(plan_action alpha) == current && $(plan_action big) == promote ]] \
   && pass "a hold keeps the reason a package would have stayed for anyway, and a current one stays current" || fail "hold over another reason: $(cat "$T/record")"
+: > "$T/record"
+pub edge $(pkgf split 3)
+: > "$T/record"
+promote --dry-run --hold split && [[ $(plan_action split) == hold && $(plan_action split-extra) == hold ]] \
+  && pass "a held pkgbase holds all of its split packages" || fail "split hold: $(cat "$T/record")"
 : > "$T/record"
 promote --dry-run --hold armonly && pass "a hold this architecture does not build is accepted, so one list serves both" || fail "other-arch hold"
 
