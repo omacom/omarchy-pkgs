@@ -1,0 +1,150 @@
+hyprland/ipc: don't apply a refresh that newer events overtook
+
+refreshMonitors() and refreshWorkspaces() send a j/monitors or j/workspaces
+request and apply the reply whenever it arrives, removing anything the reply
+does not list. Events keep arriving on the event socket meanwhile, and a
+reply can be parsed after events that describe a later state. A refresh
+asked for while one is in flight is also dropped, so nothing corrects it.
+
+When the only output drops hotplug (monitor sleep, input switch, KVM),
+Hyprland swaps it for FALLBACK and back within moments. A j/monitors reply
+taken while only FALLBACK existed, parsed after the events that brought the
+output back and focused it, removes the real output again. Hyprland.monitors
+is then empty and Hyprland.focusedMonitor null until the shell restarts:
+workspacev2 is ignored without a focused monitor, so bars stop following the
+active workspace, and the QML refreshMonitors() cannot bring the monitor back
+because it never creates one. A j/workspaces reply from the same moment sets
+every workspace's monitor to "?".
+
+Track, per model, whether an event that changes it or another refresh came
+in while a request was in flight. If so, discard the reply and ask again,
+keeping canCreate if either request had it.
+
+diff --git c/src/wayland/hyprland/ipc/connection.cpp i/src/wayland/hyprland/ipc/connection.cpp
+index c288426..d2f3441 100644
+--- c/src/wayland/hyprland/ipc/connection.cpp
++++ i/src/wayland/hyprland/ipc/connection.cpp
+@@ -285,6 +285,23 @@ HyprlandIpc* HyprlandIpc::instance() {
+ }
+ 
+ void HyprlandIpc::onEvent(HyprlandIpcEvent* event) {
++	// Hyprland may have answered a refresh in flight before sending this event, and its
++	// response would then roll back what the event changes here.
++	if (event->name == "monitoraddedv2" || event->name == "monitorremoved"
++	    || event->name == "focusedmon" || event->name == "workspacev2"
++	    || event->name == "moveworkspacev2" || event->name == "destroyworkspacev2"
++	    || event->name == "renameworkspace" || event->name == "changeworkspaceid")
++	{
++		this->invalidateMonitors();
++	}
++
++	if (event->name == "createworkspacev2" || event->name == "destroyworkspacev2"
++	    || event->name == "workspacev2" || event->name == "moveworkspacev2"
++	    || event->name == "renameworkspace" || event->name == "changeworkspaceid")
++	{
++		this->invalidateWorkspaces();
++	}
++
+ 	if (event->name == "configreloaded") {
+ 		this->refreshMonitors(true);
+ 		this->refreshWorkspaces(true);
+@@ -657,12 +674,34 @@ HyprlandWorkspace* HyprlandIpc::findWorkspaceByName(
+ 	}
+ }
+ 
++void HyprlandIpc::invalidateWorkspaces(bool canCreate) {
++	if (!this->requestingWorkspaces) return;
++	this->workspacesStale = true;
++	this->workspacesRetryCanCreate = this->workspacesRetryCanCreate || canCreate;
++}
++
+ void HyprlandIpc::refreshWorkspaces(bool canCreate) {
+-	if (this->requestingWorkspaces) return;
++	if (this->requestingWorkspaces) {
++		this->invalidateWorkspaces(canCreate);
++		return;
++	}
++
+ 	this->requestingWorkspaces = true;
+ 
+ 	this->makeRequest("j/workspaces", [this, canCreate](bool success, const QByteArray& resp) {
+ 		this->requestingWorkspaces = false;
++
++		// The response describes Hyprland when it answered, which may be before events that were
++		// already applied here. Applying it would roll them back, so ask again instead.
++		if (this->workspacesStale) {
++			auto retryCanCreate = canCreate || this->workspacesRetryCanCreate;
++			this->workspacesStale = false;
++			this->workspacesRetryCanCreate = false;
++			qCDebug(logHyprlandIpc) << "Workspaces response overtaken by events, requesting again";
++			this->refreshWorkspaces(retryCanCreate);
++			return;
++		}
++
+ 		if (!success) return;
+ 
+ 		qCDebug(logHyprlandIpc) << "Parsing workspaces response";
+@@ -842,12 +881,35 @@ void HyprlandIpc::onFocusedMonitorDestroyed() {
+ 	emit this->focusedMonitorChanged();
+ }
+ 
++void HyprlandIpc::invalidateMonitors(bool canCreate) {
++	if (!this->requestingMonitors) return;
++	this->monitorsStale = true;
++	this->monitorsRetryCanCreate = this->monitorsRetryCanCreate || canCreate;
++}
++
+ void HyprlandIpc::refreshMonitors(bool canCreate) {
+-	if (this->requestingMonitors) return;
++	if (this->requestingMonitors) {
++		this->invalidateMonitors(canCreate);
++		return;
++	}
++
+ 	this->requestingMonitors = true;
+ 
+ 	this->makeRequest("j/monitors", [this, canCreate](bool success, const QByteArray& resp) {
+ 		this->requestingMonitors = false;
++
++		// A response taken while an output was briefly replaced by FALLBACK, then parsed after
++		// the events that brought the output back, would remove the output again and leave no
++		// focused monitor. Discard a response that events have overtaken and ask again.
++		if (this->monitorsStale) {
++			auto retryCanCreate = canCreate || this->monitorsRetryCanCreate;
++			this->monitorsStale = false;
++			this->monitorsRetryCanCreate = false;
++			qCDebug(logHyprlandIpc) << "Monitors response overtaken by events, requesting again";
++			this->refreshMonitors(retryCanCreate);
++			return;
++		}
++
+ 		if (!success) return;
+ 
+ 		this->monitorsRequested = true;
+diff --git c/src/wayland/hyprland/ipc/connection.hpp i/src/wayland/hyprland/ipc/connection.hpp
+index 17959c1..353038b 100644
+--- c/src/wayland/hyprland/ipc/connection.hpp
++++ i/src/wayland/hyprland/ipc/connection.hpp
+@@ -135,6 +135,11 @@ private:
+ 
+ 	static bool compareWorkspaces(HyprlandWorkspace* a, HyprlandWorkspace* b);
+ 
++	// Mark a j/monitors or j/workspaces request in flight as overtaken by a newer event or
++	// refresh, so its response is discarded and requested again instead of applied.
++	void invalidateMonitors(bool canCreate = false);
++	void invalidateWorkspaces(bool canCreate = false);
++
+ 	QLocalSocket eventSocket;
+ 	StreamReader eventReader;
+ 	QString mRequestSocketPath;
+@@ -144,6 +149,10 @@ private:
+ 	bool requestingWorkspaces = false;
+ 	bool requestingToplevels = false;
+ 	bool monitorsRequested = false;
++	bool monitorsStale = false;
++	bool monitorsRetryCanCreate = false;
++	bool workspacesStale = false;
++	bool workspacesRetryCanCreate = false;
+ 
+ 	ObjectModel<HyprlandMonitor> mMonitors {this};
+ 	ObjectModel<HyprlandWorkspace> mWorkspaces {this};
