@@ -1,0 +1,149 @@
+#!/bin/bash
+
+# Systemd sleep hook for the ASUS Zenbook A16 (UX3607OA, Glymur).
+#
+# Unblocks full SoC deep sleep (APSS + CXSD + AOSD + DDR collapse, ~0.26 W)
+# and clean Wi-Fi/Bluetooth/audio resume across s2idle:
+#   - PCIe4 Wi-Fi root port (0004:00:00.0): keep power/wakeup disabled so
+#     dw_pcie_suspend_noirq() power-cycles WL_EN via pci_pwrctrl across CX
+#     collapse instead of setting skip_pwrctrl_off=true (which leaves the
+#     QCC2072 Wi-Fi 7 chip failing MHI start with -110 on resume).
+#   - SoundWire controllers (6c80000/6ca0000.soundwire): 60-asus-zenbook-a16-
+#     soundwire.rules keeps them power/control=on while awake to prevent
+#     WSA884x clock-stop unattach. Because qcom-soundwire has no system-suspend
+#     callback, staying "on" holds LPASS mclk/wsa2-mclk active and blocks CXSD,
+#     AOSD and DDR collapse. Switch them to "auto" before s2idle, wait for them
+#     to runtime-suspend, and restore "on" on resume.
+#   - USB DWC3 controllers (a400000/a600000/a800000.usb): disable wakeup across
+#     s2idle so dwc3_core_exit() powers down all USB PHYs instead of holding
+#     bi_tcxo / xo.lvl active.
+#   - Bluetooth UART14 (a98000.serial): soft-block Bluetooth while asleep if it
+#     was unblocked so hci_qca releases gcc_qupv3_wrap1_s6_clk -> bi_tcxo, then
+#     unblock on resume.
+
+set -euo pipefail
+
+sysfs=${ZA16_SLEEP_SYSFS:-/sys}
+run_dir=${ZA16_SLEEP_RUN_DIR:-/run}
+rfkill_bin=${ZA16_SLEEP_RFKILL:-/usr/bin/rfkill}
+sdw_wait_ms=${ZA16_SLEEP_SDW_WAIT_MS:-4000}
+sdw_poll_interval=${ZA16_SLEEP_SDW_POLL_INTERVAL:-0.1}
+bt_settle=${ZA16_SLEEP_BT_SETTLE:-0.5}
+
+board_name=""
+if [[ -r $sysfs/class/dmi/id/board_name ]]; then
+  read -r board_name <"$sysfs/class/dmi/id/board_name"
+fi
+[[ $board_name == "UX3607OA" ]] || exit 0
+
+case "${2:-}" in
+  suspend|hybrid-sleep|suspend-then-hibernate) ;;
+  *) exit 0 ;;
+esac
+
+state_usb="$run_dir/zenbook-a16-sleep-usb"
+state_bt="$run_dir/zenbook-a16-sleep-bt"
+
+sdw_devs=(6c80000.soundwire 6ca0000.soundwire)
+usb_devs=(a400000.usb a600000.usb a800000.usb)
+
+write_sysfs() {
+  local path=$1 value=$2
+  if [[ -w $path ]]; then
+    printf '%s\n' "$value" >"$path" 2>/dev/null || true
+  fi
+}
+
+soundwire_suspended() {
+  local dev status_file status
+  for dev in "${sdw_devs[@]}"; do
+    status_file="$sysfs/bus/platform/devices/$dev/power/runtime_status"
+    [[ -r $status_file ]] || continue
+    read -r status <"$status_file" || continue
+    [[ $status == "suspended" ]] || return 1
+  done
+  return 0
+}
+
+pre_suspend() {
+  local dev wakeup_file current
+  mkdir -p "$run_dir"
+
+  # Ensure PCIe4 Wi-Fi root port wakeup stays disabled before CX collapse.
+  write_sysfs "$sysfs/bus/pci/devices/0004:00:00.0/power/wakeup" disabled
+
+  # Record and disable wakeup on USB host controllers so their PHYs power off.
+  rm -f "$state_usb"
+  for dev in "${usb_devs[@]}"; do
+    wakeup_file="$sysfs/bus/platform/devices/$dev/power/wakeup"
+    [[ -r $wakeup_file && -w $wakeup_file ]] || continue
+    read -r current <"$wakeup_file" || continue
+    if [[ $current == "enabled" ]]; then
+      write_sysfs "$wakeup_file" disabled
+      printf '%s\n' "$dev" >>"$state_usb"
+    fi
+  done
+
+  # Soft-block Bluetooth if currently unblocked so UART14 releases bi_tcxo.
+  local blocked_bt=0
+  rm -f "$state_bt"
+  if [[ -x $rfkill_bin ]]; then
+    if "$rfkill_bin" -n -o TYPE,SOFT 2>/dev/null |
+      awk '$1 == "bluetooth" && $2 == "unblocked" { found = 1 } END { exit !found }'; then
+      : >"$state_bt"
+      "$rfkill_bin" block bluetooth 2>/dev/null || true
+      blocked_bt=1
+    fi
+  fi
+
+  # Let both WSA SoundWire controllers runtime-suspend so LPASS releases MCLK.
+  for dev in "${sdw_devs[@]}"; do
+    write_sysfs "$sysfs/bus/platform/devices/$dev/power/control" auto
+  done
+
+  local waited_ms=0
+  while (( waited_ms < sdw_wait_ms )); do
+    if soundwire_suspended; then
+      break
+    fi
+    sleep "$sdw_poll_interval"
+    waited_ms=$((waited_ms + 100))
+  done
+
+  # If SoundWire was already suspended (or absent), give hci_qca a short window
+  # to finish releasing UART14 clocks before s2idle starts.
+  if (( blocked_bt == 1 && waited_ms < 500 )); then
+    sleep "$bt_settle"
+  fi
+}
+
+post_resume() {
+  local dev
+
+  # Restore SoundWire controllers to "on" (matching 60-asus-zenbook-a16-soundwire.rules).
+  for dev in "${sdw_devs[@]}"; do
+    write_sysfs "$sysfs/bus/platform/devices/$dev/power/control" on
+  done
+
+  # Restore USB wakeup on controllers we disabled before suspend.
+  if [[ -r $state_usb ]]; then
+    while IFS= read -r dev; do
+      [[ -n $dev ]] || continue
+      write_sysfs "$sysfs/bus/platform/devices/$dev/power/wakeup" enabled
+    done <"$state_usb"
+    rm -f "$state_usb"
+  fi
+
+  # Unblock Bluetooth if we soft-blocked it before suspend.
+  if [[ -e $state_bt ]]; then
+    rm -f "$state_bt"
+    if [[ -x $rfkill_bin ]]; then
+      "$rfkill_bin" unblock bluetooth 2>/dev/null || true
+    fi
+  fi
+}
+
+case "${1:-}" in
+  pre) pre_suspend ;;
+  post) post_resume ;;
+esac

@@ -100,5 +100,124 @@ grep -q 'SUBSYSTEM=="scsi", ENV{DEVTYPE}=="scsi_device",.*ATTRS{idVendor}=="0bda
   fail "the Realtek SCSI rule scopes to scsi_device and enables autosuspend"
 grep -q 'SUBSYSTEM=="block", ENV{DEVTYPE}=="disk",.*ATTRS{idVendor}=="0bda", ATTRS{idProduct}=="0329",.*ATTR{events_poll_msecs}="15000"' "$scratch/power.rules" ||
   fail "the Realtek block rule scopes to disk and sets events_poll_msecs=15000"
+grep -q 'SUBSYSTEM=="pci", KERNEL=="0004:00:00.0",.*ATTR{power/wakeup}="disabled"' "$scratch/power.rules" ||
+  fail "the PCIe4 Wi-Fi root port rule disables wakeup"
 
-echo "ok - ASUS Zenbook A16 front camera relay, tuning, WirePlumber rules, guard and power rules"
+# Sleep config
+sleep_conf="$package_dir/60-zenbook-a16-sleep.conf"
+grep -qx 'MemorySleepMode=s2idle' "$sleep_conf" ||
+  fail "the sleep config selects s2idle"
+
+# Sleep hook
+sleep_hook="$package_dir/zenbook-a16-sleep"
+bash -n "$sleep_hook" || fail "the sleep hook has valid syntax"
+
+make_sleep_fixture() {
+  local dir=$1 board=$2 bt_state=$3
+  mkdir -p \
+    "$dir/sys/class/dmi/id" \
+    "$dir/sys/bus/pci/devices/0004:00:00.0/power" \
+    "$dir/sys/bus/platform/devices/6c80000.soundwire/power" \
+    "$dir/sys/bus/platform/devices/6ca0000.soundwire/power" \
+    "$dir/sys/bus/platform/devices/a400000.usb/power" \
+    "$dir/sys/bus/platform/devices/a600000.usb/power" \
+    "$dir/sys/bus/platform/devices/a800000.usb/power" \
+    "$dir/run"
+  printf '%s\n' "$board" >"$dir/sys/class/dmi/id/board_name"
+  printf 'enabled\n' >"$dir/sys/bus/pci/devices/0004:00:00.0/power/wakeup"
+  printf 'on\n' >"$dir/sys/bus/platform/devices/6c80000.soundwire/power/control"
+  printf 'suspended\n' >"$dir/sys/bus/platform/devices/6c80000.soundwire/power/runtime_status"
+  printf 'on\n' >"$dir/sys/bus/platform/devices/6ca0000.soundwire/power/control"
+  printf 'suspended\n' >"$dir/sys/bus/platform/devices/6ca0000.soundwire/power/runtime_status"
+  printf 'enabled\n' >"$dir/sys/bus/platform/devices/a400000.usb/power/wakeup"
+  printf 'disabled\n' >"$dir/sys/bus/platform/devices/a600000.usb/power/wakeup"
+  printf 'enabled\n' >"$dir/sys/bus/platform/devices/a800000.usb/power/wakeup"
+  printf '%s\n' "$bt_state" >"$dir/bt_state"
+  cat >"$dir/rfkill" <<EOF
+#!/bin/bash
+if [[ \${1:-} == "-n" ]]; then
+  echo "bluetooth \$(<"$dir/bt_state")"
+elif [[ \${1:-} == "block" && \${2:-} == "bluetooth" ]]; then
+  echo "blocked" >"$dir/bt_state"
+  echo "block bluetooth" >>"$dir/rfkill.log"
+elif [[ \${1:-} == "unblock" && \${2:-} == "bluetooth" ]]; then
+  echo "unblocked" >"$dir/bt_state"
+  echo "unblock bluetooth" >>"$dir/rfkill.log"
+fi
+EOF
+  chmod +x "$dir/rfkill"
+}
+
+run_sleep_hook() {
+  local dir=$1
+  shift
+  ZA16_SLEEP_SYSFS="$dir/sys" \
+    ZA16_SLEEP_RUN_DIR="$dir/run" \
+    ZA16_SLEEP_RFKILL="$dir/rfkill" \
+    ZA16_SLEEP_SDW_WAIT_MS=200 \
+    ZA16_SLEEP_SDW_POLL_INTERVAL=0.01 \
+    ZA16_SLEEP_BT_SETTLE=0 \
+    bash "$sleep_hook" "$@"
+}
+
+# UX3607OA pre/post suspend with BT unblocked
+f_a16="$scratch/sleep-a16"
+make_sleep_fixture "$f_a16" UX3607OA unblocked
+run_sleep_hook "$f_a16" pre suspend
+[[ $(<"$f_a16/sys/bus/pci/devices/0004:00:00.0/power/wakeup") == "disabled" ]] ||
+  fail "pre suspend disables PCIe4 Wi-Fi root port wakeup"
+[[ $(<"$f_a16/sys/bus/platform/devices/6c80000.soundwire/power/control") == "auto" ]] ||
+  fail "pre suspend sets 6c80000.soundwire to auto"
+[[ $(<"$f_a16/sys/bus/platform/devices/6ca0000.soundwire/power/control") == "auto" ]] ||
+  fail "pre suspend sets 6ca0000.soundwire to auto"
+[[ $(<"$f_a16/sys/bus/platform/devices/a400000.usb/power/wakeup") == "disabled" ]] ||
+  fail "pre suspend disables a400000.usb wakeup"
+[[ $(<"$f_a16/sys/bus/platform/devices/a600000.usb/power/wakeup") == "disabled" ]] ||
+  fail "pre suspend keeps a600000.usb wakeup disabled"
+[[ $(<"$f_a16/sys/bus/platform/devices/a800000.usb/power/wakeup") == "disabled" ]] ||
+  fail "pre suspend disables a800000.usb wakeup"
+[[ $(<"$f_a16/bt_state") == "blocked" ]] ||
+  fail "pre suspend soft-blocks Bluetooth when it was unblocked"
+
+run_sleep_hook "$f_a16" post suspend
+[[ $(<"$f_a16/sys/bus/pci/devices/0004:00:00.0/power/wakeup") == "disabled" ]] ||
+  fail "post resume keeps PCIe4 Wi-Fi root port wakeup disabled"
+[[ $(<"$f_a16/sys/bus/platform/devices/6c80000.soundwire/power/control") == "on" ]] ||
+  fail "post resume restores 6c80000.soundwire to on"
+[[ $(<"$f_a16/sys/bus/platform/devices/6ca0000.soundwire/power/control") == "on" ]] ||
+  fail "post resume restores 6ca0000.soundwire to on"
+[[ $(<"$f_a16/sys/bus/platform/devices/a400000.usb/power/wakeup") == "enabled" ]] ||
+  fail "post resume restores a400000.usb wakeup"
+[[ $(<"$f_a16/sys/bus/platform/devices/a600000.usb/power/wakeup") == "disabled" ]] ||
+  fail "post resume preserves user-disabled a600000.usb wakeup"
+[[ $(<"$f_a16/sys/bus/platform/devices/a800000.usb/power/wakeup") == "enabled" ]] ||
+  fail "post resume restores a800000.usb wakeup"
+[[ $(<"$f_a16/bt_state") == "unblocked" ]] ||
+  fail "post resume unblocks Bluetooth when pre suspend blocked it"
+
+# Respect already-blocked Bluetooth
+f_bt_off="$scratch/sleep-bt-off"
+make_sleep_fixture "$f_bt_off" UX3607OA blocked
+run_sleep_hook "$f_bt_off" pre suspend
+run_sleep_hook "$f_bt_off" post suspend
+[[ $(<"$f_bt_off/bt_state") == "blocked" ]] ||
+  fail "post resume keeps Bluetooth blocked when it was already blocked"
+[[ ! -e $f_bt_off/rfkill.log ]] ||
+  fail "already-blocked Bluetooth is not touched by rfkill"
+
+# No-op on hibernate and on other machines
+f_other="$scratch/sleep-other"
+make_sleep_fixture "$f_other" OTHER_BOARD unblocked
+run_sleep_hook "$f_other" pre suspend
+[[ $(<"$f_other/sys/bus/pci/devices/0004:00:00.0/power/wakeup") == "enabled" ]] ||
+  fail "other machines are not modified by the sleep hook"
+[[ $(<"$f_other/sys/bus/platform/devices/6c80000.soundwire/power/control") == "on" ]] ||
+  fail "other machines keep their SoundWire power control"
+
+f_hib="$scratch/sleep-hib"
+make_sleep_fixture "$f_hib" UX3607OA unblocked
+run_sleep_hook "$f_hib" pre hibernate
+[[ $(<"$f_hib/sys/bus/platform/devices/6c80000.soundwire/power/control") == "on" ]] ||
+  fail "hibernate skips s2idle sleep hook"
+
+echo "ok - ASUS Zenbook A16 front camera relay, tuning, WirePlumber rules, guard, power rules and deep sleep"
