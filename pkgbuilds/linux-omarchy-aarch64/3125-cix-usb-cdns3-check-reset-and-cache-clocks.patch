@@ -1,0 +1,164 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Clay Stan <claystan97@gmail.com>
+Date: Fri, 27 Nov 2026 12:25:01 +0800
+Subject: [PATCH] cix: check cdns3 platform reset, resume clocks, and cache
+ Sky1 USB clocks
+
+Fix three issues in the Sky1 Cadence USB3 clock and reset paths:
+
+- Check the return value of cdnsp_platform_reset() in cdns_role_set()
+  and abort via pm_put on error instead of writing controller registers
+  and calling cdns_role_start() while controller clocks may still be
+  disabled.
+- Cache the devm_clk_get() clock handles acquired in cdnsp_sky1_probe()
+  inside data->cix_usb_clks[] and reuse them in sky1_usb_clk_enable_all()
+  instead of allocating four new devres clock entries on every Type-C
+  plug/unplug cycle. Track data->clks_enabled so initial probe and
+  failed resets never call clk_disable_unprepare() on disabled clocks,
+  and preserve the cached handles on clk_prepare_enable() errors.
+- Check the return value of sky1_usb_clk_enable_resume() in
+  cdnsp_sky1_system_resume() and return immediately on error instead of
+  writing data->axi_base while controller clocks are disabled.
+
+Signed-off-by: Clay Stan <claystan97@gmail.com>
+---
+ drivers/usb/cdns3/cdnsp-sky1.c | 37 ++++++++++++++++++++--------------
+ drivers/usb/cdns3/cdnsp-sky1.h |  1 +
+ drivers/usb/cdns3/core.c       | 10 +++++++--
+ 3 files changed, 31 insertions(+), 17 deletions(-)
+
+diff --git a/drivers/usb/cdns3/cdnsp-sky1.c b/drivers/usb/cdns3/cdnsp-sky1.c
+index 3f5237b..9601ece 100644
+--- a/drivers/usb/cdns3/cdnsp-sky1.c
++++ b/drivers/usb/cdns3/cdnsp-sky1.c
+@@ -92,11 +92,15 @@ static int sky1_usb_clk_enable_all(struct device *dev)
+ 	dev_info(dev, "---------sky1_usb_clk_enable_all----------\n");
+ 
+ 	for (i = 0; i < CIX_USB_CLK_NUM; i++) {
+-		cix_usb_clks[i] = devm_clk_get(dev, cix_usb_clk_names[i]);
+-		if (IS_ERR(cix_usb_clks[i])) {
+-			ret = dev_err_probe(dev, PTR_ERR(cix_usb_clks[i]),
+-				"could not get %s clock\n", cix_usb_clk_names[i]);
+-			goto err_usb_clks;
++		if (!cix_usb_clks[i]) {
++			struct clk *clk = devm_clk_get(dev, cix_usb_clk_names[i]);
++
++			if (IS_ERR(clk)) {
++				ret = dev_err_probe(dev, PTR_ERR(clk),
++					"could not get %s clock\n", cix_usb_clk_names[i]);
++				goto err_usb_clks;
++			}
++			cix_usb_clks[i] = clk;
+ 		}
+ 
+ 		ret = clk_prepare_enable(cix_usb_clks[i]);
+@@ -106,15 +110,13 @@ static int sky1_usb_clk_enable_all(struct device *dev)
+ 		}
+ 	}
+ 
++	data->clks_enabled = true;
+ 	dev_dbg(dev, "enable sky1 USB clock done\n");
+ 	return 0;
+ 
+ err_usb_clks:
+-	cix_usb_clks[i] = NULL;
+-	while (--i >= 0) {
++	while (--i >= 0)
+ 		clk_disable_unprepare(cix_usb_clks[i]);
+-		cix_usb_clks[i] = NULL;
+-	}
+ 
+ 	return ret;
+ };
+@@ -131,11 +133,15 @@ static void sky1_usb_clk_disable_all(struct device *dev)
+ 	struct cdnsp_sky1 *data = dev_get_drvdata(dev);
+ 	struct clk **cix_usb_clks = data->cix_usb_clks;
+ 
++	if (!data->clks_enabled)
++		return;
++
+ 	dev_info(dev, "---------sky1_usb_clk_disable_all----------\n");
+ 
+ 	for (i = 0; i < CIX_USB_CLK_NUM; i++) {
+ 		clk_disable_unprepare(cix_usb_clks[i]);
+ 	}
++	data->clks_enabled = false;
+ };
+ 
+ /**
+@@ -163,11 +169,8 @@ static int sky1_usb_clk_enable_resume(struct device *dev)
+ 	return 0;
+ 
+ err_usb_clks:
+-	cix_usb_clks[i] = NULL;
+-	while (--i >= 0) {
++	while (--i >= 0)
+ 		clk_disable_unprepare(cix_usb_clks[i]);
+-		cix_usb_clks[i] = NULL;
+-	}
+ 	return ret;
+ };
+ 
+@@ -710,6 +713,7 @@ static int cdnsp_sky1_probe(struct platform_device *pdev)
+ 				return dev_err_probe(dev, PTR_ERR(clk),
+ 					"could not get %s clock\n",
+ 					cix_usb_clk_names[i]);
++			data->cix_usb_clks[i] = clk;
+ 		}
+ 	}
+ 
+@@ -838,13 +842,16 @@ static int cdnsp_sky1_system_suspend(struct device *dev)
+ 
+ static int cdnsp_sky1_system_resume(struct device *dev)
+ {
+-	int ret = 0;
++	int ret;
+ 	struct cdnsp_sky1 *data;
+ 
+ 	ret = sky1_usb_clk_enable_resume(dev);
++	if (ret)
++		return ret;
++
+ 	data = dev_get_drvdata(dev);
+ 	writel(CIX_USB_AXI_WR_CACHE_VALUE, data->axi_base);
+-	return ret;
++	return 0;
+ }
+ 
+ static int cdnsp_sky1_restore(struct device *dev)
+diff --git a/drivers/usb/cdns3/cdnsp-sky1.h b/drivers/usb/cdns3/cdnsp-sky1.h
+index 82563bd..d6ce4d1 100644
+--- a/drivers/usb/cdns3/cdnsp-sky1.h
++++ b/drivers/usb/cdns3/cdnsp-sky1.h
+@@ -110,6 +110,7 @@ struct cdnsp_sky1 {
+ 	struct reset_control *reset;
+ 	struct reset_control *preset;
+ 	struct clk *cix_usb_clks[CIX_USB_CLK_NUM];
++	bool clks_enabled;
+ 	int id;
+ 	struct regmap	*usb_syscon;
+ 	int lpm_clk_freq;
+diff --git a/drivers/usb/cdns3/core.c b/drivers/usb/cdns3/core.c
+index e09ee5a..ab111c1 100644
+--- a/drivers/usb/cdns3/core.c
++++ b/drivers/usb/cdns3/core.c
+@@ -392,8 +392,14 @@ static int cdns_role_set(struct usb_role_switch *sw, enum usb_role role)
+ 	 * This is critical for Type-C hotplug where orientation flip needs
+ 	 * to be re-applied to PHY registers.
+ 	 */
+-	if (role != USB_ROLE_NONE)
+-		cdnsp_platform_reset(cdns->dev);
++	if (role != USB_ROLE_NONE) {
++		ret = cdnsp_platform_reset(cdns->dev);
++		if (ret) {
++			dev_err(cdns->dev, "platform reset for role %d failed: %d\n",
++				role, ret);
++			goto pm_put;
++		}
++	}
+ 
+ 	if (cdns->version == CDNSP_CONTROLLER_V2)
+ 		writel(1, &cdns->otg_cdnsp_regs->simulate);
+-- 
+2.43.0
+

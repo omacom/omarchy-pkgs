@@ -1,0 +1,314 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Clay Stan <claystan97@gmail.com>
+Date: Tue, 24 Nov 2026 12:02:00 +0800
+Subject: [PATCH] pinctrl: own ACPI map inputs and unwind parsing errors
+
+Keep controller names beyond the ACPI resource walk, which frees the
+resource buffer after callbacks return. Release temporary configuration
+maps, registered mappings, and ACPI device references on their error
+and release paths. Validate state indices before allocating maps.
+
+Reject truncated Sky1 pin group data before reading vendor words and
+indexing the pin table. Check group allocations and propagate probe
+errors after freeing temporary group descriptors.
+
+Signed-off-by: Clay Stan <claystan97@gmail.com>
+---
+diff --git a/drivers/pinctrl/cix/pinctrl-sky1-base.c b/drivers/pinctrl/cix/pinctrl-sky1-base.c
+index f8c2dff..eeb39d5 100644
+--- a/drivers/pinctrl/cix/pinctrl-sky1-base.c
++++ b/drivers/pinctrl/cix/pinctrl-sky1-base.c
+@@ -621,8 +621,7 @@ sky1_free_acpi_group_desc(struct pinctrl_acpi_group_desc *acpi_grp_desc)
+ 	if (acpi_grp_desc->num_pins)
+ 		kfree(acpi_grp_desc->pins);
+ 
+-	if (acpi_grp_desc->name)
+-		kfree(acpi_grp_desc->name);
++	kfree_const(acpi_grp_desc->name);
+ 
+ 	kfree(acpi_grp_desc);
+ }
+@@ -634,8 +633,16 @@ sky1_pinctrl_parse_groups_acpi(struct pinctrl_acpi_group_desc *acpi_grp,
+ 	struct sky1_pin *pin_data;
+ 	unsigned int *pin_array;
+ 	__be16 *vendor;
++	const char *name;
+ 	int i, ret;
+ 
++	if (acpi_grp->num_pins > acpi_grp->vendor_length / (2 * sizeof(*vendor)))
++		return -EINVAL;
++	for (i = 0; i < acpi_grp->num_pins; i++) {
++		if (acpi_grp->pins[i] >= spctl->info->npins)
++			return -EINVAL;
++	}
++
+ 	pin_data = devm_kcalloc(spctl->dev, acpi_grp->num_pins,
+ 				 sizeof(struct sky1_pin),
+ 				 GFP_KERNEL);
+@@ -663,8 +670,11 @@ sky1_pinctrl_parse_groups_acpi(struct pinctrl_acpi_group_desc *acpi_grp,
+ 			pin->offset, pin->configs);
+ 	}
+ 
+-	ret = pinctrl_generic_add_group(spctl->pctl, devm_kstrdup(spctl->dev, acpi_grp->name, GFP_KERNEL),
+-					 pin_array, acpi_grp->num_pins, pin_data);
++	name = devm_kstrdup(spctl->dev, acpi_grp->name, GFP_KERNEL);
++	if (!name)
++		return -ENOMEM;
++	ret = pinctrl_generic_add_group(spctl->pctl, name, pin_array,
++					acpi_grp->num_pins, pin_data);
+ 	if (ret < 0)
+ 		dev_err(spctl->dev, "failed to add group %s: %d\n",
+ 			acpi_grp->name, ret);
+@@ -685,6 +695,8 @@ static int sky1_pinctrl_probe_acpi(struct platform_device *pdev,
+ 
+ 	INIT_LIST_HEAD(&pinctrl_group_list);
+ 	ret = pinctrl_acpi_get_pin_groups(acpi_dev, &pinctrl_group_list);
++	if (ret < 0)
++		goto free_groups;
+ 
+ 	list_for_each_entry(acpi_grp, &pinctrl_group_list, list)
+ 		num_groups++;
+@@ -694,25 +706,40 @@ static int sky1_pinctrl_probe_acpi(struct platform_device *pdev,
+ 
+ 	spctl->ngroups = num_groups;
+ 
+-	group_names = devm_kzalloc(spctl->dev,
+-				   num_groups * sizeof(char *),
+-				   GFP_KERNEL);
+-	if (!group_names)
+-		return -ENOMEM;
++	group_names = devm_kcalloc(spctl->dev, num_groups, sizeof(*group_names),
++				  GFP_KERNEL);
++	if (!group_names) {
++		ret = -ENOMEM;
++		goto free_groups;
++	}
+ 
+-	list_for_each_entry(acpi_grp, &pinctrl_group_list, list)
+-		group_names[index++] = devm_kstrdup(spctl->dev, acpi_grp->name, GFP_KERNEL);
++	list_for_each_entry(acpi_grp, &pinctrl_group_list, list) {
++		group_names[index] = devm_kstrdup(spctl->dev, acpi_grp->name, GFP_KERNEL);
++		if (!group_names[index]) {
++			ret = -ENOMEM;
++			goto free_groups;
++		}
++		index++;
++	}
++
++	ret = pinmux_generic_add_function(pctl, dev_name(&pdev->dev),
++					  group_names, num_groups, NULL);
++	if (ret < 0)
++		goto free_groups;
+ 
+-	pinmux_generic_add_function(pctl, dev_name(&pdev->dev),
+-				    group_names, num_groups, NULL);
++	list_for_each_entry(acpi_grp, &pinctrl_group_list, list) {
++		ret = sky1_pinctrl_parse_groups_acpi(acpi_grp, spctl);
++		if (ret < 0)
++			break;
++	}
+ 
++free_groups:
+ 	list_for_each_entry_safe(acpi_grp, temp, &pinctrl_group_list, list) {
+-		sky1_pinctrl_parse_groups_acpi(acpi_grp, spctl);
+ 		list_del(&acpi_grp->list);
+ 		sky1_free_acpi_group_desc(acpi_grp);
+ 	}
+ 
+-	return 0;
++	return ret < 0 ? ret : 0;
+ }
+ 
+ int sky1_base_pinctrl_probe(struct platform_device *pdev,
+diff --git a/drivers/pinctrl/pinctrl-acpi.c b/drivers/pinctrl/pinctrl-acpi.c
+index 00b25de..c767b1a 100644
+--- a/drivers/pinctrl/pinctrl-acpi.c
++++ b/drivers/pinctrl/pinctrl-acpi.c
+@@ -147,6 +147,7 @@ err_free_map:
+ 
+ static struct pinctrl_dev *get_pinctrl_dev_from_acpi_name(char *pinctrl_acpi)
+ {
++	struct pinctrl_dev *pctldev;
+ 	struct acpi_device *adev;
+ 	const char *dev_name;
+ 	acpi_status status;
+@@ -161,10 +162,10 @@ static struct pinctrl_dev *get_pinctrl_dev_from_acpi_name(char *pinctrl_acpi)
+ 		return NULL;
+ 
+ 	dev_name = acpi_dev_name(adev);
+-	if (!dev_name)
+-		return NULL;
++	pctldev = dev_name ? get_pinctrl_dev_from_devname(dev_name) : NULL;
++	acpi_dev_put(adev);
+ 
+-	return get_pinctrl_dev_from_devname(dev_name);
++	return pctldev;
+ }
+ 
+ static int acpi_to_generic_pin_config(unsigned int acpi_param,
+@@ -228,6 +229,9 @@ static int add_to_config_map(struct list_head *config_maps, char *pinctrl_acpi,
+ 	struct config_map_info *config_map;
+ 	struct pinctrl_acpi_config_node *config_node;
+ 
++	if (!pinctrl_acpi)
++		return -EINVAL;
++
+ 	config_node =
+ 		kzalloc(sizeof(struct pinctrl_acpi_config_node), GFP_KERNEL);
+ 	if (!config_node)
+@@ -249,8 +253,14 @@ static int add_to_config_map(struct list_head *config_maps, char *pinctrl_acpi,
+ 	if (!config_map)
+ 		goto err_free_config_node;
+ 
++	/* The resource walk frees the source string before we build maps. */
++	config_map->pinctrl_acpi = kstrdup(pinctrl_acpi, GFP_KERNEL);
++	if (!config_map->pinctrl_acpi) {
++		kfree(config_map);
++		goto err_free_config_node;
++	}
++
+ 	config_map->pin = pin;
+-	config_map->pinctrl_acpi = pinctrl_acpi;
+ 	config_map->nconfigs = 1;
+ 	INIT_LIST_HEAD(&config_map->node);
+ 	INIT_LIST_HEAD(&config_map->configs);
+@@ -276,6 +286,7 @@ acpi_pin_resource_to_pinctrl_map(struct pinctrl *p, char *pinctrl_acpi,
+ 	int ret;
+ #define MAX_NUM_PINTRTL_STATE	(5)
+ 	const char *pinctrl_name[MAX_NUM_PINTRTL_STATE];
++	const char *statename = "default";
+ 
+ 	pctldev = get_pinctrl_dev_from_acpi_name(pinctrl_acpi);
+ 	if (!pctldev) {
+@@ -291,28 +302,25 @@ acpi_pin_resource_to_pinctrl_map(struct pinctrl *p, char *pinctrl_acpi,
+ 		return -ENXIO;
+ 	}
+ 
+-	ret = ops->acpi_node_to_map(pctldev, resource, &new_map, &num_maps);
+-	if (ret < 0)
+-		return ret;
+-
+ 	state_index = resource->state_index;
+ 	ret = device_property_read_string_array(p->dev,
+ 						"pinctrl-names",
+ 						pinctrl_name,
+ 						MAX_NUM_PINTRTL_STATE);
+-	if (ret < 0 || state_index < 0) {
+-		return acpi_remember_or_free_map(p, "default",
+-						 pctldev, new_map, num_maps);
++	if (ret >= 0 && state_index >= 0) {
++		if (state_index >= ret) {
++			dev_err(p->dev, "invalid state index in VendorData %d, %d\n",
++				ret, state_index);
++			return -EINVAL;
++		}
++		statename = pinctrl_name[state_index];
+ 	}
+ 
+-	if (state_index + 1 > ret) {
+-		dev_err(p->dev, "invalid state index in VendorData %d, %d\n",
+-			ret, state_index);
+-		return -EINVAL;
+-	}
+-	ret = acpi_remember_or_free_map(p, pinctrl_name[state_index],
+-					pctldev, new_map, num_maps);
+-	return ret;
++	ret = ops->acpi_node_to_map(pctldev, resource, &new_map, &num_maps);
++	if (ret < 0)
++		return ret;
++
++	return acpi_remember_or_free_map(p, statename, pctldev, new_map, num_maps);
+ }
+ 
+ static int acpi_pin_group_function_to_pinctrl_map(struct pinctrl *p,
+@@ -651,6 +659,7 @@ static void free_config_maps(struct list_head *config_maps)
+ 	list_for_each_entry_safe(config_map, tmp, config_maps, node) {
+ 		list_del(&config_map->node);
+ 		free_config_nodes(&config_map->configs);
++		kfree(config_map->pinctrl_acpi);
+ 		kfree(config_map);
+ 	}
+ }
+@@ -666,8 +675,10 @@ static int parse_acpi_pin_configs(struct pinctrl *p)
+ 	INIT_LIST_HEAD(&info.config_maps);
+ 	ret = acpi_dev_get_resources(ACPI_COMPANION(p->dev), &res_list,
+ 				     parse_acpi_pin_config_resources, &info);
+-	if (ret < 0)
++	if (ret < 0) {
++		free_config_maps(&info.config_maps);
+ 		return ret;
++	}
+ 
+ 	list_for_each_entry(config_map, &info.config_maps, node) {
+ 		ret = acpi_pin_config_to_pinctrl_map(
+@@ -699,12 +710,12 @@ int pinctrl_acpi_to_map(struct pinctrl *p)
+ 		return -ENXIO;
+ 
+ 	ret = parse_acpi_pin_functions(p);
+-	if (ret < 0)
+-		return ret;
+-
+-	ret = parse_acpi_pin_configs(p);
+-	if (ret < 0)
++	if (ret >= 0)
++		ret = parse_acpi_pin_configs(p);
++	if (ret < 0) {
++		pinctrl_acpi_free_maps(p);
+ 		return ret;
++	}
+ 
+ 	return 0;
+ }
+@@ -721,6 +732,8 @@ static int pinctrl_acpi_populate_group_desc(struct acpi_resource *ares,
+ 		return 1;
+ 
+ 	ares_pin_group = &ares->data.pin_group;
++	if (!ares_pin_group->resource_label.string_ptr)
++		return -EINVAL;
+ 
+ 	desc = kzalloc(sizeof(struct pinctrl_acpi_group_desc), GFP_KERNEL);
+ 	if (!desc)
+@@ -728,28 +741,38 @@ static int pinctrl_acpi_populate_group_desc(struct acpi_resource *ares,
+ 
+ 	desc->name = kstrdup_const(ares_pin_group->resource_label.string_ptr,
+ 				   GFP_KERNEL);
++	if (!desc->name)
++		goto free_desc;
+ 
+ 	desc->num_pins = ares_pin_group->pin_table_length;
+ 	desc->vendor_length = ares_pin_group->vendor_length;
+ 	if (ares_pin_group->vendor_length) {
+ 		alloc_size = ares_pin_group->vendor_length *
+ 			sizeof(ares_pin_group->vendor_data[0]);
+-		desc->vendor_data = kzalloc(alloc_size, GFP_KERNEL);
+-		memcpy(desc->vendor_data, ares_pin_group->vendor_data,
+-		       alloc_size);
++		desc->vendor_data = kmemdup(ares_pin_group->vendor_data,
++					   alloc_size, GFP_KERNEL);
++		if (!desc->vendor_data)
++			goto free_desc;
+ 	}
+ 
+ 	if (ares_pin_group->pin_table_length) {
+ 		alloc_size = ares_pin_group->pin_table_length *
+ 			sizeof(ares_pin_group->pin_table[0]);
+-		desc->pins = kzalloc(alloc_size, GFP_KERNEL);
+-		memcpy(desc->pins, ares_pin_group->pin_table, alloc_size);
++		desc->pins = kmemdup(ares_pin_group->pin_table, alloc_size, GFP_KERNEL);
++		if (!desc->pins)
++			goto free_desc;
+ 	}
+ 
+ 	INIT_LIST_HEAD(&desc->list);
+ 	list_add(&desc->list, group_desc_list);
+ 
+ 	return 1;
++
++free_desc:
++	kfree(desc->vendor_data);
++	kfree_const(desc->name);
++	kfree(desc);
++	return -ENOMEM;
+ }
+ 
+ /* Get list of acpi pin groups definitions for the controller */

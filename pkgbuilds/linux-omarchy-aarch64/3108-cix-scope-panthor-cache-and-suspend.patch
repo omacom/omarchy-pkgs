@@ -1,0 +1,240 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Clay Stan <claystan97@gmail.com>
+Date: Tue, 24 Nov 2026 12:08:00 +0800
+Subject: [PATCH] drm/panthor: scope Sky1 cache and suspend policy
+
+GPU bus protocol selection is separate from DMA coherency. Restore
+the upstream DMA-coherent GEM and MMU paths on non-Sky1 GPUs, and
+report the selected protocol through the existing GPU info field.
+
+Keep Sky1 ACE-Lite, its shareable-cache bit and noncoherent mappings.
+Limit the no-IOMMU non-cacheable override and direct-complete
+workaround to the Sky1 GPU device.
+
+Signed-off-by: Clay Stan <claystan97@gmail.com>
+---
+diff --git a/drivers/gpu/drm/panthor/panthor_device.h b/drivers/gpu/drm/panthor/panthor_device.h
+--- a/drivers/gpu/drm/panthor/panthor_device.h
++++ b/drivers/gpu/drm/panthor/panthor_device.h
+@@ -19,27 +19,6 @@
+ #include <drm/drm_mm.h>
+ #include <drm/gpu_scheduler.h>
+ #include <drm/panthor_drm.h>
+-
+-/**
+- * enum panthor_coherency_mode - GPU bus coherency protocol
+- *
+- * Determines how the GPU participates in the system coherency fabric.
+- * Values match the GPU_COHERENCY_PROTOCOL register encoding.
+- */
+-enum panthor_coherency_mode {
+-	/** @PANTHOR_COHERENCY_ACE_LITE: GPU is RN-I on CHI fabric.
+-	 * L2 evictions route through HN-F/SLC, making WB data visible
+-	 * to non-snooping masters. No NC memattr needed. */
+-	PANTHOR_COHERENCY_ACE_LITE = 0,
+-
+-	/** @PANTHOR_COHERENCY_ACE: Full CPU-GPU coherency via snooping.
+-	 * Page table walks use outer-shareable, GEM uses cached mappings. */
+-	PANTHOR_COHERENCY_ACE = 1,
+-
+-	/** @PANTHOR_COHERENCY_NONE: GPU outside coherency domain.
+-	 * Requires NC memattr when no IOMMU is present. */
+-	PANTHOR_COHERENCY_NONE = 31,
+-};
+ 
+ struct panthor_csf;
+ struct panthor_csf_ctx;
+@@ -180,8 +159,8 @@
+ 		struct clk *coregroup;
+ 	} clks;
+ 
+-	/** @coherency_mode: GPU bus coherency protocol. */
+-	enum panthor_coherency_mode coherency_mode;
++	/** @coherent: CPU/GPU DMA and page-table coherency. */
++	bool coherent;
+ 
+ 	/** @gpu_info: GPU information. */
+ 	struct drm_panthor_gpu_info gpu_info;
+diff --git a/drivers/gpu/drm/panthor/panthor_gpu.c b/drivers/gpu/drm/panthor/panthor_gpu.c
+--- a/drivers/gpu/drm/panthor/panthor_gpu.c
++++ b/drivers/gpu/drm/panthor/panthor_gpu.c
+@@ -60,9 +60,9 @@
+ 
+ static void panthor_gpu_coherency_set(struct panthor_device *ptdev)
+ {
+-	u32 val = ptdev->coherency_mode;
+-
+-	if (val != PANTHOR_COHERENCY_NONE) {
++	u32 val = ptdev->gpu_info.selected_coherency;
++
++	if (panthor_is_sky1(ptdev) && val == GPU_COHERENCY_ACE_LITE) {
+ 		u32 features = gpu_read(ptdev->gpu->iomem, GPU_COHERENCY_FEATURES);
+ 
+ 		if (features & GPU_COHERENCY_SHAREABLE_CACHE)
+@@ -470,34 +470,28 @@
+ 
+ int panthor_gpu_coherency_init(struct panthor_device *ptdev)
+ {
++	bool sky1 = panthor_is_sky1(ptdev);
++
+ 	BUILD_BUG_ON(GPU_COHERENCY_NONE != DRM_PANTHOR_GPU_COHERENCY_NONE);
+ 	BUILD_BUG_ON(GPU_COHERENCY_ACE_LITE != DRM_PANTHOR_GPU_COHERENCY_ACE_LITE);
+ 	BUILD_BUG_ON(GPU_COHERENCY_ACE != DRM_PANTHOR_GPU_COHERENCY_ACE);
+-	bool dma_coherent = device_get_dma_attr(ptdev->base.dev) == DEV_DMA_COHERENT;
+ 
+ 	/*
+-	 * Sky1 SoC: The GPU hardware supports full ACE (128/256-bit AMBA 4
+-	 * ACE master), but the platform uses ACE-Lite (DT system-coherency=0).
+-	 * The DPU is non-snooping and reads from SLC/DRAM, so ACE-Lite is the
+-	 * correct choice: GPU L2 evictions route through HN-F and are absorbed
+-	 * into the SLC, making WB data visible to the DPU without NC memattr.
++	 * Sky1 uses ACE-Lite on the GPU bus so L2 evictions reach the SLC,
++	 * while GEM mappings and page-table walks retain noncoherent settings.
+ 	 */
+-	if (panthor_is_sky1(ptdev)) {
+-		ptdev->coherency_mode = PANTHOR_COHERENCY_ACE_LITE;
+-		drm_info(&ptdev->base, "Using ACE-Lite bus coherency (Sky1)\n");
+-	} else if (!dma_coherent) {
+-		ptdev->coherency_mode = PANTHOR_COHERENCY_NONE;
+-	} else {
+-		ptdev->coherency_mode = PANTHOR_COHERENCY_ACE_LITE;
+-	}
+-
+-	if (ptdev->coherency_mode == PANTHOR_COHERENCY_NONE)
++	ptdev->coherent = !sky1 && device_get_dma_attr(ptdev->base.dev) == DEV_DMA_COHERENT;
++	ptdev->gpu_info.selected_coherency = GPU_COHERENCY_NONE;
++	if (!sky1 && !ptdev->coherent)
+ 		return 0;
+ 
+-	/* Verify hardware supports the selected protocol. */
+ 	if (gpu_read(ptdev->gpu->iomem, GPU_COHERENCY_FEATURES) &
+-	    GPU_COHERENCY_PROT_BIT(ACE_LITE))
++	    GPU_COHERENCY_PROT_BIT(ACE_LITE)) {
++		ptdev->gpu_info.selected_coherency = GPU_COHERENCY_ACE_LITE;
++		if (sky1)
++			drm_info(&ptdev->base, "Using ACE-Lite bus coherency (Sky1)\n");
+ 		return 0;
++	}
+ 
+ 	drm_err(&ptdev->base, "ACE-Lite not supported by hardware");
+ 	return -ENOTSUPP;
+diff --git a/drivers/gpu/drm/panthor/panthor_gem.c b/drivers/gpu/drm/panthor/panthor_gem.c
+--- a/drivers/gpu/drm/panthor/panthor_gem.c
++++ b/drivers/gpu/drm/panthor/panthor_gem.c
+@@ -107,7 +107,7 @@
+ 	 * CPU cache maintenance regardless of whether the device is coherent
+ 	 * or not.
+ 	 */
+-	if (ptdev->coherency_mode == PANTHOR_COHERENCY_ACE)
++	if (ptdev->coherent)
+ 		return false;
+ 
+ 	/* Cached mappings are explicitly requested, so no write-combine. */
+diff --git a/drivers/gpu/drm/panthor/panthor_mmu.c b/drivers/gpu/drm/panthor/panthor_mmu.c
+--- a/drivers/gpu/drm/panthor/panthor_mmu.c
++++ b/drivers/gpu/drm/panthor/panthor_mmu.c
+@@ -38,6 +38,7 @@
+ #include "panthor_mmu.h"
+ #include "panthor_mmu_regs.h"
+ #include "panthor_sched.h"
++#include "panthor_sky1.h"
+ 
+ #define MAX_AS_SLOTS			32
+ 
+@@ -795,7 +796,7 @@
+ 		   AS_TRANSCFG_PTW_RA |
+ 		   AS_TRANSCFG_ADRMODE_AARCH64_4K |
+ 		   AS_TRANSCFG_INA_BITS(55 - va_bits);
+-	if (ptdev->coherency_mode == PANTHOR_COHERENCY_ACE)
++	if (ptdev->coherent)
+ 		transcfg |= AS_TRANSCFG_PTW_SH_OS;
+ 
+ 	/* If the VM is re-activated, we clear the fault. */
+@@ -2173,8 +2174,7 @@
+ 	xa_unlock(&pfile->vms->xa);
+ }
+ 
+-static u64 mair_to_memattr(u64 mair, enum panthor_coherency_mode mode,
+-			   bool has_iommu)
++static u64 mair_to_memattr(u64 mair, bool coherent, bool force_nc)
+ {
+ 	u64 memattr = 0;
+ 	u32 i;
+@@ -2187,18 +2187,10 @@
+ 		 * have to be both write-back, if one of them is write-through
+ 		 * or non-cacheable, we just choose non-cacheable. Device
+ 		 * memory is also translated to non-cacheable.
++		 * On Sky1 without an IOMMU, force NC so non-snooping
++		 * masters see the contents of GPU buffers in DRAM.
+ 		 */
+-		if (!(outer & 3) || !(outer & 4) || !(inner & 4)) {
+-			out_attr = AS_MEMATTR_AARCH64_INNER_OUTER_NC |
+-				   AS_MEMATTR_AARCH64_SH_MIDGARD_INNER |
+-				   AS_MEMATTR_AARCH64_INNER_ALLOC_EXPL(false, false);
+-		} else if (mode != PANTHOR_COHERENCY_ACE && !has_iommu) {
+-			/* GPU not fully coherent and no IOMMU to override
+-			 * memory attributes at the bus level. Even with
+-			 * ACE-Lite, GPU L2 may not evict to SLC in time
+-			 * for non-snooping masters like the DPU.
+-			 * Force NC to guarantee DRAM visibility.
+-			 */
++		if (force_nc || !(outer & 3) || !(outer & 4) || !(inner & 4)) {
+ 			out_attr = AS_MEMATTR_AARCH64_INNER_OUTER_NC |
+ 				   AS_MEMATTR_AARCH64_SH_MIDGARD_INNER |
+ 				   AS_MEMATTR_AARCH64_INNER_ALLOC_EXPL(false, false);
+@@ -2212,7 +2204,7 @@
+ 			 * that SH_IS actually maps to the standard definition
+ 			 * of inner-shareable.
+ 			 */
+-			if (mode != PANTHOR_COHERENCY_ACE)
++			if (!coherent)
+ 				out_attr |= AS_MEMATTR_AARCH64_SH_MIDGARD_INNER;
+ 			else
+ 				out_attr |= AS_MEMATTR_AARCH64_SH_CPU_INNER;
+@@ -2923,7 +2915,7 @@
+ 		.pgsize_bitmap	= ptdev->mmu_info.page_size_bitmap,
+ 		.ias		= va_bits,
+ 		.oas		= pa_bits,
+-		.coherent_walk	= ptdev->coherency_mode == PANTHOR_COHERENCY_ACE,
++		.coherent_walk	= ptdev->coherent,
+ 		.tlb		= &mmu_tlb_ops,
+ 		.iommu_dev	= ptdev->base.dev,
+ 		.alloc		= alloc_pt,
+@@ -2946,8 +2938,9 @@
+ 		goto err_sched_fini;
+ 
+ 	mair = io_pgtable_ops_to_pgtable(vm->pgtbl_ops)->cfg.arm_lpae_s1_cfg.mair;
+-	vm->memattr = mair_to_memattr(mair, ptdev->coherency_mode,
+-				      device_iommu_mapped(ptdev->base.dev));
++	vm->memattr = mair_to_memattr(mair, ptdev->coherent,
++				      panthor_is_sky1(ptdev) &&
++				      !device_iommu_mapped(ptdev->base.dev));
+ 
+ 	mutex_lock(&ptdev->mmu->vm.lock);
+ 	list_add_tail(&vm->node, &ptdev->mmu->vm.list);
+diff --git a/drivers/gpu/drm/panthor/panthor_drv.c b/drivers/gpu/drm/panthor/panthor_drv.c
+--- a/drivers/gpu/drm/panthor/panthor_drv.c
++++ b/drivers/gpu/drm/panthor/panthor_drv.c
+@@ -38,6 +38,7 @@
+ #include "panthor_heap.h"
+ #include "panthor_mmu.h"
+ #include "panthor_sched.h"
++#include "panthor_sky1.h"
+ 
+ /**
+  * DOC: user <-> kernel object copy helpers.
+@@ -1821,11 +1822,13 @@
+ {
+ 	struct panthor_device *ptdev;
+ 
+-	dev_pm_set_driver_flags(&pdev->dev, DPM_FLAG_NO_DIRECT_COMPLETE);
+ 	ptdev = devm_drm_dev_alloc(&pdev->dev, &panthor_drm_driver,
+ 				   struct panthor_device, base);
+ 	if (IS_ERR(ptdev))
+ 		return PTR_ERR(ptdev);
++
++	if (panthor_is_sky1(ptdev))
++		dev_pm_set_driver_flags(&pdev->dev, DPM_FLAG_NO_DIRECT_COMPLETE);
+ 
+ 	platform_set_drvdata(pdev, ptdev);
+ 

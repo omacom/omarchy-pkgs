@@ -1,0 +1,166 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Clay Stan <claystan97@gmail.com>
+Date: Tue, 24 Nov 2026 12:14:00 +0800
+Subject: [PATCH] drm/cix/dptx: gate Type-C connector detect on PHY_MODE_DP
+
+On CIX Sky1 Type-C ports, the USBDP combo PHY starts in PHY_MODE_INVALID
+until the RTS5453 PD controller negotiates DisplayPort Alt-Mode and
+switches the lane mux to PHY_MODE_DP.  While trilin_dp_hpd_event_work_func()
+waits for phy_get_mode() == PHY_MODE_DP before probing, synchronous callers
+such as drm_fbdev_dma_setup() invoke trilin_dp_connector_detect() directly.
+
+If HPD is already asserted before the Type-C mux reaches PHY_MODE_DP,
+trilin_dp_connector_detect() previously reported connector_status_connected,
+causing two failures:
+
+1. fbdev/DRM immediately ran trilin_dp_encoder_enable() -> trilin_dp_prepare()
+   against a USB-configured PHY, timing out in usbdp_phy_cmn_ready_ack.
+2. dp->status was already mutated to connector_status_connected, so when
+   trilin_dp_hpd_event_work_func() finished waiting for PHY_MODE_DP 80 ms
+   later it saw old_status == dp->status ("dp status is same : 1") and
+   returned without firing a hotplug event or training the link.
+
+Treat the connector as disconnected in trilin_dp_connector_detect() while
+its PHY is not yet in PHY_MODE_DP, schedule hpd_event_work to re-probe once
+the mux settles, and recover stream enablement if trilin_dp_prepare() or
+trilin_dp_enable() failed earlier while connected.
+
+Signed-off-by: Clay Stan <claystan97@gmail.com>
+---
+ drivers/gpu/drm/cix/dptx/trilin_dptx.c | 28 ++++++++++++++++++++++++++
+ drivers/gpu/drm/cix/dptx/trilin_dptx.h |  1 +
+ drivers/gpu/drm/cix/dptx/trilin_drm.c  | 34 ++++++++++++++++++++++++--
+ 3 files changed, 61 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/cix/dptx/trilin_dptx.c b/drivers/gpu/drm/cix/dptx/trilin_dptx.c
+--- a/drivers/gpu/drm/cix/dptx/trilin_dptx.c
++++ b/drivers/gpu/drm/cix/dptx/trilin_dptx.c
+@@ -2958,6 +2958,30 @@ static void trilin_dp_hpd_event_work_func(struct work_struct *work)
+ 	drm_helper_probe_detect(&dp->connector.base, NULL, false);
+ 
+ 	if(old_status == dp->status) {
++		if (dp->status == connector_status_connected &&
++		    dp->prepare_failed) {
++			struct trilin_dp_panel *dp_panel = &dp->dp_panel;
++			int rc = trilin_dp_prepare(dp);
++
++			if (!rc) {
++				trilin_dp_set_stream_info(dp, dp_panel,
++							  dp_panel->source_id,
++							  0, 0);
++				rc = trilin_dp_enable(dp, dp_panel);
++			}
++			if (!rc) {
++				dp->prepare_failed = false;
++				trilin_dp_post_enable(dp, dp_panel);
++				dp->enabled_by_gop = 0;
++				dp->psr.allow_after =
++					ktime_add_ms(ktime_get(), 1000);
++				dptx_audio_handle_plugged_change(dp_audio,
++								 true);
++				cix_hdcp_hpd_event_process(&dp->hdcp, true);
++				DP_INFO("recovered DP stream after PHY ready\n");
++			}
++			return;
++		}
+ 		DP_INFO("dp status is same : %d", dp->status);
+ 		return;
+ 	}
+@@ -3451,6 +3475,10 @@ int trilin_dp_init_config(struct trilin_dp *dp)
+ 		goto err;
+ 
+ 	DP_INFO("init hpd high is %d\n", trilin_dp_get_hpd_state(dp));
++	if (trilin_dp_get_hpd_state(dp) && !IS_ERR_OR_NULL(dp->phy.base) &&
++	    phy_get_mode(dp->phy.base) != PHY_MODE_DP)
++		queue_delayed_work(system_freezable_wq, &dp->hpd_event_work,
++				   msecs_to_jiffies(50));
+ 	return rc;
+ err:
+ 	cancel_delayed_work_sync(&dp->hpd_irq_work);
+diff --git a/drivers/gpu/drm/cix/dptx/trilin_dptx.h b/drivers/gpu/drm/cix/dptx/trilin_dptx.h
+--- a/drivers/gpu/drm/cix/dptx/trilin_dptx.h
++++ b/drivers/gpu/drm/cix/dptx/trilin_dptx.h
+@@ -466,6 +466,7 @@ struct trilin_dp {
+ 	struct delayed_work hpd_irq_work;
+ 	enum drm_connector_status status;
+ 	bool enabled;
++	bool prepare_failed;
+ 	bool psr_default_on;
+ 	bool psr_config_on;
+ 	bool fasttrain_default_on;
+diff --git a/drivers/gpu/drm/cix/dptx/trilin_drm.c b/drivers/gpu/drm/cix/dptx/trilin_drm.c
+--- a/drivers/gpu/drm/cix/dptx/trilin_drm.c
++++ b/drivers/gpu/drm/cix/dptx/trilin_drm.c
+@@ -22,6 +22,7 @@
+ #include <linux/kernel.h>
+ #include <linux/property.h>
+ #include <linux/string.h>
++#include <linux/workqueue.h>
+ 
+ #include "trilin_dptx_reg.h"
+ #include "trilin_host_tmr.h"
+@@ -91,6 +92,8 @@ trilin_dp_connector_detect(struct drm_connector *connector, bool force)
+ 	struct trilin_dp *dp = connector_to_dp(connector);
+ 	int rc;
+ 	enum drm_connector_status real_status;
++	bool hpd;
++	bool phy_ready = true;
+ 	bool vrr_capable = false;
+ 
+ 	DP_DEBUG("enter\n");
+@@ -104,9 +107,25 @@ trilin_dp_connector_detect(struct drm_connector *connector, bool force)
+ 	if (rc)
+ 		goto end;
+ 
++	hpd = trilin_dp_get_hpd_state(dp);
++	if (hpd && !IS_ERR_OR_NULL(dp->phy.base) &&
++	    phy_get_mode(dp->phy.base) != PHY_MODE_DP) {
++		/*
++		 * Hold off reporting connected until the Type-C USBDP mux
++		 * reaches PHY_MODE_DP so early fbdev/DRM callers neither
++		 * attempt link training on a USB-mode PHY nor poison
++		 * dp->status ahead of trilin_dp_hpd_event_work_func().
++		 */
++		phy_ready = false;
++		if (current_work() != &dp->hpd_event_work.work)
++			queue_delayed_work(system_freezable_wq,
++					   &dp->hpd_event_work,
++					   msecs_to_jiffies(50));
++	}
++
+ 	mutex_unlock(&dp->session_lock);
+ 
+-	if (!trilin_dp_get_hpd_state(dp)) {
++	if (!hpd || !phy_ready) {
+ 		trilin_dp_handle_disconnect(dp, false);
+ 		real_status = dp->status = connector_status_disconnected;
+ 	} else {
+@@ -706,6 +728,7 @@ static void trilin_dp_encoder_enable(struct drm_encoder *encoder,
+ 	/*link trainning*/
+ 	rc = trilin_dp_prepare(dp);
+ 	if (rc) {
++		dp->prepare_failed = true;
+ 		DP_ERR("DP display prepare failed, rc=%d\n", rc);
+ 		return;
+ 	}
+@@ -715,9 +738,11 @@ static void trilin_dp_encoder_enable(struct drm_encoder *encoder,
+ 
+ 	rc = trilin_dp_enable(dp, dp_panel);
+ 	if (rc) {
++		dp->prepare_failed = true;
+ 		DP_ERR("DP display enable failed, rc=%d\n", rc);
+ 		return;
+ 	}
++	dp->prepare_failed = false;
+ 	/*update hdr and hdcp ? */
+ 	trilin_dp_post_enable(dp, dp_panel);
+ 	dp->enabled_by_gop = 0;
+@@ -734,6 +759,8 @@ static void trilin_dp_encoder_disable(struct drm_encoder *encoder,
+ 	struct drm_crtc *crtc;
+ 	struct drm_crtc_state *new_crtc_state = NULL;
+ 
++	dp->prepare_failed = false;
++
+ 	if (!(dp->state & DPTX_STATE_INITIALIZED)) {
+ 		DP_DEBUG("[not init]");
+ 		return;

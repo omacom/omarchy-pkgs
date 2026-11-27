@@ -1,0 +1,314 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Clay Stan <claystan97@gmail.com>
+Date: Fri, 27 Nov 2026 12:25:00 +0800
+Subject: [PATCH] cix: fix rts5453 Type-C probe error, remove lifetimes, and
+ IRQ handoff
+
+Fix error-pointer cleanup, teardown ordering, and shared-IRQ handoff in
+the vendor Realtek RTS5453H Type-C PD driver:
+
+- Store the result of fwnode_usb_role_switch_get() in a local variable so
+  an error pointer such as -EPROBE_DEFER is never left in typec->role_sw,
+  clear typec->port and typec->partner on registration failure, and guard
+  every handle in rts5453h_unregister_ports() with !IS_ERR_OR_NULL().
+- Track ownership of the shared IRQ via rts->irq_requested instead of
+  blindly calling free_irq() from instances that got -EBUSY.
+- Initialize rts->irq_work before adding the peer to rts_list so a
+  concurrent rts5453h_handoff_irq() from an unbinding IRQ owner can never
+  queue an uninitialized delayed work item.
+- In rts5453h_remove() and rts5453h_probe() error unwind, mark the
+  instance removing and unlink it from rts_list under rts_lock, cancel
+  irq_work synchronously, and free the owned IRQ before releasing Type-C
+  partner/port/switch objects.
+- When the IRQ owner (or a peer with a pending handoff) cleans up, pass
+  ownership by scheduling irq_work with irq_handoff set on a remaining
+  peer sharing the same adapter and IRQ so remaining Type-C ports
+  continue receiving events without stalling on the unbound peer.
+- Release fwnode and i2c_client device references on early breaks in
+  rts5453h_init_ports() and is_rts_irq_shared_deivces_all_bound().
+
+Signed-off-by: Clay Stan <claystan97@gmail.com>
+---
+ drivers/usb/typec/rts5453.c | 141 ++++++++++++++++++++++++++++--------
+ 1 file changed, 112 insertions(+), 29 deletions(-)
+
+diff --git a/drivers/usb/typec/rts5453.c b/drivers/usb/typec/rts5453.c
+index f5d8c87..b1d669f 100644
+--- a/drivers/usb/typec/rts5453.c
++++ b/drivers/usb/typec/rts5453.c
+@@ -82,6 +82,9 @@ struct rts5453h {
+ 	struct typec_partner	*partner;
+ 	struct typec_partner_desc desc;
+ 	bool pd_int_disabled;
++	bool irq_requested;
++	bool irq_handoff;
++	bool removing;
+ 	struct list_head list;
+ 	struct delayed_work irq_work;
+ };
+@@ -277,6 +280,7 @@ static int rts5453h_typec_port_update(struct rts5453h *typec)
+ 
+ 		if (IS_ERR(typec->partner)) {
+ 			dev_info(typec->dev, "typec port(%d): register partner error \n", typec->id);
++			typec->partner = NULL;
+ 		}
+ 	}
+ 	typec->port->orientation = orientation;
+@@ -387,12 +391,15 @@ static int rts5453h_typec_get_switch_handles(struct rts5453h *typec,
+ 					 struct fwnode_handle *fwnode,
+ 					 struct device *dev)
+ {
++	struct usb_role_switch *role_sw;
++
+ 	typec->mux = typec->port->mux;
+ 	typec->ori_sw = typec->port->sw;
+-	typec->role_sw = fwnode_usb_role_switch_get(fwnode);
+-	if (IS_ERR(typec->role_sw))
+-		return dev_err_probe(dev, PTR_ERR(typec->role_sw), "USB role switch handle is error\n");
++	role_sw = fwnode_usb_role_switch_get(fwnode);
++	if (IS_ERR(role_sw))
++		return dev_err_probe(dev, PTR_ERR(role_sw), "USB role switch handle is error\n");
+ 
++	typec->role_sw = role_sw;
+ 	if (!typec->role_sw || !typec->mux || !typec->ori_sw)
+ 		dev_warn(dev, "mux or switch or role switch has not found\n");
+ 
+@@ -401,15 +408,24 @@ static int rts5453h_typec_get_switch_handles(struct rts5453h *typec,
+ 
+ static void rts5453h_unregister_ports(struct rts5453h *typec)
+ {
+-	if (typec->port) {
++	if (!IS_ERR_OR_NULL(typec->role_sw)) {
++		usb_role_switch_set_role(typec->role_sw, USB_ROLE_NONE);
++		usb_role_switch_put(typec->role_sw);
++		typec->role_sw = NULL;
++	}
++
++	if (!IS_ERR_OR_NULL(typec->port)) {
+ 		typec->state.alt = NULL;
+ 		typec->state.mode = TYPEC_STATE_USB;
+ 		typec->state.data = NULL;
+-		usb_role_switch_set_role(typec->role_sw, USB_ROLE_NONE);
+-		typec_switch_set(typec->ori_sw, TYPEC_ORIENTATION_NONE);
+-		typec_mux_set(typec->mux, &typec->state);
+-		usb_role_switch_put(typec->role_sw);
++		if (!IS_ERR_OR_NULL(typec->ori_sw))
++			typec_switch_set(typec->ori_sw, TYPEC_ORIENTATION_NONE);
++		if (!IS_ERR_OR_NULL(typec->mux))
++			typec_mux_set(typec->mux, &typec->state);
+ 		typec_unregister_port(typec->port);
++		typec->port = NULL;
++		typec->ori_sw = NULL;
++		typec->mux = NULL;
+ 	}
+ }
+ 
+@@ -471,19 +487,24 @@ static int rts5453h_init_ports(struct rts5453h *typec)
+ 
+ 	device_for_each_child_node(dev, fwnode) {
+ 		ret = rts5453h_typec_parse_port_props(&typec->caps, fwnode, dev);
+-		if (ret < 0)
++		if (ret < 0) {
++			fwnode_handle_put(fwnode);
+ 			goto unregister_ports;
++		}
+ 
+ 		typec->port = typec_register_port(dev, &typec->caps);
+ 		if (IS_ERR(typec->port)) {
+ 			dev_err(dev, "Failed to register port\n");
+ 			ret = PTR_ERR(typec->port);
++			typec->port = NULL;
++			fwnode_handle_put(fwnode);
+ 			goto unregister_ports;
+ 		}
+ 
+ 		ret = rts5453h_typec_get_switch_handles(typec, fwnode, dev);
+ 		if (ret) {
+ 			dev_err(dev, "No switch control for port \n");
++			fwnode_handle_put(fwnode);
+ 			goto unregister_ports;
+ 		}
+ 	}
+@@ -554,6 +575,7 @@ static bool is_rts_irq_shared_deivces_all_bound(struct rts5453h *rts)
+ 			&& fwnode_property_present(gchild, "data-role")
+ 			&& fwnode_property_present(gchild, "try-power-role")) {
+ 				is_rts_node = 1;
++				fwnode_handle_put(gchild);
+ 				break;
+ 			}
+ 		}
+@@ -562,9 +584,13 @@ static bool is_rts_irq_shared_deivces_all_bound(struct rts5453h *rts)
+ 
+ 		client = i2c_find_device_by_fwnode(child);
+ 		if (!client || !device_is_bound(&client->dev)) {
++			if (client)
++				put_device(&client->dev);
++			fwnode_handle_put(child);
+ 			all_bound = 0;
+ 			break;
+ 		}
++		put_device(&client->dev);
+ 	}
+ 
+ 	return all_bound;
+@@ -574,12 +600,21 @@ static void rts_request_irq_work_fn(struct work_struct *work)
+ {
+ 	struct rts5453h *rts = container_of(work, struct rts5453h, irq_work.work);
+ 	struct i2c_client *client = to_i2c_client(rts->dev);
++	bool handoff;
+ 	int ret;
+ 
+ 	if (client->irq <= 0)
+ 		return;
+ 
+-	if (!is_rts_irq_shared_deivces_all_bound(rts)) {
++	mutex_lock(&rts_lock);
++	if (rts->removing) {
++		mutex_unlock(&rts_lock);
++		return;
++	}
++	handoff = rts->irq_handoff;
++	mutex_unlock(&rts_lock);
++
++	if (!handoff && !is_rts_irq_shared_deivces_all_bound(rts)) {
+ 		schedule_delayed_work(&rts->irq_work, msecs_to_jiffies(5));
+ 		dev_dbg(rts->dev, "irq work scheduled\n");
+ 		return;
+@@ -598,11 +633,57 @@ static void rts_request_irq_work_fn(struct work_struct *work)
+ 	} else {
+ 		/* succeed! remove from polling list and handle separately. */
+ 		mutex_lock(&rts_lock);
++		rts->irq_requested = true;
++		rts->irq_handoff = false;
+ 		list_del_init(&rts->list);
+ 		mutex_unlock(&rts_lock);
+ 	}
+ }
+ 
++static void rts5453h_handoff_irq(struct i2c_client *client)
++{
++	struct rts5453h *rt;
++	struct i2c_client *cl;
++
++	if (client->irq <= 0)
++		return;
++
++	mutex_lock(&rts_lock);
++	list_for_each_entry(rt, &rts_list, list) {
++		cl = to_i2c_client(rt->dev);
++		if (cl->adapter == client->adapter && cl->irq == client->irq) {
++			rt->irq_handoff = true;
++			mod_delayed_work(system_wq, &rt->irq_work, 0);
++			break;
++		}
++	}
++	mutex_unlock(&rts_lock);
++}
++
++static void rts5453h_cleanup_irq(struct i2c_client *client,
++				 struct rts5453h *rts)
++{
++	bool need_handoff;
++
++	mutex_lock(&rts_lock);
++	rts->removing = true;
++	need_handoff = rts->irq_handoff;
++	rts->irq_handoff = false;
++	list_del_init(&rts->list);
++	mutex_unlock(&rts_lock);
++
++	cancel_delayed_work_sync(&rts->irq_work);
++
++	if (rts->irq_requested) {
++		free_irq(client->irq, rts);
++		rts->irq_requested = false;
++		need_handoff = true;
++	}
++
++	if (need_handoff)
++		rts5453h_handoff_irq(client);
++}
++
+ static int rts5453h_probe(struct i2c_client *client)
+ {
+ 	struct rts5453h *rts;
+@@ -642,29 +723,42 @@ static int rts5453h_probe(struct i2c_client *client)
+ 	ret = rts5453h_event_handler(rts, 0);
+ 	if (ret) {
+ 		dev_err(&client->dev, "typec event handling error %d", ret);
+-		return ret;
++		goto err_unregister_ports;
+ 	}
+ 	/*
+ 	* TBD Check do anything about in init schedule like enable interrupt
+ 	* or check the firmware running status before request irq
+ 	*/
+ 
++	INIT_DELAYED_WORK(&rts->irq_work, rts_request_irq_work_fn);
++
+ 	INIT_LIST_HEAD(&rts->list);
+ 	mutex_lock(&rts_lock);
+ 	list_add(&rts->list, &rts_list);
+ 	mutex_unlock(&rts_lock);
+ 
+-	INIT_DELAYED_WORK(&rts->irq_work, rts_request_irq_work_fn);
+-	if (client->irq)
++	if (client->irq > 0)
+ 		schedule_delayed_work(&rts->irq_work, msecs_to_jiffies(5));
+ 
+ 	ret = device_create_file(&client->dev, &dev_attr_disable_pd_interrupt);
+-	if (ret < 0)
++	if (ret < 0) {
+ 		dev_err(&client->dev, "Failed to create sysfs attribute, ret = %d\n",
+ 			ret);
++		goto err_cleanup_irq;
++	}
+ 
+ 	device_set_wakeup_capable(&client->dev, true);
+ 
++	return 0;
++
++err_cleanup_irq:
++	rts5453h_cleanup_irq(client, rts);
++err_unregister_ports:
++	if (!IS_ERR_OR_NULL(rts->partner)) {
++		typec_unregister_partner(rts->partner);
++		rts->partner = NULL;
++	}
++	rts5453h_unregister_ports(rts);
+ 	return ret;
+ }
+ 
+@@ -674,25 +768,14 @@ static void rts5453h_remove(struct i2c_client *client)
+ 
+ 	device_remove_file(&client->dev, &dev_attr_disable_pd_interrupt);
+ 
+-	if (rts->partner) {
++	rts5453h_cleanup_irq(client, rts);
++
++	if (!IS_ERR_OR_NULL(rts->partner)) {
+ 		typec_unregister_partner(rts->partner);
+ 		rts->partner = NULL;
+ 	}
+ 
+-	if (rts->role_sw) {
+-		usb_role_switch_put(rts->role_sw);
+-	}
+-
+-	if (rts->port) {
+-		typec_unregister_port(rts->port);
+-	}
+-
+-	if (client->irq > 0)
+-		free_irq(client->irq, rts);
+-
+-	mutex_lock(&rts_lock);
+-	list_del(&rts->list);
+-	mutex_unlock(&rts_lock);
++	rts5453h_unregister_ports(rts);
+ }
+ 
+ static const struct of_device_id rts5453h_of_match[] = {
+-- 
+2.43.0
+

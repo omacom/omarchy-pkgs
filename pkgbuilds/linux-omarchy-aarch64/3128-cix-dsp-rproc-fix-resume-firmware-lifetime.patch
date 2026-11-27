@@ -1,0 +1,220 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Clay Stan <claystan97@gmail.com>
+Date: Fri, 27 Nov 2026 06:43:48 +0000
+Subject: [PATCH] cix: remoteproc: synchronize resume firmware callback with
+ rproc->lock
+
+cix_dsp_rproc_resume() schedules cix_dsp_rproc_load_firmware() via request_firmware_nowait() with a raw rproc pointer and returns before the callback runs. Previously:
+
+- request_firmware_nowait() invokes the continuation with fw == NULL when firmware loading fails, causing rproc_load_segments() to dereference fw->data.
+- cix_dsp_rproc_remove() tore down and freed rproc without waiting for a pending resume firmware callback, risking a use-after-free and restarting a removed device.
+- A subsequent cix_dsp_rproc_suspend() could race with an in-flight resume firmware load.
+- cix_dsp_rproc_load_firmware() did not hold rproc->lock across its RPROC_RUNNING state check and load/start/kick sequence, allowing concurrent rproc_shutdown() or crash recovery to stop the DSP and release clocks/mailbox while the callback kept restarting the hardware.
+
+Track pending resume firmware loads with fw_load_lock, fw_load_comp (pre-completed at probe so remove/suspend never block when resume never ran), fw_load_pending, and removing, using the strict lock order rproc->lock -> fw_load_lock and never waiting on fw_load_comp while holding either lock:
+
+- Serialize cix_dsp_rproc_load_firmware()'s state check, rproc_load_segments(), start(), and kick() under rproc->lock and fw_load_lock; reject NULL firmware, removing state, and non-RUNNING state, clearing is_resume_back on all failure/abort paths and completing fw_load_comp as the final action after unlocking both mutexes and releasing fw.
+- Serialize cix_dsp_rproc_resume()'s state check, stall, and request_firmware_nowait() under rproc->lock and fw_load_lock, guarding against duplicate in-flight loads or teardown and unwinding cleanly if request_firmware_nowait() fails synchronously.
+- Wait on fw_load_comp before acquiring rproc->lock in cix_dsp_rproc_suspend() (with timeout returning -EBUSY), then check RPROC_RUNNING and send the suspend mailbox message under rproc->lock before pm_runtime_force_suspend().
+- Mark removing = true under fw_load_lock and wait on fw_load_comp before rproc_del() in cix_dsp_rproc_remove().
+
+Signed-off-by: Clay Stan <claystan97@gmail.com>
+---
+ drivers/remoteproc/cix_dsp_rproc.c | 88 +++++++++++++++++++++++++++---
+ 1 file changed, 81 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/remoteproc/cix_dsp_rproc.c b/drivers/remoteproc/cix_dsp_rproc.c
+index 22808db..7e1e10a 100644
+--- a/drivers/remoteproc/cix_dsp_rproc.c
++++ b/drivers/remoteproc/cix_dsp_rproc.c
+@@ -3,6 +3,7 @@
+ 
+ #include <linux/acpi.h>
+ #include <linux/clk.h>
++#include <linux/completion.h>
+ #include <linux/err.h>
+ #include <linux/firmware.h>
+ #include <linux/interrupt.h>
+@@ -11,6 +12,7 @@
+ #include <linux/mailbox_client.h>
+ #include <linux/mfd/syscon.h>
+ #include <linux/module.h>
++#include <linux/mutex.h>
+ #include <linux/platform_device.h>
+ #include <linux/regmap.h>
+ #include <linux/remoteproc.h>
+@@ -41,6 +43,7 @@
+ #define CIX_AUD_CLK_NUM				(6)
+ #define CIX_MEM_REG_NUM				(8)
+ #define PM_COMP_TIMEOUT				(100)
++#define FW_LOAD_COMP_TIMEOUT			(5000)
+ #define RPROC_READY_WAIT_MAX_CNT		(3000)
+ #define MBOX_SEND_TIMEOUT			(100)
+ #define MBOX_MSG_OFFSET				(1)
+@@ -111,6 +114,10 @@ struct cix_dsp_rproc {
+ 	struct delayed_work vring_poll_work;
+ 	struct workqueue_struct *workqueue;
+ 	struct completion rsp_comp;
++	struct completion fw_load_comp;
++	struct mutex fw_load_lock;
++	bool fw_load_pending;
++	bool removing;
+ 	bool rproc_ready;
+ 	bool is_resume_back;
+ 	bool is_wdg_trigger;
+@@ -979,6 +986,9 @@ static int cix_dsp_rproc_probe(struct platform_device *pdev)
+ 	}
+ 
+ 	init_completion(&rproc_priv->rsp_comp);
++	init_completion(&rproc_priv->fw_load_comp);
++	complete_all(&rproc_priv->fw_load_comp);
++	mutex_init(&rproc_priv->fw_load_lock);
+ 	rproc->auto_boot = false;
+ 	ret = rproc_add(rproc);
+ 	if (ret) {
+@@ -1005,6 +1015,12 @@ static void cix_dsp_rproc_remove(struct platform_device *pdev)
+ 	struct rproc *rproc = platform_get_drvdata(pdev);
+ 	struct cix_dsp_rproc *rproc_priv = rproc->priv;
+ 
++	mutex_lock(&rproc_priv->fw_load_lock);
++	rproc_priv->removing = true;
++	mutex_unlock(&rproc_priv->fw_load_lock);
++
++	wait_for_completion(&rproc_priv->fw_load_comp);
++
+ 	pm_runtime_disable(&pdev->dev);
+ 	rproc_del(rproc);
+ 	destroy_workqueue(rproc_priv->workqueue);
+@@ -1061,6 +1077,13 @@ static int cix_dsp_rproc_suspend(struct device *dev)
+ 
+ 	dev_info(dev, " %s\n", __func__);
+ 
++	if (!wait_for_completion_timeout(&rproc_priv->fw_load_comp,
++					 msecs_to_jiffies(FW_LOAD_COMP_TIMEOUT))) {
++		dev_err(dev, "timed out waiting for resume firmware load\n");
++		return -EBUSY;
++	}
++
++	mutex_lock(&rproc->lock);
+ 	if (rproc->state == RPROC_RUNNING) {
+ 		reinit_completion(&rproc_priv->rsp_comp);
+ 
+@@ -1070,13 +1093,17 @@ static int cix_dsp_rproc_suspend(struct device *dev)
+ 		if (ret < 0) {
+ 			cix_dsp_mbox_dump_regs(rproc);
+ 			dev_err(dev, "PM mbox_send_message failed: %d\n", ret);
++			mutex_unlock(&rproc->lock);
+ 			return ret;
+ 		}
+ 
+ 		if (!wait_for_completion_timeout(&rproc_priv->rsp_comp,
+-						 msecs_to_jiffies(PM_COMP_TIMEOUT)))
++						 msecs_to_jiffies(PM_COMP_TIMEOUT))) {
++			mutex_unlock(&rproc->lock);
+ 			return -EBUSY;
++		}
+ 	}
++	mutex_unlock(&rproc->lock);
+ 
+ 	return pm_runtime_force_suspend(dev);
+ }
+@@ -1084,21 +1111,44 @@ static int cix_dsp_rproc_suspend(struct device *dev)
+ static void cix_dsp_rproc_load_firmware(const struct firmware *fw, void *context)
+ {
+ 	struct rproc *rproc = context;
++	struct cix_dsp_rproc *rproc_priv = rproc->priv;
+ 	int ret;
+ 
+ 	pr_info("%s\n", __func__);
++	mutex_lock(&rproc->lock);
++	mutex_lock(&rproc_priv->fw_load_lock);
++	if (rproc_priv->removing || rproc->state != RPROC_RUNNING) {
++		rproc_priv->is_resume_back = false;
++		goto out_unlock;
++	}
++
++	if (!fw) {
++		rproc_priv->is_resume_back = false;
++		dev_err(&rproc->dev, "failed to request firmware %s on resume\n",
++			rproc->firmware);
++		goto out_unlock;
++	}
++
+ 	ret = rproc_load_segments(rproc, fw);
+-	if (ret)
+-		goto out;
++	if (ret) {
++		rproc_priv->is_resume_back = false;
++		goto out_unlock;
++	}
+ 
+ 	ret = rproc->ops->start(rproc);
+-	if (ret)
+-		goto out;
++	if (ret) {
++		rproc_priv->is_resume_back = false;
++		goto out_unlock;
++	}
+ 
+ 	rproc->ops->kick(rproc, 0);
+ 
+-out:
++out_unlock:
++	rproc_priv->fw_load_pending = false;
++	mutex_unlock(&rproc_priv->fw_load_lock);
++	mutex_unlock(&rproc->lock);
+ 	release_firmware(fw);
++	complete_all(&rproc_priv->fw_load_comp);
+ }
+ 
+ static int cix_dsp_rproc_resume(struct device *dev)
+@@ -1112,9 +1162,25 @@ static int cix_dsp_rproc_resume(struct device *dev)
+ 	if (ret)
+ 		return ret;
+ 
++	mutex_lock(&rproc->lock);
++	mutex_lock(&rproc_priv->fw_load_lock);
++	if (rproc_priv->removing) {
++		mutex_unlock(&rproc_priv->fw_load_lock);
++		mutex_unlock(&rproc->lock);
++		return 0;
++	}
++
++	if (rproc_priv->fw_load_pending) {
++		mutex_unlock(&rproc_priv->fw_load_lock);
++		mutex_unlock(&rproc->lock);
++		dev_warn(dev, "resume firmware load already pending\n");
++		return -EBUSY;
++	}
++
+ 	if (rproc->state == RPROC_RUNNING) {
+ 		rproc_priv->is_resume_back = true;
+-
++		rproc_priv->fw_load_pending = true;
++		reinit_completion(&rproc_priv->fw_load_comp);
+ 		cix_dsp_rproc_stall(rproc_priv);
+ 
+ 		ret = request_firmware_nowait(THIS_MODULE,
+@@ -1125,11 +1191,19 @@ static int cix_dsp_rproc_resume(struct device *dev)
+ 					      rproc,
+ 					      cix_dsp_rproc_load_firmware);
+ 		if (ret < 0) {
++			rproc_priv->is_resume_back = false;
++			rproc_priv->fw_load_pending = false;
++			mutex_unlock(&rproc_priv->fw_load_lock);
++			mutex_unlock(&rproc->lock);
++			complete_all(&rproc_priv->fw_load_comp);
+ 			dev_err(dev, "load firmware failed: %d\n", ret);
+ 			goto err;
+ 		}
+ 	}
+ 
++	mutex_unlock(&rproc_priv->fw_load_lock);
++	mutex_unlock(&rproc->lock);
++
+ 	return 0;
+ 
+ err:
+-- 
+2.43.0
+

@@ -1,0 +1,386 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Clay Stan <claystan97@gmail.com>
+Date: Tue, 24 Nov 2026 12:09:00 +0800
+Subject: [PATCH] pinctrl: resolve ACPI hogs before publishing the controller
+
+The ACPI mapper looked up a controller in the global list even for
+its own hogs. Early publication lets a consumer get a pointer to a
+controller whose registration can still fail.
+
+Pass the known controller through the ACPI resource walk. Use it when
+the resource names its ACPI handle and keep the existing provider
+lookup for other resources. Publish only after hog setup succeeds, as
+in the original pinctrl flow.
+
+Signed-off-by: Clay Stan <claystan97@gmail.com>
+---
+diff --git a/drivers/pinctrl/core.c b/drivers/pinctrl/core.c
+--- a/drivers/pinctrl/core.c
++++ b/drivers/pinctrl/core.c
+@@ -1117,7 +1117,7 @@
+ 
+ 	if (has_acpi_companion(dev)) {
+ 		INIT_LIST_HEAD(&p->acpi_maps);
+-		ret = pinctrl_acpi_to_map(p);
++		ret = pinctrl_acpi_to_map(p, pctldev);
+ 	} else {
+ 		INIT_LIST_HEAD(&p->dt_maps);
+ 		ret = pinctrl_dt_to_map(p, pctldev);
+@@ -2260,18 +2260,13 @@
+ {
+ 	int error;
+ 
+-	/* Add to list before claiming hogs so that ACPI lookups succeed */
++	error = pinctrl_claim_hogs(pctldev);
++	if (error)
++		return error;
++
+ 	mutex_lock(&pinctrldev_list_mutex);
+ 	list_add_tail(&pctldev->node, &pinctrldev_list);
+ 	mutex_unlock(&pinctrldev_list_mutex);
+-
+-	error = pinctrl_claim_hogs(pctldev);
+-	if (error) {
+-		mutex_lock(&pinctrldev_list_mutex);
+-		list_del_init(&pctldev->node);
+-		mutex_unlock(&pinctrldev_list_mutex);
+-		return error;
+-	}
+ 
+ 	pinctrl_init_device_debugfs(pctldev);
+ 
+diff --git a/drivers/pinctrl/pinctrl-acpi.h b/drivers/pinctrl/pinctrl-acpi.h
+--- a/drivers/pinctrl/pinctrl-acpi.h
++++ b/drivers/pinctrl/pinctrl-acpi.h
+@@ -81,12 +81,12 @@
+ };
+ 
+ #ifdef CONFIG_ACPI
+-int pinctrl_acpi_to_map(struct pinctrl *p);
++int pinctrl_acpi_to_map(struct pinctrl *p, struct pinctrl_dev *hog);
+ void pinctrl_acpi_free_maps(struct pinctrl *p);
+ int pinctrl_acpi_get_pin_groups(struct acpi_device *adev,
+ 				struct list_head *group_desc_list);
+ #else
+-static inline int pinctrl_acpi_to_map(struct pinctrl *p)
++static inline int pinctrl_acpi_to_map(struct pinctrl *p, struct pinctrl_dev *hog)
+ {
+ 	return -ENXIO;
+ }
+diff --git a/drivers/pinctrl/pinctrl-acpi.c b/drivers/pinctrl/pinctrl-acpi.c
+--- a/drivers/pinctrl/pinctrl-acpi.c
++++ b/drivers/pinctrl/pinctrl-acpi.c
+@@ -19,13 +19,18 @@
+ #include "core.h"
+ #include "pinctrl-acpi.h"
+ 
++struct pinctrl_acpi_context {
++	struct pinctrl *p;
++	struct pinctrl_dev *hog;
++};
++
+ /**
+  * struct pin_config_lookup_info - context to use for pin config look up
+- * @pctrl: pinctrl descriptor
++ * @ctx: consumer and its pin controller while claiming hogs
+  * @config_maps: list of &struct config_map_info
+  */
+ struct pin_config_lookup_info {
+-	struct pinctrl *pctrl;
++	struct pinctrl_acpi_context *ctx;
+ 	struct list_head config_maps;
+ };
+ 
+@@ -145,7 +150,8 @@
+ 	return -ENOMEM;
+ }
+ 
+-static struct pinctrl_dev *get_pinctrl_dev_from_acpi_name(char *pinctrl_acpi)
++static struct pinctrl_dev *
++get_pinctrl_dev_from_acpi_name(const char *pinctrl_acpi, struct pinctrl_dev *hog)
+ {
+ 	struct pinctrl_dev *pctldev;
+ 	struct acpi_device *adev;
+@@ -156,6 +162,9 @@
+ 	status = acpi_get_handle(NULL, pinctrl_acpi, &handle);
+ 	if (ACPI_FAILURE(status))
+ 		return NULL;
++
++	if (hog && ACPI_HANDLE(hog->dev) == handle)
++		return hog;
+ 
+ 	adev = acpi_get_acpi_dev(handle);
+ 	if (!adev)
+@@ -275,9 +284,10 @@
+ }
+ 
+ static int
+-acpi_pin_resource_to_pinctrl_map(struct pinctrl *p, char *pinctrl_acpi,
+-				 struct pinctrl_acpi_resource *resource)
+-{
++acpi_pin_resource_to_pinctrl_map(struct pinctrl_acpi_context *ctx,
++				 char *pinctrl_acpi, struct pinctrl_acpi_resource *resource)
++{
++	struct pinctrl *p = ctx->p;
+ 	const struct pinctrl_ops *ops;
+ 	struct pinctrl_map *new_map;
+ 	struct pinctrl_dev *pctldev;
+@@ -288,7 +298,7 @@
+ 	const char *pinctrl_name[MAX_NUM_PINTRTL_STATE];
+ 	const char *statename = "default";
+ 
+-	pctldev = get_pinctrl_dev_from_acpi_name(pinctrl_acpi);
++	pctldev = get_pinctrl_dev_from_acpi_name(pinctrl_acpi, ctx->hog);
+ 	if (!pctldev) {
+ 		dev_err(p->dev, "pctldev with ACPI name '%s' not found\n",
+ 			pinctrl_acpi);
+@@ -323,7 +333,7 @@
+ 	return acpi_remember_or_free_map(p, statename, pctldev, new_map, num_maps);
+ }
+ 
+-static int acpi_pin_group_function_to_pinctrl_map(struct pinctrl *p,
++static int acpi_pin_group_function_to_pinctrl_map(struct pinctrl_acpi_context *ctx,
+ 						  char *pinctrl_acpi,
+ 						  int group,
+ 						  int function, int index)
+@@ -335,10 +345,10 @@
+ 		.function.function_number = function
+ 	};
+ 
+-	return acpi_pin_resource_to_pinctrl_map(p, pinctrl_acpi, &resource);
+-}
+-
+-static int acpi_pin_function_to_pinctrl_map(struct pinctrl *p,
++	return acpi_pin_resource_to_pinctrl_map(ctx, pinctrl_acpi, &resource);
++}
++
++static int acpi_pin_function_to_pinctrl_map(struct pinctrl_acpi_context *ctx,
+ 					    char *pinctrl_acpi,
+ 					    unsigned int *pins, size_t npins,
+ 					    int function, int index)
+@@ -351,11 +361,11 @@
+ 		.function.function_number = function
+ 	};
+ 
+-	return acpi_pin_resource_to_pinctrl_map(p, pinctrl_acpi, &resource);
+-}
+-
+-static int acpi_pin_config_to_pinctrl_map(struct pinctrl *p, char *pinctrl_acpi,
+-					  unsigned int pin,
++	return acpi_pin_resource_to_pinctrl_map(ctx, pinctrl_acpi, &resource);
++}
++
++static int acpi_pin_config_to_pinctrl_map(struct pinctrl_acpi_context *ctx,
++					  char *pinctrl_acpi, unsigned int pin,
+ 					  struct list_head *configs,
+ 					  size_t nconfigs)
+ {
+@@ -366,11 +376,11 @@
+ 		.config.nconfigs = nconfigs
+ 	};
+ 
+-	return acpi_pin_resource_to_pinctrl_map(p, pinctrl_acpi, &resource);
++	return acpi_pin_resource_to_pinctrl_map(ctx, pinctrl_acpi, &resource);
+ }
+ 
+ static int
+-process_pin_config_from_pin_function(struct pinctrl *p,
++process_pin_config_from_pin_function(struct pinctrl_acpi_context *ctx,
+ 				     struct acpi_resource_pin_function *ares)
+ {
+ 	struct pinctrl_acpi_config_node config_node;
+@@ -392,7 +402,7 @@
+ 
+ 	for (i = 0; i < ares->pin_table_length; i++) {
+ 		ret = acpi_pin_config_to_pinctrl_map(
+-			p, ares->resource_source.string_ptr, ares->pin_table[i],
++			ctx, ares->resource_source.string_ptr, ares->pin_table[i],
+ 			&config_node.node, 1);
+ 		if (ret < 0)
+ 			return ret;
+@@ -401,7 +411,7 @@
+ 	return 0;
+ }
+ 
+-static int process_pin_function(struct pinctrl *p,
++static int process_pin_function(struct pinctrl_acpi_context *ctx,
+ 				struct acpi_resource_pin_function *ares)
+ {
+ 	unsigned int function;
+@@ -420,10 +430,10 @@
+ 	for (i = 0; i < npins; i++)
+ 		pins[i] = ares->pin_table[i];
+ 
+-	ret = acpi_pin_function_to_pinctrl_map(p, pinctrl_acpi, pins, npins,
++	ret = acpi_pin_function_to_pinctrl_map(ctx, pinctrl_acpi, pins, npins,
+ 					       function, -1);
+ 	if (ret >= 0)
+-		ret = process_pin_config_from_pin_function(p, ares);
++		ret = process_pin_config_from_pin_function(ctx, ares);
+ 
+ 	kfree(pins);
+ 
+@@ -498,7 +508,7 @@
+ 	return 0;
+ }
+ 
+-static int process_pin_group_config(struct pinctrl *p,
++static int process_pin_group_config(struct pinctrl_acpi_context *ctx,
+ 				    struct list_head *config_maps,
+ 				    struct acpi_resource_pin_group_config *ares)
+ {
+@@ -517,9 +527,9 @@
+ 		return ret;
+ 
+ 	pinctrl_acpi = ares->resource_source.string_ptr;
+-	pctl_dev = get_pinctrl_dev_from_acpi_name(pinctrl_acpi);
++	pctl_dev = get_pinctrl_dev_from_acpi_name(pinctrl_acpi, ctx->hog);
+ 	if (!pctl_dev) {
+-		dev_err(p->dev, "pctldev with ACPI name '%s' not found\n",
++		dev_err(ctx->p->dev, "pctldev with ACPI name '%s' not found\n",
+ 			pinctrl_acpi);
+ 		return -ENXIO;
+ 	}
+@@ -543,7 +553,7 @@
+ }
+ 
+ static int
+-process_pin_group_function(struct pinctrl *p,
++process_pin_group_function(struct pinctrl_acpi_context *ctx,
+ 			   struct acpi_resource_pin_group_function *ares)
+ {
+ 	struct pinctrl_dev *pctl_dev;
+@@ -557,9 +567,9 @@
+ 	pinctrl_acpi = ares->resource_source.string_ptr;
+ 	group = ares->resource_source_label.string_ptr;
+ 
+-	pctl_dev = get_pinctrl_dev_from_acpi_name(pinctrl_acpi);
++	pctl_dev = get_pinctrl_dev_from_acpi_name(pinctrl_acpi, ctx->hog);
+ 	if (!pctl_dev) {
+-		dev_err(p->dev, "pctldev with ACPI name '%s' not found\n",
++		dev_err(ctx->p->dev, "pctldev with ACPI name '%s' not found\n",
+ 			pinctrl_acpi);
+ 		return -ENXIO;
+ 	}
+@@ -568,7 +578,7 @@
+ 	if (ares->vendor_length > 0)
+ 		state_index = ares->vendor_data[0];
+ 	gs = pinctrl_get_group_selector(pctl_dev, group);
+-	ret = acpi_pin_group_function_to_pinctrl_map(p, pinctrl_acpi,
++	ret = acpi_pin_group_function_to_pinctrl_map(ctx, pinctrl_acpi,
+ 						     gs,
+ 						     ares->function_number,
+ 						     state_index);
+@@ -579,19 +589,19 @@
+ static int parse_acpi_pin_function_resources(struct acpi_resource *ares,
+ 					     void *data)
+ {
+-	struct pinctrl *p = data;
+-	int ret;
+-
+-	dev_dbg(p->dev, "type = %d\n", ares->type);
++	struct pinctrl_acpi_context *ctx = data;
++	int ret;
++
++	dev_dbg(ctx->p->dev, "type = %d\n", ares->type);
+ 	switch (ares->type) {
+ 	case ACPI_RESOURCE_TYPE_PIN_FUNCTION:
+-		ret = process_pin_function(p, &ares->data.pin_function);
++		ret = process_pin_function(ctx, &ares->data.pin_function);
+ 		if (ret < 0)
+ 			return ret;
+ 		break;
+ 	case ACPI_RESOURCE_TYPE_PIN_GROUP_FUNCTION:
+ 		ret = process_pin_group_function(
+-			p, &ares->data.pin_group_function);
++			ctx, &ares->data.pin_group_function);
+ 		if (ret < 0)
+ 			return ret;
+ 		break;
+@@ -614,7 +624,7 @@
+ 			return ret;
+ 		break;
+ 	case ACPI_RESOURCE_TYPE_PIN_GROUP_CONFIG:
+-		ret = process_pin_group_config(info->pctrl, &info->config_maps,
++		ret = process_pin_group_config(info->ctx, &info->config_maps,
+ 					       &ares->data.pin_group_config);
+ 		if (ret < 0)
+ 			return ret;
+@@ -624,16 +634,16 @@
+ 	return 1;
+ }
+ 
+-static int parse_acpi_pin_functions(struct pinctrl *p)
++static int parse_acpi_pin_functions(struct pinctrl_acpi_context *ctx)
+ {
+ 	struct list_head res_list;
+ 	struct acpi_device *adev;
+ 	int ret;
+ 
+ 	INIT_LIST_HEAD(&res_list);
+-	adev = ACPI_COMPANION(p->dev);
++	adev = ACPI_COMPANION(ctx->p->dev);
+ 	ret = acpi_dev_get_resources(adev, &res_list,
+-				     parse_acpi_pin_function_resources, p);
++				     parse_acpi_pin_function_resources, ctx);
+ 	if (ret < 0)
+ 		return ret;
+ 
+@@ -664,16 +674,16 @@
+ 	}
+ }
+ 
+-static int parse_acpi_pin_configs(struct pinctrl *p)
+-{
+-	struct pin_config_lookup_info info = { .pctrl = p };
++static int parse_acpi_pin_configs(struct pinctrl_acpi_context *ctx)
++{
++	struct pin_config_lookup_info info = { .ctx = ctx };
+ 	struct config_map_info *config_map;
+ 	struct list_head res_list;
+ 	int ret;
+ 
+ 	INIT_LIST_HEAD(&res_list);
+ 	INIT_LIST_HEAD(&info.config_maps);
+-	ret = acpi_dev_get_resources(ACPI_COMPANION(p->dev), &res_list,
++	ret = acpi_dev_get_resources(ACPI_COMPANION(ctx->p->dev), &res_list,
+ 				     parse_acpi_pin_config_resources, &info);
+ 	if (ret < 0) {
+ 		free_config_maps(&info.config_maps);
+@@ -682,7 +692,7 @@
+ 
+ 	list_for_each_entry(config_map, &info.config_maps, node) {
+ 		ret = acpi_pin_config_to_pinctrl_map(
+-			p, config_map->pinctrl_acpi, config_map->pin,
++			ctx, config_map->pinctrl_acpi, config_map->pin,
+ 			&config_map->configs, config_map->nconfigs);
+ 		if (ret < 0)
+ 			break;
+@@ -697,21 +707,23 @@
+ /**
+  * pinctrl_acpi_to_map() - pinctrl map from ACPI pin resources for given device
+  * @p: pinctrl descriptor for the device
++ * @hog: unpublished controller when parsing its own hogs, or NULL
+  *
+  * This will parse the ACPI pin resources for the device and creates pinctrl map.
+  *
+  * Return: Returns 0 on success, negative errno on failure.
+  */
+-int pinctrl_acpi_to_map(struct pinctrl *p)
+-{
++int pinctrl_acpi_to_map(struct pinctrl *p, struct pinctrl_dev *hog)
++{
++	struct pinctrl_acpi_context ctx = { .p = p, .hog = hog };
+ 	int ret;
+ 
+ 	if (!has_acpi_companion(p->dev))
+ 		return -ENXIO;
+ 
+-	ret = parse_acpi_pin_functions(p);
++	ret = parse_acpi_pin_functions(&ctx);
+ 	if (ret >= 0)
+-		ret = parse_acpi_pin_configs(p);
++		ret = parse_acpi_pin_configs(&ctx);
+ 	if (ret < 0) {
+ 		pinctrl_acpi_free_maps(p);
+ 		return ret;

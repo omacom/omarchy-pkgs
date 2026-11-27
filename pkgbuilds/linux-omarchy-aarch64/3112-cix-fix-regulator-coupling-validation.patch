@@ -1,0 +1,176 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Clay Stan <claystan97@gmail.com>
+Date: Tue, 24 Nov 2026 12:12:00 +0800
+Subject: [PATCH] regulator: validate fwnode constraints, coupling and refcounts
+
+The vendor fwnode coupling parser allocates a spread array for each peer
+without releasing it. A reverse reference can also select an element past
+a truncated spread property. Check the index before allocating and free
+the temporary array on both success and property-read failure.
+
+Fix fwnode initial-mode mapping to consult fwnode_map_mode, check the
+allowed-modes array allocation and node names before dereferencing them,
+and avoid taking a duplicate DT node reference via config->fwnode when
+registering a Device Tree regulator without descriptor-matched init data.
+
+Signed-off-by: Clay Stan <claystan97@gmail.com>
+---
+ drivers/regulator/core.c             |  5 +++-
+ drivers/regulator/fwnode_regulator.c | 58 ++++++++++++++++++++++--------------
+ 2 files changed, 40 insertions(+), 23 deletions(-)
+
+diff --git a/drivers/regulator/core.c b/drivers/regulator/core.c
+index 18f8f42..332e5f0 100644
+--- a/drivers/regulator/core.c
++++ b/drivers/regulator/core.c
+@@ -5825,6 +5825,8 @@ static void regulator_dev_release(struct device *dev)
+ 	debugfs_remove_recursive(rdev->debugfs);
+ 	kfree(rdev->constraints);
+ 	of_node_put(rdev->dev.of_node);
++	if (!rdev->dev.of_node)
++		fwnode_handle_put(rdev->dev.fwnode);
+ 	kfree(rdev);
+ }
+ 
+@@ -6177,7 +6179,8 @@ regulator_register(struct device *dev,
+ 	if (!init_data) {
+ 		init_data = config->init_data;
+ 		rdev->dev.of_node = of_node_get(config->of_node);
+-		rdev->dev.fwnode = fwnode_handle_get(config->fwnode);
++		if (!rdev->dev.of_node)
++			rdev->dev.fwnode = fwnode_handle_get(config->fwnode);
+ 	}
+ 
+ 	ww_mutex_init(&rdev->mutex, &regulator_ww_class);
+diff --git a/drivers/regulator/fwnode_regulator.c b/drivers/regulator/fwnode_regulator.c
+index 3553928..23f6b1d 100644
+--- a/drivers/regulator/fwnode_regulator.c
++++ b/drivers/regulator/fwnode_regulator.c
+@@ -187,8 +187,8 @@ static int fwnode_get_regulation_constraints(struct device *dev,
+ 	}
+ 
+ 	if (!fwnode_property_read_u32(np, "regulator-initial-mode", &pval)) {
+-		if (desc && desc->of_map_mode) {
+-			mode = desc->of_map_mode(pval);
++		if (desc && desc->fwnode_map_mode) {
++			mode = desc->fwnode_map_mode(pval);
+ 			if (mode == REGULATOR_MODE_INVALID)
+ 				pr_err("%pFWn: invalid mode %u\n", np, pval);
+ 			else
+@@ -203,11 +203,15 @@ static int fwnode_get_regulation_constraints(struct device *dev,
+ 
+ 	if (len > 0) {
+ 		if (desc && desc->fwnode_map_mode) {
+-			void *dbuf = kzalloc(len*4, GFP_KERNEL);
++			u32 *dbuf = kcalloc(len, sizeof(*dbuf), GFP_KERNEL);
++
++			if (!dbuf)
++				return -ENOMEM;
++
+ 			ret = fwnode_property_read_u32_array(np, "regulator-allowed-modes", dbuf, len);
+ 			if (!ret) {
+ 				for (i = 0; i < len; i++) {
+-					pval = *((u32 *)dbuf + i);
++					pval = dbuf[i];
+ 					mode = desc->fwnode_map_mode(pval);
+ 					if (mode == REGULATOR_MODE_INVALID)
+ 						pr_err("%pFWn: invalid regulator-allowed-modes element %u\n",
+@@ -467,8 +471,9 @@ fwnode_handle *regulator_fwnode_get_init_node(struct device *dev,
+ 					      desc->regulators_node);
+ 	} else {
+ 		search = fwnode_handle_get(dev->fwnode);
++		name = fwnode_get_name(search);
+ 
+-		if (!strcmp(desc->fwnode_match, fwnode_get_name(search)))
++		if (name && !strcmp(desc->fwnode_match, name))
+ 			return search;
+ 	}
+ 
+@@ -484,7 +489,7 @@ fwnode_handle *regulator_fwnode_get_init_node(struct device *dev,
+ 			name = fwnode_get_name(child);
+ 		}
+ 
+-		if (!strcmp(desc->fwnode_match, name)) {
++		if (name && !strcmp(desc->fwnode_match, name)) {
+ 			fwnode_handle_put(search);
+ 			/*
+ 			 * 'fwnode_handle_get(child)' is already performed by the
+@@ -583,8 +588,8 @@ static bool fwnode_coupling_find_node(struct fwnode_handle *src,
+ 		struct fwnode_handle *tmp = fwnode_find_reference(src,
+ 					   "regulator-coupled-with", i);
+ 
+-		if (!tmp)
+-			break;
++		if (IS_ERR_OR_NULL(tmp))
++			return false;
+ 
+ 		/* found */
+ 		if (tmp == to_find)
+@@ -626,7 +631,8 @@ bool fwnode_check_coupling_data(struct regulator_dev *rdev)
+ 	/* iterate over rdev's phandles */
+ 	for (i = 0; i < n_phandles; i++) {
+ 		int max_spread = rdev->constraints->max_spread[i];
+-		int c_max_spread, c_n_phandles;
++		int c_max_spread, c_n_phandles, count;
++		u32 *spread;
+ 
+ 		if (max_spread <= 0) {
+ 			dev_err(&rdev->dev, "max_spread value invalid\n");
+@@ -636,8 +642,8 @@ bool fwnode_check_coupling_data(struct regulator_dev *rdev)
+ 		c_node = fwnode_find_reference(node,
+ 					  "regulator-coupled-with", i);
+ 
+-		if (!c_node)
+-			ret = false;
++		if (IS_ERR_OR_NULL(c_node))
++			return false;
+ 
+ 		c_n_phandles = fwnode_count_reference_with_args(c_node,
+ 							  "regulator-coupled-with",
+@@ -655,19 +661,27 @@ bool fwnode_check_coupling_data(struct regulator_dev *rdev)
+ 			goto clean;
+ 		}
+ 
+-		int count = fwnode_property_count_u32(c_node, "regulator-coupled-max-spread");
+-		if (count > 0) {
+-			void *dbuf = kzalloc(4*count, GFP_KERNEL);
+-			if (!fwnode_property_read_u32_array(c_node, "regulator-coupled-max-spread", dbuf, count)) {
+-				c_max_spread = *((u32 *)dbuf + index);
+-			} else {
+-				ret = false;
+-				goto clean;
+-			}
+-		} else {
++		count = fwnode_property_count_u32(c_node,
++						  "regulator-coupled-max-spread");
++		if (count <= index) {
++			ret = false;
++			goto clean;
++		}
++
++		spread = kcalloc(count, sizeof(*spread), GFP_KERNEL);
++		if (!spread) {
++			ret = false;
++			goto clean;
++		}
++		if (fwnode_property_read_u32_array(c_node,
++						   "regulator-coupled-max-spread",
++						   spread, count)) {
++			kfree(spread);
+ 			ret = false;
+ 			goto clean;
+ 		}
++		c_max_spread = spread[index];
++		kfree(spread);
+ 
+ 		if (c_max_spread != max_spread) {
+ 			dev_err(&rdev->dev,
+@@ -702,7 +716,7 @@ struct regulator_dev *fwnode_parse_coupled_regulator(struct regulator_dev *rdev,
+ 	struct regulator_dev *c_rdev;
+ 
+ 	c_node = fwnode_find_reference(node, "regulator-coupled-with", index);
+-	if (!c_node)
++	if (IS_ERR_OR_NULL(c_node))
+ 		return NULL;
+ 
+ 	c_rdev = fwnode_find_regulator_by_node(c_node);
