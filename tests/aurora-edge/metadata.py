@@ -261,17 +261,27 @@ class EdgeMetadataTests(unittest.TestCase):
             for package in srcinfo(name).values():
                 self.assertEqual(package['groups'], ['omarchy-platform-apple-silicon'])
 
-    def test_mesa_follows_llvm_by_soname_and_never_spirv_tools(self):
-        # llvmpipe links the system LLVM. mesa-aurora depends on 'libLLVM.so',
-        # which makepkg versions from libgallium's NEEDED soname, so an LLVM
-        # major bump blocks the upgrade instead of breaking libgallium.
+    def test_mesa_follows_llvm_by_soname_and_only_rusticl_links_spirv_tools(self):
+        # llvmpipe and Rusticl link the system LLVM. Both packages depend on
+        # 'libLLVM.so', which makepkg versions from the NEEDED soname, so an
+        # LLVM major bump blocks the upgrade instead of breaking either driver.
+        # SPIRV-Tools has no versioned soname, so only OpenCL may follow it.
         packages = srcinfo('mesa-aurora')
-        for package in packages.values():
-            self.assertNotIn('spirv-tools', package['depends'])
+        self.assertEqual(sorted(packages), ['mesa-aurora', 'opencl-aurora', 'vulkan-aurora'])
+        for name, package in packages.items():
+            if name != 'opencl-aurora':
+                self.assertNotIn('spirv-tools', package['depends'])
             self.assertNotIn('llvm-libs', package['depends'])
-        self.assertEqual([d for d in packages['mesa-aurora']['depends'] if d.startswith('libLLVM')],
-                         ['libLLVM.so'])
+        for name in ('mesa-aurora', 'opencl-aurora'):
+            self.assertEqual([d for d in packages[name]['depends'] if d.startswith('libLLVM')],
+                             ['libLLVM.so'])
         self.assertFalse([d for d in packages['vulkan-aurora']['depends'] if d.startswith('libLLVM')])
+        opencl = packages['opencl-aurora']
+        mesa = packages['mesa-aurora']
+        self.assertIn(f"mesa-aurora={mesa['epoch'][0]}:{mesa['pkgver'][0]}-{mesa['pkgrel'][0]}",
+                      opencl['depends'])
+        self.assertEqual(opencl['provides'], ['opencl-driver'])
+        self.assertEqual(opencl['conflicts'], ['opencl-mesa'])
 
     def test_mesa_epoch_and_existing_neo_versions_upgrade(self):
         installed = {'mesa-aurora': '1:26.3.0_devel-932.a0bcbcb28528',
