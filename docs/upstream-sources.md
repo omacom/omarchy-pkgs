@@ -104,7 +104,9 @@ skips drafts, so nothing lands on its own. CI still builds it. Read the bump,
 fix the recipe on the PR branch if its build fails, and mark it **Ready for
 review**: `auto-merge-pr.yml` then arms auto-merge and the PR lands once
 `result`, `self-tests` and `build-isolation` pass. A later run that finds a
-newer release updates the same PR and leaves it as it is, draft or ready.
+newer release turns a ready PR back into a draft and takes auto-merge off
+before it pushes the update (`hold-reviewed-pr.sh`), so the new release gets
+its own review.
 `review` cannot be combined with `auto_merge`, and needs an upstream watch,
 provider or hook.
 
@@ -112,17 +114,25 @@ provider or hook.
 
 The builder controller box dispatches both groups on systemd timers
 (`ci/dispatch.sh`), because GitHub's own schedule ran them hours late.
-It uses a personal access token so its PRs trigger builds and its merges trigger
-publishing without manual approval. No GitHub App is required.
+The omarchy-pkgs-sync GitHub App pushes the branches and opens the PRs, so
+they build without an approval hold. The omarchy-pkgs-merge GitHub App arms
+auto-merge, so the merges start publishing. The built-in Actions `GITHUB_TOKEN`
+can do neither.
 
-1. Use a fine-grained PAT with access to **omacom/omarchy-pkgs** and repository
-   **Contents: Read and write** and **Pull requests: Read and write** permissions.
-   Its owner must be trusted by the build workflow (for example, a collaborator).
-   The existing controller PAT can be reused when it has these permissions.
-2. In the repository's
-   [Actions secrets](https://github.com/omacom/omarchy-pkgs/settings/secrets/actions),
-   save the PAT as `PKGS_BOT_TOKEN`. Update this secret when the token is rotated
-   or expires. The built-in Actions `GITHUB_TOKEN` cannot run this unattended chain.
+1. The omarchy-pkgs-sync App is owned by the omacom organization, has no
+   webhook, and has repository **Contents: Read and write** and **Pull
+   requests: Read and write** permissions, with Workflows left at no access.
+   It is installed on **omacom/omarchy-pkgs** only. Its client ID is the
+   repository variable `PKGS_SYNC_APP_CLIENT_ID`. Its private key is the
+   secret `PKGS_SYNC_APP_KEY` in the `bot-sync` environment, whose
+   deployment branches are limited to `master`. To rotate the key, generate
+   a new one in the App's settings, replace the secret, then delete the old
+   key there.
+2. The omarchy-pkgs-merge App arms auto-merge, so the merge, and the publish
+   it starts, run as it. It is set up the same way, with the same
+   permissions, installed on **omacom/omarchy-pkgs** only. Its client ID is
+   the variable `PKGS_MERGE_APP_CLIENT_ID`, and its private key the secret
+   `PKGS_MERGE_APP_KEY` in the `bot-merge` environment, limited to `master`.
 3. Keep **Allow auto-merge** enabled and require `result`, `self-tests`, and
    `build-isolation` on `master`; the updater does not request a protection bypass.
 4. Run **Sync Upstream** once from Actions with `cadence: hourly`
@@ -218,7 +228,7 @@ in `origin` and has no effect on release selection.
 | `nautilus-dropbox` | github | [dropbox/nautilus-dropbox](https://github.com/dropbox/nautilus-dropbox) |
 | `nordvpn-bin` | debian | [https://repo.nordvpn.com/deb/nordvpn/debian/dists/stable/main/binary-amd64/Packages](https://repo.nordvpn.com/deb/nordvpn/debian/dists/stable/main/binary-amd64/Packages) |
 | `nvidia-580xx-utils` | regex | [https://download.nvidia.com/XFree86/Linux-x86_64/](https://download.nvidia.com/XFree86/Linux-x86_64/) |
-| `omarchy-chromium-bin` | github | [omacom/omarchy-chromium](https://github.com/omacom/omarchy-chromium) |
+| `nvidia-utils` (with `nvidia-open-dkms`, `lib32-nvidia-utils` and the `linux-omarchy` kernels) | hook | Arch's [nvidia-utils](https://archlinux.org/packages/extra/x86_64/nvidia-utils/) |
 | `omarchy-emacs` | git_tags | [https://github.com/scottjones/omarchy-emacs.git](https://github.com/scottjones/omarchy-emacs.git) |
 | `omazed` | git_tags | [https://github.com/aps6/omazed.git](https://github.com/aps6/omazed.git) |
 | `once-bin` | github | [basecamp/once](https://github.com/basecamp/once) |
@@ -269,13 +279,14 @@ These packages were already excluded from automatic AUR updates. The migration p
 
 `m1n1-aurora` and `uboot-asahi` are deliberate holds: Apple Silicon boot code, pinned by hand like `linux-aurora`. A bump reaches edge, which the testing team uses as the hardware qualification lane, and is promoted to rc or stable only after a cold boot on the qualification Macs. `m1n1-aurora` pins an omacom/m1n1 commit; its source and package migration are documented in pkgbuilds/m1n1-aurora/README.md. `uboot-asahi` follows asahi-alarm's recipe and patch set (asahi-alarm/PKGBUILDs), which a tag watch on AsahiLinux/u-boot cannot carry.
 
-`cua-driver-bin` is a deliberate hold: Omarchy bumps it by hand, so a Cua release ships only when a maintainer has verified it. It keeps its `.omarchy/upstream.sh` hook and `min_release_age`, so lifting the hold means removing `"sync": false`. `cua-hyprland-plugin` declares no upstream source, so no automation updates it either.
+`cua-driver-bin` is a deliberate hold: Omarchy bumps it by hand, so a Cua release ships only when a maintainer has verified it. It keeps its `.omarchy/upstream.sh` hook and `min_release_age`, so lifting the hold means removing `"sync": false`. `cua-hyprland-plugin` declares no upstream source, so no automation moves it to a new Cua release either; `sync-rebuilds` rebuilds the release it has when Hyprland or one of its ABI packages moves.
 
 `omarchy-mlx` is a deliberate hold: its wheel's filename carries a per-build stamp (`mlx_omarchy-0.32.4.dev202610050725+5c15fba-…`) that a tag watch cannot derive, so the maintainer repins `_wheel`, the vendor tar, and the checksums together. It keeps its watch, so lifting the hold means removing `"sync": false` once the wheel's name follows the release version.
 
 ## Package-specific boundaries
 
-- NVIDIA watches remain on the 580 driver branch.
+- `nvidia-580xx-utils` and `lib32-nvidia-580xx-utils` watch NVIDIA's 580 branch.
+- The current driver follows Arch's `nvidia-utils`. Its `.omarchy/upstream.sh` runs `bin/bump-nvidia` when Arch moves, which sets the release in `nvidia-utils`, `nvidia-open-dkms`, `lib32-nvidia-utils` and every `linux-omarchy` kernel's `_nvidiaver`, bumps the kernels' `pkgrel` so their `-nvidia-open` modules are rebuilt, and swaps the checksums of NVIDIA's three files. Their `"lockstep": "nvidia"` puts all of it in one PR, which `tests/nvidia-open-lockstep.sh` holds together and which builds every kernel before it merges. An ARM patch that no longer applies leaves the PR red for a maintainer. A maintainer can run `bin/bump-nvidia <version>` the same way.
 - Hardware-specific packages keep their declared architectures; this migration does not invent ARM binaries for x86-only upstreams.
 - iA Duospace was deleted upstream. Its four legacy font files retain their original immutable pin while the other families track the current repository.
 - RustDesk reads hbb_common from the release gitlink; its existing build-time dependency/toolchain checks remain in force.
@@ -287,10 +298,32 @@ These packages were already excluded from automatic AUR updates. The migration p
 `sync-upstream.yml` (both package groups) and `sync-rebuilds.yml` each run their
 sync once, split the changed recipes into one PR per package with
 `.github/scripts/package-pr-groups.sh`, and hand them to `package-prs.yml`. That
-pushes each PR with the PAT in `PKGS_BOT_TOKEN`, so its builds start without an
-approval hold, and arms auto-merge. A push to an `auto/sync-*` or
+pushes each PR as the omarchy-pkgs-sync App, so its builds start without an
+approval hold. Its `arm` job then arms auto-merge as the omarchy-pkgs-merge
+App, in a job of its own, since a job has one environment. It finds each
+group's PR from this repository into `master` and judges it by the same rule
+as `auto-merge-pr.yml`, then arms the head it judged. A push to an `auto/sync-*` or
 `auto/track-branches-*` branch does not cancel the PR's build in flight: the new
 build waits, then reuses every artifact the finished one uploaded.
+
+Each PR's description comes from `helpers/sync-pr-body.py`, which compares the
+group's recipes and `.omarchy/package.json` with `master`. It works the same for
+every source type, hooks and rebuilds included, and shows:
+
+- each package's old and new version, with the kind of jump for dotted versions;
+- the source: the GitHub repository, tag or branch, the npm or PyPI package, or
+  the feed URL;
+- the pinned variables the sync rewrote, and each source whose URL or checksum
+  changed, per architecture;
+- for a rebuild, the dependencies in `rebuilt_against` that moved;
+- the architectures, and the channels the package ships to on merge;
+- how the new bytes were checked: against GitHub's asset digests, by the
+  recorded checksums, and by `validpgpkeys`.
+
+When a source is a tag on GitHub, the description links the release and the
+compare view, and shows the release notes. The notes sit in a code fence, cut
+to 40 lines, so they render as plain text. A hidden comment at the end repeats
+the facts as JSON. If the script fails, the PR still opens with the plain body.
 
 A red PR stays open for a maintainer and holds back only its own package. A
 later run updates it if upstream moves again, and closes it once it conflicts

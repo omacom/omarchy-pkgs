@@ -32,12 +32,15 @@ function [() {
 }
 _install_sleep_hook() { echo sleep-hook >>"$CALLS"; }
 _add_pipewire_camera() { printf 'browser %s\n' "$*" >>"$CALLS"; }
+_in_chroot() { [[ ${chroot_mode:-no} == "yes" ]]; }
 systemctl() { printf 'systemctl %s\n' "$*" >>"$CALLS"; }
 usermod() { printf 'usermod %s\n' "$*" >>"$CALLS"; }
 SUDO_USER=fixture-user
+unset OMARCHY_INSTALL_USER
 
 fail() { printf 'FAIL: %s (%s, loaded=%s, %s)\n' "$*" "$hook" "$loaded" "$scenario" >&2; exit 1; }
 
+chroot_mode=no
 for hook in post_install post_upgrade; do
   for loaded in yes no; do
     for scenario in reload-fail trigger-fail tmpfiles-fail no-udev success; do
@@ -73,4 +76,23 @@ for hook in post_install post_upgrade; do
   done
 done
 
-echo 'PASS: 20 IPU7 install/upgrade warning and lifecycle cases'
+# In a chroot ISO install, SUDO_USER is unset and OMARCHY_INSTALL_USER names the
+# target user. Runtime daemon/udev/tmpfiles operations must be skipped while
+# enabling the unit and configuring the target user still run.
+chroot_mode=yes
+loaded=no
+scenario=chroot
+hook=post_install
+unset SUDO_USER
+OMARCHY_INSTALL_USER=chroot-user
+: >"$CALLS"
+output=$(set +e; post_install 2>&1) || fail "chroot post_install failed"
+[[ -z $output ]] || fail "unexpected chroot output: $output"
+! grep -q '^tmpfiles ' "$CALLS" || fail "ran tmpfiles in chroot"
+! grep -q '^udev ' "$CALLS" || fail "ran udevadm in chroot"
+! grep -q '^systemctl daemon-reload$' "$CALLS" || fail "ran daemon-reload in chroot"
+grep -qx 'systemctl enable intel-ipu7-camera.service' "$CALLS" || fail "service enable skipped in chroot"
+grep -qx 'usermod -aG video chroot-user' "$CALLS" || fail "video group grant skipped for OMARCHY_INSTALL_USER"
+grep -qx 'browser /home/chroot-user/.config/chromium-flags.conf' "$CALLS" || fail "browser flags skipped for OMARCHY_INSTALL_USER"
+
+echo 'PASS: 21 IPU7 install/upgrade warning, chroot, and lifecycle cases'

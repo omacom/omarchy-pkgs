@@ -1,0 +1,222 @@
+diff --git a/drivers/gpu/drm/ttm/ttm_bo_util.c b/drivers/gpu/drm/ttm/ttm_bo_util.c
+--- a/drivers/gpu/drm/ttm/ttm_bo_util.c
++++ b/drivers/gpu/drm/ttm/ttm_bo_util.c
+@@ -1004,11 +1004,13 @@ __ttm_bo_lru_cursor_next(struct ttm_bo_lru_cursor *curs)
+ 			break;
+ 
+ 		bo = res->bo;
+-		if (ttm_lru_walk_trylock(curs, bo))
++		if (ttm_lru_walk_trylock(curs, bo)) {
+ 			bo_locked = true;
+-		else if ((!arg->ticket && !arg->sleeping_lock) || arg->ctx->no_wait_gpu ||
+-			 arg->trylock_only)
++		} else if ((!arg->ticket && !arg->sleeping_lock) || arg->ctx->no_wait_gpu ||
++			   arg->trylock_only) {
++			curs->skipped = true;
+ 			continue;
++		}
+ 
+ 		if (!ttm_bo_get_unless_zero(bo)) {
+ 			if (curs->needs_unlock)
+@@ -1033,6 +1035,7 @@ __ttm_bo_lru_cursor_next(struct ttm_bo_lru_cursor *curs)
+ 			return bo;
+ 
+ 		ttm_bo_lru_cursor_cleanup_bo(curs);
++		curs->skipped = true;
+ 		if (ret && ret != -EALREADY)
+ 			return ERR_PTR(ret);
+ 
+diff --git a/drivers/gpu/drm/xe/xe_bo.c b/drivers/gpu/drm/xe/xe_bo.c
+--- a/drivers/gpu/drm/xe/xe_bo.c
++++ b/drivers/gpu/drm/xe/xe_bo.c
+@@ -1368,7 +1368,7 @@ xe_bo_eviction_valuable(struct ttm_buffer_object *bo, const struct ttm_place *pl
+ 	return true;
+ }
+ 
+-static bool xe_bo_bound_to_active_vm(struct xe_bo *bo)
++static struct xe_vm *xe_bo_active_vm(struct xe_bo *bo)
+ {
+ 	u64 window = (u64)READ_ONCE(xe_modparam.shrink_active_ms) * NSEC_PER_MSEC;
+ 	int divisor = READ_ONCE(xe_modparam.shrink_active_ram_divisor);
+@@ -1376,7 +1376,7 @@ static bool xe_bo_bound_to_active_vm(struct xe_bo *bo)
+ 	long limit = LONG_MAX;
+ 
+ 	if (!window)
+-		return false;
++		return NULL;
+ 
+ 	if (divisor)
+ 		limit = totalram_pages() /
+@@ -1389,10 +1389,10 @@ static bool xe_bo_bound_to_active_vm(struct xe_bo *bo)
+ 
+ 		if (!xe_vm_in_fault_mode(vm) && last && now - last < window &&
+ 		    atomic_long_read(&vm->bound_pages) <= limit)
+-			return true;
++			return vm;
+ 	}
+ 
+-	return false;
++	return NULL;
+ }
+ 
+ /**
+@@ -1415,7 +1415,7 @@ static bool xe_bo_bound_to_active_vm(struct xe_bo *bo)
+  */
+ long xe_bo_shrink(struct ttm_operation_ctx *ctx, struct ttm_buffer_object *bo,
+ 		  const struct xe_bo_shrink_flags flags,
+-		  unsigned long *scanned)
++		  unsigned long *scanned, struct xe_vm **keeper)
+ {
+ 	struct ttm_tt *tt = bo->ttm;
+ 	struct xe_ttm_tt *xe_tt = container_of(tt, struct xe_ttm_tt, ttm);
+@@ -1446,9 +1446,14 @@ long xe_bo_shrink(struct ttm_operation_ctx *ctx, struct ttm_buffer_object *bo,
+ 		goto out_unref;
+ 	}
+ 
+-	if (flags.keep_active && xe_bo_bound_to_active_vm(xe_bo) &&
+-	    try_wait_for_completion(&xe->pm_block))
+-		goto out_unref;
++	if (flags.keep_active) {
++		struct xe_vm *vm = xe_bo_active_vm(xe_bo);
++
++		if (vm && try_wait_for_completion(&xe->pm_block)) {
++			*keeper = vm;
++			goto out_unref;
++		}
++	}
+ 
+ 	/* System CCS needs gpu copy when moving PL_TT -> PL_SYSTEM */
+ 	needs_rpm = (!IS_DGFX(xe) && bo->resource->mem_type != XE_PL_SYSTEM &&
+diff --git a/drivers/gpu/drm/xe/xe_bo.h b/drivers/gpu/drm/xe/xe_bo.h
+--- a/drivers/gpu/drm/xe/xe_bo.h
++++ b/drivers/gpu/drm/xe/xe_bo.h
+@@ -624,7 +624,7 @@ struct xe_bo_shrink_flags {
+ 
+ long xe_bo_shrink(struct ttm_operation_ctx *ctx, struct ttm_buffer_object *bo,
+ 		  const struct xe_bo_shrink_flags flags,
+-		  unsigned long *scanned);
++		  unsigned long *scanned, struct xe_vm **keeper);
+ 
+ /**
+  * xe_bo_is_mem_type - Whether the bo currently resides in the given
+diff --git a/drivers/gpu/drm/xe/xe_shrinker.c b/drivers/gpu/drm/xe/xe_shrinker.c
+--- a/drivers/gpu/drm/xe/xe_shrinker.c
++++ b/drivers/gpu/drm/xe/xe_shrinker.c
+@@ -83,14 +83,17 @@ static int __xe_shrinker_walk(struct xe_shrinker *shrinker,
+ 			      struct ttm_operation_ctx *ctx,
+ 			      const struct xe_bo_shrink_flags flags,
+ 			      unsigned long to_scan, unsigned long *scanned,
+-			      unsigned long *freed)
++			      unsigned long *freed, bool *all_kept)
+ {
++	struct ttm_operation_ctx wait_ctx = *ctx;
+ 	struct xe_device *xe = shrinker->xe;
+ 	unsigned int mem_type;
+ 	bool rpm = false;
+ 	int ret = 0;
+ 	s64 lret;
+ 
++	wait_ctx.no_wait_gpu = false;
++	*all_kept = true;
+ 	for (mem_type = XE_PL_SYSTEM; mem_type <= XE_PL_TT; ++mem_type) {
+ 		struct ttm_resource_manager *man = ttm_manager_type(&xe->ttm, mem_type);
+ 		struct ttm_bo_lru_cursor curs;
+@@ -105,16 +108,25 @@ static int __xe_shrinker_walk(struct xe_shrinker *shrinker,
+ 
+ 		if (mem_type != XE_PL_SYSTEM && !rpm &&
+ 		    xe_device_is_l2_flush_optimized(xe)) {
+-			if (!__xe_shrinker_runtime_pm_get(shrinker))
++			if (!__xe_shrinker_runtime_pm_get(shrinker)) {
++				*all_kept = false;
+ 				break;
++			}
+ 			rpm = true;
+ 		}
+ 
+ 		ttm_bo_lru_for_each_reserved_guarded(&curs, man, &arg, ttm_bo) {
+-			if (!ttm_bo_shrink_suitable(ttm_bo, ctx))
++			struct xe_vm *keeper = NULL;
++
++			if (!ttm_bo_shrink_suitable(ttm_bo, ctx)) {
++				if (ttm_bo_shrink_suitable(ttm_bo, &wait_ctx))
++					*all_kept = false;
+ 				continue;
++			}
+ 
+-			lret = xe_bo_shrink(ctx, ttm_bo, flags, scanned);
++			lret = xe_bo_shrink(ctx, ttm_bo, flags, scanned, &keeper);
++			if (!keeper)
++				*all_kept = false;
+ 			/* Like the TTM LRU walk, skip bos we can't shrink now. */
+ 			if (lret == -EBUSY)
+ 				lret = 0;
+@@ -129,6 +141,8 @@ static int __xe_shrinker_walk(struct xe_shrinker *shrinker,
+ 		}
+ 		/* Trylocks should never error, just fail. */
+ 		xe_assert(xe, !IS_ERR(ttm_bo));
++		if (curs.skipped)
++			*all_kept = false;
+ 	}
+ 
+ out:
+@@ -151,26 +165,27 @@ static int xe_shrinker_walk(struct xe_shrinker *shrinker,
+ {
+ 	bool no_wait_gpu = true;
+ 	struct xe_bo_shrink_flags save_flags = flags;
++	bool all_kept;
+ 	int ret;
+ 
+ 	swap(no_wait_gpu, ctx->no_wait_gpu);
+ 	save_flags.writeback = false;
+ 	ret = __xe_shrinker_walk(shrinker, ctx, save_flags, to_scan, scanned,
+-				 freed);
++				 freed, &all_kept);
+ 	swap(no_wait_gpu, ctx->no_wait_gpu);
+-	if (ret || *scanned >= to_scan)
++	if (ret || *scanned >= to_scan || all_kept)
+ 		return ret;
+ 
+ 	if (!ctx->no_wait_gpu) {
+ 		ret = __xe_shrinker_walk(shrinker, ctx, save_flags, to_scan, scanned,
+-					 freed);
++					 freed, &all_kept);
+ 		if (ret || *scanned >= to_scan)
+ 			return ret;
+ 	}
+ 
+ 	if (flags.writeback)
+ 		ret = __xe_shrinker_walk(shrinker, ctx, flags, to_scan, scanned,
+-					 freed);
++					 freed, &all_kept);
+ 
+ 	return ret;
+ }
+@@ -187,6 +202,7 @@ void xe_shrinker_backup_for_hibernation(struct xe_shrinker *shrinker)
+ 	};
+ 	unsigned long to_scan, scanned = 0, freed = 0;
+ 	ktime_t start = ktime_get();
++	bool all_kept;
+ 	int ret;
+ 
+ 	if (!READ_ONCE(xe_modparam.hibernate_writeback) || IS_DGFX(shrinker->xe) ||
+@@ -197,7 +213,8 @@ void xe_shrinker_backup_for_hibernation(struct xe_shrinker *shrinker)
+ 	to_scan = shrinker->shrinkable_pages + shrinker->purgeable_pages;
+ 	read_unlock(&shrinker->lock);
+ 
+-	ret = __xe_shrinker_walk(shrinker, &ctx, flags, to_scan, &scanned, &freed);
++	ret = __xe_shrinker_walk(shrinker, &ctx, flags, to_scan, &scanned, &freed,
++				 &all_kept);
+ 	drm_info(&shrinker->xe->drm,
+ 		 "Hibernation writeback: %lu of %lu pages scanned, %lu freed in %lld ms (%d)\n",
+ 		 scanned, to_scan, freed, ktime_ms_delta(ktime_get(), start), ret);
+diff --git a/include/drm/ttm/ttm_bo.h b/include/drm/ttm/ttm_bo.h
+--- a/include/drm/ttm/ttm_bo.h
++++ b/include/drm/ttm/ttm_bo.h
+@@ -507,6 +507,7 @@ struct ttm_bo_lru_cursor {
+ 	 * unlock before the next iteration or after loop exit.
+ 	 */
+ 	bool needs_unlock;
++	bool skipped;
+ 	/** @arg: Pointer to common BO LRU walk arguments. */
+ 	struct ttm_lru_walk_arg *arg;
+ };
