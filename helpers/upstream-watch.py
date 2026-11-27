@@ -5,25 +5,28 @@ The watch selects release metadata. Sources, supported architectures, integrity
 algorithms and packaging behavior stay in the checked-in PKGBUILD. Only release
 scalars and checksum arrays are replaced, atomically, after every source passes.
 """
-import argparse
-import datetime as dt
-import gzip
-import hashlib
 import io
 import json
-import lzma
 import os
 import posixpath
 from pathlib import Path
 import re
-import stat
-import subprocess
 import sys
-import tarfile
-import tempfile
 from urllib.parse import quote, urlsplit
-import zipfile
-import zlib
+
+_FAST_VALIDATE = (__name__ == "__main__" and len(sys.argv) == 3 and sys.argv[1] == "validate")
+if not _FAST_VALIDATE:
+    import argparse
+    import datetime as dt
+    import gzip
+    import hashlib
+    import lzma
+    import stat
+    import subprocess
+    import tarfile
+    import tempfile
+    import zipfile
+    import zlib
 
 PROVIDERS = {"github", "git_tags", "git_branch", "npm", "pypi", "debian", "json", "regex", "archive", "redirect"}
 VERSION = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+]*\Z")
@@ -35,7 +38,8 @@ REDIRECT_PROBES = 5
 
 
 def run(args, **kwargs):
-    return subprocess.check_output(args, **kwargs)
+    import subprocess as _sp
+    return _sp.check_output(args, **kwargs)
 
 
 def vercmp(a, b):
@@ -778,6 +782,16 @@ def main():
 
 
 if __name__ == "__main__":
+    if _FAST_VALIDATE:
+        try:
+            package = Path(sys.argv[2]).resolve()
+            validate(json.loads((package / ".omarchy/package.json").read_text())["upstream"]["watch"])
+        except Exception as error:
+            if not isinstance(error, (ValueError, KeyError, TypeError, IndexError, re.error, OSError)) and type(error).__name__ != "CalledProcessError":
+                raise
+            print(f"upstream watch failed: {error}", file=sys.stderr)
+            sys.exit(1)
+        sys.exit(0)
     try:
         main()
     except (ValueError, KeyError, TypeError, IndexError, re.error, OSError, subprocess.CalledProcessError) as error:

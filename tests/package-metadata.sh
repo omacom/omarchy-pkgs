@@ -11,10 +11,29 @@ T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
 pass() { echo "PASS: $1"; }
 fail() { echo "FAIL: $1"; exit 1; }
 
-invalid=()
-for pkgdir in "$ROOT"/pkgbuilds/*/; do
-  out=$(validate_package_metadata "${pkgdir%/}" 2>&1) || invalid+=("$out")
+workers=$(nproc 2>/dev/null || echo 1)
+if [[ -r /sys/fs/cgroup/cpu.max ]]; then
+  read -r quota period < /sys/fs/cgroup/cpu.max || true
+  if [[ "${quota:-max}" != "max" && -n "${period:-}" && "$period" -gt 0 ]]; then
+    q=$(( (quota + period - 1) / period ))
+    (( q < 1 )) && q=1
+    (( q < workers )) && workers=$q
+  fi
+fi
+pkgdirs=("$ROOT"/pkgbuilds/*/)
+pids=()
+for (( w = 0; w < workers; w++ )); do
+  (
+    for (( i = w; i < ${#pkgdirs[@]}; i += workers )); do
+      if ! out=$(validate_package_metadata "${pkgdirs[i]%/}" 2>&1); then
+        printf '%s\n' "${out:-${pkgdirs[i]%/}: validation failed}"
+      fi
+    done
+  ) > "$T/invalid-$w" &
+  pids+=($!)
 done
+for p in "${pids[@]}"; do wait "$p"; done
+mapfile -t invalid < <(cat "$T"/invalid-* | sed '/^$/d')
 (( ${#invalid[@]} == 0 )) && pass "every package's metadata is valid" || fail "$(printf '%s; ' "${invalid[@]}")"
 
 mkdir -p "$T/fast-rebuild/.omarchy"
@@ -46,3 +65,12 @@ out=$(review review-auto "{\"source\": \"local\", \"review\": true, \"auto_merge
 [[ $out == *"cannot also set auto_merge"* ]] && pass "review with auto_merge is refused" || fail "unexpected message: $out"
 out=$(review review-nowatch '{"source": "local", "review": true}') && fail "review without a watch accepted"
 [[ $out == *"only an upstream watch"* ]] && pass "review without a watch is refused" || fail "unexpected message: $out"
+
+# A five-minute package leaves the hourly group, which would otherwise push the
+# same auto/track-branches PR from a second, concurrent run.
+mkdir -p "$T/five/.omarchy"
+echo "{\"source\": \"local\", \"auto_merge\": true, \"sync_cadence\": \"five-minute\", $watch}" > "$T/five/.omarchy/package.json"
+package_in_lane "$T/five" five-minute && ! package_in_lane "$T/five" auto-merge &&
+  pass "a five-minute package syncs only in the five-minute group" || fail "a five-minute package is in the hourly group"
+out=$(review five-reviewed "{\"source\": \"local\", \"sync_cadence\": \"five-minute\", $watch}") && fail "five-minute without auto_merge accepted"
+[[ $out == *"only an auto-merged package"* ]] && pass "five-minute without auto_merge is refused" || fail "unexpected message: $out"

@@ -1,0 +1,112 @@
+From bc49029139a6b44098f84332d5142ded176b20bc Mon Sep 17 00:00:00 2001
+From: Spencer Bull <spencerbull2554@gmail.com>
+Date: Fri, 27 Nov 2026 11:58:14 -0600
+Subject: [PATCH] platform-profile: Cache the value written when emulating
+ power-saver
+
+When the platform choices offer neither low-power nor quiet, power-saver is
+emulated by writing balanced. Caching the requested power-saver profile
+makes the file-monitor event for that write look like an external switch to
+balanced, which also resets the CPU's energy preference. A direct switch
+from performance therefore reverts, while switching via balanced avoids the
+write and works.
+
+Cache the mapped platform value instead. A readback that maps to the cached
+profile, as the one from our own write now does, is ignored; a readback that
+maps to another profile still propagates as an external change. The
+integration test takes both paths into power-saver, waits for the daemon to
+read back the emulated write, and checks the CPU energy preference and
+external changes, under both D-Bus names.
+
+This is an upstream power-profiles-daemon 0.30 bug, also present on upstream
+main at 1a151cc. The class-interface fallback patch does not change it.
+---
+ src/ppd-driver-platform-profile.c |  4 ++-
+ tests/integration_test.py         | 56 +++++++++++++++++++++++++++++++
+ 2 files changed, 59 insertions(+), 1 deletion(-)
+
+diff --git a/src/ppd-driver-platform-profile.c b/src/ppd-driver-platform-profile.c
+index c1a54f7..94795b6 100644
+--- a/src/ppd-driver-platform-profile.c
++++ b/src/ppd-driver-platform-profile.c
+@@ -272,7 +272,9 @@ ppd_driver_platform_profile_activate_profile (PpdDriver                   *drive
+   g_signal_handler_unblock (G_OBJECT (self->acpi_platform_profile_mon), self->acpi_platform_profile_changed_id);
+ 
+   g_debug ("Successfully switched to profile %s", ppd_profile_to_str (profile));
+-  self->acpi_platform_profile = profile;
++  /* Cache what was written: emulated power-saver writes balanced, and the
++   * monitor event for that write must not read as an external change. */
++  self->acpi_platform_profile = acpi_platform_profile_value_to_profile (platform_profile_value);
+   return TRUE;
+ }
+ 
+diff --git a/tests/integration_test.py b/tests/integration_test.py
+index b6b7a47..8b5d223 100644
+--- a/tests/integration_test.py
++++ b/tests/integration_test.py
+@@ -2839,6 +2839,62 @@ class Tests(dbusmock.DBusTestCase):
+         profiles = self.get_dbus_property("Profiles")
+         self.assertEqual(profiles[0]["PlatformDriver"], "placeholder")
+ 
++    def test_platform_profile_emulated_power_saver(self):
++        """Emulated power-saver survives the readback of its own balanced write"""
++        self.create_platform_profile()
++        acpi_dir = os.path.join(self.testbed.get_root_dir(), "sys/firmware/acpi")
++        self.write_file_contents(
++            os.path.join(acpi_dir, "platform_profile_choices"),
++            "balanced performance\n",
++        )
++        platform_profile = os.path.join(acpi_dir, "platform_profile")
++        policy = os.path.join(
++            self.testbed.get_root_dir(), "sys/devices/system/cpu/cpufreq/policy0"
++        )
++        os.makedirs(policy)
++        self.write_file_contents(os.path.join(policy, "scaling_governor"), "powersave\n")
++        epp = os.path.join(policy, "energy_performance_preference")
++        self.write_file_contents(epp, "performance\n")
++        pstate = os.path.join(
++            self.testbed.get_root_dir(), "sys/devices/system/cpu/intel_pstate"
++        )
++        os.makedirs(pstate)
++        self.write_file_contents(os.path.join(pstate, "status"), "active\n")
++        self.write_file_contents(os.path.join(pstate, "no_turbo"), "0\n")
++        self.write_file_contents(os.path.join(pstate, "turbo_pct"), "1\n")
++        self.start_daemon()
++        profiles = self.get_dbus_property("Profiles")
++        self.assertEqual(profiles[0]["CpuDriver"], "intel_pstate")
++        self.assertEqual(profiles[0]["PlatformDriver"], "platform_profile")
++
++        # From balanced no platform write is needed, so emulation already works.
++        self.set_dbus_property("ActiveProfile", GLib.Variant.new_string("power-saver"))
++        self.assert_dbus_property_eventually_is("ActiveProfile", "power-saver")
++        self.assert_file_eventually_contains(epp, "power")
++
++        self.set_dbus_property("ActiveProfile", GLib.Variant.new_string("performance"))
++        self.assert_dbus_property_eventually_is("ActiveProfile", "performance")
++        self.assert_file_eventually_contains(platform_profile, "performance")
++        self.assert_file_eventually_contains(epp, "performance")
++
++        # This writes balanced. Wait for the daemon to read its own write back,
++        # the event that was taken for an external switch, before checking.
++        readback = "is now 'balanced', so profile is detected as balanced"
++        readbacks = self.count_text_in_log(readback)
++        self.set_dbus_property("ActiveProfile", GLib.Variant.new_string("power-saver"))
++        self.assert_file_eventually_contains(platform_profile, "balanced")
++        self.assert_eventually(lambda: self.count_text_in_log(readback) > readbacks)
++        self.assertEqual(self.get_dbus_property("ActiveProfile"), "power-saver")
++        self.assertEqual(self.read_file_contents(epp), b"power")
++
++        # Real external changes must still propagate to the CPU and D-Bus.
++        self.write_file_contents(platform_profile, "performance\n")
++        self.assert_dbus_property_eventually_is("ActiveProfile", "performance")
++        self.assert_file_eventually_contains(epp, "performance")
++        self.write_file_contents(platform_profile, "balanced\n")
++        self.assert_dbus_property_eventually_is("ActiveProfile", "balanced")
++        self.assert_file_eventually_contains(epp, "balance_performance")
++
+     def test_hp_wmi(self):
+         # Uses cool instead of low-power
+         acpi_dir = os.path.join(self.testbed.get_root_dir(), "sys/firmware/acpi/")
+-- 
+2.56.1
+
