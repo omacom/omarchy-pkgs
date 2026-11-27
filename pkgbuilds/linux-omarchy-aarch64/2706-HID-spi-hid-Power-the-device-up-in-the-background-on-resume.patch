@@ -1,0 +1,185 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: "Caleb E." <158400752+FoxesRCool1@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 15:30:00 +0800
+Subject: [PATCH] HID: spi-hid: Power the device up in the background on resume
+
+On the Surface Laptop 7 the touchpad and touchscreen are both HID over
+SPI, and they hold up system resume from deep suspend by 4.4 s of the
+6.4 s the kernel needs. Each resume callback asserts reset for 100 ms,
+switches the supply on, sleeps the 1000 ms post-power-on delay, and then
+calls the HID driver's reset_resume. hid-multitouch sends a SET_REPORT
+from there, but the device is still answering its reset with its
+descriptors, so the request is lost and times out after 1 s
+("Response timed out", "failed to set report"). The two devices resume
+one after the other, and the display comes on only after both.
+
+Do the power up in a work item and return from the resume callback at
+once, as the panel follower path already does. In the work, wait for
+the reset work to finish its descriptor handshake (at most 2 s) before
+reset_resume, so the HID driver's requests reach a ready device. Clear
+SPI_HID_READY when the device is powered down for suspend: the reset on
+power up is expected, and is no longer reported (and counted) as a
+spontaneous firmware reset. Suspend flushes a pending resume work first,
+and remove cancels it.
+---
+ drivers/hid/spi-hid/spi-hid-core.c | 54 ++++++++++++++++++++++++++----
+ drivers/hid/spi-hid/spi-hid-core.h |  3 ++
+ 2 files changed, 51 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/hid/spi-hid/spi-hid-core.c b/drivers/hid/spi-hid/spi-hid-core.c
+index e04810d..972810d 100644
+--- a/drivers/hid/spi-hid/spi-hid-core.c
++++ b/drivers/hid/spi-hid/spi-hid-core.c
+@@ -70,6 +70,7 @@
+ 
+ #define SPI_HID_MAX_RESET_ATTEMPTS	3
+ #define SPI_HID_RESP_TIMEOUT		1000
++#define SPI_HID_RESET_TIMEOUT		2000
+ 
+ /* Protocol message size constants */
+ #define SPI_HID_OUTPUT_HEADER_LEN		8
+@@ -422,6 +423,8 @@ static int spi_hid_suspend(struct spi_hid *shid)
+ 
+ 	if (!device_may_wakeup(dev)) {
+ 		set_bit(SPI_HID_RESET_PENDING, &shid->flags);
++		/* The device resets on power up, it is not spontaneous. */
++		clear_bit(SPI_HID_READY, &shid->flags);
+ 
+ 		shid->ops->assert_reset(shid->ops);
+ 
+@@ -448,11 +451,10 @@ static int spi_hid_resume(struct spi_hid *shid)
+ {
+ 	int error;
+ 	struct device *dev = &shid->spi->dev;
++	bool powered_up = false;
+ 
+-	guard(mutex)(&shid->power_lock);
+-
+-	if (!device_may_wakeup(dev)) {
+-		if (shid->power_state == HIDSPI_OFF) {
++	scoped_guard(mutex, &shid->power_lock) {
++		if (!device_may_wakeup(dev) && shid->power_state == HIDSPI_OFF) {
+ 			shid->ops->assert_reset(shid->ops);
+ 
+ 			shid->ops->sleep_minimal_reset_delay(shid->ops);
+@@ -465,11 +467,26 @@ static int spi_hid_resume(struct spi_hid *shid)
+ 				return error;
+ 			}
+ 			shid->power_state = HIDSPI_ON;
++			reinit_completion(&shid->reset_done);
++			powered_up = true;
+ 			shid->ops->deassert_reset(shid->ops);
+ 		}
++
++		enable_irq(shid->spi->irq);
+ 	}
+ 
+-	enable_irq(shid->spi->irq);
++	/*
++	 * After a power cycle the device answers the reset with its device
++	 * and report descriptors. Requests sent before that are lost, so let
++	 * the reset work finish before the HID driver restores its state.
++	 * The power lock is not held here because the reset work takes it.
++	 */
++	if (powered_up &&
++	    !wait_for_completion_timeout(&shid->reset_done,
++					 msecs_to_jiffies(SPI_HID_RESET_TIMEOUT)))
++		dev_warn(dev, "no reset response after power up\n");
++
++	guard(mutex)(&shid->power_lock);
+ 
+ 	if (shid->hid) {
+ 		error = hid_driver_reset_resume(shid->hid);
+@@ -851,6 +868,7 @@ static void spi_hid_reset_work(struct work_struct *work)
+ 		} else {
+ 			dev_err(dev, "%s: Powered off, returning\n", __func__);
+ 		}
++		complete_all(&shid->reset_done);
+ 		resched = true;
+ 	} else if (test_and_clear_bit(SPI_HID_ERROR, &shid->flags)) {
+ 		spi_hid_error_handler(shid);
+@@ -1485,6 +1503,16 @@ static int spi_hid_dev_init(struct spi_hid *shid)
+ 	return 0;
+ }
+ 
++static void spi_hid_resume_work(struct work_struct *work)
++{
++	struct spi_hid *shid = container_of(work, struct spi_hid, resume_work);
++	int error;
++
++	error = spi_hid_resume(shid);
++	if (error)
++		dev_warn(&shid->spi->dev, "Resume failed: %d\n", error);
++}
++
+ static void spi_hid_panel_follower_work(struct work_struct *work)
+ {
+ 	struct spi_hid *shid = container_of(work, struct spi_hid,
+@@ -1588,9 +1616,11 @@ int spi_hid_core_probe(struct spi_device *spi, struct spihid_ops *ops,
+ 	mutex_init(&shid->power_lock);
+ 	mutex_init(&shid->io_lock);
+ 	init_completion(&shid->output_done);
++	init_completion(&shid->reset_done);
+ 
+ 	INIT_WORK(&shid->reset_work, spi_hid_reset_work);
+ 	INIT_WORK(&shid->panel_follower_work, spi_hid_panel_follower_work);
++	INIT_WORK(&shid->resume_work, spi_hid_resume_work);
+ 
+ 	/*
+ 	 * We need to allocate the buffer without knowing the maximum
+@@ -1646,6 +1676,8 @@ void spi_hid_core_remove(struct spi_device *spi)
+ 	struct device *dev = &spi->dev;
+ 	int error;
+ 
++	cancel_work_sync(&shid->resume_work);
++
+ 	if (shid->is_panel_follower)
+ 		drm_panel_remove_follower(&shid->panel_follower);
+ 	else
+@@ -1674,6 +1706,9 @@ static int spi_hid_core_pm_suspend(struct device *dev)
+ 	if (shid->is_panel_follower)
+ 		return 0;
+ 
++	/* Let a resume that is still powering the device up finish first. */
++	flush_work(&shid->resume_work);
++
+ 	return spi_hid_suspend(shid);
+ }
+ 
+@@ -1684,7 +1719,14 @@ static int spi_hid_core_pm_resume(struct device *dev)
+ 	if (shid->is_panel_follower)
+ 		return 0;
+ 
+-	return spi_hid_resume(shid);
++	/*
++	 * Powering the device up takes more than a second (power-on delay,
++	 * reset and descriptor handshake). Do it in the background so the
++	 * rest of the system, and the user, don't wait for it.
++	 */
++	schedule_work(&shid->resume_work);
++
++	return 0;
+ }
+ 
+ const struct dev_pm_ops spi_hid_core_pm = {
+diff --git a/drivers/hid/spi-hid/spi-hid-core.h b/drivers/hid/spi-hid/spi-hid-core.h
+index ffe3e4b..9da4a06 100644
+--- a/drivers/hid/spi-hid/spi-hid-core.h
++++ b/drivers/hid/spi-hid/spi-hid-core.h
+@@ -77,6 +77,7 @@ struct spi_hid {
+ 
+ 	struct work_struct reset_work;
+ 	struct work_struct panel_follower_work;
++	struct work_struct resume_work;
+ 
+ 	/* Control lock to ensure complete output transaction. */
+ 	struct mutex output_lock;
+@@ -86,6 +87,8 @@ struct spi_hid {
+ 	struct mutex io_lock;
+ 
+ 	struct completion output_done;
++	/* Completed when the device has answered a reset with its descriptors. */
++	struct completion reset_done;
+ 
+ 	u8 read_approval_header[SPI_HID_READ_APPROVAL_MAX_LEN];
+ 	u8 read_approval_body[SPI_HID_READ_APPROVAL_MAX_LEN];
