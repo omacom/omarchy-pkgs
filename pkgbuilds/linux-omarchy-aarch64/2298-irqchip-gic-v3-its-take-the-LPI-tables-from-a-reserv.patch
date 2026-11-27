@@ -1,0 +1,144 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Birk Skyum <birk.skyum@pm.me>
+Date: Mon, 23 Nov 2026 11:22:28 +0100
+Subject: [PATCH] irqchip/gic-v3-its: take the LPI tables from a
+ reserved-memory region
+
+On this GIC, GICR_CTLR.EnableLPIs cannot be cleared once set (the previous
+patch measured -EBUSY on all 12 redistributors of the Snapdragon X1), so a
+kernel restored from hibernation can never point the redistributors at its
+own LPI tables: they keep the ones the loader kernel allocated, which are
+ordinary memory in the restored kernel.
+
+Let the device tree give the GIC node a memory-region. When it is mapped
+memory that holds the property table and nr_cpu_ids pending tables, every
+boot places them there, the hibernation loader included, so the loader and
+the restored kernel use the same physical tables and the restored image
+brings its LPI configuration to where the GIC reads it. With fixed tables,
+also remap and invalidate the boot CPU's collection on every ITS restore,
+since its redistributor may still cache the loader's configuration.
+Without a memory-region nothing changes.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/irqchip/irq-gic-v3-its.c | 68 ++++++++++++++++++++++++++++++--
+ 1 file changed, 65 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/irqchip/irq-gic-v3-its.c b/drivers/irqchip/irq-gic-v3-its.c
+index 002108971..366e6948c 100644
+--- a/drivers/irqchip/irq-gic-v3-its.c
++++ b/drivers/irqchip/irq-gic-v3-its.c
+@@ -28,6 +28,7 @@
+ #include <linux/of_address.h>
+ #include <linux/of_irq.h>
+ #include <linux/of_pci.h>
++#include <linux/of_reserved_mem.h>
+ #include <linux/of_platform.h>
+ #include <linux/percpu.h>
+ #include <linux/set_memory.h>
+@@ -2316,6 +2317,53 @@ static int gic_reserve_range(phys_addr_t addr, unsigned long size)
+ 	return 0;
+ }
+ 
++/*
++ * Hibernation on bare metal: the image is restored by a freshly booted kernel
++ * that has enabled LPIs with its own property and pending tables, and on many
++ * GICs (the Snapdragon X1's included) GICR_CTLR.EnableLPIs cannot be cleared
++ * again, so the restored kernel can never point the redistributors at its own
++ * tables. A device tree can give the GIC node a memory-region for them: every
++ * boot then puts the property table and the per-CPU pending tables at the same
++ * physical addresses, the loader and the restored kernel agree, and the image
++ * brings its LPI configuration to where the GIC reads it. The region must be
++ * mapped memory (no no-map) and hold the property table and nr_cpu_ids
++ * pending tables, 64 KiB aligned. Without one the tables are allocated.
++ */
++static phys_addr_t its_lpi_region __initdata;
++static bool its_lpi_tables_fixed __ro_after_init;
++
++static void __init its_lpi_region_init(struct device_node *np)
++{
++	phys_addr_t need = LPI_PROPBASE_SZ + (phys_addr_t)nr_cpu_ids * LPI_PENDBASE_SZ;
++	struct reserved_mem *rmem;
++	struct device_node *mem;
++
++	if (!np)
++		return;
++	mem = of_parse_phandle(np, "memory-region", 0);
++	if (!mem)
++		return;
++	rmem = of_reserved_mem_lookup(mem);
++	of_node_put(mem);
++	if (!rmem || rmem->size < need || !IS_ALIGNED(rmem->base, SZ_64K) ||
++	    !memblock_is_map_memory(rmem->base) ||
++	    !memblock_is_map_memory(rmem->base + need - 1)) {
++		pr_warn("GICv3: LPI table memory-region is not usable, allocating the tables\n");
++		return;
++	}
++	its_lpi_region = rmem->base;
++}
++
++static struct page *__init its_lpi_region_pend_page(int cpu)
++{
++	phys_addr_t pa = its_lpi_region + LPI_PROPBASE_SZ + cpu * LPI_PENDBASE_SZ;
++	void *va = phys_to_virt(pa);
++
++	memset(va, 0, LPI_PENDBASE_SZ);
++	gic_flush_dcache_to_poc(va, LPI_PENDBASE_SZ);
++	return phys_to_page(pa);
++}
++
+ static int __init its_setup_lpi_prop_table(void)
+ {
+ 	if (gic_rdists->flags & RDIST_FLAGS_RD_TABLES_PREALLOCATED) {
+@@ -2335,7 +2383,13 @@ static int __init its_setup_lpi_prop_table(void)
+ 		lpi_id_bits = min_t(u32,
+ 				    GICD_TYPER_ID_BITS(gic_rdists->gicd_typer),
+ 				    ITS_MAX_LPI_NRBITS);
+-		page = its_allocate_prop_table(GFP_NOWAIT);
++		if (its_lpi_region) {
++			page = phys_to_page(its_lpi_region);
++			gic_reset_prop_table(page_address(page));
++			its_lpi_tables_fixed = true;
++		} else {
++			page = its_allocate_prop_table(GFP_NOWAIT);
++		}
+ 		if (!page) {
+ 			pr_err("Failed to allocate PROPBASE\n");
+ 			return -ENOMEM;
+@@ -3096,7 +3150,10 @@ static int __init allocate_lpi_tables(void)
+ 	for_each_possible_cpu(cpu) {
+ 		struct page *pend_page;
+ 
+-		pend_page = its_allocate_pending_table(GFP_NOWAIT);
++		if (its_lpi_tables_fixed)
++			pend_page = its_lpi_region_pend_page(cpu);
++		else
++			pend_page = its_allocate_pending_table(GFP_NOWAIT);
+ 		if (!pend_page) {
+ 			pr_err("Failed to allocate PENDBASE for CPU%d\n", cpu);
+ 			return -ENOMEM;
+@@ -5189,8 +5246,12 @@ static void its_restore_enable(void *data)
+ 		 * Reinit the collection if it's stored in the ITS. This is
+ 		 * indicated by the col_id being less than the HCC field.
+ 		 * CID < HCC as specified in the GIC v3 Documentation.
++		 * With fixed LPI tables, also after a hibernation restore:
++		 * the redistributor may still cache the LPI configuration of
++		 * the kernel that loaded the image (the other CPUs get MAPC
++		 * and INVALL when they come back online).
+ 		 */
+-		if (rd_reinit || its->collections[smp_processor_id()].col_id <
++		if (rd_reinit || its_lpi_tables_fixed || its->collections[smp_processor_id()].col_id <
+ 		    GITS_TYPER_HCC(gic_read_typer(base + GITS_TYPER)))
+ 			its_cpu_init_collection(its);
+ 	}
+@@ -5954,6 +6015,7 @@ int __init its_init(struct fwnode_handle *handle, struct rdists *rdists,
+ 		return -ENXIO;
+ 	}
+ 
++	its_lpi_region_init(of_node);
+ 	err = allocate_lpi_tables();
+ 	if (err)
+ 		return err;
+-- 
+2.56.1
+

@@ -1,0 +1,192 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Birk Skyum <birk.skyum@pm.me>
+Date: Mon, 23 Nov 2026 11:22:26 +0100
+Subject: [PATCH] drm/msm/a6xx: re-establish GMU state after a hibernation
+ restore
+
+After a hibernation restore the GPU has been power cycled, and set up again
+only if the kernel that loaded the image used it. The GMU status saved in
+the image no longer describes the hardware:
+ - GMU_STATUS_PDC_SLEEP says the RSC is asleep and needs a wake request,
+   which a freshly powered RSC never answers ("Timeout waiting for GMU OOB
+   set GPU_SET");
+ - GMU_STATUS_SECURE_INIT skips the once-per-boot SCM init of the GPU
+   fuse and always-on registers, which the power cycle reset.
+
+Add a .restore callback that marks the GMU power cycled: secure init runs
+again, and the next RSC start reads RSC_STATUS0_DRV0 to decide whether a
+wake request is needed, instead of trusting the saved bit (the loader may
+or may not have left the RSC asleep).
+
+Based on the RFC "drm/msm/a6xx: Reset the GMU state when restoring from
+hibernation" (freedreno, 3 Nov 2026), which clears both bits; asking the
+RSC instead covers a loader that used the GPU. Local, Yoga Slim 7x.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/gpu/drm/msm/adreno/a6xx_gmu.c      | 37 ++++++++++++++++++++++
+ drivers/gpu/drm/msm/adreno/a6xx_gmu.h      |  3 ++
+ drivers/gpu/drm/msm/adreno/a6xx_gpu.c      |  3 ++
+ drivers/gpu/drm/msm/adreno/a6xx_gpu.h      |  1 +
+ drivers/gpu/drm/msm/adreno/adreno_device.c | 22 ++++++++++++-
+ drivers/gpu/drm/msm/adreno/adreno_gpu.h    |  2 ++
+ 6 files changed, 67 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/msm/adreno/a6xx_gmu.c b/drivers/gpu/drm/msm/adreno/a6xx_gmu.c
+index 93f478e49..92541d4fb 100644
+--- a/drivers/gpu/drm/msm/adreno/a6xx_gmu.c
++++ b/drivers/gpu/drm/msm/adreno/a6xx_gmu.c
+@@ -609,6 +609,25 @@ static int a6xx_rpmh_start(struct a6xx_gmu *gmu)
+ 	int ret;
+ 	u32 val;
+ 
++	/*
++	 * After a hibernation restore the GPU was power cycled, and the RSC is
++	 * asleep only if the kernel that loaded the image used the GPU. Ask the
++	 * RSC rather than trusting the state saved in the image.
++	 */
++	if (gmu->power_cycled) {
++		struct a6xx_gpu *a6xx_gpu = container_of(gmu, struct a6xx_gpu, gmu);
++		u32 asleep = adreno_is_a840(&a6xx_gpu->base) ? BIT(30) : BIT(16);
++
++		gmu->power_cycled = false;
++		asleep &= gmu_read_rscc(gmu, REG_A6XX_GPU_RSCC_RSC_STATUS0_DRV0);
++		if (asleep)
++			set_bit(GMU_STATUS_PDC_SLEEP, &gmu->status);
++		else
++			clear_bit(GMU_STATUS_PDC_SLEEP, &gmu->status);
++		dev_info(gmu->dev, "power cycled by hibernation, GPU RSC %s\n",
++			 asleep ? "asleep" : "awake");
++	}
++
+ 	if (!test_and_clear_bit(GMU_STATUS_PDC_SLEEP, &gmu->status))
+ 		return 0;
+ 
+@@ -1306,6 +1325,24 @@ static int a6xx_gmu_gxpd_put(struct a6xx_gmu *gmu)
+ 	return 0;
+ }
+ 
++/*
++ * Hibernation restore: the image was saved by this kernel, but the hardware
++ * was power cycled and set up again (or not) by the kernel that loaded it.
++ * Redo the once-per-boot secure init and let the next power-up ask the RSC
++ * whether it is asleep.
++ */
++void a6xx_gmu_power_cycled(struct adreno_gpu *adreno_gpu)
++{
++	struct a6xx_gpu *a6xx_gpu = to_a6xx_gpu(adreno_gpu);
++	struct a6xx_gmu *gmu = &a6xx_gpu->gmu;
++
++	if (adreno_has_gmu_wrapper(adreno_gpu))
++		return;
++
++	gmu->power_cycled = true;
++	clear_bit(GMU_STATUS_SECURE_INIT, &gmu->status);
++}
++
+ int a6xx_gmu_resume(struct a6xx_gpu *a6xx_gpu)
+ {
+ 	struct adreno_gpu *adreno_gpu = &a6xx_gpu->base;
+diff --git a/drivers/gpu/drm/msm/adreno/a6xx_gmu.h b/drivers/gpu/drm/msm/adreno/a6xx_gmu.h
+index 3f96b10b5..e36c9a9aa 100644
+--- a/drivers/gpu/drm/msm/adreno/a6xx_gmu.h
++++ b/drivers/gpu/drm/msm/adreno/a6xx_gmu.h
+@@ -133,6 +133,9 @@ struct a6xx_gmu {
+ /* To track whether secure world init was done */
+ #define GMU_STATUS_SECURE_INIT	3
+ 	unsigned long status;
++
++	/* Set on hibernation restore: the hardware state behind @status is gone */
++	bool power_cycled;
+ };
+ 
+ #define GMU_BYTE_OFFSET(gmu, offset) (((offset) << 2) - (gmu)->mmio_offset)
+diff --git a/drivers/gpu/drm/msm/adreno/a6xx_gpu.c b/drivers/gpu/drm/msm/adreno/a6xx_gpu.c
+index 4265a3e5d..7dfb3cc09 100644
+--- a/drivers/gpu/drm/msm/adreno/a6xx_gpu.c
++++ b/drivers/gpu/drm/msm/adreno/a6xx_gpu.c
+@@ -2822,6 +2822,7 @@ const struct adreno_gpu_funcs a6xx_gpu_funcs = {
+ 	.bus_halt = a6xx_bus_clear_pending_transactions,
+ 	.mmu_fault_handler = a6xx_fault_handler,
+ 	.gx_is_on = a6xx_gmu_gx_is_on,
++	.power_cycled = a6xx_gmu_power_cycled,
+ };
+ 
+ const struct adreno_gpu_funcs a6xx_gmuwrapper_funcs = {
+@@ -2893,6 +2894,7 @@ const struct adreno_gpu_funcs a7xx_gpu_funcs = {
+ 	.bus_halt = a6xx_bus_clear_pending_transactions,
+ 	.mmu_fault_handler = a6xx_fault_handler,
+ 	.gx_is_on = a7xx_gmu_gx_is_on,
++	.power_cycled = a6xx_gmu_power_cycled,
+ 	.aqe_is_enabled = a6xx_aqe_is_enabled,
+ };
+ 
+@@ -2925,5 +2927,6 @@ const struct adreno_gpu_funcs a8xx_gpu_funcs = {
+ 	.bus_halt = a8xx_bus_clear_pending_transactions,
+ 	.mmu_fault_handler = a8xx_fault_handler,
+ 	.gx_is_on = a8xx_gmu_gx_is_on,
++	.power_cycled = a6xx_gmu_power_cycled,
+ 	.aqe_is_enabled = a6xx_aqe_is_enabled,
+ };
+diff --git a/drivers/gpu/drm/msm/adreno/a6xx_gpu.h b/drivers/gpu/drm/msm/adreno/a6xx_gpu.h
+index cb53de26a..33b48bd75 100644
+--- a/drivers/gpu/drm/msm/adreno/a6xx_gpu.h
++++ b/drivers/gpu/drm/msm/adreno/a6xx_gpu.h
+@@ -269,6 +269,7 @@ static inline void a6xx_cx_misc_write(struct a6xx_gpu *a6xx_gpu, u32 reg, u32 va
+ 		((_ring)->id * sizeof(uint32_t)))
+ 
+ int a6xx_gmu_resume(struct a6xx_gpu *gpu);
++void a6xx_gmu_power_cycled(struct adreno_gpu *adreno_gpu);
+ int a6xx_gmu_stop(struct a6xx_gpu *gpu);
+ 
+ int a6xx_gmu_wait_for_idle(struct a6xx_gmu *gmu);
+diff --git a/drivers/gpu/drm/msm/adreno/adreno_device.c b/drivers/gpu/drm/msm/adreno/adreno_device.c
+index 9c1816d67..c16df72d2 100644
+--- a/drivers/gpu/drm/msm/adreno/adreno_device.c
++++ b/drivers/gpu/drm/msm/adreno/adreno_device.c
+@@ -405,8 +405,28 @@ static int adreno_system_resume(struct device *dev)
+ 	return pm_runtime_force_resume(dev);
+ }
+ 
++static int adreno_system_restore(struct device *dev)
++{
++	struct msm_gpu *gpu = dev_to_gpu(dev);
++	struct adreno_gpu *adreno_gpu;
++
++	if (!gpu)
++		return 0;
++
++	adreno_gpu = to_adreno_gpu(gpu);
++	if (adreno_gpu->funcs->power_cycled)
++		adreno_gpu->funcs->power_cycled(adreno_gpu);
++
++	return adreno_system_resume(dev);
++}
++
+ static const struct dev_pm_ops adreno_pm_ops = {
+-	SYSTEM_SLEEP_PM_OPS(adreno_system_suspend, adreno_system_resume)
++	.suspend = pm_sleep_ptr(adreno_system_suspend),
++	.resume = pm_sleep_ptr(adreno_system_resume),
++	.freeze = pm_sleep_ptr(adreno_system_suspend),
++	.thaw = pm_sleep_ptr(adreno_system_resume),
++	.poweroff = pm_sleep_ptr(adreno_system_suspend),
++	.restore = pm_sleep_ptr(adreno_system_restore),
+ 	RUNTIME_PM_OPS(adreno_runtime_suspend, adreno_runtime_resume, NULL)
+ };
+ 
+diff --git a/drivers/gpu/drm/msm/adreno/adreno_gpu.h b/drivers/gpu/drm/msm/adreno/adreno_gpu.h
+index ea568dabb..41fec7364 100644
+--- a/drivers/gpu/drm/msm/adreno/adreno_gpu.h
++++ b/drivers/gpu/drm/msm/adreno/adreno_gpu.h
+@@ -81,6 +81,8 @@ struct adreno_gpu_funcs {
+ 	int (*mmu_fault_handler)(void *arg, unsigned long iova, int flags, void *data);
+ 	bool (*gx_is_on)(struct adreno_gpu *adreno_gpu);
+ 	bool (*aqe_is_enabled)(struct adreno_gpu *adreno_gpu);
++	/* Called on hibernation restore, after the hardware lost its state */
++	void (*power_cycled)(struct adreno_gpu *adreno_gpu);
+ };
+ 
+ struct adreno_reglist {
+-- 
+2.56.1
+

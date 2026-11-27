@@ -1,0 +1,116 @@
+#!/bin/bash
+
+# Systemd sleep hook for the Anduril BlueChip (NY4P9, Glymur).
+#
+# Unblocks full SoC deep sleep (APSS + CXSD + AOSD + DDR collapse) and clean
+# Wi-Fi/Bluetooth resume across s2idle:
+#   - PCIe4 Wi-Fi root port & endpoint (0004:00:00.0, 0004:01:00.0): keep
+#     power/wakeup disabled so dw_pcie_suspend_noirq() power-cycles WL_EN via
+#     pci_pwrctrl across CX collapse instead of setting skip_pwrctrl_off=true.
+#   - USB DWC3 controllers (a200000/a400000/a600000/a800000.usb): disable
+#     wakeup across s2idle so dwc3_core_exit() powers down all USB PHYs
+#     instead of holding bi_tcxo / xo.lvl active, restoring only those
+#     previously "enabled".
+#   - Bluetooth UART14 (a98000.serial): record the rfkill IDs of currently
+#     unblocked Bluetooth adapters and soft-block only those while asleep so
+#     hci_qca releases gcc_qupv3_wrap1_s6_clk -> bi_tcxo, then unblock only
+#     those recorded IDs on resume.
+
+set -euo pipefail
+
+sysfs=${BLUECHIP_SLEEP_SYSFS:-/sys}
+run_dir=${BLUECHIP_SLEEP_RUN_DIR:-/run}
+rfkill_bin=${BLUECHIP_SLEEP_RFKILL:-/usr/bin/rfkill}
+bt_settle=${BLUECHIP_SLEEP_BT_SETTLE:-0.5}
+
+compat_file="$sysfs/firmware/devicetree/base/compatible"
+if [[ ! -r $compat_file ]] || ! grep -qzaFx 'anduril,bluechip' "$compat_file"; then
+  exit 0
+fi
+
+case "${2:-}" in
+  suspend|hybrid-sleep|suspend-then-hibernate) ;;
+  *) exit 0 ;;
+esac
+
+state_usb="$run_dir/bluechip-sleep-usb"
+state_bt="$run_dir/bluechip-sleep-bt"
+
+pci_wifi_devs=(0004:00:00.0 0004:01:00.0)
+usb_devs=(a200000.usb a400000.usb a600000.usb a800000.usb)
+
+write_sysfs() {
+  local path=$1 value=$2
+  if [[ -w $path ]]; then
+    printf '%s\n' "$value" >"$path" 2>/dev/null || true
+  fi
+}
+
+pre_suspend() {
+  local dev wakeup_file current id
+  mkdir -p "$run_dir"
+
+  # Ensure PCIe4 Wi-Fi root port and endpoint wakeup stay disabled before CX collapse.
+  for dev in "${pci_wifi_devs[@]}"; do
+    write_sysfs "$sysfs/bus/pci/devices/$dev/power/wakeup" disabled
+  done
+
+  # Record and disable wakeup on USB host controllers so their PHYs power off.
+  rm -f "$state_usb"
+  for dev in "${usb_devs[@]}"; do
+    wakeup_file="$sysfs/bus/platform/devices/$dev/power/wakeup"
+    [[ -r $wakeup_file && -w $wakeup_file ]] || continue
+    read -r current <"$wakeup_file" || continue
+    if [[ $current == "enabled" ]]; then
+      write_sysfs "$wakeup_file" disabled
+      printf '%s\n' "$dev" >>"$state_usb"
+    fi
+  done
+
+  # Record and soft-block only currently unblocked Bluetooth adapters so UART14
+  # releases bi_tcxo without re-enabling user-disabled adapters on resume.
+  local blocked_bt=0
+  rm -f "$state_bt"
+  if [[ -x $rfkill_bin ]]; then
+    while IFS= read -r id; do
+      [[ -n $id ]] || continue
+      printf '%s\n' "$id" >>"$state_bt"
+      "$rfkill_bin" block "$id" 2>/dev/null || true
+      blocked_bt=1
+    done < <("$rfkill_bin" -n -o ID,TYPE,SOFT 2>/dev/null |
+      awk '$2 == "bluetooth" && $3 == "unblocked" { print $1 }')
+  fi
+
+  if (( blocked_bt == 1 )); then
+    sleep "$bt_settle"
+  fi
+}
+
+post_resume() {
+  local dev id
+
+  # Restore USB wakeup on controllers we disabled before suspend.
+  if [[ -r $state_usb ]]; then
+    while IFS= read -r dev; do
+      [[ -n $dev ]] || continue
+      write_sysfs "$sysfs/bus/platform/devices/$dev/power/wakeup" enabled
+    done <"$state_usb"
+    rm -f "$state_usb"
+  fi
+
+  # Unblock only the Bluetooth adapter IDs we soft-blocked before suspend.
+  if [[ -r $state_bt ]]; then
+    if [[ -x $rfkill_bin ]]; then
+      while IFS= read -r id; do
+        [[ -n $id ]] || continue
+        "$rfkill_bin" unblock "$id" 2>/dev/null || true
+      done <"$state_bt"
+    fi
+    rm -f "$state_bt"
+  fi
+}
+
+case "${1:-}" in
+  pre) pre_suspend ;;
+  post) post_resume ;;
+esac
