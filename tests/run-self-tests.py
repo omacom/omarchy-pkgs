@@ -94,6 +94,7 @@ def build_test_list():
         ("voxtype-bin-install", ["./tests/voxtype-bin-install.sh"], {}),
         ("aurora-edge/firmware", ["python", "tests/aurora-edge/firmware.py"], {}),
         ("ipu7-lockstep", ["./tests/ipu7-lockstep.sh"], {}),
+        ("openrazer-lockstep", ["./tests/openrazer-lockstep.sh"], {}),
         ("release-owners --self-test", ["bin/release-owners", "--self-test"], {}),
         ("1password-polkit-owners", ["./tests/1password-polkit-owners.sh"], {}),
         ("omarchy-pkgs self-test", ["./bin/omarchy-pkgs", "self-test"], {}),
