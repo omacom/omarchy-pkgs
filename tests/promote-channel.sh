@@ -151,8 +151,11 @@ if promote --hold nosuch; then fail "an unknown held pkgbase should refuse"; els
 if promote big --hold big; then fail "a pkgbase both named and held should refuse"; else
   grep -q 'big is both named and held' "$T/out" && pass "a pkgbase cannot be both named and held" || fail "named and held reason"; fi
 : > "$T/record"
-promote --dry-run --hold fast && jq -e 'select(.name=="fast") | .reason | test("fast ring")' "$T/record" >/dev/null \
-  && pass "a hold keeps the reason a package would have stayed for anyway" || fail "hold over another reason"
+promote --dry-run --hold fast --hold ahead --hold alpha \
+  && jq -e 'select(.name=="fast") | .reason | test("fast ring")' "$T/record" >/dev/null \
+  && jq -e 'select(.name=="ahead") | .reason | test("rc is ahead")' "$T/record" >/dev/null \
+  && [[ $(plan_action alpha) == current && $(plan_action big) == promote ]] \
+  && pass "a hold keeps the reason a package would have stayed for anyway, and a current one stays current" || fail "hold over another reason: $(cat "$T/record")"
 : > "$T/record"
 promote --dry-run --hold armonly && pass "a hold this architecture does not build is accepted, so one list serves both" || fail "other-arch hold"
 

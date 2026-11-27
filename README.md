@@ -197,9 +197,9 @@ the only choice a package makes:
 | `"release_ring": "fast"` | `edge`, `rc` and `stable` |
 | `"pinned": true` (`omarchy`, `omarchy-settings`) | `edge`; `rc` only through a [release candidate](#releases), `stable` by promotion |
 
-Every package reaches every channel. Nothing is held to edge: a package that
-must not reach rc yet is left out of the promotion by naming the ones that
-should go.
+Every package reaches every channel. No recipe holds itself to edge: a
+package that must not move yet is left out of a promotion, by naming the ones
+that should go (`packages`) or the ones that should stay (`hold`).
 
 A package is published for each architecture in its `arch=()`. An `arch=any`
 package builds once and goes into both architectures' databases.
@@ -438,7 +438,7 @@ A [promotion](#promote-a-channel) appends a line with `"kind": "promote"`
 | `from`, `to` | The channels: `edge` → `rc`, or `rc` → `stable` |
 | `actor` | Who started the run |
 | `packages` | The pkgbases it was limited to; empty for everything eligible |
-| `hold` | The pkgbases it was told to leave where they are |
+| `hold` | The pkgbases it was told to leave where they are; empty when none |
 | `result` | `success` or `failed` |
 | `plan` | Each package promoted: `arch`, `base`, `name`, `from_version`, `to_version` (`null` when new to the destination), `file`, `size` |
 | `held` | Per architecture, how many packages stayed back, by reason |
