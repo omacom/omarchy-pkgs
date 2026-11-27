@@ -333,6 +333,7 @@ them. Run **Promote channel** from the Actions tab, or:
 gh workflow run promote.yml -R omacom/omarchy-pkgs -f direction="edge -> rc"
 gh workflow run promote.yml -R omacom/omarchy-pkgs -f direction="edge -> rc" -f dry_run=true   # plan only
 gh workflow run promote.yml -R omacom/omarchy-pkgs -f direction="rc -> stable" -f packages="<pkgbase> ..."
+gh workflow run promote.yml -R omacom/omarchy-pkgs -f direction="rc -> stable" -f hold="<pkgbase> ..."
 ```
 
 For each architecture, `bin/promote-channel` moves every pkgbase the source
@@ -346,6 +347,12 @@ channel, except:
 | `"pinned": true`, into `rc` | The release pair reaches `rc` through a release; `rc -> stable` carries it |
 | No recipe on `master` | Retired; [unpublish it](#retire-a-package) instead |
 | Destination ahead on any of its packages | Nothing moves backwards, and a pkgbase moves whole |
+| Named in `hold` | Left where it is for this run only; the next run without it moves it |
+
+`hold` is the opposite of `packages`: for when nearly everything should move.
+Like `packages`, one list serves both architectures, and a name that is
+neither published nor a recipe fails the run, so a typo never lets a package
+through. A name cannot be in both.
 
 It copies the exact files the source serves, checks each against the source
 database's SHA-256, and publishes them with `bin/publish-artifact` in batches
@@ -431,6 +438,7 @@ A [promotion](#promote-a-channel) appends a line with `"kind": "promote"`
 | `from`, `to` | The channels: `edge` → `rc`, or `rc` → `stable` |
 | `actor` | Who started the run |
 | `packages` | The pkgbases it was limited to; empty for everything eligible |
+| `hold` | The pkgbases it was told to leave where they are |
 | `result` | `success` or `failed` |
 | `plan` | Each package promoted: `arch`, `base`, `name`, `from_version`, `to_version` (`null` when new to the destination), `file`, `size` |
 | `held` | Per architecture, how many packages stayed back, by reason |

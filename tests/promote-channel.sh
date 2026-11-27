@@ -85,7 +85,7 @@ pkgf() { ls "$T/src/$1-$2"/*.pkg.tar.zst; }
 # rc: what stable users have now. edge: newer builds of most of it.
 mkpkg_par "alpha 1" "fast 1" "pinned 1" "ahead 3" \
   "alpha 2" "split 1 split-extra" "fast 2" "pinned 2" "ahead 2" "big 1" "dropped 1" \
-  "alpha 3" "split 2 split-extra" "big 2" "alpha 4" "big 3"
+  "alpha 3" "split 2 split-extra" "big 2" "alpha 4" "big 3" "alpha 5"
 pub rc $(pkgf alpha 1) $(pkgf fast 1) $(pkgf pinned 1) $(pkgf ahead 3)
 pub edge $(pkgf alpha 2) $(pkgf split 1) $(pkgf fast 2) $(pkgf pinned 2) \
   $(pkgf ahead 2) $(pkgf big 1) $(pkgf dropped 1)
@@ -139,6 +139,22 @@ promote elsewhere && grep -q 'not in edge/x86_64; skipping' "$T/out" \
 recipe armonly '{"source": "local"}' "" aarch64
 promote armonly && grep -q 'armonly does not build for x86_64; skipping it' "$T/out" && ! grep -q 'armonly is not in' "$T/out" \
   && pass "a recipe that does not build this architecture is skipped without a warning" || fail "arch-only recipe"
+
+# --hold leaves a pkgbase where it is for the run; everything else still moves.
+pub edge $(pkgf alpha 5)
+: > "$T/record"
+promote --hold big && [[ "$(entries rc)" == *"alpha-1.0-5 big-1.0-2 "* ]] && [[ $(plan_action big) == hold ]] \
+  && jq -e 'select(.name=="big") | .reason == "held for this run"' "$T/record" >/dev/null \
+  && pass "a held pkgbase stays where it is while the rest moves" || fail "hold: $(entries rc)"
+if promote --hold nosuch; then fail "an unknown held pkgbase should refuse"; else
+  grep -q -- '--hold nosuch is not a pkgbase in edge/x86_64 or a recipe' "$T/out" && pass "a misspelt hold refuses the run" || fail "unknown hold reason"; fi
+if promote big --hold big; then fail "a pkgbase both named and held should refuse"; else
+  grep -q 'big is both named and held' "$T/out" && pass "a pkgbase cannot be both named and held" || fail "named and held reason"; fi
+: > "$T/record"
+promote --dry-run --hold fast && jq -e 'select(.name=="fast") | .reason | test("fast ring")' "$T/record" >/dev/null \
+  && pass "a hold keeps the reason a package would have stayed for anyway" || fail "hold over another reason"
+: > "$T/record"
+promote --dry-run --hold armonly && pass "a hold this architecture does not build is accepted, so one list serves both" || fail "other-arch hold"
 
 # A source file that does not match its database entry is never published.
 f="$REMOTE/edge/x86_64/big-1.0-3-x86_64.pkg.tar.zst"
