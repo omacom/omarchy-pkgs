@@ -534,4 +534,40 @@ grep -q '^AttrEventCode=-BTN_RIGHT$' "$package_dir/50-surface-pro-11-flex-keyboa
 grep -q 'usr/share/libinput/50-surface-pro-11-flex-keyboard.quirks' "$package_dir/PKGBUILD" ||
   fail "the touchpad quirk is installed where libinput reads quirks"
 
+# The battery cycle count comes from the EC's _BIX reply: a revision byte, then
+# little-endian u32s (power unit, design, last full, technology, voltage,
+# warning, low, cycle count, ...), 119 bytes as the Surface Pro 11 sends it.
+bix() { # $1 = file, $2 = cycle count
+  python - "$1" "$2" <<'EOF'
+import struct, sys
+body = struct.pack("<15I", 0, 51480, 47370, 1, 7580, 0, 0, int(sys.argv[2], 0), 1000,
+                   0xFFFFFFFF, 0xFFFFFFFF, 1000, 1000, 10, 10)
+data = b"\0" + body + b"\0" * 58
+assert len(data) == 119
+open(sys.argv[1], "wb").write(data)
+EOF
+}
+battery_info() { python "$package_dir/surface-pro-11-battery-info" --out "$scratch/battery" --bix "$@"; }
+bix "$scratch/bix-148" 148
+battery_info "$scratch/bix-148"
+[[ $(<"$scratch/battery/cycle-count") == 148 ]] ||
+  fail "the EC's cycle count is written for the battery card"
+[[ $(python -c 'import json, sys; d = json.load(open(sys.argv[1])); print(d["cycle_count"], d["design_capacity_mwh"], d["last_full_capacity_mwh"])' \
+  "$scratch/battery/battery.json") == "148 51480 47370" ]] ||
+  fail "battery.json carries the count and both capacities"
+[[ $(stat -c %a "$scratch/battery/cycle-count") == 644 ]] ||
+  fail "the cycle count is readable by the desktop user"
+bix "$scratch/bix-unknown" 0xFFFFFFFF
+battery_info "$scratch/bix-unknown"
+[[ ! -e $scratch/battery/cycle-count ]] ||
+  fail "an unknown cycle count leaves no number behind"
+head -c 20 "$scratch/bix-148" >"$scratch/bix-short"
+battery_info "$scratch/bix-short" 2>/dev/null && fail "a short EC reply is an error"
+grep -q 'timers.target.wants/surface-pro-11-battery-info.timer' "$package_dir/PKGBUILD" ||
+  fail "the cycle count timer is enabled by the package"
+
+grep -qx 'ConditionFirmware=device-tree-compatible(microsoft,denali)' \
+  "$package_dir/surface-pro-11-battery-info.service" ||
+  fail "surface-pro-11-battery-info runs only on the Surface Pro 11"
+
 echo "ok - microsoft-surface-pro-11-support verifies its hardware setup"
