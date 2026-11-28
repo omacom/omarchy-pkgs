@@ -104,3 +104,129 @@ single_matrix=$("$ROOT/bin/build-matrix" omarchy-settings)
 stdin_dup_matrix=$(printf "omarchy-settings\nomarchy-settings\n" | "$ROOT/bin/build-matrix")
 [[ "$stdin_dup_matrix" == "$single_matrix" ]] || fail "repeated stdin package names changed matrix: $stdin_dup_matrix vs $single_matrix"
 pass "bin/build-matrix deduplicates repeated package arguments"
+
+# bin/build mount isolation and failure meson-log export (offline, fake engine).
+BT="$T/bin-build"
+mkdir -p "$BT/bin" "$BT/pkgbuilds/alpha/.omarchy" "$BT/pkgbuilds/beta/.omarchy" "$BT/fake-bin" "$BT/results" "$BT/src/beta"
+echo keep > "$BT/src/beta/existing-tree-marker"
+mkdir -p "$BT/src/test-logs/edge/$(uname -m | sed 's/^arm64$/aarch64/')/alpha"
+echo stale > "$BT/src/test-logs/edge/$(uname -m | sed 's/^arm64$/aarch64/')/alpha/stale.txt"
+cp "$ROOT/bin/build" "$BT/bin/"
+cp -r "$ROOT/helpers" "$ROOT/build" "$BT/"
+for pkg in alpha beta; do
+  printf '{"source":"local"}\n' > "$BT/pkgbuilds/$pkg/.omarchy/package.json"
+  printf 'pkgname=%s\npkgver=1\npkgrel=1\narch=(x86_64 aarch64)\n' "$pkg" > "$BT/pkgbuilds/$pkg/PKGBUILD"
+done
+
+cat > "$BT/fake-bin/docker" <<'FAKE'
+#!/usr/bin/env bash
+set -euo pipefail
+case "${1:-}" in
+  info) exit 0 ;;
+  image) [[ "${2:-}" == "inspect" ]] && exit 0 ;;
+  run) shift ;;
+  *) exit 0 ;;
+esac
+
+dry_run="" build_pkg="" workdir="" plan_host="" pkg_ro="" dep_ro="" out_host="" log_host="" cache_host="" src_tmpfs=""
+bad_mount=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -e)
+      case "$2" in
+        DRY_RUN=*) dry_run="${2#DRY_RUN=}" ;;
+        BUILD_PACKAGE=*) build_pkg="${2#BUILD_PACKAGE=}" ;;
+      esac
+      shift 2
+      ;;
+    -w) workdir="$2"; shift 2 ;;
+    -v)
+      host="${2%%:*}" target="${2#*:}"
+      case "$target" in
+        /build-plan) plan_host="$host" ;;
+        /build-plan/packages:ro) pkg_ro="$host" ;;
+        /build-plan/dependencies:ro) dep_ro="$host" ;;
+        "/build-output/edge/$FAKE_ARCH") out_host="$host" ;;
+        /src-export) log_host="$host" ;;
+        /var/cache/pacman/pkg) cache_host="$host" ;;
+        /build-output|/build-output:ro|/build-output/*|/src|/src:*) bad_mount="$2" ;;
+      esac
+      shift 2
+      ;;
+    --tmpfs)
+      [[ "$2" == /src:* ]] && src_tmpfs="$2"
+      shift 2
+      ;;
+    omarchy-pkg-builder:*) shift; break ;;
+    *) shift ;;
+  esac
+done
+
+fail_call() { echo "ASSERTION_FAIL: $1" >> "$FAKE_DOCKER_LOG"; exit 9; }
+[[ -z "$bad_mount" ]] || fail_call "disallowed mount ($build_pkg): $bad_mount"
+
+if [[ "$dry_run" == "true" ]]; then
+  [[ "$workdir" == "/tmp" ]] || fail_call "planning workdir was '$workdir', expected /tmp"
+  [[ -n "$plan_host" && "$plan_host" != "$FAKE_BT/src/"* ]] || fail_call "bad planning dir: $plan_host"
+  [[ -z "$out_host" && -z "$log_host" && -z "$cache_host" && -z "$src_tmpfs" ]] || fail_call "planning mounted output, cache, src-export, or /src tmpfs"
+  printf '%s\n' "$plan_host" > "$FAKE_BT/plan-dir"
+  printf 'alpha\nbeta\n' > "$plan_host/packages"
+  : > "$plan_host/dependencies"
+  : > "$plan_host/skipped"
+  echo "PLAN_OK" >> "$FAKE_DOCKER_LOG"
+  exit 0
+fi
+
+root_plan=$(cat "$FAKE_BT/plan-dir")
+[[ "$out_host" == "$FAKE_BT/build-output/edge/$FAKE_ARCH" ]] || fail_call "wrong output mount for $build_pkg: $out_host"
+[[ "$plan_host" == "$root_plan/run."* ]] || fail_call "non-isolated /build-plan for $build_pkg: $plan_host"
+[[ "$pkg_ro" == "$root_plan/packages" && "$dep_ro" == "$root_plan/dependencies" ]] || fail_call "missing :ro plan files for $build_pkg"
+[[ "$log_host" == "$root_plan/logs."* ]] || fail_call "non-isolated /src-export for $build_pkg: $log_host"
+[[ "$*" == *meson-logs* ]] || fail_call "missing meson-logs export wrapper for $build_pkg"
+
+if [[ "$build_pkg" == "alpha" ]]; then
+  [[ ! -e "$plan_host/repository-initialized" ]] || fail_call "unexpected repository-initialized before alpha"
+  touch "$plan_host/repository-initialized"
+  mkdir -p "$plan_host/artifacts"
+  printf 'alpha-1-1-%s.pkg.tar.zst\n' "$FAKE_ARCH" > "$plan_host/artifacts/alpha"
+  echo "ALPHA_OK" >> "$FAKE_DOCKER_LOG"
+  exit 0
+fi
+
+if [[ "$build_pkg" == "beta" ]]; then
+  [[ -e "$plan_host/repository-initialized" ]] || fail_call "missing repository-initialized on beta"
+  [[ ! -e "$plan_host/artifacts/alpha" ]] || fail_call "alpha artifact manifest leaked into beta"
+  mkdir -p "$log_host/beta/build/meson-logs"
+  printf 'failed assertion\n' > "$log_host/beta/build/meson-logs/testlog.txt"
+  echo "BETA_OK" >> "$FAKE_DOCKER_LOG"
+  exit 1
+fi
+FAKE
+chmod +x "$BT/fake-bin/docker"
+
+native_arch=$(uname -m)
+[[ "$native_arch" == "arm64" ]] && native_arch=aarch64
+bt_rc=0
+PATH="$BT/fake-bin:$PATH" \
+  CONTAINER_ENGINE=docker \
+  OMARCHY_SKIP_BUILDER_IMAGE=1 \
+  OMARCHY_BUILD_RESULT_DIR="$BT/results" \
+  FAKE_DOCKER_LOG="$BT/docker.log" \
+  FAKE_BT="$BT" \
+  FAKE_ARCH="$native_arch" \
+  "$BT/bin/build" --arch "$native_arch" --mirror edge --package alpha beta > "$BT/build.log" 2>&1 || bt_rc=$?
+
+if [[ "$bt_rc" != 2 ]] || grep -q '^ASSERTION_FAIL:' "$BT/docker.log" \
+  || ! grep -qx 'PLAN_OK' "$BT/docker.log" \
+  || ! grep -qx 'ALPHA_OK' "$BT/docker.log" \
+  || ! grep -qx 'BETA_OK' "$BT/docker.log"; then
+  cat "$BT/build.log"
+  cat "$BT/docker.log" 2>/dev/null || true
+  fail "bin/build fake-docker isolation checks failed (rc=$bt_rc)"
+fi
+[[ "$(cat "$BT/results/artifacts")" == "alpha-1-1-$native_arch.pkg.tar.zst" ]] || fail "artifacts mismatch"
+[[ "$(cat "$BT/results/failed")" == "beta" ]] || fail "failed mismatch"
+[[ ! -e "$BT/src/test-logs/edge/$native_arch/alpha/stale.txt" ]] || fail "stale meson logs for alpha were not cleared"
+[[ "$(cat "$BT/src/test-logs/edge/$native_arch/beta/build/meson-logs/testlog.txt")" == "failed assertion" ]] || fail "exported beta meson log missing"
+[[ "$(cat "$BT/src/beta/existing-tree-marker")" == "keep" ]] || fail "meson log export clobbered existing src/beta tree"
+pass "bin/build isolates /build-output and /build-plan mounts and exports failed meson-logs cleanly"
