@@ -22,6 +22,19 @@ DSP-side libraries the DSP asks for afterwards (`libc++.so.1`, skeletons such as
 
 Without a shell, `fastrpc_test` fails with `open_shell failed for domain 3, tried 'fastrpc_shell_unsigned_3' and 'fastrpc_shell_unsigned'` in the journal. The daemons do not need one.
 
+## Queue Monitor firmware (DSPQUEUE_QUEUE_MONITOR)
+
+Some CDSP firmware builds, made for the Windows scheduler, run dspqueues in "Queue Monitor" mode: the DSP starts no thread of its own for a queue and takes packets off it only while the host is inside a call to the queue's monitor method. Upstream's library never makes that call ([qualcomm/fastrpc#377](https://github.com/qualcomm/fastrpc/issues/377)), so a dspqueue client such as llama.cpp's Hexagon backend hangs at its first request. Reported so far: X1E80100 `CDSP.HT.2.9.c1-00078-HAMOA-1` (Surface Laptop 7, Galaxy Book4 Edge) and X2 Elite `CDSP.HT.3.3-00304`. With a DSP-side log enabled, the DSP says `Queue Monitor supported. Importing Queue ... requires packet_callback`.
+
+This package carries two patches for it. They change nothing unless the client process has `DSPQUEUE_QUEUE_MONITOR` in its environment:
+
+- `DSPQUEUE_QUEUE_MONITOR=2` (use this one): a pump thread per queue makes the monitor call, and at a normal exit the library cancels its pending DSP wait, so the kernel frees the process's DSP mappings.
+- `DSPQUEUE_QUEUE_MONITOR=1`: the monitor call is made inside every `dspqueue_write`. It works but generation in llama.cpp is about 8x slower.
+
+Do not interrupt a client (Ctrl-C, `kill -9`) while it has work on the DSP: the kernel driver keeps the interrupted call, and with it every buffer the process mapped, until the next reboot; later runs then fail with `failed to map buffer` in `journalctl -k`.
+
+For llama.cpp's Hexagon backend on the Surface Laptop 7 (DSP v73) the environment is `DSPQUEUE_QUEUE_MONITOR=2 GGML_HEXAGON_ARCH=v73 GGML_HEXAGON_LIBHTP_DIR=<dir> ADSP_LIBRARY_PATH=<dir>`, where `<dir>` holds `libggml-htp-v73.so`, with `--device HTP0 -ngl 99`.
+
 ## adsprpcd_audiopd
 
 Upstream's rule starts it with every ADSP. It asks the ADSP to create its static audio process in memory the kernel hands over, and on boards whose device tree does not protect that memory it resets the machine (qualcomm/fastrpc#414). Linux audio on Snapdragon laptops does not use that process, so here it only runs if started by hand.

@@ -1,0 +1,466 @@
+From 49eb1427f555bbc8720dcca93708168a5cc7e2e9 Mon Sep 17 00:00:00 2001
+From: "Caleb E." <158400752+FoxesRCool1@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 15:30:35 +0800
+Subject: [PATCH 2/2] dspqueue: async Queue Monitor pump and exit cancel
+
+With DSPQUEUE_QUEUE_MONITOR=1 (previous patch) every dspqueue_write
+waits inside the method 9 invoke until the DSP-side packet callback
+returns. ggml-hexagon's callback keeps polling the ring for about 10 ms
+after the last packet, so each request/response round trip costs that
+idle tail: about 81 tokens/s on a 15M model, matching the numbers in
+qualcomm/fastrpc#377.
+
+Add DSPQUEUE_QUEUE_MONITOR=2: each queue gets a pump thread that issues
+the method 9 invoke, and dspqueue_write only flags it. While a callback
+is running on the DSP it consumes later packets itself, and the host can
+read responses as soon as the DSP writes them.
+
+Guards:
+- a thread that wrote to a pumped queue waits (2 s at most) for the
+  pumps of that domain to go idle before it makes any other
+  remote_handle64_invoke, so a client's own "stop" method cannot close
+  the queue on the DSP under a running monitor invoke;
+- dspqueue_close() stops and joins the queue's pump thread;
+- an atexit handler (registered on the first pump, mode 1 or 2) waits
+  up to 500 ms for idle pumps, then cancels and joins the receive-signal
+  thread's wait_signal invoke. Clients such as llama.cpp exit without
+  closing their queues; exit_group() then interrupts that invoke, and on
+  mainline fastrpc.c an interrupted invoke stays on fl->pending and keeps
+  the process's DSP mappings until reboot. A later dspqueue_close() does
+  not cancel or join that thread a second time.
+
+Without DSPQUEUE_QUEUE_MONITOR=1 or 2 nothing changes: no thread, no
+atexit handler, and the invoke gate returns at once.
+---
+ src/dspqueue/dspqueue_cpu.c | 323 +++++++++++++++++++++++++++++++++---
+ src/fastrpc_apps_user.c     |   2 +
+ 2 files changed, 299 insertions(+), 26 deletions(-)
+
+diff --git a/src/dspqueue/dspqueue_cpu.c b/src/dspqueue/dspqueue_cpu.c
+index e9162ae..74b8e1a 100644
+--- a/src/dspqueue/dspqueue_cpu.c
++++ b/src/dspqueue/dspqueue_cpu.c
+@@ -1,3 +1,6 @@
++#ifndef _GNU_SOURCE
++#define _GNU_SOURCE
++#endif
+ // Copyright (c) 2024, Qualcomm Innovation Center, Inc. All rights reserved.
+ // SPDX-License-Identifier: BSD-3-Clause
+ 
+@@ -74,8 +77,18 @@ struct dspqueue {
+   int have_wait_counts;
+   int have_driver_signaling;
+   pthread_t error_callback_thread;
++  /* Queue Monitor async pump (DSPQUEUE_QUEUE_MONITOR=2) */
++  pthread_mutex_t qm_mutex;
++  pthread_cond_t qm_cond;
++  pthread_t qm_thread;
++  int qm_started;
++  int qm_pending;
++  int qm_busy;
++  int qm_stop;
+ };
+ 
++static void queue_monitor_stop(struct dspqueue *q);
++
+ struct dspqueue_domain_queues {
+   int domain;
+   unsigned num_queues;
+@@ -93,8 +106,39 @@ struct dspqueue_domain_queues {
+   pthread_t receive_signal_thread;
+   int dsp_error;
+   int have_dspsignal;
++  int qm_rx_joined; /* receive-signal thread already cancelled and joined at exit */
+ };
+ 
++/* Queue Monitor builds: domains whose receive-signal thread must be cancelled at exit. */
++#define QM_MAX_DQ 16
++static pthread_mutex_t qm_dq_mutex = PTHREAD_MUTEX_INITIALIZER;
++static struct dspqueue_domain_queues *qm_dq_list[QM_MAX_DQ];
++static atomic_int qm_exiting;
++
++static void qm_dq_register(struct dspqueue_domain_queues *dq) {
++  int i, free_slot = -1;
++  pthread_mutex_lock(&qm_dq_mutex);
++  for (i = 0; i < QM_MAX_DQ; i++) {
++    if (qm_dq_list[i] == dq)
++      goto out;
++    if (!qm_dq_list[i] && free_slot < 0)
++      free_slot = i;
++  }
++  if (free_slot >= 0)
++    qm_dq_list[free_slot] = dq;
++out:
++  pthread_mutex_unlock(&qm_dq_mutex);
++}
++
++static void qm_dq_unregister(struct dspqueue_domain_queues *dq) {
++  int i;
++  pthread_mutex_lock(&qm_dq_mutex);
++  for (i = 0; i < QM_MAX_DQ; i++)
++    if (qm_dq_list[i] == dq)
++      qm_dq_list[i] = NULL;
++  pthread_mutex_unlock(&qm_dq_mutex);
++}
++
+ static inline void free_skel_uri(remote_rpc_get_uri_t *dspqueue_skel) {
+   if (dspqueue_skel->domain_name) {
+     free(dspqueue_skel->domain_name);
+@@ -419,19 +463,23 @@ static AEEResult destroy_domain_queues_locked(int domain) {
+   assert(de != NULL && de->dq != NULL);
+   dq = de->dq;
+   assert(dq->num_queues == 0);
++  qm_dq_unregister(dq);
+ 
+   if (!dq->have_dspsignal) {
+-    if (dq->dsp_error) {
+-      // Ignore errors if the DSP process died
+-      dspqueue_rpc_cancel_wait_signal(dq->dsp_handle);
+-    } else {
+-      VERIFY((nErr = dspqueue_rpc_cancel_wait_signal(dq->dsp_handle)) == 0);
+-    }
+-    FARF(MEDIUM, "Join receive signal thread");
+-    VERIFY((nErr = pthread_join(dq->receive_signal_thread, &ret)) == 0);
+-    FARF(MEDIUM, " - Join receive signal thread done");
+-    if (!dq->dsp_error) {
+-      VERIFY(((uintptr_t)ret) == 0);
++    // Skip if queue_monitor_atexit() already cancelled and joined it (joining twice is undefined).
++    if (!dq->qm_rx_joined) {
++      if (dq->dsp_error) {
++        // Ignore errors if the DSP process died
++        dspqueue_rpc_cancel_wait_signal(dq->dsp_handle);
++      } else {
++        VERIFY((nErr = dspqueue_rpc_cancel_wait_signal(dq->dsp_handle)) == 0);
++      }
++      FARF(MEDIUM, "Join receive signal thread");
++      VERIFY((nErr = pthread_join(dq->receive_signal_thread, &ret)) == 0);
++      FARF(MEDIUM, " - Join receive signal thread done");
++      if (!dq->dsp_error) {
++        VERIFY(((uintptr_t)ret) == 0);
++      }
+     }
+ 
+     pthread_mutex_lock(&dq->send_signal_mutex);
+@@ -557,6 +605,8 @@ AEEResult dspqueue_create(int domain, uint32_t flags, uint32_t req_queue_size,
+ 
+   // Allocate internal queue structure
+   VERIFYC((q = calloc(1, sizeof(*q))) != NULL, AEE_ENOMEMORY);
++  pthread_mutex_init(&q->qm_mutex, NULL);
++  pthread_cond_init(&q->qm_cond, NULL);
+   VERIFY((nErr = pthread_mutex_init(&q->mutex, NULL)) == 0);
+   mutex_init = 1;
+   q->packet_callback = packet_callback;
+@@ -852,6 +902,7 @@ AEEResult dspqueue_close(dspqueue_t queue) {
+   }
+ 
+   VERIFYC(IS_VALID_EFFECTIVE_DOMAIN_ID(q->domain), AEE_EINVALIDDOMAIN);
++  queue_monitor_stop(q);
+   pthread_mutex_lock(&queues->mutex);
+   dq = dspqueue_domain_queues_lookup(q->domain);
+   if (dq == NULL) {
+@@ -970,6 +1021,8 @@ AEEResult dspqueue_close(dspqueue_t queue) {
+   pthread_mutex_destroy(&q->packet_mutex);
+   pthread_mutex_destroy(&q->space_mutex);
+   pthread_mutex_destroy(&q->mutex);
++  pthread_mutex_destroy(&q->qm_mutex);
++  pthread_cond_destroy(&q->qm_cond);
+ 
+   pthread_mutex_lock(&dq->queue_list_mutex);
+   dq->queues[q->id] = UNUSED_QUEUE;
+@@ -1417,31 +1470,248 @@ bail:
+  * existing behaviour. See qualcomm/fastrpc#377.
+  */
+ static pthread_once_t queue_monitor_once = PTHREAD_ONCE_INIT;
+-static int queue_monitor_enabled;
++static int queue_monitor_enabled; /* 0 off, 1 sync pump in write, 2 async pump thread */
+ static atomic_int queue_monitor_logged;
+ 
++/*
++ * Async mode: the DSP-side packet callback of a Queue Monitor client (e.g. ggml-hexagon's
++ * process_ops) may keep polling the ring for a while after the last packet before it returns,
++ * so a synchronous pump in dspqueue_write makes every write wait for that idle tail.
++ * In mode 2 each queue gets a pump thread; dspqueue_write only flags it. While a callback is
++ * running on the DSP, later packets are consumed by the same callback, and the host can read
++ * responses as soon as the DSP writes them.
++ *
++ * Teardown guard: a thread that wrote to a pumped queue, before it makes any other FastRPC
++ * invoke (for example the client's own "stop" method, which closes the queue on the DSP),
++ * waits until the pumps of that domain are idle (bounded wait). See dspqueue_qm_gate().
++ */
++static pthread_mutex_t qm_dom_mutex = PTHREAD_MUTEX_INITIALIZER;
++static pthread_cond_t qm_dom_cond = PTHREAD_COND_INITIALIZER;
++#define QM_DOM_SLOTS 64 /* effective domain ids are dynamic; collisions only cause extra waits */
++static int qm_dom_busy[QM_DOM_SLOTS];
++static atomic_int qm_gate_waits;
++static __thread int qm_tls_writer;
++
+ static void queue_monitor_init(void) {
+   const char *v = getenv("DSPQUEUE_QUEUE_MONITOR");
+-  queue_monitor_enabled = (v != NULL && v[0] == '1' && v[1] == '\0');
++  queue_monitor_enabled = 0;
++  if (v != NULL && v[1] == '\0') {
++    if (v[0] == '1')
++      queue_monitor_enabled = 1;
++    else if (v[0] == '2')
++      queue_monitor_enabled = 2;
++  }
+ }
+ 
+-static void queue_monitor_pump(struct dspqueue *q,
+-                               struct dspqueue_domain_queues *dq) {
+-  int32_t num_read = 0;
+-  AEEResult mErr;
+-
++static int queue_monitor_mode(void) {
+   pthread_once(&queue_monitor_once, queue_monitor_init);
+-  if (!queue_monitor_enabled)
+-    return;
+-  mErr = dspqueue_rpc_queue_monitor(dq->dsp_handle, q->dsp_id, &num_read);
++  return queue_monitor_enabled;
++}
++
++static AEEResult queue_monitor_call(struct dspqueue *q, remote_handle64 h,
++                                    int32_t *num_read) {
++  AEEResult mErr;
++  *num_read = 0;
++  mErr = dspqueue_rpc_queue_monitor(h, q->dsp_id, num_read);
+   if (mErr != AEE_SUCCESS) {
+     FARF(ERROR, "%s: queue_monitor(0x%llx) failed 0x%x", __func__,
+          (unsigned long long)q->dsp_id, mErr);
+   } else if (atomic_exchange(&queue_monitor_logged, 1) == 0) {
+-    FARF(ALWAYS, "%s: DSPQUEUE_QUEUE_MONITOR active, first queue_monitor(0x%llx) "
+-         "read %d packet(s)", __func__, (unsigned long long)q->dsp_id,
+-         (int)num_read);
++    FARF(ALWAYS, "%s: DSPQUEUE_QUEUE_MONITOR=%d active, first queue_monitor(0x%llx) "
++         "read %d packet(s)", __func__, queue_monitor_enabled,
++         (unsigned long long)q->dsp_id, (int)*num_read);
+   }
++  return mErr;
++}
++
++static void qm_set_busy_locked(struct dspqueue *q, int busy) {
++  /* q->qm_mutex held */
++  if (q->qm_busy == busy)
++    return;
++  q->qm_busy = busy;
++  pthread_mutex_lock(&qm_dom_mutex);
++  if (q->domain >= 0) {
++    int slot = q->domain % QM_DOM_SLOTS;
++    qm_dom_busy[slot] += busy ? 1 : -1;
++    if (qm_dom_busy[slot] == 0)
++      pthread_cond_broadcast(&qm_dom_cond);
++  }
++  pthread_mutex_unlock(&qm_dom_mutex);
++}
++
++struct qm_thread_arg {
++  struct dspqueue *q;
++  remote_handle64 h;
++};
++
++static void *queue_monitor_thread(void *arg) {
++  struct qm_thread_arg a = *(struct qm_thread_arg *)arg;
++  struct dspqueue *q = a.q;
++  int32_t num_read;
++  int failures = 0;
++  free(arg);
++
++  pthread_mutex_lock(&q->qm_mutex);
++  for (;;) {
++    while (!q->qm_pending && !q->qm_stop) {
++      qm_set_busy_locked(q, 0);
++      pthread_cond_wait(&q->qm_cond, &q->qm_mutex);
++    }
++    if (!q->qm_pending && q->qm_stop)
++      break;
++    q->qm_pending = 0;
++    pthread_mutex_unlock(&q->qm_mutex);
++    if (queue_monitor_call(q, a.h, &num_read) != AEE_SUCCESS) {
++      if (++failures >= 8) {
++        FARF(ERROR, "%s: queue_monitor keeps failing, pump for queue 0x%llx stops",
++             __func__, (unsigned long long)q->dsp_id);
++        pthread_mutex_lock(&q->qm_mutex);
++        q->qm_pending = 0;
++        break;
++      }
++    } else {
++      failures = 0;
++    }
++    pthread_mutex_lock(&q->qm_mutex);
++  }
++  qm_set_busy_locked(q, 0);
++  pthread_mutex_unlock(&q->qm_mutex);
++  return NULL;
++}
++
++/*
++ * At process exit, do not let exit_group() interrupt a queue_monitor invoke that is still
++ * running on the DSP (an interrupted invoke can leave its context pending in the kernel).
++ * Registered with atexit() on first pump start, so it runs before this library's destructors.
++ */
++static void queue_monitor_atexit(void) {
++  struct timespec ts;
++  int i, busy = 0;
++  clock_gettime(CLOCK_REALTIME, &ts);
++  ts.tv_nsec += 500 * 1000 * 1000;
++  if (ts.tv_nsec >= 1000000000) { ts.tv_sec++; ts.tv_nsec -= 1000000000; }
++  pthread_mutex_lock(&qm_dom_mutex);
++  for (;;) {
++    busy = 0;
++    for (i = 0; i < QM_DOM_SLOTS; i++)
++      busy += qm_dom_busy[i];
++    if (!busy)
++      break;
++    if (pthread_cond_timedwait(&qm_dom_cond, &qm_dom_mutex, &ts) == ETIMEDOUT)
++      break;
++  }
++  pthread_mutex_unlock(&qm_dom_mutex);
++
++  /*
++   * A client that exits without closing its queues (llama.cpp does) leaves the receive-signal
++   * thread inside a dspqueue_rpc_wait_signal invoke. exit_group() then interrupts it, and on
++   * mainline fastrpc.c an interrupted invoke stays on fl->pending and keeps the whole
++   * fastrpc_user (and every buffer still mapped) alive until reboot. Cancel and join it here.
++   */
++  int cancelled = 0, joined = 0;
++  atomic_store(&qm_exiting, 1);
++  pthread_mutex_lock(&qm_dq_mutex);
++  for (i = 0; i < QM_MAX_DQ; i++) {
++    struct dspqueue_domain_queues *dq = qm_dq_list[i];
++    struct timespec jt;
++    if (!dq || dq->have_dspsignal || dq->dsp_error)
++      continue;
++    if (dspqueue_rpc_cancel_wait_signal(dq->dsp_handle) != 0)
++      continue;
++    cancelled++;
++    clock_gettime(CLOCK_REALTIME, &jt);
++    jt.tv_sec += 1;
++    if (pthread_timedjoin_np(dq->receive_signal_thread, NULL, &jt) == 0) {
++      joined++;
++      dq->qm_rx_joined = 1; /* a later dspqueue_close() must not join it again */
++      qm_dq_list[i] = NULL;
++    }
++  }
++  pthread_mutex_unlock(&qm_dq_mutex);
++  FARF(ALWAYS, "%s: %s; invokes that waited for an idle pump: %d; receive-signal waits cancelled %d, joined %d",
++       __func__, busy ? "pumps still busy after 500 ms" : "pumps idle",
++       atomic_load(&qm_gate_waits), cancelled, joined);
++}
++static pthread_once_t qm_atexit_once = PTHREAD_ONCE_INIT;
++static void qm_register_atexit(void) { atexit(queue_monitor_atexit); }
++
++static void queue_monitor_pump(struct dspqueue *q,
++                               struct dspqueue_domain_queues *dq) {
++  int32_t num_read = 0;
++  int mode = queue_monitor_mode();
++
++  if (mode == 1 || mode == 2) {
++    pthread_once(&qm_atexit_once, qm_register_atexit);
++    qm_dq_register(dq);
++  }
++  if (mode == 1) {
++    queue_monitor_call(q, dq->dsp_handle, &num_read);
++    return;
++  }
++  if (mode != 2)
++    return;
++
++  qm_tls_writer = 1;
++  pthread_mutex_lock(&q->qm_mutex);
++  if (!q->qm_started && !q->qm_stop) {
++    struct qm_thread_arg *a = malloc(sizeof(*a));
++    if (a) {
++      a->q = q;
++      a->h = dq->dsp_handle;
++      if (pthread_create(&q->qm_thread, NULL, queue_monitor_thread, a) == 0) {
++        q->qm_started = 1;
++      } else {
++        free(a);
++      }
++    }
++    if (!q->qm_started) {
++      pthread_mutex_unlock(&q->qm_mutex);
++      FARF(ERROR, "%s: cannot start pump thread, pumping synchronously", __func__);
++      queue_monitor_call(q, dq->dsp_handle, &num_read);
++      return;
++    }
++  }
++  q->qm_pending = 1;
++  qm_set_busy_locked(q, 1);
++  pthread_cond_signal(&q->qm_cond);
++  pthread_mutex_unlock(&q->qm_mutex);
++}
++
++static void queue_monitor_stop(struct dspqueue *q) {
++  int started;
++  pthread_mutex_lock(&q->qm_mutex);
++  q->qm_stop = 1;
++  started = q->qm_started;
++  pthread_cond_signal(&q->qm_cond);
++  pthread_mutex_unlock(&q->qm_mutex);
++  if (started) {
++    pthread_join(q->qm_thread, NULL);
++    q->qm_started = 0;
++    FARF(ALWAYS, "%s: pump for queue 0x%llx stopped; invokes that waited for an idle pump: %d",
++         __func__, (unsigned long long)q->dsp_id, atomic_load(&qm_gate_waits));
++  }
++}
++
++/* Called from remote_handle64_invoke / remote_handle_invoke before every invoke. */
++void dspqueue_qm_gate(int domain) {
++  struct timespec ts;
++  int waited = 0;
++  if (!qm_tls_writer || domain < 0)
++    return;
++  clock_gettime(CLOCK_REALTIME, &ts);
++  ts.tv_sec += 2;
++  pthread_mutex_lock(&qm_dom_mutex);
++  while (qm_dom_busy[domain % QM_DOM_SLOTS] > 0) {
++    waited = 1;
++    if (pthread_cond_timedwait(&qm_dom_cond, &qm_dom_mutex, &ts) == ETIMEDOUT) {
++      FARF(ERROR, "%s: pumps of domain %d still busy after 2 s, invoking anyway",
++           __func__, domain);
++      break;
++    }
++  }
++  pthread_mutex_unlock(&qm_dom_mutex);
++  if (waited)
++    atomic_fetch_add(&qm_gate_waits, 1);
+ }
+ 
+ AEEResult dspqueue_write_noblock(dspqueue_t queue, uint32_t flags,
+@@ -2670,8 +2940,9 @@ static void *dspqueue_receive_signal_thread(void *arg) {
+     VERIFY((nErr = dspqueue_rpc_wait_signal(dq->dsp_handle, &signal)) == 0);
+ 
+     if (signal == -1) {
+-      // Exit
+-      assert(dq->num_queues == 0);
++      // Exit (at process exit with Queue Monitor builds, queues may still be open)
++      if (!atomic_load(&qm_exiting))
++        assert(dq->num_queues == 0);
+       return NULL;
+     }
+ 
+diff --git a/src/fastrpc_apps_user.c b/src/fastrpc_apps_user.c
+index 2b7a5cb..1f85bea 100644
+--- a/src/fastrpc_apps_user.c
++++ b/src/fastrpc_apps_user.c
+@@ -1711,6 +1711,7 @@ bail:
+   return nErr;
+ }
+ 
++void dspqueue_qm_gate(int domain);
+ int remote_handle64_invoke(remote_handle64 local, uint32_t sc,
+                            remote_arg *pra) {
+   remote_handle64 remote = 0;
+@@ -1731,6 +1732,7 @@ int remote_handle64_invoke(remote_handle64 local, uint32_t sc,
+   VERIFYC(local != (remote_handle64)-1, AEE_EINVHANDLE);
+ 
+   VERIFY(AEE_SUCCESS == (nErr = get_domain_from_handle(local, &domain)));
++  dspqueue_qm_gate(domain);
+   FASTRPC_GET_REF(domain);
+   VERIFY(AEE_SUCCESS == (nErr = get_handle_remote(local, &remote)));
+   VERIFY(AEE_SUCCESS ==
+-- 
+2.56.1
+
