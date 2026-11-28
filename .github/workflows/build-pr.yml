@@ -108,14 +108,16 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
       - if: github.event_name == 'pull_request'
+        env:
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
-          git fetch --no-tags --depth=1 origin "${{ github.event.pull_request.head.sha }}"
-          git checkout "${{ github.event.pull_request.head.sha }}" -- pkgbuilds/
+          git fetch --no-tags --depth=1 origin "$PR_HEAD_SHA"
+          git checkout "$PR_HEAD_SHA" -- pkgbuilds/
           # Bootstrap: the PR that introduces this tooling has a base without
           # it. Take the plan helper from the PR head in that one case; it
           # runs on a hosted runner and only prints a plan.
           if [[ ! -x bin/build-matrix ]]; then
-            git checkout "${{ github.event.pull_request.head.sha }}" -- bin/build-matrix helpers/
+            git checkout "$PR_HEAD_SHA" -- bin/build-matrix helpers/
             echo "::notice::base branch has no bin/build-matrix; using the PR's copy for planning"
           fi
       # One matrix entry per package per architecture. Every package builds
@@ -124,9 +126,14 @@ jobs:
       - id: list
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUT_PACKAGES: ${{ github.event.inputs.packages }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: |
-          if [[ -n "${{ github.event.inputs.packages }}" ]]; then
-            names="${{ github.event.inputs.packages }}"
+          set -euo pipefail
+          if [[ -n "$INPUT_PACKAGES" ]]; then
+            matrix=$(tr -s '[:space:]' '\n' <<<"$INPUT_PACKAGES" | bin/build-matrix)
           else
             # The PR's own files, as GitHub lists them against the merge base.
             # A two-dot diff against the current base tip also counted every
@@ -134,28 +141,26 @@ jobs:
             # planned dozens of unrelated packages at its old versions. The
             # checkout here is shallow, so there is no merge base to diff from.
             # A package the PR deletes has nothing to build.
-            names=$(gh api --paginate "repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/files" --jq '.[].filename' \
+            matrix=$(gh api --paginate "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER/files" --jq '.[].filename' \
               | awk -F/ '$1=="pkgbuilds" && NF>2 {print $2}' | sort -u \
               | while read -r name; do
-                  if git cat-file -e "${{ github.event.pull_request.head.sha }}:pkgbuilds/$name" 2>/dev/null; then echo "$name"; fi
-                done)
+                  if git cat-file -e "$PR_HEAD_SHA:pkgbuilds/$name" 2>/dev/null; then echo "$name"; fi
+                done | bin/build-matrix)
           fi
-          # shellcheck disable=SC2086 # split $names into one package per line
-          matrix=$(printf '%s\n' $names | bin/build-matrix)
           # A package directory whose exact tree already has a build artifact
           # (label <pkg>-<arch>-<tree hash>, uploaded only after a successful
           # build) is not built again. Pushing a fix for one package to a PR
           # that touches fifty rebuilds one, not fifty; publish.yml finds the
           # same artifacts on merge. workflow_dispatch is an explicit request
           # and always builds.
-          if [[ "${{ github.event_name }}" == pull_request ]]; then
-            head="${{ github.event.pull_request.head.sha }}"
+          if [[ "$GITHUB_EVENT_NAME" == pull_request ]]; then
+            head="$PR_HEAD_SHA"
             kept=(); reused=()
             while read -r entry; do
               package=$(jq -r .package <<<"$entry"); arch=$(jq -r .arch <<<"$entry")
               label="$package-$arch-$(git rev-parse "$head:pkgbuilds/$package")"
               found=$(curl -fsS -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
-                "https://api.github.com/repos/${{ github.repository }}/actions/artifacts?name=$label&per_page=5" \
+                "https://api.github.com/repos/$GITHUB_REPOSITORY/actions/artifacts?name=$label&per_page=5" \
                 | jq -r '[.artifacts[] | select(.expired|not)] | length' || echo 0)
               if (( found > 0 )); then reused+=("$label"); else kept+=("$entry"); fi
             done < <(jq -c '.include[]' <<<"$matrix")
@@ -217,8 +222,8 @@ jobs:
           # content already landed some other way (a sync PR beat it, or a
           # merge from master swallowed it). Merging it would record a change
           # that isn't one. Flag it so `result` fails rather than passes.
-          if [[ "${{ github.event_name }}" == pull_request ]]; then
-            total=$(git diff --name-only "${{ github.event.pull_request.base.sha }}" "${{ github.event.pull_request.head.sha }}" | wc -l)
+          if [[ "$GITHUB_EVENT_NAME" == pull_request ]]; then
+            total=$(git diff --name-only "$PR_BASE_SHA" "$PR_HEAD_SHA" | wc -l)
             echo "empty=$([[ $total -eq 0 ]] && echo true || echo false)" >> "$GITHUB_OUTPUT"
             echo "files changed vs base: $total"
           else
@@ -261,11 +266,13 @@ jobs:
           persist-credentials: false
       - name: Overlay the PR's package directories onto base tooling
         if: github.event_name == 'pull_request'
+        env:
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           set -euo pipefail
-          git fetch --no-tags --depth=1 origin "${{ github.event.pull_request.head.sha }}"
-          git checkout "${{ github.event.pull_request.head.sha }}" -- pkgbuilds/
-          echo "tooling: $(git rev-parse --short HEAD) (base)  packages: ${{ github.event.pull_request.head.sha }} (PR head)"
+          git fetch --no-tags --depth=1 origin "$PR_HEAD_SHA"
+          git checkout "$PR_HEAD_SHA" -- pkgbuilds/
+          echo "tooling: $(git rev-parse --short HEAD) (base)  packages: $PR_HEAD_SHA (PR head)"
           # A preview only. `head` exits after ten lines and, under pipefail,
           # git's SIGPIPE (141) failed the step for any PR far enough behind
           # master to differ in more files; sed reads the whole stream.
@@ -281,21 +288,24 @@ jobs:
         id: build
         env:
           CONTAINER_ENGINE: docker
+          PACKAGE: ${{ matrix.package }}
+          TARGET_ARCH: ${{ matrix.arch }}
+          MATRIX_BUILDER_ARCH: ${{ matrix.builder_arch || matrix.arch }}
         run: |
           set -euo pipefail
-          plan=$(bin/build --dry-run --mirror edge --arch "${{ matrix.arch }}" --package "${{ matrix.package }}" 2>&1 | grep -E '^==> Plan complete' || true)
+          plan=$(bin/build --dry-run --mirror edge --arch "$TARGET_ARCH" --package "$PACKAGE" 2>&1 | grep -E '^==> Plan complete' || true)
           if [[ -n "$plan" && -z "$(sed -E 's/.*would build: *//' <<<"$plan" | tr -d '[:space:]')" ]]; then
-            echo "==> ${{ matrix.package }} (${{ matrix.arch }}): edge already holds this version, nothing to build"
+            echo "==> $PACKAGE ($TARGET_ARCH): edge already holds this version, nothing to build"
             echo "built=false" >> "$GITHUB_OUTPUT"
             # Arch bumps pkgrel only when the built package changes, which is
             # the reviewer's call. When the recipe itself changed (comments and
             # blank lines aside), flag it on the PKGBUILD without failing: the
             # change ships only once pkgver or pkgrel moves. HEAD is the base
             # branch; the PR's package directories are overlaid on it.
-            recipe="pkgbuilds/${{ matrix.package }}/PKGBUILD"
+            recipe="pkgbuilds/$PACKAGE/PKGBUILD"
             recipe_lines() { grep -vE '^[[:space:]]*(#|$)' || true; }
             if ! cmp -s <(git show "HEAD:$recipe" 2>/dev/null | recipe_lines) <(recipe_lines < "$recipe"); then
-              note="PKGBUILD changed, but edge already holds this version of ${{ matrix.package }}, so the change will not ship until pkgver or pkgrel changes. Bump pkgrel if it affects the built package."
+              note="PKGBUILD changed, but edge already holds this version of $PACKAGE, so the change will not ship until pkgver or pkgrel changes. Bump pkgrel if it affects the built package."
               echo "::warning file=$recipe,title=Change will not ship::$note"
               echo "$note" >> "$GITHUB_STEP_SUMMARY"
             fi
@@ -306,16 +316,15 @@ jobs:
           # package job about 130 s. Build only when no image carries the key:
           # a change to build/ reaches PR builds before its refresh finishes.
           # A cross build runs in its builder's image (builder_arch).
-          builder_arch="${{ matrix.builder_arch || matrix.arch }}"
-          published="ghcr.io/omacom/omarchy-pkg-builder:$(bin/builder-image key --arch "$builder_arch" --mirror edge)"
+          published="ghcr.io/omacom/omarchy-pkg-builder:$(bin/builder-image key --arch "$MATRIX_BUILDER_ARCH" --mirror edge)"
           if docker pull --quiet "$published"; then
-            docker tag "$published" "omarchy-pkg-builder:latest-$builder_arch-edge"
+            docker tag "$published" "omarchy-pkg-builder:latest-$MATRIX_BUILDER_ARCH-edge"
             export OMARCHY_SKIP_BUILDER_IMAGE=1
             echo "==> Builder image: pulled $published"
           else
             echo "==> Builder image: none published for this key, building it"
           fi
-          bin/build --mirror edge --arch "${{ matrix.arch }}" --package "${{ matrix.package }}"
+          bin/build --mirror edge --arch "$TARGET_ARCH" --package "$PACKAGE"
           echo "built=true" >> "$GITHUB_OUTPUT"
       # The fast ring publishes this edge build to rc and stable on merge,
       # ahead of the Arch snapshot it was built against. Install it on each of
@@ -325,22 +334,26 @@ jobs:
         if: steps.build.outputs.built == 'true' && matrix.channels != 'edge'
         env:
           CONTAINER_ENGINE: docker
+          PACKAGE: ${{ matrix.package }}
+          TARGET_ARCH: ${{ matrix.arch }}
+          MATRIX_BUILDER_ARCH: ${{ matrix.builder_arch || matrix.arch }}
+          CHANNELS: ${{ matrix.channels }}
         run: |
           set -euo pipefail
           source helpers/artifact-helpers.sh
           # A cross build ran in its builder's image. The check runs the
           # package in its own architecture's image, under QEMU: pull the one
           # published for the key, or bin/check-fast-ring builds it.
-          if [[ "${{ matrix.builder_arch || matrix.arch }}" != "${{ matrix.arch }}" ]]; then
-            published="ghcr.io/omacom/omarchy-pkg-builder:$(bin/builder-image key --arch "${{ matrix.arch }}" --mirror edge)"
+          if [[ "$MATRIX_BUILDER_ARCH" != "$TARGET_ARCH" ]]; then
+            published="ghcr.io/omacom/omarchy-pkg-builder:$(bin/builder-image key --arch "$TARGET_ARCH" --mirror edge)"
             if docker pull --quiet --platform linux/arm64 "$published"; then
-              docker tag "$published" "omarchy-pkg-builder:latest-${{ matrix.arch }}-edge"
+              docker tag "$published" "omarchy-pkg-builder:latest-$TARGET_ARCH-edge"
             fi
           fi
-          mapfile -t files < <(package_files build-output/edge/${{ matrix.arch }})
+          mapfile -t files < <(package_files "build-output/edge/$TARGET_ARCH")
           compiled=()
-          grep -qE '^[[:space:]]*(function[[:space:]]+)?build[[:space:]]*(\([[:space:]]*\))?[[:space:]]*(\{|$)' "pkgbuilds/${{ matrix.package }}/PKGBUILD" && compiled=(--compiled)
-          bin/check-fast-ring --arch "${{ matrix.arch }}" --channels "${{ matrix.channels }}" "${compiled[@]}" "${files[@]}"
+          grep -qE '^[[:space:]]*(function[[:space:]]+)?build[[:space:]]*(\([[:space:]]*\))?[[:space:]]*(\{|$)' "pkgbuilds/$PACKAGE/PKGBUILD" && compiled=(--compiled)
+          bin/check-fast-ring --arch "$TARGET_ARCH" --channels "$CHANNELS" "${compiled[@]}" "${files[@]}"
       # makepkg's check() leaves meson's per-test output in the build tree,
       # never on stdout, so a failing test shows only a summary line in this
       # job log. bin/build bind-mounts $SRC_DIR at /src, so those logs outlive
@@ -361,7 +374,10 @@ jobs:
       # the tree that merges, and what publish looks up.
       - name: Tree hash
         id: tree
-        run: echo "hash=$(git rev-parse "${{ github.event.pull_request.head.sha || github.sha }}:pkgbuilds/${{ matrix.package }}")" >> "$GITHUB_OUTPUT"
+        env:
+          TREE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          PACKAGE: ${{ matrix.package }}
+        run: echo "hash=$(git rev-parse "$TREE_SHA:pkgbuilds/$PACKAGE")" >> "$GITHUB_OUTPUT"
       # The upload action rejects a path containing ':', which is how makepkg
       # names a package with an epoch. The files ride inside packages.tar
       # (helpers/artifact-helpers.sh); publish.yml unpacks it. Only a
@@ -370,9 +386,11 @@ jobs:
       - name: Pack artifact
         if: steps.build.outputs.built == 'true'
         id: pack
+        env:
+          TARGET_ARCH: ${{ matrix.arch }}
         run: |
           source helpers/artifact-helpers.sh
-          pack_packages build-output/edge/${{ matrix.arch }} packages.tar
+          pack_packages "build-output/edge/$TARGET_ARCH" packages.tar
           tar -tvf packages.tar
       # Each package as an artifact of its own, with an index beside them
       # (.github/actions/upload-packages). They go before packages.tar: a

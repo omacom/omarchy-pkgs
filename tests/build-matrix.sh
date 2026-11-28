@@ -230,3 +230,20 @@ fi
 [[ "$(cat "$BT/src/test-logs/edge/$native_arch/beta/build/meson-logs/testlog.txt")" == "failed assertion" ]] || fail "exported beta meson log missing"
 [[ "$(cat "$BT/src/beta/existing-tree-marker")" == "keep" ]] || fail "meson log export clobbered existing src/beta tree"
 pass "bin/build isolates /build-output and /build-plan mounts and exports failed meson-logs cleanly"
+
+# Package-name validation: accept valid recipe directory names and blank stdin;
+# reject path traversal, leading dashes/dots, whitespace, and shell syntax.
+mkdir -p "$T/root/pkgbuilds/1Pkg@2.0_foo+bar-1/.omarchy"
+printf 'pkgname=1pkg@2.0_foo+bar-1\narch=(x86_64)\n' > "$T/root/pkgbuilds/1Pkg@2.0_foo+bar-1/PKGBUILD"
+echo '{"source": "local"}' > "$T/root/pkgbuilds/1Pkg@2.0_foo+bar-1/.omarchy/package.json"
+[[ $(jq -r '.include[0].package' <<<"$("$T/root/bin/build-matrix" 1Pkg@2.0_foo+bar-1)") == "1Pkg@2.0_foo+bar-1" ]] || fail "valid recipe name rejected"
+[[ $("$T/root/bin/build-matrix" <<< $'\n\n') == '{"include":[]}' ]] || fail "blank stdin failed"
+
+# shellcheck disable=SC2016
+for bad in "../outside" ".hidden" "-foo" "foo;id" 'foo$(id)' "foo bar"; do
+  out=$("$T/root/bin/build-matrix" "$bad" 2>&1) && fail "accepted invalid arg: $bad"
+  [[ "$out" == *"invalid package name"* ]] || fail "unexpected error for arg $bad: $out"
+  out=$(printf '%s\n' "$bad" | "$T/root/bin/build-matrix" 2>&1) && fail "accepted invalid stdin: $bad"
+  [[ "$out" == *"invalid package name"* ]] || fail "unexpected error for stdin $bad: $out"
+done
+pass "bin/build-matrix validates package names"
