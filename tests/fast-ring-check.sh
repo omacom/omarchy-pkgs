@@ -55,15 +55,18 @@ ldd() { echo "	not a dynamic executable"; return 1; }
 out=$(printf '%s\n' /usr/bin/bash | inspect_files) && [[ -z $out ]] \
   && pass "an ELF glibc cannot load (a musl prebuild) does not abort the check" || fail "ldd failure aborted: $out"
 unset -f ldd
-if pacman -Q qt6-base >/dev/null 2>&1; then
-  qt=$(readlink -f /usr/lib/libQt6Gui.so.6)
-  [[ -z $(printf '%s\n' "$qt" | inspect_files) ]] \
-    && pass "a vendor's Qt-linked library is only link-checked" || fail "vendor Qt flagged"
-  [[ $(printf '%s\n' "$qt" | COMPILED=1 inspect_files) == rule$'\t'*libQt6Core* ]] \
-    && pass "a Qt-linked library compiled here breaks the rule" || fail "compiled Qt accepted"
-fi
-
 T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
+# A synthetic ELF linked against a nonexistent Qt6 soname version so the Qt6
+# rule and link check run deterministically whether or not qt6-base is installed.
+gcc -shared -Wl,-soname,libQt6Core.so.999 -x c /dev/null -o "$T/libQt6Core.so.999"
+gcc -shared -Wl,--no-as-needed -Wl,-rpath,'$ORIGIN' "$T/libQt6Core.so.999" -o "$T/libqt-test.so"
+out=$(printf '%s\n' "$T/libqt-test.so" | COMPILED=0 inspect_files) && [[ -z $out ]] \
+  && pass "a vendor's Qt-linked library is only link-checked" || fail "vendor Qt flagged: $out"
+out=$(printf '%s\n' "$T/libqt-test.so" | COMPILED=1 inspect_files) && [[ $out == rule$'\t'*libQt6Core* ]] \
+  && pass "a Qt-linked library compiled here breaks the rule" || fail "compiled Qt accepted: $out"
+rm "$T/libQt6Core.so.999"
+out=$(printf '%s\n' "$T/libqt-test.so" | COMPILED=0 inspect_files) && [[ $out == link$'\t'*libQt6Core.so.999* ]] \
+  && pass "a vendor's Qt-linked library still fails link checks when Qt is missing" || fail "missing vendor Qt accepted: $out"
 # split_db: the planned entries move from the channel's database to the
 # promoted one, so nothing can resolve to a version the promotion replaces.
 mkdir -p "$T/chan/keep-1-1" "$T/chan/moved-1-1" "$T/from/moved-1-2" "$T/from/new-1-1" "$T/from/other-1-9"
