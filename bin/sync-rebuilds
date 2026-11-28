@@ -1,39 +1,7 @@
-#!/bin/bash
-set -euo pipefail
+#!/usr/bin/env python3
+"""Bump pkgrel for packages that must be rebuilt when a dependency changes.
 
-BUILD_ROOT=$(realpath "${BASH_SOURCE[0]%/*}/..")
-source "$BUILD_ROOT/helpers/message-helpers.sh"
-source "$BUILD_ROOT/helpers/paths.sh"
-source "$BUILD_ROOT/helpers/package-metadata.sh"
-
-TEMP_DIR=$(mktemp -d)
-trap 'rm -rf "$TEMP_DIR"' EXIT
-
-SPECIFIC_PACKAGES=()
-SELF_TEST=false
-
-# Only the repositories a user actually installs from. A Qt release sitting in
-# testing or kde-unstable is not what the build container will link against, and
-# rebuilding for it would ship a package built against the wrong ABI.
-OFFICIAL_REPOS=" core extra multilib core-debug extra-debug "
-
-# The published repositories are the floor a bumped pkgrel has to clear.
-PUBLISHED_BASE_URL="${OMARCHY_PUBLISHED_BASE_URL:-https://pkgs.omarchy.org}"
-PUBLISHED_MIRRORS=(edge stable)
-
-# The edge mirror of Arch Linux ARM the aarch64 builder resolves
-# (build/Dockerfile); override it only when the builder mirror changes.
-ALARM_BASE_URL="${OMARCHY_ALARM_BASE_URL:-https://arm-mirror.omarchy.org/aarch64}"
-ALARM_REPOS=(core extra alarm aur)
-
-usage() {
-  cat <<EOF
-Usage: $0 [PACKAGE...]
-
-Bump pkgrel for packages that have to be rebuilt when a dependency changes
-underneath them, rather than when their own source moves.
-
-A package opts in by naming those dependencies in .omarchy/package.json:
+A package opts in by naming trigger dependencies in .omarchy/package.json:
 
   { "source": "aur", "sync": false, "rebuild_on": ["qt6-base"] }
 
@@ -45,989 +13,1309 @@ architecture in rebuilt_against, and written by this command:
       "aarch64": { "qt6-base": "6.11.2-2" }
   } }
 
-pkgrel is bumped unless every package named in rebuild_on is recorded and still
-matches. A name that is missing from the record counts as changed, so opting a
-package in, or adding a dependency to one already opted in, buys one rebuild
-rather than a record that certifies a build nobody checked.
+Per-package edits are staged and validated before either PKGBUILD or
+.omarchy/package.json is replaced, and PKGBUILD is rolled back atomically if
+committing metadata fails or the process is interrupted between renames.
+"""
 
-The bump has to happen in git rather than in the builder, because a rebuild that
-reuses the published version string is a package pacman will never offer anyone.
-For the same reason the bumped version is checked against the published one and
-refused if it would not be an upgrade.
+from __future__ import annotations
 
-Arguments:
-  PACKAGE      One or more package names to update (optional)
+import argparse
+import json
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+from dataclasses import dataclass, field
+from pathlib import Path
 
-Options:
-  --self-test  Run the built-in regression tests and exit
-  -h, --help   Show this help
+ROOT = Path(__file__).resolve().parent.parent
+VALID_ARCHES = ("x86_64", "aarch64")
+OFFICIAL_REPOS = frozenset({"core", "extra", "multilib", "core-debug", "extra-debug"})
+PUBLISHED_MIRRORS = ("edge", "stable")
+ALARM_REPOS = ("core", "extra", "alarm", "aur")
 
-Examples:
-  $0                   # Update every package that declares rebuild_on
-  $0 quickshell-git    # Update specific packages
+PKGREL_RE = re.compile(r"^[0-9]+(?:\.[0-9]+)?$")
+PKGREL_LINE_RE = re.compile(r"^pkgrel=.*$", re.MULTILINE)
+ALPM_VER_RE = re.compile(r"^[0-9A-Za-z._+~:-]+$")
+DEPENDS_START_RE = re.compile(r"^([ \t]*)(depends(?:_[A-Za-z0-9_]+)?)(\+?=)\(")
+HEREDOC_RE = re.compile(
+    r"(?:^|[^<])(<<-?)[ \t]*(\\?[A-Za-z_][A-Za-z0-9_]*|'[^']+'|\"[^\"]+\")"
+)
 
-x86_64 trigger versions come from the local pacman database; aarch64 versions
-come from the live Arch Linux ARM repository database. A trigger this
-repository carries for an architecture shadows both, so its version is the
-checked-in recipe's once edge publishes it. Every architecture in CI_ARCHES
-(what a merge builds) that the package supports is considered.
-EOF
-}
 
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    -h|--help)
-      usage
-      exit 0
-      ;;
-    --self-test)
-      SELF_TEST=true
-      shift
-      ;;
-    --*)
-      print_error "Unknown option: $1"
-      exit 1
-      ;;
-    *)
-      SPECIFIC_PACKAGES+=("$1")
-      shift
-      ;;
-  esac
+class SyncError(Exception):
+    """Operational or validation failure for a package or repository."""
+
+
+def print_header(text: str) -> None:
+    print("================================")
+    print(text)
+    print("================================")
+
+
+def print_info(text: str) -> None:
+    print(f"==> {text}")
+
+
+def print_success(text: str) -> None:
+    print(f"✓ {text}")
+
+
+def print_warning(text: str) -> None:
+    print(f"⚠ {text}", file=sys.stderr)
+
+
+def print_error(text: str) -> None:
+    print(f"✗ {text}", file=sys.stderr)
+
+
+def get_pkgbuilds_dir() -> Path:
+    env_dir = os.environ.get("PKGBUILDS_DIR")
+    return Path(env_dir) if env_dir else ROOT / "pkgbuilds"
+
+
+def get_ci_arches() -> list[str]:
+    raw = (os.environ.get("CI_ARCHES") or "x86_64 aarch64").split()
+    for arch in raw:
+        if arch not in VALID_ARCHES:
+            raise SyncError(
+                f"Invalid architecture: {arch} (must be one of: {' '.join(VALID_ARCHES)})"
+            )
+    return raw
+
+
+def vercmp(a: str, b: str) -> int:
+    proc = subprocess.run(["vercmp", a, b], capture_output=True, text=True, check=False)
+    if proc.returncode != 0:
+        raise SyncError(f"vercmp failed comparing {a!r} and {b!r}")
+    return int(proc.stdout.strip())
+
+
+def version_pkgver(version: str) -> str:
+    """Return pkgver with any epoch and pkgrel removed."""
+    if ":" in version:
+        version = version.split(":", 1)[1]
+    return version.rsplit("-", 1)[0]
+
+
+def version_normalized(version: str) -> str:
+    """Return a full version with any zero epoch omitted, matching makepkg."""
+    return version[2:] if version.startswith("0:") else version
+
+
+def version_without_pkgrel(version: str) -> str:
+    """Return [epoch:]pkgver with pkgrel removed and zero epoch omitted."""
+    return version_normalized(version).rsplit("-", 1)[0]
+
+
+def bump_pkgrel(pkgrel: str) -> str | None:
+    """2 -> 3, and 1.1 -> 1.2. Reject anything else."""
+    if not PKGREL_RE.match(pkgrel):
+        return None
+    if "." in pkgrel:
+        head, tail = pkgrel.rsplit(".", 1)
+        return f"{head}.{int(tail) + 1}"
+    return str(int(pkgrel) + 1)
+
+
+@dataclass(frozen=True)
+class RecipeFields:
+    pkgver: str
+    pkgrel: str
+    epoch: str
+    arches: tuple[str, ...]
+
+
+def read_pkgbuild_fields(pkgdir: Path, arch: str = "x86_64") -> RecipeFields | None:
+    """Source PKGBUILD once with CARCH set and return version and arch fields."""
+    env = os.environ.copy()
+    env.pop("OMARCHY_SRC", None)
+    env["CARCH"] = arch
+    script = (
+        'source PKGBUILD >/dev/null 2>&1 || exit 1\n'
+        'printf "pkgver\\t%s\\npkgrel\\t%s\\nepoch\\t%s\\n" "${pkgver:-}" "${pkgrel:-}" "${epoch:-}"\n'
+        'for a in "${arch[@]}"; do printf "arch\\t%s\\n" "$a"; done\n'
+    )
+    proc = subprocess.run(
+        ["bash", "-c", script], cwd=pkgdir, env=env, capture_output=True, text=True, check=False
+    )
+    if proc.returncode != 0:
+        return None
+    pkgver = pkgrel = epoch = ""
+    arches: list[str] = []
+    for line in proc.stdout.splitlines():
+        key, sep, val = line.partition("\t")
+        if not sep:
+            continue
+        if key == "pkgver":
+            pkgver = val
+        elif key == "pkgrel":
+            pkgrel = val
+        elif key == "epoch":
+            epoch = val
+        elif key == "arch" and val:
+            arches.append(val)
+    return RecipeFields(pkgver=pkgver, pkgrel=pkgrel, epoch=epoch, arches=tuple(arches))
+
+
+def package_supports_arch(pkgdir: Path, target: str) -> bool:
+    fields = read_pkgbuild_fields(pkgdir, target)
+    return fields is not None and ("any" in fields.arches or target in fields.arches)
+
+
+def format_carried_version(fields: RecipeFields) -> str | None:
+    if not fields.pkgver or not fields.pkgrel:
+        return None
+    epoch = "" if fields.epoch in ("", "0") else fields.epoch
+    return f"{epoch}:{fields.pkgver}-{fields.pkgrel}" if epoch else f"{fields.pkgver}-{fields.pkgrel}"
+
+
+def carried_version(arch: str, pkgdir: Path) -> str | None:
+    fields = read_pkgbuild_fields(pkgdir, arch)
+    return format_carried_version(fields) if fields else None
+
+
+def resolve_carried_trigger(pkgbuilds_dir: Path, arch: str, trigger: str) -> tuple[bool, str | None]:
+    """Return (is_carried, version) with a single PKGBUILD source."""
+    pkgdir = pkgbuilds_dir / trigger
+    if not ((pkgdir / "PKGBUILD").is_file() and (pkgdir / ".omarchy" / "package.json").is_file()):
+        return False, None
+    fields = read_pkgbuild_fields(pkgdir, arch)
+    if fields is None or ("any" not in fields.arches and arch not in fields.arches):
+        return False, None
+    return True, format_carried_version(fields)
+
+
+def parse_alpm_desc_stream(text: str) -> list[tuple[str, str, str]]:
+    """Parse concatenated ALPM desc files into (name, base, version) tuples."""
+    entries: list[tuple[str, str, str]] = []
+    name = base = version = ""
+    lines = iter(text.splitlines())
+
+    def emit() -> None:
+        nonlocal name, base, version
+        if name and version:
+            entries.append((name, base, version))
+        name = base = version = ""
+
+    for line in lines:
+        if line == "%FILENAME%":
+            emit()
+        elif line == "%NAME%":
+            if name and version:
+                emit()
+            name = next(lines, "")
+        elif line == "%BASE%":
+            base = next(lines, "")
+        elif line == "%VERSION%":
+            version = next(lines, "")
+    emit()
+    return entries
+
+
+def extract_db_entries(db_path: Path) -> list[tuple[str, str, str]] | None:
+    """Validate a repo tarball and extract all (name, base, version) entries."""
+    listing = subprocess.run(
+        ["tar", "-tf", str(db_path)], capture_output=True, text=True, check=False
+    )
+    if listing.returncode != 0:
+        return None
+    if not any(line.endswith("/desc") for line in listing.stdout.splitlines()):
+        return []
+    extract = subprocess.run(
+        ["tar", "-xOf", str(db_path), "--wildcards", "*/desc"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if extract.returncode != 0:
+        return None
+    return parse_alpm_desc_stream(extract.stdout)
+
+
+@dataclass
+class RepoCache:
+    temp_dir: Path
+    ci_arches: list[str]
+    published_base_url: str = field(
+        default_factory=lambda: os.environ.get(
+            "OMARCHY_PUBLISHED_BASE_URL", "https://pkgs.omarchy.org"
+        )
+    )
+    alarm_base_url: str = field(
+        default_factory=lambda: os.environ.get(
+            "OMARCHY_ALARM_BASE_URL", "https://arm-mirror.omarchy.org/aarch64"
+        )
+    )
+    published_loaded: bool = False
+    published_versions: dict[str, str] = field(default_factory=dict)
+    edge_versions: dict[tuple[str, str], str] = field(default_factory=dict)
+    edge_read: set[str] = field(default_factory=set)
+    alarm_repos: dict[str, dict[str, str]] = field(default_factory=dict)
+
+    def _download(self, url: str, dest: Path) -> bool:
+        proc = subprocess.run(
+            ["curl", "-fsSL", "--max-time", "120", "-o", str(dest), url],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        return proc.returncode == 0
+
+    def native_repo_version(self, package: str) -> str | None:
+        env = os.environ.copy()
+        env["LC_ALL"] = "C"
+        proc = subprocess.run(
+            ["pacman", "-Si", package], env=env, capture_output=True, text=True, check=False
+        )
+        if proc.returncode != 0:
+            return None
+        repo = ""
+        for line in proc.stdout.splitlines():
+            key, sep, val = line.partition(":")
+            if not sep:
+                continue
+            key, val = key.strip(), val.strip()
+            if key == "Repository":
+                repo = val
+            elif key == "Version" and repo in OFFICIAL_REPOS:
+                return val
+        return None
+
+    def _load_alarm_repo(self, repo: str) -> dict[str, str]:
+        if repo in self.alarm_repos:
+            return self.alarm_repos[repo]
+        db = self.temp_dir / f"alarm-{repo}.db"
+        if not self._download(f"{self.alarm_base_url}/{repo}/{repo.split('/')[-1]}.db", db):
+            raise SyncError(f"Could not read the aarch64 {repo} repository database")
+        entries = extract_db_entries(db)
+        if entries is None:
+            raise SyncError(f"Unreadable aarch64 {repo} repository database")
+        index: dict[str, str] = {}
+        for name, base, version in entries:
+            index.setdefault(name, version)
+            if base and base != name:
+                index.setdefault(base, version)
+        self.alarm_repos[repo] = index
+        return index
+
+    def repo_version(self, arch: str, package: str) -> str | None:
+        if arch == "x86_64":
+            return self.native_repo_version(package)
+        if arch == "aarch64":
+            for repo in ALARM_REPOS:
+                index = self._load_alarm_repo(repo)
+                if package in index:
+                    return index[package]
+            return None
+        raise SyncError(f"Unsupported architecture: {arch}")
+
+    def _remember_published(self, name: str, version: str) -> None:
+        known = self.published_versions.get(name)
+        if not known or vercmp(version, known) > 0:
+            self.published_versions[name] = version
+
+    def load_published_versions(self) -> None:
+        if self.published_loaded:
+            return
+        self.published_loaded = True
+        for arch in self.ci_arches:
+            for mirror in PUBLISHED_MIRRORS:
+                db = self.temp_dir / f"published-{mirror}-{arch}.db.tar.zst"
+                url = f"{self.published_base_url}/{mirror}/{arch}/omarchy.db.tar.zst"
+                if not self._download(url, db):
+                    print_warning(
+                        f"Could not read the published {mirror}/{arch} database; "
+                        "bumps are not checked against it this run"
+                    )
+                    continue
+                entries = extract_db_entries(db)
+                if entries is None:
+                    print_warning(
+                        f"Unreadable published {mirror}/{arch} database; "
+                        "bumps are not checked against it this run"
+                    )
+                    continue
+                if mirror == "edge":
+                    self.edge_read.add(arch)
+                for name, base, version in entries:
+                    if name and version:
+                        self._remember_published(name, version)
+                    if base and version:
+                        self._remember_published(base, version)
+                    if mirror == "edge" and version:
+                        if name:
+                            self.edge_versions[(arch, name)] = version
+                        if base:
+                            self.edge_versions[(arch, base)] = version
+
+    def published_version(self, package: str) -> str | None:
+        self.load_published_versions()
+        return self.published_versions.get(package)
+
+
+def rewrite_pkgrel_text(text: str, next_pkgrel: str) -> str:
+    matches = list(PKGREL_LINE_RE.finditer(text))
+    if len(matches) != 1:
+        raise SyncError(f"Expected exactly one pkgrel assignment (found {len(matches)})")
+    m = matches[0]
+    return text[: m.start()] + f"pkgrel={next_pkgrel}" + text[m.end() :]
+
+
+@dataclass(frozen=True)
+class PinRule:
+    pin_pkgver: str
+    pin_full: str
+    conflict_pkgver: bool = False
+    conflict_full: bool = False
+    partial_arch: bool = False
+    reason: str = ""
+
+
+def _build_array_pin_rules(
+    current: dict[str, dict[str, str]], missing_arch: str | None
+) -> dict[str, dict[str, PinRule]]:
+    rules: dict[str, dict[str, PinRule]] = {}
+    by_trigger: dict[str, list[str]] = {}
+
+    for arch, triggers in current.items():
+        rules[f"depends_{arch}"] = {
+            trigger: PinRule(
+                pin_pkgver=version_without_pkgrel(version),
+                pin_full=version_normalized(version),
+            )
+            for trigger, version in triggers.items()
+        }
+        for trigger, version in triggers.items():
+            by_trigger.setdefault(trigger, []).append(version)
+
+    shared_rules: dict[str, PinRule] = {}
+    for trigger, versions in by_trigger.items():
+        pkgvers = [version_without_pkgrel(v) for v in versions]
+        fulls = [version_normalized(v) for v in versions]
+        conflict_pkgver = len(set(pkgvers)) > 1
+        conflict_full = len(set(fulls)) > 1
+        if conflict_pkgver or conflict_full:
+            reason = "versions differ across architectures"
+        elif missing_arch:
+            reason = f"supported architecture {missing_arch} is not covered by this run"
+        else:
+            reason = ""
+        shared_rules[trigger] = PinRule(
+            pin_pkgver=pkgvers[0],
+            pin_full=fulls[0],
+            conflict_pkgver=conflict_pkgver,
+            conflict_full=conflict_full,
+            partial_arch=missing_arch is not None,
+            reason=reason,
+        )
+    rules["depends"] = shared_rules
+    return rules
+
+
+def _rewrite_pin_token(token: str, array_name: str, rules: dict[str, PinRule]) -> str:
+    name, sep, ver = token.partition("=")
+    if not sep or name not in rules or not ALPM_VER_RE.match(ver):
+        return token
+    rule = rules[name]
+    if "-" in ver:
+        if rule.conflict_full or (rule.partial_arch and ver != rule.pin_full):
+            raise SyncError(f"Cannot move {array_name} pin for {name} ({rule.reason})")
+        return f"{name}={rule.pin_full}"
+    if rule.conflict_pkgver or (rule.partial_arch and ver != rule.pin_pkgver):
+        raise SyncError(f"Cannot move {array_name} pin for {name} ({rule.reason})")
+    return f"{name}={rule.pin_pkgver}"
+
+
+def _is_delim(line: str, idx: int) -> bool:
+    return idx >= len(line) or line[idx] in (" ", "\t", ")")
+
+
+HEREDOC_PREFIX_RE = re.compile(r"(?:^|[^<])<<-?[ \t]*$")
+
+
+def _scan_outer_line(line: str, quote: str | None) -> tuple[str, str | None]:
+    """Scan a non-depends line, tracking multiline single/double quotes and returning
+    the unquoted code portion (preserving quoted heredoc delimiters) before `#`."""
+    code: list[str] = []
+    keep_quoted = False
+    i = 0
+    n = len(line)
+    while i < n:
+        c = line[i]
+        if quote == "'":
+            if keep_quoted:
+                code.append(c)
+            if c == "'":
+                quote = None
+                keep_quoted = False
+            i += 1
+        elif quote == '"':
+            if c == "\\" and i + 1 < n:
+                if keep_quoted:
+                    code.append(line[i : i + 2])
+                i += 2
+            elif c == '"':
+                if keep_quoted:
+                    code.append(c)
+                quote = None
+                keep_quoted = False
+                i += 1
+            else:
+                if keep_quoted:
+                    code.append(c)
+                i += 1
+        else:
+            if c == "\\" and i + 1 < n:
+                code.append(line[i : i + 2])
+                i += 2
+            elif c == "'" or c == '"':
+                keep_quoted = bool(HEREDOC_PREFIX_RE.search("".join(code)))
+                quote = c
+                if keep_quoted:
+                    code.append(c)
+                i += 1
+            elif c == "#" and (i == 0 or line[i - 1] in (" ", "\t", ";", "(")):
+                break
+            else:
+                code.append(c)
+                i += 1
+    return "".join(code), quote
+
+
+def rewrite_pins_text(
+    text: str,
+    current: dict[str, dict[str, str]],
+    missing_arch: str | None = None,
+) -> str:
+    """Move exact trigger pins inside depends / depends_<arch> arrays (=() and +=())."""
+    array_rules = _build_array_pin_rules(current, missing_arch)
+    out_lines: list[str] = []
+    active_array: str | None = None
+    outer_quote: str | None = None
+    heredoc_queue: list[tuple[str, bool]] = []
+
+    for raw_line in text.splitlines(keepends=True):
+        if raw_line.endswith("\r\n"):
+            line, eol = raw_line[:-2], "\r\n"
+        elif raw_line.endswith("\n"):
+            line, eol = raw_line[:-1], "\n"
+        else:
+            line, eol = raw_line, ""
+
+        if heredoc_queue:
+            delim, strip_tabs = heredoc_queue[0]
+            check = line.lstrip("\t") if strip_tabs else line
+            if check == delim:
+                heredoc_queue.pop(0)
+            out_lines.append(raw_line)
+            continue
+
+        i = 0
+        out: list[str] = []
+
+        if active_array is None:
+            if outer_quote is not None:
+                _, outer_quote = _scan_outer_line(line, outer_quote)
+                out_lines.append(raw_line)
+                continue
+            m = DEPENDS_START_RE.match(line)
+            if m and m.group(2) in array_rules:
+                active_array = m.group(2)
+                out.append(line[: m.end()])
+                i = m.end()
+            else:
+                code_part, outer_quote = _scan_outer_line(line, None)
+                for hd in HEREDOC_RE.finditer(code_part):
+                    heredoc_queue.append(
+                        (hd.group(2).strip("'\"\\"), hd.group(1) == "<<-")
+                    )
+                out_lines.append(raw_line)
+                continue
+
+        rules = array_rules[active_array]
+        n = len(line)
+        while i < n:
+            c = line[i]
+            if c in (" ", "\t"):
+                out.append(c)
+                i += 1
+            elif c == "#":
+                out.append(line[i:])
+                break
+            elif c == ")":
+                out.append(line[i:])
+                active_array = None
+                break
+            elif c == "'":
+                j = line.find("'", i + 1)
+                if j == -1:
+                    out.append(line[i:])
+                    active_array = None
+                    outer_quote = "'"
+                    break
+                if not _is_delim(line, j + 1):
+                    out.append(line[i:])
+                    active_array = None
+                    _, outer_quote = _scan_outer_line(line[i:], None)
+                    break
+                out.append("'" + _rewrite_pin_token(line[i + 1 : j], active_array, rules) + "'")
+                i = j + 1
+            elif c == '"':
+                j = i + 1
+                while j < n:
+                    if line[j] == "\\" and j + 1 < n:
+                        j += 2
+                        continue
+                    if line[j] == '"':
+                        break
+                    j += 1
+                if j >= n:
+                    out.append(line[i:])
+                    active_array = None
+                    outer_quote = '"'
+                    break
+                if not _is_delim(line, j + 1):
+                    out.append(line[i:])
+                    active_array = None
+                    _, outer_quote = _scan_outer_line(line[i:], None)
+                    break
+                tok = line[i + 1 : j]
+                if "$(" in tok or "`" in tok:
+                    out.append(line[i:])
+                    active_array = None
+                    break
+                out.append('"' + _rewrite_pin_token(tok, active_array, rules) + '"')
+                i = j + 1
+            else:
+                j = i
+                while j < n and line[j] not in (" ", "\t", ")"):
+                    j += 1
+                tok = line[i:j]
+                if tok == "\\" and j == n:
+                    out.append(tok)
+                    i = j
+                elif (
+                    "$(" in tok
+                    or "`" in tok
+                    or "'" in tok
+                    or '"' in tok
+                    or (j == n and tok.endswith("\\"))
+                ):
+                    out.append(line[i:])
+                    active_array = None
+                    break
+                else:
+                    out.append(_rewrite_pin_token(tok, active_array, rules))
+                    i = j
+
+        out_lines.append("".join(out) + eol)
+
+    return "".join(out_lines)
+
+
+VAR_REF_RE = re.compile(r"\$\{?([A-Za-z_][A-Za-z0-9_]*)")
+RANGE_OP_RE = re.compile(r">=|<=|>|<")
+LITERAL_PKG_RE = re.compile(r"^[a-z0-9@_+][a-z0-9@._+-]*$")
+
+
+def _split_bash_array_words(rhs: str) -> list[tuple[str, bool]]:
+    """Split a declare -f array RHS `(...)` into (unquoted_text, is_single_quoted) pairs."""
+    inner = rhs.strip()
+    if inner.startswith("(") and inner.endswith(")"):
+        inner = inner[1:-1]
+    words: list[tuple[str, bool]] = []
+    i = 0
+    n = len(inner)
+    while i < n:
+        while i < n and inner[i] in (" ", "\t", "\n"):
+            i += 1
+        if i >= n:
+            break
+        parts: list[str] = []
+        only_single = True
+        while i < n and inner[i] not in (" ", "\t", "\n"):
+            c = inner[i]
+            if c == "'":
+                j = inner.find("'", i + 1)
+                if j == -1:
+                    parts.append(inner[i + 1 :])
+                    i = n
+                else:
+                    parts.append(inner[i + 1 : j])
+                    i = j + 1
+            elif c == '"':
+                only_single = False
+                i += 1
+                while i < n and inner[i] != '"':
+                    if inner[i] == "\\" and i + 1 < n:
+                        parts.append(inner[i : i + 2])
+                        i += 2
+                    else:
+                        parts.append(inner[i])
+                        i += 1
+                if i < n:
+                    i += 1
+            elif c == "\\" and i + 1 < n:
+                only_single = False
+                parts.append(inner[i : i + 2])
+                i += 2
+            else:
+                only_single = False
+                parts.append(c)
+                i += 1
+        words.append(("".join(parts), only_single))
+    return words
+
+
+def _check_func_depends_rhs(
+    fn: str,
+    attr: str,
+    rhs: str,
+    globals_set: set[str],
+    locals_set: set[str],
+    triggers: set[str],
+) -> None:
+    """Reject unresolved local/command expansions that could hide a stale exact trigger pin,
+    while allowing range constraints like `"$_kernel>=$needs"` and non-trigger pins."""
+    for raw, is_single_quoted in _split_bash_array_words(rhs):
+        if is_single_quoted:
+            continue
+        has_cmd = "$(" in raw or "`" in raw
+        refs = VAR_REF_RE.findall(raw)
+        unresolved = [r for r in refs if r not in globals_set or r in locals_set]
+        if not has_cmd and not unresolved:
+            continue
+
+        # A range operator (>=, <=, >, <) outside ${...} with a resolved
+        # left-hand side can never produce an exact `trigger=version` pin.
+        masked = re.sub(r"\$\{[^}]*\}", lambda m: " " * len(m.group(0)), raw)
+        range_match = RANGE_OP_RE.search(masked)
+        if range_match:
+            lhs = raw[: range_match.start()]
+            lhs_refs = VAR_REF_RE.findall(lhs)
+            if (
+                "$(" not in lhs
+                and "`" not in lhs
+                and all(r in globals_set and r not in locals_set for r in lhs_refs)
+            ):
+                continue
+
+        # An exact `name=...` for a literal package name outside rebuild_on is
+        # not a trigger pin.
+        if "=" in raw:
+            lhs = raw.split("=", 1)[0]
+            if LITERAL_PKG_RE.match(lhs) and lhs not in triggers:
+                continue
+
+        if has_cmd:
+            raise SyncError(f"Cannot verify command substitution in {attr} inside {fn}")
+        raise SyncError(
+            f"Cannot verify function-local {unresolved[0]} in {attr} inside {fn}"
+        )
+
+
+def validate_staged_pkgbuild(
+    package_dir: Path,
+    staged_path: Path,
+    next_pkgrel: str,
+    current: dict[str, dict[str, str]],
+) -> None:
+    """Verify valid shell, expected pkgrel readback, and no stale exact trigger pins."""
+    staged_path = staged_path.resolve()
+    if subprocess.run(
+        ["bash", "-n", str(staged_path)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    ).returncode != 0:
+        raise SyncError("Rewritten PKGBUILD is not valid shell")
+
+    script = r"""
+source "$1" >/dev/null 2>&1 || exit 1
+printf 'PKGREL\t%s\n' "${pkgrel:-}"
+compgen -v | while IFS= read -r v; do printf 'GLOBAL\t%s\n' "$v"; done
+arch_var="depends_${PIN_ARCH}[@]"
+for d in "${depends[@]}" "${!arch_var}"; do
+  printf 'DEP\t%s\n' "$d"
 done
-
-UPDATED=0
-SKIPPED=0
-FAILED=0
-SPECIFIC_MODE=false
-
-# The version of a trigger package as the build container would resolve it.
-# A name pacman does not know reports nothing rather than failing, so the caller
-# gets to say which package was left alone instead of the run dying here.
-native_repo_version() {
-  local package="$1"
-  local info
-
-  info=$(LC_ALL=C pacman -Si "$package" 2>/dev/null) || return 0
-
-  awk -v allowed="$OFFICIAL_REPOS" '
-    /^Repository[[:space:]]*:/ { repo = $3 }
-    /^Version[[:space:]]*:/ {
-      if (index(allowed, " " repo " ") > 0) { print $3; exit }
+strip_heredocs() {
+  awk '
+    BEGIN { hd = ""; strip = 0 }
+    hd != "" {
+      chk = $0
+      if (strip) sub(/^\t+/, "", chk)
+      if (chk == hd) { hd = ""; strip = 0 }
+      next
     }
-  ' <<<"$info"
-}
-
-load_alarm_repo() {
-  local repo="$1" db index
-  index="$TEMP_DIR/alarm-$repo.index"
-  [[ -f "$index" ]] && return 0
-
-  db="$TEMP_DIR/alarm-$repo.db"
-  if ! curl -fsSL --max-time 120 -o "$db" "$ALARM_BASE_URL/$repo/$repo.db" 2>/dev/null; then
-    print_error "Could not read the aarch64 $repo repository database"
-    return 1
-  fi
-  if ! tar -tf "$db" >/dev/null 2>&1; then
-    print_error "Unreadable aarch64 $repo repository database"
-    return 1
-  fi
-
-  tar -xOf "$db" --wildcards '*/desc' 2>/dev/null | awk '
-    function emit() {
-      if (name != "" && version != "") {
-        print name "\t" version
-        if (base != "" && base != name) print base "\t" version
+    {
+      print
+      if (match($0, /(^|[^<])<<-?[ \t]*(\\?[A-Za-z_][A-Za-z0-9_]*|\047[^\047]+\047|"[^"]+")/)) {
+        t = substr($0, RSTART, RLENGTH)
+        sub(/^[^<]/, "", t)
+        strip = (substr(t, 1, 3) == "<<-")
+        sub(/^<<-?[ \t]*/, "", t)
+        gsub(/[\047"\\]/, "", t)
+        hd = t
       }
-      name=""; base=""; version=""
     }
-    $0 == "%FILENAME%" { emit(); next }
-    $0 == "%NAME%" { if (name != "" && version != "") emit(); getline; name=$0; next }
-    $0 == "%BASE%" { getline; base=$0; next }
-    $0 == "%VERSION%" { getline; version=$0; next }
-    END { emit() }
-  ' >"$index"
+  '
 }
-
-alarm_repo_version() {
-  local package="$1" repo version
-  for repo in "${ALARM_REPOS[@]}"; do
-    load_alarm_repo "$repo" || return 1
-    version=$(awk -F '\t' -v package="$package" '$1 == package { print $2; exit }' "$TEMP_DIR/alarm-$repo.index")
-    if [[ -n "$version" ]]; then
-      echo "$version"
-      return 0
-    fi
-  done
-}
-
-repo_version() { # repo_version <arch> <package>
-  case "$1" in
-    x86_64) native_repo_version "$2" ;;
-    aarch64) alarm_repo_version "$2" ;;
-    *) return 1 ;;
-  esac
-}
-
-declare -A PUBLISHED_VERSION=()
-declare -A EDGE_VERSION=()
-declare -A EDGE_READ=()
-PUBLISHED_LOADED=false
-
-remember_published() {
-  local name="$1"
-  local version="$2"
-  local known="${PUBLISHED_VERSION[$name]:-}"
-
-  # A package can be in both mirrors at different revisions. The floor is the
-  # highest of them, because that is what a user could already have installed.
-  if [[ -z "$known" || "$(vercmp "$version" "$known")" -gt 0 ]]; then
-    PUBLISHED_VERSION["$name"]="$version"
+collect_fn() {
+  local fn="$1" attr="$2" body line decl rhs tmp loc
+  declare -F "$fn" >/dev/null 2>&1 || return 0
+  body=$(declare -f "$fn" | strip_heredocs)
+  if grep -Eq "^[[:space:]]+${attr}(\[|\+?=([^(]|$))" <<<"$body"; then
+    printf 'ERR\tCannot verify non-array %s assignment inside %s\n' "$attr" "$fn"
+    return 1
   fi
-}
-
-# Versions currently published, read from the repository databases. Split
-# packages are stored under their own pkgname, so both %NAME% and %BASE% are
-# recorded to make a pkgbase findable.
-load_published_versions() {
-  [[ "$PUBLISHED_LOADED" == true ]] && return 0
-  PUBLISHED_LOADED=true
-
-  local arch mirror db name base version
-
-  for arch in $(ci_arches); do
-    for mirror in "${PUBLISHED_MIRRORS[@]}"; do
-      db="$TEMP_DIR/published-$mirror-$arch.db.tar.zst"
-
-      if ! curl -fsSL --max-time 120 -o "$db" \
-        "$PUBLISHED_BASE_URL/$mirror/$arch/omarchy.db.tar.zst" 2>/dev/null; then
-        print_warning "Could not read the published $mirror/$arch database; bumps are not checked against it this run"
-        continue
-      fi
-      if ! tar -tf "$db" >/dev/null 2>&1; then
-        print_warning "Unreadable published $mirror/$arch database; bumps are not checked against it this run"
-        continue
-      fi
-      [[ "$mirror" == edge ]] && EDGE_READ["$arch"]=1
-
-      while IFS=$'\t' read -r name base version; do
-        [[ -n "$name" && -n "$version" ]] && remember_published "$name" "$version"
-        [[ -n "$base" && -n "$version" ]] && remember_published "$base" "$version"
-        if [[ "$mirror" == edge && -n "$version" ]]; then
-          [[ -z "$name" ]] || EDGE_VERSION["$arch/$name"]="$version"
-          [[ -z "$base" ]] || EDGE_VERSION["$arch/$base"]="$version"
-        fi
-      done < <(
-        tar -xOf "$db" --wildcards '*/desc' 2>/dev/null | awk '
-          function emit() {
-            if (name != "" && version != "") print name "\t" base "\t" version
-            name=""; base=""; version=""
+  while IFS= read -r loc; do
+    [[ -n "$loc" ]] && printf 'LOCAL\t%s\t%s\n' "$fn" "$loc"
+  done < <(
+    awk '
+      {
+        line = $0
+        sub(/^[ \t]+/, "", line)
+        if (line ~ /^(local|declare|typeset)[ \t]/) {
+          sub(/^(local|declare|typeset)[ \t]+/, "", line)
+          sub(/;[ \t]*$/, "", line)
+          n = split(line, parts, /[ \t]+/)
+          for (i = 1; i <= n; i++) {
+            tok = parts[i]
+            if (tok ~ /^-/) continue
+            sub(/=.*/, "", tok)
+            if (tok ~ /^[A-Za-z_][A-Za-z0-9_]*$/) print tok
           }
-          $0 == "%FILENAME%" { emit(); next }
-          $0 == "%NAME%" { if (name != "" && version != "") emit(); getline; name=$0; next }
-          $0 == "%BASE%" { getline; base=$0; next }
-          $0 == "%VERSION%" { getline; version=$0; next }
-          END { emit() }
-        '
-      )
-    done
-  done
-}
-
-published_version() {
-  local package="$1"
-
-  load_published_versions
-  echo "${PUBLISHED_VERSION[$package]:-}"
-}
-
-# A trigger this repository builds for the architecture. The builder lists
-# [omarchy] ahead of the distribution repositories, so this recipe, not Arch or
-# Arch Linux ARM, decides what a dependent links against.
-carried_trigger_dir() { # carried_trigger_dir <arch> <trigger>
-  local pkgdir
-  pkgdir=$(package_dir_for_name "$2") || return 1
-  package_has_metadata "$pkgdir" || return 1
-  package_builds_for_mirror "$pkgdir" edge || return 1
-  package_supports_arch "$pkgdir" "$1" || return 1
-  echo "$pkgdir"
-}
-
-carried_version() { # carried_version <arch> <pkgdir>
-  local epoch pkgver pkgrel
-  epoch=$(package_pkgbuild_var "$2" epoch "$1") || return 1
-  pkgver=$(package_pkgbuild_var "$2" pkgver "$1") || return 1
-  pkgrel=$(package_pkgbuild_var "$2" pkgrel "$1") || return 1
-  [[ -n "$pkgver" && -n "$pkgrel" ]] || return 1
-  # makepkg leaves a zero epoch out of the published version
-  [[ "$epoch" != 0 ]] || epoch=""
-  echo "${epoch:+$epoch:}$pkgver-$pkgrel"
-}
-
-# The pkgver of a full version string, with any epoch and pkgrel removed.
-version_pkgver() {
-  local version="${1#*:}"
-  echo "${version%-*}"
-}
-
-pkgbuild_field() {
-  local package_dir="$1"
-  local field="$2"
-
-  package_pkgbuild_var "$package_dir" "$field"
-}
-
-# 2 -> 3, and 1.1 -> 1.2. Anything else is a pkgrel this command has no business
-# rewriting.
-bump_pkgrel() {
-  local pkgrel="$1"
-
-  [[ "$pkgrel" =~ ^[0-9]+(\.[0-9]+)?$ ]] || return 1
-
-  local head tail
-  if [[ "$pkgrel" == *.* ]]; then
-    head="${pkgrel%.*}."
-    tail="${pkgrel##*.}"
-  else
-    head=""
-    tail="$pkgrel"
-  fi
-
-  echo "${head}$((tail + 1))"
-}
-
-write_pkgrel() {
-  local package_dir="$1"
-  local pkgrel="$2"
-  local pkgbuild="$package_dir/PKGBUILD"
-
-  if [[ $(grep -c '^pkgrel=' "$pkgbuild") -ne 1 ]]; then
-    print_error "Expected exactly one pkgrel assignment in $pkgbuild"
-    return 1
-  fi
-
-  # Every edit lands on a scratch copy that replaces the PKGBUILD in one rename,
-  # so a failed rewrite leaves the original alone rather than half updated.
-  local scratch="$pkgbuild.sync-rebuilds"
-  cp "$pkgbuild" "$scratch" || return 1
-  sed -i "s/^pkgrel=.*/pkgrel=$pkgrel/" "$scratch"
-
-  if ! bash -n "$scratch" 2>/dev/null; then
-    print_error "Rewritten PKGBUILD is not valid shell"
-    rm -f "$scratch"
-    return 1
-  fi
-
-  local written
-  written=$(CARCH=x86_64 bash -c 'source "$1" >/dev/null 2>&1 || exit 1; echo "$pkgrel"' _ "$scratch" 2>/dev/null)
-  if [[ "$written" != "$pkgrel" ]]; then
-    print_error "Rewritten PKGBUILD reads back pkgrel=$written, not $pkgrel"
-    rm -f "$scratch"
-    return 1
-  fi
-
-  chmod --reference="$pkgbuild" "$scratch"
-  mv "$scratch" "$pkgbuild"
-}
-
-# A package built against a trigger's ABI pins it exactly, once per architecture
-# because Arch Linux ARM can trail x86_64: depends_x86_64=('hyprland=0.56.2').
-# Rebuilding against a newer trigger has to move that pin with it, or the
-# rebuilt package demands the version it no longer loads into. Unpinned
-# dependencies, and pins outside the per-architecture arrays, are left alone.
-write_pins() {
-  local package_dir="$1"
-  local current="$2"
-  local pkgbuild="$package_dir/PKGBUILD"
-  local scratch="$pkgbuild.sync-rebuilds"
-  local arch trigger version pattern
-
-  cp "$pkgbuild" "$scratch" || return 1
-  while IFS=$'\t' read -r arch trigger version; do
-    pattern=$(printf '%s' "$trigger" | sed 's/[][\.*^$+?(){}|/]/\\&/g')
-    if ! awk -v array="depends_$arch" -v pattern="$pattern" -v pin="$trigger=$(version_pkgver "$version")" '
-      $0 ~ "^" array "=\\(" { inside = 1 }
-      inside { gsub("[\"\047]" pattern "=[^\"\047]*[\"\047]", "\047" pin "\047") }
-      inside && /\)/ { inside = 0 }
-      { print }
-    ' "$scratch" > "$scratch.new"; then
-      rm -f "$scratch" "$scratch.new"
-      return 1
-    fi
-    mv "$scratch.new" "$scratch"
-  done < <(jq -r 'to_entries[] | .key as $arch | .value | to_entries[] | [$arch, .key, .value] | @tsv' <<<"$current")
-
-  if ! bash -n "$scratch" 2>/dev/null; then
-    print_error "PKGBUILD with moved pins is not valid shell"
-    rm -f "$scratch"
-    return 1
-  fi
-
-  chmod --reference="$pkgbuild" "$scratch"
-  mv "$scratch" "$pkgbuild"
-}
-
-write_metadata() {
-  local package_dir="$1"
-  local filter="$2"
-  shift 2
-  local metadata
-  metadata=$(metadata_file_for_dir "$package_dir")
-
-  local scratch="$metadata.sync-rebuilds"
-  jq "$@" "$filter" "$metadata" > "$scratch" || { rm -f "$scratch"; return 1; }
-  chmod --reference="$metadata" "$scratch"
-  mv "$scratch" "$metadata"
-}
-
-record_triggers() {
-  local package_dir="$1"
-  local current="$2"
-
-  # A flat record is the legacy x86_64 shape. Preserve records for
-  # architectures outside this run, then replace the ones just rebuilt.
-  write_metadata "$package_dir" '
-    (.rebuilt_against // {}) as $old |
-    (if ($old | length) == 0 then {}
-     elif ($old | to_entries | all(.value | type == "string"))
-     then {x86_64: $old}
-     else $old
-     end) as $by_arch |
-    .rebuilt_against = ($by_arch * $current)
-  ' --argjson current "$current"
-}
-
-# Metadata that does not parse would otherwise drop its package out of the run
-# without a word, because every query of it reports nothing and an absent
-# rebuild_on is indistinguishable from an unreadable one.
-check_metadata_readable() {
-  local package_dir="$1"
-  local metadata
-  metadata=$(metadata_file_for_dir "$package_dir")
-
-  [[ -f "$metadata" ]] || return 0
-
-  if ! jq empty "$metadata" 2>/dev/null; then
-    print_error "Unreadable metadata, skipping $(basename "$package_dir"): $metadata"
-    ((++FAILED))
-    return 1
-  fi
-}
-
-sync_package() {
-  local package="$1"
-  local package_dir="$PKGBUILDS_DIR/$package"
-
-  if [[ ! -f "$package_dir/PKGBUILD" ]]; then
-    print_error "Package $package has no PKGBUILD"
-    ((++FAILED))
-    return 0
-  fi
-
-  check_metadata_readable "$package_dir" || return 0
-
-  local triggers=()
-  mapfile -t triggers < <(package_rebuild_triggers "$package_dir")
-
-  if [[ ${#triggers[@]} -eq 0 ]]; then
-    if [[ "$SPECIFIC_MODE" == true ]]; then
-      print_error "Package $package does not declare rebuild_on"
-      ((++FAILED))
-    else
-      print_info "Skipping $package: no rebuild triggers"
-      ((++SKIPPED))
-    fi
-    return 0
-  fi
-
-  print_info "Checking $package against ${triggers[*]}..."
-
-  local current="{}" arch arch_current trigger version carried considered=0
-  for arch in $(ci_arches); do
-    package_supports_arch "$package_dir" "$arch" || continue
-    considered=$((considered + 1))
-    arch_current="{}"
-    for trigger in "${triggers[@]}"; do
-      if carried=$(carried_trigger_dir "$arch" "$trigger"); then
-        if ! version=$(carried_version "$arch" "$carried"); then
-          print_error "  Could not read the $arch version of $trigger from its recipe; leaving $package alone"
-          ((++FAILED))
-          return 0
-        fi
-        load_published_versions
-        if [[ -z "${EDGE_READ[$arch]:-}" ]]; then
-          print_error "  Could not read the published edge/$arch database for $trigger; leaving $package alone"
-          ((++FAILED))
-          return 0
-        fi
-        # Until edge publishes the recipe's version the builder still links
-        # against the previous one, and recording the new version now would
-        # certify a build that never saw it.
-        if [[ "${EDGE_VERSION[$arch/$trigger]:-}" != "$version" ]]; then
-          print_warning "  $trigger $version is not published on edge/$arch yet; leaving $package alone until it is"
-          ((++SKIPPED))
-          return 0
-        fi
-      elif ! version=$(repo_version "$arch" "$trigger"); then
-        print_error "  Could not read $arch repository versions; leaving $package alone"
-        ((++FAILED))
-        return 0
-      fi
-      if [[ -z "$version" ]]; then
-        print_error "  $trigger is in no $arch repository; leaving $package alone"
-        ((++FAILED))
-        return 0
-      fi
-      if ! arch_current=$(jq -c --arg name "$trigger" --arg version "$version" '.[$name] = $version' <<<"$arch_current"); then
-        print_error "  Could not record $arch/$trigger $version for $package"
-        ((++FAILED))
-        return 0
-      fi
-    done
-    if ! current=$(jq -c --arg arch "$arch" --argjson versions "$arch_current" '.[$arch] = $versions' <<<"$current"); then
-      print_error "  Could not record $arch trigger versions for $package"
-      ((++FAILED))
-      return 0
-    fi
-  done
-
-  if ((considered == 0)); then
-    print_info "  Skipping: not built for any published architecture"
-    ((++SKIPPED))
-    return 0
-  fi
-
-  local recorded
-  if ! recorded=$(package_metadata_value "$package_dir" '.rebuilt_against' ""); then
-    print_error "  Could not read .omarchy/package.json for $package"
-    ((++FAILED))
-    return 0
-  fi
-  [[ -n "$recorded" && "$recorded" != "null" ]] || recorded="{}"
-
-  # Before architecture-specific records existed, rebuilt_against described
-  # x86_64. Read it that way without forcing a metadata-only migration.
-  if jq -e 'to_entries | all(.value | type == "string")' >/dev/null <<<"$recorded"; then
-    recorded=$(jq -c '{x86_64: .}' <<<"$recorded")
-  fi
-
-  # Walk the declared triggers rather than the record, so a name the record does
-  # not carry reads as changed instead of going unexamined forever.
-  local moved
-  if ! moved=$(jq -r --argjson recorded "$recorded" '
-    [to_entries[] as $arch
-     | $arch.value | to_entries[] as $trigger
-     | select($recorded[$arch.key][$trigger.key] != $trigger.value)
-     | "\($arch.key)/\($trigger.key) \($recorded[$arch.key][$trigger.key] // "unrecorded") -> \($trigger.value)"]
-    | join(", ")
-  ' <<<"$current"); then
-    print_error "  Could not compare recorded trigger versions for $package"
-    ((++FAILED))
-    return 0
-  fi
-
-  if [[ -z "$moved" ]]; then
-    print_info "  Already rebuilt against every published architecture"
-    ((++SKIPPED))
-    return 0
-  fi
-
-  local pkgrel next_pkgrel
-  pkgrel=$(pkgbuild_field "$package_dir" pkgrel)
-
-  # An AUR-synced package gets its PKGBUILD replaced wholesale on the next sync,
-  # so the bump only survives as the dotted Omarchy suffix that sync-aur
-  # reapplies from .omarchy/package.json.
-  local suffix=""
-  if package_sync_enabled "$package_dir"; then
-    if [[ "$pkgrel" == *.* ]]; then
-      next_pkgrel=$(bump_pkgrel "$pkgrel") || next_pkgrel=""
-      suffix="${next_pkgrel##*.}"
-    else
-      next_pkgrel="$pkgrel.1"
-      suffix="1"
-    fi
-  else
-    next_pkgrel=$(bump_pkgrel "$pkgrel") || next_pkgrel=""
-  fi
-
-  if [[ -z "$next_pkgrel" ]]; then
-    print_error "  Cannot bump pkgrel=$pkgrel for $package; bump it by hand"
-    ((++FAILED))
-    return 0
-  fi
-
-  local pkgver epoch old_version new_version
-  pkgver=$(pkgbuild_field "$package_dir" pkgver)
-  epoch=$(pkgbuild_field "$package_dir" epoch)
-  old_version="${epoch:+$epoch:}$pkgver-$pkgrel"
-  new_version="${epoch:+$epoch:}$pkgver-$next_pkgrel"
-
-  if [[ "$(vercmp "$new_version" "$old_version")" -le 0 ]]; then
-    print_error "  pkgrel $pkgrel -> $next_pkgrel would not be an upgrade for $package"
-    ((++FAILED))
-    return 0
-  fi
-
-  # The checked-in version is not the floor. What a user already has is, and a
-  # checkout that has fallen behind the repository can otherwise be bumped to
-  # something pacman orders below what it would replace.
-  local floor
-  load_published_versions
-  floor=$(published_version "$package")
-  if [[ -n "$floor" && "$(version_pkgver "$floor")" == "$pkgver" ]]; then
-    if [[ "$(vercmp "$new_version" "$floor")" -le 0 ]]; then
-      print_error "  $new_version would not be an upgrade over the published $floor; leaving $package alone"
-      ((++FAILED))
-      return 0
-    fi
-  fi
-
-  if ! write_pkgrel "$package_dir" "$next_pkgrel"; then
-    print_error "  Failed to bump pkgrel for $package"
-    ((++FAILED))
-    return 0
-  fi
-
-  if ! write_pins "$package_dir" "$current"; then
-    print_error "  Failed to move pinned trigger versions for $package"
-    ((++FAILED))
-    return 0
-  fi
-
-  if [[ -n "$suffix" ]] && ! write_metadata "$package_dir" '.pkgrel.suffix = ($suffix | tonumber)' --arg suffix "$suffix"; then
-    print_error "  Failed to record pkgrel suffix for $package"
-    ((++FAILED))
-    return 0
-  fi
-
-  if ! record_triggers "$package_dir" "$current"; then
-    print_error "  Failed to record trigger versions for $package"
-    ((++FAILED))
-    return 0
-  fi
-
-  print_success "  $moved; pkgrel $pkgrel -> $next_pkgrel"
-  ((++UPDATED))
-}
-
-run_sync() {
-  if [[ ${#SPECIFIC_PACKAGES[@]} -gt 0 ]]; then
-    SPECIFIC_MODE=true
-    for package in "${SPECIFIC_PACKAGES[@]}"; do
-      sync_package "$package"
-    done
-  else
-    # Enumerated up front rather than streamed, so a producer that dies partway
-    # cannot quietly shorten the list of packages considered.
-    local packages=()
-    mapfile -t packages < <(package_dirs)
-
-    local package_dir
-    for package_dir in "${packages[@]}"; do
-      check_metadata_readable "$package_dir" || continue
-      if package_has_rebuild_triggers "$package_dir"; then
-        sync_package "$(basename "$package_dir")"
-      fi
-    done
-  fi
-
-  echo ""
-  if [[ $FAILED -gt 0 ]]; then
-    print_error "Rebuild trigger sync completed with failures"
-  else
-    print_success "Rebuild trigger sync complete!"
-  fi
-  echo "  Target: $PKGBUILDS_DIR"
-  echo "  Updated: $UPDATED"
-  echo "  Skipped: $SKIPPED"
-  echo "  Failed: $FAILED"
-
-  [[ $FAILED -eq 0 ]]
-}
-
-# --- self-test ---------------------------------------------------------------
-
-# Each case runs the real script against a throwaway repository root, with
-# pacman and curl replaced by stubs, so what is exercised is the decision path
-# itself rather than a restatement of it.
-selftest_root() {
-  local name="$1"
-  local root="$TEMP_DIR/case-$name"
-
-  mkdir -p "$root/bin" "$root/helpers" "$root/pkgbuilds" "$root/stub"
-  cp "$BUILD_ROOT/bin/sync-rebuilds" "$root/bin/"
-  cp "$BUILD_ROOT"/helpers/*.sh "$root/helpers/"
-  echo "$root"
-}
-
-selftest_package() {
-  local root="$1" name="$2" pkgrel="$3" metadata="$4" pkgver="${5:-1.0}" arches="${6:-x86_64}"
-  local dir="$root/pkgbuilds/$name"
-
-  mkdir -p "$dir/.omarchy"
-  printf 'pkgname=%s\npkgver=%s\npkgrel=%s\narch=(%s)\n' "$name" "$pkgver" "$pkgrel" "$arches" > "$dir/PKGBUILD"
-  printf '%s\n' "$metadata" > "$dir/.omarchy/package.json"
-}
-
-selftest_pacman() {
-  local root="$1"
-  shift
-  printf '%s\n' "$@" > "$root/stub/versions"
-
-  cat > "$root/stub/pacman" <<'STUB'
-#!/bin/bash
-[[ "$1" == "-Si" ]] || exit 1
-version=$(awk -F= -v p="$2" '$1 == p { print $2; exit }' "$(dirname "$0")/versions")
-[[ -n "$version" ]] || exit 1
-printf 'Repository      : extra\nName            : %s\nVersion         : %s\n\n' "$2" "$version"
-STUB
-  chmod +x "$root/stub/pacman"
-}
-
-# A repository database assembled by hand from name=version pairs.
-selftest_db() {
-  local out="$1"
-  shift
-  local staging="$out.d" entry name version
-
-  rm -rf "$staging"
-  mkdir -p "$staging"
-  for entry in "$@"; do
-    name="${entry%=*}"
-    version="${entry#*=}"
-    mkdir -p "$staging/$name-$version"
-    printf '%%FILENAME%%\n%s-%s-x86_64.pkg.tar.zst\n\n%%NAME%%\n%s\n\n%%BASE%%\n%s\n\n%%VERSION%%\n%s\n' \
-      "$name" "$version" "$name" "$name" "$version" > "$staging/$name-$version/desc"
-  done
-  tar --zstd -cf "$out" -C "$staging" .
-}
-
-# Serves one published database for every channel and architecture. With no
-# pairs given the stub fails, which is how the unreachable-repository path is
-# exercised.
-selftest_published() {
-  local root="$1"
-  shift
-
-  if [[ $# -gt 0 ]]; then
-    selftest_db "$root/stub/omarchy.db.tar.zst" "$@"
-  fi
-
-  cat > "$root/stub/curl" <<'STUB'
-#!/bin/bash
-out=""
-url=""
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    -o) out="$2"; shift 2 ;;
-    *) url="$1"; shift ;;
-  esac
-done
-case "$url" in
-  */omarchy.db.tar.zst)
-    channel="${url%/omarchy.db.tar.zst}"
-    arch="${channel##*/}"
-    channel="${channel%/*}"
-    db="$(dirname "$0")/omarchy-${channel##*/}-$arch.db.tar.zst"
-    [[ -f "$db" ]] || db="$(dirname "$0")/omarchy.db.tar.zst"
-    ;;
-  */aarch64/*)
-    repo="${url%/*}"
-    db="$(dirname "$0")/alarm-${repo##*/}.db"
-    ;;
-  *) db="" ;;
-esac
-[[ -f "$db" && -n "$out" ]] || exit 22
-cp "$db" "$out"
-STUB
-  chmod +x "$root/stub/curl"
-}
-
-# Serves one channel and architecture its own published database.
-selftest_channel() { # selftest_channel <root> <channel> <arch> [name=version...]
-  local root="$1" channel="$2" arch="$3"
-  shift 3
-  selftest_db "$root/stub/omarchy-$channel-$arch.db.tar.zst" "$@"
-}
-
-selftest_alarm() {
-  local root="$1"
-  shift
-  local repo staging="$root/stub/alarm-db" entry name version
-
-  for repo in core extra; do
-    rm -rf "$staging"
-    mkdir -p "$staging"
-    if [[ "$repo" == "core" ]]; then
-      mkdir -p "$staging/unrelated-1-1"
-      printf '%%FILENAME%%\nunrelated-1-1-aarch64.pkg.tar.zst\n\n%%NAME%%\nunrelated\n\n%%BASE%%\nunrelated\n\n%%VERSION%%\n1-1\n' \
-        > "$staging/unrelated-1-1/desc"
-    else
-      for entry in "$@"; do
-        name="${entry%=*}"
-        version="${entry#*=}"
-        mkdir -p "$staging/$name-$version"
-        printf '%%FILENAME%%\n%s-%s-aarch64.pkg.tar.zst\n\n%%NAME%%\n%s\n\n%%BASE%%\n%s\n\n%%VERSION%%\n%s\n' \
-          "$name" "$version" "$name" "$name" "$version" > "$staging/$name-$version/desc"
+        }
+      }
+    ' <<<"$body"
+  )
+  while IFS= read -r line; do
+    decl="${line#"${line%%[![:space:]]*}"}"
+    decl="${decl%;}"
+    rhs="${decl#*=}"
+    printf 'FUNC_RHS\t%s\t%s\t%s\n' "$fn" "$attr" "$rhs"
+    if [[ "$rhs" != *'$('* && "$rhs" != *'`'* ]]; then
+      tmp=()
+      eval "tmp=$rhs" 2>/dev/null || true
+      for d in "${tmp[@]}"; do
+        printf 'DEP\t%s\n' "$d"
       done
     fi
-    tar -czf "$root/stub/alarm-$repo.db" -C "$staging" .
-  done
+  done < <(grep -E "^[[:space:]]+${attr}\+?=\(" <<<"$body" || true)
 }
-
-cmd_self_test() {
-  local failures=0
-  local root
-
-  check() {
-    local label="$1" expected="$2" got="$3"
-    if [[ "$got" == "$expected" ]]; then
-      echo "  ok: $label"
-    else
-      echo "  FAIL: $label -> $got (expected $expected)"
-      failures=$((failures + 1))
-    fi
-  }
-
-  # SELFTEST_ARCHES stands in for CI_ARCHES; "default" leaves it unset, as the
-  # scheduled workflow does.
-  run_case() {
-    local root="$1"
-    shift
-    local status=0 arches=(CI_ARCHES="${SELFTEST_ARCHES:-x86_64}")
-    [[ "${SELFTEST_ARCHES:-}" != default ]] || arches=(-u CI_ARCHES)
-    env "${arches[@]}" PATH="$root/stub:$PATH" \
-      "$root/bin/sync-rebuilds" "$@" > "$root/output" 2>&1 || status=$?
-    echo "$status"
-  }
-
-  pkgrel_of() {
-    grep -m1 '^pkgrel=' "$1/PKGBUILD" | cut -d= -f2
-  }
-
-  print_header "sync-rebuilds self-test"
-
-  echo "A trigger missing from the record counts as changed:"
-  root=$(selftest_root partial)
-  selftest_package "$root" t-partial 1 '{"source":"local","rebuild_on":["dep-a","dep-b"],"rebuilt_against":{"dep-a":"1-1"}}'
-  selftest_pacman "$root" dep-a=1-1 dep-b=2-2
-  selftest_published "$root"
-  check "run succeeds" 0 "$(run_case "$root")"
-  check "pkgrel bumped" 2 "$(pkgrel_of "$root/pkgbuilds/t-partial")"
-  check "unrecorded trigger now recorded" "2-2" \
-    "$(jq -r '.rebuilt_against.x86_64["dep-b"]' "$root/pkgbuilds/t-partial/.omarchy/package.json")"
-
-  echo "Opting a package in buys a rebuild rather than a bare record:"
-  root=$(selftest_root fresh)
-  selftest_package "$root" t-fresh 1 '{"source":"local","rebuild_on":["dep-a"]}'
-  selftest_pacman "$root" dep-a=1-1
-  selftest_published "$root"
-  check "run succeeds" 0 "$(run_case "$root")"
-  check "pkgrel bumped" 2 "$(pkgrel_of "$root/pkgbuilds/t-fresh")"
-  check "trigger recorded" "1-1" \
-    "$(jq -r '.rebuilt_against.x86_64["dep-a"]' "$root/pkgbuilds/t-fresh/.omarchy/package.json")"
-
-  echo "An unchanged package is left alone:"
-  root=$(selftest_root current)
-  selftest_package "$root" t-current 1 '{"source":"local","rebuild_on":["dep-a"],"rebuilt_against":{"dep-a":"1-1"}}'
-  selftest_pacman "$root" dep-a=1-1
-  selftest_published "$root"
-  check "run succeeds" 0 "$(run_case "$root")"
-  check "pkgrel untouched" 1 "$(pkgrel_of "$root/pkgbuilds/t-current")"
-
-  echo "A rebuild moves the trigger's exact pin for the architecture it ran for:"
-  root=$(selftest_root pins)
-  selftest_package "$root" t-pins 1 '{"source":"local","rebuild_on":["dep-a"],"rebuilt_against":{"dep-a":"1.0-1"}}'
-  printf "depends_x86_64=('dep-a=1.0' 'dep-b')\ndepends_aarch64=('dep-a=1.0')\n" >> "$root/pkgbuilds/t-pins/PKGBUILD"
-  selftest_pacman "$root" dep-a=2.0-1
-  selftest_published "$root"
-  check "run succeeds" 0 "$(run_case "$root")"
-  check "pkgrel bumped" 2 "$(pkgrel_of "$root/pkgbuilds/t-pins")"
-  check "x86_64 pin moved" "depends_x86_64=('dep-a=2.0' 'dep-b')" "$(grep '^depends_x86_64=' "$root/pkgbuilds/t-pins/PKGBUILD")"
-  check "aarch64 pin left for its own run" "depends_aarch64=('dep-a=1.0')" "$(grep '^depends_aarch64=' "$root/pkgbuilds/t-pins/PKGBUILD")"
-
-  echo "Metadata that does not parse fails the run instead of vanishing from it:"
-  root=$(selftest_root unreadable)
-  selftest_package "$root" t-broken 1 '{"source":"local","rebuild_on":["dep-a"'
-  selftest_package "$root" t-good 1 '{"source":"local","rebuild_on":["dep-a"]}'
-  selftest_pacman "$root" dep-a=1-1
-  selftest_published "$root"
-  check "run fails" 1 "$(run_case "$root")"
-  check "the readable package is still processed" 2 "$(pkgrel_of "$root/pkgbuilds/t-good")"
-
-  echo "A bump that pacman would not order above the published package is refused:"
-  root=$(selftest_root floor)
-  selftest_package "$root" t-floor 1 '{"source":"local","rebuild_on":["dep-a"],"rebuilt_against":{"dep-a":"0-0"}}'
-  selftest_pacman "$root" dep-a=1-1
-  selftest_published "$root" t-floor=1.0-5
-  check "run fails" 1 "$(run_case "$root")"
-  check "pkgrel untouched" 1 "$(pkgrel_of "$root/pkgbuilds/t-floor")"
-  check "record untouched" "0-0" \
-    "$(jq -r '.rebuilt_against["dep-a"]' "$root/pkgbuilds/t-floor/.omarchy/package.json")"
-
-  echo "An AUR-synced package is bumped as a dotted suffix that sync-aur reapplies:"
-  root=$(selftest_root aur)
-  selftest_package "$root" t-aur 3 '{"source":"aur","rebuild_on":["dep-a"],"rebuilt_against":{"dep-a":"0-0"}}'
-  selftest_pacman "$root" dep-a=1-1
-  selftest_published "$root"
-  check "run succeeds" 0 "$(run_case "$root")"
-  check "pkgrel suffixed" "3.1" "$(pkgrel_of "$root/pkgbuilds/t-aur")"
-  check "suffix recorded for the next AUR sync" 1 \
-    "$(jq -r '.pkgrel.suffix' "$root/pkgbuilds/t-aur/.omarchy/package.json")"
-
-  echo "A dependency is tracked independently for both published architectures:"
-  root=$(selftest_root multiarch)
-  selftest_package "$root" t-multi 1 '{"source":"local","rebuild_on":["dep-a"],"rebuilt_against":{"dep-a":"1-1"}}' 1.0 'x86_64 aarch64'
-  selftest_pacman "$root" dep-a=1-1
-  selftest_published "$root"
-  selftest_alarm "$root" dep-a=2-1
-  SELFTEST_ARCHES="x86_64 aarch64"
-  check "run succeeds" 0 "$(run_case "$root")"
-  unset SELFTEST_ARCHES
-  check "pkgrel bumped once" 2 "$(pkgrel_of "$root/pkgbuilds/t-multi")"
-  check "x86_64 trigger recorded" "1-1" \
-    "$(jq -r '.rebuilt_against.x86_64["dep-a"]' "$root/pkgbuilds/t-multi/.omarchy/package.json")"
-  check "aarch64 trigger recorded" "2-1" \
-    "$(jq -r '.rebuilt_against.aarch64["dep-a"]' "$root/pkgbuilds/t-multi/.omarchy/package.json")"
-
-  echo "An ARM-only run records only the ARM dependency state:"
-  root=$(selftest_root arm-only)
-  selftest_package "$root" t-arm 1 '{"source":"local","rebuild_on":["dep-a"]}' 1.0 'x86_64 aarch64'
-  selftest_pacman "$root"
-  selftest_published "$root"
-  selftest_alarm "$root" dep-a=2-1
-  SELFTEST_ARCHES=aarch64
-  check "run succeeds" 0 "$(run_case "$root")"
-  unset SELFTEST_ARCHES
-  check "pkgrel bumped" 2 "$(pkgrel_of "$root/pkgbuilds/t-arm")"
-  check "ARM trigger recorded" "2-1" \
-    "$(jq -r '.rebuilt_against.aarch64["dep-a"]' "$root/pkgbuilds/t-arm/.omarchy/package.json")"
-  check "x86_64 was not consulted" "false" \
-    "$(jq -r '.rebuilt_against | has("x86_64")' "$root/pkgbuilds/t-arm/.omarchy/package.json")"
-
-  echo "An x86-only package ignores ARM during a dual-architecture run:"
-  root=$(selftest_root x86-package)
-  selftest_package "$root" t-x86 1 '{"source":"local","rebuild_on":["dep-a"],"rebuilt_against":{"dep-a":"1-1"}}'
-  selftest_pacman "$root" dep-a=1-1
-  selftest_published "$root"
-  selftest_alarm "$root" dep-a=2-1
-  SELFTEST_ARCHES="x86_64 aarch64"
-  check "run succeeds" 0 "$(run_case "$root")"
-  unset SELFTEST_ARCHES
-  check "pkgrel untouched" 1 "$(pkgrel_of "$root/pkgbuilds/t-x86")"
-
-  echo "An ARM-only package is checked when no architecture list is given:"
-  root=$(selftest_root arm-default)
-  selftest_package "$root" t-arm-default 1 '{"source":"local","rebuild_on":["dep-a"],"rebuilt_against":{"aarch64":{"dep-a":"1-1"}}}' 1.0 aarch64
-  selftest_pacman "$root"
-  selftest_published "$root"
-  selftest_alarm "$root" dep-a=2-1
-  SELFTEST_ARCHES=default
-  check "run succeeds" 0 "$(run_case "$root")"
-  unset SELFTEST_ARCHES
-  check "pkgrel bumped" 2 "$(pkgrel_of "$root/pkgbuilds/t-arm-default")"
-  check "ARM trigger recorded" "2-1" \
-    "$(jq -r '.rebuilt_against.aarch64["dep-a"]' "$root/pkgbuilds/t-arm-default/.omarchy/package.json")"
-
-  echo "A dependency carried here for ARM is read from its recipe once edge publishes it:"
-  root=$(selftest_root carried)
-  selftest_package "$root" t-carried 1.1 '{"source":"local"}' 0.15.1 aarch64
-  selftest_package "$root" t-linked 3 '{"source":"local","rebuild_on":["t-carried"],"rebuilt_against":{"x86_64":{"t-carried":"0.15.1-1"},"aarch64":{"t-carried":"0.15.0-2"}}}' 1.0 'x86_64 aarch64'
-  selftest_pacman "$root" t-carried=0.15.1-1
-  selftest_published "$root"
-  selftest_alarm "$root" t-carried=0.15.1-1
-  selftest_channel "$root" edge aarch64 t-carried=0.15.1-1.1
-  SELFTEST_ARCHES=default
-  check "run succeeds" 0 "$(run_case "$root")"
-  check "pkgrel bumped" 4 "$(pkgrel_of "$root/pkgbuilds/t-linked")"
-  check "the carried version is recorded, not Arch Linux ARM's" "0.15.1-1.1" \
-    "$(jq -r '.rebuilt_against.aarch64["t-carried"]' "$root/pkgbuilds/t-linked/.omarchy/package.json")"
-  check "x86_64, where nothing is carried, still reads the distribution" "0.15.1-1" \
-    "$(jq -r '.rebuilt_against.x86_64["t-carried"]' "$root/pkgbuilds/t-linked/.omarchy/package.json")"
-  check "a second run succeeds" 0 "$(run_case "$root")"
-  unset SELFTEST_ARCHES
-  check "a second run leaves it alone" 4 "$(pkgrel_of "$root/pkgbuilds/t-linked")"
-
-  echo "A carried dependency that edge does not publish yet leaves its dependents alone:"
-  root=$(selftest_root carried-in-flight)
-  selftest_package "$root" t-carried 1.2 '{"source":"local"}' 0.15.1 aarch64
-  selftest_package "$root" t-linked 4 '{"source":"local","rebuild_on":["t-carried"],"rebuilt_against":{"aarch64":{"t-carried":"0.15.1-1.1"}}}' 1.0 aarch64
-  selftest_pacman "$root"
-  selftest_published "$root"
-  selftest_alarm "$root" t-carried=0.15.1-1
-  selftest_channel "$root" edge aarch64 t-carried=0.15.1-1.1
-  SELFTEST_ARCHES=aarch64
-  check "run succeeds" 0 "$(run_case "$root")"
-  unset SELFTEST_ARCHES
-  check "pkgrel untouched" 4 "$(pkgrel_of "$root/pkgbuilds/t-linked")"
-  check "record untouched" "0.15.1-1.1" \
-    "$(jq -r '.rebuilt_against.aarch64["t-carried"]' "$root/pkgbuilds/t-linked/.omarchy/package.json")"
-
-  echo "A carried dependency whose edge database cannot be read fails the run:"
-  root=$(selftest_root carried-unreadable)
-  selftest_package "$root" t-carried 1.1 '{"source":"local"}' 0.15.1 aarch64
-  selftest_package "$root" t-linked 3 '{"source":"local","rebuild_on":["t-carried"],"rebuilt_against":{"aarch64":{"t-carried":"0.15.0-2"}}}' 1.0 aarch64
-  selftest_pacman "$root"
-  selftest_published "$root"
-  selftest_alarm "$root" t-carried=0.15.1-1
-  SELFTEST_ARCHES=aarch64
-  check "run fails" 1 "$(run_case "$root")"
-  check "pkgrel untouched" 3 "$(pkgrel_of "$root/pkgbuilds/t-linked")"
-  printf 'not a database\n' > "$root/stub/omarchy-edge-aarch64.db.tar.zst"
-  check "a corrupt download fails the run too" 1 "$(run_case "$root")"
-  unset SELFTEST_ARCHES
-  check "pkgrel still untouched" 3 "$(pkgrel_of "$root/pkgbuilds/t-linked")"
-
-  echo "A PKGBUILD that branches on CARCH at file scope still reads its version:"
-  root=$(selftest_root carch-branch)
-  mkdir -p "$root/pkgbuilds/t-carch/.omarchy"
-  cat > "$root/pkgbuilds/t-carch/PKGBUILD" <<'PKG'
-pkgname=t-carch
-case "$CARCH" in
-    x86_64) _suffix=x64 ;;
-    aarch64) _suffix=arm64 ;;
-    *) return 1 ;;
-esac
-pkgver=1.0
-pkgrel=3
-arch=(x86_64 aarch64)
-PKG
-  echo '{"source":"local"}' > "$root/pkgbuilds/t-carch/.omarchy/package.json"
-  check "pkgver read for x86_64" "1.0" "$(package_pkgbuild_var "$root/pkgbuilds/t-carch" pkgver x86_64)"
-  check "pkgrel read for x86_64" "3" "$(package_pkgbuild_var "$root/pkgbuilds/t-carch" pkgrel x86_64)"
-  check "arch-specific value follows CARCH" "arm64" "$(package_pkgbuild_var "$root/pkgbuilds/t-carch" _suffix aarch64)"
-  check "unsupported arch reports failure" 1 "$(package_pkgbuild_var "$root/pkgbuilds/t-carch" pkgver armv7h >/dev/null; echo $?)"
-
-  echo "A carried recipe's version is spelled the way makepkg publishes it:"
-  root=$(selftest_root carried-epoch)
-  selftest_package "$root" t-epoch 1.1 '{"source":"local"}' 0.15.1 aarch64
-  check "no epoch" "0.15.1-1.1" "$(carried_version aarch64 "$root/pkgbuilds/t-epoch")"
-  echo 'epoch=0' >> "$root/pkgbuilds/t-epoch/PKGBUILD"
-  check "a zero epoch is left out" "0.15.1-1.1" "$(carried_version aarch64 "$root/pkgbuilds/t-epoch")"
-  echo 'epoch=2' >> "$root/pkgbuilds/t-epoch/PKGBUILD"
-  check "a real epoch is kept" "2:0.15.1-1.1" "$(carried_version aarch64 "$root/pkgbuilds/t-epoch")"
-
-  echo ""
-  if [[ "$failures" -eq 0 ]]; then
-    print_success "Self-test passed"
-    return 0
-  fi
-  print_error "$failures self-test failure(s)"
-  return 1
-}
-
-if [[ "$SELF_TEST" == true ]]; then
-  cmd_self_test
-  exit $?
-fi
-
-for tool in pacman vercmp jq curl tar; do
-  if ! command -v "$tool" >/dev/null 2>&1; then
-    print_error "$tool not found: rebuild trigger sync cannot run"
-    exit 1
-  fi
+collect_fn package depends || exit 2
+collect_fn package "depends_${PIN_ARCH}" || exit 2
+for name in "${pkgname[@]}"; do
+  collect_fn "package_$name" depends || exit 2
+  collect_fn "package_$name" "depends_${PIN_ARCH}" || exit 2
 done
+"""
 
-print_header "Rebuild Trigger Sync"
+    for arch, triggers in current.items():
+        env = os.environ.copy()
+        env.pop("OMARCHY_SRC", None)
+        env["CARCH"] = arch
+        env["PIN_ARCH"] = arch
+        proc = subprocess.run(
+            ["bash", "-c", script, "_", str(staged_path)],
+            cwd=package_dir,
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if proc.returncode != 0:
+            for line in proc.stdout.splitlines():
+                if line.startswith("ERR\t"):
+                    raise SyncError(line.split("\t", 1)[1])
+            raise SyncError(f"Could not evaluate rewritten PKGBUILD for {arch}")
 
-run_sync
+        pkgrel_read = ""
+        globals_set: set[str] = set()
+        locals_by_fn: dict[str, set[str]] = {}
+        func_rhs_list: list[tuple[str, str, str]] = []
+        deps: list[str] = []
+
+        for line in proc.stdout.splitlines():
+            kind, sep, rest = line.partition("\t")
+            if not sep:
+                continue
+            if kind == "PKGREL":
+                pkgrel_read = rest
+            elif kind == "GLOBAL":
+                globals_set.add(rest)
+            elif kind == "LOCAL":
+                fn, _, var = rest.partition("\t")
+                locals_by_fn.setdefault(fn, set()).add(var)
+            elif kind == "FUNC_RHS":
+                fn, _, tail = rest.partition("\t")
+                attr, _, rhs = tail.partition("\t")
+                func_rhs_list.append((fn, attr, rhs))
+            elif kind == "DEP":
+                deps.append(rest)
+
+        if pkgrel_read != next_pkgrel:
+            raise SyncError(
+                f"Rewritten PKGBUILD reads back pkgrel={pkgrel_read}, not {next_pkgrel}"
+            )
+
+        trigger_names = set(triggers.keys())
+        for fn, attr, rhs in func_rhs_list:
+            _check_func_depends_rhs(
+                fn, attr, rhs, globals_set, locals_by_fn.get(fn, set()), trigger_names
+            )
+
+        for trigger, version in triggers.items():
+            pin_pkgver = version_without_pkgrel(version)
+            pin_full = version_normalized(version)
+            prefix = f"{trigger}="
+            for dep in deps:
+                if not dep.startswith(prefix):
+                    continue
+                eff_ver = dep[len(prefix) :]
+                expected = pin_full if "-" in eff_ver else pin_pkgver
+                if eff_ver != expected:
+                    raise SyncError(
+                        f"Effective {arch} dependency pin '{dep}' does not match "
+                        f"target '{trigger}={expected}'"
+                    )
+def normalize_recorded(recorded: object) -> dict[str, dict[str, str]]:
+    if not isinstance(recorded, dict) or not recorded:
+        return {}
+    if all(isinstance(v, str) for v in recorded.values()):
+        return {"x86_64": dict(recorded)}
+    return {k: dict(v) for k, v in recorded.items() if isinstance(v, dict)}
+
+
+def build_updated_metadata(
+    metadata: dict,
+    recorded: dict[str, dict[str, str]],
+    current: dict[str, dict[str, str]],
+    suffix: str,
+) -> dict:
+    updated = dict(metadata)
+    by_arch = {k: dict(v) for k, v in recorded.items()}
+    for arch, triggers in current.items():
+        merged = dict(by_arch.get(arch, {}))
+        merged.update(triggers)
+        by_arch[arch] = merged
+    updated["rebuilt_against"] = by_arch
+    if suffix:
+        pkgrel_obj = dict(updated["pkgrel"]) if isinstance(updated.get("pkgrel"), dict) else {}
+        pkgrel_obj["suffix"] = int(suffix)
+        updated["pkgrel"] = pkgrel_obj
+    return updated
+
+
+def _write_staged_file(target: Path, content: bytes, mode: int, prefix: str) -> Path:
+    fd, tmp_name = tempfile.mkstemp(dir=target.parent, prefix=prefix)
+    tmp_path = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(content)
+        os.chmod(tmp_path, mode)
+    except BaseException:
+        tmp_path.unlink(missing_ok=True)
+        raise
+    return tmp_path
+
+
+def apply_package_update(
+    package_dir: Path,
+    orig_metadata: dict,
+    recorded: dict[str, dict[str, str]],
+    next_pkgrel: str,
+    current: dict[str, dict[str, str]],
+    suffix: str,
+    *,
+    temp_dir: Path,
+    dry_run: bool = False,
+) -> None:
+    """Stage, validate, and transactionally commit PKGBUILD and package.json."""
+    pkgbuild = package_dir / "PKGBUILD"
+    metadata_path = package_dir / ".omarchy" / "package.json"
+
+    orig_pkgbuild_bytes = pkgbuild.read_bytes()
+    orig_pkgbuild_text = orig_pkgbuild_bytes.decode("utf-8")
+    orig_pkgbuild_mode = pkgbuild.stat().st_mode & 0o7777
+    orig_meta_mode = metadata_path.stat().st_mode & 0o7777
+
+    missing_arch = next(
+        (a for a in VALID_ARCHES if a not in current and package_supports_arch(package_dir, a)),
+        None,
+    )
+
+    new_pkgbuild_text = rewrite_pkgrel_text(orig_pkgbuild_text, next_pkgrel)
+    new_pkgbuild_text = rewrite_pins_text(new_pkgbuild_text, current, missing_arch)
+    new_pkgbuild_bytes = new_pkgbuild_text.encode("utf-8")
+
+    validate_copy = temp_dir / f"PKGBUILD.{package_dir.name}.check"
+    try:
+        validate_copy.write_bytes(new_pkgbuild_bytes)
+        validate_staged_pkgbuild(package_dir, validate_copy, next_pkgrel, current)
+    finally:
+        validate_copy.unlink(missing_ok=True)
+
+    new_metadata = build_updated_metadata(orig_metadata, recorded, current, suffix)
+    new_metadata_bytes = (
+        json.dumps(new_metadata, indent=2, ensure_ascii=False) + "\n"
+    ).encode("utf-8")
+
+    if dry_run:
+        return
+
+    pkgbuild_scratch: Path | None = None
+    metadata_scratch: Path | None = None
+    pkgbuild_backup: Path | None = None
+
+    try:
+        pkgbuild_scratch = _write_staged_file(
+            pkgbuild, new_pkgbuild_bytes, orig_pkgbuild_mode, ".PKGBUILD.sync-rebuilds."
+        )
+        metadata_scratch = _write_staged_file(
+            metadata_path, new_metadata_bytes, orig_meta_mode, ".package.json.sync-rebuilds."
+        )
+        pkgbuild_backup = _write_staged_file(
+            pkgbuild, orig_pkgbuild_bytes, orig_pkgbuild_mode, ".PKGBUILD.sync-rebuilds-backup."
+        )
+
+        os.replace(pkgbuild_scratch, pkgbuild)
+        os.replace(metadata_scratch, metadata_path)
+    except BaseException:
+        # Derive exact commit state from the atomic-rename source paths: if
+        # PKGBUILD already landed (scratch gone) and metadata has not (scratch
+        # still exists), roll back PKGBUILD by rename.
+        if (
+            pkgbuild_backup is not None
+            and pkgbuild_backup.exists()
+            and pkgbuild_scratch is not None
+            and not pkgbuild_scratch.exists()
+            and metadata_scratch is not None
+            and metadata_scratch.exists()
+        ):
+            try:
+                os.replace(pkgbuild_backup, pkgbuild)
+                pkgbuild_backup = None
+            except OSError as rb_exc:
+                print_error(
+                    f"  Failed to roll back {pkgbuild}: {rb_exc}; "
+                    f"backup preserved at {pkgbuild_backup}"
+                )
+                pkgbuild_backup = None
+        raise
+    finally:
+        for path in (pkgbuild_scratch, metadata_scratch, pkgbuild_backup):
+            if path is not None:
+                path.unlink(missing_ok=True)
+
+
+def package_sync_enabled(metadata: dict) -> bool:
+    return metadata.get("source") == "aur" and metadata.get("sync", True) is not False
+
+
+@dataclass
+class SyncStats:
+    updated: int = 0
+    skipped: int = 0
+    failed: int = 0
+
+
+def sync_package(
+    package: str,
+    pkgbuilds_dir: Path,
+    repo_cache: RepoCache,
+    stats: SyncStats,
+    *,
+    specific_mode: bool,
+    dry_run: bool,
+) -> None:
+    package_dir = pkgbuilds_dir / package
+    pkgbuild = package_dir / "PKGBUILD"
+    metadata_path = package_dir / ".omarchy" / "package.json"
+
+    if not pkgbuild.is_file():
+        print_error(f"Package {package} has no PKGBUILD")
+        stats.failed += 1
+        return
+
+    metadata: dict = {}
+    if metadata_path.is_file():
+        try:
+            loaded = json.loads(metadata_path.read_text(encoding="utf-8"))
+            if not isinstance(loaded, dict):
+                raise ValueError("metadata is not a JSON object")
+            metadata = loaded
+        except (OSError, ValueError):
+            print_error(f"Unreadable metadata, skipping {package}: {metadata_path}")
+            stats.failed += 1
+            return
+
+    raw_triggers = metadata.get("rebuild_on")
+    if raw_triggers is None or raw_triggers == []:
+        if specific_mode:
+            print_error(f"Package {package} does not declare rebuild_on")
+            stats.failed += 1
+        else:
+            print_info(f"Skipping {package}: no rebuild triggers")
+            stats.skipped += 1
+        return
+    if not isinstance(raw_triggers, list) or not all(isinstance(t, str) and t for t in raw_triggers):
+        print_error(f"Malformed rebuild_on in {metadata_path}; skipping {package}")
+        stats.failed += 1
+        return
+    triggers: list[str] = raw_triggers
+
+    print_info(f"Checking {package} against {' '.join(triggers)}...")
+
+    current: dict[str, dict[str, str]] = {}
+    first_fields: RecipeFields | None = None
+    for arch in repo_cache.ci_arches:
+        fields = read_pkgbuild_fields(package_dir, arch)
+        if fields is None or ("any" not in fields.arches and arch not in fields.arches):
+            continue
+        if first_fields is None:
+            first_fields = fields
+        arch_current: dict[str, str] = {}
+        for trigger in triggers:
+            is_carried, version = resolve_carried_trigger(pkgbuilds_dir, arch, trigger)
+            if is_carried:
+                if not version:
+                    print_error(
+                        f"  Could not read the {arch} version of {trigger} from its recipe; "
+                        f"leaving {package} alone"
+                    )
+                    stats.failed += 1
+                    return
+                repo_cache.load_published_versions()
+                if arch not in repo_cache.edge_read:
+                    print_error(
+                        f"  Could not read the published edge/{arch} database for {trigger}; "
+                        f"leaving {package} alone"
+                    )
+                    stats.failed += 1
+                    return
+                if repo_cache.edge_versions.get((arch, trigger)) != version:
+                    print_warning(
+                        f"  {trigger} {version} is not published on edge/{arch} yet; "
+                        f"leaving {package} alone until it is"
+                    )
+                    stats.skipped += 1
+                    return
+            else:
+                try:
+                    version = repo_cache.repo_version(arch, trigger)
+                except SyncError as exc:
+                    print_error(f"  {exc}; leaving {package} alone")
+                    stats.failed += 1
+                    return
+            if not version:
+                print_error(
+                    f"  {trigger} is in no {arch} repository; leaving {package} alone"
+                )
+                stats.failed += 1
+                return
+            arch_current[trigger] = version
+        current[arch] = arch_current
+
+    if not current or first_fields is None:
+        print_info("  Skipping: not built for any published architecture")
+        stats.skipped += 1
+        return
+
+    recorded = normalize_recorded(metadata.get("rebuilt_against"))
+    moved_parts = [
+        f"{arch}/{trigger} {recorded.get(arch, {}).get(trigger) or 'unrecorded'} -> {version}"
+        for arch, arch_triggers in current.items()
+        for trigger, version in arch_triggers.items()
+        if recorded.get(arch, {}).get(trigger) != version
+    ]
+    if not moved_parts:
+        print_info("  Already rebuilt against every published architecture")
+        stats.skipped += 1
+        return
+    moved = ", ".join(moved_parts)
+
+    pkgrel, pkgver, epoch = first_fields.pkgrel, first_fields.pkgver, first_fields.epoch
+    suffix = ""
+    if package_sync_enabled(metadata):
+        if "." in pkgrel:
+            next_pkgrel = bump_pkgrel(pkgrel)
+            suffix = next_pkgrel.rsplit(".", 1)[1] if next_pkgrel else ""
+        else:
+            next_pkgrel = f"{pkgrel}.1" if PKGREL_RE.match(pkgrel) else None
+            suffix = "1"
+    else:
+        next_pkgrel = bump_pkgrel(pkgrel)
+
+    if not next_pkgrel:
+        print_error(f"  Cannot bump pkgrel={pkgrel} for {package}; bump it by hand")
+        stats.failed += 1
+        return
+
+    epoch_prefix = f"{epoch}:" if epoch and epoch != "0" else ""
+    old_version = f"{epoch_prefix}{pkgver}-{pkgrel}"
+    new_version = f"{epoch_prefix}{pkgver}-{next_pkgrel}"
+
+    if vercmp(new_version, old_version) <= 0:
+        print_error(f"  pkgrel {pkgrel} -> {next_pkgrel} would not be an upgrade for {package}")
+        stats.failed += 1
+        return
+
+    floor = repo_cache.published_version(package)
+    if floor and version_pkgver(floor) == pkgver and vercmp(new_version, floor) <= 0:
+        print_error(
+            f"  {new_version} would not be an upgrade over the published {floor}; "
+            f"leaving {package} alone"
+        )
+        stats.failed += 1
+        return
+
+    try:
+        apply_package_update(
+            package_dir,
+            metadata,
+            recorded,
+            next_pkgrel,
+            current,
+            suffix,
+            temp_dir=repo_cache.temp_dir,
+            dry_run=dry_run,
+        )
+    except (SyncError, OSError, ValueError) as exc:
+        print_error(f"  Failed to update {package}: {exc}")
+        stats.failed += 1
+        return
+
+    verb = "Would bump" if dry_run else "pkgrel"
+    print_success(f"  {moved}; {verb} {pkgrel} -> {next_pkgrel}")
+    stats.updated += 1
+
+
+def discover_packages(pkgbuilds_dir: Path, stats: SyncStats) -> list[str]:
+    if not pkgbuilds_dir.is_dir():
+        return []
+    selected: list[str] = []
+    for entry in sorted(pkgbuilds_dir.iterdir()):
+        if not entry.is_dir():
+            continue
+        metadata_path = entry / ".omarchy" / "package.json"
+        if not ((entry / "PKGBUILD").is_file() and metadata_path.is_file()):
+            continue
+        try:
+            data = json.loads(metadata_path.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                raise ValueError("metadata is not a JSON object")
+        except (OSError, ValueError):
+            print_error(f"Unreadable metadata, skipping {entry.name}: {metadata_path}")
+            stats.failed += 1
+            continue
+        if "rebuild_on" in data and data["rebuild_on"] not in (None, []):
+            selected.append(entry.name)
+    return selected
+
+
+def run_sync(packages: list[str], *, dry_run: bool = False) -> int:
+    pkgbuilds_dir = get_pkgbuilds_dir()
+    ci_arches = get_ci_arches()
+    stats = SyncStats()
+
+    with tempfile.TemporaryDirectory(prefix="sync-rebuilds-") as tmp:
+        repo_cache = RepoCache(temp_dir=Path(tmp), ci_arches=ci_arches)
+        specific_mode = len(packages) > 0
+        targets = packages if specific_mode else discover_packages(pkgbuilds_dir, stats)
+        for package in targets:
+            sync_package(
+                package,
+                pkgbuilds_dir,
+                repo_cache,
+                stats,
+                specific_mode=specific_mode,
+                dry_run=dry_run,
+            )
+
+    print("")
+    if stats.failed > 0:
+        print_error("Rebuild trigger sync completed with failures")
+    else:
+        print_success("Rebuild trigger sync complete!")
+    print(f"  Target: {pkgbuilds_dir}")
+    print(f"  Updated: {stats.updated}")
+    print(f"  Skipped: {stats.skipped}")
+    print(f"  Failed: {stats.failed}")
+    return 0 if stats.failed == 0 else 1
+
+
+def run_self_test() -> int:
+    test_script = ROOT / "tests" / "sync-rebuilds.py"
+    if not test_script.is_file():
+        print_error(f"Self-test suite not found: {test_script}")
+        return 1
+    return subprocess.run([sys.executable, str(test_script)], check=False).returncode
+
+
+def check_required_tools() -> None:
+    for tool in ("pacman", "vercmp", "curl", "tar"):
+        if shutil.which(tool) is None:
+            raise SyncError(f"{tool} not found: rebuild trigger sync cannot run")
+
+
+class _SyncParser(argparse.ArgumentParser):
+    def error(self, message: str) -> None:
+        print_error(message)
+        sys.exit(1)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = _SyncParser(
+        prog="sync-rebuilds",
+        allow_abbrev=False,
+        description=(
+            "Bump pkgrel for packages that must be rebuilt when a dependency "
+            "changes underneath them."
+        ),
+    )
+    parser.add_argument(
+        "packages",
+        nargs="*",
+        metavar="PACKAGE",
+        help="One or more package names to update (default: all packages declaring rebuild_on)",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Validate and print planned bumps without modifying any files",
+    )
+    parser.add_argument(
+        "--self-test",
+        action="store_true",
+        help="Run the regression test suite and exit",
+    )
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    def _handle_sigterm(_signum: int, _frame: object) -> None:
+        raise SystemExit(143)
+
+    signal.signal(signal.SIGTERM, _handle_sigterm)
+
+    args = build_parser().parse_args(argv)
+    if args.self_test:
+        return run_self_test()
+
+    try:
+        check_required_tools()
+        print_header("Rebuild Trigger Sync")
+        return run_sync(args.packages, dry_run=args.dry_run)
+    except SyncError as exc:
+        print_error(str(exc))
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
