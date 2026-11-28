@@ -1,0 +1,156 @@
+# Maintainer: Omri Ben-Ami <omribenami@users.noreply.github.com>
+pkgname=omarchy-ai
+pkgver=0.15.0
+pkgrel=1
+pkgdesc='Agentic voice and text desktop co-pilot for Omarchy'
+arch=('x86_64')
+url='https://github.com/omribenami/Omarchy-AI'
+license=('MIT')
+# Native pieces the locked environment cannot carry: system Python (for
+# python-gobject), GStreamer/PipeWire, and the Omarchy desktop. Python
+# libraries are vendored from uv.lock at build time; several are absent from
+# the Arch repos or pinned to a different version than the one Arch ships.
+depends=(
+  'omarchy'
+  'python'
+  'python-gobject'
+  'gstreamer'
+  'gst-plugins-good'
+  'gst-plugins-bad'
+  'pipewire-audio'
+  'pipewire-pulse'
+  'libpulse'
+  'android-tools'
+  'qrencode'
+  'hicolor-icon-theme'
+)
+makedepends=('base-devel' 'git' 'uv')
+options=('!debug')
+source=(
+  'omarchy-ai.sh'
+  'omarchy-ai.desktop'
+  'omarchy-ai.service'
+)
+source_x86_64=(
+  "https://github.com/omribenami/Omarchy-AI/releases/download/v${pkgver}/${pkgname}-${pkgver}-linux-${CARCH}.tar.gz"
+)
+sha256sums=(
+  '252a3a143702074af59a21701ae124c6e211a3f25f59e657853f47a133a55904'
+  '2f282c31146c91b1509f4a27f7cb21471719f4fa804682ae7fa5cd7ce2714afa'
+  'ed620d789bb5fa796c6a3a72d083836311cf9cdc1623234666e9c074489ecf44'
+)
+sha256sums_x86_64=(
+  '29903d7fed0db2e3422d8421066ad8ec8fedd4c5e26effaa564224b0fe3958da'
+)
+
+build() {
+  local bundle="$srcdir/${pkgname}-${pkgver}-linux-${CARCH}"
+
+  export UV_CACHE_DIR="$srcdir/uv-cache"
+  export UV_LINK_MODE=copy
+  export UV_NO_MANAGED_PYTHON=1
+  uv venv --clear --system-site-packages --python /usr/bin/python3 "$bundle/.venv"
+  (
+    cd "$bundle"
+    uv sync --locked --no-dev --python "$bundle/.venv/bin/python"
+  )
+  if compgen -G "$bundle/python/jev_ultrafast-"*.whl >/dev/null; then
+    uv pip install --python "$bundle/.venv/bin/python" --no-deps \
+      "$bundle"/python/jev_ultrafast-*.whl
+  fi
+  "$bundle/.venv/bin/python" -c 'import omarchy_ai, omarchy_ai.cli.settings, omarchy_ai.cli.task, omarchy_ai.myapi.vault'
+}
+
+package() {
+  local bundle="$srcdir/${pkgname}-${pkgver}-linux-${CARCH}"
+  local dest="$pkgdir/opt/omarchy-ai"
+  local cfg cmd
+
+  mkdir -p "$dest"
+  cp -a "$bundle/." "$dest/"
+  rm -rf "$dest/docs/media" "$dest/tests" "$dest/.github"
+
+  # The release ships a prebuilt receiver. The app looks for the Gradle
+  # output path and, if gradlew is present, tries to compile it. Install the
+  # prebuilt APK there and drop the wrapper so packaging never invokes a build.
+  install -Dm644 "$dest/android/omarchy-ai-receiver.apk" \
+    "$dest/android-receiver/app/build/outputs/apk/debug/app-debug.apk"
+  rm -rf "$dest/android"
+  install -d "$dest/android"
+  ln -s ../android-receiver/app/build/outputs/apk/debug/app-debug.apk \
+    "$dest/android/omarchy-ai-receiver.apk"
+  rm -rf "$dest/android-receiver/gradle" \
+    "$dest/android-receiver/gradlew" \
+    "$dest/android-receiver/gradlew.bat"
+  if [[ -f "$dest/.venv/.lock" ]]; then
+    chmod 644 "$dest/.venv/.lock"
+  fi
+  find "$dest" -type f -perm -0002 -exec chmod a-w,u+w {} +
+
+  cfg="$dest/.venv/pyvenv.cfg"
+  if grep -q '^include-system-site-packages' "$cfg"; then
+    sed -i 's/^include-system-site-packages.*/include-system-site-packages = true/' "$cfg"
+  else
+    printf '\ninclude-system-site-packages = true\n' >> "$cfg"
+  fi
+
+  bundle="$bundle" dest="$dest" python3 - <<'PY'
+import os
+import sys
+from pathlib import Path
+
+bundle = os.environ["bundle"]
+root = Path(os.environ["dest"])
+old = bundle.encode()
+new = b"/opt/omarchy-ai"
+rewritten = 0
+for path in root.rglob("*"):
+    if path.is_symlink():
+        target = os.readlink(path)
+        if bundle in target:
+            path.unlink()
+            path.symlink_to(target.replace(bundle, "/opt/omarchy-ai"))
+            rewritten += 1
+        continue
+    if not path.is_file():
+        continue
+    data = path.read_bytes()
+    if old not in data:
+        continue
+    if data.startswith(b"\x7fELF"):
+        sys.exit(f"build path leaked into ELF file: {path}")
+    path.write_bytes(data.replace(old, new))
+    rewritten += 1
+print(f"rewrote {rewritten} packaged paths")
+PY
+
+  if grep -R -l -F -a "$bundle" "$dest" >/dev/null 2>&1; then
+    printf 'Build directory leaked into the package:\n' >&2
+    grep -R -l -F -a "$bundle" "$dest" >&2 || true
+    exit 1
+  fi
+
+  install -Dm755 "$srcdir/omarchy-ai.sh" "$pkgdir/usr/bin/omarchy-ai"
+  # The release launcher bootstraps with its own installer on first use.
+  # The packaged command is the script above, on PATH and inside the tree.
+  ln -sfn /usr/bin/omarchy-ai "$dest/bin/omarchy-ai"
+  for cmd in omarchy-ai-settings omarchy-ai-task omarchy-ai-tool omarchy-ai-dashboard omarchy-ai-vault; do
+    ln -s "/opt/omarchy-ai/.venv/bin/$cmd" "$pkgdir/usr/bin/$cmd"
+  done
+
+  install -Dm644 "$srcdir/omarchy-ai.service" "$pkgdir/usr/lib/systemd/user/omarchy-ai.service"
+
+  install -Dm644 "$srcdir/omarchy-ai.desktop" "$pkgdir/usr/share/applications/omarchy-ai.desktop"
+  install -Dm644 "$dest/src/omarchy_ai/phone/static/omarchy-logo.png" \
+    "$pkgdir/usr/share/pixmaps/omarchy-ai.png"
+  install -Dm644 "$dest/src/omarchy_ai/phone/static/omarchy-logo.png" \
+    "$pkgdir/usr/share/icons/hicolor/256x256/apps/omarchy-ai.png"
+  install -Dm644 "$dest/src/omarchy_ai/phone/static/omarchy-logo.png" \
+    "$pkgdir/usr/share/icons/hicolor/512x512/apps/omarchy-ai.png"
+  install -Dm644 "$dest/LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+
+  if find "$pkgdir" -perm /4000 -print | grep -q .; then
+    printf 'Refusing to package a setuid file\n' >&2
+    exit 1
+  fi
+}
