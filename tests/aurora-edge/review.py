@@ -149,10 +149,13 @@ class MesaRecipeTests(unittest.TestCase):
         # Only libgallium may link LLVM, exactly one libLLVM.so.<major>.<minor>,
         # and it must be executable so makepkg versions the 'libLLVM.so' depend
         # from it; it must link LLVM, or llvmpipe is missing. SPIRV-Tools stays
-        # out everywhere.
+        # out of that build. libRusticlOpenCL, from a build of its own, may link
+        # SPIRV-Tools, must be executable, must link libgallium's LLVM and must
+        # not link libgallium.
         recipe = ROOT / 'pkgbuilds/mesa-aurora/PKGBUILD'
         llvm23, llvm24 = 'libLLVM.so.23.1', 'libLLVM.so.24.1'
-        for test_status, gallium, other, reader_status, executable, expected in [
+        spirv = 'libSPIRV-Tools.so libLLVMSPIRVLib.so.23.1'
+        cases = [
             (0, llvm23, '', 0, True, 0),
             (0, llvm24, '', 0, True, 0),
             (1, llvm23, '', 0, True, 1),
@@ -161,8 +164,24 @@ class MesaRecipeTests(unittest.TestCase):
             (0, '', '', 0, True, 1),
             (0, f'{llvm23} {llvm24}', '', 0, True, 1),
             (0, llvm23, llvm23, 0, True, 1),
-            (0, llvm23, 'libSPIRV-Tools.so', 0, True, 1)]:
-            with self.subTest(tests=test_status, gallium=gallium, other=other, reader=reader_status, executable=executable), tempfile.TemporaryDirectory() as temporary:
+            (0, llvm23, 'libSPIRV-Tools.so', 0, True, 1)]
+        # (libRusticlOpenCL's NEEDED, it is executable, the ICD file exists, expected)
+        rusticl_cases = [
+            (f'{llvm23} {spirv}', True, True, 0),
+            (f'{llvm24} {spirv}', True, True, 1),
+            (spirv, True, True, 1),
+            (f'{llvm23} {spirv} libgallium-26.3.0-devel.so', True, True, 1),
+            (f'{llvm23} {spirv}', False, True, 1),
+            (f'{llvm23} {spirv}', True, False, 1)]
+        matrix = [case + (f'{case[1].split(" ")[0]} {spirv}', True, True) for case in cases]
+        matrix += [(0, llvm23, '', 0, True, expected, needed, executable, icd)
+                   for needed, executable, icd, expected in rusticl_cases]
+        for index, (test_status, gallium, other, reader_status, executable, expected,
+                    rusticl, rusticl_executable, icd) in enumerate(matrix):
+            with self.subTest(tests=test_status, gallium=gallium, other=other, reader=reader_status,
+                              executable=executable, rusticl=rusticl,
+                              rusticl_executable=rusticl_executable, icd=icd), \
+                    tempfile.TemporaryDirectory() as temporary:
                 root = Path(temporary)
                 stage = root / 'mesa-stage'
                 stage.mkdir()
@@ -172,12 +191,25 @@ class MesaRecipeTests(unittest.TestCase):
                 other_file = stage / 'libvulkan_asahi.so'
                 other_file.write_bytes(b'fixture')
                 other_file.chmod(0o755)
+                rusticl_file = root / 'rusticl-stage/usr/lib/libRusticlOpenCL.so.1.0.0'
+                rusticl_file.parent.mkdir(parents=True)
+                rusticl_file.write_bytes(b'fixture')
+                rusticl_file.chmod(0o755 if rusticl_executable else 0o644)
+                if icd:
+                    icd_file = root / 'rusticl-stage/etc/OpenCL/vendors/rusticl.icd'
+                    icd_file.parent.mkdir(parents=True)
+                    icd_file.write_text('libRusticlOpenCL.so.1\n')
                 result = shell('source "$1"\nsrcdir="$2"\nmeson() { printf \'%s\\n\' "$*"; return "$TEST_STATUS"; }\n'
                                'readelf() { local needed=$OTHER; [[ ${2##*/} == libgallium-* ]] && needed=$GALLIUM; '
+                               '[[ ${2##*/} == libRusticlOpenCL.* ]] && needed=$RUSTICL; '
                                'for lib in $needed; do echo " 0x1 (NEEDED) Shared library: [$lib]"; done; return "$READER_STATUS"; }\ncheck\n',
                                recipe, root, env=dict(os.environ, TEST_STATUS=str(test_status),
-                               GALLIUM=gallium, OTHER=other, READER_STATUS=str(reader_status)))
+                               GALLIUM=gallium, OTHER=other, RUSTICL=rusticl,
+                               READER_STATUS=str(reader_status)))
                 self.assertEqual(result.returncode, expected, result.stderr)
+                if index < len(cases):
+                    # A libgallium case must fail on libgallium, not on the later Rusticl guard.
+                    self.assertNotIn('libRusticlOpenCL', result.stderr)
                 self.assertIn('test -C build --print-errorlogs', result.stdout)
 
 
