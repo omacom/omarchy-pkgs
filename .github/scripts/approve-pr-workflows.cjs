@@ -4,7 +4,7 @@ const TESTS = '.github/workflows/test.yml';
 // pullRequest/action/since default to the pull_request_target event. The
 // sync workflows pass them explicitly: GitHub creates no pull_request_target
 // run for a GITHUB_TOKEN push, so they release their own pushes' held runs.
-module.exports = async function approve({ github, context, core, vouchStatus,
+async function approve({ github, context, core, vouchStatus,
   pullRequest = context.payload.pull_request, action = context.payload.action, since,
   sleep = ms => new Promise(resolve => setTimeout(resolve, ms)), attempts = 36 }) {
   // Missing/failed vouch lookups must not become approval. Denouncements
@@ -14,6 +14,11 @@ module.exports = async function approve({ github, context, core, vouchStatus,
   }
 
   const expected = pullRequest;
+  if (vouchStatus === 'unknown' && ['synchronize', 'reopened'].includes(action)) {
+    core.info(`Skipping workflow approval on ${action} for PR #${expected.number} (unknown).`);
+    return;
+  }
+
   const eventTime = Date.parse(since ?? expected.updated_at);
   if (!Number.isFinite(eventTime)) throw new Error('Missing PR event timestamp.');
   const approved = new Set();
@@ -85,4 +90,43 @@ module.exports = async function approve({ github, context, core, vouchStatus,
     if (pending.length === 1) return;
   }
   throw new Error('Timed out waiting for PR workflows. Remove and reapply build-approved to retry.');
-};
+}
+
+// Clear build-approved after synchronize or reopened for authors who are not
+// collaborators, bots, or vouched, unless the label was reapplied afterward.
+async function resetBuildApproval({ github, context, core, vouchStatus }) {
+  const pr = context.payload.pull_request;
+  if (['bot', 'collaborator', 'vouched'].includes(vouchStatus)) {
+    core.info(`Author ${pr.user.login} is trusted (${vouchStatus}); keeping build-approved.`);
+    return;
+  }
+  const eventTime = Date.parse(pr.updated_at);
+  if (vouchStatus !== 'denounced' && Number.isFinite(eventTime)) {
+    try {
+      for (let page = 1; ; page++) {
+        const { data: events } = await github.rest.issues.listEvents({
+          ...context.repo, issue_number: pr.number, per_page: 100, page,
+        });
+        if (events.some(e => e.event === 'labeled' && e.label?.name === 'build-approved' && Date.parse(e.created_at) > eventTime)) {
+          core.info(`build-approved was reapplied after ${context.payload.action} on #${pr.number}; keeping.`);
+          return;
+        }
+        if (events.length < 100) break;
+      }
+    } catch (error) {
+      core.info(`Could not read label events for #${pr.number} (${error?.status ?? error?.message ?? 'error'}); clearing build-approved.`);
+    }
+  }
+  try {
+    await github.rest.issues.removeLabel({
+      ...context.repo, issue_number: pr.number, name: 'build-approved',
+    });
+    core.info(`Cleared build-approved on #${pr.number} (${vouchStatus}) after ${context.payload.action}.`);
+  } catch (error) {
+    if (error?.status !== 404) throw error;
+    core.info(`build-approved already absent on #${pr.number}.`);
+  }
+}
+
+module.exports = approve;
+module.exports.resetBuildApproval = resetBuildApproval;

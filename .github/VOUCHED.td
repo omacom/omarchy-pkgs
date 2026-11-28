@@ -6,8 +6,9 @@
 # too. Anyone else gets the plan only, until a maintainer either adds them
 # here or applies the "build-approved" label to that one PR. The label also
 # releases GitHub's approval hold for that PR's build and test workflows.
-# It remains effective while attached, without vouching for the author's
-# other PRs. An explicit denouncement cannot be overridden by the label.
+# It is cleared after new commits or reopen unless the author is a collaborator,
+# bot, or vouched, and it does not enable auto-merge. An explicit denouncement
+# cannot be overridden by the label.
 #
 # Syntax:
 #   github:username
