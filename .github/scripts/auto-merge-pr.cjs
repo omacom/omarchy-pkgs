@@ -137,23 +137,24 @@ function vouchedStatus(text, login) {
 // access), or the VOUCHED.td entry. A 401, 403, 429, 5xx or network error is
 // retried five times, 1 s to 16 s apart. Only a 200 with read/none or a 404
 // (user/collaborator not found) falls through to VOUCHED.td; any other
-// failure or malformed response returns 'error' so decide() refuses to arm
-// while withdraw() preserves existing auto-merge unless content or approval
-// revocation disqualifies the PR.
+// failure or malformed response honors an explicit denouncement and otherwise
+// returns 'error' so decide() refuses to arm while withdraw() preserves
+// existing auto-merge unless content or approval revocation disqualifies it.
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 async function authorStatus({ github, context, login, vouched, wait = sleep }) {
   if (login.endsWith('[bot]')) return 'bot';
+  const onError = () => (vouchedStatus(vouched, login) === 'denounced' ? 'denounced' : 'error');
   for (let attempt = 0; ; attempt++) {
     try {
       const { data } = await github.rest.repos.getCollaboratorPermissionLevel({ ...context.repo, username: login });
       if (['admin', 'write'].includes(data?.permission)) return 'collaborator';
       if (['read', 'none'].includes(data?.permission)) return vouchedStatus(vouched, login);
-      return 'error';
+      return onError();
     } catch (error) {
       const status = error?.status;
       if (status === 404) return vouchedStatus(vouched, login);
       if (!(status === undefined || [401, 403, 429].includes(status) || status >= 500) || attempt >= 5) {
-        return 'error';
+        return onError();
       }
       await wait(1000 * 2 ** attempt);
     }
@@ -189,8 +190,15 @@ async function approvalRevoked({ github, context, pr }) {
 
 // The decision for one PR as it is now, and whether to take back auto-merge.
 const COMPARE_LIMIT = 300;
-async function evaluate({ github, context, pr, vouched, wait }) {
+async function evaluate({ github, context, pr, vouched, wait, checkRevocation = false }) {
   const vouchStatus = await authorStatus({ github, context, login: pr.user.login, vouched, wait });
+  // Removing build-approved must fail closed even if both the collaborator
+  // lookup and commit compare fail, and even if a newer event replaced the
+  // waiting unlabeled run: build-pr.yml does not re-run on unlabeled.
+  if (checkRevocation && vouchStatus === 'error' && await approvalRevoked({ github, context, pr })) {
+    return { vouchStatus, withdraw: true,
+      decision: { enable: false, reason: 'author not trusted to build (error)' } };
+  }
   const { data: diff } = await github.rest.repos.compareCommitsWithBasehead({
     ...context.repo, basehead: `${pr.base.ref}...${pr.head.sha}`,
   });
@@ -209,18 +217,14 @@ async function evaluate({ github, context, pr, vouched, wait }) {
   const repository = `${context.repo.owner}/${context.repo.repo}`;
   const decision = decide({ pr, files, vouchStatus, repository, owners });
   const asTrusted = decide({ pr, files, vouchStatus: 'collaborator', repository, owners });
-  // Removing build-approved must fail closed even if the collaborator lookup
-  // errored and a newer event replaced the waiting unlabeled run: build-pr.yml
-  // does not re-run on unlabeled, so an already-green PR could still merge.
-  const keepArmed = asTrusted.enable && !(vouchStatus === 'error' && await approvalRevoked({ github, context, pr }));
-  return { decision, vouchStatus, withdraw: withdraw(decision, vouchStatus, keepArmed) };
+  return { decision, vouchStatus, withdraw: withdraw(decision, vouchStatus, asTrusted.enable) };
 }
 
 // auto-merge-pr.yml: decide for the event's PR. vouched is the default
 // branch's .github/VOUCHED.td.
 module.exports = async function autoMerge({ github, context, core, number, vouched, wait }) {
   const { data: pr } = await github.rest.pulls.get({ ...context.repo, pull_number: prNumber(number) });
-  const { decision, vouchStatus, withdraw: takeBack } = await evaluate({ github, context, pr, vouched, wait });
+  const { decision, vouchStatus, withdraw: takeBack } = await evaluate({ github, context, pr, vouched, wait, checkRevocation: true });
   core.info(`#${pr.number}: ${decision.enable ? 'auto-merge' : 'leave for a maintainer'} (${vouchStatus}: ${decision.reason})`);
   core.setOutput('number', String(pr.number));
   core.setOutput('enable', String(decision.enable));

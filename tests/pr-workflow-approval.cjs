@@ -508,7 +508,7 @@ const { execFileSync } = require('node:child_process');
 fs.appendFileSync(${JSON.stringify(join(dir, 'calls'))}, process.argv.slice(2).join(' ') + '\\n');
 const prs = JSON.parse(fs.readFileSync(${JSON.stringify(state)}, 'utf8'));
 const args = process.argv.slice(2);
-const n = args.find(a => /^[0-9]+$/.test(a));
+const n = args.find(a => /^[1-9][0-9]{0,9}$/.test(a));
 if (args[0] === 'pr' && args[1] === 'view') {
   if (${JSON.stringify(failView)}.includes(n) || prs[n]?.failView) process.exit(1);
   const pr = prs[n];
@@ -633,6 +633,7 @@ test('the arm job accepts a peer merge or arm at the judged head/base and fails 
     ['107', '1', { head: sha('1') }, { state: 'OPEN', base: 'rc', armed: true }, 'failure', 'gh pr merge failed'],
     ['108', '2', { head: sha('2') }, { exit: 0, state: 'MERGED', base: 'rc', armed: false }, 'failure', 'gh pr merge failed'],
     ['109', '3', { head: sha('9'), state: 'MERGED' }, undefined, 'failure', `moved since it was judged: MERGED false master ${sha('9')}`],
+    ['110', '4', { head: sha('4') }, { exit: 0, state: 'MERGED', armed: false }, 'success', ''],
   ];
   const prs = Object.fromEntries(cases.map(([n, , pr]) => [n, pr]));
   const failMergeTransition = Object.fromEntries(cases.filter(([, , , t]) => t).map(([n, , , t]) => [n, t]));
@@ -1076,12 +1077,15 @@ test('a transient permission error is retried and returns error instead of downg
     assert.equal(await authorStatus({ ...f, context, login: 'wes', vouched: '', wait }), 'error', String(badPerm));
     assert.equal(f.seen.length, 1, `malformed 200 permission (${badPerm}) returns error without falling through`);
   }
+  f = flaky(Array(6).fill(503));
+  assert.equal(await authorStatus({ ...f, context, login: 'mallory', vouched: '-github:mallory spam\n', wait }), 'denounced',
+    'denounced users fail closed even on collaborator API failure');
 });
 
 test('a transient permission API failure preserves collaborator auto-merge unless content or approval revocation disqualifies', async () => {
   const autoMerge = require('../.github/scripts/auto-merge-pr.cjs');
   const wait = async () => {};
-  const runCase = async ({ status, permission, files, labels = [], payload = {}, timeline = [[]], failTimeline = false }) => {
+  const runCase = async ({ status, permission, files, labels = [], payload = {}, timeline = [[]], failTimeline = false, failCompare = false, vouched = '' }) => {
     const outputs = {};
     const pr = {
       number: 42, state: 'open', draft: false, labels, user: { login: 'wes' },
@@ -1102,12 +1106,15 @@ test('a transient permission API failure preserves collaborator auto-merge unles
           if (status) throw Object.assign(new Error(String(status)), { status });
           return { data: { permission } };
         },
-        compareCommitsWithBasehead: async () => ({ data: { files } }),
+        compareCommitsWithBasehead: async () => {
+          if (failCompare) throw Object.assign(new Error('503'), { status: 503 });
+          return { data: { files } };
+        },
       },
     } };
     const context = { repo: { owner: 'omacom', repo: 'omarchy-pkgs' }, payload };
     const core = { info() {}, setOutput: (k, v) => { outputs[k] = v; } };
-    await autoMerge({ github, context, core, number: 42, vouched: '', wait });
+    await autoMerge({ github, context, core, number: 42, vouched, wait });
     return outputs;
   };
 
@@ -1146,6 +1153,14 @@ test('a transient permission API failure preserves collaborator auto-merge unles
   const revokedOnCollab = await runCase({ permission: 'write', files: pkgOnly, payload: revoked });
   assert.equal(revokedOnCollab.enable, 'true');
   assert.equal(revokedOnCollab.withdraw, 'false', 'collaborator PR stays armed if build-approved is removed');
+
+  const revokedWithCompareDown = await runCase({ status: 503, files: pkgOnly, payload: { action: 'edited' }, timeline: [page2], failCompare: true });
+  assert.equal(revokedWithCompareDown.enable, 'false');
+  assert.equal(revokedWithCompareDown.withdraw, 'true', 'withdraws revoked approval even if compareCommitsWithBasehead also fails');
+
+  const denouncedOnError = await runCase({ status: 503, files: pkgOnly, vouched: '-github:wes\n' });
+  assert.equal(denouncedOnError.enable, 'false');
+  assert.equal(denouncedOnError.withdraw, 'true', 'withdraws denounced author even if collaborator API fails');
 
   const realUnknown = await runCase({ status: 404, files: pkgOnly });
   assert.equal(realUnknown.enable, 'false');
