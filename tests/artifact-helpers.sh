@@ -44,6 +44,35 @@ mkdir -p "$T/empty"
 if pack_packages "$T/empty" "$T/x.tar" 2>/dev/null; then fail "packing an empty build dir should fail"; else pass "empty build dir refused"; fi
 if unpack_packages "$T/empty" "$T/out3" 2>/dev/null; then fail "an empty artifact should fail"; else pass "empty artifact refused"; fi
 
+# Artifact reuse is valid only while both the package tree and the base-branch
+# build/qualification contract agree. Unrelated commits retain reuse.
+CONTRACT="$T/contract"
+mkdir -p "$CONTRACT/bin" "$CONTRACT/helpers" "$CONTRACT/build" "$CONTRACT/.github/workflows"
+for path in bin/build bin/build-matrix bin/builder-image bin/check-fast-ring build/one \
+  helpers/artifact-helpers.sh helpers/docker-helpers.sh helpers/fast-ring-check.sh \
+  helpers/message-helpers.sh helpers/package-metadata.sh helpers/package-owners.sh \
+  helpers/paths.sh .github/workflows/build-pr.yml; do
+  echo "$path" > "$CONTRACT/$path"
+done
+git -C "$CONTRACT" init -q
+git -C "$CONTRACT" add .
+git -C "$CONTRACT" -c user.name=Test -c user.email=test@example.invalid commit -qm base
+key=$(build_contract_key "$CONTRACT")
+[[ $key =~ ^v1-[0-9a-f]{64}$ ]] && pass "build contract key is versioned and content-addressed" || fail "contract key: $key"
+label=$(build_artifact_label alpha x86_64 0123456789012345678901234567890123456789 "$CONTRACT")
+[[ $label == "alpha-x86_64-0123456789012345678901234567890123456789-$key" ]] \
+  && pass "artifact label combines package tree and build contract" || fail "artifact label: $label"
+echo unrelated > "$CONTRACT/README"
+git -C "$CONTRACT" add README
+git -C "$CONTRACT" -c user.name=Test -c user.email=test@example.invalid commit -qm unrelated
+[[ $(build_contract_key "$CONTRACT") == "$key" ]] \
+  && pass "unrelated commits retain artifact reuse" || fail "unrelated commit changed contract"
+echo changed >> "$CONTRACT/bin/build"
+git -C "$CONTRACT" add bin/build
+git -C "$CONTRACT" -c user.name=Test -c user.email=test@example.invalid commit -qm tooling
+[[ $(build_contract_key "$CONTRACT") != "$key" ]] \
+  && pass "build tooling changes invalidate artifacts" || fail "tooling change retained contract"
+
 # ---- plan_slots: one pkgbase, one set of filenames, per architecture --------
 mkdir -p "$T/slots/edge/x86_64"
 for f in kernel-1-1-x86_64 kernel-headers-1-1-x86_64 stub-2-1-x86_64; do
