@@ -18,6 +18,10 @@ when the partition has its size free, with a tenth and 1 MiB more, and removes a
 staging copy that could not be finished. Either way the live firmware is not
 touched and the script fails.
 
+`asahi-fwupdate-unmount-on-exit.patch` unmounts the EFI system partition from
+`/run/.system-efi` on every exit. Without it the mount stays when there is no
+firmware tarball or the extraction fails.
+
 ## Existing installations
 
 `provides=("asahi-scripts=$pkgver")` keeps every `asahi-scripts>=…` dependency
