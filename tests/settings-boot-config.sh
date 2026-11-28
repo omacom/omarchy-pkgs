@@ -55,6 +55,10 @@ for recipe in omarchy-settings omarchy-settings-dev; do
         echo 'FAIL: backup names a 90-omarchy-arp.conf the source does not ship' >&2
         exit 1
       fi
+      if printf '%s\n' "${backup[@]}" | grep -Fxq etc/mkinitcpio.conf.d/nvidia_module.conf; then
+        echo 'FAIL: backup names a nvidia_module.conf the source does not ship' >&2
+        exit 1
+      fi
       # The installer owns the machine-specific live configuration.
       [[ ! -e $pkgdir/etc/default/limine ]]
       if printf '%s\n' "${backup[@]}" | grep -Fx 'etc/default/limine' >/dev/null; then
@@ -102,6 +106,26 @@ for recipe in omarchy-settings omarchy-settings-dev; do
   done
 done
 rm "$fixture/etc/sysctl.d/90-omarchy-arp.conf"
+
+# A source with omacom/omarchy#18600 ships the NVIDIA early-load drop-in, and
+# the package keeps local edits to it, which are its opt-out.
+printf 'MODULES+=(nvidia nvidia_modeset nvidia_uvm nvidia_drm)\n' > "$fixture/etc/mkinitcpio.conf.d/nvidia_module.conf"
+for recipe in omarchy-settings omarchy-settings-dev; do
+  for target_arch in aarch64 x86_64; do
+    (
+      export CARCH=$target_arch OMARCHY_SRC=$fixture
+      export srcdir=$scratch/src pkgdir=$scratch/nvidia-$recipe-$target_arch
+      backup=()
+      # shellcheck disable=SC1090 # Exercise each recipe's actual package function.
+      source "$BUILD_ROOT/pkgbuilds/$recipe/PKGBUILD"
+      package
+      cmp "$fixture/etc/mkinitcpio.conf.d/nvidia_module.conf" "$pkgdir/etc/mkinitcpio.conf.d/nvidia_module.conf"
+      printf '%s\n' "${backup[@]}" | grep -Fxq etc/mkinitcpio.conf.d/nvidia_module.conf
+      echo "PASS: $recipe $CARCH ships the NVIDIA early-load drop-in and backs it up"
+    )
+  done
+done
+rm "$fixture/etc/mkinitcpio.conf.d/nvidia_module.conf"
 
 # The aarch64 packages also reach Apple Silicon Macs, whose initramfs needs the
 # asahi hook. Source mkinitcpio.conf and the drop-ins in mkinitcpio's order and
