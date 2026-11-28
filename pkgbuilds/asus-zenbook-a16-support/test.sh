@@ -100,6 +100,20 @@ grep -q 'SUBSYSTEM=="scsi", ENV{DEVTYPE}=="scsi_device",.*ATTRS{idVendor}=="0bda
   fail "the Realtek SCSI rule scopes to scsi_device and enables autosuspend"
 grep -q 'SUBSYSTEM=="block", ENV{DEVTYPE}=="disk",.*ATTRS{idVendor}=="0bda", ATTRS{idProduct}=="0329",.*ATTR{events_poll_msecs}="15000"' "$scratch/power.rules" ||
   fail "the Realtek block rule scopes to disk and sets events_poll_msecs=15000"
+grep -qx 'TEST=="/run/archiso/bootmnt", GOTO="zenbook_a16_power_usb_end"' "$power_rules" ||
+  fail "the power rules skip USB runtime PM on live/Try ISO sessions"
+grep -qx 'LABEL="zenbook_a16_power_usb_end"' "$power_rules" ||
+  fail "the power rules define zenbook_a16_power_usb_end"
+awk '
+  /^TEST=="\/run\/archiso\/bootmnt", GOTO="zenbook_a16_power_usb_end"$/ { in_usb = 1; next }
+  /^LABEL="zenbook_a16_power_usb_end"$/ { in_usb = 0; next }
+  in_usb && /DRIVER=="dwc3-qcom"/ { dwc3 = 1 }
+  in_usb && /DRIVER=="xhci-hcd"/ { xhci = 1 }
+  in_usb && /DRIVER=="qcom-qmp-combo-phy\|qcom-qmp-usb-phy"/ { phy = 1 }
+  !in_usb && /KERNEL=="0004:00:00\.0\|0004:01:00\.0"/ { wifi_after = 1 }
+  END { exit !(dwc3 && xhci && phy && wifi_after) }
+' "$scratch/power.rules" ||
+  fail "the USB runtime PM rules sit inside the live-medium skip and Wi-Fi wakeup stays outside it"
 grep -q 'SUBSYSTEM=="pci", KERNEL=="0004:00:00.0|0004:01:00.0",.*ATTR{power/wakeup}="disabled"' "$scratch/power.rules" ||
   fail "the PCIe4 Wi-Fi root port and endpoint rule disables wakeup"
 awk '
