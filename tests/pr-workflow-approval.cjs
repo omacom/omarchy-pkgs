@@ -195,13 +195,26 @@ test('a lone build left pending behind an older in-flight build does not hold ba
   assert.deepEqual(state.transitions, []);
 });
 
-test('reopening a labeled PR waits for its new tests, even if old tests passed at the same SHA', async () => {
+test('reopening a labeled PR waits for its new tests for a vouched author, and skips unknown authors', async () => {
   const { state, invoke } = fixture([
     run(1, TESTS, { created_at: earlier, conclusion: 'success' }), run(2, BUILD),
   ], { onSleep(state) { if (state.tick === 2) state.runs.push(run(3, TESTS)); } });
-  await invoke({ context: { repo: { owner: 'omacom', repo: 'omarchy-pkgs' },
-    payload: { action: 'reopened', pull_request: clone(pr) } } });
+  await invoke({
+    vouchStatus: 'vouched',
+    context: { repo: { owner: 'omacom', repo: 'omarchy-pkgs' },
+      payload: { action: 'reopened', pull_request: clone(pr) } },
+  });
   assert.deepEqual(state.approved, [2, 3]);
+
+  for (const action of ['synchronize', 'reopened']) {
+    const unknown = fixture([run(1, TESTS), run(2, BUILD)]);
+    await unknown.invoke({
+      vouchStatus: 'unknown',
+      context: { repo: { owner: 'omacom', repo: 'omarchy-pkgs' },
+        payload: { action, pull_request: clone(pr) } },
+    });
+    assert.deepEqual(unknown.state.approved, [], action);
+  }
 });
 
 test('missing current runs time out without approving stale builds', async () => {
@@ -905,13 +918,13 @@ const mergeable = (overrides = {}) => ({
 const packageFiles = [{ filename: 'pkgbuilds/superwhisper-bin/PKGBUILD' },
   { filename: 'pkgbuilds/superwhisper-bin/.omarchy/package.json' }];
 
-test('auto-merge follows the build gate: trusted authors, or build-approved for unknown ones', () => {
+test('auto-merge requires collaborator, vouched, or bot status and ignores build-approved', () => {
   for (const vouchStatus of ['collaborator', 'vouched', 'bot']) {
     assert.equal(decide({ pr: mergeable(), files: packageFiles, vouchStatus, repository }).enable, true, vouchStatus);
   }
   assert.equal(decide({ pr: mergeable(), files: packageFiles, vouchStatus: 'unknown', repository }).enable, false);
   const labelled = mergeable({ labels: [{ name: 'build-approved' }] });
-  assert.equal(decide({ pr: labelled, files: packageFiles, vouchStatus: 'unknown', repository }).enable, true);
+  assert.equal(decide({ pr: labelled, files: packageFiles, vouchStatus: 'unknown', repository }).enable, false);
   // A denouncement is absolute, and a failed lookup is not approval.
   for (const vouchStatus of ['denounced', '', undefined, 'error']) {
     assert.equal(decide({ pr: labelled, files: packageFiles, vouchStatus, repository }).enable, false, String(vouchStatus));
@@ -1065,7 +1078,8 @@ test('auto-merge decides without a write credential and arms with the merge App 
   assert.match(apply, /vouched: readFileSync\('\.github\/VOUCHED\.td', 'utf8'\)/);
   assert.match(apply, /NUMBER: \$\{\{ github\.event\.pull_request\.number \|\| github\.event\.inputs\.pr \}\}/);
   assert.ok(apply.indexOf('github-script') < apply.indexOf('create-github-app-token'), 'decides before the token exists');
-  assert.match(text, /types: \[opened, reopened, synchronize, ready_for_review, labeled, unlabeled, edited\]/);
+  assert.match(text, /types: \[opened, reopened, synchronize, ready_for_review, edited\]/);
+  assert.doesNotMatch(text, /types: \[[^\]]*\b(?:labeled|unlabeled)\b/);
   assert.match(apply, /gh pr merge --auto "--\$METHOD" --match-head-commit "\$HEAD_SHA" "\$PR"/);
   assert.match(apply, /PR: \$\{\{ steps\.decide\.outputs\.number \}\}/);
   assert.match(apply, /\[\[ \$METHOD == merge \]\] \|\| METHOD=squash/);
@@ -1152,12 +1166,15 @@ test('a transient permission error is retried and returns error instead of downg
   f = flaky(Array(6).fill(503));
   assert.equal(await authorStatus({ ...f, context, login: 'mallory', vouched: '-github:mallory spam\n', wait }), 'denounced',
     'denounced users fail closed even on collaborator API failure');
+  f = flaky(Array(6).fill(503));
+  assert.equal(await authorStatus({ ...f, context, login: 'vic', vouched: 'github:vic\n', wait }), 'vouched',
+    'vouched authors stay vouched even on collaborator API failure');
 });
 
-test('a transient permission API failure preserves collaborator auto-merge unless content or approval revocation disqualifies', async () => {
+test('a transient permission API failure preserves collaborator auto-merge unless content disqualifies', async () => {
   const autoMerge = require('../.github/scripts/auto-merge-pr.cjs');
   const wait = async () => {};
-  const runCase = async ({ status, permission, files, labels = [], payload = {}, timeline = [[]], failTimeline = false, failCompare = false, vouched = '' }) => {
+  const runCase = async ({ status, permission, files, labels = [], failCompare = false, vouched = '' }) => {
     const outputs = {};
     const pr = {
       number: 42, state: 'open', draft: false, labels, user: { login: 'wes' },
@@ -1167,12 +1184,6 @@ test('a transient permission API failure preserves collaborator auto-merge unles
     };
     const github = { rest: {
       pulls: { get: async () => ({ data: pr }) },
-      issues: {
-        listEventsForTimeline: async ({ page = 1 }) => {
-          if (failTimeline) throw Object.assign(new Error('503'), { status: 503 });
-          return { data: timeline[page - 1] || [] };
-        },
-      },
       repos: {
         getCollaboratorPermissionLevel: async () => {
           if (status) throw Object.assign(new Error(String(status)), { status });
@@ -1184,7 +1195,7 @@ test('a transient permission API failure preserves collaborator auto-merge unles
         },
       },
     } };
-    const context = { repo: { owner: 'omacom', repo: 'omarchy-pkgs' }, payload };
+    const context = { repo: { owner: 'omacom', repo: 'omarchy-pkgs' }, payload: {} };
     const core = { info() {}, setOutput: (k, v) => { outputs[k] = v; } };
     await autoMerge({ github, context, core, number: 42, vouched, wait });
     return outputs;
@@ -1192,7 +1203,6 @@ test('a transient permission API failure preserves collaborator auto-merge unles
 
   const pkgOnly = [{ filename: 'pkgbuilds/foo/PKGBUILD', status: 'modified' }];
   const withWorkflow = [...pkgOnly, { filename: '.github/workflows/publish.yml', status: 'modified' }];
-  const revoked = { action: 'unlabeled', label: { name: 'build-approved' } };
 
   const kept = await runCase({ status: 503, files: pkgOnly });
   assert.equal(kept.enable, 'false');
@@ -1202,41 +1212,21 @@ test('a transient permission API failure preserves collaborator auto-merge unles
   assert.equal(stripped.enable, 'false');
   assert.equal(stripped.withdraw, 'true', 'still withdraws disqualifying PR on transient 5xx');
 
-  const revokedOnError = await runCase({ status: 503, files: pkgOnly, payload: revoked });
-  assert.equal(revokedOnError.enable, 'false');
-  assert.equal(revokedOnError.withdraw, 'true', 'fails closed when build-approved is removed during API error');
-
-  // Even when a later edited event replaced the waiting unlabeled run, the
-  // timeline still records build-approved removal (including past page 1).
-  const page1 = Array.from({ length: 100 }, () => ({ event: 'commented' }));
-  const page2 = [{ event: 'unlabeled', label: { name: 'build-approved' } }];
-  const revokedLaterRun = await runCase({ status: 503, files: pkgOnly, payload: { action: 'edited' }, timeline: [page1, page2] });
-  assert.equal(revokedLaterRun.enable, 'false');
-  assert.equal(revokedLaterRun.withdraw, 'true', 'withdraws when build-approved removal appears in PR timeline');
-
-  const timelineFailed = await runCase({ status: 503, files: pkgOnly, payload: { action: 'edited' }, failTimeline: true });
-  assert.equal(timelineFailed.enable, 'false');
-  assert.equal(timelineFailed.withdraw, 'true', 'fails closed when PR timeline lookup fails');
-
-  const stillLabelled = await runCase({ status: 503, files: pkgOnly, labels: [{ name: 'build-approved' }], failTimeline: true });
-  assert.equal(stillLabelled.enable, 'false');
-  assert.equal(stillLabelled.withdraw, 'false', 'keeps auto-merge without timeline call when build-approved is still present');
-
-  const revokedOnCollab = await runCase({ permission: 'write', files: pkgOnly, payload: revoked });
-  assert.equal(revokedOnCollab.enable, 'true');
-  assert.equal(revokedOnCollab.withdraw, 'false', 'collaborator PR stays armed if build-approved is removed');
-
-  const revokedWithCompareDown = await runCase({ status: 503, files: pkgOnly, payload: { action: 'edited' }, timeline: [page2], failCompare: true });
-  assert.equal(revokedWithCompareDown.enable, 'false');
-  assert.equal(revokedWithCompareDown.withdraw, 'true', 'withdraws revoked approval even if compareCommitsWithBasehead also fails');
-
   const denouncedOnError = await runCase({ status: 503, files: pkgOnly, vouched: '-github:wes\n' });
   assert.equal(denouncedOnError.enable, 'false');
   assert.equal(denouncedOnError.withdraw, 'true', 'withdraws denounced author even if collaborator API fails');
 
-  const realUnknown = await runCase({ status: 404, files: pkgOnly });
+  const vouchedOnError = await runCase({ status: 503, files: pkgOnly, vouched: 'github:wes\n' });
+  assert.equal(vouchedOnError.enable, 'true');
+  assert.equal(vouchedOnError.withdraw, 'false', 'vouched author still qualifies when collaborator API fails');
+
+  const realUnknown = await runCase({ status: 404, files: pkgOnly, failCompare: true });
   assert.equal(realUnknown.enable, 'false');
-  assert.equal(realUnknown.withdraw, 'true', '404 still resolves to unknown and withdraws');
+  assert.equal(realUnknown.withdraw, 'true', '404 resolves to unknown and withdraws even when diff compare fails');
+
+  const unknownWithLabel = await runCase({ status: 404, files: pkgOnly, labels: [{ name: 'build-approved' }], failCompare: true });
+  assert.equal(unknownWithLabel.enable, 'false');
+  assert.equal(unknownWithLabel.withdraw, 'true', 'build-approved does not arm auto-merge for an unknown author');
 
   // planArms classifies an exhausted collaborator permission error as failure, not refused.
   const humanPr = {
@@ -1252,6 +1242,13 @@ test('a transient permission API failure preserves collaborator auto-merge unles
   assert.equal(plan.length, 1);
   assert.equal(plan[0].outcome, 'failure');
   assert.match(plan[0].reason, /\(error\)/);
+
+  const labelledUnknownPr = { ...humanPr, number: 78, labels: [{ name: 'build-approved' }] };
+  const { github: unknownGh } = fakeGitHub({ 78: labelledUnknownPr });
+  const unknownPlan = await planArms({ github: unknownGh, context, core: { info() {} }, groups: [{ branch: 'auto/sync-upstream-x' }], vouched: '', wait });
+  assert.equal(unknownPlan.length, 1);
+  assert.equal(unknownPlan[0].outcome, 'refused');
+  assert.match(unknownPlan[0].reason, /\(unknown\)/);
 });
 
 test('a PR number is taken only as a person types it', () => {
@@ -1830,5 +1827,82 @@ test('package-prs.yml and callers grant checks/statuses read permissions for sho
     assert.match(wf, /checks: read/);
     assert.match(wf, /statuses: read/);
     assert.match(wf, /pull-requests: read/);
+  }
+});
+
+test('approve-pr.yml resets build-approved on synchronize and reopened with isolated job permissions', () => {
+  const text = readFileSync(join(__dirname, '../.github/workflows/approve-pr.yml'), 'utf8');
+  assert.match(text, /pull_request_target:\n    types: \[opened, synchronize, reopened, labeled\]/);
+  assert.doesNotMatch(text, /mitchellh|setup-nu|head\.sha \}\}|head\.ref \}\}|refs\/pull\//);
+
+  const jobs = parseWorkflowJobs(text);
+  const reset = jobs.get('reset');
+  const approveJob = jobs.get('approve');
+  assert.ok(reset && approveJob);
+
+  assert.match(reset.body, /permissions:\n      contents: read\n      pull-requests: write\n/);
+  assert.doesNotMatch(reset.body, /actions: write/);
+  assert.match(reset.body, /cancel-in-progress: false/);
+  assert.match(reset.body, /synchronize.*reopened|reopened.*synchronize/s);
+  assert.match(reset.body, /resetBuildApproval\(/);
+
+  assert.match(approveJob.body, /permissions:\n      contents: read\n      pull-requests: read\n      actions: write\n/);
+  assert.doesNotMatch(approveJob.body, /pull-requests: write/);
+  assert.match(approveJob.body, /^    if: contains\(github\.event\.pull_request\.labels\.\*\.name, 'build-approved'\)$/m);
+  assert.match(approveJob.body, /cancel-in-progress: true/);
+  assert.match(approveJob.body, /group: approve-pr-\$\{\{ github\.event\.pull_request\.number \}\}\n/);
+});
+
+test('resetBuildApproval clears stale build-approved and preserves trusted authors or fresh approvals', async () => {
+  const { resetBuildApproval } = require('../.github/scripts/approve-pr-workflows.cjs');
+  const runReset = async ({
+    vouchStatus = 'unknown', action = 'synchronize', updatedAt = '2026-11-28T10:00:00Z',
+    eventPages = [[]], failEvents = false, removeStatus,
+  } = {}) => {
+    const removed = [];
+    const github = {
+      rest: {
+        issues: {
+          listEvents: async ({ page = 1 }) => {
+            if (failEvents) throw Object.assign(new Error('503'), { status: 503 });
+            return { data: eventPages[page - 1] || [] };
+          },
+          removeLabel: async args => {
+            removed.push(args);
+            if (removeStatus) throw Object.assign(new Error(String(removeStatus)), { status: removeStatus });
+          },
+        },
+      },
+    };
+    const context = {
+      repo: { owner: 'omacom', repo: 'omarchy-pkgs' },
+      payload: { action, pull_request: { number: 77, updated_at: updatedAt, user: { login: 'stranger' } } },
+    };
+    await resetBuildApproval({ github, context, core: { info() {} }, vouchStatus });
+    return removed;
+  };
+
+  const cleared = [{ owner: 'omacom', repo: 'omarchy-pkgs', issue_number: 77, name: 'build-approved' }];
+  const freshLabel = { event: 'labeled', label: { name: 'build-approved' }, created_at: '2026-11-28T10:00:05Z' };
+  const sameSecondLabel = { event: 'labeled', label: { name: 'build-approved' }, created_at: '2026-11-28T10:00:00Z' };
+  const page1 = Array.from({ length: 100 }, () => ({ event: 'labeled', label: { name: 'other' }, created_at: '2026-11-28T09:59:00Z' }));
+
+  for (const [label, opts] of [
+    ['unknown on synchronize', { vouchStatus: 'unknown', action: 'synchronize' }],
+    ['unknown on reopened', { vouchStatus: 'unknown', action: 'reopened' }],
+    ['same-second label fails closed', { eventPages: [[sameSecondLabel]] }],
+    ['listEvents error fails closed', { failEvents: true }],
+    ['denounced even with fresh label', { vouchStatus: 'denounced', eventPages: [[freshLabel]] }],
+    ['lookup error', { vouchStatus: 'error' }],
+    ['already removed (404)', { vouchStatus: 'unknown', removeStatus: 404 }],
+  ]) {
+    assert.deepEqual(await runReset(opts), cleared, label);
+  }
+
+  assert.deepEqual(await runReset({ eventPages: [page1, [freshLabel]] }), [], 'preserves build-approved reapplied after event (including past page 1)');
+  await assert.rejects(runReset({ removeStatus: 500 }), /500/, 'reports a label removal error');
+
+  for (const vouchStatus of ['collaborator', 'vouched', 'bot']) {
+    assert.deepEqual(await runReset({ vouchStatus, failEvents: true }), [], vouchStatus);
   }
 });

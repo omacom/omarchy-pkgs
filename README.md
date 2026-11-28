@@ -129,7 +129,9 @@ Questions and problems: open an issue on this repository.
    Builds cost machines, so they run for trusted authors only.
 2. **CI builds the package** for each architecture and runs the tests. The
    required checks are `result`, `self-tests` and `build-isolation`.
-3. **It merges itself when green**, if it changes only package files.
+3. **It merges itself when green**, if the author is a collaborator, bot, or
+   vouched author and it changes only package files; otherwise a maintainer
+   merges it.
 4. **It is published to `edge`** within minutes of merging, and reaches
    `rc` and `stable` when those channels are next
    [promoted](#promote-a-channel). Say so in the PR if you think the
@@ -540,8 +542,9 @@ Builds cost machines, so `build-pr.yml` runs them only for trusted authors:
 
 - repository collaborators and bots
 - authors listed in `.github/VOUCHED.td`
-- any PR a maintainer labels `build-approved` (that PR only, including later
-  commits): `gh pr edit <number> -R omacom/omarchy-pkgs --add-label build-approved`
+- any PR a maintainer labels `build-approved` (that PR only; cleared after new
+  commits or reopen for authors who are not collaborators, bots, or vouched):
+  `gh pr edit <number> -R omacom/omarchy-pkgs --add-label build-approved`
 
 `VOUCHED.td` takes one `github:<username>` per line; `-github:<username>
 <reason>` denounces an author.
@@ -550,7 +553,8 @@ An unknown author's PR shows **Awaiting build approval** and stays blocked
 until one of those applies. An author denounced in `VOUCHED.td` cannot be
 overridden by the label.
 
-A trusted PR also merges itself. `auto-merge-pr.yml` enables auto-merge when
+A PR from a collaborator, bot or vouched author also merges itself.
+`auto-merge-pr.yml` enables auto-merge when
 the PR targets `master`, is open, is not a draft, and changes only packages:
 files under `pkgbuilds/`, new files under `tests/`, and the lines of
 `release/owners.json` that `bin/release-owners` writes. Anything touching
@@ -560,8 +564,8 @@ the merge starts `publish.yml`. Before it writes, the workflow decides again
 from the PR as it is then. A PR that stops qualifying, or moves off `master`,
 loses auto-merge.
 
-- Remove `build-approved` to withdraw the auto-merge it armed for an unknown
-  author. Runs it already released keep going.
+- `build-approved` only gates PR builds; it does not enable auto-merge for
+  unknown authors, and runs it already released keep going if removed.
 - If the builds do not start a few minutes after labelling, remove the label
   and apply it again.
 - Evaluate a PR by hand: `gh workflow run auto-merge-pr.yml -f pr=<number>`.

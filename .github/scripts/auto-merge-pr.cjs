@@ -1,9 +1,8 @@
 // Whether a PR rides to master on its own once the required checks pass.
 //
-// The rule is the build gate's, from build-pr.yml: a PR trusted to build is
-// trusted to ship. Collaborators, vouched authors and bots are trusted; an
-// unknown author is trusted while the PR carries build-approved; a
-// denouncement is absolute. Limits on top of it:
+// Collaborators, vouched authors and bots qualify for auto-merge; a
+// denouncement is absolute. The build-approved label is scoped to PR builds
+// and does not qualify unknown authors for auto-merge. Limits on top of it:
 //
 // - Only PRs into the default branch. Another branch, such as rc, has no
 //   required checks, so an armed PR into it would merge at once, unbuilt.
@@ -76,15 +75,8 @@ function decide({ pr, files, vouchStatus, repository, owners }) {
     return { enable: false, reason: `PR targets ${pr.base?.ref || 'an unknown branch'}, not ${defaultBranch || 'the default branch'}` };
   }
 
-  const labelled = pr.labels.some(label => label.name === 'build-approved');
-  let trusted;
-  switch (vouchStatus) {
-    case 'bot': case 'collaborator': case 'vouched': trusted = true; break;
-    case 'unknown': trusted = labelled; break;
-    default: trusted = false; // denounced, or a failed lookup
-  }
-  if (!trusted) {
-    return { enable: false, reason: `author not trusted to build (${vouchStatus || 'missing'}${labelled ? ', labelled' : ''})` };
+  if (!['bot', 'collaborator', 'vouched'].includes(vouchStatus)) {
+    return { enable: false, reason: `author not eligible for auto-merge (${vouchStatus || 'missing'})` };
   }
 
   if (!files.length) return { enable: false, reason: 'PR changes no files' };
@@ -97,7 +89,7 @@ function decide({ pr, files, vouchStatus, repository, owners }) {
     return { enable: false, reason: `changes more than packages, their new tests and their owners.json lines: ${names}${outside.length > 3 ? ', ...' : ''}` };
   }
   return { enable: true, method: mergeMethod(pr, repository),
-    reason: `${vouchStatus === 'unknown' ? 'build-approved' : vouchStatus} author, package changes only` };
+    reason: `${vouchStatus} author, package changes only` };
 }
 
 // Whether to take back auto-merge an earlier event turned on. GitHub keeps
@@ -137,13 +129,17 @@ function vouchedStatus(text, login) {
 // access), or the VOUCHED.td entry. A 401, 403, 429, 5xx or network error is
 // retried five times, 1 s to 16 s apart. Only a 200 with read/none or a 404
 // (user/collaborator not found) falls through to VOUCHED.td; any other
-// failure or malformed response honors an explicit denouncement and otherwise
-// returns 'error' so decide() refuses to arm while withdraw() preserves
-// existing auto-merge unless content or approval revocation disqualifies it.
+// failure or malformed response honors an explicit VOUCHED.td entry
+// (vouched or denounced) and otherwise returns 'error' so decide() refuses
+// to arm while withdraw() preserves existing auto-merge unless content
+// disqualifies it.
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 async function authorStatus({ github, context, login, vouched, wait = sleep }) {
   if (login.endsWith('[bot]')) return 'bot';
-  const onError = () => (vouchedStatus(vouched, login) === 'denounced' ? 'denounced' : 'error');
+  const onError = () => {
+    const entry = vouchedStatus(vouched, login);
+    return entry === 'unknown' ? 'error' : entry;
+  };
   for (let attempt = 0; ; attempt++) {
     try {
       const { data } = await github.rest.repos.getCollaboratorPermissionLevel({ ...context.repo, username: login });
@@ -169,35 +165,14 @@ function prNumber(value) {
   return Number(text);
 }
 
-// Whether build-approved was removed from this PR, surviving pending-run
-// replacement when a later event superseded the unlabeled run. Fails closed
-// if the PR timeline cannot be read.
-async function approvalRevoked({ github, context, pr }) {
-  if (pr.labels.some(label => label.name === 'build-approved')) return false;
-  if (context.payload?.action === 'unlabeled' && context.payload?.label?.name === 'build-approved') return true;
-  try {
-    for (let page = 1; ; page++) {
-      const { data: events } = await github.rest.issues.listEventsForTimeline({
-        ...context.repo, issue_number: pr.number, per_page: 100, page,
-      });
-      if (events.some(event => event.event === 'unlabeled' && event.label?.name === 'build-approved')) return true;
-      if (events.length < 100) return false;
-    }
-  } catch {
-    return true;
-  }
-}
-
 // The decision for one PR as it is now, and whether to take back auto-merge.
 const COMPARE_LIMIT = 300;
-async function evaluate({ github, context, pr, vouched, wait, checkRevocation = false }) {
+async function evaluate({ github, context, pr, vouched, wait }) {
   const vouchStatus = await authorStatus({ github, context, login: pr.user.login, vouched, wait });
-  // Removing build-approved must fail closed even if both the collaborator
-  // lookup and commit compare fail, and even if a newer event replaced the
-  // waiting unlabeled run: build-pr.yml does not re-run on unlabeled.
-  if (checkRevocation && vouchStatus === 'error' && await approvalRevoked({ github, context, pr })) {
-    return { vouchStatus, withdraw: true,
-      decision: { enable: false, reason: 'author not trusted to build (error)' } };
+  const repository = `${context.repo.owner}/${context.repo.repo}`;
+  if (['unknown', 'denounced'].includes(vouchStatus)) {
+    const decision = decide({ pr, files: [], vouchStatus, repository });
+    return { decision, vouchStatus, withdraw: true };
   }
   const { data: diff } = await github.rest.repos.compareCommitsWithBasehead({
     ...context.repo, basehead: `${pr.base.ref}...${pr.head.sha}`,
@@ -214,7 +189,6 @@ async function evaluate({ github, context, pr, vouched, wait, checkRevocation = 
       .then(({ data }) => Buffer.from(data.content, 'base64').toString('utf8'), () => '');
     owners = { base: await read(pr.base.sha), head: await read(pr.head.sha) };
   }
-  const repository = `${context.repo.owner}/${context.repo.repo}`;
   const decision = decide({ pr, files, vouchStatus, repository, owners });
   const asTrusted = decide({ pr, files, vouchStatus: 'collaborator', repository, owners });
   return { decision, vouchStatus, withdraw: withdraw(decision, vouchStatus, asTrusted.enable) };
@@ -224,7 +198,7 @@ async function evaluate({ github, context, pr, vouched, wait, checkRevocation = 
 // branch's .github/VOUCHED.td.
 module.exports = async function autoMerge({ github, context, core, number, vouched, wait }) {
   const { data: pr } = await github.rest.pulls.get({ ...context.repo, pull_number: prNumber(number) });
-  const { decision, vouchStatus, withdraw: takeBack } = await evaluate({ github, context, pr, vouched, wait, checkRevocation: true });
+  const { decision, vouchStatus, withdraw: takeBack } = await evaluate({ github, context, pr, vouched, wait });
   core.info(`#${pr.number}: ${decision.enable ? 'auto-merge' : 'leave for a maintainer'} (${vouchStatus}: ${decision.reason})`);
   core.setOutput('number', String(pr.number));
   core.setOutput('enable', String(decision.enable));
