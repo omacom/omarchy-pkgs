@@ -159,7 +159,7 @@ package_pkgbuild_var() {
   local arch="${3:-${ARCH:-x86_64}}"
 
   (cd "$pkgdir" && env -u OMARCHY_SRC CARCH="$arch" bash -c '
-    source PKGBUILD >/dev/null 2>&1
+    source ./PKGBUILD >/dev/null 2>&1
     rc=$?
     printf "%s\n" "${!1:-}"
     exit "$rc"
@@ -172,7 +172,7 @@ package_pkgbuild_var() {
 package_pkgbase() {
   local pkgdir="$1" arch="${2:-${ARCH:-x86_64}}" base
   base=$(cd "$pkgdir" && env -u OMARCHY_SRC CARCH="$arch" bash -c '
-    source PKGBUILD >/dev/null 2>&1 || true
+    source ./PKGBUILD >/dev/null 2>&1 || true
     printf "%s\n" "${pkgbase:-${pkgname[0]:-}}"
   ' 2>/dev/null || true)
   echo "${base:-${pkgdir##*/}}"
@@ -184,11 +184,55 @@ package_pkgbase() {
 package_arches() {
   local pkgdir="$1"
   local arch="${2:-${ARCH:-x86_64}}"
+  local out rc=0
 
-  (cd "$pkgdir" && env -u OMARCHY_SRC CARCH="$arch" bash -c '
-    source PKGBUILD >/dev/null 2>&1
+  out=$(cd "$pkgdir" && env -u OMARCHY_SRC CARCH="$arch" bash -c '
+    unset arch
+    source ./PKGBUILD >/dev/null 2>&1
+    rc=$?
+    if ! declare -p arch >/dev/null 2>&1; then
+      (( rc != 0 )) && printf "__OMARCHY_ARCH_UNSET__\n"
+      exit 1
+    fi
+    (( ${#arch[@]} )) || exit 1
+    for a in "${arch[@]}"; do
+      [[ -n "$a" ]] || exit 1
+    done
     printf "%s\n" "${arch[*]}"
-  ')
+    if (( rc != 0 )); then
+      case " ${arch[*]} " in
+        *" any "* | *" $CARCH "*) exit 1 ;;
+      esac
+    fi
+  ') || rc=$?
+  if (( rc == 0 )) && [[ -n "$out" ]]; then
+    printf '%s\n' "$out"
+    return 0
+  fi
+  if [[ "$out" != "__OMARCHY_ARCH_UNSET__" ]]; then
+    [[ -n "$out" ]] && printf '%s\n' "$out"
+    return 1
+  fi
+
+  # If a recipe returned early on CARCH before assigning arch=(), check the
+  # peer architecture: a valid recipe whose arch=() excludes $arch is
+  # unsupported, not broken.
+  local peer="x86_64"
+  [[ "$arch" == "x86_64" ]] && peer="aarch64"
+  out=$(cd "$pkgdir" && env -u OMARCHY_SRC CARCH="$peer" bash -c '
+    unset arch
+    source ./PKGBUILD >/dev/null 2>&1 || exit 1
+    (( ${#arch[@]} )) || exit 1
+    for a in "${arch[@]}"; do
+      [[ -n "$a" ]] || exit 1
+    done
+    printf "%s\n" "${arch[*]}"
+  ') || return 1
+  [[ -n "$out" ]] || return 1
+  case " $out " in
+    *" any "* | *" $arch "*) return 1 ;;
+    *) printf '%s\n' "$out"; return 0 ;;
+  esac
 }
 
 package_supports_arch() {
@@ -405,16 +449,23 @@ package_extract_vcs_hash_from_version() {
 
 package_first_git_source() {
   local pkgdir="$1"
+  local arch="${2:-${ARCH:-x86_64}}"
 
-  (cd "$pkgdir" && env -u OMARCHY_SRC bash -c '
-    source PKGBUILD 2>/dev/null
-    for s in "${source[@]}"; do
+  (cd "$pkgdir" && env -u OMARCHY_SRC CARCH="$arch" bash -c '
+    source ./PKGBUILD >/dev/null 2>&1
+    arch_source="source_${CARCH}[@]"
+    for s in "${source[@]}" "${!arch_source}"; do
       url="${s#*::}"
       [[ "$url" == git+* ]] && { echo "${url#git+}"; break; }
     done')
 }
 
 package_git_upstream_hash() {
+  local full=0
+  if [[ "${1:-}" == "--full" ]]; then
+    full=1
+    shift
+  fi
   local pkgdir="$1"
   local source_spec source_url fragment ref hash
 
@@ -429,26 +480,26 @@ package_git_upstream_hash() {
 
   case "$fragment" in
     "")
-      hash=$(git ls-remote "$source_url" HEAD 2>/dev/null | awk 'NR == 1 { print substr($1, 1, 7) }')
+      hash=$(git ls-remote "$source_url" HEAD 2>/dev/null | awk 'NR == 1 { print $1 }')
       ;;
     branch=*)
       ref="${fragment#branch=}"
       [[ -n "$ref" ]] || return 1
-      hash=$(git ls-remote "$source_url" "refs/heads/$ref" 2>/dev/null | awk 'NR == 1 { print substr($1, 1, 7) }')
+      hash=$(git ls-remote "$source_url" "refs/heads/$ref" 2>/dev/null | awk 'NR == 1 { print $1 }')
       ;;
     tag=*)
       ref="${fragment#tag=}"
       [[ -n "$ref" ]] || return 1
       hash=$(git ls-remote "$source_url" "refs/tags/$ref^{}" "refs/tags/$ref" 2>/dev/null | awk '
-        $2 ~ /\^\{\}$/ { print substr($1, 1, 7); found=1; exit }
-        NR == 1 { first=substr($1, 1, 7) }
+        $2 ~ /\^\{\}$/ { print $1; found=1; exit }
+        NR == 1 { first=$1 }
         END { if (!found && first != "") print first }
       ')
       ;;
     commit=*)
       ref="${fragment#commit=}"
       [[ "$ref" =~ ^[a-f0-9]{7,40}$ ]] || return 1
-      hash="${ref:0:7}"
+      hash="$ref"
       ;;
     *)
       return 1
@@ -456,7 +507,11 @@ package_git_upstream_hash() {
   esac
 
   [[ -n "$hash" ]] || return 1
-  echo "$hash"
+  if (( full )); then
+    echo "$hash"
+  else
+    echo "${hash:0:7}"
+  fi
 }
 
 validate_package_metadata() {

@@ -139,7 +139,10 @@ if [[ "$DRY_RUN" != true ]]; then
     # outputs or overwrite the new version with an older kept artifact.
     if [[ ! -e "$BUILD_PLAN_DIR/repository-initialized" ]]; then
       echo "==> Rebuilding build database from existing packages..."
-      repo-add omarchy-build.db.tar.zst "${staged_packages[@]}" >/dev/null 2>&1 || exit 1
+      # --prevent-downgrade ensures alphabetical glob order (e.g. 1.10-1 before
+      # 1.9-1, or 1:1.0-1 before 2.0-1) cannot replace a newer archive with an
+      # older one in the build database.
+      repo-add --prevent-downgrade omarchy-build.db.tar.zst "${staged_packages[@]}" >/dev/null 2>&1 || exit 1
       ln -sf omarchy-build.db.tar.zst omarchy-build.db || exit 1
     fi
     # A resumed/repeated build can produce different bytes under the same
@@ -209,6 +212,80 @@ find_package_dir() {
   package_dir_for_name "$pkg"
 }
 
+# Read a PKGBUILD's makepkg full version (epoch:pkgver-pkgrel when epoch > 0,
+# else pkgver-pkgrel) with CARCH set and OMARCHY_SRC unset. Fails if sourcing
+# fails, pkgver/pkgrel is empty, or epoch is not a non-negative integer.
+read_pkgbuild_version() {
+  local pkgdir="$1"
+  (
+    cd "$pkgdir" && env -u OMARCHY_SRC CARCH="$ARCH" bash -c '
+      source ./PKGBUILD >/dev/null 2>&1 || exit 1
+      [[ -n "${pkgver:-}" && -n "${pkgrel:-}" ]] || exit 1
+      if [[ -n "${epoch:-}" ]]; then
+        [[ "$epoch" =~ ^[0-9]+$ ]] || exit 1
+        if (( 10#$epoch > 0 )); then
+          printf "%s:%s-%s\n" "$epoch" "$pkgver" "$pkgrel"
+          exit 0
+        fi
+      fi
+      printf "%s-%s\n" "$pkgver" "$pkgrel"
+    '
+  )
+}
+
+# Read the pkgname array from a PKGBUILD with CARCH set and OMARCHY_SRC unset.
+read_pkgbuild_pkgnames() {
+  local pkgdir="$1"
+  (
+    cd "$pkgdir" && env -u OMARCHY_SRC CARCH="$ARCH" bash -c '
+      source ./PKGBUILD >/dev/null 2>&1 || exit 1
+      (( ${#pkgname[@]} )) || exit 1
+      for name in "${pkgname[@]}"; do
+        [[ -n "$name" ]] || exit 1
+        printf "%s\n" "$name"
+      done
+    '
+  )
+}
+
+# Extract the recorded VCS commit hash component from a pacman version string
+# (preserving its full recorded length, 7..40 chars). Recognizes g<hex>, bare
+# hex containing [a-f], or a trailing all-digit hash component (e.g. r100.1234567)
+# without mistaking a leading revision count (e.g. r12345678) for a commit hash.
+extract_vcs_hash() {
+  local ver="$1"
+  local no_rel="${ver%-*}"
+  [[ "$no_rel" == *:* ]] && no_rel="${no_rel#*:}"
+  local token g_hash="" hex_hash="" last_token=""
+  local -a tokens=()
+  IFS='.+_' read -r -a tokens <<< "$no_rel"
+  for token in "${tokens[@]}"; do
+    last_token="$token"
+    if [[ "$token" =~ g([a-f0-9]{7,40})$ ]]; then
+      g_hash="${BASH_REMATCH[1]}"
+    elif [[ "$token" =~ ^[a-f0-9]{7,40}$ && "$token" =~ [a-f] ]]; then
+      hex_hash="$token"
+    fi
+  done
+  if [[ -n "$g_hash" ]]; then
+    printf '%s\n' "$g_hash"
+  elif [[ -n "$hex_hash" ]]; then
+    printf '%s\n' "$hex_hash"
+  elif (( ${#tokens[@]} > 1 )) && [[ "$last_token" =~ ^[0-9]{7,40}$ ]]; then
+    printf '%s\n' "$last_token"
+  fi
+}
+
+# Return 0 if a pacman version's recorded commit hash matches the upstream hash
+# prefix across every digit recorded in the package version.
+version_matches_hash() {
+  local ver="$1" upstream_hash="$2"
+  [[ -n "$upstream_hash" ]] || return 1
+  local recorded
+  recorded=$(extract_vcs_hash "$ver")
+  [[ -n "$recorded" && ( "$upstream_hash" == "$recorded"* || "$recorded" == "$upstream_hash"* ) ]]
+}
+
 # Get version from final output (production packages)
 #
 # Source package directories are named after the PKGBUILD pkgbase, but split
@@ -274,20 +351,36 @@ get_local_version() {
 # otherwise read as unpublished and be rebuilt. The four candidate names are
 # asked in parallel: a HEAD is never cached at the edge, so each answer takes
 # about 160 ms, and a version that needs building misses all four.
-remote_version_is_published() {
-  local package="$1" version="$2" target ext
+remote_published_pkgnames() {
+  local version="$1"
+  shift
+  local package target ext url exitcode http_code url_req matched
   local -a requests=()
-  [[ -n "$PUBLISHED_REPO_SERVER" ]] || return 1
-  for target in "$ARCH" any; do
-    for ext in zst xz; do
-      requests+=(-o /dev/null "$PUBLISHED_REPO_SERVER/$package-$version-$target.pkg.tar.$ext")
+  local -A url_to_pkg=() seen=()
+  [[ -n "$PUBLISHED_REPO_SERVER" ]] || return 0
+  for package in "$@"; do
+    for target in "$ARCH" any; do
+      for ext in zst xz; do
+        url="$PUBLISHED_REPO_SERVER/$package-$version-$target.pkg.tar.$ext"
+        requests+=(-o /dev/null "$url")
+        url_to_pkg["$url"]="$package"
+      done
     done
   done
+  (( ${#requests[@]} )) || return 0
   # What `curl -f` accepted when the names were tried in turn: the transfer
-  # itself succeeded, and the status is below 400. All four are awaited, so
-  # each gets a time limit: one name that never answers must not hold up an
+  # itself succeeded, and the status is below 400. All candidates are awaited,
+  # so each gets a time limit: one name that never answers must not hold up an
   # archive another name already found.
-  curl -sI --parallel --max-time 10 -w '%{exitcode} %{http_code}\n' "${requests[@]}" | awk '$1 == 0 && $2 >= 200 && $2 < 400 { found = 1 } END { exit !found }'
+  while read -r exitcode http_code url_req; do
+    if [[ "$exitcode" == 0 ]] && (( http_code >= 200 && http_code < 400 )); then
+      matched="${url_to_pkg[$url_req]:-}"
+      if [[ -n "$matched" && -z "${seen[$matched]:-}" ]]; then
+        seen["$matched"]=1
+        printf '%s\n' "$matched"
+      fi
+    fi
+  done < <(curl -sI --parallel --max-time 10 -w '%{exitcode} %{http_code} %{url}\n' "${requests[@]}")
 }
 
 # Check if package should be built for current architecture, in this
@@ -295,10 +388,13 @@ remote_version_is_published() {
 # Returns 0 (success) if should build, 1 if should skip
 should_build_for_arch() {
   local pkg="$1"
-  local pkgdir
-  pkgdir=$(find_package_dir "$pkg")
-  [[ -n "$pkgdir" ]] && package_supports_arch "$pkgdir" "$ARCH" &&
-    builds_in_this_builder "$pkg"
+  local pkgdir arches
+  pkgdir=$(find_package_dir "$pkg") || return 1
+  arches=$(package_arches "$pkgdir" "$ARCH") || return 2
+  case " $arches " in
+    *" any "* | *" $ARCH "*) builds_in_this_builder "$pkg" ;;
+    *) return 1 ;;
+  esac
 }
 
 builds_in_this_builder() {
@@ -319,8 +415,8 @@ refresh_vcs_pkgver_preserving_local_pkgrel() {
   grep -qE '^pkgver[[:space:]]*\(\)' "$pkgbuild" || return 0
 
   local original_pkgver original_pkgrel refreshed_pkgver refreshed_pkgrel
-  original_pkgver=$(bash -c 'source PKGBUILD 2>/dev/null; echo "${pkgver:-}"')
-  original_pkgrel=$(bash -c 'source PKGBUILD 2>/dev/null; echo "${pkgrel:-}"')
+  original_pkgver=$(package_pkgbuild_var "$PWD" pkgver "$ARCH") || return 1
+  original_pkgrel=$(package_pkgbuild_var "$PWD" pkgrel "$ARCH") || return 1
 
   # Omarchy local rebuilds use dotted pkgrels (AUR pkgrel + .suffix). Plain
   # integer pkgrels can keep makepkg's normal reset-to-1 behavior on new VCS
@@ -339,8 +435,8 @@ refresh_vcs_pkgver_preserving_local_pkgrel() {
     return 1
   fi
 
-  refreshed_pkgver=$(bash -c 'source PKGBUILD 2>/dev/null; echo "${pkgver:-}"')
-  refreshed_pkgrel=$(bash -c 'source PKGBUILD 2>/dev/null; echo "${pkgrel:-}"')
+  refreshed_pkgver=$(package_pkgbuild_var "$PWD" pkgver "$ARCH") || return 1
+  refreshed_pkgrel=$(package_pkgbuild_var "$PWD" pkgrel "$ARCH") || return 1
 
   if [[ "$refreshed_pkgrel" != "$original_pkgrel" ]]; then
     sed -i "s/^pkgrel=.*/pkgrel=$original_pkgrel/" PKGBUILD
@@ -361,8 +457,8 @@ install_deferred_build_dependencies() {
   local -a build_deps=()
 
   mapfile -t build_deps < <(
-    CARCH="$ARCH" bash -c '
-      source PKGBUILD
+    env -u OMARCHY_SRC CARCH="$ARCH" bash -c '
+      source ./PKGBUILD >/dev/null 2>&1 || exit 1
       arch_makedepends="makedepends_${CARCH}[@]"
       arch_checkdepends="checkdepends_${CARCH}[@]"
       printf "%s\n" \
@@ -390,11 +486,37 @@ build_package() {
   # Qualifying the repository also upgrades an older dependency baked into
   # the base image, even if that version would satisfy makepkg's check.
   if [[ "$DEFER_RUNTIME_DEPS" != true ]]; then
-    local consumer dependency
-    local -a built_deps=()
+    local consumer dependency dep_dir dep_name dep_pkgname dep_pkgnames_out
+    local -a dep_dirs=() built_deps=() dep_pkgnames=() matched_pkgnames=()
     while read -r consumer dependency; do
-      [[ "$consumer" == "$pkg" ]] && built_deps+=("omarchy-build/$dependency")
+      [[ "$consumer" == "$pkg" ]] && dep_dirs+=("$dependency")
     done < "$BUILD_PLAN_DIR/dependencies"
+    if (( ${#dep_dirs[@]} )); then
+      local wanted_deps_out
+      local -A wanted_deps=() seen_built_deps=()
+      wanted_deps_out=$(get_package_deps "$pkg") || return 1
+      while IFS= read -r dep_name; do
+        [[ -n "$dep_name" ]] && wanted_deps["$dep_name"]=1
+      done <<< "$wanted_deps_out"
+      for dependency in "${dep_dirs[@]}"; do
+        dep_dir=$(find_package_dir "$dependency") || return 1
+        dep_pkgnames_out=$(read_pkgbuild_pkgnames "$dep_dir") || return 1
+        mapfile -t dep_pkgnames <<< "$dep_pkgnames_out"
+        matched_pkgnames=()
+        for dep_pkgname in "${dep_pkgnames[@]}"; do
+          [[ -n "${wanted_deps[$dep_pkgname]:-}" ]] && matched_pkgnames+=("$dep_pkgname")
+        done
+        if (( ! ${#matched_pkgnames[@]} )); then
+          echo "    No matching package name from $dependency for $pkg" >&2
+          return 1
+        fi
+        for dep_pkgname in "${matched_pkgnames[@]}"; do
+          [[ -n "${seen_built_deps[$dep_pkgname]:-}" ]] && continue
+          seen_built_deps["$dep_pkgname"]=1
+          built_deps+=("omarchy-build/$dep_pkgname")
+        done
+      done
+    fi
     if (( ${#built_deps[@]} )); then
       if [[ $BUILDER_ARCH != "$ARCH" ]]; then
         echo "    $pkg needs ${built_deps[*]#omarchy-build/} from this run, built for $ARCH, which cannot run on this $BUILDER_ARCH builder"
@@ -406,19 +528,18 @@ build_package() {
   fi
 
   # Copy to build directory
-  cd /src || return 1
+  cd "$SRC_DIR" || return 1
   rm -rf "$pkg" || return 1
   cp -r "$pkgdir" "$pkg" || return 1
-  cd "/src/$pkg" || return 1
+  cd "$SRC_DIR/$pkg" || return 1
 
   refresh_vcs_pkgver_preserving_local_pkgrel "$pkg" || {
     return 1
   }
 
   # Get PKGBUILD version (including epoch if present)
-  local pkgbuild_version=$(bash -c 'source PKGBUILD; if [[ -n "$epoch" ]]; then echo "${epoch}:${pkgver}-${pkgrel}"; else echo "${pkgver}-${pkgrel}"; fi' 2>/dev/null)
-
-  if [[ -z "$pkgbuild_version" ]]; then
+  local pkgbuild_version
+  if ! pkgbuild_version=$(read_pkgbuild_version "$PWD"); then
     echo "    Failed to read PKGBUILD version"
     return 1
   fi
@@ -519,10 +640,11 @@ build_package() {
   fi
 }
 
-# Get package dependencies from PKGBUILD
+# Get package dependency names from PKGBUILD (with version constraints stripped)
 get_package_deps() {
   local pkg="$1"
-  local pkgdir=$(find_package_dir "$pkg")
+  local pkgdir
+  pkgdir=$(find_package_dir "$pkg") || return 0
   local pkgbuild="$pkgdir/PKGBUILD"
 
   if [[ ! -f "$pkgbuild" ]]; then
@@ -531,22 +653,18 @@ get_package_deps() {
 
   # Include test dependencies and target-specific arrays: each container must
   # receive its prerequisites through the repository, not a previous build.
-  (
-    CARCH="$ARCH"
-    source "$pkgbuild" 2>/dev/null
-    for kind in depends makedepends checkdepends; do
-      generic="${kind}[@]"
-      specific="${kind}_${CARCH}[@]"
-      printf '%s\n' "${!generic}" "${!specific}"
-    done
-  ) | awk 'NF && !seen[$0]++' | while read -r dep; do
-    # Strip version constraints (e.g., 'hyprshade>=1.0' -> 'hyprshade')
-    dep=$(echo "$dep" | sed 's/[<>=].*$//')
-    # Check if this dependency exists in our pkgbuilds
-    if find_package_dir "$dep" >/dev/null 2>&1; then
-      echo "$dep"
-    fi
-  done
+  local deps_out
+  deps_out=$(
+    cd "$pkgdir" && env -u OMARCHY_SRC CARCH="$ARCH" bash -c '
+      source ./PKGBUILD >/dev/null 2>&1 || exit 1
+      for kind in depends makedepends checkdepends; do
+        generic="${kind}[@]"
+        specific="${kind}_${CARCH}[@]"
+        printf "%s\n" "${!generic}" "${!specific}"
+      done
+    '
+  ) || return 1
+  printf '%s\n' "$deps_out" | sed 's/[<>=].*$//' | awk 'NF && !seen[$0]++'
 }
 
 # For VCS packages (those with a pkgver() function), the static pkgver= in the
@@ -558,39 +676,24 @@ get_package_deps() {
 # (both `...gabcdef0` and `...abcdef0` styles are common). Returns 0 when
 # upstream is unchanged (build can be skipped).
 check_vcs_unchanged() {
-  local pkg="$1"
-  local pkgdir="$2"
-  local pkgbuild="$pkgdir/PKGBUILD"
+  local pkgbuild_version="$1"
+  local prod_version="$2"
+  local upstream_hash="$3"
+  [[ -n "$pkgbuild_version" && -n "$prod_version" && -n "$upstream_hash" ]] || return 1
 
-  grep -qE '^pkgver[[:space:]]*\(\)' "$pkgbuild" || return 1
+  local pkgbuild_pkgrel="${pkgbuild_version##*-}"
+  local pkgbuild_no_pkgrel="${pkgbuild_version%-*}"
+  local pkgbuild_epoch=""
+  [[ "$pkgbuild_no_pkgrel" == *:* ]] && pkgbuild_epoch="${pkgbuild_no_pkgrel%%:*}"
 
-  local local_version=$(get_local_version "$pkg")
-  [[ -z "$local_version" ]] && return 1
-
-  # If epoch or pkgrel changed in PKGBUILD, rebuild even if upstream is unchanged
-  local pkgbuild_epoch=$(cd "$pkgdir" && bash -c 'source PKGBUILD 2>/dev/null; echo "${epoch:-}"')
-  local pkgbuild_pkgrel=$(cd "$pkgdir" && bash -c 'source PKGBUILD 2>/dev/null; echo "${pkgrel}"')
-
-  local prod_pkgrel="${local_version##*-}"
-  local prod_no_pkgrel="${local_version%-*}"
+  local prod_pkgrel="${prod_version##*-}"
+  local prod_no_pkgrel="${prod_version%-*}"
   local prod_epoch=""
-  if [[ "$prod_no_pkgrel" == *:* ]]; then
-    prod_epoch="${prod_no_pkgrel%%:*}"
-  fi
+  [[ "$prod_no_pkgrel" == *:* ]] && prod_epoch="${prod_no_pkgrel%%:*}"
 
-  [[ "$pkgbuild_epoch" != "$prod_epoch" ]] && return 1
-  [[ "$pkgbuild_pkgrel" != "$prod_pkgrel" ]] && return 1
-
-  # Compare the commit represented in the published version to the current
-  # upstream ref. Supports unfragmented git sources as well as #branch=,
-  # #tag=, and #commit= fragments.
-  local prod_hash=$(package_extract_vcs_hash_from_version "$local_version")
-  [[ -z "$prod_hash" ]] && return 1
-
-  local upstream_hash=$(package_git_upstream_hash "$pkgdir")
-  [[ -z "$upstream_hash" ]] && return 1
-
-  [[ "$prod_hash" == "$upstream_hash" ]]
+  [[ "$pkgbuild_epoch" == "$prod_epoch" ]] || return 1
+  [[ "$pkgbuild_pkgrel" == "$prod_pkgrel" ]] || return 1
+  version_matches_hash "$prod_version" "$upstream_hash"
 }
 
 # Check which packages need building (version check only)
@@ -602,36 +705,144 @@ check_needs_build() {
   [[ ! -f "$pkgbuild" ]] && return 1
 
   # Get PKGBUILD version (including epoch if present)
-  local pkgbuild_version=$(cd "$pkgdir" && bash -c 'source PKGBUILD; if [[ -n "$epoch" ]]; then echo "${epoch}:${pkgver}-${pkgrel}"; else echo "${pkgver}-${pkgrel}"; fi' 2>/dev/null)
-  [[ -z "$pkgbuild_version" ]] && return 1
+  local pkgbuild_version
+  if ! pkgbuild_version=$(read_pkgbuild_version "$pkgdir"); then
+    echo "==> ERROR: Failed to read PKGBUILD version for $pkg" >&2
+    return 2
+  fi
 
-  # Check if already built
-  local local_version=$(get_local_version "$pkg")
+  local pkgnames_out pkgname_item
+  local -a pkgnames=()
+  if ! pkgnames_out=$(read_pkgbuild_pkgnames "$pkgdir"); then
+    echo "==> ERROR: Failed to read PKGBUILD pkgname for $pkg" >&2
+    return 2
+  fi
+  mapfile -t pkgnames <<< "$pkgnames_out"
+
+  load_local_versions
+  local -a target_versions=()
+  local is_vcs=0
 
   if grep -qE '^pkgver[[:space:]]*\(\)' "$pkgbuild"; then
-    if [[ -n "$local_version" && -n "$(package_extract_vcs_hash_from_version "$local_version")" ]]; then
-      if check_vcs_unchanged "$pkg" "$pkgdir"; then
-        return 1  # VCS upstream ref is already represented in the repo
-      else
-        return 0  # New VCS ref, missing repo package, or pkgrel/epoch changed
+    is_vcs=1
+    local -A seen_cand_vers=()
+    local -a cand_vers=()
+    local cand_ver vcs_has_hash=0 upstream_hash=""
+    for pkgname_item in "${pkgnames[@]}"; do
+      cand_ver="${LOCAL_VERSION_BY_NAME[$pkgname_item]:-}"
+      if [[ -n "$cand_ver" && -z "${seen_cand_vers[$cand_ver]:-}" ]]; then
+        seen_cand_vers["$cand_ver"]=1
+        cand_vers+=("$cand_ver")
       fi
-    elif [[ "$local_version" == "$pkgbuild_version" ]]; then
-      return 1  # VCS package does not expose a hash; fall back to static version
-    else
-      return 0
+    done
+    local -A seen_targets=()
+    upstream_hash=$(package_git_upstream_hash --full "$pkgdir")
+    for cand_ver in "${cand_vers[@]}"; do
+      if [[ -n "$(extract_vcs_hash "$cand_ver")" ]]; then
+        vcs_has_hash=1
+        if check_vcs_unchanged "$pkgbuild_version" "$cand_ver" "$upstream_hash"; then
+          target_versions+=("$cand_ver")
+          seen_targets["$cand_ver"]=1
+        fi
+      fi
+    done
+    if [[ -z "${seen_targets[$pkgbuild_version]:-}" ]]; then
+      if (( ! vcs_has_hash )) && [[ -n "${seen_cand_vers[$pkgbuild_version]:-}" ]]; then
+        target_versions+=("$pkgbuild_version")
+      elif version_matches_hash "$pkgbuild_version" "$upstream_hash"; then
+        target_versions+=("$pkgbuild_version")
+      fi
     fi
+    (( ${#target_versions[@]} > 0 )) || return 0
+  else
+    target_versions+=("$pkgbuild_version")
   fi
 
-  if [[ "$local_version" == "$pkgbuild_version" ]]; then
-    return 1  # Already up to date
-  fi
+  # Evaluate publication per output pkgname across target_versions and decide
+  # from the highest published/partial version(s) via vercmp: completely
+  # unpublished higher static versions never hide a partial DB release, older
+  # complete releases never hide a newer partial one, and tied equal-precedence
+  # versions fail closed if any is partial (independent of pkgname order).
+  local target_version cmp_rc best_ver="" best_has_complete=0 best_complete_msg="" best_partial_err=""
+  for target_version in "${target_versions[@]}"; do
+    local -a db_missing=() archive_missing=()
+    local db_present=0 archive_present=0 state="" msg=""
+    for pkgname_item in "${pkgnames[@]}"; do
+      if [[ "${LOCAL_VERSION_BY_NAME[$pkgname_item]:-}" == "$target_version" ]]; then
+        ((db_present++))
+      else
+        db_missing+=("$pkgname_item")
+      fi
+    done
+    if (( ${#db_missing[@]} == 0 )); then
+      state="complete"
+    else
+      for pkgname_item in "${db_missing[@]}"; do
+        if package_version_is_published "$FINAL_OUTPUT_DIR" "$pkgname_item" "$target_version" "$ARCH"; then
+          ((archive_present++))
+        else
+          archive_missing+=("$pkgname_item")
+        fi
+      done
+      if (( ${#archive_missing[@]} > 0 )) && [[ -n "$PUBLISHED_REPO_SERVER" ]]; then
+        local -A remote_found=()
+        local remote_name
+        while IFS= read -r remote_name; do
+          [[ -n "$remote_name" ]] && remote_found["$remote_name"]=1
+        done < <(remote_published_pkgnames "$target_version" "${archive_missing[@]}")
+        local -a still_missing=()
+        for pkgname_item in "${archive_missing[@]}"; do
+          if [[ -n "${remote_found[$pkgname_item]:-}" ]]; then
+            ((archive_present++))
+          else
+            still_missing+=("$pkgname_item")
+          fi
+        done
+        archive_missing=("${still_missing[@]}")
+      fi
+      if (( ${#archive_missing[@]} == 0 )); then
+        state="complete"
+        msg="  + $pkg $target_version - archive already published; skipping rebuild"
+      elif (( db_present > 0 || archive_present > 0 )); then
+        state="partial"
+        if (( is_vcs )); then
+          msg="==> ERROR: $pkg $target_version is partially published (missing: ${archive_missing[*]}); update pkgver with a pkgrel bump or use a dotted pkgrel to rebuild"
+        else
+          msg="==> ERROR: $pkg $target_version is partially published (missing: ${archive_missing[*]}); bump pkgrel to rebuild"
+        fi
+      else
+        continue
+      fi
+    fi
 
-  # A retained archive is already published even when the DB now indexes a
-  # newer release (for example, 4.0.4rc1 vs 4.0.3).
-  # Rebuilding it would produce different bytes under an immutable filename.
-  if package_version_is_published "$FINAL_OUTPUT_DIR" "$pkg" "$pkgbuild_version" "$ARCH" ||
-    remote_version_is_published "$pkg" "$pkgbuild_version"; then
-    echo "  + $pkg $pkgbuild_version - archive already published; skipping rebuild"
+    if [[ -z "$best_ver" ]]; then
+      cmp_rc=1
+    elif ! cmp_rc=$(vercmp "$target_version" "$best_ver"); then
+      echo "==> ERROR: vercmp is required to compare multiple candidate versions for $pkg" >&2
+      return 2
+    fi
+    if (( cmp_rc > 0 )); then
+      best_ver="$target_version"
+      best_has_complete=0
+      best_complete_msg=""
+      best_partial_err=""
+    fi
+    if (( cmp_rc >= 0 )); then
+      if [[ "$state" == "partial" ]]; then
+        [[ -z "$best_partial_err" ]] && best_partial_err="$msg"
+      else
+        best_has_complete=1
+        [[ -z "$best_complete_msg" ]] && best_complete_msg="$msg"
+      fi
+    fi
+  done
+
+  if [[ -n "$best_partial_err" ]]; then
+    echo "$best_partial_err" >&2
+    return 2
+  fi
+  if (( best_has_complete )); then
+    [[ -n "$best_complete_msg" ]] && echo "$best_complete_msg"
     return 1
   fi
 
@@ -641,14 +852,24 @@ check_needs_build() {
 # Collect packages that should be built for the selected mirror
 collect_packages() {
   # A package that cross-compiles builds only in its own builder image.
-  local pkg
-  packages_for_unscoped_build "$MIRROR" "$ARCH" | while IFS= read -r pkg; do
-    if builds_in_this_builder "$pkg"; then
+  local pkgdir pkg arch_rc
+  while IFS= read -r pkgdir; do
+    package_builds_for_mirror "$pkgdir" "$MIRROR" || continue
+    package_build_skipped "$pkgdir" && continue
+    pkg=$(basename "$pkgdir")
+    arch_rc=0
+    should_build_for_arch "$pkg" || arch_rc=$?
+    if (( arch_rc == 0 )); then
       echo "$pkg"
+    elif (( arch_rc == 1 )); then
+      if package_supports_arch "$pkgdir" "$ARCH"; then
+        echo "  - $pkg - builds for $ARCH in the $(package_build_host "$pkg" "$ARCH") builder image" >&2
+      fi
     else
-      echo "  - $pkg - builds for $ARCH in the $(package_build_host "$pkg" "$ARCH") builder image" >&2
+      echo "==> ERROR: Failed to read PKGBUILD for $pkg" >&2
+      return 2
     fi
-  done
+  done < <(package_dirs)
 }
 
 # Main execution
@@ -686,29 +907,44 @@ if [[ -n "$PACKAGES" ]]; then
     fi
 
     # Check if package should be built for this architecture
-    if ! should_build_for_arch "$pkg_name"; then
+    arch_rc=0
+    should_build_for_arch "$pkg_name" || arch_rc=$?
+    if (( arch_rc == 1 )); then
       echo "  - $pkg_name - not built for $ARCH"
       SKIPPED_PACKAGES="$SKIPPED_PACKAGES $pkg_name"
       continue
+    elif (( arch_rc != 0 )); then
+      echo "==> ERROR: Failed to read PKGBUILD for $pkg_name" >&2
+      exit 1
     fi
 
-    if check_needs_build "$pkg_name"; then
+    needs_rc=0
+    check_needs_build "$pkg_name" || needs_rc=$?
+    if (( needs_rc == 0 )); then
       PACKAGES_TO_BUILD+=("$pkg_name")
-    else
+    elif (( needs_rc == 1 )); then
       echo "  + $pkg_name - already up to date"
       SKIPPED_PACKAGES="$SKIPPED_PACKAGES $pkg_name"
+    else
+      exit 1
     fi
   done
 else
   # Build all packages that need updates from the relevant directories
+  collected_pkgs=$(collect_packages) || exit 1
   while IFS= read -r pkg; do
-    if check_needs_build "$pkg"; then
+    [[ -n "$pkg" ]] || continue
+    needs_rc=0
+    check_needs_build "$pkg" || needs_rc=$?
+    if (( needs_rc == 0 )); then
       PACKAGES_TO_BUILD+=("$pkg")
-    else
+    elif (( needs_rc == 1 )); then
       echo "  + $pkg - already up to date"
       SKIPPED_PACKAGES="$SKIPPED_PACKAGES $pkg"
+    else
+      exit 1
     fi
-  done < <(collect_packages)
+  done <<< "$collected_pkgs"
 fi
 
 if [[ ${#PACKAGES_TO_BUILD[@]} -eq 0 ]]; then
@@ -727,20 +963,39 @@ else
     unmet_deps_count[$pkg]=0
   done
 
+  # Map every pkgname produced by this run to its recipe directory so split
+  # packages and pkgbase!=pkgname recipes are ordered and recorded properly.
+  declare -A pkgname_to_dir=()
+  for build_pkg in "${PACKAGES_TO_BUILD[@]}"; do
+    pkgdir=$(find_package_dir "$build_pkg") || exit 1
+    pkgnames_out=$(read_pkgbuild_pkgnames "$pkgdir") || {
+      echo "==> ERROR: Failed to read PKGBUILD pkgname for $build_pkg" >&2
+      exit 1
+    }
+    while IFS= read -r produced_name; do
+      [[ -n "$produced_name" ]] && pkgname_to_dir["$produced_name"]="$build_pkg"
+    done <<< "$pkgnames_out"
+  done
+
   # Build the dependency relationships
   for pkg in "${PACKAGES_TO_BUILD[@]}"; do
+    declare -A seen_dep_dirs=()
+    pkg_deps_out=$(get_package_deps "$pkg") || {
+      echo "==> ERROR: Failed to read PKGBUILD dependencies for $pkg" >&2
+      exit 1
+    }
     while IFS= read -r dep; do
-      # Only care about deps that are being built in this run
-      for build_pkg in "${PACKAGES_TO_BUILD[@]}"; do
-        if [[ "$dep" == "$build_pkg" ]]; then
-          # pkg needs dep, so increment pkg's unmet count
-          ((unmet_deps_count[$pkg]++))
-          # Track that dep blocks pkg from building
-          blocks_packages[$dep]="${blocks_packages[$dep]} $pkg"
-          PLANNED_DEPENDENCIES+=("$pkg $dep")
-        fi
-      done
-    done < <(get_package_deps "$pkg")
+      [[ -n "$dep" ]] || continue
+      dep_dir="${pkgname_to_dir[$dep]:-}"
+      [[ -n "$dep_dir" && "$dep_dir" != "$pkg" && -z "${seen_dep_dirs[$dep_dir]:-}" ]] || continue
+      seen_dep_dirs["$dep_dir"]=1
+      # pkg needs dep_dir, so increment pkg's unmet count
+      ((unmet_deps_count[$pkg]++))
+      # Track that dep_dir blocks pkg from building
+      blocks_packages[$dep_dir]="${blocks_packages[$dep_dir]} $pkg"
+      PLANNED_DEPENDENCIES+=("$pkg $dep_dir")
+    done <<< "$pkg_deps_out"
+    unset seen_dep_dirs
   done
 
   # Start with packages that have all dependencies met (count = 0)
