@@ -40,7 +40,10 @@ MAX_LARGE_DROPLETS=${MAX_LARGE_DROPLETS:-1}
 REGIONS=${REGIONS:-${REGION:-}}
 IMAGE=${IMAGE:-ubuntu-24-04-x64}
 MAX_DROPLETS=${MAX_DROPLETS:-4}
-MAX_AGE_MINUTES=${MAX_AGE_MINUTES:-200}
+# Must stay above the longest workflow timeout-minutes on omarchy-builder*
+# runners (240m in publish.yml) plus headroom for boot, registration, and
+# teardown; enforced by tests/controller.sh.
+MAX_AGE_MINUTES=${MAX_AGE_MINUTES:-265}
 # A droplet DigitalOcean still reports as "new" this long after creation is
 # stuck provisioning. Left alone it counts as a runner booting, and holds a
 # queued job until MAX_AGE_MINUTES.

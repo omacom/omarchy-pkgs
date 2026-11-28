@@ -84,7 +84,7 @@ Edit `/etc/omarchy-controller.env` on the box. The next tick reads it.
 | `LARGE_SIZES` | `g5-64vcpu-128gb-80gb` | Sizes for jobs labelled `omarchy-builder-large`, tried in order |
 | `MAX_LARGE_DROPLETS` | 1 | Large builders alive at once, apart from `MAX_DROPLETS` |
 | `REGIONS` | empty | Regions to try first; empty means any |
-| `MAX_AGE_MINUTES` | 200 | Delete a droplet older than this |
+| `MAX_AGE_MINUTES` | 265 | Delete a droplet older than this. Must exceed the longest builder job `timeout-minutes` plus `MAX_BOOT_MINUTES` and teardown headroom; on existing controller boxes seeded with `200` in `/etc/omarchy-controller.env`, raise it to `265` first or remove the line after the controller pulls the new default |
 | `MAX_BOOT_MINUTES` | 10 | Delete a droplet still provisioning after this |
 | `DO_SSH_KEYS` | Ryan, DHH and Emir's account key IDs | Attached to every builder. Without one, DigitalOcean emails a root password per builder |
 
