@@ -1,0 +1,439 @@
+From 4113ec4a262dd2c6fde635a2774a158d0e10538c Mon Sep 17 00:00:00 2001
+From: Allan Clempe <allan.clempe@gmail.com>
+Date: Thu, 26 Nov 2026 16:40:00 +1000
+Subject: [PATCH] linux-user: keep 64-bit guest mappings inside the guest
+ address space
+
+Without reserved_va, guest_addr_max admits every host address, so a
+mapping the guest did not place lands wherever the host puts it.  On
+an arm64 host with 48-bit user addresses the kernel places it top-down
+from 2^48, so an x86-64 guest gets mappings above 2^47, which x86-64
+programs take for kernel addresses: SQL Server 2022 sign-extends such
+pointers from bit 47 and faults.
+
+For 64-bit guests with at most 47 address bits, and no reserved_va,
+QEMU now chooses where such mappings go, as it does for reserved_va:
+
+- mmap_find_vma() searches the guest page table for a hole below the
+  top of the guest address space with page_find_range_empty(), and
+  claims it on the host with MAP_FIXED_NOREPLACE.  A host mapping of
+  QEMU's own in the hole fails the claim; the search then resumes past
+  it, using /proc/self/maps.  The search runs from the hint (or
+  mmap_next_start) to the top, then from task_unmapped_base, reusing
+  freed space, and last from the bottom, so every hole is reachable
+  and the search is bounded.  Accepting whatever address the host
+  returned for a taken hint, as the host-driven search does, would
+  put the mapping past the top.
+
+- target_mmap() releases that hole and maps into it with
+  MAP_FIXED_NOREPLACE, retrying if another thread took it first.
+  Nothing is left reserved if the mapping fails.  With host pages
+  larger than guest pages, mmap_h_gt_g() maps a placed hole the way
+  it maps an unplaced one, not as a fixed guest range, so a shared
+  file mapping whose length is not a host page multiple still works.
+  MAP_HUGETLB holes are aligned and sized to the host's huge page.
+
+- mremap() with MREMAP_MAYMOVE resizes in place when it can, as the
+  host kernel does, rather than taking a fresh range every call, and
+  in-place growth may not cross the top of the guest address space.
+
+Mappings start at 3/4 of the guest address space, where the guest
+kernel's default top-down layout would put them: SQL Server also
+refuses mappings below 2^46, which it takes for the legacy layout.
+
+Tested on an arm64 host (16 KiB kernel pages, run under both 4 KiB
+and 16 KiB user pages) with x86-64 guests: amd64 node:22-slim starts
+10/10 under 4 KiB pages, as on stock QEMU; SQL Server 2022 starts and
+passes a write workload and DBCC CHECKDB; and a hint that is taken, a
+mapping just above mmap_next_start, 2000 rounds of 64 GiB map and
+unmap, mremap growth in 4 KiB steps to 1 GiB, a 5000-byte shared file
+mapping under 16 KiB pages, mremap growth past 2^47 and 1000 failed
+64 GiB file mappings all behave as on an x86-64 kernel.
+
+Signed-off-by: Allan Clempe <allan.clempe@gmail.com>
+---
+ linux-user/main.c |  16 +++
+ linux-user/mmap.c | 268 +++++++++++++++++++++++++++++++++++++++++++---
+ 2 files changed, 270 insertions(+), 14 deletions(-)
+
+diff --git a/linux-user/main.c b/linux-user/main.c
+index 60a695b7c..3b225b265 100644
+--- a/linux-user/main.c
++++ b/linux-user/main.c
+@@ -877,6 +877,22 @@ int main(int argc, char **argv, char **envp)
+         /* 32-bit host: pick something medium size. */
+         task_unmapped_base = 0x10000000;
+     }
++
++#if TARGET_ABI_BITS == 64 && HOST_LONG_BITS == 64 && \
++    TARGET_VIRT_ADDR_SPACE_BITS <= 47
++    /*
++     * With no reserved_va, mmap.c keeps such a guest's mappings inside its
++     * own address space. Place them high in that space, as the guest
++     * kernel's default top-down layout would: SQL Server's PAL refuses
++     * mappings below 2^46, which it takes for the legacy layout. 3/4 of the
++     * space leaves 32 TiB above on x86-64, and the program and its heap,
++     * at ELF_ET_DYN_BASE (2/3), sit below.
++     */
++    if (!reserved_va) {
++        task_unmapped_base = TARGET_PAGE_ALIGN(
++            ((abi_ulong)1 << TARGET_VIRT_ADDR_SPACE_BITS) / 4 * 3);
++    }
++#endif
+     mmap_next_start = task_unmapped_base;
+ 
+     /* Similarly for elf_et_dyn_base. */
+diff --git a/linux-user/mmap.c b/linux-user/mmap.c
+index cc0c2ee6c..0204757ed 100644
+--- a/linux-user/mmap.c
++++ b/linux-user/mmap.c
+@@ -29,6 +29,7 @@
+ #include "user-mmap.h"
+ #include "target_mman.h"
+ #include "qemu/interval-tree.h"
++#include "user/selfmap.h"
+ 
+ #ifdef TARGET_ARM
+ #include "target/arm/cpu-features.h"
+@@ -417,6 +418,153 @@ abi_ulong task_unmapped_base;
+ abi_ulong elf_et_dyn_base;
+ abi_ulong mmap_next_start;
+ 
++/*
++ * The highest guest address for a mapping the guest didn't place itself.
++ * Without reserved_va, guest_addr_max admits every host address. A 64-bit
++ * guest with a smaller address space than the host's must still not be
++ * handed addresses past its own: on an arm64 host with 48-bit user
++ * addresses, an x86-64 guest would get mappings above 2^47, which x86-64
++ * programs take for kernel addresses (SQL Server's PAL sign-extends them
++ * from bit 47 and faults).
++ */
++static abi_ulong guest_mmap_max(void)
++{
++#if TARGET_ABI_BITS == 64 && HOST_LONG_BITS == 64 && \
++    TARGET_VIRT_ADDR_SPACE_BITS <= 47
++    if (!reserved_va) {
++        return MIN(guest_addr_max,
++                   ((abi_ulong)1 << TARGET_VIRT_ADDR_SPACE_BITS) - 1);
++    }
++#endif
++    return guest_addr_max;
++}
++
++/*
++ * True when QEMU, not the host kernel, must choose where the guest's
++ * unplaced mappings go: the host would put them above guest_mmap_max().
++ */
++static bool mmap_window_capped(void)
++{
++    return !reserved_va && guest_mmap_max() < guest_addr_max;
++}
++
++/*
++ * The end of the host mappings that overlap the guest range [addr, addr +
++ * size), as a guest address. These are QEMU's own mappings, which the guest
++ * page table doesn't record. If none is found (it has gone again), return
++ * the next host page, so a search always moves on.
++ */
++static abi_ulong host_mappings_end(abi_ulong addr, abi_ulong size)
++{
++    uintptr_t start = (uintptr_t)g2h_untagged(addr);
++    uintptr_t last = start + size - 1;
++    uintptr_t end = start + qemu_real_host_page_size();
++    IntervalTreeRoot *maps = read_self_maps();
++    IntervalTreeNode *n;
++
++    if (maps) {
++        for (n = interval_tree_iter_first(maps, start, last); n;
++             n = interval_tree_iter_next(n, start, last)) {
++            end = MAX(end, n->last + 1);
++        }
++        free_self_maps(maps);
++    }
++    return h2g_nocheck(end);
++}
++
++/*
++ * Subroutine of mmap_find_vma, used when the guest's mappings must stay
++ * below guest_mmap_max() and no address space was reserved for it.
++ *
++ * Search the guest page table for a hole, as mmap_find_vma_reserved does,
++ * and claim it on the host with MAP_FIXED_NOREPLACE. A host mapping of
++ * QEMU's own in the hole fails the claim; the search then resumes past it.
++ * The search runs from @start to the top of the window, then again from
++ * task_unmapped_base, reusing space the guest has freed, and last from the
++ * bottom of the address space, so every hole in the window is reachable.
++ */
++static abi_ulong mmap_find_vma_capped(abi_ulong start, abi_ulong size,
++                                      abi_ulong align, bool from_next)
++{
++    abi_ulong max = guest_mmap_max();
++    abi_ulong low = ROUND_UP(MAX(mmap_min_addr, TARGET_PAGE_SIZE), align);
++    abi_ulong from[3] = { start, ROUND_UP(task_unmapped_base, align), low };
++    abi_ulong searched = -1;
++    int i;
++
++    if (size - 1 > max) {
++        return -1;
++    }
++    for (i = 0; i < ARRAY_SIZE(from); i++) {
++        abi_ulong addr = from[i];
++
++        /* [searched, max] has been searched already. */
++        if (addr >= searched) {
++            continue;
++        }
++        searched = addr;
++
++        while (addr <= max - (size - 1)) {
++            void *want, *p;
++            abi_ulong next;
++
++            addr = page_find_range_empty(addr, max, size, align);
++            if (addr == (abi_ulong)-1) {
++                break;
++            }
++            want = g2h_untagged(addr);
++            p = mmap(want, size, PROT_NONE,
++                     MAP_ANONYMOUS | MAP_PRIVATE | MAP_NORESERVE |
++                     MAP_FIXED_NOREPLACE, -1, 0);
++            if (p == want) {
++                if (from_next && addr >= task_unmapped_base) {
++                    mmap_next_start = addr + size;
++                }
++                return addr;
++            }
++            if (p != MAP_FAILED) {
++                /* The host took MAP_FIXED_NOREPLACE as a hint. */
++                munmap(p, size);
++            } else if (errno != EEXIST) {
++                return -1;
++            }
++            next = ROUND_UP(host_mappings_end(addr, size), align);
++            if (next <= addr) {
++                break;
++            }
++            addr = next;
++        }
++    }
++    return -1;
++}
++
++/*
++ * The host's default huge page size, which a MAP_HUGETLB mapping without
++ * a size gets, or 0 if it is unknown.
++ */
++static abi_ulong host_hugetlb_size(void)
++{
++    static abi_ulong size = -1;
++
++    if (size == (abi_ulong)-1) {
++        FILE *f = fopen("/proc/meminfo", "r");
++        char line[128];
++        unsigned long kb;
++
++        size = 0;
++        if (f) {
++            while (fgets(line, sizeof(line), f)) {
++                if (sscanf(line, "Hugepagesize: %lu kB", &kb) == 1) {
++                    size = (abi_ulong)kb << 10;
++                    break;
++                }
++            }
++            fclose(f);
++        }
++    }
++    return size;
++}
++
+ /*
+  * Subroutine of mmap_find_vma, used when we have pre-allocated
+  * a chunk of guest address space.
+@@ -450,6 +598,7 @@ abi_ulong mmap_find_vma(abi_ulong start, abi_ulong size, abi_ulong align)
+     void *ptr, *prev;
+     abi_ulong addr;
+     int wrapped, repeat;
++    bool from_next = start == 0;
+ 
+     align = MAX(align, host_page_size);
+ 
+@@ -465,6 +614,9 @@ abi_ulong mmap_find_vma(abi_ulong start, abi_ulong size, abi_ulong align)
+     if (reserved_va) {
+         return mmap_find_vma_reserved(start, size, align);
+     }
++    if (mmap_window_capped()) {
++        return mmap_find_vma_capped(start, size, align, from_next);
++    }
+ 
+     addr = start;
+     wrapped = repeat = 0;
+@@ -792,7 +944,7 @@ static abi_long mmap_h_lt_g(abi_ulong start, abi_ulong len, int host_prot,
+ static abi_long mmap_h_gt_g(abi_ulong start, abi_ulong len,
+                             int target_prot, int host_prot,
+                             int flags, int page_flags, int fd,
+-                            off_t offset, int host_page_size)
++                            off_t offset, int host_page_size, bool placed)
+ {
+     void *p, *want_p = NULL;
+     off_t host_offset = offset & -host_page_size;
+@@ -804,7 +956,13 @@ static abi_long mmap_h_gt_g(abi_ulong start, abi_ulong len,
+         want_p = g2h_untagged(start);
+     }
+ 
+-    if (!(flags & (MAP_FIXED | MAP_FIXED_NOREPLACE))) {
++    /*
++     * @placed: QEMU chose @start, a host-page-aligned hole of whole host
++     * pages, and @flags has MAP_FIXED_NOREPLACE. Map it as the host would
++     * place it, rather than as a fixed guest range, which would need
++     * mmap_frag() for a length that doesn't end on a host page.
++     */
++    if (placed || !(flags & (MAP_FIXED | MAP_FIXED_NOREPLACE))) {
+         /*
+          * Adjust the offset to something representable on the host.
+          */
+@@ -813,6 +971,12 @@ static abi_long mmap_h_gt_g(abi_ulong start, abi_ulong len,
+         if (p == MAP_FAILED) {
+             return -1;
+         }
++        /* If the host kernel does not support MAP_FIXED_NOREPLACE, emulate. */
++        if (placed && p != want_p) {
++            do_munmap(p, host_len);
++            errno = EEXIST;
++            return -1;
++        }
+ 
+         /* Update start to the file position at offset. */
+         p += offset - host_offset;
+@@ -911,6 +1075,23 @@ static abi_long mmap_h_gt_g(abi_ulong start, abi_ulong len,
+     return mmap_end(start, last, -1, 0, flags, page_flags);
+ }
+ 
++static abi_long target_mmap_host(abi_ulong start, abi_ulong len,
++                                 int target_prot, int host_prot, int flags,
++                                 int page_flags, int fd, off_t offset,
++                                 int host_page_size, bool placed)
++{
++    if (host_page_size == TARGET_PAGE_SIZE) {
++        return mmap_h_eq_g(start, len, host_prot, flags,
++                           page_flags, fd, offset);
++    } else if (host_page_size < TARGET_PAGE_SIZE) {
++        return mmap_h_lt_g(start, len, host_prot, flags,
++                           page_flags, fd, offset, host_page_size);
++    } else {
++        return mmap_h_gt_g(start, len, target_prot, host_prot, flags,
++                           page_flags, fd, offset, host_page_size, placed);
++    }
++}
++
+ static abi_long target_mmap__locked(abi_ulong start, abi_ulong len,
+                                     int target_prot, int flags, int page_flags,
+                                     int fd, off_t offset)
+@@ -948,16 +1129,58 @@ static abi_long target_mmap__locked(abi_ulong start, abi_ulong len,
+ 
+     host_prot = target_to_host_prot(target_prot);
+ 
+-    if (host_page_size == TARGET_PAGE_SIZE) {
+-        return mmap_h_eq_g(start, len, host_prot, flags,
+-                           page_flags, fd, offset);
+-    } else if (host_page_size < TARGET_PAGE_SIZE) {
+-        return mmap_h_lt_g(start, len, host_prot, flags,
+-                           page_flags, fd, offset, host_page_size);
+-    } else {
+-        return mmap_h_gt_g(start, len, target_prot, host_prot, flags,
+-                           page_flags, fd, offset, host_page_size);
++    if (mmap_window_capped() && !(flags & (MAP_FIXED | MAP_FIXED_NOREPLACE))) {
++        /*
++         * As for reserved_va, place the mapping inside the guest's address
++         * space ourselves: the host would put it top-down, past the end.
++         * Unlike reserved_va, there is no reservation to map over: release
++         * the hole mmap_find_vma claimed and map into it with
++         * MAP_FIXED_NOREPLACE. A thread that maps host memory of QEMU's own
++         * in between takes the hole first; then search again.
++         */
++        off_t host_offset = offset & -host_page_size;
++        abi_ulong real_len = len + offset - host_offset;
++        abi_ulong align = MAX(host_page_size, TARGET_PAGE_SIZE);
++        abi_ulong hint = start;
++        int tries;
++
++        if (flags & MAP_HUGETLB) {
++            /* The host aligns and sizes the mapping to its huge page. */
++            abi_ulong huge = host_hugetlb_size();
++
++            if (!huge) {
++                errno = EINVAL;
++                return -1;
++            }
++            align = MAX(align, huge);
++            real_len = ROUND_UP(real_len, huge);
++        } else {
++            real_len = ROUND_UP(real_len, host_page_size);
++        }
++
++        for (tries = 0; tries < 8; tries++) {
++            abi_ulong hole = mmap_find_vma(hint, real_len, align);
++            abi_long ret;
++
++            if (hole == (abi_ulong)-1) {
++                errno = ENOMEM;
++                return -1;
++            }
++            munmap(g2h_untagged(hole), real_len);
++            ret = target_mmap_host(hole, len, target_prot, host_prot,
++                                   flags | MAP_FIXED_NOREPLACE, page_flags,
++                                   fd, offset, host_page_size, true);
++            if (ret != -1 || errno != EEXIST) {
++                return ret;
++            }
++            hint = hole;
++        }
++        errno = ENOMEM;
++        return -1;
+     }
++
++    return target_mmap_host(start, len, target_prot, host_prot, flags,
++                            page_flags, fd, offset, host_page_size, false);
+ }
+ 
+ /* NOTE: all the constants are the HOST ones */
+@@ -1194,9 +1417,24 @@ abi_long target_mremap(abi_ulong old_addr, abi_ulong old_size,
+     } else if (flags & MREMAP_MAYMOVE) {
+         abi_ulong mmap_start;
+ 
+-        mmap_start = mmap_find_vma(0, new_size, TARGET_PAGE_SIZE);
++        host_addr = MAP_FAILED;
++        if (mmap_window_capped() &&
++            (new_size <= old_size ||
++             (old_addr + new_size - 1 <= guest_mmap_max() &&
++              page_check_range_empty(old_addr + old_size,
++                                     old_addr + new_size - 1)))) {
++            /*
++             * Resize in place first, as the host kernel would. Moving
++             * every time takes a fresh range of new_size per call, so a
++             * buffer grown in small steps would use up the window.
++             */
++            host_addr = mremap(g2h_untagged(old_addr), old_size, new_size, 0);
++        }
+ 
+-        if (mmap_start == -1) {
++        if (host_addr != MAP_FAILED) {
++            /* Resized in place. */
++        } else if ((mmap_start = mmap_find_vma(0, new_size,
++                                               TARGET_PAGE_SIZE)) == -1) {
+             errno = ENOMEM;
+             host_addr = MAP_FAILED;
+         } else {
+@@ -1223,7 +1461,9 @@ abi_long target_mremap(abi_ulong old_addr, abi_ulong old_size,
+ 
+             if (host_addr != MAP_FAILED) {
+                 /* Check if address fits target address space */
+-                if (!guest_range_valid_untagged(h2g(host_addr), new_size)) {
++                if (!guest_range_valid_untagged(h2g(host_addr), new_size) ||
++                    (mmap_window_capped() &&
++                     h2g(host_addr) + new_size - 1 > guest_mmap_max())) {
+                     /* Revert mremap() changes */
+                     host_addr = mremap(g2h_untagged(old_addr),
+                                        new_size, old_size, flags);
+-- 
+2.56.0
+
