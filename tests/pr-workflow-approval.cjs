@@ -219,9 +219,68 @@ test('API failure is reported rather than silently treated as approval', async (
 // Execute the actual build workflow's approval script and shell gate. This
 // covers the stale event payload that originally accompanied held PR runs.
 const workflow = readFileSync(join(__dirname, '../.github/workflows/build-pr.yml'), 'utf8');
-const approvalScript = workflow.match(/- id: approval[\s\S]*?script: \|\n([\s\S]*?)(?=      # One matrix)/)[1]
+const approvalScript = workflow.match(/- id: approval[\s\S]*?script: \|\n([\s\S]*?)(?=      - id: gate)/)[1]
   .split('\n').map(line => line.replace(/^            /, '')).join('\n');
 const gateScript = workflow.match(/          case "\$STATUS" in[\s\S]*?          esac/)[0] + '\nprintf "%s" "$trusted"';
+
+function parseWorkflowJobs(text) {
+  const jobs = new Map();
+  let current = null;
+  for (const line of text.slice(text.indexOf("\njobs:\n") + 7).split("\n")) {
+    if (line && !line.startsWith(" ") && !line.startsWith("#")) break;
+    const header = line.match(/^  ([A-Za-z0-9_-]+):\s*$/);
+    if (header) {
+      current = { name: header[1], lines: [] };
+      jobs.set(current.name, current);
+    } else if (current && !/^\s*#/.test(line)) {
+      current.lines.push(line);
+    }
+  }
+  return new Map([...jobs].map(([name, { lines }]) => {
+    const body = lines.join("\n");
+    const needs = [];
+    for (let i = 0; i < lines.length; i++) {
+      const m = lines[i].match(/^    needs:\s*(.*)$/);
+      if (!m) continue;
+      const v = m[1].trim();
+      if (v.startsWith("[")) needs.push(...v.slice(1, -1).split(",").map(s => s.trim()).filter(Boolean));
+      else if (v) needs.push(v);
+      else while (lines[i + 1]?.match(/^      -\s*(\S+)/)) needs.push(lines[++i].match(/^      -\s*(\S+)/)[1]);
+    }
+    const condition = body.match(/^    if:\s*(.+)$/m)?.[1].trim() ?? "";
+    return [name, { name, body, needs, condition }];
+  }));
+}
+
+test('build-pr.yml runs gate before planning and package build jobs', () => {
+  const jobs = parseWorkflowJobs(workflow);
+  const gate = jobs.get('gate');
+  const changes = jobs.get('changes');
+  const build = jobs.get('build');
+  const result = jobs.get('result');
+
+  assert.ok(gate && changes && build && result);
+  const checkoutOrPlan = /actions\/checkout|git\s+(?:fetch|checkout)\b|pkgbuilds\/|bin\/build-matrix|bin\/build\b/;
+  assert.doesNotMatch(gate.body, checkoutOrPlan);
+  assert.deepEqual(changes.needs, ['gate']);
+  assert.equal(changes.condition, "needs.gate.outputs.trusted == 'true'");
+  assert.deepEqual(build.needs, ['changes']);
+  assert.equal(build.condition, "needs.changes.outputs.count != '0'");
+  assert.deepEqual([...result.needs].sort(), ['build', 'changes', 'gate']);
+  assert.equal(result.condition, 'always()');
+
+  const behindGate = (name, seen = new Set()) => {
+    const job = !seen.has(name) && jobs.get(name);
+    if (!job || /\b(?:always|failure|cancelled)\s*\(/.test(job.condition)) return false;
+    seen.add(name);
+    return name === 'changes' || job.needs.some(dep => behindGate(dep, seen));
+  };
+  for (const job of jobs.values()) {
+    if (checkoutOrPlan.test(job.body)) {
+      assert.ok(behindGate(job.name), `${job.name} must run behind gate`);
+    }
+  }
+});
 
 test('the build reads the live label rather than its pre-label event payload', async () => {
   const execute = new (Object.getPrototypeOf(async function () {}).constructor)('github', 'context', 'core', approvalScript);
@@ -257,9 +316,17 @@ test('the build gate permits a missing vouch only with approval, never a denounc
 const resultJob = workflow.slice(workflow.indexOf('\n  result:\n'));
 const resultName = resultJob.match(/^    name: (.+)$/m)[1];
 const resultScript = resultJob.split('      - run: |\n')[1];
-function report({ trusted = 'false', vouch = 'unknown', empty = 'false', changes = 'success', build = 'skipped' } = {}) {
+function report({
+  trusted = 'false',
+  vouch = 'unknown',
+  empty = 'false',
+  gate = 'success',
+  changes = gate === 'success' && trusted === 'true' ? 'success' : 'skipped',
+  build = 'skipped',
+} = {}) {
   const needs = {
-    changes: { result: changes, outputs: { trusted, vouch_status: vouch, empty } },
+    gate: { result: gate, outputs: { trusted, vouch_status: vouch } },
+    changes: { result: changes, outputs: { empty } },
     build: { result: build },
   };
   // The reporting expressions use &&, || and string equality, with the
@@ -302,16 +369,21 @@ test('trusted tooling-only PRs still satisfy the required result without a packa
   const result = report({ trusted: 'true', vouch: 'vouched' });
   assert.equal(result.name, 'result');
   assert.equal(result.status, 0);
+  const dispatch = report({ trusted: 'true', vouch: '', build: 'success' });
+  assert.equal(dispatch.name, 'result');
+  assert.equal(dispatch.status, 0);
 });
 
 for (const [name, overrides] of [
   ['denounced author', { vouch: 'denounced' }],
-  ['failed trust lookup', { vouch: '', changes: 'failure' }],
+  ['failed trust lookup', { vouch: '', gate: 'failure' }],
+  ['cancelled trust lookup', { vouch: '', gate: 'cancelled' }],
   ['missing trust result', { vouch: '' }],
   ['missing gate output', { trusted: '' }],
-  ['failed planning', { changes: 'failure' }],
-  ['cancelled planning', { changes: 'cancelled' }],
-  ['empty PR', { empty: 'true' }],
+  ['failed planning', { trusted: 'true', changes: 'failure' }],
+  ['cancelled planning', { trusted: 'true', changes: 'cancelled' }],
+  ['unskipped planning on untrusted PR', { changes: 'success' }],
+  ['empty PR', { trusted: 'true', empty: 'true' }],
   ['cancelled build', { trusted: 'true', build: 'cancelled' }],
 ]) {
   test(`${name} fails the required result instead of masquerading as pending approval`, () => {

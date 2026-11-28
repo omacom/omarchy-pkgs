@@ -37,35 +37,14 @@ jobs:
   # Builds cost real machines, so they run only for trusted authors:
   # collaborators, anyone in .github/VOUCHED.td (read from the default
   # branch, so a PR cannot vouch for itself), or a PR a maintainer has
-  # labelled "build-approved". Everyone else gets this job's plan output
-  # while the required `result` stays pending until a maintainer approves.
-  changes:
+  # labelled "build-approved". Untrusted PRs stop here while the required
+  # `result` stays pending until a maintainer approves.
+  gate:
     runs-on: ubuntu-latest
     outputs:
-      matrix: ${{ steps.list.outputs.matrix }}
-      count: ${{ steps.gate.outputs.count }}
       trusted: ${{ steps.gate.outputs.trusted }}
       vouch_status: ${{ steps.vouch.outputs.status }}
-      empty: ${{ steps.list.outputs.empty }}
     steps:
-      # Same rule as the build job: bin/build-matrix comes from the base
-      # branch tip, the package directories from the PR head.
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: ${{ github.event.pull_request.base.ref || github.sha }}
-          fetch-depth: 0
-          persist-credentials: false
-      - if: github.event_name == 'pull_request'
-        run: |
-          git fetch --no-tags --depth=1 origin "${{ github.event.pull_request.head.sha }}"
-          git checkout "${{ github.event.pull_request.head.sha }}" -- pkgbuilds/
-          # Bootstrap: the PR that introduces this tooling has a base without
-          # it. Take the plan helper from the PR head in that one case; it
-          # runs on a hosted runner and only prints a plan.
-          if [[ ! -x bin/build-matrix ]]; then
-            git checkout "${{ github.event.pull_request.head.sha }}" -- bin/build-matrix helpers/
-            echo "::notice::base branch has no bin/build-matrix; using the PR's copy for planning"
-          fi
       - id: vouch
         if: github.event_name == 'pull_request'
         uses: mitchellh/vouch/action/check-user@d66fa29a64600490892131ad87597c30c91fcac4 # v1.5.0
@@ -87,6 +66,58 @@ jobs:
             core.setOutput('approved', pr.state === 'open' &&
               pr.head.sha === context.payload.pull_request.head.sha &&
               pr.labels.some(label => label.name === 'build-approved'));
+      - id: gate
+        env:
+          STATUS: ${{ github.event_name == 'workflow_dispatch' && 'dispatch' || steps.vouch.outputs.status }}
+          AUTHOR: ${{ github.event.pull_request.user.login }}
+          APPROVED: ${{ steps.approval.outputs.approved || 'false' }}
+        run: |
+          case "$STATUS" in
+            bot|collaborator|vouched|dispatch) trusted=true ;;
+            # A denouncement is absolute: the label cannot override it.
+            denounced) trusted=false ;;
+            unknown) trusted=$APPROVED ;;
+            *) trusted=false ;;
+          esac
+          echo "trusted=$trusted" >> "$GITHUB_OUTPUT"
+          if [[ $trusted == true ]]; then
+            echo "Author $AUTHOR is trusted ($STATUS); proceeding to build planning."
+          else
+            echo "::warning::Author $AUTHOR is not trusted ($STATUS). Skipping build planning and package builds."
+            if [[ $STATUS == denounced ]]; then
+              echo "::warning::The author is denounced in .github/VOUCHED.td; the build-approved label does not apply."
+            else
+              echo "::warning::A maintainer can add the author to .github/VOUCHED.td, or apply the 'build-approved' label to build this PR."
+            fi
+          fi
+
+  changes:
+    needs: gate
+    if: needs.gate.outputs.trusted == 'true'
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.list.outputs.matrix }}
+      count: ${{ steps.list.outputs.planned }}
+      empty: ${{ steps.list.outputs.empty }}
+    steps:
+      # Same rule as the build job: bin/build-matrix comes from the base
+      # branch tip, the package directories from the PR head.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.base.ref || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - if: github.event_name == 'pull_request'
+        run: |
+          git fetch --no-tags --depth=1 origin "${{ github.event.pull_request.head.sha }}"
+          git checkout "${{ github.event.pull_request.head.sha }}" -- pkgbuilds/
+          # Bootstrap: the PR that introduces this tooling has a base without
+          # it. Take the plan helper from the PR head in that one case; it
+          # runs on a hosted runner and only prints a plan.
+          if [[ ! -x bin/build-matrix ]]; then
+            git checkout "${{ github.event.pull_request.head.sha }}" -- bin/build-matrix helpers/
+            echo "::notice::base branch has no bin/build-matrix; using the PR's copy for planning"
+          fi
       # One matrix entry per package per architecture. Every package builds
       # once, against edge; the channels it ships to on merge are carried
       # along for information. A filename means one set of bytes.
@@ -192,33 +223,6 @@ jobs:
             echo "files changed vs base: $total"
           else
             echo "empty=false" >> "$GITHUB_OUTPUT"
-          fi
-      - id: gate
-        env:
-          STATUS: ${{ github.event_name == 'workflow_dispatch' && 'dispatch' || steps.vouch.outputs.status }}
-          AUTHOR: ${{ github.event.pull_request.user.login }}
-          APPROVED: ${{ steps.approval.outputs.approved || 'false' }}
-          PLANNED: ${{ steps.list.outputs.planned }}
-        run: |
-          case "$STATUS" in
-            bot|collaborator|vouched|dispatch) trusted=true ;;
-            # A denouncement is absolute: the label cannot override it.
-            denounced) trusted=false ;;
-            unknown) trusted=$APPROVED ;;
-            *) trusted=false ;;
-          esac
-          echo "trusted=$trusted" >> "$GITHUB_OUTPUT"
-          if [[ $trusted == true ]]; then
-            echo "count=$PLANNED" >> "$GITHUB_OUTPUT"
-            echo "Author $AUTHOR is trusted ($STATUS); building $PLANNED package(s)."
-          else
-            echo "count=0" >> "$GITHUB_OUTPUT"
-            echo "::warning::Author $AUTHOR is not trusted ($STATUS). $PLANNED package build(s) planned but not run."
-            if [[ $STATUS == denounced ]]; then
-              echo "::warning::The author is denounced in .github/VOUCHED.td; the build-approved label does not apply."
-            else
-              echo "::warning::A maintainer can add the author to .github/VOUCHED.td, or apply the 'build-approved' label to build this PR."
-            fi
           fi
 
   build:
@@ -400,30 +404,34 @@ jobs:
   # as satisfying the requirement even though no build was authorized.
   # Actual planning/build failures and denouncements still report `result`.
   result:
-    name: ${{ needs.changes.result == 'success' && needs.changes.outputs.trusted == 'false' && needs.changes.outputs.vouch_status == 'unknown' && needs.changes.outputs.empty == 'false' && 'Awaiting build approval' || 'result' }}
-    needs: [changes, build]
+    name: ${{ needs.gate.result == 'success' && needs.gate.outputs.trusted == 'false' && needs.gate.outputs.vouch_status == 'unknown' && needs.changes.result == 'skipped' && 'Awaiting build approval' || 'result' }}
+    needs: [gate, changes, build]
     if: always()
     runs-on: ubuntu-latest
     steps:
       - run: |
-          echo "trusted=${{ needs.changes.outputs.trusted }} build=${{ needs.build.result }}"
+          echo "gate=${{ needs.gate.result }} trusted=${{ needs.gate.outputs.trusted }} changes=${{ needs.changes.result }} build=${{ needs.build.result }}"
+          if [[ "${{ needs.gate.result }}" != "success" ]]; then
+            echo "::error::The trust check failed. See the gate job."
+            exit 1
+          fi
+          if [[ "${{ needs.gate.outputs.trusted }}" == "false" && "${{ needs.gate.outputs.vouch_status }}" == "unknown" && "${{ needs.changes.result }}" == "skipped" ]]; then
+            echo "::notice::Awaiting maintainer build approval. Apply 'build-approved' to this PR or vouch for the author in .github/VOUCHED.td."
+            echo "Package builds are waiting for maintainer approval. Apply **build-approved** to this PR to start them. The required **result** check remains pending." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          if [[ "${{ needs.gate.outputs.trusted }}" != "true" ]]; then
+            echo "::error::Builds are blocked: the author is denounced or the trust result is invalid. The build-approved label cannot override this."
+            exit 1
+          fi
           if [[ "${{ needs.changes.result }}" != "success" ]]; then
-            echo "::error::Build planning or the trust check failed. See the changes job."
+            echo "::error::Build planning failed. See the changes job."
             exit 1
           fi
           # Nothing to merge: the PR's diff against its base is empty. Its
           # change already landed elsewhere. Close it rather than merge it.
           if [[ "${{ needs.changes.outputs.empty }}" == "true" ]]; then
             echo "::error::This PR changes no files relative to its base. Its content is already on the target branch; close it instead of merging."
-            exit 1
-          fi
-          if [[ "${{ needs.changes.outputs.trusted }}" == "false" && "${{ needs.changes.outputs.vouch_status }}" == "unknown" && "${{ needs.changes.outputs.empty }}" == "false" ]]; then
-            echo "::notice::Awaiting maintainer build approval. Apply 'build-approved' to this PR or vouch for the author in .github/VOUCHED.td."
-            echo "Package builds are waiting for maintainer approval. Apply **build-approved** to this PR to start them. The required **result** check remains pending." >> "$GITHUB_STEP_SUMMARY"
-            exit 0
-          fi
-          if [[ "${{ needs.changes.outputs.trusted }}" != "true" ]]; then
-            echo "::error::Builds are blocked: the author is denounced or the trust result is invalid. The build-approved label cannot override this."
             exit 1
           fi
           [[ "${{ needs.build.result }}" == "success" || "${{ needs.build.result }}" == "skipped" ]]
