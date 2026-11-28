@@ -43,7 +43,7 @@ ARCH_SUM_ALGOS = ("sha256", "sha512", "b2", "sha224", "sha384", "sha1", "md5")
 MUTABLE_PATH_RE = re.compile(
     r"("
     r"/archive/(refs/heads/|(HEAD|main|master)\.(tar\.(gz|xz|bz2|zst)|tgz|zip)$)"
-    r"|/(tarball|zipball)/(HEAD|main|master)$"
+    r"|/(tarball|zipball)/(refs/heads/|HEAD$|main$|master$)"
     r"|/(tar\.gz|zip)/(refs/heads/|HEAD$|main$|master$)"
     r"|/-/archive/(HEAD|main|master)/"
     r")",
@@ -51,7 +51,7 @@ MUTABLE_PATH_RE = re.compile(
 )
 SIG_PATH_RE = re.compile(r"\.(sig|asc|gpg|sign|minisig)$", re.IGNORECASE)
 GENERIC_ARCHIVE_RE = re.compile(
-    r"^(v?\d[\d._-]*|latest|download|linux|archive|release|main|master|head)"
+    r"^(v?\d[\d._-]*(?:[-._]?(?:alpha|beta|rc|pre|dev|post)[\d._-]*)?|latest|download|linux|archive|release|main|master|head)"
     r"(\.(tar\.(gz|xz|bz2|zst)|tgz|zip))?$",
     re.IGNORECASE,
 )
@@ -82,6 +82,41 @@ printf "VAR|_name|%s\n" "${_name:-}"
 printf "VAR|install|%s\n" "${install:-}"
 printf "%s\n" "__RECIPE_HYGIENE_END__"
 """
+
+
+def strip_comments(line: str) -> str:
+    """Return the shell line with unquoted # comments removed, preserving quoted text."""
+    out = []
+    in_sq = False
+    in_dq = False
+    escaped = False
+    word_start = True
+    for ch in line:
+        if escaped:
+            out.append(ch)
+            escaped = False
+            word_start = False
+            continue
+        if ch == "\\" and not in_sq:
+            escaped = True
+            out.append(ch)
+            word_start = False
+            continue
+        if ch == "'" and not in_dq:
+            in_sq = not in_sq
+            out.append(ch)
+            word_start = False
+            continue
+        if ch == "\"" and not in_sq:
+            in_dq = not in_dq
+            out.append(ch)
+            word_start = False
+            continue
+        if ch == "#" and not in_sq and not in_dq and word_start:
+            break
+        out.append(ch)
+        word_start = (not in_sq and not in_dq and ch in " \t;|&()")
+    return "".join(out)
 
 
 def strip_single_quotes_and_comments(line: str) -> str:
@@ -140,11 +175,11 @@ def audit_tree(pkgbuilds_dir: Path) -> list[str]:
         if not pb.is_file():
             continue
         text = pb.read_text(errors="replace")
-        code_lines = [strip_single_quotes_and_comments(l) for l in text.splitlines()]
-        code_text = "\n".join(code_lines)
+        code_text = "\n".join(strip_comments(l) for l in text.splitlines())
+        expandable_lines = [strip_single_quotes_and_comments(l) for l in text.splitlines()]
 
         # 4. No $startdir references outside comments/single quotes/escaped dollars
-        for lineno, code_line in enumerate(code_lines, 1):
+        for lineno, code_line in enumerate(expandable_lines, 1):
             if STARTDIR_RE.search(code_line):
                 errors.append(
                     f"{name}/PKGBUILD:{lineno}: references $startdir (declare local files in source=())"
@@ -167,7 +202,7 @@ def audit_tree(pkgbuilds_dir: Path) -> list[str]:
                 )
             else:
                 runner_code = "\n".join(
-                    strip_single_quotes_and_comments(l)
+                    strip_comments(l)
                     for l in test_sh.read_text(errors="replace").splitlines()
                 )
                 if not (re.search(r"\b(unittest|pytest)\b", runner_code) and "tests" in runner_code):
@@ -332,7 +367,7 @@ def self_test() -> None:
         (good / "fix.patch").write_text("--- a\n+++ b\n")
         (good / "good-x86.install").write_text("post_install() { :; }\n")
         (good / "good-arm.install").write_text("post_install() { :; }\n")
-        (good / "test.sh").write_text("#!/bin/bash\npython3 -m unittest discover -s tests\n")
+        (good / "test.sh").write_text("#!/bin/bash\npython3 -m unittest discover -s 'tests'\n")
         (good / "test.sh").chmod(0o755)
         (good / "tests").mkdir()
         (good / "tests/test_ok.py").write_text("pass\n")
@@ -349,13 +384,19 @@ def self_test() -> None:
             "source=(\n"
             "  \"https://github.com/org/repo/archive/refs/heads/main.tar.gz\"\n"
             "  \"https://github.com/org/repo/archive/HEAD.tar.gz\"\n"
+            "  \"dev.tar.gz::https://github.com/org/repo/tarball/refs/heads/develop\"\n"
             "  \"https://github.com/org/repo/archive/refs/tags/v1.0.0.tar.gz\"\n"
+            "  \"https://github.com/org/repo/archive/refs/tags/v1.2.3-rc1.tar.gz\"\n"
+            "  \"https://github.com/org/repo/archive/refs/tags/1.2.3-beta.tar.gz\"\n"
             "  \"https://example.com/latest.zip\"\n"
             "  \"pinned.tar.gz::https://github.com/org/repo/archive/deadbeef.tar.gz?hint=.sig\"\n"
             ")\n"
             "sha256sums=(\n"
             "  \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"\n"
             "  \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"\n"
+            "  \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"\n"
+            "  \"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"\n"
+            "  \"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"\n"
             "  \"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"\n"
             "  \"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\"\n"
             "  \"SKIP\"\n"
@@ -398,6 +439,9 @@ def self_test() -> None:
             "does not appear to invoke bad-py/tests/",
             "mutable branch archive URL https://github.com/org/repo/archive/refs/heads/main.tar.gz",
             "mutable branch archive URL https://github.com/org/repo/archive/HEAD.tar.gz",
+            "mutable branch archive URL https://github.com/org/repo/tarball/refs/heads/develop",
+            "non-unique source filename 'v1.2.3-rc1.tar.gz'",
+            "non-unique source filename '1.2.3-beta.tar.gz'",
             "non-unique source filename \x27v1.0.0.tar.gz\x27",
             "non-unique source filename \x27latest.zip\x27",
             "HTTP(S) source uses SKIP checksum",
