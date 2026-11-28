@@ -1,0 +1,79 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Nicola Nicodemo <nicola084@gmail.com>
+Date: Mon, 5 Oct 2026 11:58:55 +0200
+Subject: [PATCH] usb: typec: samsung-emuec: wake for a charger
+ plugged in during sleep
+
+With event handling quiesced across system sleep, a charger plugged in
+while the lid is closed is only negotiated at the next resume, so the
+battery runs down although a charger is connected.
+
+While quiesced, arm the masked interrupt as a wake source on a port that
+had nothing attached at suspend. A plug-in then wakes the system, the
+port is resynced at PM_POST_SUSPEND (PD contract), and userspace
+suspends again with the lid closed. Ports with something attached stay
+unarmed, so a charger unplugged during sleep is still left alone until
+resume.
+
+Tested on a Galaxy Book4 Edge 14" (Fedora, KDE, lid-close suspend): ten
+minutes asleep on battery without a spurious wake; a plug-in wakes, 20 V
+is negotiated and the machine sleeps again within about 15 seconds,
+charging; an unplug during sleep, alone or after such a plug-in, does
+not wake or reset it.
+
+Signed-off-by: Nicola Nicodemo <nicola084@gmail.com>
+[birk: rebased onto antheas's samsung-emuec at 00dbccf779]
+Signed-off-by: Birk Skyum <birk.skyum@pm.me>
+---
+ drivers/usb/typec/samsung-emuec.c | 20 +++++++++++++++++++-
+ 1 file changed, 19 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/usb/typec/samsung-emuec.c b/drivers/usb/typec/samsung-emuec.c
+index 5ce664aed..81de81eda 100644
+--- a/drivers/usb/typec/samsung-emuec.c
++++ b/drivers/usb/typec/samsung-emuec.c
+@@ -112,6 +112,7 @@ struct samsung_emuec {
+ 	u32 requested_pdo;
+ 	struct notifier_block pm_nb;
+ 	bool quiesced;
++	bool wake_armed;
+ };
+ 
+ static int samsung_emuec_pm_notify(struct notifier_block *nb,
+@@ -1148,11 +1149,26 @@ static int samsung_emuec_pm_notify(struct notifier_block *nb,
+ 		disable_irq(pdic->client->irq);	/* waits for a running handler */
+ 		cancel_delayed_work_sync(&pdic->work);
+ 		flush_work(&pdic->hpd_work);
+-		dev_info(dev, "pm: quiesced (attached=%d)\n", pdic->attached);
++		/*
++		 * A charger plugged into an empty port during sleep is otherwise
++		 * negotiated only after the next resume: wake for it. The wake
++		 * stays off on an attached port, so an unplug during sleep is
++		 * still left alone until resume (the reset this quiescing fixes).
++		 * The masked interrupt still wakes: the msm GPIO irqchip enables
++		 * wake-armed lines on suspend.
++		 */
++		if (!pdic->attached && !enable_irq_wake(pdic->client->irq))
++			pdic->wake_armed = true;
++		dev_info(dev, "pm: quiesced (attached=%d wake=%d)\n",
++			 pdic->attached, pdic->wake_armed);
+ 		break;
+ 	case PM_POST_SUSPEND:
+ 		if (!pdic->quiesced)
+ 			break;
++		if (pdic->wake_armed) {
++			disable_irq_wake(pdic->client->irq);
++			pdic->wake_armed = false;
++		}
+ 		scoped_guard(mutex, &pdic->lock)
+ 			pdic->quiesced = false;
+ 		enable_irq(pdic->client->irq);
+@@ -1169,6 +1185,8 @@ static void samsung_emuec_remove(struct i2c_client *client)
+ 	struct samsung_emuec *pdic = i2c_get_clientdata(client);
+ 
+ 	unregister_pm_notifier(&pdic->pm_nb);
++	if (pdic->wake_armed)
++		disable_irq_wake(client->irq);
+ 	if (pdic->quiesced)
+ 		enable_irq(client->irq);
+ 

@@ -6,7 +6,8 @@ and starts the two workflows that build and move packages:
 
 - **Build release candidate** (`.github/workflows/release-rc.yml`) builds the
   `omarchy` and `omarchy-settings` pins on this repository's `rc` branch for
-  both architectures and publishes them to `rc`.
+  both architectures and publishes them to `rc`, then carries the same files
+  to `edge` when they are newer than what edge serves.
 - **Promote channel** (`.github/workflows/promote.yml`) carries one channel
   into the next ([below](#promoting-a-channel)).
 
@@ -20,10 +21,10 @@ moments, each one command — and bare `omarchy-release` observes reality
 
 ```bash
 bin/omarchy-release              # shepherd: status + guided next step
-bin/omarchy-release start 4.0.2  # open the train: branch v4-0-2 + staging PR
-                                 # (a minor/major also promotes edge → rc)
-bin/omarchy-release pick         # choose merged PRs to cherry-pick (multi-select)
-bin/omarchy-release rc           # pin the next 4.0.2rcN, build it into rc
+bin/omarchy-release start 4.0.2  # patch: branch v4-0-2 + staging PR
+bin/omarchy-release start 4.5.0  # minor/major: choose what of edge enters rc, cut rc1 from quattro
+bin/omarchy-release pick         # (patch) choose merged PRs to cherry-pick
+bin/omarchy-release rc           # pin the next X.Y.ZrcN, build it into rc + edge
 bin/omarchy-release ship         # tag, final pins built into rc, promote rc → stable,
                                  # draft GitHub release, ISO, website — one swoop
 bin/omarchy-release doctor       # verify credentials/connections up front
@@ -38,16 +39,56 @@ ones, run **Build release candidate** from the Actions tab, or:
 gh workflow run release-rc.yml -R omacom/omarchy-pkgs
 ```
 
-Versions are inferred from branch names (`v4-0-2` ⇒ `4.0.2rcN` ⇒ tag
-`v4.0.2`); `start` is the only place a version is typed. Every command is
+There are two kinds of train, and `start` is the only place a version is
+typed:
+
+- **Patch** (`4.0.2`): takes a subset of quattro by cherry-pick. `start`
+  branches `v4-0-2` from the previous tag, `pick` lands fixes on it, and each
+  `rc` pins the branch head as an untagged `4.0.2rcN`. The version comes from
+  the branch name.
+- **Minor/major** (`4.5.0`): takes everything, so it has no branch and follows
+  quattro itself. Each `rc` tags quattro's tip `v4.5.0-rcN` upstream and pins
+  from that tag; `start` cuts the first. The rc tags are what mark the train
+  open. `ship` ships the newest
+  candidate even if quattro has moved on since, and drafts its GitHub release
+  with notes generated from the merged PRs, there being no staging PR.
+
+Either way `ship` tags `vX.Y.Z` at the tested commit, which closes the
+train.
+
+Shipping promotes all of rc to stable, so a minor/major usually carries edge
+into rc first: RC testers then run the package set stable users will get.
+`start` asks how much of it to carry: everything, nothing, or a list of
+pkgbases. Carrying nothing keeps rc as it is, which suits a train opened right
+after a promotion, when new edge packages should stay out of the RCs. Answer
+up front with `--promote-edge`, `--promote-edge="omakade omacharts"` or
+`--no-promote-edge`; `--yes` alone carries everything. Anything held back can
+still be [promoted](#promoting-a-channel) later in the train. Every command is
 idempotent — re-runs skip whatever is already done. `ship` refuses to promote
-a commit no RC was cut from. It also waits for the Arch mirror: stable
-packages are only promoted once `stable-mirror.omarchy.org` serves the
-snapshot rc was tested on (the two `lastsync` stamps match). On release day,
-run `omarchy-mirror-sync-stable-from-rc` on the mirror host first (see
-omacom/omarchy-mirror), then `ship`. One exception: `ship` carries on past a failed
+a commit no RC was cut from. It also waits for the Arch mirrors of every
+architecture: stable packages are only promoted once
+`stable-mirror.omarchy.org` and `arm-stable-mirror.omarchy.org` serve the
+snapshots rc was tested on (each pair's `lastsync` stamps match). On release
+day, run `omarchy-mirror-sync-stable-from-rc` on the mirror host and
+`omarchy-mirror-promote-arm --from omarchy:omarchy-mirror-arm-rc --to
+omarchy:omarchy-mirror-arm-stable` on the ARM mirror host first (see
+omacom/omarchy-mirror), then `ship`. Snapshots only move forward: a
+feature rc takes a fresh one (`omarchy-mirror-sync-rc`, and
+`omarchy-mirror-promote-arm` from the edge ARM bucket), a patch rc keeps
+the one rc and stable have shared since the last ship, and release day
+copies rc's to stable. Stable never syncs from upstream. If it is ever
+newer than rc, `ship` says so: copying rc over it would roll stable back,
+so it gives the command that copies stable's snapshot to rc by hand
+instead; test rc on that snapshot before shipping. One exception: `ship` carries on past a failed
 ISO or website step, and a later `ship` exits once stable holds the version
 and the GitHub release exists. Finish a failed ISO or website step by hand.
+
+`rc` and `ship` build the ISO for the machine they run on, natively; built
+for the other architecture it would run emulated. Release the other one from
+a machine of that architecture, in parallel, with the command they print:
+`bin/omarchy-iso-release --rc 4.5.0rc1` in omarchy-iso for x86_64 (uploaded
+as `omarchy-4.5.0rc1.iso`), or with `--arch aarch64` for aarch64 (uploaded as
+`omarchy-4.5.0rc1-aarch64.iso`). Drop `--rc` for a final.
 
 ## Promoting a channel
 
@@ -78,8 +119,14 @@ The release pair is marked `"pinned": true`. It is built for `rc` only by
 `OMARCHY_RC_PINS=1`, and never built for `stable`: stable gets it by promotion.
 A merge to `master` therefore cannot overwrite an RC in flight.
 
+The same run carries rc's exact files into `edge`, so edge users run every RC
+and final too. Like every publish, it skips a channel that already serves that
+version or a newer one: a patch train's RC never takes edge back from a newer
+train's. When `ship` merges the final pins to
+`master`, edge already serves them and the merge's publish builds nothing.
+
 The `omarchy` and `omarchy-settings` packages are released as a pair, always
-built from the same upstream commit of basecamp/omarchy.
+built from the same upstream commit of omacom/omarchy.
 
 **Use `bin/omarchy-release`** — it drives the whole train across all four repositories and
 calls the pin engine below for you.

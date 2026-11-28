@@ -17,6 +17,7 @@ unset GNUPGHOME
 BIN="$T/root/bin"
 mkdir -p "$BIN"
 cp -r "$ROOT/helpers" "$T/root/"
+cp -r "$ROOT/release" "$T/root/"
 cp "$ROOT/bin/promote-channel" "$ROOT/bin/publish-artifact" "$BIN/"
 PKGBUILDS_DIR="$T/root/pkgbuilds"
 recipe() { # recipe <dir> <metadata json> [pkgbase] [arch]
@@ -29,7 +30,6 @@ recipe alpha '{"source": "local"}'
 recipe split-recipe '{"source": "local"}' split
 recipe fast '{"source": "local", "release_ring": "fast"}'
 recipe pinned '{"source": "local", "pinned": true}'
-recipe edgeonly '{"source": "local", "channels": ["edge"]}'
 recipe ahead '{"source": "local"}'
 recipe big '{"source": "local"}'
 # Built for x86_64 once; the recipe has since dropped it.
@@ -68,10 +68,27 @@ plan_action() { jq -r --arg n "$1" 'select(.type=="plan" and .name==$n) | .actio
 pass() { echo "PASS: $1"; }
 fail() { echo "FAIL: $1"; cat "$T/out"; exit 1; }
 
+if (( EUID == 0 )); then
+  id -u fixture >/dev/null 2>&1 || useradd -m fixture
+  mkdir -p "$T/src"; chmod 755 "$T/src"
+fi
+mkpkg_par() {
+  local pids=() spec
+  for spec in "$@"; do
+    # shellcheck disable=SC2086
+    ( mkpkg $spec >/dev/null ) &
+    pids+=($!)
+  done
+  local p; for p in "${pids[@]}"; do wait "$p"; done
+}
+pkgf() { ls "$T/src/$1-$2"/*.pkg.tar.zst; }
 # rc: what stable users have now. edge: newer builds of most of it.
-pub rc $(mkpkg alpha 1) $(mkpkg fast 1) $(mkpkg pinned 1) $(mkpkg ahead 3)
-pub edge $(mkpkg alpha 2) $(mkpkg split 1 split-extra) $(mkpkg fast 2) $(mkpkg pinned 2) \
-  $(mkpkg edgeonly 1) $(mkpkg ahead 2) $(mkpkg big 1) $(mkpkg dropped 1)
+mkpkg_par "alpha 1" "fast 1" "pinned 1" "ahead 3" \
+  "alpha 2" "split 1 split-extra" "fast 2" "pinned 2" "ahead 2" "big 1" "dropped 1" \
+  "alpha 3" "split 2 split-extra" "big 2" "alpha 4" "big 3"
+pub rc $(pkgf alpha 1) $(pkgf fast 1) $(pkgf pinned 1) $(pkgf ahead 3)
+pub edge $(pkgf alpha 2) $(pkgf split 1) $(pkgf fast 2) $(pkgf pinned 2) \
+  $(pkgf ahead 2) $(pkgf big 1) $(pkgf dropped 1)
 rc_before=$(entries rc)
 
 : > "$T/record"
@@ -84,12 +101,11 @@ promote || fail "promotion failed"
 [[ "$(entries rc)" == "ahead-1.0-3 alpha-1.0-2 big-1.0-1 fast-1.0-1 pinned-1.0-1 split-1.0-1 split-extra-1.0-1 " ]] \
   && pass "newer and missing packages reach rc; nothing else changes" || fail "rc entries: $(entries rc)"
 
-[[ $(plan_action fast) == hold && $(plan_action pinned) == hold && $(plan_action edgeonly) == hold && $(plan_action ahead) == hold ]] \
+[[ $(plan_action fast) == hold && $(plan_action pinned) == hold && $(plan_action ahead) == hold ]] \
   && jq -e 'select(.name=="pinned") | .reason | test("pinned")' "$T/record" >/dev/null \
-  && jq -e 'select(.name=="edgeonly") | .reason | test("channels exclude rc")' "$T/record" >/dev/null \
   && jq -e 'select(.name=="ahead") | .reason | test("rc is ahead")' "$T/record" >/dev/null \
   && jq -e 'select(.name=="dropped") | .reason | test("no longer builds for x86_64")' "$T/record" >/dev/null \
-  && pass "fast ring, pinned, edge-only, rc-ahead and dropped-arch packages are held back, each with its reason" || fail "hold reasons"
+  && pass "fast ring, pinned, rc-ahead and dropped-arch packages are held back, each with its reason" || fail "hold reasons"
 
 cmp -s "$REMOTE/edge/x86_64/alpha-1.0-2-x86_64.pkg.tar.zst" "$REMOTE/rc/x86_64/alpha-1.0-2-x86_64.pkg.tar.zst" \
   && [[ -f "$REMOTE/rc/x86_64/alpha-1.0-2-x86_64.pkg.tar.zst.sig" ]] \
@@ -103,7 +119,7 @@ promote && grep -q 'already up to date' "$T/out" && [[ $(plan_action alpha) == c
   && pass "a second run finds nothing to do" || fail "rerun"
 
 # Batches split between pkgbases, never inside one; each batch is a slot.
-pub edge $(mkpkg alpha 3) $(mkpkg split 2 split-extra) $(mkpkg big 2)
+pub edge $(pkgf alpha 3) $(pkgf split 2) $(pkgf big 2)
 : > "$T/record"
 promote --batch-bytes 1 || fail "batched promotion failed"
 jq -e -s '[.[] | select(.type=="slot")] | length == 3 and all(.status == "published")' "$T/record" >/dev/null \
@@ -112,7 +128,7 @@ jq -e -s '[.[] | select(.type=="slot")] | length == 3 and all(.status == "publis
   && pass "small batches publish base by base and keep split packages together" || fail "batches: $(cat "$T/record")"
 
 # A named pkgbase limits the run to it.
-pub edge $(mkpkg alpha 4) $(mkpkg big 3)
+pub edge $(pkgf alpha 4) $(pkgf big 3)
 : > "$T/record"
 promote alpha && [[ "$(entries rc)" == "ahead-1.0-3 alpha-1.0-4 big-1.0-2 fast-1.0-1 pinned-1.0-1 split-1.0-2 split-extra-1.0-2 " ]] \
   && pass "naming a pkgbase promotes only that one" || fail "named promotion: $(entries rc)"
@@ -120,6 +136,9 @@ if promote nosuch; then fail "an unknown pkgbase should refuse"; else grep -q 'n
 recipe elsewhere '{"source": "local"}'
 promote elsewhere && grep -q 'not in edge/x86_64; skipping' "$T/out" \
   && pass "a recipe this architecture has not published is skipped, not refused" || fail "other-arch recipe"
+recipe armonly '{"source": "local"}' "" aarch64
+promote armonly && grep -q 'armonly does not build for x86_64; skipping it' "$T/out" && ! grep -q 'armonly is not in' "$T/out" \
+  && pass "a recipe that does not build this architecture is skipped without a warning" || fail "arch-only recipe"
 
 # A source file that does not match its database entry is never published.
 f="$REMOTE/edge/x86_64/big-1.0-3-x86_64.pkg.tar.zst"

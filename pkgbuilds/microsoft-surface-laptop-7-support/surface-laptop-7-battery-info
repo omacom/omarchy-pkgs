@@ -1,0 +1,94 @@
+#!/usr/bin/env python3
+"""Publish what the Surface Aggregator (SAM) knows about the battery pack.
+
+Linux reads the Surface Laptop 7's battery through the Qualcomm battery
+service (qcom_battmgr), which has the charge limit but reports a placeholder
+identity (QCOMMBATT01, Qualcomm, made 2014) and a cycle count of 0. SAM has
+the pack's own data, and the kernel leaves SAM's battery unregistered on this
+laptop so that UPower sees one battery.
+
+This sends SAM one read-only request, the "static information" read the
+kernel's surface_battery driver uses on other Surfaces (category 0x02,
+command 0x02), and writes the result, without the serial number, to
+/run/microsoft-surface-laptop-7-support/battery for surface-laptop-7-battery
+to show. It never sends anything that sets or changes state. It needs root,
+for the SAM device node; surface-laptop-7-battery-info.service runs it.
+"""
+import ctypes, fcntl, os, struct, subprocess, sys, time
+
+SSAM_CDEV_REQUEST = 0xC028A501    # _IOWR(0xA5, 1, struct ssam_cdev_request), 40 bytes
+BIX_FORMAT = "<B15I21s11s5s21s"   # struct spwr_bix, packed
+BIX_SIZE = struct.calcsize(BIX_FORMAT)
+
+COMPATIBLE = os.environ.get("SL7_BATTERY_COMPATIBLE", "/proc/device-tree/compatible")
+SAM_DEVICE = os.environ.get("SL7_BATTERY_SAM_DEVICE", "/dev/surface/aggregator")
+RESPONSE_FILE = os.environ.get("SL7_BATTERY_RESPONSE")    # a saved response, for the test
+OUT = os.environ.get("SL7_BATTERY_OUT", "/run/microsoft-surface-laptop-7-support/battery")
+
+MODELS = {b"microsoft,romulus13", b"microsoft,romulus15"}    # the 13.8" and the 15"
+
+def on_this_laptop():
+    try:
+        return bool(MODELS & set(open(COMPATIBLE, "rb").read().split(b"\0")))
+    except OSError:
+        return False
+
+def read_bix():
+    loaded_here = False
+    if not os.path.exists(SAM_DEVICE):
+        subprocess.run(["modprobe", "surface_aggregator_cdev"], check=True)
+        loaded_here = True
+        for _ in range(50):
+            if os.path.exists(SAM_DEVICE):
+                break
+            time.sleep(0.1)
+    try:
+        buf = ctypes.create_string_buffer(BIX_SIZE)
+        # category BAT, target 1, command 2, instance 1, has-response, no payload
+        req = bytearray(struct.pack("<BBBBHhQH6xQH6x", 0x02, 0x01, 0x02, 0x01, 0x01, 0,
+                                    0, 0, ctypes.addressof(buf), len(buf)))
+        fd = os.open(SAM_DEVICE, os.O_RDWR)
+        try:
+            fcntl.ioctl(fd, SSAM_CDEV_REQUEST, req, True)
+        finally:
+            os.close(fd)
+        status = struct.unpack_from("<h", req, 6)[0]
+        length = struct.unpack_from("<H", req, 32)[0]
+        if status != 0:
+            raise RuntimeError(f"SAM answered with status {status}")
+        return buf.raw[:length]
+    finally:
+        if loaded_here:
+            subprocess.run(["modprobe", "-r", "surface_aggregator_cdev"], check=False)
+
+def parse(bix):
+    if len(bix) != BIX_SIZE:
+        raise ValueError(f"static information is {len(bix)} bytes, expected {BIX_SIZE}")
+    v = struct.unpack(BIX_FORMAT, bix)
+    text = lambda b: b.split(b"\0")[0].decode("ascii", "replace").strip()
+    info = {"cycle_count": v[8], "design_voltage_mv": v[5],
+            "model": text(v[16]), "type": text(v[18]), "maker": text(v[19])}
+    if v[1] == 0:    # power unit 0: capacities are in mWh
+        info["design_capacity_mwh"] = v[2]
+        info["full_charge_capacity_mwh"] = v[3]
+    return {k: val for k, val in info.items() if val != 0xFFFFFFFF}
+
+def main():
+    if not on_this_laptop():
+        return
+    bix = open(RESPONSE_FILE, "rb").read() if RESPONSE_FILE else read_bix()
+    info = parse(bix)
+    info["read_at"] = int(time.time())
+    os.makedirs(os.path.dirname(OUT), mode=0o755, exist_ok=True)
+    tmp = f"{OUT}.{os.getpid()}"
+    with open(tmp, "w") as f:
+        for k, val in info.items():
+            f.write(f"{k}={val}\n")
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, OUT)
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (OSError, RuntimeError, ValueError, subprocess.CalledProcessError) as e:
+        sys.exit(f"surface-laptop-7-battery-info: {e}")

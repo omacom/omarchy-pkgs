@@ -1,0 +1,99 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jim Martin <jimmartin@gmail.com>
+Date: Thu, 8 Oct 2026 13:55:29 -0500
+Subject: [PATCH] phy: qcom: qmp-combo: Stay resumed until the USB controller
+ powers on
+
+Once the PHY's clocks no longer hold a runtime PM reference on the PHY
+(the next change), the combo PHY runtime suspends, when userspace allows
+it, whenever none of its PHYs holds a reference. dwc3 initialises the
+PHY with phy_init(), soft-resets its core and only then calls
+phy_power_on(). The PHY runtime suspends right after phy_init() has
+dropped its reference, enters autonomous mode and turns off the clocks
+the core reset needs: on a plug into an idle port "DWC3 controller soft
+reset failed" is logged, the xHCI host is not created and the port stays
+dead until the next boot.
+
+qmp_combo_usb_init() already programs and starts the USB PHY, so the
+USB PHY has had no power_on and power_off operations. Add them to record
+whether the controller has powered the PHY on, and refuse runtime
+suspend while USB or USB4 is initialised but not powered on. Autonomous
+mode is then entered only for a PHY that its controller powered on and
+released, as dwc3 does in its runtime suspend, and a PHY used for
+DisplayPort alone is not held active.
+
+Assisted-by: Opus 5.5
+Signed-off-by: Jim Martin <jimmartin@gmail.com>
+---
+ drivers/phy/qualcomm/phy-qcom-qmp-combo.c | 38 +++++++++++++++++++++++
+ 1 file changed, 38 insertions(+)
+
+diff --git a/drivers/phy/qualcomm/phy-qcom-qmp-combo.c b/drivers/phy/qualcomm/phy-qcom-qmp-combo.c
+index fabc92db09c..7b13f6a4295 100644
+--- a/drivers/phy/qualcomm/phy-qcom-qmp-combo.c
++++ b/drivers/phy/qualcomm/phy-qcom-qmp-combo.c
+@@ -2674,6 +2674,8 @@ struct qmp_combo {
+ 	struct phy *usb_phy;
+ 	enum phy_mode phy_mode;
+ 	unsigned int usb_init_count;
++	/* The USB controller has powered the USB PHY on. */
++	bool usb_powered_on;
+ 
+ 	struct phy *dp_phy;
+ 	unsigned int dp_aux_cfg;
+@@ -4831,9 +4833,35 @@ static int qmp_combo_usb4_set_mode(struct phy *phy, enum phy_mode mode, int subm
+ 	return 0;
+ }
+ 
++/*
++ * qmp_combo_usb_init() already programs and starts the USB PHY. power_on and
++ * power_off only record whether the controller has taken it into use: dwc3
++ * resets its core between phy_init() and phy_power_on() and needs the PHY
++ * clocks until then.
++ */
++static int qmp_combo_usb_phy_power_on(struct phy *phy)
++{
++	struct qmp_combo *qmp = phy_get_drvdata(phy);
++
++	WRITE_ONCE(qmp->usb_powered_on, true);
++
++	return 0;
++}
++
++static int qmp_combo_usb_phy_power_off(struct phy *phy)
++{
++	struct qmp_combo *qmp = phy_get_drvdata(phy);
++
++	WRITE_ONCE(qmp->usb_powered_on, false);
++
++	return 0;
++}
++
+ static const struct phy_ops qmp_combo_usb_phy_ops = {
+ 	.init		= qmp_combo_usb_init,
+ 	.exit		= qmp_combo_usb_exit,
++	.power_on	= qmp_combo_usb_phy_power_on,
++	.power_off	= qmp_combo_usb_phy_power_off,
+ 	.set_mode	= qmp_combo_usb_set_mode,
+ 	.owner		= THIS_MODULE,
+ };
+@@ -4928,6 +4956,16 @@ static int __maybe_unused qmp_combo_runtime_suspend(struct device *dev)
+ 		return 0;
+ 	}
+ 
++	/*
++	 * Autonomous mode is for a USB PHY that its controller has powered on
++	 * and then released. Between phy_init() and phy_power_on() the
++	 * controller still needs the PHY clocks: dwc3 resets its core there.
++	 * A PHY used for DisplayPort alone has no controller to wait for.
++	 */
++	if ((qmp->usb_init_count || qmp->usb4_init_count) &&
++	    !READ_ONCE(qmp->usb_powered_on))
++		return -EBUSY;
++
+ 	qmp_combo_enable_autonomous_mode(qmp);
+ 
+ 	clk_disable_unprepare(qmp->pipe_clk);
+-- 
+2.56.0
+

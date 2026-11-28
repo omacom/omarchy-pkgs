@@ -1,0 +1,153 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Sibi Sankar <sibi.sankar@oss.qualcomm.com>
+Date: Fri, 24 Jul 2026 12:48:11 +0530
+Subject: [PATCH] PM / devfreq: Add a governor for tracking remote device
+ frequencies
+
+On SoCs where the governor and the mechanism to control the frequency for
+devices like caches is hosted on the System Control Processor (SCP), there
+exists a need to track the frequency changes in a reliable way and provide
+ways to tweak parameters on the remote governor.
+
+Add a new "remote" devfreq governor that uses the track_remote flag to
+expose the remote device's frequency to userspace via trans_stat. The
+governor deliberately does not advertise the DEVFREQ_GOV_ATTR_TARGET_FREQ
+attribute since the kernel cannot set the frequency on a remote-managed
+device; reads of the target_freq sysfs node therefore return -EINVAL.
+
+Signed-off-by: Sibi Sankar <sibi.sankar@oss.qualcomm.com>
+Signed-off-by: Pragnesh Papaniya <pragnesh.papaniya@oss.qualcomm.com>
+Link: https://lore.kernel.org/r/20260724-rfc_v8_scmi_memlat-v1-6-cb732bcff1f4@oss.qualcomm.com
+---
+ drivers/devfreq/Kconfig           |  8 ++++
+ drivers/devfreq/Makefile          |  1 +
+ drivers/devfreq/governor_remote.c | 73 +++++++++++++++++++++++++++++++
+ include/linux/devfreq.h           |  1 +
+ 4 files changed, 83 insertions(+)
+ create mode 100644 drivers/devfreq/governor_remote.c
+
+diff --git a/drivers/devfreq/Kconfig b/drivers/devfreq/Kconfig
+index c999c4a1e56..2caa8755491 100644
+--- a/drivers/devfreq/Kconfig
++++ b/drivers/devfreq/Kconfig
+@@ -56,6 +56,14 @@ config DEVFREQ_GOV_POWERSAVE
+ 	  the DEVFREQ framework returns the lowest frequency available
+ 	  at any time.
+ 
++config DEVFREQ_GOV_REMOTE
++	tristate "Remote"
++	help
++	  A simple governor to track the frequency of devices whose
++	  dvfs control lies outside the kernel. This governor acts
++	  as an observer and provides for ways to track frequency and
++	  set/get information related to the remote dvfs device.
++
+ config DEVFREQ_GOV_USERSPACE
+ 	tristate "Userspace"
+ 	help
+diff --git a/drivers/devfreq/Makefile b/drivers/devfreq/Makefile
+index 404179d79a9..cde57c8cda7 100644
+--- a/drivers/devfreq/Makefile
++++ b/drivers/devfreq/Makefile
+@@ -4,6 +4,7 @@ obj-$(CONFIG_PM_DEVFREQ_EVENT)	+= devfreq-event.o
+ obj-$(CONFIG_DEVFREQ_GOV_SIMPLE_ONDEMAND)	+= governor_simpleondemand.o
+ obj-$(CONFIG_DEVFREQ_GOV_PERFORMANCE)	+= governor_performance.o
+ obj-$(CONFIG_DEVFREQ_GOV_POWERSAVE)	+= governor_powersave.o
++obj-$(CONFIG_DEVFREQ_GOV_REMOTE)	+= governor_remote.o
+ obj-$(CONFIG_DEVFREQ_GOV_USERSPACE)	+= governor_userspace.o
+ obj-$(CONFIG_DEVFREQ_GOV_PASSIVE)	+= governor_passive.o
+ 
+diff --git a/drivers/devfreq/governor_remote.c b/drivers/devfreq/governor_remote.c
+new file mode 100644
+index 00000000000..df3819757e5
+--- /dev/null
++++ b/drivers/devfreq/governor_remote.c
+@@ -0,0 +1,73 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
++ */
++
++#include <linux/errno.h>
++#include <linux/module.h>
++#include <linux/devfreq.h>
++#include <linux/devfreq-governor.h>
++
++static int devfreq_remote_track_func(struct devfreq *devfreq, unsigned long *freq)
++{
++	if (!devfreq->profile->get_cur_freq)
++		return -ENXIO;
++
++	return devfreq->profile->get_cur_freq(devfreq->dev.parent, freq);
++}
++
++static int devfreq_remote_track_handler(struct devfreq *devfreq, unsigned int event, void *data)
++{
++	switch (event) {
++	case DEVFREQ_GOV_START:
++		devfreq_monitor_start(devfreq);
++		break;
++
++	case DEVFREQ_GOV_STOP:
++		devfreq_monitor_stop(devfreq);
++		break;
++
++	case DEVFREQ_GOV_UPDATE_INTERVAL:
++		devfreq_update_interval(devfreq, (unsigned int *)data);
++		break;
++
++	case DEVFREQ_GOV_SUSPEND:
++		devfreq_monitor_suspend(devfreq);
++		break;
++
++	case DEVFREQ_GOV_RESUME:
++		devfreq_monitor_resume(devfreq);
++		break;
++	}
++
++	return 0;
++}
++
++static struct devfreq_governor devfreq_remote_track = {
++	.name = DEVFREQ_GOV_REMOTE,
++	.attrs = DEVFREQ_GOV_ATTR_POLLING_INTERVAL
++		| DEVFREQ_GOV_ATTR_TIMER,
++	.flags = DEVFREQ_GOV_FLAG_IMMUTABLE
++		| DEVFREQ_GOV_FLAG_TRACK_REMOTE,
++	.get_target_freq = devfreq_remote_track_func,
++	.event_handler = devfreq_remote_track_handler,
++};
++
++static int __init devfreq_remote_track_init(void)
++{
++	return devfreq_add_governor(&devfreq_remote_track);
++}
++subsys_initcall(devfreq_remote_track_init);
++
++static void __exit devfreq_remote_track_exit(void)
++{
++	int ret;
++
++	ret = devfreq_remove_governor(&devfreq_remote_track);
++	if (ret)
++		pr_err("%s: failed to remove governor %d\n", __func__, ret);
++}
++module_exit(devfreq_remote_track_exit);
++
++MODULE_DESCRIPTION("DEVFREQ Remote Tracking governor");
++MODULE_LICENSE("GPL");
+diff --git a/include/linux/devfreq.h b/include/linux/devfreq.h
+index dc1075dc344..4d50cf23095 100644
+--- a/include/linux/devfreq.h
++++ b/include/linux/devfreq.h
+@@ -21,6 +21,7 @@
+ #define DEVFREQ_GOV_POWERSAVE		"powersave"
+ #define DEVFREQ_GOV_USERSPACE		"userspace"
+ #define DEVFREQ_GOV_PASSIVE		"passive"
++#define DEVFREQ_GOV_REMOTE		"remote"
+ 
+ /* DEVFREQ notifier interface */
+ #define DEVFREQ_TRANSITION_NOTIFIER	(0)
+-- 
+2.56.0
+

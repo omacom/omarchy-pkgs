@@ -11,12 +11,21 @@ if [[ ${parent##*/} == [Pp][Rr][Oo][Ff][Ii][Ll][Ee][Ss] ]]; then
 fi
 export HERMES_HOME="$hermes_home"
 runtime="$hermes_home/hermes-agent"
-native="$runtime/apps/desktop/release/linux-unpacked/Hermes"
+# electron-builder names the app linux-unpacked on x86_64 and
+# linux-arm64-unpacked on aarch64, and an ARM runtime can hold both: one seeded
+# under the x86_64 name, then the one `hermes update` rebuilt beside it. Like
+# Hermes itself, open the newest.
+native=""
+for candidate in "$runtime"/apps/desktop/release/{linux-unpacked,linux-arm64-unpacked}/Hermes; do
+  if [[ -x $candidate && ( -z $native || $candidate -nt $native ) ]]; then
+    native=$candidate
+  fi
+done
 # Current runtimes publish their CLI as .hermes/bin/hermes and keep their
 # environments under installs/; older ones had a venv inside the checkout.
 cli="$runtime/.hermes/bin/hermes"
 [[ -x $cli ]] || cli="$runtime/venv/bin/hermes"
-if [[ ! -x $native || ! -x $cli ]]; then
+if [[ -z $native || ! -x $cli ]]; then
   native=/opt/hermes-desktop/Hermes
   # Only the packaged app, built from the release commit rather than the runtime's
   # checkout, is told to skip an existing Hermes.

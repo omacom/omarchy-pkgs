@@ -79,38 +79,63 @@ selects a commit from a merged side branch. This uses Git's committer date, not
 the time a commit was pushed, measured from when the run cloned the branch so
 packages pinned from it agree. `BYPASS_MIN_RELEASE_AGE=1` bypasses the hold.
 
-Packages marked `"auto_merge": true` ride the unattended lane
-(`track-branches.yml`), checked hourly instead of every 6 hours. Every lane
-opens its PRs through `package-prs.yml` and auto-merges them as soon as the
-build checks pass. Each package gets its own
-PR on `auto/track-branches-<package>`, and packages that pin the same branch
-share one, so a package whose build fails holds back only itself. The lane works with every
-provider, not only branch watches, so it also carries release feeds trusted to
-ship without review: the browsers, large vendors' apps, Omacom's own projects,
+Packages marked `"auto_merge": true` use the hourly group in
+`sync-upstream.yml`; other packages are checked every 6 hours. Both groups
+open their PRs through `package-prs.yml` and auto-merge them as soon as the
+build checks pass. Hourly packages keep their PRs on
+`auto/track-branches-<package>`; the others use `auto/sync-upstream-<package>`.
+Packages that pin the same branch share a PR, so a package whose build fails
+holds back only itself and its branch companions. The hourly group works with
+every provider, not only branch watches, so it also carries release feeds worth
+checking frequently: the browsers, large vendors' apps, Omacom's own projects,
 and vendor binaries that hold fresh releases with `min_release_age`. `bin/sync-upstream --lane
-reviewed|auto-merge|all` selects a lane; the scheduled workflows each pass their
-own. Packages that pin the same branch move in lockstep: if one of them fails
-to update, the run restores the others and reports the group as failed. A
+reviewed|auto-merge|all` selects a lane; the shared workflow passes the lane
+for the dispatched `cadence`. These historical names select cadence, not
+whether the PR auto-merges. Packages that pin the same branch move in lockstep:
+if one of them fails to update, the run restores the others and reports the group as failed. A
 targeted sync includes the other packages watching that branch, so requesting
 only `omarchy-dev` also updates `omarchy-settings-dev`.
 
+### Reviewed updates
+
+`"review": true` keeps a package's update PRs for a maintainer. The PR opens as
+a draft, `package-prs.yml` does not arm auto-merge, and `auto-merge-pr.yml`
+skips drafts, so nothing lands on its own. CI still builds it. Read the bump,
+fix the recipe on the PR branch if its build fails, and mark it **Ready for
+review**: `auto-merge-pr.yml` then arms auto-merge and the PR lands once
+`result`, `self-tests` and `build-isolation` pass. A later run that finds a
+newer release turns a ready PR back into a draft and takes auto-merge off
+before it pushes the update (`hold-reviewed-pr.sh`), so the new release gets
+its own review.
+`review` cannot be combined with `auto_merge`, and needs an upstream watch,
+provider or hook.
+
 ### Enable unattended branch updates
 
-The schedule already runs in GitHub Actions; no server cron job is needed.
-It uses a personal access token so its PRs trigger builds and its merges trigger
-publishing without manual approval. No GitHub App is required.
+The builder controller box dispatches both groups on systemd timers
+(`ci/dispatch.sh`), because GitHub's own schedule ran them hours late.
+The omarchy-pkgs-sync GitHub App pushes the branches and opens the PRs, so
+they build without an approval hold. The omarchy-pkgs-merge GitHub App arms
+auto-merge, so the merges start publishing. The built-in Actions `GITHUB_TOKEN`
+can do neither.
 
-1. Use a fine-grained PAT with access to **omacom/omarchy-pkgs** and repository
-   **Contents: Read and write** and **Pull requests: Read and write** permissions.
-   Its owner must be trusted by the build workflow (for example, a collaborator).
-   The existing controller PAT can be reused when it has these permissions.
-2. In the repository's
-   [Actions secrets](https://github.com/omacom/omarchy-pkgs/settings/secrets/actions),
-   save the PAT as `PKGS_BOT_TOKEN`. Update this secret when the token is rotated
-   or expires. The built-in Actions `GITHUB_TOKEN` cannot run this unattended chain.
+1. The omarchy-pkgs-sync App is owned by the omacom organization, has no
+   webhook, and has repository **Contents: Read and write** and **Pull
+   requests: Read and write** permissions, with Workflows left at no access.
+   It is installed on **omacom/omarchy-pkgs** only. Its client ID is the
+   repository variable `PKGS_SYNC_APP_CLIENT_ID`. Its private key is the
+   secret `PKGS_SYNC_APP_KEY` in the `bot-sync` environment, whose
+   deployment branches are limited to `master`. To rotate the key, generate
+   a new one in the App's settings, replace the secret, then delete the old
+   key there.
+2. The omarchy-pkgs-merge App arms auto-merge, so the merge, and the publish
+   it starts, run as it. It is set up the same way, with the same
+   permissions, installed on **omacom/omarchy-pkgs** only. Its client ID is
+   the variable `PKGS_MERGE_APP_CLIENT_ID`, and its private key the secret
+   `PKGS_MERGE_APP_KEY` in the `bot-merge` environment, limited to `master`.
 3. Keep **Allow auto-merge** enabled and require `result`, `self-tests`, and
-   `build-isolation` on `master`; the tracker does not request a protection bypass.
-4. After merging the tracker, run **Track upstream branches** once from Actions
+   `build-isolation` on `master`; the updater does not request a protection bypass.
+4. Run **Sync Upstream** once from Actions with `cadence: hourly`
    to verify that its PR builds, auto-merges, and starts **Publish merged packages**.
    Subsequent runs happen hourly.
 
@@ -128,10 +153,32 @@ Archive watches use `member` to select a text member, or `filenames: true` to re
 versions from archive member names. Debian archives are read through their control
 metadata. `unescape_json` handles JSON strings embedded in a vendor's HTML page.
 
+`source_variables` sets a recipe variable from a file inside one of the new
+release's own sources, for facts a vendor publishes only in the artifact:
+
+```json
+"source_variables": {
+  "_electronver": {
+    "source": "source:0",
+    "member": "usr/lib/slack/version",
+    "pattern": "(?P<value>[0-9]+\\.[0-9]+\\.[0-9]+)"
+  }
+}
+```
+
+After the new pkgver is written, the watch fetches that source (`source:0`
+names the first `source` entry, `source_aarch64:1` the second AArch64 one),
+reads `member` from a zip, a tar or a `.deb`'s data archive without
+extracting anything else, and requires the whole trimmed file (64 KiB at most)
+to match `pattern`. The `value` capture replaces the variable, and sources that
+use it are hashed again. Slack's AArch64 build uses it to follow the Electron
+release each Slack `.deb` ships.
+
 ## Maintenance and validation
 
-Running watches locally requires Python 3.11+, Bash, curl, git, jq, Arch's
-`vercmp`, and `bsdtar`. CI installs these in its Arch container.
+Running watches locally requires Python 3.14+ (its `tarfile` reads zstd), Bash,
+curl, git, jq, Arch's `vercmp`, and `bsdtar`. CI installs these in its Arch
+container.
 
 - Edit packaging and architecture changes directly in PKGBUILD. The old AUR
   overlays have been folded into these recipes and removed.
@@ -175,13 +222,13 @@ in `origin` and has no effect on release selection.
 | `lmstudio-bin` | regex | [https://lmstudio.ai/download](https://lmstudio.ai/download) |
 | `localsend` | github | [localsend/localsend](https://github.com/localsend/localsend) |
 | `macbook12-spi-driver-dkms` | git_branch | [https://github.com/marc-git/macbook12-spi-driver.git](https://github.com/marc-git/macbook12-spi-driver.git) |
-| `omarchy-dev`, `omarchy-settings-dev` | git_branch (auto-merge) | [https://github.com/basecamp/omarchy.git](https://github.com/basecamp/omarchy.git) `quattro` |
+| `omarchy-dev`, `omarchy-settings-dev` | git_branch (auto-merge) | [https://github.com/omacom/omarchy.git](https://github.com/omacom/omarchy.git) `quattro` |
 | `omasnap-git` | git_branch (auto-merge) | [https://github.com/omacom/omasnap.git](https://github.com/omacom/omasnap.git) `main` |
 | `minecraft-launcher` | archive | [https://launcher.mojang.com/download/Minecraft.deb](https://launcher.mojang.com/download/Minecraft.deb) |
 | `nautilus-dropbox` | github | [dropbox/nautilus-dropbox](https://github.com/dropbox/nautilus-dropbox) |
 | `nordvpn-bin` | debian | [https://repo.nordvpn.com/deb/nordvpn/debian/dists/stable/main/binary-amd64/Packages](https://repo.nordvpn.com/deb/nordvpn/debian/dists/stable/main/binary-amd64/Packages) |
 | `nvidia-580xx-utils` | regex | [https://download.nvidia.com/XFree86/Linux-x86_64/](https://download.nvidia.com/XFree86/Linux-x86_64/) |
-| `omarchy-chromium-bin` | github | [omacom/omarchy-chromium](https://github.com/omacom/omarchy-chromium) |
+| `nvidia-utils` (with `nvidia-open-dkms`, `lib32-nvidia-utils` and the `linux-omarchy` kernels) | hook | Arch's [nvidia-utils](https://archlinux.org/packages/extra/x86_64/nvidia-utils/) |
 | `omarchy-emacs` | git_tags | [https://github.com/scottjones/omarchy-emacs.git](https://github.com/scottjones/omarchy-emacs.git) |
 | `omazed` | git_tags | [https://github.com/aps6/omazed.git](https://github.com/aps6/omazed.git) |
 | `once-bin` | github | [basecamp/once](https://github.com/basecamp/once) |
@@ -204,21 +251,42 @@ in `origin` and has no effect on release selection.
 | `yay` | github | [Jguer/yay](https://github.com/Jguer/yay) |
 | `yt6801-dkms` | archive | [https://www.motor-comm.com/Cn/Skippower/downloadFile.html?id=1817](https://www.motor-comm.com/Cn/Skippower/downloadFile.html?id=1817) |
 
+## Apple Silicon imports from asahi-alarm
+
+These replace asahi-alarm's packages for Omarchy Mac. Each watches its upstream's tags with `"review": true`, so every bump opens as a draft PR for the owner (see [Reviewed updates](#reviewed-updates)). The reference recipe stays asahi-alarm's [PKGBUILDs](https://github.com/asahi-alarm/PKGBUILDs). Before marking a bump ready, compare its directory there for new patches, dependencies or install steps. A watch moves only `pkgver`, `pkgrel`, declared variables and source checksums.
+
+| Package | Provider | Upstream | asahi-alarm recipe |
+|---|---|---|---|
+| `aurora-scripts` | git_tags (review) | [asahi-alarm/asahi-scripts](https://github.com/asahi-alarm/asahi-scripts) | [asahi-scripts](https://github.com/asahi-alarm/PKGBUILDs/tree/main/asahi-scripts) |
+| `aurora-fwextract` | git_tags (review) | [asahi-alarm/asahi-alarm-installer](https://github.com/asahi-alarm/asahi-alarm-installer) `v` tags | [asahi-fwextract](https://github.com/asahi-alarm/PKGBUILDs/tree/main/asahi-fwextract) |
+| `lzfse` | git_tags (review) | [lzfse/lzfse](https://github.com/lzfse/lzfse) `lzfse-` tags | [lzfse](https://github.com/asahi-alarm/PKGBUILDs/tree/main/lzfse) |
+| `speakersafetyd` | git_tags (review) | [AsahiLinux/speakersafetyd](https://github.com/AsahiLinux/speakersafetyd) | [speakersafetyd](https://github.com/asahi-alarm/PKGBUILDs/tree/main/speakersafetyd) |
+| `bankstown` | git_tags (review) | [chadmed/bankstown](https://github.com/chadmed/bankstown) | [bankstown](https://github.com/asahi-alarm/PKGBUILDs/tree/main/bankstown) |
+| `triforce-lv2` | git_tags (review) | [chadmed/triforce](https://github.com/chadmed/triforce) | [triforce-lv2](https://github.com/asahi-alarm/PKGBUILDs/tree/main/triforce-lv2) |
+| `muvm` | git_tags (review) | [AsahiLinux/muvm](https://github.com/AsahiLinux/muvm) `muvm-` tags | [muvm](https://github.com/asahi-alarm/PKGBUILDs/tree/main/muvm) |
+| `fex-emu` | git_tags (review) | [FEX-Emu/FEX](https://github.com/FEX-Emu/FEX) `FEX-` tags | [FEX-Emu](https://github.com/asahi-alarm/PKGBUILDs/tree/main/FEX-Emu) |
+| `widevine` | regex (review) | asahi-alarm's [widevine/PKGBUILD](https://github.com/asahi-alarm/PKGBUILDs/blob/main/widevine/PKGBUILD) | the same file |
+
+- `widevine` has no upstream of its own that we can follow: Google's CDM comes from a Lacros image that asahi-alarm picks. The watch reads asahi-alarm's `pkgver`, `_lacros_version` and first `sha256sums_aarch64` entry into our `pkgver`, `_lacros_version` and `_lacros_sha256`. `_lacros_revision` is the Lacros version as one number (`120.0.6098.0` is `1200060980000`), declared as the watch's revision. So when asahi-alarm moves to a newer Lacros without a new `pkgver`, the PR bumps `pkgrel`. If they change only the sha256, or go back to an older Lacros, the watch fails, so the change is never skipped quietly. A change to their `widevine_fixup.py` isn't picked up: compare it when reviewing.
+- `speakersafetyd` carries asahi-alarm's J504 patch. A release that already includes it fails to patch: drop the patch on the PR branch.
+- The Aurora recipes (`linux-aurora`, `m1n1-aurora`, `uboot-aurora` and the rest) stay pinned by hand.
+
 ## Existing manual holds
 
 `libfprint-git`, `libretro-cap32-git`, `libretro-database-git`, `libretro-fbneo-git`, `libretro-uae-git`, `libretro-vice-git`, `quickshell-git`, `supergfxctl`.
 
 These packages were already excluded from automatic AUR updates. The migration preserves that policy.
 
-`m1n1-aurora` and `uboot-asahi` are deliberate holds: Apple Silicon boot code, pinned by hand like `linux-aurora`, and bumped only after a cold boot on the qualification Macs. `m1n1-aurora` pins an aurora-silicon/m1n1 commit plus a local patch. `uboot-asahi` follows asahi-alarm's recipe and patch set (asahi-alarm/PKGBUILDs), which a tag watch on AsahiLinux/u-boot cannot carry.
+`m1n1-aurora` and `uboot-asahi` are deliberate holds: Apple Silicon boot code, pinned by hand like `linux-aurora`. A bump reaches edge, which the testing team uses as the hardware qualification lane, and is promoted to rc or stable only after a cold boot on the qualification Macs. `m1n1-aurora` pins an omacom/m1n1 commit; its source and package migration are documented in pkgbuilds/m1n1-aurora/README.md. `uboot-asahi` follows asahi-alarm's recipe and patch set (asahi-alarm/PKGBUILDs), which a tag watch on AsahiLinux/u-boot cannot carry.
 
-`cua-driver-bin` is a deliberate hold: Omarchy bumps it by hand, so a Cua release ships only when a maintainer has verified it. It keeps its `.omarchy/upstream.sh` hook and `min_release_age`, so lifting the hold means removing `"sync": false`. `cua-hyprland-plugin` declares no upstream source, so no automation updates it either.
+`cua-driver-bin` is a deliberate hold: Omarchy bumps it by hand, so a Cua release ships only when a maintainer has verified it. It keeps its `.omarchy/upstream.sh` hook and `min_release_age`, so lifting the hold means removing `"sync": false`. `cua-hyprland-plugin` declares no upstream source, so no automation moves it to a new Cua release either; `sync-rebuilds` rebuilds the release it has when Hyprland or one of its ABI packages moves.
 
 `omarchy-mlx` is a deliberate hold: its wheel's filename carries a per-build stamp (`mlx_omarchy-0.32.4.dev202610050725+5c15fba-…`) that a tag watch cannot derive, so the maintainer repins `_wheel`, the vendor tar, and the checksums together. It keeps its watch, so lifting the hold means removing `"sync": false` once the wheel's name follows the release version.
 
 ## Package-specific boundaries
 
-- NVIDIA watches remain on the 580 driver branch.
+- `nvidia-580xx-utils` and `lib32-nvidia-580xx-utils` watch NVIDIA's 580 branch.
+- The current driver follows Arch's `nvidia-utils`. Its `.omarchy/upstream.sh` runs `bin/bump-nvidia` when Arch moves, which sets the release in `nvidia-utils`, `nvidia-open-dkms`, `lib32-nvidia-utils` and every `linux-omarchy` kernel's `_nvidiaver`, bumps the kernels' `pkgrel` so their `-nvidia-open` modules are rebuilt, and swaps the checksums of NVIDIA's three files. Their `"lockstep": "nvidia"` puts all of it in one PR, which `tests/nvidia-open-lockstep.sh` holds together and which builds every kernel before it merges. An ARM patch that no longer applies leaves the PR red for a maintainer. A maintainer can run `bin/bump-nvidia <version>` the same way.
 - Hardware-specific packages keep their declared architectures; this migration does not invent ARM binaries for x86-only upstreams.
 - iA Duospace was deleted upstream. Its four legacy font files retain their original immutable pin while the other families track the current repository.
 - RustDesk reads hbb_common from the release gitlink; its existing build-time dependency/toolchain checks remain in force.
@@ -227,13 +295,35 @@ These packages were already excluded from automatic AUR updates. The migration p
 
 ## How the sync PRs build
 
-`sync-upstream.yml`, `sync-rebuilds.yml` and `track-branches.yml` each run their
+`sync-upstream.yml` (both package groups) and `sync-rebuilds.yml` each run their
 sync once, split the changed recipes into one PR per package with
 `.github/scripts/package-pr-groups.sh`, and hand them to `package-prs.yml`. That
-pushes each PR with the PAT in `PKGS_BOT_TOKEN`, so its builds start without an
-approval hold, and arms auto-merge. A push to an `auto/sync-*` or
+pushes each PR as the omarchy-pkgs-sync App, so its builds start without an
+approval hold. Its `arm` job then arms auto-merge as the omarchy-pkgs-merge
+App, in a job of its own, since a job has one environment. It finds each
+group's PR from this repository into `master` and judges it by the same rule
+as `auto-merge-pr.yml`, then arms the head it judged. A push to an `auto/sync-*` or
 `auto/track-branches-*` branch does not cancel the PR's build in flight: the new
 build waits, then reuses every artifact the finished one uploaded.
+
+Each PR's description comes from `helpers/sync-pr-body.py`, which compares the
+group's recipes and `.omarchy/package.json` with `master`. It works the same for
+every source type, hooks and rebuilds included, and shows:
+
+- each package's old and new version, with the kind of jump for dotted versions;
+- the source: the GitHub repository, tag or branch, the npm or PyPI package, or
+  the feed URL;
+- the pinned variables the sync rewrote, and each source whose URL or checksum
+  changed, per architecture;
+- for a rebuild, the dependencies in `rebuilt_against` that moved;
+- the architectures, and the channels the package ships to on merge;
+- how the new bytes were checked: against GitHub's asset digests, by the
+  recorded checksums, and by `validpgpkeys`.
+
+When a source is a tag on GitHub, the description links the release and the
+compare view, and shows the release notes. The notes sit in a code fence, cut
+to 40 lines, so they render as plain text. A hidden comment at the end repeats
+the facts as JSON. If the script fails, the PR still opens with the plain body.
 
 A red PR stays open for a maintainer and holds back only its own package. A
 later run updates it if upstream moves again, and closes it once it conflicts

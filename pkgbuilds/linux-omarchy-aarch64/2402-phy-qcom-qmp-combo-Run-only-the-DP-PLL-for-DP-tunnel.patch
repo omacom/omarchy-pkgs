@@ -1,0 +1,133 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jim Martin <jimmartin@gmail.com>
+Date: Thu, 8 Oct 2026 13:55:30 -0500
+Subject: [PATCH] phy: qcom: qmp-combo: Run only the DP PLL for DP tunnelled
+ over USB4
+
+With DisplayPort tunnelled over USB4 the PHY stays in USB4 mode and the
+router owns the lanes. The DP block only has to generate the link and
+pixel clocks for the router's DP IN adapter, with DP_TUNNELING_CLOCK_GEN_EN
+set in PHY_MODE_CTRL. The DP PHY operations do not know this:
+
+- qmp_combo_dp_power_on(), qmp_combo_dp_configure() and
+  qmp_combo_dp_calibrate() write the DP lane table, swing and
+  calibration settings into the lane blocks that carry the USB4 link;
+- nothing sets DP_TUNNELING_CLOCK_GEN_EN, and qmp_combo_dp_power_off()
+  does not clear it;
+- qmp_combo_com_init() looks for the bit in RESET_OVRD_CTRL instead of
+  PHY_MODE_CTRL, and then overwrites PHY_MODE_CTRL with USB4_MODE alone,
+  so a USB4 re-initialisation stops the clock of an active tunnel.
+
+In USB4 mode, let a DP power-on set the tunnelling bit and program only
+the DP serdes and PLL, skip the lane writes of configure and calibrate,
+and clear the bit again on power-off. Read the bit from PHY_MODE_CTRL in
+qmp_combo_com_init() and keep it when switching that register to USB4
+mode.
+
+Fixes: 89563a152973 ("phy: qualcomm: qmp-combo: Add preliminary USB4 support")
+Assisted-by: Opus 5.5
+Signed-off-by: Jim Martin <jimmartin@gmail.com>
+---
+ drivers/phy/qualcomm/phy-qcom-qmp-combo.c | 40 ++++++++++++++++++++---
+ 1 file changed, 35 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/phy/qualcomm/phy-qcom-qmp-combo.c b/drivers/phy/qualcomm/phy-qcom-qmp-combo.c
+index b9473f005c6..a754f46929c 100644
+--- a/drivers/phy/qualcomm/phy-qcom-qmp-combo.c
++++ b/drivers/phy/qualcomm/phy-qcom-qmp-combo.c
+@@ -4250,7 +4250,9 @@ static int qmp_combo_dp_configure(struct phy *phy, union phy_configure_opts *opt
+ 
+ 	memcpy(&qmp->dp_opts, dp_opts, sizeof(*dp_opts));
+ 	if (qmp->dp_opts.set_voltages) {
+-		cfg->configure_dp_tx(qmp);
++		/* USB4 owns the physical lanes; DP uses only its PLL. */
++		if (qmp->qmpphy_mode != QMPPHY_MODE_USB4)
++			cfg->configure_dp_tx(qmp);
+ 		qmp->dp_opts.set_voltages = 0;
+ 	}
+ 
+@@ -4267,7 +4269,7 @@ static int qmp_combo_dp_calibrate(struct phy *phy)
+ 
+ 	mutex_lock(&qmp->phy_mutex);
+ 
+-	if (cfg->calibrate_dp_phy)
++	if (qmp->qmpphy_mode != QMPPHY_MODE_USB4 && cfg->calibrate_dp_phy)
+ 		ret = cfg->calibrate_dp_phy(qmp);
+ 
+ 	mutex_unlock(&qmp->phy_mutex);
+@@ -4284,7 +4286,7 @@ static int qmp_combo_com_init(struct qmp_combo *qmp, bool force)
+ 	void __iomem *com = qmp->com;
+ 	void __iomem *aon_toggle;
+ 	int ret;
+-	u32 val;
++	u32 val, usb4_mode = USB4_MODE;
+ 
+ 	if (!force && qmp->init_count++ && qmp->com_powered_on)
+ 		return 0;
+@@ -4296,11 +4298,13 @@ static int qmp_combo_com_init(struct qmp_combo *qmp, bool force)
+ 
+ 	if (qmp->qmpphy_mode == QMPPHY_MODE_USB4) {
+ 		pcs = qmp->usb4_pcs;
++		usb4_mode |= readl(com + QPHY_V3_DP_COM_PHY_MODE_CTRL) &
++			      DP_TUNNELING_CLOCK_GEN_EN;
+ 
+ 		qphy_setbits(pcs_aon, cfg->regs[QPHY_PCS_USB4_CLAMP_ENABLE], CLAMP_EN);
+ 
+ 		/* Do not disturb the DP PLL in case there's an active DP tunnel */
+-		if (readl(com + QPHY_V3_DP_COM_RESET_OVRD_CTRL) & DP_TUNNELING_CLOCK_GEN_EN)
++		if (usb4_mode & DP_TUNNELING_CLOCK_GEN_EN)
+ 			dp_reset_val &= ~SW_DPPHY_RESET_MUX;
+ 	}
+ 
+@@ -4387,7 +4391,7 @@ static int qmp_combo_com_init(struct qmp_combo *qmp, bool force)
+ 				SW_USB3PHY_RESET_MUX | SW_USB3PHY_RESET);
+ 		break;
+ 	case QMPPHY_MODE_USB4:
+-		writel(USB4_MODE, com + QPHY_V3_DP_COM_PHY_MODE_CTRL);
++		writel(usb4_mode, com + QPHY_V3_DP_COM_PHY_MODE_CTRL);
+ 
+ 		/* bring both QMP USB and QMP DP PHYs PCS block out of reset */
+ 		/*
+@@ -4490,6 +4494,28 @@ static int qmp_combo_dp_power_on(struct phy *phy)
+ 
+ 	mutex_lock(&qmp->phy_mutex);
+ 
++	/*
++	 * DisplayPort tunneling: while the PHY is in USB4 mode the lanes
++	 * belong to the router, and the DP block only has to run its PLL and
++	 * clock generation for the router's DP IN adapter. Skip every lane
++	 * write and keep the DP PLL bit that qmp_combo_com_init() preserves
++	 * across USB4 re-initialization.
++	 */
++	if (qmp->qmpphy_mode == QMPPHY_MODE_USB4) {
++		qphy_setbits(qmp->com, QPHY_V3_DP_COM_PHY_MODE_CTRL,
++			     DP_TUNNELING_CLOCK_GEN_EN);
++		qmp_combo_dp_serdes_init(qmp);
++		ret = qmp_combo_configure_dp_phy_common(qmp);
++		if (ret)
++			dev_err(qmp->dev, "tunneled DP PLL configuration failed: %d\n", ret);
++		else
++			qmp->dp_powered_on = true;
++		dev_dbg(qmp->dev, "tunneled DP PLL: rate %u lanes %u ret %d mode_ctrl %#x\n",
++			qmp->dp_opts.link_rate, qmp->dp_opts.lanes, ret,
++			readl(qmp->com + QPHY_V3_DP_COM_PHY_MODE_CTRL));
++		goto out_unlock;
++	}
++
+ 	/*
+ 	 * In USB3-only mode the Type-C partner has no DisplayPort lanes and
+ 	 * the DP PCS stays in reset: a DP power-on can only fail, and its lane
+@@ -4542,6 +4568,10 @@ static int qmp_combo_dp_power_off(struct phy *phy)
+ 	if (qmp->com_powered_on)
+ 		writel(DP_PHY_PD_CTL_PSR_PWRDN, qmp->dp_dp_phy + QSERDES_DP_PHY_PD_CTL);
+ 
++	if (qmp->qmpphy_mode == QMPPHY_MODE_USB4 && qmp->com_powered_on)
++		qphy_clrbits(qmp->com, QPHY_V3_DP_COM_PHY_MODE_CTRL,
++			     DP_TUNNELING_CLOCK_GEN_EN);
++
+ 	qmp->dp_powered_on = false;
+ 
+ 	mutex_unlock(&qmp->phy_mutex);
+-- 
+2.56.0
+

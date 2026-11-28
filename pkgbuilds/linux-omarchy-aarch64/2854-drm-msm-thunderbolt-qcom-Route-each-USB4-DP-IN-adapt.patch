@@ -1,0 +1,544 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jim Martin <jimmartin@gmail.com>
+Date: Thu, 12 Nov 2026 22:18:22 -0600
+Subject: [PATCH 2854/2856] drm/msm, thunderbolt: qcom: Route each USB4 DP IN adapter to
+ its DP controller
+
+The DisplayPort tunnel of the Glymur USB4 host routers was tied to
+router 0 and DP controller 0: the router driver looked the controller
+up by one fixed name, the DP driver refused any other controller, and
+the route helper wrote one value to bits 1:0 of MDP top register 0x464,
+described as "DPTX0: USB4 or native".
+
+That register has one two-bit field per DP IN adapter, two adapters per
+router (bits 1:0 and 5:4 for router 0, 9:8 and 13:12 for router 1,
+17:16 and 21:20 for router 2), and the value is the DP controller that
+feeds the adapter: 1 to 3 for DPTX0 to DPTX2, 0 for none. The value
+written for router 0 with DPTX0 does not change.
+
+Make the route helper take the adapter and write the calling
+controller's number, cache each field for the restore after the MDP
+power domain comes back, and accept DPTX0 to DPTX2 as tunnel sources.
+In the router driver, give each router the DP controller that feeds its
+DP IN 0 adapter: DPTX0 for router 0, DPTX1 for router 1, the pairing the
+platform's Windows display driver prefers (it falls back to another
+free controller; this driver does not). Router 1's DP IN registers and
+mailbox codes are those of router 0.
+
+The saved modeset state for system sleep had a single owner. Count the
+owners, so that two routers with a tunnel can both go through sleep: the
+first saves the state and the last one back restores it.
+
+Tested on a Surface Laptop 8 with a Surface Thunderbolt 4 Dock and a
+monitor on the dock. Through router 1 and DPTX1 the monitor runs at
+3840x2160 60 Hz (8.1 Gb/s, four lanes) on plug-in in both orientations,
+after a suspend rehearsal (pm_test=platform), after a suspend and at
+boot. Through router 0 and DPTX0 it runs as before, on plug-in and
+after a suspend rehearsal. Two tunnels at once were not tested.
+
+Assisted-by: Claude Fable 5.2
+Signed-off-by: Jim Martin <jimmartin@gmail.com>
+---
+ drivers/gpu/drm/msm/disp/dpu1/dpu_hw_top.c | 11 +++++---
+ drivers/gpu/drm/msm/disp/dpu1/dpu_hw_top.h |  6 +++--
+ drivers/gpu/drm/msm/disp/dpu1/dpu_kms.c    | 27 ++++++++++++-------
+ drivers/gpu/drm/msm/disp/dpu1/dpu_kms.h    |  7 +++--
+ drivers/gpu/drm/msm/dp/dp_display.c        | 30 +++++++++++++++------
+ drivers/gpu/drm/msm/msm_kms.c              | 13 ++++++++-
+ drivers/gpu/drm/msm/msm_kms.h              |  9 +++++--
+ drivers/thunderbolt/qcom-usb4-dp-link.c    |  2 +-
+ drivers/thunderbolt/qcom-usb4-dp.c         | 31 ++++++++++++++++------
+ drivers/thunderbolt/qcom-usb4-dp.h         |  7 ++++-
+ drivers/thunderbolt/qcom-usb4-host.c       | 16 ++++++-----
+ include/linux/soc/qcom/usb4-dp.h           | 10 +++++--
+ 12 files changed, 123 insertions(+), 46 deletions(-)
+
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_top.c b/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_top.c
+index 0be29e88e..7df8bb06a 100644
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_top.c
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_top.c
+@@ -22,16 +22,19 @@
+ #define TRAFFIC_SHAPER_WR_CLIENT(num)     (0x060 + (num * 4))
+ #define TRAFFIC_SHAPER_FIXPOINT_FACTOR    4
+ 
++/*
++ * One field per DP IN adapter of the USB4 host routers (two per router),
++ * holding the DP controller that feeds it: 1 to 3 for DPTX0 to DPTX2, 0 for
++ * none.
++ */
+ #define MDP_DP_USB4_MUX 0x464
+-#define MDP_DP_USB4_MUX_DP0_MASK 0x3
+ 
+-void dpu_hw_setup_usb4_dp_route(struct dpu_hw_mdp *mdp, u32 resource)
++void dpu_hw_setup_usb4_dp_route(struct dpu_hw_mdp *mdp, u32 mask, u32 route)
+ {
+ 	struct dpu_hw_blk_reg_map *c = &mdp->hw;
+ 	u32 val = DPU_REG_READ(c, MDP_DP_USB4_MUX);
+ 
+-	DPU_REG_WRITE(c, MDP_DP_USB4_MUX,
+-		      (val & ~MDP_DP_USB4_MUX_DP0_MASK) | resource);
++	DPU_REG_WRITE(c, MDP_DP_USB4_MUX, (val & ~mask) | (route & mask));
+ }
+ 
+ static void dpu_hw_setup_split_pipe(struct dpu_hw_mdp *mdp,
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_top.h b/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_top.h
+index 7d3b986e8..b16ef0954 100644
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_top.h
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_top.h
+@@ -156,8 +156,10 @@ struct dpu_hw_mdp {
+ 	struct dpu_hw_mdp_ops ops;
+ };
+ 
+-/* Caller must hold the DPU runtime-PM reference; Glymur DP0 only. */
+-void dpu_hw_setup_usb4_dp_route(struct dpu_hw_mdp *mdp, u32 resource);
++/* Glymur only; the caller must hold the DPU runtime-PM reference. */
++#define DPU_USB4_DP_ADAPTERS		6
++#define DPU_USB4_DP_ROUTE_MASK(adapter)	(0x3 << (4 * (adapter)))
++void dpu_hw_setup_usb4_dp_route(struct dpu_hw_mdp *mdp, u32 mask, u32 route);
+ 
+ struct dpu_hw_mdp *dpu_hw_mdptop_init(struct drm_device *dev,
+ 				      const struct dpu_mdp_cfg *cfg,
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_kms.c b/drivers/gpu/drm/msm/disp/dpu1/dpu_kms.c
+index fb3a67865..d4cc2c001 100644
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_kms.c
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_kms.c
+@@ -1069,21 +1069,28 @@ static void dpu_kms_mdp_snapshot(struct msm_disp_state *disp_state, struct msm_k
+ static void dpu_kms_restore_usb4_dp_route(struct dpu_kms *dpu_kms)
+ {
+ 	mutex_lock(&dpu_kms->usb4_route_lock);
+-	if (dpu_kms->usb4_dp_route_valid && dpu_kms->hw_mdp) {
+-		dpu_hw_setup_usb4_dp_route(dpu_kms->hw_mdp, dpu_kms->usb4_dp_route);
+-		dev_dbg(&dpu_kms->pdev->dev, "USB4 DP route restored: resource=%u\n",
+-			dpu_kms->usb4_dp_route);
++	if (dpu_kms->usb4_dp_route_mask && dpu_kms->hw_mdp) {
++		dpu_hw_setup_usb4_dp_route(dpu_kms->hw_mdp, dpu_kms->usb4_dp_route_mask,
++					   dpu_kms->usb4_dp_route);
++		dev_dbg(&dpu_kms->pdev->dev, "USB4 DP routes restored: %#x of %#x\n",
++			dpu_kms->usb4_dp_route, dpu_kms->usb4_dp_route_mask);
+ 	}
+ 	mutex_unlock(&dpu_kms->usb4_route_lock);
+ }
+ 
+-static int dpu_kms_set_usb4_dp_route(struct msm_kms *kms, unsigned int resource)
++/*
++ * Route DP controller @source (1 to 3 for DPTX0 to DPTX2, 0 for none) to DP IN
++ * adapter @adapter of the USB4 host routers (two per router, in order).
++ */
++static int dpu_kms_set_usb4_dp_route(struct msm_kms *kms, unsigned int adapter,
++				     unsigned int source)
+ {
+ 	struct dpu_kms *dpu_kms = to_dpu_kms(kms);
+ 	struct device *dev = &dpu_kms->pdev->dev;
++	u32 mask, route;
+ 	int ret;
+ 
+-	if (resource > 3)
++	if (adapter >= DPU_USB4_DP_ADAPTERS || source > 3)
+ 		return -EINVAL;
+ 	if (!of_device_is_compatible(dev->of_node, "qcom,glymur-dpu") ||
+ 	    !dpu_kms->hw_mdp)
+@@ -1094,12 +1101,14 @@ static int dpu_kms_set_usb4_dp_route(struct msm_kms *kms, unsigned int resource)
+ 	 * PM disabled during system sleep) cache the route: the resume
+ 	 * callback restores it.
+ 	 */
++	mask = DPU_USB4_DP_ROUTE_MASK(adapter);
++	route = source << (4 * adapter);
+ 	ret = pm_runtime_get_if_active(dev);
+ 	mutex_lock(&dpu_kms->usb4_route_lock);
+-	dpu_kms->usb4_dp_route = resource;
+-	dpu_kms->usb4_dp_route_valid = true;
++	dpu_kms->usb4_dp_route = (dpu_kms->usb4_dp_route & ~mask) | route;
++	dpu_kms->usb4_dp_route_mask |= mask;
+ 	if (ret > 0)
+-		dpu_hw_setup_usb4_dp_route(dpu_kms->hw_mdp, resource);
++		dpu_hw_setup_usb4_dp_route(dpu_kms->hw_mdp, mask, route);
+ 	mutex_unlock(&dpu_kms->usb4_route_lock);
+ 	if (ret > 0)
+ 		pm_runtime_put(dev);
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_kms.h b/drivers/gpu/drm/msm/disp/dpu1/dpu_kms.h
+index d66042fd9..fcfd78b01 100644
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_kms.h
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_kms.h
+@@ -84,10 +84,13 @@ struct dpu_kms {
+ 	struct dpu_hw_vbif *hw_vbif;
+ 	struct dpu_hw_mdp *hw_mdp;
+ 
+-	/* Desired DP-IN route, restored after the MDP power domain resumes. */
++	/*
++	 * Desired DP-IN routes, restored after the MDP power domain resumes:
++	 * the route register's fields that were set, and their values.
++	 */
+ 	struct mutex usb4_route_lock;
+ 	u32 usb4_dp_route;
+-	bool usb4_dp_route_valid;
++	u32 usb4_dp_route_mask;
+ 
+ 	bool has_danger_ctrl;
+ 
+diff --git a/drivers/gpu/drm/msm/dp/dp_display.c b/drivers/gpu/drm/msm/dp/dp_display.c
+index c41e6e2f4..f24697648 100644
+--- a/drivers/gpu/drm/msm/dp/dp_display.c
++++ b/drivers/gpu/drm/msm/dp/dp_display.c
+@@ -627,6 +627,15 @@ static void msm_dp_usb4_hpd_work(struct work_struct *work)
+ 		drm_kms_helper_hotplug_event(dp->drm_dev);
+ }
+ 
++/*
++ * DPTX0 to DPTX2 can feed a DP IN adapter of a USB4 host router: the route
++ * register has no value for DPTX3.
++ */
++static bool msm_dp_usb4_capable(struct msm_dp_display_private *dp)
++{
++	return dp->id <= MSM_DP_CONTROLLER_2 && !dp->msm_dp_display.is_edp;
++}
++
+ static int msm_dp_usb4_attach_locked(struct device *dev, struct drm_dp_aux *aux,
+ 		      const struct msm_dp_usb4_ops *ops, void *data)
+ {
+@@ -638,7 +647,7 @@ static int msm_dp_usb4_attach_locked(struct device *dev, struct drm_dp_aux *aux,
+ 	if (!dev_get_drvdata(dev))
+ 		return -EPROBE_DEFER;
+ 	dp = dev_get_dp_display_private(dev);
+-	if (dp->id != MSM_DP_CONTROLLER_0 || dp->msm_dp_display.is_edp)
++	if (!msm_dp_usb4_capable(dp))
+ 		return -ENODEV;
+ 	if (!dp->msm_dp_display.connector || !dp->drm_dev || !dp->drm_dev->registered)
+ 		return -EPROBE_DEFER;
+@@ -1867,15 +1876,16 @@ static const struct dev_pm_ops msm_dp_pm_ops = {
+ 				pm_runtime_force_resume)
+ };
+ 
+-static int msm_dp_usb4_route_locked(struct device *dev, unsigned int resource)
++static int msm_dp_usb4_route_locked(struct device *dev, unsigned int adapter,
++				    bool enable)
+ {
+ 	struct msm_dp_display_private *dp;
+ 	struct msm_drm_private *priv;
+ 
+-	if (!dev || !dev_get_drvdata(dev) || resource > 3)
++	if (!dev || !dev_get_drvdata(dev))
+ 		return -EINVAL;
+ 	dp = dev_get_dp_display_private(dev);
+-	if (dp->id != MSM_DP_CONTROLLER_0 || dp->msm_dp_display.is_edp ||
++	if (!msm_dp_usb4_capable(dp) ||
+ 	    !READ_ONCE(dp->usb4_bound) || !dp->drm_dev || !dev->parent ||
+ 	    !of_device_is_compatible(dev->parent->of_node, "qcom,glymur-mdss"))
+ 		return -ENODEV;
+@@ -1884,18 +1894,22 @@ static int msm_dp_usb4_route_locked(struct device *dev, unsigned int resource)
+ 	if (!priv || !priv->kms || !priv->kms->funcs->set_usb4_dp_route)
+ 		return -EOPNOTSUPP;
+ 
+-	/* MDP_TOP routing belongs to DPU and must survive its power collapse. */
+-	return priv->kms->funcs->set_usb4_dp_route(priv->kms, resource);
++	/*
++	 * MDP_TOP routing belongs to DPU and must survive its power collapse.
++	 * The route names this controller: 1 for DPTX0.
++	 */
++	return priv->kms->funcs->set_usb4_dp_route(priv->kms, adapter,
++						   enable ? dp->id + 1 : 0);
+ }
+ 
+-int msm_dp_usb4_route(struct device *dev, unsigned int resource)
++int msm_dp_usb4_route(struct device *dev, unsigned int adapter, bool enable)
+ {
+ 	int ret;
+ 
+ 	if (!dev)
+ 		return -EINVAL;
+ 	device_lock(dev);
+-	ret = msm_dp_usb4_route_locked(dev, resource);
++	ret = msm_dp_usb4_route_locked(dev, adapter, enable);
+ 	device_unlock(dev);
+ 	return ret;
+ }
+diff --git a/drivers/gpu/drm/msm/msm_kms.c b/drivers/gpu/drm/msm/msm_kms.c
+index 0f5752462..c0a10f63d 100644
+--- a/drivers/gpu/drm/msm/msm_kms.c
++++ b/drivers/gpu/drm/msm/msm_kms.c
+@@ -346,6 +346,9 @@ int msm_drm_kms_init(struct device *dev, const struct drm_driver *drv)
+  * after the router is running again after resume. Calls are serialized by
+  * the system-sleep notifier chain. The ordinary device PM callbacks must
+  * neither overwrite this state nor restore it early.
++ *
++ * Each router with a tunnel is an owner: the first one saves the state and
++ * the last one to return restores it.
+  */
+ bool msm_kms_usb4_sleep_blocked(struct msm_kms *kms)
+ {
+@@ -360,7 +363,11 @@ int msm_kms_usb4_sleep_prepare(struct drm_device *ddev)
+ 
+ 	if (!priv || !priv->kms)
+ 		return -ENODEV;
+-	if (priv->kms->usb4_sleep_owned || ddev->mode_config.suspend_state)
++	if (priv->kms->usb4_sleep_owned) {
++		priv->kms->usb4_sleep_owners++;
++		return 0;
++	}
++	if (ddev->mode_config.suspend_state)
+ 		return -EBUSY;
+ 	/*
+ 	 * Block new commits while taking the snapshot, including from a desktop
+@@ -372,6 +379,8 @@ int msm_kms_usb4_sleep_prepare(struct drm_device *ddev)
+ 	ret = drm_mode_config_helper_suspend(ddev);
+ 	if (ret)
+ 		WRITE_ONCE(priv->kms->usb4_sleep_owned, false);
++	else
++		priv->kms->usb4_sleep_owners = 1;
+ 	WRITE_ONCE(priv->kms->usb4_sleep_task, NULL);
+ 	return ret;
+ }
+@@ -383,6 +392,8 @@ int msm_kms_usb4_sleep_complete(struct drm_device *ddev)
+ 
+ 	if (!priv || !priv->kms || !priv->kms->usb4_sleep_owned)
+ 		return 0;
++	if (--priv->kms->usb4_sleep_owners)
++		return 0;
+ 	WRITE_ONCE(priv->kms->usb4_sleep_task, current);
+ 	ret = drm_mode_config_helper_resume(ddev);
+ 	WRITE_ONCE(priv->kms->usb4_sleep_owned, false);
+diff --git a/drivers/gpu/drm/msm/msm_kms.h b/drivers/gpu/drm/msm/msm_kms.h
+index baf91ce4b..dd91b052a 100644
+--- a/drivers/gpu/drm/msm/msm_kms.h
++++ b/drivers/gpu/drm/msm/msm_kms.h
+@@ -24,7 +24,8 @@
+  */
+ struct msm_kms_funcs {
+ 	/* Optional DP-IN routing, including power-domain state restoration. */
+-	int (*set_usb4_dp_route)(struct msm_kms *kms, unsigned int resource);
++	int (*set_usb4_dp_route)(struct msm_kms *kms, unsigned int adapter,
++				 unsigned int source);
+ 	/* hw initialization: */
+ 	int (*hw_init)(struct msm_kms *kms);
+ 	/* irq handling: */
+@@ -140,7 +141,11 @@ struct msm_drm_thread {
+ struct msm_kms {
+ 	const struct msm_kms_funcs *funcs;
+ 	struct drm_device *dev;
+-	/* USB4 owns the saved modeset state until its provider is back. */
++	/*
++	 * USB4 owns the saved modeset state until its providers are back: one
++	 * owner per DP controller with a tunnel.
++	 */
++	unsigned int usb4_sleep_owners;
+ 	bool usb4_sleep_owned;
+ 	struct task_struct *usb4_sleep_task;
+ 
+diff --git a/drivers/thunderbolt/qcom-usb4-dp-link.c b/drivers/thunderbolt/qcom-usb4-dp-link.c
+index 4edcd3ed8..2676f72ec 100644
+--- a/drivers/thunderbolt/qcom-usb4-dp-link.c
++++ b/drivers/thunderbolt/qcom-usb4-dp-link.c
+@@ -1,6 +1,6 @@
+ // SPDX-License-Identifier: GPL-2.0-only
+ /*
+- * DisplayPort IN adapter link protocol of Glymur USB4 host router 0, DP IN 0.
++ * DisplayPort IN adapter link protocol of a Glymur USB4 host router, DP IN 0.
+  * The adapter register offsets are those of that adapter; tested only on the
+  * Surface Laptop 8. Capability publication follows real receiver reads; it is
+  * not a bypass of the connection manager's DPRX completion check.
+diff --git a/drivers/thunderbolt/qcom-usb4-dp.c b/drivers/thunderbolt/qcom-usb4-dp.c
+index 288da863e..b2dadf444 100644
+--- a/drivers/thunderbolt/qcom-usb4-dp.c
++++ b/drivers/thunderbolt/qcom-usb4-dp.c
+@@ -1,6 +1,11 @@
+ // SPDX-License-Identifier: GPL-2.0-only
+ /*
+- * Experimental display owner for DP IN 0 of Glymur USB4 host router 0.
++ * Experimental display owner for DP IN 0 of a Glymur USB4 host router.
++ *
++ * Each router is paired with one DP controller, the one the platform's
++ * Windows display driver prefers for it (it takes another of DPTX0 to DPTX2
++ * if that one is busy; this driver does not). The second DP IN adapter of a
++ * router is not used.
+  *
+  * The firmware's op-4 mailbox messages are requests to the display owner,
+  * not adapter hardware commands. Service them independently of the USB4
+@@ -66,6 +71,10 @@
+ struct qcom_usb4_dp {
+ 	struct device *dev;
+ 	void __iomem *router;
++	/* The DP controller that feeds this router, by platform device name. */
++	const char *display_name;
++	/* DP IN 0's index among the routers' DP IN adapters, two per router. */
++	unsigned int route;
+ 	struct device *display;
+ 	/* Retained across stop/reprobe until the saved display state is restored. */
+ 	struct device *sleep_display;
+@@ -562,7 +571,7 @@ static void dp_mailbox_work(struct work_struct *work)
+ 			break;
+ 		case 0x1104:
+ 			if (!adapter && !dp->fifo_fault && !dp->release_failed) {
+-				ret = msm_dp_usb4_route(dp->display, 1);
++				ret = msm_dp_usb4_route(dp->display, dp->route, true);
+ 				if (!ret) {
+ 					writel(readl(base + DP_IRQ_ENABLE) | DP_IRQ_RESOURCE,
+ 					       base + DP_IRQ_ENABLE);
+@@ -601,7 +610,7 @@ static void dp_mailbox_work(struct work_struct *work)
+ 			ret = msm_dp_usb4_hpd_sync(dp->display, false, false);
+ 			dev_dbg(dp->dev, "USB4 release: HPD sync return %d\n", ret);
+ 			if (!ret)
+-				ret = msm_dp_usb4_route(dp->display, 0);
++				ret = msm_dp_usb4_route(dp->display, dp->route, false);
+ 			dev_dbg(dp->dev, "USB4 release: route return %d, clear resource\n", ret);
+ 			writel(readl(dp->router + 0x84078) & ~BIT(31),
+ 			       dp->router + 0x84078);
+@@ -746,7 +755,8 @@ void qcom_usb4_dp_restart(struct qcom_usb4_dp *dp)
+ 	mutex_unlock(&dp->lifecycle_lock);
+ }
+ 
+-struct qcom_usb4_dp *qcom_usb4_dp_create(struct device *dev, void __iomem *router)
++struct qcom_usb4_dp *qcom_usb4_dp_create(struct device *dev, void __iomem *router,
++					 unsigned int port, const char *display)
+ {
+ 	struct qcom_usb4_dp *dp;
+ 
+@@ -755,6 +765,8 @@ struct qcom_usb4_dp *qcom_usb4_dp_create(struct device *dev, void __iomem *route
+ 		return ERR_PTR(-ENOMEM);
+ 	dp->dev = dev;
+ 	dp->router = router;
++	dp->display_name = display;
++	dp->route = 2 * port;
+ 	mutex_init(&dp->lifecycle_lock);
+ 	mutex_init(&dp->state_lock);
+ 	mutex_init(&dp->fifo_lock);
+@@ -763,7 +775,9 @@ struct qcom_usb4_dp *qcom_usb4_dp_create(struct device *dev, void __iomem *route
+ 	INIT_WORK(&dp->link_work, qcom_usb4_dp_link_work);
+ 	INIT_DELAYED_WORK(&dp->mailbox_work, dp_mailbox_work);
+ 	INIT_DELAYED_WORK(&dp->caps_work, dp_caps_work);
+-	dp->aux.name = "USB4 router 0 DP IN 0";
++	dp->aux.name = devm_kasprintf(dev, GFP_KERNEL, "USB4 router %u DP IN 0", port);
++	if (!dp->aux.name)
++		return ERR_PTR(-ENOMEM);
+ 	dp->aux.dev = dev;
+ 	dp->aux.transfer = dp_aux_transfer;
+ 	dp->aux.no_zero_sized = true;
+@@ -792,7 +806,7 @@ int qcom_usb4_dp_enable(struct qcom_usb4_dp *dp)
+ 		}
+ 	}
+ 	dp->display = bus_find_device_by_name(&platform_bus_type, NULL,
+-					      "af54000.displayport-controller");
++					      dp->display_name);
+ 	if (!dp->display) {
+ 		ret = -EPROBE_DEFER;
+ 		goto out;
+@@ -808,7 +822,8 @@ int qcom_usb4_dp_enable(struct qcom_usb4_dp *dp)
+ 		goto put_runtime;
+ 	WRITE_ONCE(dp->enabled, true);
+ 	queue_delayed_work(system_unbound_wq, &dp->mailbox_work, 0);
+-	dev_dbg(dp->dev, "DP0 mailbox owner and router AUX enabled\n");
++	dev_dbg(dp->dev, "DP IN 0 mailbox owner and router AUX enabled, display %s\n",
++		dp->display_name);
+ 	/* Discovery failure does not undo the live owner. A later link event
+ 	 * can retry without creating an unbound child with active callbacks.
+ 	 */
+@@ -847,7 +862,7 @@ int qcom_usb4_dp_disable(struct qcom_usb4_dp *dp, bool force)
+ 	cancel_delayed_work_sync(&dp->mailbox_work);
+ 	cancel_delayed_work_sync(&dp->caps_work);
+ 	msm_dp_usb4_detach(dp->display);
+-	msm_dp_usb4_route(dp->display, 0);
++	msm_dp_usb4_route(dp->display, dp->route, false);
+ 	writel(readl(dp->router + 0x84078) & ~BIT(31), dp->router + 0x84078);
+ 	/* Detach has stopped producer transfers; drain direct AUX users too. */
+ 	mutex_lock(&dp->fifo_lock);
+diff --git a/drivers/thunderbolt/qcom-usb4-dp.h b/drivers/thunderbolt/qcom-usb4-dp.h
+index 96843cff7..81d7bf478 100644
+--- a/drivers/thunderbolt/qcom-usb4-dp.h
++++ b/drivers/thunderbolt/qcom-usb4-dp.h
+@@ -12,7 +12,12 @@ void qcom_usb4_dp_set_connected(struct qcom_usb4_dp *dp, bool connected);
+ void qcom_usb4_dp_stop(struct qcom_usb4_dp *dp);
+ void qcom_usb4_dp_restart(struct qcom_usb4_dp *dp);
+ 
+-struct qcom_usb4_dp *qcom_usb4_dp_create(struct device *dev, void __iomem *router);
++/*
++ * @port is the router's index; @display the platform device name of the DP
++ * controller that feeds its DP IN 0 adapter.
++ */
++struct qcom_usb4_dp *qcom_usb4_dp_create(struct device *dev, void __iomem *router,
++					 unsigned int port, const char *display);
+ int qcom_usb4_dp_enable(struct qcom_usb4_dp *dp);
+ int qcom_usb4_dp_disable(struct qcom_usb4_dp *dp, bool force);
+ bool qcom_usb4_dp_active(struct qcom_usb4_dp *dp);
+diff --git a/drivers/thunderbolt/qcom-usb4-host.c b/drivers/thunderbolt/qcom-usb4-host.c
+index c30de0f37..ed574d38c 100644
+--- a/drivers/thunderbolt/qcom-usb4-host.c
++++ b/drivers/thunderbolt/qcom-usb4-host.c
+@@ -3,8 +3,7 @@
+  * Qualcomm Glymur USB4 host router platform frontend.
+  *
+  * Experimental. Routers 0 and 1 have startup profiles, for the Surface
+- * Laptop 8 only; router 1 has no DisplayPort owner yet, so it tunnels USB3
+- * but no display. The driver connects the cold-start sequence, the MCU
++ * Laptop 8 only. The driver connects the cold-start sequence, the MCU
+  * firmware/mailbox helpers and the line-interrupt NHI adapter to the common
+  * Thunderbolt/USB4 core, and takes Type-C tunnelling requests from the
+  * platform's alternate-mode driver.
+@@ -99,8 +98,11 @@ struct qcom_usb4_router_desc {
+ 	enum qcom_usb4_start_profile profile;
+ 	size_t ram_size;
+ 	u32 lane0_status;
+-	/* Only router 0's DisplayPort IN adapters have a display owner. */
+-	bool display;
++	/*
++	 * The DP controller that feeds the router's DP IN 0 adapter, by
++	 * platform device name: DPTX0 for router 0, DPTX1 for router 1.
++	 */
++	const char *display;
+ 	/*
+ 	 * The start-up touches router registers (0xe030 and after) that reset
+ 	 * the SoC unless the tunnelled PCIe power domain is on as well.
+@@ -114,13 +116,14 @@ static const struct qcom_usb4_router_desc qcom_usb4_routers[] = {
+ 		.profile = QCOM_USB4_START_SURFACE_A8_PORT0,
+ 		.ram_size = 0xf000,
+ 		.lane0_status = 0x2050,
+-		.display = true,
++		.display = "af54000.displayport-controller",
+ 	},
+ 	[1] = {
+ 		.layout = QCOM_USB4_MCU_V2,
+ 		.profile = QCOM_USB4_START_SURFACE_A8_PORT1,
+ 		.ram_size = 0x11000,
+ 		.lane0_status = 0x2058,
++		.display = "af5c000.displayport-controller",
+ 		.pcie_tunnel_domain = true,
+ 	},
+ };
+@@ -1654,7 +1657,8 @@ static int qcom_usb4_host_probe(struct platform_device *pdev)
+ 	if (ret)
+ 		return ret;
+ 	if (host->desc->display) {
+-		host->dp = qcom_usb4_dp_create(dev, host->router);
++		host->dp = qcom_usb4_dp_create(dev, host->router, host->port,
++					       host->desc->display);
+ 		if (IS_ERR(host->dp))
+ 			return PTR_ERR(host->dp);
+ 	}
+diff --git a/include/linux/soc/qcom/usb4-dp.h b/include/linux/soc/qcom/usb4-dp.h
+index fd1528fa7..335f88691 100644
+--- a/include/linux/soc/qcom/usb4-dp.h
++++ b/include/linux/soc/qcom/usb4-dp.h
+@@ -37,7 +37,12 @@ void msm_dp_usb4_detach(struct device *dev);
+ int msm_dp_usb4_hpd(struct device *dev, bool connected, bool irq);
+ /* Returns -EBUSY on disconnect while DRM still owns an active/prepared link. */
+ int msm_dp_usb4_hpd_sync(struct device *dev, bool connected, bool irq);
+-int msm_dp_usb4_route(struct device *dev, unsigned int resource);
++/*
++ * Route this controller to DP IN adapter @adapter of the USB4 host routers
++ * (two per router: 0 and 1 on router 0, 2 and 3 on router 1), or release
++ * the adapter's route.
++ */
++int msm_dp_usb4_route(struct device *dev, unsigned int adapter, bool enable);
+ /* Paired system-sleep calls; restore after the provider has returned. */
+ int msm_dp_usb4_sleep_prepare(struct device *dev);
+ int msm_dp_usb4_sleep_complete(struct device *dev);
+@@ -49,7 +54,8 @@ static inline int msm_dp_usb4_hpd(struct device *dev, bool connected, bool irq)
+ { return -ENODEV; }
+ static inline int msm_dp_usb4_hpd_sync(struct device *dev, bool connected, bool irq)
+ { return -ENODEV; }
+-static inline int msm_dp_usb4_route(struct device *dev, unsigned int resource)
++static inline int msm_dp_usb4_route(struct device *dev, unsigned int adapter,
++				    bool enable)
+ { return -ENODEV; }
+ static inline int msm_dp_usb4_sleep_prepare(struct device *dev)
+ { return -ENODEV; }
+-- 
+2.56.0
+

@@ -1,0 +1,155 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jim Martin <jimmartin@gmail.com>
+Date: Thu, 8 Oct 2026 13:45:13 -0500
+Subject: [PATCH] drm/msm/dpu: use the DSC 1.2 initial line calculation for DP
+ on DPU 7 and later
+
+DPU 7 and later use the DSC 1.2 encoder blocks (dpu_hw_dsc_1_2.c), but
+dpu_encoder_prep_dsc() still sizes their initial line delay with the
+DSC 1.1 estimate. The DSC 1.2 encoder's output buffer and sub-stream
+multiplexer add latency that grows with the slice chunk size, which that
+estimate does not include, so wide slices get fewer initial lines than
+the encoder needs.
+
+For DisplayPort interfaces on DPU 7 and later, compute the initial lines
+as Qualcomm's downstream display driver does, from the output buffer
+width, the multiplexer word size and the number of soft slices each
+encoder handles (half the slices when two encoders are merged). DSI
+panels and older DPUs keep the DSC 1.1 estimate, since only compressed
+DisplayPort streams have been tested.
+
+Assisted-by: Opus 5.5
+Signed-off-by: Jim Martin <jimmartin@gmail.com>
+---
+ drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.c | 84 ++++++++++++++++++++-
+ 1 file changed, 82 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.c b/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.c
+index 560af336e45..fada24cdb1a 100644
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.c
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.c
+@@ -1977,6 +1977,70 @@ dpu_encoder_dsc_initial_line_calc(struct drm_dsc_config *dsc,
+ 	return DIV_ROUND_UP(total_pixels, dsc->slice_width);
+ }
+ 
++/*
++ * Initial line latency for the DSC 1.2 encoders (DPU 7 and later), computed
++ * as Qualcomm's downstream display driver does. The encoder's output buffer
++ * and the sub-stream multiplexer add latency that grows with the slice
++ * chunk, so wide slices need more lines than the DSC 1.1 estimate above
++ * allows.
++ */
++static u32
++dpu_encoder_dsc_1_2_initial_line_calc(const struct drm_dsc_config *dsc,
++				      u32 dsc_common_mode,
++				      u32 num_active_ss_per_enc)
++{
++	const int rtl_max_bpc = 10, rtl_output_data_width = 64;
++	const int pipeline_latency = 28;
++	int bpc = dsc->bits_per_component;
++	int bpp = dsc->bits_per_pixel >> 4;
++	bool native_422 = dsc->native_422;
++	bool native_420 = dsc->native_420;
++	bool multiplex = dsc_common_mode & DSC_MODE_MULTIPLEX;
++	bool split_panel = dsc_common_mode & DSC_MODE_SPLIT_PANEL;
++	int max_muxword_size, max_se_size, max_ssm_delay, mux_word_size;
++	int compress_bpp_group, input_ssm_out_latency, rtl_num_components;
++	int ob_data_width, obuf_latency, base_hs_latency, chunk_bits;
++	int output_rate_ratio_complement, output_rate_extra_budget_bits;
++	int multi_hs_extra_budget_bits, multi_hs_extra_latency;
++	int container_slice_width;
++
++	container_slice_width = native_422 ? dsc->slice_width / 2 : dsc->slice_width;
++	max_muxword_size = (rtl_max_bpc >= 12) ? 64 : 48;
++	max_se_size = 4 * (rtl_max_bpc + 1);
++	max_ssm_delay = max_se_size + max_muxword_size - 1;
++	mux_word_size = (bpc >= 12) ? 64 : 48;
++	compress_bpp_group = native_422 ? (2 * bpp) : bpp;
++	input_ssm_out_latency = pipeline_latency +
++		3 * (max_ssm_delay + 2) * num_active_ss_per_enc;
++	rtl_num_components = (native_420 || native_422) ? 4 : 3;
++	if (rtl_num_components == 4)
++		ob_data_width = (rtl_output_data_width >= 2 * max_muxword_size) ?
++			rtl_output_data_width : 2 * rtl_output_data_width;
++	else
++		ob_data_width = (rtl_output_data_width >= max_muxword_size) ?
++			rtl_output_data_width : 2 * rtl_output_data_width;
++	obuf_latency = DIV_ROUND_UP(9 * ob_data_width + mux_word_size,
++				    compress_bpp_group) + 1;
++	base_hs_latency = dsc->initial_xmit_delay + input_ssm_out_latency +
++			  obuf_latency;
++	chunk_bits = 8 * dsc->slice_chunk_size;
++	output_rate_ratio_complement = ob_data_width - compress_bpp_group;
++	output_rate_extra_budget_bits =
++		(output_rate_ratio_complement * chunk_bits) >>
++		((ob_data_width == 128) ? 7 : 6);
++	if (split_panel && multiplex)
++		multi_hs_extra_budget_bits = chunk_bits;
++	else if (num_active_ss_per_enc > 1 && ob_data_width > compress_bpp_group)
++		multi_hs_extra_budget_bits = chunk_bits;
++	else
++		multi_hs_extra_budget_bits = output_rate_extra_budget_bits;
++	multi_hs_extra_latency = DIV_ROUND_UP(multi_hs_extra_budget_bits,
++					      compress_bpp_group);
++
++	return DIV_ROUND_UP(base_hs_latency + multi_hs_extra_latency,
++			    container_slice_width);
++}
++
+ static void dpu_encoder_dsc_pipe_cfg(struct dpu_hw_ctl *ctl,
+ 				     struct dpu_hw_dsc *hw_dsc,
+ 				     struct dpu_hw_pingpong *hw_pp,
+@@ -2007,6 +2071,7 @@ static void dpu_encoder_prep_dsc(struct dpu_encoder_virt *dpu_enc,
+ 				 struct drm_dsc_config *dsc)
+ {
+ 	struct dpu_encoder_phys *enc_master = dpu_enc->cur_master;
++	struct dpu_kms *dpu_kms = enc_master->dpu_kms;
+ 	struct dpu_hw_ctl *ctl = enc_master->hw_ctl;
+ 	struct dpu_hw_dsc *hw_dsc[MAX_CHANNELS_PER_ENC];
+ 	struct dpu_hw_pingpong *hw_pp[MAX_CHANNELS_PER_ENC];
+@@ -2015,6 +2080,7 @@ static void dpu_encoder_prep_dsc(struct dpu_encoder_virt *dpu_enc,
+ 	int dsc_common_mode;
+ 	int pic_width;
+ 	u32 initial_lines;
++	bool dsc_merge;
+ 	int num_dsc = 0;
+ 	int i;
+ 
+@@ -2030,10 +2096,12 @@ static void dpu_encoder_prep_dsc(struct dpu_encoder_virt *dpu_enc,
+ 
+ 	pic_width = dsc->pic_width;
+ 
++	dsc_merge = dpu_encoder_use_dsc_merge(enc_master->parent);
++
+ 	dsc_common_mode = 0;
+ 	if (num_dsc > 1)
+ 		dsc_common_mode |= DSC_MODE_SPLIT_PANEL;
+-	if (dpu_encoder_use_dsc_merge(enc_master->parent))
++	if (dsc_merge)
+ 		dsc_common_mode |= DSC_MODE_MULTIPLEX;
+ 	if (enc_master->intf_mode == INTF_MODE_VIDEO)
+ 		dsc_common_mode |= DSC_MODE_VIDEO;
+@@ -2042,7 +2110,19 @@ static void dpu_encoder_prep_dsc(struct dpu_encoder_virt *dpu_enc,
+ 	intf_ip_w = this_frame_slices * dsc->slice_width;
+ 
+ 	enc_ip_w = intf_ip_w / num_dsc;
+-	initial_lines = dpu_encoder_dsc_initial_line_calc(dsc, enc_ip_w);
++
++	/* Tested only for DisplayPort; DSI panels keep the DSC 1.1 estimate. */
++	if (dpu_kms->catalog->mdss_ver->core_major_ver >= 7 &&
++	    dpu_enc->disp_info.intf_type == INTF_DP) {
++		u32 ss_per_enc = dsc->slice_count;
++
++		if (dsc_merge)
++			ss_per_enc /= 2;
++		initial_lines = dpu_encoder_dsc_1_2_initial_line_calc(dsc, dsc_common_mode,
++								      max(ss_per_enc, 1U));
++	} else {
++		initial_lines = dpu_encoder_dsc_initial_line_calc(dsc, enc_ip_w);
++	}
+ 
+ 	for (i = 0; i < num_dsc; i++)
+ 		dpu_encoder_dsc_pipe_cfg(ctl, hw_dsc[i], hw_pp[i],
+-- 
+2.56.0
+

@@ -28,15 +28,17 @@
 
 set -euo pipefail
 
-# Where each channel's Arch packages come from, as in build/Dockerfile.
-# Arch Linux ARM has no snapshots: every channel follows the live mirror,
-# so on aarch64 only the Omarchy repository differs between channels.
+# Where each channel's Arch packages come from, as in build/Dockerfile:
+# Omarchy's mirrors of Arch for x86_64 and of Arch Linux ARM for aarch64, a
+# snapshot each for rc and stable.
 channel_mirror() { # channel_mirror <channel> <arch>
   case "$2:$1" in
     x86_64:stable) echo 'https://stable-mirror.omarchy.org/$repo/os/$arch' ;;
     x86_64:rc) echo 'https://rc-mirror.omarchy.org/$repo/os/$arch' ;;
     x86_64:edge) echo 'https://mirror.omarchy.org/$repo/os/$arch' ;;
-    aarch64:*) echo 'https://fl.us.mirror.archlinuxarm.org/aarch64/$repo' ;;
+    aarch64:stable) echo 'https://arm-stable-mirror.omarchy.org/$arch/$repo' ;;
+    aarch64:rc) echo 'https://arm-rc-mirror.omarchy.org/$arch/$repo' ;;
+    aarch64:edge) echo 'https://arm-mirror.omarchy.org/$arch/$repo' ;;
     *) return 1 ;;
   esac
 }

@@ -97,8 +97,16 @@ out=$(printf '%s\n' libQt6Core.so.6 libpython3.14.so.1.0 libQt5Gui.so.5 libgtk-4
 
 [[ $(channel_mirror stable x86_64) == 'https://stable-mirror.omarchy.org/$repo/os/$arch' ]] \
   && pass "stable resolves to its Arch snapshot" || fail "stable mirror"
-[[ $(channel_mirror rc aarch64) == *archlinuxarm.org* ]] \
-  && pass "aarch64 follows Arch Linux ARM on every channel" || fail "aarch64 mirror"
-grep -q "$(channel_mirror stable x86_64)" "$ROOT/build/Dockerfile" \
-  && grep -q "$(channel_mirror rc x86_64)" "$ROOT/build/Dockerfile" \
-  && pass "the channel mirrors match build/Dockerfile" || fail "mirrors drifted from build/Dockerfile"
+[[ $(channel_mirror rc aarch64) == 'https://arm-rc-mirror.omarchy.org/$arch/$repo' ]] \
+  && pass "aarch64 rc resolves to its Arch Linux ARM snapshot" || fail "aarch64 mirror"
+drifted=""
+for arch in x86_64 aarch64; do
+  for channel in stable rc edge; do
+    grep -qF "Server = $(channel_mirror "$channel" "$arch")" "$ROOT/build/Dockerfile" || drifted+=" $arch:$channel"
+  done
+done
+[[ -z $drifted ]] && pass "the channel mirrors match build/Dockerfile" || fail "mirrors drifted from build/Dockerfile:$drifted"
+! grep -q 'ARCH == aarch64' "$ROOT/bin/check-fast-ring" \
+  && pass "aarch64 rc and stable are checked against their own snapshots" || fail "check-fast-ring still skips aarch64's channels"
+! grep -rq 'archlinuxarm\.org' "$ROOT/build" "$ROOT/bin" "$ROOT/helpers" \
+  && pass "nothing builds or checks against Arch Linux ARM's own mirrors" || fail "Arch Linux ARM's own mirror is still named: $(grep -rl 'archlinuxarm\.org' "$ROOT/build" "$ROOT/bin" "$ROOT/helpers")"

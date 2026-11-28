@@ -1,0 +1,1330 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jim Martin <jimmartin@gmail.com>
+Date: Thu, 8 Oct 2026 15:51:02 -0500
+Subject: [PATCH] thunderbolt: qcom: Add the Glymur USB4 DisplayPort IN adapter
+
+On Glymur the DisplayPort stream for a USB4 tunnel comes from the msm
+DisplayPort controller, which drives the router's DP IN adapter instead
+of the PHY. The router firmware asks the host, as the display owner, to
+allocate and release that adapter through a per-adapter request and
+reply mailbox, and the host reaches the sink's DPCD through the
+adapter's AUX FIFO instead of a native AUX channel.
+
+Add a display owner for DP IN 0 of router 0:
+- a worker that answers the firmware's allocate and release requests,
+  hands the DP controller over to the tunnel through the msm DP USB4
+  interface, and hands it back on release;
+- an AUX channel over the adapter FIFO, and the control messages that
+  negotiate capabilities with the far DP OUT adapter, configure the
+  producer, train the link and set FEC readiness;
+- a child device that exists only while a USB4 or Thunderbolt partner
+  is connected, so the DRM side can defer until its connector exists
+  without deferring the Type-C mux;
+- save and restore of the display state around system sleep.
+
+The display owner uses the USB4 interface of the msm DisplayPort driver
+(<linux/soc/qcom/usb4-dp.h>). The adapter register layout, the reset,
+link-down, clock-sync and control-completion sequences, and the mailbox
+codes match what the platform's Windows driver programs on the Surface
+Laptop 8.
+
+Assisted-by: Opus 5.5
+Signed-off-by: Jim Martin <jimmartin@gmail.com>
+---
+ drivers/thunderbolt/qcom-usb4-dp-link.c | 252 +++++++
+ drivers/thunderbolt/qcom-usb4-dp-link.h |  20 +
+ drivers/thunderbolt/qcom-usb4-dp.c      | 965 ++++++++++++++++++++++++
+ drivers/thunderbolt/qcom-usb4-dp.h      |  23 +
+ 4 files changed, 1260 insertions(+)
+ create mode 100644 drivers/thunderbolt/qcom-usb4-dp-link.c
+ create mode 100644 drivers/thunderbolt/qcom-usb4-dp-link.h
+ create mode 100644 drivers/thunderbolt/qcom-usb4-dp.c
+ create mode 100644 drivers/thunderbolt/qcom-usb4-dp.h
+
+diff --git a/drivers/thunderbolt/qcom-usb4-dp-link.c b/drivers/thunderbolt/qcom-usb4-dp-link.c
+new file mode 100644
+index 00000000000..4edcd3ed823
+--- /dev/null
++++ b/drivers/thunderbolt/qcom-usb4-dp-link.c
+@@ -0,0 +1,252 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * DisplayPort IN adapter link protocol of Glymur USB4 host router 0, DP IN 0.
++ * The adapter register offsets are those of that adapter; tested only on the
++ * Surface Laptop 8. Capability publication follows real receiver reads; it is
++ * not a bypass of the connection manager's DPRX completion check.
++ */
++#include <linux/bitops.h>
++#include <linux/delay.h>
++#include <linux/errno.h>
++#include <linux/iopoll.h>
++#include <linux/printk.h>
++#include <drm/display/drm_dp_helper.h>
++
++#include "qcom-usb4-dp-link.h"
++
++#define DP_LOCAL		0x6038
++#define DP_REMOTE	0x603c
++#define DP_COMMON	0x6044
++#define DP_LOCAL_WRITE	0x84070
++#define DP_COMMON_WRITE	0x84078
++#define DP_STATUS	0x83154
++#define DP_ACK		0x83158
++
++static u32 field(u32 word, u32 mask)
++{
++	return (word & mask) >> __ffs(mask);
++}
++
++static u32 replace(u32 word, u32 mask, u32 value)
++{
++	return (word & ~mask) | ((value << __ffs(mask)) & mask);
++}
++
++static void update(void __iomem *router, unsigned int offset, u32 mask, u32 val)
++{
++	writel((readl(router + offset) & ~mask) | (val & mask), router + offset);
++}
++
++static u32 intersect(u32 local, u32 remote, u32 common)
++{
++	static const u32 masks[] = {
++		GENMASK(3, 0), GENMASK(7, 4), GENMASK(11, 8), GENMASK(14, 12),
++		BIT(15), BIT(22), BIT(24), BIT(25), BIT(26), BIT(27), BIT(29),
++	};
++	unsigned int i;
++
++	for (i = 0; i < ARRAY_SIZE(masks); i++) {
++		u32 a = field(local, masks[i]), b = field(remote, masks[i]);
++		bool maximum = masks[i] & (BIT(25) | BIT(27) | BIT(29));
++
++		common = replace(common, masks[i], maximum ? max(a, b) : min(a, b));
++	}
++	return common & ~BIT(31);
++}
++
++static int rate_index(unsigned int rate)
++{
++	switch (rate) {
++	case 162000: return 0;
++	case 270000: return 1;
++	case 540000: return 2;
++	case 810000: return 3;
++	default: return -EINVAL;
++	}
++}
++
++static u8 link_byte(u32 caps, unsigned int rate, unsigned int lanes)
++{
++	return (caps & BIT(24) ? BIT(7) : 0) |
++	       (caps & BIT(22) ? BIT(6) : 0) | BIT(4) |
++	       ((rate & 2) << 4) | (lanes << 1) | (rate & 1);
++}
++
++int qcom_usb4_dp_negotiate_caps(void __iomem *router, struct drm_dp_aux *aux,
++			      qcom_usb4_dp_control_fn control, void *ctx)
++{
++	u8 caps[DP_RECEIVER_CAP_SIZE], tx[4] = {};
++	u32 local, common, revision, lanes;
++	int rate, ret;
++
++	local = readl(router + DP_LOCAL);
++	common = intersect(local, readl(router + DP_REMOTE),
++			   readl(router + DP_COMMON));
++	writel(common, router + DP_COMMON_WRITE);
++	ret = drm_dp_dpcd_read(aux, DP_DPCD_REV, caps, sizeof(caps));
++	if (ret != sizeof(caps))
++		return ret < 0 ? ret : -EIO;
++	if (caps[DP_TRAINING_AUX_RD_INTERVAL] & DP_EXTENDED_RECEIVER_CAP_FIELD_PRESENT) {
++		ret = drm_dp_dpcd_read(aux, DP_DP13_DPCD_REV, caps, sizeof(caps));
++		if (ret != sizeof(caps))
++			return ret < 0 ? ret : -EIO;
++	}
++	if (caps[0] < 0x11 || caps[0] > 0x14)
++		return -EOPNOTSUPP;
++	revision = caps[0] - 0x11;
++	rate = rate_index(drm_dp_bw_code_to_link_rate(caps[DP_MAX_LINK_RATE]));
++	lanes = caps[DP_MAX_LANE_COUNT] & DP_MAX_LANE_COUNT_MASK;
++	if (rate < 0 || (lanes != 1 && lanes != 2 && lanes != 4))
++		return -EOPNOTSUPP;
++	lanes = __ffs(lanes);
++	common = replace(common, GENMASK(7, 4), min(field(common, GENMASK(7, 4)), revision));
++	common = replace(common, GENMASK(11, 8), min_t(u32, field(common, GENMASK(11, 8)), rate));
++	common = replace(common, GENMASK(14, 12), min(field(common, GENMASK(14, 12)), lanes));
++	if (!(caps[DP_MAX_LANE_COUNT] & DP_ENHANCED_FRAME_CAP))
++		common &= ~BIT(15);
++	if (!(caps[DP_MAX_LANE_COUNT] & DP_TPS3_SUPPORTED))
++		common &= ~BIT(22);
++	if (!(caps[DP_MAX_DOWNSPREAD] & DP_TPS4_SUPPORTED))
++		common &= ~BIT(24);
++	writel(common, router + DP_COMMON_WRITE);
++
++	/* Tell the far adapter the receiver revision. This has TX completion only. */
++	tx[0] = revision;
++	tx[1] = 0x13;
++	tx[2] = link_byte(common, field(common, GENMASK(11, 8)),
++			  1U << field(common, GENMASK(14, 12)));
++	ret = control(ctx, tx, NULL);
++	if (ret)
++		return ret;
++	writel(common | BIT(31), router + DP_COMMON_WRITE);
++	return 0;
++}
++
++int qcom_usb4_dp_configure_link(void __iomem *router,
++			       qcom_usb4_dp_dpsw_fn dpsw, void *ctx,
++			       unsigned int rate_khz, unsigned int lanes)
++{
++	u32 value, common = readl(router + DP_COMMON);
++	int rate = rate_index(rate_khz), ret;
++
++	if (rate < 0 || (lanes != 1 && lanes != 2 && lanes != 4))
++		return -EINVAL;
++	if (!(common & BIT(31)) || rate > field(common, GENMASK(11, 8)) ||
++	    lanes > (1U << field(common, GENMASK(14, 12))))
++		return -EINVAL;
++	update(router, 0x85000, BIT(0), rate < 2 ? BIT(0) : 0);
++
++	/* Native producer reset acknowledgment, after its clocks/PHY are ready. */
++	if (!(readl(router + 0x84044) & BIT(1))) {
++		writel(BIT(5), router + DP_ACK);
++		update(router, 0x84044, BIT(0), BIT(0));
++		ret = readl_poll_timeout(router + DP_STATUS, value, value & BIT(5), 100, 50000);
++		if (!ret) {
++			writel(BIT(5), router + DP_ACK);
++		} else {
++			/* Pulse the adapter reset only when the first request times out. */
++			pr_warn("qcom-usb4-dp: initial reset ACK timed out (%#x), trying fallback\n",
++				value);
++			update(router, 0x85008, BIT(0), BIT(0));
++			usleep_range(1000, 1100);
++			update(router, 0x85008, BIT(0), 0);
++			update(router, 0x84044, BIT(0), BIT(0));
++			ret = readl_poll_timeout(router + 0x84044, value,
++					 value & BIT(1), 100, 50000);
++			if (ret) {
++				pr_err("qcom-usb4-dp: fallback reset ACK timed out (%#x)\n", value);
++				return ret;
++			}
++		}
++	}
++	writel(BIT(4), router + DP_ACK);
++	ret = dpsw(ctx, 1);
++	if (ret) {
++		pr_err("qcom-usb4-dp: producer-enable command failed: %d\n", ret);
++		return ret;
++	}
++	ret = readl_poll_timeout(router + DP_STATUS, value, value & BIT(4), 100, 50000);
++	if (ret) {
++		pr_err("qcom-usb4-dp: producer-enable ACK timed out (%#x)\n", value);
++		return ret;
++	}
++	writel(BIT(4), router + DP_ACK);
++	update(router, 0x84000, GENMASK(5, 0), 0);
++	/* The scoped MSM path is SST; this bit selects MST producer framing. */
++	update(router, 0x84004, BIT(0), 0);
++	value = readl(router + 0x84008);
++	switch (rate) {
++	case 3:
++		value = (value & ~7) | 0x300;
++		writel(value, router + 0x84008);
++		usleep_range(1000, 1100);
++		value = (value & ~0x204) | 0x103;
++		break;
++	case 2:
++		value = (value & ~0x105) | 0x202;
++		break;
++	case 1:
++		value = (value & ~6) | 0x301;
++		break;
++	default:
++		value = (value & ~7) | 0x300;
++		break;
++	}
++	writel(value, router + 0x84008);
++	update(router, 0x84084, BIT(3), 0);
++	pr_debug("qcom-usb4-dp: producer configured at %u kHz, %u lanes\n", rate_khz, lanes);
++	return 0;
++}
++
++/* USB4 2.0 autonomous mode: autonomous DP OUT training, then clock sync. */
++int qcom_usb4_dp_train_link(void __iomem *router,
++			    qcom_usb4_dp_control_fn control, void *ctx,
++			    unsigned int rate_khz, unsigned int lanes)
++{
++	u8 tx[4] = {}, rx[4];
++	u32 value, common = readl(router + DP_COMMON);
++	int rate = rate_index(rate_khz), ret;
++
++	if (rate < 0 || (lanes != 1 && lanes != 2 && lanes != 4))
++		return -EINVAL;
++	if (!(common & BIT(31)) || rate > field(common, GENMASK(11, 8)) ||
++	    lanes > (1U << field(common, GENMASK(14, 12))))
++		return -EINVAL;
++
++	/*
++	 * Request link down before startup training. With LC=LR=0 there is
++	 * no training result; control() waits for control completion.
++	 */
++	tx[1] = 1;
++	tx[2] = link_byte(common, 0, 0);
++	ret = control(ctx, tx, NULL);
++	if (ret)
++		return ret;
++	/* Respect the SET_CONFIG minimum gap before the next request. */
++	usleep_range(50, 100);
++
++	/* Mode zero: the DP OUT adapter trains its physical link itself.
++	 * Its matching SET_LINK response reports completed receiver training.
++	 */
++	tx[1] = 1;
++	tx[2] = link_byte(common, rate, lanes);
++	ret = control(ctx, tx, rx);
++	if (ret)
++		return ret;
++	if (rx[1] != tx[1] || rx[0] || ((rx[2] ^ tx[2]) & 0x2f))
++		return -EREMOTEIO;
++	update(router, 0x84074, 0xf07, (rate << 8) | lanes);
++
++	/* Request clock sync, wait for status bit 3, acknowledge. */
++	writel(BIT(3), router + DP_ACK);
++	update(router, 0x8400c, BIT(0), BIT(0));
++	ret = readl_poll_timeout(router + DP_STATUS, value, value & BIT(3), 100, 36000);
++	if (ret) {
++		pr_err("qcom-usb4-dp: clock-sync ACK timed out (%#x)\n", value);
++		return ret;
++	}
++	writel(BIT(3), router + DP_ACK);
++	pr_debug("qcom-usb4-dp: receiver trained and clock sync complete at %u kHz, %u lanes\n",
++		 rate_khz, lanes);
++	return 0;
++}
+diff --git a/drivers/thunderbolt/qcom-usb4-dp-link.h b/drivers/thunderbolt/qcom-usb4-dp-link.h
+new file mode 100644
+index 00000000000..44c33bed835
+--- /dev/null
++++ b/drivers/thunderbolt/qcom-usb4-dp-link.h
+@@ -0,0 +1,20 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef QCOM_USB4_DP_LINK_H
++#define QCOM_USB4_DP_LINK_H
++
++#include <linux/io.h>
++#include <linux/types.h>
++
++struct drm_dp_aux;
++typedef int (*qcom_usb4_dp_control_fn)(void *ctx, const u8 tx[4], u8 rx[4]);
++typedef int (*qcom_usb4_dp_dpsw_fn)(void *ctx, u32 command);
++
++int qcom_usb4_dp_negotiate_caps(void __iomem *router, struct drm_dp_aux *aux,
++			      qcom_usb4_dp_control_fn control, void *ctx);
++int qcom_usb4_dp_configure_link(void __iomem *router,
++			       qcom_usb4_dp_dpsw_fn dpsw, void *ctx,
++			       unsigned int rate_khz, unsigned int lanes);
++int qcom_usb4_dp_train_link(void __iomem *router,
++			    qcom_usb4_dp_control_fn control, void *ctx,
++			    unsigned int rate_khz, unsigned int lanes);
++#endif
+diff --git a/drivers/thunderbolt/qcom-usb4-dp.c b/drivers/thunderbolt/qcom-usb4-dp.c
+new file mode 100644
+index 00000000000..288da863e2b
+--- /dev/null
++++ b/drivers/thunderbolt/qcom-usb4-dp.c
+@@ -0,0 +1,965 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Experimental display owner for DP IN 0 of Glymur USB4 host router 0.
++ *
++ * The firmware's op-4 mailbox messages are requests to the display owner,
++ * not adapter hardware commands. Service them independently of the USB4
++ * connection manager, which may be synchronously waiting for their replies.
++ * FIFO AUX/control transactions use a separate lock and work item so that
++ * slow receiver discovery cannot stall those mailbox replies.
++ */
++#include <linux/bitfield.h>
++#include <linux/delay.h>
++#include <linux/device.h>
++#include <linux/err.h>
++#include <linux/io.h>
++#include <linux/iopoll.h>
++#include <linux/jiffies.h>
++#include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/platform_device.h>
++#include <linux/device/driver.h>
++#include <linux/pm_runtime.h>
++#include <linux/slab.h>
++#include <linux/soc/qcom/usb4-dp.h>
++#include <linux/unaligned.h>
++#include <linux/wait.h>
++#include <linux/workqueue.h>
++
++#include <drm/display/drm_dp_helper.h>
++
++#include "qcom-usb4-dp.h"
++#include "qcom-usb4-dp-link.h"
++
++#define DP_AUX_BASE		0x83000
++#define DP_ADAPTER_STRIDE	0x3000
++#define DP_FIFO_TX		0x000
++#define DP_FIFO_TX_DATA		0x004
++#define DP_FIFO_RX_CONSUME	0x03c
++#define DP_FIFO_RX_STATUS	0x044
++#define DP_FIFO_READY		0x048
++#define DP_FIFO_RX_HEADER	0x050
++#define DP_FIFO_RX_DATA		0x054
++#define DP_IRQ_ENABLE		0x150
++#define DP_IRQ_STATUS		0x154
++#define DP_IRQ_CLEAR		0x158
++#define DP_MCU_REQUEST		0x22c
++#define DP_MCU_REPLY		0x230
++#define DP_IRQ_MCU_REQUEST	BIT(11)
++#define DP_IRQ_RESOURCE		BIT(9)
++#define DP_IRQ_TX_DONE		BIT(0)
++#define DP_IRQ_CONTROL_DONE	BIT(7)
++#define DP_IRQ_RX_READY		BIT(1)
++#define DP_RX_COUNT		GENMASK(29, 26)
++#define DP_RX_ERROR		BIT(15)
++#define DP_PACKET_TYPE		GENMASK(31, 28)
++#define DP_PACKET_COUNT		GENMASK(15, 8)
++#define DP_PACKET_AUX		0
++#define DP_PACKET_CONTROL	2
++#define DP_FIFO_TIMEOUT_US	100000
++#define DP_FIFO_MAX_PACKETS	32
++#define DP_MAILBOX_POLL_MS	2
++#define DP_CAPS_POLL_MS		20
++#define DP_CAPS_MAX_POLLS	500
++#define DP_SLEEP_READY_MS	15000
++
++struct qcom_usb4_dp {
++	struct device *dev;
++	void __iomem *router;
++	struct device *display;
++	/* Retained across stop/reprobe until the saved display state is restored. */
++	struct device *sleep_display;
++	/* A sink was driven through the tunnel when sleep began. */
++	bool sleep_had_sink;
++	wait_queue_head_t ready_wait;
++	struct platform_device *child;
++	struct work_struct link_work;
++	bool connected;
++	bool stopping;
++	/* Router kept across system sleep: no discovery until it resumes. */
++	bool sleeping;
++	struct drm_dp_aux aux;
++	struct mutex lifecycle_lock;
++	struct mutex state_lock;
++	struct mutex fifo_lock;
++	struct mutex command_lock;
++	u32 pending_reply[2];
++	struct delayed_work mailbox_work;
++	struct delayed_work caps_work;
++	bool enabled;
++	bool allocated;
++	bool ready;
++	bool fifo_fault;
++	bool release_failed;
++	bool runtime_held;
++	unsigned int caps_polls;
++};
++
++static void __iomem *dp_base(struct qcom_usb4_dp *dp, unsigned int adapter)
++{
++	return dp->router + DP_AUX_BASE + adapter * DP_ADAPTER_STRIDE;
++}
++
++static bool dp_known_control(const u8 packet[4])
++{
++	switch (packet[1]) {
++	case 0x02:
++	case 0x03:
++	case 0x0c:
++	case 0x12:
++	case 0x16:
++	case 0x1d:
++		return true;
++	default:
++		return false;
++	}
++}
++
++/* fifo_lock held. Every observed packet is consumed exactly once. */
++static int dp_fifo_rx(struct qcom_usb4_dp *dp, unsigned int *type,
++		      u8 payload[20], unsigned int *count)
++{
++	void __iomem *base = dp_base(dp, 0);
++	u32 status = readl(base + DP_FIFO_RX_STATUS);
++	u32 header;
++	unsigned int i, raw_count;
++	int ret = 0;
++
++	if (!(status & DP_RX_COUNT))
++		return -EAGAIN;
++	header = readl(base + DP_FIFO_RX_HEADER);
++	*type = FIELD_GET(DP_PACKET_TYPE, header);
++	raw_count = FIELD_GET(DP_PACKET_COUNT, header);
++	if (status & DP_RX_ERROR) {
++		ret = -EIO;
++		goto consume;
++	}
++	if (*type == DP_PACKET_AUX) {
++		if (raw_count < 6 || raw_count > 25) {
++			ret = -EPROTO;
++			goto consume;
++		}
++		*count = raw_count - 5;
++	} else if (*type == DP_PACKET_CONTROL && raw_count == 4) {
++		*count = 4;
++	} else {
++		ret = -EPROTO;
++		goto consume;
++	}
++	for (i = 0; i < *count; i += 4)
++		put_unaligned_le32(readl(base + DP_FIFO_RX_DATA + i), payload + i);
++consume:
++	/* Complete the payload reads before releasing the receive slot. */
++	mb();
++	writel(1, base + DP_FIFO_RX_CONSUME);
++	writel(DP_IRQ_RX_READY, base + DP_IRQ_CLEAR);
++	return ret;
++}
++
++/* A previous unmatched AUX reply cannot belong to a new transaction. */
++static int dp_fifo_drain(struct qcom_usb4_dp *dp)
++{
++	u8 payload[20];
++	unsigned int type, count, i;
++	int ret;
++
++	for (i = 0; i < DP_FIFO_MAX_PACKETS; i++) {
++		ret = dp_fifo_rx(dp, &type, payload, &count);
++		if (ret == -EAGAIN)
++			return 0;
++		if (ret)
++			return ret;
++		if (type != DP_PACKET_CONTROL || !dp_known_control(payload))
++			return -EPROTO;
++		dev_dbg(dp->dev, "DP control notification %*ph\n", 4, payload);
++	}
++	return -EOVERFLOW;
++}
++
++static int dp_fifo_tx(struct qcom_usb4_dp *dp, unsigned int type,
++		      const u8 *payload, unsigned int count)
++{
++	void __iomem *base = dp_base(dp, 0);
++	u8 padded[20] = {};
++	u32 status;
++	unsigned int i;
++
++	if (count > sizeof(padded))
++		return -EINVAL;
++	memcpy(padded, payload, count);
++	writel(DP_IRQ_TX_DONE | DP_IRQ_RX_READY, base + DP_IRQ_CLEAR);
++	for (i = 0; i < sizeof(padded); i += 4)
++		writel(get_unaligned_le32(padded + i), base + DP_FIFO_TX_DATA + i);
++	writel(FIELD_PREP(DP_PACKET_TYPE, type) |
++	       FIELD_PREP(DP_PACKET_COUNT, count + (type == DP_PACKET_AUX ? 5 : 0)) |
++	       BIT(0), base + DP_FIFO_TX);
++	return readl_poll_timeout(base + DP_IRQ_STATUS, status,
++				  status & DP_IRQ_TX_DONE, 100, DP_FIFO_TIMEOUT_US);
++}
++
++static int dp_fifo_wait(struct qcom_usb4_dp *dp, unsigned int wanted_type,
++			int wanted_opcode, u8 payload[20], unsigned int *count)
++{
++	unsigned long deadline = jiffies + usecs_to_jiffies(DP_FIFO_TIMEOUT_US);
++	unsigned int type, packets = 0;
++	int ret;
++
++	do {
++		ret = dp_fifo_rx(dp, &type, payload, count);
++		if (ret == -EAGAIN) {
++			usleep_range(100, 200);
++			continue;
++		}
++		if (ret)
++			return ret;
++		if (type == wanted_type &&
++		    (wanted_type == DP_PACKET_AUX || payload[1] == wanted_opcode))
++			return 0;
++		if (type != DP_PACKET_CONTROL || !dp_known_control(payload))
++			return -EPROTO;
++		dev_dbg(dp->dev, "DP control while waiting: %*ph\n", 4, payload);
++		if (++packets >= DP_FIFO_MAX_PACKETS)
++			return -EOVERFLOW;
++	} while (time_before(jiffies, deadline));
++	return -ETIMEDOUT;
++}
++
++static int dp_fifo_fault(struct qcom_usb4_dp *dp, int ret)
++{
++	if (ret < 0) {
++		/* No transaction IDs exist: a late response after timeout cannot
++		 * safely be distinguished from a subsequent transaction's reply.
++		 */
++		WRITE_ONCE(dp->fifo_fault, true);
++		dev_err(dp->dev, "DP FIFO stopped after error %d; router reset required\n", ret);
++	}
++	return ret;
++}
++
++static int dp_control(void *ctx, const u8 tx[4], u8 rx[4])
++{
++	struct qcom_usb4_dp *dp = ctx;
++	void __iomem *base = dp_base(dp, 0);
++	u32 status;
++	u8 payload[20];
++	unsigned int count;
++	int ret;
++
++	mutex_lock(&dp->fifo_lock);
++	if (!READ_ONCE(dp->enabled) || !READ_ONCE(dp->allocated) ||
++	    READ_ONCE(dp->fifo_fault) ||
++	    READ_ONCE(dp->release_failed)) {
++		ret = -ENODEV;
++		goto out;
++	}
++	ret = dp_fifo_drain(dp);
++	if (ret)
++		goto fault;
++	/*
++	 * Control completion is cleared and waited for separately from TX.
++	 * Clear the prior completion before submission; AUX keeps its own path.
++	 */
++	writel(DP_IRQ_CONTROL_DONE, base + DP_IRQ_CLEAR);
++	ret = dp_fifo_tx(dp, DP_PACKET_CONTROL, tx, 4);
++	if (!ret)
++		ret = readl_poll_timeout(base + DP_IRQ_STATUS, status,
++					 status & DP_IRQ_CONTROL_DONE,
++					 100, DP_FIFO_TIMEOUT_US);
++	if (!ret && rx) {
++		ret = dp_fifo_wait(dp, DP_PACKET_CONTROL, tx[1], payload, &count);
++		if (!ret)
++			memcpy(rx, payload, 4);
++	}
++fault:
++	dp_fifo_fault(dp, ret);
++out:
++	mutex_unlock(&dp->fifo_lock);
++	return ret;
++}
++
++static ssize_t dp_aux_transfer(struct drm_dp_aux *aux, struct drm_dp_aux_msg *msg)
++{
++	struct qcom_usb4_dp *dp = container_of(aux, struct qcom_usb4_dp, aux);
++	u8 tx[20] = {}, rx[20];
++	unsigned int request = msg->request & ~DP_AUX_I2C_MOT;
++	unsigned int count, tx_count = 4;
++	bool read;
++	int ret;
++
++	if (!msg->size || msg->size > 16 || !msg->buffer || msg->address > 0xfffff)
++		return -EINVAL;
++	switch (request) {
++	case DP_AUX_NATIVE_READ:
++	case DP_AUX_I2C_READ:
++		read = true;
++		break;
++	case DP_AUX_NATIVE_WRITE:
++	case DP_AUX_I2C_WRITE:
++	case DP_AUX_I2C_WRITE_STATUS_UPDATE:
++		read = false;
++		break;
++	default:
++		return -EINVAL;
++	}
++	tx[0] = (msg->request << 4) | (msg->address >> 16);
++	tx[1] = msg->address >> 8;
++	tx[2] = msg->address;
++	tx[3] = msg->size - 1;
++	if (!read && request != DP_AUX_I2C_WRITE_STATUS_UPDATE) {
++		memcpy(tx + 4, msg->buffer, msg->size);
++		tx_count += msg->size;
++	}
++
++	mutex_lock(&dp->fifo_lock);
++	if (!READ_ONCE(dp->enabled) || !READ_ONCE(dp->allocated) ||
++	    READ_ONCE(dp->fifo_fault) || READ_ONCE(dp->release_failed)) {
++		ret = -ENODEV;
++		goto out;
++	}
++	ret = dp_fifo_drain(dp);
++	if (ret)
++		goto fault;
++	ret = dp_fifo_tx(dp, DP_PACKET_AUX, tx, tx_count);
++	if (ret)
++		goto fault;
++	ret = dp_fifo_wait(dp, DP_PACKET_AUX, 0, rx, &count);
++	if (ret)
++		goto fault;
++	/* This FIFO carries the raw AUX reply byte, whose reply code is the
++	 * upper nibble (the same framing as its raw request header).
++	 */
++	if (rx[0] & 0x0f) {
++		ret = -EPROTO;
++		goto fault;
++	}
++	msg->reply = rx[0] >> 4;
++	if ((msg->reply & DP_AUX_NATIVE_REPLY_MASK) == DP_AUX_NATIVE_REPLY_MASK ||
++	    (msg->reply & DP_AUX_I2C_REPLY_MASK) == DP_AUX_I2C_REPLY_MASK) {
++		ret = -EPROTO;
++		goto fault;
++	}
++	if (msg->reply) {
++		ret = 0;
++		goto out;
++	}
++	if (read) {
++		if (count - 1 > msg->size) {
++			ret = -EPROTO;
++			goto fault;
++		}
++		memcpy(msg->buffer, rx + 1, count - 1);
++		ret = count - 1;
++	} else if (count == 1) {
++		ret = msg->size;
++	} else if (count == 2 && rx[1] <= msg->size) {
++		ret = rx[1];
++	} else {
++		ret = -EPROTO;
++		goto fault;
++	}
++	goto out;
++fault:
++	dp_fifo_fault(dp, ret);
++out:
++	mutex_unlock(&dp->fifo_lock);
++	return ret;
++}
++
++static int dp_dpsw(void *ctx, u32 command)
++{
++	struct qcom_usb4_dp *dp = ctx;
++	void __iomem *base = dp_base(dp, 0);
++	u32 value;
++	int ret;
++
++	mutex_lock(&dp->command_lock);
++	if (!READ_ONCE(dp->enabled) ||
++	    (command == 5 ? READ_ONCE(dp->allocated) : !READ_ONCE(dp->allocated)) ||
++	    READ_ONCE(dp->fifo_fault) || READ_ONCE(dp->release_failed) ||
++	    dp->pending_reply[0] ||
++	    readl(base + DP_MCU_REQUEST) || readl(base + DP_MCU_REPLY)) {
++		ret = -EBUSY;
++	} else {
++		writel(command, base + DP_MCU_REPLY);
++		ret = 0;
++	}
++	mutex_unlock(&dp->command_lock);
++	if (ret)
++		return ret;
++	/* Never hold the command lock while firmware may ask its display owner
++	 * for a resource. The mailbox worker must be able to send that reply.
++	 */
++	return readl_poll_timeout(base + DP_MCU_REPLY, value, !value,
++				  100, DP_FIFO_TIMEOUT_US);
++}
++
++static int dp_discover(struct qcom_usb4_dp *dp)
++{
++	int ret;
++
++	if (!READ_ONCE(dp->enabled))
++		return -ENODEV;
++	if (READ_ONCE(dp->allocated))
++		return -EALREADY;
++	/* The proven initial request causes firmware to ask its display owner
++	 * for allocation. A plain core resource query does not start this flow.
++	 */
++	ret = dp_dpsw(dp, 5);
++	if (ret)
++		dev_warn(dp->dev,
++			 "DP discovery command failed (%d); mailbox service retained\n",
++			 ret);
++	return ret;
++}
++
++static int dp_configure_link(void *ctx, unsigned int rate, unsigned int lanes)
++{
++	struct qcom_usb4_dp *dp = ctx;
++
++	return qcom_usb4_dp_configure_link(dp->router, dp_dpsw, dp, rate, lanes);
++}
++
++/* Called under the producer AUX mutex before training, with source FEC off. */
++static int dp_set_fec_ready(void *ctx, bool enable)
++{
++	struct qcom_usb4_dp *dp = ctx;
++	u8 ready, status, tx[4] = { enable, 0x0a, 0, 0 }, rx[4] = {};
++	int ret;
++
++	/* Receiver readiness may survive a previous stream or a host reset. */
++	ret = drm_dp_dpcd_read_byte(&dp->aux, DP_FEC_CONFIGURATION, &ready);
++	if (ret)
++		return ret;
++	/* Preserve the error-counter selection while changing readiness. */
++	ready = (ready & ~DP_FEC_READY) | (enable ? DP_FEC_READY : 0);
++	ret = drm_dp_dpcd_write_byte(&dp->aux, DP_FEC_CONFIGURATION, ready);
++	if (ret)
++		return ret;
++	ret = drm_dp_dpcd_read_byte(&dp->aux, DP_FEC_CONFIGURATION, &status);
++	if (ret)
++		return ret;
++	if (status != ready)
++		return -EIO;
++
++	/* FEC detection flags are latched W1C events, not current encoder state.
++	 * Require a fresh enable event from the next stream's FEC sequence.
++	 */
++	ret = drm_dp_dpcd_write_byte(&dp->aux, DP_FEC_STATUS,
++			DP_FEC_DECODE_EN_DETECTED | DP_FEC_DECODE_DIS_DETECTED);
++	if (ret)
++		return ret;
++	ret = drm_dp_dpcd_read_byte(&dp->aux, DP_FEC_STATUS, &status);
++	if (ret)
++		return ret;
++	if (status & (DP_FEC_DECODE_EN_DETECTED | DP_FEC_DECODE_DIS_DETECTED))
++		return -EIO;
++	dev_dbg(dp->dev, "USB4 FEC readiness prepared: ready=%#x status=%#x\n",
++		ready, status);
++
++	/* USB4 2.0 section 10.4.9: SET_FEC_READY needs a matching
++	 * acknowledgment; its returned data bytes have no defined meaning.
++	 * Raw software AUX transactions do not drive the DPTX snooper.
++	 */
++	tx[0] = enable;
++	ret = dp_control(dp, tx, rx);
++	dev_dbg(dp->dev, "FEC readiness acknowledged: %d\n", ret);
++	return ret;
++}
++
++static int dp_train_link(void *ctx, unsigned int rate, unsigned int lanes)
++{
++	struct qcom_usb4_dp *dp = ctx;
++
++	return qcom_usb4_dp_train_link(dp->router, dp_control, dp, rate, lanes);
++}
++
++static const struct msm_dp_usb4_ops dp_producer_ops = {
++	.configure_link = dp_configure_link,
++	.train_link = dp_train_link,
++	.set_fec_ready = dp_set_fec_ready,
++};
++
++static void dp_caps_work(struct work_struct *work)
++{
++	struct qcom_usb4_dp *dp = container_of(to_delayed_work(work),
++					      struct qcom_usb4_dp, caps_work);
++	int ret;
++
++	if (!READ_ONCE(dp->enabled) || !READ_ONCE(dp->allocated) ||
++	    READ_ONCE(dp->ready) || READ_ONCE(dp->fifo_fault))
++		return;
++	if ((readl(dp->router + 0x6028) & GENMASK(31, 30)) != GENMASK(31, 30) ||
++	    !(readl(dp_base(dp, 0) + DP_FIFO_READY) & BIT(0))) {
++		if (++dp->caps_polls < DP_CAPS_MAX_POLLS)
++			queue_delayed_work(system_unbound_wq, &dp->caps_work,
++					   msecs_to_jiffies(DP_CAPS_POLL_MS));
++		else
++			dev_warn(dp->dev, "DP tunnel/AUX readiness deadline expired\n");
++		return;
++	}
++	ret = qcom_usb4_dp_negotiate_caps(dp->router, &dp->aux, dp_control, dp);
++	if (ret) {
++		dev_err(dp->dev, "DP receiver capability negotiation failed: %d\n", ret);
++		return;
++	}
++	mutex_lock(&dp->state_lock);
++	if (dp->enabled && dp->allocated) {
++		ret = msm_dp_usb4_hpd(dp->display, true, false);
++		dp->ready = !ret;
++		dev_dbg(dp->dev, "DP receiver ready; HPD queued: %d\n", ret);
++	}
++	mutex_unlock(&dp->state_lock);
++	wake_up_all(&dp->ready_wait);
++}
++
++static void dp_mailbox_work(struct work_struct *work)
++{
++	struct qcom_usb4_dp *dp = container_of(to_delayed_work(work),
++					      struct qcom_usb4_dp, mailbox_work);
++	unsigned int adapter;
++
++	if (!READ_ONCE(dp->enabled))
++		return;
++	for (adapter = 0; adapter < 2; adapter++) {
++		void __iomem *base = dp_base(dp, adapter);
++		u32 request, reply = 0;
++		bool release = false;
++		int ret = 0;
++
++		mutex_lock(&dp->command_lock);
++		if (readl(base + DP_MCU_REPLY)) {
++			mutex_unlock(&dp->command_lock);
++			continue;
++		}
++		if (dp->pending_reply[adapter]) {
++			writel(dp->pending_reply[adapter], base + DP_MCU_REPLY);
++			dp->pending_reply[adapter] = 0;
++			mutex_unlock(&dp->command_lock);
++			continue;
++		}
++		request = readl(base + DP_MCU_REQUEST);
++		if (!request) {
++			mutex_unlock(&dp->command_lock);
++			continue;
++		}
++		if (request != 0x1004 && request != 0x1104 &&
++		    request != 0x1204 && request != 0x2) {
++			mutex_unlock(&dp->command_lock);
++			dev_warn_ratelimited(dp->dev, "DP%u unknown request %#x left pending\n",
++					    adapter, request);
++			continue;
++		}
++		writel(DP_IRQ_MCU_REQUEST, base + DP_IRQ_CLEAR);
++		writel(0, base + DP_MCU_REQUEST);
++		/* Reserve this adapter's response slot while callbacks execute. */
++		dp->pending_reply[adapter] = U32_MAX;
++		mutex_unlock(&dp->command_lock);
++		mutex_lock(&dp->state_lock);
++		switch (request) {
++		case 0x1004:
++			reply = !adapter && !dp->allocated && !dp->fifo_fault &&
++				!dp->release_failed ? 0x1006 : 0x11006;
++			break;
++		case 0x1104:
++			if (!adapter && !dp->fifo_fault && !dp->release_failed) {
++				ret = msm_dp_usb4_route(dp->display, 1);
++				if (!ret) {
++					writel(readl(base + DP_IRQ_ENABLE) | DP_IRQ_RESOURCE,
++					       base + DP_IRQ_ENABLE);
++					dp->allocated = true;
++					dp->caps_polls = 0;
++					queue_delayed_work(system_unbound_wq, &dp->caps_work,
++							   msecs_to_jiffies(DP_CAPS_POLL_MS));
++				}
++			} else {
++				ret = -ENOSPC;
++			}
++			reply = ret ? 0x11106 : 0x1106;
++			break;
++		case 0x1204:
++			dev_dbg(dp->dev, "USB4 release: request adapter=%u allocated=%d ready=%d\n",
++				adapter, dp->allocated, dp->ready);
++			if (!adapter && dp->allocated) {
++				dp->allocated = false;
++				dp->ready = false;
++				release = true;
++			}
++			reply = 0x1206;
++			break;
++		case 0x2:
++			/* Notification only; no opcode-6 response. */
++			break;
++		}
++		mutex_unlock(&dp->state_lock);
++		if (release) {
++			/* The capability worker takes state_lock at completion. Do
++			 * not hold it while draining work or stopping the producer.
++			 */
++			dev_dbg(dp->dev, "USB4 release: drain caps\n");
++			cancel_delayed_work_sync(&dp->caps_work);
++			dev_dbg(dp->dev, "USB4 release: HPD sync enter\n");
++			ret = msm_dp_usb4_hpd_sync(dp->display, false, false);
++			dev_dbg(dp->dev, "USB4 release: HPD sync return %d\n", ret);
++			if (!ret)
++				ret = msm_dp_usb4_route(dp->display, 0);
++			dev_dbg(dp->dev, "USB4 release: route return %d, clear resource\n", ret);
++			writel(readl(dp->router + 0x84078) & ~BIT(31),
++			       dp->router + 0x84078);
++			dev_dbg(dp->dev, "USB4 release: resource cleared\n");
++			mutex_lock(&dp->state_lock);
++			dp->release_failed = !!ret;
++			if (ret) {
++				dp->allocated = true;
++				/* Failure status uses the observed opcode-6 layout;
++				 * this negative release encoding is not hardware-tested.
++				 */
++				reply = 0x11206;
++				dev_warn(dp->dev, "DP release incomplete (%d); ownership retained\n",
++					 ret);
++			}
++			mutex_unlock(&dp->state_lock);
++		}
++		mutex_lock(&dp->command_lock);
++		dp->pending_reply[adapter] = reply;
++		if (reply && !readl(base + DP_MCU_REPLY)) {
++			writel(reply, base + DP_MCU_REPLY);
++			dp->pending_reply[adapter] = 0;
++		}
++		mutex_unlock(&dp->command_lock);
++		if (release && !ret && !READ_ONCE(dp->stopping) && !READ_ONCE(dp->sleeping))
++			schedule_work(&dp->link_work);
++		dev_dbg(dp->dev, "DP%u request %#x reply %#x\n", adapter, request, reply);
++	}
++	if (READ_ONCE(dp->enabled))
++		queue_delayed_work(system_unbound_wq, &dp->mailbox_work,
++				   msecs_to_jiffies(DP_MAILBOX_POLL_MS));
++}
++
++/* A separate consumer lets DRM defer until its connector exists without
++ * deferring the host mux on which the Type-C display bridge itself depends.
++ * Only USB4/TBT link ownership creates this child; native DP keeps its AUX.
++ */
++static int qcom_usb4_dp_probe(struct platform_device *pdev)
++{
++	struct qcom_usb4_dp *dp = *(struct qcom_usb4_dp **)dev_get_platdata(&pdev->dev);
++	struct device_link *link;
++	int ret;
++
++	if (READ_ONCE(dp->stopping) || !READ_ONCE(dp->connected))
++		return -ENODEV;
++	ret = qcom_usb4_dp_enable(dp);
++	if (ret)
++		return dev_err_probe(&pdev->dev, ret, "display provider attachment failed\n");
++	link = device_link_add(&pdev->dev, dp->display, DL_FLAG_AUTOREMOVE_CONSUMER);
++	if (!link) {
++		qcom_usb4_dp_disable(dp, true);
++		return -ENOMEM;
++	}
++	platform_set_drvdata(pdev, dp);
++	return 0;
++}
++
++static void qcom_usb4_dp_remove(struct platform_device *pdev)
++{
++	qcom_usb4_dp_disable(platform_get_drvdata(pdev), true);
++}
++
++struct platform_driver qcom_usb4_dp_driver = {
++	.probe = qcom_usb4_dp_probe,
++	.remove = qcom_usb4_dp_remove,
++	.shutdown = qcom_usb4_dp_remove,
++	.driver.name = "qcom-usb4-dp",
++};
++
++static void qcom_usb4_dp_link_work(struct work_struct *work)
++{
++	struct qcom_usb4_dp *dp = container_of(work, struct qcom_usb4_dp, link_work);
++	struct platform_device *child;
++	int ret;
++
++	if (READ_ONCE(dp->stopping))
++		return;
++	if (READ_ONCE(dp->connected)) {
++		if (!dp->child) {
++			child = platform_device_register_data(dp->dev, "qcom-usb4-dp",
++					PLATFORM_DEVID_AUTO, &dp, sizeof(dp));
++			if (IS_ERR(child)) {
++				dev_err(dp->dev, "display child registration failed: %ld\n",
++					PTR_ERR(child));
++				return;
++			}
++			dp->child = child;
++		} else if (READ_ONCE(dp->enabled) && !READ_ONCE(dp->allocated) &&
++			   !READ_ONCE(dp->sleeping)) {
++			dp_discover(dp);
++		}
++		return;
++	}
++	/* Keep servicing firmware release until DRM has stopped the producer. */
++	ret = qcom_usb4_dp_disable(dp, false);
++	if (ret)
++		return;
++	if (dp->child) {
++		platform_device_unregister(dp->child);
++		dp->child = NULL;
++	}
++}
++
++void qcom_usb4_dp_set_connected(struct qcom_usb4_dp *dp, bool connected)
++{
++	if (!dp || READ_ONCE(dp->stopping))
++		return;
++	WRITE_ONCE(dp->connected, connected);
++	wake_up_all(&dp->ready_wait);
++	schedule_work(&dp->link_work);
++}
++
++void qcom_usb4_dp_stop(struct qcom_usb4_dp *dp)
++{
++	if (!dp)
++		return;
++	WRITE_ONCE(dp->stopping, true);
++	cancel_work_sync(&dp->link_work);
++	if (dp->child) {
++		platform_device_unregister(dp->child);
++		dp->child = NULL;
++	}
++	qcom_usb4_dp_disable(dp, true);
++}
++
++/*
++ * The router was stopped with qcom_usb4_dp_stop() and cold-started again:
++ * its adapters start from reset, so earlier FIFO and release faults no
++ * longer describe the hardware. Accept link events again.
++ */
++void qcom_usb4_dp_restart(struct qcom_usb4_dp *dp)
++{
++	if (!dp)
++		return;
++	mutex_lock(&dp->lifecycle_lock);
++	WARN_ON(dp->enabled || dp->child);
++	WRITE_ONCE(dp->fifo_fault, false);
++	WRITE_ONCE(dp->release_failed, false);
++	WRITE_ONCE(dp->connected, false);
++	WRITE_ONCE(dp->stopping, false);
++	WRITE_ONCE(dp->sleeping, false);
++	mutex_unlock(&dp->lifecycle_lock);
++}
++
++struct qcom_usb4_dp *qcom_usb4_dp_create(struct device *dev, void __iomem *router)
++{
++	struct qcom_usb4_dp *dp;
++
++	dp = devm_kzalloc(dev, sizeof(*dp), GFP_KERNEL);
++	if (!dp)
++		return ERR_PTR(-ENOMEM);
++	dp->dev = dev;
++	dp->router = router;
++	mutex_init(&dp->lifecycle_lock);
++	mutex_init(&dp->state_lock);
++	mutex_init(&dp->fifo_lock);
++	mutex_init(&dp->command_lock);
++	init_waitqueue_head(&dp->ready_wait);
++	INIT_WORK(&dp->link_work, qcom_usb4_dp_link_work);
++	INIT_DELAYED_WORK(&dp->mailbox_work, dp_mailbox_work);
++	INIT_DELAYED_WORK(&dp->caps_work, dp_caps_work);
++	dp->aux.name = "USB4 router 0 DP IN 0";
++	dp->aux.dev = dev;
++	dp->aux.transfer = dp_aux_transfer;
++	dp->aux.no_zero_sized = true;
++	drm_dp_aux_init(&dp->aux);
++	return dp;
++}
++
++int qcom_usb4_dp_enable(struct qcom_usb4_dp *dp)
++{
++	unsigned int adapter;
++	int ret;
++
++	mutex_lock(&dp->lifecycle_lock);
++	if (dp->enabled) {
++		ret = -EALREADY;
++		goto out;
++	}
++	if (dp->fifo_fault) {
++		ret = -EIO;
++		goto out;
++	}
++	for (adapter = 0; adapter < 2; adapter++) {
++		if (readl(dp_base(dp, adapter) + DP_MCU_REPLY)) {
++			ret = -EBUSY;
++			goto out;
++		}
++	}
++	dp->display = bus_find_device_by_name(&platform_bus_type, NULL,
++					      "af54000.displayport-controller");
++	if (!dp->display) {
++		ret = -EPROBE_DEFER;
++		goto out;
++	}
++	ret = pm_runtime_resume_and_get(dp->dev);
++	if (ret < 0)
++		goto put_display;
++	dp->runtime_held = true;
++	ret = msm_dp_usb4_attach(dp->display, &dp->aux,
++				 &dp_producer_ops,
++				 dp);
++	if (ret)
++		goto put_runtime;
++	WRITE_ONCE(dp->enabled, true);
++	queue_delayed_work(system_unbound_wq, &dp->mailbox_work, 0);
++	dev_dbg(dp->dev, "DP0 mailbox owner and router AUX enabled\n");
++	/* Discovery failure does not undo the live owner. A later link event
++	 * can retry without creating an unbound child with active callbacks.
++	 */
++	dp_discover(dp);
++	ret = 0;
++	goto out;
++put_runtime:
++	pm_runtime_put(dp->dev);
++	dp->runtime_held = false;
++put_display:
++	put_device(dp->display);
++	dp->display = NULL;
++out:
++	mutex_unlock(&dp->lifecycle_lock);
++	return ret;
++}
++
++int qcom_usb4_dp_disable(struct qcom_usb4_dp *dp, bool force)
++{
++	int ret = 0;
++
++	if (!dp)
++		return 0;
++	mutex_lock(&dp->lifecycle_lock);
++	if (!dp->enabled)
++		goto out;
++	mutex_lock(&dp->state_lock);
++	if (dp->allocated && !force) {
++		mutex_unlock(&dp->state_lock);
++		ret = -EBUSY;
++		goto out;
++	}
++	WRITE_ONCE(dp->enabled, false);
++	wake_up_all(&dp->ready_wait);
++	mutex_unlock(&dp->state_lock);
++	cancel_delayed_work_sync(&dp->mailbox_work);
++	cancel_delayed_work_sync(&dp->caps_work);
++	msm_dp_usb4_detach(dp->display);
++	msm_dp_usb4_route(dp->display, 0);
++	writel(readl(dp->router + 0x84078) & ~BIT(31), dp->router + 0x84078);
++	/* Detach has stopped producer transfers; drain direct AUX users too. */
++	mutex_lock(&dp->fifo_lock);
++	mutex_unlock(&dp->fifo_lock);
++	dp->allocated = false;
++	dp->ready = false;
++	if (dp->runtime_held) {
++		pm_runtime_put(dp->dev);
++		dp->runtime_held = false;
++	}
++	put_device(dp->display);
++	dp->display = NULL;
++	dev_dbg(dp->dev, "experimental DP mailbox owner disabled\n");
++out:
++	mutex_unlock(&dp->lifecycle_lock);
++	return ret;
++}
++
++bool qcom_usb4_dp_active(struct qcom_usb4_dp *dp)
++{
++	return dp && READ_ONCE(dp->enabled);
++}
++
++int qcom_usb4_dp_sleep_prepare(struct qcom_usb4_dp *dp)
++{
++	int ret = 0;
++
++	if (!dp)
++		return 0;
++	mutex_lock(&dp->lifecycle_lock);
++	if (!dp->enabled)
++		goto out;
++	WRITE_ONCE(dp->sleeping, true);
++	if (dp->sleep_display) {
++		ret = -EBUSY;
++		goto out;
++	}
++	mutex_lock(&dp->state_lock);
++	dp->sleep_had_sink = dp->ready;
++	mutex_unlock(&dp->state_lock);
++	ret = msm_dp_usb4_sleep_prepare(dp->display);
++	if (!ret)
++		dp->sleep_display = get_device(dp->display);
++out:
++	mutex_unlock(&dp->lifecycle_lock);
++	return ret;
++}
++
++/*
++ * A kept router's firmware does not announce the sink again after its warm
++ * restart from system sleep: rediscover it.
++ */
++int qcom_usb4_dp_resume_discover(struct qcom_usb4_dp *dp)
++{
++	int ret = 0;
++
++	if (!dp)
++		return 0;
++	mutex_lock(&dp->lifecycle_lock);
++	WRITE_ONCE(dp->sleeping, false);
++	if (dp->enabled && READ_ONCE(dp->connected) && !dp->allocated) {
++		queue_delayed_work(system_unbound_wq, &dp->mailbox_work, 0);
++		ret = dp_discover(dp);
++	}
++	mutex_unlock(&dp->lifecycle_lock);
++	return ret;
++}
++
++int qcom_usb4_dp_sleep_complete(struct qcom_usb4_dp *dp, bool connected)
++{
++	struct device *display;
++	int ready_ret = 0, ret;
++	long left;
++
++	if (!dp)
++		return 0;
++	WRITE_ONCE(dp->sleeping, false);
++	mutex_lock(&dp->lifecycle_lock);
++	display = dp->sleep_display;
++	mutex_unlock(&dp->lifecycle_lock);
++	if (!display)
++		return 0;
++
++	/*
++	 * Only a sink driven before sleep is waited for; without one the tunnel
++	 * never becomes ready and the saved modeset, internal panel included,
++	 * would be held back. A sink attached during sleep is found by hotplug.
++	 */
++	connected = connected && dp->sleep_had_sink;
++	/* Probing is unblocked in PM_POST_SUSPEND. Do not hold the lock that
++	 * the new display consumer needs while waiting for tunnel readiness.
++	 */
++	if (connected) {
++		left = wait_event_timeout(dp->ready_wait,
++					  READ_ONCE(dp->ready) || !READ_ONCE(dp->connected),
++					  msecs_to_jiffies(DP_SLEEP_READY_MS));
++		if (!left)
++			ready_ret = -ETIMEDOUT;
++	}
++	mutex_lock(&dp->lifecycle_lock);
++	if (connected && dp->connected && dp->enabled && dp->allocated && dp->ready)
++		ready_ret = msm_dp_usb4_hpd_sync(dp->display, true, false);
++	else if (connected && !ready_ret)
++		ready_ret = -ENODEV;
++	if (ready_ret)
++		dev_err(dp->dev, "USB4 sleep display readiness failed: %d\n", ready_ret);
++	/* Also resume clients and the internal display if the partner went away
++	 * or restoration failed; never leave the saved modeset state orphaned.
++	 */
++	ret = msm_dp_usb4_sleep_complete(display);
++	dp->sleep_display = NULL;
++	put_device(display);
++	mutex_unlock(&dp->lifecycle_lock);
++	return ret ?: ready_ret;
++}
+diff --git a/drivers/thunderbolt/qcom-usb4-dp.h b/drivers/thunderbolt/qcom-usb4-dp.h
+new file mode 100644
+index 00000000000..96843cff74f
+--- /dev/null
++++ b/drivers/thunderbolt/qcom-usb4-dp.h
+@@ -0,0 +1,23 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef QCOM_USB4_DP_H
++#define QCOM_USB4_DP_H
++
++#include <linux/types.h>
++
++struct device;
++struct qcom_usb4_dp;
++struct platform_driver;
++extern struct platform_driver qcom_usb4_dp_driver;
++void qcom_usb4_dp_set_connected(struct qcom_usb4_dp *dp, bool connected);
++void qcom_usb4_dp_stop(struct qcom_usb4_dp *dp);
++void qcom_usb4_dp_restart(struct qcom_usb4_dp *dp);
++
++struct qcom_usb4_dp *qcom_usb4_dp_create(struct device *dev, void __iomem *router);
++int qcom_usb4_dp_enable(struct qcom_usb4_dp *dp);
++int qcom_usb4_dp_disable(struct qcom_usb4_dp *dp, bool force);
++bool qcom_usb4_dp_active(struct qcom_usb4_dp *dp);
++int qcom_usb4_dp_sleep_prepare(struct qcom_usb4_dp *dp);
++int qcom_usb4_dp_sleep_complete(struct qcom_usb4_dp *dp, bool connected);
++int qcom_usb4_dp_resume_discover(struct qcom_usb4_dp *dp);
++
++#endif
+-- 
+2.56.0
+

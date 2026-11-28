@@ -1,0 +1,160 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Birk Skyum <birk.skyum@pm.me>
+Date: Mon, 23 Nov 2026 11:22:27 +0100
+Subject: [PATCH] irqchip/gic-v3-its: point the redistributors back at our LPI
+ tables after hibernation
+
+A hibernation image is restored by a freshly booted kernel, which allocated
+its own LPI property and pending tables (at addresses that differ between
+boots) and enabled LPIs with them. The ITS syscore restore reprograms CBASER
+and BASER but not the redistributors, so after a cold restore the GIC reads
+LPI configuration from memory that the restored kernel uses for something
+else, and MSIs set up or changed after the resume may never arrive.
+
+In its_restore_enable(), disable LPIs on every redistributor whose tables
+are not ours, where GICR_CTLR.EnableLPIs can be cleared, zero its pending
+table and let its_cpu_init_lpis() program it again: the boot CPU at once,
+the others when they come back online. Remap and invalidate the boot
+CPU's collection. Every mismatch is logged, and read-only parameters
+gic_its_rd_{restores,moved,repointed,failed} count what each restore did.
+
+On the Snapdragon X1 (Lenovo Yoga Slim 7x) EnableLPIs cannot be cleared,
+every redistributor reports -EBUSY, and the next patch is what fixes it
+there. This one is the fix where the GIC allows it, and the diagnostics.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/irqchip/irq-gic-v3-its.c | 98 +++++++++++++++++++++++++++++++-
+ 1 file changed, 97 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/irqchip/irq-gic-v3-its.c b/drivers/irqchip/irq-gic-v3-its.c
+index e9807af23..002108971 100644
+--- a/drivers/irqchip/irq-gic-v3-its.c
++++ b/drivers/irqchip/irq-gic-v3-its.c
+@@ -22,6 +22,7 @@
+ #include <linux/mem_encrypt.h>
+ #include <linux/memblock.h>
+ #include <linux/mm.h>
++#include <linux/moduleparam.h>
+ #include <linux/msi.h>
+ #include <linux/of.h>
+ #include <linux/of_address.h>
+@@ -5041,11 +5042,106 @@ static int its_save_disable(void *data)
+ 	return err;
+ }
+ 
++/*
++ * Hibernation on bare metal: the image is restored by a freshly booted
++ * kernel, which allocated its own LPI property and pending tables and enabled
++ * LPIs with them. The redistributors keep pointing at those tables, which are
++ * ordinary memory in the restored kernel, so its LPI configuration is not the
++ * one the GIC reads. Where GICR_CTLR.EnableLPIs can be cleared, disable LPIs
++ * on every redistributor whose tables moved and point it back at this
++ * kernel's tables. Only the boot CPU is online here: it is programmed at once,
++ * the others by its_cpu_init_lpis() when they come back online.
++ */
++/* Counts since boot: restores seen, RDs found moved, re-pointed, and stuck. */
++static unsigned int its_rd_restores, its_rd_moved, its_rd_repointed, its_rd_failed;
++core_param(gic_its_rd_restores, its_rd_restores, uint, 0444);
++core_param(gic_its_rd_moved, its_rd_moved, uint, 0444);
++core_param(gic_its_rd_repointed, its_rd_repointed, uint, 0444);
++core_param(gic_its_rd_failed, its_rd_failed, uint, 0444);
++
++static int its_rd_disable_lpis(void __iomem *rbase)
++{
++	u64 timeout = USEC_PER_SEC;
++	u32 val;
++
++	val = readl_relaxed(rbase + GICR_CTLR);
++	writel_relaxed(val & ~GICR_CTLR_ENABLE_LPIS, rbase + GICR_CTLR);
++	dsb(sy);
++	while (readl_relaxed(rbase + GICR_CTLR) & GICR_CTLR_RWP) {
++		if (!timeout--)
++			return -ETIMEDOUT;
++		udelay(1);
++	}
++	if (readl_relaxed(rbase + GICR_CTLR) & GICR_CTLR_ENABLE_LPIS)
++		return -EBUSY;
++	return 0;
++}
++
++static bool its_restore_rd_tables(void)
++{
++	int cpu, this_cpu = smp_processor_id();
++	bool reinit_self = false;
++
++	its_rd_restores++;
++	if (list_empty(&its_nodes) ||
++	    (gic_rdists->flags & RDIST_FLAGS_RD_TABLES_PREALLOCATED))
++		return false;
++
++	for_each_possible_cpu(cpu) {
++		typeof(gic_data_rdist()) rd = gic_data_rdist_cpu(cpu);
++		void __iomem *rbase = rd->rd_base;
++		phys_addr_t prop, pend, own_pend;
++		bool enabled;
++		int err;
++
++		if (!rbase || !rd->pend_page || !(rd->flags & RD_LOCAL_LPI_ENABLED) ||
++		    (rd->flags & RD_LOCAL_PENDTABLE_PREALLOCATED))
++			continue;
++
++		enabled = readl_relaxed(rbase + GICR_CTLR) & GICR_CTLR_ENABLE_LPIS;
++		prop = gicr_read_propbaser(rbase + GICR_PROPBASER) & GENMASK_ULL(51, 12);
++		pend = gicr_read_pendbaser(rbase + GICR_PENDBASER) & GENMASK_ULL(51, 16);
++		own_pend = page_to_phys(rd->pend_page);
++		if (enabled && prop == gic_rdists->prop_table_pa && pend == own_pend)
++			continue;
++		its_rd_moved++;
++
++		pr_warn("GICv3: CPU%d: LPI tables at %pa/%pa (LPIs %s) after resume, this kernel's are %pa/%pa\n",
++			cpu, &prop, &pend, enabled ? "on" : "off",
++			&gic_rdists->prop_table_pa, &own_pend);
++		if (enabled) {
++			err = its_rd_disable_lpis(rbase);
++			if (err) {
++				pr_err("GICv3: CPU%d: cannot disable LPIs (%d), its LPI tables stay where they are\n",
++				       cpu, err);
++				its_rd_failed++;
++				continue;
++			}
++		}
++		memset(page_address(rd->pend_page), 0, LPI_PENDBASE_SZ);
++		gic_flush_dcache_to_poc(page_address(rd->pend_page), LPI_PENDBASE_SZ);
++		rd->flags &= ~RD_LOCAL_LPI_ENABLED;
++		its_rd_repointed++;
++		if (cpu == this_cpu)
++			reinit_self = true;
++	}
++
++	if (reinit_self) {
++		if (gic_rdists->flags & RDIST_FLAGS_PROPBASE_NEEDS_FLUSHING)
++			gic_flush_dcache_to_poc(gic_rdists->prop_table_va, LPI_PROPBASE_SZ);
++		its_cpu_init_lpis();
++	}
++	return reinit_self;
++}
++
+ static void its_restore_enable(void *data)
+ {
+ 	struct its_node *its;
++	bool rd_reinit;
+ 	int ret;
+ 
++	rd_reinit = its_restore_rd_tables();
++
+ 	raw_spin_lock(&its_lock);
+ 	list_for_each_entry(its, &its_nodes, entry) {
+ 		void __iomem *base;
+@@ -5094,7 +5190,7 @@ static void its_restore_enable(void *data)
+ 		 * indicated by the col_id being less than the HCC field.
+ 		 * CID < HCC as specified in the GIC v3 Documentation.
+ 		 */
+-		if (its->collections[smp_processor_id()].col_id <
++		if (rd_reinit || its->collections[smp_processor_id()].col_id <
+ 		    GITS_TYPER_HCC(gic_read_typer(base + GITS_TYPER)))
+ 			its_cpu_init_collection(its);
+ 	}
+-- 
+2.56.1
+

@@ -1,0 +1,1728 @@
+diff --git a/libfprint/drivers/aurora/aurora.c b/libfprint/drivers/aurora/aurora.c
+index be044609..b13e4084 100644
+--- a/libfprint/drivers/aurora/aurora.c
++++ b/libfprint/drivers/aurora/aurora.c
+@@ -192,6 +192,16 @@ aurora_label_from_print (FpPrint *print, guint8 *label_out, GError **error)
+   return TRUE;
+ }
+ 
++/* Set once a closed lid has covered the sensor: see aurora_removed_cb(). */
++static gboolean
++aurora_is_removed (FpDevice *device)
++{
++  gboolean removed = FALSE;
++
++  g_object_get (device, "removed", &removed, NULL);
++  return removed;
++}
++
+ static void
+ aurora_stop_watch (FpiDeviceAurora *self)
+ {
+@@ -366,6 +376,12 @@ aurora_open (FpDevice *device)
+   FpiDeviceAurora *self = FPI_DEVICE_AURORA (device);
+   const gchar *path;
+ 
++  if (aurora_is_removed (device))
++    {
++      fpi_device_open_complete (device, fpi_device_error_new (FP_DEVICE_ERROR_REMOVED));
++      return;
++    }
++
+   path = fpi_device_get_udev_data (device, FPI_DEVICE_UDEV_SUBTYPE_MISC);
+   if (path == NULL)
+     {
+@@ -425,6 +441,27 @@ aurora_cancel (FpDevice *device)
+     ioctl (self->fd, AURORA_BIO_CANCEL);
+ }
+ 
++/* The sensor is in the power button, so a closed lid covers it, and the
++ * context removes this device then (covered_by_lid below). An operation still
++ * waiting for a finger can never finish: cancel it in the enclave, and libfprint
++ * completes it as FP_DEVICE_ERROR_REMOVED, which fprintd reports as
++ * verify-disconnected and pam_fprintd answers by moving on to the password.
++ * The device stays open until its user releases it; refuse anything that would
++ * arm the sensor again in the meantime. */
++static void
++aurora_removed_cb (FpDevice *device, GParamSpec *pspec, gpointer user_data)
++{
++  FpiDeviceAurora *self = FPI_DEVICE_AURORA (device);
++
++  if (!aurora_is_removed (device))
++    return;
++
++  fp_dbg ("device removed%s", self->watch_id != 0 ? "; cancelling the running operation" : "");
++
++  if (self->watch_id != 0)
++    aurora_cancel (device);
++}
++
+ static void
+ aurora_report_guidance (FpDevice *device, guint32 guidance, gboolean active)
+ {
+@@ -532,6 +569,12 @@ aurora_enroll (FpDevice *device)
+   g_autoptr(GError) error = NULL;
+   FpPrint *print = NULL;
+ 
++  if (aurora_is_removed (device))
++    {
++      fpi_device_enroll_complete (device, NULL, fpi_device_error_new (FP_DEVICE_ERROR_REMOVED));
++      return;
++    }
++
+   fpi_device_get_enroll_data (device, &print);
+ 
+   if (!aurora_label_from_print (print, start.label, &error))
+@@ -801,6 +844,16 @@ aurora_match_start (FpDevice *device)
+         }
+     }
+ 
++  if (aurora_is_removed (device))
++    {
++      error = fpi_device_error_new (FP_DEVICE_ERROR_REMOVED);
++      if (action == FPI_DEVICE_ACTION_VERIFY)
++        fpi_device_verify_complete (device, g_steal_pointer (&error));
++      else
++        fpi_device_identify_complete (device, g_steal_pointer (&error));
++      return;
++    }
++
+   /* A fresh nonce per operation is what makes the result non-replayable. If we
+    * cannot get one we must not fall back to anything weaker. */
+   if (getrandom (self->nonce, sizeof (self->nonce), 0) != (gssize) sizeof (self->nonce))
+@@ -930,6 +983,8 @@ fpi_device_aurora_init (FpiDeviceAurora *self)
+   self->fd = -1;
+   self->watch_id = 0;
+   self->nonce_valid = FALSE;
++
++  g_signal_connect (self, "notify::removed", G_CALLBACK (aurora_removed_cb), NULL);
+ }
+ 
+ static void
+@@ -965,6 +1020,7 @@ fpi_device_aurora_class_init (FpiDeviceAuroraClass *klass)
+   dev_class->scan_type = FP_SCAN_TYPE_PRESS;
+   dev_class->nr_enroll_stages = 8;
+   dev_class->temp_hot_seconds = -1;
++  dev_class->covered_by_lid = TRUE;
+ 
+   dev_class->probe = aurora_probe;
+   dev_class->open = aurora_open;
+diff --git a/libfprint/fp-context.c b/libfprint/fp-context.c
+index 6fdf53b4..2491d162 100644
+--- a/libfprint/fp-context.c
++++ b/libfprint/fp-context.c
+@@ -29,6 +29,7 @@
+ 
+ #ifdef HAVE_UDEV
+ #include <gudev/gudev.h>
++#include "fpi-lid-switch.h"
+ #endif
+ 
+ /**
+@@ -55,6 +56,11 @@ typedef struct
+ 
+   GArray       *drivers;
+   GPtrArray    *devices;
++
++#ifdef HAVE_UDEV
++  FpiLidSwitch *lid;
++  GPtrArray    *lid_covered;
++#endif
+ } FpContextPrivate;
+ 
+ G_DEFINE_TYPE_WITH_PRIVATE (FpContext, fp_context, G_TYPE_OBJECT)
+@@ -96,17 +102,67 @@ typedef struct
+   GSource   *source;
+ } RemoveDeviceData;
+ 
++#ifdef HAVE_UDEV
++/* A udev device whose sensor a closed lid covers (FpDeviceClass:covered_by_lid).
++ *
++ * Nobody can touch such a sensor while the lid is closed, so the device is
++ * removed then, and anyone asking for a reader sees none instead of one that
++ * waits for a finger that cannot come. This record outlives the FpDevice
++ * instances made from it, so the device can be probed again once the lid
++ * opens. */
++typedef struct
++{
++  FpContext *context;     /* NULL once the context is gone */
++  GType      driver;
++  guint64    driver_data;
++  gchar     *spidev_path;
++  gchar     *hidraw_path;
++  gchar     *misc_path;
++  FpDevice  *device;      /* current instance, until the context drops it */
++  gboolean   probing;
++} LidCoveredDevice;
++
++static void lid_covered_probe (FpContext        *context,
++                               LidCoveredDevice *covered);
++#endif
++
+ static gboolean
+ remove_device_idle_cb (RemoveDeviceData *data)
+ {
+   FpContextPrivate *priv = fp_context_get_instance_private (data->context);
+   guint idx = 0;
+ 
++#ifdef HAVE_UDEV
++  LidCoveredDevice *covered = NULL;
++  guint i;
++#endif
++
+   g_return_val_if_fail (g_ptr_array_find (priv->devices, data->device, &idx), G_SOURCE_REMOVE);
+ 
++#ifdef HAVE_UDEV
++  for (i = 0; priv->lid_covered && i < priv->lid_covered->len; i++)
++    {
++      LidCoveredDevice *c = g_ptr_array_index (priv->lid_covered, i);
++
++      if (c->device == data->device)
++        {
++          c->device = NULL;
++          covered = c;
++          break;
++        }
++    }
++#endif
++
+   g_signal_emit (data->context, signals[DEVICE_REMOVED_SIGNAL], 0, data->device);
+   g_ptr_array_remove_index_fast (priv->devices, idx);
+ 
++#ifdef HAVE_UDEV
++  /* The lid may have opened again while the old instance was still open. It
++   * is gone now, so the node is free for a new one. */
++  if (covered && !fpi_lid_switch_get_closed (priv->lid))
++    lid_covered_probe (data->context, covered);
++#endif
++
+   return G_SOURCE_REMOVE;
+ }
+ 
+@@ -166,6 +222,21 @@ device_removed_cb (FpContext *context, FpDevice *device)
+     }
+ }
+ 
++static void
++add_device (FpContext *context, FpDevice *device)
++{
++  FpContextPrivate *priv = fp_context_get_instance_private (context);
++
++  g_ptr_array_add (priv->devices, device);
++
++  g_signal_connect_object (device, "removed",
++                           (GCallback) device_removed_cb,
++                           context,
++                           G_CONNECT_SWAPPED);
++
++  g_signal_emit (context, signals[DEVICE_ADDED_SIGNAL], 0, device);
++}
++
+ static void
+ async_device_init_done_cb (GObject *source_object, GAsyncResult *res, gpointer user_data)
+ {
+@@ -189,15 +260,167 @@ async_device_init_done_cb (GObject *source_object, GAsyncResult *res, gpointer u
+       return;
+     }
+ 
+-  g_ptr_array_add (priv->devices, device);
++  add_device (context, device);
++}
+ 
+-  g_signal_connect_object (device, "removed",
+-                           (GCallback) device_removed_cb,
+-                           context,
+-                           G_CONNECT_SWAPPED);
++#ifdef HAVE_UDEV
++static void
++lid_covered_device_free (LidCoveredDevice *covered)
++{
++  g_free (covered->spidev_path);
++  g_free (covered->hidraw_path);
++  g_free (covered->misc_path);
++}
+ 
+-  g_signal_emit (context, signals[DEVICE_ADDED_SIGNAL], 0, device);
++static void
++lid_covered_device_release (LidCoveredDevice *covered)
++{
++  g_rc_box_release_full (covered, (GDestroyNotify) lid_covered_device_free);
++}
++
++static void
++lid_covered_init_done_cb (GObject *source_object, GAsyncResult *res, gpointer user_data)
++{
++  LidCoveredDevice *covered = user_data;
++  g_autoptr(GError) error = NULL;
++  g_autoptr(FpDevice) device = NULL;
++  FpContextPrivate *priv;
++
++  device = FP_DEVICE (g_async_initable_new_finish (G_ASYNC_INITABLE (source_object),
++                                                   res, &error));
++
++  if (g_error_matches (error, G_IO_ERROR, G_IO_ERROR_CANCELLED) || !covered->context)
++    {
++      lid_covered_device_release (covered);
++      return;
++    }
++
++  priv = fp_context_get_instance_private (covered->context);
++  priv->pending_devices--;
++  covered->probing = FALSE;
++
++  if (error)
++    {
++      g_message ("Ignoring device due to initialization error: %s", error->message);
++    }
++  else if (fpi_lid_switch_get_closed (priv->lid))
++    {
++      /* The lid closed while the device was being probed. */
++      fp_dbg ("Lid closed during probe; %s stays hidden",
++              fp_device_get_driver (device));
++    }
++  else
++    {
++      covered->device = device;
++      add_device (covered->context, g_steal_pointer (&device));
++    }
++
++  lid_covered_device_release (covered);
++}
++
++static void
++lid_covered_probe (FpContext *context, LidCoveredDevice *covered)
++{
++  FpContextPrivate *priv = fp_context_get_instance_private (context);
++
++  if (covered->device || covered->probing)
++    return;
++
++  covered->probing = TRUE;
++  priv->pending_devices++;
++  g_async_initable_new_async (covered->driver,
++                              G_PRIORITY_LOW,
++                              priv->cancellable,
++                              lid_covered_init_done_cb,
++                              g_rc_box_acquire (covered),
++                              "fpi-driver-data", covered->driver_data,
++                              "fpi-udev-data-spidev", covered->spidev_path,
++                              "fpi-udev-data-hidraw", covered->hidraw_path,
++                              "fpi-udev-data-misc", covered->misc_path,
++                              NULL);
++}
++
++static void
++lid_closed_changed_cb (FpContext *context)
++{
++  FpContextPrivate *priv = fp_context_get_instance_private (context);
++  gboolean closed = fpi_lid_switch_get_closed (priv->lid);
++  guint i;
++
++  for (i = 0; i < priv->lid_covered->len; i++)
++    {
++      LidCoveredDevice *covered = g_ptr_array_index (priv->lid_covered, i);
++
++      if (!closed)
++        {
++          /* Probed now if the old instance is gone, else once it is. */
++          lid_covered_probe (context, covered);
++        }
++      else if (covered->device)
++        {
++          gboolean removed;
++
++          g_object_get (covered->device, "removed", &removed, NULL);
++          if (!removed)
++            {
++              fp_dbg ("Lid closed; removing %s", fp_device_get_driver (covered->device));
++              /* The context drops the device once its user has closed it. */
++              fpi_device_remove (covered->device);
++            }
++        }
++    }
++}
++
++/*
++ * fpi_context_add_lid_covered_device:
++ * @lid: (nullable): the lid switch to follow, or %NULL for the system's.
++ *   Only the first device added decides it.
++ *
++ * Register a udev device whose sensor a closed lid covers, and probe it
++ * unless the lid is closed. Tests use @lid to drive a detached switch.
++ */
++void
++fpi_context_add_lid_covered_device (FpContext    *context,
++                                    FpiLidSwitch *lid,
++                                    GType         driver,
++                                    guint64       driver_data,
++                                    const gchar  *spidev_path,
++                                    const gchar  *hidraw_path,
++                                    const gchar  *misc_path)
++{
++  FpContextPrivate *priv = fp_context_get_instance_private (context);
++  LidCoveredDevice *covered;
++
++  if (!priv->lid)
++    {
++      priv->lid = lid ? g_object_ref (lid) : fpi_lid_switch_new ();
++      priv->lid_covered = g_ptr_array_new_with_free_func ((GDestroyNotify) lid_covered_device_release);
++      g_signal_connect_object (priv->lid, "notify::closed",
++                               G_CALLBACK (lid_closed_changed_cb),
++                               context,
++                               G_CONNECT_SWAPPED);
++    }
++
++  covered = g_rc_box_new0 (LidCoveredDevice);
++  covered->context = context;
++  covered->driver = driver;
++  covered->driver_data = driver_data;
++  covered->spidev_path = g_strdup (spidev_path);
++  covered->hidraw_path = g_strdup (hidraw_path);
++  covered->misc_path = g_strdup (misc_path);
++  g_ptr_array_add (priv->lid_covered, covered);
++
++  if (fpi_lid_switch_get_closed (priv->lid))
++    {
++      g_autoptr(FpDeviceClass) cls = g_type_class_ref (driver);
++
++      fp_info ("The lid covers the %s sensor; it appears once the lid opens", cls->id);
++      return;
++    }
++
++  lid_covered_probe (context, covered);
+ }
++#endif
+ 
+ static void
+ usb_device_added_cb (FpContext *self, GUsbDevice *device, GUsbContext *usb_ctx)
+@@ -287,6 +510,20 @@ fp_context_finalize (GObject *object)
+ 
+   g_cancellable_cancel (priv->cancellable);
+   g_clear_object (&priv->cancellable);
++
++#ifdef HAVE_UDEV
++  if (priv->lid_covered)
++    {
++      guint i;
++
++      /* Probes still in flight hold their own reference. */
++      for (i = 0; i < priv->lid_covered->len; i++)
++        ((LidCoveredDevice *) g_ptr_array_index (priv->lid_covered, i))->context = NULL;
++    }
++  g_clear_pointer (&priv->lid_covered, g_ptr_array_unref);
++  g_clear_object (&priv->lid);
++#endif
++
+   g_clear_pointer (&priv->drivers, g_array_unref);
+   g_clear_pointer (&priv->devices, g_ptr_array_unref);
+ 
+@@ -545,17 +782,27 @@ fp_context_enumerate (FpContext *context)
+                 if (matched_misc == NULL)
+                   continue;
+               }
+-            priv->pending_devices++;
+-            g_async_initable_new_async (driver,
+-                                        G_PRIORITY_LOW,
+-                                        priv->cancellable,
+-                                        async_device_init_done_cb,
+-                                        context,
+-                                        "fpi-driver-data", entry->driver_data,
+-                                        "fpi-udev-data-spidev", (matched_spidev ? g_udev_device_get_device_file (matched_spidev->data) : NULL),
+-                                        "fpi-udev-data-hidraw", (matched_hidraw ? g_udev_device_get_device_file (matched_hidraw->data) : NULL),
+-                                        "fpi-udev-data-misc", (matched_misc ? g_udev_device_get_device_file (matched_misc->data) : NULL),
+-                                        NULL);
++            if (cls->covered_by_lid)
++              {
++                fpi_context_add_lid_covered_device (context, NULL, driver, entry->driver_data,
++                                                    (matched_spidev ? g_udev_device_get_device_file (matched_spidev->data) : NULL),
++                                                    (matched_hidraw ? g_udev_device_get_device_file (matched_hidraw->data) : NULL),
++                                                    (matched_misc ? g_udev_device_get_device_file (matched_misc->data) : NULL));
++              }
++            else
++              {
++                priv->pending_devices++;
++                g_async_initable_new_async (driver,
++                                            G_PRIORITY_LOW,
++                                            priv->cancellable,
++                                            async_device_init_done_cb,
++                                            context,
++                                            "fpi-driver-data", entry->driver_data,
++                                            "fpi-udev-data-spidev", (matched_spidev ? g_udev_device_get_device_file (matched_spidev->data) : NULL),
++                                            "fpi-udev-data-hidraw", (matched_hidraw ? g_udev_device_get_device_file (matched_hidraw->data) : NULL),
++                                            "fpi-udev-data-misc", (matched_misc ? g_udev_device_get_device_file (matched_misc->data) : NULL),
++                                            NULL);
++              }
+             /* remove entries from list to avoid conflicts */
+             if (matched_spidev)
+               {
+@@ -578,6 +825,7 @@ fp_context_enumerate (FpContext *context)
+     /* free all unused elemnts in both lists */
+     g_list_foreach (spidev_devices, (GFunc) g_object_unref, NULL);
+     g_list_foreach (hidraw_devices, (GFunc) g_object_unref, NULL);
++    g_list_foreach (misc_devices, (GFunc) g_object_unref, NULL);
+   }
+ #endif
+ 
+diff --git a/libfprint/fp-device.c b/libfprint/fp-device.c
+index 70b10f1f..f488f71b 100644
+--- a/libfprint/fp-device.c
++++ b/libfprint/fp-device.c
+@@ -1092,6 +1092,10 @@ fp_device_resume (FpDevice           *device,
+ 
+   if (priv->is_removed)
+     {
++      /* There is nothing left to resume, but the device must not stay
++       * suspended: its user still has to close it, and a suspended device
++       * refuses that as busy, so it would never be released. */
++      priv->is_suspended = FALSE;
+       g_task_return_error (task,
+                            fpi_device_error_new (FP_DEVICE_ERROR_REMOVED));
+       return;
+diff --git a/libfprint/fpi-device.h b/libfprint/fpi-device.h
+index 7671ad6a..db872952 100644
+--- a/libfprint/fpi-device.h
++++ b/libfprint/fpi-device.h
+@@ -96,6 +96,11 @@ struct _FpIdEntry
+  *   after being mostly cold. Set to -1 if the device can be always-on.
+  * @temp_cold_seconds: Assumed time in seconds for the device to be mostly cold
+  *   after having been too hot to operate.
++ * @covered_by_lid: The sensor is built into a laptop's base (e.g. its keyboard
++ *   or power button), so nobody can touch it while the lid is closed. #FpContext
++ *   then removes the device, and probes it again once the lid opens. Only
++ *   udev devices support this. A driver that sets it must fail a running
++ *   operation promptly when the device is removed.
+  * @usb_discover: Class method to check whether a USB device is supported by
+  *  the driver. Should return 0 if the device is unsupported and a positive
+  *  score otherwise. The default score is 50 and the driver with the highest
+@@ -168,6 +173,9 @@ struct _FpDeviceClass
+   gint32 temp_hot_seconds;
+   gint32 temp_cold_seconds;
+ 
++  /* The sensor sits in a laptop's base, where a closed lid covers it */
++  gboolean covered_by_lid;
++
+   /* Callbacks */
+   gint (*usb_discover) (GUsbDevice *usb_device);
+   void (*probe)    (FpDevice *device);
+diff --git a/libfprint/fpi-lid-switch.c b/libfprint/fpi-lid-switch.c
+new file mode 100644
+index 00000000..9411dd8d
+--- /dev/null
++++ b/libfprint/fpi-lid-switch.c
+@@ -0,0 +1,386 @@
++/*
++ * Laptop lid switch tracking
++ * Copyright (C) 2026 Ryan Murray <ryan@aurorasilicon.org>
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++#define FP_COMPONENT "lid"
++#include <fpi-log.h>
++
++#include "fpi-lid-switch.h"
++
++#include <errno.h>
++#include <fcntl.h>
++#include <glib-unix.h>
++#include <gudev/gudev.h>
++#include <linux/input.h>
++#include <sys/ioctl.h>
++#include <unistd.h>
++
++/*
++ * FpiLidSwitch follows every input device that reports SW_LID and says
++ * whether the lid is closed. The kernel's switch state (EVIOCGSW) is the
++ * truth: events only tell us when to read it again, so a dropped event or a
++ * SYN_DROPPED cannot leave a stale state behind. Without a lid switch the
++ * lid counts as open, which keeps desktops and external readers unaffected.
++ *
++ * Lid switches can appear late (a platform driver loading after the daemon
++ * started), so input hotplug is followed as well.
++ */
++
++#define BITS_PER_LONG (sizeof (unsigned long) * 8)
++#define NLONGS(x) (((x) + BITS_PER_LONG - 1) / BITS_PER_LONG)
++
++typedef struct
++{
++  gchar   *path;
++  gint     fd;
++  GSource *source;
++} FpiLidInput;
++
++struct _FpiLidSwitch
++{
++  GObject      parent;
++
++  GMainContext *context;    /* the thread-default context at creation */
++  GUdevClient  *udev_client;
++  GHashTable   *inputs;   /* device file -> FpiLidInput */
++  gboolean      closed;
++};
++
++enum {
++  PROP_0,
++  PROP_CLOSED,
++  N_PROPS
++};
++static GParamSpec *properties[N_PROPS];
++
++G_DEFINE_TYPE (FpiLidSwitch, fpi_lid_switch, G_TYPE_OBJECT)
++
++static gboolean
++test_bit (guint bit, const unsigned long *array)
++{
++  return !!(array[bit / BITS_PER_LONG] & (1UL << (bit % BITS_PER_LONG)));
++}
++
++static void
++lid_input_free (FpiLidInput *input)
++{
++  if (input->source)
++    {
++      g_source_destroy (input->source);
++      g_clear_pointer (&input->source, g_source_unref);
++    }
++  if (input->fd >= 0)
++    close (input->fd);
++  g_free (input->path);
++  g_free (input);
++}
++
++static void
++lid_switch_set_closed (FpiLidSwitch *self, gboolean closed)
++{
++  if (closed == self->closed)
++    return;
++
++  self->closed = closed;
++  fp_info ("Lid %s", closed ? "closed" : "opened");
++  g_object_notify_by_pspec (G_OBJECT (self), properties[PROP_CLOSED]);
++}
++
++static void
++lid_switch_update (FpiLidSwitch *self)
++{
++  GHashTableIter iter;
++  FpiLidInput *input;
++  gboolean closed = FALSE;
++
++  g_hash_table_iter_init (&iter, self->inputs);
++  while (g_hash_table_iter_next (&iter, NULL, (gpointer *) &input))
++    {
++      unsigned long state[NLONGS (SW_CNT)] = { 0 };
++
++      if (ioctl (input->fd, EVIOCGSW (sizeof (state)), state) < 0)
++        {
++          fp_dbg ("Cannot read switch state of %s: %s", input->path, g_strerror (errno));
++          continue;
++        }
++
++      /* Any closed lid covers the sensor. */
++      if (test_bit (SW_LID, state))
++        closed = TRUE;
++    }
++
++  lid_switch_set_closed (self, closed);
++}
++
++static gboolean
++lid_input_ready_cb (gint fd, GIOCondition condition, gpointer user_data)
++{
++  FpiLidSwitch *self = FPI_LID_SWITCH (user_data);
++  struct input_event events[16];
++  FpiLidInput *input = NULL;
++  FpiLidInput *candidate;
++  GHashTableIter iter;
++  gboolean gone = (condition & (G_IO_HUP | G_IO_ERR)) != 0;
++
++  /* g_hash_table_iter_next() leaves its last entry behind when nothing
++   * matches, so only take an input whose fd is ours. */
++  g_hash_table_iter_init (&iter, self->inputs);
++  while (g_hash_table_iter_next (&iter, NULL, (gpointer *) &candidate))
++    if (candidate->fd == fd)
++      {
++        input = candidate;
++        break;
++      }
++
++  /* Drain; the content does not matter, the state is read back below. */
++  while (!gone)
++    {
++      gssize len = read (fd, events, sizeof (events));
++
++      if (len > 0)
++        continue;
++      if (len < 0 && errno == EINTR)
++        continue;
++      if (len < 0 && errno == EAGAIN)
++        break;
++
++      gone = TRUE;
++    }
++
++  if (gone)
++    {
++      if (input != NULL)
++        {
++          fp_dbg ("Lid switch %s went away", input->path);
++          g_hash_table_remove (self->inputs, input->path);
++          lid_switch_update (self);
++        }
++      return G_SOURCE_REMOVE;
++    }
++
++  lid_switch_update (self);
++  return G_SOURCE_CONTINUE;
++}
++
++static void
++lid_switch_add_input (FpiLidSwitch *self, GUdevDevice *udev_device)
++{
++  unsigned long sw_bits[NLONGS (SW_CNT)] = { 0 };
++  const gchar *path = g_udev_device_get_device_file (udev_device);
++  FpiLidInput *input;
++  gint fd;
++
++  if (path == NULL || !g_str_has_prefix (path, "/dev/input/event"))
++    return;
++
++  if (g_hash_table_contains (self->inputs, path))
++    return;
++
++  /* With a udev database, only open devices that have switches at all;
++   * without one, fall back to asking the device. */
++  if (g_udev_device_has_property (udev_device, "ID_INPUT") &&
++      !g_udev_device_get_property_as_boolean (udev_device, "ID_INPUT_SWITCH"))
++    return;
++
++  fd = open (path, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
++  if (fd < 0)
++    {
++      fp_dbg ("Cannot open %s: %s", path, g_strerror (errno));
++      return;
++    }
++
++  if (ioctl (fd, EVIOCGBIT (EV_SW, sizeof (sw_bits)), sw_bits) < 0 ||
++      !test_bit (SW_LID, sw_bits))
++    {
++      close (fd);
++      return;
++    }
++
++  input = g_new0 (FpiLidInput, 1);
++  input->path = g_strdup (path);
++  input->fd = fd;
++  /* Like the rest of libfprint, and like the GUdevClient above, dispatch in
++   * the thread-default main context of whoever created us. */
++  input->source = g_unix_fd_source_new (fd, G_IO_IN | G_IO_HUP | G_IO_ERR);
++  g_source_set_callback (input->source, G_SOURCE_FUNC (lid_input_ready_cb), self, NULL);
++  g_source_attach (input->source, self->context);
++  g_hash_table_insert (self->inputs, input->path, input);
++
++  fp_dbg ("Following lid switch %s (%s)", path,
++          g_udev_device_get_sysfs_attr (udev_device, "device/name") ? : "unnamed");
++}
++
++static void
++lid_switch_uevent_cb (GUdevClient *client,
++                      const gchar *action,
++                      GUdevDevice *udev_device,
++                      gpointer     user_data)
++{
++  FpiLidSwitch *self = FPI_LID_SWITCH (user_data);
++  const gchar *path = g_udev_device_get_device_file (udev_device);
++
++  if (path == NULL)
++    return;
++
++  if (g_str_equal (action, "add") || g_str_equal (action, "change"))
++    lid_switch_add_input (self, udev_device);
++  else if (g_str_equal (action, "remove"))
++    g_hash_table_remove (self->inputs, path);
++  else
++    return;
++
++  lid_switch_update (self);
++}
++
++static void
++fpi_lid_switch_get_property (GObject    *object,
++                             guint       prop_id,
++                             GValue     *value,
++                             GParamSpec *pspec)
++{
++  FpiLidSwitch *self = FPI_LID_SWITCH (object);
++
++  switch (prop_id)
++    {
++    case PROP_CLOSED:
++      g_value_set_boolean (value, self->closed);
++      break;
++
++    default:
++      G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
++    }
++}
++
++static void
++fpi_lid_switch_dispose (GObject *object)
++{
++  FpiLidSwitch *self = FPI_LID_SWITCH (object);
++
++  if (self->udev_client)
++    g_signal_handlers_disconnect_by_data (self->udev_client, self);
++  g_clear_object (&self->udev_client);
++  g_clear_pointer (&self->inputs, g_hash_table_unref);
++  g_clear_pointer (&self->context, g_main_context_unref);
++
++  G_OBJECT_CLASS (fpi_lid_switch_parent_class)->dispose (object);
++}
++
++static void
++fpi_lid_switch_class_init (FpiLidSwitchClass *klass)
++{
++  GObjectClass *object_class = G_OBJECT_CLASS (klass);
++
++  object_class->get_property = fpi_lid_switch_get_property;
++  object_class->dispose = fpi_lid_switch_dispose;
++
++  properties[PROP_CLOSED] =
++    g_param_spec_boolean ("closed",
++                          "Closed",
++                          "Whether a laptop lid is closed",
++                          FALSE,
++                          G_PARAM_STATIC_STRINGS | G_PARAM_READABLE);
++
++  g_object_class_install_properties (object_class, N_PROPS, properties);
++}
++
++static void
++fpi_lid_switch_init (FpiLidSwitch *self)
++{
++  self->context = g_main_context_ref_thread_default ();
++  self->inputs = g_hash_table_new_full (g_str_hash, g_str_equal, NULL,
++                                        (GDestroyNotify) lid_input_free);
++}
++
++/* Start following the lid switches of the system. */
++static void
++lid_switch_follow_system (FpiLidSwitch *self)
++{
++  const gchar * const subsystems[] = { "input", NULL };
++  GList *devices, *l;
++
++  self->udev_client = g_udev_client_new (subsystems);
++  g_signal_connect (self->udev_client, "uevent",
++                    G_CALLBACK (lid_switch_uevent_cb), self);
++
++  devices = g_udev_client_query_by_subsystem (self->udev_client, "input");
++  for (l = devices; l; l = l->next)
++    lid_switch_add_input (self, l->data);
++  g_list_free_full (devices, g_object_unref);
++
++  lid_switch_update (self);
++}
++
++/**
++ * fpi_lid_switch_new:
++ *
++ * Follow the laptop lid switches of the system.
++ *
++ * Returns: (transfer full): a new #FpiLidSwitch
++ */
++FpiLidSwitch *
++fpi_lid_switch_new (void)
++{
++  FpiLidSwitch *self = g_object_new (FPI_TYPE_LID_SWITCH, NULL);
++
++  lid_switch_follow_system (self);
++  return self;
++}
++
++/**
++ * fpi_lid_switch_new_detached:
++ *
++ * Make a lid switch that follows no device and is open until
++ * fpi_lid_switch_set_closed() says otherwise. This is for tests.
++ *
++ * Returns: (transfer full): a new #FpiLidSwitch
++ */
++FpiLidSwitch *
++fpi_lid_switch_new_detached (void)
++{
++  return g_object_new (FPI_TYPE_LID_SWITCH, NULL);
++}
++
++/**
++ * fpi_lid_switch_set_closed:
++ * @self: a #FpiLidSwitch made by fpi_lid_switch_new_detached()
++ * @closed: whether the lid is closed
++ *
++ * Open or close a detached lid switch, as a real one would on its own.
++ */
++void
++fpi_lid_switch_set_closed (FpiLidSwitch *self, gboolean closed)
++{
++  g_return_if_fail (FPI_IS_LID_SWITCH (self));
++  g_return_if_fail (self->udev_client == NULL);
++
++  lid_switch_set_closed (self, !!closed);
++}
++
++/**
++ * fpi_lid_switch_get_closed:
++ * @self: a #FpiLidSwitch
++ *
++ * Returns: %TRUE if a lid is closed, %FALSE if it is open or there is none
++ */
++gboolean
++fpi_lid_switch_get_closed (FpiLidSwitch *self)
++{
++  g_return_val_if_fail (FPI_IS_LID_SWITCH (self), FALSE);
++
++  return self->closed;
++}
+diff --git a/libfprint/fpi-lid-switch.h b/libfprint/fpi-lid-switch.h
+new file mode 100644
+index 00000000..b7370b86
+--- /dev/null
++++ b/libfprint/fpi-lid-switch.h
+@@ -0,0 +1,46 @@
++/*
++ * Laptop lid switch tracking
++ * Copyright (C) 2026 Ryan Murray <ryan@aurorasilicon.org>
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++#pragma once
++
++#include <glib-object.h>
++
++#include "fp-context.h"
++
++#define FPI_TYPE_LID_SWITCH (fpi_lid_switch_get_type ())
++G_DECLARE_FINAL_TYPE (FpiLidSwitch, fpi_lid_switch, FPI, LID_SWITCH, GObject)
++
++FpiLidSwitch *fpi_lid_switch_new (void);
++
++gboolean      fpi_lid_switch_get_closed (FpiLidSwitch *self);
++
++/* For tests: a switch that follows no device, opened and closed by hand. */
++FpiLidSwitch *fpi_lid_switch_new_detached (void);
++
++void          fpi_lid_switch_set_closed (FpiLidSwitch *self,
++                                         gboolean      closed);
++
++/* Private to FpContext; tests call it to register a reader without udev. */
++void fpi_context_add_lid_covered_device (FpContext    *context,
++                                         FpiLidSwitch *lid,
++                                         GType         driver,
++                                         guint64       driver_data,
++                                         const gchar  *spidev_path,
++                                         const gchar  *hidraw_path,
++                                         const gchar  *misc_path);
+diff --git a/libfprint/meson.build b/libfprint/meson.build
+index 400c5b74..516ad107 100644
+--- a/libfprint/meson.build
++++ b/libfprint/meson.build
+@@ -6,6 +6,12 @@ if have_spi
+   spi_sources = ['fpi-spi-transfer.c']
+ endif
+ 
++lid_sources = []
++
++if libfprint_conf.has('HAVE_UDEV')
++  lid_sources = ['fpi-lid-switch.c']
++endif
++
+ libfprint_sources = [
+     'fp-context.c',
+     'fp-device.c',
+@@ -25,7 +31,7 @@ libfprint_private_sources = [
+     'fpi-print.c',
+     'fpi-ssm.c',
+     'fpi-usb-transfer.c',
+-] + spi_sources
++] + spi_sources + lid_sources
+ 
+ libfprint_public_headers = [
+     'fp-context.h',
+@@ -302,6 +308,24 @@ libfprint_private_dep = declare_dependency(
+     ]
+ )
+ 
++# The shared library hides FpContext's private functions. Tests that drive
++# them (test-lid-covered) link the whole library statically instead.
++if libfprint_conf.has('HAVE_UDEV')
++    libfprint_static = static_library('fprint-static',
++        sources: [
++            fp_enums,
++            libfprint_sources,
++        ],
++        link_with: [libfprint_drivers, libfprint_private],
++        dependencies: deps,
++        install: false)
++
++    libfprint_static_dep = declare_dependency(
++        include_directories: include_directories('.'),
++        link_with: libfprint_static,
++        dependencies: deps)
++endif
++
+ udev_hwdb_list = 'fprint-list-udev-hwdb.c'
+ udev_hwdb_list_file = files(udev_hwdb_list)
+ udev_hwdb = executable('fprint-list-udev-hwdb',
+diff --git a/tests/meson.build b/tests/meson.build
+index d218e04d..98c67564 100644
+--- a/tests/meson.build
++++ b/tests/meson.build
+@@ -322,8 +322,32 @@ if 'virtual_image' in drivers
+     ]
+ endif
+ 
++# Makes uinput lid switches: skipped without /dev/uinput access and udev
++if libfprint_conf.has('HAVE_UDEV')
++    unit_tests += [
++        'lid-switch',
++    ]
++endif
++
+ unit_tests_deps = { 'fpi-assembling' : [cairo_dep] }
+ 
++# FpContext hiding a lid-covered reader, with a detached lid switch: runs
++# anywhere. It calls FpContext's private functions, so it links the library
++# statically.
++if libfprint_conf.has('HAVE_UDEV')
++    test_lid_covered = executable('test-lid-covered',
++        sources: ['test-lid-covered.c', 'test-device-fake.c'],
++        dependencies: libfprint_static_dep,
++        c_args: common_cflags,
++        install: false,
++    )
++    test('lid-covered',
++        test_lid_covered,
++        suite: ['unit-tests'],
++        env: envs,
++    )
++endif
++
+ foreach test_name: unit_tests
+     if unit_tests_deps.has_key(test_name)
+         missing_deps = false
+diff --git a/tests/test-fpi-device.c b/tests/test-fpi-device.c
+index 165532d7..0b9b3b9e 100644
+--- a/tests/test-fpi-device.c
++++ b/tests/test-fpi-device.c
+@@ -2834,6 +2834,43 @@ test_driver_identify_suspend_while_idle (void)
+   g_assert_no_error (error);
+ }
+ 
++static void
++on_removed_set_flag (gboolean *flag)
++{
++  *flag = TRUE;
++}
++
++/* A device removed while the system sleeps, such as a reader that a closed
++ * lid covers, must still be closable after resume. */
++static void
++test_driver_removed_while_suspended (void)
++{
++  g_autoptr(FpAutoResetClass) dev_class = auto_reset_device_class ();
++  g_autoptr(FpDevice) device = NULL;
++  g_autoptr(GError) error = NULL;
++  gboolean removed_emitted = FALSE;
++
++  device = g_object_new (FPI_TYPE_DEVICE_FAKE, NULL);
++  g_signal_connect_swapped (device, "removed", G_CALLBACK (on_removed_set_flag), &removed_emitted);
++  g_assert_true (fp_device_open_sync (device, NULL, NULL));
++
++  g_assert_true (fp_device_suspend_sync (device, NULL, &error));
++  g_assert_no_error (error);
++
++  fpi_device_remove (device);
++  g_assert_true (removed_emitted);
++
++  fp_device_resume_sync (device, NULL, &error);
++  g_assert_error (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_REMOVED);
++  g_clear_error (&error);
++
++  /* Closing reports the removal, but must close the device rather than
++   * refuse as busy. */
++  fp_device_close_sync (device, NULL, &error);
++  g_assert_error (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_REMOVED);
++  g_assert_false (fp_device_is_open (device));
++}
++
+ static void
+ test_driver_identify_warmup_cooldown (void)
+ {
+@@ -4155,6 +4192,7 @@ main (int argc, char *argv[])
+   g_test_add_func ("/driver/identify/suspend_succeeds", test_driver_identify_suspend_succeeds);
+   g_test_add_func ("/driver/identify/suspend_busy_error", test_driver_identify_suspend_busy_error);
+   g_test_add_func ("/driver/identify/suspend_while_idle", test_driver_identify_suspend_while_idle);
++  g_test_add_func ("/driver/removed_while_suspended", test_driver_removed_while_suspended);
+ 
+   g_test_add_func ("/driver/identify/warmup_cooldown", test_driver_identify_warmup_cooldown);
+ 
+diff --git a/tests/test-lid-covered.c b/tests/test-lid-covered.c
+new file mode 100644
+index 00000000..3afb15d7
+--- /dev/null
++++ b/tests/test-lid-covered.c
+@@ -0,0 +1,316 @@
++/*
++ * FpContext: readers that a closed lid covers
++ * Copyright (C) 2026 Ryan Murray <ryan@aurorasilicon.org>
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++/*
++ * How FpContext hides a lid-covered reader and probes it again. A detached
++ * lid switch stands in for the real one and the fake driver for the reader,
++ * so these run anywhere: no udev, uinput or hardware.
++ */
++
++#include <libfprint/fprint.h>
++
++#include "fpi-device.h"
++#include "fpi-lid-switch.h"
++#include "test-device-fake.h"
++
++#define SETTLE_US (G_USEC_PER_SEC / 5)
++#define WAIT_US (5 * G_USEC_PER_SEC)
++
++typedef struct
++{
++  FpContext    *context;
++  FpiLidSwitch *lid;
++  GPtrArray    *devices;   /* what device-added/removed say is there */
++  guint         added;
++  guint         removed;
++} Fixture;
++
++static void
++device_added_cb (FpContext *context, FpDevice *device, Fixture *f)
++{
++  g_assert_false (g_ptr_array_find (f->devices, device, NULL));
++  g_ptr_array_add (f->devices, g_object_ref (device));
++  f->added++;
++}
++
++static void
++device_removed_cb (FpContext *context, FpDevice *device, Fixture *f)
++{
++  g_assert_false (fp_device_is_open (device));
++  g_assert_true (g_ptr_array_remove (f->devices, device));
++  f->removed++;
++}
++
++static void
++fixture_set_up (Fixture *f, gconstpointer user_data)
++{
++  f->context = fp_context_new ();
++  f->lid = fpi_lid_switch_new_detached ();
++  f->devices = g_ptr_array_new_with_free_func (g_object_unref);
++
++  g_signal_connect (f->context, "device-added", G_CALLBACK (device_added_cb), f);
++  g_signal_connect (f->context, "device-removed", G_CALLBACK (device_removed_cb), f);
++}
++
++static void
++fixture_tear_down (Fixture *f, gconstpointer user_data)
++{
++  if (f->context)
++    g_signal_handlers_disconnect_by_data (f->context, f);
++  g_clear_object (&f->context);
++  g_clear_pointer (&f->devices, g_ptr_array_unref);
++
++  /* Let callbacks still in flight finish against a context that is gone. */
++  while (g_main_context_iteration (NULL, FALSE))
++    ;
++
++  g_clear_object (&f->lid);
++}
++
++static void
++add_reader (Fixture *f)
++{
++  fpi_context_add_lid_covered_device (f->context, f->lid, FPI_TYPE_DEVICE_FAKE,
++                                      0, NULL, NULL, NULL);
++}
++
++/* Iterate until device-added and device-removed have fired @added and
++ * @removed times, then a little longer to see nothing else happens. */
++static void
++wait_for_counts (Fixture *f, guint added, guint removed)
++{
++  gint64 deadline = g_get_monotonic_time () + WAIT_US;
++  gint64 settle;
++
++  while (f->added < added || f->removed < removed)
++    {
++      g_assert_cmpint (g_get_monotonic_time (), <, deadline);
++      if (!g_main_context_iteration (NULL, FALSE))
++        g_usleep (1000);
++    }
++
++  settle = g_get_monotonic_time () + SETTLE_US;
++  while (g_get_monotonic_time () < settle)
++    if (!g_main_context_iteration (NULL, FALSE))
++      g_usleep (1000);
++
++  g_assert_cmpuint (f->added, ==, added);
++  g_assert_cmpuint (f->removed, ==, removed);
++}
++
++static FpDevice *
++the_reader (Fixture *f)
++{
++  g_assert_cmpuint (f->devices->len, ==, 1);
++  return g_ptr_array_index (f->devices, 0);
++}
++
++static gboolean
++is_removed (FpDevice *device)
++{
++  gboolean removed = FALSE;
++
++  g_object_get (device, "removed", &removed, NULL);
++  return removed;
++}
++
++/* Lid open: the reader is there. Closing removes it, opening brings back a
++ * new instance. */
++static void
++test_close_and_open (Fixture *f, gconstpointer user_data)
++{
++  FpDevice *first;
++
++  add_reader (f);
++  wait_for_counts (f, 1, 0);
++  first = the_reader (f);
++
++  fpi_lid_switch_set_closed (f->lid, TRUE);
++  g_assert_true (is_removed (first));
++  wait_for_counts (f, 1, 1);
++  g_assert_cmpuint (f->devices->len, ==, 0);
++
++  fpi_lid_switch_set_closed (f->lid, FALSE);
++  wait_for_counts (f, 2, 1);
++  g_assert_false (is_removed (the_reader (f)));
++
++  /* And once more, to show nothing is left over from the first round. */
++  fpi_lid_switch_set_closed (f->lid, TRUE);
++  wait_for_counts (f, 2, 2);
++  fpi_lid_switch_set_closed (f->lid, FALSE);
++  wait_for_counts (f, 3, 2);
++}
++
++/* A reader matched while the lid is closed is only probed once it opens. */
++static void
++test_matched_while_closed (Fixture *f, gconstpointer user_data)
++{
++  fpi_lid_switch_set_closed (f->lid, TRUE);
++
++  add_reader (f);
++  wait_for_counts (f, 0, 0);
++
++  fpi_lid_switch_set_closed (f->lid, FALSE);
++  wait_for_counts (f, 1, 0);
++}
++
++/* The lid closes while the reader is being probed: it stays hidden, and
++ * appears when the lid opens. */
++static void
++test_closed_during_probe (Fixture *f, gconstpointer user_data)
++{
++  add_reader (f);
++  /* The probe is in flight: nothing has dispatched yet. */
++  fpi_lid_switch_set_closed (f->lid, TRUE);
++  wait_for_counts (f, 0, 0);
++
++  fpi_lid_switch_set_closed (f->lid, FALSE);
++  wait_for_counts (f, 1, 0);
++}
++
++/* The lid closes and opens again while the removed instance is still open
++ * (claimed by fprintd, say). The new instance is probed only once the old
++ * one is closed, never next to it. */
++static void
++test_opened_while_still_claimed (Fixture *f, gconstpointer user_data)
++{
++  g_autoptr(GError) error = NULL;
++  g_autoptr(FpDevice) first = NULL;
++
++  add_reader (f);
++  wait_for_counts (f, 1, 0);
++  first = g_object_ref (the_reader (f));
++  g_assert_true (fp_device_open_sync (first, NULL, &error));
++  g_assert_no_error (error);
++
++  fpi_lid_switch_set_closed (f->lid, TRUE);
++  g_assert_true (is_removed (first));
++  /* Still open, so the context keeps it. */
++  wait_for_counts (f, 1, 0);
++
++  fpi_lid_switch_set_closed (f->lid, FALSE);
++  wait_for_counts (f, 1, 0);
++
++  /* Closing it reports the removal; then it is dropped and a new one
++   * probed in its place. */
++  fp_device_close_sync (first, NULL, &error);
++  g_assert_error (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_REMOVED);
++  wait_for_counts (f, 2, 1);
++  g_assert_true (the_reader (f) != first);
++  g_assert_false (is_removed (the_reader (f)));
++}
++
++/* The removed instance is closed while the lid is still shut: it is
++ * dropped, and nothing comes back until the lid opens. */
++static void
++test_released_while_closed (Fixture *f, gconstpointer user_data)
++{
++  g_autoptr(GError) error = NULL;
++  g_autoptr(FpDevice) first = NULL;
++
++  add_reader (f);
++  wait_for_counts (f, 1, 0);
++  first = g_object_ref (the_reader (f));
++  g_assert_true (fp_device_open_sync (first, NULL, &error));
++
++  fpi_lid_switch_set_closed (f->lid, TRUE);
++  fp_device_close_sync (first, NULL, &error);
++  g_assert_error (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_REMOVED);
++  wait_for_counts (f, 1, 1);
++
++  fpi_lid_switch_set_closed (f->lid, FALSE);
++  wait_for_counts (f, 2, 1);
++}
++
++static void
++verify_done_cb (GObject *source, GAsyncResult *res, gpointer user_data)
++{
++  GError **error = user_data;
++
++  g_assert_false (fp_device_verify_finish (FP_DEVICE (source), res, NULL, NULL, error));
++  g_assert_nonnull (*error);
++}
++
++/* The lid closes while a verify runs: the verify ends as removed, the way
++ * fprintd reports verify-disconnected, and the reader goes once it is
++ * closed. */
++static void
++test_closed_during_verify (Fixture *f, gconstpointer user_data)
++{
++  g_autoptr(GError) error = NULL;
++  g_autoptr(GError) verify_error = NULL;
++  g_autoptr(FpPrint) enrolled = NULL;
++  gint64 deadline;
++  FpDevice *reader;
++
++  add_reader (f);
++  wait_for_counts (f, 1, 0);
++  reader = the_reader (f);
++  g_assert_true (fp_device_open_sync (reader, NULL, &error));
++  g_assert_no_error (error);
++
++  FPI_DEVICE_FAKE (reader)->ret_result = FPI_MATCH_FAIL;
++  enrolled = g_object_ref_sink (fp_print_new (reader));
++  fp_device_verify (reader, enrolled, NULL, NULL, NULL, NULL,
++                    verify_done_cb, &verify_error);
++  fpi_lid_switch_set_closed (f->lid, TRUE);
++
++  deadline = g_get_monotonic_time () + WAIT_US;
++  while (verify_error == NULL)
++    {
++      g_assert_cmpint (g_get_monotonic_time (), <, deadline);
++      g_main_context_iteration (NULL, TRUE);
++    }
++  g_assert_error (verify_error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_REMOVED);
++  g_assert_true (is_removed (reader));
++  wait_for_counts (f, 1, 0);
++
++  fp_device_close_sync (reader, NULL, &error);
++  g_assert_error (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_REMOVED);
++  wait_for_counts (f, 1, 1);
++}
++
++/* The context goes away with a probe in flight. */
++static void
++test_context_gone_during_probe (Fixture *f, gconstpointer user_data)
++{
++  add_reader (f);
++  g_signal_handlers_disconnect_by_data (f->context, f);
++  g_clear_object (&f->context);
++  /* fixture_tear_down() dispatches the cancelled probe. */
++}
++
++int
++main (int argc, char *argv[])
++{
++  g_test_init (&argc, &argv, NULL);
++
++#define ADD(path, func) \
++  g_test_add ("/lid-covered/" path, Fixture, NULL, fixture_set_up, func, fixture_tear_down)
++
++  ADD ("close-and-open", test_close_and_open);
++  ADD ("matched-while-closed", test_matched_while_closed);
++  ADD ("closed-during-probe", test_closed_during_probe);
++  ADD ("opened-while-still-claimed", test_opened_while_still_claimed);
++  ADD ("released-while-closed", test_released_while_closed);
++  ADD ("closed-during-verify", test_closed_during_verify);
++  ADD ("context-gone-during-probe", test_context_gone_during_probe);
++
++  return g_test_run ();
++}
+diff --git a/tests/test-lid-switch.c b/tests/test-lid-switch.c
+new file mode 100644
+index 00000000..ef3f6d36
+--- /dev/null
++++ b/tests/test-lid-switch.c
+@@ -0,0 +1,306 @@
++/*
++ * FpiLidSwitch tests, with uinput lid switches
++ * Copyright (C) 2026 Ryan Murray <ryan@aurorasilicon.org>
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++/*
++ * These tests make real lid switches with uinput, so they need write access
++ * to /dev/uinput and a running udev; without either they are skipped. They
++ * also need a system whose own lid, if it has one, is open.
++ */
++
++#include <errno.h>
++#include <fcntl.h>
++#include <linux/uinput.h>
++#include <string.h>
++#include <sys/ioctl.h>
++#include <unistd.h>
++
++#include <glib.h>
++
++#include "fpi-lid-switch.h"
++
++#define LID_TIMEOUT_US (5 * G_USEC_PER_SEC)
++
++typedef struct
++{
++  gint fd;
++} TestLid;
++
++static TestLid *
++test_lid_new (const gchar *name)
++{
++  struct uinput_setup setup = { 0 };
++  TestLid *lid;
++  gint fd;
++
++  fd = open ("/dev/uinput", O_WRONLY | O_NONBLOCK | O_CLOEXEC);
++  if (fd < 0)
++    return NULL;
++
++  setup.id.bustype = BUS_VIRTUAL;
++  g_strlcpy (setup.name, name, sizeof (setup.name));
++
++  if (ioctl (fd, UI_SET_EVBIT, EV_SW) < 0 ||
++      ioctl (fd, UI_SET_SWBIT, SW_LID) < 0 ||
++      ioctl (fd, UI_DEV_SETUP, &setup) < 0 ||
++      ioctl (fd, UI_DEV_CREATE) < 0)
++    {
++      close (fd);
++      return NULL;
++    }
++
++  lid = g_new0 (TestLid, 1);
++  lid->fd = fd;
++  return lid;
++}
++
++static void
++test_lid_emit (TestLid *lid, guint16 type, guint16 code, gint32 value)
++{
++  struct input_event ev = { 0 };
++
++  ev.type = type;
++  ev.code = code;
++  ev.value = value;
++  g_assert_cmpint (write (lid->fd, &ev, sizeof (ev)), ==, sizeof (ev));
++}
++
++static void
++test_lid_set_closed (TestLid *lid, gboolean closed)
++{
++  test_lid_emit (lid, EV_SW, SW_LID, closed);
++  test_lid_emit (lid, EV_SYN, SYN_REPORT, 0);
++}
++
++static void
++test_lid_free (TestLid *lid)
++{
++  ioctl (lid->fd, UI_DEV_DESTROY);
++  close (lid->fd);
++  g_free (lid);
++}
++
++G_DEFINE_AUTOPTR_CLEANUP_FUNC (TestLid, test_lid_free)
++
++/* Iterate @context until @self says @closed, for at most LID_TIMEOUT_US. */
++static gboolean
++wait_for_closed (GMainContext *context, FpiLidSwitch *self, gboolean closed)
++{
++  gint64 deadline = g_get_monotonic_time () + LID_TIMEOUT_US;
++
++  while (fpi_lid_switch_get_closed (self) != closed)
++    {
++      if (g_get_monotonic_time () > deadline)
++        return FALSE;
++      if (!g_main_context_iteration (context, FALSE))
++        g_usleep (10000);
++    }
++
++  return TRUE;
++}
++
++/* Settle for a while and check @self never says anything but @closed. */
++static gboolean
++stays_closed (GMainContext *context, FpiLidSwitch *self, gboolean closed)
++{
++  gint64 deadline = g_get_monotonic_time () + G_USEC_PER_SEC / 2;
++
++  while (g_get_monotonic_time () < deadline)
++    {
++      if (fpi_lid_switch_get_closed (self) != closed)
++        return FALSE;
++      if (!g_main_context_iteration (context, FALSE))
++        g_usleep (10000);
++    }
++
++  return fpi_lid_switch_get_closed (self) == closed;
++}
++
++static guint
++count_open_fds (void)
++{
++  g_autoptr(GDir) dir = g_dir_open ("/proc/self/fd", 0, NULL);
++  guint n = 0;
++
++  g_assert_nonnull (dir);
++  while (g_dir_read_name (dir))
++    n++;
++  return n;
++}
++
++static gboolean
++skip_unless_usable (void)
++{
++  g_autoptr(FpiLidSwitch) lid = NULL;
++
++  if (access ("/dev/uinput", W_OK) != 0)
++    {
++      g_test_skip ("needs write access to /dev/uinput");
++      return TRUE;
++    }
++
++  if (access ("/run/udev/control", F_OK) != 0)
++    {
++      g_test_skip ("needs a running udev");
++      return TRUE;
++    }
++
++  lid = fpi_lid_switch_new ();
++  if (fpi_lid_switch_get_closed (lid))
++    {
++      g_test_skip ("this system's own lid is closed");
++      return TRUE;
++    }
++
++  return FALSE;
++}
++
++/* A switch that appears after we started, bounces, and goes away again. */
++static void
++test_lid_switch_hotplug (void)
++{
++  g_autoptr(FpiLidSwitch) self = NULL;
++  g_autoptr(TestLid) lid = NULL;
++  guint fds_before;
++
++  if (skip_unless_usable ())
++    return;
++
++  fds_before = count_open_fds ();
++  self = fpi_lid_switch_new ();
++  g_assert_false (fpi_lid_switch_get_closed (self));
++
++  lid = test_lid_new ("libfprint test lid");
++  g_assert_nonnull (lid);
++
++  test_lid_set_closed (lid, TRUE);
++  g_assert_true (wait_for_closed (NULL, self, TRUE));
++
++  /* Bounce */
++  test_lid_set_closed (lid, FALSE);
++  test_lid_set_closed (lid, TRUE);
++  test_lid_set_closed (lid, FALSE);
++  g_assert_true (wait_for_closed (NULL, self, FALSE));
++  g_assert_true (stays_closed (NULL, self, FALSE));
++
++  /* A switch that goes away while closed no longer counts */
++  test_lid_set_closed (lid, TRUE);
++  g_assert_true (wait_for_closed (NULL, self, TRUE));
++  g_clear_pointer (&lid, test_lid_free);
++  g_assert_true (wait_for_closed (NULL, self, FALSE));
++
++  g_clear_object (&self);
++  while (g_main_context_iteration (NULL, FALSE))
++    continue;
++  g_assert_cmpuint (count_open_fds (), ==, fds_before);
++}
++
++/* Any closed lid counts, as for logind. */
++static void
++test_lid_switch_two_lids (void)
++{
++  g_autoptr(FpiLidSwitch) self = NULL;
++  g_autoptr(TestLid) a = NULL;
++  g_autoptr(TestLid) b = NULL;
++
++  if (skip_unless_usable ())
++    return;
++
++  a = test_lid_new ("libfprint test lid A");
++  b = test_lid_new ("libfprint test lid B");
++  g_assert_nonnull (a);
++  g_assert_nonnull (b);
++
++  self = fpi_lid_switch_new ();
++
++  /* Both must be followed before we go on */
++  test_lid_set_closed (a, TRUE);
++  g_assert_true (wait_for_closed (NULL, self, TRUE));
++  test_lid_set_closed (a, FALSE);
++  g_assert_true (wait_for_closed (NULL, self, FALSE));
++  test_lid_set_closed (b, TRUE);
++  g_assert_true (wait_for_closed (NULL, self, TRUE));
++
++  test_lid_set_closed (a, TRUE);
++  test_lid_set_closed (b, FALSE);
++  g_assert_true (stays_closed (NULL, self, TRUE));
++
++  test_lid_set_closed (a, FALSE);
++  g_assert_true (wait_for_closed (NULL, self, FALSE));
++}
++
++static gpointer
++lid_thread_func (gpointer user_data)
++{
++  TestLid *lid = user_data;
++  g_autoptr(GMainContext) context = g_main_context_new ();
++  g_autoptr(FpiLidSwitch) self = NULL;
++  gboolean ok;
++
++  g_main_context_push_thread_default (context);
++
++  self = fpi_lid_switch_new ();
++  g_assert_false (fpi_lid_switch_get_closed (self));
++
++  test_lid_set_closed (lid, TRUE);
++  ok = wait_for_closed (context, self, TRUE);
++
++  g_clear_object (&self);
++  g_main_context_pop_thread_default (context);
++
++  return GINT_TO_POINTER (ok);
++}
++
++/* Like the rest of libfprint, the switch must dispatch in the thread-default
++ * main context of the thread that made it, not in the global default one. */
++static void
++test_lid_switch_thread_default_context (void)
++{
++  g_autoptr(TestLid) lid = NULL;
++  g_autoptr(FpiLidSwitch) settle = NULL;
++  GThread *thread;
++
++  if (skip_unless_usable ())
++    return;
++
++  lid = test_lid_new ("libfprint test lid");
++  g_assert_nonnull (lid);
++
++  /* Wait until udev knows the switch, so the thread finds it at once. */
++  settle = fpi_lid_switch_new ();
++  test_lid_set_closed (lid, TRUE);
++  g_assert_true (wait_for_closed (NULL, settle, TRUE));
++  test_lid_set_closed (lid, FALSE);
++  g_assert_true (wait_for_closed (NULL, settle, FALSE));
++  g_clear_object (&settle);
++
++  thread = g_thread_new ("lid", lid_thread_func, lid);
++  g_assert_true (GPOINTER_TO_INT (g_thread_join (thread)));
++}
++
++int
++main (int argc, char *argv[])
++{
++  g_test_init (&argc, &argv, NULL);
++
++  g_test_add_func ("/lid-switch/hotplug", test_lid_switch_hotplug);
++  g_test_add_func ("/lid-switch/two-lids", test_lid_switch_two_lids);
++  g_test_add_func ("/lid-switch/thread-default-context", test_lid_switch_thread_default_context);
++
++  return g_test_run ();
++}

@@ -1,0 +1,83 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ryan Hughes <ryan@heyoodle.com>
+Date: Thu, 15 Oct 2026 21:45:49 -0400
+Subject: [PATCH] iommu: Give external-facing ports the domain of untrusted
+ devices
+
+Devices tunneled below an external-facing Root Port are untrusted, and
+iommu_get_default_domain_type() gives an untrusted device a DMA domain
+even when the default is passthrough. That only works when the device
+gets a group of its own. Behind a Root Port without ACS, such as the
+USB4 tunnel Root Ports of the NVIDIA N1x, everything plugged in later
+joins the Root Port's own group. Its domain was chosen at boot, when
+only the trusted port was in it, so with IOMMU_DEFAULT_PASSTHROUGH a
+dock's xHCI and Ethernet controller ran with an identity mapping.
+Joining an existing group does not go through
+iommu_get_default_domain_type(), so nothing noticed.
+
+Choose the domain of an external-facing port as if it were untrusted,
+so whatever it carries later is translated, and refuse to probe an
+untrusted device that would join a group in an identity domain rather
+than give it unrestricted DMA.
+---
+ drivers/iommu/iommu.c | 30 +++++++++++++++++++++++++++++-
+ 1 file changed, 29 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/iommu/iommu.c b/drivers/iommu/iommu.c
+index 23a5315..4639783 100644
+--- a/drivers/iommu/iommu.c
++++ b/drivers/iommu/iommu.c
+@@ -667,6 +667,18 @@ static int __iommu_probe_device(struct device *dev, struct list_head *group_list
+ 	 */
+ 	list_add_tail(&gdev->list, &group->devices);
+ 	WARN_ON(group->default_domain && !group->domain);
++	/*
++	 * A device joining a group that already has a domain is not run
++	 * through iommu_get_default_domain_type(). Never let an untrusted one
++	 * share an identity domain.
++	 */
++	if (group->domain && group->domain->type == IOMMU_DOMAIN_IDENTITY &&
++	    dev_is_pci(dev) && to_pci_dev(dev)->untrusted) {
++		dev_err(dev, "Device is not trusted, but IOMMU group %u is in an identity domain, refusing to probe.\n",
++			group->id);
++		ret = -EPERM;
++		goto err_remove_gdev;
++	}
+ 	if (group->default_domain)
+ 		iommu_create_device_direct_mappings(group->default_domain, dev);
+ 	if (group->domain) {
+@@ -1872,6 +1884,22 @@ static int iommu_get_def_domain_type(struct iommu_group *group,
+ 	return cur_type;
+ }
+ 
++/*
++ * Devices plugged in below an external-facing Root Port are untrusted. When
++ * the port does not isolate them with ACS they join the port's own group,
++ * whose domain was chosen before anything was plugged in, so the port needs
++ * the same domain as the untrusted devices it will carry.
++ */
++static bool iommu_dev_needs_untrusted_domain(struct device *dev)
++{
++	struct pci_dev *pdev;
++
++	if (!dev_is_pci(dev))
++		return false;
++	pdev = to_pci_dev(dev);
++	return pdev->untrusted || pdev->external_facing;
++}
++
+ /*
+  * A target_type of 0 will select the best domain type. 0 can be returned in
+  * this case meaning the global default should be used.
+@@ -1901,7 +1929,7 @@ static int iommu_get_default_domain_type(struct iommu_group *group,
+ 		driver_type = iommu_get_def_domain_type(group, gdev->dev,
+ 							driver_type);
+ 
+-		if (dev_is_pci(gdev->dev) && to_pci_dev(gdev->dev)->untrusted) {
++		if (iommu_dev_needs_untrusted_domain(gdev->dev)) {
+ 			/*
+ 			 * No ARM32 using systems will set untrusted, it cannot
+ 			 * work.
+-- 
+2.56.0
+

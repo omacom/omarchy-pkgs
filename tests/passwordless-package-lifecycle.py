@@ -189,8 +189,7 @@ def run_suite(scriptlet, channel):
 
 def main():
     if len(sys.argv) == 1:
-        # Stable settings joins once its pinned source ships the grant helpers.
-        scriptlets = [ROOT / "pkgbuilds" / name / f"{name}.install" for name in ("omarchy-settings-dev",)]
+        scriptlets = [ROOT / "pkgbuilds" / name / f"{name}.install" for name in ("omarchy-settings-dev", "omarchy-settings")]
     else:
         scriptlets = [Path(path).resolve() for path in sys.argv[1:]]
     results = [run_suite(path, path.parent.name) for path in scriptlets]

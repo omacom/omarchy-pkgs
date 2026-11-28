@@ -1,0 +1,617 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jim Martin <jimmartin@gmail.com>
+Date: Thu, 8 Oct 2026 15:51:02 -0500
+Subject: [PATCH] thunderbolt: qcom: Add the Glymur USB4 line-interrupt host
+ interface
+
+The host interface (NHI) of the Glymur USB4 host router is not a PCI
+device and has no MSI-X. All ring interrupts arrive on one wired
+interrupt, with a pending, acknowledge, mask and enable register bank
+that covers every path, and clear-on-read must be turned off before the
+pending causes can be captured.
+
+Add the register access for that bank and an adapter that implements
+the interrupt callbacks of struct tb_nhi_ops on it. The adapter
+requests the one interrupt with IRQF_NO_SUSPEND, as the control rings
+need, gives each ring a message ID, captures and acknowledges the whole
+pending bank in the handler and passes each owned cause to
+nhi_handle_interrupt(). It can be shut down and prepared again, so the
+router can be stopped and restarted while the driver stays bound.
+
+The register layout matches what the platform's Windows driver programs
+on the Surface Laptop 8.
+
+Assisted-by: Opus 5.5
+Signed-off-by: Jim Martin <jimmartin@gmail.com>
+---
+ drivers/thunderbolt/qcom-usb4-irq.c | 131 ++++++++++++++
+ drivers/thunderbolt/qcom-usb4-irq.h |  76 ++++++++
+ drivers/thunderbolt/qcom-usb4-nhi.c | 269 ++++++++++++++++++++++++++++
+ drivers/thunderbolt/qcom-usb4-nhi.h |  78 ++++++++
+ 4 files changed, 554 insertions(+)
+ create mode 100644 drivers/thunderbolt/qcom-usb4-irq.c
+ create mode 100644 drivers/thunderbolt/qcom-usb4-irq.h
+ create mode 100644 drivers/thunderbolt/qcom-usb4-nhi.c
+ create mode 100644 drivers/thunderbolt/qcom-usb4-nhi.h
+
+diff --git a/drivers/thunderbolt/qcom-usb4-irq.c b/drivers/thunderbolt/qcom-usb4-irq.c
+new file mode 100644
+index 00000000000..86ab7118d4f
+--- /dev/null
++++ b/drivers/thunderbolt/qcom-usb4-irq.c
+@@ -0,0 +1,131 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/* Line-interrupt register access of the Qualcomm USB4 host interface (NHI). */
++
++#include <linux/bits.h>
++#include <linux/errno.h>
++
++#include "qcom-usb4-irq.h"
++
++#define QCOM_USB4_IRQ_PENDING		0x37800
++#define QCOM_USB4_IRQ_ACK			0x37808
++#define QCOM_USB4_IRQ_MASK		0x38208
++#define QCOM_USB4_IRQ_ENABLE		0x38210
++#define QCOM_USB4_IRQ_DMA_MISC		0x39864
++#define QCOM_USB4_IRQ_DISABLE_CLEAR_ON_READ	BIT(17)
++
++static bool qcom_usb4_irq_valid(const struct qcom_usb4_irq *irq)
++{
++	if (!irq || !irq->base || !irq->paths || irq->paths > 21)
++		return false;
++	if ((unsigned long)irq->base &
++	    (irq->width == QCOM_USB4_IRQ_NATIVE_64 ? 7 : 3))
++		return false;
++	if (irq->paths <= 10)
++		return irq->width == QCOM_USB4_IRQ_32;
++	return irq->width == QCOM_USB4_IRQ_NATIVE_64 ||
++	       irq->width == QCOM_USB4_IRQ_SPLIT_64;
++}
++
++int qcom_usb4_irq_init(struct qcom_usb4_irq *irq, void __iomem *base,
++		      size_t mapping_size, unsigned int paths,
++		      enum qcom_usb4_irq_width width)
++{
++	struct qcom_usb4_irq layout = {
++		.base = base,
++		.paths = paths,
++		.width = width,
++	};
++
++	if (!irq)
++		return -EINVAL;
++	*irq = (struct qcom_usb4_irq) { 0 };
++	if (mapping_size < QCOM_USB4_IRQ_DMA_MISC + sizeof(u32) ||
++	    !qcom_usb4_irq_valid(&layout))
++		return -EINVAL;
++	*irq = layout;
++	return 0;
++}
++
++static u64 qcom_usb4_irq_read(const struct qcom_usb4_irq *irq)
++{
++	u32 low, high;
++
++	if (irq->width == QCOM_USB4_IRQ_NATIVE_64)
++		return readq(irq->base + QCOM_USB4_IRQ_PENDING);
++	low = readl(irq->base + QCOM_USB4_IRQ_PENDING);
++	if (irq->width == QCOM_USB4_IRQ_32)
++		return low;
++	high = readl(irq->base + QCOM_USB4_IRQ_PENDING + sizeof(u32));
++	return low | (u64)high << 32;
++}
++
++static void qcom_usb4_irq_write(const struct qcom_usb4_irq *irq, u32 offset,
++			       u64 value)
++{
++	if (irq->width == QCOM_USB4_IRQ_NATIVE_64) {
++		writeq(value, irq->base + offset);
++		return;
++	}
++	writel((u32)value, irq->base + offset);
++	if (irq->width == QCOM_USB4_IRQ_SPLIT_64)
++		writel((u32)(value >> 32), irq->base + offset + sizeof(u32));
++}
++
++int qcom_usb4_irq_configure(struct qcom_usb4_irq *irq)
++{
++	u32 value;
++
++	if (!qcom_usb4_irq_valid(irq))
++		return -EINVAL;
++	value = readl(irq->base + QCOM_USB4_IRQ_DMA_MISC);
++	writel(value | QCOM_USB4_IRQ_DISABLE_CLEAR_ON_READ,
++	       irq->base + QCOM_USB4_IRQ_DMA_MISC);
++	return 0;
++}
++
++int qcom_usb4_irq_capture(struct qcom_usb4_irq *irq, u64 *pending)
++{
++	u64 value;
++
++	if (!pending || !qcom_usb4_irq_valid(irq))
++		return -EINVAL;
++	value = qcom_usb4_irq_read(irq);
++	if (value) {
++		qcom_usb4_irq_write(irq, QCOM_USB4_IRQ_MASK, value);
++		qcom_usb4_irq_write(irq, QCOM_USB4_IRQ_ACK, value);
++	}
++	*pending = value;
++	return value ? 1 : 0;
++}
++
++int qcom_usb4_irq_set_mask(struct qcom_usb4_irq *irq, unsigned int cause,
++			  bool mask)
++{
++	if (!qcom_usb4_irq_valid(irq) || cause >= 3 * irq->paths)
++		return -EINVAL;
++	qcom_usb4_irq_write(irq, mask ? QCOM_USB4_IRQ_MASK : QCOM_USB4_IRQ_ENABLE,
++			    BIT_ULL(cause));
++	return 0;
++}
++
++int qcom_usb4_irq_disable(struct qcom_usb4_irq *irq)
++{
++	if (!qcom_usb4_irq_valid(irq))
++		return -EINVAL;
++	/* The line pool implements 63 slots; 32-bit access truncates this mask. */
++	qcom_usb4_irq_write(irq, QCOM_USB4_IRQ_MASK, BIT_ULL(63) - 1);
++	qcom_usb4_irq_write(irq, QCOM_USB4_IRQ_ACK, ~0ULL);
++	/* Flush the mask/ack writes before the owner proceeds with teardown. */
++	readl(irq->base + QCOM_USB4_IRQ_DMA_MISC);
++	return 0;
++}
++
++int qcom_usb4_irq_clear_cause(struct qcom_usb4_irq *irq, unsigned int cause)
++{
++	if (!qcom_usb4_irq_valid(irq) || cause >= 3 * irq->paths)
++		return -EINVAL;
++	qcom_usb4_irq_write(irq, QCOM_USB4_IRQ_MASK, BIT_ULL(cause));
++	qcom_usb4_irq_write(irq, QCOM_USB4_IRQ_ACK, BIT_ULL(cause));
++	readl(irq->base + QCOM_USB4_IRQ_DMA_MISC);
++	return 0;
++}
+diff --git a/drivers/thunderbolt/qcom-usb4-irq.h b/drivers/thunderbolt/qcom-usb4-irq.h
+new file mode 100644
+index 00000000000..5da6ce36b00
+--- /dev/null
++++ b/drivers/thunderbolt/qcom-usb4-irq.h
+@@ -0,0 +1,76 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef QCOM_USB4_IRQ_H
++#define QCOM_USB4_IRQ_H
++
++#include <linux/io.h>
++#include <linux/types.h>
++
++enum qcom_usb4_irq_width {
++	QCOM_USB4_IRQ_32,
++	QCOM_USB4_IRQ_NATIVE_64,
++	QCOM_USB4_IRQ_SPLIT_64,
++};
++
++/* Initialized layout, immutable while in use. This object does not own MMIO. */
++struct qcom_usb4_irq {
++	void __iomem *base;
++	unsigned int paths;
++	enum qcom_usb4_irq_width width;
++};
++
++/*
++ * The caller supplies verified capabilities and the NHI-relative mapping.
++ * Only the normal acknowledgment layout at 0x37808 is supported. Width is
++ * 32 bits for up to ten paths, otherwise native or split 64-bit access.
++ * The base must be aligned to eight bytes for native 64-bit access, otherwise
++ * four bytes. Initialization checks bounds without touching hardware.
++ */
++int qcom_usb4_irq_init(struct qcom_usb4_irq *irq, void __iomem *base,
++		      size_t mapping_size, unsigned int paths,
++		      enum qcom_usb4_irq_width width);
++
++/*
++ * All following operations require exclusive/serialized ownership of the
++ * registers and a powered, accessible mapping. They do not manage IRQs,
++ * clocks, work, vectors or ring lifetime. Configure clear-on-read off before
++ * capturing causes, including after any reset that loses this configuration.
++ */
++int qcom_usb4_irq_configure(struct qcom_usb4_irq *irq);
++
++/*
++ * Capture, mask and acknowledge the entire pending bank, in that order.
++ * Returns 1 for a captured snapshot, 0 for an empty bank, or a negative error
++ * before MMIO for invalid arguments. On error *pending is unchanged.
++ * The caller must consume the snapshot while maintaining ring/lifetime locks;
++ * this helper does not queue or accumulate it. Filter unsupported causes only
++ * after capture: even reserved pending bits must be masked and acknowledged.
++ * A repeated same-bit event before W1C may coalesce; the snapshot is not an
++ * event counter and does not establish descriptor DMA completion.
++ */
++int qcom_usb4_irq_capture(struct qcom_usb4_irq *irq, u64 *pending);
++
++/* Mask or reenable one valid cause through the write-one mask/set registers. */
++int qcom_usb4_irq_set_mask(struct qcom_usb4_irq *irq, unsigned int cause,
++			  bool mask);
++
++/*
++ * Init/shutdown only: mask the line pool's 63 slots (all 32 bits for a 32-bit
++ * bank), including quiet causes, then discard all pending status. The reserved
++ * bit 63 is excluded from this fixed mask but included in the full-bank ACK,
++ * as in the platform's teardown sequence. A DMA-misc readback follows.
++ * The owner must quiesce ring producers and serialize this operation against
++ * handlers/poll completion, preventing subsequent rearm. This does not release
++ * or synchronize the physical IRQ, drain work, or stop MCU/DMA/power. In
++ * particular, the separate MCU completion IRQ remains outside this helper.
++ */
++int qcom_usb4_irq_disable(struct qcom_usb4_irq *irq);
++
++/*
++ * Discard one stopped cause before reuse: mask, ACK that bit, then read back.
++ * Other causes are untouched; the selected cause stays masked. The caller
++ * must own the cause under the NHI lock and prevent new descriptor submissions.
++ * Do not use during polling completion: a new completion could be discarded.
++ */
++int qcom_usb4_irq_clear_cause(struct qcom_usb4_irq *irq, unsigned int cause);
++
++#endif
+diff --git a/drivers/thunderbolt/qcom-usb4-nhi.c b/drivers/thunderbolt/qcom-usb4-nhi.c
+new file mode 100644
+index 00000000000..eed2297ad89
+--- /dev/null
++++ b/drivers/thunderbolt/qcom-usb4-nhi.c
+@@ -0,0 +1,269 @@
++// SPDX-License-Identifier: GPL-2.0-only
++#include <linux/bitops.h>
++#include <linux/device.h>
++#include <linux/errno.h>
++#include <linux/interrupt.h>
++#include <linux/lockdep.h>
++
++#include "qcom-usb4-nhi.h"
++
++static struct qcom_usb4_nhi *to_qcom_nhi(struct tb_nhi *nhi)
++{
++	return container_of(nhi, struct qcom_usb4_nhi, nhi);
++}
++
++static struct tb_ring *qcom_usb4_nhi_owned_ring(struct qcom_usb4_nhi *qnhi,
++					     unsigned int cause)
++{
++	struct tb_nhi *nhi = &qnhi->nhi;
++	struct tb_ring *ring;
++
++	lockdep_assert_held(&nhi->lock);
++	if (cause >= 2 * nhi->hop_count)
++		return NULL;
++	if (cause < nhi->hop_count)
++		ring = nhi->tx_rings[cause];
++	else
++		ring = nhi->rx_rings[cause - nhi->hop_count];
++	if (!ring || (ring->flags & RING_FLAG_NO_INTERRUPT) ||
++	    ring->irq != qnhi->irq || ring->vector >= QCOM_USB4_NHI_MESSAGE_IDS ||
++	    qnhi->owners[ring->vector] != ring)
++		return NULL;
++	return ring;
++}
++
++int qcom_usb4_nhi_prepare(struct qcom_usb4_nhi *qnhi, size_t mapping_size,
++			 unsigned int paths, enum qcom_usb4_irq_width width,
++			 int irq)
++{
++	struct qcom_usb4_irq transport;
++	int ret;
++
++	if (!qnhi || !qnhi->nhi.dev || irq <= 0)
++		return -EINVAL;
++	if (qnhi->prepared)
++		return -EBUSY;
++	ret = qcom_usb4_irq_init(&transport, qnhi->nhi.iobase, mapping_size,
++			       paths, width);
++	if (ret)
++		return ret;
++	qnhi->transport = transport;
++	qnhi->irq = irq;
++	ida_init(&qnhi->message_ids);
++	mutex_init(&qnhi->ownership_lock);
++	qnhi->prepared = true;
++	return 0;
++}
++
++static irqreturn_t qcom_usb4_nhi_interrupt(int irq, void *data)
++{
++	struct qcom_usb4_nhi *qnhi = data;
++	struct tb_nhi *nhi = &qnhi->nhi;
++	unsigned long flags;
++	unsigned int cause;
++	u64 pending;
++	int ret = 0;
++
++	spin_lock_irqsave(&nhi->lock, flags);
++	if (!qnhi->accept_rearm || nhi->going_away)
++		goto unlock;
++	ret = qcom_usb4_irq_capture(&qnhi->transport, &pending);
++	if (ret <= 0)
++		goto unlock;
++	for (cause = 0; cause < 3 * qnhi->transport.paths; cause++) {
++		if (!(pending & BIT_ULL(cause)))
++			continue;
++		if (cause < 2 * nhi->hop_count &&
++		    !qcom_usb4_nhi_owned_ring(qnhi, cause))
++			continue;
++		if (nhi_handle_interrupt(nhi, cause))
++			qcom_usb4_irq_set_mask(&qnhi->transport, cause, false);
++	}
++unlock:
++	spin_unlock_irqrestore(&nhi->lock, flags);
++	return ret > 0 ? IRQ_HANDLED : IRQ_NONE;
++}
++
++int qcom_usb4_nhi_init_interrupts(struct tb_nhi *nhi)
++{
++	struct qcom_usb4_nhi *qnhi = to_qcom_nhi(nhi);
++	unsigned long flags;
++	int ret;
++
++	if (!qnhi->prepared || qnhi->released)
++		return -EINVAL;
++	if (qnhi->init_attempted)
++		return -EBUSY;
++	if (!nhi->tx_rings || !nhi->rx_rings ||
++	    nhi->hop_count != qnhi->transport.paths ||
++	    (nhi->quirks & QUIRK_AUTO_CLEAR_INT))
++		return -EINVAL;
++	qnhi->core_ready = true;
++	qnhi->init_attempted = true;
++	spin_lock_irqsave(&nhi->lock, flags);
++	qnhi->accept_rearm = false;
++	ret = qcom_usb4_irq_configure(&qnhi->transport);
++	if (!ret)
++		ret = qcom_usb4_irq_disable(&qnhi->transport);
++	spin_unlock_irqrestore(&nhi->lock, flags);
++	if (ret)
++		return ret;
++
++	/* Control rings require NO_SUSPEND; this is one controller-owned IRQ. */
++	ret = request_irq(qnhi->irq, qcom_usb4_nhi_interrupt, IRQF_NO_SUSPEND,
++			 dev_name(nhi->dev), qnhi);
++	if (ret)
++		return ret;
++	spin_lock_irqsave(&nhi->lock, flags);
++	qnhi->irq_requested = true;
++	qnhi->accept_rearm = true;
++	spin_unlock_irqrestore(&nhi->lock, flags);
++	return 0;
++}
++
++int qcom_usb4_nhi_request_ring_irq(struct tb_ring *ring, bool no_suspend)
++{
++	struct qcom_usb4_nhi *qnhi = to_qcom_nhi(ring->nhi);
++	unsigned long flags;
++	int id, ret = 0;
++
++	if (!qnhi->prepared)
++		return -EINVAL;
++	mutex_lock(&qnhi->ownership_lock);
++	if (!qnhi->core_ready || qnhi->released ||
++	    (ring->flags & RING_FLAG_NO_INTERRUPT)) {
++		ret = -EINVAL;
++		goto unlock;
++	}
++	/* All rings share the NO_SUSPEND physical IRQ, including these requests. */
++	(void)no_suspend;
++	id = ida_alloc_max(&qnhi->message_ids, QCOM_USB4_NHI_MESSAGE_IDS - 1,
++			   GFP_KERNEL);
++	if (id < 0) {
++		ret = id;
++		goto unlock;
++	}
++	spin_lock_irqsave(&ring->nhi->lock, flags);
++	if (!qnhi->accept_rearm || ring->nhi->going_away)
++		ret = -ESHUTDOWN;
++	else if (ring->irq)
++		ret = -EBUSY;
++	else {
++		qnhi->owners[id] = ring;
++		ring->vector = id;
++		ring->irq = qnhi->irq;
++		/* The platform default: 125 units, each nominally 256 ns. */
++		ring->interval_nsec = 32000;
++	}
++	spin_unlock_irqrestore(&ring->nhi->lock, flags);
++	if (ret)
++		ida_free(&qnhi->message_ids, id);
++unlock:
++	mutex_unlock(&qnhi->ownership_lock);
++	return ret;
++}
++
++void qcom_usb4_nhi_release_ring_irq(struct tb_ring *ring)
++{
++	struct qcom_usb4_nhi *qnhi = to_qcom_nhi(ring->nhi);
++	unsigned long flags;
++	int id = -1;
++
++	if (!qnhi->prepared)
++		return;
++	mutex_lock(&qnhi->ownership_lock);
++	if (!qnhi->core_ready || qnhi->released)
++		goto unlock;
++	spin_lock_irqsave(&ring->nhi->lock, flags);
++	if (ring->irq == qnhi->irq && ring->vector < QCOM_USB4_NHI_MESSAGE_IDS &&
++	    qnhi->owners[ring->vector] == ring) {
++		id = ring->vector;
++		qnhi->owners[id] = NULL;
++		ring->irq = 0;
++		ring->vector = 0;
++	}
++	spin_unlock_irqrestore(&ring->nhi->lock, flags);
++	if (id >= 0)
++		ida_free(&qnhi->message_ids, id);
++	/* No cause MMIO: the old hop can already belong to another ring. */
++unlock:
++	mutex_unlock(&qnhi->ownership_lock);
++}
++
++void qcom_usb4_nhi_ring_interrupt_mask(struct tb_nhi *nhi, unsigned int cause,
++				     bool mask)
++{
++	struct qcom_usb4_nhi *qnhi = to_qcom_nhi(nhi);
++	struct tb_ring *ring;
++
++	lockdep_assert_held(&nhi->lock);
++	if (!qnhi->accept_rearm || nhi->going_away || cause >= 2 * nhi->hop_count)
++		return;
++	ring = qcom_usb4_nhi_owned_ring(qnhi, cause);
++	if (!ring)
++		return;
++	/* Start precedes running=true. Poll rearm must preserve new pending bits. */
++	if (!mask && !ring->running &&
++	    qcom_usb4_irq_clear_cause(&qnhi->transport, cause))
++		return;
++	qcom_usb4_irq_set_mask(&qnhi->transport, cause, mask);
++}
++
++void qcom_usb4_nhi_disable_interrupts(struct tb_nhi *nhi)
++{
++	struct qcom_usb4_nhi *qnhi = to_qcom_nhi(nhi);
++	unsigned long flags;
++
++	if (!qnhi->prepared || qnhi->released)
++		return;
++	/* The common caller initializes the lock before its first disable call. */
++	if (!qnhi->core_ready)
++		qnhi->core_ready = true;
++	spin_lock_irqsave(&nhi->lock, flags);
++	qnhi->accept_rearm = false;
++	qcom_usb4_irq_disable(&qnhi->transport);
++	spin_unlock_irqrestore(&nhi->lock, flags);
++}
++
++void qcom_usb4_nhi_shutdown(struct tb_nhi *nhi)
++{
++	struct qcom_usb4_nhi *qnhi = to_qcom_nhi(nhi);
++	unsigned int id;
++
++	if (!qnhi->prepared)
++		return;
++	mutex_lock(&qnhi->ownership_lock);
++	if (qnhi->released)
++		goto unlock;
++	if (qnhi->core_ready)
++		qcom_usb4_nhi_disable_interrupts(nhi);
++	if (qnhi->irq_requested) {
++		free_irq(qnhi->irq, qnhi);
++		qnhi->irq_requested = false;
++	}
++	/* Keep ownership intact if the caller has not yet drained its rings. */
++	for (id = 0; id < QCOM_USB4_NHI_MESSAGE_IDS; id++) {
++		if (WARN_ON(qnhi->owners[id]))
++			goto unlock;
++	}
++	ida_destroy(&qnhi->message_ids);
++	qnhi->released = true;
++unlock:
++	mutex_unlock(&qnhi->ownership_lock);
++}
++
++int qcom_usb4_nhi_reset(struct qcom_usb4_nhi *qnhi)
++{
++	struct tb_nhi *nhi = &qnhi->nhi;
++
++	if (qnhi->prepared && !qnhi->released)
++		return -EBUSY;
++	if (nhi->dev && nhi->tx_rings)
++		devm_kfree(nhi->dev, nhi->tx_rings);
++	if (nhi->dev && nhi->rx_rings)
++		devm_kfree(nhi->dev, nhi->rx_rings);
++	if (qnhi->prepared)
++		mutex_destroy(&qnhi->ownership_lock);
++	memset(qnhi, 0, sizeof(*qnhi));
++	return 0;
++}
+diff --git a/drivers/thunderbolt/qcom-usb4-nhi.h b/drivers/thunderbolt/qcom-usb4-nhi.h
+new file mode 100644
+index 00000000000..15318def63d
+--- /dev/null
++++ b/drivers/thunderbolt/qcom-usb4-nhi.h
+@@ -0,0 +1,78 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef QCOM_USB4_NHI_H
++#define QCOM_USB4_NHI_H
++
++#include <linux/idr.h>
++#include <linux/mutex.h>
++
++#include "nhi.h"
++#include "qcom-usb4-irq.h"
++
++#define QCOM_USB4_NHI_MESSAGE_IDS 16
++
++/* One lifetime, initially zeroed; the frontend owns the surrounding object. */
++struct qcom_usb4_nhi {
++	struct tb_nhi nhi;
++	struct qcom_usb4_irq transport;
++	struct ida message_ids;
++	struct mutex ownership_lock;
++	struct tb_ring *owners[QCOM_USB4_NHI_MESSAGE_IDS];
++	int irq;
++	bool prepared;
++	bool core_ready;
++	bool init_attempted;
++	bool irq_requested;
++	bool accept_rearm;
++	bool released;
++};
++
++/*
++ * Set nhi.dev and nhi.iobase first. Validate the caller-supplied capabilities
++ * and initialize ownership before common probe; no MMIO or IRQ registration.
++ * Prepare, init, controller disable and shutdown must be serialized by the
++ * frontend. Repeating prepare is rejected, including after shutdown. This is
++ * not a platform driver or a complete tb_nhi_ops implementation.
++ */
++int qcom_usb4_nhi_prepare(struct qcom_usb4_nhi *qnhi, size_t mapping_size,
++			 unsigned int paths, enum qcom_usb4_irq_width width,
++			 int irq);
++
++/*
++ * Individual callbacks for a frontend's tb_nhi_ops. They require the embedded
++ * NHI above. Common probe must initialize its lock and ring arrays before
++ * init_interrupts; its earlier disable_interrupts call is supported.
++ *
++ * The single physical IRQ uses IRQF_NO_SUSPEND for the control rings. Its
++ * handler accesses MMIO only while accept_rearm is true; the owner must close
++ * that gate while registers remain accessible before removing power. This
++ * flag is not system wake enablement. The separate MCU event IRQ is not owned.
++ * Request/release callbacks run in sleepable context without the NHI lock.
++ * Their ownership mutex is always acquired before the NHI spinlock.
++ */
++int qcom_usb4_nhi_init_interrupts(struct tb_nhi *nhi);
++int qcom_usb4_nhi_request_ring_irq(struct tb_ring *ring, bool no_suspend);
++void qcom_usb4_nhi_release_ring_irq(struct tb_ring *ring);
++void qcom_usb4_nhi_ring_interrupt_mask(struct tb_nhi *nhi, unsigned int cause,
++				     bool mask);
++void qcom_usb4_nhi_disable_interrupts(struct tb_nhi *nhi);
++
++/*
++ * Idempotent final cleanup, also usable after failed probe. The owner must
++ * release every ring first. Mask/ack under the NHI lock, then free the physical
++ * IRQ outside it (waiting for handlers) before destroying the ID allocator.
++ * There is no adapter workqueue. Core ring work and domain lifetime must be
++ * drained by their owner; this callback does not stop MCU, DMA or power.
++ * An ownership mutex serializes complete allocation/release callbacks against
++ * allocator destruction. Before freeing the surrounding object, the caller
++ * must also exclude every future callback and complete all existing callers.
++ */
++void qcom_usb4_nhi_shutdown(struct tb_nhi *nhi);
++
++/*
++ * Return a shut-down interface to its unprepared state so the frontend can
++ * prepare and probe it again after restarting the router. Rejected before
++ * shutdown has released ring ownership. Frees the common layer's ring tables.
++ */
++int qcom_usb4_nhi_reset(struct qcom_usb4_nhi *qnhi);
++
++#endif
+-- 
+2.56.0
+

@@ -18,7 +18,7 @@ def values(path):
 def validate(fragment, resolved):
     requested, actual = values(fragment), values(resolved)
     missing = [f'{name}: wanted {value}, got {actual.get(name, "absent")}'
-               for name, value in requested.items() if actual.get(name) != value]
+               for name, value in requested.items() if actual.get(name, 'n') != value]
     if missing:
         raise ValueError('Kernel capabilities disabled by Kconfig:\n' + '\n'.join(missing))
 

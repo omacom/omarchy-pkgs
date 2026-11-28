@@ -1,0 +1,72 @@
+From: Spencer Bull <spencer@omarchy.org>
+Date: Fri, 27 Nov 2026 13:15:00 -0600
+Subject: [PATCH] ASoC: rt1320-sdw: sync regcache on SoundWire attach
+
+rt1320_sdw_init() puts both regmap and mbq_regmap into cache-only mode
+before the SoundWire peripheral attaches. On systems where the ALSA card
+registers and userspace (such as UCM/alsactl) restores mixer controls
+before rt1320_io_init() runs (observed on boot on the Dell XPS 16
+DX16263, where pre-attach control writes log "Unknown device ID 0"),
+writes to cached controls such as "RX Channel Select" (0x41080200) land
+in regcache with cache_dirty set.
+
+rt1320_io_init() clears cache_only and, on re-attach after a bus reset
+(first_hw_init == true), marks both regmaps dirty without calling
+regcache_sync(). Cached writes therefore stay out of sync with hardware
+until a later PM runtime suspend/resume cycle runs regcache_sync().
+
+Call regcache_sync() on both regmap and mbq_regmap in rt1320_io_init()
+before marking hw_init complete, leaving the cache dirty on error so a
+subsequent resume can retry, and defer scheduling load_dspfw_work until
+after regcache_sync() and hw_init = true so firmware reload cannot race
+against the sync on active re-attach.
+
+Signed-off-by: Spencer Bull <spencer@omarchy.org>
+---
+ sound/soc/codecs/rt1320-sdw.c | 16 +++++++++++++++-
+ 1 file changed, 15 insertions(+), 1 deletion(-)
+
+diff --git a/sound/soc/codecs/rt1320-sdw.c b/sound/soc/codecs/rt1320-sdw.c
+--- a/sound/soc/codecs/rt1320-sdw.c
++++ b/sound/soc/codecs/rt1320-sdw.c
+@@ -2420,6 +2420,8 @@
+ {
+ 	struct rt1320_sdw_priv *rt1320 = dev_get_drvdata(dev);
+ 	unsigned int amp_func_status, val, tmp;
++	bool reload_dspfw = false;
++	int ret;
+ 
+ 	if (rt1320->hw_init)
+ 		return 0;
+@@ -2491,7 +2493,7 @@
+ 
+ 		/* reload DSP FW */
+ 		if (rt1320->fw_load_done)
+-			schedule_work(&rt1320->load_dspfw_work);
++			reload_dspfw = true;
+ 	}
+ 	if (!rt1320->first_hw_init && rt1320->version_id == RT1320_VA && rt1320->dev_id == RT1320_DEV_ID) {
+ 		regmap_write(rt1320->regmap, SDW_SDCA_CTL(FUNC_NUM_AMP, RT1320_SDCA_ENT_PDE23,
+@@ -2522,10 +2524,22 @@
+ 		regcache_mark_dirty(rt1320->mbq_regmap);
+ 	}
+ 
++	/* Flush early pre-attach writes and dirty state after bus reset. */
++	ret = regcache_sync(rt1320->regmap);
++	if (ret)
++		dev_warn(dev, "%s: failed to sync regmap cache: %d\n", __func__, ret);
++
++	ret = regcache_sync(rt1320->mbq_regmap);
++	if (ret)
++		dev_warn(dev, "%s: failed to sync mbq regmap cache: %d\n", __func__, ret);
++
+ 	/* Mark Slave initialization complete */
+ 	rt1320->first_hw_init = true;
+ 	rt1320->hw_init = true;
+ 
++	if (reload_dspfw)
++		schedule_work(&rt1320->load_dspfw_work);
++
+ 	pm_runtime_put_autosuspend(&slave->dev);
+ 
+ 	dev_dbg(&slave->dev, "%s hw_init complete\n", __func__);
