@@ -67,13 +67,24 @@ IFS='|' read -r mergeable commit_count first_oid tip_author tip_date check_state
 paths=()
 for package in "$@"; do paths+=("pkgbuilds/$package"); done
 
+# Compare both tracked changes and any newly added (untracked) files created by
+# `git apply` under pkgbuilds/<pkg>/ against FETCH_HEAD.
+tree_matches_fetch_head() {
+  local untracked
+  untracked=$(git ls-files --others --exclude-standard -- "${paths[@]}")
+  [[ -z $untracked ]] && git diff --quiet FETCH_HEAD -- "${paths[@]}"
+}
+
 # Check for maintainer commits BEFORE handling conflicts so a conflict on master
-# never wipes out a human fix commit pushed onto the PR branch. Compare the
-# working tree against the bot's original first commit on the PR: if identical,
-# upstream has not moved (including revision/checksum/rebuilt_against changes).
-if (( commit_count > 1 )) && [[ -n $first_oid && -n $tip_author && $tip_author != "$bot_login" && $tip_author != "app/$bot_login" ]]; then
-  if git fetch --quiet --no-tags --depth=1 origin "$first_oid" &&
-     git diff --quiet FETCH_HEAD -- "${paths[@]}"; then
+# never wipes out a human fix commit pushed onto the PR branch. An empty
+# tip_author (unlinked git email) is treated as non-bot, and a failed fetch of
+# the bot's original commit preserves the branch rather than overwriting it.
+if (( commit_count > 1 )) && [[ $tip_author != "$bot_login" && $tip_author != "app/$bot_login" ]]; then
+  if [[ -z $first_oid ]] || ! git fetch --quiet --no-tags --depth=1 origin "$first_oid"; then
+    emit false "$pr" human-commit
+    exit 0
+  fi
+  if tree_matches_fetch_head; then
     emit false "$pr" human-commit
     exit 0
   fi
@@ -91,8 +102,8 @@ if ! git fetch --quiet --no-tags --depth=1 origin "refs/heads/$branch"; then
 fi
 
 # Any difference in pkgbuilds/<pkg>/ (new upstream release, revision, checksum,
-# rebuilt_against, or a recipe fix that landed on master) refreshes the PR.
-if ! git diff --quiet FETCH_HEAD -- "${paths[@]}"; then
+# rebuilt_against, new file, or a recipe fix that landed on master) refreshes the PR.
+if ! tree_matches_fetch_head; then
   emit true "$pr" updated
   exit 0
 fi

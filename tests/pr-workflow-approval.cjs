@@ -1423,6 +1423,18 @@ fi
     assert.deepEqual(run('auto/sync-upstream-human', { STUB_PR: '43', STUB_MERGEABLE: 'CONFLICTING', STUB_COMMITS: '2', STUB_AUTHOR: 'emirb' }),
       { push: 'false', pr: '43', reason: 'human-commit' });
 
+    // 6b. Maintainer commit with unlinked git email (empty login) or unfetchable base commit still protects the branch
+    assert.deepEqual(run('auto/sync-upstream-human', { STUB_PR: '43', STUB_MERGEABLE: 'CONFLICTING', STUB_COMMITS: '2', STUB_AUTHOR: '' }),
+      { push: 'false', pr: '43', reason: 'human-commit' });
+    assert.deepEqual(run('auto/sync-upstream-human', { STUB_PR: '43', STUB_MERGEABLE: 'CONFLICTING', STUB_COMMITS: '2', STUB_AUTHOR: 'emirb', STUB_FIRST_OID: 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef' }),
+      { push: 'false', pr: '43', reason: 'human-commit' });
+
+    // 6c. New untracked file under pkgbuilds/<pkg>/ counts as an update
+    writeFileSync(join(work, 'pkgbuilds/demo/new.patch'), 'diff\n');
+    assert.deepEqual(run('auto/sync-upstream-demo', { STUB_PR: '42', STUB_MERGEABLE: 'MERGEABLE', STUB_COMMITS: '1', STUB_AUTHOR: 'omarchy-pkgs-sync' }),
+      { push: 'true', pr: '42', reason: 'updated' });
+    rmSync(join(work, 'pkgbuilds/demo/new.patch'));
+
     // 7. Same pkgver but revision (_build) changed -> diff vs bot's first commit -> push=true (updated)
     writeFileSync(join(work, 'pkgbuilds/demo/PKGBUILD'), 'pkgname=demo\npkgver=2.0\npkgrel=1\n_build=2\n');
     assert.deepEqual(run('auto/sync-upstream-human', { STUB_PR: '43', STUB_MERGEABLE: 'MERGEABLE', STUB_COMMITS: '2', STUB_AUTHOR: 'emirb' }),
