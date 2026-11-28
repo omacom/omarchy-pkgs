@@ -51,10 +51,28 @@ REAL_RCLONE=$(command -v rclone)
 FAKEBIN="$T/fakebin"; mkdir -p "$FAKEBIN"
 cat <<RCLONE_EOF > "$FAKEBIN/rclone"
 #!/bin/bash
+if [[ -n \${LOG_RCLONE:-} ]]; then
+  printf '%s\n' "\$*" >> "\$LOG_RCLONE"
+fi
 if [[ \${1:-} == lsf && -n \${FAIL_LSF_RC:-} ]]; then
   [[ -n \${FAIL_LSF_STDOUT:-} ]] && printf '%s\n' "\$FAIL_LSF_STDOUT"
   echo "simulated rclone lsf failure (rc=\$FAIL_LSF_RC)" >&2
   exit "\$FAIL_LSF_RC"
+fi
+if [[ \${1:-} == lsf && -n \${STRIP_LSF_HASH:-} && " \$* " == *"--format shp"* ]]; then
+  "$REAL_RCLONE" "\$@" | awk -F';' 'BEGIN{OFS=";"} {\$2=""; print}'
+  exit "\${PIPESTATUS[0]}"
+fi
+if [[ \${1:-} == hashsum && -n \${STRIP_LSF_HASH:-} ]]; then
+  printf '%32s  %s\n' '' "\$(basename "\${3:-}")"
+  exit 0
+fi
+if [[ \${1:-} == copy && -n \${INJECT_SRC:-} && " \$* " == *"\${INJECT_MATCH:-}"* ]]; then
+  cp "\$INJECT_SRC" "\$INJECT_DST"
+fi
+if [[ (\${1:-} == copy || \${1:-} == copyto) && -n \${FAIL_COPY_RC:-} && " \$* " == *"\${FAIL_COPY_MATCH:-}"* ]]; then
+  echo "simulated rclone \${1} failure (rc=\$FAIL_COPY_RC)" >&2
+  exit "\$FAIL_COPY_RC"
 fi
 exec "$REAL_RCLONE" "\$@"
 RCLONE_EOF
@@ -153,6 +171,7 @@ kill "$S3_PID" 2>/dev/null || true
 # Valid 0-entry omarchy.db.tar.zst is an initialized empty channel: live publish
 # must succeed without --init (GNU tar exits 2 on --wildcards "*/desc" if not guarded).
 tar --zstd -cf "$REMOTE/edge/x86_64/omarchy.db.tar.zst" -T /dev/null
+tar --zstd -cf "$REMOTE/edge/x86_64/omarchy.files.tar.zst" -T /dev/null
 pub "$A1" && [[ "$(entries)" == "alpha-1.0-1/ " ]] \
   && pass "live publish succeeds into a valid empty db without --init" || fail "empty db publish"
 rm -f "$REMOTE/edge/x86_64"/*
@@ -163,6 +182,39 @@ pub --init "$A1" && [[ "$(entries)" == "alpha-1.0-1/ " ]] && [[ -f "$REMOTE/edge
 sum_before=$(sha256sum "$REMOTE/edge/x86_64/$(basename "$A1")")
 pub "$B1" && [[ "$(entries)" == "alpha-1.0-1/ beta-1.0-1/ " ]] && [[ "$(sha256sum "$REMOTE/edge/x86_64/$(basename "$A1")")" == "$sum_before" ]] \
   && pass "second package added incrementally; first file untouched" || fail "incremental add"
+
+# No .old backup files from repo-add may be uploaded to the remote.
+if compgen -G "$REMOTE/edge/x86_64/*.old" >/dev/null; then
+  fail "repo-add .old backup files leaked to remote: $(ls "$REMOTE/edge/x86_64"/*.old)"
+else
+  [[ -f "$REMOTE/edge/x86_64/omarchy.db" && -f "$REMOTE/edge/x86_64/omarchy.files" ]] \
+    && pass "incremental publish uploads db/files without .old backups" || fail "missing db/files aliases"
+fi
+
+# Missing, corrupt, or failed omarchy.files.tar.zst pull must fail closed instead
+# of silently rebuilding omarchy.files with only the incoming package.
+db_sum_before=$(sha256sum "$REMOTE/edge/x86_64/omarchy.db.tar.zst")
+files_bak="$T/omarchy.files.tar.zst.bak"
+cp "$REMOTE/edge/x86_64/omarchy.files.tar.zst" "$files_bak"
+
+rm "$REMOTE/edge/x86_64/omarchy.files.tar.zst"
+pub "$A2" && fail "missing omarchy.files.tar.zst should fail closed" || true
+cp "$files_bak" "$REMOTE/edge/x86_64/omarchy.files.tar.zst"
+grep -q 'Failed to pull omarchy.files.tar.zst' "$T/out" \
+  && [[ "$(sha256sum "$REMOTE/edge/x86_64/omarchy.db.tar.zst")" == "$db_sum_before" ]] \
+  && pass "missing omarchy.files.tar.zst fails closed" || fail "missing files db reason"
+
+printf 'corrupt archive\n' > "$REMOTE/edge/x86_64/omarchy.files.tar.zst"
+pub "$A2" && fail "corrupt omarchy.files.tar.zst should fail closed" || true
+cp "$files_bak" "$REMOTE/edge/x86_64/omarchy.files.tar.zst"
+[[ "$(sha256sum "$REMOTE/edge/x86_64/omarchy.db.tar.zst")" == "$db_sum_before" ]] \
+  && pass "corrupt omarchy.files.tar.zst fails closed" || fail "corrupt files db"
+
+PATH="$FAKEBIN:$PATH" FAIL_COPY_RC=1 FAIL_COPY_MATCH="/omarchy.files.tar.zst" pub "$A2" \
+  && fail "rclone copy failure on db/files pull should fail closed" || true
+grep -q 'simulated rclone copy failure' "$T/out" \
+  && [[ "$(sha256sum "$REMOTE/edge/x86_64/omarchy.db.tar.zst")" == "$db_sum_before" ]] \
+  && pass "rclone copy failure on db/files pull fails closed" || fail "files copy failure"
 
 # Transient rclone lsf error on a populated channel must fail closed and leave
 # the existing database intact (both with and without --init).
@@ -207,15 +259,59 @@ pub "$A1" && grep -q 'already serves alpha 1.0-2' "$T/out" && [[ "$(entries)" ==
   && pass "an older version never takes the channel backwards" || fail "older version published"
 
 drop_alpha() {
-  ( cd "$REMOTE/edge/x86_64" && repo-remove --quiet omarchy.db.tar.zst alpha >/dev/null 2>&1 )
+  ( cd "$REMOTE/edge/x86_64" && repo-remove --quiet omarchy.db.tar.zst alpha >/dev/null 2>&1 && rm -f ./*.old )
   [[ "$(entries)" == "beta-1.0-1/ " ]] || fail "fixture: could not drop alpha from the db"
 }
 
 # Orphan repair: a file that reached the remote but whose db entry was lost
-# (a concurrent publish overwrote the db) is fixed by publishing it again.
+# (a concurrent publish overwrote the db) is fixed by publishing it again, and
+# verifies + reuses the immutable remote .sig so %PGPSIG% matches it byte-for-byte.
 drop_alpha
-pub "$A2" && grep -q 'identical bytes' "$T/out" && [[ "$(entries)" == "alpha-1.0-2/ beta-1.0-1/ " ]] \
-  && pass "orphaned file regains its db entry on republish" || fail "orphan repair"
+a2_sig="$REMOTE/edge/x86_64/$(basename "$A2").sig"
+# Replace remote .sig with a distinct valid signature from the same key so
+# reusing vs re-signing is observable and deterministic.
+GNUPGHOME="$T/g" gpg --batch --yes --pinentry-mode loopback --passphrase "" \
+  --set-notation test@omarchy=orig --detach-sign --no-armor -o "$a2_sig" "$A2"
+cp "$a2_sig" "$T/a2.sig.orig"
+pub "$A2" \
+  && grep -q 'identical bytes' "$T/out" && grep -q 'reused existing signature' "$T/out" \
+  && [[ "$(entries)" == "alpha-1.0-2/ beta-1.0-1/ " ]] && cmp -s "$a2_sig" "$T/a2.sig.orig" \
+  || fail "orphan repair"
+pgpsig=$(tar -xO --zstd -f "$REMOTE/edge/x86_64/omarchy.db.tar.zst" alpha-1.0-2/desc \
+  | awk '/^%PGPSIG%$/{getline; print; exit}')
+[[ -n "$pgpsig" ]] && cmp -s "$a2_sig" <(base64 -d <<<"$pgpsig") \
+  && pass "orphaned file regains its db entry with %PGPSIG% matching remote .sig" || fail "orphan %PGPSIG% drift"
+
+# A corrupt/unverifiable remote .sig on an orphan retry must fail closed.
+drop_alpha
+printf 'not a valid signature\n' > "$a2_sig"
+db_sum_before=$(sha256sum "$REMOTE/edge/x86_64/omarchy.db.tar.zst")
+pub "$A2" && fail "corrupt remote .sig on orphan retry should fail closed" || true
+cp "$T/a2.sig.orig" "$a2_sig"
+grep -q 'does not verify' "$T/out" \
+  && [[ "$(sha256sum "$REMOTE/edge/x86_64/omarchy.db.tar.zst")" == "$db_sum_before" ]] \
+  && pass "corrupt remote .sig on orphan retry fails closed" || fail "corrupt remote sig"
+
+# A same-size sidecar appearing after the initial listing with different bytes
+# must fail the checksum check before any metadata upload is attempted.
+rm "$a2_sig"
+GNUPGHOME="$T/g" gpg --batch --yes --pinentry-mode loopback --passphrase "" \
+  --detach-sign --no-armor -o "$T/a2.sig.same-size" "$A2"
+python3 -c 'import sys; p=sys.argv[1]; b=bytearray(open(p,"rb").read()); b[-1]^=1; open(p,"wb").write(b)' "$T/a2.sig.same-size"
+db_sum_before=$(sha256sum "$REMOTE/edge/x86_64/omarchy.db.tar.zst")
+: > "$T/rclone.log"
+PATH="$FAKEBIN:$PATH" LOG_RCLONE="$T/rclone.log" INJECT_MATCH="*.pkg.tar.*.sig" INJECT_SRC="$T/a2.sig.same-size" INJECT_DST="$a2_sig" pub "$A2" \
+  && fail "concurrent sidecar with different bytes should fail closed" || true
+grep -q 'Remote checksum mismatch' "$T/out" \
+  && ! grep -q '^copyto ' "$T/rclone.log" \
+  && [[ "$(sha256sum "$REMOTE/edge/x86_64/omarchy.db.tar.zst")" == "$db_sum_before" ]] \
+  && pass "concurrent same-size sidecar mismatch fails checksum before metadata upload" || fail "sidecar mismatch"
+
+# Orphaned package whose .sig never uploaded is signed fresh and uploaded.
+rm "$a2_sig"
+pub "$A2" && grep -q 'identical bytes' "$T/out" && grep -q 'signed alpha-1.0-2' "$T/out" \
+  && [[ -f "$a2_sig" ]] \
+  && pass "orphaned package without remote .sig signs and uploads fresh .sig" || fail "orphan missing sig"
 
 # Different bytes under an existing name: refused. Build alpha-2 again with
 # a different payload (makepkg is reproducible, so the content must change).
@@ -234,9 +330,90 @@ cp "$B1" "$T/renamed-1.0-1-x86_64.pkg.tar.zst"
 if pub "$T/renamed-1.0-1-x86_64.pkg.tar.zst"; then fail "filename/PKGINFO mismatch should refuse"; else grep -q 'does not match PKGINFO' "$T/out" && pass "filename must match PKGINFO" || fail "mismatch reason"; fi
 
 A3=$(mkpkg alpha 3 any); D1=$(mkpkg delta 1 any)
-pub "$A1" "$A3" "$D1" && [[ "$(entries)" == "alpha-1.0-3/ beta-1.0-1/ delta-1.0-1/ " ]] \
-  && pass "newer and new packages publish, the rest are dropped" || fail "mixed publish"
+# A same-size different-byte package appearing after initial listing must fail
+# the checksum check before any metadata upload is attempted.
+db_sum_before=$(sha256sum "$REMOTE/edge/x86_64/omarchy.db.tar.zst")
+cp "$D1" "$T/d1.same-size"
+python3 -c 'import sys; p=sys.argv[1]; b=bytearray(open(p,"rb").read()); b[-1]^=1; open(p,"wb").write(b)' "$T/d1.same-size"
+: > "$T/rclone.log"
+PATH="$FAKEBIN:$PATH" LOG_RCLONE="$T/rclone.log" INJECT_MATCH="- *.sig" INJECT_SRC="$T/d1.same-size" INJECT_DST="$REMOTE/edge/x86_64/$(basename "$D1")" pub "$D1" \
+  && fail "concurrent package collision should fail closed" || true
+rm -f "$REMOTE/edge/x86_64/$(basename "$D1")" "$REMOTE/edge/x86_64/$(basename "$D1").sig"
+grep -q 'Remote checksum mismatch' "$T/out" \
+  && ! grep -q '^copyto ' "$T/rclone.log" \
+  && [[ "$(sha256sum "$REMOTE/edge/x86_64/omarchy.db.tar.zst")" == "$db_sum_before" ]] \
+  && pass "concurrent same-size package collision fails checksum before metadata upload" || fail "pkg collision"
 
-# db must verify: pacman can read it and each package's signature checks
-gpg --batch --quiet --import <<<"$GPG_PRIVATE_KEY" 2>/dev/null || true
-( cd "$REMOTE/edge/x86_64" && for f in *.pkg.tar.zst; do gpg --batch --quiet --verify "$f.sig" "$f" 2>/dev/null || { echo "FAIL: signature $f"; exit 1; }; done ) && pass "all signatures verify"
+# When remote lsf omits MD5 (e.g. S3 multipart upload), streaming fallback still catches mismatch.
+: > "$T/rclone.log"
+PATH="$FAKEBIN:$PATH" LOG_RCLONE="$T/rclone.log" STRIP_LSF_HASH=1 INJECT_MATCH="- *.sig" INJECT_SRC="$T/d1.same-size" INJECT_DST="$REMOTE/edge/x86_64/$(basename "$D1")" pub "$D1" \
+  && fail "empty-hash fallback should still catch package mismatch" || true
+rm -f "$REMOTE/edge/x86_64/$(basename "$D1")" "$REMOTE/edge/x86_64/$(basename "$D1").sig"
+grep -q 'Remote checksum mismatch' "$T/out" && grep -q '^cat ' "$T/rclone.log" \
+  && ! grep -q '^copyto ' "$T/rclone.log" \
+  && pass "empty-hash fallback verifies via rclone cat and fails closed on mismatch" || fail "empty-hash fallback"
+
+# Empty-hash fallback also succeeds on orphan retry when remote bytes match.
+drop_alpha
+: > "$T/rclone.log"
+PATH="$FAKEBIN:$PATH" LOG_RCLONE="$T/rclone.log" STRIP_LSF_HASH=1 pub "$A2" \
+  && grep -q 'identical bytes' "$T/out" && grep -q '^cat ' "$T/rclone.log" \
+  && [[ "$(entries)" == "alpha-1.0-2/ beta-1.0-1/ " ]] \
+  && pass "empty-hash fallback succeeds on matching orphan retry" || fail "empty-hash orphan ok"
+
+# Failed unpublish of beta (files landed, db.tar.zst failed) followed by an unrelated
+# publish of delta must refuse to commit mismatched db and files indexes.
+db_sum_before=$(sha256sum "$REMOTE/edge/x86_64/omarchy.db.tar.zst")
+cp "$REMOTE/edge/x86_64/omarchy.files.tar.zst" "$T/files.pre-unpub"
+cp "$REMOTE/edge/x86_64/omarchy.files" "$T/files.alias.pre-unpub"
+cp "$REMOTE/edge/x86_64/omarchy.db" "$T/db.alias.pre-unpub"
+PATH="$FAKEBIN:$PATH" FAIL_COPY_RC=1 FAIL_COPY_MATCH="/omarchy.db.tar.zst --s3-no-head --checksum" \
+  "$ROOT/bin/unpublish-packages" --remote "$REMOTE" --mirror edge --arch x86_64 beta >"$T/out" 2>&1 \
+  && fail "fixture: simulated partial unpublish should fail" || true
+: > "$T/rclone.log"
+PATH="$FAKEBIN:$PATH" LOG_RCLONE="$T/rclone.log" pub "$D1" \
+  && fail "unrelated publish over diverged db/files should fail closed" || true
+cp "$T/files.pre-unpub" "$REMOTE/edge/x86_64/omarchy.files.tar.zst"
+cp "$T/files.alias.pre-unpub" "$REMOTE/edge/x86_64/omarchy.files"
+cp "$T/db.alias.pre-unpub" "$REMOTE/edge/x86_64/omarchy.db"
+rm -f "$REMOTE/edge/x86_64/$(basename "$D1")" "$REMOTE/edge/x86_64/$(basename "$D1").sig"
+grep -q 'entries diverge' "$T/out" && ! grep -q '^copyto ' "$T/rclone.log" \
+  && [[ ! -e "$REMOTE/edge/x86_64/$(basename "$D1")" ]] \
+  && [[ "$(sha256sum "$REMOTE/edge/x86_64/omarchy.db.tar.zst")" == "$db_sum_before" ]] \
+  && pass "unrelated publish refuses to commit diverged db/files after partial unpublish" || fail "diverged index publish"
+
+# Simulate mid-upload failure after omarchy.files.tar.zst, omarchy.files, and omarchy.db
+# land, failing on omarchy.db.tar.zst (the commit point): retry must succeed and
+# leave omarchy.files.tar.zst with exact flat paths (no nested pkg/pkg/ dirs).
+PATH="$FAKEBIN:$PATH" FAIL_COPY_RC=1 FAIL_COPY_MATCH="/omarchy.db.tar.zst --s3-no-head --checksum" pub "$A1" "$A3" "$D1" \
+  && fail "failed omarchy.db.tar.zst upload should fail closed" || true
+[[ "$(sha256sum "$REMOTE/edge/x86_64/omarchy.db.tar.zst")" == "$db_sum_before" ]] \
+  || fail "omarchy.db.tar.zst changed despite simulated failure"
+[[ "$(tar -tf "$REMOTE/edge/x86_64/omarchy.files.tar.zst" | grep '/$' | sort | tr '\n' ' ')" == "alpha-1.0-3/ beta-1.0-1/ delta-1.0-1/ " ]] \
+  || fail "fixture: expected omarchy.files.tar.zst to have landed before db failure"
+
+: > "$T/rclone.log"
+PATH="$FAKEBIN:$PATH" LOG_RCLONE="$T/rclone.log" pub "$A1" "$A3" "$D1" \
+  && [[ "$(entries)" == "alpha-1.0-3/ beta-1.0-1/ delta-1.0-1/ " ]] \
+  && cmp -s "$REMOTE/edge/x86_64/omarchy.db" "$REMOTE/edge/x86_64/omarchy.db.tar.zst" \
+  && cmp -s "$REMOTE/edge/x86_64/omarchy.files" "$REMOTE/edge/x86_64/omarchy.files.tar.zst" \
+  && [[ "$(tar -tf "$REMOTE/edge/x86_64/omarchy.files.tar.zst" | sort | tr '\n' ' ')" == "alpha-1.0-3/ alpha-1.0-3/desc alpha-1.0-3/files beta-1.0-1/ beta-1.0-1/desc beta-1.0-1/files delta-1.0-1/ delta-1.0-1/desc delta-1.0-1/files " ]] \
+  && pass "mixed-generation retry heals cleanly without nested files entries" || fail "mixed publish: $(tar -tf "$REMOTE/edge/x86_64/omarchy.files.tar.zst" | sort | tr '\n' ' ')"
+
+# Upload ordering: pkg -> .sig -> lsf -> files.tar.zst -> files -> db -> db.tar.zst last.
+pkg_line=$(grep -Fn -- '--filter - *.sig --filter + *.pkg.tar.*' "$T/rclone.log" | cut -d: -f1 | head -n1)
+sig_line=$(grep -Fn -- '--filter + *.pkg.tar.*.sig' "$T/rclone.log" | cut -d: -f1 | head -n1)
+lsf_line=$(grep -n '^lsf --format shp ' "$T/rclone.log" | cut -d: -f1 | tail -n1)
+ftz_line=$(grep -Fn -- '/omarchy.files.tar.zst --s3-no-head --checksum' "$T/rclone.log" | cut -d: -f1 | tail -n1)
+fal_line=$(grep -Fn -- '/omarchy.files --s3-no-head --checksum' "$T/rclone.log" | cut -d: -f1 | tail -n1)
+dal_line=$(grep -Fn -- '/omarchy.db --s3-no-head --checksum' "$T/rclone.log" | cut -d: -f1 | tail -n1)
+dtz_line=$(grep -Fn -- '/omarchy.db.tar.zst --s3-no-head --checksum' "$T/rclone.log" | cut -d: -f1 | tail -n1)
+[[ -n "$pkg_line" && -n "$sig_line" && -n "$lsf_line" && -n "$ftz_line" && -n "$fal_line" && -n "$dal_line" && -n "$dtz_line" ]] \
+  && (( pkg_line < sig_line && sig_line < lsf_line && lsf_line < ftz_line && ftz_line < fal_line && fal_line < dal_line && dal_line < dtz_line )) \
+  && pass "upload order puts packages, signatures, files, and db alias before db.tar.zst" || fail "upload order: $(cat "$T/rclone.log")"
+
+! compgen -G "$REMOTE/edge/x86_64/*.old" >/dev/null \
+  && pass "no .old files left on remote after publish" || fail ".old files present on remote"
+
+# db must verify: each package's signature checks
+( cd "$REMOTE/edge/x86_64" && for f in *.pkg.tar.zst; do GNUPGHOME="$T/g" gpg --batch --quiet --verify "$f.sig" "$f" 2>/dev/null || { echo "FAIL: signature $f"; exit 1; }; done ) && pass "all signatures verify"

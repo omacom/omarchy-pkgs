@@ -56,6 +56,10 @@ if [[ \${1:-} == lsf && -n \${FAIL_LSF_RC:-} ]]; then
   echo "simulated rclone lsf failure (rc=\$FAIL_LSF_RC)" >&2
   exit "\$FAIL_LSF_RC"
 fi
+if [[ (\${1:-} == copy || \${1:-} == copyto) && -n \${FAIL_COPY_RC:-} && " \$* " == *"\${FAIL_COPY_MATCH:-}"* ]]; then
+  echo "simulated rclone \${1} failure (rc=\$FAIL_COPY_RC)" >&2
+  exit "\$FAIL_COPY_RC"
+fi
 exec "$REAL_RCLONE" "\$@"
 RCLONE_EOF
 chmod +x "$FAKEBIN/rclone"
@@ -113,3 +117,57 @@ unpub split && [[ "$(entries)" == "alpha-1.0-1 beta-1.0-1 " ]] \
 # Re-running for an already-absent package is a clean no-op.
 unpub split && grep -q 'nothing to remove' "$T/out" && [[ "$(entries)" == "alpha-1.0-1 beta-1.0-1 " ]] \
   && pass "unpublishing an absent package is a no-op" || fail "absent package"
+
+# No .old backup files from repo-remove may be uploaded to the remote, and
+# omarchy.files.tar.zst must stay in sync with omarchy.db.tar.zst.
+if compgen -G "$REMOTE/edge/x86_64/*.old" >/dev/null; then
+  fail "repo-remove .old backup files leaked to remote: $(ls "$REMOTE/edge/x86_64"/*.old)"
+else
+  files_entries=$(tar -tf "$REMOTE/edge/x86_64/omarchy.files.tar.zst" | grep '/$' | tr -d / | sort | tr '\n' ' ')
+  [[ "$files_entries" == "alpha-1.0-1 beta-1.0-1 " ]] \
+    && pass "unpublish excludes .old backups and preserves omarchy.files entries" || fail "files entries: $files_entries"
+fi
+
+# Missing, corrupt, or failed omarchy.files.tar.zst pull must fail closed.
+db_sum_before=$(sha256sum "$REMOTE/edge/x86_64/omarchy.db.tar.zst")
+files_bak="$T/omarchy.files.tar.zst.bak"
+cp "$REMOTE/edge/x86_64/omarchy.files.tar.zst" "$files_bak"
+
+rm "$REMOTE/edge/x86_64/omarchy.files.tar.zst"
+unpub alpha && fail "missing omarchy.files.tar.zst should fail closed" || true
+cp "$files_bak" "$REMOTE/edge/x86_64/omarchy.files.tar.zst"
+grep -q 'Failed to pull omarchy.files.tar.zst' "$T/out" \
+  && [[ "$(sha256sum "$REMOTE/edge/x86_64/omarchy.db.tar.zst")" == "$db_sum_before" ]] \
+  && pass "unpublish fails closed when omarchy.files.tar.zst is missing" || fail "unpub missing files db"
+
+printf 'corrupt archive\n' > "$REMOTE/edge/x86_64/omarchy.files.tar.zst"
+unpub alpha && fail "corrupt omarchy.files.tar.zst should fail closed" || true
+cp "$files_bak" "$REMOTE/edge/x86_64/omarchy.files.tar.zst"
+[[ "$(sha256sum "$REMOTE/edge/x86_64/omarchy.db.tar.zst")" == "$db_sum_before" ]] \
+  && pass "unpublish fails closed when omarchy.files.tar.zst is corrupt" || fail "unpub corrupt files db"
+
+PATH="$FAKEBIN:$PATH" FAIL_COPY_RC=1 FAIL_COPY_MATCH="/omarchy.files.tar.zst" unpub alpha \
+  && fail "rclone copy failure on omarchy.files.tar.zst should fail closed" || true
+grep -q 'simulated rclone copy failure' "$T/out" \
+  && [[ "$(sha256sum "$REMOTE/edge/x86_64/omarchy.db.tar.zst")" == "$db_sum_before" ]] \
+  && pass "unpublish fails closed on rclone copy failure for omarchy.files.tar.zst" || fail "unpub files copy failure"
+
+# Mid-upload failure after omarchy.files* and omarchy.db land (failing on omarchy.db.tar.zst):
+# retry must not skip as a no-op and must leave all 4 metadata objects in sync.
+PATH="$FAKEBIN:$PATH" FAIL_COPY_RC=1 FAIL_COPY_MATCH="/omarchy.db.tar.zst --s3-no-head --checksum" unpub alpha \
+  && fail "failed omarchy.db.tar.zst upload should fail closed" || true
+[[ "$(sha256sum "$REMOTE/edge/x86_64/omarchy.db.tar.zst")" == "$db_sum_before" ]] \
+  || fail "omarchy.db.tar.zst changed despite simulated failure"
+unpub alpha && [[ "$(entries)" == "beta-1.0-1 " ]] \
+  && cmp -s "$REMOTE/edge/x86_64/omarchy.db" "$REMOTE/edge/x86_64/omarchy.db.tar.zst" \
+  && cmp -s "$REMOTE/edge/x86_64/omarchy.files" "$REMOTE/edge/x86_64/omarchy.files.tar.zst" \
+  && [[ "$(tar -tf "$REMOTE/edge/x86_64/omarchy.files.tar.zst" | sort | tr '\n' ' ')" == "beta-1.0-1/ beta-1.0-1/desc beta-1.0-1/files " ]] \
+  && ! compgen -G "$REMOTE/edge/x86_64/*.old" >/dev/null \
+  && pass "unpublish retries cleanly after partial metadata upload" || fail "unpub retry"
+
+# Removing the last remaining package leaves a valid 0-entry db/files pair, and
+# re-running against that empty initialized channel is a clean no-op.
+unpub beta && [[ "$(tar -tf "$REMOTE/edge/x86_64/omarchy.db.tar.zst" | grep -c '/$' || true)" == "0" ]] \
+  && [[ "$(tar -tf "$REMOTE/edge/x86_64/omarchy.files.tar.zst" | grep -c '/$' || true)" == "0" ]] \
+  && unpub beta && grep -q 'nothing to remove' "$T/out" \
+  && pass "removing last package leaves valid empty db/files and re-run is a no-op" || fail "last package unpublish"
