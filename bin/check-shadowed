@@ -1,24 +1,31 @@
 #!/bin/bash
-# Omarchy's pacman.conf lists [omarchy] above [core], [extra] and [multilib], and
-# pacman takes the first repository carrying a name without comparing versions
-# across the rest. So a package here that falls behind Arch is not dead weight:
-# -Syu stops offering the newer official build, and the -Syyuu in
-# omarchy-refresh-pacman downgrades to ours. Publishing a name Arch also ships is
-# a promise to stay ahead of it.
+# Omarchy's pacman.conf lists [omarchy] above the official repositories
+# ([core], [extra], [multilib] on x86_64; [core], [extra], [alarm] on installed
+# aarch64 systems, plus [aur] in the aarch64 builder and online installer ISO),
+# and pacman takes the first repository carrying a name without comparing
+# versions across the rest. So a package here that falls behind Arch or Arch
+# Linux ARM is not dead weight: -Syu stops offering the newer official build,
+# and the -Syyuu in omarchy-refresh-pacman downgrades to ours. Publishing a
+# name an official repository also ships is a promise to stay ahead of it.
 #
-# Arch's repositories in the container are x86_64, so only recipes that build for
-# x86_64 (or any) are compared. An aarch64-only recipe replaces nothing here.
+# Official repository databases are fetched directly from Omarchy's x86_64 and
+# Arch Linux ARM mirrors (mirror.omarchy.org and arm-mirror.omarchy.org) into a
+# private temporary dbpath and listed with pacman -Sl (read-only, no root), so
+# database parsing and version ordering match libalpm on users' machines.
 #
 # Every shadow is a decision, so release/shadowed-packages.txt lists each one
 # with its reason. A shadow it does not list fails, and so does a listed name
-# that no longer shadows anything.
+# that no longer shadows anything on any architecture (on a full-tree all-arch
+# run when every architecture loaded cleanly).
 #
 # With package directory names as arguments, only those recipes are checked:
-# a pull request answers for its own packages, not for one elsewhere that Arch
-# has since passed. The daily run checks the whole tree.
+# a pull request answers for its own packages, not for one elsewhere that
+# upstream has since passed. The daily run checks the whole tree.
 #
-# It exits 1 on a finding and 2 when it could not check at all, so the daily run
-# alerts on the first and not on a missing tool or an unreachable mirror.
+# It exits 1 on a confirmed finding and 2 when it could not check without any
+# confirmed finding, so the daily run alerts on real regressions even if the
+# other architecture's mirror is transiently down, and stays quiet on a pure
+# mirror outage or missing tool.
 #
 # This reads the PKGBUILDs, which is what a pull request changes. It says nothing
 # about what the mirror currently serves -- a build that never published leaves an
@@ -30,49 +37,95 @@ source "$BUILD_ROOT/helpers/message-helpers.sh"
 source "$BUILD_ROOT/helpers/paths.sh"
 source "$BUILD_ROOT/helpers/package-metadata.sh"
 
-# Loaded in pacman's own resolution order, so the first repository carrying a name
-# is the one that answers for it.
-SHADOWED_REPOS=(core extra multilib)
-TARGET_ARCH=x86_64
-SHADOW_LIST="$BUILD_ROOT/release/shadowed-packages.txt"
+PKGBUILDS_DIR="${OMARCHY_PKGBUILDS:-$PKGBUILDS_DIR}"
+SHADOW_LIST="${OMARCHY_SHADOW_LIST:-$BUILD_ROOT/release/shadowed-packages.txt}"
+ARCH_MIRROR_URL="${OMARCHY_ARCH_MIRROR_URL:-https://mirror.omarchy.org}"
+ALARM_BASE_URL="${OMARCHY_ALARM_BASE_URL:-https://arm-mirror.omarchy.org/aarch64}"
+
+# Loaded in pacman's own resolution order per architecture, so the first
+# repository carrying a name is the one that answers for it. On aarch64,
+# installed systems enable core/extra/alarm and the builder (build/Dockerfile)
+# and online installer ISO also enable aur, so all four are checked.
+X86_64_REPOS=(core extra multilib)
+AARCH64_REPOS=(core extra alarm aur)
+
+ARCH_MODE=all
+PACKAGES=()
+
+usage() {
+  cat <<USAGE
+Usage: $0 [--arch x86_64|aarch64|all] [--] [PACKAGE...]
+
+Check PKGBUILDs that publish package names also shipped by official Arch
+(x86_64) or Arch Linux ARM (aarch64) repositories.
+
+Options:
+  --arch ARCH   Architecture to check: x86_64, aarch64, or all (default: all)
+  -h, --help    Show this help
+USAGE
+}
+
+while (($# > 0)); do
+  case "$1" in
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    --arch)
+      if (($# < 2)); then
+        print_error "--arch requires an argument (x86_64, aarch64, or all)"
+        exit 1
+      fi
+      ARCH_MODE="$2"
+      shift 2
+      ;;
+    --arch=*)
+      ARCH_MODE="${1#--arch=}"
+      shift
+      ;;
+    --)
+      shift
+      PACKAGES+=("$@")
+      break
+      ;;
+    -*)
+      print_error "Unknown option: $1"
+      exit 1
+      ;;
+    *)
+      PACKAGES+=("$1")
+      shift
+      ;;
+  esac
+done
+
+case "$ARCH_MODE" in
+  all)
+    TARGET_ARCHES=(x86_64 aarch64)
+    ;;
+  x86_64|aarch64)
+    TARGET_ARCHES=("$ARCH_MODE")
+    ;;
+  *)
+    print_error "Invalid architecture: $ARCH_MODE (must be one of: x86_64 aarch64 all)"
+    exit 1
+    ;;
+esac
 
 print_header "Shadowed Package Check"
 
-for tool in pacman vercmp; do
+for tool in pacman vercmp curl tar gzip zstd; do
   command -v "$tool" >/dev/null || {
     print_error "$tool is required; run this on Arch or in the archlinux container"
     exit 2
   }
 done
 
-declare -A official_repo official_version
-
-load_repo() {
-  local repo="$1" listing name version rest
-
-  # Not `|| true`: a listing that fails after emitting some rows would leave a
-  # partial repository behind and check fewer names while reporting success.
-  if ! listing=$(pacman -Sl "$repo" 2>/dev/null); then
-    print_error "[$repo] could not be listed; enable it and sync the package databases first"
-    exit 2
-  fi
-
-  if [[ -z $listing ]]; then
-    print_error "[$repo] lists no packages; enable it and sync the package databases first"
-    exit 2
-  fi
-
-  while read -r _ name version rest; do
-    [[ -n $name ]] || continue
-    [[ -n ${official_repo[$name]:-} ]] && continue
-    official_repo[$name]="$repo"
-    official_version[$name]="$version"
-  done <<<"$listing"
-}
-
-for repo in "${SHADOWED_REPOS[@]}"; do
-  load_repo "$repo"
-done
+if ! TEMP_DIR=$(mktemp -d); then
+  print_error "Could not create temporary directory"
+  exit 2
+fi
+trap 'rm -rf "$TEMP_DIR"' EXIT
 
 declare -A declared
 
@@ -89,6 +142,109 @@ while read -r name reason; do
   fi
   declared[$name]="$reason"
 done <"$SHADOW_LIST"
+
+pkgdirs=()
+if ((${#PACKAGES[@]} > 0)); then
+  for package in "${PACKAGES[@]}"; do
+    if [[ ! $package =~ ^[a-z0-9@._+][a-z0-9@._+-]*$ ]]; then
+      print_error "Not a package directory name: $package"
+      exit 1
+    fi
+    # A pull request that deletes a recipe leaves nothing here to check.
+    [[ -f $PKGBUILDS_DIR/$package/PKGBUILD ]] && pkgdirs+=("$PKGBUILDS_DIR/$package")
+  done
+  if ((${#pkgdirs[@]} == 0)); then
+    print_success "None of the named packages has a recipe left to check"
+    exit 0
+  fi
+else
+  mapfile -t pkgdirs < <(package_dirs)
+  if ((${#pkgdirs[@]} == 0)); then
+    print_error "No packages were examined; expected PKGBUILDs under $PKGBUILDS_DIR"
+    exit 1
+  fi
+fi
+
+repo_db_url() {
+  local arch="$1" repo="$2"
+  case "$arch" in
+    x86_64)  printf '%s/%s/os/x86_64/%s.db\n' "${ARCH_MIRROR_URL%/}" "$repo" "$repo" ;;
+    aarch64) printf '%s/%s/%s.db\n' "${ALARM_BASE_URL%/}" "$repo" "$repo" ;;
+    *) return 1 ;;
+  esac
+}
+
+declare -A official_repo=() official_version=()
+
+verify_archive() {
+  local db="$1" err_file="$2" magic
+  : >"$err_file"
+  magic=$(LC_ALL=C od -An -tx1 -N4 "$db" 2>/dev/null | tr -d ' \n')
+  case "$magic" in
+    1f8b*)     LC_ALL=C gzip -t "$db" 2>"$err_file" || return 1 ;;
+    28b52ffd*) LC_ALL=C zstd -tq "$db" 2>"$err_file" || return 1 ;;
+    fd377a58*) LC_ALL=C xz -t "$db" 2>"$err_file" || return 1 ;;
+    425a68*)   LC_ALL=C bzip2 -t "$db" 2>"$err_file" || return 1 ;;
+  esac
+  [[ ! -s $err_file ]] || return 1
+  LC_ALL=C tar --warning=all -tf "$db" >/dev/null 2>"$err_file" && [[ ! -s $err_file ]]
+}
+
+load_repo() {
+  local arch="$1" repo="$2" url dbpath db conf tar_err err_file listing name version rest
+  url=$(repo_db_url "$arch" "$repo")
+  dbpath="$TEMP_DIR/db-${arch}-${repo}"
+  db="$dbpath/sync/${repo}.db"
+  conf="$dbpath/pacman.conf"
+  tar_err="$dbpath/tar.err"
+  err_file="$dbpath/pacman.err"
+  if ! mkdir -p "$dbpath/sync"; then
+    print_error "[$arch/$repo] could not create temporary dbpath"
+    return 2
+  fi
+
+  if ! curl -fsSL --retry 3 --retry-delay 2 --connect-timeout 15 --max-time 120 -o "$db" "$url" 2>/dev/null; then
+    print_error "[$arch/$repo] could not be fetched from $url"
+    return 2
+  fi
+
+  # Verify compression integrity through EOF (GNU tar stops at the tar
+  # end-of-archive zero blocks and can miss a bad trailer CRC after padding),
+  # then verify the tar structure and terminating zero blocks with --warning=all.
+  if ! verify_archive "$db" "$tar_err"; then
+    print_error "[$arch/$repo] archive from $url is unreadable ($(awk 'NF { print; exit }' "$tar_err" 2>/dev/null || true))"
+    return 2
+  fi
+
+  printf '[options]\nArchitecture = %s\nSigLevel = Never\n[%s]\nServer = file:///nonexistent\n' \
+    "$arch" "$repo" >"$conf"
+
+  # Read the sync database with libalpm itself (read-only, no root needed).
+  # This matches how pacman resolves packages on users' machines, preserves
+  # archive member boundaries, and handles upstream ARM records whose desc
+  # payload is all-NUL while still surfacing libalpm errors via stderr.
+  if ! listing=$(LC_ALL=C pacman --config "$conf" --dbpath "$dbpath" -Sl "$repo" 2>"$err_file"); then
+    print_error "[$arch/$repo] could not be listed by pacman from $url"
+    return 2
+  fi
+
+  if [[ -s $err_file ]]; then
+    print_error "[$arch/$repo] reported errors reading $url: $(head -n 1 "$err_file")"
+    return 2
+  fi
+
+  if [[ -z $listing ]]; then
+    print_error "[$arch/$repo] lists no packages"
+    return 2
+  fi
+
+  while read -r _ name version rest; do
+    [[ -n $name ]] || continue
+    [[ -n ${official_repo[$name]:-} ]] && continue
+    official_repo[$name]="$repo"
+    official_version[$name]="$version"
+  done <<<"$listing"
+}
 
 # The PKGBUILD is the only place pkgname and epoch are recorded, and makepkg
 # sources it too, so read it the same way rather than parsing it by hand. That
@@ -114,8 +270,8 @@ read_pkgbuild='
   [[ -n "${pkgname:-}" && -n "${pkgver:-}" && -n "${pkgrel:-}" ]] || exit 1
 
   # A recipe that does not build for this architecture publishes nothing that
-  # could replace the build Arch ships here. It says so, because empty output
-  # means the PKGBUILD could not be read.
+  # could replace the build upstream ships here. It says so, because empty
+  # output means the PKGBUILD could not be read.
   if [[ " ${arch[*]:-} " != *" $2 "* && " ${arch[*]:-} " != *" any "* ]]; then
     echo "-"
     exit 0
@@ -130,108 +286,136 @@ read_pkgbuild='
 '
 
 package_versions() {
-  env -i PATH="$PATH" HOME="$HOME" bash -c "$read_pkgbuild" read-pkgbuild "$1" "$TARGET_ARCH" </dev/null
+  env -i PATH="$PATH" HOME="$HOME" bash -c "$read_pkgbuild" read-pkgbuild "$1" "$2" </dev/null
 }
 
-declare -A seen
+declare -A seen=()
 
-pkgdirs=()
-if (($#)); then
-  for package in "$@"; do
-    if [[ ! $package =~ ^[a-z0-9@._+-]+$ ]]; then
-      print_error "Not a package directory name: $package"
-      exit 1
-    fi
-    # A pull request that deletes a recipe leaves nothing here to check.
-    [[ -f $PKGBUILDS_DIR/$package/PKGBUILD ]] && pkgdirs+=("$PKGBUILDS_DIR/$package")
-  done
-  if ((${#pkgdirs[@]} == 0)); then
-    print_success "None of the named packages has a recipe left to check"
-    exit 0
-  fi
-else
-  mapfile -t pkgdirs < <(package_dirs)
-fi
-
-examined=0
-names=0
-shadowed=0
-stale=0
-undeclared=0
+total_shadowed=0
+total_stale=0
+total_undeclared=0
+total_unreadable=0
+empty_tree=0
+fetch_errors=0
 unused=0
-unreadable=0
 
-while IFS= read -r pkgdir; do
-  package=$(basename "$pkgdir")
+for arch in "${TARGET_ARCHES[@]}"; do
+  official_repo=()
+  official_version=()
 
-  # Empty output counts as unreadable too: a PKGBUILD that calls exit at the top
-  # level ends the subshell successfully without ever naming a package, and
-  # skipping it quietly is how one drifts behind Arch unnoticed.
-  if ! versions=$(package_versions "$pkgdir") || [[ -z $versions ]]; then
-    print_error "$package: could not read pkgname and pkgver from its PKGBUILD"
-    unreadable=$((unreadable + 1))
+  case "$arch" in
+    x86_64)  arch_repos=("${X86_64_REPOS[@]}") ;;
+    aarch64) arch_repos=("${AARCH64_REPOS[@]}") ;;
+  esac
+
+  arch_load_failed=0
+  for repo in "${arch_repos[@]}"; do
+    if ! load_repo "$arch" "$repo"; then
+      arch_load_failed=1
+      break
+    fi
+  done
+  if ((arch_load_failed)); then
+    fetch_errors=$((fetch_errors + 1))
     continue
   fi
-  [[ $versions == "-" ]] && continue
 
-  examined=$((examined + 1))
+  arch_examined=0
+  arch_names=0
+  arch_shadowed=0
+  arch_stale=0
+  arch_undeclared=0
+  arch_unreadable=0
 
-  while read -r name ours; do
-    [[ -n $name ]] || continue
-    names=$((names + 1))
+  while IFS= read -r pkgdir; do
+    package=$(basename "$pkgdir")
 
-    repo="${official_repo[$name]:-}"
-    [[ -n $repo ]] || continue
-
-    theirs="${official_version[$name]}"
-    shadowed=$((shadowed + 1))
-    seen[$name]=1
-
-    if [[ -z ${declared[$name]:-} ]]; then
-      print_error "$name shadows $repo/$name, and ${SHADOW_LIST#"$BUILD_ROOT/"} does not list it"
-      undeclared=$((undeclared + 1))
-    elif [[ "$(vercmp "$theirs" "$ours")" -gt 0 ]]; then
-      print_error "$name shadows $repo/$name with an older build: ours $ours, $repo $theirs"
-      stale=$((stale + 1))
-    else
-      print_info "$name shadows $repo/$name (ours $ours, $repo $theirs)"
+    # Empty output counts as unreadable too: a PKGBUILD that calls exit at the top
+    # level ends the subshell successfully without ever naming a package, and
+    # skipping it quietly is how one drifts behind upstream unnoticed.
+    if ! versions=$(package_versions "$pkgdir" "$arch") || [[ -z $versions ]]; then
+      print_error "[$arch] $package: could not read pkgname and pkgver from its PKGBUILD"
+      arch_unreadable=$((arch_unreadable + 1))
+      continue
     fi
-  done <<<"$versions"
-done < <(printf '%s\n' "${pkgdirs[@]}")
+    [[ $versions == "-" ]] && continue
 
-echo
+    arch_examined=$((arch_examined + 1))
 
-if ((unreadable > 0)); then
-  print_error "$unreadable PKGBUILD(s) could not be read, so they went unchecked"
-  exit 1
-fi
+    while read -r name ours; do
+      [[ -n $name ]] || continue
+      arch_names=$((arch_names + 1))
 
-# Nothing examined in the whole tree means the tree was not found, not that it
-# is clean. A check that passes when it compared nothing is worse than no
-# check at all. Named packages may all be aarch64-only, which is fine.
-if (($# == 0 && examined == 0)); then
-  print_error "No packages were examined; expected PKGBUILDs under $PKGBUILDS_DIR"
-  exit 1
-fi
+      repo="${official_repo[$name]:-}"
+      [[ -n $repo ]] || continue
 
-# Only the whole tree shows which listed names still shadow something.
-for name in "${!declared[@]}"; do
-  if (($# == 0)) && [[ -z ${seen[$name]:-} ]]; then
-    print_error "${SHADOW_LIST#"$BUILD_ROOT/"} lists $name, which shadows nothing"
-    unused=$((unused + 1))
+      theirs="${official_version[$name]}"
+      arch_shadowed=$((arch_shadowed + 1))
+      seen[$name]=1
+
+      if [[ -z ${declared[$name]:-} ]]; then
+        print_error "[$arch] $name shadows $repo/$name (ours $ours, $repo $theirs), and ${SHADOW_LIST#"$BUILD_ROOT/"} does not list it"
+        arch_undeclared=$((arch_undeclared + 1))
+      elif [[ "$(vercmp "$theirs" "$ours")" -gt 0 ]]; then
+        print_error "[$arch] $name shadows $repo/$name with an older build: ours $ours, $repo $theirs"
+        arch_stale=$((arch_stale + 1))
+      else
+        print_info "[$arch] $name shadows $repo/$name (ours $ours, $repo $theirs)"
+      fi
+    done <<<"$versions"
+  done < <(printf '%s\n' "${pkgdirs[@]}")
+
+  # Nothing examined in the whole tree for an architecture means the tree was
+  # not found or misconfigured, not that it is clean. Named packages may all
+  # target the other architecture, which is fine.
+  if ((${#PACKAGES[@]} == 0 && arch_examined == 0 && arch_unreadable == 0)); then
+    print_error "[$arch] No packages were examined; expected PKGBUILDs under $PKGBUILDS_DIR"
+    empty_tree=1
+    continue
+  fi
+
+  total_shadowed=$((total_shadowed + arch_shadowed))
+  total_stale=$((total_stale + arch_stale))
+  total_undeclared=$((total_undeclared + arch_undeclared))
+  total_unreadable=$((total_unreadable + arch_unreadable))
+
+  if ((arch_unreadable == 0 && arch_undeclared == 0 && arch_stale == 0)); then
+    print_success "[$arch] Checked $arch_examined package(s) ($arch_names $arch names) against ${arch_repos[*]}: $arch_shadowed shadowed, none behind"
   fi
 done
 
+echo
+
+# Only a full-tree run across all architectures where every architecture loaded
+# and read cleanly shows which listed names shadow nothing anywhere.
+if ((${#PACKAGES[@]} == 0 && fetch_errors == 0 && total_unreadable == 0 && empty_tree == 0)) && [[ $ARCH_MODE == all ]]; then
+  for name in "${!declared[@]}"; do
+    if [[ -z ${seen[$name]:-} ]]; then
+      print_error "${SHADOW_LIST#"$BUILD_ROOT/"} lists $name, which shadows nothing"
+      unused=$((unused + 1))
+    fi
+  done
+fi
+
 failed=0
 
-if ((undeclared > 0)); then
-  print_error "$undeclared shadowed name(s) are not in ${SHADOW_LIST#"$BUILD_ROOT/"}"
-  echo "Build them for aarch64 only, or list them with the reason Omarchy carries its own build."
+if ((total_unreadable > 0)); then
+  print_error "$total_unreadable PKGBUILD(s) could not be read, so they went unchecked"
   failed=1
 fi
 
-if ((stale > 0)); then
-  print_error "$stale of $shadowed shadowed package(s) are behind the official repositories"
+if ((empty_tree > 0)); then
+  failed=1
+fi
+
+if ((total_undeclared > 0)); then
+  print_error "$total_undeclared shadowed name(s) are not in ${SHADOW_LIST#"$BUILD_ROOT/"}"
+  echo "List them in ${SHADOW_LIST#"$BUILD_ROOT/"} with the reason Omarchy carries its own build, or drop them where the official repository ships them."
+  failed=1
+fi
+
+if ((total_stale > 0)); then
+  print_error "$total_stale of $total_shadowed shadowed package(s) are behind the official repositories"
   echo "Either update them, or drop them so pacman resolves the official build."
   failed=1
 fi
@@ -241,7 +425,10 @@ if ((unused > 0)); then
   failed=1
 fi
 
+# Confirmed findings always exit 1 even if another architecture's mirror failed,
+# so a transient outage on one mirror never suppresses a real alert on the other.
 ((failed)) && exit 1
 
-print_success "Checked $examined package(s) ($names $TARGET_ARCH names) against ${SHADOWED_REPOS[*]}: $shadowed shadowed, none behind"
+((fetch_errors > 0)) && exit 2
+
 exit 0
