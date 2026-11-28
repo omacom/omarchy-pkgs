@@ -88,7 +88,7 @@ packages pinned from it agree. `BYPASS_MIN_RELEASE_AGE=1` bypasses the hold.
 `sync-upstream.yml` runs three cadence lanes:
 
 - `five-minute`: packages marked `"auto_merge": true` and `"sync_cadence": "five-minute"`
-  (`omarchy-dev` and `omarchy-settings-dev`), using `auto/track-branches-<package>`.
+  (`omarchy-dev` and `omarchy-settings-dev`), using `auto/sync-five-minute-<package>`.
 - `hourly`: other packages marked `"auto_merge": true`, using
   `auto/track-branches-<package>`.
 - `six-hourly`: all other tracked packages, using `auto/sync-upstream-<package>`.
@@ -386,10 +386,11 @@ the facts as JSON. If the script fails, the PR still opens with the plain body.
 
 A red PR stays open for a maintainer and holds back only its own package (or
 branch/lockstep PR group). A later run updates it if upstream moves again, and
-`close-superseded` closes any unrefreshed PR once it conflicts with `master` or
-its edits have already landed on `master`. A
-run started by hand with `packages` updates the same
-per-package PRs a scheduled run would.
+unscoped runs let `close-superseded` close any unrefreshed PR under that run's
+own branch prefix once it conflicts with `master` or its edits have already
+landed on `master`. A run started by hand with `packages` updates the same
+per-package PRs a scheduled run would, while skipping `close-superseded` so it
+never touches unrelated PRs.
 
 ## Declarative providers and hooks
 
