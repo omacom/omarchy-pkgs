@@ -1,23 +1,28 @@
 #!/usr/bin/python3 -I
 """Install the Surface Laptop 8's USB4 router firmware from Windows.
 
-The USB4 host router's firmware is only shipped inside Qualcomm's Windows USB4
-filter driver, QcUsb4Filter8480.sys. This finds that driver in the machine's
-Windows driver store (internal NTFS partitions, mounted read-only), or in a
-directory or file given on the command line, and copies out the one router
-image tested on this laptop: a run of MCU load records whose SHA-256 is pinned
-below. Nothing else is ever installed, so a driver without that exact image
-leaves USB4 off. The image is the same in Microsoft's, HP's and ASUS's driver
-packages.
+The USB4 host routers' firmware is only shipped inside Qualcomm's Windows USB4
+filter driver, QcUsb4Filter8480.sys. Each USB-C port has a router, and the two
+routers take different images. This finds that driver in the machine's Windows
+driver store (internal NTFS partitions, mounted read-only), or in a directory
+or file given on the command line, and copies out the two router images tested
+on this laptop: runs of MCU load records whose SHA-256 are pinned below.
+Nothing else is ever installed, so a port whose exact image is not in the
+driver stays without USB4. The images are the same in Microsoft's, HP's and
+ASUS's driver packages.
 
-The router driver requests the image once, at probe in the initramfs, so the
+The router driver requests an image once, at probe in the initramfs, so the
 boot images are rebuilt afterwards (unless --no-rebuild); thunderbolt_qcom
-declares the file, so mkinitcpio adds it to the initramfs.
+declares the files, so mkinitcpio adds them to the initramfs.
+
+Exit status: 0 with both images installed, 2 with one or both missing, 1 on an
+error.
 
 Usage: surface-laptop8-usb4-firmware [--no-rebuild] [-d DIR | FILE]
 """
 
 import argparse
+import collections
 import hashlib
 import os
 import struct
@@ -25,16 +30,26 @@ import subprocess
 import sys
 import tempfile
 
-FIRMWARE = 'qcom/glymur/surface-laptop8/usb4-router-legacy.bin'
 DRIVER = 'qcusb4filter8480.sys'
 PACKAGE_PREFIX = 'qcusb4filter8480.inf_'
 DRIVER_STORE = ('Windows', 'System32', 'DriverStore', 'FileRepository')
-# Router 0, legacy MCU layout, current silicon: the image the Windows driver
-# selects on this laptop, tested with the router driver (5 October 2026, and
-# on linux-omarchy 7.3-2 and 7.3-4).
-IMAGE_SHA256 = '0f2eb991490ce26b7d3932f2af44987f61e033f5b689e5bf7642f457a13cbb1d'
-IMAGE_SIZE = 39152
 MCU_MEMORY = 0x100000
+
+Image = collections.namedtuple('Image', 'firmware sha256 size port')
+# The images the Windows driver selects on this laptop, each tested with the
+# router driver.
+IMAGES = (
+    # Router 0, legacy MCU layout, current silicon (5 October 2026, and on
+    # linux-omarchy 7.3-2 and 7.3-4).
+    Image('qcom/glymur/surface-laptop8/usb4-router-legacy.bin',
+          '0f2eb991490ce26b7d3932f2af44987f61e033f5b689e5bf7642f457a13cbb1d', 39152,
+          'first USB-C port'),
+    # Router 1, v2 MCU layout, current silicon (13 November 2026, with
+    # linux-omarchy's router 1 patches).
+    Image('qcom/glymur/surface-laptop8/usb4-router-v2.bin',
+          '2fc59d3dba382135defd85dc303052c85aefb22001f675f33ade0b7f6a52963f', 48268,
+          'second USB-C port'),
+)
 
 
 def log(message):
@@ -58,14 +73,14 @@ def records_fill(data, start, size):
     return pos == end
 
 
-def find_image(data, sha256=IMAGE_SHA256, size=IMAGE_SIZE):
-    """The tested image inside a driver file, or None."""
-    for start in range(0, len(data) - size + 1, 4):
-        if data[start:start + 4] != b'\0\0\0\0' or not records_fill(data, start, size):
+def find_image(data, image):
+    """The bytes of a tested image inside a driver file, or None."""
+    for start in range(0, len(data) - image.size + 1, 4):
+        if data[start:start + 4] != b'\0\0\0\0' or not records_fill(data, start, image.size):
             continue
-        image = data[start:start + size]
-        if hashlib.sha256(image).hexdigest() == sha256:
-            return image
+        found = data[start:start + image.size]
+        if hashlib.sha256(found).hexdigest() == image.sha256:
+            return found
     return None
 
 
@@ -132,22 +147,22 @@ def unmount(mounts):
             pass
 
 
-def install(image, root):
-    target = os.path.join(root, 'usr/lib/firmware/updates', FIRMWARE)
+def install(image, data, root):
+    target = os.path.join(root, 'usr/lib/firmware/updates', image.firmware)
     os.makedirs(os.path.dirname(target), exist_ok=True)
     temporary = target + '.new'
     with open(temporary, 'wb') as output:
-        output.write(image)
+        output.write(data)
     os.chmod(temporary, 0o644)
     os.replace(temporary, target)
     return target
 
 
-def installed(root):
-    target = os.path.join(root, 'usr/lib/firmware/updates', FIRMWARE)
+def installed(image, root):
+    target = os.path.join(root, 'usr/lib/firmware/updates', image.firmware)
     try:
         with open(target, 'rb') as existing:
-            return hashlib.sha256(existing.read()).hexdigest() == IMAGE_SHA256
+            return hashlib.sha256(existing.read()).hexdigest() == image.sha256
     except OSError:
         return False
 
@@ -178,9 +193,13 @@ def main(argv):
         log('must run as root')
         return 1
 
-    if installed(root):
-        log(f'{FIRMWARE} is already installed')
-    else:
+    missing = []
+    for image in IMAGES:
+        if installed(image, root):
+            log(f'{image.firmware} is already installed')
+        else:
+            missing.append(image)
+    if missing:
         mounts = []
         try:
             if args.file:
@@ -190,31 +209,35 @@ def main(argv):
             else:
                 drivers = [d for store in windows_driver_stores(mounts, root) for d in store_drivers(store)]
             if not drivers:
-                log(f'{DRIVER} not found; USB4 stays off')
-                return 2
-            image = None
+                log(f'{DRIVER} not found')
             for driver in drivers:
                 with open(driver, 'rb') as source:
-                    image = find_image(source.read())
-                if image:
-                    log(f'tested router image found in {driver}')
+                    data = source.read()
+                for image in list(missing):
+                    found = find_image(data, image)
+                    if found:
+                        log(f'tested router image for the {image.port} found in {driver}')
+                        log(f'installed {install(image, found, root)}')
+                        missing.remove(image)
+                for image in missing:
+                    log(f'{driver} lacks the tested image for the {image.port}')
+                if not missing:
                     break
-                log(f'no tested router image in {driver}')
-            if not image:
-                log('USB4 stays off')
-                return 2
-            log(f'installed {install(image, root)}')
         finally:
             unmount(mounts)
+    for image in missing:
+        log(f'USB4 stays off on the {image.port}')
+    if len(missing) == len(IMAGES):
+        return 2
 
-    # Rebuilt even when the image was already there, so rerunning recovers
+    # Rebuilt even when the images were already there, so rerunning recovers
     # from a rebuild that failed.
     if args.no_rebuild:
-        return 0
+        return 2 if missing else 0
     if not rebuild():
         return 1
-    log('reboot to start the USB4 router')
-    return 0
+    log('reboot to start the USB4 routers')
+    return 2 if missing else 0
 
 
 if __name__ == '__main__':

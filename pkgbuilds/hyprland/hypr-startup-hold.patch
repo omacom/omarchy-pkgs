@@ -1,0 +1,177 @@
+Hold frames at startup while a monitor keeps the picture from before us
+
+When something else had the screen before Hyprland, e.g. a boot splash
+whose last frame the backend kept (aquamarine's AQ_SPLASH_ADOPT), the first
+frames Hyprland presents show its own startup state, such as an empty
+workspace or a half-faded layer, before the session's cover appears.
+
+misc:startup_hold_layer (level:namespace, empty by default) names a layer
+surface. From the first frame until one with that namespace is mapped on
+that layer level of the monitor and opaque, a monitor whose output still
+shows the picture from before us presents nothing, so the picture stays.
+Each monitor is released on its own. misc:startup_hold_timeout (ms, 5000)
+releases every monitor still held, for a layer that never comes. A
+released monitor never holds again. A monitor the backend kept no picture
+on (no adoption, another mode, a later disable or mode change) renders as
+before, so the hold never keeps an unrendered frame of ours on screen.
+
+Needs IOutput::showsAdoptedPicture() from aquamarine's AQ_SPLASH_ADOPT
+patch.
+
+Not yet upstream.
+
+--- a/src/config/values/ConfigValues.cpp
++++ b/src/config/values/ConfigValues.cpp
+@@ -601,6 +601,11 @@ std::vector<SP<IValue>> Values::getConfigValues() {
+         MS<Bool>("misc:disable_hyprland_guiutils_check", "disable the warning if hyprland-guiutils is missing", false),
+         MS<Bool>("misc:disable_watchdog_warning", "whether to disable the warning about not using start-hyprland.", false),
+         MS<Int>("misc:lockdead_screen_delay", "the delay in ms after the lockdead screen appears.", 1000, {.min = 0, .max = 5000}),
++        MS<String>("misc:startup_hold_layer",
++                   "at startup, a monitor still showing a picture from before Hyprland (e.g. a boot splash's, which the backend kept) keeps it until this layer is mapped "
++                   "and opaque. As level:namespace, e.g. overlay:my-splash. Empty disables.",
++                   ""),
++        MS<Int>("misc:startup_hold_timeout", "the most ms misc:startup_hold_layer holds frames back.", 5000, {.min = 0, .max = 60000}),
+         MS<Bool>("misc:enable_anr_dialog", "whether to enable the ANR (app not responding) dialog when your apps hang", true),
+         MS<Int>("misc:anr_missed_pings", "number of missed pings before showing the ANR dialog", 5, {.min = 1, .max = 20}),
+         MS<Bool>("misc:screencopy_force_8b", "forces 8 bit screencopy", true),
+--- a/src/render/Renderer.cpp
++++ b/src/render/Renderer.cpp
+@@ -54,6 +54,7 @@
+ #include "scene/MonitorScene.hpp"
+ #include "scene/SceneSelection.hpp"
+ #include "SceneResources.hpp"
++#include "StartupHold.hpp"
+ #include "../debug/log/Logger.hpp"
+ #include "../protocols/ColorManagement.hpp"
+ #include "../protocols/types/ContentType.hpp"
+@@ -2296,9 +2297,14 @@ void IHyprRenderer::renderMonitor(PHLMONITOR pMonitor, bool commit) {
+         if (once) {
+             Event::bus()->m_events.start.emit();
+             once = false;
++            startupHold()->start();
+         }
+     }
+ 
++    // after this frame's animation tick, so a layer that just turned opaque is drawn as such
++    if (startupHold()->holds(pMonitor))
++        return;
++
+     if (pMonitor->m_scheduledRecalc) {
+         pMonitor->m_scheduledRecalc = false;
+         if (pMonitor->m_activeWorkspace) // might be missing (mirror)
+--- /dev/null
++++ b/src/render/StartupHold.cpp
+@@ -0,0 +1,79 @@
++#include "StartupHold.hpp"
++#include "Renderer.hpp"
++#include "../config/ConfigValue.hpp"
++#include "../debug/log/Logger.hpp"
++#include "../desktop/view/LayerSurface.hpp"
++#include "../managers/eventLoop/EventLoopManager.hpp"
++#include "../output/Monitor.hpp"
++#include "../state/MonitorState.hpp"
++
++#include <algorithm>
++#include <array>
++#include <aquamarine/output/Output.hpp>
++
++using namespace Render;
++
++void CStartupHold::start() {
++    static auto       PLAYER   = CConfigValue<Config::STRING>("misc:startup_hold_layer");
++    static auto       PTIMEOUT = CConfigValue<Config::INTEGER>("misc:startup_hold_timeout");
++    const std::string SPEC     = *PLAYER;
++
++    if (SPEC.empty())
++        return;
++
++    static constexpr std::array<std::string_view, 4> LEVELS = {"background", "bottom", "top", "overlay"};
++    const auto                                       COLON  = SPEC.find(':');
++    const auto                                       LEVEL  = std::ranges::find(LEVELS, std::string_view{SPEC}.substr(0, COLON));
++    if (COLON == std::string::npos || COLON + 1 == SPEC.size() || LEVEL == LEVELS.end()) {
++        LOG(Log::ERR, "misc:startup_hold_layer \"{}\" is not level:namespace with level one of background, bottom, top, overlay; not holding", SPEC);
++        return;
++    }
++
++    m_level     = LEVEL - LEVELS.begin();
++    m_namespace = SPEC.substr(COLON + 1);
++    m_timeout   = makeShared<CEventLoopTimer>(std::chrono::milliseconds(*PTIMEOUT), [this](auto, auto) { timeOut(); }, nullptr);
++    g_pEventLoopManager->addTimer(m_timeout);
++
++    LOG(Log::DEBUG, "Startup hold: monitors keep the picture from before us until the {} layer {} is mapped and opaque, {} ms at most", *LEVEL, m_namespace, *PTIMEOUT);
++}
++
++bool CStartupHold::holds(PHLMONITOR monitor) {
++    // only a picture the backend kept is worth holding: elsewhere, our unrendered first frame is on screen
++    if (!m_timeout || !monitor->m_output->showsAdoptedPicture() || std::ranges::any_of(m_released, [&](const auto& m) { return m == monitor; }))
++        return false;
++
++    for (auto const& ref : monitor->m_layerSurfaceLayers[m_level]) {
++        const auto LS = ref.lock();
++        if (!LS || !LS->mapped() || LS->m_namespace != m_namespace)
++            continue;
++
++        // a layer maps at alpha 0 and fades in; even a no_anim one is only opaque after the next animation tick
++        if (LS->alpha().getTotal() < 1.F)
++            return true;
++
++        LOG(Log::DEBUG, "Startup hold released on {}: {} is opaque", monitor->m_name, m_namespace);
++        m_released.emplace_back(monitor);
++        return false;
++    }
++
++    return true;
++}
++
++void CStartupHold::timeOut() {
++    for (auto const& m : State::monitorState()->monitors()) {
++        if (!holds(m))
++            continue;
++
++        LOG(Log::DEBUG, "Startup hold timed out on {}", m->m_name);
++        g_pHyprRenderer->damageMonitor(m);
++        m->scheduleFrame();
++    }
++
++    m_timeout.reset();
++    m_released.clear();
++}
++
++UP<CStartupHold>& Render::startupHold() {
++    static UP<CStartupHold> hold = makeUnique<CStartupHold>();
++    return hold;
++}
+--- /dev/null
++++ b/src/render/StartupHold.hpp
+@@ -0,0 +1,31 @@
++#pragma once
++
++#include "../desktop/DesktopTypes.hpp"
++#include "../helpers/memory/Memory.hpp"
++
++#include <string>
++#include <vector>
++
++class CEventLoopTimer;
++
++namespace Render {
++    // misc:startup_hold_layer: from the first frame on, a monitor that still shows a picture from before us,
++    // e.g. a boot splash's that the backend adopted, presents nothing until that layer is mapped on it and
++    // opaque. misc:startup_hold_timeout after the first frame, every monitor is released. A released
++    // monitor never holds again.
++    class CStartupHold {
++      public:
++        void start();
++        bool holds(PHLMONITOR monitor);
++
++      private:
++        void                       timeOut();
++
++        SP<CEventLoopTimer>        m_timeout;
++        std::vector<PHLMONITORREF> m_released;
++        size_t                     m_level = 0;
++        std::string                m_namespace;
++    };
++
++    UP<CStartupHold>& startupHold();
++}

@@ -1,0 +1,273 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jim Martin <jimmartin@gmail.com>
+Date: Fri, 13 Nov 2026 20:16:53 -0600
+Subject: [PATCH] thunderbolt: Let an NHI have its USB3 tunnels re-activated
+ after the noirq resume
+
+The connection manager re-activates every tunnel when the domain
+resumes, in the noirq phase, and relies on device links for the native
+ports to resume after it. Both assume a host whose USB and PCIe
+controllers are PCI devices that resume in that phase as well.
+
+A platform host interface can sit in front of a USB controller that
+sleeps and wakes in the normal phase. Re-activating the USB3 tunnel
+while that controller's clocks are still off leaves its port dead.
+Let the NHI's glue ask for the USB3 tunnels to be left out of the
+noirq resume and re-activate them itself, with
+tb_domain_resume_usb3(), once the controller runs again. The delay a
+USB3 adapter needs between being disabled and enabled again is kept:
+it is counted from the point the noirq resume would have waited at.
+
+The connection manager handles hot-plug events again as soon as the noirq
+resume is done. Until the glue has called tb_domain_resume_usb3(), no
+USB3 tunnel is created for a router that is plugged in either; that call
+creates the ones held back.
+
+Such a glue also orders its native ports after the host interface by
+other means (they are below it in the device hierarchy, or it links
+them). Let it say so, so that the connection manager does not warn
+about device links it could not have made.
+
+Assisted-by: Claude Fable 5.2
+Signed-off-by: Jim Martin <jimmartin@gmail.com>
+---
+ drivers/thunderbolt/domain.c | 23 +++++++++++
+ drivers/thunderbolt/tb.c     | 76 +++++++++++++++++++++++++++++++++++-
+ drivers/thunderbolt/tb.h     |  5 +++
+ include/linux/thunderbolt.h  | 11 ++++++
+ 4 files changed, 114 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/thunderbolt/domain.c b/drivers/thunderbolt/domain.c
+index c8f5c9869..8387a2822 100644
+--- a/drivers/thunderbolt/domain.c
++++ b/drivers/thunderbolt/domain.c
+@@ -564,6 +564,29 @@ int tb_domain_resume_noirq(struct tb *tb)
+ 	return ret;
+ }
+ 
++/**
++ * tb_domain_resume_usb3() - Re-activate the USB3 tunnels of a resumed domain
++ * @tb: Domain that was resumed with tb_domain_resume_noirq()
++ *
++ * For an NHI with @usb3_resume_deferred set: its glue calls this once the
++ * USB controller the tunnels lead to runs again, and before that controller's
++ * ports resume.
++ *
++ * Return: %0 on success, negative errno otherwise.
++ */
++int tb_domain_resume_usb3(struct tb *tb)
++{
++	int ret = 0;
++
++	mutex_lock(&tb->lock);
++	if (tb->cm_ops->resume_usb3)
++		ret = tb->cm_ops->resume_usb3(tb);
++	mutex_unlock(&tb->lock);
++
++	return ret;
++}
++EXPORT_SYMBOL_NS_GPL(tb_domain_resume_usb3, "THUNDERBOLT_NHI");
++
+ int tb_domain_suspend(struct tb *tb)
+ {
+ 	return tb->cm_ops->suspend ? tb->cm_ops->suspend(tb) : 0;
+diff --git a/drivers/thunderbolt/tb.c b/drivers/thunderbolt/tb.c
+index 778516b54..a23bba671 100644
+--- a/drivers/thunderbolt/tb.c
++++ b/drivers/thunderbolt/tb.c
+@@ -81,6 +81,11 @@ struct tb_pci_rescan {
+  * @kept_awake: The routers stayed awake through the current system sleep
+  *		(%QUIRK_NO_SYSTEM_SLEEP), so they kept their configuration
+  *		and their tunnels.
++ * @usb3_deferred: The domain resumed without its USB3 tunnels: the ones it
++ *		   had are not re-activated, and none is created for a router
++ *		   plugged in meanwhile, until tb_domain_resume_usb3()
++ * @usb3_skipped: A USB3 tunnel was not created while @usb3_deferred was set
++ * @usb3_resume_at: The earliest time (in jiffies) they may be re-activated
+  */
+ struct tb_cm {
+ 	struct list_head tunnel_list;
+@@ -90,6 +95,9 @@ struct tb_cm {
+ 	struct tb_bandwidth_group groups[MAX_GROUPS];
+ 	struct tb_pci_rescan *pci_rescan;
+ 	bool kept_awake;
++	bool usb3_deferred;
++	bool usb3_skipped;
++	unsigned long usb3_resume_at;
+ };
+ 
+ static struct workqueue_struct *tb_pci_rescan_wq;
+@@ -949,6 +957,16 @@ static int tb_tunnel_usb3(struct tb *tb, struct tb_switch *sw)
+ 	if (!sw->link_usb4)
+ 		return 0;
+ 
++	/*
++	 * The controller behind the USB3 adapter does not run yet.
++	 * tb_resume_usb3() creates the tunnel once it does.
++	 */
++	if (tcm->usb3_deferred) {
++		tb_sw_dbg(sw, "USB3 tunnels deferred, not creating one yet\n");
++		tcm->usb3_skipped = true;
++		return 0;
++	}
++
+ 	/*
+ 	 * Look up available down port. Since we are chaining it should
+ 	 * be found right above this switch.
+@@ -3356,6 +3374,7 @@ static int tb_resume_noirq(struct tb *tb)
+ 	LIST_HEAD(tunnels);
+ 
+ 	tb_dbg(tb, "resuming...\n");
++	tcm->usb3_deferred = false;
+ 
+ 	/*
+ 	 * For non-USB4 hosts (Apple systems) remove any PCIe devices
+@@ -3400,8 +3419,22 @@ static int tb_resume_noirq(struct tb *tb)
+ 		tb_tunnel_put(tunnel);
+ 	}
+ 
++	/*
++	 * The controller behind the USB3 adapters may not run in this phase.
++	 * The USB3 tunnels are then left for tb_resume_usb3(), with the delay
++	 * still to be kept, and so is the tunnel of a router that is plugged
++	 * in before it.
++	 */
++	if (tb->nhi->usb3_resume_deferred) {
++		tcm->usb3_deferred = true;
++		tcm->usb3_skipped = false;
++		tcm->usb3_resume_at = jiffies + msecs_to_jiffies(usb3_delay);
++	}
++
+ 	/* Re-create our tunnels now */
+ 	list_for_each_entry_safe(tunnel, n, &tcm->tunnel_list, list) {
++		if (tb_tunnel_is_usb3(tunnel) && tcm->usb3_deferred)
++			continue;
+ 		/* USB3 requires delay before it can be re-activated */
+ 		if (tb_tunnel_is_usb3(tunnel)) {
+ 			msleep(usb3_delay);
+@@ -3427,6 +3460,45 @@ static int tb_resume_noirq(struct tb *tb)
+ 	return 0;
+ }
+ 
++/*
++ * The USB3 tunnels tb_resume_noirq() left out, see @usb3_resume_deferred, and
++ * the ones not created since for a router that was plugged in meanwhile.
++ */
++static int tb_resume_usb3(struct tb *tb)
++{
++	struct tb_cm *tcm = tb_priv(tb);
++	unsigned long now = jiffies;
++	struct tb_tunnel *tunnel;
++	int ret = 0, err;
++
++	if (!tcm->usb3_deferred)
++		return 0;
++
++	/* USB3 requires delay before it can be re-activated */
++	if (time_before(now, tcm->usb3_resume_at))
++		msleep(jiffies_to_msecs(tcm->usb3_resume_at - now));
++
++	/*
++	 * Every USB3 tunnel in the list is one from before the sleep, none
++	 * was created since. They are in the order they were created in,
++	 * which is from the host router outwards.
++	 */
++	list_for_each_entry(tunnel, &tcm->tunnel_list, list) {
++		if (!tb_tunnel_is_usb3(tunnel))
++			continue;
++		err = tb_tunnel_activate(tunnel);
++		if (err && !ret)
++			ret = err;
++	}
++	tcm->usb3_deferred = false;
++	if (!tcm->usb3_skipped)
++		return ret;
++
++	/* A router arrived since; the ones that have a tunnel are passed over */
++	err = tb_create_usb3_tunnels(tb->root_switch);
++	return ret ?: err;
++}
++
+ static int tb_freeze_noirq(struct tb *tb)
+ {
+ 	struct tb_cm *tcm = tb_priv(tb);
+@@ -3517,6 +3589,7 @@ static const struct tb_cm_ops tb_cm_ops = {
+ 	.deinit = tb_deinit,
+ 	.suspend_noirq = tb_suspend_noirq,
+ 	.resume_noirq = tb_resume_noirq,
++	.resume_usb3 = tb_resume_usb3,
+ 	.freeze_noirq = tb_freeze_noirq,
+ 	.thaw_noirq = tb_thaw_noirq,
+ 	.complete = tb_complete,
+@@ -3629,7 +3702,8 @@ struct tb *tb_probe(struct tb_nhi *nhi)
+ 	 * before the PCIe/USB stack is resumed so complain here if we
+ 	 * found them missing.
+ 	 */
+-	if (!tb_apple_add_links(nhi) && !tb_acpi_add_links(nhi))
++	if (!tb_apple_add_links(nhi) && !tb_acpi_add_links(nhi) &&
++	    !nhi->native_ports_ordered)
+ 		tb_warn(tb, "device links to tunneled native ports are missing!\n");
+ 
+ 	return tb;
+diff --git a/drivers/thunderbolt/tb.h b/drivers/thunderbolt/tb.h
+index 27de83a4a..e3f071e5a 100644
+--- a/drivers/thunderbolt/tb.h
++++ b/drivers/thunderbolt/tb.h
+@@ -483,6 +483,9 @@ struct tb_path {
+  *	     it is unregistered. Called without @tb->lock taken. Optional.
+  * @suspend_noirq: Connection manager specific suspend_noirq
+  * @resume_noirq: Connection manager specific resume_noirq
++ * @resume_usb3: Re-activates the USB3 tunnels @resume_noirq left out for an
++ *		 NHI with @usb3_resume_deferred set, and creates the ones
++ *		 held back since. Called with @tb->lock taken. Optional.
+  * @suspend: Connection manager specific suspend
+  * @freeze_noirq: Connection manager specific freeze_noirq
+  * @thaw_noirq: Connection manager specific thaw_noirq
+@@ -517,6 +520,7 @@ struct tb_cm_ops {
+ 	void (*deinit)(struct tb *tb);
+ 	int (*suspend_noirq)(struct tb *tb);
+ 	int (*resume_noirq)(struct tb *tb);
++	int (*resume_usb3)(struct tb *tb);
+ 	int (*suspend)(struct tb *tb);
+ 	int (*freeze_noirq)(struct tb *tb);
+ 	int (*thaw_noirq)(struct tb *tb);
+@@ -783,6 +787,7 @@ int tb_domain_add(struct tb *tb, bool reset);
+ void tb_domain_remove(struct tb *tb);
+ int tb_domain_suspend_noirq(struct tb *tb);
+ int tb_domain_resume_noirq(struct tb *tb);
++int tb_domain_resume_usb3(struct tb *tb);
+ int tb_domain_suspend(struct tb *tb);
+ int tb_domain_freeze_noirq(struct tb *tb);
+ int tb_domain_thaw_noirq(struct tb *tb);
+diff --git a/include/linux/thunderbolt.h b/include/linux/thunderbolt.h
+index a0ad852ad..ca25440e9 100644
+--- a/include/linux/thunderbolt.h
++++ b/include/linux/thunderbolt.h
+@@ -510,6 +510,15 @@ void tb_service_properties_changed(struct tb_service *svc);
+  * @going_away: The host controller device is about to disappear so when
+  *		this flag is set, avoid touching the hardware anymore.
+  * @iommu_dma_protection: An IOMMU will isolate external-facing ports.
++ * @native_ports_ordered: The PM core already resumes this NHI before the
++ *			  native ports it tunnels for, without device links
++ *			  from the connection manager: they are below it in
++ *			  the device hierarchy, or the NHI's glue links them.
++ * @usb3_resume_deferred: The USB3 tunnels are not re-activated when the
++ *			  domain resumes in the noirq phase, and none is
++ *			  created from then on. The controller they lead to
++ *			  is not running yet, and the NHI's glue calls
++ *			  tb_domain_resume_usb3() once it is.
+  * @interrupt_work: Work scheduled to handle ring interrupt when no
+  *		    MSI-X is used.
+  * @hop_count: Number of rings (end point hops) supported by NHI.
+@@ -530,6 +539,8 @@ struct tb_nhi {
+ 	struct tb_ring **rx_rings;
+ 	bool going_away;
+ 	bool iommu_dma_protection;
++	bool native_ports_ordered;
++	bool usb3_resume_deferred;
+ 	struct work_struct interrupt_work;
+ 	u32 hop_count;
+ 	unsigned long quirks;
+-- 
+2.56.1
+

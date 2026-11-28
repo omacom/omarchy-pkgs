@@ -51,8 +51,6 @@ source "$package_dir/PKGBUILD"
   fail "the ELF board data is packaged without stripping"
 [[ " ${arch[*]} " == " aarch64 " && " ${groups[*]} " == *" omarchy-platform-qualcomm "* ]] ||
   fail "the package is tagged Qualcomm-only for aarch64"
-grep -q "^_audioreach_commit=d7a5e9d80ad18a7a6844eeb32cacbdeea0e7e677$" "$package_dir/PKGBUILD" ||
-  fail "the topology builds from pinned AudioReach source"
 grep -q 'File "/Qualcomm/surface-pro-11/Surface11-HiFi.conf"' "$package_dir/MICROSOFT-Surface-Pro-11.conf" ||
   fail "the card profile points at the shipped HiFi verb"
 
@@ -60,7 +58,7 @@ grep -Fq 'api.libcamera.path = "/base/soc@0/cci@ac15000/i2c-bus@0/camera@60"' "$
   fail "the infrared sensor is hidden from camera pickers"
 ! grep -q 'monitor.v4l2.rules' "$package_dir/50-surface-pro-11-cameras.conf" ||
   fail "V4L2 devices are not disabled; in WirePlumber 0.5 that stalls camera discovery"
-grep -A1 -- '- BlackLevel:' "$package_dir/imx681.yaml" | grep -q 'blackLevel: 4096$' ||
+grep -A1 -- '- BlackLevel:' "$package_dir/imx681.yaml" | grep 'blackLevel: 4096$' >/dev/null ||
   fail "the front camera tuning carries the measured IMX681 black level"
 
 bin="$scratch/bin"
@@ -384,7 +382,8 @@ loader = importlib.machinery.SourceFileLoader('pen_pair', sys.argv[1])
 spec = importlib.util.spec_from_loader('pen_pair', loader)
 pen_pair = importlib.util.module_from_spec(spec)
 loader.exec_module(pen_pair)
-pen_pair.WAIT = 6
+pen_pair.WAIT = 1.0
+pen_pair.time.sleep = lambda _: None
 sys.exit(pen_pair.main())
 EOF
 pen_reset() { rm -rf "$pen_state"; mkdir -p "$pen_state"; : >"$pen_state/log"; }

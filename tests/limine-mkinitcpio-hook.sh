@@ -46,7 +46,7 @@ apple_tree() { printf 'apple,j316s\0apple,t6000\0apple,arm-platform\0'; }
 live_is_mac() {
   local source
   for source in /proc/device-tree/compatible /sys/firmware/devicetree/base/compatible; do
-    [[ -r $source ]] && tr '\0' '\n' <"$source" | grep -q '^apple,' && return 0
+    [[ -r $source ]] && tr '\0' '\n' <"$source" | grep '^apple,' >/dev/null && return 0
   done
   return 1
 }

@@ -1,0 +1,569 @@
+From 92a17ec16c3760cb6f7bf77577cfb209232181ae Mon Sep 17 00:00:00 2001
+From: Jake Steinman <j@metarealtyinc.ca>
+Date: Sun, 25 Oct 2026 21:54:19 +0530
+Subject: [PATCH] media: i2c: hm1092: Add ACPI enumeration and the 19.2 MHz
+ configuration
+
+The HM1092 is also the IR camera of Intel IPU6/IPU7 laptops. There it is
+enumerated through ACPI as HIMX1092 and clocked at 19.2 MHz rather than
+24 MHz. The driver cannot bind on those machines: it has no ACPI match
+table and probe rejects any external clock other than 24 MHz.
+
+Turn the single fixed mode into a table of configurations selected by
+the external clock rate, each with its own init sequence, link
+frequency, timings, readout window and exposure default. Add the
+configuration the vendor Windows driver uses on the Intel platforms:
+648x368, HTS 1620, VTS 740, with the PLL pre-divider at 10 and the
+multiplier at 94, giving 19200000 * 94 / 10 = 180480000 Hz.
+
+ipu-bridge lists both 180000000 and 180480000 for this sensor, so
+matching any menu entry against the endpoint is no longer enough. Check
+that the endpoint offers the link frequency of the selected
+configuration.
+
+The 24 MHz configuration is unchanged: same init sequence, timings,
+controls and defaults.
+
+Tested on a Dell XPS 16 DA16260 (Panther Lake, IPU7, 19.2 MHz clock
+from INT3472): the sensor binds on CSI-2 port 2, streams 648x368 at
+link frequency 180480000 and the exposure control changes the image
+level. The 24 MHz configuration is compile-tested only.
+
+[rshouriesh: drop the <linux/mod_devicetable.h> include, <linux/i2c.h>
+ already provides struct acpi_device_id; rebase the pixel-array comment
+ over the widened crop bounds]
+
+Assisted-by: Claude:claude-opus-5-5
+Signed-off-by: Jake Steinman <j@metarealtyinc.ca>
+Tested-by: Eduard Kulyk <kulikeduard89@gmail.com> # Dell Latitude 7350 (IPU6)
+Link: https://lore.kernel.org/r/b0d32a3b82eca233652f878b7ca91e4dc2d8e863.1791608336.git.j@metarealtyinc.ca
+Signed-off-by: Ramshouriesh R <rshouriesh@gmail.com>
+Link: https://patch.msgid.link/20261025-hm1092-driver-v8-3-9cd575c366cf@gmail.com
+Signed-off-by: Abel Vesa <abel.vesa@oss.qualcomm.com>
+---
+ drivers/media/i2c/hm1092.c | 362 ++++++++++++++++++++++++++++++++-----
+ 1 file changed, 316 insertions(+), 46 deletions(-)
+
+diff --git a/drivers/media/i2c/hm1092.c b/drivers/media/i2c/hm1092.c
+index 400e9ded216671..ac61fd59c63ca8 100644
+--- a/drivers/media/i2c/hm1092.c
++++ b/drivers/media/i2c/hm1092.c
+@@ -20,15 +20,19 @@
+ /*
+  * CSI-2 D-PHY link frequency (DDR, i.e. half the per-lane bit rate).
+  *
+- * The vendor Windows configuration supplies a 24 MHz EXTCLK and programs the
+- * MIPI PLL pre-divider to 12 (0x030d = 0x0c) and multiplier to 90
+- * (0x030f = 0x5a):
+- *   link freq  = 24000000 * 90 / 12          = 180000000
+- *   bit rate   = link freq * 2               = 360000000 bps
+- *   pixel_rate = bit rate * 1 lane / 10 bpp  = 36000000 pixels/s
++ * Two vendor Windows configurations are known. Each pairs an EXTCLK rate with
++ * its own MIPI PLL pre-divider (0x030d) and multiplier (0x030f):
++ *
++ *   24 MHz EXTCLK, pre-divider 12, multiplier 90 (Qualcomm):
++ *     link freq  = 24000000 * 90 / 12          = 180000000
++ *     pixel_rate = link freq * 2 * 1 lane / 10 = 36000000 pixels/s
++ *
++ *   19.2 MHz EXTCLK, pre-divider 10, multiplier 94 (Intel IPU):
++ *     link freq  = 19200000 * 94 / 10          = 180480000
++ *     pixel_rate = link freq * 2 * 1 lane / 10 = 36096000 pixels/s
+  */
+-#define HM1092_LINK_FREQ		180000000ULL
+-#define HM1092_MCLK			24000000
++#define HM1092_LINK_FREQ_180MHZ		180000000ULL
++#define HM1092_LINK_FREQ_180P48MHZ	180480000ULL
+ #define HM1092_BITS_PER_SAMPLE		10
+ 
+ #define HM1092_REG_STREAM		CCI_REG8(0x0100)
+@@ -43,16 +47,14 @@
+  * Digital gain is a 10-bit value in 2.8 fixed point (0x100 is unity) split
+  * across 0x020e/0x020f; bits above bit 9 are ignored by the sensor.
+  * The register layout is not documented publicly; it was recovered from the
+- * vendor Windows driver. The exposure default (500) was selected from
+- * illuminated hardware tests and is also programmed by the init sequence at
+- * 0x0202/0x0203.
++ * vendor Windows driver. The exposure default is per mode and matches what
++ * that mode's init sequence programs at 0x0202/0x0203.
+  */
+ #define HM1092_REG_EXPOSURE_H		CCI_REG8(0x0202)
+ #define HM1092_REG_EXPOSURE_L		CCI_REG8(0x0203)
+ #define HM1092_EXPOSURE_MIN		2
+ #define HM1092_EXPOSURE_MARGIN		21
+ #define HM1092_EXPOSURE_STEP		1
+-#define HM1092_EXPOSURE_DEFAULT		500
+ 
+ #define HM1092_REG_ANALOGUE_GAIN	CCI_REG8(0x0205)
+ #define HM1092_ANALOGUE_GAIN_MIN	0
+@@ -76,9 +78,9 @@
+  * full array including the surrounding dummy/optical-black pixels is 1296x736
+  * (8 pixels of margin on each side). The crop bounds cover the full array,
+  * since a readout window may include the margin; the default crop is the
+- * active array. The single fixed mode reads a window out of the active array
+- * (X_ADDR [0x0030..0x04ad], Y_ADDR [0x0008..0x02d5]); subsequent internal
+- * processing produces the 560x360 output.
++ * active array. Each mode reads a fixed window out of the array (X_ADDR/Y_ADDR
++ * registers 0x0344..0x034b, reported as the crop rectangle); subsequent
++ * internal processing produces the output size.
+  */
+ #define HM1092_NATIVE_WIDTH		1296U
+ #define HM1092_NATIVE_HEIGHT		736U
+@@ -86,12 +88,8 @@
+ #define HM1092_ACTIVE_TOP		8U
+ #define HM1092_ACTIVE_WIDTH		1280U
+ #define HM1092_ACTIVE_HEIGHT		720U
+-#define HM1092_CROP_LEFT		48U
+-#define HM1092_CROP_TOP			8U
+-#define HM1092_CROP_WIDTH		1150U
+-#define HM1092_CROP_HEIGHT		718U
+ 
+-static const struct cci_reg_sequence hm1092_init_regs[] = {
++static const struct cci_reg_sequence hm1092_560x360_regs[] = {
+ 	{ CCI_REG8(0x0103), 0x00 },
+ 	{ CCI_REG8(0x030a), 0x05 },
+ 	{ CCI_REG8(0x030d), 0x0c },
+@@ -279,18 +277,265 @@ static const struct cci_reg_sequence hm1092_init_regs[] = {
+ 	{ CCI_REG8(0x0037), 0x30 },
+ };
+ 
++/*
++ * Init sequence used with a 19.2 MHz EXTCLK, as found on Intel IPU laptops
++ * where the sensor is described in ACPI as HIMX1092. Recovered from the
++ * vendor Windows driver for those platforms; kept in the order that driver
++ * issues it, including its repeated writes.
++ */
++static const struct cci_reg_sequence hm1092_648x368_regs[] = {
++	{ CCI_REG8(0x0100), 0x00 },
++	{ CCI_REG8(0x0103), 0x00 },
++	{ CCI_REG8(0x0000), 0x00 },
++	{ CCI_REG8(0x0101), 0x00 },
++	{ CCI_REG8(0x0202), 0x02 },
++	{ CCI_REG8(0x0203), 0xe5 },
++	{ CCI_REG8(0x0307), 0x00 },
++	{ CCI_REG8(0x0309), 0x01 },
++	{ CCI_REG8(0x030a), 0x05 },
++	{ CCI_REG8(0x030d), 0x0a },
++	{ CCI_REG8(0x030f), 0x5e },
++	{ CCI_REG8(0x0310), 0x00 },
++	{ CCI_REG8(0x0340), 0x03 },
++	{ CCI_REG8(0x0341), 0x1e },
++	{ CCI_REG8(0x0342), 0x05 },
++	{ CCI_REG8(0x0343), 0xe4 },
++	{ CCI_REG8(0x0350), 0x53 },
++	{ CCI_REG8(0x0387), 0x01 },
++	{ CCI_REG8(0x3110), 0x02 },
++	{ CCI_REG8(0x3735), 0xe2 },
++	{ CCI_REG8(0x3704), 0x04 },
++	{ CCI_REG8(0x4001), 0x00 },
++	{ CCI_REG8(0x4002), 0x2b },
++	{ CCI_REG8(0x4024), 0x40 },
++	{ CCI_REG8(0x4131), 0x01 },
++	{ CCI_REG8(0x4132), 0x20 },
++	{ CCI_REG8(0x4265), 0x02 },
++	{ CCI_REG8(0x4b04), 0x01 },
++	{ CCI_REG8(0x4b0e), 0x0e },
++	{ CCI_REG8(0x4b18), 0x00 },
++	{ CCI_REG8(0x4b20), 0x9e },
++	{ CCI_REG8(0x4b31), 0x06 },
++	{ CCI_REG8(0x4b3b), 0x02 },
++	{ CCI_REG8(0x4b3e), 0x00 },
++	{ CCI_REG8(0x4b44), 0x0c },
++	{ CCI_REG8(0x4b45), 0x01 },
++	{ CCI_REG8(0x4b47), 0x00 },
++	{ CCI_REG8(0x5004), 0x40 },
++	{ CCI_REG8(0x5005), 0x28 },
++	{ CCI_REG8(0x5006), 0x40 },
++	{ CCI_REG8(0x5007), 0x28 },
++	{ CCI_REG8(0x5010), 0x20 },
++	{ CCI_REG8(0x5011), 0x00 },
++	{ CCI_REG8(0x5013), 0x03 },
++	{ CCI_REG8(0x5015), 0xb3 },
++	{ CCI_REG8(0x501d), 0x4c },
++	{ CCI_REG8(0x5098), 0x00 },
++	{ CCI_REG8(0x5099), 0x11 },
++	{ CCI_REG8(0x509b), 0x03 },
++	{ CCI_REG8(0x50a0), 0x30 },
++	{ CCI_REG8(0x50a2), 0x0b },
++	{ CCI_REG8(0x50a6), 0x00 },
++	{ CCI_REG8(0x50a7), 0x00 },
++	{ CCI_REG8(0x50aa), 0x22 },
++	{ CCI_REG8(0x50ab), 0x07 },
++	{ CCI_REG8(0x50ac), 0x24 },
++	{ CCI_REG8(0x50ad), 0x07 },
++	{ CCI_REG8(0x50ae), 0x20 },
++	{ CCI_REG8(0x50af), 0x40 },
++	{ CCI_REG8(0x50b3), 0x04 },
++	{ CCI_REG8(0x50b4), 0x00 },
++	{ CCI_REG8(0x50b7), 0x00 },
++	{ CCI_REG8(0x50b8), 0x70 },
++	{ CCI_REG8(0x50b9), 0xff },
++	{ CCI_REG8(0x50ba), 0xff },
++	{ CCI_REG8(0x50bb), 0x14 },
++	{ CCI_REG8(0x50cb), 0x21 },
++	{ CCI_REG8(0x50d5), 0xe0 },
++	{ CCI_REG8(0x50d7), 0x12 },
++	{ CCI_REG8(0x50dd), 0x00 },
++	{ CCI_REG8(0x50e8), 0x00 },
++	{ CCI_REG8(0x50ea), 0x74 },
++	{ CCI_REG8(0x50fa), 0x02 },
++	{ CCI_REG8(0x5100), 0x03 },
++	{ CCI_REG8(0x5101), 0x13 },
++	{ CCI_REG8(0x5102), 0x23 },
++	{ CCI_REG8(0x5103), 0x33 },
++	{ CCI_REG8(0x5104), 0x43 },
++	{ CCI_REG8(0x5105), 0x42 },
++	{ CCI_REG8(0x5106), 0x40 },
++	{ CCI_REG8(0x5118), 0x00 },
++	{ CCI_REG8(0x5119), 0x00 },
++	{ CCI_REG8(0x511a), 0x00 },
++	{ CCI_REG8(0x511b), 0x00 },
++	{ CCI_REG8(0x511c), 0x00 },
++	{ CCI_REG8(0x511d), 0x00 },
++	{ CCI_REG8(0x511e), 0x00 },
++	{ CCI_REG8(0x5130), 0x13 },
++	{ CCI_REG8(0x5131), 0x23 },
++	{ CCI_REG8(0x5132), 0x33 },
++	{ CCI_REG8(0x5133), 0x43 },
++	{ CCI_REG8(0x5134), 0x42 },
++	{ CCI_REG8(0x5135), 0x40 },
++	{ CCI_REG8(0x5136), 0x40 },
++	{ CCI_REG8(0x5148), 0x01 },
++	{ CCI_REG8(0x5149), 0x01 },
++	{ CCI_REG8(0x514a), 0x01 },
++	{ CCI_REG8(0x514b), 0x01 },
++	{ CCI_REG8(0x514c), 0x01 },
++	{ CCI_REG8(0x514d), 0x01 },
++	{ CCI_REG8(0x514e), 0x01 },
++	{ CCI_REG8(0x51c0), 0x00 },
++	{ CCI_REG8(0x51c1), 0x81 },
++	{ CCI_REG8(0x51c2), 0xec },
++	{ CCI_REG8(0x51c3), 0x00 },
++	{ CCI_REG8(0x51c4), 0x55 },
++	{ CCI_REG8(0x51c5), 0x44 },
++	{ CCI_REG8(0x51c6), 0x00 },
++	{ CCI_REG8(0x51c7), 0x81 },
++	{ CCI_REG8(0x51c8), 0xec },
++	{ CCI_REG8(0x51c9), 0x00 },
++	{ CCI_REG8(0x51ca), 0x55 },
++	{ CCI_REG8(0x51cb), 0x24 },
++	{ CCI_REG8(0x51cc), 0x00 },
++	{ CCI_REG8(0x51cd), 0x81 },
++	{ CCI_REG8(0x51ce), 0xec },
++	{ CCI_REG8(0x51cf), 0x00 },
++	{ CCI_REG8(0x51d0), 0x54 },
++	{ CCI_REG8(0x51d1), 0x24 },
++	{ CCI_REG8(0x51d2), 0x00 },
++	{ CCI_REG8(0x51d3), 0x81 },
++	{ CCI_REG8(0x51d4), 0xec },
++	{ CCI_REG8(0x51d5), 0x00 },
++	{ CCI_REG8(0x51d6), 0x53 },
++	{ CCI_REG8(0x51d7), 0x14 },
++	{ CCI_REG8(0x51d8), 0x00 },
++	{ CCI_REG8(0x51d9), 0x81 },
++	{ CCI_REG8(0x51da), 0xec },
++	{ CCI_REG8(0x51db), 0x00 },
++	{ CCI_REG8(0x51dc), 0x53 },
++	{ CCI_REG8(0x51dd), 0x14 },
++	{ CCI_REG8(0x51e0), 0x09 },
++	{ CCI_REG8(0x51e1), 0x03 },
++	{ CCI_REG8(0x51e2), 0x04 },
++	{ CCI_REG8(0x51e3), 0x03 },
++	{ CCI_REG8(0x51e4), 0x08 },
++	{ CCI_REG8(0x51e5), 0x07 },
++	{ CCI_REG8(0x51e6), 0x08 },
++	{ CCI_REG8(0x51e7), 0x07 },
++	{ CCI_REG8(0x51e8), 0x04 },
++	{ CCI_REG8(0x51e9), 0x46 },
++	{ CCI_REG8(0x51ea), 0x43 },
++	{ CCI_REG8(0x51eb), 0x62 },
++	{ CCI_REG8(0x51ec), 0x61 },
++	{ CCI_REG8(0x51ed), 0x00 },
++	{ CCI_REG8(0x51ee), 0x00 },
++	{ CCI_REG8(0x5200), 0x60 },
++	{ CCI_REG8(0x5201), 0x80 },
++	{ CCI_REG8(0x5202), 0x00 },
++	{ CCI_REG8(0x5203), 0x01 },
++	{ CCI_REG8(0x5206), 0x80 },
++	{ CCI_REG8(0x5208), 0x0b },
++	{ CCI_REG8(0x5209), 0x0c },
++	{ CCI_REG8(0x520c), 0x15 },
++	{ CCI_REG8(0x520d), 0x40 },
++	{ CCI_REG8(0x5214), 0x28 },
++	{ CCI_REG8(0x5215), 0x04 },
++	{ CCI_REG8(0x5216), 0x02 },
++	{ CCI_REG8(0x5217), 0x01 },
++	{ CCI_REG8(0x5218), 0x07 },
++	{ CCI_REG8(0x521e), 0x01 },
++	{ CCI_REG8(0x5282), 0xff },
++	{ CCI_REG8(0x5283), 0x03 },
++	{ CCI_REG8(0x0202), 0x01 },
++	{ CCI_REG8(0x0203), 0x68 },
++	{ CCI_REG8(0x0340), 0x02 },
++	{ CCI_REG8(0x0341), 0xe4 },
++	{ CCI_REG8(0x0342), 0x06 },
++	{ CCI_REG8(0x0343), 0x54 },
++	{ CCI_REG8(0x0344), 0x00 },
++	{ CCI_REG8(0x0345), 0x00 },
++	{ CCI_REG8(0x0346), 0x00 },
++	{ CCI_REG8(0x0347), 0x00 },
++	{ CCI_REG8(0x0348), 0x05 },
++	{ CCI_REG8(0x0349), 0x0d },
++	{ CCI_REG8(0x034a), 0x02 },
++	{ CCI_REG8(0x034b), 0xdd },
++	{ CCI_REG8(0x034c), 0x02 },
++	{ CCI_REG8(0x034d), 0x88 },
++	{ CCI_REG8(0x034e), 0x01 },
++	{ CCI_REG8(0x034f), 0x70 },
++	{ CCI_REG8(0x0383), 0x00 },
++	{ CCI_REG8(0x0387), 0x10 },
++	{ CCI_REG8(0x0390), 0x03 },
++	{ CCI_REG8(0x4800), 0xac },
++	{ CCI_REG8(0x0104), 0x01 },
++	{ CCI_REG8(0x0104), 0x00 },
++	{ CCI_REG8(0x4801), 0xae },
++	{ CCI_REG8(0x4b20), 0x9e },
++	{ CCI_REG8(0x0101), 0x03 },
++};
++
++/**
++ * struct hm1092_mode - sensor configuration, selected by the EXTCLK rate
++ * @mclk: EXTCLK rate the init sequence programs the PLL for
++ * @link_freq_index: index into hm1092_link_freq_menu
++ * @width: output width
++ * @height: output height
++ * @hts: horizontal total size, 0x0342/0x0343
++ * @vts: vertical total size, 0x0340/0x0341
++ * @exposure_def: exposure programmed by the init sequence
++ * @crop: readout window on the pixel array
++ * @regs: init sequence
++ * @num_regs: number of entries in @regs
++ */
+ struct hm1092_mode {
++	unsigned long mclk;
++	unsigned int link_freq_index;
+ 	u32 width;
+ 	u32 height;
+ 	u32 hts;
+ 	u32 vts;
++	u32 exposure_def;
++	struct v4l2_rect crop;
++	const struct cci_reg_sequence *regs;
++	unsigned int num_regs;
+ };
+ 
+-static const struct hm1092_mode hm1092_mode_560x360 = {
+-	.width = 560,
+-	.height = 360,
+-	.hts = 0x0650,
+-	.vts = 0x02ee,
++static const struct hm1092_mode hm1092_modes[] = {
++	{
++		.mclk = 24000000,
++		.link_freq_index = 0,
++		.width = 560,
++		.height = 360,
++		.hts = 0x0650,
++		.vts = 0x02ee,
++		.exposure_def = 500,
++		.crop = {
++			.left = 48,
++			.top = 8,
++			.width = 1150,
++			.height = 718,
++		},
++		.regs = hm1092_560x360_regs,
++		.num_regs = ARRAY_SIZE(hm1092_560x360_regs),
++	}, {
++		.mclk = 19200000,
++		.link_freq_index = 1,
++		.width = 648,
++		.height = 368,
++		.hts = 0x0654,
++		.vts = 0x02e4,
++		.exposure_def = 360,
++		.crop = {
++			.left = 0,
++			.top = 0,
++			.width = 1294,
++			.height = 734,
++		},
++		.regs = hm1092_648x368_regs,
++		.num_regs = ARRAY_SIZE(hm1092_648x368_regs),
++	},
+ };
+ 
+ static const char * const hm1092_supply_names[] = {
+@@ -313,7 +558,8 @@ static const char * const hm1092_test_pattern_menu[] = {
+ };
+ 
+ static const s64 hm1092_link_freq_menu[] = {
+-	HM1092_LINK_FREQ,
++	HM1092_LINK_FREQ_180MHZ,
++	HM1092_LINK_FREQ_180P48MHZ,
+ };
+ 
+ struct hm1092 {
+@@ -330,6 +576,7 @@ struct hm1092 {
+ 	struct v4l2_ctrl *hblank;
+ 	struct v4l2_ctrl *vblank;
+ 	struct v4l2_ctrl *exposure;
++	const struct hm1092_mode *mode;
+ 	u8 mipi_lanes;
+ };
+ 
+@@ -405,7 +652,7 @@ static const struct v4l2_ctrl_ops hm1092_ctrl_ops = {
+ static int hm1092_init_controls(struct hm1092 *hm1092)
+ {
+ 	struct v4l2_ctrl_handler *ctrl_hdlr = &hm1092->ctrl_handler;
+-	const struct hm1092_mode *mode = &hm1092_mode_560x360;
++	const struct hm1092_mode *mode = hm1092->mode;
+ 	struct v4l2_fwnode_device_properties props;
+ 	s64 hblank, pixel_rate;
+ 	int ret;
+@@ -419,11 +666,12 @@ static int hm1092_init_controls(struct hm1092 *hm1092)
+ 	hm1092->link_freq = v4l2_ctrl_new_int_menu(ctrl_hdlr,
+ 						   &hm1092_ctrl_ops,
+ 						   V4L2_CID_LINK_FREQ,
+-						   0, 0,
++						   ARRAY_SIZE(hm1092_link_freq_menu) - 1,
++						   mode->link_freq_index,
+ 						   hm1092_link_freq_menu);
+ 
+-	pixel_rate = div_u64(HM1092_LINK_FREQ * 2 * hm1092->mipi_lanes,
+-			     HM1092_BITS_PER_SAMPLE);
++	pixel_rate = div_u64(hm1092_link_freq_menu[mode->link_freq_index] * 2 *
++			     hm1092->mipi_lanes, HM1092_BITS_PER_SAMPLE);
+ 	hm1092->pixel_rate = v4l2_ctrl_new_std(ctrl_hdlr, &hm1092_ctrl_ops,
+ 					       V4L2_CID_PIXEL_RATE, 0,
+ 					       pixel_rate, 1, pixel_rate);
+@@ -445,7 +693,7 @@ static int hm1092_init_controls(struct hm1092 *hm1092)
+ 					     mode->vts -
+ 					     HM1092_EXPOSURE_MARGIN,
+ 					     HM1092_EXPOSURE_STEP,
+-					     HM1092_EXPOSURE_DEFAULT);
++					     mode->exposure_def);
+ 
+ 	v4l2_ctrl_new_std(ctrl_hdlr, &hm1092_ctrl_ops,
+ 			  V4L2_CID_ANALOGUE_GAIN,
+@@ -487,10 +735,11 @@ static int hm1092_init_controls(struct hm1092 *hm1092)
+ 	return ret;
+ }
+ 
+-static void hm1092_update_pad_format(struct v4l2_mbus_framefmt *fmt)
++static void hm1092_update_pad_format(const struct hm1092_mode *mode,
++				     struct v4l2_mbus_framefmt *fmt)
+ {
+-	fmt->width = hm1092_mode_560x360.width;
+-	fmt->height = hm1092_mode_560x360.height;
++	fmt->width = mode->width;
++	fmt->height = mode->height;
+ 	fmt->code = MEDIA_BUS_FMT_Y10_1X10;
+ 	fmt->field = V4L2_FIELD_NONE;
+ 	fmt->colorspace = V4L2_COLORSPACE_RAW;
+@@ -510,8 +759,8 @@ static int hm1092_enable_streams(struct v4l2_subdev *sd,
+ 	if (ret)
+ 		return ret;
+ 
+-	ret = cci_multi_reg_write(hm1092->regmap, hm1092_init_regs,
+-				  ARRAY_SIZE(hm1092_init_regs), NULL);
++	ret = cci_multi_reg_write(hm1092->regmap, hm1092->mode->regs,
++				  hm1092->mode->num_regs, NULL);
+ 	if (ret) {
+ 		dev_err(hm1092->dev, "failed to write init registers\n");
+ 		goto out;
+@@ -563,16 +812,18 @@ static int hm1092_enum_frame_size(struct v4l2_subdev *sd,
+ 				  struct v4l2_subdev_state *state,
+ 				  struct v4l2_subdev_frame_size_enum *fse)
+ {
++	const struct hm1092_mode *mode = to_hm1092(sd)->mode;
++
+ 	if (fse->index)
+ 		return -EINVAL;
+ 
+ 	if (fse->code != MEDIA_BUS_FMT_Y10_1X10)
+ 		return -EINVAL;
+ 
+-	fse->min_width = hm1092_mode_560x360.width;
+-	fse->max_width = hm1092_mode_560x360.width;
+-	fse->min_height = hm1092_mode_560x360.height;
+-	fse->max_height = hm1092_mode_560x360.height;
++	fse->min_width = mode->width;
++	fse->max_width = mode->width;
++	fse->min_height = mode->height;
++	fse->max_height = mode->height;
+ 
+ 	return 0;
+ }
+@@ -584,10 +835,7 @@ static int hm1092_get_selection(struct v4l2_subdev *sd,
+ {
+ 	switch (sel->target) {
+ 	case V4L2_SEL_TGT_CROP:
+-		sel->r.left = HM1092_CROP_LEFT;
+-		sel->r.top = HM1092_CROP_TOP;
+-		sel->r.width = HM1092_CROP_WIDTH;
+-		sel->r.height = HM1092_CROP_HEIGHT;
++		sel->r = to_hm1092(sd)->mode->crop;
+ 		return 0;
+ 	case V4L2_SEL_TGT_CROP_DEFAULT:
+ 		sel->r.left = HM1092_ACTIVE_LEFT;
+@@ -610,7 +858,8 @@ static int hm1092_get_selection(struct v4l2_subdev *sd,
+ static int hm1092_init_state(struct v4l2_subdev *sd,
+ 			     struct v4l2_subdev_state *state)
+ {
+-	hm1092_update_pad_format(v4l2_subdev_state_get_format(state, 0));
++	hm1092_update_pad_format(to_hm1092(sd)->mode,
++				 v4l2_subdev_state_get_format(state, 0));
+ 
+ 	return 0;
+ }
+@@ -670,6 +919,14 @@ static int hm1092_check_hwcfg(struct hm1092 *hm1092)
+ 	if (ret)
+ 		goto out;
+ 
++	if (!(link_freq_bitmap & BIT(hm1092->mode->link_freq_index))) {
++		ret = dev_err_probe(dev, -EINVAL,
++				    "link frequency %lld not available for a %lu Hz external clock\n",
++				    hm1092_link_freq_menu[hm1092->mode->link_freq_index],
++				    hm1092->mode->mclk);
++		goto out;
++	}
++
+ 	if (bus_cfg.bus.mipi_csi2.num_data_lanes != 1) {
+ 		ret = dev_err_probe(dev, -EINVAL,
+ 				    "only 1 data lane is supported, got %u\n",
+@@ -782,7 +1039,13 @@ static int hm1092_probe(struct i2c_client *client)
+ 				     "failed to get imaging clock\n");
+ 
+ 	freq = clk_get_rate(hm1092->img_clk);
+-	if (freq != HM1092_MCLK)
++	for (unsigned int i = 0; i < ARRAY_SIZE(hm1092_modes); i++) {
++		if (hm1092_modes[i].mclk == freq) {
++			hm1092->mode = &hm1092_modes[i];
++			break;
++		}
++	}
++	if (!hm1092->mode)
+ 		return dev_err_probe(hm1092->dev, -EINVAL,
+ 				     "external clock %lu is not supported\n",
+ 				     freq);
+@@ -848,6 +1111,12 @@ static int hm1092_probe(struct i2c_client *client)
+ static DEFINE_RUNTIME_DEV_PM_OPS(hm1092_pm_ops, hm1092_power_off,
+ 				 hm1092_power_on, NULL);
+ 
++static const struct acpi_device_id hm1092_acpi_ids[] = {
++	{ "HIMX1092" },
++	{ /* sentinel */ }
++};
++MODULE_DEVICE_TABLE(acpi, hm1092_acpi_ids);
++
+ static const struct of_device_id hm1092_of_match[] = {
+ 	{ .compatible = "himax,hm1092" },
+ 	{ /* sentinel */ }
+@@ -858,6 +1127,7 @@ static struct i2c_driver hm1092_i2c_driver = {
+ 	.driver = {
+ 		.name = "hm1092",
+ 		.pm = pm_ptr(&hm1092_pm_ops),
++		.acpi_match_table = hm1092_acpi_ids,
+ 		.of_match_table = hm1092_of_match,
+ 	},
+ 	.probe = hm1092_probe,

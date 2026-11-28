@@ -1,0 +1,1311 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Antheas Kapenekakis <lkml@antheas.dev>
+Date: Sat, 26 Sep 2026 00:00:00 +0200
+Subject: [PATCH] usb: typec: add Samsung EmuEC Type-C driver
+
+The Samsung Galaxy Book4 Edge has a Samsung S2MM006 USB Type-C and PD
+controller per port, managed on Windows by Samsung's EmuEC software
+rather than through the ADSP's UCSI, so pmic_glink never gets a port.
+
+Add a driver for them that reports attach, roles and orientation,
+controls VBUS and the USB data paths, sets the mux and retimer through
+the connector graph, negotiates a PD sink contract through the
+controller firmware, and tells the EC the port state.
+
+Signed-off-by: Antheas Kapenekakis <lkml@antheas.dev>
+[birk: the state of drivers/usb/typec/samsung-emuec.c and its binding at
+ anatase-org/patchwork 00dbccf77911, squashing 686b85b2899, 3f90ece616f,
+ 5efe18b1c0c, 62cdef60193 and c618779c076; MAINTAINERS left out]
+Signed-off-by: Birk Skyum <birk.skyum@pm.me>
+---
+ .../bindings/usb/samsung,s2mm006.yaml         |   60 +
+ drivers/usb/typec/Kconfig                     |   15 +
+ drivers/usb/typec/Makefile                    |    1 +
+ drivers/usb/typec/samsung-emuec.c             | 1173 +++++++++++++++++
+ 4 files changed, 1249 insertions(+)
+ create mode 100644 Documentation/devicetree/bindings/usb/samsung,s2mm006.yaml
+ create mode 100644 drivers/usb/typec/samsung-emuec.c
+
+diff --git a/Documentation/devicetree/bindings/usb/samsung,s2mm006.yaml b/Documentation/devicetree/bindings/usb/samsung,s2mm006.yaml
+new file mode 100644
+index 000000000..b0422c478
+--- /dev/null
++++ b/Documentation/devicetree/bindings/usb/samsung,s2mm006.yaml
+@@ -0,0 +1,60 @@
++# SPDX-License-Identifier: (GPL-2.0 OR BSD-2-Clause)
++# Copyright (c) 2026 Antheas Kapenekakis <lkml@antheas.dev>
++%YAML 1.2
++---
++$id: http://devicetree.org/schemas/usb/samsung,s2mm006.yaml#
++$schema: http://devicetree.org/meta-schemas/core.yaml#
++
++title: Samsung S2MM006 USB Type-C controller
++
++maintainers:
++  - Antheas Kapenekakis <lkml@antheas.dev>
++
++description: |
++  The S2MM006 controls Type-C attachment, power paths and USB Power Delivery
++  on the Samsung Galaxy Book4 Edge NP750XQB. Its connector describes the USB
++  data role, orientation and mode switch connections.
++
++properties:
++  compatible:
++    const: samsung,s2mm006
++
++  reg:
++    maxItems: 1
++
++  interrupts:
++    maxItems: 1
++
++  connector:
++    $ref: /schemas/connector/usb-connector.yaml#
++
++required:
++  - compatible
++  - reg
++  - interrupts
++  - connector
++
++additionalProperties: false
++
++examples:
++  - |
++    #include <dt-bindings/interrupt-controller/irq.h>
++
++    i2c {
++        #address-cells = <1>;
++        #size-cells = <0>;
++
++        pdic@33 {
++            compatible = "samsung,s2mm006";
++            reg = <0x33>;
++            interrupt-parent = <&gpio0>;
++            interrupts = <42 IRQ_TYPE_LEVEL_LOW>;
++
++            connector {
++                compatible = "usb-c-connector";
++                power-role = "dual";
++                data-role = "dual";
++            };
++        };
++    };
++...
+diff --git a/drivers/usb/typec/Kconfig b/drivers/usb/typec/Kconfig
+index 2f80c2792..64f69ec2c 100644
+--- a/drivers/usb/typec/Kconfig
++++ b/drivers/usb/typec/Kconfig
+@@ -88,6 +88,21 @@ config TYPEC_HD3SS3220
+ 	  If you choose to build this driver as a dynamically linked module, the
+ 	  module will be called hd3ss3220.ko.
+ 
++config TYPEC_SAMSUNG_EMUEC
++	tristate "Samsung EmuEC Type-C controller"
++	depends on I2C && OF && POWER_SUPPLY && USB_ROLE_SWITCH
++	depends on DRM
++	select DRM_KMS_HELPER
++	help
++	  Support the S2MM006 USB Type-C controllers managed by Samsung's EmuEC
++	  software on the Galaxy Book4 Edge NP750XQB. The driver reports Type-C
++	  attachment and roles, controls the power and USB data paths, and selects
++	  a fixed USB Power Delivery sink contract through the controller firmware.
++	  USB4 link establishment also requires a Qualcomm host-router driver.
++
++	  If built as a module, the module is called samsung-emuec.
++
++
+ config TYPEC_STUSB160X
+ 	tristate "STMicroelectronics STUSB160x Type-C controller driver"
+ 	depends on USB_ROLE_SWITCH || !USB_ROLE_SWITCH
+diff --git a/drivers/usb/typec/Makefile b/drivers/usb/typec/Makefile
+index 8a6a1c663..4b79345b7 100644
+--- a/drivers/usb/typec/Makefile
++++ b/drivers/usb/typec/Makefile
+@@ -8,6 +8,7 @@ obj-$(CONFIG_TYPEC_UCSI)	+= ucsi/
+ obj-$(CONFIG_TYPEC_TPS6598X)	+= tipd/
+ obj-$(CONFIG_TYPEC_ANX7411)	+= anx7411.o
+ obj-$(CONFIG_TYPEC_HD3SS3220)	+= hd3ss3220.o
++obj-$(CONFIG_TYPEC_SAMSUNG_EMUEC)	+= samsung-emuec.o
+ obj-$(CONFIG_TYPEC_STUSB160X) 	+= stusb160x.o
+ obj-$(CONFIG_TYPEC_RT1719)	+= rt1719.o
+ obj-$(CONFIG_TYPEC_WUSB3801)	+= wusb3801.o
+diff --git a/drivers/usb/typec/samsung-emuec.c b/drivers/usb/typec/samsung-emuec.c
+new file mode 100644
+index 000000000..269e9b4b4
+--- /dev/null
++++ b/drivers/usb/typec/samsung-emuec.c
+@@ -0,0 +1,1173 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Copyright (c) 2026 Antheas Kapenekakis <lkml@antheas.dev>
++ *
++ * Samsung EmuEC Type-C controller for the S2MM006 on Galaxy Book4 Edge.
++ * The controller firmware owns the PD policy engine. Linux selects a sink
++ * contract through its mailbox and reports the resulting Type-C state.
++ */
++
++#include <linux/bitops.h>
++#include <linux/cleanup.h>
++#include <linux/delay.h>
++#include <linux/errno.h>
++#include <linux/i2c.h>
++#include <linux/interrupt.h>
++#include <linux/iopoll.h>
++#include <linux/math.h>
++#include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/of.h>
++#include <linux/pm.h>
++#include <linux/power_supply.h>
++#include <linux/slab.h>
++#include <linux/unaligned.h>
++#include <linux/usb/pd.h>
++#include <linux/usb/pd_vdo.h>
++#include <linux/usb/role.h>
++#include <linux/usb/typec.h>
++#include <linux/usb/typec_altmode.h>
++#include <linux/usb/typec_dp.h>
++#include <linux/usb/typec_mux.h>
++#include <linux/usb/typec_retimer.h>
++#include <linux/workqueue.h>
++
++#include <drm/drm_atomic_helper.h>
++#include <drm/drm_bridge.h>
++
++#define S2MM006_IRQ_FIRST		0x02
++#define S2MM006_IRQ_LAST		0x07
++#define S2MM006_REG_BC_STATUS		0x0e
++#define S2MM006_REG_CC_STATUS		0x11
++#define S2MM006_REG_PD_STATUS2		0x14
++#define S2MM006_REG_PD_STATUS3		0x1a
++#define S2MM006_REG_SWITCH_STATUS	0x1c
++#define S2MM006_REG_SWITCH_COMMAND	0x4e
++#define S2MM006_REG_TX_STATUS		0x50
++#define S2MM006_REG_DP_PIN_ASSIGN	0x51
++#define S2MM006_REG_ENTER_USB_STATUS	0x56
++#define S2MM006_REG_TX_BUFFER		0x80
++#define S2MM006_REG_ACTIVE_RDO		0x6a4
++#define S2MM006_REG_SOURCE_CAPS		0x900
++#define S2MM006_REG_DISCOVER_SVID	0xa20
++#define S2MM006_REG_DISCOVER_MODE	0xa40
++#define S2MM006_REG_ENTER_MODE		0xa60
++#define S2MM006_REG_DP_ATTENTION	0xaa0
++#define S2MM006_REG_DP_STATUS		0xac0
++#define S2MM006_REG_DP_CONFIGURE	0xae0
++
++#define S2MM006_CONSUMER_COMMAND	0x12
++#define S2MM006_PROVIDER_COMMAND	0x09
++#define S2MM006_TX_REQUEST		BIT(6)
++#define S2MM006_TX_CONTINUE_ALT		BIT(1)
++#define S2MM006_DP_MODE_RECEIVED	BIT(2)
++#define S2MM006_DP_ENTER_RECEIVED	BIT(3)
++#define S2MM006_DP_STATUS_RECEIVED	BIT(5)
++#define S2MM006_DP_CONFIG_RECEIVED	BIT(6)
++#define S2MM006_DP_ATTENTION_RECEIVED	BIT(7)
++#define S2MM006_ENTER_USB_SUCCESS	(2 << 2)
++#define S2MM006_MAX_CHARGE_MV		20000
++
++enum samsung_emuec_mode {
++	SAMSUNG_EMUEC_MODE_NONE,
++	SAMSUNG_EMUEC_MODE_CONSUMER,
++	SAMSUNG_EMUEC_MODE_PROVIDER,
++};
++
++struct samsung_emuec {
++	struct i2c_client *client;
++	struct mutex lock;
++	struct delayed_work work;
++	struct work_struct hpd_work;
++	struct device_node *connector;
++	struct drm_bridge *dp_bridge;
++	struct typec_port *port;
++	struct typec_partner *partner;
++	struct usb_power_delivery *pd;
++	struct usb_power_delivery *partner_pd;
++	struct usb_power_delivery_capabilities *source_caps;
++	struct usb_role_switch *role_sw;
++	struct typec_mux *mux;
++	struct typec_retimer *retimer;
++	struct typec_altmode dp_alt;
++	struct power_supply *psy;
++	struct power_supply_desc psy_desc;
++	enum samsung_emuec_mode attempted_mode;
++	enum typec_role power_role;
++	enum typec_data_role data_role;
++	enum typec_orientation orientation;
++	enum usb_role usb_role;
++	enum usb_mode usb_mode;
++	u32 voltage_uv;
++	u32 current_ua;
++	bool attached;
++	bool usb_mux_active;
++	bool dp_active;
++	bool dp_enter_requested;
++	bool dp_hpd;
++	u8 dp_pin;
++	u32 requested_rdo;
++	u32 requested_pdo;
++};
++
++static int samsung_emuec_read(struct samsung_emuec *pdic, u16 reg,
++			      void *buf, size_t len)
++{
++	u8 address[] = { reg >> 8, reg & 0xff };
++	struct i2c_msg messages[] = {
++		{ .addr = pdic->client->addr, .len = sizeof(address),
++		  .buf = address },
++		{ .addr = pdic->client->addr, .flags = I2C_M_RD,
++		  .len = len, .buf = buf },
++	};
++	int ret;
++
++	ret = i2c_transfer(pdic->client->adapter, messages, ARRAY_SIZE(messages));
++	if (ret < 0)
++		return ret;
++	if (ret != ARRAY_SIZE(messages))
++		return -EIO;
++
++	return 0;
++}
++
++static int samsung_emuec_write(struct samsung_emuec *pdic, u16 reg,
++			       const void *buf, size_t len)
++{
++	u8 data[2 + 8];
++	int ret;
++
++	if (len > sizeof(data) - 2)
++		return -EINVAL;
++
++	data[0] = reg >> 8;
++	data[1] = reg & 0xff;
++	memcpy(data + 2, buf, len);
++
++	ret = i2c_master_send(pdic->client, data, len + 2);
++	if (ret < 0)
++		return ret;
++	if (ret != len + 2)
++		return -EIO;
++
++	return 0;
++}
++
++static int samsung_emuec_clear_irqs(struct samsung_emuec *pdic)
++{
++	u8 pending[S2MM006_IRQ_LAST - S2MM006_IRQ_FIRST + 1];
++	int reg, ret;
++
++	for (reg = S2MM006_IRQ_FIRST; reg <= S2MM006_IRQ_LAST; reg++) {
++		ret = samsung_emuec_read(pdic, reg,
++					&pending[reg - S2MM006_IRQ_FIRST],
++					sizeof(pending[0]));
++		if (ret)
++			return ret;
++	}
++	dev_dbg(&pdic->client->dev, "interrupts: %*ph\n",
++		(int)sizeof(pending), pending);
++
++	/* The Windows driver acknowledges each interrupt byte by writing it back. */
++	for (reg = S2MM006_IRQ_FIRST; reg <= S2MM006_IRQ_LAST; reg++) {
++		ret = samsung_emuec_write(pdic, reg,
++				     &pending[reg - S2MM006_IRQ_FIRST],
++				     sizeof(pending[0]));
++		if (ret)
++			return ret;
++	}
++
++	return 0;
++}
++
++static int samsung_emuec_get_property(struct power_supply *psy,
++				      enum power_supply_property prop,
++				      union power_supply_propval *val)
++{
++	struct samsung_emuec *pdic = power_supply_get_drvdata(psy);
++	int ret = 0;
++
++	guard(mutex)(&pdic->lock);
++	switch (prop) {
++	case POWER_SUPPLY_PROP_ONLINE:
++		val->intval = pdic->attached && pdic->power_role == TYPEC_SINK;
++		break;
++	case POWER_SUPPLY_PROP_VOLTAGE_NOW:
++		val->intval = pdic->voltage_uv;
++		break;
++	case POWER_SUPPLY_PROP_CURRENT_MAX:
++		val->intval = pdic->current_ua;
++		break;
++	default:
++		ret = -EINVAL;
++	}
++
++	return ret;
++}
++
++static enum power_supply_property samsung_emuec_properties[] = {
++	POWER_SUPPLY_PROP_ONLINE,
++	POWER_SUPPLY_PROP_VOLTAGE_NOW,
++	POWER_SUPPLY_PROP_CURRENT_MAX,
++};
++
++static void samsung_emuec_unregister_partner(struct samsung_emuec *pdic)
++{
++	usb_power_delivery_unregister_capabilities(pdic->source_caps);
++	pdic->source_caps = NULL;
++
++	if (pdic->partner_pd) {
++		typec_partner_set_usb_power_delivery(pdic->partner, NULL);
++		usb_power_delivery_unregister(pdic->partner_pd);
++		pdic->partner_pd = NULL;
++	}
++
++	if (pdic->partner) {
++		typec_unregister_partner(pdic->partner);
++		pdic->partner = NULL;
++	}
++}
++
++static int samsung_emuec_set_mux(struct samsung_emuec *pdic,
++				struct typec_mux_state *state)
++{
++	struct typec_retimer_state retimer_state = {
++		.alt = state->alt,
++		.mode = state->mode,
++		.data = state->data,
++	};
++	int ret;
++
++	ret = typec_retimer_set(pdic->retimer, &retimer_state);
++	if (ret)
++		return ret;
++
++	return typec_mux_set(pdic->mux, state);
++}
++
++static void samsung_emuec_detach(struct samsung_emuec *pdic)
++{
++	struct typec_mux_state mux_state = { .mode = TYPEC_STATE_SAFE };
++
++	if (!pdic->attached && pdic->attempted_mode == SAMSUNG_EMUEC_MODE_NONE)
++		return;
++
++	if (pdic->attached) {
++		usb_role_switch_set_role(pdic->role_sw, USB_ROLE_NONE);
++		pdic->usb_role = USB_ROLE_NONE;
++		typec_set_orientation(pdic->port, TYPEC_ORIENTATION_NONE);
++		pdic->orientation = TYPEC_ORIENTATION_NONE;
++		samsung_emuec_set_mux(pdic, &mux_state);
++		pdic->usb_mux_active = false;
++		typec_port_set_usb_mode(pdic->port, USB_MODE_NONE);
++		typec_set_pwr_opmode(pdic->port, TYPEC_PWR_MODE_USB);
++		samsung_emuec_unregister_partner(pdic);
++	}
++
++	pdic->attached = false;
++	pdic->dp_active = false;
++	pdic->dp_enter_requested = false;
++	if (pdic->dp_hpd) {
++		WRITE_ONCE(pdic->dp_hpd, false);
++		schedule_work(&pdic->hpd_work);
++	}
++	pdic->dp_pin = 0;
++	pdic->requested_rdo = 0;
++	pdic->requested_pdo = 0;
++	pdic->usb_mode = USB_MODE_NONE;
++	pdic->attempted_mode = SAMSUNG_EMUEC_MODE_NONE;
++	pdic->voltage_uv = 0;
++	pdic->current_ua = 0;
++	if (pdic->psy)
++		power_supply_changed(pdic->psy);
++}
++
++static int samsung_emuec_read_source_caps(struct samsung_emuec *pdic,
++					  u32 *pdos, int *count, u16 *revision)
++{
++	u8 buf[4 + PDO_MAX_OBJECTS * sizeof(u32)];
++	u16 header;
++	int i, ret;
++
++	ret = samsung_emuec_read(pdic, S2MM006_REG_SOURCE_CAPS,
++				buf, sizeof(buf));
++	if (ret)
++		return ret;
++
++	header = get_unaligned_le16(buf);
++	*count = pd_header_cnt(header);
++
++	if (pd_header_type(header) != PD_DATA_SOURCE_CAP || !*count)
++		return -ENODATA;
++
++	if (pdo_type(get_unaligned_le32(buf + 4)) != PDO_TYPE_FIXED ||
++	    pdo_fixed_voltage(get_unaligned_le32(buf + 4)) != 5000)
++		return -ENODATA;
++
++	*revision = pd_header_rev(header) == PD_REV30 ? 0x0300 : 0x0200;
++	for (i = 0; i < *count; i++)
++		pdos[i] = get_unaligned_le32(buf + 4 + i * sizeof(u32));
++
++	return 0;
++}
++
++static unsigned int samsung_emuec_limit_current(u32 pdo)
++{
++	u32 voltage = pdo_fixed_voltage(pdo);
++	u32 power;
++
++	/* Galaxy Book input limits from Windows Policy_limit_MaxCurrent. */
++	if (!voltage || voltage > S2MM006_MAX_CHARGE_MV)
++		return 0;
++	if (voltage <= 5000)
++		power = 15000;
++	else if (voltage <= 9000)
++		power = 25000;
++	else if (voltage <= 12000)
++		power = 36000;
++	else if (voltage <= 15000)
++		power = 45000;
++	else
++		power = 65000;
++
++	return rounddown(min3(pdo_max_current(pdo), 5000U,
++			      power * 1000 / voltage), 10);
++}
++
++static int samsung_emuec_choose_pdo(const u32 *pdos, int count,
++				    unsigned int *mv, unsigned int *ma)
++{
++	u32 best_power = 0;
++	int best = 0, i;
++
++	for (i = 0; i < count; i++) {
++		u32 voltage, current_ma, power;
++
++		if (pdo_type(pdos[i]) != PDO_TYPE_FIXED)
++			continue;
++		voltage = pdo_fixed_voltage(pdos[i]);
++		if (!voltage || voltage > S2MM006_MAX_CHARGE_MV)
++			continue;
++		current_ma = samsung_emuec_limit_current(pdos[i]);
++		power = voltage * current_ma / 1000;
++		if (power > best_power) {
++			best_power = power;
++			best = i + 1;
++			*mv = voltage;
++			*ma = current_ma;
++		}
++	}
++
++	return best;
++}
++
++static int samsung_emuec_active_rdo(struct samsung_emuec *pdic, u32 *rdo)
++{
++	__le32 value;
++	int ret;
++
++	ret = samsung_emuec_read(pdic, S2MM006_REG_ACTIVE_RDO,
++				&value, sizeof(value));
++	if (ret)
++		return ret;
++
++	*rdo = le32_to_cpu(value);
++	return 0;
++}
++
++static int samsung_emuec_request_pdo(struct samsung_emuec *pdic, u32 rdo)
++{
++	u8 request[8], status;
++	int ret, err;
++
++	/* Windows waits up to ten 30 ms intervals for the transmit mailbox. */
++	ret = read_poll_timeout(samsung_emuec_read, err,
++				err || !(status & S2MM006_TX_REQUEST),
++				30000, 300000, false, pdic,
++				S2MM006_REG_TX_STATUS, &status, sizeof(status));
++	if (ret)
++		return ret;
++	if (err)
++		return err;
++
++	/* The EC mailbox expects a PD Request header and a reserved halfword. */
++	put_unaligned_le16(0x1002, request);
++	put_unaligned_le16(0, request + 2);
++	put_unaligned_le32(rdo, request + 4);
++	ret = samsung_emuec_write(pdic, S2MM006_REG_TX_BUFFER,
++				 request, sizeof(request));
++	if (ret)
++		return ret;
++
++	status |= S2MM006_TX_REQUEST;
++	/* Contract completion is reported by the controller's interrupts. */
++	return samsung_emuec_write(pdic, S2MM006_REG_TX_STATUS,
++				    &status, sizeof(status));
++}
++
++static void samsung_emuec_update_pd(struct samsung_emuec *pdic)
++{
++	struct usb_power_delivery_capabilities_desc caps = { .role = TYPEC_SOURCE };
++	struct usb_power_delivery_desc desc;
++	u32 pdos[PDO_MAX_OBJECTS] = {}, active, requested;
++	unsigned int mv = 0, ma = 0;
++	u8 status;
++	u16 revision;
++	int count, selected, actual, ret;
++
++	ret = samsung_emuec_read_source_caps(pdic, pdos, &count, &revision);
++	if (ret)
++		return;
++
++	if (!pdic->partner_pd) {
++		desc.revision = revision;
++		desc.version = 0;
++		pdic->partner_pd = typec_partner_usb_power_delivery_register(
++							pdic->partner, &desc);
++		if (!IS_ERR(pdic->partner_pd)) {
++			memcpy(caps.pdo, pdos, sizeof(pdos));
++			pdic->source_caps = usb_power_delivery_register_capabilities(
++							pdic->partner_pd, &caps);
++			if (IS_ERR(pdic->source_caps))
++				pdic->source_caps = NULL;
++			ret = typec_partner_set_usb_power_delivery(pdic->partner,
++							pdic->partner_pd);
++			if (ret) {
++				usb_power_delivery_unregister_capabilities(
++							pdic->source_caps);
++				pdic->source_caps = NULL;
++				usb_power_delivery_unregister(pdic->partner_pd);
++				pdic->partner_pd = NULL;
++			}
++		} else {
++			pdic->partner_pd = NULL;
++		}
++	}
++
++	selected = samsung_emuec_choose_pdo(pdos, count, &mv, &ma);
++	if (!selected)
++		return;
++	ret = samsung_emuec_active_rdo(pdic, &active);
++	if (ret)
++		return;
++	ret = samsung_emuec_read(pdic, S2MM006_REG_TX_STATUS,
++				&status, sizeof(status));
++	if (ret)
++		return;
++
++	requested = RDO_FIXED(selected, ma, ma, RDO_USB_COMM | RDO_NO_SUSPEND);
++	actual = rdo_index(active);
++	/* Do not mistake the outgoing RDO for a completed power transition. */
++	if (!(status & S2MM006_TX_REQUEST) &&
++	    actual >= 1 && actual <= count &&
++	    pdo_type(pdos[actual - 1]) == PDO_TYPE_FIXED &&
++	    rdo_op_current(active) <= samsung_emuec_limit_current(pdos[actual - 1]) &&
++	    pdo_fixed_voltage(pdos[actual - 1]) * rdo_op_current(active) >= mv * ma) {
++		/* A later contract loss must be allowed to request this PDO again. */
++		pdic->requested_rdo = 0;
++		pdic->requested_pdo = 0;
++		goto report;
++	}
++
++	/* Suppress duplicates, but re-evaluate changed source limits. */
++	if (pdic->requested_rdo != requested ||
++	    pdic->requested_pdo != pdos[selected - 1]) {
++		ret = samsung_emuec_request_pdo(pdic, requested);
++		if (ret)
++			dev_warn(&pdic->client->dev,
++				 "failed to submit PD request %#x: %d\n", requested, ret);
++		else {
++			pdic->requested_rdo = requested;
++			pdic->requested_pdo = pdos[selected - 1];
++		}
++	}
++	dev_dbg(&pdic->client->dev, "PD requested %#x, active %#x, TX %#x\n",
++		 requested, active, status);
++
++report:
++	if (status & S2MM006_TX_REQUEST)
++		return;
++	if (actual < 1 || actual > count ||
++	    pdo_type(pdos[actual - 1]) != PDO_TYPE_FIXED)
++		return;
++
++	mv = pdo_fixed_voltage(pdos[actual - 1]);
++	ma = min(rdo_op_current(active), pdo_max_current(pdos[actual - 1]));
++	if (!mv || !ma)
++		return;
++	if (pdic->voltage_uv == mv * 1000 && pdic->current_ua == ma * 1000)
++		return;
++	pdic->voltage_uv = mv * 1000;
++	pdic->current_ua = ma * 1000;
++	typec_set_pwr_opmode(pdic->port, TYPEC_PWR_MODE_PD);
++	power_supply_changed(pdic->psy);
++
++	dev_info(&pdic->client->dev, "PD contract %u mV %u mA (PDO %d)\n",
++		 mv, ma, actual);
++}
++
++static int samsung_emuec_read_vdm(struct samsung_emuec *pdic, u16 reg,
++				  u16 svid, u8 command, u8 command_type,
++				  u32 *data)
++{
++	u8 buf[12];
++	u32 vdm;
++	u16 header;
++	int ret;
++
++	ret = samsung_emuec_read(pdic, reg, buf, sizeof(buf));
++	if (ret)
++		return ret;
++
++	header = get_unaligned_le16(buf);
++	vdm = get_unaligned_le32(buf + 4);
++	if (pd_header_type(header) != PD_DATA_VENDOR_DEF ||
++	    pd_header_cnt(header) < (data ? 2 : 1) ||
++	    PD_VDO_VID(vdm) != svid || !PD_VDO_SVDM(vdm) ||
++	    PD_VDO_CMD(vdm) != command || PD_VDO_CMDT(vdm) != command_type)
++		return -ENODATA;
++
++	if (data)
++		*data = get_unaligned_le32(buf + 8);
++
++	return 0;
++}
++
++static u8 samsung_emuec_choose_dp_pin(u32 mode, u32 status)
++{
++	u8 pins = DP_CAP_PIN_ASSIGN_UFP_D(mode);
++
++	if (DP_STATUS_CONNECTION(status) != DP_STATUS_CON_UFP_D &&
++	    DP_STATUS_CONNECTION(status) != DP_STATUS_CON_BOTH)
++		return 0;
++
++	if (status & DP_STATUS_PREFER_MULTI_FUNC) {
++		if (pins & BIT(DP_PIN_ASSIGN_D))
++			return DP_PIN_ASSIGN_D;
++		if (pins & BIT(DP_PIN_ASSIGN_F))
++			return DP_PIN_ASSIGN_F;
++	}
++	if (pins & BIT(DP_PIN_ASSIGN_C))
++		return DP_PIN_ASSIGN_C;
++	if (pins & BIT(DP_PIN_ASSIGN_E))
++		return DP_PIN_ASSIGN_E;
++	if (pins & BIT(DP_PIN_ASSIGN_D))
++		return DP_PIN_ASSIGN_D;
++
++	return 0;
++}
++
++static void samsung_emuec_update_dp(struct samsung_emuec *pdic)
++{
++	struct typec_displayport_data dp_data = {};
++	struct typec_mux_state mux_state = {};
++	u32 svids, mode, dp_status, hpd_status;
++	u8 events, control, pin_reg, pin;
++	bool initial, update_hpd, hpd;
++	int ret;
++
++	if (pdic->data_role != TYPEC_HOST)
++		return;
++
++	ret = samsung_emuec_read(pdic, S2MM006_REG_PD_STATUS3,
++				&events, sizeof(events));
++	if (ret)
++		return;
++
++	/* Windows clears the latched events before reading responses. */
++	if (events) {
++		control = 0;
++		ret = samsung_emuec_write(pdic, S2MM006_REG_PD_STATUS3,
++					  &control, sizeof(control));
++		if (ret)
++			return;
++	}
++
++	/* On boot, the firmware may have completed DP negotiation before probe. */
++	initial = !pdic->dp_active;
++
++	ret = samsung_emuec_read_vdm(pdic, S2MM006_REG_DISCOVER_SVID,
++				      USB_SID_PD, CMD_DISCOVER_SVID,
++				      CMDT_RSP_ACK, &svids);
++	if (ret || (PD_VDO_SVID_SVID0(svids) != USB_TYPEC_DP_SID &&
++		    PD_VDO_SVID_SVID1(svids) != USB_TYPEC_DP_SID))
++		return;
++
++	ret = samsung_emuec_read_vdm(pdic, S2MM006_REG_DISCOVER_MODE,
++				      USB_TYPEC_DP_SID, CMD_DISCOVER_MODES,
++				      CMDT_RSP_ACK, &mode);
++	if (ret)
++		return;
++
++	ret = samsung_emuec_read_vdm(pdic, S2MM006_REG_ENTER_MODE,
++				      USB_TYPEC_DP_SID, CMD_ENTER_MODE,
++				      CMDT_RSP_ACK, NULL);
++
++	if (ret) {
++		if (!(events & S2MM006_DP_MODE_RECEIVED) ||
++		    pdic->dp_enter_requested)
++			return;
++
++		ret = samsung_emuec_read(pdic, S2MM006_REG_TX_STATUS,
++					 &control, sizeof(control));
++		if (ret)
++			return;
++		control |= S2MM006_TX_CONTINUE_ALT;
++		ret = samsung_emuec_write(pdic, S2MM006_REG_TX_STATUS,
++					  &control, sizeof(control));
++		if (ret)
++			return;
++		pdic->dp_enter_requested = true;
++
++		mod_delayed_work(system_dfl_wq, &pdic->work,
++				 msecs_to_jiffies(150));
++		return;
++	}
++
++	ret = samsung_emuec_read_vdm(pdic, S2MM006_REG_DP_STATUS,
++				      USB_TYPEC_DP_SID, DP_CMD_STATUS_UPDATE,
++				      CMDT_RSP_ACK, &dp_status);
++	if (ret)
++		return;
++
++	pin = samsung_emuec_choose_dp_pin(mode, dp_status);
++	if (!pin)
++		return;
++
++	ret = samsung_emuec_read(pdic, S2MM006_REG_DP_PIN_ASSIGN,
++				&pin_reg, sizeof(pin_reg));
++	if (ret)
++		return;
++
++	if ((pin_reg & GENMASK(2, 0)) != pin) {
++		if (!(events & S2MM006_DP_STATUS_RECEIVED))
++			return;
++		pin_reg = (pin_reg & ~GENMASK(2, 0)) | pin;
++
++		ret = samsung_emuec_write(pdic, S2MM006_REG_DP_PIN_ASSIGN,
++					  &pin_reg, sizeof(pin_reg));
++		if (ret)
++			return;
++
++		mod_delayed_work(system_dfl_wq, &pdic->work,
++				 msecs_to_jiffies(150));
++		return;
++	}
++
++	ret = samsung_emuec_read_vdm(pdic, S2MM006_REG_DP_CONFIGURE,
++				      USB_TYPEC_DP_SID, DP_CMD_CONFIGURE,
++				      CMDT_RSP_ACK, NULL);
++	if (ret)
++		return;
++
++	dp_data.status = dp_status;
++	dp_data.conf = DP_CONF_UFP_U_AS_UFP_D |
++		       DP_CONF_SET_PIN_ASSIGN(BIT(pin));
++	update_hpd = !pdic->dp_active ||
++		     (events & S2MM006_DP_STATUS_RECEIVED);
++
++	if (!pdic->dp_active || pdic->dp_pin != pin) {
++		mux_state.alt = &pdic->dp_alt;
++		mux_state.mode = TYPEC_MODAL_STATE(pin);
++		mux_state.data = &dp_data;
++		ret = samsung_emuec_set_mux(pdic, &mux_state);
++		if (ret) {
++			dev_warn(&pdic->client->dev,
++				 "failed to enable DisplayPort mux: %d\n", ret);
++			return;
++		}
++		pdic->dp_active = true;
++		pdic->dp_enter_requested = false;
++		pdic->dp_pin = pin;
++		dev_info(&pdic->client->dev,
++			 "DisplayPort Alt Mode configured with pin %c\n", 'A' + pin);
++	}
++
++	/* Attention also preserves HPD changes that happened before probe. */
++	hpd_status = dp_status;
++	if (initial || (events & S2MM006_DP_ATTENTION_RECEIVED)) {
++		ret = samsung_emuec_read_vdm(pdic, S2MM006_REG_DP_ATTENTION,
++					      USB_TYPEC_DP_SID, CMD_ATTENTION,
++					      CMDT_INIT, &hpd_status);
++		if (ret && (events & S2MM006_DP_ATTENTION_RECEIVED))
++			return;
++		if (!ret)
++			update_hpd = true;
++	}
++
++	hpd = hpd_status & DP_STATUS_HPD_STATE;
++	if (update_hpd && pdic->dp_hpd != hpd) {
++		WRITE_ONCE(pdic->dp_hpd, hpd);
++		schedule_work(&pdic->hpd_work);
++	}
++}
++
++struct samsung_emuec_dp_bridge {
++	struct drm_bridge bridge;
++	struct samsung_emuec *pdic;
++};
++
++static void samsung_emuec_hpd_work(struct work_struct *work)
++{
++	struct samsung_emuec *pdic = container_of(work, struct samsung_emuec,
++						   hpd_work);
++
++	drm_bridge_hpd_notify(pdic->dp_bridge,
++			      READ_ONCE(pdic->dp_hpd) ?
++			      connector_status_connected :
++			      connector_status_disconnected);
++}
++
++static void samsung_emuec_bridge_hpd_enable(struct drm_bridge *bridge)
++{
++	struct samsung_emuec_dp_bridge *dp_bridge =
++		container_of(bridge, struct samsung_emuec_dp_bridge, bridge);
++
++	if (READ_ONCE(dp_bridge->pdic->dp_hpd))
++		schedule_work(&dp_bridge->pdic->hpd_work);
++}
++
++static int samsung_emuec_bridge_attach(struct drm_bridge *bridge,
++				       struct drm_encoder *encoder,
++				       enum drm_bridge_attach_flags flags)
++{
++	return flags & DRM_BRIDGE_ATTACH_NO_CONNECTOR ? 0 : -EINVAL;
++}
++
++static const struct drm_bridge_funcs samsung_emuec_bridge_funcs = {
++	.atomic_create_state = drm_atomic_helper_bridge_create_state,
++	.atomic_duplicate_state = drm_atomic_helper_bridge_duplicate_state,
++	.atomic_destroy_state = drm_atomic_helper_bridge_destroy_state,
++	.attach = samsung_emuec_bridge_attach,
++	.hpd_enable = samsung_emuec_bridge_hpd_enable,
++};
++
++static int samsung_emuec_register_bridge(struct samsung_emuec *pdic)
++{
++	struct device *dev = &pdic->client->dev;
++	struct samsung_emuec_dp_bridge *dp_bridge;
++	struct drm_bridge *bridge;
++
++	dp_bridge = devm_drm_bridge_alloc(dev, struct samsung_emuec_dp_bridge,
++					   bridge, &samsung_emuec_bridge_funcs);
++	if (IS_ERR(dp_bridge))
++		return PTR_ERR(dp_bridge);
++
++	dp_bridge->pdic = pdic;
++	bridge = &dp_bridge->bridge;
++	bridge->of_node = pdic->connector;
++	bridge->type = DRM_MODE_CONNECTOR_DisplayPort;
++	bridge->ops = DRM_BRIDGE_OP_HPD;
++	bridge->interlace_allowed = true;
++	bridge->ycbcr_420_allowed = true;
++	pdic->dp_bridge = bridge;
++
++	return devm_drm_bridge_add(dev, bridge);
++}
++
++static void samsung_emuec_sync(struct work_struct *work)
++{
++	struct samsung_emuec *pdic = container_of(to_delayed_work(work),
++						    struct samsung_emuec, work);
++	struct typec_mux_state mux_state = { .mode = TYPEC_STATE_USB };
++	u8 command, status_bit, bc, cc, pd, sw, enter_usb;
++	struct typec_partner_desc partner_desc = {
++		.accessory = TYPEC_ACCESSORY_NONE,
++		.usb_capability = 0,
++	};
++	enum samsung_emuec_mode mode;
++	enum typec_orientation orientation;
++	enum typec_role power_role;
++	enum typec_data_role data_role;
++	enum usb_role usb_role;
++	bool vbus_present, source_path_attached, consumer_path_active;
++	int ret;
++
++	guard(mutex)(&pdic->lock);
++
++	ret = samsung_emuec_read(pdic, S2MM006_REG_BC_STATUS, &bc, sizeof(bc));
++	if (ret)
++		return;
++	ret = samsung_emuec_read(pdic, S2MM006_REG_CC_STATUS, &cc, sizeof(cc));
++	if (ret)
++		return;
++	ret = samsung_emuec_read(pdic, S2MM006_REG_PD_STATUS2, &pd, sizeof(pd));
++	if (ret)
++		return;
++	ret = samsung_emuec_read(pdic, S2MM006_REG_SWITCH_STATUS, &sw, sizeof(sw));
++	if (ret)
++		return;
++	ret = samsung_emuec_read(pdic, S2MM006_REG_ENTER_USB_STATUS,
++				&enter_usb, sizeof(enter_usb));
++	if (ret)
++		return;
++
++	orientation = (cc >> 4) == 1 ? TYPEC_ORIENTATION_NORMAL :
++		      (cc >> 4) == 2 ? TYPEC_ORIENTATION_REVERSE :
++					  TYPEC_ORIENTATION_NONE;
++	power_role = pd & BIT(3) ? TYPEC_SOURCE : TYPEC_SINK;
++	data_role = pd & BIT(2) ? TYPEC_HOST : TYPEC_DEVICE;
++	vbus_present = bc & BIT(0);
++	source_path_attached = bc & BIT(4);
++	consumer_path_active = sw & BIT(1);
++
++	if (orientation == TYPEC_ORIENTATION_NONE) {
++		samsung_emuec_detach(pdic);
++		return;
++	}
++
++	/* A sink needs external VBUS; a source may need its path enabled first. */
++	if (power_role == TYPEC_SINK && !vbus_present) {
++		mod_delayed_work(system_dfl_wq, &pdic->work,
++				 msecs_to_jiffies(150));
++		return;
++	}
++
++	mode = power_role == TYPEC_SOURCE ? SAMSUNG_EMUEC_MODE_PROVIDER :
++					    SAMSUNG_EMUEC_MODE_CONSUMER;
++	command = mode == SAMSUNG_EMUEC_MODE_PROVIDER ?
++		  S2MM006_PROVIDER_COMMAND : S2MM006_CONSUMER_COMMAND;
++	status_bit = mode == SAMSUNG_EMUEC_MODE_PROVIDER ? BIT(0) : BIT(1);
++
++	if (pdic->attempted_mode != mode)
++		pdic->attempted_mode = SAMSUNG_EMUEC_MODE_NONE;
++
++	if (!(sw & status_bit) && pdic->attempted_mode != mode) {
++		ret = samsung_emuec_write(pdic, S2MM006_REG_SWITCH_COMMAND,
++					 &command, sizeof(command));
++		if (ret)
++			dev_warn(&pdic->client->dev,
++				 "failed to enable %s path: %d\n",
++				 mode == SAMSUNG_EMUEC_MODE_PROVIDER ?
++				 "provider" : "consumer", ret);
++		else
++			pdic->attempted_mode = mode;
++	}
++
++	if (!(sw & status_bit) ||
++	    (power_role == TYPEC_SOURCE && !source_path_attached)) {
++		/* Keep checking until the requested power path becomes active. */
++		if (pdic->attempted_mode == mode)
++			mod_delayed_work(system_dfl_wq, &pdic->work,
++					 msecs_to_jiffies(150));
++		return;
++	}
++
++	if (pdic->attached && (pdic->power_role != power_role ||
++			       pdic->data_role != data_role))
++		samsung_emuec_detach(pdic);
++
++	if (!pdic->attached) {
++		partner_desc.usb_pd = power_role == TYPEC_SINK;
++
++		pdic->partner = typec_register_partner(pdic->port, &partner_desc);
++		if (IS_ERR(pdic->partner)) {
++			dev_warn(&pdic->client->dev,
++				 "failed to register Type-C partner: %ld\n",
++				 PTR_ERR(pdic->partner));
++			pdic->partner = NULL;
++			return;
++		}
++
++		pdic->attached = true;
++		pdic->power_role = power_role;
++		pdic->data_role = data_role;
++		typec_port_set_usb_mode(pdic->port, USB_MODE_NONE);
++		typec_set_pwr_opmode(pdic->port, TYPEC_PWR_MODE_USB);
++		pdic->voltage_uv = 0;
++		pdic->current_ua = 0;
++		power_supply_changed(pdic->psy);
++	}
++
++	if (pdic->orientation != orientation) {
++		ret = typec_set_orientation(pdic->port, orientation);
++		if (ret)
++			dev_warn(&pdic->client->dev,
++				 "failed to set connector orientation: %d\n", ret);
++		else
++			pdic->orientation = orientation;
++	}
++
++	if (!pdic->usb_mux_active && !pdic->dp_active) {
++		ret = samsung_emuec_set_mux(pdic, &mux_state);
++		if (ret)
++			dev_warn(&pdic->client->dev,
++				 "failed to enable USB mux: %d\n", ret);
++		else
++			pdic->usb_mux_active = true;
++	}
++
++	typec_set_pwr_role(pdic->port, power_role);
++	typec_set_data_role(pdic->port, data_role);
++
++	/* Windows names status 2 in these bits the Enter_USB success response. */
++	if ((enter_usb & GENMASK(3, 2)) == S2MM006_ENTER_USB_SUCCESS) {
++		if (pdic->usb_mode != USB_MODE_USB4) {
++			/* A USB4 host router must own the USB4 mux transition. */
++			typec_port_set_usb_mode(pdic->port, USB_MODE_USB4);
++			pdic->usb_mode = USB_MODE_USB4;
++		}
++	} else if (pdic->usb_mode == USB_MODE_USB4) {
++		typec_port_set_usb_mode(pdic->port, USB_MODE_NONE);
++		pdic->usb_mode = USB_MODE_NONE;
++	}
++
++	samsung_emuec_update_dp(pdic);
++
++	/* The DWC3 host timed out when started with this PHY in four-lane DP. */
++	usb_role = USB_ROLE_NONE;
++	if (data_role == TYPEC_DEVICE)
++		usb_role = USB_ROLE_DEVICE;
++	else if (!pdic->dp_enter_requested &&
++		 !(pdic->dp_active &&
++		   (pdic->dp_pin == DP_PIN_ASSIGN_C ||
++		    pdic->dp_pin == DP_PIN_ASSIGN_E)))
++		usb_role = USB_ROLE_HOST;
++
++	if (pdic->usb_role != usb_role) {
++		ret = usb_role_switch_set_role(pdic->role_sw, usb_role);
++		if (ret)
++			dev_warn(&pdic->client->dev,
++				 "failed to set USB role: %d\n", ret);
++		else
++			pdic->usb_role = usb_role;
++	}
++
++	if (power_role == TYPEC_SINK && consumer_path_active)
++		samsung_emuec_update_pd(pdic);
++
++	if (pdic->dp_active)
++		mod_delayed_work(system_dfl_wq, &pdic->work,
++				 msecs_to_jiffies(500));
++}
++
++static irqreturn_t samsung_emuec_irq_thread(int irq, void *data)
++{
++	struct samsung_emuec *pdic = data;
++	int ret;
++
++	scoped_guard(mutex, &pdic->lock)
++		ret = samsung_emuec_clear_irqs(pdic);
++	if (ret)
++		dev_warn_ratelimited(&pdic->client->dev,
++				     "failed to clear interrupt: %d\n", ret);
++
++	mod_delayed_work(system_dfl_wq, &pdic->work, 0);
++	return IRQ_HANDLED;
++}
++
++static int samsung_emuec_probe(struct i2c_client *client)
++{
++	struct device *dev = &client->dev;
++	struct power_supply_config psy_config = {};
++	struct usb_power_delivery_desc pd_desc = { .revision = 0x0300 };
++	struct typec_capability typec_cap = {
++		.type = TYPEC_PORT_DRP,
++		.data = TYPEC_PORT_DRD,
++		.revision = USB_TYPEC_REV_2_0,
++		.pd_revision = 0x0300,
++		.orientation_aware = true,
++		.usb_capability = USB_CAPABILITY_USB2 | USB_CAPABILITY_USB3 |
++				  USB_CAPABILITY_USB4,
++		.no_mode_control = true,
++	};
++	struct samsung_emuec *pdic;
++	u8 status;
++	int ret;
++
++	if (!i2c_check_functionality(client->adapter, I2C_FUNC_I2C))
++		return dev_err_probe(dev, -EOPNOTSUPP,
++				     "adapter lacks combined I2C transfers\n");
++
++	if (client->irq <= 0)
++		return dev_err_probe(dev, -EINVAL, "missing interrupt\n");
++
++	pdic = devm_kzalloc(dev, sizeof(*pdic), GFP_KERNEL);
++	if (!pdic)
++		return -ENOMEM;
++
++	pdic->client = client;
++	pdic->dp_alt.svid = USB_TYPEC_DP_SID;
++	pdic->dp_alt.mode = USB_TYPEC_DP_MODE;
++	pdic->dp_alt.active = 1;
++	mutex_init(&pdic->lock);
++	INIT_DELAYED_WORK(&pdic->work, samsung_emuec_sync);
++	INIT_WORK(&pdic->hpd_work, samsung_emuec_hpd_work);
++	i2c_set_clientdata(client, pdic);
++
++	ret = samsung_emuec_read(pdic, S2MM006_REG_SWITCH_STATUS,
++				&status, sizeof(status));
++	if (ret)
++		return dev_err_probe(dev, ret, "unable to read PDIC status\n");
++
++	pdic->connector = of_get_child_by_name(dev->of_node, "connector");
++	if (!pdic->connector)
++		return dev_err_probe(dev, -EINVAL, "missing Type-C connector\n");
++
++	typec_cap.fwnode = of_fwnode_handle(pdic->connector);
++	typec_cap.driver_data = pdic;
++
++	pdic->role_sw = fwnode_usb_role_switch_get(typec_cap.fwnode);
++	if (IS_ERR(pdic->role_sw)) {
++		ret = PTR_ERR(pdic->role_sw);
++		goto err_node;
++	}
++	if (!pdic->role_sw) {
++		ret = -ENODEV;
++		goto err_node;
++	}
++
++	pdic->mux = fwnode_typec_mux_get(typec_cap.fwnode);
++	if (IS_ERR(pdic->mux)) {
++		ret = PTR_ERR(pdic->mux);
++		goto err_role;
++	}
++
++	pdic->retimer = fwnode_typec_retimer_get(typec_cap.fwnode);
++	if (IS_ERR(pdic->retimer)) {
++		ret = PTR_ERR(pdic->retimer);
++		goto err_mux;
++	}
++	if (!pdic->mux && !pdic->retimer) {
++		ret = -ENODEV;
++		goto err_retimer;
++	}
++
++	pdic->port = typec_register_port(dev, &typec_cap);
++	if (IS_ERR(pdic->port)) {
++		ret = PTR_ERR(pdic->port);
++		goto err_retimer;
++	}
++
++	pdic->pd = usb_power_delivery_register(dev, &pd_desc);
++	if (IS_ERR(pdic->pd)) {
++		ret = PTR_ERR(pdic->pd);
++		goto err_port;
++	}
++
++	ret = typec_port_set_usb_power_delivery(pdic->port, pdic->pd);
++	if (ret)
++		goto err_pd;
++
++	pdic->psy_desc.name = devm_kasprintf(dev, GFP_KERNEL, "%s-usb",
++					       dev_name(dev));
++	if (!pdic->psy_desc.name) {
++		ret = -ENOMEM;
++		goto err_pd;
++	}
++
++	pdic->psy_desc.type = POWER_SUPPLY_TYPE_USB_PD;
++	pdic->psy_desc.properties = samsung_emuec_properties;
++	pdic->psy_desc.num_properties = ARRAY_SIZE(samsung_emuec_properties);
++	pdic->psy_desc.get_property = samsung_emuec_get_property;
++	psy_config.drv_data = pdic;
++	psy_config.fwnode = dev_fwnode(dev);
++
++	pdic->psy = devm_power_supply_register(dev, &pdic->psy_desc, &psy_config);
++	if (IS_ERR(pdic->psy)) {
++		ret = PTR_ERR(pdic->psy);
++		goto err_pd;
++	}
++
++	ret = samsung_emuec_clear_irqs(pdic);
++	if (ret)
++		goto err_pd;
++
++	ret = samsung_emuec_register_bridge(pdic);
++	if (ret)
++		goto err_pd;
++
++	ret = devm_request_threaded_irq(dev, client->irq, NULL,
++					samsung_emuec_irq_thread, IRQF_ONESHOT,
++					dev_name(dev), pdic);
++	if (ret)
++		goto err_pd;
++
++	mod_delayed_work(system_dfl_wq, &pdic->work, 0);
++	return 0;
++
++err_pd:
++	typec_port_set_usb_power_delivery(pdic->port, NULL);
++	usb_power_delivery_unregister(pdic->pd);
++err_port:
++	typec_unregister_port(pdic->port);
++err_retimer:
++	typec_retimer_put(pdic->retimer);
++err_mux:
++	typec_mux_put(pdic->mux);
++err_role:
++	usb_role_switch_put(pdic->role_sw);
++err_node:
++	of_node_put(pdic->connector);
++	return ret;
++}
++
++static void samsung_emuec_remove(struct i2c_client *client)
++{
++	struct samsung_emuec *pdic = i2c_get_clientdata(client);
++
++	devm_free_irq(&client->dev, client->irq, pdic);
++	cancel_delayed_work_sync(&pdic->work);
++
++	scoped_guard(mutex, &pdic->lock)
++		samsung_emuec_detach(pdic);
++	flush_work(&pdic->hpd_work);
++
++	typec_port_set_usb_power_delivery(pdic->port, NULL);
++	usb_power_delivery_unregister(pdic->pd);
++	typec_unregister_port(pdic->port);
++	typec_retimer_put(pdic->retimer);
++	typec_mux_put(pdic->mux);
++	usb_role_switch_put(pdic->role_sw);
++	of_node_put(pdic->connector);
++}
++
++static int samsung_emuec_suspend(struct device *dev)
++{
++	struct samsung_emuec *pdic = dev_get_drvdata(dev);
++
++	/* Leave controller events latched until its I2C bus has resumed. */
++	disable_irq(pdic->client->irq);
++	cancel_delayed_work_sync(&pdic->work);
++	flush_work(&pdic->hpd_work);
++
++	return 0;
++}
++
++static int samsung_emuec_resume(struct device *dev)
++{
++	struct samsung_emuec *pdic = dev_get_drvdata(dev);
++
++	scoped_guard(mutex, &pdic->lock) {
++		pdic->requested_rdo = 0;
++		pdic->requested_pdo = 0;
++		pdic->attempted_mode = SAMSUNG_EMUEC_MODE_NONE;
++	}
++	enable_irq(pdic->client->irq);
++	mod_delayed_work(system_dfl_wq, &pdic->work, 0);
++
++	return 0;
++}
++
++static DEFINE_SIMPLE_DEV_PM_OPS(samsung_emuec_pm_ops, samsung_emuec_suspend,
++			      samsung_emuec_resume);
++
++static const struct of_device_id samsung_emuec_of_match[] = {
++	{ .compatible = "samsung,s2mm006" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, samsung_emuec_of_match);
++
++static struct i2c_driver samsung_emuec_driver = {
++	.driver = {
++		.name = "samsung-emuec",
++		.of_match_table = samsung_emuec_of_match,
++		.pm = pm_sleep_ptr(&samsung_emuec_pm_ops),
++	},
++	.probe = samsung_emuec_probe,
++	.remove = samsung_emuec_remove,
++};
++module_i2c_driver(samsung_emuec_driver);
++
++MODULE_DESCRIPTION("Samsung EmuEC USB Type-C and Power Delivery driver");
++MODULE_LICENSE("GPL");

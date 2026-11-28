@@ -1,0 +1,291 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jim Martin <jimmartin@gmail.com>
+Date: Sun, 15 Nov 2026 15:28:46 -0600
+Subject: [PATCH] usb: roles: Let a switch be held in a role while requests are
+ recorded
+
+A component that sits between a dual-role controller and its connector
+can have to take the controller out of its role for a moment, without
+having a say in what the role is. The Qualcomm USB4 host router is one:
+the SuperSpeed port of the controller it tunnels is routed either to the
+router or to the PHY, and the route must not change under a running
+host. The role itself is decided by the Type-C driver, from what the
+partner is.
+
+Setting the role and setting it back with usb_role_switch_set_role()
+does not do: what to set it back to is a guess. The Type-C driver can
+ask for another role in between, because the partner was unplugged or
+the data role was swapped, and the role that is written back then
+overrules it. Nothing tells it to ask again.
+
+Add usb_role_switch_hold(), which sets a role and makes
+usb_role_switch_set_role() record what it is asked for instead of
+applying it, and usb_role_switch_unhold(), which ends that and sets the
+role that was asked for last. A switch that is not held behaves as
+before.
+
+The holder has to know that the role it asked for is in effect, and a
+switch may change its role after its set callback has returned. Such a
+switch can provide a sync callback, which returns once the role given
+to set last is in effect; the hold calls it. usb_role_switch_get_role()
+cannot stand in for it: a switch that has not started on a role it was
+asked for a moment ago still reports the one before.
+
+A switch that is in the role already is left as it is, and the release
+does not set a role again that the switch was given last. Holding a
+switch that needs no change makes no call to its set callback.
+
+For a switch without a get callback the role that was set last with
+success is kept apart from the one that was asked for last, so that the
+role reported during a hold, and after a release that failed, is the one
+the switch is in.
+
+Assisted-by: Claude Fable 5.2
+Signed-off-by: Jim Martin <jimmartin@gmail.com>
+---
+ drivers/usb/roles/class.c | 134 +++++++++++++++++++++++++++++++++++---
+ include/linux/usb/role.h  |  19 ++++++
+ 2 files changed, 145 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/usb/roles/class.c b/drivers/usb/roles/class.c
+index edec139b6..9b26036e4 100644
+--- a/drivers/usb/roles/class.c
++++ b/drivers/usb/roles/class.c
+@@ -25,7 +25,9 @@ struct usb_role_switch {
+ 	struct lock_class_key key;
+ 	struct mutex lock; /* device lock*/
+ 	struct module *module; /* the module this device depends on */
+-	enum usb_role role;
++	enum usb_role role; /* asked for last */
++	enum usb_role applied; /* given to @set last, with success */
++	bool held; /* role requests are recorded, not applied */
+ 	bool registered;
+ 
+ 	/* From descriptor */
+@@ -34,6 +36,7 @@ struct usb_role_switch {
+ 	struct device *udc;
+ 	usb_role_switch_set_t set;
+ 	usb_role_switch_get_t get;
++	usb_role_switch_sync_t sync;
+ 	bool allow_userspace_control;
+ };
+ 
+@@ -84,10 +87,17 @@ int usb_role_switch_set_role(struct usb_role_switch *sw, enum usb_role role)
+ 
+ 	mutex_lock(&sw->lock);
+ 
+-	ret = sw->set(sw, role);
+-	if (!ret) {
++	if (sw->held) {
++		/* Applied by usb_role_switch_unhold() */
+ 		sw->role = role;
+-		kobject_uevent(&sw->dev.kobj, KOBJ_CHANGE);
++		ret = 0;
++	} else {
++		ret = sw->set(sw, role);
++		if (!ret) {
++			sw->role = role;
++			sw->applied = role;
++			kobject_uevent(&sw->dev.kobj, KOBJ_CHANGE);
++		}
+ 	}
+ 
+ 	mutex_unlock(&sw->lock);
+@@ -96,6 +106,116 @@ int usb_role_switch_set_role(struct usb_role_switch *sw, enum usb_role role)
+ }
+ EXPORT_SYMBOL_GPL(usb_role_switch_set_role);
+ 
++/* The role the switch is in, as far as it can tell. Called with the lock held. */
++static enum usb_role usb_role_switch_current(struct usb_role_switch *sw)
++{
++	return sw->get ? sw->get(sw) : sw->applied;
++}
++
++/**
++ * usb_role_switch_hold - Put a switch into a role and keep it there
++ * @sw: USB role switch
++ * @role: USB role to hold the switch in
++ *
++ * For a component that has to take the controller behind @sw out of its role
++ * for a while without deciding the role itself, for example to change what
++ * the controller's port is connected to. Until usb_role_switch_unhold(), the
++ * role usb_role_switch_set_role() is asked for is recorded instead of applied,
++ * and that call returns 0, also when the role cannot be set at the release:
++ * whoever decides the role is not overruled, only made to wait.
++ *
++ * @role is in effect when this returns. A switch that changes its role after
++ * its set callback has returned provides the sync callback for that; without
++ * one, the role is taken to be in effect when the set callback returns. A
++ * switch that is in @role already is left as it is.
++ *
++ * This can sleep for as long as the switch takes to change its role, the
++ * removal of a host for example, with the lock of @sw held, under which the
++ * sync callback is called. It must not be called while tasks are frozen for
++ * system sleep: a switch may change its role from a freezable workqueue.
++ *
++ * The caller keeps its reference to @sw until usb_role_switch_unhold(). There
++ * is one holder at a time, and usb_role_switch_unhold() is for the holder
++ * only: it does not check who calls.
++ *
++ * Returns 0 on success, -EBUSY if @sw is held already, -ENODEV if @sw is not
++ * registered, or the error of the switch. @sw is held only on success.
++ */
++int usb_role_switch_hold(struct usb_role_switch *sw, enum usb_role role)
++{
++	int ret;
++
++	if (IS_ERR_OR_NULL(sw) || !sw->registered)
++		return -ENODEV;
++
++	mutex_lock(&sw->lock);
++
++	if (sw->held) {
++		ret = -EBUSY;
++	} else {
++		/* A role asked for a moment ago may not be in effect yet */
++		if (sw->sync)
++			sw->sync(sw);
++		ret = 0;
++		if (usb_role_switch_current(sw) != role) {
++			ret = sw->set(sw, role);
++			if (!ret) {
++				sw->applied = role;
++				if (sw->sync)
++					sw->sync(sw);
++				kobject_uevent(&sw->dev.kobj, KOBJ_CHANGE);
++			}
++		}
++		if (!ret)
++			sw->held = true;
++	}
++
++	mutex_unlock(&sw->lock);
++
++	return ret;
++}
++EXPORT_SYMBOL_GPL(usb_role_switch_hold);
++
++/**
++ * usb_role_switch_unhold - Let a held switch take the role it was asked for
++ * @sw: USB role switch
++ *
++ * Ends usb_role_switch_hold() and sets the role that was asked for last with
++ * usb_role_switch_set_role(), before or during the hold, unless that is the
++ * role the switch was given last. It does not wait for the role to be in
++ * effect.
++ *
++ * Returns 0 on success, -ENODEV if @sw is not registered any more (the hold
++ * ends with the switch then), or the error of the switch, in which case @sw
++ * is no longer held, stays in the role it was held in and, if it has no get
++ * callback, reports that role.
++ */
++int usb_role_switch_unhold(struct usb_role_switch *sw)
++{
++	int ret = 0;
++
++	if (IS_ERR_OR_NULL(sw) || !sw->registered)
++		return -ENODEV;
++
++	mutex_lock(&sw->lock);
++
++	if (sw->held) {
++		sw->held = false;
++		if (sw->role != sw->applied) {
++			ret = sw->set(sw, sw->role);
++			if (!ret) {
++				sw->applied = sw->role;
++				kobject_uevent(&sw->dev.kobj, KOBJ_CHANGE);
++			}
++		}
++	}
++
++	mutex_unlock(&sw->lock);
++
++	return ret;
++}
++EXPORT_SYMBOL_GPL(usb_role_switch_unhold);
++
+ /**
+  * usb_role_switch_get_role - Get the USB role for a switch
+  * @sw: USB role switch
+@@ -112,10 +232,7 @@ enum usb_role usb_role_switch_get_role(struct usb_role_switch *sw)
+ 
+ 	mutex_lock(&sw->lock);
+ 
+-	if (sw->get)
+-		role = sw->get(sw);
+-	else
+-		role = sw->role;
++	role = usb_role_switch_current(sw);
+ 
+ 	mutex_unlock(&sw->lock);
+ 
+@@ -382,6 +499,7 @@ usb_role_switch_register(struct device *parent,
+ 	sw->udc = desc->udc;
+ 	sw->set = desc->set;
+ 	sw->get = desc->get;
++	sw->sync = desc->sync;
+ 
+ 	sw->module = parent->driver->owner;
+ 	sw->dev.parent = parent;
+diff --git a/include/linux/usb/role.h b/include/linux/usb/role.h
+index b5deafd91..a5d21df6f 100644
+--- a/include/linux/usb/role.h
++++ b/include/linux/usb/role.h
+@@ -16,6 +16,7 @@ enum usb_role {
+ typedef int (*usb_role_switch_set_t)(struct usb_role_switch *sw,
+ 				     enum usb_role role);
+ typedef enum usb_role (*usb_role_switch_get_t)(struct usb_role_switch *sw);
++typedef void (*usb_role_switch_sync_t)(struct usb_role_switch *sw);
+ 
+ /**
+  * struct usb_role_switch_desc - USB Role Switch Descriptor
+@@ -25,6 +26,10 @@ typedef enum usb_role (*usb_role_switch_get_t)(struct usb_role_switch *sw);
+  * @udc: Optional reference to the peripheral controller device
+  * @set: Callback for setting the role
+  * @get: Callback for getting the role (optional)
++ * @sync: Callback that returns once the role given to @set last is in effect
++ *	(optional; for a switch that changes its role after @set has returned).
++ *	Called with the lock of the switch held; it may sleep and must not call
++ *	usb_role_switch_set_role() and the like for the same switch.
+  * @allow_userspace_control: If true userspace may change the role through sysfs
+  * @driver_data: Private data pointer
+  * @name: Name for the switch (optional)
+@@ -42,6 +47,7 @@ struct usb_role_switch_desc {
+ 	struct device *udc;
+ 	usb_role_switch_set_t set;
+ 	usb_role_switch_get_t get;
++	usb_role_switch_sync_t sync;
+ 	bool allow_userspace_control;
+ 	void *driver_data;
+ 	const char *name;
+@@ -51,6 +57,8 @@ struct usb_role_switch_desc {
+ #if IS_ENABLED(CONFIG_USB_ROLE_SWITCH)
+ int usb_role_switch_set_role(struct usb_role_switch *sw, enum usb_role role);
+ enum usb_role usb_role_switch_get_role(struct usb_role_switch *sw);
++int usb_role_switch_hold(struct usb_role_switch *sw, enum usb_role role);
++int usb_role_switch_unhold(struct usb_role_switch *sw);
+ struct usb_role_switch *usb_role_switch_get(struct device *dev);
+ struct usb_role_switch *fwnode_usb_role_switch_get(struct fwnode_handle *node);
+ void usb_role_switch_put(struct usb_role_switch *sw);
+@@ -78,6 +86,17 @@ static inline enum usb_role usb_role_switch_get_role(struct usb_role_switch *sw)
+ 	return USB_ROLE_NONE;
+ }
+ 
++static inline int usb_role_switch_hold(struct usb_role_switch *sw,
++		enum usb_role role)
++{
++	return -ENODEV;
++}
++
++static inline int usb_role_switch_unhold(struct usb_role_switch *sw)
++{
++	return -ENODEV;
++}
++
+ static inline struct usb_role_switch *usb_role_switch_get(struct device *dev)
+ {
+ 	return ERR_PTR(-ENODEV);
+-- 
+2.56.1
+

@@ -18,7 +18,7 @@ BIN="$T/root/bin"
 mkdir -p "$BIN"
 cp -r "$ROOT/helpers" "$T/root/"
 cp -r "$ROOT/release" "$T/root/"
-cp "$ROOT/bin/promote-channel" "$ROOT/bin/publish-artifact" "$ROOT/bin/check-mac-set" "$BIN/"
+cp "$ROOT/bin/promote-channel" "$ROOT/bin/publish-artifact" "$BIN/"
 PKGBUILDS_DIR="$T/root/pkgbuilds"
 recipe() { # recipe <dir> <metadata json> [pkgbase] [arch]
   mkdir -p "$PKGBUILDS_DIR/$1/.omarchy"
@@ -68,10 +68,27 @@ plan_action() { jq -r --arg n "$1" 'select(.type=="plan" and .name==$n) | .actio
 pass() { echo "PASS: $1"; }
 fail() { echo "FAIL: $1"; cat "$T/out"; exit 1; }
 
+if (( EUID == 0 )); then
+  id -u fixture >/dev/null 2>&1 || useradd -m fixture
+  mkdir -p "$T/src"; chmod 755 "$T/src"
+fi
+mkpkg_par() {
+  local pids=() spec
+  for spec in "$@"; do
+    # shellcheck disable=SC2086
+    ( mkpkg $spec >/dev/null ) &
+    pids+=($!)
+  done
+  local p; for p in "${pids[@]}"; do wait "$p"; done
+}
+pkgf() { ls "$T/src/$1-$2"/*.pkg.tar.zst; }
 # rc: what stable users have now. edge: newer builds of most of it.
-pub rc $(mkpkg alpha 1) $(mkpkg fast 1) $(mkpkg pinned 1) $(mkpkg ahead 3)
-pub edge $(mkpkg alpha 2) $(mkpkg split 1 split-extra) $(mkpkg fast 2) $(mkpkg pinned 2) \
-  $(mkpkg ahead 2) $(mkpkg big 1) $(mkpkg dropped 1)
+mkpkg_par "alpha 1" "fast 1" "pinned 1" "ahead 3" \
+  "alpha 2" "split 1 split-extra" "fast 2" "pinned 2" "ahead 2" "big 1" "dropped 1" \
+  "alpha 3" "split 2 split-extra" "big 2" "alpha 4" "big 3"
+pub rc $(pkgf alpha 1) $(pkgf fast 1) $(pkgf pinned 1) $(pkgf ahead 3)
+pub edge $(pkgf alpha 2) $(pkgf split 1) $(pkgf fast 2) $(pkgf pinned 2) \
+  $(pkgf ahead 2) $(pkgf big 1) $(pkgf dropped 1)
 rc_before=$(entries rc)
 
 : > "$T/record"
@@ -102,7 +119,7 @@ promote && grep -q 'already up to date' "$T/out" && [[ $(plan_action alpha) == c
   && pass "a second run finds nothing to do" || fail "rerun"
 
 # Batches split between pkgbases, never inside one; each batch is a slot.
-pub edge $(mkpkg alpha 3) $(mkpkg split 2 split-extra) $(mkpkg big 2)
+pub edge $(pkgf alpha 3) $(pkgf split 2) $(pkgf big 2)
 : > "$T/record"
 promote --batch-bytes 1 || fail "batched promotion failed"
 jq -e -s '[.[] | select(.type=="slot")] | length == 3 and all(.status == "published")' "$T/record" >/dev/null \
@@ -111,7 +128,7 @@ jq -e -s '[.[] | select(.type=="slot")] | length == 3 and all(.status == "publis
   && pass "small batches publish base by base and keep split packages together" || fail "batches: $(cat "$T/record")"
 
 # A named pkgbase limits the run to it.
-pub edge $(mkpkg alpha 4) $(mkpkg big 3)
+pub edge $(pkgf alpha 4) $(pkgf big 3)
 : > "$T/record"
 promote alpha && [[ "$(entries rc)" == "ahead-1.0-3 alpha-1.0-4 big-1.0-2 fast-1.0-1 pinned-1.0-1 split-1.0-2 split-extra-1.0-2 " ]] \
   && pass "naming a pkgbase promotes only that one" || fail "named promotion: $(entries rc)"
@@ -119,6 +136,20 @@ if promote nosuch; then fail "an unknown pkgbase should refuse"; else grep -q 'n
 recipe elsewhere '{"source": "local"}'
 promote elsewhere && grep -q 'not in edge/x86_64; skipping' "$T/out" \
   && pass "a recipe this architecture has not published is skipped, not refused" || fail "other-arch recipe"
+recipe armonly '{"source": "local"}' "" aarch64
+promote armonly && grep -q 'armonly does not build for x86_64; skipping it' "$T/out" && ! grep -q 'armonly is not in' "$T/out" \
+  && pass "a recipe that does not build this architecture is skipped without a warning" || fail "arch-only recipe"
+
+# --expect: only the files that were checked may move.
+pub edge $(mkpkg alpha 5)
+printf '%s\n' big-1.0-3-x86_64.pkg.tar.zst > "$T/expect"
+if promote --expect "$T/expect" alpha; then fail "a plan other than the checked one should refuse"; else
+  grep -q 'not the one that was checked' "$T/out" && [[ "$(entries rc)" == *"alpha-1.0-4 "* ]] \
+    && pass "a plan that differs from the checked files publishes nothing" || fail "--expect mismatch"
+fi
+printf '%s\n' alpha-1.0-5-x86_64.pkg.tar.zst > "$T/expect"
+promote --expect "$T/expect" alpha && [[ "$(entries rc)" == *"alpha-1.0-5 "* ]] \
+  && pass "the checked plan publishes" || fail "--expect match: $(entries rc)"
 
 # A source file that does not match its database entry is never published.
 f="$REMOTE/edge/x86_64/big-1.0-3-x86_64.pkg.tar.zst"

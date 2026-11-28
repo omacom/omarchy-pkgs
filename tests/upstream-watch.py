@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
 """Offline integration tests for owned-recipe updates and failure isolation."""
 import importlib.util
+import io
 import json
 import os
+import re
 from pathlib import Path
 import shutil
+import stat
 import subprocess
+import tarfile
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -430,7 +434,8 @@ os.execv(os.environ['REAL_GIT'], ['git', *args])
             ('1password-beta', 'Package: unrelated\nVersion: 99.0\n\nPackage: 1password\nVersion: 8.12.38~25.BETA\n', '8.12.38_25.BETA'),
             ('spotify', 'Package: spotify-client\nVersion: 1:1.2.96.518.g366879e1\n', '1.2.96.518'),
             ('typora', 'Package: typora\nVersion: 1.12.6-1\n\nPackage: typora\nVersion: 1.9.0-1\n', '1.12.6'),
-            ('nvidia-580xx-utils', '<a href="580.159.04/">580.159.04/</a> <a href="590.1/">590.1/</a>', '580.159.04'),
+            ('nvidia-580xx-utils', '{"IDS":[{"downloadInfo":{"DownloadURL" : "https://us.download.nvidia.com/XFree86/Linux-x86_64/580.142/NVIDIA-Linux-x86_64-580.142.run"}},{"downloadInfo":{"DownloadURL" : "https://us.download.nvidia.com/XFree86/Linux-x86_64/580.196.11/NVIDIA-Linux-x86_64-580.196.11.run"}},{"downloadInfo":{"DownloadURL" : "https:\\/\\/download.nvidia.com\\/XFree86\\/Linux-x86_64\\/580.196.09\\/NVIDIA-Linux-x86_64-580.196.09.run"}},{"downloadInfo":{"DownloadURL" : "https://us.download.nvidia.com/tesla/580.999.01/NVIDIA-Linux-x86_64-580.999.01.run"}},{"downloadInfo":{"DownloadURL" : "https://us.download.nvidia.com/XFree86/Linux-x86_64/580.999.02/NVIDIA-Linux-x86_64-580.999.02.run.sha256sum"}},{"downloadInfo":{"DownloadURL" : "https://us.download.nvidia.com/XFree86/Linux-x86_64/580.999.03/NVIDIA-Linux-x86_64-580.999.04.run"}},{"downloadInfo":{"ReleaseNotes" : "https://us.download.nvidia.com/XFree86/Linux-x86_64/580.999.05/NVIDIA-Linux-x86_64-580.999.05.run"}},{"downloadInfo":{"DownloadURL" : "https://mirror.example.test/XFree86/Linux-x86_64/580.999.06/NVIDIA-Linux-x86_64-580.999.06.run"}},{"downloadInfo":{"DownloadURL" : "https://us.download.nvidia.com/XFree86/Linux-x86_64/620.73.04/NVIDIA-Linux-x86_64-620.73.04.run"}}]}', '580.196.11'),
+            ('lib32-nvidia-580xx-utils', '{"IDS":[{"downloadInfo":{"DownloadURL" : "https://us.download.nvidia.com/XFree86/Linux-x86_64/580.196.07/NVIDIA-Linux-x86_64-580.196.07.run"}},{"downloadInfo":{"DownloadURL" : "https:\\/\\/download.nvidia.com\\/XFree86\\/Linux-x86_64\\/580.200\\/NVIDIA-Linux-x86_64-580.200.run"}},{"downloadInfo":{"DownloadURL" : "https://us.download.nvidia.com/XFree86/Linux-x86_64/580.196.11/NVIDIA-Linux-x86_64-580.196.11.run"}},{"downloadInfo":{"DownloadURL" : "https://us.download.nvidia.com/tesla/580.999.01/NVIDIA-Linux-x86_64-580.999.01.run"}},{"downloadInfo":{"DownloadURL" : "https://us.download.nvidia.com/XFree86/Linux-x86_64/580.999.02/NVIDIA-Linux-x86_64-580.999.02.run.sha256sum"}},{"downloadInfo":{"DownloadURL" : "https://us.download.nvidia.com/XFree86/Linux-x86_64/580.999.03/NVIDIA-Linux-x86_64-580.999.04.run"}},{"downloadInfo":{"ReleaseNotes" : "https://us.download.nvidia.com/XFree86/Linux-x86_64/580.999.05/NVIDIA-Linux-x86_64-580.999.05.run"}},{"downloadInfo":{"DownloadURL" : "https://mirror.example.test/XFree86/Linux-x86_64/580.999.06/NVIDIA-Linux-x86_64-580.999.06.run"}},{"downloadInfo":{"DownloadURL" : "https://us.download.nvidia.com/XFree86/Linux-x86_64/620.73.04/NVIDIA-Linux-x86_64-620.73.04.run"}}]}', '580.200'),
         ]
         for name, feed, expected in cases:
             watch = json.loads((ROOT / 'pkgbuilds' / name / '.omarchy/package.json').read_text())['upstream']['watch']
@@ -452,6 +457,151 @@ os.execv(os.environ['REAL_GIT'], ['git', *args])
         watch = json.loads((ROOT / 'pkgbuilds/yt6801-dkms/.omarchy/package.json').read_text())['upstream']['watch']
         with patch.object(self.fetch, 'file', return_value=archive):
             self.assertEqual(w.discover(watch, self.fetch)[0]['pkgver'], '1.0.34')
+
+    def build_deb(self, name, files):
+        """A real .deb (ar: debian-binary, control.tar.xz, data.tar.zst)."""
+        work = self.root / f"deb-{name}"
+        tree = work / "tree"
+        for path, text in files.items():
+            (tree / path).parent.mkdir(parents=True, exist_ok=True)
+            (tree / path).write_text(text)
+        (work / "debian-binary").write_text("2.0\n")
+        (work / "control").write_text("Package: app\nVersion: 2.0\n")
+        subprocess.run(["bsdtar", "-C", str(work), "-cJf", str(work / "control.tar.xz"), "control"], check=True)
+        subprocess.run(["bsdtar", "-C", str(tree), "--zstd", "-cf", str(work / "data.tar.zst"), "."], check=True)
+        deb = self.root / f"{name}.deb"
+        subprocess.run(["bsdtar", "-C", str(work), "--format", "ar", "-cf", str(deb),
+                        "debian-binary", "control.tar.xz", "data.tar.zst"], check=True)
+        return deb
+
+    def source_variable_package(self):
+        self.write_watch({"json": "https://example.test/feed", "path": "version", "source_variables": {
+            "_runtimever": {"source": "source:0", "member": "usr/lib/app/version",
+                            "pattern": r"(?P<value>[0-9]+(?:\.[0-9]+)+)"}}})
+        self.recipe.write_text("""pkgname=app
+pkgver=1.0
+pkgrel=2
+_runtimever=1.1.1
+arch=('x86_64' 'aarch64')
+source=("app-$pkgver.deb::https://example.test/app-$pkgver.deb")
+source_aarch64=("https://example.test/runtime-v$_runtimever-arm64.zip")
+sha256sums=('old-deb')
+sha256sums_aarch64=('old-runtime')
+""")
+
+    def test_source_variable_follows_the_version_inside_the_new_deb(self):
+        self.source_variable_package()
+        deb = self.build_deb("app-2.0", {"usr/lib/app/version": "2.2.2\n", "usr/lib/app/app": "binary"})
+        file = lambda url: deb if url.endswith("/app-2.0.deb") else self.fake_file(url)
+        self.assertEqual(self.sync_release(self.release("2.0"), file)["status"], "updated")
+        recipe = w.read_recipe(self.recipe, "aarch64")
+        self.assertEqual((recipe["pkgver"], recipe["pkgrel"], recipe["_runtimever"]), (["2.0"], ["1"], ["2.2.2"]))
+        self.assertEqual(recipe["sha256sums"], [w.hash_file(deb, "sha256")])
+        runtime = self.fake_file("https://example.test/runtime-v2.2.2-arm64.zip")
+        self.assertEqual(recipe["sha256sums_aarch64"], [w.hash_file(runtime, "sha256")])
+
+    def test_source_variable_missing_from_the_deb_leaves_the_recipe_alone(self):
+        self.source_variable_package()
+        before = self.recipe.read_text()
+        deb = self.build_deb("app-2.0", {"usr/lib/app/app": "binary"})
+        file = lambda url: deb if url.endswith(".deb") else self.fake_file(url)
+        with self.assertRaisesRegex(ValueError, "missing or ambiguous"):
+            self.sync_release(self.release("2.0"), file)
+        self.assertEqual(self.recipe.read_text(), before)
+        self.assertFalse((self.package / "PKGBUILD.sync-upstream").exists())
+
+    def test_source_variable_must_match_its_pattern(self):
+        self.source_variable_package()
+        deb = self.build_deb("app-2.0", {"usr/lib/app/version": "2.2.2; rm -rf /\n"})
+        file = lambda url: deb if url.endswith(".deb") else self.fake_file(url)
+        with self.assertRaisesRegex(ValueError, "does not match its pattern"):
+            self.sync_release(self.release("2.0"), file)
+
+    def deb_with_entries(self, name, entries):
+        """A .deb whose data.tar.xz holds exactly these raw tar entries."""
+        work = self.root / f"raw-{name}"
+        work.mkdir()
+        with tarfile.open(work / "data.tar.xz", "w:xz") as data:
+            for path, body in entries:
+                info = tarfile.TarInfo(path)
+                if isinstance(body, tuple):
+                    info.type, info.linkname = tarfile.SYMTYPE, body[1]
+                    data.addfile(info)
+                else:
+                    info.size = len(body)
+                    data.addfile(info, io.BytesIO(body))
+        (work / "debian-binary").write_text("2.0\n")
+        deb = self.root / f"{name}.deb"
+        subprocess.run(["bsdtar", "-C", str(work), "--format", "ar", "-cf", str(deb), "debian-binary", "data.tar.xz"], check=True)
+        return deb
+
+    def test_archive_member_rejects_ambiguous_large_and_linked_entries(self):
+        member = "usr/lib/app/version"
+        self.assertEqual(w.archive_member(self.deb_with_entries("plain", [("./" + member, b"2.2.2\n")]), member), b"2.2.2\n")
+        # libarchive would match both spellings and concatenate them into 45.1.0.
+        dup = self.deb_with_entries("dup", [(member, b"45.1."), ("././" + member, b"0")])
+        with self.assertRaisesRegex(ValueError, "ambiguous"):
+            w.archive_member(dup, member)
+        big = self.deb_with_entries("big", [(member, b"1" * 65537)])
+        with self.assertRaisesRegex(ValueError, "at most 65536 bytes"):
+            w.archive_member(big, member)
+        link = self.deb_with_entries("link", [(member, ("link", "/etc/hostname"))])
+        with self.assertRaisesRegex(ValueError, "regular file"):
+            w.archive_member(link, member)
+
+    def test_archive_member_never_reads_files_an_mtree_names(self):
+        # libarchive reads an mtree manifest as an archive and fills
+        # contents= from the local disk; only real tar and zip are accepted.
+        secret = self.root / "secret"
+        secret.write_text("45.1.0")
+        manifest = f"#mtree\nusr/lib/app/version type=file contents={secret}\n".encode()
+        plain = self.root / "manifest.tar"
+        plain.write_bytes(manifest)
+        work = self.root / "mtree-deb"
+        work.mkdir()
+        (work / "debian-binary").write_text("2.0\n")
+        (work / "data.tar").write_bytes(manifest)
+        deb = self.root / "mtree.deb"
+        subprocess.run(["bsdtar", "-C", str(work), "--format", "ar", "-cf", str(deb), "debian-binary", "data.tar"], check=True)
+        for archive in (plain, deb):
+            with self.subTest(archive=archive.name), self.assertRaisesRegex(ValueError, "cannot read"):
+                w.archive_member(archive, "usr/lib/app/version")
+
+    def test_archive_member_reads_zip_files_but_not_zip_symlinks(self):
+        archive = self.root / "runtime.zip"
+        with zipfile.ZipFile(archive, "w") as z:
+            z.writestr("./usr/lib/app/version", "2.2.2\n")
+            link = zipfile.ZipInfo("usr/lib/app/link")
+            link.create_system, link.external_attr = 3, (stat.S_IFLNK | 0o777) << 16
+            z.writestr(link, "45.1.0")
+        self.assertEqual(w.archive_member(archive, "usr/lib/app/version"), b"2.2.2\n")
+        with self.assertRaisesRegex(ValueError, "regular file"):
+            w.archive_member(archive, "usr/lib/app/link")
+
+    def test_invalid_source_variables_fail_validation(self):
+        good = {"source": "source:0", "member": "usr/lib/app/version", "pattern": "(?P<value>.+)"}
+        for bad in ({"_x": {**good, "pattern": "(.+)"}}, {"_x": {**good, "source": "sources:0"}},
+                    {"_x": {**good, "member": "../etc/passwd"}}, {"_x": {**good, "member": "./usr/lib/app/version"}},
+                    {"_x": {**good, "member": "usr//lib/app/version"}}, {"_x": {**good, "member": "/usr/lib/app/version"}},
+                    {"x": good}, {"_x": {**good, "extra": "1"}}):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                w.validate({"json": "https://example.test/feed", "path": "version", "source_variables": bad})
+        with self.assertRaisesRegex(ValueError, "cannot also be"):
+            w.validate({"json": "https://example.test/feed", "path": "version",
+                        "variables": {"_x": "{version}"}, "source_variables": {"_x": good}})
+
+    def test_zstd_without_tarfile_support_names_the_python_it_needs(self):
+        deb = self.build_deb("old-python", {"usr/lib/app/version": "2.2.2"})
+        methods = {k: v for k, v in w.tarfile.TarFile.OPEN_METH.items() if k != "zst"}
+        with patch.object(w.tarfile.TarFile, "OPEN_METH", methods), self.assertRaisesRegex(ValueError, "Python 3.14"):
+            w.archive_member(deb, "usr/lib/app/version")
+
+    def test_slack_reads_its_electron_version_from_its_deb(self):
+        watch = json.loads((ROOT / "pkgbuilds/slack-desktop/.omarchy/package.json").read_text())["upstream"]["watch"]
+        w.validate(watch)
+        spec = watch["source_variables"]["_electronver"]
+        deb = self.build_deb("slack", {"usr/lib/slack/version": "45.1.0"})
+        self.assertEqual(re.fullmatch(spec["pattern"], w.archive_member(deb, spec["member"]).decode().strip())["value"], "45.1.0")
 
     def test_cursor_same_day_hash_uses_counter_not_hash_order(self):
         self.write_watch({'regex': 'https://example.test/feed', 'pattern': r'(?P<version>[0-9.]+)-(?P<hash>[a-f0-9]+)',
@@ -556,11 +706,11 @@ class T3CodeHookTest(unittest.TestCase):
         self.recipe = self.root / "PKGBUILD"
         self.recipe.write_text("pkgver=0.0.41\n")
         self.feed = self.root / "latest-linux.yml"
-        self.feed.write_text("version: 0.0.42\npath: T3-Code-0.0.42-x86_64.AppImage\n")
+        self.feed.write_text("version: 0.0.42\npath: T3-Code-x86_64.AppImage\n")
         self.arm_feed = self.root / "latest-linux-arm64.yml"
-        self.arm_feed.write_text("version: 0.0.42\npath: T3-Code-0.0.42-arm64.AppImage\n")
+        self.arm_feed.write_text("version: 0.0.42\npath: T3-Code-arm64.AppImage\n")
         for arch in ("x86_64", "arm64"):
-            (self.root / f"T3-Code-0.0.42-{arch}.AppImage").write_text(arch)
+            (self.root / f"T3-Code-{arch}.AppImage").write_text(arch)
         # Serve only fixture assets, and record the requested release URLs.
         curl = self.root / "curl"
         curl.write_text('#!/bin/bash\nurl="${@: -1}"\nprintf "%s\\n" "$url" >> requests\ncat "${url##*/}"\n')
@@ -579,7 +729,7 @@ class T3CodeHookTest(unittest.TestCase):
         self.assertEqual(json.loads(result.stdout), {
             'pkgver': '0.0.42',
             'sha256sums': {
-                arch: [w.hash_file(self.root / f'T3-Code-0.0.42-{asset_arch}.AppImage', 'sha256')]
+                arch: [w.hash_file(self.root / f'T3-Code-{asset_arch}.AppImage', 'sha256')]
                 for arch, asset_arch in [('x86_64', 'x86_64'), ('aarch64', 'arm64')]
             },
         })
@@ -593,7 +743,7 @@ class T3CodeHookTest(unittest.TestCase):
         self.assertEqual(len((self.root / 'requests').read_text().splitlines()), 1)
 
     def test_incomplete_or_mismatched_arm_release_reports_no_update(self):
-        for bad_feed in ('', 'version: 0.0.43\npath: T3-Code-0.0.42-arm64.AppImage\n',
+        for bad_feed in ('', 'version: 0.0.43\npath: T3-Code-arm64.AppImage\n',
                          'version: 0.0.42\npath: renamed.AppImage\n'):
             with self.subTest(feed=bad_feed):
                 self.arm_feed.write_text(bad_feed)
@@ -606,10 +756,165 @@ class T3CodeHookTest(unittest.TestCase):
         self.assertEqual(result.stdout, '')
 
     def test_missing_arm_asset_reports_no_update(self):
-        (self.root / 'T3-Code-0.0.42-arm64.AppImage').unlink()
+        (self.root / 'T3-Code-arm64.AppImage').unlink()
         result = self.run_hook()
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(result.stdout, '')
+
+
+class P1WatchImprovementsTests(unittest.TestCase):
+    def test_github_paginates_monorepo_when_page_one_has_no_matches(self):
+        pages = {
+            'https://api.github.com/repos/example/mono/releases?per_page=100': [
+                {'tag_name': f'other-v{i}.0.0', 'draft': False, 'prerelease': False,
+                 'published_at': '2026-01-01T00:00:00Z', 'assets': []}
+                for i in range(100)
+            ],
+            'https://api.github.com/repos/example/mono/releases?per_page=100&page=2': [
+                {'tag_name': 'desktop-v2.3.4', 'draft': False, 'prerelease': False,
+                 'published_at': '2026-01-01T00:00:00Z', 'assets': []}
+            ],
+        }
+        seen = []
+        class FakeFetch:
+            def json(self, url):
+                seen.append(url)
+                return pages[url]
+        watch = {'github': 'example/mono', 'pattern': r'desktop-v(?P<version>[0-9]+(?:\.[0-9]+)*)'}
+        found = w.discover(watch, FakeFetch())
+        self.assertEqual([r['pkgver'] for r in found], ['2.3.4'])
+        self.assertEqual(len(seen), 2)
+
+    def test_github_stops_on_page_one_when_match_found(self):
+        pages = {
+            'https://api.github.com/repos/example/mono/releases?per_page=100': [
+                {'tag_name': 'desktop-v2.3.4', 'draft': False, 'prerelease': False,
+                 'published_at': '2026-01-01T00:00:00Z', 'assets': []}
+            ] + [
+                {'tag_name': f'other-v{i}.0.0', 'draft': False, 'prerelease': False,
+                 'published_at': '2026-01-01T00:00:00Z', 'assets': []}
+                for i in range(99)
+            ],
+        }
+        seen = []
+        class FakeFetch:
+            def json(self, url):
+                seen.append(url)
+                return pages[url]
+        watch = {'github': 'example/mono', 'pattern': r'desktop-v(?P<version>[0-9]+(?:\.[0-9]+)*)'}
+        found = w.discover(watch, FakeFetch())
+        self.assertEqual([r['pkgver'] for r in found], ['2.3.4'])
+        self.assertEqual(len(seen), 1)
+
+    def test_npm_pattern_transforms_prerelease_and_preserves_published_at(self):
+        class FakeFetch:
+            def json(self, url):
+                return {
+                    'dist-tags': {'latest': '1.0.0-rc.6'},
+                    'time': {'1.0.0-rc.6': '2026-11-20T12:00:00.000Z'},
+                }
+        watch = {
+            'npm': 'cf',
+            'pattern': r'(?P<version>[0-9]+(?:\.[0-9]+)*)(?P<sep>-?)(?P<pre>(?:[a-z]+\.[0-9]+)?)',
+            'version': '{version}{pre}',
+            'variables': {'_npmver': '{version}{sep}{pre}'},
+        }
+        found = w.discover(watch, FakeFetch())
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0]['pkgver'], '1.0.0rc.6')
+        self.assertEqual(found[0]['published_at'], '2026-11-20T12:00:00.000Z')
+        self.assertEqual(found[0]['values']['sep'], '-')
+        self.assertEqual(found[0]['values']['pre'], 'rc.6')
+
+    def test_deb_archive_uses_range_fast_path_without_full_download(self):
+        import io, tarfile
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode='w:gz') as tf:
+            ctrl = b'Package: demo\nVersion: 4.1.13.29\n'
+            info = tarfile.TarInfo('./control')
+            info.size = len(ctrl)
+            tf.addfile(info, io.BytesIO(ctrl))
+        ctrl_tar = buf.getvalue()
+        def ar_member(name, payload):
+            hdr = f"{name:<16}{'0':<12}{'0':<6}{'0':<6}{'100644':<8}{len(payload):<10}`\n".encode()
+            pad = b'\n' if len(payload) % 2 else b''
+            return hdr + payload + pad
+        prefix = b'!<arch>\n' + ar_member('debian-binary', b'2.0\n') + ar_member('control.tar.gz', ctrl_tar)
+        class FakeFetch:
+            def range_bytes(self, url, size=w.DEB_RANGE_BYTES):
+                return prefix
+            def file(self, url):
+                raise AssertionError('full file download must not run when Range prefix contains control.tar')
+        watch = {'archive': 'https://example.test/demo.deb', 'pattern': r'(?m)^Version: (?P<version>[0-9.]+)$'}
+        found = w.discover(watch, FakeFetch())
+        self.assertEqual([r['pkgver'] for r in found], ['4.1.13.29'])
+        # Negative ar member size must return None instead of looping forever.
+        bad_hdr = f"{'debian-binary':<16}{'0':<12}{'0':<6}{'0':<6}{'100644':<8}{'-60':<10}`\n".encode()
+        self.assertIsNone(w.deb_control_from_prefix(b'!<arch>\n' + bad_hdr))
+        # Duplicate control.tar members in prefix must return None (fall back to full parser).
+        dup = b'!<arch>\n' + ar_member('control.tar.gz', ctrl_tar) + ar_member('control.tar.xz', ctrl_tar)
+        self.assertIsNone(w.deb_control_from_prefix(dup))
+
+    def test_deb_range_sync_verifies_full_download_version(self):
+        import io, tarfile, tempfile
+        def make_deb(version):
+            buf = io.BytesIO()
+            with tarfile.open(fileobj=buf, mode='w:gz') as tf:
+                ctrl = f'Package: demo\nVersion: {version}\n'.encode()
+                info = tarfile.TarInfo('./control')
+                info.size = len(ctrl)
+                tf.addfile(info, io.BytesIO(ctrl))
+            ctrl_tar = buf.getvalue()
+            def ar_member(name, payload):
+                hdr = f"{name:<16}{'0':<12}{'0':<6}{'0':<6}{'100644':<8}{len(payload):<10}`\n".encode()
+                return hdr + payload + (b'\n' if len(payload) % 2 else b'')
+            return b'!<arch>\n' + ar_member('debian-binary', b'2.0\n') + ar_member('control.tar.gz', ctrl_tar)
+
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            pkg = td / 'demo'
+            (pkg / '.omarchy').mkdir(parents=True)
+            url = 'https://example.test/demo.deb'
+            (pkg / '.omarchy/package.json').write_text(json.dumps({
+                'source': 'local',
+                'upstream': {'watch': {
+                    'archive': url,
+                    'pattern': r'(?m)^Version: (?P<version>[0-9.]+)$',
+                    'mutable_sources': ['source:0'],
+                }},
+            }))
+            original_recipe = (
+                "pkgname=demo\npkgver=4.1.13.29\npkgrel=1\narch=('x86_64')\n"
+                f"source=('demo.deb::{url}')\nsha256sums=('" + "0" * 64 + "')\n"
+            )
+            (pkg / 'PKGBUILD').write_text(original_recipe)
+
+            deb_30 = make_deb('4.1.13.30')
+            deb_31 = make_deb('4.1.13.31')
+            full_path = td / 'full.deb'
+
+            # Case 1: Range reports 4.1.13.30, full download swapped to 4.1.13.31 -> must fail and keep recipe untouched
+            full_path.write_bytes(deb_31)
+            class SwappedFetch:
+                def range_bytes(self, u, size=w.DEB_RANGE_BYTES):
+                    return deb_30
+                def file(self, u):
+                    return full_path
+            with self.assertRaisesRegex(ValueError, 'mutable deb changed version'):
+                w.sync(pkg, SwappedFetch())
+            self.assertEqual((pkg / 'PKGBUILD').read_text(), original_recipe)
+
+            # Case 2: Range reports 4.1.13.30 and full download matches 4.1.13.30 -> updates cleanly
+            full_path.write_bytes(deb_30)
+            class MatchingFetch:
+                def range_bytes(self, u, size=w.DEB_RANGE_BYTES):
+                    return deb_30
+                def file(self, u):
+                    return full_path
+            result = w.sync(pkg, MatchingFetch())
+            self.assertEqual(result['status'], 'updated')
+            self.assertIn('pkgver=4.1.13.30', (pkg / 'PKGBUILD').read_text())
+            self.assertIn(w.hash_file(full_path, 'sha256'), (pkg / 'PKGBUILD').read_text())
 
 
 if __name__ == '__main__':

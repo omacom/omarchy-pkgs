@@ -5,12 +5,21 @@ name: Open package PRs
 # changes with .github/scripts/package-pr-groups.sh and uploads them as the
 # `package-pins` artifact. This opens or updates one PR per group and arms
 # auto-merge, so every green package lands on its own and only the failures
-# stay open. A single batch PR let one red package hold back every other one
+# stay open. A group marked review (a package with "review": true) opens as a
+# draft and is never armed: a maintainer reads it and marks it ready, and
+# auto-merge-pr.yml lands it once green. A newer update to a reviewed PR first
+# turns it back into a draft with auto-merge off (hold-reviewed-pr.sh). A single batch PR let one red package hold back every other one
 # (#788, #837).
 #
-# Everything goes through the PAT in PKGS_BOT_TOKEN: its pushes build without
-# an approval hold, and a merge made with it starts publish.yml. A merge made
-# with the built-in GITHUB_TOKEN would not publish.
+# The omarchy-pkgs-sync App pushes the branches and opens, updates, drafts
+# and closes the PRs. Its pushes build without an approval hold, which a
+# GITHUB_TOKEN push would get. This workflow never merges with it. Its key is
+# in the bot-sync environment, which only master can use.
+#
+# The omarchy-pkgs-merge App arms auto-merge, in the arm job: GitHub merges
+# as whoever armed it, and a merge made with the built-in GITHUB_TOKEN would
+# not start publish.yml. Its key is in the bot-merge environment. A job has
+# one environment, so no job here holds both Apps.
 
 on:
   workflow_call:
@@ -28,7 +37,7 @@ on:
         required: true
         type: string
       body:
-        description: 'PR body'
+        description: 'PR body used when the generated description cannot be written'
         required: true
         type: string
       report-package-failures:
@@ -36,16 +45,87 @@ on:
         type: boolean
         default: false
     secrets:
-      PKGS_BOT_TOKEN:
+      # An environment secret reaches a called workflow only when the caller
+      # passes it by name. The jobs here name bot-sync, so they get its value,
+      # and only on master. A caller that forgets it fails here, not silently.
+      PKGS_SYNC_APP_KEY:
+        required: true
+      PKGS_MERGE_APP_KEY:
         required: true
 
 permissions:
   contents: read
+  pull-requests: read
+  checks: read
+  statuses: read
 
 jobs:
-  pr:
+  # Writes each PR's description with helpers/sync-pr-body.py. Reading a
+  # recipe means sourcing it in bash, so that happens here, in a job that holds
+  # nothing able to write: the jobs that push, open PRs and arm auto-merge never
+  # run recipe code. A failure or a timeout here only costs the descriptions.
+  describe:
     if: ${{ inputs.groups != '[]' }}
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    continue-on-error: true
+    permissions:
+      contents: read
+    outputs:
+      artifact-id: ${{ steps.upload.outputs.artifact-id }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Fetch the pins
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: package-pins
+          path: ${{ runner.temp }}
+
+      # One description per PR, keyed like the result records below. The
+      # read-only token is for GitHub's API (release notes); the script gives
+      # recipes an empty environment. A group that fails costs only its own
+      # description.
+      - name: Write each PR's description
+        env:
+          GROUPS_JSON: ${{ inputs.groups }}
+          UPSTREAM_GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/pr-descriptions"
+          while IFS=$'\t' read -r branch packages review; do
+            read -r -a names <<<"$packages"
+            key=$(printf '%s\n' "$branch" | sha256sum | cut -d' ' -f1)
+            args=()
+            [[ $review == true ]] && args+=(--review)
+            # shellcheck disable=SC2046 # one --include argument per package
+            if ! { git apply $(printf -- '--include=pkgbuilds/%s/* ' "${names[@]}") "$RUNNER_TEMP/pins.patch" &&
+                timeout 120 python3 helpers/sync-pr-body.py "${args[@]}" "${names[@]}" > "$RUNNER_TEMP/pr-descriptions/$key.md"; }; then
+              echo "::warning::No description for $branch; it opens with the plain one"
+              rm -f "$RUNNER_TEMP/pr-descriptions/$key.md"
+            fi
+            git checkout -q -- pkgbuilds || true
+            git clean -qfd -- pkgbuilds || true
+          done < <(jq -r '.[] | [.branch, .packages, (.review == true | tostring)] | @tsv' <<<"$GROUPS_JSON")
+
+      - name: Upload the descriptions
+        id: upload
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: pr-descriptions
+          path: ${{ runner.temp }}/pr-descriptions/*.md
+          if-no-files-found: ignore
+          retention-days: 1
+
+  pr:
+    needs: describe
+    if: ${{ !cancelled() && inputs.groups != '[]' }}
+    runs-on: ubuntu-latest
+    environment:
+      name: bot-sync
+      deployment: false
     strategy:
       fail-fast: false
       max-parallel: 4
@@ -77,7 +157,7 @@ jobs:
           # shellcheck disable=SC2046 # one --include argument per package
           git apply $(printf -- '--include=pkgbuilds/%s/* ' "${packages[@]}") "$RUNNER_TEMP/pins.patch"
           git status --porcelain
-          field() { sed -n "s/^$2=//p" "pkgbuilds/$1/PKGBUILD" | head -1 | tr -d "\"'"; }
+          field() { sed -n "/^$2=/{s/^$2=//p;q;}" "pkgbuilds/$1/PKGBUILD" | tr -d "\"'"; }
           versions=$(for package in "${packages[@]}"; do
             printf '%s %s-%s, ' "$package" "$(field "$package" pkgver)" "$(field "$package" pkgrel)"
           done)
@@ -85,38 +165,96 @@ jobs:
           echo "title=$title" >> "$GITHUB_OUTPUT"
           echo "- $title" >> "$GITHUB_STEP_SUMMARY"
 
+      # The description comes from this run's describe job, by artifact ID.
+      # Without a clean download of it, the PR opens with the caller's body.
+      - name: Fetch the PR descriptions
+        id: descriptions
+        if: ${{ steps.apply.outcome == 'success' && needs.describe.outputs.artifact-id != '' }}
+        continue-on-error: true
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          artifact-ids: ${{ needs.describe.outputs.artifact-id }}
+          # Without it, a download by ID lands in a subdirectory named after
+          # the artifact, where the next step would not find the file.
+          merge-multiple: true
+          path: ${{ runner.temp }}/pr-descriptions
+
+      - name: Choose this PR's description
+        if: ${{ steps.apply.outcome == 'success' }}
+        env:
+          BRANCH: ${{ matrix.group.branch }}
+          FALLBACK: ${{ inputs.body }}
+          DOWNLOADED: ${{ steps.descriptions.outcome == 'success' }}
+        run: |
+          key=$(printf '%s\n' "$BRANCH" | sha256sum | cut -d' ' -f1)
+          described="$RUNNER_TEMP/pr-descriptions/$key.md"
+          if [[ $DOWNLOADED == true && -s $described ]]; then
+            cp "$described" "$RUNNER_TEMP/pr-body.md"
+          else
+            echo "::warning::No generated description for $BRANCH; using the plain one"
+            printf '%s\n' "$FALLBACK" > "$RUNNER_TEMP/pr-body.md"
+          fi
+
+      # One token per job, valid for an hour and revoked when the job ends.
+      # A failure here is a setup failure, not a package's, so it fails the job.
+      - name: Get the sync App's token
+        id: app
+        if: ${{ steps.apply.outcome == 'success' }}
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ vars.PKGS_SYNC_APP_CLIENT_ID }}
+          private-key: ${{ secrets.PKGS_SYNC_APP_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
+
+      # Skip force-pushing an open PR that already carries the exact same
+      # package files (or a maintainer's manual fix at the same version), so
+      # broken PRs do not re-trigger builds every six hours.
+      - name: Check whether the PR needs an update
+        id: should_push
+        if: ${{ steps.apply.outcome == 'success' }}
+        continue-on-error: ${{ inputs.report-package-failures }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BRANCH: ${{ matrix.group.branch }}
+          PACKAGES: ${{ matrix.group.packages }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          read -r -a packages <<<"$PACKAGES"
+          out=$(.github/scripts/should-push-pr.sh "$BRANCH" "${packages[@]}")
+          printf '%s\n' "$out"
+          printf '%s\n' "$out" >> "$GITHUB_OUTPUT"
+
+      # A reviewed PR the owner already marked ready (and auto-merge-pr.yml
+      # armed) would otherwise take a newer update and land it unreviewed.
+      - name: Hold an existing reviewed PR as a draft
+        id: hold
+        if: ${{ steps.apply.outcome == 'success' && steps.should_push.outputs.push == 'true' && matrix.group.review == true }}
+        continue-on-error: ${{ inputs.report-package-failures }}
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          BRANCH: ${{ matrix.group.branch }}
+          PACKAGES: ${{ matrix.group.packages }}
+        run: |
+          read -r -a packages <<<"$PACKAGES"
+          .github/scripts/hold-reviewed-pr.sh "$BRANCH" "${packages[@]}"
+
       - name: Open or update the PR
         id: pr
-        if: ${{ steps.apply.outcome == 'success' }}
+        if: ${{ steps.apply.outcome == 'success' && steps.should_push.outputs.push == 'true' && steps.hold.outcome != 'failure' }}
         continue-on-error: ${{ inputs.report-package-failures }}
         uses: peter-evans/create-pull-request@3ffccacd46053766916f087ce41d627c0b8cf2d1 # v8.1.3
         with:
-          token: ${{ secrets.PKGS_BOT_TOKEN }}
+          token: ${{ steps.app.outputs.token }}
+          author: omarchy-pkgs-sync[bot] <361282032+omarchy-pkgs-sync[bot]@users.noreply.github.com>
+          committer: omarchy-pkgs-sync[bot] <361282032+omarchy-pkgs-sync[bot]@users.noreply.github.com>
           commit-message: ${{ steps.apply.outputs.title }}
           title: ${{ steps.apply.outputs.title }}
-          body: ${{ inputs.body }}
+          body-path: ${{ runner.temp }}/pr-body.md
           branch: ${{ matrix.group.branch }}
           delete-branch: true
           labels: automated
-
-      # Auto-merge, not a direct merge: branch protection still has to see
-      # `result`, `self-tests` and `build-isolation` green. auto-merge-pr.yml
-      # may arm the same PR at the same moment; either one arming it is the
-      # outcome wanted.
-      - name: Enable auto-merge
-        id: merge
-        if: ${{ steps.pr.outcome == 'success' && steps.pr.outputs.pull-request-number != '' }}
-        continue-on-error: ${{ inputs.report-package-failures }}
-        env:
-          GH_TOKEN: ${{ secrets.PKGS_BOT_TOKEN }}
-          PR: ${{ steps.pr.outputs.pull-request-number }}
-        run: |
-          armed() { [[ "$(gh pr view "$PR" -R "$GITHUB_REPOSITORY" --json autoMergeRequest --jq '.autoMergeRequest != null')" == true ]]; }
-          if armed; then
-            echo "auto-merge already enabled on #$PR"
-            exit 0
-          fi
-          gh pr merge --auto --merge "$PR" -R "$GITHUB_REPOSITORY" || armed
+          draft: ${{ matrix.group.review == true }}
 
       # Step outcomes retain failures even when continue-on-error lets the
       # batch finish green. Artifacts preserve every matrix leg's result;
@@ -134,11 +272,15 @@ jobs:
           key=$(jq -r '.branch' <<< "$GROUP_JSON" | sha256sum | cut -d' ' -f1)
           echo "key=$key" >> "$GITHUB_OUTPUT"
           jq -n --argjson group "$GROUP_JSON" --argjson steps "$STEPS_JSON" '
+            ($steps.should_push.outputs.push // "") as $push |
             $group + {
               apply: ($steps.apply.outcome // "skipped"),
-              pr: ($steps.pr.outcome // "skipped"),
-              merge: ($steps.merge.outcome // "skipped"),
-              number: ($steps.pr.outputs["pull-request-number"] // "")
+              token: ($steps.app.outcome // "skipped"),
+              should_push: ($steps.should_push.outcome // "skipped"),
+              hold: ($steps.hold.outcome // "skipped"),
+              pr: (if $push == "false" then "unchanged" else ($steps.pr.outcome // "skipped") end),
+              pr_operation: (if $push == "false" then "none" else ($steps.pr.outputs["pull-request-operation"] // "") end),
+              number: (if $push == "false" then ($steps.should_push.outputs.pr // "") else ($steps.pr.outputs["pull-request-number"] // "") end)
             }
           ' > "$RUNNER_TEMP/package-pr-results/$key.json"
 
@@ -152,27 +294,203 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
-  # A PR on this lane's prefix that the run did not refresh, and that
-  # conflicts with master, is stale: master moved its packages on without it.
-  # Close it rather than leave a red PR behind. Not being refreshed is not
-  # enough on its own, since a feed that failed this run (one of dozens timing
-  # out is routine) leaves a still-valid PR unrefreshed too. The lane's old
-  # batch PR, on the bare prefix, is retired outright.
+  # Arms auto-merge on this run's PRs with the merge App, by the rule
+  # auto-merge-pr.yml uses (.github/scripts/auto-merge-pr.cjs). Auto-merge,
+  # not a direct merge: branch protection still has to see `result`,
+  # `self-tests` and `build-isolation` green. auto-merge-pr.yml may arm a PR
+  # first; either one arming it is the outcome wanted. Each run re-arms a PR
+  # an earlier run left unarmed, and its outcome reaches the sync summary.
+  # A reviewed group stays a draft and is never armed here: auto-merge-pr.yml
+  # arms it once a maintainer marks it ready.
+  #
+  # Nothing from the PR jobs decides what is armed: each group's PR is looked
+  # up and judged again here, from GitHub, with the default branch's code.
+  arm:
+    needs: pr
+    if: ${{ !cancelled() && inputs.groups != '[]' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment:
+      name: bot-merge
+      deployment: false
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+
+      - name: Get a read-only token from the merge App
+        id: read
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ vars.PKGS_MERGE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.PKGS_MERGE_APP_KEY }}
+          permission-contents: read
+          permission-pull-requests: read
+
+      - name: Judge each group's PR
+        id: plan
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          GROUPS_JSON: ${{ inputs.groups }}
+        with:
+          github-token: ${{ steps.read.outputs.token }}
+          script: |
+            const { readFileSync, writeFileSync } = require('fs');
+            const { planArms } = require('./.github/scripts/auto-merge-pr.cjs');
+            const plan = await planArms({ github, context, core,
+              groups: JSON.parse(process.env.GROUPS_JSON),
+              vouched: readFileSync('.github/VOUCHED.td', 'utf8') });
+            writeFileSync(`${process.env.RUNNER_TEMP}/arm-plan.json`, JSON.stringify(plan));
+            core.setOutput('enable', String(plan.some(entry => entry.action === 'enable')));
+
+      - name: Get the merge App's token
+        id: app
+        if: ${{ steps.plan.outputs.enable == 'true' }}
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ vars.PKGS_MERGE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.PKGS_MERGE_APP_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
+
+      # --match-head-commit holds GitHub to the head the plan judged. One PR
+      # that cannot be armed does not stop the others, and a failed lookup is
+      # a failure, never "not armed". Anything but success fails this job
+      # when there is no sync summary to report it.
+      - name: Arm auto-merge on each PR
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          REPORT: ${{ inputs.report-package-failures }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/armed"
+          rows=$(jq -r '.[] | [.branch, .number, (.action // ""), (.head_sha // ""), (.base // ""), (.method // ""), (.outcome // ""), (.reason // "")] | map(tostring | gsub("[\u001f\n]"; " ")) | join("\u001f")' "$RUNNER_TEMP/arm-plan.json")
+          outcomes='{}'
+          failed=0
+          # Fields split on the unit separator, not a tab: bash merges runs of
+          # tabs, which would shift every field after an empty one.
+          while IFS=$'\x1f' read -r branch number action sha base method outcome reason; do
+            [[ -n $branch ]] || continue
+            if [[ $action == enable ]]; then
+              [[ $method == merge ]] || method=squash
+              # The PR as judged, read again right before the write: gh merges
+              # at once a PR that is already green, so nothing may have moved.
+              if ! [[ $number =~ ^[1-9][0-9]*$ && $sha =~ ^[0-9a-f]{40}$ && -n $base ]]; then
+                outcome=failure reason="bad plan entry"
+              elif ! facts=$(gh pr view "$number" -R "$GITHUB_REPOSITORY" --json state,isDraft,baseRefName,headRefOid,autoMergeRequest \
+                --jq '"\(.state) \(.isDraft) \(.baseRefName) \(.headRefOid) \(.autoMergeRequest != null)"'); then
+                outcome=failure reason="could not read the PR"
+              elif [[ ${facts%% *} == MERGED ]]; then
+                outcome=success reason="merged"
+              elif [[ ${facts% *} != "OPEN false $base $sha" ]]; then
+                outcome=failure reason="moved since it was judged: ${facts% *}"
+              elif [[ ${facts##* } == true ]] ||
+                gh pr merge --auto "--$method" --match-head-commit "$sha" "$number" -R "$GITHUB_REPOSITORY" ||
+                [[ "$(gh pr view "$number" -R "$GITHUB_REPOSITORY" --json autoMergeRequest --jq '.autoMergeRequest != null' || true)" == true ]]; then
+                outcome=success reason=""
+              else
+                outcome=failure reason="gh pr merge failed"
+              fi
+            fi
+            if [[ $outcome != success ]]; then
+              failed=1
+              echo "::warning::Could not enable auto-merge on #$number ($branch): $outcome, $reason"
+            fi
+            outcomes=$(jq -c --arg branch "$branch" --arg number "$number" --arg outcome "$outcome" --arg reason "$reason" \
+              '. + {($branch): {number: $number, outcome: $outcome, reason: $reason}}' <<<"$outcomes")
+          done <<<"$rows"
+          printf '%s\n' "$outcomes" > "$RUNNER_TEMP/armed/armed.outcomes"
+          if [[ $failed == 1 && $REPORT != true ]]; then exit 1; fi
+
+      - name: Upload the auto-merge outcomes
+        if: ${{ !cancelled() && inputs.report-package-failures }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: package-pr-result-armed
+          path: ${{ runner.temp }}/armed/armed.outcomes
+          overwrite: true
+          if-no-files-found: error
+          retention-days: 1
+
+  # A PR on this lane's prefix that the run did not refresh is stale if it
+  # conflicts with master or if merging it into master would be a no-op (the
+  # exact same edits already landed on master). Close it rather than leave an
+  # orphaned or red PR behind. Not being refreshed is not enough on its own,
+  # since a feed that failed this run (one of dozens timing out is routine)
+  # leaves a still-valid PR unrefreshed too. The lane's old batch PR, on the
+  # bare prefix, is retired outright.
   close-superseded:
     runs-on: ubuntu-latest
+    environment:
+      name: bot-sync
+      deployment: false
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Get the sync App's token
+        id: app
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ vars.PKGS_SYNC_APP_CLIENT_ID }}
+          private-key: ${{ secrets.PKGS_SYNC_APP_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
+
       - name: Close superseded PRs
         env:
-          GH_TOKEN: ${{ secrets.PKGS_BOT_TOKEN }}
+          GH_TOKEN: ${{ steps.app.outputs.token }}
           GROUPS_JSON: ${{ inputs.groups }}
           PREFIX: ${{ inputs.prefix }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
-          gh pr list -R "$GITHUB_REPOSITORY" --state open --limit 500 --json number,headRefName,mergeable \
-            --jq '.[] | select(.headRefName == env.PREFIX or (.headRefName | startswith(env.PREFIX + "-"))) | "\(.number) \(.headRefName) \(.mergeable)"' |
-          while read -r number branch mergeable; do
+          set -o pipefail
+          owner=${GITHUB_REPOSITORY%%/*}
+          name=${GITHUB_REPOSITORY#*/}
+          master_tree=$(git rev-parse 'HEAD^{tree}')
+          # Paginate through every open PR: gh pr list truncates at 500
+          # once the repository exceeds 500 open PRs.
+          # shellcheck disable=SC2016
+          gh api graphql --paginate -f owner="$owner" -f name="$name" -f query='
+            query($owner: String!, $name: String!, $endCursor: String) {
+              repository(owner: $owner, name: $name) {
+                pullRequests(states: OPEN, first: 100, after: $endCursor) {
+                  nodes { number headRefName baseRefName headRefOid mergeable headRepository { nameWithOwner } }
+                  pageInfo { hasNextPage endCursor }
+                }
+              }
+            }' --jq '.data.repository.pullRequests.nodes[] | select(.baseRefName == env.DEFAULT_BRANCH and .headRepository.nameWithOwner == env.GITHUB_REPOSITORY and (.headRefName == env.PREFIX or (.headRefName | startswith(env.PREFIX + "-")))) | "\(.number) \(.headRefName) \(.headRefOid) \(.mergeable)"' |
+          while read -r number branch head_oid mergeable; do
             jq -e --arg branch "$branch" 'any(.[]; .branch == $branch)' <<<"$GROUPS_JSON" >/dev/null && continue
-            [[ $branch == "$PREFIX" || $mergeable == CONFLICTING ]] || continue
-            echo "closing #$number ($branch): superseded"
+            reason=""
+            if [[ $branch == "$PREFIX" ]]; then
+              reason="retired batch branch"
+            elif [[ $mergeable == CONFLICTING ]]; then
+              reason="conflicts with $DEFAULT_BRANCH"
+            elif git fetch -q --no-tags origin "$head_oid"; then
+              rc=0
+              tree=$(git merge-tree --write-tree HEAD FETCH_HEAD 2>/dev/null) || rc=$?
+              if (( rc == 0 )); then
+                [[ "${tree%%$'\n'*}" == "$master_tree" ]] || continue
+                reason="already landed on $DEFAULT_BRANCH"
+              elif (( rc == 1 )); then
+                reason="conflicts with $DEFAULT_BRANCH"
+              else
+                echo "::warning::git merge-tree failed for #$number ($branch) with exit $rc; skipping"
+                continue
+              fi
+            else
+              continue
+            fi
+            # Re-verify PR state, base, and head SHA immediately before closing
+            # so a concurrent push or retarget is never closed or deleted.
+            live=$(gh pr view "$number" -R "$GITHUB_REPOSITORY" --json state,baseRefName,headRefOid               --jq '"\(.state) \(.baseRefName) \(.headRefOid)"' 2>/dev/null) || continue
+            [[ "$live" == "OPEN $DEFAULT_BRANCH $head_oid" ]] || continue
+            echo "closing #$number ($branch): superseded ($reason)"
             gh pr close "$number" -R "$GITHUB_REPOSITORY" --delete-branch \
               --comment "Superseded: master has moved these packages on, or per-package PRs carry them now."
           done

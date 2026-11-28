@@ -16,20 +16,16 @@ ALSA lib main.c:1814:(snd_use_case_mgr_open) [error.ucm] failed to import hw:0 (
 
 and PipeWire offers no speakers, microphones or headset.
 
-The board has the A14's audio layout: two WSA884x speakers, two DMICs on the VA macro, a WCD938x headset jack and three DP/HDMI outputs. This package links the card's long name to the ThinkPad T14s profile, the one alsa-ucm-conf gives the A14:
+The board has the A14's audio layout: two WSA884x speakers, two DMICs on the VA macro, a WCD938x headset jack and three DP/HDMI outputs.
 
-- `/usr/share/alsa/ucm2/conf.d/x1e80100/ASUSTeKCOMPUTERINC.-Zenbook14UX3480QA-1.0-UX3480QA.conf` → `Qualcomm/x1e80100/LENOVO-T14s.conf` (alsa-ucm-conf)
-- `/usr/share/alsa/ucm2/conf.d/x1e80100/ASUSTeKCOMPUTERINC.-Zenbook14UX3480QAB-1.0-UX3480QAB.conf`, the same link for the UX3480QAB, whose product and board names end in B
+- `/usr/share/alsa/ucm2/conf.d/x1e80100/ASUSTeKCOMPUTERINC.-Zenbook14UX3480QA-1.0-UX3480QA.conf` (and the matching `UX3480QAB` path): the ThinkPad T14s profile (`Qualcomm/x1e80100/LENOVO-T14s.conf`, alsa-ucm-conf, Syntax 6) restated, plus a `FixedBootSequence` that sets `WSA WSA_RX0 Digital Volume` and `WSA WSA_RX1 Digital Volume` to `100%`, the kernel's ceiling, on every boot: `84` (`0 dB`) with `linux-omarchy-aarch64`'s raised limit, `81` (`-3 dB`) without it. A level saved under an older, lower kernel ceiling would otherwise stick in `/var/lib/alsa/asound.state`, and with software volume nothing else moves them.
+- `/usr/share/wireplumber/wireplumber.conf.d/60-asus-zenbook-14-ux3480qa-soft-volume.conf`: sets `api.alsa.soft-mixer = true` for this card.
 
-It is a symlink, as alsa-ucm-conf's own `conf.d` entries are, so UCM reads the T14s profile as the top-level file with its own `Syntax`. pkgrel 1 installed a wrapper with `Syntax 4` that included it. Once alsa-ucm-conf d260eed gave the T14s profile `Syntax 6` (its mic LED macros), UCM rejected the card:
+## Volume
 
-```
-ALSA lib parser.c:473:(evaluate_define_macro) [error.ucm] DefineMacro is supported in v6+ syntax
-ALSA lib main.c:1805:(snd_use_case_mgr_open) [error.ucm] failed to import hw:0 use case configuration -22
-```
-
-UCM looks up `conf.d/<driver>/<long name>.conf` before the driver's own profile. The kernel builds the long name from DMI (`board_vendor-product_name-product_version-board_name`, stripped of spaces).
+UCM merges the two amplifiers' `PA Volume` controls into `Speakers Volume`, which PipeWire uses as the speakers' hardware volume and fills out with software attenuation below it. On this board `PA Volume` does not change the output: measured with the built-in DMICs at 1 kHz, levels matched within `0.04 dB` across PA `1`, `3`, and `6` (`-36.80` / `-36.77` / `-36.76 dBFS`), and within `0.01 dB` with the compander disabled, while a 3 dB digital step (`81 -> 78`) dropped output by `2.96 dB`. Roughly the top 30% of the volume slider therefore did nothing. Switching the card to `api.alsa.soft-mixer = true` lets PipeWire scale the full range smoothly in software while UCM holds the WSA digital path at the kernel's ceiling.
 
 ## Retirement
 
-Drop once alsa-ucm-conf's x1e80100 DMI match covers the UX3480QA.
+- UCM profile: drop once `alsa-ucm-conf` matches `Zenbook 14-UX3480QA` / `UX3480QAB` and sets the WSA digital volumes on every boot.
+- WirePlumber rule: drop once `PA Volume` changes the output on this board, or UCM stops using it as the speakers' volume.

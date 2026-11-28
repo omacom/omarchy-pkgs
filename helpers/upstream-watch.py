@@ -5,21 +5,28 @@ The watch selects release metadata. Sources, supported architectures, integrity
 algorithms and packaging behavior stay in the checked-in PKGBUILD. Only release
 scalars and checksum arrays are replaced, atomically, after every source passes.
 """
-import argparse
-import datetime as dt
-import gzip
-import hashlib
 import io
 import json
 import os
+import posixpath
 from pathlib import Path
 import re
-import subprocess
 import sys
-import tarfile
-import tempfile
 from urllib.parse import quote, urlsplit
-import zipfile
+
+_FAST_VALIDATE = (__name__ == "__main__" and len(sys.argv) == 3 and sys.argv[1] == "validate")
+if not _FAST_VALIDATE:
+    import argparse
+    import datetime as dt
+    import gzip
+    import hashlib
+    import lzma
+    import stat
+    import subprocess
+    import tarfile
+    import tempfile
+    import zipfile
+    import zlib
 
 PROVIDERS = {"github", "git_tags", "git_branch", "npm", "pypi", "debian", "json", "regex", "archive", "redirect"}
 VERSION = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+]*\Z")
@@ -28,10 +35,13 @@ SUM = re.compile(r"(md5|sha1|sha224|sha256|sha384|sha512|b2)sums(_[a-z0-9_]+)?\Z
 HASHES = {"b2": "blake2b"}
 # How many times a redirect watch probes before it calls the feed unmatched.
 REDIRECT_PROBES = 5
+GITHUB_MAX_PAGES = 5
+DEB_RANGE_BYTES = 65536
 
 
 def run(args, **kwargs):
-    return subprocess.check_output(args, **kwargs)
+    import subprocess as _sp
+    return _sp.check_output(args, **kwargs)
 
 
 def vercmp(a, b):
@@ -78,6 +88,42 @@ class Fetcher:
     def json(self, url):
         return json.loads(self.text(url))
 
+    def range_bytes(self, url, size=DEB_RANGE_BYTES):
+        """Fetch the first `size` bytes of `url` via HTTP Range, returning None
+        if the server does not honor Range with a valid 206 bytes 0-... response."""
+        https(url)
+        scratch = self.cache / f"range.{os.getpid()}.tmp"
+        headers = self.cache / f"range.{os.getpid()}.hdr"
+        try:
+            proc = subprocess.run(
+                ["curl", "--http1.1", "--proto", "=https", "--proto-redir", "=https",
+                 "-sSL", "--connect-timeout", "20", "--max-time", "30", "--retry", "2",
+                 "--max-filesize", str(size * 2), "-r", f"0-{size - 1}",
+                 "-D", str(headers), "-o", str(scratch), "-w", "%{http_code}", url],
+                capture_output=True, text=True,
+            )
+            if proc.returncode != 0 or proc.stdout.strip() != "206":
+                return None
+            # Check Content-Range on the final HTTP response block (after redirects).
+            raw_hdrs = headers.read_text(errors="replace").replace("\r\n", "\n")
+            blocks = [b for b in re.split(r"\n\n+", raw_hdrs.strip()) if b.strip()]
+            final_hdr = blocks[-1] if blocks else ""
+            cr_matches = re.findall(r"(?im)^content-range:\s*bytes\s+0-([0-9]+)/([0-9]+|\*)\s*$", final_hdr)
+            if len(cr_matches) != 1:
+                return None
+            end_byte = int(cr_matches[0][0])
+            total = cr_matches[0][1]
+            if total != "*" and int(total) <= end_byte:
+                return None
+            expected_len = end_byte + 1
+            data = scratch.read_bytes()
+            if not data or len(data) != expected_len or len(data) > size:
+                return None
+            return data
+        finally:
+            scratch.unlink(missing_ok=True)
+            headers.unlink(missing_ok=True)
+
 
 def validate(watch):
     if not isinstance(watch, dict) or len(PROVIDERS & watch.keys()) != 1:
@@ -86,7 +132,7 @@ def validate(watch):
     allowed = PROVIDERS | {"pattern", "path", "package", "branch", "variables", "fields",
                            "submodules", "allow_prerelease", "unescape_json", "filenames",
                            "sequence", "version", "revision", "revision_variable",
-                           "mutable_sources", "member", "dist_tag", "tag_pattern"}
+                           "mutable_sources", "member", "dist_tag", "tag_pattern", "source_variables"}
     if watch.keys() - allowed:
         raise ValueError(f"unknown watch fields: {sorted(watch.keys() - allowed)}")
     value = watch[provider]
@@ -154,6 +200,21 @@ def validate(watch):
         name = watch["revision_variable"]
         if not isinstance(name, str) or name not in watch.get("variables", {}) or not watch.get("revision"):
             raise ValueError("revision_variable requires a declared variable and revision template")
+    sourced = watch.get("source_variables", {})
+    if not isinstance(sourced, dict):
+        raise ValueError("watch.source_variables must map recipe variables to source files")
+    for name, spec in sourced.items():
+        if (not re.fullmatch(r"_[a-z][a-z0-9_]*", name) or not isinstance(spec, dict)
+                or spec.keys() != {"source", "member", "pattern"}
+                or not all(isinstance(v, str) and v for v in spec.values())
+                or not re.fullmatch(r"source(?:_[a-z0-9_]+)?:[0-9]+", spec["source"])
+                or posixpath.normpath(spec["member"]) != spec["member"]
+                or spec["member"].startswith(("/", "../")) or spec["member"] in {".", ".."}):
+            raise ValueError(f"invalid watch.source_variables.{name}")
+        if "value" not in re.compile(spec["pattern"]).groupindex:
+            raise ValueError(f"watch.source_variables.{name} pattern needs a named value group")
+    if sourced.keys() & (watch.get("variables", {}).keys() | watch.get("submodules", {}).keys()):
+        raise ValueError("a source variable cannot also be a release variable or submodule")
     for field in ("mutable_sources",):
         entries = watch.get(field, [])
         if not isinstance(entries, list) or any(not isinstance(v, str) or not re.fullmatch(r"source(?:_[a-z0-9_]+)?:[0-9]+", v) for v in entries):
@@ -248,20 +309,78 @@ def git_branch_tip(url, branch, tag_pattern, cache, min_age=0):
     return values
 
 
+def is_ar_archive(path):
+    with path.open("rb") as fh:
+        return fh.read(8) == b"!<arch>\n"
+
+
+def read_deb_control(control_tar_bytes):
+    # Use Python's tarfile exclusively (never bsdtar) so untrusted bytes
+    # cannot be interpreted as a libarchive mtree manifest with contents=.
+    with tarfile.open(fileobj=io.BytesIO(control_tar_bytes)) as archive:
+        members = [m for m in archive if m.name.removeprefix("./") == "control"]
+        if len(members) != 1 or not members[0].isfile() or members[0].size > DEB_RANGE_BYTES:
+            raise ValueError("deb control file is missing, non-regular, oversized, or ambiguous")
+        data = archive.extractfile(members[0]).read(DEB_RANGE_BYTES + 1)
+        if len(data) > DEB_RANGE_BYTES:
+            raise ValueError("deb control file exceeds size limit")
+        return data.decode()
+
+
+def deb_control_from_prefix(prefix):
+    """Extract the Debian control file from an HTTP Range prefix of a .deb ar archive.
+    Returns None if control.tar.* is missing, truncated, malformed, or ambiguous."""
+    pos = 8
+    found = []
+    while pos + 60 <= len(prefix):
+        hdr = prefix[pos:pos + 60]
+        if hdr[58:60] != b"`\n":
+            return None
+        name = hdr[:16].decode("ascii", "replace").strip().rstrip("/")
+        raw_size = hdr[48:58].decode("ascii", "replace").strip()
+        if not raw_size.isascii() or not raw_size.isdigit():
+            return None
+        size = int(raw_size)
+        data_start = pos + 60
+        data_end = data_start + size
+        if name.startswith("control.tar"):
+            if data_end > len(prefix):
+                return None
+            found.append(prefix[data_start:data_end])
+            if len(found) > 1:
+                return None
+        if data_end > len(prefix):
+            break
+        pos = data_end + (size % 2)
+    if len(found) != 1:
+        return None
+    try:
+        return read_deb_control(found[0])
+    except (tarfile.TarError, UnicodeDecodeError, ValueError):
+        return None
+
+
 def discover(watch, fetch, min_age=0):
     provider = validate(watch)
     feed = watch[provider]
     results = []
     if provider == "github":
-        releases = fetch.json(f"https://api.github.com/repos/{feed}/releases?per_page=100")
-        if not isinstance(releases, list):
-            raise ValueError("GitHub did not return a release list")
-        for release in releases:
-            if release.get("draft") or (release.get("prerelease") and not watch.get("allow_prerelease")):
-                continue
-            for item in matches(watch, release["tag_name"], {"tag": release["tag_name"], "published_at": release["published_at"]}, full=True):
-                item["assets"] = release.get("assets", [])
-                results.append(item)
+        # Stop on page 1 whenever it already yields an eligible release (zero
+        # extra API calls for normal repos); paginate up to GITHUB_MAX_PAGES
+        # only when busy monorepos push matching component releases past 100.
+        for page in range(1, GITHUB_MAX_PAGES + 1):
+            suffix = "" if page == 1 else f"&page={page}"
+            releases = fetch.json(f"https://api.github.com/repos/{feed}/releases?per_page=100{suffix}")
+            if not isinstance(releases, list):
+                raise ValueError("GitHub did not return a release list")
+            for release in releases:
+                if release.get("draft") or (release.get("prerelease") and not watch.get("allow_prerelease")):
+                    continue
+                for item in matches(watch, release["tag_name"], {"tag": release["tag_name"], "published_at": release["published_at"]}, full=True):
+                    item["assets"] = release.get("assets", [])
+                    results.append(item)
+            if len(releases) < 100 or (results and select_release(results, min_age) is not None):
+                break
     elif provider == "git_tags":
         refs = run(["git", "ls-remote", "--tags", feed], text=True)
         tags = {}
@@ -280,7 +399,11 @@ def discover(watch, fetch, min_age=0):
     elif provider == "npm":
         data = fetch.json("https://registry.npmjs.org/" + quote(feed, safe=""))
         version = data["dist-tags"][watch.get("dist_tag", "latest")]
-        results.append(candidate(watch, {"version": version, "published_at": data.get("time", {}).get(version)}))
+        extra = {"published_at": data.get("time", {}).get(version)}
+        if "pattern" in watch:
+            results.extend(matches(watch, version, extra, full=True))
+        else:
+            results.append(candidate(watch, {"version": version, **extra}))
     elif provider == "pypi":
         data = fetch.json(f"https://pypi.org/pypi/{feed}/json")
         version = data["info"]["version"]
@@ -319,31 +442,37 @@ def discover(watch, fetch, min_age=0):
             text = text.replace('\\"', '"')
         results.extend(matches(watch, text))
     elif provider == "archive":
-        file = fetch.file(feed)
-        if zipfile.is_zipfile(file):
-            with zipfile.ZipFile(file) as archive:
-                names = archive.namelist()
-                if watch.get("filenames"):
-                    results.extend(matches(watch, "\n".join(names)))
-                for name in ([] if watch.get("filenames") else names):
-                    if re.fullmatch(watch.get("member", ".*"), name):
-                        results.extend(matches(watch, archive.read(name).decode()))
-        elif file.read_bytes()[:8] == b"!<arch>\n":
-            names = run(["bsdtar", "-tf", str(file)], text=True).splitlines()
-            controls = [name for name in names if name.startswith("control.tar")]
-            if len(controls) != 1:
-                raise ValueError("deb does not contain exactly one control archive")
-            data = run(["bsdtar", "-xOf", str(file), controls[0]])
-            with tarfile.open(fileobj=io.BytesIO(data)) as archive:
-                members = [m for m in archive if m.name.removeprefix("./") == "control"]
-                if len(members) != 1:
-                    raise ValueError("deb control file is missing or ambiguous")
-                results.extend(matches(watch, archive.extractfile(members[0]).read().decode()))
+        control_text = None
+        if urlsplit(feed).path.endswith(".deb") and hasattr(fetch, "range_bytes"):
+            head = fetch.range_bytes(feed, DEB_RANGE_BYTES)
+            if head and head[:8] == b"!<arch>\n":
+                control_text = deb_control_from_prefix(head)
+        if control_text is not None:
+            for item in matches(watch, control_text):
+                item["deb_range_url"] = feed
+                results.append(item)
         else:
-            with tarfile.open(file) as archive:
-                for member in archive:
-                    if member.isfile() and re.fullmatch(watch.get("member", ".*"), member.name):
-                        results.extend(matches(watch, archive.extractfile(member).read().decode()))
+            file = fetch.file(feed)
+            if zipfile.is_zipfile(file):
+                with zipfile.ZipFile(file) as archive:
+                    names = archive.namelist()
+                    if watch.get("filenames"):
+                        results.extend(matches(watch, "\n".join(names)))
+                    for name in ([] if watch.get("filenames") else names):
+                        if re.fullmatch(watch.get("member", ".*"), name):
+                            results.extend(matches(watch, archive.read(name).decode()))
+            elif is_ar_archive(file):
+                names = run(["bsdtar", "-tf", str(file)], text=True).splitlines()
+                controls = [name for name in names if name.startswith("control.tar")]
+                if len(controls) != 1:
+                    raise ValueError("deb does not contain exactly one control archive")
+                data = run(["bsdtar", "-xOf", str(file), controls[0]])
+                results.extend(matches(watch, read_deb_control(data)))
+            else:
+                with tarfile.open(file) as archive:
+                    for member in archive:
+                        if member.isfile() and re.fullmatch(watch.get("member", ".*"), member.name):
+                            results.extend(matches(watch, archive.extractfile(member).read().decode()))
     if not results:
         raise ValueError(f"no matching releases in {feed}")
     return results
@@ -549,6 +678,123 @@ def resolve_release_fields(watch, release, fetch):
     return release
 
 
+class _Slice(io.RawIOBase):
+    """Read at most `size` bytes of `stream` from its current offset."""
+    def __init__(self, stream, size):
+        self.stream, self.left = stream, size
+
+    def readable(self):
+        return True
+
+    def readinto(self, buffer):
+        data = self.stream.read(min(len(buffer), self.left))
+        self.left -= len(data)
+        buffer[:len(data)] = data
+        return len(data)
+
+
+def deb_data(stream):
+    """Position `stream` at a .deb's data.tar.* member and return its size.
+
+    A .deb is a plain ar archive: an 8-byte magic, then a 60-byte header and
+    an even-padded body per member. Parsing it here keeps archive format
+    detection out of libarchive, which also reads mtree manifests that name
+    files on the local disk.
+    """
+    if stream.read(8) != b"!<arch>\n":
+        raise ValueError("not a deb")
+    found = []
+    while header := stream.read(60):
+        if len(header) != 60 or header[58:60] != b"`\n" or not header[48:58].strip().isdigit():
+            raise ValueError("malformed deb member header")
+        name, size = header[:16].decode("ascii", "replace").strip().rstrip("/"), int(header[48:58])
+        if name.startswith("data.tar"):
+            found.append((stream.tell(), size))
+        stream.seek(size + size % 2, os.SEEK_CUR)
+    if len(found) != 1:
+        raise ValueError("deb does not contain exactly one data archive")
+    stream.seek(found[0][0])
+    return found[0][1]
+
+
+def archive_member(file, member, limit=65536):
+    """Read one small file from a zip, a tar or a .deb's data archive.
+
+    Nothing else is extracted and nothing inside runs. A .deb's data.tar.*
+    member holds the installed tree, so its names are paths like
+    ./usr/lib/app/version. Every entry name is normalized the same way
+    (././a and /a both mean a). The member must be exactly one regular file,
+    and its declared size is checked before a byte of it is read. Tar
+    archives stream through Python's tarfile, which decompresses gzip, bzip2,
+    xz and zstd itself and reads no other formats, so a 100 MB .deb is never
+    held in memory.
+    """
+    def same(name):
+        return posixpath.normpath(name).lstrip("/") == member
+
+    if zipfile.is_zipfile(file):
+        with zipfile.ZipFile(file) as archive:
+            entries = [e for e in archive.infolist() if same(e.filename)]
+            if len(entries) != 1:
+                raise ValueError(f"{member} is missing or ambiguous in {file.name}")
+            # Unix-made zips carry the file type; a symlink's body is its target.
+            kind = stat.S_IFMT(entries[0].external_attr >> 16) if entries[0].create_system == 3 else 0
+            if entries[0].is_dir() or kind not in (0, stat.S_IFREG) or entries[0].file_size > limit:
+                raise ValueError(f"{member} in {file.name} is not a regular file of at most {limit} bytes")
+            with archive.open(entries[0]) as stream:
+                return stream.read(limit + 1)[:limit]
+    found = None
+    with open(file, "rb") as raw:
+        is_deb = raw.read(8) == b"!<arch>\n"
+        raw.seek(0)
+        stream = io.BufferedReader(_Slice(raw, deb_data(raw))) if is_deb else raw
+        # tarfile reads zstd from Python 3.14; Debian and vendors use it widely.
+        if stream.peek(4)[:4] == b"\x28\xb5\x2f\xfd" and "zst" not in tarfile.TarFile.OPEN_METH:
+            raise ValueError(f"{file.name} is zstd-compressed; reading it needs Python 3.14 or newer")
+        try:
+            with tarfile.open(fileobj=stream, mode="r|*") as archive:
+                for entry in archive:
+                    if not same(entry.name):
+                        continue
+                    if found is not None:
+                        raise ValueError(f"{member} is ambiguous in {file.name}")
+                    if not entry.isreg() or entry.size > limit:
+                        raise ValueError(f"{member} in {file.name} is not a regular file of at most {limit} bytes")
+                    found = archive.extractfile(entry).read()
+        except (tarfile.TarError, EOFError, lzma.LZMAError, zlib.error) as error:
+            raise ValueError(f"cannot read {file.name} as a tar archive: {error}") from error
+    if found is None:
+        raise ValueError(f"{member} is missing or ambiguous in {file.name}")
+    return found
+
+
+def resolve_source_variables(watch, path, fetch):
+    """Read release variables from files inside the release's own sources.
+
+    Some vendors publish facts a recipe needs only inside the artifact: Slack's
+    .deb names the Electron release it was built on, and its AArch64 package
+    must download exactly that Electron. Reading it here, after the new pkgver
+    is written, keeps the recipe in step without a hand edit per release. The
+    named source must not itself depend on another source variable.
+    """
+    found = {}
+    for name, spec in watch.get("source_variables", {}).items():
+        array, index = spec["source"].split(":")
+        arch = array.removeprefix("source_") if array != "source" else "x86_64"
+        sources = read_recipe(path, arch).get(array, [])
+        if int(index) >= len(sources):
+            raise ValueError(f"source_variables.{name}: {spec['source']} does not exist")
+        url = source_url(sources[int(index)])
+        if not url.startswith("https://"):
+            raise ValueError(f"source_variables.{name} reads only HTTPS sources")
+        text = archive_member(fetch.file(url), spec["member"]).decode().strip()
+        match = re.fullmatch(spec["pattern"], text)
+        if not match or not SCALAR.fullmatch(match["value"]):
+            raise ValueError(f"source_variables.{name}: {spec['member']} does not match its pattern")
+        found[name] = match["value"]
+    return found
+
+
 def sync(package, fetch, min_age=0, check=False):
     metadata = json.loads((package / ".omarchy/package.json").read_text())
     if metadata.get("sync") is False:
@@ -593,6 +839,9 @@ def sync(package, fetch, min_age=0, check=False):
     scratch = path.with_name("PKGBUILD.sync-upstream")
     try:
         scratch.write_text(text)
+        for name, value in resolve_source_variables(watch, scratch, fetch).items():
+            text = replace_scalar(text, name, value)
+        scratch.write_text(text)
         after = read_recipe(scratch)
         if scalar(after, "pkgver") != release["pkgver"] or scalar(after, "pkgrel") != new_pkgrel:
             raise ValueError("recipe did not retain the release version")
@@ -601,6 +850,20 @@ def sync(package, fetch, min_age=0, check=False):
         if before["arch"] != after["arch"]:
             raise ValueError("release changed supported architectures")
         arrays = updated_checksums(before, after, package, fetch, release, watch)
+        if release.get("deb_range_url"):
+            # Re-verify the discovered version against the full cached .deb so a
+            # mid-rollout swap on a mutable URL cannot pair an old pkgver with new bytes.
+            full_file = fetch.file(release["deb_range_url"])
+            if not is_ar_archive(full_file):
+                raise ValueError("mutable deb response is not an ar archive")
+            names = run(["bsdtar", "-tf", str(full_file)], text=True).splitlines()
+            controls = [name for name in names if name.startswith("control.tar")]
+            if len(controls) != 1:
+                raise ValueError("deb does not contain exactly one control archive")
+            full_ctrl = read_deb_control(run(["bsdtar", "-xOf", str(full_file), controls[0]]))
+            full_versions = {item["pkgver"] for item in matches(watch, full_ctrl)}
+            if release["pkgver"] not in full_versions:
+                raise ValueError("mutable deb changed version between range check and full download")
         for name, values in arrays.items():
             text = replace_array(text, name, values)
         scratch.write_text(text)
@@ -639,6 +902,16 @@ def main():
 
 
 if __name__ == "__main__":
+    if _FAST_VALIDATE:
+        try:
+            package = Path(sys.argv[2]).resolve()
+            validate(json.loads((package / ".omarchy/package.json").read_text())["upstream"]["watch"])
+        except Exception as error:
+            if not isinstance(error, (ValueError, KeyError, TypeError, IndexError, re.error, OSError)) and type(error).__name__ != "CalledProcessError":
+                raise
+            print(f"upstream watch failed: {error}", file=sys.stderr)
+            sys.exit(1)
+        sys.exit(0)
     try:
         main()
     except (ValueError, KeyError, TypeError, IndexError, re.error, OSError, subprocess.CalledProcessError) as error:

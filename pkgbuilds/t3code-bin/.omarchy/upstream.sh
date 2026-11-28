@@ -27,7 +27,7 @@ fi
 # The PKGBUILD builds fixed asset names, so a feed naming anything else --
 # a rename, or an arm64 build reaching the Linux feed first -- has to stop the
 # sync rather than pin that file's checksum to a URL nobody will fetch.
-expected="T3-Code-${version}-x86_64.AppImage"
+expected="T3-Code-x86_64.AppImage"
 if [[ "$asset" != "$expected" ]]; then
   echo "Upstream feed names $asset, but the PKGBUILD builds $expected" >&2
   exit 1
@@ -38,8 +38,8 @@ fi
 arm_feed=$(curl -fsSL "$RELEASE_URL/v${version}/latest-linux-arm64.yml")
 arm_version=$(awk '/^version:/ { print $2; exit }' <<<"$arm_feed" | tr -d '"'\''')
 arm_asset=$(awk '/^path:/ { print $2; exit }' <<<"$arm_feed" | tr -d '"'\''')
-if [[ "$arm_version" != "$version" || "$arm_asset" != "T3-Code-${version}-arm64.AppImage" ]]; then
-  echo "Upstream ARM feed does not match T3-Code-${version}-arm64.AppImage" >&2
+if [[ "$arm_version" != "$version" || "$arm_asset" != "T3-Code-arm64.AppImage" ]]; then
+  echo "Upstream ARM feed does not match T3-Code-arm64.AppImage at ${version}" >&2
   exit 1
 fi
 

@@ -1,0 +1,85 @@
+#!/bin/bash
+# Move the NVIDIA driver set to another release, all at once.
+#
+#   bin/bump-nvidia 620.73.04
+#
+# nvidia-utils, nvidia-open-dkms and lib32-nvidia-utils ship the driver, and
+# every linux-omarchy kernel builds its $kernel-nvidia-open modules from the
+# same release (_nvidiaver). tests/nvidia-open-lockstep.sh fails a tree where
+# they disagree, so they only ever move together: this sets the version in all
+# of them, resets the driver pkgrels, bumps the kernels' pkgrel so their
+# modules are rebuilt, and swaps each of NVIDIA's three files' old checksums
+# for the new ones in whichever sha512sums, sha256sums or b2sums array holds
+# them. It downloads those files at both versions to know both checksums.
+#
+# The nvidia-utils sync hook runs this when Arch moves; a maintainer can too.
+set -euo pipefail
+
+ROOT=$(realpath "$(dirname "$0")/..")
+PKGBUILDS=${PKGBUILDS:-$ROOT/pkgbuilds}
+DRIVER=(nvidia-utils nvidia-open-dkms lib32-nvidia-utils)
+KERNELS=(linux-omarchy linux-omarchy-eevdf linux-omarchy-muqss linux-omarchy-aarch64)
+NVIDIA_DOWNLOADS=${NVIDIA_DOWNLOADS:-https://download.nvidia.com/XFree86}
+
+new=${1:?usage: bin/bump-nvidia <version>}
+[[ $new =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ ]] || { echo "bump-nvidia: '$new' is not an NVIDIA version" >&2; exit 1; }
+old=$(sed -n 's/^pkgver=//p' "$PKGBUILDS/nvidia-utils/PKGBUILD")
+[[ $new != "$old" ]] || { echo "bump-nvidia: already at $new" >&2; exit 0; }
+
+files() { # files <version>: NVIDIA's three files for that release
+  echo "Linux-x86_64/$1/NVIDIA-Linux-x86_64-$1.run"
+  echo "Linux-aarch64/$1/NVIDIA-Linux-aarch64-$1.run"
+  echo "NVIDIA-kernel-module-source/NVIDIA-kernel-module-source-$1.tar.xz"
+}
+
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+
+# Every checksum of every old file, followed by the same checksum of its new
+# counterpart, one pair per line.
+mapfile -t old_files < <(files "$old")
+mapfile -t new_files < <(files "$new")
+for i in "${!old_files[@]}"; do
+  for version_file in "${old_files[$i]}" "${new_files[$i]}"; do
+    curl -fsSL --retry 3 -o "$work/file" "$NVIDIA_DOWNLOADS/$version_file"
+    sums=()
+    for sum in sha512sum sha256sum b2sum; do
+      sums+=("$($sum "$work/file" | cut -d' ' -f1)")
+    done
+    printf '%s\n' "${sums[@]}" >>"$work/$i"
+  done
+  paste -d' ' <(head -3 "$work/$i") <(tail -3 "$work/$i") >>"$work/pairs"
+done
+
+# Rewrite copies and check them there, so a failure leaves the tree as it was
+# and the same command can simply run again.
+mkdir -p "$work/recipes"
+for package in "${DRIVER[@]}" "${KERNELS[@]}"; do
+  cp "$PKGBUILDS/$package/PKGBUILD" "$work/recipes/$package"
+  while read -r from to; do
+    sed -i "s/$from/$to/g" "$work/recipes/$package"
+  done <"$work/pairs"
+done
+
+for package in "${DRIVER[@]}"; do
+  sed -i -e "s/^pkgver=$old\$/pkgver=$new/" -e 's/^pkgrel=.*/pkgrel=1/' "$work/recipes/$package"
+done
+for kernel in "${KERNELS[@]}"; do
+  pkgrel=$(sed -n 's/^pkgrel=//p' "$work/recipes/$kernel")
+  sed -i -e "s/^_nvidiaver=$old\$/_nvidiaver=$new/" -e "s/^pkgrel=$pkgrel\$/pkgrel=$((pkgrel + 1))/" "$work/recipes/$kernel"
+done
+
+# Nothing may still name the old release or its files' checksums.
+if grep -lF -e "$old" "$work/recipes"/*; then
+  echo "bump-nvidia: the recipes above still name $old" >&2
+  exit 1
+fi
+if cut -d' ' -f1 "$work/pairs" | grep -lFf - "$work/recipes"/*; then
+  echo "bump-nvidia: the recipes above still carry a checksum of an old file" >&2
+  exit 1
+fi
+
+for package in "${DRIVER[@]}" "${KERNELS[@]}"; do
+  cp "$work/recipes/$package" "$PKGBUILDS/$package/PKGBUILD"
+done
+echo "NVIDIA $old -> $new"

@@ -32,7 +32,7 @@ for recipe in omarchy-settings omarchy-settings-dev; do
       for path in etc/mkinitcpio.conf.d/omarchy_hooks.conf \
         etc/limine-entry-tool.d/omarchy-defaults.conf \
         etc/limine-entry-tool.d/omarchy-uki.conf; do
-        printf '%s\n' "${backup[@]}" | grep -Fxq "$path"
+        printf '%s\n' "${backup[@]}" | grep -Fx "$path" >/dev/null
       done
       for path in etc/limine-entry-tool.d/omarchy-defaults.conf etc/limine-entry-tool.d/omarchy-uki.conf; do
         cmp "$fixture/$path" "$pkgdir/$path"
@@ -47,17 +47,17 @@ for recipe in omarchy-settings omarchy-settings-dev; do
       for template in default.conf limine.conf; do
         cmp "$fixture/default/limine/$template" "$pkgdir/usr/share/omarchy/default/limine/$template"
       done
-      if printf '%s\n' "${backup[@]}" | grep -Fxq etc/mkinitcpio.conf.d/00-omarchy-hooks.conf; then
+      if printf '%s\n' "${backup[@]}" | grep -Fx etc/mkinitcpio.conf.d/00-omarchy-hooks.conf >/dev/null; then
         echo 'FAIL: backup names a 00-omarchy-hooks.conf the source does not ship' >&2
         exit 1
       fi
-      if printf '%s\n' "${backup[@]}" | grep -Fxq etc/sysctl.d/90-omarchy-arp.conf; then
+      if printf '%s\n' "${backup[@]}" | grep -Fx etc/sysctl.d/90-omarchy-arp.conf >/dev/null; then
         echo 'FAIL: backup names a 90-omarchy-arp.conf the source does not ship' >&2
         exit 1
       fi
       # The installer owns the machine-specific live configuration.
       [[ ! -e $pkgdir/etc/default/limine ]]
-      if printf '%s\n' "${backup[@]}" | grep -Fxq 'etc/default/limine'; then
+      if printf '%s\n' "${backup[@]}" | grep -Fx 'etc/default/limine' >/dev/null; then
         echo 'FAIL: installer-owned Limine configuration is in backup metadata' >&2
         exit 1
       fi
@@ -69,13 +69,13 @@ for recipe in omarchy-settings omarchy-settings-dev; do
       thunderbolt=etc/mkinitcpio.conf.d/thunderbolt_module.conf
       if [[ $CARCH == aarch64 ]]; then
         [[ ! -e $pkgdir/$thunderbolt ]]
-        if printf '%s\n' "${backup[@]}" | grep -Fxq "$thunderbolt"; then
+        if printf '%s\n' "${backup[@]}" | grep -Fx "$thunderbolt" >/dev/null; then
           echo 'FAIL: removed ARM Thunderbolt config remains in backup metadata' >&2
           exit 1
         fi
       else
         cmp "$fixture/$thunderbolt" "$pkgdir/$thunderbolt"
-        printf '%s\n' "${backup[@]}" | grep -Fxq "$thunderbolt"
+        printf '%s\n' "${backup[@]}" | grep -Fx "$thunderbolt" >/dev/null
       fi
       echo "PASS: $recipe $CARCH retains boot configuration and matching backup metadata"
     )
@@ -96,7 +96,7 @@ for recipe in omarchy-settings omarchy-settings-dev; do
       source "$BUILD_ROOT/pkgbuilds/$recipe/PKGBUILD"
       package
       cmp "$fixture/etc/sysctl.d/90-omarchy-arp.conf" "$pkgdir/etc/sysctl.d/90-omarchy-arp.conf"
-      printf '%s\n' "${backup[@]}" | grep -Fxq etc/sysctl.d/90-omarchy-arp.conf
+      printf '%s\n' "${backup[@]}" | grep -Fx etc/sysctl.d/90-omarchy-arp.conf >/dev/null
       echo "PASS: $recipe $CARCH ships the ARP sysctl drop-in and backs it up"
     )
   done
@@ -247,6 +247,52 @@ refuse "a hooks file that sets no HOOKS" "$unsafe" omarchy_hooks.conf 'FILES+=(/
 refuse "a HOOKS line with a trailing comment" "$unguardable" omarchy_hooks.conf "HOOKS=($omarchy_hooks) # local"
 refuse "a HOOKS line split over lines" "$unguardable" omarchy_hooks.conf "HOOKS=(base udev"$'\n'"  block encrypt filesystems)"
 refuse "an indented HOOKS that ignores asahi" "$unsafe" 00-omarchy-hooks.conf "if true; then"$'\n'"  HOOKS=($omarchy_hooks)"$'\n'"fi"
+
+# Sources shipping 91-omarchy-initcpio-rebuild.hook place Omarchy's initcpio
+# hooks under /etc/initcpio/ so unchanged settings upgrades skip
+# 90-mkinitcpio-install.hook; older sources keep /usr/lib/initcpio/.
+initcpio_src=$scratch/initcpio/omarchy
+mkdir -p "$initcpio_src/default/initcpio/hooks" "$initcpio_src/default/initcpio/install" \
+  "$initcpio_src/default/libalpm/hooks"
+cp -a "$fixture/." "$initcpio_src/"
+for hook in omarchy-snapshot-overlay omarchy-restore; do
+  printf 'hook %s\n' "$hook" > "$initcpio_src/default/initcpio/hooks/$hook"
+  printf 'install %s\n' "$hook" > "$initcpio_src/default/initcpio/install/$hook"
+done
+
+for recipe in omarchy-settings omarchy-settings-dev; do
+  (
+    export CARCH=x86_64 OMARCHY_SRC=$initcpio_src srcdir=$scratch/initcpio pkgdir=$scratch/initcpio-legacy-$recipe
+    backup=()
+    # shellcheck disable=SC1090
+    source "$BUILD_ROOT/pkgbuilds/$recipe/PKGBUILD"
+    package
+    for hook in omarchy-snapshot-overlay omarchy-restore; do
+      cmp "$initcpio_src/default/initcpio/hooks/$hook" "$pkgdir/usr/lib/initcpio/hooks/$hook"
+      cmp "$initcpio_src/default/initcpio/install/$hook" "$pkgdir/usr/lib/initcpio/install/$hook"
+      [[ ! -e $pkgdir/etc/initcpio/hooks/$hook && ! -e $pkgdir/etc/initcpio/install/$hook ]]
+    done
+  )
+done
+
+printf '[Action]\nExec = /usr/bin/omarchy-boot-sync-initcpio --pacman-hook\n' \
+  > "$initcpio_src/default/libalpm/hooks/91-omarchy-initcpio-rebuild.hook"
+
+for recipe in omarchy-settings omarchy-settings-dev; do
+  (
+    export CARCH=x86_64 OMARCHY_SRC=$initcpio_src srcdir=$scratch/initcpio pkgdir=$scratch/initcpio-etc-$recipe
+    backup=()
+    # shellcheck disable=SC1090
+    source "$BUILD_ROOT/pkgbuilds/$recipe/PKGBUILD"
+    package
+    for hook in omarchy-snapshot-overlay omarchy-restore; do
+      cmp "$initcpio_src/default/initcpio/hooks/$hook" "$pkgdir/etc/initcpio/hooks/$hook"
+      cmp "$initcpio_src/default/initcpio/install/$hook" "$pkgdir/etc/initcpio/install/$hook"
+      [[ ! -e $pkgdir/usr/lib/initcpio/hooks/$hook && ! -e $pkgdir/usr/lib/initcpio/install/$hook ]]
+    done
+  )
+done
+echo "PASS: initcpio hooks move to /etc/initcpio/ when 91-omarchy-initcpio-rebuild.hook is present"
 
 # Upgrades: pacman replaces an unmodified hooks file, keeps a modified one and
 # leaves the guarded version as .pacnew, and installs it where it was absent.

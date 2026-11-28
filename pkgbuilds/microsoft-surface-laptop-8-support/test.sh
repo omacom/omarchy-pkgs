@@ -64,14 +64,14 @@ for name in WSAInit.conf SpeakerSeq.conf; do
     fail "the profile includes the shipped $name"
 done
 
-# The board list holds what the boot firmware starts and the router image this
+# The board list holds what the boot firmware starts and the router images this
 # package copies itself, so the extractor still copies the ADSP and CDSP from
 # Windows (Omarchy's DSP check looks for the ADSP in --list-missing).
 listed=$(sed 's/#.*//; s/[[:space:]]//g; /^$/d' "$package_dir/qcom-firmware-extract-provided.list")
-[[ $listed == $'qcom/glymur/microsoft/surface-laptop8/soccp.mbn\nqcom/glymur/microsoft/surface-laptop8/soccp_dtb.mbn\nqcom/glymur/surface-laptop8/usb4-router-legacy.bin' ]] ||
-  fail "the extractor's board list names the SOCCP pair and the router image"
+[[ $listed == $'qcom/glymur/microsoft/surface-laptop8/soccp.mbn\nqcom/glymur/microsoft/surface-laptop8/soccp_dtb.mbn\nqcom/glymur/surface-laptop8/usb4-router-legacy.bin\nqcom/glymur/surface-laptop8/usb4-router-v2.bin' ]] ||
+  fail "the extractor's board list names the SOCCP pair and the two router images"
 
-# USB4 router image: found by its load records and pinned hash, never by
+# USB4 router images: found by their load records and pinned hashes, never by
 # position; anything else is left alone.
 router="$package_dir/surface-laptop8-usb4-firmware"
 python3 -I - "$router" <<'PY' || fail "the router image is found only with its pinned hash"
@@ -84,60 +84,103 @@ def record(address, words):
     return struct.pack('<II', address, len(words)) + b''.join(struct.pack('<I', w) for w in words)
 
 image = record(0, [1, 2, 3]) + record(0x8000, [4, 5])
-sha = hashlib.sha256(image).hexdigest()
+wanted = router.Image('test.bin', hashlib.sha256(image).hexdigest(), len(image), 'test port')
 driver = b'MZ' + b'\xff' * 30 + image + b'\xff' * 12
-assert router.find_image(driver, sha, len(image)) == image
+assert router.find_image(driver, wanted) == image
 # Shifted by four bytes: still found.
-assert router.find_image(b'\xff' * 4 + driver, sha, len(image)) == image
+assert router.find_image(b'\xff' * 4 + driver, wanted) == image
 # A different image of the same layout is refused.
 other = record(0, [1, 2, 9]) + record(0x8000, [4, 5])
-assert router.find_image(b'\xff' * 32 + other, sha, len(image)) is None
+assert router.find_image(b'\xff' * 32 + other, wanted) is None
 # Records must fill the image exactly and load from MCU address 0.
 assert not router.records_fill(record(4, [1]), 0, 12)
 assert not router.records_fill(record(0, [1]) + b'\0' * 4, 0, 16)
 assert not router.records_fill(record(0, [1, 2]), 0, 12)
 assert not router.records_fill(record(0, [1]) + record(0, [2]), 0, 24)
 assert router.records_fill(image, 0, len(image))
-assert router.FIRMWARE == 'qcom/glymur/surface-laptop8/usb4-router-legacy.bin'
+# One image for each port's router, at the paths the device tree names.
+assert [(i.firmware, i.port) for i in router.IMAGES] == [
+    ('qcom/glymur/surface-laptop8/usb4-router-legacy.bin', 'first USB-C port'),
+    ('qcom/glymur/surface-laptop8/usb4-router-v2.bin', 'second USB-C port')]
 PY
 mkdir -p "$scratch/store/qcusb4filter8480.inf_arm64_test" "$scratch/root"
 head -c 65536 /dev/zero >"$scratch/store/qcusb4filter8480.inf_arm64_test/QcUsb4Filter8480.sys"
 status=0
 SURFACE_LAPTOP8_ROOT="$scratch/root" python3 -I "$router" --no-rebuild -d "$scratch/store" 2>/dev/null || status=$?
-(( status == 2 )) || fail "a driver without the tested image leaves USB4 off (exit 2, got $status)"
-[[ ! -e $scratch/root/usr/lib/firmware/updates/qcom/glymur/surface-laptop8/usb4-router-legacy.bin ]] ||
-  fail "nothing is installed without the tested image"
+(( status == 2 )) || fail "a driver without the tested images leaves USB4 off (exit 2, got $status)"
+[[ ! -e $scratch/root/usr/lib/firmware/updates ]] ||
+  fail "nothing is installed without the tested images"
 status=0
 SURFACE_LAPTOP8_ROOT="$scratch/root" python3 -I "$router" --no-rebuild -d "$scratch/root" 2>/dev/null || status=$?
 (( status == 2 )) || fail "no driver found exits 2 (got $status)"
 
-# A driver holding the tested image (a stand-in with its hash pinned here):
-# installed 0644 under firmware/updates, and a second run leaves it alone.
-python3 -I - "$router" "$scratch/install" <<'PY' || fail "the tested image is installed once, readable, under firmware/updates"
+# Drivers holding the tested images (stand-ins with their hashes pinned here):
+# each is installed 0644 under firmware/updates, and a second run leaves it
+# alone. A driver with one of the two installs that one and says which port
+# stays without USB4; a later run with both adds only the other, as on a
+# machine set up when the package knew one image.
+python3 -I - "$router" "$scratch/install" <<'PY' || fail "the tested images are installed once, readable, under firmware/updates, one at a time or both in one run, from any driver in the store"
 import contextlib, hashlib, importlib.machinery, importlib.util, io, os, struct, sys
 loader = importlib.machinery.SourceFileLoader('router', sys.argv[1])
 router = importlib.util.module_from_spec(importlib.util.spec_from_loader('router', loader))
 loader.exec_module(router)
 root = sys.argv[2]
-image = struct.pack('<II', 0, 2) + struct.pack('<II', 7, 8)
-router.IMAGE_SHA256 = hashlib.sha256(image).hexdigest()
-router.find_image.__defaults__ = (router.IMAGE_SHA256, len(image))
-store = os.path.join(root, 'store', 'qcusb4filter8480.inf_arm64_test')
-os.makedirs(store)
-with open(os.path.join(store, 'QcUsb4Filter8480.sys'), 'wb') as driver:
-    driver.write(b'MZ' + b'\xff' * 6 + image + b'\xff' * 8)
+first = struct.pack('<II', 0, 2) + struct.pack('<II', 7, 8)
+second = struct.pack('<II', 0, 3) + struct.pack('<III', 9, 10, 11)
+router.IMAGES = (
+    router.Image('test/first.bin', hashlib.sha256(first).hexdigest(), len(first), 'first USB-C port'),
+    router.Image('test/second.bin', hashlib.sha256(second).hexdigest(), len(second), 'second USB-C port'))
+targets = [os.path.join(root, 'usr/lib/firmware/updates', image.firmware) for image in router.IMAGES]
+
+def store(name, *images, version='test'):
+    directory = os.path.join(root, name, 'qcusb4filter8480.inf_arm64_' + version)
+    os.makedirs(directory)
+    with open(os.path.join(directory, 'QcUsb4Filter8480.sys'), 'wb') as driver:
+        driver.write(b'MZ' + b'\xff' * 6 + b'\xff\xff\xff\xff'.join(images) + b'\xff' * 8)
+    return os.path.join(root, name)
+
+def run(directory):
+    log = io.StringIO()
+    with contextlib.redirect_stderr(log):
+        status = router.main(['--no-rebuild', '-d', directory])
+    return status, log.getvalue()
+
 os.environ['SURFACE_LAPTOP8_ROOT'] = root
 os.umask(0o077)
-with contextlib.redirect_stderr(io.StringIO()):
-    assert router.main(['--no-rebuild', '-d', os.path.join(root, 'store')]) == 0
-target = os.path.join(root, 'usr/lib/firmware/updates', router.FIRMWARE)
-assert open(target, 'rb').read() == image
-assert os.stat(target).st_mode & 0o777 == 0o644
-assert not os.path.exists(target + '.new')
-log = io.StringIO()
-with contextlib.redirect_stderr(log):
-    assert router.main(['--no-rebuild', '-d', os.path.join(root, 'empty')]) == 0
-assert 'already installed' in log.getvalue()
+status, log = run(store('one', first))
+assert status == 2, status
+assert open(targets[0], 'rb').read() == first
+assert not os.path.exists(targets[1])
+assert 'USB4 stays off on the second USB-C port' in log and 'first USB-C port found' in log, log
+assert log.count('lacks the tested image') == 1 and 'lacks the tested image for the second USB-C port' in log, log
+before = os.stat(targets[0]).st_mtime_ns
+status, log = run(store('both', first, second))
+assert status == 0, status
+assert open(targets[1], 'rb').read() == second
+assert os.stat(targets[0]).st_mtime_ns == before
+assert 'test/first.bin is already installed' in log and 'stays off' not in log, log
+for target in targets:
+    assert os.stat(target).st_mode & 0o777 == 0o644
+    assert not os.path.exists(target + '.new')
+status, log = run(os.path.join(root, 'empty'))
+assert status == 0, status
+assert log.count('already installed') == 2, log
+# Neither image yet and both in one driver, as on a fresh install: one run
+# installs both.
+fresh = os.path.join(root, 'fresh')
+os.environ['SURFACE_LAPTOP8_ROOT'] = fresh
+status, log = run(os.path.join(root, 'both'))
+assert status == 0, status
+for image, data in zip(router.IMAGES, (first, second)):
+    assert open(os.path.join(fresh, 'usr/lib/firmware/updates', image.firmware), 'rb').read() == data
+assert 'stays off' not in log and 'already installed' not in log, log
+# Two versions of the driver package, the first without a tested image: the
+# search goes on to the second.
+store('two', version='a')
+os.environ['SURFACE_LAPTOP8_ROOT'] = os.path.join(root, 'fresh-two')
+status, log = run(store('two', first, second, version='b'))
+assert status == 0, status
+assert log.count('lacks the tested image') == 2 and log.count('found in') == 2, log
 PY
 
 # Partition discovery, with stand-ins for lsblk, mount, umount and the boot
@@ -170,15 +213,14 @@ printf 'rebuild\n' >>"$STUB_LOG"
 [[ ! -e $STUB_REBUILD_FAILS ]]
 SH
 chmod +x "$scratch/stubs"/*
-python3 -I - "$router" "$scratch/discover" "$scratch/stubs" <<'PY' || fail "only internal NTFS is mounted, read-only, and always cleaned up; a failed rebuild is an error a rerun recovers from"
+python3 -I - "$router" "$scratch/discover" "$scratch/stubs" <<'PY' || fail "only internal NTFS is mounted, read-only, and always cleaned up; nothing found rebuilds nothing; a failed rebuild is an error a rerun recovers from; one image of two is still put in the boot images"
 import contextlib, hashlib, importlib.machinery, importlib.util, io, os, struct, sys
 loader = importlib.machinery.SourceFileLoader('router', sys.argv[1])
 router = importlib.util.module_from_spec(importlib.util.spec_from_loader('router', loader))
 loader.exec_module(router)
 work, stubs = sys.argv[2], sys.argv[3]
 image = struct.pack('<II', 0, 2) + struct.pack('<II', 7, 8)
-router.IMAGE_SHA256 = hashlib.sha256(image).hexdigest()
-router.find_image.__defaults__ = (router.IMAGE_SHA256, len(image))
+router.IMAGES = (router.Image('test/router.bin', hashlib.sha256(image).hexdigest(), len(image), 'first USB-C port'),)
 os.environ['PATH'] = stubs + os.pathsep + os.environ['PATH']
 log_path = os.path.join(work, 'log')
 os.environ['STUB_LOG'] = log_path
@@ -205,10 +247,12 @@ def check_mounts(root, log):
     assert [line.split()[1] for line in log if line.startswith('umount ')] == [mounts[0][6]], log
     assert os.listdir(os.path.join(root, 'run')) == [], os.listdir(os.path.join(root, 'run'))
 
-# No tested image on the partition: nothing installed, still cleaned up.
-root, status, log = run('none', b'\xff' * 64, '--no-rebuild')
+# No tested image on the partition: nothing installed, still cleaned up, and
+# no rebuild for nothing.
+root, status, log = run('none', b'\xff' * 64)
 assert status == 2, status
 check_mounts(root, log)
+assert 'rebuild' not in log, log
 assert not os.path.exists(os.path.join(root, 'usr'))
 
 # The tested image: installed, then a failed rebuild is an error.
@@ -217,7 +261,7 @@ root, status, log = run('found', b'MZ' + b'\xff' * 6 + image)
 assert status == 1, status
 check_mounts(root, log)
 assert log[-1] == 'rebuild', log
-assert open(os.path.join(root, 'usr/lib/firmware/updates', router.FIRMWARE), 'rb').read() == image
+assert open(os.path.join(root, 'usr/lib/firmware/updates', 'test/router.bin'), 'rb').read() == image
 
 # Rerun once the rebuild works: no mounting, just the rebuild.
 os.remove(os.environ['STUB_REBUILD_FAILS'])
@@ -226,6 +270,17 @@ with contextlib.redirect_stderr(io.StringIO()):
     status = router.main([])
 assert status == 0, status
 assert open(log_path).read().splitlines() == ['rebuild']
+
+# One of two images on the partition: it is installed and the boot images are
+# rebuilt for it, and the status still says an image is missing.
+other = struct.pack('<II', 0, 1) + struct.pack('<I', 9)
+router.IMAGES += (router.Image('test/other.bin', hashlib.sha256(other).hexdigest(), len(other), 'second USB-C port'),)
+root, status, log = run('partial', b'MZ' + b'\xff' * 6 + image)
+assert status == 2, status
+check_mounts(root, log)
+assert log[-1] == 'rebuild', log
+assert open(os.path.join(root, 'usr/lib/firmware/updates', 'test/router.bin'), 'rb').read() == image
+assert not os.path.exists(os.path.join(root, 'usr/lib/firmware/updates', 'test/other.bin'))
 PY
 
 # Device tree and touchpad: only this model.

@@ -1,0 +1,192 @@
+From 335686b7b5d276ad77dc3b6935678c847da6a2e3 Mon Sep 17 00:00:00 2001
+From: fidecastro <18445184+fidecastro@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 14:48:19 -0500
+Subject: [PATCH] contacts: Add a position slop for new contacts
+
+While a finger lands on a touchscreen, the area it covers grows and its
+center shifts. On the Surface Laptop 7 15" (045E:0C6F) the position of a
+tap moves by up to 2 mm within its first 40 ms. The position threshold
+only drops changes below 0.4 mm between two frames, so the shift is passed
+on, and at that screen's scale it is about as far as applications allow a
+touch to move before they treat it as a drag. Light taps drag or scroll
+instead of clicking.
+
+Add the option PositionSlop to the Contacts section: a new contact stays
+where it first appeared until it has moved that far away, and follows the
+finger from then on. Nothing is delayed. The default of zero keeps the
+current behaviour.
+---
+ etc/iptsd.conf                        |  8 +++++
+ src/contacts/stability/config.hpp     |  6 ++++
+ src/contacts/stability/stabilizer.hpp | 52 +++++++++++++++++++++++++++
+ src/core/generic/config.hpp           |  7 ++++
+ src/core/linux/config-loader.hpp      |  1 +
+ 5 files changed, 74 insertions(+)
+
+diff --git a/etc/iptsd.conf b/etc/iptsd.conf
+index 140fb2b..6dea830 100644
+--- a/etc/iptsd.conf
++++ b/etc/iptsd.conf
+@@ -119,6 +119,14 @@
+ ##
+ # PositionThresholdMax = 2
+ 
++##
++## How many centimeters a new contact has to move away from where it first appeared
++## before its position starts to change. Until then it stays where it appeared.
++## This keeps the shift of a landing finger from turning a tap into a drag.
++## Setting this value to zero disables it.
++##
++# PositionSlop = 0
++
+ ##
+ ## How many degrees the orientation of a contact must change before the change is considered stable.
+ ## Changes below this threshold are ignored.
+diff --git a/src/contacts/stability/config.hpp b/src/contacts/stability/config.hpp
+index a94057a..65b77d8 100644
+--- a/src/contacts/stability/config.hpp
++++ b/src/contacts/stability/config.hpp
+@@ -31,6 +31,12 @@ public:
+ 	 * exceed.
+ 	 */
+ 	std::optional<Vector2<T>> orientation_threshold = std::nullopt;
++
++	/*
++	 * How far a new contact has to move away from where it first appeared before its
++	 * position starts to change, on each axis. Until then it stays where it appeared.
++	 */
++	std::optional<Vector2<T>> position_slop = std::nullopt;
+ };
+ 
+ } // namespace iptsd::contacts::stability
+diff --git a/src/contacts/stability/stabilizer.hpp b/src/contacts/stability/stabilizer.hpp
+index 11bb62f..0c1ddb1 100644
+--- a/src/contacts/stability/stabilizer.hpp
++++ b/src/contacts/stability/stabilizer.hpp
+@@ -13,6 +13,7 @@
+ 
+ #include <algorithm>
+ #include <iterator>
++#include <map>
+ #include <type_traits>
+ #include <vector>
+ 
+@@ -29,6 +30,9 @@ private:
+ 	// The last frame.
+ 	std::vector<Contact<T>> m_last {};
+ 
++	// Where the contacts that have not left their slop yet first appeared, by index.
++	std::map<usize, Vector2<T>> m_anchors {};
++
+ public:
+ 	Stabilizer(Config<T> config) : m_config {std::move(config)} {};
+ 
+@@ -38,6 +42,7 @@ public:
+ 	void reset()
+ 	{
+ 		m_last.clear();
++		m_anchors.clear();
+ 	}
+ 
+ 	/*!
+@@ -51,6 +56,9 @@ public:
+ 		for (Contact<T> &contact : frame)
+ 			this->stabilize_contact(contact);
+ 
++		if (m_config.position_slop.has_value())
++			this->apply_slop(frame);
++
+ 		m_last.clear();
+ 
+ 		// Save a copy of the new data
+@@ -58,6 +66,50 @@ public:
+ 	}
+ 
+ private:
++	/*!
++	 * Keeps new contacts where they first appeared until they have moved out of the slop.
++	 *
++	 * While a finger lands, the area it covers grows and its center shifts, by more than
++	 * applications allow a tap to move. Holding the position until the contact has clearly
++	 * moved turns that shift into no movement at all, without delaying anything.
++	 *
++	 * @param[in,out] frame The list of contacts to stabilize.
++	 */
++	void apply_slop(std::vector<Contact<T>> &frame)
++	{
++		const Vector2<T> slop = m_config.position_slop.value();
++
++		// Forget the contacts that are gone.
++		for (auto it = m_anchors.begin(); it != m_anchors.end();) {
++			if (Contact<T>::find_in_frame(it->first, frame).has_value())
++				++it;
++			else
++				it = m_anchors.erase(it);
++		}
++
++		for (Contact<T> &contact : frame) {
++			if (!contact.index.has_value())
++				continue;
++
++			const usize index = contact.index.value();
++
++			// A contact that was not in the last frame is new.
++			if (!Contact<T>::find_in_frame(index, m_last).has_value())
++				m_anchors.insert_or_assign(index, contact.mean);
++
++			const auto anchor = m_anchors.find(index);
++			if (anchor == m_anchors.end())
++				continue;
++
++			const Vector2<T> delta = (contact.mean - anchor->second).array() / slop.array();
++
++			if (std::hypot(delta.x(), delta.y()) < 1)
++				contact.mean = anchor->second;
++			else
++				m_anchors.erase(anchor);
++		}
++	}
++
+ 	/*!
+ 	 * Stabilize a single contact.
+ 	 *
+diff --git a/src/core/generic/config.hpp b/src/core/generic/config.hpp
+index f16553d..26a3816 100644
+--- a/src/core/generic/config.hpp
++++ b/src/core/generic/config.hpp
+@@ -44,6 +44,7 @@ public:
+ 	f64 contacts_size_thresh_max = 0.5;
+ 	f64 contacts_position_thresh_min = 0.04;
+ 	f64 contacts_position_thresh_max = 2;
++	f64 contacts_position_slop = 0;
+ 	f64 contacts_orientation_thresh_min = 1;
+ 	f64 contacts_orientation_thresh_max = 15;
+ 	f64 contacts_size_min = 0.2;
+@@ -125,6 +126,12 @@ public:
+ 			this->contacts_position_thresh_min / diagonal,
+ 			this->contacts_position_thresh_max / diagonal,
+ 		};
++		if (this->contacts_position_slop > 0) {
++			config.stability.position_slop = Vector2<f64> {
++				this->contacts_position_slop / this->width,
++				this->contacts_position_slop / this->height,
++			};
++		}
+ 		config.stability.orientation_threshold = Vector2<f64> {
+ 			this->contacts_orientation_thresh_min / 180,
+ 			this->contacts_orientation_thresh_max / 180,
+diff --git a/src/core/linux/config-loader.hpp b/src/core/linux/config-loader.hpp
+index 8ffd944..6578534 100644
+--- a/src/core/linux/config-loader.hpp
++++ b/src/core/linux/config-loader.hpp
+@@ -169,6 +169,7 @@ private:
+ 		this->get(ini, "Contacts", "SizeThresholdMax", m_config.contacts_size_thresh_max);
+ 		this->get(ini, "Contacts", "PositionThresholdMin", m_config.contacts_position_thresh_min);
+ 		this->get(ini, "Contacts", "PositionThresholdMax", m_config.contacts_position_thresh_max);
++		this->get(ini, "Contacts", "PositionSlop", m_config.contacts_position_slop);
+ 		this->get(ini, "Contacts", "OrientationThresholdMin", m_config.contacts_orientation_thresh_min);
+ 		this->get(ini, "Contacts", "OrientationThresholdMax", m_config.contacts_orientation_thresh_max);
+ 		this->get(ini, "Contacts", "SizeMin", m_config.contacts_size_min);
+-- 
+2.56.1
+

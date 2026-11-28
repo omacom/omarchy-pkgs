@@ -16,7 +16,7 @@ access are required. To work locally you need:
 - `git`, `bash`, `jq`, `curl` and a `tar` that reads zstd
 - Docker or Podman that your user can run, to build. With Docker, a build
   calls `sudo` to fix the ownership of its output.
-- on Arch, to check an upstream declaration: Python 3.11+, `vercmp`, `bsdtar`
+- on Arch, to check an upstream declaration: Python 3.14+, `vercmp`, `bsdtar`
 
 Questions and problems: open an issue on this repository.
 
@@ -31,6 +31,11 @@ Questions and problems: open an issue on this repository.
    ```
 
    An imported recipe is Omarchy's from then on; there is no AUR sync.
+   On Arch, `bin/add-package` also adds the package to
+   `release/owners.json`. Elsewhere, or when you later change a recipe's
+   `pkgname`, `provides`, `replaces` or `arch`, run
+   `bin/release-owners my-package` on Arch, or let the `self-tests` check
+   show you the lines to commit.
 3. Write `pkgbuilds/my-package/PKGBUILD` to Arch packaging standards.
    - List every architecture it supports in `arch=()`: `x86_64`, `aarch64`,
      or `any`. CI builds each one.
@@ -49,8 +54,9 @@ Questions and problems: open an issue on this repository.
 
      ```bash
      gpg --auto-key-locate clear,nodefault,wkd --locate-external-keys dev@example.org
-     gpg --armor --export-options export-minimal --export <FINGERPRINT> \
+     gpg --armor --export-options export-clean --export <FINGERPRINT> \
        > pkgbuilds/my-package/keys/pgp/<FINGERPRINT>.asc
+     bin/refresh-pgp-keys pkgbuilds/my-package/keys/pgp/<FINGERPRINT>.asc
      ```
    - Extract a vendor archive in `package()` with `bsdtar --no-same-owner`.
      pacman installs the numeric owners a package records, so every file
@@ -133,8 +139,9 @@ Keep a package PR to these files, or it needs a maintainer to merge it by
 hand:
 
 - anything under `pkgbuilds/`
-- a new test under `tests/`, and the one line in `.github/workflows/test.yml`
-  that runs it
+- a new test under `tests/`
+- the directory lines `bin/release-owners` writes in `release/owners.json`.
+  An `approved` line always needs a maintainer.
 
 Changes to `bin/`, `helpers/`, `build/` or the workflows go in a separate PR,
 first: a PR's packages are built with `master`'s tooling, not its own.
@@ -205,6 +212,11 @@ It also decides where each build runs (`package_runner` in
 | x86_64 | the droplet pool |
 | aarch64 | GitHub's `ubuntu-24.04-arm` (4 vCPU) |
 | aarch64 kernel (`linux-*`) | `namespace-profile-arm64-linux-apple-12x32` (Linux on Apple Silicon, 12 vCPU) |
+| chromium, both architectures | the large droplet pool (64 vCPU, 128 GB) |
+
+Chromium's aarch64 build cross-compiles on an x86_64 builder, as Google builds
+Chrome for Linux arm64: its pinned toolchain runs on x64 hosts only
+(`package_build_host`). Its fast-ring check then runs the package under QEMU.
 
 A build that has to be repeated at merge runs on the same runner.
 
@@ -339,6 +351,24 @@ It copies the exact files the source serves, checks each against the source
 database's SHA-256, and publishes them with `bin/publish-artifact` in batches
 of about 2 GiB, inside the same lock as merges. Nothing is removed from the
 destination. A re-run after a failure picks up where it stopped.
+
+Every file was built against edge's Arch packages, and the destination's Arch
+snapshot can be weeks older. So before anything publishes, dry runs included,
+the workflow runs `bin/check-promotion` on every package the plan moves. It
+prepares the destination as the promotion would leave it, installs each
+package in a fresh container from there, and refuses the run when a binary
+needs a library or a symbol version that the destination lacks, unless the
+source channel and edge lack it too (`ldd -r`), when a Python module needs a Python version the
+destination lacks, or when the package cannot be installed. aarch64 is
+checked under qemu-user on the x86_64 runner. Before either architecture
+publishes, both must still plan exactly the files that were checked. A
+refused package waits until the destination's snapshot catches up; leave it
+out with `packages`.
+
+On 2026-11-23, without this check, `linux-omarchy-headers` 7.2.15-4 reached
+stable with a `sign-file` linked against OpenSSL 4's `libcrypto.so.4`, while
+stable's snapshot had OpenSSL 3.6.5. DKMS then left every module unsigned
+(omacom/omarchy#19941).
 
 The run's summary lists what moved and what stayed back, with the reason;
 the full plan is kept as the `promote-record-<run-id>` artifact for 90 days,
@@ -521,10 +551,14 @@ until one of those applies. An author denounced in `VOUCHED.td` cannot be
 overridden by the label.
 
 A trusted PR also merges itself. `auto-merge-pr.yml` enables auto-merge when
-the PR is open, not a draft, and changes only packages: files under
-`pkgbuilds/`, new files under `tests/`, and `test.yml` lines that only add a
-`./tests/<name>.sh` call. Anything touching workflows, scripts, build tooling
-or an existing test needs a maintainer to merge it.
+the PR targets `master`, is open, is not a draft, and changes only packages:
+files under `pkgbuilds/`, new files under `tests/`, and the lines of
+`release/owners.json` that `bin/release-owners` writes. Anything touching
+workflows, `test.yml` included, scripts, build tooling or an existing test
+needs a maintainer to merge it. The omarchy-pkgs-merge GitHub App arms it, so
+the merge starts `publish.yml`. Before it writes, the workflow decides again
+from the PR as it is then. A PR that stops qualifying, or moves off `master`,
+loses auto-merge.
 
 - Remove `build-approved` to withdraw the auto-merge it armed for an unknown
   author. Runs it already released keep going.
@@ -545,9 +579,10 @@ on named packages.
 |---|---|---|---|
 | `sync-upstream.yml` | every 6 hours | `auto/sync-upstream-<package>` | upstream updates for packages without `"auto_merge": true` |
 | `sync-upstream.yml` | hourly | `auto/track-branches-<package>` | `"auto_merge": true` packages: the newest upstream release or branch tip |
-| `sync-rebuilds.yml` | every 6 hours | `auto/sync-rebuilds-<package>` | a `pkgrel` bump where a `rebuild_on` dependency moved |
+| `sync-upstream.yml` | every 5 minutes | `auto/track-branches-<package>` | `"sync_cadence": "five-minute"` packages: `omarchy-dev` and `omarchy-settings-dev` |
+| `sync-rebuilds.yml` | every hour | `auto/sync-rebuilds-<package>` | a `pkgrel` bump where a `rebuild_on` dependency moved |
 
-For a manual upstream run, choose the `hourly` or `six-hourly` package group
+For a manual upstream run, choose the `five-minute`, `hourly` or `six-hourly` package group
 with the `cadence` input (default: `six-hourly`). The historical PR branch
 prefixes remain unchanged so existing PRs keep receiving updates. The separate
 `track-branches.yml` workflow has been retired.
@@ -560,20 +595,30 @@ prefixes remain unchanged so existing PRs keep receiving updates. The separate
 - **A package with no upstream declaration or hook gets no upstream updates.** That
   includes the kernels (`linux-omarchy*`, `linux-aurora`): bump
   them by PR.
-- `sync-upstream.yml` reports each completed run to Basecamp when
-  `BASECAMP_CHATBOT_URL` is set, identifying the hourly or six-hourly group.
-  Individual package update and PR check
+- `sync-upstream.yml` writes a GitHub Actions summary for every run and posts
+  to Basecamp when `BASECAMP_CHATBOT_URL` is set (identifying the five-minute,
+  hourly, or six-hourly group) only when a run needs attention: workflow
+  failures, package update failures, or failing/unavailable checks on a
+  created or updated PR. Fully green runs (no updates needed, clean PR updates
+  with passing or pending checks, or unchanged open PRs) stay quiet in
+  Basecamp. Individual package update and PR check
   failures leave the completed sync green; its notification and Actions
   summary give counts and link to the affected PRs. PR update results and
   current PR check results are counted separately: checks still running (or
   not started yet) are pending, and the sync does not wait for builds.
   Feed-fetch, setup, and missing-result failures still fail the workflow.
+  A sync PR that was not armed, or has no auto-merge result, counts as a
+  failing package update.
   A failed `sync-rebuilds.yml` run also posts to Basecamp.
-- Every self-merging path (both workflows and `auto-merge-pr.yml`) needs
-  the `PKGS_BOT_TOKEN` secret: a personal access token with Contents and Pull
-  requests write access to this repository, owned by an account trusted to
-  build. A merge made with the built-in `GITHUB_TOKEN` does not start
-  `publish.yml`.
+- The omarchy-pkgs-sync GitHub App pushes the sync branches and opens,
+  updates and closes their PRs, so their builds start without an approval
+  hold. It has Contents and Pull requests write access to this repository
+  only. The workflows never merge with it.
+- The omarchy-pkgs-merge GitHub App arms auto-merge, in `package-prs.yml`'s
+  `arm` job and in `auto-merge-pr.yml`. GitHub merges as whoever armed
+  auto-merge, and a merge made with the built-in `GITHUB_TOKEN` does not
+  start `publish.yml`. It has Contents and Pull requests write access to
+  this repository only, and no Workflows access.
 
 Details: [docs/upstream-sources.md](docs/upstream-sources.md),
 [docs/rebuild-triggers.md](docs/rebuild-triggers.md).
@@ -594,6 +639,8 @@ Details: [docs/upstream-sources.md](docs/upstream-sources.md),
 | `upstream` | Where releases come from. Mutually exclusive with an `.omarchy/upstream.sh` hook. |
 | `min_release_age` | Hold a new upstream release back this long (`"24h"`, `"2d"`). A release whose age cannot be proven fails the sync. |
 | `auto_merge` | `true` selects the hourly group in `sync-upstream.yml`; other packages are checked every 6 hours. Both groups auto-merge passing PRs. For packages that follow a moving branch, and for feeds worth shipping within the hour. Needs an upstream declaration. |
+| `lockstep` | Names a group of packages that only ever move together, such as `"nvidia"` for the NVIDIA driver and the kernels that build its modules. Their changes from one sync share a PR. |
+| `sync_cadence` | `"five-minute"` moves an `auto_merge` package from the hourly group to one checked every 5 minutes. For the dev packages that follow omarchy's `quattro`, so a merge reaches dev installs within minutes. |
 | `release_ring` | `fast`: publish to `rc` and `stable` on merge, not only `edge`. Only for packages that run on any channel's libraries: see [What can be on the fast ring](#what-can-be-on-the-fast-ring). Takes effect with the package's next version: bump `pkgrel` in the same PR. |
 | `pinned` | Version is set per release on the `rc` branch. Used by `omarchy` and `omarchy-settings`. |
 | `rebuild_on` | Packages whose version change forces a rebuild of this one. |
@@ -636,10 +683,23 @@ Both can also be run from the Actions tab. Read
   keys in each recipe's `keys/pgp/` only. A build that asks a keyserver
   waits on someone else's uptime: on 11 November 2026 keyserver.ubuntu.com
   went down, builds hung on `gpg --receive-keys` for up to two hours and
-  held every builder. `refresh-pgp-keys.yml` brings revocations and new
+  held every builder. `Tests/self-tests` runs `bin/refresh-pgp-keys --check`
+  on any key a PR adds or modifies so trimmed, stale, or revoked keys are
+  caught before merge. `refresh-pgp-keys.yml` also brings revocations and new
   expiry dates in once a day; when it goes red, apply its
   `refreshed-keys.patch` artifact, or run `bin/refresh-pgp-keys`, and open
   a PR.
+
+- **One package name, one directory.** `release/owners.json` lists which
+  directory makes which package names on each architecture, from the
+  recipes. `bin/release-owners --check` fails when two directories make one
+  name on one architecture, or when a recipe provides another directory's
+  package or replaces anything but its own names without a line in
+  `approved`. No recipe may make, provide or replace `omarchy-keyring`. A
+  maintainer adds an `approved` line only for an intended alternative, such
+  as `omarchy-dev` providing `omarchy`, or a migration, such as
+  `omarchy-mac-boot` replacing `omarchy-apple-boot`: `pacman -Syu` offers
+  every replacement, and yes is its default.
 
 ## Layout
 
@@ -650,6 +710,7 @@ build/                         Builder image and the in-container build script
 helpers/                       Shell and Python shared by bin/ and the workflows
 ci/                            x86_64 builder pool: controller and runner setup
 tests/                         Tests; test.yml runs them on every PR
+release/owners.json            Which directory makes which package names (bin/release-owners)
 docs/                          Reference
 .github/workflows/             The pipeline
 .github/VOUCHED.td             Authors trusted to build
@@ -665,9 +726,9 @@ docs/                          Reference
 | `unpublish.yml` | dispatch | Removes retired packages from channel databases |
 | `auto-merge-pr.yml` | PR events, dispatch | Enables auto-merge on trusted package PRs |
 | `approve-pr.yml` | PR events | Releases GitHub's hold on a `build-approved` PR's runs |
-| `sync-upstream.yml` | hourly and every 6 hours, dispatch | Upstream release and branch-tip PRs, with a result notification for either package group |
-| `sync-rebuilds.yml` | every 6 hours, dispatch | Dependency rebuild PR |
-| `package-prs.yml` | called by the sync workflows | Opens, updates and closes their PRs |
+| `sync-upstream.yml` | every 5 minutes, hourly and every 6 hours, dispatch | Upstream release and branch-tip PRs, with a result notification for either package group |
+| `sync-rebuilds.yml` | every hour, dispatch | Dependency rebuild PR |
+| `package-prs.yml` | called by the sync workflows | Opens, updates and closes their PRs, with a description from `helpers/sync-pr-body.py` |
 | `builder-images.yml` | daily, changes to the image's inputs (push and PR), dispatch | Builds and tests the builder image; publishes it from `master` |
 | `refresh-pgp-keys.yml` | daily, dispatch | Merges revocations and new expiry dates into the shipped source-signing keys; fails with a patch when any changed |
 
@@ -676,7 +737,12 @@ signing key and bucket credentials: `GPG_PRIVATE_KEY`, `GPG_PASSPHRASE`,
 `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, `R2_ENDPOINT`. Its variable
 `OMARCHY_PUBLISH_PREFIX` redirects every bucket write to a scratch prefix
 in the bucket for a proof run; it must be empty for live publishing.
-Repository secrets: `PKGS_BOT_TOKEN`, `BASECAMP_CHATBOT_URL`.
+The `bot-sync` environment (usable from `master` only) holds
+`PKGS_SYNC_APP_KEY`, the omarchy-pkgs-sync App's private key, and
+`bot-merge` holds `PKGS_MERGE_APP_KEY`, the omarchy-pkgs-merge App's. The
+repository variables `PKGS_SYNC_APP_CLIENT_ID` and
+`PKGS_MERGE_APP_CLIENT_ID` are their client IDs.
+Repository secret: `BASECAMP_CHATBOT_URL`.
 
 ## More
 
