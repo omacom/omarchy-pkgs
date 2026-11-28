@@ -159,7 +159,7 @@ package_pkgbuild_var() {
   local arch="${3:-${ARCH:-x86_64}}"
 
   (cd "$pkgdir" && env -u OMARCHY_SRC CARCH="$arch" bash -c '
-    source PKGBUILD >/dev/null 2>&1
+    source ./PKGBUILD >/dev/null 2>&1
     rc=$?
     printf "%s\n" "${!1:-}"
     exit "$rc"
@@ -172,7 +172,7 @@ package_pkgbuild_var() {
 package_pkgbase() {
   local pkgdir="$1" arch="${2:-${ARCH:-x86_64}}" base
   base=$(cd "$pkgdir" && env -u OMARCHY_SRC CARCH="$arch" bash -c '
-    source PKGBUILD >/dev/null 2>&1 || true
+    source ./PKGBUILD >/dev/null 2>&1 || true
     printf "%s\n" "${pkgbase:-${pkgname[0]:-}}"
   ' 2>/dev/null || true)
   echo "${base:-${pkgdir##*/}}"
@@ -186,7 +186,7 @@ package_arches() {
   local arch="${2:-${ARCH:-x86_64}}"
 
   (cd "$pkgdir" && env -u OMARCHY_SRC CARCH="$arch" bash -c '
-    source PKGBUILD >/dev/null 2>&1
+    source ./PKGBUILD >/dev/null 2>&1 || exit 1
     printf "%s\n" "${arch[*]}"
   ')
 }
@@ -405,9 +405,10 @@ package_extract_vcs_hash_from_version() {
 
 package_first_git_source() {
   local pkgdir="$1"
+  local arch="${2:-${ARCH:-x86_64}}"
 
-  (cd "$pkgdir" && env -u OMARCHY_SRC bash -c '
-    source PKGBUILD 2>/dev/null
+  (cd "$pkgdir" && env -u OMARCHY_SRC CARCH="$arch" bash -c '
+    source ./PKGBUILD >/dev/null 2>&1
     for s in "${source[@]}"; do
       url="${s#*::}"
       [[ "$url" == git+* ]] && { echo "${url#git+}"; break; }
