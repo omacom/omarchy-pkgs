@@ -48,8 +48,8 @@ MAX_AGE_MINUTES=${MAX_AGE_MINUTES:-265}
 # stuck provisioning. Left alone it counts as a runner booting, and holds a
 # queued job until MAX_AGE_MINUTES.
 MAX_BOOT_MINUTES=${MAX_BOOT_MINUTES:-10}
-RUNNER_VERSION=${RUNNER_VERSION:-2.337.0}
-CLOUD_INIT=${CLOUD_INIT:-$(dirname "$0")/runner-cloud-init.yaml}
+# Runner version and SHA-256 live in runner-cloud-init.yaml.
+BUNDLED_CLOUD_INIT=$(dirname "${BASH_SOURCE[0]}")/runner-cloud-init.yaml
 # Operator public keys authorized on every builder (JSON array of strings).
 # The box's env file carries them; empty means no root login.
 SSH_KEYS_JSON=${SSH_KEYS_JSON:-[]}
@@ -176,6 +176,16 @@ candidates() {
 CANDIDATES=""
 create_droplet() {
   local token userdata name size region body response
+  if [[ -n ${RUNNER_VERSION:-} || -n ${RUNNER_SHA256:-} ]]; then
+    log "ignoring RUNNER_VERSION/RUNNER_SHA256 from environment; runner pin lives in $BUNDLED_CLOUD_INIT"
+  fi
+  if [[ -n ${CLOUD_INIT:-} && $CLOUD_INIT != "$BUNDLED_CLOUD_INIT" ]]; then
+    log "ignoring CLOUD_INIT ($CLOUD_INIT) from environment; using bundled $BUNDLED_CLOUD_INIT"
+  fi
+  if [[ ! -f $BUNDLED_CLOUD_INIT || ! -r $BUNDLED_CLOUD_INIT ]]; then
+    log "cloud-init template $BUNDLED_CLOUD_INIT is unreadable, so no droplet is created"
+    return 1
+  fi
   [[ -n $CANDIDATES ]] || CANDIDATES=$(candidates) || return 1
   # Checked here, not left to errexit: pool_tick calls this in an || list,
   # where errexit is off, and a droplet without a token never registers.
@@ -184,8 +194,8 @@ create_droplet() {
     return 1
   fi
   userdata=$(sed -e "s|__REPO__|$REPO|g" -e "s|__RUNNER_TOKEN__|$token|g" \
-                 -e "s|__RUNNER_LABELS__|$LABEL|g" -e "s|__RUNNER_VERSION__|$RUNNER_VERSION|g" \
-                 -e "s|__SSH_KEYS_JSON__|$SSH_KEYS_JSON|" "$CLOUD_INIT") || return 1
+                 -e "s|__RUNNER_LABELS__|$LABEL|g" \
+                 -e "s|__SSH_KEYS_JSON__|$SSH_KEYS_JSON|" "$BUNDLED_CLOUD_INIT") || return 1
   name="$TAG-$(date +%s)-$RANDOM"
   while read -r size region; do
     [[ -n $size ]] || continue
