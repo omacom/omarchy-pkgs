@@ -55,6 +55,13 @@ leaked a small slab object per frame while anything on screen moved, gigabytes
 of unreclaimable memory over a few days of uptime. nvkms now frees the record
 on that path. Keep it until NVIDIA merges the fix.
 
+And `0010-allow-suspend-on-gb20b.patch` ([NVIDIA/open-gpu-kernel-modules#1577](https://github.com/NVIDIA/open-gpu-kernel-modules/issues/1577)):
+620.73.04 added GB20B (the RTX Spark N1X GPU) to `gpuIsPowerManagementUnsupported()`,
+so `RmInitPowerManagement()` sets `nv->is_pm_unsupported` and both the kernel PM
+suspend notifier and `nvidia_suspend()` abort every s2idle suspend with
+`NV_ERR_NOT_SUPPORTED` (`0x56`). Excluding GB20B restores s2idle suspend and
+resume on N1x laptops. Keep it until NVIDIA excludes GB20B upstream.
+
 The patches are carried for ARM only (`source_aarch64`); x86_64 builds NVIDIA's sources as Arch does.
 
 Requires `[omarchy]` before `[extra]` and matching `nvidia-utils=615.78.08`. Omarchy carries the driver on both architectures; `nvidia-utils`'s README says why and what a driver update changes. The `linux-omarchy` recipes (x86_64 and aarch64), `linux-omarchy-eevdf` and `linux-omarchy-muqss` build the same driver into their prebuilt modules, and `linux-omarchy-aarch64` copies these patches with an `nvidia-` prefix: update them in the same change (`tests/nvidia-open-lockstep.sh` checks them).
