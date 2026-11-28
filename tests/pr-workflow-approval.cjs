@@ -416,6 +416,11 @@ test('every bot lane opens its PRs per package through package-prs.yml', () => {
   assert.doesNotMatch(describe, /secrets\.|create-github-app-token|environment:/);
   assert.doesNotMatch(job('pr'), /sync-pr-body\.py/);
   assert.doesNotMatch(job('close-superseded'), /sync-pr-body\.py/);
+  // close-superseded paginates all open PRs (no 500-PR cap) and detects
+  // non-conflicting PRs whose edits already landed on master via merge-tree.
+  assert.doesNotMatch(job('close-superseded'), /--limit 500/);
+  assert.match(job('close-superseded'), /gh api graphql --paginate/);
+  assert.match(job('close-superseded'), /git merge-tree --write-tree HEAD FETCH_HEAD/);
   assert.match(job('pr'), /^    needs: describe\n    if: \$\{\{ !cancelled\(\) && inputs\.groups != '\[\]' \}\}\n/);
   const choose = step("Choose this PR's description");
   assert.match(choose, /printf '%s\\n' "\$FALLBACK" > "\$RUNNER_TEMP\/pr-body\.md"/);
@@ -1102,4 +1107,133 @@ test('the arm plan judges each group PR by the auto-merge rule and never a fork 
   assert.deepEqual([...new Set(calls.map(call => call.head))], looked);
   assert.ok(calls.every(call => call.base === 'master'));
   assert.deepEqual(calls.filter(call => call.head === 'omacom:auto/sync-upstream-c').map(call => call.state), ['open', 'closed']);
+});
+
+test('close-superseded closes only superseded PRs and guards against errors and concurrent pushes', () => {
+  const { execFileSync } = require('node:child_process');
+  const { mkdtempSync, mkdirSync, writeFileSync, chmodSync, readFileSync: read, rmSync } = require('node:fs');
+  const { tmpdir } = require('node:os');
+  const prs = read(join(__dirname, '../.github/workflows/package-prs.yml'), 'utf8');
+  const stepStart = prs.indexOf('- name: Close superseded PRs\n');
+  assert.ok(stepStart > 0);
+  const runMarker = '        run: |\n';
+  const runStart = prs.indexOf(runMarker, stepStart);
+  assert.ok(runStart > 0);
+  const script = prs.slice(runStart + runMarker.length)
+    .split('\n')
+    .map(l => l.startsWith('          ') ? l.slice(10) : l)
+    .join('\n');
+
+  const root = mkdtempSync(join(tmpdir(), 'close-superseded-'));
+  try {
+    const remote = join(root, 'remote.git');
+    const work = join(root, 'work');
+    const bin = join(root, 'bin');
+    const closedLog = join(root, 'closed.log');
+    mkdirSync(bin);
+    const git = (cwd, args) => execFileSync('git', args, {
+      cwd,
+      encoding: 'utf8',
+      env: { ...process.env, GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@t', GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@t' },
+    }).trim();
+
+    git(root, ['init', '--bare', '-b', 'master', remote]);
+    git(root, ['clone', remote, work]);
+    writeFileSync(join(work, 'a.txt'), 'v1\n');
+    writeFileSync(join(work, 'b.txt'), 'v1\n');
+    writeFileSync(join(work, 'c.txt'), 'v1\n');
+    git(work, ['add', '.']);
+    git(work, ['commit', '-m', 'base']);
+    git(work, ['push', 'origin', 'master']);
+
+    const makeBranch = (name, file, content) => {
+      git(work, ['checkout', '-b', name, 'origin/master']);
+      writeFileSync(join(work, file), content);
+      git(work, ['add', file]);
+      git(work, ['commit', '-m', name]);
+      const sha = git(work, ['rev-parse', 'HEAD']);
+      git(work, ['push', 'origin', name]);
+      return sha;
+    };
+
+    const shaLanded = makeBranch('auto/sync-upstream-landed', 'a.txt', 'v2\n');
+    const shaValid = makeBranch('auto/sync-upstream-valid', 'b.txt', 'v2\n');
+    const shaConflict = makeBranch('auto/sync-upstream-conflict', 'c.txt', 'branch-v2\n');
+    const shaMoved = makeBranch('auto/sync-upstream-moved', 'a.txt', 'v2\n');
+    const shaMergeErr = makeBranch('auto/sync-upstream-mergeerr', 'b.txt', 'v3\n');
+
+    git(work, ['checkout', 'master']);
+    writeFileSync(join(work, 'a.txt'), 'v2\n');
+    writeFileSync(join(work, 'c.txt'), 'master-v2\n');
+    git(work, ['add', 'a.txt', 'c.txt']);
+    git(work, ['commit', '-m', 'master moves on']);
+    git(work, ['push', 'origin', 'master']);
+
+    const sameRepo = { nameWithOwner: 'omacom/omarchy-pkgs' };
+    const nodes = [
+      { number: 10, headRefName: 'auto/sync-upstream-landed', baseRefName: 'master', headRefOid: shaLanded, mergeable: 'MERGEABLE', headRepository: sameRepo },
+      { number: 11, headRefName: 'auto/sync-upstream-valid', baseRefName: 'master', headRefOid: shaValid, mergeable: 'MERGEABLE', headRepository: sameRepo },
+      { number: 12, headRefName: 'auto/sync-upstream-conflict', baseRefName: 'master', headRefOid: shaConflict, mergeable: 'UNKNOWN', headRepository: sameRepo },
+      { number: 13, headRefName: 'auto/sync-upstream-moved', baseRefName: 'master', headRefOid: shaMoved, mergeable: 'MERGEABLE', headRepository: sameRepo },
+      { number: 14, headRefName: 'auto/sync-upstream-fetcherr', baseRefName: 'master', headRefOid: 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef', mergeable: 'MERGEABLE', headRepository: sameRepo },
+      { number: 15, headRefName: 'auto/sync-upstream-mergeerr', baseRefName: 'master', headRefOid: shaMergeErr, mergeable: 'MERGEABLE', headRepository: sameRepo },
+      { number: 16, headRefName: 'auto/sync-upstream', baseRefName: 'master', headRefOid: shaLanded, mergeable: 'CONFLICTING', headRepository: { nameWithOwner: 'fork/omarchy-pkgs' } },
+    ];
+    writeFileSync(join(root, 'nodes.json'), JSON.stringify({ data: { repository: { pullRequests: { nodes } } } }));
+
+    // Wrap git to inject a status-128 merge-tree error for shaMergeErr only.
+    const realGit = execFileSync('which', ['git'], { encoding: 'utf8' }).trim();
+    const gitStub = `#!/bin/bash
+if [[ "$1" == "merge-tree" ]]; then
+  if [[ "$("${realGit}" rev-parse FETCH_HEAD 2>/dev/null || true)" == "${shaMergeErr}" ]]; then
+    exit 128
+  fi
+fi
+exec "${realGit}" "$@"
+`;
+    writeFileSync(join(bin, 'git'), gitStub);
+    chmodSync(join(bin, 'git'), 0o755);
+
+    const ghStub = `#!/bin/bash
+set -euo pipefail
+if [[ "$1" == "api" && "$2" == "graphql" ]]; then
+  jq_expr=""
+  while [[ $# -gt 0 ]]; do
+    if [[ "$1" == "--jq" ]]; then jq_expr="$2"; shift 2; else shift; fi
+  done
+  jq -r "$jq_expr" "${join(root, 'nodes.json')}"
+elif [[ "$1" == "pr" && "$2" == "view" ]]; then
+  num="$3"
+  case "$num" in
+    10) echo "OPEN master ${shaLanded}" ;;
+    11) echo "OPEN master ${shaValid}" ;;
+    12) echo "OPEN master ${shaConflict}" ;;
+    13) echo "OPEN master 1111111111111111111111111111111111111111" ;;
+    14) echo "OPEN master deadbeefdeadbeefdeadbeefdeadbeefdeadbeef" ;;
+    15) echo "OPEN master ${shaMergeErr}" ;;
+  esac
+elif [[ "$1" == "pr" && "$2" == "close" ]]; then
+  echo "$3" >> "${closedLog}"
+fi
+`;
+    writeFileSync(join(bin, 'gh'), ghStub);
+    chmodSync(join(bin, 'gh'), 0o755);
+
+    execFileSync('bash', ['-euo', 'pipefail', '-c', script], {
+      cwd: work,
+      env: {
+        ...process.env,
+        PATH: `${bin}:${process.env.PATH}`,
+        GITHUB_REPOSITORY: 'omacom/omarchy-pkgs',
+        GROUPS_JSON: '[]',
+        PREFIX: 'auto/sync-upstream',
+        DEFAULT_BRANCH: 'master',
+      },
+    });
+
+    const closed = read(closedLog, 'utf8').trim().split('\n').filter(Boolean);
+    assert.deepEqual(closed, ['10', '12']);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
