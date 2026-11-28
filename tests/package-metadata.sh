@@ -74,3 +74,25 @@ package_in_lane "$T/five" five-minute && ! package_in_lane "$T/five" auto-merge 
   pass "a five-minute package syncs only in the five-minute group" || fail "a five-minute package is in the hourly group"
 out=$(review five-reviewed "{\"source\": \"local\", \"sync_cadence\": \"five-minute\", $watch}") && fail "five-minute without auto_merge accepted"
 [[ $out == *"only an auto-merged package"* ]] && pass "five-minute without auto_merge is refused" || fail "unexpected message: $out"
+
+# package_policy_moves_to_channel must match !package_builds_for_mirror (and
+# hold pinned packages out of rc) for every (pinned, release_ring, channel) tuple.
+for pinned in false true; do
+  for ring in "" fast; do
+    d="$T/policy-$pinned-${ring:-std}"
+    mkdir -p "$d/.omarchy"
+    : > "$d/PKGBUILD"
+    printf '{"source":"local","pinned":%s%s}\n' "$pinned" "${ring:+,\"release_ring\":\"$ring\"}" > "$d/.omarchy/package.json"
+    for ch in rc stable; do
+      want=1
+      if [[ $ch == rc && $pinned == true ]]; then
+        want=1
+      elif ! package_builds_for_mirror "$d" "$ch"; then
+        want=0
+      fi
+      got=0; package_policy_moves_to_channel "$pinned" "$ring" "$ch" || got=1
+      (( got == want )) || fail "policy drift for pinned=$pinned ring=${ring:-std} ch=$ch (want=$want got=$got)"
+    done
+  done
+done
+pass "package_policy_moves_to_channel matches package_builds_for_mirror for every policy tuple"

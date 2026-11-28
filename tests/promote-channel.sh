@@ -335,3 +335,134 @@ fastring --to rc && [[ $(plan_action fast) == current ]] && pass "--fast-ring is
 if "$BIN/promote-channel" --remote "$REMOTE" --fast-ring --from rc --to stable --arch x86_64 >"$T/out" 2>&1; then
   fail "--fast-ring from rc should refuse"
 else grep -q 'fast ring follows edge' "$T/out" && pass "--fast-ring only follows edge" || fail "fast-ring direction reason"; fi
+
+# Disjoint-arch recipes sharing a pkgbase must not clobber each other in RECIPE,
+# regardless of directory sort order.
+recipe disjoint-a '{"source": "local"}' disjoint x86_64
+recipe disjoint-z '{"source": "local", "release_ring": "fast"}' disjoint aarch64
+recipe disjoint2-a '{"source": "local", "release_ring": "fast"}' disjoint2 aarch64
+recipe disjoint2-z '{"source": "local"}' disjoint2 x86_64
+recipe disjoint-unpub-a '{"source": "local"}' disjoint-unpub x86_64
+recipe disjoint-unpub-z '{"source": "local"}' disjoint-unpub aarch64
+mkpkg_par "disjoint 1" "disjoint2 1"
+pub edge "$(pkgf disjoint 1)" "$(pkgf disjoint2 1)"
+: > "$T/record"
+promote disjoint disjoint2 || fail "disjoint-arch promotion failed"
+[[ $(plan_action disjoint) == promote && $(plan_action disjoint2) == promote ]] \
+  && [[ "$(entries rc)" == *"disjoint-1.0-1 "* && "$(entries rc)" == *"disjoint2-1.0-1 "* ]] \
+  && pass "disjoint-arch recipes sharing a pkgbase both promote on x86_64 regardless of dir order" || fail "disjoint-arch promotion: $(cat "$T/record")"
+promote disjoint-unpub && grep -q "disjoint-unpub is not in edge/x86_64; skipping" "$T/out" \
+  && ! grep -q "does not build for x86_64" "$T/out" \
+  && pass "missing named disjoint-arch pkgbase warns instead of misreporting unsupported arch" || fail "disjoint-unpub skip"
+
+# A PKGBUILD that fails if stdin is non-empty proves recipe sourcing closes stdin.
+recipe 00-stdin '{"source": "local"}'
+sed -i '1i if read -r _leaked; then return 1; fi' "$PKGBUILDS_DIR/00-stdin/PKGBUILD"
+
+# Real split build with one native x86_64 output and one per-package arch=(any) output,
+# using the exact same PKGBUILD for both recipe lookup and makepkg.
+mkdir -p "$PKGBUILDS_DIR/mixed-split/.omarchy"
+cat << 'MIXED_EOF' > "$PKGBUILDS_DIR/mixed-split/PKGBUILD"
+pkgbase=mixed-split
+pkgname=(mixed-split mixed-split-data)
+pkgver=1.0
+pkgrel=1
+arch=(x86_64)
+package_mixed-split() { install -Dm644 /dev/null "$pkgdir/usr/share/mixed-split"; }
+package_mixed-split-data() { arch=(any); install -Dm644 /dev/null "$pkgdir/usr/share/mixed-split-data"; }
+MIXED_EOF
+echo '{"source": "local"}' > "$PKGBUILDS_DIR/mixed-split/.omarchy/package.json"
+d="$T/src/mixed-split-1"; mkdir -p "$d"
+cp "$PKGBUILDS_DIR/mixed-split/PKGBUILD" "$d/PKGBUILD"
+if (( EUID == 0 )); then
+  chmod 755 "$T/src"; chown -R fixture "$d"
+  (cd "$d" && runuser -u fixture -- env CARCH=x86_64 PKGEXT=.pkg.tar.zst makepkg -f --nodeps --ignorearch >/dev/null 2>&1)
+else
+  (cd "$d" && CARCH=x86_64 PKGEXT=.pkg.tar.zst makepkg -f --nodeps --ignorearch >/dev/null 2>&1)
+fi
+[[ -f "$d/mixed-split-1.0-1-x86_64.pkg.tar.zst" && -f "$d/mixed-split-data-1.0-1-any.pkg.tar.zst" ]] \
+  || fail "expected both native and -any split artifacts"
+pub edge "$d/mixed-split-1.0-1-x86_64.pkg.tar.zst" "$d/mixed-split-data-1.0-1-any.pkg.tar.zst"
+: > "$T/record"
+printf "leaked\n" | promote mixed-split && [[ $(plan_action mixed-split) == promote && $(plan_action mixed-split-data) == promote ]] \
+  && [[ "$(entries rc)" == *"mixed-split-1.0-1 "* && "$(entries rc)" == *"mixed-split-data-1.0-1 "* ]] \
+  && pass "split package with native and -any outputs promotes together with stdin closed during recipe sourcing" \
+  || fail "mixed-split promotion: $(cat "$T/record")"
+rm -rf "$PKGBUILDS_DIR/00-stdin"
+
+# Ambiguous recipes sharing a pkgbase on the target arch must fail closed.
+recipe ambig-a '{"source": "local"}' ambig any
+recipe ambig-z '{"source": "local"}' ambig x86_64
+if promote --dry-run; then
+  fail "ambiguous recipes sharing pkgbase on target arch should fail closed"
+else
+  grep -q "Ambiguous recipes for ambig on x86_64" "$T/out" \
+    && pass "ambiguous recipes sharing a pkgbase on the target arch fail closed" || fail "ambiguous reason"
+fi
+rm -rf "$PKGBUILDS_DIR/ambig-a" "$PKGBUILDS_DIR/ambig-z"
+
+# Duplicate JSON documents or whitespace-only metadata abort a real promotion
+# with no plan and an untouched destination database.
+rc_db_before=$(sha256sum "$REMOTE/rc/x86_64/omarchy.db.tar.zst")
+cp "$PKGBUILDS_DIR/pinned/.omarchy/package.json" "$T/pinned.json.bak"
+cp "$PKGBUILDS_DIR/alpha/.omarchy/package.json" "$T/alpha.json.bak"
+printf '{"source":"local"}{"source":"local"}\n' > "$PKGBUILDS_DIR/alpha/.omarchy/package.json"
+: > "$T/record"
+if promote; then
+  cp "$T/alpha.json.bak" "$PKGBUILDS_DIR/alpha/.omarchy/package.json"
+  fail "two-object package.json should fail closed"
+else
+  cp "$T/alpha.json.bak" "$PKGBUILDS_DIR/alpha/.omarchy/package.json"
+  [[ ! -s $T/record ]] && [[ "$(sha256sum "$REMOTE/rc/x86_64/omarchy.db.tar.zst")" == "$rc_db_before" ]] \
+    && grep -q "multiple JSON documents in .*alpha/.omarchy/package.json" "$T/out" \
+    && pass "two-object metadata aborts a real promotion with no plan and untouched rc db" || fail "two-object metadata check"
+fi
+printf '   \n' > "$PKGBUILDS_DIR/pinned/.omarchy/package.json"
+: > "$T/record"
+if promote; then
+  cp "$T/pinned.json.bak" "$PKGBUILDS_DIR/pinned/.omarchy/package.json"
+  fail "whitespace-only package.json should fail closed"
+else
+  cp "$T/pinned.json.bak" "$PKGBUILDS_DIR/pinned/.omarchy/package.json"
+  [[ ! -s $T/record ]] && grep -q "pinned/.omarchy/package.json" "$T/out" \
+    && pass "whitespace-only package.json aborts promotion in jq validation" || fail "whitespace metadata check"
+fi
+
+# A package with both pinned:true and release_ring:"fast" is held on edge -> rc
+# (both regular and --fast-ring) and still promoted on rc -> stable.
+recipe pinned-fast '{"source": "local", "pinned": true, "release_ring": "fast"}'
+mkpkg pinned-fast 1 >/dev/null
+pub edge "$(pkgf pinned-fast 1)"
+: > "$T/record"
+promote pinned-fast && [[ $(plan_action pinned-fast) == hold ]] \
+  && jq -e 'select(.name=="pinned-fast") | .reason | test("pinned")' "$T/record" >/dev/null \
+  && pass "pinned+fast package is held on edge -> rc" || fail "pinned-fast edge->rc"
+: > "$T/record"
+fastring --to rc pinned-fast && [[ $(plan_action pinned-fast) == hold ]] \
+  && jq -e 'select(.name=="pinned-fast") | .reason | test("pinned")' "$T/record" >/dev/null \
+  && pass "pinned+fast package is held under --fast-ring too" || fail "pinned-fast --fast-ring"
+pub rc "$(pkgf pinned-fast 1)"
+: > "$T/record"
+"$BIN/promote-channel" --remote "$REMOTE" --from rc --to stable --arch x86_64 --record "$T/record" pinned-fast >"$T/out" 2>&1 \
+  && [[ $(plan_action pinned-fast) == promote ]] && [[ "$(entries stable)" == *"pinned-fast-1.0-1 "* ]] \
+  && pass "pinned+fast package promotes on rc -> stable" || fail "pinned-fast rc->stable: $(cat "$T/record")"
+
+# An ARM-only recipe promotes cleanly on aarch64 and is skipped on x86_64.
+recipe arm-only-pkg '{"source": "local"}' "" aarch64
+: > "$T/record"
+promote --dry-run alpha   && [[ $(plan_action alpha) == current ]]   && pass "ARM-only recipe does not interfere with x86_64 promotion"   || fail "arm-only-pkg x86_64 promote"
+d="$T/src/arm-only-pkg-1"; mkdir -p "$d"
+cat > "$d/PKGBUILD" <<'EOF'
+pkgname=arm-only-pkg; pkgver=1.0; pkgrel=1; arch=(aarch64)
+package() { install -Dm644 /dev/null "$pkgdir/usr/share/arm-only-pkg"; }
+EOF
+if (( EUID == 0 )); then
+  chmod 755 "$T/src"; chown -R fixture "$d"
+  (cd "$d" && runuser -u fixture -- env CARCH=aarch64 PKGEXT=.pkg.tar.zst makepkg -f --nodeps --ignorearch >/dev/null 2>&1)
+else
+  (cd "$d" && CARCH=aarch64 PKGEXT=.pkg.tar.zst makepkg -f --nodeps --ignorearch >/dev/null 2>&1)
+fi
+"$BIN/publish-artifact" --remote "$REMOTE" --mirror edge --arch aarch64 --init "$d/arm-only-pkg-1.0-1-aarch64.pkg.tar.zst" >"$T/out" 2>&1   || fail "arm-only-pkg publish"
+: > "$T/record"
+"$BIN/promote-channel" --remote "$REMOTE" --from edge --to rc --arch aarch64 --init --dry-run --record "$T/record" arm-only-pkg >"$T/out" 2>&1   && [[ $(plan_action arm-only-pkg) == promote ]]   && pass "ARM-only recipe promotes cleanly on aarch64"   || fail "arm-only-pkg aarch64 promote"
+rm -rf "$PKGBUILDS_DIR/arm-only-pkg"
