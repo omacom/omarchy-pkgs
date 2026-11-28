@@ -48,16 +48,16 @@ jobs:
       - id: list
         env:
           GH_TOKEN: ${{ github.token }}
+          INPUT_PACKAGES: ${{ github.event.inputs.packages }}
+          BEFORE_SHA: ${{ github.event.before }}
         run: |
           set -euo pipefail
-          if [[ -n "${{ github.event.inputs.packages }}" ]]; then
-            names="${{ github.event.inputs.packages }}"
+          if [[ -n "$INPUT_PACKAGES" ]]; then
+            matrix=$(tr -s '[:space:]' '\n' <<<"$INPUT_PACKAGES" | bin/build-matrix)
           else
-            names=$(git diff --name-only "${{ github.event.before }}..${{ github.sha }}" -- pkgbuilds \
-              | awk -F/ '$1=="pkgbuilds" && NF>2 {print $2}' | sort -u)
+            matrix=$(git diff --name-only "$BEFORE_SHA..$GITHUB_SHA" -- pkgbuilds \
+              | awk -F/ '$1=="pkgbuilds" && NF>2 {print $2}' | sort -u | bin/build-matrix)
           fi
-          # shellcheck disable=SC2086 # split $names into one package per line
-          matrix=$(printf '%s\n' $names | bin/build-matrix)
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
           echo "count=$(jq '.include | length' <<<"$matrix")" >> "$GITHUB_OUTPUT"
           jq -r '.include[] | "\(.package) \(.arch) -> \(.channels)"' <<<"$matrix"
@@ -73,7 +73,7 @@ jobs:
             hash=$(git rev-parse "HEAD:pkgbuilds/$package")
             label="$package-$arch-$hash"
             found=$(curl -fsS -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/${{ github.repository }}/actions/artifacts?name=$label&per_page=5" \
+              "https://api.github.com/repos/$GITHUB_REPOSITORY/actions/artifacts?name=$label&per_page=5" \
               | jq -r '[.artifacts[] | select(.expired|not)] | sort_by(.created_at) | last | select(. != null) | "run \(.workflow_run.id), expires \(.expires_at)"')
             # The plan the publish job makes, made here before a runner is
             # asked for: a tree the channel already holds at master's version
@@ -125,24 +125,29 @@ jobs:
         id: build
         env:
           CONTAINER_ENGINE: docker
+          PACKAGE: ${{ matrix.package }}
+          TARGET_ARCH: ${{ matrix.arch }}
         run: |
           set -euo pipefail
-          plan=$(bin/build --dry-run --mirror edge --arch "${{ matrix.arch }}" --package "${{ matrix.package }}" 2>&1 | grep -E '^==> Plan complete' || true)
+          plan=$(bin/build --dry-run --mirror edge --arch "$TARGET_ARCH" --package "$PACKAGE" 2>&1 | grep -E '^==> Plan complete' || true)
           if [[ -n "$plan" && -z "$(sed -E 's/.*would build: *//' <<<"$plan" | tr -d '[:space:]')" ]]; then
-            echo "==> ${{ matrix.package }} (${{ matrix.arch }}): already published at master's version, nothing to build"
+            echo "==> $PACKAGE ($TARGET_ARCH): already published at master's version, nothing to build"
             echo "built=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          bin/build --mirror edge --arch "${{ matrix.arch }}" --package "${{ matrix.package }}"
+          bin/build --mirror edge --arch "$TARGET_ARCH" --package "$PACKAGE"
           echo "built=true" >> "$GITHUB_OUTPUT"
       - name: Pack artifact
         if: steps.build.outputs.built == 'true'
         id: pack
+        env:
+          PACKAGE: ${{ matrix.package }}
+          TARGET_ARCH: ${{ matrix.arch }}
         run: |
           source helpers/artifact-helpers.sh
-          pack_packages build-output/edge/${{ matrix.arch }} packages.tar
+          pack_packages "build-output/edge/$TARGET_ARCH" packages.tar
           tar -tvf packages.tar
-          echo "label=${{ matrix.package }}-${{ matrix.arch }}-$(git rev-parse "HEAD:pkgbuilds/${{ matrix.package }}")" >> "$GITHUB_OUTPUT"
+          echo "label=$PACKAGE-$TARGET_ARCH-$(git rev-parse "HEAD:pkgbuilds/$PACKAGE")" >> "$GITHUB_OUTPUT"
       # Each package as an artifact of its own, with an index beside them
       # (.github/actions/upload-packages). They go before packages.tar: a
       # rerun takes that archive as proof the build is done, so it comes
@@ -205,11 +210,12 @@ jobs:
       # Every matrix entry, as a file the shell steps can loop over:
       # package arch channels publish_arches
       - name: Plan
+        env:
+          MATRIX: ${{ needs.changes.outputs.matrix }}
         run: |
+          printf '%s\n' "$MATRIX" > matrix.json
           jq -r '.include[] | "\(.package) \(.arch) \(.channels|gsub(" ";",")) \(.publish_arches|gsub(" ";","))"' \
-            <<'EOF_MATRIX' > plan.txt
-          ${{ needs.changes.outputs.matrix }}
-          EOF_MATRIX
+            matrix.json > plan.txt
           cat plan.txt
 
       # Fetch each package's artifact into build-output/edge/<arch>/: the PR's,
@@ -233,12 +239,12 @@ jobs:
             hash=$(git rev-parse "HEAD:pkgbuilds/$package")
             label="$package-$arch-$hash"
             found=$(curl -fsS -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/${{ github.repository }}/actions/artifacts?name=$label&per_page=5" \
+              "https://api.github.com/repos/$GITHUB_REPOSITORY/actions/artifacts?name=$label&per_page=5" \
               | jq -r '[.artifacts[] | select(.expired|not)] | sort_by(.created_at) | last | select(. != null) | "\(.archive_download_url) \(.workflow_run.id)"')
             read -r found from_run <<<"$found" || true
             mkdir -p "build-output/edge/$arch"
             if [[ -n "$found" ]]; then
-              if [[ $from_run == "${{ github.run_id }}" ]]; then
+              if [[ $from_run == "$GITHUB_RUN_ID" ]]; then
                 kind=rebuild
                 echo "==> $label: artifact from this run's $arch rebuild"
               else
@@ -275,10 +281,10 @@ jobs:
           ls -1 build-output/edge/*/*.pkg.tar.zst 2>/dev/null || true
           if (( failed )); then
             # Write the record now; the publish step will not run.
-            jq -n --arg sha "${{ github.sha }}" --arg run "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
-              --arg prefix "${OMARCHY_PUBLISH_PREFIX:-}" --arg event "${{ github.event_name }}" \
-              --slurpfile sources sources.jsonl --slurpfile plan <(jq -c '.include[]' <<<'${{ needs.changes.outputs.matrix }}' | jq -sc .) \
-              '{time: (now|todate), commit:$sha, run:$run, event:$event, target: (if $prefix=="" then "live" else $prefix end), plan:$plan[0], sources:$sources, slots:[]}' \
+            jq -n --arg sha "$GITHUB_SHA" --arg run "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+              --arg prefix "${OMARCHY_PUBLISH_PREFIX:-}" --arg event "$GITHUB_EVENT_NAME" \
+              --slurpfile sources sources.jsonl --slurpfile matrix matrix.json \
+              '{time: (now|todate), commit:$sha, run:$run, event:$event, target: (if $prefix=="" then "live" else $prefix end), plan:$matrix[0].include, sources:$sources, slots:[]}' \
               > publish-record.json
             cat publish-record.json
             exit 1
@@ -304,10 +310,10 @@ jobs:
           source helpers/artifact-helpers.sh
           if ! compgen -G "build-output/edge/*/*.pkg.tar.zst" >/dev/null; then
             echo "Nothing to publish: every requested package is already published at master's version."
-            jq -n --arg sha "${{ github.sha }}" --arg run "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
-              --arg prefix "${OMARCHY_PUBLISH_PREFIX:-}" --arg event "${{ github.event_name }}" \
-              --slurpfile sources sources.jsonl --slurpfile plan <(jq -c '.include[]' <<<'${{ needs.changes.outputs.matrix }}' | jq -sc .) \
-              '{time: (now|todate), commit:$sha, run:$run, event:$event, target: (if $prefix=="" then "live" else $prefix end), plan:$plan[0], sources:$sources, slots:[]}' \
+            jq -n --arg sha "$GITHUB_SHA" --arg run "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+              --arg prefix "${OMARCHY_PUBLISH_PREFIX:-}" --arg event "$GITHUB_EVENT_NAME" \
+              --slurpfile sources sources.jsonl --slurpfile matrix matrix.json \
+              '{time: (now|todate), commit:$sha, run:$run, event:$event, target: (if $prefix=="" then "live" else $prefix end), plan:$matrix[0].include, sources:$sources, slots:[]}' \
               > publish-record.json
             cat publish-record.json
             exit 0
@@ -363,10 +369,10 @@ jobs:
             unmatched=1
           fi
           if [[ -n ${unmatched:-} ]]; then
-            jq -n --arg sha "${{ github.sha }}" --arg run "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
-              --arg prefix "${OMARCHY_PUBLISH_PREFIX:-}" --arg event "${{ github.event_name }}" \
-              --slurpfile sources sources.jsonl --slurpfile plan <(jq -c '.include[]' <<<'${{ needs.changes.outputs.matrix }}' | jq -sc .) \
-              '{time: (now|todate), commit:$sha, run:$run, event:$event, target: (if $prefix=="" then "live" else $prefix end), plan:$plan[0], sources:$sources, slots:[]}' \
+            jq -n --arg sha "$GITHUB_SHA" --arg run "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+              --arg prefix "${OMARCHY_PUBLISH_PREFIX:-}" --arg event "$GITHUB_EVENT_NAME" \
+              --slurpfile sources sources.jsonl --slurpfile matrix matrix.json \
+              '{time: (now|todate), commit:$sha, run:$run, event:$event, target: (if $prefix=="" then "live" else $prefix end), plan:$matrix[0].include, sources:$sources, slots:[]}' \
               > publish-record.json
             exit 1
           fi
@@ -402,10 +408,10 @@ jobs:
               fi
             done
           done
-          jq -n --arg sha "${{ github.sha }}" --arg run "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
-            --arg prefix "${OMARCHY_PUBLISH_PREFIX:-}" --arg event "${{ github.event_name }}" \
-            --slurpfile slots slots.jsonl --slurpfile sources sources.jsonl --slurpfile plan <(jq -c '.include[]' <<<'${{ needs.changes.outputs.matrix }}' | jq -sc .) \
-            '{time: (now|todate), commit:$sha, run:$run, event:$event, target: (if $prefix=="" then "live" else $prefix end), plan:$plan[0], sources:$sources, slots:$slots}' \
+          jq -n --arg sha "$GITHUB_SHA" --arg run "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            --arg prefix "${OMARCHY_PUBLISH_PREFIX:-}" --arg event "$GITHUB_EVENT_NAME" \
+            --slurpfile slots slots.jsonl --slurpfile sources sources.jsonl --slurpfile matrix matrix.json \
+            '{time: (now|todate), commit:$sha, run:$run, event:$event, target: (if $prefix=="" then "live" else $prefix end), plan:$matrix[0].include, sources:$sources, slots:$slots}' \
             > publish-record.json
           cat publish-record.json
           exit $status
@@ -581,19 +587,22 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          pr=$(gh api "repos/${{ github.repository }}/commits/${{ github.sha }}/pulls" --jq '.[0].number // empty')
+          pr=$(gh api "repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA/pulls" --jq '.[0].number // empty')
           if [[ -n "$pr" ]]; then
-            gh pr comment "$pr" -R "${{ github.repository }}" --body-file comment.md
+            gh pr comment "$pr" -R "$GITHUB_REPOSITORY" --body-file comment.md
             echo "commented on #$pr"
           else
-            echo "no PR for ${{ github.sha }} (manual dispatch?); skipping PR comment"
+            echo "no PR for $GITHUB_SHA (manual dispatch?); skipping PR comment"
           fi
   result:
     needs: [changes, publish]
     if: always()
     runs-on: ubuntu-latest
     steps:
-      - run: |
-          echo "changes result: ${{ needs.changes.result }}, publish result: ${{ needs.publish.result }}"
-          [[ "${{ needs.changes.result }}" == "success" ]]
-          [[ "${{ needs.publish.result }}" == "success" || "${{ needs.publish.result }}" == "skipped" ]]
+      - env:
+          CHANGES_RESULT: ${{ needs.changes.result }}
+          PUBLISH_RESULT: ${{ needs.publish.result }}
+        run: |
+          echo "changes result: $CHANGES_RESULT, publish result: $PUBLISH_RESULT"
+          [[ "$CHANGES_RESULT" == "success" ]]
+          [[ "$PUBLISH_RESULT" == "success" || "$PUBLISH_RESULT" == "skipped" ]]

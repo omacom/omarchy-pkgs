@@ -8,6 +8,7 @@
 #    the multi-arch build matrix starts, archives the pinned recipe trees so
 #    both arches unpack the exact same commit even if rc moves mid-run, and
 #    propagates pin metadata and artifact names from pins rather than build.
+# 3. build-pr.yml and publish.yml run: blocks bind github/inputs/matrix/env via env:, not ${{ }}.
 import os, pathlib, re, shutil, subprocess, sys, tempfile, yaml
 
 root = pathlib.Path(__file__).resolve().parent.parent
@@ -153,6 +154,8 @@ def check_release_rc_pins(repo_root):
 
 
 failures = []
+gha_expr = re.compile(r"\$\{\{(?:'[^']*'|[^'])*?\}\}")
+forbidden_ctx = re.compile(r'\b(?:github|inputs|matrix|env)\b', re.I)
 workflows_dir = root / '.github/workflows'
 for workflow in sorted(workflows_dir.glob('*.yml')):
     doc = yaml.safe_load(workflow.read_text())
@@ -161,12 +164,16 @@ for workflow in sorted(workflows_dir.glob('*.yml')):
             run = step.get('run')
             if not run:
                 continue
+            label = step.get('name') or f'step {i + 1}'
+            if workflow.name in ('build-pr.yml', 'publish.yml'):
+                for expr in gha_expr.findall(run):
+                    if forbidden_ctx.search(expr):
+                        failures.append(f'{workflow.name}: {job_id}: "{label}" interpolates {expr} in run:')
             body = code(run)
             for name, files in defined.items():
                 if not re.search(rf'(?<![\w.-]){name}(?![\w.-])', body):
                     continue
                 if not any(re.search(rf'(source|\.)\s+(\S*/)?{re.escape(f)}\b', body) for f in files):
-                    label = step.get('name') or f'step {i + 1}'
                     failures.append(f'{workflow.name}: {job_id}: "{label}" calls {name} without sourcing {" or ".join(sorted(files))}')
 
 failures.extend(check_release_rc_pins(root))
@@ -175,4 +182,4 @@ for failure in failures:
     print(f'FAIL: {failure}')
 if failures:
     sys.exit(1)
-print('PASS: workflow helper sourcing and release-rc pin invariants hold')
+print('PASS: workflow helper sourcing, release-rc pin, and run-expression invariants hold')
