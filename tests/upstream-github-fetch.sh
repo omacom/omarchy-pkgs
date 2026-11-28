@@ -28,7 +28,7 @@ retries() {
   local flag value
   for flag in --retry=3 --retry-max-time=60 --connect-timeout=20 --max-time=30; do
     value=${flag#*=}
-    grep -A1 -x -- "${flag%%=*}" "$T/args" | tail -n +2 | grep -qx -- "$value" || return 1
+    grep -A1 -x -- "${flag%%=*}" "$T/args" | tail -n +2 | grep -x -- "$value" >/dev/null || return 1
   done
 }
 
@@ -39,7 +39,7 @@ grep -qx -- '--http1.1' "$T/args" && pass "the release feed uses HTTP/1.1" || fa
 retries && pass "the release feed retries with a bounded backoff" || fail "release feed args: $(<"$T/args")"
 grep -q job-token "$T/args" && fail "the token is on the command line"
 pass "the token stays off the command line"
-grep -A1 -x -- '--config' "$T/args" | grep -qx -- '-' \
+grep -A1 -x -- '--config' "$T/args" | grep -x -- '-' >/dev/null \
   && [[ $(<"$T/stdin") == 'header = "Authorization: Bearer job-token"' ]] \
   && pass "the token goes to the API through stdin config" || fail "args: $(<"$T/args") stdin: $(<"$T/stdin")"
 
@@ -60,7 +60,7 @@ pass "the token never goes to a release download"
 # partial attempt already wrote to stdout, so the body has to go to a file
 # and reach stdout only once the whole fetch succeeded.
 out=$(CURL_BODY='[{"tag_name":"v1"}]' github_fetch_releases owner/repo </dev/null)
-grep -A1 -x -- '-o' "$T/args" | tail -n +2 | grep -q . \
+grep -A1 -x -- '-o' "$T/args" | tail -n +2 | grep . >/dev/null \
   && [[ $out == '[{"tag_name":"v1"}]' ]] \
   && pass "a fetch prints the body it downloaded to a file" || fail "output: $out args: $(<"$T/args")"
 mkdir "$T/tmp"
@@ -68,5 +68,5 @@ status=0
 out=$(TMPDIR="$T/tmp" CURL_BODY='[{"tag_n' CURL_STATUS=28 github_fetch_releases owner/repo </dev/null) || status=$?
 (( status == 28 )) && [[ -z $out ]] \
   && pass "a failed fetch prints nothing and keeps curl's exit status" || fail "status $status, output: $out"
-grep -A1 -x -- '-o' "$T/args" | tail -n +2 | grep -q "^$T/tmp/" && [[ -z $(ls -A "$T/tmp") ]] \
+grep -A1 -x -- '-o' "$T/args" | tail -n +2 | grep "^$T/tmp/" >/dev/null && [[ -z $(ls -A "$T/tmp") ]] \
   && pass "the download file is removed" || fail "download file: $(ls -A "$T/tmp") args: $(<"$T/args")"

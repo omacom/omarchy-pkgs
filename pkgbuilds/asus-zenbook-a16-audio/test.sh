@@ -40,7 +40,7 @@ if [[ -f $crd ]]; then
   done <"$crd"
 fi
 for c in "WSA WSA_RX0" "WSA WSA_RX1" "WSA2 WSA_RX0" "WSA2 WSA_RX1"; do
-  sed -n '/^FixedBootSequence \[/,/^\]/p' "$ucm" | grep -qF "cset \"name='$c Digital Volume' 100%\"" ||
+  sed -n '/^FixedBootSequence \[/,/^\]/p' "$ucm" | grep -F "cset \"name='$c Digital Volume' 100%\"" >/dev/null ||
     fail "the UCM profile sets $c Digital Volume to its ceiling on every boot"
 done
 

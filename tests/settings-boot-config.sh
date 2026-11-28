@@ -32,7 +32,7 @@ for recipe in omarchy-settings omarchy-settings-dev; do
       for path in etc/mkinitcpio.conf.d/omarchy_hooks.conf \
         etc/limine-entry-tool.d/omarchy-defaults.conf \
         etc/limine-entry-tool.d/omarchy-uki.conf; do
-        printf '%s\n' "${backup[@]}" | grep -Fxq "$path"
+        printf '%s\n' "${backup[@]}" | grep -Fx "$path" >/dev/null
       done
       for path in etc/limine-entry-tool.d/omarchy-defaults.conf etc/limine-entry-tool.d/omarchy-uki.conf; do
         cmp "$fixture/$path" "$pkgdir/$path"
@@ -47,17 +47,17 @@ for recipe in omarchy-settings omarchy-settings-dev; do
       for template in default.conf limine.conf; do
         cmp "$fixture/default/limine/$template" "$pkgdir/usr/share/omarchy/default/limine/$template"
       done
-      if printf '%s\n' "${backup[@]}" | grep -Fxq etc/mkinitcpio.conf.d/00-omarchy-hooks.conf; then
+      if printf '%s\n' "${backup[@]}" | grep -Fx etc/mkinitcpio.conf.d/00-omarchy-hooks.conf >/dev/null; then
         echo 'FAIL: backup names a 00-omarchy-hooks.conf the source does not ship' >&2
         exit 1
       fi
-      if printf '%s\n' "${backup[@]}" | grep -Fxq etc/sysctl.d/90-omarchy-arp.conf; then
+      if printf '%s\n' "${backup[@]}" | grep -Fx etc/sysctl.d/90-omarchy-arp.conf >/dev/null; then
         echo 'FAIL: backup names a 90-omarchy-arp.conf the source does not ship' >&2
         exit 1
       fi
       # The installer owns the machine-specific live configuration.
       [[ ! -e $pkgdir/etc/default/limine ]]
-      if printf '%s\n' "${backup[@]}" | grep -Fxq 'etc/default/limine'; then
+      if printf '%s\n' "${backup[@]}" | grep -Fx 'etc/default/limine' >/dev/null; then
         echo 'FAIL: installer-owned Limine configuration is in backup metadata' >&2
         exit 1
       fi
@@ -69,13 +69,13 @@ for recipe in omarchy-settings omarchy-settings-dev; do
       thunderbolt=etc/mkinitcpio.conf.d/thunderbolt_module.conf
       if [[ $CARCH == aarch64 ]]; then
         [[ ! -e $pkgdir/$thunderbolt ]]
-        if printf '%s\n' "${backup[@]}" | grep -Fxq "$thunderbolt"; then
+        if printf '%s\n' "${backup[@]}" | grep -Fx "$thunderbolt" >/dev/null; then
           echo 'FAIL: removed ARM Thunderbolt config remains in backup metadata' >&2
           exit 1
         fi
       else
         cmp "$fixture/$thunderbolt" "$pkgdir/$thunderbolt"
-        printf '%s\n' "${backup[@]}" | grep -Fxq "$thunderbolt"
+        printf '%s\n' "${backup[@]}" | grep -Fx "$thunderbolt" >/dev/null
       fi
       echo "PASS: $recipe $CARCH retains boot configuration and matching backup metadata"
     )
@@ -96,7 +96,7 @@ for recipe in omarchy-settings omarchy-settings-dev; do
       source "$BUILD_ROOT/pkgbuilds/$recipe/PKGBUILD"
       package
       cmp "$fixture/etc/sysctl.d/90-omarchy-arp.conf" "$pkgdir/etc/sysctl.d/90-omarchy-arp.conf"
-      printf '%s\n' "${backup[@]}" | grep -Fxq etc/sysctl.d/90-omarchy-arp.conf
+      printf '%s\n' "${backup[@]}" | grep -Fx etc/sysctl.d/90-omarchy-arp.conf >/dev/null
       echo "PASS: $recipe $CARCH ships the ARP sysctl drop-in and backs it up"
     )
   done

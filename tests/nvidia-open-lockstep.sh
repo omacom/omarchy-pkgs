@@ -38,13 +38,13 @@ mapfile -t dkms_patches < <(recipe aarch64 "$DKMS" 'printf "%s\n" "${source_aarc
 
 for patch in "${dkms_patches[@]}"; do
   copy="nvidia-$patch"
-  printf '%s\n' "${kernel_sources[@]}" | grep -qxF "$copy" || fail "linux-omarchy-aarch64 does not build with $copy"
+  printf '%s\n' "${kernel_sources[@]}" | grep -xF "$copy" >/dev/null || fail "linux-omarchy-aarch64 does not build with $copy"
   cmp -s "$DKMS/$patch" "$ARM_KERNEL/$copy" || fail "$ARM_KERNEL/$copy differs from nvidia-open-dkms's $patch"
 done
 
 for source in "${kernel_sources[@]}"; do
   [[ $source == nvidia-*.patch ]] || continue
-  printf '%s\n' "${dkms_patches[@]}" | grep -qxF "${source#nvidia-}" || fail "linux-omarchy-aarch64 carries $source, which nvidia-open-dkms dropped"
+  printf '%s\n' "${dkms_patches[@]}" | grep -xF "${source#nvidia-}" >/dev/null || fail "linux-omarchy-aarch64 carries $source, which nvidia-open-dkms dropped"
 done
 
 echo "NVIDIA $version in ${#DRIVER[@]} driver recipes and ${#KERNELS[@]} kernels, ${#dkms_patches[@]} ARM patches in step"
