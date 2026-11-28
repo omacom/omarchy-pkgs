@@ -79,6 +79,12 @@ if [[ \${1:-} == lsf && -n \${FAIL_LSF_RC:-} ]]; then
     exit "\$FAIL_LSF_RC"
   fi
 fi
+if [[ \${1:-} == copyto && -n \${FAIL_COPYTO_RC:-} ]]; then
+  if [[ -z \${FAIL_COPYTO_MATCH:-} || \${2:-} == *"\$FAIL_COPYTO_MATCH"* ]]; then
+    echo "simulated rclone copyto failure on \${2:-} (rc=\$FAIL_COPYTO_RC)" >&2
+    exit "\$FAIL_COPYTO_RC"
+  fi
+fi
 exec "$REAL_RCLONE" "\$@"
 RCLONE_EOF
 chmod +x "$FAKEBIN/rclone"
@@ -245,6 +251,50 @@ if PATH="$FAKEBIN:$PATH" FAIL_LSF_RC=1 FAIL_LSF_MATCH="/rc/" FAIL_LSF_STDOUT=oma
 else
   grep -q 'Failed to list' "$T/out" \
     && pass "promote fails closed when rclone lsf emits db name before failing" || fail "promote partial stdout"
+fi
+
+# Failed database downloads and unreadable archives on either source or
+# destination must fail closed (guards against set -e being disabled on read_db)
+# and leave the destination database untouched.
+if PATH="$FAKEBIN:$PATH" FAIL_COPYTO_RC=1 FAIL_COPYTO_MATCH="/edge/" promote --dry-run; then
+  fail "rclone copyto failure on source db should fail closed"
+else
+  grep -q 'simulated rclone copyto failure' "$T/out" && ! grep -q 'has .* packages' "$T/out" \
+    && [[ "$(sha256sum "$REMOTE/rc/x86_64/omarchy.db.tar.zst")" == "$rc_db_before" ]] \
+    && pass "rclone copyto error on source db fails closed and preserves rc db" || fail "source copyto error"
+fi
+if PATH="$FAKEBIN:$PATH" FAIL_COPYTO_RC=1 FAIL_COPYTO_MATCH="/rc/" promote --dry-run; then
+  fail "rclone copyto failure on destination db should fail closed"
+else
+  grep -q 'simulated rclone copyto failure' "$T/out" && ! grep -q 'has .* packages' "$T/out" \
+    && [[ "$(sha256sum "$REMOTE/rc/x86_64/omarchy.db.tar.zst")" == "$rc_db_before" ]] \
+    && pass "rclone copyto error on destination db fails closed and preserves rc db" || fail "dest copyto error"
+fi
+
+cp "$REMOTE/edge/x86_64/omarchy.db.tar.zst" "$T/edge.db.bak"
+printf 'not a valid archive\n' > "$REMOTE/edge/x86_64/omarchy.db.tar.zst"
+if promote --dry-run; then
+  cp "$T/edge.db.bak" "$REMOTE/edge/x86_64/omarchy.db.tar.zst"
+  fail "corrupt source db archive should fail closed"
+else
+  cp "$T/edge.db.bak" "$REMOTE/edge/x86_64/omarchy.db.tar.zst"
+  grep -q 'bsdtar:' "$T/out" && ! grep -q 'has .* packages' "$T/out" && [[ "$(sha256sum "$REMOTE/rc/x86_64/omarchy.db.tar.zst")" == "$rc_db_before" ]] \
+    && pass "corrupt source db archive fails closed before planning and preserves rc db" || fail "corrupt source db"
+fi
+
+cp "$REMOTE/rc/x86_64/omarchy.db.tar.zst" "$T/rc.db.bak"
+printf 'not a valid archive\n' > "$REMOTE/rc/x86_64/omarchy.db.tar.zst"
+corrupt_rc_sum=$(sha256sum "$REMOTE/rc/x86_64/omarchy.db.tar.zst")
+if promote --dry-run; then
+  cp "$T/rc.db.bak" "$REMOTE/rc/x86_64/omarchy.db.tar.zst"
+  fail "corrupt destination db archive should fail closed"
+else
+  grep -q 'bsdtar:' "$T/out" && ! grep -q 'has .* packages' "$T/out" && [[ "$(sha256sum "$REMOTE/rc/x86_64/omarchy.db.tar.zst")" == "$corrupt_rc_sum" ]] || {
+    cp "$T/rc.db.bak" "$REMOTE/rc/x86_64/omarchy.db.tar.zst"
+    fail "corrupt destination db reached planning or was modified"
+  }
+  cp "$T/rc.db.bak" "$REMOTE/rc/x86_64/omarchy.db.tar.zst"
+  pass "corrupt destination db archive fails closed before planning without overwriting rc db"
 fi
 
 # rc -> stable: pinned packages move there (stable gets the release pair by
