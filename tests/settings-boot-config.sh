@@ -28,6 +28,8 @@ for recipe in omarchy-settings omarchy-settings-dev; do
       # shellcheck disable=SC1090 # Exercise each recipe's actual package function.
       source "$BUILD_ROOT/pkgbuilds/$recipe/PKGBUILD"
       package
+      # Release pins without the Bluetooth preference unit still build.
+      [[ ! -e $pkgdir/usr/lib/systemd/user/omarchy-bluetooth-power.service ]]
 
       for path in etc/mkinitcpio.conf.d/omarchy_hooks.conf \
         etc/limine-entry-tool.d/omarchy-defaults.conf \
@@ -293,6 +295,27 @@ for recipe in omarchy-settings omarchy-settings-dev; do
   )
 done
 echo "PASS: initcpio hooks move to /etc/initcpio/ when 91-omarchy-initcpio-rebuild.hook is present"
+
+# New runtime sources must install the Bluetooth unit at the fixed path used
+# by first-run and migration, in both settings packages and architectures.
+bluetooth_unit=default/systemd/user/omarchy-bluetooth-power.service
+printf '[Service]\nExecStart=/usr/bin/omarchy-bluetooth-power monitor\n' > "$fixture/$bluetooth_unit"
+chmod 0600 "$fixture/$bluetooth_unit"
+for recipe in omarchy-settings omarchy-settings-dev; do
+  for target_arch in aarch64 x86_64; do
+    (
+      export CARCH=$target_arch OMARCHY_SRC=$fixture
+      export srcdir=$scratch/src pkgdir=$scratch/bluetooth-$recipe-$target_arch
+      backup=()
+      source "$BUILD_ROOT/pkgbuilds/$recipe/PKGBUILD"
+      package
+      destination="$pkgdir/usr/lib/systemd/user/omarchy-bluetooth-power.service"
+      cmp "$fixture/$bluetooth_unit" "$destination"
+      [[ $(stat -c %a "$destination") == 644 ]]
+      echo "PASS: $recipe $CARCH installs the Bluetooth power unit at its live path"
+    )
+  done
+done
 
 # Upgrades: pacman replaces an unmodified hooks file, keeps a modified one and
 # leaves the guarded version as .pacnew, and installs it where it was absent.
