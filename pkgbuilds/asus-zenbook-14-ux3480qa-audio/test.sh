@@ -18,21 +18,30 @@ source "$package_dir/PKGBUILD"
 pkgdir="$scratch/pkg"
 (cd "$package_dir" && package)
 
-# A symlink, not a wrapper: a wrapper declares its own Syntax, and UCM
-# rejects the T14s profile's Syntax 6 macros under a wrapper's Syntax 4.
+# Each model gets a top-level Syntax 6 UCM profile restating the T14s profile
+# and setting the WSA digital volumes to 100% on every boot.
+t14s=/usr/share/alsa/ucm2/Qualcomm/x1e80100/LENOVO-T14s.conf
 for model in UX3480QA UX3480QAB; do
   ucm="$pkgdir/usr/share/alsa/ucm2/conf.d/x1e80100/ASUSTeKCOMPUTERINC.-Zenbook14$model-1.0-$model.conf"
-  [[ -L $ucm ]] || fail "the $model profile is named after the card's long name and is a symlink"
-  [[ $(readlink "$ucm") == ../../Qualcomm/x1e80100/LENOVO-T14s.conf ]] ||
-    fail "the $model profile links to the T14s profile"
+  [[ -f $ucm && ! -L $ucm ]] || fail "the $model profile is installed as a regular file"
+  if command -v pacman &>/dev/null && pacman -Qq alsa-ucm-conf &>/dev/null && [[ -f $t14s ]]; then
+    while IFS= read -r line; do
+      [[ -z ${line//[[:space:]]/} || $line == \#* ]] && continue
+      grep -qxF -- "$line" "$ucm" || fail "the $model profile restates the T14s profile: $line"
+    done <"$t14s"
+  fi
+  for c in "WSA WSA_RX0" "WSA WSA_RX1"; do
+    sed -n '/^FixedBootSequence \[/,/^\]/p' "$ucm" | grep -qF "cset \"name='$c Digital Volume' 100%\"" ||
+      fail "the $model profile sets $c Digital Volume to its ceiling on every boot"
+  done
 done
 
-# Where alsa-ucm-conf is installed, check that the profile it names still
-# exists and still drives two speakers.
-t14s=/usr/share/alsa/ucm2/Qualcomm/x1e80100/LENOVO-T14s.conf
-if pacman -Qq alsa-ucm-conf &>/dev/null; then
-  [[ -f $t14s ]] || fail "alsa-ucm-conf ships the T14s profile"
-  grep -qF '/codecs/wsa884x/two-speakers/' "$t14s" || fail "the T14s profile drives two WSA884x speakers"
-fi
+wp="$pkgdir/usr/share/wireplumber/wireplumber.conf.d/60-asus-zenbook-14-ux3480qa-soft-volume.conf"
+[[ -f $wp ]] || fail "the WirePlumber soft-volume rule is installed"
+for model in UX3480QA UX3480QAB; do
+  grep -q "api.alsa.card.longname = \"ASUSTeKCOMPUTERINC.-Zenbook14$model-1.0-$model\"" "$wp" ||
+    fail "the soft-volume rule matches $model's card longname"
+done
+grep -q 'api.alsa.soft-mixer = true' "$wp" || fail "the soft-volume rule switches to software volume"
 
 echo "ok - asus-zenbook-14-ux3480qa-audio"
