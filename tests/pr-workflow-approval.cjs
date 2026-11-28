@@ -1367,7 +1367,7 @@ set -euo pipefail
 if [[ "$1" == "api" ]]; then
   if [[ "$STUB_PR" == "" ]]; then echo ""; else echo "$STUB_PR"; fi
 elif [[ "$1" == "pr" && "$2" == "view" ]]; then
-  printf "%s\t%s\t%s\t%s\t%s\t%s\n" "$STUB_MERGEABLE" "$STUB_COMMITS" "$STUB_FIRST_OID" "$STUB_AUTHOR" "$STUB_DATE" "$STUB_CHECKS"
+  printf "%s|%s|%s|%s|%s|%s\n" "$STUB_MERGEABLE" "$STUB_COMMITS" "$STUB_FIRST_OID" "$STUB_AUTHOR" "$STUB_DATE" "$STUB_CHECKS"
 fi
 `;
     writeFileSync(join(bin, 'gh'), ghStub);
@@ -1409,6 +1409,12 @@ fi
     assert.deepEqual(run('auto/sync-upstream-demo', { STUB_PR: '42', STUB_MERGEABLE: 'MERGEABLE', STUB_COMMITS: '1', STUB_AUTHOR: 'omarchy-pkgs-sync', STUB_DATE: staleDate }),
       { push: 'true', pr: '42', reason: 'stale-retry' });
 
+    // 4b. Empty commit author login does not shift date or check_state fields
+    assert.deepEqual(run('auto/sync-upstream-demo', { STUB_PR: '42', STUB_MERGEABLE: 'MERGEABLE', STUB_COMMITS: '1', STUB_AUTHOR: '', STUB_CHECKS: 'TRANSIENT' }),
+      { push: 'true', pr: '42', reason: 'transient-check' });
+    assert.deepEqual(run('auto/sync-upstream-demo', { STUB_PR: '42', STUB_MERGEABLE: 'MERGEABLE', STUB_COMMITS: '1', STUB_AUTHOR: '', STUB_DATE: staleDate, STUB_CHECKS: 'SETTLED' }),
+      { push: 'true', pr: '42', reason: 'stale-retry' });
+
     // 5. Conflicting bot PR -> push=true (conflict)
     assert.deepEqual(run('auto/sync-upstream-demo', { STUB_PR: '42', STUB_MERGEABLE: 'CONFLICTING', STUB_COMMITS: '1', STUB_AUTHOR: 'omarchy-pkgs-sync' }),
       { push: 'true', pr: '42', reason: 'conflict' });
@@ -1428,5 +1434,16 @@ fi
       { push: 'true', pr: '42', reason: 'updated' });
   } finally {
     rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('package-prs.yml and callers grant checks/statuses read permissions for should-push-pr.sh', () => {
+  const pprs = readFileSync(join(__dirname, '../.github/workflows/package-prs.yml'), 'utf8');
+  assert.match(pprs, /name: Check whether the PR needs an update[\s\S]*?GH_TOKEN: \$\{\{ github\.token \}\}/);
+  for (const file of ['package-prs.yml', 'sync-upstream.yml', 'sync-rebuilds.yml']) {
+    const wf = readFileSync(join(__dirname, '../.github/workflows', file), 'utf8');
+    assert.match(wf, /checks: read/);
+    assert.match(wf, /statuses: read/);
+    assert.match(wf, /pull-requests: read/);
   }
 });

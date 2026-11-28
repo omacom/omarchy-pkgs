@@ -45,12 +45,12 @@ if [[ -z $pr ]]; then
   exit 0
 fi
 
-IFS=$'\t' read -r mergeable commit_count first_oid tip_author tip_date check_state < <(
+IFS='|' read -r mergeable commit_count first_oid tip_author tip_date check_state < <(
   # shellcheck disable=SC2016
   gh pr view "$pr" -R "$repo" --json mergeable,commits,statusCheckRollup \
     --jq '[
       (.mergeable // "UNKNOWN"),
-      (.commits | length),
+      (.commits | length | tostring),
       (.commits[0].oid // ""),
       (.commits[-1].authors[0].login // ""),
       (.commits[-1].committedDate // ""),
@@ -61,7 +61,7 @@ IFS=$'\t' read -r mergeable commit_count first_oid tip_author tip_date check_sta
         else "SETTLED"
         end
       )
-    ] | @tsv'
+    ] | join("|")'
 )
 
 paths=()
