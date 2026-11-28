@@ -1,0 +1,180 @@
+From 0e684f86b71e14bef4a3099d50832e0fac5df8a6 Mon Sep 17 00:00:00 2001
+From: dpatrongomez <dpatrongomez@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 09:41:31 +0100
+Subject: [PATCH] cpufreq: Check each policy's own boost switch, not the global
+ one
+
+The apple-cpufreq boost method was kept when the global cpufreq/boost
+switch reads 1, even where no policy lists boost frequencies. On the
+M3 (Mac15,6) and M3 Max (Mac15,9) the global switch reads 1 at boot,
+while every policy's own boost reads 0 and the kernel refuses writes to
+the switch in both directions ("Cannot enable/disable BOOST"). The
+daemon therefore kept the boost method and failed every profile
+activation with EINVAL, exactly as before the caps fallback landed.
+
+Check each policy's own boost switch instead: keep the boost method
+when a policy lists boost frequencies or a policy's own boost reads 1.
+The machines above now get the caps method with power-saver capped,
+which is what the fallback was meant to give them.
+
+Add a test of a machine whose global switch reads 1: it fails without
+the change. The boost fixtures now also create the per-policy boost
+switches the real machines expose, reading 1 where boost is on and 0
+where no policy uses boost.
+
+Fixes the M3 report in omacom/omarchy-mac#794; reported there for the
+M3 Max by davidricardocristancho-max, tracked as omacom/omarchy-pkgs#2501.
+---
+ README.md                 |  8 +++++---
+ src/ppd-driver-cpufreq.c  | 23 +++++++++++++----------
+ tests/integration_test.py | 39 ++++++++++++++++++++++++++++++++++++---
+ 3 files changed, 54 insertions(+), 16 deletions(-)
+
+diff --git a/README.md b/README.md
+index bc7b8f7..7f24fea 100644
+--- a/README.md
++++ b/README.md
+@@ -239,8 +239,8 @@ of the CPU frequency scaling subsystem.
+ It is only used if every CPU frequency policy uses a scaling driver where
+ turning boost off is known to cap the CPU at its sustainable frequency,
+ currently only `apple-cpufreq`, the boost switch has something to turn on (a
+-policy lists boost frequencies, or boost is already on), and the switch can be
+-written:
++policy lists boost frequencies, or a policy's own boost reads 1), and the
++switch can be written:
+ 
+ ```sh
+ $ cat /sys/devices/system/cpu/cpufreq/policy*/scaling_driver
+@@ -264,7 +264,9 @@ on AC alike.
+ 
+ Some Apple Silicon machines, such as the M3 Max, have no boost frequencies:
+ `scaling_boost_frequencies` is empty or missing, and `boost` reads 0, where
+-the kernel refuses to turn it on, or does not exist. There the driver caps
++the kernel refuses to turn it on, or does not exist. The global switch can
++also read 1, as on the M3, where every policy's own `boost` reads 0 and
++writes to the switch are refused in both directions. There the driver caps
+ `scaling_max_freq` like on the machines below, but only in "power-saver", at
+ 60% of each policy's highest frequency. "balanced" and "performance" are
+ uncapped, the same split as with the boost switch. The boost switch is left
+diff --git a/src/ppd-driver-cpufreq.c b/src/ppd-driver-cpufreq.c
+index 3940c73..f2d60f8 100644
+--- a/src/ppd-driver-cpufreq.c
++++ b/src/ppd-driver-cpufreq.c
+@@ -350,27 +350,30 @@ probe_boost (PpdDriverCpufreq *cpufreq)
+ }
+ 
+ /* Whether the boost switch has anything to turn on: a policy lists boost
+- * frequencies, or boost is already on. Without boost frequencies the kernel
+- * refuses to turn it on ("Cannot enable BOOST"). */
++ * frequencies, or a policy's own boost switch reads 1. Without boost
++ * frequencies the kernel refuses to turn boost on ("Cannot enable BOOST"),
++ * even where the global switch reads 1: on those machines, such as the M3
++ * and M3 Max, every policy's own boost reads 0 and writes to the switch are
++ * refused in both directions. */
+ static gboolean
+ boost_can_be_enabled (GPtrArray *policy_dirs)
+ {
+-  g_autofree char *boost_path = NULL;
+-  g_autofree char *boost = NULL;
+-
+   for (guint i = 0; i < policy_dirs->len; i++) {
++    const char *dir = g_ptr_array_index (policy_dirs, i);
+     g_autofree guint64 *boost_freqs = NULL;
++    g_autofree char *boost = NULL;
+     guint n_boost_freqs;
+ 
+-    boost_freqs = read_freqs (g_ptr_array_index (policy_dirs, i),
+-                              "scaling_boost_frequencies", &n_boost_freqs);
++    boost_freqs = read_freqs (dir, "scaling_boost_frequencies", &n_boost_freqs);
+     if (n_boost_freqs > 0)
+       return TRUE;
++
++    boost = read_attr (dir, "boost");
++    if (g_strcmp0 (boost, "1") == 0)
++      return TRUE;
+   }
+ 
+-  boost_path = ppd_utils_get_sysfs_path (CPUFREQ_POLICY_DIR);
+-  boost = read_attr (boost_path, "boost");
+-  return g_strcmp0 (boost, "1") == 0;
++  return FALSE;
+ }
+ 
+ static gboolean
+diff --git a/tests/integration_test.py b/tests/integration_test.py
+index bb512d7..bf99050 100644
+--- a/tests/integration_test.py
++++ b/tests/integration_test.py
+@@ -1572,6 +1572,7 @@ class Tests(dbusmock.DBusTestCase):
+             self.write_file_contents(
+                 os.path.join(policy, "scaling_driver"), scaling_driver + "\n"
+             )
++            self.write_file_contents(os.path.join(policy, "boost"), "1\n")
+         boost = os.path.join(cpufreq_dir, "boost")
+         self.write_file_contents(boost, "1\n")
+         return boost
+@@ -1758,8 +1759,9 @@ class Tests(dbusmock.DBusTestCase):
+     )
+     M3_MAX_E_FREQS = "1020000 1320000 1704000 2088000 2484000 2568000"
+ 
+-    def create_apple_without_boost(self):
+-        """An M3 Max: no boost frequencies, and a boost switch stuck off"""
++    def create_apple_without_boost(self, global_boost="0"):
++        """An M3 Max: no boost frequencies, a boost switch stuck off, and
++        per-policy boost switches reading 0"""
+         max0 = self.create_cpufreq_policy(
+             "policy0", "apple-cpufreq", self.M3_MAX_P_FREQS
+         )
+@@ -1771,10 +1773,13 @@ class Tests(dbusmock.DBusTestCase):
+                 os.path.join(os.path.dirname(policy), "scaling_boost_frequencies"),
+                 "\n",
+             )
++            self.write_file_contents(
++                os.path.join(os.path.dirname(policy), "boost"), "0\n"
++            )
+         boost = os.path.join(
+             self.testbed.get_root_dir(), "sys/devices/system/cpu/cpufreq/boost"
+         )
+-        self.write_file_contents(boost, "0\n")
++        self.write_file_contents(boost, global_boost + "\n")
+         return max0, max1, boost
+ 
+     def test_cpufreq_apple_without_boost(self):
+@@ -1860,6 +1865,34 @@ class Tests(dbusmock.DBusTestCase):
+         self.assert_file_eventually_contains(boost, "0")
+         self.assertEqual(self.read_file_contents(max0), b"3036000\n")
+ 
++    def test_cpufreq_apple_global_boost_on(self):
++        """Apple Silicon without boost frequencies keeps the caps method even
++        when the global boost switch reads 1, as on the M3 and M3 Max, where
++        no policy's own boost reads 1 and writes to the switch are refused"""
++        max0, max1, boost = self.create_apple_without_boost(global_boost="1")
++
++        self.start_daemon()
++        profiles = self.get_dbus_property("Profiles")
++        self.assertEqual(len(profiles), 3)
++        self.assertEqual(profiles[0]["CpuDriver"], "cpufreq")
++        self.assertEqual(self.get_dbus_property("ActiveProfile"), "balanced")
++        self.assert_file_eventually_contains(max0, "4056000")
++        self.assert_file_eventually_contains(max1, "2568000")
++
++        self.set_dbus_property("ActiveProfile", GLib.Variant.new_string("power-saver"))
++        self.assertEqual(self.get_dbus_property("ActiveProfile"), "power-saver")
++        self.assert_file_eventually_contains(max0, "2424000")
++        self.assert_file_eventually_contains(max1, "1704000")
++
++        self.set_dbus_property("ActiveProfile", GLib.Variant.new_string("performance"))
++        self.assertEqual(self.get_dbus_property("ActiveProfile"), "performance")
++        self.assert_file_eventually_contains(max0, "4056000")
++        self.assert_file_eventually_contains(max1, "2568000")
++
++        # The global switch, which the kernel would refuse, is never touched
++        self.assertEqual(self.read_file_contents(boost), b"1\n")
++        self.assertFalse(self.have_text_in_log("Failed to activate"))
++
+     def start_upower(self, on_battery):
+         _, upowerd, _ = self.start_dbus_template(
+             "upower", {"DaemonVersion": "0.99", "OnBattery": on_battery}
+-- 
+2.56.0
+
