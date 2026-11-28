@@ -25,7 +25,51 @@ on:
   workflow_dispatch:
 
 jobs:
+  # Resolve refs/heads/rc once before the architecture matrix starts, so a push
+  # to rc mid-run cannot split x86_64 and aarch64 across two commits. Archive
+  # the two pinned recipe directories so both legs unpack the exact same
+  # snapshot even if rc is force-pushed afterward.
+  pins:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      rc_commit: ${{ steps.checkout.outputs.commit }}
+      pkgver: ${{ steps.resolve.outputs.pkgver }}
+    steps:
+      - id: checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/heads/rc
+          sparse-checkout: |
+            pkgbuilds/omarchy
+            pkgbuilds/omarchy-settings
+          persist-credentials: false
+      - name: Archive rc pins
+        id: resolve
+        env:
+          RC_COMMIT: ${{ steps.checkout.outputs.commit }}
+        run: |
+          set -euo pipefail
+          [[ "$RC_COMMIT" =~ ^[0-9a-f]{40}$ ]] || { echo "invalid rc commit: $RC_COMMIT" >&2; exit 1; }
+          [[ -f pkgbuilds/omarchy/PKGBUILD && -f pkgbuilds/omarchy-settings/PKGBUILD ]] || { echo "missing rc pin PKGBUILDs" >&2; exit 1; }
+          pkgver=$(grep -m1 '^pkgver=' pkgbuilds/omarchy/PKGBUILD | cut -d= -f2)
+          [[ -n "$pkgver" ]] || { echo "missing pkgver in pkgbuilds/omarchy/PKGBUILD" >&2; exit 1; }
+          git archive --format=tar -o rc-pins.tar HEAD -- pkgbuilds/omarchy pkgbuilds/omarchy-settings
+          echo "pkgver=$pkgver" >> "$GITHUB_OUTPUT"
+          echo "pins: ${RC_COMMIT:0:7} (rc), omarchy $pkgver"
+      - name: Upload pinned recipes
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: rc-pins-${{ steps.checkout.outputs.commit }}
+          path: rc-pins.tar
+          if-no-files-found: error
+          overwrite: ${{ github.run_attempt != '1' }}
+          retention-days: 7
+
   build:
+    needs: pins
     # The runners package_runner names for these packages.
     runs-on: ${{ matrix.arch == 'aarch64' && 'ubuntu-24.04-arm' || fromJSON('["self-hosted","omarchy-builder"]') }}
     timeout-minutes: 180
@@ -35,33 +79,36 @@ jobs:
       fail-fast: true
       matrix:
         arch: [x86_64, aarch64]
-    outputs:
-      rc_commit: ${{ steps.pins.outputs.rc_commit }}
-      pkgver: ${{ steps.pins.outputs.pkgver }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Take the pins from the rc branch
-        id: pins
+      - name: Download pinned recipes
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: rc-pins-${{ needs.pins.outputs.rc_commit }}
+          path: .rc-pins
+      - name: Take the pins from the resolved rc commit
+        env:
+          RC_COMMIT: ${{ needs.pins.outputs.rc_commit }}
+          PKGVER: ${{ needs.pins.outputs.pkgver }}
         run: |
           set -euo pipefail
-          git fetch --no-tags --depth=1 origin rc
-          git checkout FETCH_HEAD -- pkgbuilds/omarchy pkgbuilds/omarchy-settings
-          pkgver=$(grep -m1 '^pkgver=' pkgbuilds/omarchy/PKGBUILD | cut -d= -f2)
-          echo "rc_commit=$(git rev-parse FETCH_HEAD)" >> "$GITHUB_OUTPUT"
-          echo "pkgver=$pkgver" >> "$GITHUB_OUTPUT"
-          echo "tooling: $(git rev-parse --short HEAD) (master)  pins: $(git rev-parse --short FETCH_HEAD) (rc), omarchy $pkgver"
+          rm -rf pkgbuilds/omarchy pkgbuilds/omarchy-settings
+          tar -xf .rc-pins/rc-pins.tar
+          rm -rf .rc-pins
+          echo "tooling: $(git rev-parse --short HEAD) (master)  pins: ${RC_COMMIT:0:7} (rc), omarchy $PKGVER"
       - name: Build omarchy-settings and omarchy (${{ matrix.arch }})
         id: build
         env:
           CONTAINER_ENGINE: docker
           OMARCHY_RC_PINS: "1"
+          PKGVER: ${{ needs.pins.outputs.pkgver }}
         run: |
           set -euo pipefail
           plan=$(bin/build --dry-run --mirror rc --arch "${{ matrix.arch }}" --package omarchy-settings omarchy 2>&1 | grep -E '^==> Plan complete' || true)
           if [[ -n "$plan" && -z "$(sed -E 's/.*would build: *//' <<<"$plan" | tr -d '[:space:]')" ]]; then
-            echo "==> rc/${{ matrix.arch }} already serves omarchy ${{ steps.pins.outputs.pkgver }}, nothing to build"
+            echo "==> rc/${{ matrix.arch }} already serves omarchy $PKGVER, nothing to build"
             echo "built=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -81,13 +128,13 @@ jobs:
         if: steps.build.outputs.built == 'true'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: release-rc-${{ matrix.arch }}-${{ github.run_id }}
+          name: release-rc-${{ matrix.arch }}-${{ needs.pins.outputs.rc_commit }}-${{ github.run_id }}
           path: packages-${{ matrix.arch }}.tar
           if-no-files-found: error
           retention-days: 7
 
   publish:
-    needs: build
+    needs: [pins, build]
     runs-on: ubuntu-latest
     environment: publish
     timeout-minutes: 30
@@ -104,7 +151,7 @@ jobs:
       # An architecture whose pins rc already serves uploaded nothing.
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          pattern: release-rc-*-${{ github.run_id }}
+          pattern: release-rc-*-${{ needs.pins.outputs.rc_commit }}-${{ github.run_id }}
           path: artifacts
       - name: Collect the builds
         run: |
@@ -173,7 +220,7 @@ jobs:
       - name: Carry the pins into edge
         id: edge
         env:
-          PKGVER: ${{ needs.build.outputs.pkgver }}
+          PKGVER: ${{ needs.pins.outputs.pkgver }}
           GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
           GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
           RCLONE_CONFIG_R2_TYPE: s3
@@ -232,8 +279,8 @@ jobs:
         env:
           OUTCOME: ${{ steps.publish.outcome == 'success' && steps.edge.outcome || steps.publish.outcome }}
           ACTOR: ${{ github.triggering_actor }}
-          PKGVER: ${{ needs.build.outputs.pkgver }}
-          RC_COMMIT: ${{ needs.build.outputs.rc_commit }}
+          PKGVER: ${{ needs.pins.outputs.pkgver }}
+          RC_COMMIT: ${{ needs.pins.outputs.rc_commit }}
           OMARCHY_PUBLISH_PREFIX: ${{ vars.OMARCHY_PUBLISH_PREFIX }}
         run: |
           set -euo pipefail
