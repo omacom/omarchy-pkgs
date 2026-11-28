@@ -3,47 +3,100 @@
 # Needs repo-add, gpg, rclone, bsdtar (run in the Arch builder/test container).
 set -euo pipefail
 ROOT=$(realpath "${BASH_SOURCE[0]%/*}/..")
-T=$(mktemp -d); chmod 755 "$T"; trap 'rm -rf "$T"' EXIT
+T=$(mktemp -d)
+GPG_TEST_HOME="$T/g"
+GPG_STOPPED=0
+S3_PID=""
+STOP_RC=0
+stop_s3() {
+  [[ -n $S3_PID ]] || return 0
+  if kill "$S3_PID" 2>/dev/null; then
+    wait "$S3_PID" 2>/dev/null || true
+  fi
+  S3_PID=""
+}
+stop_gpg() {
+  (( GPG_STOPPED == 0 )) && [[ -d $GPG_TEST_HOME ]] || return 0
+  local rc=0
+  GNUPGHOME="$GPG_TEST_HOME" timeout -k 1 5 gpgconf --kill all >/dev/null 2>&1 || rc=1
+  GNUPGHOME="$GPG_TEST_HOME" timeout -k 1 5 gpgconf --remove-socketdir >/dev/null 2>&1 || rc=1
+  (( rc == 0 )) && GPG_STOPPED=1
+  return "$rc"
+}
+cleanup() {
+  local rc=$?
+  trap '' INT TERM HUP
+  stop_s3
+  stop_gpg || true
+  if ! rm -rf "$T"; then
+    echo "FAIL: failed to remove temporary directory $T" >&2
+    (( rc == 0 )) && rc=1
+  fi
+  exit "$rc"
+}
+defer_signals() {
+  STOP_RC=0
+  trap 'STOP_RC=130' INT
+  trap 'STOP_RC=143' TERM
+  trap 'STOP_RC=129' HUP
+}
+arm_signals() {
+  trap - INT TERM HUP
+  (( STOP_RC == 0 )) || exit "$STOP_RC"
+}
+trap cleanup EXIT
+
+# Isolate HOME/XDG/rclone so neither gpg nor rclone touches the caller's home.
+for _v in "${!RCLONE_@}"; do unset "$_v"; done
+unset GNUPGHOME OMARCHY_PUBLISH_PREFIX
+export HOME="$T/home" XDG_CONFIG_HOME="$T/home/.config" RCLONE_CONFIG="$T/rclone.conf"
+mkdir -p "$HOME"
+: > "$RCLONE_CONFIG"
+
 REMOTE="$T/r2"; mkdir -p "$REMOTE"
 
 # throwaway signing key
-export GNUPGHOME="$T/g"; mkdir -m700 "$GNUPGHOME"
-gpg --batch --quiet --passphrase "" --quick-gen-key 'Test <t@t>' ed25519 sign 0 2>/dev/null
-export GPG_PRIVATE_KEY=$(gpg --batch --armor --export-secret-keys 'Test <t@t>') GPG_PASSPHRASE=""
-unset GNUPGHOME
+mkdir -m700 "$GPG_TEST_HOME"
+gpg_test() { GNUPGHOME="$GPG_TEST_HOME" gpg "$@"; }
+gpg_test --batch --quiet --passphrase "" --quick-gen-key 'Test <t@t>' ed25519 sign 0 2>/dev/null
+GPG_PRIVATE_KEY=$(gpg_test --batch --armor --export-secret-keys 'Test <t@t>')
+export GPG_PRIVATE_KEY GPG_PASSPHRASE=""
 
-# minimal real packages via makepkg
+# minimal valid Arch package archives via bsdtar + .PKGINFO
 mkpkg() { # mkpkg <name> <pkgrel> <arch> [payload]
-  local d="$T/src/$1-$2${4:+-$4}"; mkdir -p "$d"; cd "$d"
-  printf 'pkgname=%s\npkgver=1.0\npkgrel=%s\narch=(%s)\npackage(){ install -Dm644 /dev/null "$pkgdir/usr/share/%s-%s"; echo "%s" > "$pkgdir/usr/share/%s-%s"; }\n' "$1" "$2" "$3" "$1" "$2" "${4:-payload}" "$1" "$2" > PKGBUILD
-  # CARCH so the PKGINFO records the requested arch (--ignorearch would
-  # stamp the host's).
-  # makepkg refuses to run as root (the CI test container does); build the
-  # fixture as an unprivileged user in that case.
-  if (( EUID == 0 )); then
-    id -u fixture >/dev/null 2>&1 || useradd -m fixture
-    chmod 755 "$T/src"; chown -R fixture "$d"
-    runuser -u fixture -- env CARCH=$3 makepkg -f --nodeps --ignorearch >/dev/null 2>&1
-  else
-    CARCH=$3 makepkg -f --nodeps --ignorearch >/dev/null 2>&1
-  fi
-  ls "$d"/*.pkg.tar.zst
+  local d="$T/src/$1-$2${4:+-$4}" payload="${4:-payload}" out
+  out="$d/$1-1.0-$2-$3.pkg.tar.zst"
+  mkdir -p "$d/usr/share" || return
+  printf '%s\n' "$payload" > "$d/usr/share/$1-$2" || return
+  printf 'pkgname = %s\npkgbase = %s\npkgver = 1.0-%s\npkgdesc = test fixture\nbuilddate = 1700000000\npackager = Test <t@t>\nsize = %d\narch = %s\n' \
+    "$1" "$1" "$2" "$(( ${#payload} + 1 ))" "$3" > "$d/.PKGINFO" || return
+  ( cd "$d" && bsdtar --zstd -cf "$out" .PKGINFO usr ) || return
+  printf '%s\n' "$out"
 }
-if (( EUID == 0 )); then
-  id -u fixture >/dev/null 2>&1 || useradd -m fixture
-  mkdir -p "$T/src"; chmod 755 "$T/src"
-fi
-mkpkg alpha 1 any >"$T/p-A1" & p1=$!
-mkpkg alpha 2 any >"$T/p-A2" & p2=$!
-mkpkg beta 1 x86_64 >"$T/p-B1" & p3=$!
-mkpkg gamma 1 aarch64 >"$T/p-C1" & p4=$!
-for p in "$p1" "$p2" "$p3" "$p4"; do wait "$p"; done
-A1=$(<"$T/p-A1"); A2=$(<"$T/p-A2"); B1=$(<"$T/p-B1"); C1=$(<"$T/p-C1")
+A1=$(mkpkg alpha 1 any)
+A2=$(mkpkg alpha 2 any)
+B1=$(mkpkg beta 1 x86_64)
+C1=$(mkpkg gamma 1 aarch64)
 
 pub() { "$ROOT/bin/publish-artifact" --remote "$REMOTE" --mirror edge --arch x86_64 "$@" >"$T/out" 2>&1; }
 entries() { tar -tf "$REMOTE/edge/x86_64/omarchy.db.tar.zst" | grep '/$' | sort | tr '\n' ' '; }
 pass() { echo "PASS: $1"; }
 fail() { echo "FAIL: $1"; cat "$T/out"; exit 1; }
+flip_last_byte() {
+  local f=$1 size byte oct
+  size=$(wc -c < "$f")
+  (( size > 0 )) || fail "flip_last_byte: empty file $f"
+  byte=$(tail -c 1 "$f" | od -An -tu1)
+  printf -v oct '%03o' $(( byte ^ 1 ))
+  printf '%b' "\0$oct" | dd of="$f" bs=1 seek=$(( size - 1 )) conv=notrunc status=none
+}
+# An exited agent stays a zombie when the container's PID 1 does not reap
+# orphans, and kill -0 succeeds on a zombie.
+agent_running() {
+  local state
+  state=$(awk '$1 == "State:" { print $2; exit }' "/proc/$1/status" 2>/dev/null) || return 1
+  [[ -n $state && $state != [ZX] ]]
+}
 
 # Fake rclone wrapper that fails `lsf` with a chosen exit code while delegating
 # everything else to the real binary.
@@ -77,6 +130,34 @@ fi
 exec "$REAL_RCLONE" "\$@"
 RCLONE_EOF
 chmod +x "$FAKEBIN/rclone"
+
+# Optional pass-through gpg/gpgconf wrappers to verify bin/publish-artifact cleans up its temp GNUPGHOME.
+REAL_GPG=$(command -v gpg)
+REAL_GPGCONF=$(command -v gpgconf)
+REAL_GPG_CONNECT=$(command -v gpg-connect-agent)
+cat <<GPG_EOF > "$FAKEBIN/gpg"
+#!/bin/bash
+if [[ -n \${LOG_GPG_SOCK:-} ]]; then
+  rc=0
+  "$REAL_GPG" "\$@" || rc=\$?
+  agent_pid=\$("$REAL_GPG_CONNECT" --no-autostart 'GETINFO pid' /bye 2>/dev/null | awk '\$1=="D"{print \$2; exit}')
+  printf '%s\0%s\0%s\0' "\${GNUPGHOME:-}" "\$("$REAL_GPGCONF" --list-dirs socketdir)" "\$agent_pid" >> "\$LOG_GPG_SOCK"
+  exit "\$rc"
+fi
+exec "$REAL_GPG" "\$@"
+GPG_EOF
+chmod +x "$FAKEBIN/gpg"
+cat <<GPGCONF_EOF > "$FAKEBIN/gpgconf"
+#!/bin/bash
+if [[ -n \${LOG_GPGCONF:-} ]]; then
+  rc=0
+  "$REAL_GPGCONF" "\$@" || rc=\$?
+  printf '%s %s rc=%d\n' "\${GNUPGHOME:-}" "\$*" "\$rc" >> "\$LOG_GPGCONF"
+  exit "\$rc"
+fi
+exec "$REAL_GPGCONF" "\$@"
+GPGCONF_EOF
+chmod +x "$FAKEBIN/gpgconf"
 
 # Brand-new channel must refuse to initialize without --init (both missing dir
 # and existing empty dir).
@@ -117,34 +198,16 @@ rm "$REMOTE/edge/x86_64/omarchy.db"
 #   - 500 InternalError (non-zero rclone exit): refused EVEN with --init
 S3_MODE="$T/s3-mode"; echo empty > "$S3_MODE"
 S3_PORT="$T/s3-port"
-python3 - "$S3_MODE" "$S3_PORT" <<'S3_PY' &
-import http.server, sys
-mode_path, port_path = sys.argv[1], sys.argv[2]
-class H(http.server.BaseHTTPRequestHandler):
-    def log_message(self, *a): pass
-    def do_GET(self):
-        m = open(mode_path).read().strip()
-        if m == "empty":
-            body = b'<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Name>omarchy-pkgs</Name><Prefix>edge/x86_64/</Prefix><KeyCount>0</KeyCount><MaxKeys>1000</MaxKeys><IsTruncated>false</IsTruncated></ListBucketResult>'
-            self.send_response(200)
-        elif m == "404":
-            body = b"<Error><Code>NoSuchBucket</Code><Message>No such bucket</Message></Error>"
-            self.send_response(404)
-        else:
-            body = b"<Error><Code>InternalError</Code><Message>Internal Error</Message></Error>"
-            self.send_response(500)
-        self.send_header("Content-Type", "application/xml")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
-open(port_path, "w").write(str(srv.server_address[1]))
-srv.serve_forever()
-S3_PY
+defer_signals
+python3 "$ROOT/tests/fixtures/mock-s3-server.py" "$S3_MODE" "$S3_PORT" >"$T/s3.log" 2>&1 &
 S3_PID=$!
-trap 'kill "$S3_PID" 2>/dev/null || true; rm -rf "$T"' EXIT
-for _ in $(seq 1 50); do [[ -s "$S3_PORT" ]] && break; sleep 0.05; done
-[[ -s "$S3_PORT" ]] || fail "mock S3 server failed to start"
+arm_signals
+for _ in $(seq 1 50); do [[ -s "$S3_PORT" ]] && break; kill -0 "$S3_PID" 2>/dev/null || break; sleep 0.05; done
+if [[ ! -s "$S3_PORT" ]]; then
+  echo "FAIL: mock S3 server failed to start"
+  cat "$T/s3.log"
+  exit 1
+fi
 s3_pub() {
   RCLONE_CONFIG_S3T_TYPE=s3 RCLONE_CONFIG_S3T_PROVIDER=Cloudflare \
   RCLONE_CONFIG_S3T_NO_CHECK_BUCKET=true RCLONE_CONFIG_S3T_ENDPOINT="http://127.0.0.1:$(<"$S3_PORT")" \
@@ -163,10 +226,10 @@ if s3_pub --init "$A1"; then fail "S3 NoSuchBucket (exit 3) should refuse even w
 fi
 echo 500 > "$S3_MODE"
 if s3_pub --init "$A1"; then fail "S3 500 error should refuse even with --init"; else
-  grep -q 'Failed to list' "$T/out" \
+  grep -q 'Failed to list' "$T/out" && grep -q 'InternalError' "$T/out" \
     && pass "S3 500 error fails closed even with --init" || fail "S3 500"
 fi
-kill "$S3_PID" 2>/dev/null || true
+stop_s3
 
 # Valid 0-entry omarchy.db.tar.zst is an initialized empty channel: live publish
 # must succeed without --init (GNU tar exits 2 on --wildcards "*/desc" if not guarded).
@@ -180,8 +243,23 @@ pub --init "$A1" && [[ "$(entries)" == "alpha-1.0-1/ " ]] && [[ -f "$REMOTE/edge
   && pass "first publish with --init creates db with one entry and a signature" || fail "first publish"
 
 sum_before=$(sha256sum "$REMOTE/edge/x86_64/$(basename "$A1")")
-pub "$B1" && [[ "$(entries)" == "alpha-1.0-1/ beta-1.0-1/ " ]] && [[ "$(sha256sum "$REMOTE/edge/x86_64/$(basename "$A1")")" == "$sum_before" ]] \
+: > "$T/gpg.sock"
+: > "$T/gpgconf.log"
+PATH="$FAKEBIN:$PATH" LOG_GPG_SOCK="$T/gpg.sock" LOG_GPGCONF="$T/gpgconf.log" pub "$B1" \
+  && [[ "$(entries)" == "alpha-1.0-1/ beta-1.0-1/ " ]] && [[ "$(sha256sum "$REMOTE/edge/x86_64/$(basename "$A1")")" == "$sum_before" ]] \
   && pass "second package added incrementally; first file untouched" || fail "incremental add"
+pub_gnupghome="" sockdir="" agent_pid=""
+{ IFS= read -r -d '' pub_gnupghome && IFS= read -r -d '' sockdir && IFS= read -r -d '' agent_pid; } < "$T/gpg.sock" || true
+if [[ -n $agent_pid ]]; then
+  for _ in $(seq 1 20); do agent_running "$agent_pid" || break; sleep 0.05; done
+fi
+if [[ -z $pub_gnupghome || -z $sockdir || -z $agent_pid || -e $pub_gnupghome || -e $sockdir ]] \
+  || agent_running "$agent_pid" \
+  || ! grep -qxF "$pub_gnupghome --kill all rc=0" "$T/gpgconf.log" \
+  || ! grep -qxF "$pub_gnupghome --remove-socketdir rc=0" "$T/gpgconf.log"; then
+  fail "publish-artifact did not clean up temp GNUPGHOME ($pub_gnupghome / $sockdir / pid=$agent_pid): $(cat "$T/gpgconf.log")"
+fi
+pass "publish-artifact stops gpg-agent and removes its temporary socketdir on exit"
 
 # No .old backup files from repo-add may be uploaded to the remote.
 if compgen -G "$REMOTE/edge/x86_64/*.old" >/dev/null; then
@@ -270,7 +348,7 @@ drop_alpha
 a2_sig="$REMOTE/edge/x86_64/$(basename "$A2").sig"
 # Replace remote .sig with a distinct valid signature from the same key so
 # reusing vs re-signing is observable and deterministic.
-GNUPGHOME="$T/g" gpg --batch --yes --pinentry-mode loopback --passphrase "" \
+gpg_test --batch --yes --pinentry-mode loopback --passphrase "" \
   --set-notation test@omarchy=orig --detach-sign --no-armor -o "$a2_sig" "$A2"
 cp "$a2_sig" "$T/a2.sig.orig"
 pub "$A2" \
@@ -295,9 +373,9 @@ grep -q 'does not verify' "$T/out" \
 # A same-size sidecar appearing after the initial listing with different bytes
 # must fail the checksum check before any metadata upload is attempted.
 rm "$a2_sig"
-GNUPGHOME="$T/g" gpg --batch --yes --pinentry-mode loopback --passphrase "" \
+gpg_test --batch --yes --pinentry-mode loopback --passphrase "" \
   --detach-sign --no-armor -o "$T/a2.sig.same-size" "$A2"
-python3 -c 'import sys; p=sys.argv[1]; b=bytearray(open(p,"rb").read()); b[-1]^=1; open(p,"wb").write(b)' "$T/a2.sig.same-size"
+flip_last_byte "$T/a2.sig.same-size"
 db_sum_before=$(sha256sum "$REMOTE/edge/x86_64/omarchy.db.tar.zst")
 : > "$T/rclone.log"
 PATH="$FAKEBIN:$PATH" LOG_RCLONE="$T/rclone.log" INJECT_MATCH="*.pkg.tar.*.sig" INJECT_SRC="$T/a2.sig.same-size" INJECT_DST="$a2_sig" pub "$A2" \
@@ -314,7 +392,7 @@ pub "$A2" && grep -q 'identical bytes' "$T/out" && grep -q 'signed alpha-1.0-2' 
   && pass "orphaned package without remote .sig signs and uploads fresh .sig" || fail "orphan missing sig"
 
 # Different bytes under an existing name: refused. Build alpha-2 again with
-# a different payload (makepkg is reproducible, so the content must change).
+# a different payload so the archive bytes differ.
 A2b=$(mkpkg alpha 2 any different-payload)
 [[ "$(md5sum < "$A2")" != "$(md5sum < "$A2b")" ]] || { echo "fixture: rebuilt package is byte-identical, cannot test"; exit 1; }
 sum_before=$(sha256sum < "$REMOTE/edge/x86_64/$(basename "$A2")")
@@ -334,7 +412,7 @@ A3=$(mkpkg alpha 3 any); D1=$(mkpkg delta 1 any)
 # the checksum check before any metadata upload is attempted.
 db_sum_before=$(sha256sum "$REMOTE/edge/x86_64/omarchy.db.tar.zst")
 cp "$D1" "$T/d1.same-size"
-python3 -c 'import sys; p=sys.argv[1]; b=bytearray(open(p,"rb").read()); b[-1]^=1; open(p,"wb").write(b)' "$T/d1.same-size"
+flip_last_byte "$T/d1.same-size"
 : > "$T/rclone.log"
 PATH="$FAKEBIN:$PATH" LOG_RCLONE="$T/rclone.log" INJECT_MATCH="- *.sig" INJECT_SRC="$T/d1.same-size" INJECT_DST="$REMOTE/edge/x86_64/$(basename "$D1")" pub "$D1" \
   && fail "concurrent package collision should fail closed" || true
@@ -416,4 +494,11 @@ dtz_line=$(grep -Fn -- '/omarchy.db.tar.zst --s3-no-head --checksum' "$T/rclone.
   && pass "no .old files left on remote after publish" || fail ".old files present on remote"
 
 # db must verify: each package's signature checks
-( cd "$REMOTE/edge/x86_64" && for f in *.pkg.tar.zst; do GNUPGHOME="$T/g" gpg --batch --quiet --verify "$f.sig" "$f" 2>/dev/null || { echo "FAIL: signature $f"; exit 1; }; done ) && pass "all signatures verify"
+( cd "$REMOTE/edge/x86_64" && for f in *.pkg.tar.zst; do gpg_test --batch --quiet --verify "$f.sig" "$f" 2>/dev/null || { echo "FAIL: signature $f"; exit 1; }; done )
+pass "all signatures verify"
+
+stop_gpg || fail "failed to stop temporary gpg-agent"
+if [[ -e "$HOME/.gnupg" ]]; then
+  fail "test or publish-artifact created $HOME/.gnupg"
+fi
+pass "isolated HOME has no .gnupg directory after full test run"
