@@ -7,8 +7,8 @@ set -euo pipefail
 ROOT=$(realpath "${BASH_SOURCE[0]%/*}/..")
 
 export REPO=o/r DIGITALOCEAN_TOKEN=x GITHUB_TOKEN=x
-export CLOUD_INIT="$ROOT/ci/runner-cloud-init.yaml" LOCK=/tmp/controller-test.lock
-unset MAX_AGE_MINUTES MAX_BOOT_MINUTES
+export LOCK=/tmp/controller-test.lock
+unset MAX_AGE_MINUTES MAX_BOOT_MINUTES RUNNER_VERSION RUNNER_SHA256 CLOUD_INIT
 CONTROLLER_LIBRARY_ONLY=1 source "$ROOT/ci/controller.sh"
 
 # Calls are recorded to a file: the controller invokes the API functions
@@ -241,8 +241,9 @@ DROPLETS="1 active $NOW ops,omarchy-builder-large" QUEUED=0 QUEUED_LARGE=1; run;
 if NO_TOKEN=1 controller_tick >/dev/null; then echo "FAIL: a missing token passed the tick"; exit 1; fi
 check_large "no registration token: no droplet, and the tick fails" 0 0
 : >"$CALLS_FILE"
-if CLOUD_INIT=/nonexistent controller_tick >/dev/null 2>&1; then echo "FAIL: an unreadable cloud-init passed the tick"; exit 1; fi
-check_large "unreadable cloud-init: no droplet, and the tick fails" 0 0
+if BUNDLED_CLOUD_INIT=/nonexistent controller_tick >/dev/null 2>&1; then echo "FAIL: an unreadable cloud-init passed the tick"; exit 1; fi
+if grep -q "registration-token" "$CALLS_FILE"; then echo "FAIL: unreadable cloud-init requested a registration token"; cat "$CALLS_FILE"; exit 1; fi
+check_large "unreadable cloud-init: no droplet, no registration token, and the tick fails" 0 0
 : >"$CALLS_FILE"
 if LARGE_SIZES=sold-out controller_tick >/dev/null; then echo "FAIL: a refused large pool passed the tick"; exit 1; fi
 check_large "a refused large pool still lets the default pool create, and the tick fails" 1 0
@@ -300,6 +301,35 @@ CANDIDATES=""; DO_SSH_KEYS='[123]' create_droplet >/dev/null
 jq -e '.ssh_keys == [123]' "$BODY_FILE" >/dev/null \
   && echo "PASS: create body attaches DO_SSH_KEYS" \
   || { echo "FAIL: create body ssh_keys"; jq .ssh_keys "$BODY_FILE"; exit 1; }
+
+# Exercise the controller-rendered cloud-init bootstrap offline against valid,
+# tampered, extraction-failing, and unsupported-architecture runs.
+"$ROOT/tests/runner-tarball-sha256.py" "$BODY_FILE"
+
+# Obsolete RUNNER_VERSION, RUNNER_SHA256, and CLOUD_INIT env overrides warn and
+# still provision with the bundled template so rollout never stalls.
+CUSTOM_CLOUD_INIT=$(mktemp)
+trap 'rm -f "$CALLS_FILE" "$BODY_FILE" "$CUSTOM_CLOUD_INIT"' EXIT
+printf '# CUSTOM_CLOUD_INIT_SENTINEL\n' >"$CUSTOM_CLOUD_INIT"
+for env_case in "RUNNER_VERSION=0.0.0-obsolete" "RUNNER_SHA256=deadbeef" "CLOUD_INIT=$CUSTOM_CLOUD_INIT"; do
+  : >"$BODY_FILE"
+  out=$(export "${env_case?}"; CANDIDATES=""; create_droplet 2>&1)
+  want_warn="ignoring RUNNER_VERSION/RUNNER_SHA256 from environment"
+  sentinel=${env_case#*=}
+  if [[ $env_case == CLOUD_INIT=* ]]; then
+    want_warn="ignoring CLOUD_INIT ($CUSTOM_CLOUD_INIT) from environment"
+    sentinel="CUSTOM_CLOUD_INIT_SENTINEL"
+  fi
+  if [[ $out != *"$want_warn"* ]] ||
+     ! jq -e --arg bad "$sentinel" '
+       (.user_data | contains("sha256sum --check --strict"))
+       and (.user_data | contains($bad) | not)
+     ' "$BODY_FILE" >/dev/null; then
+    echo "FAIL: env override $env_case (out=$out)"; exit 1
+  fi
+done
+echo "PASS: obsolete RUNNER_VERSION, RUNNER_SHA256, and CLOUD_INIT env vars warn and use bundled template"
+
 
 # Sizes are tried in SIZES order, each in the regions DigitalOcean lists it
 # in stock (REGIONS first); a 422 falls through to the next pair with the

@@ -21,7 +21,10 @@ exception: its aarch64 build cross-compiles on a droplet too
   `omarchy-controller`). It polls GitHub for queued jobs with the label and
   creates droplets up to `MAX_DROPLETS`. It has no inbound endpoint.
 - **A droplet runs one job and powers off.** `runner-cloud-init.yaml` installs
-  Docker and the GitHub runner, registers it `--ephemeral` with a
+  Docker and the GitHub runner (verifying its pinned `linux-x64` tarball
+  SHA-256 before extracting; obsolete `RUNNER_VERSION`, `RUNNER_SHA256`, and
+  `CLOUD_INIT` env overrides are ignored with a warning in favor of the
+  bundled template), registers it `--ephemeral` with a
   registration token that expires in an hour, runs the job, and powers off, also when the runner download or
   registration fails. The controller removes any other failed droplet at
   `MAX_AGE_MINUTES`.
