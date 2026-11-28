@@ -1,0 +1,207 @@
+From a88e1d16c36e4454f063a10888fe3abab30d17d3 Mon Sep 17 00:00:00 2001
+From: Ryan Murray <ryan@aurorasilicon.org>
+Date: Sat, 31 Oct 2026 15:31:33 +1100
+Subject: [PATCH] firmware: extract H17 camera tuning from current daemon
+ locations
+
+Add the IMX958 2224 setfile and the H17 IMX558 1925 setfile to the
+legacy extractor, and register 2224 in the native converter. Search both
+usr/sbin and usr/libexec for h13/h16 camera daemons and retain their
+flattened fallback inputs for device-local firmware updates.
+
+Copy only each setfile's published source length, then zero its alignment
+padding. This avoids reading the object after J700's short 1925 file.
+Reject conflicting inputs and cover extraction, truncation, padding and
+archive interoperability with synthetic data. Document that the existing
+raw factory archive preserves iCCl but the ISP upload ABI remains unknown.
+
+Setfile identities and lengths are public driver interoperability facts;
+no vendor or per-module calibration bytes are included.
+
+(asahi_firmware/isp.py and tests/test_isp.py part of aurora-silicon/aurora-installer
+a88e1d16c36e4454f063a10888fe3abab30d17d3; the native macOS converter, stub.py
+and the docs have no counterpart in asahi-alarm-installer.)
+
+---
+diff --git a/asahi_firmware/isp.py b/asahi_firmware/isp.py
+index f66494d..a087ba0 100644
+--- a/asahi_firmware/isp.py
++++ b/asahi_firmware/isp.py
+@@ -3,7 +3,7 @@ import struct, os, logging
+ from collections import namedtuple
+ from .core import FWFile
+ 
+-SetFile = namedtuple('SetFile', ['sensor', 'magic', 'name', 'size'])
++SetFile = namedtuple('SetFile', ['sensor', 'magic', 'name', 'size', 'file_size'], defaults=[None])
+ 
+ ISP_PREFIX = "apple/isp_"
+ ISP_SETFILE_ALIGNMENT = 0x1000
+@@ -33,6 +33,8 @@ ISP_SETFILES = [
+     # SetFile(0x514, 0x28200405, "2820_04XX", 0xa198),
+     SetFile(0x558, 0x19210106, "1921_01XX", 0xad40),
+     SetFile(0x558, 0x19220201, "1922_02XX", 0xad40),
++    SetFile(0x558, 0x19250306, "1925_03XX", 0xcbc0, 0xcba6),
++    SetFile(0x958, 0x22240106, "2224_01XX", 0x6ff4),
+     # SetFile(0x603, 0x79200109, "7920_01XX", 0xad2c),
+     # SetFile(0x603, 0x79200205, "7920_02XX", 0xad2c),
+     # SetFile(0x603, 0x79210104, "7921_01XX", 0xad90),
+@@ -79,6 +81,7 @@ def isp_setfile_header_check(hdr):
+ class ISPFWCollection(object):
+     def __init__(self, source_path):
+         self.fwfiles = []
++        self.sources = {}
+         self.load(source_path)
+ 
+     def extract_isp(self, data):
+@@ -96,8 +99,14 @@ class ISPFWCollection(object):
+             if not setfile:
+                 continue
+ 
+-            size = round_up(setfile.size, 64)  # align to be safe
+-            dat = data[offset:offset + size]
++            length = setfile.file_size or setfile.size
++            if length > len(data) - offset:
++                log.warning("isp-extract: Truncated sensor tuning, skipping %s", setfile.name)
++                continue
++            # Padding belongs to the firmware buffer, not to the next object
++            # in the camera daemon. In particular, J700 has a short file.
++            dat = data[offset:offset + length]
++            dat += bytes(round_up(setfile.size, 64) - length)
+             sensor_name = f"{setfile.sensor:x}_{setfile.name}"
+ 
+             log.info(f"isp-extract: {found + 1}/{ISP_SETFILE_COUNT}: Found sensor {sensor_name} data at offset {offset:#x}")
+@@ -106,28 +115,38 @@ class ISPFWCollection(object):
+             found += 1
+ 
+         if found != ISP_SETFILE_COUNT:
+-            log.warn(f"isp-extract: Found {found}/{ISP_SETFILE_COUNT} calibration files.")
++            log.warning(f"isp-extract: Found {found}/{ISP_SETFILE_COUNT} calibration files.")
+         else:
+             log.info(f"isp-extract: Found all {found}/{ISP_SETFILE_COUNT} sensor calibration files!")
+ 
+     def load(self, source_path):
+         if os.path.isdir(source_path):
+-            bin_path = os.path.join(source_path, "appleh13camerad")
++            paths = [os.path.join(source_path, directory, name)
++                     for directory in ("", "usr/sbin", "usr/libexec")
++                     for name in ("appleh13camerad", "appleh16camerad")]
+         else:
+-            bin_path = source_path
+-
+-        if not os.path.exists(bin_path):
+-            log.warn("appleh13camerad not found, cannot extract ISP camera calibration firmwares. Webcam output will be low quality.")
+-            return
+-
+-        log.info(f"Extracting firmware from camera daemon at {bin_path}")
++            paths = [source_path]
+ 
+-        with open(bin_path, "rb") as fd:
+-            data = fd.read()
++        files = {}
++        for bin_path in paths:
++            if not os.path.isfile(bin_path):
++                continue
+ 
+-        for fwf in self.extract_isp(data):
+-            self.fwfiles.append((fwf.name, fwf))
++            log.info(f"Extracting firmware from camera daemon at {bin_path}")
++            with open(bin_path, "rb") as fd:
++                data = fd.read()
++            name = os.path.basename(bin_path)
++            if name in self.sources and self.sources[name] != data:
++                raise ValueError("Conflicting camera daemon inputs")
++            self.sources[name] = data
++            for fwf in self.extract_isp(data):
++                if fwf.name in files and files[fwf.name] != fwf:
++                    raise ValueError("Conflicting camera sensor tuning")
++                files[fwf.name] = fwf
++
++        if not self.sources:
++            log.warning("Camera daemon not found, cannot extract ISP sensor tuning. Webcam output will be low quality.")
++        self.fwfiles = sorted(files.items())
+ 
+     def files(self):
+         return self.fwfiles
+-
+diff --git a/tests/test_isp.py b/tests/test_isp.py
+new file mode 100644
+index 0000000..bb572ff
+--- /dev/null
++++ b/tests/test_isp.py
+@@ -0,0 +1,76 @@
++# SPDX-License-Identifier: MIT
++import struct
++import tarfile
++import tempfile
++import unittest
++from pathlib import Path
++
++from asahi_firmware.isp import ISPFWCollection, ISP_SETFILE_MAP
++from asahi_firmware.core import FWPackage
++
++
++def tuning(magic):
++    entry = ISP_SETFILE_MAP[magic]
++    data = bytearray(entry.file_size or entry.size)
++    data[:32] = struct.pack('>8L', magic, 0x21000000, 0, 0,
++                            0x01000000, 0x01000000, 0, 0x03c00000)
++    data[-1] = 0x55
++    return bytes(data)
++
++
++class CameraExtractionTests(unittest.TestCase):
++    def test_h17_extraction_fallback_and_package_round_trip(self):
++        # Only synthetic inputs; no device calibration or vendor bytes.
++        for magic in (0x19250306, 0x22240106):
++            with self.subTest(magic=hex(magic)), tempfile.TemporaryDirectory() as tmp:
++                root = Path(tmp)
++                daemon = root / 'usr/libexec/appleh16camerad'
++                daemon.parent.mkdir(parents=True)
++                source = tuning(magic)
++                daemon.write_bytes(source + b'\xa5' * 64)
++                collection = ISPFWCollection(root)
++                self.assertEqual(collection.sources['appleh16camerad'], daemon.read_bytes())
++                entry = ISP_SETFILE_MAP[magic]
++                name = f'apple/isp_{entry.name}.dat'
++                files = dict(collection.files())
++                self.assertEqual(set(files), {name})
++                result = files[name].data
++                self.assertEqual(result[:len(source)], source)
++                self.assertEqual(len(result) % 64, 0)
++                self.assertEqual(result[len(source):], bytes(len(result) - len(source)))
++                package = FWPackage(tmp)
++                package.add_files(collection.files())
++                package.close()
++                with tarfile.open(root / 'firmware.tar') as archive:
++                    self.assertEqual(archive.extractfile(name).read(), result)
++                # The updater reads the flattened device-local fallback inputs.
++                (root / 'appleh16camerad').write_bytes(daemon.read_bytes())
++                self.assertEqual(dict(ISPFWCollection(root).files())[name].data, result)
++
++    def test_truncated_setfile_is_not_packaged(self):
++        for magic in (0x19250306, 0x22240106):
++            with self.subTest(magic=hex(magic)), tempfile.TemporaryDirectory() as tmp:
++                source = Path(tmp) / 'appleh16camerad'
++                source.write_bytes(tuning(magic)[:-1])
++                self.assertEqual(ISPFWCollection(source).files(), [])
++
++    def test_conflicting_sources_and_setfiles_are_rejected(self):
++        with tempfile.TemporaryDirectory() as tmp:
++            root = Path(tmp)
++            source = tuning(0x22240106)
++            (root / 'appleh13camerad').write_bytes(source)
++            other = bytearray(source)
++            other[-1] ^= 1
++            (root / 'appleh16camerad').write_bytes(other)
++            with self.assertRaisesRegex(ValueError, 'Conflicting camera sensor tuning'):
++                ISPFWCollection(root)
++            (root / 'appleh16camerad').unlink()
++            duplicate = root / 'usr/libexec/appleh13camerad'
++            duplicate.parent.mkdir(parents=True)
++            duplicate.write_bytes(other)
++            with self.assertRaisesRegex(ValueError, 'Conflicting camera daemon inputs'):
++                ISPFWCollection(root)
++
++
++if __name__ == '__main__':
++    unittest.main()
