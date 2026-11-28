@@ -248,6 +248,44 @@ read_pkgbuild_pkgnames() {
   )
 }
 
+# Extract the recorded VCS commit hash component from a pacman version string
+# (preserving its full recorded length, 7..40 chars). Recognizes g<hex>, bare
+# hex containing [a-f], or a trailing all-digit hash component (e.g. r100.1234567)
+# without mistaking a leading revision count (e.g. r12345678) for a commit hash.
+extract_vcs_hash() {
+  local ver="$1"
+  local no_rel="${ver%-*}"
+  [[ "$no_rel" == *:* ]] && no_rel="${no_rel#*:}"
+  local token g_hash="" hex_hash="" last_token=""
+  local -a tokens=()
+  IFS='.+_' read -r -a tokens <<< "$no_rel"
+  for token in "${tokens[@]}"; do
+    last_token="$token"
+    if [[ "$token" =~ g([a-f0-9]{7,40})$ ]]; then
+      g_hash="${BASH_REMATCH[1]}"
+    elif [[ "$token" =~ ^[a-f0-9]{7,40}$ && "$token" =~ [a-f] ]]; then
+      hex_hash="$token"
+    fi
+  done
+  if [[ -n "$g_hash" ]]; then
+    printf '%s\n' "$g_hash"
+  elif [[ -n "$hex_hash" ]]; then
+    printf '%s\n' "$hex_hash"
+  elif (( ${#tokens[@]} > 1 )) && [[ "$last_token" =~ ^[0-9]{7,40}$ ]]; then
+    printf '%s\n' "$last_token"
+  fi
+}
+
+# Return 0 if a pacman version's recorded commit hash matches the upstream hash
+# prefix across every digit recorded in the package version.
+version_matches_hash() {
+  local ver="$1" upstream_hash="$2"
+  [[ -n "$upstream_hash" ]] || return 1
+  local recorded
+  recorded=$(extract_vcs_hash "$ver")
+  [[ -n "$recorded" && ( "$upstream_hash" == "$recorded"* || "$recorded" == "$upstream_hash"* ) ]]
+}
+
 # Get version from final output (production packages)
 #
 # Source package directories are named after the PKGBUILD pkgbase, but split
@@ -638,46 +676,24 @@ get_package_deps() {
 # (both `...gabcdef0` and `...abcdef0` styles are common). Returns 0 when
 # upstream is unchanged (build can be skipped).
 check_vcs_unchanged() {
-  local pkg="$1"
-  local pkgdir="$2"
-  local upstream_hash="${3:-}"
-  local pkgbuild="$pkgdir/PKGBUILD"
+  local pkgbuild_version="$1"
+  local prod_version="$2"
+  local upstream_hash="$3"
+  [[ -n "$pkgbuild_version" && -n "$prod_version" && -n "$upstream_hash" ]] || return 1
 
-  grep -qE '^pkgver[[:space:]]*\(\)' "$pkgbuild" || return 1
+  local pkgbuild_pkgrel="${pkgbuild_version##*-}"
+  local pkgbuild_no_pkgrel="${pkgbuild_version%-*}"
+  local pkgbuild_epoch=""
+  [[ "$pkgbuild_no_pkgrel" == *:* ]] && pkgbuild_epoch="${pkgbuild_no_pkgrel%%:*}"
 
-  local local_version=$(get_local_version "$pkg")
-  [[ -z "$local_version" ]] && return 1
-
-  # If epoch or pkgrel changed in PKGBUILD, rebuild even if upstream is unchanged
-  local pkgbuild_epoch pkgbuild_pkgrel
-  pkgbuild_epoch=$(package_pkgbuild_var "$pkgdir" epoch "$ARCH") || return 1
-  pkgbuild_pkgrel=$(package_pkgbuild_var "$pkgdir" pkgrel "$ARCH") || return 1
-  if [[ "$pkgbuild_epoch" =~ ^[0-9]+$ ]] && (( 10#$pkgbuild_epoch == 0 )); then
-    pkgbuild_epoch=""
-  fi
-
-  local prod_pkgrel="${local_version##*-}"
-  local prod_no_pkgrel="${local_version%-*}"
+  local prod_pkgrel="${prod_version##*-}"
+  local prod_no_pkgrel="${prod_version%-*}"
   local prod_epoch=""
-  if [[ "$prod_no_pkgrel" == *:* ]]; then
-    prod_epoch="${prod_no_pkgrel%%:*}"
-  fi
+  [[ "$prod_no_pkgrel" == *:* ]] && prod_epoch="${prod_no_pkgrel%%:*}"
 
-  [[ "$pkgbuild_epoch" != "$prod_epoch" ]] && return 1
-  [[ "$pkgbuild_pkgrel" != "$prod_pkgrel" ]] && return 1
-
-  # Compare the commit represented in the published version to the current
-  # upstream ref. Supports unfragmented git sources as well as #branch=,
-  # #tag=, and #commit= fragments.
-  local prod_hash=$(package_extract_vcs_hash_from_version "$local_version")
-  [[ -z "$prod_hash" ]] && return 1
-
-  if (( $# < 3 )); then
-    upstream_hash=$(package_git_upstream_hash "$pkgdir")
-  fi
-  [[ -z "$upstream_hash" ]] && return 1
-
-  [[ "$prod_hash" == "$upstream_hash" ]]
+  [[ "$pkgbuild_epoch" == "$prod_epoch" ]] || return 1
+  [[ "$pkgbuild_pkgrel" == "$prod_pkgrel" ]] || return 1
+  version_matches_hash "$prod_version" "$upstream_hash"
 }
 
 # Check which packages need building (version check only)
@@ -703,88 +719,131 @@ check_needs_build() {
   fi
   mapfile -t pkgnames <<< "$pkgnames_out"
 
-  # Check if already built
-  local local_version
-  local_version=$(get_local_version "$pkg")
+  load_local_versions
+  local -a target_versions=()
+  local is_vcs=0
 
   if grep -qE '^pkgver[[:space:]]*\(\)' "$pkgbuild"; then
-    if [[ -n "$local_version" && -n "$(package_extract_vcs_hash_from_version "$local_version")" ]]; then
-      local upstream_hash
-      upstream_hash=$(package_git_upstream_hash "$pkgdir")
-      if check_vcs_unchanged "$pkg" "$pkgdir" "$upstream_hash"; then
-        load_local_versions
-        local -a vcs_missing=()
-        for pkgname_item in "${pkgnames[@]}"; do
-          [[ "${LOCAL_VERSION_BY_NAME[$pkgname_item]:-}" == "$local_version" ]] || vcs_missing+=("$pkgname_item")
-        done
-        (( ${#vcs_missing[@]} == 0 )) && return 1
-        echo "==> ERROR: $pkg $local_version is partially published (missing: ${vcs_missing[*]}); bump pkgrel to rebuild" >&2
-        return 2
-      fi
-      # Only check retained archives for VCS recipes when the static PKGBUILD
-      # version names the current upstream commit (e.g. a #commit= pin); moving
-      # VCS branches carry a stale placeholder pkgver that must not skip a build.
-      local static_hash
-      static_hash=$(package_extract_vcs_hash_from_version "$pkgbuild_version")
-      [[ -n "$static_hash" && -n "$upstream_hash" && "$static_hash" == "$upstream_hash" ]] || return 0
-    elif [[ "$local_version" != "$pkgbuild_version" ]]; then
-      local static_hash upstream_hash
-      static_hash=$(package_extract_vcs_hash_from_version "$pkgbuild_version")
-      [[ -n "$static_hash" ]] || return 0
-      upstream_hash=$(package_git_upstream_hash "$pkgdir")
-      [[ -n "$upstream_hash" && "$static_hash" == "$upstream_hash" ]] || return 0
-    fi
-  fi
-
-  # Check publication per output pkgname: all indexed in the DB means up to
-  # date; all present as retained archives skips rebuilding; a partial split
-  # set fails closed so missing siblings are never hidden and immutable
-  # archives are never overwritten.
-  load_local_versions
-  local -a db_missing=() archive_missing=()
-  local db_present=0 archive_present=0
-  for pkgname_item in "${pkgnames[@]}"; do
-    if [[ "${LOCAL_VERSION_BY_NAME[$pkgname_item]:-}" == "$pkgbuild_version" ]]; then
-      ((db_present++))
-    else
-      db_missing+=("$pkgname_item")
-    fi
-  done
-  if (( ${#db_missing[@]} == 0 )); then
-    return 1  # Already up to date
-  fi
-
-  for pkgname_item in "${db_missing[@]}"; do
-    if package_version_is_published "$FINAL_OUTPUT_DIR" "$pkgname_item" "$pkgbuild_version" "$ARCH"; then
-      ((archive_present++))
-    else
-      archive_missing+=("$pkgname_item")
-    fi
-  done
-  if (( ${#archive_missing[@]} > 0 )) && [[ -n "$PUBLISHED_REPO_SERVER" ]]; then
-    local -A remote_found=()
-    local remote_name
-    while IFS= read -r remote_name; do
-      [[ -n "$remote_name" ]] && remote_found["$remote_name"]=1
-    done < <(remote_published_pkgnames "$pkgbuild_version" "${archive_missing[@]}")
-    local -a still_missing=()
-    for pkgname_item in "${archive_missing[@]}"; do
-      if [[ -n "${remote_found[$pkgname_item]:-}" ]]; then
-        ((archive_present++))
-      else
-        still_missing+=("$pkgname_item")
+    is_vcs=1
+    local -A seen_cand_vers=()
+    local -a cand_vers=()
+    local cand_ver vcs_has_hash=0 upstream_hash=""
+    for pkgname_item in "${pkgnames[@]}"; do
+      cand_ver="${LOCAL_VERSION_BY_NAME[$pkgname_item]:-}"
+      if [[ -n "$cand_ver" && -z "${seen_cand_vers[$cand_ver]:-}" ]]; then
+        seen_cand_vers["$cand_ver"]=1
+        cand_vers+=("$cand_ver")
       fi
     done
-    archive_missing=("${still_missing[@]}")
+    local -A seen_targets=()
+    upstream_hash=$(package_git_upstream_hash --full "$pkgdir")
+    for cand_ver in "${cand_vers[@]}"; do
+      if [[ -n "$(extract_vcs_hash "$cand_ver")" ]]; then
+        vcs_has_hash=1
+        if check_vcs_unchanged "$pkgbuild_version" "$cand_ver" "$upstream_hash"; then
+          target_versions+=("$cand_ver")
+          seen_targets["$cand_ver"]=1
+        fi
+      fi
+    done
+    if [[ -z "${seen_targets[$pkgbuild_version]:-}" ]]; then
+      if (( ! vcs_has_hash )) && [[ -n "${seen_cand_vers[$pkgbuild_version]:-}" ]]; then
+        target_versions+=("$pkgbuild_version")
+      elif version_matches_hash "$pkgbuild_version" "$upstream_hash"; then
+        target_versions+=("$pkgbuild_version")
+      fi
+    fi
+    (( ${#target_versions[@]} > 0 )) || return 0
+  else
+    target_versions+=("$pkgbuild_version")
   fi
 
-  if (( ${#archive_missing[@]} == 0 )); then
-    echo "  + $pkg $pkgbuild_version - archive already published; skipping rebuild"
-    return 1
-  fi
-  if (( db_present > 0 || archive_present > 0 )); then
-    echo "==> ERROR: $pkg $pkgbuild_version is partially published (missing: ${archive_missing[*]}); bump pkgrel to rebuild" >&2
+  # Evaluate publication per output pkgname across target_versions and decide
+  # from the highest published/partial version(s) via vercmp: completely
+  # unpublished higher static versions never hide a partial DB release, older
+  # complete releases never hide a newer partial one, and tied equal-precedence
+  # versions fail closed if any is partial (independent of pkgname order).
+  local target_version cmp_rc best_ver="" best_has_complete=0 best_complete_msg="" best_partial_err=""
+  for target_version in "${target_versions[@]}"; do
+    local -a db_missing=() archive_missing=()
+    local db_present=0 archive_present=0 state="" msg=""
+    for pkgname_item in "${pkgnames[@]}"; do
+      if [[ "${LOCAL_VERSION_BY_NAME[$pkgname_item]:-}" == "$target_version" ]]; then
+        ((db_present++))
+      else
+        db_missing+=("$pkgname_item")
+      fi
+    done
+    if (( ${#db_missing[@]} == 0 )); then
+      state="complete"
+    else
+      for pkgname_item in "${db_missing[@]}"; do
+        if package_version_is_published "$FINAL_OUTPUT_DIR" "$pkgname_item" "$target_version" "$ARCH"; then
+          ((archive_present++))
+        else
+          archive_missing+=("$pkgname_item")
+        fi
+      done
+      if (( ${#archive_missing[@]} > 0 )) && [[ -n "$PUBLISHED_REPO_SERVER" ]]; then
+        local -A remote_found=()
+        local remote_name
+        while IFS= read -r remote_name; do
+          [[ -n "$remote_name" ]] && remote_found["$remote_name"]=1
+        done < <(remote_published_pkgnames "$target_version" "${archive_missing[@]}")
+        local -a still_missing=()
+        for pkgname_item in "${archive_missing[@]}"; do
+          if [[ -n "${remote_found[$pkgname_item]:-}" ]]; then
+            ((archive_present++))
+          else
+            still_missing+=("$pkgname_item")
+          fi
+        done
+        archive_missing=("${still_missing[@]}")
+      fi
+      if (( ${#archive_missing[@]} == 0 )); then
+        state="complete"
+        msg="  + $pkg $target_version - archive already published; skipping rebuild"
+      elif (( db_present > 0 || archive_present > 0 )); then
+        state="partial"
+        if (( is_vcs )); then
+          msg="==> ERROR: $pkg $target_version is partially published (missing: ${archive_missing[*]}); update pkgver with a pkgrel bump or use a dotted pkgrel to rebuild"
+        else
+          msg="==> ERROR: $pkg $target_version is partially published (missing: ${archive_missing[*]}); bump pkgrel to rebuild"
+        fi
+      else
+        continue
+      fi
+    fi
+
+    if [[ -z "$best_ver" ]]; then
+      cmp_rc=1
+    elif ! cmp_rc=$(vercmp "$target_version" "$best_ver"); then
+      echo "==> ERROR: vercmp is required to compare multiple candidate versions for $pkg" >&2
+      return 2
+    fi
+    if (( cmp_rc > 0 )); then
+      best_ver="$target_version"
+      best_has_complete=0
+      best_complete_msg=""
+      best_partial_err=""
+    fi
+    if (( cmp_rc >= 0 )); then
+      if [[ "$state" == "partial" ]]; then
+        [[ -z "$best_partial_err" ]] && best_partial_err="$msg"
+      else
+        best_has_complete=1
+        [[ -z "$best_complete_msg" ]] && best_complete_msg="$msg"
+      fi
+    fi
+  done
+
+  if [[ -n "$best_partial_err" ]]; then
+    echo "$best_partial_err" >&2
     return 2
+  fi
+  if (( best_has_complete )); then
+    [[ -n "$best_complete_msg" ]] && echo "$best_complete_msg"
+    return 1
   fi
 
   return 0  # Needs building

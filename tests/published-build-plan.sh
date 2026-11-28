@@ -356,8 +356,24 @@ epoch=abc
 pkgver=1.0
 pkgrel=1
 arch=(x86_64)'
+write_pkg missing-arch 'pkgname=missing-arch
+pkgver=1.0
+pkgrel=1'
+write_pkg empty-arch 'pkgname=empty-arch
+pkgver=1.0
+pkgrel=1
+arch=("")'
+write_pkg zero-arch 'pkgname=zero-arch
+pkgver=1.0
+pkgrel=1
+arch=()'
+write_pkg exit2-broken 'exit 2
+pkgname=exit2-broken
+pkgver=1.0
+pkgrel=1
+arch=(x86_64)'
 
-for bad in missing-ver broken-source broken-early broken-epoch; do
+for bad in missing-ver broken-source broken-early broken-epoch missing-arch empty-arch zero-arch exit2-broken; do
   rm -rf "$EDGE_ROOT/plan-$bad"
   if ARCH=x86_64 MIRROR=edge DRY_RUN=true PACKAGES="$bad" \
       PKGBUILDS_DIR="$EDGE_ROOT/pkgbuilds" HELPERS_DIR="$TEST_ROOT/helpers" \
@@ -544,7 +560,7 @@ pkgrel=1
 arch=(x86_64)
 source=("repo::git+https://example.invalid/repo.git#commit=fdda9d0cb32604519dbc7fb127058469cb9472be")
 pkgver() { echo r100.fdda9d0; }'
-write_db_entry "$EDGE_ROOT/db" vcs-split-a vcs-split-retained r101.abcdef0-1
+write_db_entry "$EDGE_ROOT/db" vcs-split-a vcs-split-retained r99.fdda9d0-1
 
 write_pkg vcs-moving "pkgname=vcs-moving
 pkgver=r1.g${vcs_c1}
@@ -600,5 +616,393 @@ if ARCH=x86_64 MIRROR=edge DRY_RUN=true PACKAGES="vcs-split-partial" \
   cat "$EDGE_ROOT/plan-vcs-partial.log" >&2
   exit 1
 fi
-grep -q "vcs-split-partial r100.fdda9d0-1 is partially published (missing: vcs-part-b)" "$EDGE_ROOT/plan-vcs-partial.log"
+grep -q "vcs-split-partial r100.fdda9d0-1 is partially published (missing: vcs-part-b); update pkgver with a pkgrel bump or use a dotted pkgrel to rebuild" "$EDGE_ROOT/plan-vcs-partial.log"
 printf 'PASS: partially published VCS split package fails closed\n'
+
+# x86_64-only recipe returning early on unsupported CARCH is skipped cleanly on aarch64
+write_pkg x86-early-return 'pkgname=x86-early-return
+arch=(x86_64)
+case "${CARCH:-}" in
+  x86_64) pkgver=1.0 ;;
+  *) return 1 ;;
+esac
+pkgrel=1'
+rm -rf "$EDGE_ROOT/plan-x86-on-arm"
+ARCH=aarch64 MIRROR=edge DRY_RUN=true PACKAGES="x86-early-return" \
+  PKGBUILDS_DIR="$EDGE_ROOT/pkgbuilds" HELPERS_DIR="$TEST_ROOT/helpers" \
+  FINAL_OUTPUT_DIR="$EDGE_ROOT/repo-arm" BUILD_PLAN_DIR="$EDGE_ROOT/plan-x86-on-arm" \
+  OMARCHY_PUBLISHED_REPO_URL="" \
+  "$TEST_ROOT/build/build.sh" > "$EDGE_ROOT/plan-x86-on-arm.log" 2>&1
+[[ ! -s "$EDGE_ROOT/plan-x86-on-arm/packages" ]]
+grep -q 'x86-early-return - not built for aarch64' "$EDGE_ROOT/plan-x86-on-arm.log"
+printf 'PASS: arch-restricted recipe returning early on unsupported CARCH is skipped cleanly\n'
+
+# Unchanged VCS split with one output in DB and its sibling retained as an archive
+# (and a directory name != pkgbase/pkgname) skips cleanly instead of failing as partial.
+write_pkg vcs-alias-dir 'pkgbase=vcs-real-base
+pkgname=(vcs-sib-a vcs-sib-b)
+pkgver=r99.g0000000
+pkgrel=1
+arch=(x86_64)
+source=("repo::git+https://example.invalid/repo.git#commit=fdda9d0cb32604519dbc7fb127058469cb9472be")
+pkgver() { echo r100.fdda9d0; }'
+write_db_entry "$EDGE_ROOT/db" vcs-sib-a vcs-real-base r100.fdda9d0-1
+tar --zstd -cf "$EDGE_ROOT/repo/omarchy.db.tar.zst" -C "$EDGE_ROOT/db" .
+touch "$EDGE_ROOT/repo/vcs-sib-b-r100.fdda9d0-1-x86_64.pkg.tar.zst"
+rm -rf "$EDGE_ROOT/plan-vcs-retained-sib"
+ARCH=x86_64 MIRROR=edge DRY_RUN=true PACKAGES="vcs-alias-dir" \
+  PKGBUILDS_DIR="$EDGE_ROOT/pkgbuilds" HELPERS_DIR="$TEST_ROOT/helpers" \
+  FINAL_OUTPUT_DIR="$EDGE_ROOT/repo" BUILD_PLAN_DIR="$EDGE_ROOT/plan-vcs-retained-sib" \
+  OMARCHY_PUBLISHED_REPO_URL="" \
+  "$TEST_ROOT/build/build.sh" > "$EDGE_ROOT/plan-vcs-retained-sib.log" 2>&1
+[[ ! -s "$EDGE_ROOT/plan-vcs-retained-sib/packages" ]]
+grep -q 'vcs-alias-dir r100.fdda9d0-1 - archive already published' "$EDGE_ROOT/plan-vcs-retained-sib.log"
+printf 'PASS: unchanged VCS split with retained sibling and aliased directory skips cleanly\n'
+
+# x86_64-only recipe with CARCH guard BEFORE arch=() also skips cleanly on aarch64 (explicit & unscoped)
+write_pkg x86-guard-first 'pkgname=x86-guard-first
+case "${CARCH:-}" in
+  x86_64) pkgver=1.0 ;;
+  *) return 1 ;;
+esac
+pkgrel=1
+arch=(x86_64)'
+mkdir -p "$EDGE_ROOT/unscoped-x86-guard/x86-guard-first/.omarchy"
+cp -a "$EDGE_ROOT/pkgbuilds/x86-guard-first/." "$EDGE_ROOT/unscoped-x86-guard/x86-guard-first/"
+rm -rf "$EDGE_ROOT/plan-x86-guard-arm"
+ARCH=aarch64 MIRROR=edge DRY_RUN=true PACKAGES="" \
+  PKGBUILDS_DIR="$EDGE_ROOT/unscoped-x86-guard" HELPERS_DIR="$TEST_ROOT/helpers" \
+  FINAL_OUTPUT_DIR="$EDGE_ROOT/repo-arm" BUILD_PLAN_DIR="$EDGE_ROOT/plan-x86-guard-arm" \
+  OMARCHY_PUBLISHED_REPO_URL="" \
+  "$TEST_ROOT/build/build.sh" > "$EDGE_ROOT/plan-x86-guard-arm.log" 2>&1
+[[ ! -s "$EDGE_ROOT/plan-x86-guard-arm/packages" ]]
+printf 'PASS: CARCH guard before arch=() skips cleanly in unscoped unsupported-arch plan\n'
+
+# VCS split with two DB versions sharing hash/epoch/pkgrel selects the highest
+# version (r100) regardless of pkgname order: an older complete r99 must NOT
+# hide a newer partial r100, while a complete r100 skips cleanly.
+write_db_entry "$EDGE_ROOT/db" vcs-ord-a vcs-order-indep r99.fdda9d0-1
+write_db_entry "$EDGE_ROOT/db" vcs-ord-b vcs-order-indep r100.fdda9d0-1
+tar --zstd -cf "$EDGE_ROOT/repo/omarchy.db.tar.zst" -C "$EDGE_ROOT/db" .
+touch "$EDGE_ROOT/repo/vcs-ord-b-r99.fdda9d0-1-x86_64.pkg.tar.zst"
+for order in "vcs-ord-a vcs-ord-b" "vcs-ord-b vcs-ord-a"; do
+  write_pkg vcs-order-indep "pkgbase=vcs-order-indep
+pkgname=($order)
+pkgver=r101.g0000000
+pkgrel=1
+arch=(x86_64)
+source=(\"repo::git+https://example.invalid/repo.git#commit=fdda9d0cb32604519dbc7fb127058469cb9472be\")
+pkgver() { echo r100.fdda9d0; }"
+  rm -rf "$EDGE_ROOT/plan-vcs-ord"
+  if ARCH=x86_64 MIRROR=edge DRY_RUN=true PACKAGES="vcs-order-indep" \
+      PKGBUILDS_DIR="$EDGE_ROOT/pkgbuilds" HELPERS_DIR="$TEST_ROOT/helpers" \
+      FINAL_OUTPUT_DIR="$EDGE_ROOT/repo" BUILD_PLAN_DIR="$EDGE_ROOT/plan-vcs-ord" \
+      OMARCHY_PUBLISHED_REPO_URL="" \
+      "$TEST_ROOT/build/build.sh" > "$EDGE_ROOT/plan-vcs-ord.log" 2>&1; then
+    echo "FAIL: older complete r99 hid newer partial r100 ($order)" >&2
+    cat "$EDGE_ROOT/plan-vcs-ord.log" >&2
+    exit 1
+  fi
+  grep -q 'vcs-order-indep r100.fdda9d0-1 is partially published (missing: vcs-ord-a)' "$EDGE_ROOT/plan-vcs-ord.log"
+done
+touch "$EDGE_ROOT/repo/vcs-ord-a-r100.fdda9d0-1-x86_64.pkg.tar.zst"
+rm -rf "$EDGE_ROOT/plan-vcs-ord"
+ARCH=x86_64 MIRROR=edge DRY_RUN=true PACKAGES="vcs-order-indep" \
+  PKGBUILDS_DIR="$EDGE_ROOT/pkgbuilds" HELPERS_DIR="$TEST_ROOT/helpers" \
+  FINAL_OUTPUT_DIR="$EDGE_ROOT/repo" BUILD_PLAN_DIR="$EDGE_ROOT/plan-vcs-ord" \
+  OMARCHY_PUBLISHED_REPO_URL="" \
+  "$TEST_ROOT/build/build.sh" > "$EDGE_ROOT/plan-vcs-ord.log" 2>&1
+[[ ! -s "$EDGE_ROOT/plan-vcs-ord/packages" ]]
+grep -q 'vcs-order-indep r100.fdda9d0-1 - archive already published' "$EDGE_ROOT/plan-vcs-ord.log"
+printf 'PASS: VCS split selects highest version independent of pkgname order\n'
+
+# Target branch that declares arch=(aarch64) and then fails must NOT be hidden by peer x86_64
+write_pkg arch-branch-fail 'pkgname=arch-branch-fail
+case "${CARCH:-}" in
+  x86_64) arch=(x86_64); pkgver=1.0 ;;
+  aarch64) arch=(aarch64); return 1 ;;
+esac
+pkgrel=1'
+rm -rf "$EDGE_ROOT/plan-branch-fail"
+if ARCH=aarch64 MIRROR=edge DRY_RUN=true PACKAGES="arch-branch-fail" \
+    PKGBUILDS_DIR="$EDGE_ROOT/pkgbuilds" HELPERS_DIR="$TEST_ROOT/helpers" \
+    FINAL_OUTPUT_DIR="$EDGE_ROOT/repo-arm" BUILD_PLAN_DIR="$EDGE_ROOT/plan-branch-fail" \
+    OMARCHY_PUBLISHED_REPO_URL="" \
+    "$TEST_ROOT/build/build.sh" > "$EDGE_ROOT/plan-branch-fail.log" 2>&1; then
+  echo "FAIL: supported-arch branch failure was hidden by peer fallback" >&2
+  cat "$EDGE_ROOT/plan-branch-fail.log" >&2
+  exit 1
+fi
+grep -q "Failed to read PKGBUILD for arch-branch-fail" "$EDGE_ROOT/plan-branch-fail.log"
+printf 'PASS: arch-specific failure on supported target is not hidden by peer fallback\n'
+
+# Peer probe rejecting arch=("") must fail closed (not silently skip)
+write_pkg peer-empty-arch 'pkgname=peer-empty-arch
+case "${CARCH:-}" in
+  x86_64) arch=(""); pkgver=1.0 ;;
+  *) return 1 ;;
+esac
+pkgrel=1'
+rm -rf "$EDGE_ROOT/plan-peer-empty"
+if ARCH=aarch64 MIRROR=edge DRY_RUN=true PACKAGES="peer-empty-arch" \
+    PKGBUILDS_DIR="$EDGE_ROOT/pkgbuilds" HELPERS_DIR="$TEST_ROOT/helpers" \
+    FINAL_OUTPUT_DIR="$EDGE_ROOT/repo-arm" BUILD_PLAN_DIR="$EDGE_ROOT/plan-peer-empty" \
+    OMARCHY_PUBLISHED_REPO_URL="" \
+    "$TEST_ROOT/build/build.sh" > "$EDGE_ROOT/plan-peer-empty.log" 2>&1; then
+  echo "FAIL: peer arch=("") succeeded instead of failing closed" >&2
+  cat "$EDGE_ROOT/plan-peer-empty.log" >&2
+  exit 1
+fi
+grep -q "Failed to read PKGBUILD for peer-empty-arch" "$EDGE_ROOT/plan-peer-empty.log"
+
+# VCS recipe using source_${CARCH} resolves upstream hash for target CARCH
+write_pkg vcs-arch-src 'pkgname=vcs-arch-src
+pkgver=r99.g0000000
+pkgrel=1
+arch=(x86_64)
+source_x86_64=("repo::git+https://example.invalid/repo.git#commit=fdda9d0cb32604519dbc7fb127058469cb9472be")
+pkgver() { echo r100.fdda9d0; }'
+write_db_entry "$EDGE_ROOT/db" vcs-arch-src vcs-arch-src r100.fdda9d0-1
+tar --zstd -cf "$EDGE_ROOT/repo/omarchy.db.tar.zst" -C "$EDGE_ROOT/db" .
+rm -rf "$EDGE_ROOT/plan-vcs-arch-src"
+ARCH=x86_64 MIRROR=edge DRY_RUN=true PACKAGES="vcs-arch-src" \
+  PKGBUILDS_DIR="$EDGE_ROOT/pkgbuilds" HELPERS_DIR="$TEST_ROOT/helpers" \
+  FINAL_OUTPUT_DIR="$EDGE_ROOT/repo" BUILD_PLAN_DIR="$EDGE_ROOT/plan-vcs-arch-src" \
+  OMARCHY_PUBLISHED_REPO_URL="" \
+  "$TEST_ROOT/build/build.sh" > "$EDGE_ROOT/plan-vcs-arch-src.log" 2>&1
+[[ ! -s "$EDGE_ROOT/plan-vcs-arch-src/packages" ]]
+grep -q '+ vcs-arch-src - already up to date' "$EDGE_ROOT/plan-vcs-arch-src.log"
+printf 'PASS: peer empty-arch fails closed, source_CARCH VCS and integer pkgrel reset handled\n'
+
+# package_arches still prints declared arch on a supported-arch source failure
+# (with non-zero exit) and bin/build-matrix keeps the broken recipe visible to CI.
+source "$TEST_ROOT/helpers/package-metadata.sh"
+broken_arches_rc=0
+broken_arches_out=$(package_arches "$EDGE_ROOT/pkgbuilds/broken-source" x86_64) || broken_arches_rc=$?
+(( broken_arches_rc != 0 ))
+[[ "$broken_arches_out" == "x86_64" ]]
+mkdir -p "$EDGE_ROOT/bm/bin"
+cp "$BUILD_ROOT/bin/build-matrix" "$EDGE_ROOT/bm/bin/build-matrix"
+ln -s "$TEST_ROOT/helpers" "$EDGE_ROOT/bm/helpers"
+ln -s "$EDGE_ROOT/pkgbuilds" "$EDGE_ROOT/bm/pkgbuilds"
+matrix_out=$("$EDGE_ROOT/bm/bin/build-matrix" broken-source)
+jq -e '.include | length == 1 and .[0].package == "broken-source" and .[0].arch == "x86_64"' <<< "$matrix_out" >/dev/null
+printf 'PASS: package_arches and bin/build-matrix keep supported-arch broken recipes visible to CI\n'
+
+# Pinned all-digit commit hash (e.g. 1234567) still probes retained archives
+write_pkg vcs-numeric-hash 'pkgbase=vcs-numeric-hash
+pkgname=(vcs-num-a vcs-num-b)
+pkgver=r100.1234567
+pkgrel=1
+arch=(x86_64)
+source=("repo::git+https://example.invalid/repo.git#commit=1234567000000000000000000000000000000000")
+pkgver() { echo r100.1234567; }'
+write_db_entry "$EDGE_ROOT/db" vcs-num-a vcs-numeric-hash r99.fdda9d0-1
+tar --zstd -cf "$EDGE_ROOT/repo/omarchy.db.tar.zst" -C "$EDGE_ROOT/db" .
+touch "$EDGE_ROOT/repo/vcs-num-a-r100.1234567-1-x86_64.pkg.tar.zst"
+rm -rf "$EDGE_ROOT/plan-vcs-num"
+if ARCH=x86_64 MIRROR=edge DRY_RUN=true PACKAGES="vcs-numeric-hash" \
+    PKGBUILDS_DIR="$EDGE_ROOT/pkgbuilds" HELPERS_DIR="$TEST_ROOT/helpers" \
+    FINAL_OUTPUT_DIR="$EDGE_ROOT/repo" BUILD_PLAN_DIR="$EDGE_ROOT/plan-vcs-num" \
+    OMARCHY_PUBLISHED_REPO_URL="" \
+    "$TEST_ROOT/build/build.sh" > "$EDGE_ROOT/plan-vcs-num.log" 2>&1; then
+  echo "FAIL: pinned all-digit commit hash missed partial retained archive" >&2
+  cat "$EDGE_ROOT/plan-vcs-num.log" >&2
+  exit 1
+fi
+grep -q "vcs-numeric-hash r100.1234567-1 is partially published (missing: vcs-num-b)" "$EDGE_ROOT/plan-vcs-num.log"
+printf 'PASS: pinned all-digit commit hash checks retained archives\n'
+
+if command -v vercmp >/dev/null 2>&1; then
+  # Tied equal-precedence VCS candidates (r0100 vs r100) fail closed if either is
+  # partial, regardless of pkgname order.
+  write_db_entry "$EDGE_ROOT/db" vcs-tie-a vcs-tie r0100.fdda9d0-1
+  write_db_entry "$EDGE_ROOT/db" vcs-tie-b vcs-tie r100.fdda9d0-1
+  tar --zstd -cf "$EDGE_ROOT/repo/omarchy.db.tar.zst" -C "$EDGE_ROOT/db" .
+  touch "$EDGE_ROOT/repo/vcs-tie-b-r0100.fdda9d0-1-x86_64.pkg.tar.zst"
+  for order in "vcs-tie-a vcs-tie-b" "vcs-tie-b vcs-tie-a"; do
+    write_pkg vcs-tie "pkgbase=vcs-tie
+pkgname=($order)
+pkgver=r98.g0000000
+pkgrel=1
+arch=(x86_64)
+source=(\"repo::git+https://example.invalid/repo.git#commit=fdda9d0cb32604519dbc7fb127058469cb9472be\")
+pkgver() { echo r100.fdda9d0; }"
+    rm -rf "$EDGE_ROOT/plan-vcs-tie"
+    if ARCH=x86_64 MIRROR=edge DRY_RUN=true PACKAGES="vcs-tie" \
+        PKGBUILDS_DIR="$EDGE_ROOT/pkgbuilds" HELPERS_DIR="$TEST_ROOT/helpers" \
+        FINAL_OUTPUT_DIR="$EDGE_ROOT/repo" BUILD_PLAN_DIR="$EDGE_ROOT/plan-vcs-tie" \
+        OMARCHY_PUBLISHED_REPO_URL="" \
+        "$TEST_ROOT/build/build.sh" > "$EDGE_ROOT/plan-vcs-tie.log" 2>&1; then
+      echo "FAIL: tied partial VCS candidate succeeded ($order)" >&2
+      cat "$EDGE_ROOT/plan-vcs-tie.log" >&2
+      exit 1
+    fi
+    grep -q "vcs-tie r100.fdda9d0-1 is partially published (missing: vcs-tie-a)" "$EDGE_ROOT/plan-vcs-tie.log"
+  done
+  printf 'PASS: tied equal-precedence VCS candidates fail closed independent of pkgname order\n'
+fi
+
+# Pass 12 regressions:
+# (a) Higher unpublished static VCS version (r101) must NOT hide a partial DB release (r100).
+# (b) Indexed all-digit commit hash (1234567) partial release is detected even with stale static r99.
+# (c) 8-char commit hash (like libretro-uae-git's 1720.232ec89b) matches 7-char upstream hash.
+write_pkg vcs-high-static 'pkgbase=vcs-high-static
+pkgname=(vcs-hs-a vcs-hs-b)
+pkgver=r101.fdda9d0
+pkgrel=1
+arch=(x86_64)
+source=("repo::git+https://example.invalid/repo.git#commit=fdda9d0cb32604519dbc7fb127058469cb9472be")
+pkgver() { echo r100.fdda9d0; }'
+write_db_entry "$EDGE_ROOT/db" vcs-hs-a vcs-high-static r100.fdda9d0-1
+
+write_pkg vcs-num-indexed 'pkgbase=vcs-num-indexed
+pkgname=(vcs-ni-a vcs-ni-b)
+pkgver=r99.1234567
+pkgrel=1
+arch=(x86_64)
+source=("repo::git+https://example.invalid/repo.git#commit=1234567000000000000000000000000000000000")
+pkgver() { echo r100.1234567; }'
+write_db_entry "$EDGE_ROOT/db" vcs-ni-a vcs-num-indexed r100.1234567-1
+
+write_pkg vcs-8char-hash 'pkgname=vcs-8char-hash
+pkgver=1720.232ec89b
+pkgrel=2
+arch=(x86_64)
+source=("repo::git+https://example.invalid/repo.git#commit=232ec89b068f104caa20853ea058529c36157b82")
+pkgver() { echo 1720.232ec89b; }'
+write_db_entry "$EDGE_ROOT/db" vcs-8char-hash vcs-8char-hash 1721.abcdef01-1
+
+tar --zstd -cf "$EDGE_ROOT/repo/omarchy.db.tar.zst" -C "$EDGE_ROOT/db" .
+touch "$EDGE_ROOT/repo/vcs-8char-hash-1720.232ec89b-2-x86_64.pkg.tar.zst"
+
+for p12 in vcs-high-static vcs-num-indexed; do
+  rm -rf "$EDGE_ROOT/plan-$p12"
+  if ARCH=x86_64 MIRROR=edge DRY_RUN=true PACKAGES="$p12" \
+      PKGBUILDS_DIR="$EDGE_ROOT/pkgbuilds" HELPERS_DIR="$TEST_ROOT/helpers" \
+      FINAL_OUTPUT_DIR="$EDGE_ROOT/repo" BUILD_PLAN_DIR="$EDGE_ROOT/plan-$p12" \
+      OMARCHY_PUBLISHED_REPO_URL="" \
+      "$TEST_ROOT/build/build.sh" > "$EDGE_ROOT/plan-$p12.log" 2>&1; then
+    echo "FAIL: $p12 succeeded instead of failing closed on partial DB release" >&2
+    cat "$EDGE_ROOT/plan-$p12.log" >&2
+    exit 1
+  fi
+  grep -q "is partially published" "$EDGE_ROOT/plan-$p12.log"
+done
+
+rm -rf "$EDGE_ROOT/plan-vcs-8char"
+ARCH=x86_64 MIRROR=edge DRY_RUN=true PACKAGES="vcs-8char-hash" \
+  PKGBUILDS_DIR="$EDGE_ROOT/pkgbuilds" HELPERS_DIR="$TEST_ROOT/helpers" \
+  FINAL_OUTPUT_DIR="$EDGE_ROOT/repo" BUILD_PLAN_DIR="$EDGE_ROOT/plan-vcs-8char" \
+  OMARCHY_PUBLISHED_REPO_URL="" \
+  "$TEST_ROOT/build/build.sh" > "$EDGE_ROOT/plan-vcs-8char.log" 2>&1
+[[ ! -s "$EDGE_ROOT/plan-vcs-8char/packages" ]]
+grep -q 'vcs-8char-hash 1720.232ec89b-2 - archive already published' "$EDGE_ROOT/plan-vcs-8char.log"
+printf 'PASS: unpublished higher static VCS, indexed numeric hash, and 8-char VCS hash handled\n'
+
+# Pass 13 regressions:
+# (a) All-digit hash in DB + static (r100.1234567-1) rebuilds when upstream moves to 89abcde.
+# (b) 8-char hash mismatch at 8th char (1720.232ec89a vs 232ec89b...) rebuilds (not truncated to 7).
+# (c) Leading revcount r12345678 is NOT mistaken for commit hash when g7654321 is present.
+write_pkg vcs-num-moved 'pkgname=vcs-num-moved
+pkgver=r100.1234567
+pkgrel=1
+arch=(x86_64)
+source=("repo::git+https://example.invalid/repo.git#commit=89abcde000000000000000000000000000000000")
+pkgver() { echo r101.89abcde; }'
+write_db_entry "$EDGE_ROOT/db" vcs-num-moved vcs-num-moved r100.1234567-1
+
+write_pkg vcs-8char-mismatch 'pkgname=vcs-8char-mismatch
+pkgver=1720.232ec89a
+pkgrel=1
+arch=(x86_64)
+source=("repo::git+https://example.invalid/repo.git#commit=232ec89b068f104caa20853ea058529c36157b82")
+pkgver() { echo 1720.232ec89b; }'
+write_db_entry "$EDGE_ROOT/db" vcs-8char-mismatch vcs-8char-mismatch 1720.232ec89a-1
+
+write_pkg vcs-revcount-collision 'pkgname=vcs-revcount-collision
+pkgver=r12345678.g7654321
+pkgrel=1
+arch=(x86_64)
+source=("repo::git+https://example.invalid/repo.git#commit=1234567800000000000000000000000000000000")
+pkgver() { echo r12345679.g12345678; }'
+write_db_entry "$EDGE_ROOT/db" vcs-revcount-collision vcs-revcount-collision r12345678.g7654321-1
+
+tar --zstd -cf "$EDGE_ROOT/repo/omarchy.db.tar.zst" -C "$EDGE_ROOT/db" .
+rm -rf "$EDGE_ROOT/plan-p13"
+ARCH=x86_64 MIRROR=edge DRY_RUN=true \
+  PACKAGES="vcs-num-moved vcs-8char-mismatch vcs-revcount-collision" \
+  PKGBUILDS_DIR="$EDGE_ROOT/pkgbuilds" HELPERS_DIR="$TEST_ROOT/helpers" \
+  FINAL_OUTPUT_DIR="$EDGE_ROOT/repo" BUILD_PLAN_DIR="$EDGE_ROOT/plan-p13" \
+  OMARCHY_PUBLISHED_REPO_URL="" \
+  "$TEST_ROOT/build/build.sh" > "$EDGE_ROOT/plan-p13.log" 2>&1
+diff -u <(printf '%s\n' vcs-8char-mismatch vcs-num-moved vcs-revcount-collision) <(sort "$EDGE_ROOT/plan-p13/packages")
+printf 'PASS: all-digit move, 8-char hash mismatch, and revcount-vs-hash collisions all rebuild\n'
+
+# Pass 14 regressions:
+# (a) bin/build-matrix fails closed on broken-early (instead of emitting empty matrix).
+# (b) VCS release bump (1720.232ec89b-2 vs indexed 1720.232ec89-1) rebuilds instead of skipping.
+# (c) Standalone numeric hash (1234567-1) rebuilds when upstream moves to 89abcde.
+# (d) Abbreviated #commit=232ec89 pin matches 8-char indexed 1720.232ec89b-1.
+if "$EDGE_ROOT/bm/bin/build-matrix" broken-early > "$EDGE_ROOT/bm-early.log" 2>&1; then
+  echo "FAIL: bin/build-matrix silently dropped broken-early" >&2
+  cat "$EDGE_ROOT/bm-early.log" >&2
+  exit 1
+fi
+grep -q "failed to read arch for broken-early" "$EDGE_ROOT/bm-early.log"
+
+write_pkg vcs-rel-bump 'pkgname=vcs-rel-bump
+pkgver=1720.232ec89b
+pkgrel=2
+arch=(x86_64)
+source=("repo::git+https://example.invalid/repo.git#commit=232ec89b068f104caa20853ea058529c36157b82")
+pkgver() { echo 1720.232ec89b; }'
+write_db_entry "$EDGE_ROOT/db" vcs-rel-bump vcs-rel-bump 1720.232ec89-1
+
+write_pkg exit0-before-arch 'exit 0
+pkgname=exit0-before-arch
+pkgver=1.0
+pkgrel=1
+arch=(x86_64)'
+if "$EDGE_ROOT/bm/bin/build-matrix" exit0-before-arch > "$EDGE_ROOT/bm-exit0.log" 2>&1; then
+  echo "FAIL: bin/build-matrix silently dropped exit0-before-arch" >&2
+  cat "$EDGE_ROOT/bm-exit0.log" >&2
+  exit 1
+fi
+
+write_pkg vcs-inline-g 'pkgname=vcs-inline-g
+pkgver=r123gabcdef1
+pkgrel=1
+arch=(x86_64)
+source=("repo::git+https://example.invalid/repo.git#commit=89abcde000000000000000000000000000000000")
+pkgver() { echo r124g89abcde; }'
+write_db_entry "$EDGE_ROOT/db" vcs-inline-g vcs-inline-g r123gabcdef1-1
+
+write_pkg vcs-date-only 'pkgname=vcs-date-only
+pkgver=20261128
+pkgrel=1
+arch=(x86_64)
+source=("repo::git+https://example.invalid/repo.git#commit=89abcde000000000000000000000000000000000")
+pkgver() { echo 20261128; }'
+write_db_entry "$EDGE_ROOT/db" vcs-date-only vcs-date-only 20261128-1
+
+write_pkg vcs-abbrev-pin 'pkgname=vcs-abbrev-pin
+pkgver=1720.232ec89b
+pkgrel=1
+arch=(x86_64)
+source=("repo::git+https://example.invalid/repo.git#commit=232ec89")
+pkgver() { echo 1720.232ec89b; }'
+write_db_entry "$EDGE_ROOT/db" vcs-abbrev-pin vcs-abbrev-pin 1720.232ec89b-1
+
+tar --zstd -cf "$EDGE_ROOT/repo/omarchy.db.tar.zst" -C "$EDGE_ROOT/db" .
+rm -rf "$EDGE_ROOT/plan-p14"
+ARCH=x86_64 MIRROR=edge DRY_RUN=true \
+  PACKAGES="vcs-rel-bump vcs-inline-g vcs-date-only vcs-abbrev-pin" \
+  PKGBUILDS_DIR="$EDGE_ROOT/pkgbuilds" HELPERS_DIR="$TEST_ROOT/helpers" \
+  FINAL_OUTPUT_DIR="$EDGE_ROOT/repo" BUILD_PLAN_DIR="$EDGE_ROOT/plan-p14" \
+  OMARCHY_PUBLISHED_REPO_URL="" \
+  "$TEST_ROOT/build/build.sh" > "$EDGE_ROOT/plan-p14.log" 2>&1
+diff -u <(printf '%s\n' vcs-inline-g vcs-rel-bump) <(sort "$EDGE_ROOT/plan-p14/packages")
+grep -q '+ vcs-date-only - already up to date' "$EDGE_ROOT/plan-p14.log"
+grep -q '+ vcs-abbrev-pin - already up to date' "$EDGE_ROOT/plan-p14.log"
+printf 'PASS: build-matrix fails closed on broken-early/exit0; VCS bump, inline g-hash, date-only, and abbrev pin handled\n'
