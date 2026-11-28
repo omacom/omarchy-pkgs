@@ -45,13 +45,14 @@ if [[ -z $pr ]]; then
   exit 0
 fi
 
-IFS='|' read -r mergeable commit_count first_oid tip_author tip_date check_state < <(
+IFS='|' read -r mergeable commit_count first_oid tip_oid tip_author tip_date check_state < <(
   # shellcheck disable=SC2016
   gh pr view "$pr" -R "$repo" --json mergeable,commits,statusCheckRollup \
     --jq '[
       (.mergeable // "UNKNOWN"),
       (.commits | length | tostring),
       (.commits[0].oid // ""),
+      (.commits[-1].oid // ""),
       (.commits[-1].authors[0].login // ""),
       (.commits[-1].committedDate // ""),
       (
@@ -67,12 +68,17 @@ IFS='|' read -r mergeable commit_count first_oid tip_author tip_date check_state
 paths=()
 for package in "$@"; do paths+=("pkgbuilds/$package"); done
 
-# Compare both tracked changes and any newly added (untracked) files created by
-# `git apply` under pkgbuilds/<pkg>/ against FETCH_HEAD.
+# Stage pkgbuilds/<pkg>/ (including newly added untracked files) into a
+# throwaway index and compare that candidate tree against FETCH_HEAD so both
+# newly added files and already-present added files compare accurately.
 tree_matches_fetch_head() {
-  local untracked
-  untracked=$(git ls-files --others --exclude-standard -- "${paths[@]}")
-  [[ -z $untracked ]] && git diff --quiet FETCH_HEAD -- "${paths[@]}"
+  local tmp_index rc=0
+  tmp_index=$(mktemp)
+  GIT_INDEX_FILE="$tmp_index" git read-tree HEAD &&
+    GIT_INDEX_FILE="$tmp_index" git add -A -- "${paths[@]}" &&
+    GIT_INDEX_FILE="$tmp_index" git diff --cached --quiet FETCH_HEAD -- "${paths[@]}" || rc=$?
+  rm -f "$tmp_index"
+  return "$rc"
 }
 
 # Check for maintainer commits BEFORE handling conflicts so a conflict on master
@@ -96,7 +102,10 @@ if [[ $mergeable == CONFLICTING ]]; then
   exit 0
 fi
 
-if ! git fetch --quiet --no-tags --depth=1 origin "refs/heads/$branch"; then
+# Fetch the exact tip commit inspected above rather than re-reading the moving
+# branch ref, avoiding a race with a maintainer push arriving mid-check.
+fetch_ref=${tip_oid:-refs/heads/$branch}
+if ! git fetch --quiet --no-tags --depth=1 origin "$fetch_ref"; then
   emit true "$pr" updated
   exit 0
 fi

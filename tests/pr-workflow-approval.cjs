@@ -1367,7 +1367,7 @@ set -euo pipefail
 if [[ "$1" == "api" ]]; then
   if [[ "$STUB_PR" == "" ]]; then echo ""; else echo "$STUB_PR"; fi
 elif [[ "$1" == "pr" && "$2" == "view" ]]; then
-  printf "%s|%s|%s|%s|%s|%s\n" "$STUB_MERGEABLE" "$STUB_COMMITS" "$STUB_FIRST_OID" "$STUB_AUTHOR" "$STUB_DATE" "$STUB_CHECKS"
+  printf "%s|%s|%s|%s|%s|%s|%s\n" "$STUB_MERGEABLE" "$STUB_COMMITS" "$STUB_FIRST_OID" "$STUB_TIP_OID" "$STUB_AUTHOR" "$STUB_DATE" "$STUB_CHECKS"
 fi
 `;
     writeFileSync(join(bin, 'gh'), ghStub);
@@ -1383,6 +1383,7 @@ fi
           GITHUB_REPOSITORY: 'omacom/omarchy-pkgs',
           DEFAULT_BRANCH: 'master',
           STUB_FIRST_OID: botOid,
+          STUB_TIP_OID: botOid,
           STUB_DATE: recentDate,
           STUB_CHECKS: 'SETTLED',
           ...env,
@@ -1429,10 +1430,22 @@ fi
     assert.deepEqual(run('auto/sync-upstream-human', { STUB_PR: '43', STUB_MERGEABLE: 'CONFLICTING', STUB_COMMITS: '2', STUB_AUTHOR: 'emirb', STUB_FIRST_OID: 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef' }),
       { push: 'false', pr: '43', reason: 'human-commit' });
 
-    // 6c. New untracked file under pkgbuilds/<pkg>/ counts as an update
+    // 6c. New untracked file under pkgbuilds/<pkg>/ counts as an update when absent on PR,
+    // and as unchanged when the PR branch already committed that exact file.
     writeFileSync(join(work, 'pkgbuilds/demo/new.patch'), 'diff\n');
     assert.deepEqual(run('auto/sync-upstream-demo', { STUB_PR: '42', STUB_MERGEABLE: 'MERGEABLE', STUB_COMMITS: '1', STUB_AUTHOR: 'omarchy-pkgs-sync' }),
       { push: 'true', pr: '42', reason: 'updated' });
+    git(work, ['checkout', '--', 'pkgbuilds/demo/PKGBUILD']);
+    git(work, ['checkout', '-b', 'auto/sync-upstream-added', 'auto/sync-upstream-demo']);
+    git(work, ['add', 'pkgbuilds/demo/new.patch']);
+    git(work, ['commit', '-m', 'bot adds new.patch']);
+    const addedOid = git(work, ['rev-parse', 'HEAD']);
+    git(work, ['push', 'origin', 'auto/sync-upstream-added']);
+    git(work, ['checkout', 'master']);
+    writeFileSync(join(work, 'pkgbuilds/demo/PKGBUILD'), 'pkgname=demo\npkgver=2.0\npkgrel=1\n_build=1\n');
+    writeFileSync(join(work, 'pkgbuilds/demo/new.patch'), 'diff\n');
+    assert.deepEqual(run('auto/sync-upstream-added', { STUB_PR: '44', STUB_MERGEABLE: 'MERGEABLE', STUB_COMMITS: '1', STUB_FIRST_OID: addedOid, STUB_TIP_OID: addedOid, STUB_AUTHOR: 'omarchy-pkgs-sync' }),
+      { push: 'false', pr: '44', reason: 'unchanged' });
     rmSync(join(work, 'pkgbuilds/demo/new.patch'));
 
     // 7. Same pkgver but revision (_build) changed -> diff vs bot's first commit -> push=true (updated)
