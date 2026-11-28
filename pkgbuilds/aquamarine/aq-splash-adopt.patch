@@ -1,0 +1,258 @@
+From 8a04546f1d38d9130f6e3cf36c353276ca3ffc05 Mon Sep 17 00:00:00 2001
+From: outfoxxed <outfoxxed@outfoxxed.me>
+Date: Tue, 24 Nov 2026 17:54:43 -0700
+Subject: [PATCH] drm: keep the picture an output shows at startup
+ (AQ_SPLASH_ADOPT)
+
+A boot splash that hands the display over to the compositor leaves its
+last frame on screen. Taking the output over replaced that frame at once
+with our first, unrendered one.
+
+With AQ_SPLASH_ADOPT=1:
+- a connector found while the backend starts, whose CRTC is active with
+  its primary plane scanning out on it, adopts that picture and the mode
+  it is shown in;
+- commits in that mode leave the primary plane alone until one brings a
+  rendered frame, so the configuration needs no modeset if nothing else
+  changes. A commit in another mode, a disable, a CRTC change or a session
+  deactivation ends the adoption, and the output commits as before;
+- such a commit is not the one a test of the same state checks, which
+  carries the primary plane. If the kernel refuses it, the adoption ends
+  and the commit goes again as a modeset with the plane, as without one;
+- IOutput::showsAdoptedPicture() says which outputs still show such a
+  picture, e.g. for the compositor to hold its frames back until its own
+  cover is up.
+
+Setting the variable vouches that whatever is lit at startup may stay on
+screen: a console that a lastclose restored would be adopted too.
+---
+ docs/env.md                          |  1 +
+ include/aquamarine/backend/DRM.hpp   |  6 ++++
+ include/aquamarine/output/Output.hpp |  1 +
+ src/backend/drm/DRM.cpp              | 45 ++++++++++++++++++++++++++++
+ src/backend/drm/impl/Atomic.cpp      | 31 ++++++++++++++-----
+ src/output/Output.cpp                |  4 +++
+ 6 files changed, 80 insertions(+), 8 deletions(-)
+
+diff --git a/docs/env.md b/docs/env.md
+index b496edb..b045bb0 100644
+--- a/docs/env.md
++++ b/docs/env.md
+@@ -8,6 +8,7 @@ Unless specified otherwise, a variable is enabled if and only if it's set to `1`
+ `AQ_NO_ATOMIC` -> Disables drm atomic modesetting
+ `AQ_MGPU_NO_EXPLICIT` -> Disables explicit syncing on mgpu buffers
+ `AQ_NO_MODIFIERS` -> Disables modifiers for DRM buffers
++`AQ_SPLASH_ADOPT` -> An output found lit at startup, e.g. by a boot splash, keeps its picture until the first rendered frame if configured in the mode it was found in. Setting it vouches that whatever is lit at startup may stay on screen, a console included. Atomic modesetting only
+ 
+ ### Input
+ 
+diff --git a/include/aquamarine/backend/DRM.hpp b/include/aquamarine/backend/DRM.hpp
+index 25e27da..55a441f 100644
+--- a/include/aquamarine/backend/DRM.hpp
++++ b/include/aquamarine/backend/DRM.hpp
+@@ -250,6 +250,7 @@ namespace Aquamarine {
+         virtual bool                                                      pendingIdleFrame();
+         virtual uint32_t                                                  commitCapabilities() const;
+         virtual SCommitSubmission                                         commitAsync(const SCommitOptions& options);
++        virtual bool                                                      showsAdoptedPicture() const;
+         void                                                              releaseMgpuResources();
+ 
+         int                                                               getConnectorID();
+@@ -367,6 +368,7 @@ namespace Aquamarine {
+         void                                           releaseFBReferences(DRMFBList* retired = nullptr);
+         void                                           invalidateFrame();
+         void                                           setCRTC(Hyprutils::Memory::CSharedPointer<SDRMCRTC> newCRTC);
++        void                                           adoptPicture();
+ 
+         Hyprutils::Memory::CSharedPointer<CDRMOutput>  output;
+         Hyprutils::Memory::CWeakPointer<CDRMBackend>   backend;
+@@ -399,6 +401,10 @@ namespace Aquamarine {
+ 
+         Hyprutils::Memory::CSharedPointer<SOutputMode> fallbackMode;
+ 
++        // AQ_SPLASH_ADOPT: the mode our CRTC was found showing a picture in, e.g. a boot splash's.
++        // Commits in that mode keep the picture until one brings a rendered frame; any other ends it.
++        std::optional<drmModeModeInfo> adoptedMode;
++
+         struct {
+             bool vrrEnabled = false;
+ 
+diff --git a/include/aquamarine/output/Output.hpp b/include/aquamarine/output/Output.hpp
+index 5ab263a..fc83283 100644
+--- a/include/aquamarine/output/Output.hpp
++++ b/include/aquamarine/output/Output.hpp
+@@ -257,6 +257,7 @@ namespace Aquamarine {
+         virtual bool                                                      pendingIdleFrame() = 0;
+         virtual uint32_t                                                  commitCapabilities() const;
+         virtual SCommitSubmission                                         commitAsync(const SCommitOptions& options);
++        virtual bool                                                      showsAdoptedPicture() const; // still shows a picture from before us (AQ_SPLASH_ADOPT)
+ 
+         std::string                                                       name, description, make, model, serial;
+         SParsedEDID                                                       parsedEDID;
+diff --git a/src/backend/drm/DRM.cpp b/src/backend/drm/DRM.cpp
+index d798b58..06cba44 100644
+--- a/src/backend/drm/DRM.cpp
++++ b/src/backend/drm/DRM.cpp
+@@ -81,6 +81,7 @@ Aquamarine::CDRMBackend::CDRMBackend(SP<CBackend> backend_) : backend(backend_)
+                 if (connector->output)
+                     cancelAsyncOutput(connector->output.get(), true);
+                 connector->invalidateFrame();
++                connector->adoptedMode.reset();
+             }
+     });
+ }
+@@ -1807,6 +1808,7 @@ bool Aquamarine::SDRMConnector::init(drmModeConnector* connector) {
+         backend->backend->log(AQ_LOG_ERROR, "drm: No CRTCs possible");
+ 
+     setCRTC(getCurrentCRTC(connector));
++    adoptPicture();
+ 
+     return true;
+ }
+@@ -1934,6 +1936,32 @@ drmModeModeInfo* Aquamarine::SDRMConnector::getCurrentMode() {
+     return modeInfo;
+ }
+ 
++// With AQ_SPLASH_ADOPT=1, keep the picture our CRTC shows when we start, e.g. a boot splash's last
++// frame, until our first rendered frame. That the picture is ours to keep is the caller's promise:
++// the console after a lastclose would be adopted too. Only connectors found while the backend starts
++// adopt. Atomic only: legacy clients see no ACTIVE, FB_ID or plane CRTC_ID.
++void Aquamarine::SDRMConnector::adoptPicture() {
++    static const bool ADOPT = envEnabled("AQ_SPLASH_ADOPT");
++    if (!ADOPT || backend->backend->ready || !crtc || !backend->sessionActive())
++        return;
++
++    const int FD     = backend->drmFD();
++    uint64_t  active = 0, fb = 0, planeCRTC = 0;
++    getDRMProp(FD, crtc->id, crtc->props.values.active, &active);
++    getDRMProp(FD, crtc->primary->id, crtc->primary->props.values.fb_id, &fb);
++    getDRMProp(FD, crtc->primary->id, crtc->primary->props.values.crtc_id, &planeCRTC);
++    if (!active || !fb || planeCRTC != crtc->id)
++        return;
++
++    auto mode = getCurrentMode();
++    if (!mode)
++        return;
++
++    adoptedMode = *mode;
++    free(mode);
++    backend->backend->log(AQ_LOG_DEBUG, std::format("drm: {} adopts the picture on crtc {} ({}x{})", szName, crtc->id, adoptedMode->hdisplay, adoptedMode->vdisplay));
++}
++
+ IOutput::SParsedEDID Aquamarine::SDRMConnector::parseEDID(std::vector<uint8_t> data) {
+     auto                 info   = di_info_parse_edid(data.data(), data.size());
+     IOutput::SParsedEDID parsed = {};
+@@ -2327,6 +2355,7 @@ void Aquamarine::SDRMConnector::setCRTC(SP<SDRMCRTC> newCRTC) {
+     invalidateFrame();
+ 
+     crtc = newCRTC;
++    adoptedMode.reset();
+ }
+ 
+ void Aquamarine::SDRMConnector::onPresent(bool primary, bool cursor, DRMFBList* deferred) {
+@@ -2861,6 +2890,18 @@ bool Aquamarine::CDRMOutput::commitState(bool onlyTest) {
+ 
+     bool ok = connector->commitState(data);
+ 
++    // A commit that keeps an adopted picture leaves out the primary plane, which a test of the same
++    // state carries. If the kernel refuses it, the adoption ends, and the commit goes again as it would
++    // without one, as a modeset.
++    if (!ok && !onlyTest && connector->adoptedMode) {
++        backend->backend->log(AQ_LOG_DEBUG, std::format("drm: {} could not keep its adopted picture, committing without it", name));
++        connector->adoptedMode.reset();
++        data.modeset  = true;
++        data.blocking = true;
++        data.flags &= ~DRM_MODE_PAGE_FLIP_ASYNC;
++        ok = connector->commitState(data);
++    }
++
+     // a buffer acquired only to validate/attempt the modeset isn't consumed by the
+     // consumer: rewind the swapchain so the acquire cursor stays in sync with it.
+     if (acquiredModesetBuffer && (onlyTest || !ok))
+@@ -3129,6 +3170,10 @@ std::optional<std::chrono::steady_clock::time_point> Aquamarine::CDRMOutput::nex
+     return std::nullopt;
+ }
+ 
++bool Aquamarine::CDRMOutput::showsAdoptedPicture() const {
++    return connector->adoptedMode.has_value();
++}
++
+ uint32_t Aquamarine::CDRMOutput::commitCapabilities() const {
+     if (!backend || !backend->commitThread || !backend->atomic)
+         return 0;
+diff --git a/src/backend/drm/impl/Atomic.cpp b/src/backend/drm/impl/Atomic.cpp
+index 350dd95..d7182f0 100644
+--- a/src/backend/drm/impl/Atomic.cpp
++++ b/src/backend/drm/impl/Atomic.cpp
+@@ -78,9 +78,10 @@ bool Aquamarine::CDRMAtomicRequest::restateConnectors(SP<SDRMConnector> self) {
+         add(c->crtc->id, c->crtc->props.values.active, 1);
+         add(c->id, c->props.values.crtc_id, c->crtc->id);
+ 
+-        // A head that has not scanned out yet has no buffer to restate; its
+-        // existing plane state carries over untouched, which is what we want.
+-        if (c->crtc->primary && c->crtc->primary->front) {
++        // A head that has not scanned out yet, or still shows an adopted picture,
++        // has no buffer to restate; its existing plane state carries over untouched,
++        // which is what we want.
++        if (c->crtc->primary && c->crtc->primary->front && !c->adoptedMode) {
+             // planeProps reads per-connector state off `conn`, so point it at the
+             // head we are restating rather than ours.
+             const auto saved = conn;
+@@ -271,6 +272,18 @@ void Aquamarine::CDRMAtomicRequest::addConnector(Hyprutils::Memory::CSharedPoint
+ 
+     add(connector->crtc->id, connector->crtc->props.values.active, enable);
+ 
++    // an adopted picture stays while commits keep its mode and bring no rendered frame
++    bool keepPicture = false;
++    if (connector->adoptedMode && !data.test) {
++        const bool RENDERED = (data.committed & COutputState::AQ_OUTPUT_STATE_BUFFER) && !data.modeset;
++        keepPicture         = enable && !RENDERED && !memcmp(&data.modeInfo, &*connector->adoptedMode, sizeof(drmModeModeInfo));
++        if (!keepPicture) {
++            connector->adoptedMode.reset();
++            const auto WHY = !enable ? "disabled" : (RENDERED ? "a rendered frame" : "another mode");
++            backend->log(AQ_LOG_DEBUG, std::format("atomic drm: {} replaces its adopted picture: {}", connector->szName, WHY));
++        }
++    }
++
+     if (enable) {
+         if (connector->output->supportsExplicit && data.committed & COutputState::AQ_OUTPUT_STATE_EXPLICIT_OUT_FENCE)
+             add(connector->crtc->id, connector->crtc->props.values.out_fence_ptr, (uintptr_t)&data.outputState.explicitOutFence);
+@@ -287,13 +300,15 @@ void Aquamarine::CDRMAtomicRequest::addConnector(Hyprutils::Memory::CSharedPoint
+         if (connector->crtc->props.values.vrr_enabled)
+             add(connector->crtc->id, connector->crtc->props.values.vrr_enabled, (uint64_t)STATE.adaptiveSync);
+ 
+-        planeProps(connector->crtc->primary, data.mainFB, connector->crtc->id, {}, STATE.colorRange);
++        if (!keepPicture) {
++            planeProps(connector->crtc->primary, data.mainFB, connector->crtc->id, {}, STATE.colorRange);
+ 
+-        if (connector->output->supportsExplicit && (data.committed & COutputState::AQ_OUTPUT_STATE_EXPLICIT_IN_FENCE) && STATE.explicitInFence >= 0)
+-            add(connector->crtc->primary->id, connector->crtc->primary->props.values.in_fence_fd, STATE.explicitInFence);
++            if (connector->output->supportsExplicit && (data.committed & COutputState::AQ_OUTPUT_STATE_EXPLICIT_IN_FENCE) && STATE.explicitInFence >= 0)
++                add(connector->crtc->primary->id, connector->crtc->primary->props.values.in_fence_fd, STATE.explicitInFence);
+ 
+-        if (connector->crtc->primary->props.values.fb_damage_clips)
+-            add(connector->crtc->primary->id, connector->crtc->primary->props.values.fb_damage_clips, data.atomic.fbDamage);
++            if (connector->crtc->primary->props.values.fb_damage_clips)
++                add(connector->crtc->primary->id, connector->crtc->primary->props.values.fb_damage_clips, data.atomic.fbDamage);
++        }
+     } else {
+         planeProps(connector->crtc->primary, nullptr, 0, {});
+     }
+diff --git a/src/output/Output.cpp b/src/output/Output.cpp
+index 649f27d..30056f6 100644
+--- a/src/output/Output.cpp
++++ b/src/output/Output.cpp
+@@ -24,6 +24,10 @@ uint32_t Aquamarine::IOutput::commitCapabilities() const {
+     return 0;
+ }
+ 
++bool Aquamarine::IOutput::showsAdoptedPicture() const {
++    return false;
++}
++
+ Aquamarine::IOutput::SCommitSubmission Aquamarine::IOutput::commitAsync(const SCommitOptions& options) {
+     return {
+         .error = ENOTSUP,
+-- 
+2.56.0
+

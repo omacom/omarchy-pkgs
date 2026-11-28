@@ -50,4 +50,44 @@ _ensure_user_config test-user "$home"
 [[ $(cat "$config_path") == 'INTENSITY=100' ]]
 grep -q '^--user test-user -- /usr/bin/env ' "$runuser_call"
 
-echo 'PASS: user config creation drops privileges and never chowns symlink targets'
+runtime_calls="$TEST_ROOT/runtime-calls"
+_in_chroot() { return 0; }
+systemctl() { printf 'systemctl %s\n' "$*" >>"$runtime_calls"; }
+udevadm() { printf 'udevadm %s\n' "$*" >>"$runtime_calls"; }
+omarchy-restart-trackpad() { printf 'restart-trackpad\n' >>"$runtime_calls"; }
+
+_reload_runtime_state
+_reset_trackpad
+start_output=$(_start_service_if_possible)
+[[ ! -e $runtime_calls ]]
+[[ $start_output == *"will start on next boot"* ]]
+
+python3 - "$REPO_ROOT/pkgbuilds/dell-xps-touchpad-haptics/dell-xps-touchpad-haptics-daemon" <<'PY'
+import errno
+import importlib.machinery
+import importlib.util
+import sys
+from unittest import mock
+
+loader = importlib.machinery.SourceFileLoader("haptics_daemon", sys.argv[1])
+spec = importlib.util.spec_from_loader(loader.name, loader)
+daemon = importlib.util.module_from_spec(spec)
+loader.exec_module(daemon)
+
+# MediaTek I2C (i2c-mt65xx) returns ENXIO on unsupported HIDIOCGFEATURE readback.
+daemon.STATE["readback_supported"] = None
+with mock.patch.object(daemon.fcntl, "ioctl", side_effect=OSError(errno.ENXIO, "No such device or address")):
+    assert daemon.read_haptic_report(0, 0) is daemon.READBACK_UNSUPPORTED
+    assert daemon.STATE["readback_supported"] is False
+
+# ENXIO on HIDIOCSFEATURE writes must still signal device disconnect.
+with mock.patch.object(daemon.fcntl, "ioctl", side_effect=OSError(errno.ENXIO, "No such device or address")):
+    try:
+        daemon.send_haptic_report(0, 0, b"\x37\x64")
+    except daemon.DeviceDisconnected:
+        pass
+    else:
+        raise AssertionError("send_haptic_report did not raise DeviceDisconnected on ENXIO")
+PY
+
+echo 'PASS: user config creation drops privileges, never chowns symlinks, skips runtime calls in chroot, and daemon treats ENXIO readback as write-only'

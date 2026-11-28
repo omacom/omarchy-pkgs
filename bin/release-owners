@@ -108,6 +108,29 @@ def publish_arches(dirs):
     return arches
 
 
+def cpu_limit():
+    """Effective CPU count, respecting cgroup v2 CPU quota inside containers."""
+    n = len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else (os.cpu_count() or 1)
+    try:
+        parts = Path("/sys/fs/cgroup/cpu.max").read_text().split()
+        if len(parts) == 2 and parts[0] != "max":
+            quota, period = int(parts[0]), int(parts[1])
+            if period > 0:
+                n = min(n, max(1, (quota + period - 1) // period))
+    except OSError:
+        pass
+    return n
+
+
+def needs_per_arch_srcinfo(pkgdir):
+    """True when PKGBUILD may vary its output by CARCH (or sources another file)."""
+    text = (pkgdir / "PKGBUILD").read_text(errors="ignore")
+    if "CARCH" in text:
+        return True
+    # Conservative: if a recipe sources another shell file at top level, run both arches.
+    return bool(re.search(r"(?:^|[;\s&(])(?:source|\.)\s", text))
+
+
 def srcinfo_conf(arch, work):
     """A makepkg.conf for one architecture, writing only under work."""
     build = work / f"build-{arch}"
@@ -119,11 +142,12 @@ def srcinfo_conf(arch, work):
     (work / f"makepkg-{arch}.conf").write_text(base + dirs)
 
 
-def srcinfo(pkgdir, arch, work):
+def srcinfo(pkgdir, arch, work, makepkg_lib=None):
     """Run makepkg --printsrcinfo for one architecture."""
     conf = work / f"makepkg-{arch}.conf"
     cmd = ["makepkg", "--config", str(conf), "--printsrcinfo"]
-    out = subprocess.run(cmd, cwd=pkgdir, capture_output=True, text=True)
+    env = None if makepkg_lib is None else {**os.environ, "MAKEPKG_LIBRARY": makepkg_lib}
+    out = subprocess.run(cmd, cwd=pkgdir, env=env, capture_output=True, text=True)
     if out.returncode:
         sys.exit(f"{pkgdir.name}: makepkg --printsrcinfo for {arch} failed:\n{out.stderr}")
     return out.stdout
@@ -134,6 +158,79 @@ def recipe_dirs():
                   if (p / "PKGBUILD").is_file() and p.name not in UNMAPPED)
 
 
+def srcinfo_batch(batch, work, makepkg_lib):
+    """Run makepkg's libmakepkg lint_pkgbuild + write_srcinfo_content for a batch
+    of (name, arch) jobs inside one pre-loaded bash process, isolating each
+    recipe in its own subshell. Falls back to standalone makepkg on error."""
+    if not batch:
+        return {}
+    if not makepkg_lib or not (Path(makepkg_lib) / "srcinfo.sh").is_file():
+        return {j: srcinfo(ROOT / "pkgbuilds" / j[0], j[1], work, makepkg_lib) for j in batch}
+
+    marker = "__OMARCHY_SRCINFO_RECORD_7f3a9c__"
+    script = f"""
+shopt -s extglob
+BUILDSCRIPT=PKGBUILD
+MAKEPKG_LINT_PKGBUILD=1
+IGNOREARCH=1
+PRINTSRCINFO=1
+export MAKEPKG_LIBRARY={makepkg_lib!r}
+source /etc/makepkg.conf
+for _lib in "$MAKEPKG_LIBRARY"/*.sh; do source "$_lib"; done
+while IFS=$'\\t' read -r _name _arch _pkgdir; do
+  _rc=0
+  _out=$(
+    cd "$_pkgdir" || exit 1
+    startdir="$PWD"
+    source "{work}/makepkg-${{_arch}}.conf"
+    CARCH="$_arch"
+    [[ $(<PKGBUILD) != *$'\r'* ]] || exit 1
+    source ./PKGBUILD >/dev/null || exit 1
+    pkgbase=${{pkgbase:-${{pkgname[0]}}}}
+    srcdir="$BUILDDIR/$pkgbase/src"
+    pkgdirbase="$BUILDDIR/$pkgbase/pkg"
+    pkgdir="$pkgdirbase/$pkgbase"
+    lint_pkgbuild >/dev/null || exit 1
+    write_srcinfo_content
+  ) || _rc=$?
+  printf '%s\\t%s\\t%s\\t%d\\n' "{marker}" "$_name" "$_arch" "$_rc"
+  printf '%s\\n' "$_out"
+done
+"""
+    stdin_data = "".join(f"{n}\t{a}\t{ROOT / 'pkgbuilds' / n}\n" for n, a in batch)
+    proc = subprocess.run(["bash", "-c", script], input=stdin_data, capture_output=True, text=True)
+    if proc.returncode != 0:
+        return {j: srcinfo(ROOT / "pkgbuilds" / j[0], j[1], work, makepkg_lib) for j in batch}
+
+    results = {}
+    cur_key = None
+    cur_rc = 0
+    buf = []
+
+    def flush():
+        if cur_key is not None:
+            if cur_rc == 0:
+                results[cur_key] = "\n".join(buf) + "\n"
+            else:
+                results[cur_key] = srcinfo(ROOT / "pkgbuilds" / cur_key[0], cur_key[1], work, makepkg_lib)
+
+    for line in proc.stdout.splitlines():
+        if line.startswith(marker + "\t"):
+            flush()
+            _, n, a, rc_s = line.split("\t", 3)
+            cur_key = (n, a)
+            cur_rc = int(rc_s)
+            buf = []
+        else:
+            buf.append(line)
+    flush()
+    # Any missing job falls back to standalone makepkg.
+    for j in batch:
+        if j not in results:
+            results[j] = srcinfo(ROOT / "pkgbuilds" / j[0], j[1], work, makepkg_lib)
+    return results
+
+
 def entries(names):
     """The owners entries of the named directories, read in parallel."""
     if shutil.which("makepkg") is None:
@@ -141,14 +238,42 @@ def entries(names):
     if not names:
         return {}
     arches = publish_arches(names)
-    jobs = [(n, a) for n in names if n in arches for a in sorted(arches[n])]
+    jobs = []
+    shared = {}
+    for n in names:
+        if n not in arches:
+            continue
+        pkg_arches = sorted(arches[n])
+        if len(pkg_arches) > 1 and not needs_per_arch_srcinfo(ROOT / "pkgbuilds" / n):
+            jobs.append((n, pkg_arches[0]))
+            for extra in pkg_arches[1:]:
+                shared[(n, extra)] = (n, pkg_arches[0])
+        else:
+            for a in pkg_arches:
+                jobs.append((n, a))
     with tempfile.TemporaryDirectory() as tmp:
         work = Path(tmp)
         work.chmod(0o755)
         for arch in ARCHES:
             srcinfo_conf(arch, work)
-        with concurrent.futures.ThreadPoolExecutor(max_workers=os.cpu_count() or 1) as pool:
-            texts = dict(zip(jobs, pool.map(lambda j: srcinfo(ROOT / "pkgbuilds" / j[0], j[1], work), jobs)))
+        makepkg_lib = os.environ.get("MAKEPKG_LIBRARY")
+        fast_helper = ROOT / "helpers" / "fast-makepkg.sh"
+        if not makepkg_lib and fast_helper.is_file():
+            makepkg_lib = subprocess.check_output(
+                ["bash", str(fast_helper), str(work / "libmakepkg")], text=True).strip()
+        workers = min(cpu_limit(), len(jobs)) if jobs else 1
+        if len(jobs) <= workers:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+                texts = dict(zip(jobs, pool.map(
+                    lambda j: srcinfo(ROOT / "pkgbuilds" / j[0], j[1], work, makepkg_lib), jobs)))
+        else:
+            shards = [jobs[i::workers] for i in range(workers)]
+            texts = {}
+            with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+                for part in pool.map(lambda b: srcinfo_batch(b, work, makepkg_lib), shards):
+                    texts.update(part)
+        for key, primary in shared.items():
+            texts[key] = texts[primary]
     out = {}
     for (name, arch), text in texts.items():
         base, pkgnames, provides, replaces = parse_srcinfo(text, arch)

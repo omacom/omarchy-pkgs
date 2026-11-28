@@ -1,0 +1,229 @@
+backend/drm: show buffers in CPU memory by copying them
+
+A software renderer draws into dumb buffers of the first GPU. Another GPU
+can show them only by importing them over PRIME, as it can't copy them
+without a renderer that imports DMA-BUFs, and a GPU that can't import them
+shows nothing.
+
+Accept buffers in CPU memory (WLR_BUFFER_CAP_DATA_PTR), and copy them into
+buffers of each GPU's own with its multi-GPU renderer, which is created the
+first time formats are asked for with DATA_PTR alone. A software renderer
+then gets an shm allocator, and every GPU copies what changed. A compositor
+that renders on the GPU never asks, and keeps its buffers.
+
+diff --git a/backend/drm/backend.c b/backend/drm/backend.c
+index 5a545b19..366ab3f7 100644
+--- a/backend/drm/backend.c
++++ b/backend/drm/backend.c
+@@ -177,7 +177,7 @@ static void sanitize_mgpu_modifiers(struct wlr_drm_format_set *set) {
+ }
+ 
+ static bool init_mgpu_renderer(struct wlr_drm_backend *drm) {
+-	if (!init_drm_renderer(drm, &drm->mgpu_renderer)) {
++	if (!init_drm_renderer(drm, &drm->mgpu_renderer, WLR_BUFFER_CAP_DMABUF)) {
+ 		wlr_log(WLR_INFO, "Failed to initialize mgpu blit renderer"
+ 			", falling back to scanning out from primary GPU");
+ 
+@@ -232,7 +232,9 @@ struct wlr_backend *wlr_drm_backend_create(struct wlr_session *session,
+ 	}
+ 	wlr_backend_init(&drm->backend, &backend_impl);
+ 
+-	drm->backend.buffer_caps = WLR_BUFFER_CAP_DMABUF;
++	// Buffers in CPU memory, like a software renderer's, are shown by copying
++	// them into ones the GPU can scan out (see drm_get_copy_formats)
++	drm->backend.buffer_caps = WLR_BUFFER_CAP_DMABUF | WLR_BUFFER_CAP_DATA_PTR;
+ 
+ 	drm->session = session;
+ 	wl_list_init(&drm->fbs);
+diff --git a/backend/drm/drm.c b/backend/drm/drm.c
+index 827c9a23..78e25875 100644
+--- a/backend/drm/drm.c
++++ b/backend/drm/drm.c
+@@ -861,6 +861,60 @@ static bool drm_connector_set_pending_layer_fbs(struct wlr_drm_connector *conn,
+ 
+ static bool drm_connector_alloc_crtc(struct wlr_drm_connector *conn);
+ 
++// No GPU scans out of CPU memory, so buffers there, like those of a software
++// renderer, are copied into ones of the GPU's own, as on a secondary GPU. The
++// renderer for that is created when the compositor asks for formats to render
++// to in CPU memory, which only a software renderer does: a compositor that
++// renders on the GPU never has its buffers copied, nor a client's buffer in
++// shared memory accepted for direct scan-out. Once the renderer exists, the
++// GPU copies every buffer.
++static const struct wlr_drm_format_set *drm_get_copy_formats(struct wlr_drm_backend *drm) {
++	if (!drm->mgpu_renderer.wlr_rend) {
++		if (!init_drm_renderer(drm, &drm->mgpu_renderer, WLR_BUFFER_CAP_DATA_PTR)) {
++			wlr_log(WLR_ERROR, "Failed to create a renderer to copy buffers in CPU memory");
++			return NULL;
++		}
++		drm->backend.features.timeline = drm->backend.features.timeline &&
++			drm->mgpu_renderer.wlr_rend->features.timeline;
++	}
++	drm->copies_cpu_buffers = true;
++	return wlr_renderer_get_texture_formats(drm->mgpu_renderer.wlr_rend,
++		WLR_BUFFER_CAP_DATA_PTR);
++}
++
++static bool drm_connector_check_buffer(struct wlr_drm_connector *conn,
++		struct wlr_buffer *buffer) {
++	struct wlr_drm_backend *drm = conn->backend;
++
++	struct wlr_dmabuf_attributes dmabuf;
++	if (wlr_buffer_get_dmabuf(buffer, &dmabuf)) {
++		if (drm->mgpu_renderer.wlr_rend &&
++				!wlr_drm_format_set_has(&drm->mgpu_formats, dmabuf.format, dmabuf.modifier)) {
++			wlr_drm_conn_log(conn, WLR_DEBUG,
++				"Buffer format 0x%"PRIX32" with modifier 0x%"PRIX64" cannot be "
++				"imported into multi-GPU renderer",
++				dmabuf.format, dmabuf.modifier);
++			return false;
++		}
++		return true;
++	}
++
++	struct wlr_shm_attributes shm;
++	if (!drm->copies_cpu_buffers || !wlr_buffer_get_shm(buffer, &shm)) {
++		wlr_drm_conn_log(conn, WLR_DEBUG, "Buffer is not a DMA-BUF");
++		return false;
++	}
++	const struct wlr_drm_format_set *formats = wlr_renderer_get_texture_formats(
++		drm->mgpu_renderer.wlr_rend, WLR_BUFFER_CAP_DATA_PTR);
++	if (formats == NULL || wlr_drm_format_set_get(formats, shm.format) == NULL) {
++		wlr_drm_conn_log(conn, WLR_DEBUG,
++			"Buffer format 0x%"PRIX32" cannot be copied by multi-GPU renderer",
++			shm.format);
++		return false;
++	}
++	return true;
++}
++
+ static bool drm_connector_prepare(struct wlr_drm_connector_state *conn_state, bool test_only) {
+ 	const struct wlr_output_state *state = conn_state->base;
+ 	struct wlr_drm_connector *conn = conn_state->connector;
+@@ -889,20 +943,9 @@ static bool drm_connector_prepare(struct wlr_drm_connector_state *conn_state, bo
+ 		return false;
+ 	}
+ 
+-	if ((state->committed & WLR_OUTPUT_STATE_BUFFER) && conn->backend->mgpu_renderer.wlr_rend) {
+-		struct wlr_dmabuf_attributes dmabuf;
+-		if (!wlr_buffer_get_dmabuf(state->buffer, &dmabuf)) {
+-			wlr_drm_conn_log(conn, WLR_DEBUG, "Buffer is not a DMA-BUF");
+-			return false;
+-		}
+-
+-		if (!wlr_drm_format_set_has(&conn->backend->mgpu_formats, dmabuf.format, dmabuf.modifier)) {
+-			wlr_drm_conn_log(conn, WLR_DEBUG,
+-				"Buffer format 0x%"PRIX32" with modifier 0x%"PRIX64" cannot be "
+-				"imported into multi-GPU renderer",
+-				dmabuf.format, dmabuf.modifier);
+-			return false;
+-		}
++	if ((state->committed & WLR_OUTPUT_STATE_BUFFER) &&
++			!drm_connector_check_buffer(conn, state->buffer)) {
++		return false;
+ 	}
+ 
+ 	if ((state->committed & WLR_OUTPUT_STATE_COLOR_TRANSFORM) && state->color_transform != NULL &&
+@@ -1275,10 +1318,11 @@ static void drm_connector_destroy_output(struct wlr_output *output) {
+ 
+ static const struct wlr_drm_format_set *drm_connector_get_cursor_formats(
+ 		struct wlr_output *output, uint32_t buffer_caps) {
++	struct wlr_drm_connector *conn = get_drm_connector_from_output(output);
+ 	if (!(buffer_caps & WLR_BUFFER_CAP_DMABUF)) {
+-		return NULL;
++		return buffer_caps & WLR_BUFFER_CAP_DATA_PTR ?
++			drm_get_copy_formats(conn->backend) : NULL;
+ 	}
+-	struct wlr_drm_connector *conn = get_drm_connector_from_output(output);
+ 	if (!drm_connector_alloc_crtc(conn)) {
+ 		return NULL;
+ 	}
+@@ -1308,10 +1352,11 @@ static const struct wlr_output_cursor_size *drm_connector_get_cursor_sizes(struc
+ 
+ static const struct wlr_drm_format_set *drm_connector_get_primary_formats(
+ 		struct wlr_output *output, uint32_t buffer_caps) {
++	struct wlr_drm_connector *conn = get_drm_connector_from_output(output);
+ 	if (!(buffer_caps & WLR_BUFFER_CAP_DMABUF)) {
+-		return NULL;
++		return buffer_caps & WLR_BUFFER_CAP_DATA_PTR ?
++			drm_get_copy_formats(conn->backend) : NULL;
+ 	}
+-	struct wlr_drm_connector *conn = get_drm_connector_from_output(output);
+ 	if (!drm_connector_alloc_crtc(conn)) {
+ 		return NULL;
+ 	}
+diff --git a/backend/drm/renderer.c b/backend/drm/renderer.c
+index 10771d19..2f0be0ba 100644
+--- a/backend/drm/renderer.c
++++ b/backend/drm/renderer.c
+@@ -8,25 +8,30 @@
+ #include "backend/drm/drm.h"
+ #include "backend/drm/fb.h"
+ #include "backend/drm/renderer.h"
++#include "render/allocator/allocator.h"
+ #include "render/drm_format_set.h"
+ #include "render/pixel_format.h"
+ #include "render/wlr_renderer.h"
+ 
+ bool init_drm_renderer(struct wlr_drm_backend *drm,
+-		struct wlr_drm_renderer *renderer) {
++		struct wlr_drm_renderer *renderer, uint32_t source_caps) {
+ 	wlr_log(WLR_DEBUG, "Creating multi-GPU renderer");
+ 	renderer->wlr_rend = renderer_autocreate_with_drm_fd(drm->fd);
+ 	if (!renderer->wlr_rend) {
+ 		return false;
+ 	}
+-	if (wlr_renderer_get_texture_formats(renderer->wlr_rend, WLR_BUFFER_CAP_DMABUF) == NULL) {
+-		wlr_log(WLR_ERROR, "Renderer did not support importing DMA-BUFs");
++	if (wlr_renderer_get_texture_formats(renderer->wlr_rend, source_caps) == NULL) {
++		wlr_log(WLR_ERROR, "Renderer did not support importing %s",
++			source_caps == WLR_BUFFER_CAP_DMABUF ? "DMA-BUFs" : "buffers in CPU memory");
+ 		wlr_renderer_destroy(renderer->wlr_rend);
+ 		renderer->wlr_rend = NULL;
+ 		return false;
+ 	}
+ 
+-	renderer->allocator = wlr_allocator_autocreate(&drm->backend, renderer->wlr_rend);
++	// The copies are for this GPU to scan out, whatever else the backend
++	// accepts
++	renderer->allocator = allocator_autocreate_with_drm_fd(WLR_BUFFER_CAP_DMABUF,
++		renderer->wlr_rend, drm->fd);
+ 	if (renderer->allocator == NULL) {
+ 		wlr_renderer_destroy(renderer->wlr_rend);
+ 		renderer->wlr_rend = NULL;
+diff --git a/include/backend/drm/drm.h b/include/backend/drm/drm.h
+index a8c5e077..602f4c9b 100644
+--- a/include/backend/drm/drm.h
++++ b/include/backend/drm/drm.h
+@@ -119,8 +119,11 @@ struct wlr_drm_backend {
+ 
+ 	struct wl_list page_flips; // wlr_drm_page_flip.link
+ 
+-	/* Only initialized on multi-GPU setups */
++	/* Only initialized on multi-GPU setups, or to copy buffers in CPU memory */
+ 	struct wlr_drm_renderer mgpu_renderer;
++	/* Whether buffers in CPU memory are shown, by copying them with
++	 * mgpu_renderer (see drm_get_copy_formats) */
++	bool copies_cpu_buffers;
+ 
+ 	struct wlr_session *session;
+ 
+diff --git a/include/backend/drm/renderer.h b/include/backend/drm/renderer.h
+index 2570cbd2..5d3522a1 100644
+--- a/include/backend/drm/renderer.h
++++ b/include/backend/drm/renderer.h
+@@ -30,8 +30,13 @@ struct wlr_drm_surface {
+ 	struct wlr_damage_ring damage_ring;
+ };
+ 
++/**
++ * Creates a renderer that copies buffers into ones this GPU can scan out:
++ * DMA-BUFs from another GPU (source_caps WLR_BUFFER_CAP_DMABUF), or buffers in
++ * CPU memory, like those of a software renderer (WLR_BUFFER_CAP_DATA_PTR).
++ */
+ bool init_drm_renderer(struct wlr_drm_backend *drm,
+-	struct wlr_drm_renderer *renderer);
++	struct wlr_drm_renderer *renderer, uint32_t source_caps);
+ void finish_drm_renderer(struct wlr_drm_renderer *renderer);
+ 
+ bool init_drm_surface(struct wlr_drm_surface *surf,

@@ -8,6 +8,7 @@ BUILD_ROOT=$(realpath "${BASH_SOURCE[0]%/*}/..")
 source "$BUILD_ROOT/helpers/message-helpers.sh"
 source "$BUILD_ROOT/helpers/docker-helpers.sh"
 source "$BUILD_ROOT/helpers/paths.sh"
+source "$BUILD_ROOT/helpers/package-metadata.sh"
 
 print_header "Omarchy Package Builder"
 
@@ -137,8 +138,27 @@ if [[ $DEFER_RUNTIME_DEPS == "true" ]]; then
   fi
 fi
 
+# The builder image every requested package builds in: the target itself, or
+# x86_64 for a package that cross-compiles there (package_build_host). One
+# image serves the whole run, so the requested packages have to agree. A dry
+# run runs no image: it plans the whole selection, whatever builds it.
+BUILDER_ARCH=$ARCH
+builder_chosen_by=""
+for package in $PACKAGES; do
+  package_builder=$(package_build_host "$package" "$ARCH")
+  if [[ -n $builder_chosen_by && $package_builder != "$BUILDER_ARCH" && $DRY_RUN != true ]]; then
+    print_error "$package builds for $ARCH on $package_builder, $builder_chosen_by on $BUILDER_ARCH: build them separately"
+    exit 1
+  fi
+  BUILDER_ARCH=$package_builder
+  builder_chosen_by=$package
+done
+
 # Show target architecture and mirror after parsing args
 print_info "Target architecture: $ARCH"
+if [[ $BUILDER_ARCH != "$ARCH" ]]; then
+  print_info "Builder architecture: $BUILDER_ARCH (cross build)"
+fi
 print_info "Mirror: $MIRROR"
 print_info "Build workspace: $BUILD_OUTPUT_DIR"
 print_info "Final output: $REPO_DIR"
@@ -149,6 +169,7 @@ fi
 if [[ "$DRY_RUN" == true ]]; then
   print_warning "DRY RUN MODE - build plan only; no container or makepkg will run"
   ARCH="$ARCH" \
+    BUILDER_ARCH=any \
     MIRROR="$MIRROR" \
     PACKAGES="$PACKAGES" \
     DRY_RUN=true \
@@ -168,12 +189,13 @@ mkdir -p "$BUILD_OUTPUT_DIR" "$REPO_DIR" "$SRC_DIR"
 # Check the selected container engine is available
 check_engine
 
-# A foreign target architecture runs under QEMU user emulation. Probe by
-# actually running a container for the target platform: that is the only
-# test that covers both "binfmt not registered" and "registered but broken".
+# A foreign builder architecture runs under QEMU user emulation. Probe by
+# actually running a container for that platform: that is the only test that
+# covers both "binfmt not registered" and "registered but broken". A cross
+# build runs its builder natively and needs no emulation.
 HOST_ARCH=$(uname -m)
 [[ "$HOST_ARCH" == "arm64" ]] && HOST_ARCH=aarch64
-if [[ "$HOST_ARCH" != "$ARCH" ]]; then
+if [[ "$HOST_ARCH" != "$BUILDER_ARCH" ]]; then
   PROBE_IMAGE="alpine:3.21"
   [[ "$CONTAINER_ENGINE" == "podman" ]] && PROBE_IMAGE="docker.io/library/alpine:3.21"
 
@@ -181,17 +203,17 @@ if [[ "$HOST_ARCH" != "$ARCH" ]]; then
   # before the basic probe, because an F-only registration can start an ARM
   # container but silently breaks sudo inside it.
   if [[ "$CONTAINER_ENGINE" == "podman" ]]; then
-    setup_qemu "$ARCH"
+    setup_qemu "$BUILDER_ARCH"
   fi
 
-  if ! "$CONTAINER_ENGINE" run "${CONTAINER_RUN_ARGS[@]}" --rm "$(get_platform_arg "$ARCH")" "$PROBE_IMAGE" /bin/true >/dev/null 2>&1; then
+  if ! "$CONTAINER_ENGINE" run "${CONTAINER_RUN_ARGS[@]}" --rm "$(get_platform_arg "$BUILDER_ARCH")" "$PROBE_IMAGE" /bin/true >/dev/null 2>&1; then
     if [[ "$CONTAINER_ENGINE" == "podman" ]]; then
-      print_error "QEMU $ARCH is registered, but the container probe failed"
+      print_error "QEMU $BUILDER_ARCH is registered, but the container probe failed"
       print_info "Refresh the registration with: sudo systemctl restart systemd-binfmt"
       exit 1
     else
-      print_info "Setting up QEMU for $ARCH emulation on this $HOST_ARCH host..."
-      setup_qemu "$ARCH"
+      print_info "Setting up QEMU for $BUILDER_ARCH emulation on this $HOST_ARCH host..."
+      setup_qemu "$BUILDER_ARCH"
     fi
   fi
 fi
@@ -217,7 +239,7 @@ fi
 # already (a workflow building it once with an external BuildKit cache). A
 # missing image is an error rather than a silent rebuild: the point of the
 # flag is that every job runs the same bytes.
-IMAGE_TAG="omarchy-pkg-builder:latest-$ARCH-$MIRROR"
+IMAGE_TAG="omarchy-pkg-builder:latest-$BUILDER_ARCH-$MIRROR"
 if [[ $SKIP_BUILDER_IMAGE == "1" ]]; then
   if ! "$CONTAINER_ENGINE" image inspect "$IMAGE_TAG" >/dev/null 2>&1; then
     print_error "Prepared builder image is unavailable: $IMAGE_TAG"
@@ -225,7 +247,7 @@ if [[ $SKIP_BUILDER_IMAGE == "1" ]]; then
   fi
   print_info "Using prepared builder image: $IMAGE_TAG"
 else
-  build_docker_image "$BUILD_DIR" "$ARCH" "$MIRROR"
+  build_docker_image "$BUILD_DIR" "$BUILDER_ARCH" "$MIRROR"
 fi
 
 print_info "Planning isolated package builds..."
@@ -236,7 +258,7 @@ mkdir -p "$REPO_DIR"
 
 # Share downloaded archives, never /var/lib/pacman or an installed root.
 # Channel/architecture separation preserves each mirror's dependency set.
-PACKAGE_CACHE_DIR="$BUILD_ROOT/cache/pacman/$MIRROR/$ARCH"
+PACKAGE_CACHE_DIR="$BUILD_ROOT/cache/pacman/$MIRROR/$BUILDER_ARCH"
 mkdir -p "$PACKAGE_CACHE_DIR"
 PLAN_DIR=$(mktemp -d "$SRC_DIR/build-plan.XXXXXX")
 trap 'rm -rf "$PLAN_DIR"' EXIT
@@ -255,6 +277,7 @@ fi
 DOCKER_ARGS=(
   --rm
   -e ARCH="$ARCH"
+  -e BUILDER_ARCH="$BUILDER_ARCH"
   -e MIRROR="$MIRROR"
   -e PACKAGES="$PACKAGES"
   -e OMARCHY_RC_PINS="${OMARCHY_RC_PINS:-}"
@@ -292,7 +315,7 @@ fi
 # Plan once against the published database, then keep that order throughout
 # the run. Each package sees the staged artifacts but starts with a fresh
 # pacman database and root filesystem, even after a failed build.
-PLATFORM_ARG=$(get_platform_arg "$ARCH")
+PLATFORM_ARG=$(get_platform_arg "$BUILDER_ARCH")
 
 "$CONTAINER_ENGINE" run "${CONTAINER_RUN_ARGS[@]}" "$PLATFORM_ARG" "${DOCKER_ARGS[@]}" \
   -e DRY_RUN=true "$IMAGE_TAG" /build/build.sh

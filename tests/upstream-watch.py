@@ -434,7 +434,8 @@ os.execv(os.environ['REAL_GIT'], ['git', *args])
             ('1password-beta', 'Package: unrelated\nVersion: 99.0\n\nPackage: 1password\nVersion: 8.12.38~25.BETA\n', '8.12.38_25.BETA'),
             ('spotify', 'Package: spotify-client\nVersion: 1:1.2.96.518.g366879e1\n', '1.2.96.518'),
             ('typora', 'Package: typora\nVersion: 1.12.6-1\n\nPackage: typora\nVersion: 1.9.0-1\n', '1.12.6'),
-            ('nvidia-580xx-utils', '<a href="580.159.04/">580.159.04/</a> <a href="590.1/">590.1/</a>', '580.159.04'),
+            ('nvidia-580xx-utils', '{"IDS":[{"downloadInfo":{"DownloadURL" : "https://us.download.nvidia.com/XFree86/Linux-x86_64/580.142/NVIDIA-Linux-x86_64-580.142.run"}},{"downloadInfo":{"DownloadURL" : "https://us.download.nvidia.com/XFree86/Linux-x86_64/580.196.11/NVIDIA-Linux-x86_64-580.196.11.run"}},{"downloadInfo":{"DownloadURL" : "https:\\/\\/download.nvidia.com\\/XFree86\\/Linux-x86_64\\/580.196.09\\/NVIDIA-Linux-x86_64-580.196.09.run"}},{"downloadInfo":{"DownloadURL" : "https://us.download.nvidia.com/tesla/580.999.01/NVIDIA-Linux-x86_64-580.999.01.run"}},{"downloadInfo":{"DownloadURL" : "https://us.download.nvidia.com/XFree86/Linux-x86_64/580.999.02/NVIDIA-Linux-x86_64-580.999.02.run.sha256sum"}},{"downloadInfo":{"DownloadURL" : "https://us.download.nvidia.com/XFree86/Linux-x86_64/580.999.03/NVIDIA-Linux-x86_64-580.999.04.run"}},{"downloadInfo":{"ReleaseNotes" : "https://us.download.nvidia.com/XFree86/Linux-x86_64/580.999.05/NVIDIA-Linux-x86_64-580.999.05.run"}},{"downloadInfo":{"DownloadURL" : "https://mirror.example.test/XFree86/Linux-x86_64/580.999.06/NVIDIA-Linux-x86_64-580.999.06.run"}},{"downloadInfo":{"DownloadURL" : "https://us.download.nvidia.com/XFree86/Linux-x86_64/620.73.04/NVIDIA-Linux-x86_64-620.73.04.run"}}]}', '580.196.11'),
+            ('lib32-nvidia-580xx-utils', '{"IDS":[{"downloadInfo":{"DownloadURL" : "https://us.download.nvidia.com/XFree86/Linux-x86_64/580.196.07/NVIDIA-Linux-x86_64-580.196.07.run"}},{"downloadInfo":{"DownloadURL" : "https:\\/\\/download.nvidia.com\\/XFree86\\/Linux-x86_64\\/580.200\\/NVIDIA-Linux-x86_64-580.200.run"}},{"downloadInfo":{"DownloadURL" : "https://us.download.nvidia.com/XFree86/Linux-x86_64/580.196.11/NVIDIA-Linux-x86_64-580.196.11.run"}},{"downloadInfo":{"DownloadURL" : "https://us.download.nvidia.com/tesla/580.999.01/NVIDIA-Linux-x86_64-580.999.01.run"}},{"downloadInfo":{"DownloadURL" : "https://us.download.nvidia.com/XFree86/Linux-x86_64/580.999.02/NVIDIA-Linux-x86_64-580.999.02.run.sha256sum"}},{"downloadInfo":{"DownloadURL" : "https://us.download.nvidia.com/XFree86/Linux-x86_64/580.999.03/NVIDIA-Linux-x86_64-580.999.04.run"}},{"downloadInfo":{"ReleaseNotes" : "https://us.download.nvidia.com/XFree86/Linux-x86_64/580.999.05/NVIDIA-Linux-x86_64-580.999.05.run"}},{"downloadInfo":{"DownloadURL" : "https://mirror.example.test/XFree86/Linux-x86_64/580.999.06/NVIDIA-Linux-x86_64-580.999.06.run"}},{"downloadInfo":{"DownloadURL" : "https://us.download.nvidia.com/XFree86/Linux-x86_64/620.73.04/NVIDIA-Linux-x86_64-620.73.04.run"}}]}', '580.200'),
         ]
         for name, feed, expected in cases:
             watch = json.loads((ROOT / 'pkgbuilds' / name / '.omarchy/package.json').read_text())['upstream']['watch']
@@ -759,6 +760,161 @@ class T3CodeHookTest(unittest.TestCase):
         result = self.run_hook()
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(result.stdout, '')
+
+
+class P1WatchImprovementsTests(unittest.TestCase):
+    def test_github_paginates_monorepo_when_page_one_has_no_matches(self):
+        pages = {
+            'https://api.github.com/repos/example/mono/releases?per_page=100': [
+                {'tag_name': f'other-v{i}.0.0', 'draft': False, 'prerelease': False,
+                 'published_at': '2026-01-01T00:00:00Z', 'assets': []}
+                for i in range(100)
+            ],
+            'https://api.github.com/repos/example/mono/releases?per_page=100&page=2': [
+                {'tag_name': 'desktop-v2.3.4', 'draft': False, 'prerelease': False,
+                 'published_at': '2026-01-01T00:00:00Z', 'assets': []}
+            ],
+        }
+        seen = []
+        class FakeFetch:
+            def json(self, url):
+                seen.append(url)
+                return pages[url]
+        watch = {'github': 'example/mono', 'pattern': r'desktop-v(?P<version>[0-9]+(?:\.[0-9]+)*)'}
+        found = w.discover(watch, FakeFetch())
+        self.assertEqual([r['pkgver'] for r in found], ['2.3.4'])
+        self.assertEqual(len(seen), 2)
+
+    def test_github_stops_on_page_one_when_match_found(self):
+        pages = {
+            'https://api.github.com/repos/example/mono/releases?per_page=100': [
+                {'tag_name': 'desktop-v2.3.4', 'draft': False, 'prerelease': False,
+                 'published_at': '2026-01-01T00:00:00Z', 'assets': []}
+            ] + [
+                {'tag_name': f'other-v{i}.0.0', 'draft': False, 'prerelease': False,
+                 'published_at': '2026-01-01T00:00:00Z', 'assets': []}
+                for i in range(99)
+            ],
+        }
+        seen = []
+        class FakeFetch:
+            def json(self, url):
+                seen.append(url)
+                return pages[url]
+        watch = {'github': 'example/mono', 'pattern': r'desktop-v(?P<version>[0-9]+(?:\.[0-9]+)*)'}
+        found = w.discover(watch, FakeFetch())
+        self.assertEqual([r['pkgver'] for r in found], ['2.3.4'])
+        self.assertEqual(len(seen), 1)
+
+    def test_npm_pattern_transforms_prerelease_and_preserves_published_at(self):
+        class FakeFetch:
+            def json(self, url):
+                return {
+                    'dist-tags': {'latest': '1.0.0-rc.6'},
+                    'time': {'1.0.0-rc.6': '2026-11-20T12:00:00.000Z'},
+                }
+        watch = {
+            'npm': 'cf',
+            'pattern': r'(?P<version>[0-9]+(?:\.[0-9]+)*)(?P<sep>-?)(?P<pre>(?:[a-z]+\.[0-9]+)?)',
+            'version': '{version}{pre}',
+            'variables': {'_npmver': '{version}{sep}{pre}'},
+        }
+        found = w.discover(watch, FakeFetch())
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0]['pkgver'], '1.0.0rc.6')
+        self.assertEqual(found[0]['published_at'], '2026-11-20T12:00:00.000Z')
+        self.assertEqual(found[0]['values']['sep'], '-')
+        self.assertEqual(found[0]['values']['pre'], 'rc.6')
+
+    def test_deb_archive_uses_range_fast_path_without_full_download(self):
+        import io, tarfile
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode='w:gz') as tf:
+            ctrl = b'Package: demo\nVersion: 4.1.13.29\n'
+            info = tarfile.TarInfo('./control')
+            info.size = len(ctrl)
+            tf.addfile(info, io.BytesIO(ctrl))
+        ctrl_tar = buf.getvalue()
+        def ar_member(name, payload):
+            hdr = f"{name:<16}{'0':<12}{'0':<6}{'0':<6}{'100644':<8}{len(payload):<10}`\n".encode()
+            pad = b'\n' if len(payload) % 2 else b''
+            return hdr + payload + pad
+        prefix = b'!<arch>\n' + ar_member('debian-binary', b'2.0\n') + ar_member('control.tar.gz', ctrl_tar)
+        class FakeFetch:
+            def range_bytes(self, url, size=w.DEB_RANGE_BYTES):
+                return prefix
+            def file(self, url):
+                raise AssertionError('full file download must not run when Range prefix contains control.tar')
+        watch = {'archive': 'https://example.test/demo.deb', 'pattern': r'(?m)^Version: (?P<version>[0-9.]+)$'}
+        found = w.discover(watch, FakeFetch())
+        self.assertEqual([r['pkgver'] for r in found], ['4.1.13.29'])
+        # Negative ar member size must return None instead of looping forever.
+        bad_hdr = f"{'debian-binary':<16}{'0':<12}{'0':<6}{'0':<6}{'100644':<8}{'-60':<10}`\n".encode()
+        self.assertIsNone(w.deb_control_from_prefix(b'!<arch>\n' + bad_hdr))
+        # Duplicate control.tar members in prefix must return None (fall back to full parser).
+        dup = b'!<arch>\n' + ar_member('control.tar.gz', ctrl_tar) + ar_member('control.tar.xz', ctrl_tar)
+        self.assertIsNone(w.deb_control_from_prefix(dup))
+
+    def test_deb_range_sync_verifies_full_download_version(self):
+        import io, tarfile, tempfile
+        def make_deb(version):
+            buf = io.BytesIO()
+            with tarfile.open(fileobj=buf, mode='w:gz') as tf:
+                ctrl = f'Package: demo\nVersion: {version}\n'.encode()
+                info = tarfile.TarInfo('./control')
+                info.size = len(ctrl)
+                tf.addfile(info, io.BytesIO(ctrl))
+            ctrl_tar = buf.getvalue()
+            def ar_member(name, payload):
+                hdr = f"{name:<16}{'0':<12}{'0':<6}{'0':<6}{'100644':<8}{len(payload):<10}`\n".encode()
+                return hdr + payload + (b'\n' if len(payload) % 2 else b'')
+            return b'!<arch>\n' + ar_member('debian-binary', b'2.0\n') + ar_member('control.tar.gz', ctrl_tar)
+
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            pkg = td / 'demo'
+            (pkg / '.omarchy').mkdir(parents=True)
+            url = 'https://example.test/demo.deb'
+            (pkg / '.omarchy/package.json').write_text(json.dumps({
+                'source': 'local',
+                'upstream': {'watch': {
+                    'archive': url,
+                    'pattern': r'(?m)^Version: (?P<version>[0-9.]+)$',
+                    'mutable_sources': ['source:0'],
+                }},
+            }))
+            original_recipe = (
+                "pkgname=demo\npkgver=4.1.13.29\npkgrel=1\narch=('x86_64')\n"
+                f"source=('demo.deb::{url}')\nsha256sums=('" + "0" * 64 + "')\n"
+            )
+            (pkg / 'PKGBUILD').write_text(original_recipe)
+
+            deb_30 = make_deb('4.1.13.30')
+            deb_31 = make_deb('4.1.13.31')
+            full_path = td / 'full.deb'
+
+            # Case 1: Range reports 4.1.13.30, full download swapped to 4.1.13.31 -> must fail and keep recipe untouched
+            full_path.write_bytes(deb_31)
+            class SwappedFetch:
+                def range_bytes(self, u, size=w.DEB_RANGE_BYTES):
+                    return deb_30
+                def file(self, u):
+                    return full_path
+            with self.assertRaisesRegex(ValueError, 'mutable deb changed version'):
+                w.sync(pkg, SwappedFetch())
+            self.assertEqual((pkg / 'PKGBUILD').read_text(), original_recipe)
+
+            # Case 2: Range reports 4.1.13.30 and full download matches 4.1.13.30 -> updates cleanly
+            full_path.write_bytes(deb_30)
+            class MatchingFetch:
+                def range_bytes(self, u, size=w.DEB_RANGE_BYTES):
+                    return deb_30
+                def file(self, u):
+                    return full_path
+            result = w.sync(pkg, MatchingFetch())
+            self.assertEqual(result['status'], 'updated')
+            self.assertIn('pkgver=4.1.13.30', (pkg / 'PKGBUILD').read_text())
+            self.assertIn(w.hash_file(full_path, 'sha256'), (pkg / 'PKGBUILD').read_text())
 
 
 if __name__ == '__main__':

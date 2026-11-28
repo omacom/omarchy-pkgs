@@ -29,7 +29,16 @@ mkpkg() { # mkpkg <name> <pkgrel> <arch> [payload]
   fi
   ls "$d"/*.pkg.tar.zst
 }
-A1=$(mkpkg alpha 1 any); A2=$(mkpkg alpha 2 any); B1=$(mkpkg beta 1 x86_64); C1=$(mkpkg gamma 1 aarch64)
+if (( EUID == 0 )); then
+  id -u fixture >/dev/null 2>&1 || useradd -m fixture
+  mkdir -p "$T/src"; chmod 755 "$T/src"
+fi
+mkpkg alpha 1 any >"$T/p-A1" & p1=$!
+mkpkg alpha 2 any >"$T/p-A2" & p2=$!
+mkpkg beta 1 x86_64 >"$T/p-B1" & p3=$!
+mkpkg gamma 1 aarch64 >"$T/p-C1" & p4=$!
+for p in "$p1" "$p2" "$p3" "$p4"; do wait "$p"; done
+A1=$(<"$T/p-A1"); A2=$(<"$T/p-A2"); B1=$(<"$T/p-B1"); C1=$(<"$T/p-C1")
 
 pub() { "$ROOT/bin/publish-artifact" --remote "$REMOTE" --mirror edge --arch x86_64 "$@" >"$T/out" 2>&1; }
 entries() { tar -tf "$REMOTE/edge/x86_64/omarchy.db.tar.zst" | grep '/$' | sort | tr '\n' ' '; }
