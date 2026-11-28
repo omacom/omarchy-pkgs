@@ -25,6 +25,7 @@ for recipe in omarchy-settings omarchy-settings-dev; do
       export CARCH=$target_arch OMARCHY_SRC=$fixture
       export srcdir=$scratch/src pkgdir=$scratch/$recipe-$target_arch
       backup=()
+      provides=()
       # shellcheck disable=SC1090 # Exercise each recipe's actual package function.
       source "$BUILD_ROOT/pkgbuilds/$recipe/PKGBUILD"
       package
@@ -49,6 +50,11 @@ for recipe in omarchy-settings omarchy-settings-dev; do
       done
       if printf '%s\n' "${backup[@]}" | grep -Fx etc/mkinitcpio.conf.d/00-omarchy-hooks.conf >/dev/null; then
         echo 'FAIL: backup names a 00-omarchy-hooks.conf the source does not ship' >&2
+        exit 1
+      fi
+      [[ ! -e $pkgdir/etc/mkinitcpio.conf.d/00-omarchy-hooks.conf ]]
+      if printf '%s\n' ${provides[@]+"${provides[@]}"} | grep -Fx omarchy-mkinitcpio-hooks-baseline >/dev/null; then
+        echo "FAIL: $recipe $CARCH provides omarchy-mkinitcpio-hooks-baseline without 00-omarchy-hooks.conf" >&2
         exit 1
       fi
       if printf '%s\n' "${backup[@]}" | grep -Fx etc/sysctl.d/90-omarchy-arp.conf >/dev/null; then
@@ -113,10 +119,12 @@ package_aarch64() {
     # package() builds from $srcdir/omarchy.
     export CARCH=aarch64 OMARCHY_SRC=$source_tree srcdir=${source_tree%/omarchy} pkgdir=$out
     backup=()
+    provides=()
     # shellcheck disable=SC1090 # Exercise the recipe's actual package function.
     source "$BUILD_ROOT/pkgbuilds/$recipe/PKGBUILD"
     package || exit 1
     printf '%s\n' "${backup[@]}" > "$out.backup"
+    printf '%s\n' ${provides[@]+"${provides[@]}"} > "$out.provides"
   )
 }
 
@@ -195,12 +203,89 @@ cp -a "$fixture" "$split"
 cp "$fixtures"/omarchy-13362/*.conf "$split/etc/mkinitcpio.conf.d/"
 # Its 00-omarchy-hooks.conf asks the runtime's own detector (omarchy-hw-platform
 # on PATH), so the package builds without a copy of it and ships none.
+# Contract with omarchy-mac-boot: when its staged payload omits
+# 93-omarchy-mac-plymouth.conf, package() adds a virtual dependency on the
+# HOOKS baseline. Exercise omarchy-mac-boot's real package() with and without
+# that drop-in so any rename in omarchy-mac-boot fails this test immediately.
+mac_boot_depends() {
+  local mode=$1 out=$scratch/mac-boot-$1
+  mkdir -p "$out/src/boot" "$out/pkg"
+  cat > "$out/src/boot/install" <<'EOF'
+#!/bin/sh
+mkdir -p "$1/etc/mkinitcpio.conf.d" "$1/usr/lib/omarchy/initcpio"
+EOF
+  if [[ $mode == with-plymouth ]]; then
+    printf ': > "$1/etc/mkinitcpio.conf.d/93-omarchy-mac-plymouth.conf"\n' >> "$out/src/boot/install"
+  fi
+  chmod +x "$out/src/boot/install"
+  (
+    export CARCH=aarch64 srcdir=$out/src pkgdir=$out/pkg
+    depends=() backup=()
+    # shellcheck disable=SC1091 # Exercise omarchy-mac-boot's actual package function.
+    source "$BUILD_ROOT/pkgbuilds/omarchy-mac-boot/PKGBUILD"
+    package
+    printf '%s\n' "${depends[@]}" | sort -u
+  ) > "$out.depends"
+}
+mac_boot_depends with-plymouth
+mac_boot_depends without-plymouth
+mac_boot_baseline_dep=$(comm -13 "$scratch/mac-boot-with-plymouth.depends" "$scratch/mac-boot-without-plymouth.depends")
+if [[ $mac_boot_baseline_dep != omarchy-mkinitcpio-hooks-baseline ]]; then
+  echo "FAIL: omarchy-mac-boot baseline dependency drifted: '$mac_boot_baseline_dep'" >&2
+  exit 1
+fi
+
 for recipe in omarchy-settings omarchy-settings-dev; do
   package_aarch64 "$recipe" "$split" "$scratch/split-$recipe" >/dev/null
   for conf in 00-omarchy-hooks.conf omarchy_hooks.conf; do
     cmp "$fixtures/omarchy-13362/$conf" "$scratch/split-$recipe/etc/mkinitcpio.conf.d/$conf"
   done
   grep -Fxq etc/mkinitcpio.conf.d/00-omarchy-hooks.conf "$scratch/split-$recipe.backup"
+  grep -Fxq "$mac_boot_baseline_dep" "$scratch/split-$recipe.provides" || {
+    echo "FAIL: $recipe aarch64 ships 00-omarchy-hooks.conf without providing $mac_boot_baseline_dep" >&2
+    exit 1
+  }
+  grep -Fxq omarchy-security-functions "$scratch/split-$recipe.provides" || {
+    echo "FAIL: $recipe aarch64 lost provides=omarchy-security-functions" >&2
+    exit 1
+  }
+  if [[ $recipe == omarchy-settings-dev ]]; then
+    grep -Fxq omarchy-settings "$scratch/split-$recipe.provides" || {
+      echo "FAIL: $recipe aarch64 lost top-level provides=omarchy-settings" >&2
+      exit 1
+    }
+  fi
+  # x86_64 ships 00-omarchy-hooks.conf too and must carry the same drop-ins,
+  # backup entry and provides entries.
+  (
+    export CARCH=x86_64 OMARCHY_SRC=$split srcdir=${split%/omarchy} pkgdir=$scratch/split-$recipe-x86_64
+    backup=()
+    provides=()
+    # shellcheck disable=SC1090 # Exercise each recipe's actual package function.
+    source "$BUILD_ROOT/pkgbuilds/$recipe/PKGBUILD"
+    package
+    for conf in 00-omarchy-hooks.conf omarchy_hooks.conf; do
+      cmp "$fixtures/omarchy-13362/$conf" "$pkgdir/etc/mkinitcpio.conf.d/$conf"
+    done
+    printf '%s\n' "${backup[@]}" | grep -Fxq etc/mkinitcpio.conf.d/00-omarchy-hooks.conf || {
+      echo "FAIL: $recipe x86_64 ships 00-omarchy-hooks.conf without backing it up" >&2
+      exit 1
+    }
+    printf '%s\n' ${provides[@]+"${provides[@]}"} | grep -Fxq "$mac_boot_baseline_dep" || {
+      echo "FAIL: $recipe x86_64 ships 00-omarchy-hooks.conf without providing $mac_boot_baseline_dep" >&2
+      exit 1
+    }
+    printf '%s\n' ${provides[@]+"${provides[@]}"} | grep -Fxq omarchy-security-functions || {
+      echo "FAIL: $recipe x86_64 lost provides=omarchy-security-functions" >&2
+      exit 1
+    }
+    if [[ $recipe == omarchy-settings-dev ]]; then
+      printf '%s\n' ${provides[@]+"${provides[@]}"} | grep -Fxq omarchy-settings || {
+        echo "FAIL: $recipe x86_64 lost top-level provides=omarchy-settings" >&2
+        exit 1
+      }
+    fi
+  )
   [[ ! -e $scratch/split-$recipe/usr/share/libalpm/scripts/omarchy-hw-platform ]]
 done
 layout="omacom/omarchy#13362 (00-omarchy-hooks.conf)"
@@ -221,6 +306,16 @@ done
 for hook in udev encrypt; do
   [[ $hooks != *" $hook "* ]] || { echo "FAIL: $layout: an Aurora Mac keeps $hook:$hooks" >&2; exit 1; }
 done
+# Even when omarchy-mac-boot drops its own 93-omarchy-mac-plymouth.conf
+# (omacom/omarchy-mac#544), 00-omarchy-hooks.conf keeps plymouth right after
+# systemd in an Aurora Mac's initramfs.
+aurora_no_plymouth=$(machine aurora-no-plymouth "$arch_default" "$packaged" mac-boot)
+rm -f "$aurora_no_plymouth/mkinitcpio.conf.d/93-omarchy-mac-plymouth.conf"
+hooks_no_plymouth=" $(effective_hooks "$aurora_no_plymouth" apple-silicon) "
+[[ $hooks_no_plymouth == *" systemd plymouth "* ]] || {
+  echo "FAIL: $layout: an Aurora Mac without 93-omarchy-mac-plymouth.conf loses plymouth after systemd:$hooks_no_plymouth" >&2
+  exit 1
+}
 echo "PASS: $layout: shipped unchanged and backed up; Snapdragon and the Spark get Omarchy's hooks; Macs keep theirs"
 
 # Sources the recipe cannot make safe for Macs stop the aarch64 build, each
