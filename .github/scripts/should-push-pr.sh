@@ -1,0 +1,115 @@
+#!/bin/bash
+# Usage: should-push-pr.sh BRANCH PACKAGE...
+#
+# Run by package-prs.yml after the group's changes are applied to the working
+# tree, before hold-reviewed-pr.sh and peter-evans/create-pull-request.
+#
+# Stops scheduled runs from force-pushing a fresh rebased commit onto an
+# already-open PR when nothing in its packages changed (cutting repeated builds
+# on broken PRs from every 6 hours to a weekly retry) and prevents overwriting
+# a maintainer's manual fix commit pushed directly onto the PR branch while
+# upstream has not moved past the bot's original commit.
+#
+# Still refreshes immediately when:
+# - upstream produces any different package tree (new version, revision, hash,
+#   rebuilt_against, or a recipe fix landed on master);
+# - the PR conflicts with base (and carries no protected maintainer commit);
+# - checks never started or ended in a transient status (TIMED_OUT, CANCELLED,
+#   STARTUP_FAILURE); or
+# - the PR head commit is older than RETRY_AFTER_SECONDS (default 7 days), so
+#   toolchain or shared-infra fixes on master still get re-tested periodically.
+#
+# Prints key=value lines suitable for $GITHUB_OUTPUT:
+#   push=true|false
+#   pr=<number or empty>
+#   reason=new|updated|conflict|transient-check|stale-retry|unchanged|human-commit
+set -euo pipefail
+
+branch=${1:?branch required}
+shift
+(( $# > 0 )) || { echo "should-push-pr.sh: packages required" >&2; exit 2; }
+repo=${GITHUB_REPOSITORY:?GITHUB_REPOSITORY required}
+base=${DEFAULT_BRANCH:-master}
+bot_login=${SYNC_BOT_LOGIN:-omarchy-pkgs-sync}
+retry_after=${RETRY_AFTER_SECONDS:-604800}
+
+emit() {
+  printf "push=%s\npr=%s\nreason=%s\n" "$1" "$2" "$3"
+}
+
+# Only this repository's open PR targeting base.
+pr=$(gh api -X GET "repos/$repo/pulls" -f head="${repo%%/*}:$branch" -f base="$base" -f state=open \
+  --jq '.[0].number // empty')
+if [[ -z $pr ]]; then
+  emit true "" new
+  exit 0
+fi
+
+IFS=$'\t' read -r mergeable commit_count first_oid tip_author tip_date check_state < <(
+  # shellcheck disable=SC2016
+  gh pr view "$pr" -R "$repo" --json mergeable,commits,statusCheckRollup \
+    --jq '[
+      (.mergeable // "UNKNOWN"),
+      (.commits | length),
+      (.commits[0].oid // ""),
+      (.commits[-1].authors[0].login // ""),
+      (.commits[-1].committedDate // ""),
+      (
+        (.statusCheckRollup // []) as $r |
+        if ($r | length) == 0 then "NONE"
+        elif any($r[]; (.conclusion // "") | IN("TIMED_OUT", "CANCELLED", "STARTUP_FAILURE", "STALE")) then "TRANSIENT"
+        else "SETTLED"
+        end
+      )
+    ] | @tsv'
+)
+
+paths=()
+for package in "$@"; do paths+=("pkgbuilds/$package"); done
+
+# Check for maintainer commits BEFORE handling conflicts so a conflict on master
+# never wipes out a human fix commit pushed onto the PR branch. Compare the
+# working tree against the bot's original first commit on the PR: if identical,
+# upstream has not moved (including revision/checksum/rebuilt_against changes).
+if (( commit_count > 1 )) && [[ -n $first_oid && -n $tip_author && $tip_author != "$bot_login" && $tip_author != "app/$bot_login" ]]; then
+  if git fetch --quiet --no-tags --depth=1 origin "$first_oid" &&
+     git diff --quiet FETCH_HEAD -- "${paths[@]}"; then
+    emit false "$pr" human-commit
+    exit 0
+  fi
+fi
+
+# A conflicting PR (with no protected maintainer work) must refresh onto base.
+if [[ $mergeable == CONFLICTING ]]; then
+  emit true "$pr" conflict
+  exit 0
+fi
+
+if ! git fetch --quiet --no-tags --depth=1 origin "refs/heads/$branch"; then
+  emit true "$pr" updated
+  exit 0
+fi
+
+# Any difference in pkgbuilds/<pkg>/ (new upstream release, revision, checksum,
+# rebuilt_against, or a recipe fix that landed on master) refreshes the PR.
+if ! git diff --quiet FETCH_HEAD -- "${paths[@]}"; then
+  emit true "$pr" updated
+  exit 0
+fi
+
+# Identical package files, but checks never registered or hit a transient infra failure.
+if [[ $check_state == NONE || $check_state == TRANSIENT ]]; then
+  emit true "$pr" transient-check
+  exit 0
+fi
+
+# Periodic retry so Arch repo or shared-tooling fixes on master re-test old PRs.
+if [[ -n $tip_date ]] && tip_epoch=$(date --date="$tip_date" +%s 2>/dev/null); then
+  now=$(date +%s)
+  if (( now - tip_epoch >= retry_after )); then
+    emit true "$pr" stale-retry
+    exit 0
+  fi
+fi
+
+emit false "$pr" unchanged

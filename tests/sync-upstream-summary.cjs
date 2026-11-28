@@ -45,7 +45,7 @@ function fixture(t, count = 1) {
   const invoke = ({ armed = true, ...overrides } = {}) => {
     results.forEach((result, i) => writeFileSync(join(resultsPath, `${i}.json`), JSON.stringify(result)));
     if (armed) {
-      const outcomes = Object.fromEntries(results.filter(r => r && r.pr === 'success' && r.number && r.review !== true)
+      const outcomes = Object.fromEntries(results.filter(r => r && (r.pr === 'success' || r.pr === 'unchanged') && r.number && r.review !== true)
         .map(r => [r.branch, { number: r.number, outcome: r.merge }]));
       writeFileSync(join(resultsPath, 'armed.outcomes'), JSON.stringify(outcomes));
     }
@@ -82,7 +82,7 @@ test('a rejected PR push counts as a package failure and finds its existing PR',
   Object.assign(f.results[6], { pr: 'failure', merge: 'skipped', number: '' });
   const result = await f.invoke();
   assert.equal(result.succeeded, true);
-  assert.deepEqual(result.updates, { passing: 6, failing: 1, unknown: 0 });
+  assert.deepEqual(result.updates, { passing: 6, unchanged: 0, failing: 1, unknown: 0 });
   assert.deepEqual(f.failures, []);
   assert.deepEqual(f.lookup, [{ owner: 'omacom', repo: 'omarchy-pkgs',
     head: 'omacom:auto/sync-upstream-package-6', state: 'open', per_page: 100 }]);
@@ -109,7 +109,7 @@ test('the workflow records failed outcomes despite successful conclusions and ke
   const keys = readFileSync(outputPath, 'utf8').trim().split('\n').map(line => line.slice('key='.length));
   assert.equal(keys[0], keys[1]);
   const record = JSON.parse(readFileSync(join(f.resultsPath, 'package-pr-results', `${keys[0]}.json`), 'utf8'));
-  assert.deepEqual(record, { ...f.groups[0], apply: 'success', token: 'skipped', hold: 'skipped', pr: 'failure', number: '' });
+  assert.deepEqual(record, { ...f.groups[0], apply: 'success', token: 'skipped', should_push: 'skipped', hold: 'skipped', pr: 'failure', number: '' });
   const result = await f.invoke({ resultsPath: join(f.resultsPath, 'package-pr-results') });
   assert.equal(result.succeeded, true);
   assert.equal(result.updates.failing, 1);
@@ -382,4 +382,43 @@ test('an hourly feed-fetch failure still reports the three successful PR updates
   assert.match(result.content, /PR updates: 3 passing, 0 failing/);
   assert.match(result.content, /Sync job: failure/);
   assert.match(result.content, /actions\/runs\/123/);
+});
+
+test('all-unchanged open PRs succeed quietly without spamming Basecamp while writing the job summary', async t => {
+  const f = fixture(t, 2);
+  f.results[0].pr = 'unchanged';
+  f.results[1].pr = 'unchanged';
+  f.states.set(1, 'FAILURE');
+  f.states.set(2, 'FAILURE');
+  const report = await f.invoke({ armed: true, cadence: 'six-hourly' });
+  assert.equal(report.succeeded, true);
+  assert.equal(report.updates.passing, 0);
+  assert.equal(report.updates.unchanged, 2);
+  assert.equal(report.updates.failing, 0);
+  assert.equal(report.checks.failing, 2);
+  assert.equal(f.outputs.content, '');
+  assert.equal(report.content, '');
+  assert.match(f.summary, /PR updates: 0 passing, 2 unchanged, 0 failing\./);
+  assert.match(f.summary, /<td>Unchanged<\/td><td>failing<\/td>/);
+});
+
+test('mixed passing and unchanged PRs still notify Basecamp with separate counts', async t => {
+  const { results, states, outputs, invoke } = fixture(t, 2);
+  results[1].pr = 'unchanged';
+  states.set(2, 'FAILURE');
+  const report = await invoke({ cadence: 'six-hourly' });
+  assert.equal(report.succeeded, true);
+  assert.equal(report.updates.passing, 1);
+  assert.equal(report.updates.unchanged, 1);
+  assert.match(outputs.content, /PR updates: 1 passing, 1 unchanged, 0 failing\./);
+});
+
+test('unchanged PR with refused auto-merge still reports failure to Basecamp', async t => {
+  const f = fixture(t, 1);
+  f.results[0].pr = 'unchanged';
+  f.results[0].merge = 'refused';
+  const report = await f.invoke({ cadence: 'six-hourly' });
+  assert.equal(report.updates.failing, 1);
+  assert.equal(report.updates.unchanged, 0);
+  assert.match(f.outputs.content, /Auto-merge refused/);
 });
