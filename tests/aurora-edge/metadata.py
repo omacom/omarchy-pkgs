@@ -224,10 +224,47 @@ class EdgeMetadataTests(unittest.TestCase):
         self.assertIn('"$pkgdir/usr/lib/systemd/system/speakersafetyd.service.d/50-j700-guard.conf"', guard)
 
     def test_kernel_replaces_nothing(self):
-        # linux-aurora sets its relations inside generated package functions,
-        # which --printsrcinfo does not see.
+        packages = srcinfo('linux-aurora')
+        for pkg in packages.values():
+            self.assertNotIn('replaces', pkg)
         recipe = (ROOT / 'pkgbuilds' / 'linux-aurora' / 'PKGBUILD').read_text()
         self.assertNotIn('replaces=', recipe)
+
+    def test_headers_provide_linux_headers(self):
+        packages = srcinfo('linux-aurora')
+        kernel = packages['linux-aurora']
+        headers = packages['linux-aurora-headers']
+        ver = kernel['pkgver'][0]
+        recipe = (ROOT / 'pkgbuilds' / 'linux-aurora' / 'PKGBUILD').read_text()
+        m1n1_floor = next(line.split('=', 1)[1] for line in recipe.splitlines()
+                          if line.startswith('_m1n1_version='))
+        self.assertEqual(kernel['pkgdesc'], ['The AArch64 Apple Silicon (Aurora kernel) kernel and modules'])
+        self.assertEqual(
+            headers['pkgdesc'],
+            ['Headers and scripts for building modules for the AArch64 Apple Silicon (Aurora kernel) kernel'],
+        )
+        self.assertCountEqual(
+            kernel['depends'],
+            ['coreutils', 'kmod', 'initramfs', f'm1n1>={m1n1_floor}'],
+        )
+        self.assertCountEqual(
+            kernel['optdepends'],
+            [
+                'crda: to set the correct wireless channels of your country',
+                'linux-firmware: firmware images needed for some devices',
+                'python: extract-mesa-calibration, for Touch ID',
+            ],
+        )
+        self.assertCountEqual(
+            kernel['provides'],
+            ['WIREGUARD-MODULE', f'linux-asahi={ver}'],
+        )
+        self.assertEqual(headers['depends'], ['pahole'])
+        self.assertCountEqual(
+            headers['provides'],
+            ['LINUX-HEADERS', f'linux-asahi-headers={ver}'],
+        )
+        self.assertEqual(headers['conflicts'], ['linux-asahi-headers'])
 
     def test_kernel_and_platform_hold_mesa_to_the_aurora_gpu_driver(self):
         # The 7.3 kernel names its GPU driver "aurora": stock mesa and older
@@ -239,8 +276,11 @@ class EdgeMetadataTests(unittest.TestCase):
                      if line.startswith('_mesa_version='))
         self.assertGreaterEqual(int(subprocess.check_output(['vercmp', built, floor], text=True)), 0)
         # A floor as a conflict, so a headless install does not pull Mesa in.
-        self.assertIn('"mesa-aurora<$_mesa_version" "vulkan-aurora<$_mesa_version"', recipe)
-        self.assertNotIn('mesa-aurora', ''.join(l for l in recipe.splitlines() if 'depends=' in l))
+        kernel = srcinfo('linux-aurora')['linux-aurora']
+        self.assertCountEqual(
+            kernel['conflicts'],
+            ['linux-asahi', f'mesa-aurora<{floor}', f'vulkan-aurora<{floor}'],
+        )
         depends = srcinfo('omarchy-mac')['omarchy-mac']['depends']
         self.assertIn('mesa-aurora>=' + floor, depends)
         self.assertIn('vulkan-aurora>=' + floor, depends)
