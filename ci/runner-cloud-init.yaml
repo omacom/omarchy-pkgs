@@ -21,6 +21,12 @@ chpasswd:
   expire: false
 ssh_authorized_keys: __SSH_KEYS_JSON__
 
+# Bound the entire bootstrap (apt, docker, download, registration) so a hang
+# before run.sh cannot leave an unregistered droplet idling active. Cancelled
+# right after config.sh succeeds.
+bootcmd:
+  - systemd-run --unit=runner-bootstrap-deadline --on-boot=9min --timer-property=DefaultDependencies=no --property=DefaultDependencies=no --timer-property=AccuracySec=1s /usr/bin/systemctl --no-block poweroff
+
 package_update: true
 packages:
   - docker.io
@@ -38,6 +44,14 @@ users:
     sudo: ALL=(ALL) NOPASSWD:ALL
 
 write_files:
+  # Written before package installation (not deferred) so Ubuntu's docker.io
+  # postinst cannot block forever on docker.service's TimeoutStartSec=0.
+  - path: /etc/systemd/system/docker.service.d/10-bootstrap-timeout.conf
+    permissions: "0644"
+    content: |
+      [Unit]
+      JobTimeoutSec=60s
+
   # defer: write after users/groups exist, so /home/runner is created by
   # useradd (owned by runner) rather than by this module as root.
   - path: /home/runner/start.sh
@@ -47,10 +61,10 @@ write_files:
     content: |
       #!/bin/bash
       set -euo pipefail
-      # Power off after the one job, and also when the download or the
-      # registration fails: the controller deletes powered-off droplets, but
-      # counts a running one as a runner still booting until MAX_AGE_MINUTES.
-      trap 'sudo poweroff' EXIT
+      # Runs once from runcmd. cloud-init power_state powers the droplet off
+      # after cloud-final, on success or failure: the controller deletes
+      # powered-off droplets, but counts a running one as still booting until
+      # MAX_AGE_MINUTES.
       cd /home/runner
       mkdir -p actions-runner
       cd actions-runner
@@ -60,24 +74,47 @@ write_files:
       RUNNER_SHA256=70920811a4f8ad4328818682bca5c6469c1c942fab52448868071d0063816613
       arch=$(uname -m)
       [[ $arch == x86_64 ]] || { echo "unsupported arch: $arch" >&2; exit 1; }
-      curl -fsSL -o runner.tgz \
+      curl -fsSL \
+        --connect-timeout 15 \
+        --max-time 90 \
+        --retry 2 \
+        --retry-delay 5 \
+        --retry-max-time 190 \
+        --retry-all-errors \
+        -o runner.tgz \
         "https://github.com/actions/runner/releases/download/v${RUNNER_VERSION}/actions-runner-linux-x64-${RUNNER_VERSION}.tar.gz"
       echo "${RUNNER_SHA256}  runner.tgz" | sha256sum --check --strict
       tar xzf runner.tgz
       rm runner.tgz
+      for i in {1..15}; do
+        timeout -k 1 3 docker info >/dev/null && break
+        (( i < 15 )) || { echo "docker daemon not ready" >&2; exit 1; }
+        sleep 1
+      done
+      runner_host=$(hostname)
       ./config.sh --unattended --ephemeral \
         --url "https://github.com/__REPO__" \
         --token "__RUNNER_TOKEN__" \
-        --name "do-$(hostname)" \
+        --name "do-${runner_host}" \
         --labels "__RUNNER_LABELS__" \
         --replace
+      sudo systemctl stop runner-bootstrap-deadline.timer
       ./run.sh
 
 runcmd:
   # With no account ssh key attached, DO expires root's password, and sshd
   # then refuses every non-interactive session. Clear it first so operators
   # can read the logs of a builder that never registers.
-  - chage -d "$(date +%F)" -M -1 root
-  - systemctl enable --now docker
-  - chown -R runner:runner /home/runner
-  - sudo -u runner /home/runner/start.sh > /home/runner/runner.log 2>&1
+  - |-
+    set -e
+    if ! today=$(date +%F) || ! chage -d "$today" -M -1 root; then
+      echo "Could not clear root password expiry" >&2
+    fi
+    systemctl --no-block enable --now docker
+    chown -R runner:runner /home/runner
+    sudo -u runner /home/runner/start.sh > /home/runner/runner.log 2>&1
+
+# Always power off after cloud-final finishes (success or failure) so a broken
+# droplet never idles active until MAX_AGE_MINUTES.
+power_state:
+  mode: poweroff
