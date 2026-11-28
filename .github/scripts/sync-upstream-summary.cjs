@@ -102,7 +102,7 @@ module.exports = async function summarize({ github, context, core, groups,
     if (error.code !== 'ENOENT') problems.push(`Could not read auto-merge outcomes: ${error.message}`);
   }
   for (const result of results) {
-    if (!result || (result.pr !== 'success' && result.pr !== 'unchanged') || !result.number || result.review === true) continue;
+    if (!result || (result.pr !== 'success' && result.pr !== 'unchanged') || result.pr_operation === 'closed' || !result.number || result.review === true) continue;
     const outcome = armed[result.branch];
     const mine = outcome && String(outcome.number) === String(result.number) && typeof outcome.outcome === 'string';
     Object.assign(result, { armable: true, merge: mine ? outcome.outcome : 'missing', mergeReason: mine ? outcome.reason : '' });
@@ -115,7 +115,7 @@ module.exports = async function summarize({ github, context, core, groups,
     const matches = results.filter(result => result?.branch === group.branch && result.packages === group.packages);
     const result = matches.length === 1 ? matches[0] : undefined;
     const failure = result ? updateFailure(result) : 'Package result missing or duplicated';
-    const unchanged = !failure && result?.pr === 'unchanged';
+    const unchanged = !failure && (result?.pr === 'unchanged' || (result?.pr === 'success' && (result?.pr_operation === 'none' || result?.pr_operation === 'closed')));
     if (!result) {
       updates.unknown++;
       problems.push(`${group.packages}: ${failure}`);
@@ -151,8 +151,11 @@ module.exports = async function summarize({ github, context, core, groups,
   for (const row of rows) {
     const reasons = [];
     if (row.failure) reasons.push(row.failure);
-    if (row.checks === 'failing') reasons.push('PR checks failing');
-    if (row.checks === 'unknown') reasons.push('PR checks unavailable');
+    if (!row.unchanged) {
+      if (row.checks === 'failing') reasons.push('PR checks failing');
+      if (row.checks === 'unknown') reasons.push('PR checks unavailable');
+      if (!row.failure && row.checks === 'not available') reasons.push('PR link unavailable');
+    }
     if (!reasons.length) continue;
     const target = row.url ? link(row.url, `${row.packages} #${row.number}`) :
       `${escape(row.packages)} — no PR link available; ${link(runUrl, 'view run')}`;
@@ -161,9 +164,15 @@ module.exports = async function summarize({ github, context, core, groups,
   content.push(link(runUrl, 'View run'));
 
   const html = content.join('<br>');
-  // Skip Basecamp notifications when every open PR was unchanged and nothing
-  // new opened or failed, so stuck PRs do not spam chat every six hours.
-  const quiet = succeeded && groups.length > 0 && updates.passing === 0 && updates.failing === 0 && updates.unknown === 0;
+  // Only post to Basecamp when a run needs attention: workflow or package
+  // update failures, or failing/unavailable checks on a newly created or
+  // updated PR. Truly green runs (no updates, clean updates with passing or
+  // pending checks, and unchanged open PRs) still write the Actions summary.
+  const actionable = !succeeded ||
+    updates.failing > 0 ||
+    updates.unknown > 0 ||
+    rows.some(row => !row.unchanged && row.checks !== 'passing' && row.checks !== 'pending');
+  const quiet = !actionable;
   core.setOutput('content', quiet ? '' : html);
   const table = rows.length ? '<table><tr><th>Package / PR</th><th>PR update</th><th>PR checks</th></tr>' +
     rows.map(row => `<tr><td>${row.url ? link(row.url, `${row.packages} #${row.number}`) : escape(row.packages)}</td>` +
