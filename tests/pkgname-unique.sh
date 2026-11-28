@@ -36,6 +36,9 @@ claim() {
           for __pkg in "${pkgname[@]}"; do
             [[ -n $__pkg ]] || { echo "$__dir/PKGBUILD: empty pkgname (CARCH=$__carch)" >&2; exit 1; }
           done
+          for __a in "${arch[@]}"; do
+            [[ -n $__a ]] || { echo "$__dir/PKGBUILD: empty arch (CARCH=$__carch)" >&2; exit 1; }
+          done
           if [[ " ${arch[*]} " == *" any "* ]]; then
             if [[ $__carch == "${__arches[0]}" ]]; then
               printf "ANY\n"
@@ -122,3 +125,9 @@ printf 'pkgname=(ok)\narch=(any)\nreturn 1\n' >"$T/ret1/bad/PKGBUILD"
 ! collisions "$T/ret1" >/dev/null 2>&1 \
   && pass "a PKGBUILD that returns non-zero after declaring metadata fails the check" \
   || fail "a failing PKGBUILD was silently skipped"
+
+mkdir -p "$T/empty-arch/bad"
+printf 'pkgname=(ok)\narch=("")\n' >"$T/empty-arch/bad/PKGBUILD"
+! collisions "$T/empty-arch" >/dev/null 2>&1 \
+  && pass "a PKGBUILD with an empty arch entry fails the check" \
+  || fail "an empty arch entry was silently skipped"
