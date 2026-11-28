@@ -36,8 +36,8 @@ expose additional capture values through `fields`, a name-to-JSON-path map.
 `variables` maps recipe scalars such as `_commit` or `_build` to capture templates.
 Only explicitly declared underscore-prefixed variables can change. GitHub
 `{commit}` resolves the selected tag, not a moving target_commitish branch.
-`submodules` can map a recipe variable to a gitlink in the selected GitHub tag;
-RustDesk uses this for hbb_common. Downloaded repository code is never evaluated.
+`submodules` can map a recipe variable to a gitlink in the selected GitHub tag.
+Downloaded repository code is never evaluated.
 
 For upstreams that rebuild a release, declare a numeric `revision` template and
 its `revision_variable`. With unchanged pkgver, only an increasing revision can
@@ -235,7 +235,6 @@ in `origin` and has no effect on release selection.
 | `python-mediapipe` | github | [google-ai-edge/mediapipe](https://github.com/google-ai-edge/mediapipe) |
 | `python-sounddevice` | pypi | [sounddevice](https://pypi.org/project/sounddevice/) |
 | `python-terminaltexteffects` | pypi | [terminaltexteffects](https://pypi.org/project/terminaltexteffects/) |
-| `rustdesk` | github | [rustdesk/rustdesk](https://github.com/rustdesk/rustdesk) |
 | `spotify` | debian | [https://repository.spotify.com/dists/testing/non-free/binary-amd64/Packages](https://repository.spotify.com/dists/testing/non-free/binary-amd64/Packages) |
 | `sublime-text-4` | json | [https://www.sublimetext.com/updates/4/stable_update_check](https://www.sublimetext.com/updates/4/stable_update_check) |
 | `sunshine` | github | [LizardByte/Sunshine](https://github.com/LizardByte/Sunshine) |
@@ -289,7 +288,6 @@ These packages were already excluded from automatic AUR updates. The migration p
 - The current driver follows Arch's `nvidia-utils`. Its `.omarchy/upstream.sh` runs `bin/bump-nvidia` when Arch moves, which sets the release in `nvidia-utils`, `nvidia-open-dkms`, `lib32-nvidia-utils` and every `linux-omarchy` kernel's `_nvidiaver`, bumps the kernels' `pkgrel` so their `-nvidia-open` modules are rebuilt, and swaps the checksums of NVIDIA's three files. Their `"lockstep": "nvidia"` puts all of it in one PR, which `tests/nvidia-open-lockstep.sh` holds together and which builds every kernel before it merges. An ARM patch that no longer applies leaves the PR red for a maintainer. A maintainer can run `bin/bump-nvidia <version>` the same way.
 - Hardware-specific packages keep their declared architectures; this migration does not invent ARM binaries for x86-only upstreams.
 - iA Duospace was deleted upstream. Its four legacy font files retain their original immutable pin while the other families track the current repository.
-- RustDesk reads hbb_common from the release gitlink; its existing build-time dependency/toolchain checks remain in force.
 - Spotify uses HTTPS and retains its signed Release/Packages verification.
 - Source and build compatibility still need review when upstream code changes. Direct watches remove AUR recipe churn, not the need to maintain packaging.
 
