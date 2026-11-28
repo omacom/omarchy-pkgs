@@ -91,6 +91,7 @@ def build_test_list():
         ("fast-ring-check", ["./tests/fast-ring-check.sh"], {}),
         ("check-shadowed", ["./tests/check-shadowed.sh"], {}),
         ("workflow-helpers-sourced", ["python", "tests/workflow-helpers-sourced.py"], {}),
+        ("workflow-quoting", ["python", "tests/workflow-quoting.py"], {}),
         ("owe-package-restart", ["python", "tests/owe-package-restart.py"], {}),
         ("nvidia-open-lockstep", ["./tests/nvidia-open-lockstep.sh"], {}),
         ("ipu7-headers", ["bash", "tests/ipu7-headers.sh"], {}),
