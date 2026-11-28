@@ -1,6 +1,6 @@
 #!/bin/bash
 # Offline hook fixtures, also run by bin/sync-upstream self-test. Requires
-# GNU date, jq, and pacman's vercmp, like the repository's other self-tests.
+# GNU date, jq, python3, and pacman's vercmp, like the repository's other self-tests.
 set -euo pipefail
 hook="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/upstream.sh"
 fixture_dir=$(mktemp -d)
@@ -26,23 +26,57 @@ date() {
     command date "$@"
   fi
 }
+
+timeout() {
+  shift
+  "$@"
+}
+git() {
+  local arg
+  for arg in "$@"; do
+    if [[ "$arg" == "ls-remote" ]]; then
+      [[ "${FAIL_GIT:-}" != 1 ]] || { echo 'fixture git ls-remote failure' >&2; return 128; }
+      printf '%s\n' "$TAGS_OUTPUT"
+      return 0
+    fi
+  done
+  command git "$@"
+}
+
 curl() {
-  local url="${!#}"
+  local out_file="" write_code=0 url=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -o) out_file="$2"; shift 2 ;;
+      -w) write_code=1; shift 2 ;;
+      --retry|--retry-max-time|--connect-timeout|--max-time) shift 2 ;;
+      -*) shift ;;
+      *) url="$1"; shift ;;
+    esac
+  done
+
   case "$url" in
-    'https://api.github.com/repos/trycua/cua/releases?per_page=100&page='*)
-      local page="${url##*=}"
-      [[ "$page" != "${FAIL_PAGE:-}" ]] || { echo 'fixture API failure' >&2; return 22; }
-      if [[ "${ENDLESS:-}" == 1 || "$page" == 1 ]]; then
-        if [[ "${LARGE_PAGE:-}" == 1 ]]; then
-          jq -c '.[0].body = ("x" * 131072)' <<<"$PAGE1"
-        else
-          printf '%s\n' "$PAGE1"
-        fi
-      elif [[ "$page" == 2 ]]; then
-        printf '%s\n' "$PAGE2"
+    'https://api.github.com/repos/trycua/cua/releases/tags/'*)
+      local tag="${url##*/}"
+      [[ "$tag" != "${FAIL_TAG:-}" ]] || { echo 'fixture API failure' >&2; return 22; }
+      local entry code body
+      entry=$(jq -c --arg t "$tag" '.[$t] // empty' <<<"$RELEASES_BY_TAG")
+      if [[ -z "$entry" ]]; then
+        code="404"
+        body='{"message":"Not Found"}'
+      elif [[ "$(jq -r 'type' <<<"$entry")" == "object" ]] && jq -e 'has("__http_code")' <<<"$entry" >/dev/null; then
+        code=$(jq -r '.__http_code' <<<"$entry")
+        body=$(jq -r '.__body // "{}"' <<<"$entry")
       else
-        echo '[]'
+        code="200"
+        body="$entry"
       fi
+      if [[ -n "$out_file" ]]; then
+        printf '%s\n' "$body" > "$out_file"
+      else
+        printf '%s\n' "$body"
+      fi
+      (( write_code == 1 )) && printf '%s' "$code"
       ;;
     'https://github.com/trycua/cua/releases/download/'*'/checksums.txt')
       [[ "${FAIL_CHECKSUMS:-}" != 1 ]] || { echo 'fixture download failure' >&2; return 22; }
@@ -51,16 +85,21 @@ curl() {
     *) echo "unexpected fixture URL: $url" >&2; return 1 ;;
   esac
 }
-export -f curl date
-export PAGE1 PAGE2 CHECKSUMS FAIL_PAGE FAIL_CHECKSUMS ENDLESS LARGE_PAGE
+export -f curl date git timeout
+export TAGS_OUTPUT RELEASES_BY_TAG CHECKSUMS FAIL_GIT FAIL_TAG FAIL_CHECKSUMS
 export MIN_RELEASE_AGE_SECONDS=86400
 export BYPASS_MIN_RELEASE_AGE=''
-FAIL_PAGE='' FAIL_CHECKSUMS='' ENDLESS='' LARGE_PAGE=''
-PAGE2='[]'
+FAIL_GIT='' FAIL_TAG='' FAIL_CHECKSUMS=''
 
 release() {
   jq -cn --arg tag "$1" --arg published "${2:-2026-09-06T16:51:50Z}" \
     '{tag_name: $tag, published_at: $published, draft: false, prerelease: true}'
+}
+tags_from() {
+  local t
+  for t in "$@"; do
+    printf 'deadbeef\trefs/tags/%s\n' "$t"
+  done
 }
 run_hook() {
   status=0
@@ -71,84 +110,74 @@ expect_failure() {
   check "$1 fails" yes "$([[ "$status" != 0 ]] && echo yes || echo no)"
   check "$1 reports the reason" yes "$([[ "$out" == *"$2"* ]] && echo yes || echo no)"
 }
+
 sum_x=$(printf 'a%.0s' {1..64})
 sum_a=$(printf 'b%.0s' {1..64})
 CHECKSUMS=$(printf '%s\n' \
   "$sum_x  cua-driver-rs-0.24.0-linux-x86_64.tar.gz" \
   "$sum_a  cua-driver-rs-0.24.0-linux-arm64.tar.gz")
-foreign_page=$(jq -cn '[range(100) | {tag_name: "fleet-v9.0.0", draft: false}]')
 stable=$(release cua-driver-rs-v0.24.0 2026-09-07T16:51:50Z)
 
 echo 'Cua Driver release hook:'
-PAGE1="$foreign_page"
-PAGE2="[$stable]"
+# Highest numeric version wins regardless of tag listing order (0.24.0 > 0.9.9 > 0.23.3).
+TAGS_OUTPUT=$(tags_from cua-driver-rs-v0.9.9 cua-driver-rs-v0.23.3 cua-driver-rs-v0.24.0 fleet-v9.0.0)
+RELEASES_BY_TAG=$(jq -cn --argjson s "$stable" '{"cua-driver-rs-v0.24.0": $s}')
 run_hook
-check 'component found beyond the first 100 releases' 0 "$status"
+check 'tag enumeration selects highest stable version' 0 "$status"
 check 'stable-shaped prerelease accepted at exactly 24h' 0.24.0 "$(jq -r '.pkgver' <<<"$out")"
 check 'x86_64 checksum' "$sum_x" "$(jq -r '.sha256sums.x86_64[0]' <<<"$out")"
 check 'ARM checksum' "$sum_a" "$(jq -r '.sha256sums.aarch64[0]' <<<"$out")"
 check 'publication date preserved' 2026-09-07T16:51:50Z "$(jq -r '.published_at' <<<"$out")"
 
-LARGE_PAGE=1
-run_hook
-check 'release page larger than the argument limit succeeds' 0 "$status"
-check 'large release page preserves version selection' 0.24.0 "$(jq -r '.pkgver' <<<"$out")"
-LARGE_PAGE=''
-
-# An eligible lower version on page one must not terminate the scan.
-rebuilt=$(release cua-driver-rs-v0.23.3 2026-09-07T16:51:50Z)
-PAGE1=$(jq -c --argjson rebuilt "$rebuilt" '.[0] = $rebuilt' <<<"$foreign_page")
-PAGE2="[$(release cua-driver-rs-v0.24.0)]"
-run_hook
-check 'older page outranks recently rebuilt lower version' 0.24.0 "$(jq -r '.pkgver' <<<"$out")"
-
+# Draft, unpublished tag (404), nightly tags, and young release are skipped in favor of 0.24.0.
 draft=$(release cua-driver-rs-v99.0.0 | jq -c '.draft = true')
-nightly=$(release nightly-cua-driver-rs-v99.0.0)
-suffix=$(release cua-driver-rs-v99.0.0-nightly.1)
 young=$(release cua-driver-rs-v0.25.0 2026-09-07T16:51:51Z)
-PAGE1="[$draft,$nightly,$suffix,$young,$stable,$rebuilt]"
-PAGE2='[]'
+TAGS_OUTPUT=$(tags_from cua-driver-rs-v99.0.0 cua-driver-rs-v98.0.0 nightly-cua-driver-rs-v99.0.0 cua-driver-rs-v99.0.0-nightly.1 cua-driver-rs-v0.25.0 cua-driver-rs-v0.24.0 cua-driver-rs-v0.23.3)
+RELEASES_BY_TAG=$(jq -cn --argjson d "$draft" --argjson y "$young" --argjson s "$stable" \
+  '{"cua-driver-rs-v99.0.0": $d, "cua-driver-rs-v0.25.0": $y, "cua-driver-rs-v0.24.0": $s}')
 run_hook
-check 'drafts/nightlies rejected and young release quarantined' 0.24.0 "$(jq -r '.pkgver' <<<"$out")"
+check 'drafts/404s/nightlies rejected and young release quarantined' 0.24.0 "$(jq -r '.pkgver' <<<"$out")"
 
-PAGE1="[$young]"
+TAGS_OUTPUT=$(tags_from cua-driver-rs-v0.25.0 cua-driver-rs-v0.23.2)
+RELEASES_BY_TAG=$(jq -cn --argjson y "$young" '{"cua-driver-rs-v0.25.0": $y}')
 run_hook
-check 'all candidates too young is a successful skip' 0 "$status"
+check 'all newer candidates too young is a successful skip' 0 "$status"
 check 'all young candidates emit empty JSON' '{}' "${out##*$'\n'}"
 check 'quarantine reason is reported' yes "$([[ "$out" == *release-age* ]] && echo yes || echo no)"
 
-PAGE1="[$(release cua-driver-rs-v0.23.2)]"
+TAGS_OUTPUT=$(tags_from cua-driver-rs-v0.23.2)
+RELEASES_BY_TAG='{}'
 run_hook
 check 'current package version is unchanged' '{}' "$out"
 
-PAGE1="[$draft,$nightly,$suffix]"
+TAGS_OUTPUT=$(tags_from cua-driver-rs-v99.0.0 nightly-cua-driver-rs-v99.0.0 cua-driver-rs-v99.0.0-nightly.1)
+RELEASES_BY_TAG=$(jq -cn --argjson d "$draft" '{"cua-driver-rs-v99.0.0": $d}')
 expect_failure 'no stable component candidate' 'no stable cua-driver-rs-v'
-PAGE1='[]'
-expect_failure 'empty feed' 'no stable cua-driver-rs-v'
-PAGE1="[$(release cua-driver-rs-v0.24.0 yesterday)]"
+
+TAGS_OUTPUT=''
+RELEASES_BY_TAG='{}'
+expect_failure 'empty tag list' 'no stable cua-driver-rs-v'
+
+TAGS_OUTPUT=$(tags_from cua-driver-rs-v0.24.0)
+RELEASES_BY_TAG=$(jq -cn --argjson r "$(release cua-driver-rs-v0.24.0 yesterday)" '{"cua-driver-rs-v0.24.0": $r}')
 expect_failure 'relative publication date' 'invalid published_at'
-PAGE1="[$(release cua-driver-rs-v0.24.0 2026-02-30T00:00:00Z)]"
+RELEASES_BY_TAG=$(jq -cn --argjson r "$(release cua-driver-rs-v0.24.0 2026-02-30T00:00:00Z)" '{"cua-driver-rs-v0.24.0": $r}')
 expect_failure 'impossible publication date' 'invalid published_at'
-PAGE1='[{"tag_name":"cua-driver-rs-v0.24.0","draft":false}]'
+RELEASES_BY_TAG='{"cua-driver-rs-v0.24.0":{"tag_name":"cua-driver-rs-v0.24.0","draft":false}}'
 expect_failure 'missing publication date' 'invalid published_at'
+RELEASES_BY_TAG='{"cua-driver-rs-v0.24.0":{"__http_code":"403","__body":"{\"message\":\"rate limit\"}"}}'
+expect_failure 'HTTP 403 error fails closed' 'HTTP 403'
+RELEASES_BY_TAG='{"cua-driver-rs-v0.24.0":{"__http_code":"200","__body":"not json"}}'
+expect_failure 'malformed JSON fails closed' 'invalid release JSON'
 
-PAGE1="$foreign_page"
-PAGE2='{"message":"API rate limit exceeded"}'
-expect_failure 'API error object on later page' 'invalid release feed'
-PAGE2='not json'
-expect_failure 'malformed JSON on later page' 'invalid release feed'
-PAGE2='[42]'
-expect_failure 'malformed release entry' 'Cannot index'
-PAGE2="[$stable]"
-FAIL_PAGE=2
-expect_failure 'network failure after first page' 'fixture API failure'
-FAIL_PAGE=''
-ENDLESS=1
-expect_failure 'feed exceeds pagination bound' 'refusing incomplete selection'
-ENDLESS=''
+FAIL_GIT=1
+expect_failure 'git ls-remote failure' 'fixture git ls-remote failure'
+FAIL_GIT=''
+FAIL_TAG=cua-driver-rs-v0.24.0
+expect_failure 'network failure on tag lookup' 'fixture API failure'
+FAIL_TAG=''
 
-PAGE1="[$stable]"
-PAGE2='[]'
+RELEASES_BY_TAG=$(jq -cn --argjson s "$stable" '{"cua-driver-rs-v0.24.0": $s}')
 FAIL_CHECKSUMS=1
 expect_failure 'checksum download failure' 'fixture download failure'
 FAIL_CHECKSUMS=''

@@ -388,18 +388,26 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
-  # A PR on this lane's prefix that the run did not refresh, and that
-  # conflicts with master, is stale: master moved its packages on without it.
-  # Close it rather than leave a red PR behind. Not being refreshed is not
-  # enough on its own, since a feed that failed this run (one of dozens timing
-  # out is routine) leaves a still-valid PR unrefreshed too. The lane's old
-  # batch PR, on the bare prefix, is retired outright.
+  # A PR on this lane's prefix that the run did not refresh is stale if it
+  # conflicts with master or if merging it into master would be a no-op (the
+  # exact same edits already landed on master). Close it rather than leave an
+  # orphaned or red PR behind. Not being refreshed is not enough on its own,
+  # since a feed that failed this run (one of dozens timing out is routine)
+  # leaves a still-valid PR unrefreshed too. The lane's old batch PR, on the
+  # bare prefix, is retired outright.
   close-superseded:
     runs-on: ubuntu-latest
     environment:
       name: bot-sync
       deployment: false
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 0
+          persist-credentials: false
+
       - name: Get the sync App's token
         id: app
         uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
@@ -414,13 +422,49 @@ jobs:
           GH_TOKEN: ${{ steps.app.outputs.token }}
           GROUPS_JSON: ${{ inputs.groups }}
           PREFIX: ${{ inputs.prefix }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
-          gh pr list -R "$GITHUB_REPOSITORY" --state open --limit 500 --json number,headRefName,mergeable \
-            --jq '.[] | select(.headRefName == env.PREFIX or (.headRefName | startswith(env.PREFIX + "-"))) | "\(.number) \(.headRefName) \(.mergeable)"' |
-          while read -r number branch mergeable; do
+          owner=${GITHUB_REPOSITORY%%/*}
+          name=${GITHUB_REPOSITORY#*/}
+          master_tree=$(git rev-parse HEAD^{tree})
+          # Paginate through every open PR: gh pr list truncates at 500
+          # once the repository exceeds 500 open PRs.
+          gh api graphql --paginate -f owner="$owner" -f name="$name" -f query='
+            query($owner: String!, $name: String!, $endCursor: String) {
+              repository(owner: $owner, name: $name) {
+                pullRequests(states: OPEN, first: 100, after: $endCursor) {
+                  nodes { number headRefName baseRefName headRefOid mergeable }
+                  pageInfo { hasNextPage endCursor }
+                }
+              }
+            }' --jq '.data.repository.pullRequests.nodes[] | select(.baseRefName == env.DEFAULT_BRANCH and (.headRefName == env.PREFIX or (.headRefName | startswith(env.PREFIX + "-")))) | "\(.number) \(.headRefName) \(.headRefOid) \(.mergeable)"' |
+          while read -r number branch head_oid mergeable; do
             jq -e --arg branch "$branch" 'any(.[]; .branch == $branch)' <<<"$GROUPS_JSON" >/dev/null && continue
-            [[ $branch == "$PREFIX" || $mergeable == CONFLICTING ]] || continue
-            echo "closing #$number ($branch): superseded"
+            reason=""
+            if [[ $branch == "$PREFIX" ]]; then
+              reason="retired batch branch"
+            elif [[ $mergeable == CONFLICTING ]]; then
+              reason="conflicts with $DEFAULT_BRANCH"
+            elif git fetch -q --no-tags origin "$head_oid"; then
+              rc=0
+              tree=$(git merge-tree --write-tree HEAD FETCH_HEAD 2>/dev/null) || rc=$?
+              if (( rc == 0 )); then
+                [[ "${tree%%$'\n'*}" == "$master_tree" ]] || continue
+                reason="already landed on $DEFAULT_BRANCH"
+              elif (( rc == 1 )); then
+                reason="conflicts with $DEFAULT_BRANCH"
+              else
+                echo "::warning::git merge-tree failed for #$number ($branch) with exit $rc; skipping"
+                continue
+              fi
+            else
+              continue
+            fi
+            # Re-verify PR state, base, and head SHA immediately before closing
+            # so a concurrent push or retarget is never closed or deleted.
+            live=$(gh pr view "$number" -R "$GITHUB_REPOSITORY" --json state,baseRefName,headRefOid               --jq '"\(.state) \(.baseRefName) \(.headRefOid)"' 2>/dev/null) || continue
+            [[ "$live" == "OPEN $DEFAULT_BRANCH $head_oid" ]] || continue
+            echo "closing #$number ($branch): superseded ($reason)"
             gh pr close "$number" -R "$GITHUB_REPOSITORY" --delete-branch \
               --comment "Superseded: master has moved these packages on, or per-package PRs carry them now."
           done

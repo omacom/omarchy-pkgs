@@ -416,6 +416,11 @@ test('every bot lane opens its PRs per package through package-prs.yml', () => {
   assert.doesNotMatch(describe, /secrets\.|create-github-app-token|environment:/);
   assert.doesNotMatch(job('pr'), /sync-pr-body\.py/);
   assert.doesNotMatch(job('close-superseded'), /sync-pr-body\.py/);
+  // close-superseded paginates all open PRs (no 500-PR cap) and detects
+  // non-conflicting PRs whose edits already landed on master via merge-tree.
+  assert.doesNotMatch(job('close-superseded'), /--limit 500/);
+  assert.match(job('close-superseded'), /gh api graphql --paginate/);
+  assert.match(job('close-superseded'), /git merge-tree --write-tree HEAD FETCH_HEAD/);
   assert.match(job('pr'), /^    needs: describe\n    if: \$\{\{ !cancelled\(\) && inputs\.groups != '\[\]' \}\}\n/);
   const choose = step("Choose this PR's description");
   assert.match(choose, /printf '%s\\n' "\$FALLBACK" > "\$RUNNER_TEMP\/pr-body\.md"/);
