@@ -1,0 +1,174 @@
+backend/drm: copy only damage in multi-GPU blits
+
+A GPU that copies another's buffers into its own, to scan them out, copied
+the whole buffer every frame. Track with a damage ring what each swapchain
+buffer lacks of the latest copy, and copy only that: the frame's damage,
+when the buffer covers the output pixel for pixel, and what the swapchain
+buffer missed since it was last copied into.
+
+The frame's damage is recorded before anything can fail, so a copy that
+fails leaves it to the next one. A render pass that fails leaves the
+destination unknown, so it damages the whole buffer.
+
+diff --git a/backend/drm/drm.c b/backend/drm/drm.c
+index bd29872f..ff169477 100644
+--- a/backend/drm/drm.c
++++ b/backend/drm/drm.c
+@@ -730,6 +730,25 @@ static void drm_connector_state_finish(struct wlr_drm_connector_state *state) {
+ 	wlr_drm_syncobj_timeline_unref(state->wait_timeline);
+ }
+ 
++// The frame's damage is in buffer coordinates when the buffer covers the
++// output pixel for pixel
++static const pixman_region32_t *get_buffer_damage(const struct wlr_output_state *state) {
++	if (!(state->committed & WLR_OUTPUT_STATE_DAMAGE)) {
++		return NULL;
++	}
++
++	struct wlr_fbox src_box;
++	struct wlr_box dst_box;
++	output_state_get_buffer_src_box(state, &src_box);
++	output_state_get_buffer_dst_box(state, &dst_box);
++	int width = state->buffer->width, height = state->buffer->height;
++	if (!wlr_fbox_equal(&src_box, &(struct wlr_fbox){ .width = width, .height = height }) ||
++			!wlr_box_equal(&dst_box, &(struct wlr_box){ .width = width, .height = height })) {
++		return NULL;
++	}
++	return &state->damage;
++}
++
+ static bool drm_connector_state_update_primary_fb(struct wlr_drm_connector *conn,
+ 		struct wlr_drm_connector_state *state) {
+ 	struct wlr_drm_backend *drm = conn->backend;
+@@ -767,7 +786,7 @@ static bool drm_connector_state_update_primary_fb(struct wlr_drm_connector *conn
+ 		}
+ 
+ 		local_buf = drm_surface_blit(&plane->mgpu_surf, source_buf,
+-			wait_timeline, wait_point);
++			get_buffer_damage(state->base), wait_timeline, wait_point);
+ 		if (local_buf == NULL) {
+ 			return false;
+ 		}
+@@ -1173,7 +1192,7 @@ static bool drm_connector_set_cursor(struct wlr_output *output,
+ 				return false;
+ 			}
+ 
+-			local_buf = drm_surface_blit(&plane->mgpu_surf, buffer, NULL, 0);
++			local_buf = drm_surface_blit(&plane->mgpu_surf, buffer, NULL, NULL, 0);
+ 			if (local_buf == NULL) {
+ 				return false;
+ 			}
+diff --git a/backend/drm/renderer.c b/backend/drm/renderer.c
+index af9908e9..10771d19 100644
+--- a/backend/drm/renderer.c
++++ b/backend/drm/renderer.c
+@@ -52,6 +52,7 @@ void finish_drm_surface(struct wlr_drm_surface *surf) {
+ 
+ 	wlr_drm_syncobj_timeline_unref(surf->timeline);
+ 	wlr_swapchain_destroy(surf->swapchain);
++	wlr_damage_ring_finish(&surf->damage_ring);
+ 
+ 	*surf = (struct wlr_drm_surface){0};
+ }
+@@ -83,16 +84,24 @@ bool init_drm_surface(struct wlr_drm_surface *surf,
+ 		}
+ 	}
+ 
++	wlr_damage_ring_init(&surf->damage_ring);
+ 	surf->renderer = renderer;
+ 
+ 	return true;
+ }
+ 
+ struct wlr_buffer *drm_surface_blit(struct wlr_drm_surface *surf,
+-		struct wlr_buffer *buffer,
++		struct wlr_buffer *buffer, const pixman_region32_t *damage,
+ 		struct wlr_drm_syncobj_timeline *wait_timeline, uint64_t wait_point) {
+ 	struct wlr_renderer *renderer = surf->renderer->wlr_rend;
+ 
++	// Recorded before anything can fail, so a failed copy leaves it to the next
++	if (damage != NULL) {
++		wlr_damage_ring_add(&surf->damage_ring, damage);
++	} else {
++		wlr_damage_ring_add_whole(&surf->damage_ring);
++	}
++
+ 	if (surf->swapchain->width != buffer->width ||
+ 			surf->swapchain->height != buffer->height) {
+ 		wlr_log(WLR_ERROR, "Surface size doesn't match buffer size");
+@@ -111,6 +120,10 @@ struct wlr_buffer *drm_surface_blit(struct wlr_drm_surface *surf,
+ 		goto error_tex;
+ 	}
+ 
++	pixman_region32_t copy;
++	pixman_region32_init(&copy);
++	wlr_damage_ring_rotate_buffer(&surf->damage_ring, dst, &copy);
++
+ 	surf->point++;
+ 	const struct wlr_buffer_pass_options pass_options = {
+ 		.signal_timeline = surf->timeline,
+@@ -124,6 +137,7 @@ struct wlr_buffer *drm_surface_blit(struct wlr_drm_surface *surf,
+ 
+ 	wlr_render_pass_add_texture(pass, &(struct wlr_render_texture_options){
+ 		.texture = tex,
++		.clip = &copy,
+ 		.blend_mode = WLR_RENDER_BLEND_MODE_NONE,
+ 		.wait_timeline = wait_timeline,
+ 		.wait_point = wait_point,
+@@ -133,11 +147,15 @@ struct wlr_buffer *drm_surface_blit(struct wlr_drm_surface *surf,
+ 		goto error_dst;
+ 	}
+ 
++	pixman_region32_fini(&copy);
+ 	wlr_texture_destroy(tex);
+ 
+ 	return dst;
+ 
+ error_dst:
++	// The swapchain buffer may not hold what the damage ring now says it does
++	wlr_damage_ring_add_whole(&surf->damage_ring);
++	pixman_region32_fini(&copy);
+ 	wlr_buffer_unlock(dst);
+ error_tex:
+ 	wlr_texture_destroy(tex);
+diff --git a/include/backend/drm/renderer.h b/include/backend/drm/renderer.h
+index 2cf98fdb..2570cbd2 100644
+--- a/include/backend/drm/renderer.h
++++ b/include/backend/drm/renderer.h
+@@ -3,8 +3,10 @@
+ 
+ #include <stdbool.h>
+ #include <stdint.h>
++#include <pixman.h>
+ #include <wlr/backend.h>
+ #include <wlr/render/wlr_renderer.h>
++#include <wlr/types/wlr_damage_ring.h>
+ #include <wlr/util/addon.h>
+ 
+ struct wlr_drm_backend;
+@@ -23,6 +25,9 @@ struct wlr_drm_surface {
+ 
+ 	struct wlr_drm_syncobj_timeline *timeline;
+ 	uint64_t point;
++
++	// What each swapchain buffer lacks of the latest copy
++	struct wlr_damage_ring damage_ring;
+ };
+ 
+ bool init_drm_renderer(struct wlr_drm_backend *drm,
+@@ -34,8 +39,14 @@ bool init_drm_surface(struct wlr_drm_surface *surf,
+ 	const struct wlr_drm_format *drm_format);
+ void finish_drm_surface(struct wlr_drm_surface *surf);
+ 
++/**
++ * Copies a buffer into the surface's next swapchain buffer. Only damage, the
++ * region the buffer changed in since the previous copy, and what that
++ * swapchain buffer missed before, is copied; a NULL damage is the whole
++ * buffer.
++ */
+ struct wlr_buffer *drm_surface_blit(struct wlr_drm_surface *surf,
+-	struct wlr_buffer *buffer,
++	struct wlr_buffer *buffer, const pixman_region32_t *damage,
+ 	struct wlr_drm_syncobj_timeline *wait_timeline, uint64_t wait_point);
+ 
+ bool drm_plane_pick_render_format(struct wlr_drm_plane *plane,

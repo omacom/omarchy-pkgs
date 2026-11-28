@@ -29,15 +29,18 @@ version `path`), `regex` (text URL), `redirect` (final HTTPS download URL), or
 `archive` (inspect archive metadata without extracting/executing code).
 
 Tag, text, redirect and archive watches use an explicit `pattern` with a named
-`version` capture. Tag patterns match the entire tag. `version` optionally formats
-those captures into an Arch pkgver; e.g. Sublime uses `4.{version}`. JSON feeds can
-expose additional capture values through `fields`, a name-to-JSON-path map.
+`version` capture; `debian` and `npm` watches also accept an optional `pattern`
+to normalize vendor versions (such as npm prereleases). Tag and `npm` patterns
+match the entire string. `npm` watches default to `dist_tag: "latest"`. `version`
+optionally formats those captures into an Arch pkgver; e.g. Sublime uses
+`4.{version}`. JSON feeds can expose additional capture values through `fields`,
+a name-to-JSON-path map.
 
 `variables` maps recipe scalars such as `_commit` or `_build` to capture templates.
 Only explicitly declared underscore-prefixed variables can change. GitHub
 `{commit}` resolves the selected tag, not a moving target_commitish branch.
-`submodules` can map a recipe variable to a gitlink in the selected GitHub tag;
-RustDesk uses this for hbb_common. Downloaded repository code is never evaluated.
+`submodules` can map a recipe variable to a gitlink in the selected GitHub tag.
+Downloaded repository code is never evaluated.
 
 For upstreams that rebuild a release, declare a numeric `revision` template and
 its `revision_variable`. With unchanged pkgver, only an increasing revision can
@@ -46,7 +49,10 @@ Cursor CLI uses `sequence` to preserve its date/counter/hash version convention
 when the vendor publishes a second hash on the same day. A new pkgver resets
 pkgrel to 1, but the complete epoch:pkgver-pkgrel must still increase.
 
-GitHub releases exclude drafts and prereleases unless `allow_prerelease` is true.
+GitHub releases always exclude drafts, exclude prereleases unless
+`allow_prerelease` is true, and paginate up to five pages of 100 entries only
+when page 1 yields no eligible
+match (keeping normal repositories at one API call while protecting monorepos).
 Existing `min_release_age` policies apply: a feed without a verifiable publication
 time cannot bypass a configured hold.
 
@@ -79,22 +85,29 @@ selects a commit from a merged side branch. This uses Git's committer date, not
 the time a commit was pushed, measured from when the run cloned the branch so
 packages pinned from it agree. `BYPASS_MIN_RELEASE_AGE=1` bypasses the hold.
 
-Packages marked `"auto_merge": true` use the hourly group in
-`sync-upstream.yml`; other packages are checked every 6 hours. Both groups
-open their PRs through `package-prs.yml` and auto-merge them as soon as the
-build checks pass. Hourly packages keep their PRs on
-`auto/track-branches-<package>`; the others use `auto/sync-upstream-<package>`.
-Packages that pin the same branch share a PR, so a package whose build fails
-holds back only itself and its branch companions. The hourly group works with
-every provider, not only branch watches, so it also carries release feeds worth
+`sync-upstream.yml` runs three cadence lanes:
+
+- `five-minute`: packages marked `"auto_merge": true` and `"sync_cadence": "five-minute"`
+  (`omarchy-dev` and `omarchy-settings-dev`), using `auto/track-branches-<package>`.
+- `hourly`: other packages marked `"auto_merge": true`, using
+  `auto/track-branches-<package>`.
+- `six-hourly`: all other tracked packages, using `auto/sync-upstream-<package>`.
+
+All three lanes open their PRs through `package-prs.yml` and auto-merge them as
+soon as the build checks pass (unless marked `"review": true`). Packages that
+pin the same branch, or declare the same `"lockstep"` group name (such as
+`"lockstep": "nvidia"`), share a PR so a package whose build fails holds back
+only itself and its lockstep companions. The hourly lane works with every
+provider, not only branch watches, so it also carries release feeds worth
 checking frequently: the browsers, large vendors' apps, Omacom's own projects,
-and vendor binaries that hold fresh releases with `min_release_age`. `bin/sync-upstream --lane
-reviewed|auto-merge|all` selects a lane; the shared workflow passes the lane
-for the dispatched `cadence`. These historical names select cadence, not
-whether the PR auto-merges. Packages that pin the same branch move in lockstep:
-if one of them fails to update, the run restores the others and reports the group as failed. A
-targeted sync includes the other packages watching that branch, so requesting
-only `omarchy-dev` also updates `omarchy-settings-dev`.
+and vendor binaries that hold fresh releases with `min_release_age`.
+`bin/sync-upstream --lane reviewed|auto-merge|five-minute|all` selects a lane;
+the shared workflow passes the lane for the dispatched `cadence`. These
+historical names select cadence, not whether the PR auto-merges. Packages that
+pin the same branch move in lockstep: if one of them fails to update, the run
+restores the others and reports the group as failed. A targeted sync includes
+the other packages watching that branch, so requesting only `omarchy-dev` also
+updates `omarchy-settings-dev`.
 
 ### Reviewed updates
 
@@ -108,12 +121,14 @@ newer release turns a ready PR back into a draft and takes auto-merge off
 before it pushes the update (`hold-reviewed-pr.sh`), so the new release gets
 its own review.
 `review` cannot be combined with `auto_merge`, and needs an upstream watch,
-provider or hook.
+provider or hook. Outside the Asahi-derived table below, `facetimehd-dkms`,
+`intel-media-driver`, and `libva-nvidia-driver` also set `"review": true`.
 
 ### Enable unattended branch updates
 
-The builder controller box dispatches both groups on systemd timers
-(`ci/dispatch.sh`), because GitHub's own schedule ran them hours late.
+The builder controller box dispatches all three cadence groups on systemd timers
+(`ci/dispatch.sh`, including `omarchy-dispatch-sync-five-minute.timer`), because
+GitHub's own schedule ran them hours late.
 The omarchy-pkgs-sync GitHub App pushes the branches and opens the PRs, so
 they build without an approval hold. The omarchy-pkgs-merge GitHub App arms
 auto-merge, so the merges start publishing. The built-in Actions `GITHUB_TOKEN`
@@ -149,9 +164,13 @@ A matching GitHub release asset SHA256 digest avoids downloading large assets.
 Missing architecture artifacts or malformed metadata fail the package atomically.
 Every declared architecture must read back the same release and checksum values.
 
-Archive watches use `member` to select a text member, or `filenames: true` to read
-versions from archive member names. Debian archives are read through their control
-metadata. `unescape_json` handles JSON strings embedded in a vendor's HTML page.
+Archive watches use `member` to select a text member in ZIP or tar archives, or
+`filenames: true` (ZIP only) to read versions from archive member names. Debian `.deb` archives ignore `member` and read their `control` metadata; when
+the feed URL ends in `.deb`, discovery probes the first 64 KiB via HTTP Range
+(`206 Partial Content`) and falls back to a full download if unsupported or
+incomplete, while an actual update still downloads the full archive and
+re-verifies its version before writing checksums. `unescape_json` handles JSON strings embedded
+in a vendor's HTML page.
 
 `source_variables` sets a recipe variable from a file inside one of the new
 release's own sources, for facts a vendor publishes only in the artifact:
@@ -195,65 +214,80 @@ container.
 The scheduled workflow continues reviewing completed updates if another package
 fails. The failing recipe stays unchanged and the run still reports failure.
 
-## Migrated package watches
+## Tracked upstream watches
 
-68 active AUR packages now use direct watches. The nine previously disabled
-packages retain manual maintenance holds. Historical AUR provenance is recorded
-in `origin` and has no effect on release selection.
+Across `pkgbuilds/`, **206** active packages track upstream directly (**160** via
+`upstream.watch`, **35** via legacy top-level `upstream`, and **11** via
+`.omarchy/upstream.sh`). Each package's `.omarchy/package.json` is the source of
+truth for the full inventory; the tables below record the **50** active `upstream.watch`
+recipes carrying historical `origin.aur` provenance (a 51st `origin.aur`
+recipe, `grok-bot`, uses an `.omarchy/upstream.sh` hook), the **9**
+Asahi-derived reviewed
+watches, and all intentional `"sync": false` holds. Historical AUR provenance in
+`origin` has no effect on release selection.
 
 | Package | Provider | Upstream |
 |---|---|---|
 | `1password-beta` | debian | [https://downloads.1password.com/linux/debian/amd64/dists/beta/main/binary-amd64/Packages](https://downloads.1password.com/linux/debian/amd64/dists/beta/main/binary-amd64/Packages) |
-| `1password-cli` | json | [https://app-updates.agilebits.com/check/1/0/CLI2/en/0](https://app-updates.agilebits.com/check/1/0/CLI2/en/0) |
-| `aether` | github | [omacom/aether](https://github.com/omacom/aether) |
-| `basecamp-cli` | github | [basecamp/basecamp-cli](https://github.com/basecamp/basecamp-cli) |
-| `claude-code` | regex | [https://downloads.claude.ai/claude-code-releases/latest](https://downloads.claude.ai/claude-code-releases/latest) |
-| `cliamp` | github | [bjarneo/cliamp](https://github.com/bjarneo/cliamp) |
-| `crush-bin` | github | [charmbracelet/crush](https://github.com/charmbracelet/crush) |
-| `cursor-bin` | json | [https://www.cursor.com/api/download?platform=linux-x64&releaseTrack=stable](https://www.cursor.com/api/download?platform=linux-x64&releaseTrack=stable) |
-| `cursor-cli` | regex | [https://cursor.com/install](https://cursor.com/install) |
+| `1password-cli` | json (auto-merge) | [https://app-updates.agilebits.com/check/1/0/CLI2/en/0](https://app-updates.agilebits.com/check/1/0/CLI2/en/0) |
+| `aether` | github (auto-merge) | [omacom/aether](https://github.com/omacom/aether) |
+| `amp-desktop-bin` | debian (auto-merge) | [https://static.ampcode.com/linux/dists/stable/main/binary-amd64/Packages](https://static.ampcode.com/linux/dists/stable/main/binary-amd64/Packages) |
+| `bambustudio-bin` | regex | [bambulab/BambuStudio](https://api.github.com/repos/bambulab/BambuStudio/releases/latest) |
+| `brave-bin` | debian (auto-merge) | [https://brave-browser-apt-release.s3.brave.com/dists/stable/main/binary-amd64/Packages](https://brave-browser-apt-release.s3.brave.com/dists/stable/main/binary-amd64/Packages) |
+| `brave-origin-bin` | debian (auto-merge) | [https://brave-browser-apt-release.s3.brave.com/dists/stable/main/binary-amd64/Packages](https://brave-browser-apt-release.s3.brave.com/dists/stable/main/binary-amd64/Packages) |
+| `cliamp` | github (auto-merge) | [bjarneo/cliamp](https://github.com/bjarneo/cliamp) |
+| `cursor-bin` | json (auto-merge) | [https://www.cursor.com/api/download?platform=linux-x64&releaseTrack=stable](https://www.cursor.com/api/download?platform=linux-x64&releaseTrack=stable) |
 | `dbxcli-bin` | github | [dropbox/dbxcli](https://github.com/dropbox/dbxcli) |
-| `dropbox` | redirect | [https://www.dropbox.com/download?plat=lnx.x86_64](https://www.dropbox.com/download?plat=lnx.x86_64) |
+| `dotnet-core-bin` | json | [https://builds.dotnet.microsoft.com/dotnet/release-metadata/10.0/releases.json](https://builds.dotnet.microsoft.com/dotnet/release-metadata/10.0/releases.json) |
+| `dropbox` | redirect (auto-merge) | [https://www.dropbox.com/download?plat=lnx.x86_64](https://www.dropbox.com/download?plat=lnx.x86_64) |
 | `dropbox-cli` | regex | [https://linux.dropbox.com/packages/](https://linux.dropbox.com/packages/) |
+| `facetimehd-dkms` | git_branch (review) | [https://github.com/patjak/facetimehd.git](https://github.com/patjak/facetimehd.git) `master` |
+| `google-chrome` | debian (auto-merge) | [https://dl.google.com/linux/chrome/deb/dists/stable/main/binary-amd64/Packages](https://dl.google.com/linux/chrome/deb/dists/stable/main/binary-amd64/Packages) |
+| `helium-browser-bin` | github (auto-merge) | [imputnet/helium-linux](https://github.com/imputnet/helium-linux) |
 | `heroic-games-launcher-bin` | github | [Heroic-Games-Launcher/HeroicGamesLauncher](https://github.com/Heroic-Games-Launcher/HeroicGamesLauncher) |
-| `lib32-nvidia-580xx-utils` | regex | [https://download.nvidia.com/XFree86/Linux-x86_64/](https://download.nvidia.com/XFree86/Linux-x86_64/) |
+| `hex-bin` | json (auto-merge) | [https://anoma.ly/release/hex/desktop/stable.json](https://anoma.ly/release/hex/desktop/stable.json) |
+| `lib32-nvidia-580xx-utils` | regex | NVIDIA GeForce Linux x64 lookup ([GeForce 10 Series](https://gfwsl.geforce.com/services_toolkit/services/com/nvidia/services/AjaxDriverService.php?func=DriverManualLookup&psid=101&pfid=816&osID=12&languageCode=1033&isWHQL=0&dch=0&sort1=0&numberOfResults=10)) |
 | `limine-mkinitcpio-hook` | git_tags | [https://gitlab.com/Zesko/limine-entry-tool.git](https://gitlab.com/Zesko/limine-entry-tool.git) |
 | `limine-snapper-sync` | git_tags | [https://gitlab.com/Zesko/limine-snapper-sync.git](https://gitlab.com/Zesko/limine-snapper-sync.git) |
-| `lmstudio-bin` | regex | [https://lmstudio.ai/download](https://lmstudio.ai/download) |
+| `lmstudio-bin` | regex (auto-merge) | [https://lmstudio.ai/download](https://lmstudio.ai/download) |
 | `localsend` | github | [localsend/localsend](https://github.com/localsend/localsend) |
-| `macbook12-spi-driver-dkms` | git_branch | [https://github.com/marc-git/macbook12-spi-driver.git](https://github.com/marc-git/macbook12-spi-driver.git) |
-| `omarchy-dev`, `omarchy-settings-dev` | git_branch (auto-merge) | [https://github.com/omacom/omarchy.git](https://github.com/omacom/omarchy.git) `quattro` |
-| `omasnap-git` | git_branch (auto-merge) | [https://github.com/omacom/omasnap.git](https://github.com/omacom/omasnap.git) `main` |
+| `macbook12-spi-driver-dkms` | git_branch | [https://github.com/marc-git/macbook12-spi-driver.git](https://github.com/marc-git/macbook12-spi-driver.git) `touchbar-driver-hid-driver` |
+| `microsoft-edge-stable-bin` | debian (auto-merge) | [https://packages.microsoft.com/repos/edge/dists/stable/main/binary-amd64/Packages](https://packages.microsoft.com/repos/edge/dists/stable/main/binary-amd64/Packages) |
 | `minecraft-launcher` | archive | [https://launcher.mojang.com/download/Minecraft.deb](https://launcher.mojang.com/download/Minecraft.deb) |
 | `nautilus-dropbox` | github | [dropbox/nautilus-dropbox](https://github.com/dropbox/nautilus-dropbox) |
 | `nordvpn-bin` | debian | [https://repo.nordvpn.com/deb/nordvpn/debian/dists/stable/main/binary-amd64/Packages](https://repo.nordvpn.com/deb/nordvpn/debian/dists/stable/main/binary-amd64/Packages) |
-| `nvidia-580xx-utils` | regex | [https://download.nvidia.com/XFree86/Linux-x86_64/](https://download.nvidia.com/XFree86/Linux-x86_64/) |
-| `nvidia-utils` (with `nvidia-open-dkms`, `lib32-nvidia-utils` and the `linux-omarchy` kernels) | hook | Arch's [nvidia-utils](https://archlinux.org/packages/extra/x86_64/nvidia-utils/) |
+| `nvidia-580xx-utils` | regex | NVIDIA GeForce Linux x64 lookup ([GeForce 10 Series](https://gfwsl.geforce.com/services_toolkit/services/com/nvidia/services/AjaxDriverService.php?func=DriverManualLookup&psid=101&pfid=816&osID=12&languageCode=1033&isWHQL=0&dch=0&sort1=0&numberOfResults=10)) |
 | `omarchy-emacs` | git_tags | [https://github.com/scottjones/omarchy-emacs.git](https://github.com/scottjones/omarchy-emacs.git) |
 | `omazed` | git_tags | [https://github.com/aps6/omazed.git](https://github.com/aps6/omazed.git) |
 | `once-bin` | github | [basecamp/once](https://github.com/basecamp/once) |
+| `owe` | github (auto-merge) | [omacom/owe](https://github.com/omacom/owe) |
 | `python-mediapipe` | github | [google-ai-edge/mediapipe](https://github.com/google-ai-edge/mediapipe) |
 | `python-sounddevice` | pypi | [sounddevice](https://pypi.org/project/sounddevice/) |
 | `python-terminaltexteffects` | pypi | [terminaltexteffects](https://pypi.org/project/terminaltexteffects/) |
-| `rustdesk` | github | [rustdesk/rustdesk](https://github.com/rustdesk/rustdesk) |
-| `spotify` | debian | [https://repository.spotify.com/dists/testing/non-free/binary-amd64/Packages](https://repository.spotify.com/dists/testing/non-free/binary-amd64/Packages) |
-| `sublime-text-4` | json | [https://www.sublimetext.com/updates/4/stable_update_check](https://www.sublimetext.com/updates/4/stable_update_check) |
-| `sunshine` | github | [LizardByte/Sunshine](https://github.com/LizardByte/Sunshine) |
-| `ttf-ia-writer` | git_branch | [https://github.com/iaolo/iA-Fonts.git](https://github.com/iaolo/iA-Fonts.git) |
+| `spotify` | debian (auto-merge) | [https://repository.spotify.com/dists/testing/non-free/binary-amd64/Packages](https://repository.spotify.com/dists/testing/non-free/binary-amd64/Packages) |
+| `sublime-text-4` | json (auto-merge) | [https://www.sublimetext.com/updates/4/stable_update_check](https://www.sublimetext.com/updates/4/stable_update_check) |
+| `sunshine` | github | [SunshineStream/Sunshine](https://github.com/SunshineStream/Sunshine) |
+| `ttf-ia-writer` | git_branch | [https://github.com/iaolo/iA-Fonts.git](https://github.com/iaolo/iA-Fonts.git) `master` |
 | `tuxedo-drivers-nocompatcheck-dkms` | git_tags | [https://gitlab.com/kronerm/tuxedo-drivers-nocompatcheck.git](https://gitlab.com/kronerm/tuxedo-drivers-nocompatcheck.git) |
-| `typora` | debian | [https://downloads.typora.io/linux/Packages](https://downloads.typora.io/linux/Packages) |
+| `typora` | debian (auto-merge) | [https://downloads.typora.io/linux/Packages](https://downloads.typora.io/linux/Packages) |
 | `ufw-docker` | git_tags | [https://github.com/chaifeng/ufw-docker.git](https://github.com/chaifeng/ufw-docker.git) |
 | `vi` | regex | [https://sources.archlinux.org/other/vi/](https://sources.archlinux.org/other/vi/) |
-| `visual-studio-code-bin` | json | [https://update.code.visualstudio.com/api/update/linux-deb-x64/stable/latest](https://update.code.visualstudio.com/api/update/linux-deb-x64/stable/latest) |
+| `visual-studio-code-bin` | json (auto-merge) | [https://update.code.visualstudio.com/api/update/linux-deb-x64/stable/latest](https://update.code.visualstudio.com/api/update/linux-deb-x64/stable/latest) |
 | `walker` | github | [abenz1267/walker](https://github.com/abenz1267/walker) |
 | `xpadneo-dkms` | github | [atar-axis/xpadneo](https://github.com/atar-axis/xpadneo) |
 | `yaru-icon-theme` | git_tags | [https://github.com/ubuntu/yaru.git](https://github.com/ubuntu/yaru.git) |
 | `yay` | github | [Jguer/yay](https://github.com/Jguer/yay) |
-| `yt6801-dkms` | archive | [https://www.motor-comm.com/Cn/Skippower/downloadFile.html?id=1817](https://www.motor-comm.com/Cn/Skippower/downloadFile.html?id=1817) |
+| `zen-browser-bin` | github (auto-merge) | [zen-browser/desktop](https://github.com/zen-browser/desktop) |
 
-## Apple Silicon imports from asahi-alarm
+Notable non-AUR branch watches: `omarchy-dev` and `omarchy-settings-dev` watch
+[omacom/omarchy](https://github.com/omacom/omarchy) `quattro` on the
+`five-minute` lane (auto-merge), and `omasnap-git` watches
+[omacom/omasnap](https://github.com/omacom/omasnap) `main` on the `hourly` lane
+(auto-merge).
 
-These replace asahi-alarm's packages for Omarchy Mac. Each watches its upstream's tags with `"review": true`, so every bump opens as a draft PR for the owner (see [Reviewed updates](#reviewed-updates)). The reference recipe stays asahi-alarm's [PKGBUILDs](https://github.com/asahi-alarm/PKGBUILDs). Before marking a bump ready, compare its directory there for new patches, dependencies or install steps. A watch moves only `pkgver`, `pkgrel`, declared variables and source checksums.
+### Asahi-derived packages
+
+Apple Silicon userland and audio packages originally taken from Asahi Linux's Arch packages watch their own upstreams. Every one carries `"review": true`, so every bump opens as a draft PR for the owner (see [Reviewed updates](#reviewed-updates)). The reference recipe stays asahi-alarm's [PKGBUILDs](https://github.com/asahi-alarm/PKGBUILDs). Before marking a bump ready, compare its directory there for new patches, dependencies or install steps. A watch moves only `pkgver`, `pkgrel`, declared variables and source checksums.
 
 | Package | Provider | Upstream | asahi-alarm recipe |
 |---|---|---|---|
@@ -265,37 +299,61 @@ These replace asahi-alarm's packages for Omarchy Mac. Each watches its upstream'
 | `triforce-lv2` | git_tags (review) | [chadmed/triforce](https://github.com/chadmed/triforce) | [triforce-lv2](https://github.com/asahi-alarm/PKGBUILDs/tree/main/triforce-lv2) |
 | `muvm` | git_tags (review) | [AsahiLinux/muvm](https://github.com/AsahiLinux/muvm) `muvm-` tags | [muvm](https://github.com/asahi-alarm/PKGBUILDs/tree/main/muvm) |
 | `fex-emu` | git_tags (review) | [FEX-Emu/FEX](https://github.com/FEX-Emu/FEX) `FEX-` tags | [FEX-Emu](https://github.com/asahi-alarm/PKGBUILDs/tree/main/FEX-Emu) |
-| `widevine` | regex (review) | asahi-alarm's [widevine/PKGBUILD](https://github.com/asahi-alarm/PKGBUILDs/blob/main/widevine/PKGBUILD) | the same file |
+| `widevine` | regex (review) | asahi-alarm's [widevine/PKGBUILD](https://raw.githubusercontent.com/asahi-alarm/PKGBUILDs/main/widevine/PKGBUILD) | the same file |
 
 - `widevine` has no upstream of its own that we can follow: Google's CDM comes from a Lacros image that asahi-alarm picks. The watch reads asahi-alarm's `pkgver`, `_lacros_version` and first `sha256sums_aarch64` entry into our `pkgver`, `_lacros_version` and `_lacros_sha256`. `_lacros_revision` is the Lacros version as one number (`120.0.6098.0` is `1200060980000`), declared as the watch's revision. So when asahi-alarm moves to a newer Lacros without a new `pkgver`, the PR bumps `pkgrel`. If they change only the sha256, or go back to an older Lacros, the watch fails, so the change is never skipped quietly. A change to their `widevine_fixup.py` isn't picked up: compare it when reviewing.
 - `speakersafetyd` carries asahi-alarm's J504 patch. A release that already includes it fails to patch: drop the patch on the PR branch.
 - The Aurora recipes (`linux-aurora`, `m1n1-aurora`, `uboot-aurora` and the rest) stay pinned by hand.
 
-## Existing manual holds
+## Manual holds (`"sync": false`)
 
-`libfprint-git`, `libretro-cap32-git`, `libretro-database-git`, `libretro-fbneo-git`, `libretro-uae-git`, `libretro-vice-git`, `quickshell-git`, `supergfxctl`.
+**Previously excluded AUR packages (8):** `libfprint-git`, `libretro-cap32-git`,
+`libretro-database-git`, `libretro-fbneo-git`, `libretro-uae-git`,
+`libretro-vice-git`, `quickshell-git`, `supergfxctl`. These were already
+excluded from automatic AUR updates and retain manual maintenance holds.
 
-These packages were already excluded from automatic AUR updates. The migration preserves that policy.
+**Held packages carrying a declared upstream watch, provider, or hook (7):**
+- `cua-driver-bin`: Omarchy bumps it by hand after verifying Hyprland
+  compatibility; keeps its `.omarchy/upstream.sh` hook and `min_release_age`,
+  so lifting the hold means removing `"sync": false`. `cua-hyprland-plugin`
+  declares no upstream source and is rebuilt by `sync-rebuilds` when Hyprland
+  or its ABI packages move.
+- `omarchy-mlx`: its wheel filename carries a per-build stamp
+  (`mlx_omarchy-0.32.4.dev202610050725+5c15fba-…`) that a tag watch cannot
+  derive, so the maintainer repins `_wheel`, the vendor tar, and checksums
+  together. Keeps its watch until wheel names follow the release version.
+- `hyprland` and `wlroots0.20`: compositor/ABI pins bumped manually with their
+  ecosystem and rebuild set.
+- `linuxqq`, `spark-hwmon-dkms`, and `yt6801-dkms`: retain their watch
+  declarations while held for manual verification.
 
-`m1n1-aurora` and `uboot-asahi` are deliberate holds: Apple Silicon boot code, pinned by hand like `linux-aurora`. A bump reaches edge, which the testing team uses as the hardware qualification lane, and is promoted to rc or stable only after a cold boot on the qualification Macs. `m1n1-aurora` pins an omacom/m1n1 commit; its source and package migration are documented in pkgbuilds/m1n1-aurora/README.md. `uboot-asahi` follows asahi-alarm's recipe and patch set (asahi-alarm/PKGBUILDs), which a tag watch on AsahiLinux/u-boot cannot carry.
-
-`cua-driver-bin` is a deliberate hold: Omarchy bumps it by hand, so a Cua release ships only when a maintainer has verified it. It keeps its `.omarchy/upstream.sh` hook and `min_release_age`, so lifting the hold means removing `"sync": false`. `cua-hyprland-plugin` declares no upstream source, so no automation updates it either.
-
-`omarchy-mlx` is a deliberate hold: its wheel's filename carries a per-build stamp (`mlx_omarchy-0.32.4.dev202610050725+5c15fba-…`) that a tag watch cannot derive, so the maintainer repins `_wheel`, the vendor tar, and the checksums together. It keeps its watch, so lifting the hold means removing `"sync": false` once the wheel's name follows the release version.
+**Hardware, boot, firmware, and pinned local holds without upstream watches (23):**
+- Apple Silicon / Aurora boot, kernel, audio, and graphics: `alsa-ucm-conf-aurora`,
+  `aurora-audio`, `aurora-bless`, `linux-aurora`, `m1n1-aurora`, `mesa-aurora`,
+  `omarchy-aurora-firmware`, `uboot-asahi`, `uboot-aurora`. (`m1n1-aurora` and
+  `uboot-asahi` are Apple Silicon boot code qualified by cold boot on
+  qualification Macs in `edge` before promotion to `rc` or `stable`; see
+  `pkgbuilds/m1n1-aurora/README.md`.)
+- Apple T2 Mac support: `apple-bcm-firmware-fetcher`, `apple-t2-audio-config`,
+  `linux-t2`, `t2fanrd`.
+- Platform audio, firmware, and hardware daemons: `alsa-ucm-conf`,
+  `linux-firmware-cirrus-dx13260`, `linux-firmware-qcom`,
+  `raspberry-pi-4-bluetooth-firmware`, `speakerguardd`.
+- Benchmarks, toolkits, and local apps: `aura`, `geekbench`, `geekbench6`,
+  `omarchy-amiga-screensaver`, `openvino-genai`.
 
 ## Package-specific boundaries
 
-- `nvidia-580xx-utils` and `lib32-nvidia-580xx-utils` watch NVIDIA's 580 branch.
+- `nvidia-580xx-utils` (building `nvidia-580xx-utils`, `nvidia-580xx-dkms`, and `opencl-nvidia-580xx`) and `lib32-nvidia-580xx-utils` serve Maxwell, Pascal, and Volta GPUs on NVIDIA's closed-source R580 branch. Turing and newer GPUs use the mainline branch (`nvidia-utils`, `lib32-nvidia-utils`, `nvidia-open-dkms`, and `linux-omarchy-nvidia-open`). Pacman `provides` and `conflicts` keep the two branches mutually exclusive on one system. GPU family detection lives in `omarchy` (`omarchy-hw-nvidia-gsp` and `omarchy-hw-nvidia-without-gsp`), not in package headers. Both 580xx recipes watch NVIDIA's GeForce Linux x64 lookup feed (GeForce 10 Series, GTX 1080) and filter it to `580.*` `XFree86` runfiles. The `download.nvidia.com/XFree86/Linux-x86_64/` index stopped regenerating on 18 November 2026. Tesla's `releases.json` includes Data Center hotfixes absent from `XFree86` and omits display-only kernel fixes. NVIDIA maintains R580 as a Long Term Support Branch with kernel compatibility and security fixes through June 2028 for Data Center. GeForce and Quadro GPUs receive critical security updates through October 2028 (NVIDIA KB 3142, KB 5676, and KB 5706). Today `nvidia-580xx-dkms` builds modules locally with DKMS. Omarchy carries `nvidia-580xx` itself so planned Secure Boot work can ship prebuilt, signed `580xx` modules with the kernel. After NVIDIA ends R580 support in 2028, forward-porting to newer kernels becomes best-effort. When R580 stops building against the current kernel, Omarchy freezes the last working 580xx package without holding back the kernel. Maxwell, Pascal, and Volta users then fall back to `nouveau` (with its Maxwell+ signed-firmware and re-clocking limits) or upgrade to a Turing+ GPU.
 - The current driver follows Arch's `nvidia-utils`. Its `.omarchy/upstream.sh` runs `bin/bump-nvidia` when Arch moves, which sets the release in `nvidia-utils`, `nvidia-open-dkms`, `lib32-nvidia-utils` and every `linux-omarchy` kernel's `_nvidiaver`, bumps the kernels' `pkgrel` so their `-nvidia-open` modules are rebuilt, and swaps the checksums of NVIDIA's three files. Their `"lockstep": "nvidia"` puts all of it in one PR, which `tests/nvidia-open-lockstep.sh` holds together and which builds every kernel before it merges. An ARM patch that no longer applies leaves the PR red for a maintainer. A maintainer can run `bin/bump-nvidia <version>` the same way.
 - Hardware-specific packages keep their declared architectures; this migration does not invent ARM binaries for x86-only upstreams.
 - iA Duospace was deleted upstream. Its four legacy font files retain their original immutable pin while the other families track the current repository.
-- RustDesk reads hbb_common from the release gitlink; its existing build-time dependency/toolchain checks remain in force.
 - Spotify uses HTTPS and retains its signed Release/Packages verification.
 - Source and build compatibility still need review when upstream code changes. Direct watches remove AUR recipe churn, not the need to maintain packaging.
 
 ## How the sync PRs build
 
-`sync-upstream.yml` (both package groups) and `sync-rebuilds.yml` each run their
+`sync-upstream.yml` (all three cadence groups) and `sync-rebuilds.yml` each run their
 sync once, split the changed recipes into one PR per package with
 `.github/scripts/package-pr-groups.sh`, and hand them to `package-prs.yml`. That
 pushes each PR as the omarchy-pkgs-sync App, so its builds start without an
@@ -321,13 +379,16 @@ every source type, hooks and rebuilds included, and shows:
   recorded checksums, and by `validpgpkeys`.
 
 When a source is a tag on GitHub, the description links the release and the
-compare view, and shows the release notes. The notes sit in a code fence, cut
-to 40 lines, so they render as plain text. A hidden comment at the end repeats
+compare view, and shows the release notes. The notes sit in a 4-space indented
+code block, capped at 40 lines or 4,000 characters, so they render as plain
+text. A hidden comment at the end repeats
 the facts as JSON. If the script fails, the PR still opens with the plain body.
 
-A red PR stays open for a maintainer and holds back only its own package. A
-later run updates it if upstream moves again, and closes it once it conflicts
-with `master`. A run started by hand with `packages` updates the same
+A red PR stays open for a maintainer and holds back only its own package (or
+branch/lockstep PR group). A later run updates it if upstream moves again, and
+`close-superseded` closes any unrefreshed PR once it conflicts with `master` or
+its edits have already landed on `master`. A
+run started by hand with `packages` updates the same
 per-package PRs a scheduled run would.
 
 ## Declarative providers and hooks
@@ -337,7 +398,7 @@ package an `upstream.watch`; `helpers/upstream-watch.py check` validates that
 form only.
 
 ```bash
-bin/sync-upstream                       # Update every package with an upstream hook
+bin/sync-upstream                       # Update every package with an upstream watch, provider, or hook
 bin/sync-upstream openai-codex-desktop  # Update specific packages
 ```
 
@@ -447,10 +508,12 @@ newest exact package version, then hash immutable source URLs:
 }
 ```
 
-This deliberately accepts only Debian versions that are already valid Arch
-`pkgver` values. Feeds needing epoch, revision, or filename translation retain
-a hook. Exactly one of `github`, `git_tags`, `npm`, or `debian` may appear in a
-declaration.
+This legacy provider deliberately accepts only Debian versions that are already
+valid Arch `pkgver` values. Feeds needing revision or filename translation
+should use `upstream.watch` (`debian` with `pattern`, `revision`, and
+`revision_variable`, as `google-chrome` and `microsoft-edge-stable-bin` do) or
+a hook. Exactly one of `watch`, `github`, `git_tags`, `npm`, or `debian` may
+appear in a declaration.
 
 A timestamped provider may also declare `"min_release_age": "24h"`
 (`s`/`m`/`h`/`d` suffix or bare seconds) to quarantine fresh releases until
@@ -464,8 +527,8 @@ or the sync fails. A maintainer deliberately shipping inside the window runs
 `BYPASS_MIN_RELEASE_AGE=1 bin/sync-upstream <package>` locally and merges the
 result through a normal PR; scheduled automation never sets the bypass.
 
-A vendor whose feed fits no convention (a Debian package index, a bare
-version.txt) instead provides `.omarchy/upstream.sh`, a hook that reports the
+A vendor whose feed fits no convention (such as an OSTree repository or a
+multi-feed manifest) instead provides `.omarchy/upstream.sh`, a hook that reports the
 newest upstream release as JSON on stdout — declaring both an `upstream` block
 and a hook is an error:
 
@@ -482,9 +545,11 @@ An empty object (`{}`) reports no update, which is how a hook waits out a releas
 that has landed for one architecture but not yet the other.
 
 When the reported version is newer than the checked-in one, `bin/sync-upstream`
-rewrites `pkgver` and those checksum arrays and resets `pkgrel` to 1. A version
-that is equal or older leaves the package alone, so a vendor rolling a release
-back cannot walk the repository backwards.
+rewrites `pkgver` and those checksum arrays and resets `pkgrel` to 1. A hook may
+also report an explicit `"pkgrel"` for a same-`pkgver` rebuild (such as
+`notion-desktop` advancing off a pruned OSTree commit) when `vercmp` confirms
+`pkgver-pkgrel` increases. An equal or older release leaves the package alone,
+so a vendor rolling a release back cannot walk the repository backwards.
 
 Hooks should read checksums from whatever manifest the vendor publishes rather
 than downloading the artifacts — see `pkgbuilds/openai-codex-desktop/.omarchy/upstream.sh`,

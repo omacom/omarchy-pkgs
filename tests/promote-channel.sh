@@ -140,6 +140,17 @@ recipe armonly '{"source": "local"}' "" aarch64
 promote armonly && grep -q 'armonly does not build for x86_64; skipping it' "$T/out" && ! grep -q 'armonly is not in' "$T/out" \
   && pass "a recipe that does not build this architecture is skipped without a warning" || fail "arch-only recipe"
 
+# --expect: only the files that were checked may move.
+pub edge $(mkpkg alpha 5)
+printf '%s\n' big-1.0-3-x86_64.pkg.tar.zst > "$T/expect"
+if promote --expect "$T/expect" alpha; then fail "a plan other than the checked one should refuse"; else
+  grep -q 'not the one that was checked' "$T/out" && [[ "$(entries rc)" == *"alpha-1.0-4 "* ]] \
+    && pass "a plan that differs from the checked files publishes nothing" || fail "--expect mismatch"
+fi
+printf '%s\n' alpha-1.0-5-x86_64.pkg.tar.zst > "$T/expect"
+promote --expect "$T/expect" alpha && [[ "$(entries rc)" == *"alpha-1.0-5 "* ]] \
+  && pass "the checked plan publishes" || fail "--expect match: $(entries rc)"
+
 # A source file that does not match its database entry is never published.
 f="$REMOTE/edge/x86_64/big-1.0-3-x86_64.pkg.tar.zst"
 cp "$f" "$T/good"; echo tampered >> "$f"

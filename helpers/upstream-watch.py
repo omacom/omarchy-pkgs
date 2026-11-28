@@ -35,6 +35,8 @@ SUM = re.compile(r"(md5|sha1|sha224|sha256|sha384|sha512|b2)sums(_[a-z0-9_]+)?\Z
 HASHES = {"b2": "blake2b"}
 # How many times a redirect watch probes before it calls the feed unmatched.
 REDIRECT_PROBES = 5
+GITHUB_MAX_PAGES = 5
+DEB_RANGE_BYTES = 65536
 
 
 def run(args, **kwargs):
@@ -85,6 +87,42 @@ class Fetcher:
 
     def json(self, url):
         return json.loads(self.text(url))
+
+    def range_bytes(self, url, size=DEB_RANGE_BYTES):
+        """Fetch the first `size` bytes of `url` via HTTP Range, returning None
+        if the server does not honor Range with a valid 206 bytes 0-... response."""
+        https(url)
+        scratch = self.cache / f"range.{os.getpid()}.tmp"
+        headers = self.cache / f"range.{os.getpid()}.hdr"
+        try:
+            proc = subprocess.run(
+                ["curl", "--http1.1", "--proto", "=https", "--proto-redir", "=https",
+                 "-sSL", "--connect-timeout", "20", "--max-time", "30", "--retry", "2",
+                 "--max-filesize", str(size * 2), "-r", f"0-{size - 1}",
+                 "-D", str(headers), "-o", str(scratch), "-w", "%{http_code}", url],
+                capture_output=True, text=True,
+            )
+            if proc.returncode != 0 or proc.stdout.strip() != "206":
+                return None
+            # Check Content-Range on the final HTTP response block (after redirects).
+            raw_hdrs = headers.read_text(errors="replace").replace("\r\n", "\n")
+            blocks = [b for b in re.split(r"\n\n+", raw_hdrs.strip()) if b.strip()]
+            final_hdr = blocks[-1] if blocks else ""
+            cr_matches = re.findall(r"(?im)^content-range:\s*bytes\s+0-([0-9]+)/([0-9]+|\*)\s*$", final_hdr)
+            if len(cr_matches) != 1:
+                return None
+            end_byte = int(cr_matches[0][0])
+            total = cr_matches[0][1]
+            if total != "*" and int(total) <= end_byte:
+                return None
+            expected_len = end_byte + 1
+            data = scratch.read_bytes()
+            if not data or len(data) != expected_len or len(data) > size:
+                return None
+            return data
+        finally:
+            scratch.unlink(missing_ok=True)
+            headers.unlink(missing_ok=True)
 
 
 def validate(watch):
@@ -271,20 +309,78 @@ def git_branch_tip(url, branch, tag_pattern, cache, min_age=0):
     return values
 
 
+def is_ar_archive(path):
+    with path.open("rb") as fh:
+        return fh.read(8) == b"!<arch>\n"
+
+
+def read_deb_control(control_tar_bytes):
+    # Use Python's tarfile exclusively (never bsdtar) so untrusted bytes
+    # cannot be interpreted as a libarchive mtree manifest with contents=.
+    with tarfile.open(fileobj=io.BytesIO(control_tar_bytes)) as archive:
+        members = [m for m in archive if m.name.removeprefix("./") == "control"]
+        if len(members) != 1 or not members[0].isfile() or members[0].size > DEB_RANGE_BYTES:
+            raise ValueError("deb control file is missing, non-regular, oversized, or ambiguous")
+        data = archive.extractfile(members[0]).read(DEB_RANGE_BYTES + 1)
+        if len(data) > DEB_RANGE_BYTES:
+            raise ValueError("deb control file exceeds size limit")
+        return data.decode()
+
+
+def deb_control_from_prefix(prefix):
+    """Extract the Debian control file from an HTTP Range prefix of a .deb ar archive.
+    Returns None if control.tar.* is missing, truncated, malformed, or ambiguous."""
+    pos = 8
+    found = []
+    while pos + 60 <= len(prefix):
+        hdr = prefix[pos:pos + 60]
+        if hdr[58:60] != b"`\n":
+            return None
+        name = hdr[:16].decode("ascii", "replace").strip().rstrip("/")
+        raw_size = hdr[48:58].decode("ascii", "replace").strip()
+        if not raw_size.isascii() or not raw_size.isdigit():
+            return None
+        size = int(raw_size)
+        data_start = pos + 60
+        data_end = data_start + size
+        if name.startswith("control.tar"):
+            if data_end > len(prefix):
+                return None
+            found.append(prefix[data_start:data_end])
+            if len(found) > 1:
+                return None
+        if data_end > len(prefix):
+            break
+        pos = data_end + (size % 2)
+    if len(found) != 1:
+        return None
+    try:
+        return read_deb_control(found[0])
+    except (tarfile.TarError, UnicodeDecodeError, ValueError):
+        return None
+
+
 def discover(watch, fetch, min_age=0):
     provider = validate(watch)
     feed = watch[provider]
     results = []
     if provider == "github":
-        releases = fetch.json(f"https://api.github.com/repos/{feed}/releases?per_page=100")
-        if not isinstance(releases, list):
-            raise ValueError("GitHub did not return a release list")
-        for release in releases:
-            if release.get("draft") or (release.get("prerelease") and not watch.get("allow_prerelease")):
-                continue
-            for item in matches(watch, release["tag_name"], {"tag": release["tag_name"], "published_at": release["published_at"]}, full=True):
-                item["assets"] = release.get("assets", [])
-                results.append(item)
+        # Stop on page 1 whenever it already yields an eligible release (zero
+        # extra API calls for normal repos); paginate up to GITHUB_MAX_PAGES
+        # only when busy monorepos push matching component releases past 100.
+        for page in range(1, GITHUB_MAX_PAGES + 1):
+            suffix = "" if page == 1 else f"&page={page}"
+            releases = fetch.json(f"https://api.github.com/repos/{feed}/releases?per_page=100{suffix}")
+            if not isinstance(releases, list):
+                raise ValueError("GitHub did not return a release list")
+            for release in releases:
+                if release.get("draft") or (release.get("prerelease") and not watch.get("allow_prerelease")):
+                    continue
+                for item in matches(watch, release["tag_name"], {"tag": release["tag_name"], "published_at": release["published_at"]}, full=True):
+                    item["assets"] = release.get("assets", [])
+                    results.append(item)
+            if len(releases) < 100 or (results and select_release(results, min_age) is not None):
+                break
     elif provider == "git_tags":
         refs = run(["git", "ls-remote", "--tags", feed], text=True)
         tags = {}
@@ -303,7 +399,11 @@ def discover(watch, fetch, min_age=0):
     elif provider == "npm":
         data = fetch.json("https://registry.npmjs.org/" + quote(feed, safe=""))
         version = data["dist-tags"][watch.get("dist_tag", "latest")]
-        results.append(candidate(watch, {"version": version, "published_at": data.get("time", {}).get(version)}))
+        extra = {"published_at": data.get("time", {}).get(version)}
+        if "pattern" in watch:
+            results.extend(matches(watch, version, extra, full=True))
+        else:
+            results.append(candidate(watch, {"version": version, **extra}))
     elif provider == "pypi":
         data = fetch.json(f"https://pypi.org/pypi/{feed}/json")
         version = data["info"]["version"]
@@ -342,31 +442,37 @@ def discover(watch, fetch, min_age=0):
             text = text.replace('\\"', '"')
         results.extend(matches(watch, text))
     elif provider == "archive":
-        file = fetch.file(feed)
-        if zipfile.is_zipfile(file):
-            with zipfile.ZipFile(file) as archive:
-                names = archive.namelist()
-                if watch.get("filenames"):
-                    results.extend(matches(watch, "\n".join(names)))
-                for name in ([] if watch.get("filenames") else names):
-                    if re.fullmatch(watch.get("member", ".*"), name):
-                        results.extend(matches(watch, archive.read(name).decode()))
-        elif file.read_bytes()[:8] == b"!<arch>\n":
-            names = run(["bsdtar", "-tf", str(file)], text=True).splitlines()
-            controls = [name for name in names if name.startswith("control.tar")]
-            if len(controls) != 1:
-                raise ValueError("deb does not contain exactly one control archive")
-            data = run(["bsdtar", "-xOf", str(file), controls[0]])
-            with tarfile.open(fileobj=io.BytesIO(data)) as archive:
-                members = [m for m in archive if m.name.removeprefix("./") == "control"]
-                if len(members) != 1:
-                    raise ValueError("deb control file is missing or ambiguous")
-                results.extend(matches(watch, archive.extractfile(members[0]).read().decode()))
+        control_text = None
+        if urlsplit(feed).path.endswith(".deb") and hasattr(fetch, "range_bytes"):
+            head = fetch.range_bytes(feed, DEB_RANGE_BYTES)
+            if head and head[:8] == b"!<arch>\n":
+                control_text = deb_control_from_prefix(head)
+        if control_text is not None:
+            for item in matches(watch, control_text):
+                item["deb_range_url"] = feed
+                results.append(item)
         else:
-            with tarfile.open(file) as archive:
-                for member in archive:
-                    if member.isfile() and re.fullmatch(watch.get("member", ".*"), member.name):
-                        results.extend(matches(watch, archive.extractfile(member).read().decode()))
+            file = fetch.file(feed)
+            if zipfile.is_zipfile(file):
+                with zipfile.ZipFile(file) as archive:
+                    names = archive.namelist()
+                    if watch.get("filenames"):
+                        results.extend(matches(watch, "\n".join(names)))
+                    for name in ([] if watch.get("filenames") else names):
+                        if re.fullmatch(watch.get("member", ".*"), name):
+                            results.extend(matches(watch, archive.read(name).decode()))
+            elif is_ar_archive(file):
+                names = run(["bsdtar", "-tf", str(file)], text=True).splitlines()
+                controls = [name for name in names if name.startswith("control.tar")]
+                if len(controls) != 1:
+                    raise ValueError("deb does not contain exactly one control archive")
+                data = run(["bsdtar", "-xOf", str(file), controls[0]])
+                results.extend(matches(watch, read_deb_control(data)))
+            else:
+                with tarfile.open(file) as archive:
+                    for member in archive:
+                        if member.isfile() and re.fullmatch(watch.get("member", ".*"), member.name):
+                            results.extend(matches(watch, archive.extractfile(member).read().decode()))
     if not results:
         raise ValueError(f"no matching releases in {feed}")
     return results
@@ -744,6 +850,20 @@ def sync(package, fetch, min_age=0, check=False):
         if before["arch"] != after["arch"]:
             raise ValueError("release changed supported architectures")
         arrays = updated_checksums(before, after, package, fetch, release, watch)
+        if release.get("deb_range_url"):
+            # Re-verify the discovered version against the full cached .deb so a
+            # mid-rollout swap on a mutable URL cannot pair an old pkgver with new bytes.
+            full_file = fetch.file(release["deb_range_url"])
+            if not is_ar_archive(full_file):
+                raise ValueError("mutable deb response is not an ar archive")
+            names = run(["bsdtar", "-tf", str(full_file)], text=True).splitlines()
+            controls = [name for name in names if name.startswith("control.tar")]
+            if len(controls) != 1:
+                raise ValueError("deb does not contain exactly one control archive")
+            full_ctrl = read_deb_control(run(["bsdtar", "-xOf", str(full_file), controls[0]]))
+            full_versions = {item["pkgver"] for item in matches(watch, full_ctrl)}
+            if release["pkgver"] not in full_versions:
+                raise ValueError("mutable deb changed version between range check and full download")
         for name, values in arrays.items():
             text = replace_array(text, name, values)
         scratch.write_text(text)

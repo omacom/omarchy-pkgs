@@ -352,6 +352,24 @@ database's SHA-256, and publishes them with `bin/publish-artifact` in batches
 of about 2 GiB, inside the same lock as merges. Nothing is removed from the
 destination. A re-run after a failure picks up where it stopped.
 
+Every file was built against edge's Arch packages, and the destination's Arch
+snapshot can be weeks older. So before anything publishes, dry runs included,
+the workflow runs `bin/check-promotion` on every package the plan moves. It
+prepares the destination as the promotion would leave it, installs each
+package in a fresh container from there, and refuses the run when a binary
+needs a library or a symbol version that the destination lacks, unless the
+source channel and edge lack it too (`ldd -r`), when a Python module needs a Python version the
+destination lacks, or when the package cannot be installed. aarch64 is
+checked under qemu-user on the x86_64 runner. Before either architecture
+publishes, both must still plan exactly the files that were checked. A
+refused package waits until the destination's snapshot catches up; leave it
+out with `packages`.
+
+On 2026-11-23, without this check, `linux-omarchy-headers` 7.2.15-4 reached
+stable with a `sign-file` linked against OpenSSL 4's `libcrypto.so.4`, while
+stable's snapshot had OpenSSL 3.6.5. DKMS then left every module unsigned
+(omacom/omarchy#19941).
+
 The run's summary lists what moved and what stayed back, with the reason;
 the full plan is kept as the `promote-record-<run-id>` artifact for 90 days,
 and a run that publishes appends to the [publish log](#read-the-publish-log)
@@ -577,9 +595,13 @@ prefixes remain unchanged so existing PRs keep receiving updates. The separate
 - **A package with no upstream declaration or hook gets no upstream updates.** That
   includes the kernels (`linux-omarchy*`, `linux-aurora`): bump
   them by PR.
-- `sync-upstream.yml` reports each completed run to Basecamp when
-  `BASECAMP_CHATBOT_URL` is set, identifying the hourly or six-hourly group.
-  Individual package update and PR check
+- `sync-upstream.yml` writes a GitHub Actions summary for every run and posts
+  to Basecamp when `BASECAMP_CHATBOT_URL` is set (identifying the five-minute,
+  hourly, or six-hourly group) only when a run needs attention: workflow
+  failures, package update failures, or failing/unavailable checks on a
+  created or updated PR. Fully green runs (no updates needed, clean PR updates
+  with passing or pending checks, or unchanged open PRs) stay quiet in
+  Basecamp. Individual package update and PR check
   failures leave the completed sync green; its notification and Actions
   summary give counts and link to the affected PRs. PR update results and
   current PR check results are counted separately: checks still running (or

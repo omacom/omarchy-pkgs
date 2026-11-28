@@ -1,6 +1,6 @@
 # Hyprland
 
-Automatic upstream version bumps are held (`sync: false`) because `omarchy-hyprland-titlebars` requires the exact Hyprland it was built against, and a new Hyprland release can break the plugin's build. 0.57.0 did, so the plugin's rebuild failed and every `pacman -Syu` that offered Arch's 0.57.0 stopped on its `hyprland=0.56.2` dependency. Bump Hyprland by hand, in the same change as a plugin release that builds against it. Hyprland is on the normal ring, so a merge publishes it to edge only, and rc and stable get it by promotion together with the plugin. Aquamarine changes in the official/ALARM repositories are checked by the separate six-hour `sync-rebuilds` job through `rebuild_on`, which proposes a package release bump for rebuilding.
+Automatic upstream version bumps are held (`sync: false`) because `omarchy-hyprland-titlebars` requires the exact Hyprland it was built against, and a new Hyprland release can break the plugin's build. 0.57.0 did, so the plugin's rebuild failed and every `pacman -Syu` that offered Arch's 0.57.0 stopped on its `hyprland=0.56.2` dependency. Bump Hyprland by hand, in the same change as a plugin release that builds against it. Hyprland is on the normal ring, so a merge publishes it to edge only, and rc and stable get it by promotion together with the plugin. Aquamarine changes, which come from `pkgbuilds/aquamarine` on both architectures, are checked by the separate six-hour `sync-rebuilds` job through `rebuild_on`, which proposes a package release bump for rebuilding.
 
 ## Output, VRR, and NVIDIA fixes
 
@@ -9,6 +9,10 @@ Automatic upstream version bumps are held (`sync: false`) because `omarchy-hyprl
 ## Pointer focus through a press
 
 `held-pointer-without-keyboard-focus.patch` keeps a pressed surface's pointer focus until the button is released, whether or not anything holds keyboard focus. Upstream keeps it only while some surface has keyboard focus, so on an empty workspace a drag that starts on a layer surface ends the moment the pointer leaves it: Hyprland hit-tests every motion afresh and hands the pointer to whatever is underneath. Omarchy's bar needs its drags to leave its strip (a widget pulled off the bar is removed, and the bar is dragged to another edge), and without this it had to keep a transparent surface over its whole screen, about 155 MiB of VRAM per 4K screen. The requirement arrived as an incidental check in the 2024 wl-data-device rewrite; drop the patch once upstream holds an implicit grab without keyboard focus.
+
+## Boot splash handoff
+
+`hypr-startup-hold.patch` adds `misc:startup_hold_layer` (`level:namespace`; empty, the default, turns it off) and `misc:startup_hold_timeout` (ms, 5000 by default). A monitor that still shows the picture aquamarine adopted with `AQ_SPLASH_ADOPT=1`, the boot splash's last frame, presents nothing until that layer is mapped on it and opaque, or until the timeout; every other monitor renders as before. `hypr-startup-cursor.patch` adds `cursor:hide_at_startup` (false by default): from startup, no cursor shows until the client under the pointer sets one or the pointer moves, so Hyprland's own cursor doesn't appear over the held picture before the session's cover sets a blank one. `hypr-monitor-added-zoom.patch` starts a new monitor at its normal size when the `monitorAdded` animation or all animations are off, instead of drawing its first five frames magnified. The hold calls aquamarine's `IOutput::showsAdoptedPicture()` from `pkgbuilds/aquamarine`, so this recipe needs `aquamarine>=0.16.0-1.2`, and the two are promoted together. None of the three patches is upstream yet.
 
 ## x86_64
 

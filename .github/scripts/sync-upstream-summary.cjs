@@ -21,8 +21,9 @@ function readResults(path) {
 function updateFailure(result) {
   if (result.apply !== 'success') return 'Could not apply the package update';
   if (result.token === 'failure') return 'Could not get the sync App token';
+  if (result.should_push === 'failure') return 'Could not inspect the existing PR';
   if (result.hold === 'failure') return 'Could not turn the reviewed PR back into a draft';
-  if (result.pr !== 'success') return 'Could not push or update the PR';
+  if (result.pr !== 'success' && result.pr !== 'unchanged') return 'Could not push or update the PR';
   if (!result.armable) return '';
   switch (result.merge) {
     case 'success': return '';
@@ -101,23 +102,25 @@ module.exports = async function summarize({ github, context, core, groups,
     if (error.code !== 'ENOENT') problems.push(`Could not read auto-merge outcomes: ${error.message}`);
   }
   for (const result of results) {
-    if (!result || result.pr !== 'success' || !result.number || result.review === true) continue;
+    if (!result || (result.pr !== 'success' && result.pr !== 'unchanged') || result.pr_operation === 'closed' || !result.number || result.review === true) continue;
     const outcome = armed[result.branch];
     const mine = outcome && String(outcome.number) === String(result.number) && typeof outcome.outcome === 'string';
     Object.assign(result, { armable: true, merge: mine ? outcome.outcome : 'missing', mergeReason: mine ? outcome.reason : '' });
   }
 
-  const updates = { passing: 0, failing: 0, unknown: 0 };
+  const updates = { passing: 0, unchanged: 0, failing: 0, unknown: 0 };
   const checks = { passing: 0, failing: 0, pending: 0, unknown: 0 };
   const rows = [];
   for (const group of groups) {
     const matches = results.filter(result => result?.branch === group.branch && result.packages === group.packages);
     const result = matches.length === 1 ? matches[0] : undefined;
     const failure = result ? updateFailure(result) : 'Package result missing or duplicated';
+    const unchanged = !failure && (result?.pr === 'unchanged' || (result?.pr === 'success' && (result?.pr_operation === 'none' || result?.pr_operation === 'closed')));
     if (!result) {
       updates.unknown++;
       problems.push(`${group.packages}: ${failure}`);
     } else if (failure) updates.failing++;
+    else if (unchanged) updates.unchanged++;
     else updates.passing++;
 
     let pr;
@@ -128,7 +131,7 @@ module.exports = async function summarize({ github, context, core, groups,
     }
     if (pr.warning) core.warning(`${group.packages}: PR checks unavailable: ${pr.warning}`);
     if (pr.checks in checks) checks[pr.checks]++;
-    rows.push({ ...group, ...pr, failure });
+    rows.push({ ...group, ...pr, failure, unchanged });
   }
 
   const succeeded = problems.length === 0;
@@ -136,7 +139,9 @@ module.exports = async function summarize({ github, context, core, groups,
   const content = [`<strong>${heading}</strong>`];
   if (cadence) content.push(`Package group: ${escape(cadence)}.`);
   if (groups.length) {
-    content.push(`PR updates: ${updates.passing} passing, ${updates.failing} failing` +
+    content.push(`PR updates: ${updates.passing} passing` +
+      (updates.unchanged ? `, ${updates.unchanged} unchanged` : '') +
+      `, ${updates.failing} failing` +
       (updates.unknown ? `, ${updates.unknown} unknown` : '') + '.');
     content.push(`PR checks at notification time: ${checks.passing} passing, ${checks.failing} failing, ${checks.pending} pending` +
       (checks.unknown ? `, ${checks.unknown} unknown` : '') + '.');
@@ -146,8 +151,11 @@ module.exports = async function summarize({ github, context, core, groups,
   for (const row of rows) {
     const reasons = [];
     if (row.failure) reasons.push(row.failure);
-    if (row.checks === 'failing') reasons.push('PR checks failing');
-    if (row.checks === 'unknown') reasons.push('PR checks unavailable');
+    if (!row.unchanged) {
+      if (row.checks === 'failing') reasons.push('PR checks failing');
+      if (row.checks === 'unknown') reasons.push('PR checks unavailable');
+      if (!row.failure && row.checks === 'not available') reasons.push('PR link unavailable');
+    }
     if (!reasons.length) continue;
     const target = row.url ? link(row.url, `${row.packages} #${row.number}`) :
       `${escape(row.packages)} — no PR link available; ${link(runUrl, 'view run')}`;
@@ -156,13 +164,22 @@ module.exports = async function summarize({ github, context, core, groups,
   content.push(link(runUrl, 'View run'));
 
   const html = content.join('<br>');
-  core.setOutput('content', html);
+  // Only post to Basecamp when a run needs attention: workflow or package
+  // update failures, or failing/unavailable checks on a newly created or
+  // updated PR. Truly green runs (no updates, clean updates with passing or
+  // pending checks, and unchanged open PRs) still write the Actions summary.
+  const actionable = !succeeded ||
+    updates.failing > 0 ||
+    updates.unknown > 0 ||
+    rows.some(row => !row.unchanged && row.checks !== 'passing' && row.checks !== 'pending');
+  const quiet = !actionable;
+  core.setOutput('content', quiet ? '' : html);
   const table = rows.length ? '<table><tr><th>Package / PR</th><th>PR update</th><th>PR checks</th></tr>' +
     rows.map(row => `<tr><td>${row.url ? link(row.url, `${row.packages} #${row.number}`) : escape(row.packages)}</td>` +
-      `<td>${escape(row.failure || 'Passing')}</td><td>${escape(row.checks)}</td></tr>`).join('') + '</table>' : '';
+      `<td>${escape(row.failure || (row.unchanged ? 'Unchanged' : 'Passing'))}</td><td>${escape(row.checks)}</td></tr>`).join('') + '</table>' : '';
   await core.summary.addRaw(html + table).write();
   // Missing reports and orchestration errors remain failures. Individual PR
   // update/check failures are actionable summary data, not a failed sync.
   if (!succeeded) core.setFailed('Upstream sync did not complete; see the summary.');
-  return { succeeded, updates, checks, rows, content: html };
+  return { succeeded, updates, checks, rows, content: quiet ? '' : html };
 };
