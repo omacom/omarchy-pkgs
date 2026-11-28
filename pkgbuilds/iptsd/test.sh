@@ -79,4 +79,15 @@ grep -qx 'Product = 0x0C6E' "$package_dir/surface-laptop-7-13.conf" &&
   grep -qx 'PositionSlop = 0.25' "$package_dir/surface-laptop-7-13.conf" ||
   fail "the position slop covers the Surface Laptop 7 13.8\" touchscreen"
 
+grep -q 'patch -d iptsd -Np1 -i ../0003-contacts-Add-a-speed-adaptive-position-filter.patch' "$package_dir/PKGBUILD" ||
+  fail "the position filter patch is applied"
+grep -qx 'PositionFilterMinCutoff = 1.5' "$package_dir/surface-laptop-7-touchpad.conf" &&
+  grep -qx 'PositionFilterBeta = 1.2' "$package_dir/surface-laptop-7-touchpad.conf" &&
+  grep -qx 'PositionThresholdMin = 0' "$package_dir/surface-laptop-7-touchpad.conf" ||
+  fail "slow movements on the Surface Laptop 7 touchpad are smoothed instead of held"
+(( $(grep -l 'PositionFilter' "$package_dir"/*.conf | wc -l) == 1 )) ||
+  fail "the position filter is limited to the Surface Laptop 7 touchpad"
+grep -q '^  ./test-position-filter$' "$package_dir/PKGBUILD" ||
+  fail "the position filter is checked against contacts that rest, move slowly and move fast"
+
 echo "ok - iptsd builds pinned upstream source against Arch libraries"
