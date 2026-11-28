@@ -1,0 +1,242 @@
+Apple Touch ID: enrol only under a Unix account and finger, as the aurora
+kernel's SEP interface v5 requires, and report the matched identity.
+
+By Ryan Murray, from aurora-silicon/aurora-sep-userspace 12f26f61
+(ae9e9323, 2026-10-31), libfprint/0004-aurora-refuse-unbound-enrollment.patch,
+as carried by aurora-silicon/alarm-aurora libfprint-aurora. LGPL-2.1-or-later,
+like libfprint. Adapted: this driver keeps the kernel UAPI as aurora-bio.h, so
+SEP_BIO_* reads AURORA_BIO_* and sep_bio_* reads aurora_bio_*, and the
+aurora-bio.h hunk brings that header to the v5 UAPI of aurora-silicon/linux
+f70f1acd352 (enrolment account and finger, LIST_ENCLAVE, DELETE_ORPHAN,
+PREPARE_ENROL). Needs aurora-touchid-v4-and-v5.patch on top to keep v4
+kernels working.
+
+Original description:
+
+  aurora: admit only bound enrolments and report match identity
+
+  Resolve the Unix account and finger before any SEP write, prepare the empty
+  Linux owner context, then start enrolment under kernel persistence checks.
+  Report the SEP identity when single verify or identify lacks the requested
+  print. Avoid DATA_FULL, which makes fprintd garbage-collect another print.
+
+  Assisted-by: LLM
+
+diff --git a/libfprint/drivers/aurora/aurora-bio.h b/libfprint/drivers/aurora/aurora-bio.h
+index 6bb0e9fc..ae15a916 100644
+--- a/libfprint/drivers/aurora/aurora-bio.h
++++ b/libfprint/drivers/aurora/aurora-bio.h
+@@ -15,7 +15,7 @@
+ #include <linux/ioctl.h>
+ #include <linux/types.h>
+ 
+-#define AURORA_BIO_IFACE_VERSION  4
++#define AURORA_BIO_IFACE_VERSION  5
+ 
+ #define AURORA_BIO_UUID_LEN       16
+ #define AURORA_BIO_LABEL_LEN      128
+@@ -66,10 +66,22 @@ struct aurora_bio_list {
+ 
+ struct aurora_bio_enrol_start {
+   __u32 flags;
++  __u32 account_uid; /* resolved passwd uid; UINT32_MAX is invalid */
++  __u32 finger;      /* FP_FINGER_LEFT_THUMB..FP_FINGER_RIGHT_LITTLE (1..10) */
+   __u32 reserved;
+   __u8  label[AURORA_BIO_LABEL_LEN];
+ };
+ 
++/* Linux's built-in SEP user context only. This does not enumerate other SEP
++ * users or OS lanes. DELETE_ORPHAN uses an exact UUID; the kernel index may
++ * still hold it when fprintd has already lost its own record.
++ */
++struct aurora_bio_enclave_list {
++  __u32 count;
++  __u32 reserved;
++  __u8  uuid[AURORA_BIO_MAX_IDENTITIES][AURORA_BIO_UUID_LEN];
++};
++
+ #define AURORA_BIO_GUIDANCE_NONE          0
+ #define AURORA_BIO_GUIDANCE_PLACE         1
+ #define AURORA_BIO_GUIDANCE_LIFT_AND_MOVE 2
+@@ -130,3 +142,9 @@ struct aurora_bio_attest {
+ #define AURORA_BIO_DELETE       _IOW (AURORA_BIO_IOC_MAGIC, 0x08, struct aurora_bio_delete)
+ #define AURORA_BIO_DELETE_ALL   _IO  (AURORA_BIO_IOC_MAGIC, 0x09)
+ #define AURORA_BIO_ATTEST       _IOWR(AURORA_BIO_IOC_MAGIC, 0x0a, struct aurora_bio_attest)
++#define AURORA_BIO_LIST_ENCLAVE _IOR (AURORA_BIO_IOC_MAGIC, 0x0b, struct aurora_bio_enclave_list)
++#define AURORA_BIO_DELETE_ORPHAN _IOW (AURORA_BIO_IOC_MAGIC, 0x0c, struct aurora_bio_delete)
++/* Creates the empty Linux owner context only when SEP lists zero Linux
++ * identities. ENROL_START itself never repairs a missing persistence binding.
++ */
++#define AURORA_BIO_PREPARE_ENROL _IOW (AURORA_BIO_IOC_MAGIC, 0x0d, struct aurora_bio_enrol_start)
+diff --git a/libfprint/drivers/aurora/aurora.c b/libfprint/drivers/aurora/aurora.c
+index b13e4084..5d3f74c4 100644
+--- a/libfprint/drivers/aurora/aurora.c
++++ b/libfprint/drivers/aurora/aurora.c
+@@ -84,8 +84,29 @@ aurora_ioctl (FpiDeviceAurora *self, unsigned long req, void *arg, GError **erro
+           break;
+ 
+         case ENOSPC:
+-          g_set_error_literal (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_DATA_FULL,
+-                               "three SEP fingerprint slots are full; delete one before enrolling");
++          /* DATA_FULL makes fprintd garbage-collect another device print. */
++          g_set_error_literal (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_GENERAL,
++                               "SEP fingerprint slots or host store are full; no enrolment was started");
++          break;
++
++        case ENODATA:
++          g_set_error_literal (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_GENERAL,
++                               "SEP enrolment has no durable Catacomb or identity-bag binding");
++          break;
++
++        case EROFS:
++          g_set_error_literal (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_GENERAL,
++                               "SEP enrolment needs writable Linux identity and Catacomb storage");
++          break;
++
++        case ENXIO:
++          g_set_error_literal (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_GENERAL,
++                               "no Linux SEP OS identity is selected");
++          break;
++
++        case EINVAL:
++          g_set_error_literal (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_DATA_INVALID,
++                               "invalid SEP enrolment account, finger or device request");
+           break;
+ 
+         case ENOENT:
+@@ -295,6 +316,13 @@ aurora_print_has_uuid (FpPrint *print, const guint8 *uuid)
+   return memcmp (stored, uuid, AURORA_BIO_UUID_LEN) == 0;
+ }
+ 
++static void
++aurora_uuid_hex (const guint8 *uuid, gchar out[AURORA_BIO_UUID_LEN * 2 + 1])
++{
++  for (gsize i = 0; i < AURORA_BIO_UUID_LEN; i++)
++    g_snprintf (out + 2 * i, 3, "%02x", uuid[i]);
++}
++
+ /* ------------------------------------------------------------------ */
+ /* probe / open / close                                                */
+ /* ------------------------------------------------------------------ */
+@@ -568,6 +596,12 @@ aurora_enroll (FpDevice *device)
+   struct aurora_bio_enrol_start start = { 0 };
+   g_autoptr(GError) error = NULL;
+   FpPrint *print = NULL;
++  const gchar *username;
++  FpFinger finger;
++  struct passwd account;
++  struct passwd *found = NULL;
++  gchar account_buf[16384];
++  gint lookup;
+ 
+   if (aurora_is_removed (device))
+     {
+@@ -577,12 +611,47 @@ aurora_enroll (FpDevice *device)
+ 
+   fpi_device_get_enroll_data (device, &print);
+ 
++  username = print ? fp_print_get_username (print) : NULL;
++  finger = print ? fp_print_get_finger (print) : FP_FINGER_UNKNOWN;
++  if (username == NULL || username[0] == '\0')
++    {
++      fpi_device_enroll_complete (device, NULL,
++                                  fpi_device_error_new_msg (FP_DEVICE_ERROR_DATA_INVALID,
++                                                            "enrolment needs a Unix account name"));
++      return;
++    }
++  if (!FP_FINGER_IS_VALID (finger))
++    {
++      fpi_device_enroll_complete (device, NULL,
++                                  fpi_device_error_new_msg (FP_DEVICE_ERROR_DATA_INVALID,
++                                                            "unknown finger; choose a supported finger name"));
++      return;
++    }
++  lookup = getpwnam_r (username, &account, account_buf, sizeof (account_buf), &found);
++  if (lookup != 0 || found == NULL || g_strcmp0 (found->pw_name, username) != 0 ||
++      (guint64) found->pw_uid > G_MAXUINT32)
++    {
++      fpi_device_enroll_complete (device, NULL,
++                                  fpi_device_error_new_msg (FP_DEVICE_ERROR_DATA_INVALID,
++                                                            "Unix account '%s' has no passwd entry or uid; enrolment was not started",
++                                                            username));
++      return;
++    }
++  start.account_uid = (guint32) found->pw_uid;
++  start.finger = finger;
++
+   if (!aurora_label_from_print (print, start.label, &error))
+     {
+       fpi_device_enroll_complete (device, NULL, g_steal_pointer (&error));
+       return;
+     }
+ 
++  if (!aurora_ioctl (self, AURORA_BIO_PREPARE_ENROL, &start, &error))
++    {
++      fpi_device_enroll_complete (device, NULL, g_steal_pointer (&error));
++      return;
++    }
++
+   if (!aurora_ioctl (self, AURORA_BIO_ENROL_START, &start, &error))
+     {
+       fpi_device_enroll_complete (device, NULL, g_steal_pointer (&error));
+@@ -712,9 +781,28 @@ aurora_verify_ready (gint fd, GIOCondition condition, gpointer user_data)
+   if (action == FPI_DEVICE_ACTION_VERIFY)
+     {
+       FpPrint *expected = NULL;
++      guint8 expected_uuid[AURORA_BIO_UUID_LEN];
++      gchar actual_hex[AURORA_BIO_UUID_LEN * 2 + 1];
++      gchar expected_hex[AURORA_BIO_UUID_LEN * 2 + 1];
+ 
+       fpi_device_get_verify_data (device, &expected);
+ 
++      if (res.state == AURORA_BIO_STATE_DONE && res.result == AURORA_BIO_MATCH)
++        {
++          aurora_uuid_hex (res.uuid, actual_hex);
++          if (expected == NULL || !aurora_uuid_from_print (expected, expected_uuid, NULL))
++            g_warning ("SEP matched enclave identity %s, but the expected print has no identity", actual_hex);
++          else
++            {
++              aurora_uuid_hex (expected_uuid, expected_hex);
++              if (memcmp (expected_uuid, res.uuid, AURORA_BIO_UUID_LEN) != 0)
++                g_warning ("SEP matched enclave identity %s; requested print identity is %s",
++                           actual_hex, expected_hex);
++              else
++                fp_dbg ("SEP matched requested enclave identity %s", actual_hex);
++            }
++        }
++
+       if (retry != NULL)
+         {
+           fpi_device_verify_report (device, FPI_MATCH_ERROR, NULL, retry);
+@@ -732,6 +820,12 @@ aurora_verify_ready (gint fd, GIOCondition condition, gpointer user_data)
+            * was never examined. */
+           fpi_device_verify_complete (device, aurora_not_compared_new (&res));
+         }
++      else if (res.result == AURORA_BIO_MATCH && matched == NULL)
++        {
++          fpi_device_verify_complete (device,
++                                      fpi_device_error_new_msg (FP_DEVICE_ERROR_GENERAL,
++                                                                "SEP matched an identity but its result token was invalid"));
++        }
+       else
+         {
+           fpi_device_verify_report (device, FPI_MATCH_FAIL, matched, NULL);
+@@ -761,6 +855,18 @@ aurora_verify_ready (gint fd, GIOCondition condition, gpointer user_data)
+             }
+         }
+ 
++      if (matched != NULL)
++        {
++          gchar actual_hex[AURORA_BIO_UUID_LEN * 2 + 1];
++
++          aurora_uuid_hex (res.uuid, actual_hex);
++          if (hit == NULL)
++            g_warning ("SEP matched enclave identity %s, but no fprintd gallery print has that identity",
++                       actual_hex);
++          else
++            fp_dbg ("SEP identified gallery identity %s", actual_hex);
++        }
++
+       if (retry != NULL)
+         {
+           fpi_device_identify_report (device, NULL, NULL, retry);

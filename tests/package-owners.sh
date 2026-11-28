@@ -32,22 +32,31 @@ mkpkg() { # mkpkg <name> <package() body>
 pass() { echo "PASS: $1"; }
 fail() { echo "FAIL: $1"; cat "$T/out"; exit 1; }
 
-runner=$(mkpkg runner 'install -d "$pkgdir/opt/app"; bsdtar -xf vendor.tar.gz -C "$pkgdir/opt/app"')
+if (( EUID == 0 )); then
+  id -u fixture >/dev/null 2>&1 || useradd -m fixture
+  mkdir -p "$T/src"; chmod 755 "$T/src"
+fi
+mkpkg runner 'install -d "$pkgdir/opt/app"; bsdtar -xf vendor.tar.gz -C "$pkgdir/opt/app"' >"$T/p-runner" & p1=$!
+mkpkg root 'install -d "$pkgdir/opt/app"; bsdtar --no-same-owner -xf vendor.tar.gz -C "$pkgdir/opt/app"' >"$T/p-root" & p2=$!
+mkpkg games 'install -Dm644 /dev/null "$pkgdir/var/games/app/scores"; chgrp 50 "$pkgdir/var/games/app/scores"' >"$T/p-games" & p3=$!
+mkpkg users 'install -Dm644 /dev/null "$pkgdir/usr/share/app/data"; chgrp 100 "$pkgdir/usr/share/app/data"' >"$T/p-users" & p4=$!
+for p in "$p1" "$p2" "$p3" "$p4"; do wait "$p"; done
+runner=$(<"$T/p-runner")
+root=$(<"$T/p-root")
+games=$(<"$T/p-games")
+users=$(<"$T/p-users")
+
 if check_package_owners "$runner" >"$T/out"; then
   fail "a vendor tarball extracted under fakeroot keeps uid 1001"
 fi
 grep -q ' 1001 *1001 .* opt/app/app/app$' "$T/out" || fail "the refusal does not name the file and its owner"
 pass "refuses the runner's uid from a vendor tarball"
 
-root=$(mkpkg root 'install -d "$pkgdir/opt/app"; bsdtar --no-same-owner -xf vendor.tar.gz -C "$pkgdir/opt/app"')
 check_package_owners "$root" >"$T/out" || fail "--no-same-owner extraction is refused"
 pass "accepts the same tarball extracted with --no-same-owner"
 
-games=$(mkpkg games 'install -Dm644 /dev/null "$pkgdir/var/games/app/scores"; chgrp 50 "$pkgdir/var/games/app/scores"')
 check_package_owners "$games" >"$T/out" || fail "a file in group games is refused"
 pass "accepts a system group with a fixed ID"
-
-users=$(mkpkg users 'install -Dm644 /dev/null "$pkgdir/usr/share/app/data"; chgrp 100 "$pkgdir/usr/share/app/data"')
 if check_package_owners "$users" >"$T/out"; then
   fail "a file in group users (100) is accepted"
 fi

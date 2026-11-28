@@ -1,0 +1,67 @@
+drm: send no SDR metadata to a connector without HDR metadata
+
+Compositors commit all-zero HDR metadata for SDR, Hyprland on every output
+that supports HDR, to clear whatever metadata the kernel may hold from
+before. As a blob, it makes the kernel send an HDR infoframe where it sent
+none. That changes nothing on screen, but drivers modeset for it: amdgpu
+whenever metadata appears or goes (amdgpu_dm_connector_atomic_check), and
+i915 because its fastset check compares which infoframes are enabled
+(intel_crtc_check_fastset). The modeset blanks what the CRTC showed, e.g. a
+boot splash's last frame.
+
+Read the connector's HDR_OUTPUT_METADATA property first, and when the kernel
+has none, send no blob for all-zero metadata, and don't count it as a reason
+to reconfigure: that commit is a plain page flip, not a blocking modeset.
+Metadata left from before is still cleared with it.
+
+Not yet upstream.
+
+diff --git a/src/backend/drm/DRM.cpp b/src/backend/drm/DRM.cpp
+index ec0e345..432f4ac 100644
+--- a/src/backend/drm/DRM.cpp
++++ b/src/backend/drm/DRM.cpp
+@@ -2566,6 +2566,17 @@ bool Aquamarine::CDRMOutput::prepareAsyncCommitData(const COutputState::CSnapsho
+     return true;
+ }
+ 
++// All-zero metadata, which compositors commit for SDR, is what a connector without any holds already.
++// Sending it would still turn an HDR infoframe on, which i915 and amdgpu modeset for.
++static bool keepsNoHDRMetadata(SP<SDRMConnector> connector, const hdr_output_metadata& metadata) {
++    static constexpr hdr_metadata_infoframe NONE = {};
++    if (metadata.metadata_type || memcmp(&metadata.hdmi_metadata_type1, &NONE, sizeof(NONE)))
++        return false;
++
++    uint64_t blob = 0;
++    return getDRMProp(connector->backend->drmFD(), connector->id, connector->props.values.hdr_output_metadata, &blob) && !blob;
++}
++
+ bool Aquamarine::CDRMOutput::commitState(bool onlyTest) {
+     if (!backend->backend->session->active) {
+         backend->backend->log(AQ_LOG_ERROR, "drm: Session inactive");
+@@ -2640,9 +2651,15 @@ bool Aquamarine::CDRMOutput::commitState(bool onlyTest) {
+         return false;
+     }
+ 
++    // HDR metadata the connector keeps isn't sent, so it needs no modeset either
++    const bool SENDS_HDR = (COMMITTED & COutputState::eOutputStateProperties::AQ_OUTPUT_STATE_HDR) && !keepsNoHDRMetadata(connector, STATE.hdrMetadata);
++
+     // If we are changing the rendering format, we may need to reconfigure the output (aka modeset)
+-    // which may result in some glitches
+-    const bool NEEDS_RECONFIG = SNAPSHOT.needsReconfig();
++    // which may result in some glitches. needsReconfig() without HDR, which SENDS_HDR covers.
++    const bool NEEDS_RECONFIG = SENDS_HDR ||
++        (COMMITTED &
++         (COutputState::AQ_OUTPUT_STATE_ENABLED | COutputState::AQ_OUTPUT_STATE_FORMAT | COutputState::AQ_OUTPUT_STATE_MODE | COutputState::AQ_OUTPUT_STATE_WCG |
++          COutputState::AQ_OUTPUT_STATE_MAX_BPC));
+ 
+     const bool BLOCKING = NEEDS_RECONFIG || !(COMMITTED & COutputState::eOutputStateProperties::AQ_OUTPUT_STATE_BUFFER);
+ 
+@@ -2850,7 +2867,7 @@ bool Aquamarine::CDRMOutput::commitState(bool onlyTest) {
+         }
+     }
+ 
+-    if (COMMITTED & COutputState::eOutputStateProperties::AQ_OUTPUT_STATE_HDR)
++    if (SENDS_HDR)
+         data.hdrMetadata = STATE.hdrMetadata;
+ 
+     data.blocking  = BLOCKING || formatMismatch;

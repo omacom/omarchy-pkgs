@@ -25,8 +25,10 @@ package, every file of the node comes from the one driver package whose INF
 `DriverVer` Windows ranks first (date, then version). Identical duplicates are
 accepted; other differing variants are skipped. The result is
 installed under `/usr/lib/firmware/updates/<name>`. The GPU zap shader is
-added to the initramfs through `/etc/mkinitcpio.conf.d/qcom-firmware.conf`;
-the DSP images are loaded from the root filesystem. What was installed, from
+added to the initramfs through `/etc/mkinitcpio.conf.d/qcom-firmware.conf`.
+If that file has gone when the image is built, for example a copy moved away
+by hand, the image takes the file the kernel would load instead, or leaves the
+shader out, so the build still succeeds. The DSP images are loaded from the root filesystem. What was installed, from
 where, and its checksum is recorded in
 `/var/lib/omarchy/qcom-firmware/manifest`.
 

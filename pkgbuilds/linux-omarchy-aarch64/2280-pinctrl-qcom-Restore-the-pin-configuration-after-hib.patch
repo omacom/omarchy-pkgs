@@ -1,0 +1,256 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Birk Skyum <birk.skyum@pm.me>
+Date: Wed, 21 Oct 2026 21:04:35 +0000
+Subject: [PATCH] pinctrl: qcom: Restore the pin configuration after
+ hibernation
+
+A hibernation image is restored after a power cycle. The TLMM registers
+then hold what the boot firmware and the kernel that loaded the image
+made of them. The restored kernel has the configuration it applied in
+memory only, and nothing writes it to the hardware again, so every pin
+that the loading kernel did not set up the same way stays wrong.
+
+On a Lenovo Yoga Slim 7x (X1E80100) the Bluetooth and Wi-Fi enable lines
+are two of them. Their drivers are loaded from the root file system, so
+the kernel that loads the image never touches the pins. This is
+/sys/kernel/debug/gpio before the hibernation and after the resume:
+
+  gpio116 : out low  func0 2mA no pull
+  gpio117 : out high func0 2mA no pull
+
+  gpio116 : in  low  func0 2mA pull down
+  gpio117 : out high func0 16mA no pull
+
+The driver that owns gpio116 still believes it drives the line.
+
+Save the control, output and interrupt configuration registers in
+freeze_noirq and write them back in restore_noirq, the output level
+first, so that a pin drives the right level from the moment it becomes
+an output. Changing the interrupt configuration can latch an interrupt,
+so the configuration is written with the interrupt disabled, the status
+is cleared where the register changed, as msm_gpio_irq_set_type() does
+with the interrupt masked, and only then is the interrupt enabled again.
+
+Only the GPIOs the kernel uses are put back: those requested as a GPIO,
+muxed to a function or used as an interrupt, as pinctrl-intel does. A
+valid GPIO without an owner may be in use by firmware. The SDC pads
+after the GPIOs are configured without a mux function, so they never
+have an owner, and their control register is always put back.
+
+msm_pinctrl_dev_pm_ops gets the two callbacks and x1e80100 starts using
+these ops. With that x1e80100 also gets their suspend and resume
+callbacks, which apply the sleep and default state of the controller's
+own pins where a board defines them.
+
+Signed-off-by: Birk Skyum <birk.skyum@pm.me>
+Link: https://lore.kernel.org/r/20261021210425.57066-1-birk.skyum@pm.me
+---
+ drivers/pinctrl/qcom/pinctrl-msm.c      | 150 +++++++++++++++++++++++-
+ drivers/pinctrl/qcom/pinctrl-x1e80100.c |   1 +
+ 2 files changed, 149 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/pinctrl/qcom/pinctrl-msm.c b/drivers/pinctrl/qcom/pinctrl-msm.c
+index 27f06bbc1..32aa7b919 100644
+--- a/drivers/pinctrl/qcom/pinctrl-msm.c
++++ b/drivers/pinctrl/qcom/pinctrl-msm.c
+@@ -39,6 +39,15 @@
+ #define MAX_NR_TILES 4
+ #define PS_HOLD_OFFSET 0x820
+ 
++/* Register values of one pin group, kept across a hibernation. */
++struct msm_pin_state {
++	u32 ctl;
++	u32 io;
++	u32 intr_cfg;
++	u32 intr_target;
++	bool saved;
++};
++
+ /**
+  * struct msm_pinctrl - state for a pinctrl-msm device
+  * @dev:            device handle.
+@@ -58,6 +67,7 @@
+  * @soc:            Reference to soc_data of platform specific data.
+  * @regs:           Base addresses for the TLMM tiles.
+  * @phys_base:      Physical base address
++ * @saved:          Pin registers kept while a hibernation image is taken.
+  */
+ struct msm_pinctrl {
+ 	struct device *dev;
+@@ -80,6 +90,8 @@ struct msm_pinctrl {
+ 	const struct msm_pinctrl_soc_data *soc;
+ 	void __iomem *regs[MAX_NR_TILES];
+ 	u32 phys_base[MAX_NR_TILES];
++
++	struct msm_pin_state *saved;
+ };
+ 
+ #define MSM_ACCESSOR(name) \
+@@ -1583,9 +1595,136 @@ static __maybe_unused int msm_pinctrl_resume(struct device *dev)
+ 	return pinctrl_force_default(pctrl->pctrl);
+ }
+ 
+-SIMPLE_DEV_PM_OPS(msm_pinctrl_dev_pm_ops, msm_pinctrl_suspend,
+-		  msm_pinctrl_resume);
++static bool msm_pin_has_own_intr_target(struct msm_pinctrl *pctrl,
++					const struct msm_pingroup *g)
++{
++	return !pctrl->intr_target_use_scm && g->intr_target_reg &&
++	       g->intr_target_reg != g->intr_cfg_reg;
++}
+ 
++/*
++ * A GPIO is only put back when the kernel uses it, as a GPIO, through a mux
++ * function or as an interrupt. Other valid pins may be in use by firmware.
++ * The pads after the GPIOs (SDC) have no GPIO and are configured without a
++ * mux function, so they never have an owner and are always put back.
++ */
++static bool msm_pin_in_use(struct msm_pinctrl *pctrl, unsigned int i)
++{
++	const struct pin_desc *desc;
++
++	if (i >= pctrl->chip.ngpio)
++		return true;
++
++	if (!gpiochip_line_is_valid(&pctrl->chip, i))
++		return false;
++
++	desc = pin_desc_get(pctrl->pctrl, i);
++
++	return desc && (desc->mux_owner || desc->gpio_owner ||
++			gpiochip_line_is_irq(&pctrl->chip, i));
++}
++
++/* Remember how the pins are set up when a hibernation image is taken. */
++static int msm_pinctrl_freeze_noirq(struct device *dev)
++{
++	struct msm_pinctrl *pctrl = dev_get_drvdata(dev);
++	const struct msm_pingroup *g;
++	struct msm_pin_state *s;
++	unsigned int i;
++
++	guard(raw_spinlock_irqsave)(&pctrl->lock);
++
++	for (i = 0; i < pctrl->soc->ngroups; i++) {
++		g = &pctrl->soc->groups[i];
++		s = &pctrl->saved[i];
++		s->saved = msm_pin_in_use(pctrl, i);
++		if (!s->saved)
++			continue;
++
++		s->ctl = msm_readl_ctl(pctrl, g);
++		if (i >= pctrl->chip.ngpio)
++			continue;
++
++		s->io = msm_readl_io(pctrl, g);
++		if (!g->intr_cfg_reg)
++			continue;
++
++		s->intr_cfg = msm_readl_intr_cfg(pctrl, g);
++		if (msm_pin_has_own_intr_target(pctrl, g))
++			s->intr_target = msm_readl_intr_target(pctrl, g);
++	}
++
++	return 0;
++}
++
++/*
++ * The image is restored after a power cycle, when the pins are back at what
++ * the firmware and the kernel that loaded the image made of them. Nothing else
++ * writes the configuration again, so put back what was there.
++ *
++ * A both-edge interrupt that is emulated by flipping the polarity gets the
++ * polarity it had, which is not primed for a line that changed meanwhile. No
++ * SoC with such pins (one-bit detection) uses these callbacks.
++ */
++static int msm_pinctrl_restore_noirq(struct device *dev)
++{
++	struct msm_pinctrl *pctrl = dev_get_drvdata(dev);
++	const struct msm_pingroup *g;
++	struct msm_pin_state *s;
++	unsigned int i;
++	u32 val;
++
++	guard(raw_spinlock_irqsave)(&pctrl->lock);
++
++	for (i = 0; i < pctrl->soc->ngroups; i++) {
++		g = &pctrl->soc->groups[i];
++		s = &pctrl->saved[i];
++		if (!s->saved)
++			continue;
++
++		if (i >= pctrl->chip.ngpio) {
++			msm_writel_ctl(s->ctl, pctrl, g);
++			continue;
++		}
++
++		/* Set the level before the pin starts driving it. */
++		val = msm_readl_io(pctrl, g);
++		val &= ~BIT(g->out_bit);
++		val |= s->io & BIT(g->out_bit);
++		msm_writel_io(val, pctrl, g);
++
++		msm_writel_ctl(s->ctl, pctrl, g);
++		if (!g->intr_cfg_reg)
++			continue;
++
++		if (msm_pin_has_own_intr_target(pctrl, g))
++			msm_writel_intr_target(s->intr_target, pctrl, g);
++
++		/*
++		 * Changing the configuration can latch an interrupt, so write it
++		 * with the interrupt disabled and clear the status before the
++		 * interrupt is enabled again. One that is latched with the
++		 * configuration unchanged is a real one.
++		 */
++		val = msm_readl_intr_cfg(pctrl, g);
++		msm_writel_intr_cfg(s->intr_cfg & ~BIT(g->intr_enable_bit),
++				    pctrl, g);
++		if (val != s->intr_cfg)
++			msm_ack_intr_status(pctrl, g);
++		if (s->intr_cfg & BIT(g->intr_enable_bit))
++			msm_writel_intr_cfg(s->intr_cfg, pctrl, g);
++	}
++
++	return 0;
++}
++
++const struct dev_pm_ops msm_pinctrl_dev_pm_ops = {
++	SYSTEM_SLEEP_PM_OPS(msm_pinctrl_suspend, msm_pinctrl_resume)
++	.freeze_noirq = PTR_IF(IS_ENABLED(CONFIG_HIBERNATE_CALLBACKS),
++			       msm_pinctrl_freeze_noirq),
++	.restore_noirq = PTR_IF(IS_ENABLED(CONFIG_HIBERNATE_CALLBACKS),
++				msm_pinctrl_restore_noirq),
++};
+ EXPORT_SYMBOL(msm_pinctrl_dev_pm_ops);
+ 
+ int msm_pinctrl_probe(struct platform_device *pdev,
+@@ -1663,6 +1802,13 @@ int msm_pinctrl_probe(struct platform_device *pdev,
+ 	if (ret)
+ 		return ret;
+ 
++	if (IS_ENABLED(CONFIG_HIBERNATE_CALLBACKS)) {
++		pctrl->saved = devm_kcalloc(&pdev->dev, pctrl->soc->ngroups,
++					    sizeof(*pctrl->saved), GFP_KERNEL);
++		if (!pctrl->saved)
++			return -ENOMEM;
++	}
++
+ 	platform_set_drvdata(pdev, pctrl);
+ 
+ 	dev_dbg(&pdev->dev, "Probed Qualcomm pinctrl driver\n");
+diff --git a/drivers/pinctrl/qcom/pinctrl-x1e80100.c b/drivers/pinctrl/qcom/pinctrl-x1e80100.c
+index b4e794161..70f8e1472 100644
+--- a/drivers/pinctrl/qcom/pinctrl-x1e80100.c
++++ b/drivers/pinctrl/qcom/pinctrl-x1e80100.c
+@@ -1856,6 +1856,7 @@ static struct platform_driver x1e80100_pinctrl_driver = {
+ 	.driver = {
+ 		.name = "x1e80100-tlmm",
+ 		.of_match_table = x1e80100_pinctrl_of_match,
++		.pm = &msm_pinctrl_dev_pm_ops,
+ 	},
+ 	.probe = x1e80100_pinctrl_probe,
+ };
+-- 
+2.56.1
+

@@ -36,7 +36,9 @@ Architecture keys become sha256sums_<arch> in the PKGBUILD; the key "any" means
 the unsuffixed sha256sums array. An empty object ({}) reports no update.
 
 When the reported version is newer than the checked-in one, pkgver and the
-listed checksum arrays are rewritten and pkgrel is reset to 1.
+listed checksum arrays are rewritten and pkgrel is reset to 1. A hook may also
+report an explicit "pkgrel" for a same-pkgver rebuild (such as an upstream
+OSTree republish) when vercmp confirms the new pkgver-pkgrel is newer.
 
 A package may declare "min_release_age" in .omarchy/package.json ("24h", "2d",
 or bare seconds) to quarantine fresh releases until maintainers have had time
@@ -52,10 +54,12 @@ Arguments:
   PACKAGE    One or more package names to update (optional)
 
 Options:
-  --lane <reviewed|auto-merge|all>
+  --lane <reviewed|auto-merge|five-minute|all>
              Which delivery lane to sync (default: all). Packages marked
-             "auto_merge": true are checked hourly; everything else every
-             six hours. Both groups open PRs and auto-merge when checks pass.
+             "auto_merge": true are checked hourly, those also marked
+             "sync_cadence": "five-minute" every five minutes instead, and
+             everything else every six hours. All open PRs and auto-merge
+             when checks pass.
              The workflow selects a lane for each schedule; these historical
              lane names remain compatible with existing CLI callers.
 
@@ -78,8 +82,8 @@ while [[ $# -gt 0 ]]; do
     --lane)
       LANE="${2:-}"
       case "$LANE" in
-        reviewed|auto-merge|all) ;;
-        *) print_error "Invalid --lane '$LANE' (expected reviewed, auto-merge, or all)"; exit 1 ;;
+        reviewed|auto-merge|five-minute|all) ;;
+        *) print_error "Invalid --lane '$LANE' (expected reviewed, auto-merge, five-minute, or all)"; exit 1 ;;
       esac
       shift 2
       ;;
@@ -110,6 +114,12 @@ get_pkgver() {
   local package_dir="$1"
 
   grep -m1 '^pkgver=' "$package_dir/PKGBUILD" | cut -d= -f2- | tr -d "\"'"
+}
+
+get_pkgrel() {
+  local package_dir="$1"
+
+  grep -m1 '^pkgrel=' "$package_dir/PKGBUILD" | cut -d= -f2- | tr -d "\"'"
 }
 
 assert_single_assignment() {
@@ -232,6 +242,7 @@ validate_release() {
     and (.sha256sums | to_entries | all(
       .value | type == "array" and length > 0 and all(test("\\A[0-9a-f]{64}\\z"))
     ))
+    and (if has("pkgrel") then (.pkgrel | type == "string" and test("\\A[1-9][0-9]*(?:\\.[0-9]+)?\\z")) else true end)
     and (if has("published_at") then (.published_at | type == "string" and length > 0) else true end)
   ' <<<"$release" >/dev/null
 }
@@ -244,7 +255,8 @@ verify_pkgbuild() {
   local pkgbuild="$1"
   local release="$2"
   local pkgver="$3"
-  shift 3
+  local target_pkgrel="$4"
+  shift 4
   local arrays=("$@")
 
   if ! bash -n "$pkgbuild" 2>/dev/null; then
@@ -269,7 +281,7 @@ verify_pkgbuild() {
   local expected
   expected=$(
     printf 'pkgver\t%s\n' "$pkgver"
-    printf 'pkgrel\t1\n'
+    printf 'pkgrel\t%s\n' "$target_pkgrel"
     local array arch
     for array in "${arrays[@]}"; do
       arch="${array#sha256sums}"
@@ -291,6 +303,7 @@ apply_release() {
   local package_dir="$1"
   local release="$2"
   local pkgver="$3"
+  local target_pkgrel="${4:-1}"
   local pkgbuild="$package_dir/PKGBUILD"
 
   local arch array values
@@ -333,9 +346,9 @@ apply_release() {
     done
 
     set_pkgbuild_scalar "$scratch" pkgver "$pkgver" || exit 1
-    set_pkgbuild_scalar "$scratch" pkgrel 1 || exit 1
+    set_pkgbuild_scalar "$scratch" pkgrel "$target_pkgrel" || exit 1
 
-    verify_pkgbuild "$scratch" "$release" "$pkgver" "${arrays[@]}" || exit 1
+    verify_pkgbuild "$scratch" "$release" "$pkgver" "$target_pkgrel" "${arrays[@]}" || exit 1
   ); then
     rm -f "$scratch"
     return 1
@@ -475,9 +488,11 @@ sync_package() {
       ;;
   esac
 
-  local pkgver current_pkgver
+  local pkgver pkgrel current_pkgver current_pkgrel target_pkgrel="1"
   pkgver=$(jq -r '.pkgver' <<<"$release")
+  pkgrel=$(jq -r '.pkgrel // empty' <<<"$release")
   current_pkgver=$(get_pkgver "$package_dir")
+  current_pkgrel=$(get_pkgrel "$package_dir")
 
   if [[ -z "$current_pkgver" ]]; then
     print_error "Could not read pkgver from $package_dir/PKGBUILD"
@@ -486,24 +501,39 @@ sync_package() {
   fi
 
   if [[ "$pkgver" == "$current_pkgver" ]]; then
-    print_info "  Already at $current_pkgver"
-    ((++SKIPPED))
-    return 0
-  fi
-
-  if ! version_is_newer "$pkgver" "$current_pkgver"; then
+    if [[ -z "$pkgrel" ]]; then
+      print_info "  Already at $current_pkgver"
+      ((++SKIPPED))
+      return 0
+    fi
+    if [[ -z "$current_pkgrel" ]]; then
+      print_error "Could not read pkgrel from $package_dir/PKGBUILD"
+      ((++FAILED))
+      return 0
+    fi
+    if ! version_is_newer "${pkgver}-${pkgrel}" "${current_pkgver}-${current_pkgrel}"; then
+      print_warning "  Upstream reports ${pkgver}-${pkgrel}, not newer than the checked-in ${current_pkgver}-${current_pkgrel}; leaving it alone"
+      ((++SKIPPED))
+      return 0
+    fi
+    target_pkgrel="$pkgrel"
+  elif ! version_is_newer "$pkgver" "$current_pkgver"; then
     print_warning "  Upstream reports $pkgver, older than the checked-in $current_pkgver; leaving it alone"
     ((++SKIPPED))
     return 0
   fi
 
-  if ! apply_release "$package_dir" "$release" "$pkgver"; then
+  if ! apply_release "$package_dir" "$release" "$pkgver" "$target_pkgrel"; then
     print_error "Failed to update $package"
     ((++FAILED))
     return 0
   fi
 
-  print_success "  $current_pkgver -> $pkgver"
+  if [[ "$pkgver" == "$current_pkgver" ]]; then
+    print_success "  ${current_pkgver}-${current_pkgrel} -> ${pkgver}-${target_pkgrel}"
+  else
+    print_success "  $current_pkgver -> $pkgver"
+  fi
   ((++UPDATED))
 }
 
@@ -1048,6 +1078,25 @@ EOF
   if ! bash "$BUILD_ROOT/pkgbuilds/tmog-bin/.omarchy/upstream-test.sh"; then
     failures=$((failures + 1))
   fi
+  if ! bash "$BUILD_ROOT/pkgbuilds/notion-desktop/.omarchy/upstream-test.sh"; then
+    failures=$((failures + 1))
+  fi
+
+  # Explicit pkgrel allows a hook to advance a same-pkgver rebuild (e.g. an
+  # upstream OSTree republish) while rejecting invalid or non-advancing pkgrel.
+  local rel_pkg="$TEMP_DIR/selftest-pkgrel"
+  mkdir -p "$rel_pkg/.omarchy"
+  printf 'pkgver=7.45.2\npkgrel=1\nsha256sums_x86_64=(\x27%s\x27)\n' "$(printf 'a%.0s' {1..64})" > "$rel_pkg/PKGBUILD"
+  local new_sum good_rel bad_rel
+  new_sum=$(printf 'b%.0s' {1..64})
+  good_rel=$(jq -nc --arg s "$new_sum" '{pkgver: "7.45.2", pkgrel: "2", sha256sums: {x86_64: [$s]}}')
+  bad_rel=$(jq -nc --arg s "$new_sum" '{pkgver: "7.45.2", pkgrel: "0", sha256sums: {x86_64: [$s]}}')
+  check "validate_release accepts valid pkgrel" "0" "$(validate_release "$good_rel" && echo 0 || echo 1)"
+  check "validate_release rejects zero pkgrel" "1" "$(validate_release "$bad_rel" && echo 0 || echo 1)"
+  check "version_is_newer rejects same pkgver-pkgrel" "1" "$(version_is_newer "7.45.2-1" "7.45.2-1" && echo 0 || echo 1)"
+  check "version_is_newer accepts higher pkgrel" "0" "$(version_is_newer "7.45.2-2" "7.45.2-1" && echo 0 || echo 1)"
+  check "apply_release writes explicit pkgrel" "0" "$(apply_release "$rel_pkg" "$good_rel" "7.45.2" "2" && echo 0 || echo 1)"
+  check "explicit pkgrel persisted in PKGBUILD" "2" "$(get_pkgrel "$rel_pkg")"
 
   echo ""
   if [[ "$failures" -eq 0 ]]; then

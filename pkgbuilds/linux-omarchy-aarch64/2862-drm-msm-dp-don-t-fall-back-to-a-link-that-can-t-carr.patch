@@ -1,0 +1,90 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jesse Casco <jesse.casco@gmail.com>
+Date: Sat, 14 Nov 2026 18:37:58 -0500
+Subject: [PATCH] drm/msm/dp: don't fall back to a link that can't carry the
+ eDP mode
+
+When channel equalisation fails after clock recovery succeeded,
+msm_dp_ctrl_on_link() halves the lane count and trains again. Nothing
+checks that the reduced link can still carry the current mode.
+
+On the ASUS Zenbook A16, channel equalisation at 4 lanes x HBR2 fails
+on some DPMS wakes. The 2-lane retry trains but can't carry the mode
+(17.03 Gbps needed, 8.64 Gbps available), so the panel stays dark
+while userspace sees the output as on.
+
+For eDP, check the reduced link against the mode with the same
+bandwidth check as msm_dp_display_mode_valid(), and retry at the
+previous parameters when it falls short. External DisplayPort keeps
+the existing fallback.
+
+Tested with 100 DPMS off/on cycles before and after: channel
+equalisation failed on 6-7% of wakes either way. Without this patch
+each failure left the panel dark; with it, each one recovered on the
+first retry at 4 lanes.
+
+Link: https://lore.kernel.org/r/20261115000021.78869-1-jesse.casco@gmail.com
+Signed-off-by: Jesse Casco <jesse.casco@gmail.com>
+---
+ drivers/gpu/drm/msm/dp/dp_ctrl.c | 24 ++++++++++++++++++++++++
+ 1 file changed, 24 insertions(+)
+
+diff --git a/drivers/gpu/drm/msm/dp/dp_ctrl.c b/drivers/gpu/drm/msm/dp/dp_ctrl.c
+index 9bc954b..cbecf84 100644
+--- a/drivers/gpu/drm/msm/dp/dp_ctrl.c
++++ b/drivers/gpu/drm/msm/dp/dp_ctrl.c
+@@ -1776,6 +1776,16 @@ static int msm_dp_ctrl_link_rate_down_shift(struct msm_dp_ctrl_private *ctrl)
+ 	return -EINVAL;
+ }
+ 
++static bool msm_dp_ctrl_link_fits_mode(struct msm_dp_ctrl_private *ctrl,
++				       struct msm_dp_panel *panel,
++				       unsigned long pixel_rate)
++{
++	const struct msm_dp_link_info *params = &ctrl->link->link_params;
++
++	return (u64)pixel_rate * panel->msm_dp_mode.bpp <=
++	       (u64)params->num_lanes * params->rate * 8;
++}
++
+ static int msm_dp_ctrl_link_lane_down_shift(struct msm_dp_ctrl_private *ctrl,
+ 					    struct msm_dp_panel *panel)
+ {
+@@ -2909,6 +2919,7 @@ int msm_dp_ctrl_on_link(struct msm_dp_ctrl *msm_dp_ctrl,
+ 	int same_params_retries = 2;
+ 	bool is_edp = panel->connector &&
+ 		      panel->connector->connector_type == DRM_MODE_CONNECTOR_eDP;
++	struct msm_dp_link_info prev_params;
+ 	u32 const phy_cts_pixel_clk_khz = 148500;
+ 	u8 link_status[DP_LINK_STATUS_SIZE];
+ 	unsigned int training_step;
+@@ -2967,6 +2978,7 @@ int msm_dp_ctrl_on_link(struct msm_dp_ctrl *msm_dp_ctrl,
+ 	ctrl->lttpr_eq_tps3 = false;
+ 
+ 	while (--link_train_max_retries) {
++		prev_params = ctrl->link->link_params;
+ 		training_step = DP_TRAINING_NONE;
+ 		rc = msm_dp_ctrl_setup_main_link(ctrl, panel, &training_step);
+ 		if (rc == 0) {
+@@ -3044,6 +3056,18 @@ int msm_dp_ctrl_on_link(struct msm_dp_ctrl *msm_dp_ctrl,
+ 			msm_dp_ctrl_clear_training_pattern(ctrl, panel, DP_PHY_DPRX);
+ 		}
+ 
++		/*
++		 * An eDP panel has one fixed mode. A lower rate or lane count that
++		 * cannot carry it trains, but leaves the panel dark: retry at the
++		 * previous parameters instead.
++		 */
++		if (is_edp && !msm_dp_ctrl_link_fits_mode(ctrl, panel, pixel_rate)) {
++			ctrl->link->link_params = prev_params;
++			drm_dbg_dp(ctrl->drm_dev,
++				   "eDP mode needs rate=%d lanes=%d, retrying\n",
++				   prev_params.rate, prev_params.num_lanes);
++		}
++
+ 		rc = msm_dp_ctrl_reinitialize_mainlink(ctrl, panel);
+ 		if (rc) {
+ 			DRM_ERROR("Failed to reinitialize mainlink. rc=%d\n", rc);
+-- 
+2.56.0
+

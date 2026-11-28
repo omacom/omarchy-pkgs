@@ -18,7 +18,11 @@ shift
 (( $# > 0 )) || { echo "hold-reviewed-pr.sh: packages required" >&2; exit 2; }
 repo=${GITHUB_REPOSITORY:?GITHUB_REPOSITORY required}
 
-pr=$(gh pr list -R "$repo" --head "$branch" --state open --json number --jq '.[0].number // empty')
+# Only this repository's PR into master. GitHub filters by owner:branch
+# itself: a client-side filter after a page limit could miss ours behind
+# forks' PRs from a branch of the same name. A failed lookup stops the push.
+pr=$(gh api -X GET "repos/$repo/pulls" -f head="${repo%%/*}:$branch" -f base=master -f state=open \
+  --jq '.[0].number // empty')
 if [[ -z $pr ]]; then
   echo "no open PR on $branch: it opens as a draft"
   exit 0

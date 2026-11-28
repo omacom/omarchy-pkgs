@@ -9,6 +9,10 @@ ARCH=${ARCH:-x86_64}
 # interpret an exported ARCH themselves (Linux calls this target "arm64").
 # Keep the shell variable local to the orchestrator so PKGBUILDs see CARCH only.
 export -n ARCH
+# The architecture this container runs. It differs from ARCH only for a
+# package that cross-compiles (package_build_host); bin/build sets both. A
+# dry run plans for every builder and passes "any".
+BUILDER_ARCH=${BUILDER_ARCH:-$ARCH}
 MIRROR=${MIRROR:-edge}
 DRY_RUN=${DRY_RUN:-false}
 # bin/build plans the whole run, then invokes this script once per package in
@@ -104,9 +108,13 @@ if [[ "$DRY_RUN" != true ]]; then
   # Always add omarchy-build repo first (for incremental builds). Repository
   # order is pacman's priority order, so this must precede the official repos;
   # otherwise pacman can select an older official package with the same name.
-  # Packages in build-output are unsigned, so use SigLevel = Never.
-  sudo sed -i "/^\[core\]$/i [omarchy-build]\nSigLevel = Never\nServer = file://$BUILD_OUTPUT_DIR\n" /etc/pacman.conf
-  echo "  -> omarchy-build (priority 1): $BUILD_OUTPUT_DIR"
+  # Packages in build-output are unsigned, so use SigLevel = Never. A cross
+  # build keeps the database for its outputs, but its $ARCH packages cannot
+  # run in this container, so pacman never installs from it.
+  if [[ $BUILDER_ARCH == "$ARCH" ]]; then
+    sudo sed -i "/^\[core\]$/i [omarchy-build]\nSigLevel = Never\nServer = file://$BUILD_OUTPUT_DIR\n" /etc/pacman.conf
+    echo "  -> omarchy-build (priority 1): $BUILD_OUTPUT_DIR"
+  fi
 
   # Initialize empty build database if it doesn't exist
   cd "$BUILD_OUTPUT_DIR" || exit 1
@@ -145,8 +153,20 @@ if [[ "$DRY_RUN" != true ]]; then
 
   # Add omarchy repo if it has a database (stable packages). The local tree
   # is trusted as-is; the public channel is verified against the omarchy
-  # keyring the image already carries.
-  if [[ -f "$FINAL_OUTPUT_DIR/omarchy.db.tar.zst" ]] || [[ -f "$FINAL_OUTPUT_DIR/omarchy.db" ]]; then
+  # keyring the image already carries. A cross build installs only packages
+  # that run here, so it takes Omarchy's tree or channel for the builder's
+  # architecture, found the same way.
+  if [[ $BUILDER_ARCH != "$ARCH" ]]; then
+    builder_tree="${FINAL_OUTPUT_DIR%/*}/$BUILDER_ARCH"
+    builder_channel="$PUBLISHED_REPO_URL/$MIRROR/$BUILDER_ARCH"
+    if [[ -f "$builder_tree/omarchy.db.tar.zst" ]] || [[ -f "$builder_tree/omarchy.db" ]]; then
+      sudo sed -i "/^\[core\]$/i [omarchy]\nSigLevel = Optional TrustAll\nServer = file://$builder_tree\n" /etc/pacman.conf
+      echo "  -> omarchy (priority 2): $builder_tree"
+    elif [[ -n "$PUBLISHED_REPO_URL" ]] && curl -fsI --max-time 30 "$builder_channel/omarchy.db.tar.zst" >/dev/null; then
+      sudo sed -i "/^\[core\]$/i [omarchy]\nSigLevel = Required DatabaseOptional\nServer = $builder_channel\n" /etc/pacman.conf
+      echo "  -> omarchy (priority 2): $builder_channel"
+    fi
+  elif [[ -f "$FINAL_OUTPUT_DIR/omarchy.db.tar.zst" ]] || [[ -f "$FINAL_OUTPUT_DIR/omarchy.db" ]]; then
     sudo sed -i "/^\[core\]$/i [omarchy]\nSigLevel = Optional TrustAll\nServer = file://$FINAL_OUTPUT_DIR\n" /etc/pacman.conf
     echo "  -> omarchy (priority 2): $FINAL_OUTPUT_DIR"
   elif [[ -n "$PUBLISHED_REPO_SERVER" ]]; then
@@ -156,6 +176,19 @@ if [[ "$DRY_RUN" != true ]]; then
 
   # Sync pacman database
   sudo pacman -Sy || exit 1
+
+  # A cross build: makepkg names and checks packages for ARCH. Its strip
+  # step runs this image's GNU strip, which reads only $BUILDER_ARCH objects,
+  # so it is off; a cross recipe strips with its own toolchain. makepkg -s
+  # still installs the recipe's depends, in their $BUILDER_ARCH builds: host
+  # tools the build runs link them (V8's snapshot generator needs libxcb).
+  if [[ $BUILDER_ARCH != "$ARCH" ]]; then
+    echo "==> Cross-building for $ARCH on $BUILDER_ARCH"
+    sed -e "s/^CARCH=.*/CARCH=\"$ARCH\"/" -e "s/^CHOST=.*/CHOST=\"$ARCH-unknown-linux-gnu\"/" \
+      -e "/^OPTIONS=/s/\([( ]\)strip/\1!strip/" /etc/makepkg.conf > "/tmp/makepkg-$ARCH.conf" || exit 1
+    grep -q '^OPTIONS=(.*!strip' "/tmp/makepkg-$ARCH.conf" || exit 1
+    export MAKEPKG_CONF="/tmp/makepkg-$ARCH.conf"
+  fi
 fi
 
 echo "==> Package Builder"
@@ -257,13 +290,19 @@ remote_version_is_published() {
   curl -sI --parallel --max-time 10 -w '%{exitcode} %{http_code}\n' "${requests[@]}" | awk '$1 == 0 && $2 >= 200 && $2 < 400 { found = 1 } END { exit !found }'
 }
 
-# Check if package should be built for current architecture
+# Check if package should be built for current architecture, in this
+# builder: a package that cross-compiles builds only in its own builder image.
 # Returns 0 (success) if should build, 1 if should skip
 should_build_for_arch() {
   local pkg="$1"
   local pkgdir
   pkgdir=$(find_package_dir "$pkg")
-  [[ -n "$pkgdir" ]] && package_supports_arch "$pkgdir" "$ARCH"
+  [[ -n "$pkgdir" ]] && package_supports_arch "$pkgdir" "$ARCH" &&
+    builds_in_this_builder "$pkg"
+}
+
+builds_in_this_builder() {
+  [[ $BUILDER_ARCH == any || $(package_build_host "$1" "$ARCH") == "$BUILDER_ARCH" ]]
 }
 
 # For VCS packages, makepkg recalculates pkgver() before the build. If the
@@ -357,6 +396,10 @@ build_package() {
       [[ "$consumer" == "$pkg" ]] && built_deps+=("omarchy-build/$dependency")
     done < "$BUILD_PLAN_DIR/dependencies"
     if (( ${#built_deps[@]} )); then
+      if [[ $BUILDER_ARCH != "$ARCH" ]]; then
+        echo "    $pkg needs ${built_deps[*]#omarchy-build/} from this run, built for $ARCH, which cannot run on this $BUILDER_ARCH builder"
+        return 1
+      fi
       echo "    Installing freshly built dependencies for $pkg..."
       sudo /usr/local/bin/pacman-for-makepkg -S --needed --noconfirm -- "${built_deps[@]}" || return 1
     fi
@@ -597,7 +640,15 @@ check_needs_build() {
 
 # Collect packages that should be built for the selected mirror
 collect_packages() {
-  packages_for_unscoped_build "$MIRROR" "$ARCH"
+  # A package that cross-compiles builds only in its own builder image.
+  local pkg
+  packages_for_unscoped_build "$MIRROR" "$ARCH" | while IFS= read -r pkg; do
+    if builds_in_this_builder "$pkg"; then
+      echo "$pkg"
+    else
+      echo "  - $pkg - builds for $ARCH in the $(package_build_host "$pkg" "$ARCH") builder image" >&2
+    fi
+  done
 }
 
 # Main execution

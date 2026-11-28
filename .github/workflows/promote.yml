@@ -14,12 +14,15 @@ name: Promote channel
 # database, and published with bin/publish-artifact, so a filename keeps one
 # set of bytes in every channel.
 #
-# Inside the same lock, bin/check-mac-set holds what the plan would leave in
-# the destination to the qualified Mac set (release/mac-inventory.txt) and
-# its shared dependency closure, and refuses the run when it does not hold.
-# Every architecture is checked before any publishes, so a refusal leaves
-# both as they were. The step summary shows the result for any run that
-# moves a Mac package or something the Mac set depends on.
+# A promotion copies files built against edge's Arch packages into a channel
+# whose Arch snapshot can be weeks older. Before anything publishes, dry run
+# included, bin/check-promotion installs every package the plan moves on the
+# destination as the promotion would leave it, and refuses the run when a
+# binary needs a library or symbol version that the destination lacks and
+# the source or edge has (`ldd -r`). The publishing run then refuses to move anything but
+# the files that were checked. linux-omarchy-headers 7.2.15-4 reached stable on
+# 2026-11-23 with a sign-file that needed OpenSSL 4's libcrypto.so.4, while
+# stable had OpenSSL 3.6.5, so DKMS left every module unsigned.
 #
 # Every run writes its plan to the step summary and keeps the full record as
 # an artifact. A run that publishes appends it to the publish log
@@ -73,7 +76,8 @@ jobs:
           *) echo "::error::Unknown direction: $DIRECTION"; exit 1 ;;
           esac
           for p in $PACKAGES; do
-            [[ $p =~ ^[a-z0-9@._+-]+$ ]] || { echo "::error::Not a package name: $p"; exit 1; }
+            # A leading - would reach promote-channel as an option.
+            [[ $p =~ ^[a-z0-9@._+][a-z0-9@._+-]*$ ]] || { echo "::error::Not a package name: $p"; exit 1; }
           done
 
       - name: Promote
@@ -106,8 +110,6 @@ jobs:
           # not own the runner's files; let it append to the record.
           chmod 0777 "$RUNNER_TEMP/promote"
           chmod 0666 "$RUNNER_TEMP/promote/record.jsonl"
-          flags=()
-          [[ $DRY_RUN == true ]] && flags+=(--dry-run)
           run() { # run <arch> <record> [flags...]
             local arch=$1 record=$2; shift 2
             # shellcheck disable=SC2086 # $PACKAGES is a space-separated list of names
@@ -122,22 +124,79 @@ jobs:
           # Plan and check every architecture before either publishes: a
           # refusal on one leaves both channels as they were. The lock is
           # held throughout, so the plans below are these plans.
-          if [[ $DRY_RUN != true ]]; then
-            : > "$RUNNER_TEMP/promote/preflight.jsonl"
-            chmod 0666 "$RUNNER_TEMP/promote/preflight.jsonl"
-            for arch in x86_64 aarch64; do
-              if ! run "$arch" preflight.jsonl --dry-run; then
-                # The refused plan, so the record shows what would have moved.
-                cat "$RUNNER_TEMP/promote/preflight.jsonl" >> "$RUNNER_TEMP/promote/record.jsonl"
-                exit 1
+          plan=$RUNNER_TEMP/promote/plan.jsonl
+          : > "$plan"
+          chmod 0666 "$plan"
+          for arch in x86_64 aarch64; do
+            if ! run "$arch" plan.jsonl --dry-run; then
+              # The refused plan, so the record shows what would have moved.
+              cat "$plan" >> "$RUNNER_TEMP/promote/record.jsonl"
+              exit 1
+            fi
+          done
+          # Every file the plan moves must run on the destination's Arch
+          # snapshot, not only on edge's, where it was built.
+          for arch in x86_64 aarch64; do
+            dir=$RUNNER_TEMP/promote/check-$arch
+            jq -r --arg a "$arch" 'select(.type == "plan" and .arch == $a and .action == "promote") | [.base, .name, .file] | @tsv' "$plan" > "$dir.plan"
+            # The publishing run below must move exactly these files.
+            cut -f3 "$dir.plan" > "$RUNNER_TEMP/promote/expect-$arch.list"
+            [[ -s $dir.plan ]] || continue
+            # A proof run's files are only in its scratch prefix, which
+            # pkgs.omarchy.org does not serve, so there is nothing to install.
+            if [[ -n ${OMARCHY_PUBLISH_PREFIX:-} ]]; then
+              echo "::notice::Proof run under $OMARCHY_PUBLISH_PREFIX: no link check for $arch"
+              continue
+            fi
+            # bin/check-promotion runs edge's builder image for the architecture.
+            if [[ $arch == x86_64 ]]; then
+              docker tag "$builder" omarchy-pkg-builder:latest-x86_64-edge
+            else
+              # The runner is x86_64: aarch64 containers run under qemu-user,
+              # registered with the F flag so it works inside a container.
+              if ! grep -qs '^flags: .*F' /proc/sys/fs/binfmt_misc/qemu-aarch64; then
+                sudo apt-get update -qq
+                sudo apt-get install -y -qq qemu-user-binfmt
               fi
-            done
+              grep -qs '^flags: .*F' /proc/sys/fs/binfmt_misc/qemu-aarch64 || { echo "::error::No qemu-aarch64 binfmt with the F flag on this runner"; exit 1; }
+              arm=ghcr.io/omacom/omarchy-pkg-builder:$(bin/builder-image key --arch aarch64 --mirror edge)
+              docker pull --quiet --platform linux/arm64 "$arm" ||
+                docker buildx build --load --platform linux/arm64 -t "$arm" --build-arg MIRROR=edge build
+              docker tag "$arm" omarchy-pkg-builder:latest-aarch64-edge
+            fi
+            status=0
+            CONTAINER_ENGINE=docker bin/check-promotion --arch "$arch" --from "$FROM" --to "$TO" "$dir.plan" 2>&1 | tee "$dir.log" || status=1
+            result=pass
+            (( status )) && result=refused
+            # The problems bin/check-promotion names, one "  path: detail" per line.
+            jq -nc --arg arch "$arch" --arg result "$result" --rawfile log "$dir.log" \
+              '{type: "links", arch: $arch, result: $result, problems: [$log | split("\n")[] | select(test("^  [^ ]")) | ltrimstr("  ")]}' >> "$plan"
+            if (( status )); then
+              cat "$plan" >> "$RUNNER_TEMP/promote/record.jsonl"
+              exit 1
+            fi
+          done
+          if [[ $DRY_RUN == true ]]; then
+            cat "$plan" >> "$RUNNER_TEMP/promote/record.jsonl"
+            exit 0
           fi
+          grep '"type":"links"' "$plan" >> "$RUNNER_TEMP/promote/record.jsonl" || true
+          # Both architectures must still plan exactly the checked files
+          # before either publishes, so a mismatch on aarch64 cannot follow
+          # an x86_64 publish.
+          : > "$RUNNER_TEMP/promote/recheck.jsonl"
+          chmod 0666 "$RUNNER_TEMP/promote/recheck.jsonl"
+          for arch in x86_64 aarch64; do
+            if ! run "$arch" recheck.jsonl --dry-run --expect "/out/expect-$arch.list"; then
+              echo "::error::The $arch plan changed after it was checked; nothing published"
+              exit 1
+            fi
+          done
           # One architecture after the other; a failure stops before the next
           # one, so a channel never moves for one architecture alone without
           # the record saying so.
           for arch in x86_64 aarch64; do
-            run "$arch" record.jsonl "${flags[@]}"
+            run "$arch" record.jsonl --expect "/out/expect-$arch.list"
           done
 
       - name: Write the record
@@ -166,7 +225,7 @@ jobs:
              result: (if $outcome == "success" then "success" else "failed" end),
              sources: [],
              plan: [.[] | select(.type == "plan") | del(.type)],
-             mac_set: [.[] | select(.type == "mac-set") | del(.type)],
+             links: [.[] | select(.type == "links") | del(.type)],
              slots: [.[] | select(.type == "slot") | del(.type)]}' \
             "$RUNNER_TEMP/promote/record.jsonl" > promote-record.json
           jq '{kind, from, to, actor, dry_run, result, slots: (.slots | length)}' promote-record.json
@@ -196,10 +255,10 @@ jobs:
                 (.[] | select(.action == "hold") | "| " + .name + " | " + (.to_version // "—") + " | " + .from_version + " | " + .reason + " |"),
                 "", "</details>", ""
               else empty end)),
-            (.mac_set[] | select(.result != "untouched") |
-              "#### Mac package set, " + .arch + ": " + (if .result == "pass" then "matches release/mac-inventory.txt" else "**refused**: nothing was published" end),
+            (.links[] |
+              "#### Link check, " + .arch + ": " + (if .result == "pass" then "every promoted file runs on `" + $ARGS.named.to + "`" else "**refused**: nothing was published" end),
               "",
-              (.problems[] | "- " + .problem),
+              (.problems[] | "- `" + . + "`"),
               ""),
             (if (.slots | length) > 0 then
               "#### Publishes", "",

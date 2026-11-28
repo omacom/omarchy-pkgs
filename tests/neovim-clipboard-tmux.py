@@ -14,7 +14,7 @@ import termios
 import time
 
 ROOT = Path(__file__).resolve().parents[1]
-PROVIDER = ROOT / "pkgbuilds/omarchy-nvim/lua/config/remote_clipboard.lua"
+PROVIDER = ROOT / "pkgbuilds/omarchy-nvim/remote_clipboard.lua"
 
 
 def drain(fd, seconds=0.1):

@@ -1,0 +1,169 @@
+#!/bin/bash
+# Check that the files a promotion moves run on the channel it moves them
+# into. They were built against edge's Arch packages, and rc's and
+# stable's Arch snapshots can be weeks older. helpers/fast-ring-check.sh
+# has what is checked and why.
+#
+# Usage: bin/check-promotion --arch <arch> --from <edge|rc> --to <rc|stable> <plan>
+#   <plan>: the files the promotion moves, one "pkgbase TAB pkgname TAB file"
+#   per line, from promote-channel's plan.
+#
+# The destination, the source and edge are each prepared once from the edge
+# builder image (omarchy-pkg-builder:latest-<arch>-edge) as the promotion
+# would leave them: the planned entries move from the channel's [omarchy]
+# repository to a [promoted] one. Each package is then installed in a fresh
+# container from that image, so packages that conflict with each other are
+# never installed together, and a dependency on another promoted package
+# resolves to the promoted version. A link problem fails the package unless
+# the source and edge, where it was built, show the same one: a problem the
+# source only has because an earlier promotion broke it is not excused. A
+# problem that blocks wherever it happens fails it too: it cannot be
+# installed, or pacman installed something else.
+set -euo pipefail
+BUILD_ROOT=$(realpath "${BASH_SOURCE[0]%/*}/..")
+source "$BUILD_ROOT/helpers/message-helpers.sh"
+source "$BUILD_ROOT/helpers/docker-helpers.sh"
+source "$BUILD_ROOT/helpers/paths.sh"
+
+JOBS=${CHECK_PROMOTION_JOBS:-3}
+while [[ $# -gt 0 && $1 == --* ]]; do
+  case $1 in
+    --arch) ARCH=${2:?Missing architecture}; shift 2 ;;
+    --from) FROM=${2:?Missing channel}; shift 2 ;;
+    --to) TO=${2:?Missing channel}; shift 2 ;;
+    *) print_error "Unknown option: $1"; exit 2 ;;
+  esac
+done
+require_valid_arch "$ARCH"
+if ! validate_mirror "${FROM:-}" || ! validate_mirror "${TO:-}" || [[ $FROM == "$TO" ]]; then
+  print_error "--from and --to must name two channels"
+  exit 2
+fi
+[[ $JOBS =~ ^[1-9][0-9]*$ ]] || { print_error "CHECK_PROMOTION_JOBS must be a positive number"; exit 2; }
+PLAN=${1:?Usage: bin/check-promotion --arch <arch> --from <channel> --to <channel> <plan>}
+[[ -s $PLAN ]] || { print_error "The plan $PLAN is empty"; exit 2; }
+check_engine
+
+image="omarchy-pkg-builder:latest-$ARCH-edge"
+"$CONTAINER_ENGINE" image inspect "$image" >/dev/null 2>&1 || {
+  print_error "Builder image $image is missing; run bin/build for $ARCH first"
+  exit 1
+}
+platform=$(get_platform_arg "$ARCH")
+tag="omarchy-promotion-check:$ARCH-$$"
+results=$(mktemp -d)
+cleanup() {
+  rm -rf "$results"
+  "$CONTAINER_ENGINE" rmi "$tag-$FROM" "$tag-$TO" "$tag-edge" >/dev/null 2>&1 || true
+}
+trap cleanup EXIT
+
+# One package per line: its name and file, which every later step reads.
+names=()
+declare -A file_of=()
+while IFS=$'\t' read -r _ name file; do
+  [[ -n $name && -n $file && -z ${file_of[$name]:-} ]] || { print_error "Bad or repeated plan line for '$name'"; exit 2; }
+  names+=("$name")
+  file_of[$name]=$file
+done < "$PLAN"
+(( ${#names[@]} == $(wc -l < "$PLAN") )) || { print_error "Could not read every line of $PLAN"; exit 2; }
+
+# prepare <channel>: the image of <channel> as the promotion would leave it.
+# For an rc -> stable baseline, edge keeps its own packages so RC versions in
+# the plan cannot manufacture a matching failure on edge.
+prepare() {
+  local channel=$1 cid
+  local -a cmd=(/helpers/fast-ring-check.sh prepare-view "$channel" "$FROM" "$ARCH" "${names[@]}")
+  if [[ $channel == edge && $FROM != edge ]]; then
+    print_info "Preparing edge ($ARCH) as the build baseline..."
+    cmd=(/helpers/fast-ring-check.sh prepare edge "$ARCH")
+  else
+    print_info "Preparing $channel ($ARCH) as this promotion would leave it..."
+  fi
+  cid=$("$CONTAINER_ENGINE" create --user root "$platform" -v "$BUILD_ROOT/helpers:/helpers:ro" "$image" \
+    "${cmd[@]}")
+  if ! "$CONTAINER_ENGINE" start -a "$cid" > "$results/prepare-$channel.log" 2>&1 ||
+    ! "$CONTAINER_ENGINE" commit "$cid" "$tag-$channel" >/dev/null; then
+    tail -n 30 "$results/prepare-$channel.log" >&2
+    "$CONTAINER_ENGINE" rm "$cid" >/dev/null 2>&1 || true
+    print_error "Could not prepare $channel ($ARCH); the check itself failed"
+    exit 1
+  fi
+  "$CONTAINER_ENGINE" rm "$cid" >/dev/null
+}
+prepare "$TO"
+prepare "$FROM"
+[[ $FROM == edge ]] || prepare edge
+
+# inspect <package> <channel>: install the package's planned file on the
+# prepared <channel> and record what would break there. The results come
+# back on stdout: the container, which runs the package's pacman hooks as
+# root, gets no writable mount of the host.
+inspect() {
+  local out=$results/$1 channel=$2
+  if [[ $channel == edge && $FROM != edge ]]; then
+    # shellcheck disable=SC2016 # $1 and $2 expand in the container's shell
+    "$CONTAINER_ENGINE" run --rm --user root "$platform" -e PROMOTION=1 \
+      -v "$BUILD_ROOT/helpers:/helpers:ro" "$tag-$channel" \
+      bash -c 'curl -fsSL --retry 3 -o "/tmp/$1" "$2" >&2 && /helpers/fast-ring-check.sh check /tmp/results "/tmp/$1" >&2 && cat /tmp/results' \
+      _ "${file_of[$1]}" "https://pkgs.omarchy.org/$FROM/$ARCH/${file_of[$1]}" > "$out/$channel" 2> "$out/$channel.log"
+    return
+  fi
+  # shellcheck disable=SC2016 # $1 expands in the container's shell
+  "$CONTAINER_ENGINE" run --rm --user root "$platform" -e PROMOTION=1 \
+    -v "$BUILD_ROOT/helpers:/helpers:ro" "$tag-$channel" \
+    bash -c '/helpers/fast-ring-check.sh check-plan /tmp/results "$1" >&2 && cat /tmp/results' \
+    _ "$1=${file_of[$1]}" > "$out/$channel" 2> "$out/$channel.log"
+}
+
+# check_package <package>: the destination first; the source and edge only
+# when there is a link problem for them to excuse. The baseline is what
+# both of them show. "done" marks a check that ran to the end.
+check_package() {
+  local out=$results/$1
+  mkdir -p "$out"
+  inspect "$1" "$TO" || return 0
+  : > "$out/baseline"
+  if grep -q '^link' "$out/$TO"; then
+    inspect "$1" "$FROM" || return 0
+    if [[ $FROM == edge ]]; then
+      cp "$out/$FROM" "$out/baseline"
+    else
+      inspect "$1" edge || return 0
+      grep -Fxf "$out/edge" "$out/$FROM" > "$out/baseline" || true
+    fi
+  fi
+  bash -c 'source "$1"; channel_failures "$2" "$3"' _ \
+    "$BUILD_ROOT/helpers/fast-ring-check.sh" "$out/baseline" "$out/$TO" > "$out/failures" || return 0
+  touch "$out/done"
+}
+
+print_info "Checking ${#names[@]} package(s) on $TO ($ARCH)..."
+for name in "${names[@]}"; do
+  while (( $(jobs -rp | wc -l) >= JOBS )); do wait -n || true; done
+  check_package "$name" &
+done
+wait
+
+failed=0
+for name in "${names[@]}"; do
+  if [[ ! -f $results/$name/done ]]; then
+    print_error "$name: the check itself failed on $ARCH"
+    tail -n 20 "$results/$name"/*.log 2>/dev/null >&2 || true
+    failed=1
+  elif [[ -s $results/$name/failures ]]; then
+    print_error "$name does not run on $TO ($ARCH):"
+    awk -F'\t' '{ printf "  %s: %s\n", $2, $3 }' "$results/$name/failures"
+    # pacman's own words when it would not install the package.
+    if grep -q '^rule' "$results/$name/failures"; then
+      { grep -E '^(error|warning|:: )' "$results/$name/$TO.log" || true; } | tail -n 8 | sed 's/^/    | /'
+    fi
+    failed=1
+  fi
+done
+if (( failed )); then
+  print_error "Refusing to promote $FROM -> $TO ($ARCH)."
+  print_info "Leave these out until $TO's Arch snapshot has what they were built against."
+  exit 1
+fi
+print_success "Every promoted file runs on $TO ($ARCH)"
