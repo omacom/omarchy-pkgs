@@ -4,6 +4,9 @@ _env_path="/etc/dell-xps-touchpad-haptics.env"
 _legacy_env_path="/etc/omarchy-dell-haptic-touchpad.env"
 _legacy_override_dir="/etc/systemd/system/dell-xps-haptic-touchpad.service.d"
 _runuser_path="/usr/bin/runuser"
+_service_unit_dir="/usr/lib/systemd/system"
+_systemd_runtime_dir="/run/systemd/system"
+_udev_control_socket="/run/udev/control"
 
 _existing_home() {
   local line value
@@ -31,34 +34,41 @@ _resolve_target_user() {
     return 0
   fi
 
+  if [[ -n ${OMARCHY_INSTALL_USER:-} && ${OMARCHY_INSTALL_USER} != "root" ]]; then
+    printf '%s\n' "$OMARCHY_INSTALL_USER"
+    return 0
+  fi
+
   if [[ -n ${SUDO_USER:-} && ${SUDO_USER} != "root" ]]; then
     printf '%s\n' "$SUDO_USER"
     return 0
   fi
 
-  if command -v logname >/dev/null 2>&1; then
-    local login_name
-    login_name=$(logname 2>/dev/null || true)
-    if [[ -n $login_name && $login_name != "root" ]]; then
-      printf '%s\n' "$login_name"
-      return 0
+  if ! _in_chroot; then
+    if command -v logname >/dev/null 2>&1; then
+      local login_name
+      login_name=$(logname 2>/dev/null || true)
+      if [[ -n $login_name && $login_name != "root" ]]; then
+        printf '%s\n' "$login_name"
+        return 0
+      fi
+    fi
+
+    if command -v loginctl >/dev/null 2>&1; then
+      local active_user
+      active_user=$(loginctl list-users --no-legend 2>/dev/null | awk '$2 != "root" && $4 == "active" { print $2; exit }')
+      if [[ -n $active_user ]]; then
+        printf '%s\n' "$active_user"
+        return 0
+      fi
     fi
   fi
 
-  if command -v loginctl >/dev/null 2>&1; then
-    local active_user
-    active_user=$(loginctl list-users --no-legend 2>/dev/null | awk '$2 != "root" && $4 == "active" { print $2; exit }')
-    if [[ -n $active_user ]]; then
-      printf '%s\n' "$active_user"
-      return 0
-    fi
-  fi
-
-  getent passwd | awk -F: '$3 >= 1000 && $1 != "nobody" && $7 !~ /(nologin|false)$/ { print $1; exit }'
+  getent passwd 2>/dev/null | awk -F: '$3 >= 1000 && $1 != "nobody" && $7 !~ /(nologin|false)$/ { print $1; exit }' || true
 }
 
 _user_home() {
-  getent passwd "$1" | cut -d: -f6
+  (getent passwd "$1" 2>/dev/null || true) | cut -d: -f6
 }
 
 _debug_value() {
@@ -84,31 +94,39 @@ _debug_value() {
 _write_env_file() {
   local home=$1
   local debug_value=$2
-  local tmpfile
+  local tmpfile rc
 
-  tmpfile=$(mktemp)
+  tmpfile=$(mktemp) || return 1
   printf 'DELL_XPS_TOUCHPAD_HAPTICS_HOME=%s\n' "$home" >"$tmpfile"
   if [[ -n $debug_value ]]; then
     printf 'DELL_XPS_TOUCHPAD_HAPTICS_DEBUG=%s\n' "$debug_value" >>"$tmpfile"
   fi
   install -D -m 644 "$tmpfile" "$_env_path"
+  rc=$?
   rm -f "$tmpfile"
+  return "$rc"
 }
 
 _in_chroot() {
-  command -v systemd-detect-virt >/dev/null 2>&1 && systemd-detect-virt -r >/dev/null 2>&1
+  if command -v systemd-detect-virt >/dev/null 2>&1 && systemd-detect-virt -r >/dev/null 2>&1; then
+    return 0
+  fi
+  if command -v ischroot >/dev/null 2>&1 && ischroot >/dev/null 2>&1; then
+    return 0
+  fi
+  return 1
 }
 
 _systemd_runtime_available() {
-  ! _in_chroot && [[ -d /run/systemd/system ]]
+  ! _in_chroot && [[ -d $_systemd_runtime_dir ]]
 }
 
 _udev_runtime_available() {
-  ! _in_chroot && [[ -S /run/udev/control ]]
+  ! _in_chroot && [[ -S $_udev_control_socket ]]
 }
 
 _service_unit_present() {
-  [[ -f /usr/lib/systemd/system/$_service_name ]]
+  [[ -f $_service_unit_dir/$_service_name ]]
 }
 
 _reload_runtime_state() {
@@ -121,6 +139,8 @@ _reload_runtime_state() {
     echo ":: Failed to reload udev rules for ${_service_name}." >&2
     return 1
   fi
+
+  return 0
 }
 
 _ensure_user_config() {
@@ -140,7 +160,7 @@ _ensure_user_config() {
 }
 
 _reset_trackpad() {
-  if _in_chroot; then
+  if ! _systemd_runtime_available; then
     return 0
   fi
 
@@ -155,7 +175,11 @@ _cleanup_legacy_state() {
 }
 
 _enable_service() {
-  if ! systemctl enable "$_service_name" >/dev/null; then
+  local -a cmd=(systemctl)
+  if ! _systemd_runtime_available; then
+    cmd+=(--root=/)
+  fi
+  if ! "${cmd[@]}" enable "$_service_name" >/dev/null; then
     echo ":: Failed to enable ${_service_name}." >&2
     return 1
   fi
@@ -193,31 +217,36 @@ _configure_package() {
   user=$(_resolve_target_user)
   if [[ -n $user ]]; then
     home=$(_user_home "$user")
+    if [[ -z $home || ! -d $home ]]; then
+      user=""
+      home=""
+    fi
   fi
 
-  if [[ -z $home || ! -d $home ]]; then
+  if [[ -z $home ]]; then
     home=$(_existing_home)
   fi
 
-  if [[ -z $home || ! -d $home ]]; then
-    echo ":: Could not determine a usable home directory for ${_service_name}." >&2
-    echo ":: Reinstall the package after logging in as your desktop user to finish setup." >&2
-    return 1
-  fi
-
-  debug_value=$(_debug_value)
-  _write_env_file "$home" "$debug_value"
-
-  if [[ -n $user ]]; then
-    if ! _ensure_user_config "$user" "$home"; then
+  if [[ -n $home && -d $home ]]; then
+    debug_value=$(_debug_value)
+    if ! _write_env_file "$home" "$debug_value"; then
+      echo ":: Failed to write ${_env_path}." >&2
       return 1
+    fi
+
+    if [[ -n $user ]]; then
+      if ! _ensure_user_config "$user" "$home"; then
+        return 1
+      fi
+    else
+      config_path="$home/.config/omarchy/dell-haptic.conf"
+      if [[ ! -f $config_path ]]; then
+        echo ":: Deferring ${config_path} setup because no desktop user could be identified."
+      fi
     fi
   else
-    config_path="$home/.config/omarchy/dell-haptic.conf"
-    if [[ ! -f $config_path ]]; then
-      echo ":: Could not seed ${config_path} because no desktop user could be identified." >&2
-      return 1
-    fi
+    echo ":: No desktop user found yet; deferring user config for ${_service_name}."
+    echo ":: Reinstall dell-xps-touchpad-haptics after creating your desktop user to configure ~/.config/omarchy/dell-haptic.conf."
   fi
 
   if ! _enable_service; then
@@ -242,8 +271,12 @@ post_upgrade() {
 }
 
 pre_remove() {
-  systemctl disable "$_service_name" 2>/dev/null || true
-  systemctl stop "$_service_name" 2>/dev/null || true
+  if _systemd_runtime_available; then
+    systemctl disable "$_service_name" 2>/dev/null || true
+    systemctl stop "$_service_name" 2>/dev/null || true
+  else
+    systemctl --root=/ disable "$_service_name" 2>/dev/null || true
+  fi
 }
 
 post_remove() {

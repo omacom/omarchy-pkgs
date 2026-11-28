@@ -11,13 +11,22 @@ Arch kernel ships it, this package selects the equivalent existing driver path
 with the module's `quirk=65536` override.
 
 The package does not replace the kernel, audio firmware, or speaker tuning. It
-owns only a modprobe drop-in and rebuilds the boot images when installed,
-upgraded, or removed.
+owns only a modprobe drop-in and ensures boot images are rebuilt on live
+systems when installed, upgraded, or removed (letting Pacman's
+`90-mkinitcpio-install.hook` perform the rebuild when it already covers
+`usr/lib/modprobe.d/` for that operation). In chroot or offline environments,
+or when `/etc/pacman.d/hooks/90-mkinitcpio-install.hook` is masked, the
+scriptlet skips the direct rebuild and prints a reminder to rebuild boot images
+before rebooting.
 
 `dell-xps13-sidecar-amps-apply` repeats the legacy cleanup and boot-image
 rebuild idempotently. System integrations can run it as root after installation
 when they need a directly observable success or failure status; package-manager
-scriptlet failures are otherwise only reported by Pacman.
+scriptlet failures are otherwise only reported by Pacman. Pass `--no-rebuild`
+to perform only legacy override cleanup. When
+`/etc/pacman.d/hooks/90-mkinitcpio-install.hook` is masked, the command
+likewise performs cleanup, skips the rebuild, and exits 0 after printing a
+reminder to rebuild boot images before rebooting.
 
 ## Removal
 
@@ -29,5 +38,7 @@ sudo pacman -Rns dell-xps13-sidecar-amps
 systemctl reboot
 ```
 
-Removing the package deletes its modprobe drop-in and rebuilds the boot images,
-so no temporary override remains embedded in the initramfs or Limine UKIs.
+Removing the package deletes its modprobe drop-in and rebuilds the boot images
+on live systems (or defers the rebuild as noted above when offline or when
+`90-mkinitcpio-install.hook` is masked), so no temporary override remains
+embedded in the initramfs or Limine UKIs once boot images are rebuilt.
