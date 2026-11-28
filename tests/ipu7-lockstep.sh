@@ -33,13 +33,13 @@ for kernel in "${KERNELS[@]}"; do
 
   for patch in "${camera_patches[@]}"; do
     copy="ipu7-$patch"
-    printf '%s\n' "${kernel_sources[@]}" | grep -qxF "$copy" || fail "$kernel does not build with $copy"
+    printf '%s\n' "${kernel_sources[@]}" | grep -xF "$copy" >/dev/null || fail "$kernel does not build with $copy"
     cmp -s "$CAMERA/$patch" "$KERNEL/$copy" || fail "$KERNEL/$copy differs from intel-ipu7-camera's $patch"
   done
 
   for src in "${kernel_sources[@]}"; do
     [[ $src == ipu7-*.patch ]] || continue
-    printf '%s\n' "${camera_patches[@]}" | grep -qxF "${src#ipu7-}" || fail "$kernel carries $src, which intel-ipu7-camera dropped"
+    printf '%s\n' "${camera_patches[@]}" | grep -xF "${src#ipu7-}" >/dev/null || fail "$kernel carries $src, which intel-ipu7-camera dropped"
   done
 done
 
