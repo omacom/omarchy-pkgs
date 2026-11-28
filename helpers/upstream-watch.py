@@ -309,6 +309,11 @@ def git_branch_tip(url, branch, tag_pattern, cache, min_age=0):
     return values
 
 
+def is_ar_archive(path):
+    with path.open("rb") as fh:
+        return fh.read(8) == b"!<arch>\n"
+
+
 def read_deb_control(control_tar_bytes):
     # Use Python's tarfile exclusively (never bsdtar) so untrusted bytes
     # cannot be interpreted as a libarchive mtree manifest with contents=.
@@ -456,7 +461,7 @@ def discover(watch, fetch, min_age=0):
                     for name in ([] if watch.get("filenames") else names):
                         if re.fullmatch(watch.get("member", ".*"), name):
                             results.extend(matches(watch, archive.read(name).decode()))
-            elif file.read_bytes()[:8] == b"!<arch>\n":
+            elif is_ar_archive(file):
                 names = run(["bsdtar", "-tf", str(file)], text=True).splitlines()
                 controls = [name for name in names if name.startswith("control.tar")]
                 if len(controls) != 1:
@@ -849,7 +854,7 @@ def sync(package, fetch, min_age=0, check=False):
             # Re-verify the discovered version against the full cached .deb so a
             # mid-rollout swap on a mutable URL cannot pair an old pkgver with new bytes.
             full_file = fetch.file(release["deb_range_url"])
-            if full_file.read_bytes()[:8] != b"!<arch>\n":
+            if not is_ar_archive(full_file):
                 raise ValueError("mutable deb response is not an ar archive")
             names = run(["bsdtar", "-tf", str(full_file)], text=True).splitlines()
             controls = [name for name in names if name.startswith("control.tar")]
