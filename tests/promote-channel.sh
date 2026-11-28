@@ -68,6 +68,27 @@ plan_action() { jq -r --arg n "$1" 'select(.type=="plan" and .name==$n) | .actio
 pass() { echo "PASS: $1"; }
 fail() { echo "FAIL: $1"; cat "$T/out"; exit 1; }
 
+REAL_RCLONE=$(command -v rclone)
+FAKEBIN="$T/fakebin"; mkdir -p "$FAKEBIN"
+cat <<RCLONE_EOF > "$FAKEBIN/rclone"
+#!/bin/bash
+if [[ \${1:-} == lsf && -n \${FAIL_LSF_RC:-} ]]; then
+  if [[ -z \${FAIL_LSF_MATCH:-} || \${2:-} == *"\$FAIL_LSF_MATCH"* ]]; then
+    [[ -n \${FAIL_LSF_STDOUT:-} ]] && printf '%s\n' "\$FAIL_LSF_STDOUT"
+    echo "simulated rclone lsf failure on \${2:-} (rc=\$FAIL_LSF_RC)" >&2
+    exit "\$FAIL_LSF_RC"
+  fi
+fi
+if [[ \${1:-} == copyto && -n \${FAIL_COPYTO_RC:-} ]]; then
+  if [[ -z \${FAIL_COPYTO_MATCH:-} || \${2:-} == *"\$FAIL_COPYTO_MATCH"* ]]; then
+    echo "simulated rclone copyto failure on \${2:-} (rc=\$FAIL_COPYTO_RC)" >&2
+    exit "\$FAIL_COPYTO_RC"
+  fi
+fi
+exec "$REAL_RCLONE" "\$@"
+RCLONE_EOF
+chmod +x "$FAKEBIN/rclone"
+
 if (( EUID == 0 )); then
   id -u fixture >/dev/null 2>&1 || useradd -m fixture
   mkdir -p "$T/src"; chmod 755 "$T/src"
@@ -86,8 +107,8 @@ pkgf() { ls "$T/src/$1-$2"/*.pkg.tar.zst; }
 mkpkg_par "alpha 1" "fast 1" "pinned 1" "ahead 3" \
   "alpha 2" "split 1 split-extra" "fast 2" "pinned 2" "ahead 2" "big 1" "dropped 1" \
   "alpha 3" "split 2 split-extra" "big 2" "alpha 4" "big 3"
-pub rc $(pkgf alpha 1) $(pkgf fast 1) $(pkgf pinned 1) $(pkgf ahead 3)
-pub edge $(pkgf alpha 2) $(pkgf split 1) $(pkgf fast 2) $(pkgf pinned 2) \
+pub rc --init $(pkgf alpha 1) $(pkgf fast 1) $(pkgf pinned 1) $(pkgf ahead 3)
+pub edge --init $(pkgf alpha 2) $(pkgf split 1) $(pkgf fast 2) $(pkgf pinned 2) \
   $(pkgf ahead 2) $(pkgf big 1) $(pkgf dropped 1)
 rc_before=$(entries rc)
 
@@ -166,10 +187,134 @@ if "$BIN/promote-channel" --remote "$REMOTE" --from edge --to stable --arch x86_
   fail "edge -> stable should refuse"
 else grep -q 'refusing edge -> stable' "$T/out" && pass "channels only move one step forward" || fail "direction reason"; fi
 
+# Transient rclone lsf errors on either source or destination must fail closed
+# and leave the destination untouched.
+rc_db_before=$(sha256sum "$REMOTE/rc/x86_64/omarchy.db.tar.zst")
+if PATH="$FAKEBIN:$PATH" FAIL_LSF_RC=5 FAIL_LSF_MATCH="/edge/" promote; then
+  fail "rclone lsf error on source should fail closed"
+else
+  grep -q "Failed to list" "$T/out" && grep -q "simulated rclone lsf failure" "$T/out" \
+    && [[ "$(sha256sum "$REMOTE/rc/x86_64/omarchy.db.tar.zst")" == "$rc_db_before" ]] \
+    && pass "rclone lsf error on source fails closed" || fail "source lsf error"
+fi
+if PATH="$FAKEBIN:$PATH" FAIL_LSF_RC=1 FAIL_LSF_MATCH="/rc/" promote; then
+  fail "rclone lsf error on destination should fail closed"
+else
+  grep -q "Failed to list" "$T/out" && grep -q "simulated rclone lsf failure" "$T/out" \
+    && [[ "$(sha256sum "$REMOTE/rc/x86_64/omarchy.db.tar.zst")" == "$rc_db_before" ]] \
+    && pass "rclone lsf error on destination fails closed and preserves rc db" || fail "dest lsf error"
+fi
+
+# Brand-new destination channel (stable does not exist yet): refuse without --init
+# for both missing dir and empty dir, and fail closed on non-3 rclone lsf error
+# even with --init.
+if "$BIN/promote-channel" --remote "$REMOTE" --from rc --to stable --arch x86_64 >"$T/out" 2>&1; then
+  fail "missing destination dir without --init should refuse"
+else
+  grep -q "Failed to list" "$T/out" && [[ ! -e "$REMOTE/stable/x86_64/omarchy.db.tar.zst" ]] \
+    && pass "promote refuses missing destination dir without --init" || fail "promote missing dest"
+fi
+mkdir -p "$REMOTE/stable/x86_64"
+if "$BIN/promote-channel" --remote "$REMOTE" --from rc --to stable --arch x86_64 >"$T/out" 2>&1; then
+  fail "empty destination without --init should refuse"
+else
+  grep -q -- "--init" "$T/out" && [[ ! -e "$REMOTE/stable/x86_64/omarchy.db.tar.zst" ]] \
+    && pass "promote refuses empty destination without --init" || fail "promote empty dest"
+fi
+if PATH="$FAKEBIN:$PATH" FAIL_LSF_RC=5 FAIL_LSF_MATCH="/stable/" "$BIN/promote-channel" --init --remote "$REMOTE" --from rc --to stable --arch x86_64 >"$T/out" 2>&1; then
+  fail "rclone lsf error on destination with --init should fail closed"
+else
+  grep -q "Failed to list" "$T/out" && [[ ! -e "$REMOTE/stable/x86_64/omarchy.db.tar.zst" ]] \
+    && pass "promote with --init still fails closed on rclone lsf error" || fail "promote --init lsf error"
+fi
+# Partial database artifact (omarchy.db without omarchy.db.tar.zst) must be
+# refused even with --init.
+touch "$REMOTE/stable/x86_64/omarchy.db"
+if "$BIN/promote-channel" --init --remote "$REMOTE" --from rc --to stable --arch x86_64 >"$T/out" 2>&1; then
+  fail "partial db artifacts at destination should refuse even with --init"
+else
+  grep -q 'partial database artifacts' "$T/out" && [[ ! -e "$REMOTE/stable/x86_64/omarchy.db.tar.zst" ]] \
+    && pass "promote --init refuses partial destination db artifacts" || fail "promote partial db"
+fi
+rm "$REMOTE/stable/x86_64/omarchy.db"
+# A valid 0-entry omarchy.db.tar.zst is an initialized empty channel and must
+# not abort under set -e during dry-run planning.
+tar --zstd -cf "$REMOTE/stable/x86_64/omarchy.db.tar.zst" -T /dev/null
+"$BIN/promote-channel" --dry-run --remote "$REMOTE" --from rc --to stable --arch x86_64 >"$T/out" 2>&1 \
+  && pass "promote reads a valid empty destination db without --init" || fail "empty destination db"
+rm "$REMOTE/stable/x86_64/omarchy.db.tar.zst"
+rmdir "$REMOTE/stable/x86_64"
+
+# Failed listing that already emitted omarchy.db.tar.zst must still fail closed.
+if PATH="$FAKEBIN:$PATH" FAIL_LSF_RC=1 FAIL_LSF_MATCH="/rc/" FAIL_LSF_STDOUT=omarchy.db.tar.zst promote; then
+  fail "failed rclone lsf emitting db name should fail closed"
+else
+  grep -q 'Failed to list' "$T/out" \
+    && pass "promote fails closed when rclone lsf emits db name before failing" || fail "promote partial stdout"
+fi
+
+# Failed database downloads and unreadable archives on either source or
+# destination must fail closed (guards against set -e being disabled on read_db)
+# and leave the destination database untouched.
+if PATH="$FAKEBIN:$PATH" FAIL_COPYTO_RC=1 FAIL_COPYTO_MATCH="/edge/" promote --dry-run; then
+  fail "rclone copyto failure on source db should fail closed"
+else
+  grep -q 'simulated rclone copyto failure' "$T/out" && ! grep -q 'has .* packages' "$T/out" \
+    && [[ "$(sha256sum "$REMOTE/rc/x86_64/omarchy.db.tar.zst")" == "$rc_db_before" ]] \
+    && pass "rclone copyto error on source db fails closed and preserves rc db" || fail "source copyto error"
+fi
+if PATH="$FAKEBIN:$PATH" FAIL_COPYTO_RC=1 FAIL_COPYTO_MATCH="/rc/" promote --dry-run; then
+  fail "rclone copyto failure on destination db should fail closed"
+else
+  grep -q 'simulated rclone copyto failure' "$T/out" && ! grep -q 'has .* packages' "$T/out" \
+    && [[ "$(sha256sum "$REMOTE/rc/x86_64/omarchy.db.tar.zst")" == "$rc_db_before" ]] \
+    && pass "rclone copyto error on destination db fails closed and preserves rc db" || fail "dest copyto error"
+fi
+
+cp "$REMOTE/edge/x86_64/omarchy.db.tar.zst" "$T/edge.db.bak"
+printf 'not a valid archive\n' > "$REMOTE/edge/x86_64/omarchy.db.tar.zst"
+if promote --dry-run; then
+  cp "$T/edge.db.bak" "$REMOTE/edge/x86_64/omarchy.db.tar.zst"
+  fail "corrupt source db archive should fail closed"
+else
+  cp "$T/edge.db.bak" "$REMOTE/edge/x86_64/omarchy.db.tar.zst"
+  grep -q 'bsdtar:' "$T/out" && ! grep -q 'has .* packages' "$T/out" && [[ "$(sha256sum "$REMOTE/rc/x86_64/omarchy.db.tar.zst")" == "$rc_db_before" ]] \
+    && pass "corrupt source db archive fails closed before planning and preserves rc db" || fail "corrupt source db"
+fi
+
+cp "$REMOTE/rc/x86_64/omarchy.db.tar.zst" "$T/rc.db.bak"
+printf 'not a valid archive\n' > "$REMOTE/rc/x86_64/omarchy.db.tar.zst"
+corrupt_rc_sum=$(sha256sum "$REMOTE/rc/x86_64/omarchy.db.tar.zst")
+if promote --dry-run; then
+  cp "$T/rc.db.bak" "$REMOTE/rc/x86_64/omarchy.db.tar.zst"
+  fail "corrupt destination db archive should fail closed"
+else
+  grep -q 'bsdtar:' "$T/out" && ! grep -q 'has .* packages' "$T/out" && [[ "$(sha256sum "$REMOTE/rc/x86_64/omarchy.db.tar.zst")" == "$corrupt_rc_sum" ]] || {
+    cp "$T/rc.db.bak" "$REMOTE/rc/x86_64/omarchy.db.tar.zst"
+    fail "corrupt destination db reached planning or was modified"
+  }
+  cp "$T/rc.db.bak" "$REMOTE/rc/x86_64/omarchy.db.tar.zst"
+  pass "corrupt destination db archive fails closed before planning without overwriting rc db"
+fi
+
 # rc -> stable: pinned packages move there (stable gets the release pair by
-# promotion); fast-ring ones are published at merge.
+# promotion); fast-ring ones are published at merge. Use --batch-bytes 1 and
+# record every publish-artifact invocation to verify only batch 1 gets --init.
+mv "$BIN/publish-artifact" "$BIN/publish-artifact.real"
+cat <<WRAP_EOF > "$BIN/publish-artifact"
+#!/bin/bash
+printf '%s\n' "\$*" >> "$T/pub-args.log"
+exec "$BIN/publish-artifact.real" "\$@"
+WRAP_EOF
+chmod +x "$BIN/publish-artifact"
+: > "$T/pub-args.log"
 : > "$T/record"
-"$BIN/promote-channel" --remote "$REMOTE" --from rc --to stable --arch x86_64 --record "$T/record" >"$T/out" 2>&1 || fail "rc -> stable"
+"$BIN/promote-channel" --init --batch-bytes 1 --remote "$REMOTE" --from rc --to stable --arch x86_64 --record "$T/record" >"$T/out" 2>&1 || fail "rc -> stable"
+mv "$BIN/publish-artifact.real" "$BIN/publish-artifact"
+batch_count=$(wc -l < "$T/pub-args.log")
+(( batch_count >= 2 )) && head -n 1 "$T/pub-args.log" | grep -q -- '--init' \
+  && ! tail -n +2 "$T/pub-args.log" | grep -q -- '--init' \
+  && pass "multi-batch promote --init passes --init only to the first batch ($batch_count batches)" || fail "batch --init args: $(cat "$T/pub-args.log")"
 [[ $(plan_action pinned) == promote && $(plan_action fast) == hold ]] && [[ "$(entries stable)" == *"pinned-1.0-1 "* ]] \
   && pass "rc -> stable carries the pinned pair and holds the fast ring" || fail "stable promotion: $(entries stable)"
 
