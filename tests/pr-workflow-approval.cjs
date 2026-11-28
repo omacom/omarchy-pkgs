@@ -1169,13 +1169,15 @@ test('close-superseded closes only superseded PRs and guards against errors and 
     git(work, ['commit', '-m', 'master moves on']);
     git(work, ['push', 'origin', 'master']);
 
+    const sameRepo = { nameWithOwner: 'omacom/omarchy-pkgs' };
     const nodes = [
-      { number: 10, headRefName: 'auto/sync-upstream-landed', baseRefName: 'master', headRefOid: shaLanded, mergeable: 'MERGEABLE' },
-      { number: 11, headRefName: 'auto/sync-upstream-valid', baseRefName: 'master', headRefOid: shaValid, mergeable: 'MERGEABLE' },
-      { number: 12, headRefName: 'auto/sync-upstream-conflict', baseRefName: 'master', headRefOid: shaConflict, mergeable: 'UNKNOWN' },
-      { number: 13, headRefName: 'auto/sync-upstream-moved', baseRefName: 'master', headRefOid: shaMoved, mergeable: 'MERGEABLE' },
-      { number: 14, headRefName: 'auto/sync-upstream-fetcherr', baseRefName: 'master', headRefOid: 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef', mergeable: 'MERGEABLE' },
-      { number: 15, headRefName: 'auto/sync-upstream-mergeerr', baseRefName: 'master', headRefOid: shaMergeErr, mergeable: 'MERGEABLE' },
+      { number: 10, headRefName: 'auto/sync-upstream-landed', baseRefName: 'master', headRefOid: shaLanded, mergeable: 'MERGEABLE', headRepository: sameRepo },
+      { number: 11, headRefName: 'auto/sync-upstream-valid', baseRefName: 'master', headRefOid: shaValid, mergeable: 'MERGEABLE', headRepository: sameRepo },
+      { number: 12, headRefName: 'auto/sync-upstream-conflict', baseRefName: 'master', headRefOid: shaConflict, mergeable: 'UNKNOWN', headRepository: sameRepo },
+      { number: 13, headRefName: 'auto/sync-upstream-moved', baseRefName: 'master', headRefOid: shaMoved, mergeable: 'MERGEABLE', headRepository: sameRepo },
+      { number: 14, headRefName: 'auto/sync-upstream-fetcherr', baseRefName: 'master', headRefOid: 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef', mergeable: 'MERGEABLE', headRepository: sameRepo },
+      { number: 15, headRefName: 'auto/sync-upstream-mergeerr', baseRefName: 'master', headRefOid: shaMergeErr, mergeable: 'MERGEABLE', headRepository: sameRepo },
+      { number: 16, headRefName: 'auto/sync-upstream', baseRefName: 'master', headRefOid: shaLanded, mergeable: 'CONFLICTING', headRepository: { nameWithOwner: 'fork/omarchy-pkgs' } },
     ];
     writeFileSync(join(root, 'nodes.json'), JSON.stringify({ data: { repository: { pullRequests: { nodes } } } }));
 
