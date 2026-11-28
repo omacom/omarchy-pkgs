@@ -1245,3 +1245,63 @@ test('check-shadowed runs on every PR without paths filter and narrows full-tree
   assert.match(wf, /helpers\/message-helpers\.sh helpers\/paths\.sh helpers\/package-metadata\.sh/);
   assert.doesNotMatch(wf, /release\/shadowed-packages\.txt helpers /);
 });
+test('publish.yml renders PR comments as Markdown tables for sources and slots', () => {
+  const { execFileSync } = require('node:child_process');
+  const wf = readFileSync(join(__dirname, '../.github/workflows/publish.yml'), 'utf8');
+  const start = wf.indexOf('      - name: Render\n');
+  assert.ok(start > 0);
+  const marker = "jq -r --arg outcome \"${{ needs.publish.result }}\" '\n";
+  const jqStart = wf.indexOf(marker, start);
+  assert.ok(jqStart > 0);
+  const jqEnd = wf.indexOf("\n          ' publish-record.json > comment.md", jqStart);
+  assert.ok(jqEnd > jqStart);
+  const filter = wf.slice(jqStart + marker.length, jqEnd).replaceAll("'\"'\"'", "'");
+
+  const render = (record, outcome = 'success') =>
+    execFileSync('jq', ['-r', '--arg', 'outcome', outcome, filter], {
+      input: JSON.stringify(record),
+      encoding: 'utf8',
+    });
+
+  // 1. All skipped: groups identical-status arches onto one row
+  const skipped = render({
+    target: 'live', commit: '86c5371abcdef', run: 'https://example.test/run/1',
+    plan: [], slots: [],
+    sources: [
+      { package: 'amp-desktop-bin', arch: 'x86_64', source: 'already-published' },
+      { package: 'amp-desktop-bin', arch: 'aarch64', source: 'already-published' },
+      { package: 'bambustudio-bin', arch: 'x86_64', source: 'already-published' },
+    ],
+  });
+  assert.match(skipped, /\| Package \| Arch \| Status \|/);
+  assert.match(skipped, /\| `amp-desktop-bin` \| `aarch64`, `x86_64` \| already published \(skipped\) \|/);
+  assert.match(skipped, /_Nothing to publish: already at master's version everywhere\._/);
+
+  // 2. Published with mixed statuses + slots table
+  const published = render({
+    target: 'live', commit: '1234567abcdef', run: 'https://example.test/run/2',
+    plan: [{ package: 'notion-desktop', arch: 'x86_64', channels: 'edge', publish_arches: 'x86_64' }],
+    sources: [
+      { package: 'notion-desktop', arch: 'x86_64', source: 'pr-artifact' },
+      { package: 'notion-desktop', arch: 'aarch64', source: 'rebuild' },
+    ],
+    slots: [
+      { mirror: 'edge', arch: 'x86_64', status: 'published', packages: ['notion-desktop-7.45.2-2-x86_64.pkg.tar.zst', 'notion-desktop-debug-7.45.2-2-x86_64.pkg.tar.zst'] },
+    ],
+  });
+  assert.match(published, /\| `notion-desktop` \| `x86_64` \| PR artifact \|/);
+  assert.match(published, /\| `notion-desktop` \| `aarch64` \| rebuilt at merge \|/);
+  assert.match(published, /\| Channel \| Status \| Packages \|/);
+  assert.match(published, /\| `edge\/x86_64` \| published \| `notion-desktop-7\.45\.2-2-x86_64\.pkg\.tar\.zst` \|/);
+  assert.doesNotMatch(published, /-debug-/);
+
+  // 3. Failure state
+  const failed = render({
+    target: 'live', commit: '9999999abcdef', run: 'https://example.test/run/3',
+    plan: [], slots: [],
+    sources: [{ package: 'foo', arch: 'x86_64', source: 'build-failed' }],
+  }, 'failure');
+  assert.match(failed, /### Publish FAILED → \*\*live\*\*/);
+  assert.match(failed, /\| `foo` \| `x86_64` \| \*\*build-failed\*\* \|/);
+  assert.match(failed, /_A build failed, so no channel was touched\._/);
+});
