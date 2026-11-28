@@ -1,0 +1,129 @@
+#!/bin/bash
+# Safely append one JSON object line to publish-log.jsonl on an rclone remote.
+#
+#   append-publish-log --remote REMOTE [--object NAME] [--rclone BIN] RECORD
+#
+# Checks whether the log object already exists via `rclone lsf` before creating
+# an empty file: any listing or download error fails closed so a transient R2
+# failure can never overwrite the existing publish history with a 1-line file.
+# RECORD is a path to a JSON object file, or `-` to read from stdin.
+set -euo pipefail
+
+usage() {
+  echo "Usage: append-publish-log --remote REMOTE [--object publish-log.jsonl] [--rclone rclone] RECORD" >&2
+  exit 64
+}
+
+REMOTE=""
+OBJECT="publish-log.jsonl"
+RCLONE_BIN="${RCLONE:-rclone}"
+RECORD=""
+
+while [[ $# -gt 0 ]]; do
+  case $1 in
+  --remote)
+    [[ $# -ge 2 ]] || usage
+    REMOTE=$2
+    shift 2
+    ;;
+  --object)
+    [[ $# -ge 2 ]] || usage
+    OBJECT=$2
+    shift 2
+    ;;
+  --rclone)
+    [[ $# -ge 2 ]] || usage
+    RCLONE_BIN=$2
+    shift 2
+    ;;
+  -h|--help)
+    sed -n "2,9p" "$0"
+    exit 0
+    ;;
+  -)
+    [[ -z "$RECORD" ]] || usage
+    RECORD="-"
+    shift
+    ;;
+  -*)
+    echo "Unknown option: $1" >&2
+    exit 64
+    ;;
+  *)
+    [[ -z "$RECORD" ]] || usage
+    RECORD=$1
+    shift
+    ;;
+  esac
+done
+
+[[ -n "$REMOTE" && -n "$RECORD" ]] || usage
+REMOTE=${REMOTE%/}
+[[ -n "$REMOTE" ]] || usage
+if [[ -z "$OBJECT" || "$OBJECT" == */* || "$OBJECT" == *";"* || "$OBJECT" =~ [[:space:]] ]]; then
+  echo "error: invalid object name: $OBJECT" >&2
+  exit 64
+fi
+
+WORK=$(mktemp -d)
+trap 'rm -rf "$WORK"' EXIT
+
+if [[ "$RECORD" == "-" ]]; then
+  cat > "$WORK/record.json"
+else
+  [[ -r "$RECORD" ]] || { echo "error: cannot read record: $RECORD" >&2; exit 1; }
+  cp "$RECORD" "$WORK/record.json"
+fi
+
+# Validate and compact to a single JSON object line before touching the remote.
+entry=$(jq -sc 'if length == 1 and (.[0] | type == "object") then .[0] else error("expected a single JSON object") end' "$WORK/record.json")
+
+# Fail closed on any listing error: only treat the log as absent when rclone lsf
+# succeeds (exit 0) and does not list the object at the top level of REMOTE.
+listing=$("$RCLONE_BIN" lsf "$REMOTE/" --s3-no-head --files-only --max-depth 1 --format sp)
+
+exists=0
+remote_size=""
+while IFS= read -r line; do
+  [[ -n "$line" ]] || continue
+  size=${line%%;*}
+  name=${line#*;}
+  if [[ "$name" == "$OBJECT" ]]; then
+    exists=1
+    remote_size=$size
+    break
+  fi
+done <<< "$listing"
+
+log="$WORK/$OBJECT"
+if (( exists )); then
+  # Object exists on remote: any download error must abort rather than truncate.
+  "$RCLONE_BIN" copyto "$REMOTE/$OBJECT" "$log" --s3-no-head
+  if [[ ! -f "$log" ]]; then
+    echo "error: remote $REMOTE/$OBJECT exists but download produced no local file" >&2
+    exit 1
+  fi
+  local_size=$(wc -c < "$log" | tr -d "[:space:]")
+  if [[ "$remote_size" =~ ^[0-9]+$ ]] && (( remote_size > 0 && local_size != remote_size )); then
+    echo "error: downloaded $OBJECT size ($local_size bytes) does not match remote size ($remote_size bytes)" >&2
+    exit 1
+  fi
+else
+  : > "$log"
+fi
+
+# Ensure a trailing newline on non-empty logs so entries never merge on one line.
+if [[ -s "$log" ]] && [[ $(tail -c 1 "$log" | wc -l) -eq 0 ]]; then
+  printf "\n" >> "$log"
+fi
+
+before_lines=$(wc -l < "$log" | tr -d "[:space:]")
+printf "%s\n" "$entry" >> "$log"
+after_lines=$(wc -l < "$log" | tr -d "[:space:]")
+if (( after_lines != before_lines + 1 )); then
+  echo "error: expected $((before_lines + 1)) log lines after append, got $after_lines" >&2
+  exit 1
+fi
+
+"$RCLONE_BIN" copyto "$log" "$REMOTE/$OBJECT" --s3-no-head
+echo "log now has $after_lines entries"

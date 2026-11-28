@@ -56,6 +56,7 @@ def build_test_list():
         ("promote-channel", ["./tests/promote-channel.sh"], {}),
         ("release-owners --check", owners_check_cmd, {}),
         ("publish-artifact", ["./tests/publish-artifact.sh"], {}),
+        ("append-publish-log", ["./tests/append-publish-log.sh"], {}),
         ("fast-makepkg", ["runuser", "-u", "nobody", "--", "python", "tests/fast-makepkg.py"], {}),
         ("sync-upstream self-test", ["./bin/sync-upstream", "self-test"], {}),
         ("pinned-sources", ["./tests/pinned-sources.sh"], {}),
