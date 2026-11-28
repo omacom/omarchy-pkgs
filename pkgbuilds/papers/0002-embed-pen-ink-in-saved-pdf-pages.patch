@@ -1,0 +1,2110 @@
+From bb9b0c3689b00c970db7ed83ca382237d599187e Mon Sep 17 00:00:00 2001
+From: nickkostik <161902345+nickkostik@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 01:41:00 -0600
+Subject: [PATCH] Embed new Pencil strokes in saved PDF pages
+
+Write Pencil ink from the current editing session as vector page content so readers and printers that omit annotations can draw handwritten signatures. Preserve existing annotations and keep a separate editable save path.
+
+Stage the PDF before replacing the destination and clear edits only when the saved revision reaches that destination. Verify that placement, forms, and protected documents survive the save round trip.
+---
+ help/C/annotations-save.page           |  14 +-
+ libdocument/backend/pdf/meson.build    |  10 +
+ libdocument/backend/pdf/pps-pdf-ink.cc | 300 ++++++++++++++++
+ libdocument/backend/pdf/pps-pdf-ink.h  |  23 ++
+ libdocument/backend/pdf/pps-poppler.c  | 232 ++++++++++--
+ libdocument/pps-document.c             |  65 +++-
+ libdocument/pps-document.h             |  32 ++
+ libview/pps-jobs.c                     | 183 +++++++---
+ libview/tests/meson.build              |  11 +
+ libview/tests/test-pps-ink-save.cc     | 466 +++++++++++++++++++++++++
+ meson.build                            |   3 +-
+ shell/resources/pps-document-view.blp  |   6 +
+ shell/src/document_view.rs             |  11 +-
+ shell/src/document_view/actions.rs     |  15 +-
+ shell/src/document_view/io.rs          | 124 +++++--
+ shell/src/document_view/signals.rs     |   5 +
+ 16 files changed, 1353 insertions(+), 147 deletions(-)
+ create mode 100644 libdocument/backend/pdf/pps-pdf-ink.cc
+ create mode 100644 libdocument/backend/pdf/pps-pdf-ink.h
+ create mode 100644 libview/tests/test-pps-ink-save.cc
+
+diff --git a/help/C/annotations-save.page b/help/C/annotations-save.page
+index bb78dbe..a93148d 100644
+--- a/help/C/annotations-save.page
++++ b/help/C/annotations-save.page
+@@ -22,9 +22,7 @@
+ </info>
+ <title>Save a copy of an annotated PDF</title>
+  <p>
+-  To save a copy of your annotated PDF for future viewing using the
+-  <app>Document Viewer</app> or any other PDF viewer
+-  <em>that supports annotations</em>:
++  Use <app>Document Viewer</app> to save a copy of your PDF edits.
+  </p>
+   <steps>
+    <item>
+@@ -40,8 +38,14 @@
+     </item>
+    </steps>
+    <p>
+-   Annotations are added according to the PDF specification. Therefore, most PDF
+-   readers should be able to read them. Adobe Reader is known to work.
++   In the saved PDF, new Pencil strokes become part of the page so they
++   stay visible in other viewers and when printed. To keep the new strokes
++   editable, choose <guiseq><gui>File options</gui><gui>Save Editable Copy…</gui></guiseq>.
++   </p>
++   <p>
++   Password-protected PDFs and PDFs with certificate signatures keep their
++   editable annotations. Review ink already in the PDF and other types of
++   annotations also keep their existing display and print settings.
+    </p>
+ 
+ </page>
+diff --git a/libdocument/backend/pdf/meson.build b/libdocument/backend/pdf/meson.build
+index 72e9092..0ec98b7 100644
+--- a/libdocument/backend/pdf/meson.build
++++ b/libdocument/backend/pdf/meson.build
+@@ -1,7 +1,17 @@
++qpdf_dep = dependency('libqpdf', version: '>= 11.0')
++ink_bake_lib = static_library(
++  'pps-pdf-ink',
++  'pps-pdf-ink.cc',
++  include_directories: top_inc,
++  dependencies: [glib_dep, qpdf_dep],
++  gnu_symbol_visibility: 'hidden',
++)
++
+ backend_deps = backends_common_deps + [
+   cairo_pdf_dep,
+   cairo_ps_dep,
+   poppler_glib_dep,
++  declare_dependency(link_with: ink_bake_lib),
+ ]
+ 
+ backend_sources = files('pps-poppler.c')
+diff --git a/libdocument/backend/pdf/pps-pdf-ink.cc b/libdocument/backend/pdf/pps-pdf-ink.cc
+new file mode 100644
+index 0000000..e9a6c0b
+--- /dev/null
++++ b/libdocument/backend/pdf/pps-pdf-ink.cc
+@@ -0,0 +1,300 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++#include "pps-pdf-ink.h"
++#include "config.h"
++
++#include <glib/gi18n-lib.h>
++
++#include <glib/gstdio.h>
++#include <qpdf/Constants.h>
++#include <qpdf/QPDF.hh>
++#include <qpdf/QPDFAcroFormDocumentHelper.hh>
++#include <qpdf/QPDFPageDocumentHelper.hh>
++#include <qpdf/QPDFWriter.hh>
++
++#include <cerrno>
++#include <cmath>
++#include <iomanip>
++#include <locale>
++#include <set>
++#include <sstream>
++#include <stdexcept>
++#include <vector>
++
++namespace
++{
++std::vector<double>
++read_numbers (QPDFObjectHandle array)
++{
++	if (!array.isArray ())
++		return {};
++
++	std::vector<double> values;
++	for (auto item : array.aitems ()) {
++		if (!item.isNumber () || !std::isfinite (item.getNumericValue ()))
++			return {};
++
++		values.push_back (item.getNumericValue ());
++	}
++	return values;
++}
++
++bool
++get_ink_width (QPDFObjectHandle annot, double &width)
++{
++	auto style = annot.getKey ("/BS");
++	if (style.isDictionary ()) {
++		if (style.hasKey ("/S") && !style.getKey ("/S").isNameAndEquals ("/S"))
++			return false;
++
++		auto width_obj = style.getKey ("/W");
++		return width_obj.isNull () || width_obj.getValueAsNumber (width);
++	}
++	if (!style.isNull ())
++		return false;
++
++	// Poppler writes the Draw tool's width as a legacy border array.
++	auto border = annot.getKey ("/Border");
++	if (border.isNull ())
++		return true;
++
++	auto values = read_numbers (border);
++	if (values.size () != 3)
++		return false;
++
++	width = values[2];
++	return true;
++}
++
++bool
++write_ink_path (QPDFObjectHandle annot, std::ostringstream &drawing, double &opacity)
++{
++	// A stored appearance can contain custom artwork or the highlighter's
++	// multiply blend mode. Keep it as well as ink with display or review semantics.
++	if (!annot.getKey ("/Subtype").isNameAndEquals ("/Ink") ||
++	    annot.hasKey ("/AP") || annot.hasKey ("/OC") || annot.hasKey ("/Popup") ||
++	    annot.hasKey ("/IRT") || annot.hasKey ("/StructParent") || annot.hasKey ("/AF"))
++		return false;
++
++	auto flags = annot.getKey ("/F");
++	long long value;
++	if (!flags.isNull () && (!flags.getValueAsInt (value) || (value & ~an_print)))
++		return false;
++
++	auto ink_list = annot.getKey ("/InkList");
++	if (!ink_list.isArray ())
++		return false;
++
++	double width = 1.0;
++	if (!get_ink_width (annot, width) || !std::isfinite (width) || width < 0)
++		return false;
++
++	auto alpha = annot.getKey ("/CA");
++	opacity = 1.0;
++	if ((!alpha.isNull () && !alpha.getValueAsNumber (opacity)) ||
++	    !std::isfinite (opacity) || opacity < 0 || opacity > 1)
++		return false;
++
++	auto color = annot.getKey ("/C");
++	const auto components = color.isNull () ? std::vector<double>{ 0.0 } : read_numbers (color);
++	const auto count = components.size ();
++	if (count != 1 && count != 3 && count != 4)
++		return false;
++
++	drawing.imbue (std::locale::classic ());
++	drawing << std::fixed << std::setprecision (5);
++	for (auto value : components) {
++		if (value < 0 || value > 1)
++			return false;
++
++		drawing << value << ' ';
++	}
++	const char *color_operator = "G";
++	if (count == 3)
++		color_operator = "RG";
++	else if (count == 4)
++		color_operator = "K";
++
++	drawing << color_operator << '\n';
++	drawing << width << " w\n";
++
++	bool has_stroke = false;
++	for (auto path : ink_list.aitems ()) {
++		const auto points = read_numbers (path);
++		if (points.size () < 2 || points.size () % 2 != 0)
++			return false;
++
++		for (size_t i = 0; i < points.size (); i += 2)
++			drawing << points[i] << ' ' << points[i + 1] << (i == 0 ? " m\n" : " l\n");
++		drawing << "S\n";
++		has_stroke = true;
++	}
++	return has_stroke;
++}
++
++guint
++bake_page (QPDF &pdf, QPDFPageObjectHelper &page, const char *marker, bool &has_transparency)
++{
++	auto page_obj = page.getObjectHandle ();
++	auto annots = page_obj.getKey ("/Annots");
++	if (!annots.isArray ())
++		return 0;
++
++	std::set<QPDFObjGen> targets;
++	for (auto annot : annots.aitems ()) {
++		if (!annot.isDictionary ())
++			continue;
++
++		auto in_reply_to = annot.getKey ("/IRT");
++		auto popup_parent = annot.getKey ("/Parent");
++		if (in_reply_to.isIndirect ())
++			targets.insert (in_reply_to.getObjGen ());
++		if (popup_parent.isIndirect () && annot.getKey ("/Subtype").isNameAndEquals ("/Popup"))
++			targets.insert (popup_parent.getObjGen ());
++	}
++
++	std::string overlay;
++	std::vector<QPDFObjectHandle> retained;
++	QPDFObjectHandle resources;
++	QPDFObjectHandle states;
++	int resource_id = 1;
++	guint baked = 0;
++	for (auto annot : annots.aitems ()) {
++		auto contents = annot.isDictionary () ? annot.getKey ("/Contents") : QPDFObjectHandle::newNull ();
++		if (!contents.isString () || contents.getUTF8Value () != marker) {
++			retained.push_back (annot);
++			continue;
++		}
++
++		std::ostringstream drawing;
++		double opacity;
++		if ((annot.isIndirect () && targets.contains (annot.getObjGen ())) ||
++		    !write_ink_path (annot, drawing, opacity))
++			throw std::runtime_error (_ ("A Pencil stroke could not be saved as page content. Save an editable copy to keep the stroke."));
++
++		++baked;
++		overlay += "q\n";
++		if (opacity < 1) {
++			if (!states.isInitialized ()) {
++				resources = page.getAttribute ("/Resources", true);
++				if (!resources.isDictionary ()) {
++					resources = QPDFObjectHandle::newDictionary ();
++					page_obj.replaceKey ("/Resources", resources);
++				}
++
++				states = resources.getKey ("/ExtGState");
++				states = states.isDictionary () ? states.shallowCopy () : QPDFObjectHandle::newDictionary ();
++				resources.replaceKey ("/ExtGState", states);
++			}
++
++			auto name = resources.getUniqueResourceName ("/PpsInk", resource_id);
++			auto state = QPDFObjectHandle::newDictionary ();
++			state.replaceKey ("/CA", QPDFObjectHandle::newReal (opacity, 8));
++			states.replaceKey (name, state);
++			overlay += name + " gs\n";
++			has_transparency = true;
++		}
++		overlay += drawing.str ();
++		overlay += "Q\n";
++	}
++
++	if (baked == 0)
++		return 0;
++
++	// Isolate the original page's graphics state before painting in default PDF
++	// user space. Crop boxes and page rotation then apply to the ink and page alike.
++	page.addPageContents (pdf.newStream ("q\n"), true);
++	page.addPageContents (pdf.newStream ("\nQ\nn\n" + overlay), false);
++	if (retained.empty ())
++		page_obj.removeKey ("/Annots");
++	else
++		page_obj.replaceKey ("/Annots", QPDFObjectHandle::newArray (retained));
++	return baked;
++}
++
++bool
++has_certificate_signature (QPDF &pdf, int signature_fields)
++{
++	auto permissions = pdf.getRoot ().getKey ("/Perms");
++	if (permissions.isDictionary () &&
++	    (permissions.hasKey ("/DocMDP") || permissions.hasKey ("/UR") || permissions.hasKey ("/UR3")))
++		return true;
++
++	if (signature_fields == 0)
++		return false;
++
++	int empty_fields = 0;
++	for (auto &field : QPDFAcroFormDocumentHelper (pdf).getFormFields ()) {
++		if (field.getFieldType () != "/Sig")
++			continue;
++		if (!field.getValue ().isNull ())
++			return true;
++		++empty_fields;
++	}
++
++	// Poppler also finds some orphaned signature widgets. Keep the original
++	// save path if we could not account for every field as unsigned.
++	return empty_fields < signature_fields;
++}
++
++PpsPdfInkSaveResult
++save_baked_ink (const char *input, const char *output, const char *password, int signature_fields, const char *marker, guint expected_strokes, GError **error)
++{
++	QPDF pdf;
++	pdf.setAttemptRecovery (false);
++	pdf.processFile (input, password);
++	if (pdf.isEncrypted () || has_certificate_signature (pdf, signature_fields))
++		return PPS_PDF_INK_SAVE_EDITABLE;
++
++	guint baked = 0;
++	bool has_transparency = false;
++	for (auto &page : QPDFPageDocumentHelper (pdf).getAllPages ())
++		baked += bake_page (pdf, page, marker, has_transparency);
++
++	if (baked != expected_strokes)
++		throw std::runtime_error (_ ("Papers could not identify all Pencil strokes in the saved PDF. Save an editable copy to keep the strokes."));
++
++	g_autofree char *directory = g_path_get_dirname (output);
++	g_autofree char *temporary = g_build_filename (directory, ".papers-ink.XXXXXX", nullptr);
++	int fd = g_mkstemp (temporary);
++	if (fd < 0) {
++		int saved_errno = errno;
++		g_set_error_literal (error, G_FILE_ERROR, g_file_error_from_errno (saved_errno), g_strerror (saved_errno));
++		return PPS_PDF_INK_SAVE_ERROR;
++	}
++	g_close (fd, nullptr);
++
++	try {
++		QPDFWriter writer (pdf, temporary);
++		if (has_transparency)
++			writer.setMinimumPDFVersion ("1.4");
++		writer.write ();
++	} catch (...) {
++		g_unlink (temporary);
++		throw;
++	}
++
++	if (g_rename (temporary, output) == 0)
++		return PPS_PDF_INK_SAVE_FLATTENED;
++
++	int saved_errno = errno;
++	g_unlink (temporary);
++	g_set_error_literal (error, G_FILE_ERROR, g_file_error_from_errno (saved_errno), g_strerror (saved_errno));
++	return PPS_PDF_INK_SAVE_ERROR;
++}
++} // namespace
++
++PpsPdfInkSaveResult
++pps_pdf_bake_ink (const char *input, const char *output_uri, const char *password, int signature_fields, const char *marker, guint expected_strokes, GError **error)
++{
++	g_autofree char *filename = g_filename_from_uri (output_uri, nullptr, error);
++	if (!filename)
++		return PPS_PDF_INK_SAVE_ERROR;
++
++	try {
++		return save_baked_ink (input, filename, password, signature_fields, marker, expected_strokes, error);
++	} catch (const std::exception &exception) {
++		g_set_error_literal (error, G_FILE_ERROR, G_FILE_ERROR_FAILED, exception.what ());
++		return PPS_PDF_INK_SAVE_ERROR;
++	}
++}
+diff --git a/libdocument/backend/pdf/pps-pdf-ink.h b/libdocument/backend/pdf/pps-pdf-ink.h
+new file mode 100644
+index 0000000..2d39210
+--- /dev/null
++++ b/libdocument/backend/pdf/pps-pdf-ink.h
+@@ -0,0 +1,23 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++
++#pragma once
++
++#include <glib.h>
++
++G_BEGIN_DECLS
++
++typedef enum {
++	PPS_PDF_INK_SAVE_ERROR,
++	PPS_PDF_INK_SAVE_EDITABLE,
++	PPS_PDF_INK_SAVE_FLATTENED
++} PpsPdfInkSaveResult;
++
++PpsPdfInkSaveResult pps_pdf_bake_ink (const char *input,
++                                      const char *output_uri,
++                                      const char *password,
++                                      int signature_fields,
++                                      const char *marker,
++                                      guint expected_strokes,
++                                      GError **error);
++
++G_END_DECLS
+diff --git a/libdocument/backend/pdf/pps-poppler.c b/libdocument/backend/pdf/pps-poppler.c
+index 60df04f..5081a9c 100644
+--- a/libdocument/backend/pdf/pps-poppler.c
++++ b/libdocument/backend/pdf/pps-poppler.c
+@@ -19,6 +19,8 @@
+ #include <cairo-ps.h>
+ #endif
+ #include <glib/gi18n-lib.h>
++#include <glib/gstdio.h>
++#include <unistd.h>
+ 
+ #include "pps-attachment.h"
+ #include "pps-document-annotations.h"
+@@ -42,6 +44,7 @@
+ #include "pps-form-field-private.h"
+ #include "pps-image.h"
+ #include "pps-media.h"
++#include "pps-pdf-ink.h"
+ #include "pps-poppler.h"
+ #include "pps-selection.h"
+ #include "pps-signature.h"
+@@ -81,6 +84,9 @@ struct _PdfDocument {
+ 	gchar *password;
+ 	gboolean forms_modified;
+ 	gboolean annots_modified;
++	guint64 edit_revision;
++	GHashTable *pencil_strokes;
++	gboolean has_pencil_strokes;
+ 	GRWLock rwlock;
+ 
+ 	PopplerFontsIter *fonts_iter;
+@@ -89,6 +95,11 @@ struct _PdfDocument {
+ 	PdfPrintContext *print_ctx;
+ };
+ 
++enum {
++	PROP_0,
++	PROP_HAS_PENCIL_STROKES
++};
++
+ static void pdf_document_security_iface_init (PpsDocumentSecurityInterface *iface);
+ static void pdf_document_document_links_iface_init (PpsDocumentLinksInterface *iface);
+ static void pdf_document_document_images_iface_init (PpsDocumentImagesInterface *iface);
+@@ -105,6 +116,7 @@ static void pdf_document_file_exporter_iface_init (PpsFileExporterInterface *ifa
+ static void pdf_selection_iface_init (PpsSelectionInterface *iface);
+ static void pdf_document_page_transition_iface_init (PpsDocumentTransitionInterface *iface);
+ static void pdf_document_text_iface_init (PpsDocumentTextInterface *iface);
++static void pdf_document_staged_save_iface_init (PpsDocumentStagedSaveInterface *iface);
+ static int pdf_document_get_n_pages (PpsDocument *document);
+ 
+ static PpsLinkDest *pps_link_dest_from_dest (PdfDocument *self,
+@@ -172,7 +184,9 @@ G_DEFINE_TYPE_WITH_CODE (PdfDocument,
+                                                                                  G_IMPLEMENT_INTERFACE (PPS_TYPE_DOCUMENT_TRANSITION,
+                                                                                                         pdf_document_page_transition_iface_init)
+                                                                                      G_IMPLEMENT_INTERFACE (PPS_TYPE_DOCUMENT_TEXT,
+-                                                                                                            pdf_document_text_iface_init));
++                                                                                                            pdf_document_text_iface_init)
++                                                                                         G_IMPLEMENT_INTERFACE (PPS_TYPE_DOCUMENT_STAGED_SAVE,
++                                                                                                                pdf_document_staged_save_iface_init));
+ 
+ static void
+ pdf_document_dispose (GObject *object)
+@@ -180,6 +194,7 @@ pdf_document_dispose (GObject *object)
+ 	PdfDocument *self = PDF_DOCUMENT (object);
+ 
+ 	g_clear_pointer (&self->print_ctx, pdf_print_context_free);
++	g_clear_pointer (&self->pencil_strokes, g_hash_table_unref);
+ 	g_clear_object (&self->document);
+ 	g_clear_pointer (&self->fonts_iter, poppler_fonts_iter_free);
+ 	g_rw_lock_clear (&self->rwlock);
+@@ -191,9 +206,27 @@ static void
+ pdf_document_init (PdfDocument *self)
+ {
+ 	self->password = NULL;
++	self->pencil_strokes = g_hash_table_new_full (g_direct_hash, g_direct_equal, g_object_unref, NULL);
+ 	g_rw_lock_init (&self->rwlock);
+ }
+ 
++static void
++pdf_document_get_property (GObject *object, guint property_id, GValue *value, GParamSpec *pspec)
++{
++	if (property_id == PROP_HAS_PENCIL_STROKES)
++		g_value_set_boolean (value, g_atomic_int_get (&PDF_DOCUMENT (object)->has_pencil_strokes));
++	else
++		G_OBJECT_CLASS (pdf_document_parent_class)->get_property (object, property_id, value, pspec);
++}
++
++/* Update under the writer lock and notify after releasing it. */
++static gboolean
++pdf_document_update_pencil_stroke_presence (PdfDocument *self)
++{
++	gboolean has_strokes = g_hash_table_size (self->pencil_strokes) > 0;
++	return g_atomic_int_exchange (&self->has_pencil_strokes, has_strokes) != has_strokes;
++}
++
+ static void
+ convert_error (GError *poppler_error,
+                GError **error)
+@@ -258,29 +291,118 @@ poppler_rect_to_pps (PpsPage *page, const PopplerRectangle *poppler_rect)
+ 
+ /* PpsDocument */
+ static gboolean
+-pdf_document_save (PpsDocument *document,
+-                   const char *uri,
+-                   GError **error)
++pdf_document_save_editable (PdfDocument *self, const char *uri, GError **error)
+ {
+-	PdfDocument *self = PDF_DOCUMENT (document);
+-	gboolean retval;
+ 	GError *poppler_error = NULL;
+-
+-	g_rw_lock_writer_lock (&self->rwlock);
+-
+-	retval = poppler_document_save (self->document,
+-	                                uri, &poppler_error);
+-	if (retval) {
+-		self->forms_modified = FALSE;
+-		self->annots_modified = FALSE;
+-		pps_document_set_modified (PPS_DOCUMENT (document), FALSE);
+-	} else {
++	gboolean saved = poppler_document_save (self->document, uri, &poppler_error);
++	if (!saved)
+ 		convert_error (poppler_error, error);
++	return saved;
++}
++
++static gboolean
++pdf_document_save_with_pencil_ink (PdfDocument *self, const char *uri, GError **error)
++{
++	g_autoptr (GPtrArray) strokes = g_ptr_array_new ();
++	GHashTableIter iter;
++	gpointer key;
++	g_hash_table_iter_init (&iter, self->pencil_strokes);
++	while (g_hash_table_iter_next (&iter, &key, NULL)) {
++		PopplerAnnot *annot = POPPLER_ANNOT (key);
++		g_autofree char *contents = poppler_annot_get_contents (annot);
++		if (poppler_annot_get_page_index (annot) >= 0 &&
++		    !(poppler_annot_get_flags (annot) & ~POPPLER_ANNOT_FLAG_PRINT) &&
++		    (!contents || !*contents) && !poppler_annot_markup_has_popup (POPPLER_ANNOT_MARKUP (annot)))
++			g_ptr_array_add (strokes, annot);
+ 	}
+ 
++	if (strokes->len == 0)
++		return pdf_document_save_editable (self, uri, error);
++
++	g_autofree char *input = NULL;
++	int fd = pps_mkstemp ("pencil-ink.XXXXXX", &input, error);
++	if (fd == -1)
++		return FALSE;
++
++	close (fd);
++	g_autofree char *input_uri = g_filename_to_uri (input, NULL, error);
++	if (!input_uri) {
++		g_unlink (input);
++		return FALSE;
++	}
++
++	/* Poppler GLib cannot expose an annotation's PDF object reference or set
++	 * its /NM field. Tag only these live Pencil objects during serialization,
++	 * then restore their empty contents before unlocking or saving an editable copy.
++	 * The tagged PDF stays in a private temporary file. */
++	g_autofree char *marker = g_uuid_string_random ();
++	for (guint i = 0; i < strokes->len; i++)
++		poppler_annot_set_contents (g_ptr_array_index (strokes, i), marker);
++	gboolean saved = pdf_document_save_editable (self, input_uri, error);
++	for (guint i = 0; i < strokes->len; i++)
++		poppler_annot_set_contents (g_ptr_array_index (strokes, i), NULL);
++
++	PpsPdfInkSaveResult result = PPS_PDF_INK_SAVE_ERROR;
++	if (saved)
++		result = pps_pdf_bake_ink (input, uri, self->password,
++		                           poppler_document_get_n_signatures (self->document),
++		                           marker, strokes->len, error);
++	g_unlink (input);
++	if (result == PPS_PDF_INK_SAVE_EDITABLE)
++		return pdf_document_save_editable (self, uri, error);
++	return result == PPS_PDF_INK_SAVE_FLATTENED;
++}
++
++static gboolean
++pdf_document_stage_save (PpsDocument *document,
++                         const char *uri,
++                         gboolean keep_editable_ink,
++                         guint64 *revision,
++                         GError **error)
++{
++	PdfDocument *self = PDF_DOCUMENT (document);
++
++	g_rw_lock_writer_lock (&self->rwlock);
++	gboolean saved = keep_editable_ink ? pdf_document_save_editable (self, uri, error)
++	                                   : pdf_document_save_with_pencil_ink (self, uri, error);
++	*revision = self->edit_revision;
+ 	g_rw_lock_writer_unlock (&self->rwlock);
+ 
+-	return retval;
++	return saved;
++}
++
++static void
++pdf_document_save_committed (PpsDocument *document, guint64 revision)
++{
++	PdfDocument *self = PDF_DOCUMENT (document);
++
++	g_object_freeze_notify (G_OBJECT (document));
++	g_rw_lock_writer_lock (&self->rwlock);
++	if (self->edit_revision == revision) {
++		g_atomic_int_set (&self->forms_modified, FALSE);
++		g_atomic_int_set (&self->annots_modified, FALSE);
++		pps_document_set_modified (document, FALSE);
++	}
++	g_rw_lock_writer_unlock (&self->rwlock);
++	g_object_thaw_notify (G_OBJECT (document));
++}
++
++static void
++pdf_document_staged_save_iface_init (PpsDocumentStagedSaveInterface *iface)
++{
++	iface->stage_save = pdf_document_stage_save;
++	iface->save_committed = pdf_document_save_committed;
++}
++
++static void
++pdf_document_mark_edited (PdfDocument *self, gboolean form)
++{
++	if (form)
++		g_atomic_int_set (&self->forms_modified, TRUE);
++	else
++		g_atomic_int_set (&self->annots_modified, TRUE);
++	self->edit_revision++;
++	pps_document_set_modified (PPS_DOCUMENT (self), TRUE);
+ }
+ 
+ static gboolean
+@@ -292,9 +414,14 @@ pdf_document_load (PpsDocument *document,
+ 	PdfDocument *self = PDF_DOCUMENT (document);
+ 
+ 	g_rw_lock_writer_lock (&self->rwlock);
++	g_hash_table_remove_all (self->pencil_strokes);
++	gboolean pencil_strokes_changed = pdf_document_update_pencil_stroke_presence (self);
++	self->edit_revision++;
+ 	self->document =
+ 	    poppler_document_new_from_file (uri, self->password, &poppler_error);
+ 	g_rw_lock_writer_unlock (&self->rwlock);
++	if (pencil_strokes_changed)
++		g_object_notify (G_OBJECT (self), "has-pencil-strokes");
+ 
+ 	if (self->document == NULL) {
+ 		convert_error (poppler_error, error);
+@@ -315,6 +442,10 @@ pdf_document_load_fd (PpsDocument *document,
+ 
+ 	g_rw_lock_writer_lock (&self->rwlock);
+ 
++	g_hash_table_remove_all (self->pencil_strokes);
++	gboolean pencil_strokes_changed = pdf_document_update_pencil_stroke_presence (self);
++	self->edit_revision++;
++
+ 	/* Note: this consumes @fd */
+ 	self->document =
+ 	    poppler_document_new_from_fd (fd,
+@@ -329,6 +460,8 @@ pdf_document_load_fd (PpsDocument *document,
+ 	}
+ 
+ 	g_rw_lock_writer_unlock (&self->rwlock);
++	if (pencil_strokes_changed)
++		g_object_notify (G_OBJECT (self), "has-pencil-strokes");
+ 
+ 	return success;
+ }
+@@ -775,8 +908,11 @@ pdf_document_class_init (PdfDocumentClass *klass)
+ 	PpsDocumentClass *pps_document_class = PPS_DOCUMENT_CLASS (klass);
+ 
+ 	g_object_class->dispose = pdf_document_dispose;
++	g_object_class->get_property = pdf_document_get_property;
++	g_object_class_install_property (
++	    g_object_class, PROP_HAS_PENCIL_STROKES,
++	    g_param_spec_boolean ("has-pencil-strokes", NULL, NULL, FALSE, G_PARAM_READABLE | G_PARAM_STATIC_STRINGS));
+ 
+-	pps_document_class->save = pdf_document_save;
+ 	pps_document_class->load = pdf_document_load;
+ 	pps_document_class->get_n_pages = pdf_document_get_n_pages;
+ 	pps_document_class->get_page = pdf_document_get_page;
+@@ -2457,7 +2593,7 @@ pdf_document_forms_get_form_fields (PpsDocumentForms *document,
+ static gboolean
+ pdf_document_forms_document_is_modified (PpsDocumentForms *document)
+ {
+-	return PDF_DOCUMENT (document)->forms_modified;
++	return g_atomic_int_get (&PDF_DOCUMENT (document)->forms_modified);
+ }
+ 
+ static void
+@@ -2516,8 +2652,7 @@ pdf_document_forms_form_field_text_set_text (PpsDocumentForms *document,
+ 	}
+ 
+ 	poppler_form_field_text_set_text (poppler_field, text);
+-	self->forms_modified = TRUE;
+-	pps_document_set_modified (PPS_DOCUMENT (document), TRUE);
++	pdf_document_mark_edited (self, TRUE);
+ 
+ 	g_rw_lock_writer_unlock (&self->rwlock);
+ }
+@@ -2539,8 +2674,7 @@ pdf_document_forms_form_field_button_set_state (PpsDocumentForms *document,
+ 	}
+ 
+ 	poppler_form_field_button_set_state (poppler_field, state);
+-	PDF_DOCUMENT (document)->forms_modified = TRUE;
+-	pps_document_set_modified (PPS_DOCUMENT (document), TRUE);
++	pdf_document_mark_edited (self, TRUE);
+ 
+ 	g_rw_lock_writer_unlock (&self->rwlock);
+ }
+@@ -2635,8 +2769,7 @@ pdf_document_forms_form_field_choice_select_item (PpsDocumentForms *document,
+ 	}
+ 
+ 	poppler_form_field_choice_select_item (poppler_field, index);
+-	PDF_DOCUMENT (document)->forms_modified = TRUE;
+-	pps_document_set_modified (PPS_DOCUMENT (document), TRUE);
++	pdf_document_mark_edited (self, TRUE);
+ 
+ 	g_rw_lock_writer_unlock (&self->rwlock);
+ }
+@@ -2658,8 +2791,7 @@ pdf_document_forms_form_field_choice_toggle_item (PpsDocumentForms *document,
+ 	}
+ 
+ 	poppler_form_field_choice_toggle_item (poppler_field, index);
+-	self->forms_modified = TRUE;
+-	pps_document_set_modified (PPS_DOCUMENT (document), TRUE);
++	pdf_document_mark_edited (self, TRUE);
+ 
+ 	g_rw_lock_writer_unlock (&self->rwlock);
+ }
+@@ -2680,8 +2812,7 @@ pdf_document_forms_form_field_choice_unselect_all (PpsDocumentForms *document,
+ 	}
+ 
+ 	poppler_form_field_choice_unselect_all (poppler_field);
+-	self->forms_modified = TRUE;
+-	pps_document_set_modified (PPS_DOCUMENT (document), TRUE);
++	pdf_document_mark_edited (self, TRUE);
+ 
+ 	g_rw_lock_writer_unlock (&self->rwlock);
+ }
+@@ -2703,8 +2834,7 @@ pdf_document_forms_form_field_choice_set_text (PpsDocumentForms *document,
+ 	}
+ 
+ 	poppler_form_field_choice_set_text (poppler_field, text);
+-	self->forms_modified = TRUE;
+-	pps_document_set_modified (PPS_DOCUMENT (document), TRUE);
++	pdf_document_mark_edited (self, TRUE);
+ 
+ 	g_rw_lock_writer_unlock (&self->rwlock);
+ }
+@@ -3136,8 +3266,7 @@ annot_set_unique_name (PpsAnnotation *annot)
+ static void
+ annot_change_data_finish (PdfDocument *self)
+ {
+-	self->annots_modified = TRUE;
+-	pps_document_set_modified (PPS_DOCUMENT (self), TRUE);
++	pdf_document_mark_edited (self, FALSE);
+ 	g_rw_lock_writer_unlock (&self->rwlock);
+ }
+ 
+@@ -3166,6 +3295,11 @@ annot_color_set (PpsAnnotation *annot, PopplerAnnot *poppler_annot)
+ 	} else {
+ 		poppler_annot_set_color (poppler_annot, NULL);
+ 	}
++
++	if (PPS_IS_ANNOTATION_INK (annot) &&
++	    !pps_annotation_ink_get_highlight (PPS_ANNOTATION_INK (annot)) &&
++	    poppler_annot_markup_get_opacity (POPPLER_ANNOT_MARKUP (poppler_annot)) != pps_color.alpha)
++		poppler_annot_markup_set_opacity (POPPLER_ANNOT_MARKUP (poppler_annot), pps_color.alpha);
+ }
+ 
+ static void
+@@ -3582,7 +3716,13 @@ pdf_document_annotations_get_annotations (PpsDocumentAnnotations *document_annot
+ static gboolean
+ pdf_document_annotations_document_is_modified (PpsDocumentAnnotations *document_annotations)
+ {
+-	return PDF_DOCUMENT (document_annotations)->annots_modified;
++	return g_atomic_int_get (&PDF_DOCUMENT (document_annotations)->annots_modified);
++}
++
++static gboolean
++detached_pencil_stroke (gpointer key, gpointer value, gpointer data)
++{
++	return poppler_annot_get_page_index (POPPLER_ANNOT (key)) < 0;
+ }
+ 
+ static void
+@@ -3599,12 +3739,18 @@ pdf_document_annotations_remove_annotation (PpsDocumentAnnotations *document_ann
+ 	poppler_annot = POPPLER_ANNOT (g_object_get_data (G_OBJECT (annot), "poppler-annot"));
+ 
+ 	poppler_page_remove_annot (poppler_page, poppler_annot);
++	/* A second view can have a different GLib wrapper for the same ink. */
++	if (g_hash_table_remove (self->pencil_strokes, poppler_annot) ||
++	    g_hash_table_foreach_remove (self->pencil_strokes, detached_pencil_stroke, NULL) > 0)
++		g_object_set_data (G_OBJECT (annot), "pps-new-pencil", GINT_TO_POINTER (TRUE));
++	gboolean pencil_strokes_changed = pdf_document_update_pencil_stroke_presence (self);
+ 	g_signal_handlers_disconnect_by_data (annot, self);
+ 
+-	self->annots_modified = TRUE;
+-	pps_document_set_modified (PPS_DOCUMENT (document_annotations), TRUE);
++	pdf_document_mark_edited (self, FALSE);
+ 
+ 	g_rw_lock_writer_unlock (&self->rwlock);
++	if (pencil_strokes_changed)
++		g_object_notify (G_OBJECT (self), "has-pencil-strokes");
+ }
+ 
+ static GArray *
+@@ -3828,6 +3974,15 @@ pdf_document_annotations_add_annotation (PpsDocumentAnnotations *document_annota
+ 
+ 	poppler_page_add_annot (POPPLER_PAGE (page->backend_page), poppler_annot);
+ 
++	if (PPS_IS_ANNOTATION_INK (annot) &&
++	    !pps_annotation_ink_get_highlight (PPS_ANNOTATION_INK (annot)) &&
++	    (!g_object_get_data (G_OBJECT (annot), "poppler-annot") ||
++	     g_object_get_data (G_OBJECT (annot), "pps-new-pencil"))) {
++		g_object_set_data (G_OBJECT (annot), "pps-new-pencil", GINT_TO_POINTER (TRUE));
++		g_hash_table_add (self->pencil_strokes, g_object_ref (poppler_annot));
++	}
++	gboolean pencil_strokes_changed = pdf_document_update_pencil_stroke_presence (self);
++
+ 	g_object_set_data_full (G_OBJECT (annot),
+ 	                        "poppler-annot",
+ 	                        poppler_annot,
+@@ -3836,8 +3991,7 @@ pdf_document_annotations_add_annotation (PpsDocumentAnnotations *document_annota
+ 	annot_set_unique_name (annot);
+ 	connect_annot_signals (self, annot);
+ 
+-	self->annots_modified = TRUE;
+-	pps_document_set_modified (PPS_DOCUMENT (document_annotations), TRUE);
++	pdf_document_mark_edited (self, FALSE);
+ 	if (pps_annotation_get_annotation_type (annot) == PPS_ANNOTATION_TYPE_INK) {
+ 		PpsInkList *ink_list = pps_annotation_ink_get_ink_list (PPS_ANNOTATION_INK (annot));
+ 		gsize n_paths;
+@@ -3857,6 +4011,8 @@ pdf_document_annotations_add_annotation (PpsDocumentAnnotations *document_annota
+ 		g_free (paths);
+ 	}
+ 	g_rw_lock_writer_unlock (&self->rwlock);
++	if (pencil_strokes_changed)
++		g_object_notify (G_OBJECT (self), "has-pencil-strokes");
+ }
+ 
+ /* Creates a vector from points @p1 and @p2 and stores it on @vector */
+diff --git a/libdocument/pps-document.c b/libdocument/pps-document.c
+index 827ad2e..19cb8d0 100644
+--- a/libdocument/pps-document.c
++++ b/libdocument/pps-document.c
+@@ -62,6 +62,13 @@ typedef struct _PpsDocumentPrivate PpsDocumentPrivate;
+ 
+ G_DEFINE_ABSTRACT_TYPE_WITH_PRIVATE (PpsDocument, pps_document, G_TYPE_OBJECT)
+ 
++G_DEFINE_INTERFACE (PpsDocumentStagedSave, pps_document_staged_save, PPS_TYPE_DOCUMENT)
++
++static void
++pps_document_staged_save_default_init (PpsDocumentStagedSaveInterface *iface)
++{
++}
++
+ GQuark
+ pps_document_error_quark (void)
+ {
+@@ -136,7 +143,7 @@ pps_document_get_property (GObject *object,
+ 
+ 	switch (prop_id) {
+ 	case PROP_MODIFIED:
+-		g_value_set_boolean (value, priv->modified);
++		g_value_set_boolean (value, g_atomic_int_get (&priv->modified));
+ 		break;
+ 	default:
+ 		G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
+@@ -193,7 +200,7 @@ pps_document_get_modified (PpsDocument *document)
+ 	g_return_val_if_fail (PPS_IS_DOCUMENT (document), FALSE);
+ 	PpsDocumentPrivate *priv = GET_PRIVATE (document);
+ 
+-	return priv->modified;
++	return g_atomic_int_get (&priv->modified);
+ }
+ 
+ /**
+@@ -210,10 +217,9 @@ pps_document_set_modified (PpsDocument *document,
+ 	g_return_if_fail (PPS_IS_DOCUMENT (document));
+ 	PpsDocumentPrivate *priv = GET_PRIVATE (document);
+ 
+-	if (priv->modified != modified) {
+-		priv->modified = modified;
++	modified = !!modified;
++	if (g_atomic_int_exchange (&priv->modified, modified) != modified)
+ 		g_object_notify (G_OBJECT (document), "modified");
+-	}
+ }
+ 
+ void
+@@ -463,11 +469,58 @@ pps_document_save (PpsDocument *document,
+                    const char *uri,
+                    GError **error)
+ {
+-	PpsDocumentClass *klass = PPS_DOCUMENT_GET_CLASS (document);
++	guint64 revision;
++	if (!pps_document_stage_save (document, uri, FALSE, &revision, error))
++		return FALSE;
+ 
++	pps_document_save_committed (document, revision);
++	return TRUE;
++}
++
++/**
++ * pps_document_stage_save: (skip)
++ * @document: a #PpsDocument
++ * @uri: the staging URI
++ * @keep_editable_ink: whether to preserve Pencil strokes as annotations
++ * @revision: (out): the revision captured in the staged copy
++ * @error: a #GError location to store an error, or %NULL
++ *
++ * Writes a snapshot of @document. Call pps_document_save_committed()
++ * after transferring the snapshot to its destination.
++ */
++gboolean
++pps_document_stage_save (PpsDocument *document,
++                         const char *uri,
++                         gboolean keep_editable_ink,
++                         guint64 *revision,
++                         GError **error)
++{
++	if (PPS_IS_DOCUMENT_STAGED_SAVE (document)) {
++		PpsDocumentStagedSaveInterface *iface = PPS_DOCUMENT_STAGED_SAVE_GET_IFACE (document);
++		return iface->stage_save (document, uri, keep_editable_ink, revision, error);
++	}
++
++	*revision = 0;
++	PpsDocumentClass *klass = PPS_DOCUMENT_GET_CLASS (document);
+ 	return klass->save (document, uri, error);
+ }
+ 
++/**
++ * pps_document_save_committed: (skip)
++ * @document: a #PpsDocument
++ * @revision: the staged revision which reached the destination
++ *
++ * Marks the saved revision clean if no newer edit has been made.
++ */
++void
++pps_document_save_committed (PpsDocument *document, guint64 revision)
++{
++	if (PPS_IS_DOCUMENT_STAGED_SAVE (document)) {
++		PpsDocumentStagedSaveInterface *iface = PPS_DOCUMENT_STAGED_SAVE_GET_IFACE (document);
++		iface->save_committed (document, revision);
++	}
++}
++
+ /**
+  * pps_document_get_page:
+  * @document: a #PpsDocument
+diff --git a/libdocument/pps-document.h b/libdocument/pps-document.h
+index a996ada..9d039e8 100644
+--- a/libdocument/pps-document.h
++++ b/libdocument/pps-document.h
+@@ -83,6 +83,29 @@ struct _PpsDocumentClass {
+ 	                              PpsDocumentBackendInfo *info);
+ };
+ 
++/**
++ * PpsDocumentStagedSave: (skip)
++ *
++ * Optional backend support for saving without clearing edits until the
++ * staged copy reaches its destination.
++ */
++#define PPS_TYPE_DOCUMENT_STAGED_SAVE (pps_document_staged_save_get_type ())
++
++PPS_PUBLIC
++G_DECLARE_INTERFACE (PpsDocumentStagedSave, pps_document_staged_save, PPS, DOCUMENT_STAGED_SAVE, PpsDocument)
++
++struct _PpsDocumentStagedSaveInterface {
++	GTypeInterface base_iface;
++
++	gboolean (*stage_save) (PpsDocument *document,
++	                        const char *uri,
++	                        gboolean keep_editable_ink,
++	                        guint64 *revision,
++	                        GError **error);
++	void (*save_committed) (PpsDocument *document,
++	                        guint64 revision);
++};
++
+ PPS_PUBLIC
+ GQuark pps_document_error_quark (void);
+ 
+@@ -113,6 +136,15 @@ gboolean pps_document_save (PpsDocument *document,
+                             const char *uri,
+                             GError **error);
+ PPS_PUBLIC
++gboolean pps_document_stage_save (PpsDocument *document,
++                                  const char *uri,
++                                  gboolean keep_editable_ink,
++                                  guint64 *revision,
++                                  GError **error);
++PPS_PUBLIC
++void pps_document_save_committed (PpsDocument *document,
++                                  guint64 revision);
++PPS_PUBLIC
+ gint pps_document_get_n_pages (PpsDocument *document);
+ PPS_PUBLIC
+ PpsPage *pps_document_get_page (PpsDocument *document,
+diff --git a/libview/pps-jobs.c b/libview/pps-jobs.c
+index 13f87bd..a1b4c1e 100644
+--- a/libview/pps-jobs.c
++++ b/libview/pps-jobs.c
+@@ -1076,8 +1076,15 @@ pps_job_load_get_loaded_document (PpsJobLoad *job)
+ typedef struct _PpsJobSavePrivate {
+ 	gchar *uri;
+ 	gchar *document_uri;
++	gboolean keep_editable_ink;
++	guint64 revision;
+ } PpsJobSavePrivate;
+ 
++enum {
++	PROP_SAVE_0,
++	PROP_SAVE_KEEP_EDITABLE_INK
++};
++
+ G_DEFINE_TYPE_WITH_PRIVATE (PpsJobSave, pps_job_save, PPS_TYPE_JOB)
+ 
+ #define JOB_SAVE_GET_PRIVATE(o) pps_job_save_get_instance_private (o)
+@@ -1087,6 +1094,28 @@ pps_job_save_init (PpsJobSave *job)
+ {
+ }
+ 
++static void
++pps_job_save_set_property (GObject *object, guint property_id, const GValue *value, GParamSpec *pspec)
++{
++	PpsJobSavePrivate *priv = JOB_SAVE_GET_PRIVATE (PPS_JOB_SAVE (object));
++
++	if (property_id == PROP_SAVE_KEEP_EDITABLE_INK)
++		priv->keep_editable_ink = g_value_get_boolean (value);
++	else
++		G_OBJECT_WARN_INVALID_PROPERTY_ID (object, property_id, pspec);
++}
++
++static void
++pps_job_save_get_property (GObject *object, guint property_id, GValue *value, GParamSpec *pspec)
++{
++	PpsJobSavePrivate *priv = JOB_SAVE_GET_PRIVATE (PPS_JOB_SAVE (object));
++
++	if (property_id == PROP_SAVE_KEEP_EDITABLE_INK)
++		g_value_set_boolean (value, priv->keep_editable_ink);
++	else
++		G_OBJECT_WARN_INVALID_PROPERTY_ID (object, property_id, pspec);
++}
++
+ static void
+ pps_job_save_dispose (GObject *object)
+ {
+@@ -1101,46 +1130,91 @@ pps_job_save_dispose (GObject *object)
+ 	G_OBJECT_CLASS (pps_job_save_parent_class)->dispose (object);
+ }
+ 
++static gboolean
++pps_job_save_transfer (const char *source_uri, const char *destination_uri, const char *original_uri, GCancellable *cancellable, GError **error)
++{
++	g_autoptr (GFile) source = g_file_new_for_uri (source_uri);
++	g_autoptr (GFile) destination = g_file_new_for_uri (destination_uri);
++	g_autofree char *path = g_file_get_path (destination);
++	GFileCopyFlags flags = G_FILE_COPY_TARGET_DEFAULT_PERMS | G_FILE_COPY_OVERWRITE;
++
++	if (!path) {
++		if (!g_file_copy (source, destination, flags, cancellable, NULL, NULL, error))
++			return FALSE;
++
++		pps_file_copy_metadata (original_uri, destination_uri, NULL);
++		return TRUE;
++	}
++
++	/* Finish the copy beside the local destination before replacing it. */
++	g_autofree char *directory = g_path_get_dirname (path);
++	g_autofree char *staged_path = g_build_filename (directory, ".papers-save.XXXXXX", NULL);
++	int fd = g_mkstemp (staged_path);
++	if (fd == -1) {
++		int saved_errno = errno;
++		g_set_error_literal (error, G_IO_ERROR, g_io_error_from_errno (saved_errno), g_strerror (saved_errno));
++		return FALSE;
++	}
++	close (fd);
++
++	g_autoptr (GFile) staged = g_file_new_for_path (staged_path);
++	g_autofree char *staged_uri = g_file_get_uri (staged);
++	gboolean copied = g_file_copy (source, staged, flags, cancellable, NULL, NULL, error);
++	if (copied) {
++		/* Failure to copy metadata is not a hard error. */
++		pps_file_copy_metadata (original_uri, staged_uri, NULL);
++		if (!g_cancellable_set_error_if_cancelled (cancellable, error)) {
++			if (g_rename (staged_path, path) == 0)
++				return TRUE;
++
++			int saved_errno = errno;
++			g_set_error_literal (error, G_IO_ERROR, g_io_error_from_errno (saved_errno), g_strerror (saved_errno));
++		}
++	}
++	g_unlink (staged_path);
++	return FALSE;
++}
++
++static void
++pps_job_save_finished (gpointer data)
++{
++	g_autoptr (PpsJob) job = data;
++	PpsJobSavePrivate *priv = JOB_SAVE_GET_PRIVATE (PPS_JOB_SAVE (job));
++	pps_document_save_committed (pps_job_get_document (job), priv->revision);
++	pps_job_succeeded (job);
++}
++
+ static void
+ pps_job_save_run (PpsJob *job)
+ {
+-	PpsJobSave *job_save = PPS_JOB_SAVE (job);
+-	PpsJobSavePrivate *priv = JOB_SAVE_GET_PRIVATE (job_save);
+-	gint fd;
++	PpsJobSavePrivate *priv = JOB_SAVE_GET_PRIVATE (PPS_JOB_SAVE (job));
++	PpsDocument *document = pps_job_get_document (job);
++	GCancellable *cancellable = pps_job_get_cancellable (job);
+ 	g_autofree gchar *tmp_filename = NULL;
+ 	g_autofree gchar *tmp_uri = NULL;
++	g_autofree gchar *compressed_uri = NULL;
+ 	g_autoptr (GError) error = NULL;
+ 
+ 	g_debug ("running save job: uri: %s, document_uri: %s",
+ 	         priv->uri, priv->document_uri);
+ 
+-	fd = pps_mkstemp ("saveacopy.XXXXXX", &tmp_filename, &error);
+-	if (fd == -1) {
+-		pps_job_failed_from_error (job, error);
+-		return;
+-	}
++	if (g_cancellable_set_error_if_cancelled (cancellable, &error))
++		goto failed;
++
++	int fd = pps_mkstemp ("saveacopy.XXXXXX", &tmp_filename, &error);
++	if (fd == -1)
++		goto failed;
+ 	close (fd);
+ 
+-	/* Save document to temp filename */
+ 	tmp_uri = g_filename_to_uri (tmp_filename, NULL, &error);
+-	if (tmp_uri != NULL) {
+-		pps_document_save (pps_job_get_document (job), tmp_uri, &error);
+-	}
++	if (!tmp_uri ||
++	    !pps_document_stage_save (document, tmp_uri, priv->keep_editable_ink, &priv->revision, &error))
++		goto failed;
+ 
+-	if (error) {
+-		pps_job_failed_from_error (job, error);
+-		return;
+-	}
+-
+-	/* If original document was compressed,
+-	 * compress it again before saving
+-	 */
+-	if (g_object_get_data (G_OBJECT (pps_job_get_document (job)), "uri-uncompressed")) {
++	/* If the input was compressed, use the same format for the output. */
++	if (g_object_get_data (G_OBJECT (document), "uri-uncompressed")) {
+ 		PpsCompressionType ctype = PPS_COMPRESSION_NONE;
+-		const gchar *ext;
+-		gchar *uri_comp;
+-
+-		ext = g_strrstr (priv->document_uri, ".gz");
++		const gchar *ext = g_strrstr (priv->document_uri, ".gz");
+ 		if (ext && g_ascii_strcasecmp (ext, ".gz") == 0)
+ 			ctype = PPS_COMPRESSION_GZIP;
+ 
+@@ -1148,38 +1222,31 @@ pps_job_save_run (PpsJob *job)
+ 		if (ext && g_ascii_strcasecmp (ext, ".bz2") == 0)
+ 			ctype = PPS_COMPRESSION_BZIP2;
+ 
+-		uri_comp = pps_file_compress (tmp_uri, ctype, &error);
++		compressed_uri = pps_file_compress (tmp_uri, ctype, &error);
++		if (!compressed_uri || error)
++			goto failed;
++	}
++
++	if (!pps_job_save_transfer (compressed_uri ? compressed_uri : tmp_uri, priv->uri,
++	                            priv->document_uri, cancellable, &error))
++		goto failed;
++
++	g_unlink (tmp_filename);
++	if (compressed_uri)
++		pps_tmp_uri_unlink (compressed_uri);
++	/* Notify GTK listeners of the committed revision on the main thread. */
++	g_idle_add_once (pps_job_save_finished, g_object_ref (job));
++	return;
++
++failed:
++	if (tmp_filename)
+ 		g_unlink (tmp_filename);
+-
+-		if (!uri_comp || error) {
+-			tmp_uri = NULL;
+-		} else {
+-			tmp_uri = uri_comp;
+-		}
+-	}
+-
+-	if (error) {
++	if (compressed_uri)
++		pps_tmp_uri_unlink (compressed_uri);
++	if (error)
+ 		pps_job_failed_from_error (job, error);
+-		return;
+-	}
+-
+-	if (!tmp_uri)
+-		return;
+-
+-	pps_xfer_uri_simple (tmp_uri, priv->uri, &error);
+-	pps_tmp_uri_unlink (tmp_uri);
+-
+-	/* Copy the metadata from the original file */
+-	if (!error) {
+-		/* Ignore errors here. Failure to copy metadata is not a hard error */
+-		pps_file_copy_metadata (priv->document_uri, priv->uri, NULL);
+-	}
+-
+-	if (error) {
+-		pps_job_failed_from_error (job, error);
+-	} else {
+-		pps_job_succeeded (job);
+-	}
++	else
++		pps_job_failed (job, G_IO_ERROR, G_IO_ERROR_FAILED, _ ("The document could not be saved."));
+ }
+ 
+ static void
+@@ -1189,7 +1256,13 @@ pps_job_save_class_init (PpsJobSaveClass *class)
+ 	PpsJobClass *job_class = PPS_JOB_CLASS (class);
+ 
+ 	oclass->dispose = pps_job_save_dispose;
++	oclass->set_property = pps_job_save_set_property;
++	oclass->get_property = pps_job_save_get_property;
+ 	job_class->run = pps_job_save_run;
++
++	g_object_class_install_property (
++	    oclass, PROP_SAVE_KEEP_EDITABLE_INK,
++	    g_param_spec_boolean ("keep-editable-ink", NULL, NULL, FALSE, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+ }
+ 
+ PpsJob *
+diff --git a/libview/tests/meson.build b/libview/tests/meson.build
+index 73b652e..05012ea 100644
+--- a/libview/tests/meson.build
++++ b/libview/tests/meson.build
+@@ -13,3 +13,14 @@ test_executable = executable(
+ )
+ 
+ test('pps-jobs-test', test_executable, env: backend_env)
++
++if enable_pdf
++  ink_save_test = executable(
++    'test-pps-ink-save',
++    'test-pps-ink-save.cc',
++    include_directories: [top_inc],
++    dependencies: [libppsview_dep, poppler_glib_dep, qpdf_dep],
++    cpp_args: cflags + ['-DI_KNOW_THE_PAPERS_LIBS_ARE_UNSTABLE_AND_HAVE_TALKED_WITH_THE_AUTHORS'],
++  )
++  test('pps-ink-save-test', ink_save_test, env: backend_env)
++endif
+diff --git a/libview/tests/test-pps-ink-save.cc b/libview/tests/test-pps-ink-save.cc
+new file mode 100644
+index 0000000..687f25c
+--- /dev/null
++++ b/libview/tests/test-pps-ink-save.cc
+@@ -0,0 +1,466 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++#include <context/pps-annotations-context.h>
++#include <glib/gstdio.h>
++#include <poppler.h>
++#include <pps-document-annotations.h>
++#include <pps-document-factory.h>
++#include <pps-document-security.h>
++#include <pps-init.h>
++#include <pps-jobs.h>
++#include <qpdf/Constants.h>
++#include <qpdf/QPDF.hh>
++#include <qpdf/QPDFPageDocumentHelper.hh>
++#include <qpdf/QPDFWriter.hh>
++
++#include <cstring>
++#include <unistd.h>
++
++namespace
++{
++void
++create_input (const char *filename, bool encrypted = false)
++{
++	QPDF pdf;
++	pdf.emptyPDF ();
++	auto font = pdf.makeIndirectObject (QPDFObjectHandle::parse (
++	    "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"));
++	auto fonts = QPDFObjectHandle::newDictionary ();
++	fonts.replaceKey ("/F1", font);
++	auto page = pdf.makeIndirectObject (QPDFObjectHandle::parse (
++	    "<< /Type /Page /MediaBox [0 0 240 200] /CropBox [12 18 230 180] /Rotate 90 /Resources <<>> >>"));
++	page.getKey ("/Resources").replaceKey ("/Font", fonts);
++	// The original page leaves a transform active. The ink must still use page coordinates.
++	page.replaceKey ("/Contents", pdf.newStream (
++					  "0 g 28 28 8 8 re f BT /F1 11 Tf 30 53 Td (Sample form) Tj ET 1 0 0 1 120 40 cm\n"));
++	auto link = pdf.makeIndirectObject (QPDFObjectHandle::parse (
++	    "<< /Type /Annot /Subtype /Link /Rect [140 120 180 140] /A << /S /URI /URI (https://example.org) >> >>"));
++	auto widget = pdf.makeIndirectObject (QPDFObjectHandle::parse (
++	    "<< /Type /Annot /Subtype /Widget /FT /Tx /T (name) /V (Sample) /Rect [173 58 199 78] >>"));
++	widget.replaceKey ("/P", page);
++	auto signature_field = pdf.makeIndirectObject (QPDFObjectHandle::parse (
++	    "<< /Type /Annot /Subtype /Widget /FT /Sig /T (sign-here) /Rect [130 50 200 70] >>"));
++	signature_field.replaceKey ("/P", page);
++
++	auto legacy_ink = pdf.makeIndirectObject (QPDFObjectHandle::parse (
++	    "<< /Type /Annot /Subtype /Ink /Rect [30 67 87 90] "
++	    "/InkList [[36 76 55 86 80 76]] /C [1 0 0] /F 0 /CA 0.5 /Border [0 0 5] >>"));
++	auto hidden_ink = pdf.makeIndirectObject (QPDFObjectHandle::parse (
++	    "<< /Type /Annot /Subtype /Ink /Rect [30 100 87 120] "
++	    "/InkList [[35 105 57 108 80 116]] /C [0 1 0] /F 2 /Border [0 0 5] >>"));
++	auto styled_ink = pdf.makeIndirectObject (QPDFObjectHandle::parse (
++	    "<< /Type /Annot /Subtype /Ink /Rect [150 80 180 100] /InkList [[153 85 177 95]] >>"));
++	auto appearance = pdf.newStream ("1 1 0 RG 4 w 3 5 m 27 15 l S\n");
++	appearance.getDict ().replaceKey ("/Subtype", QPDFObjectHandle::newName ("/Form"));
++	appearance.getDict ().replaceKey ("/BBox", QPDFObjectHandle::parse ("[0 0 30 20]"));
++	auto appearances = QPDFObjectHandle::newDictionary ();
++	appearances.replaceKey ("/N", appearance);
++	styled_ink.replaceKey ("/AP", appearances);
++
++	page.replaceKey ("/Annots", QPDFObjectHandle::newArray ({ link, widget, signature_field, legacy_ink, hidden_ink, styled_ink }));
++	QPDFPageDocumentHelper (pdf).addPage (page, false);
++	auto second_page = pdf.makeIndirectObject (QPDFObjectHandle::parse (
++	    "<< /Type /Page /MediaBox [0 0 160 140] /Resources <<>> >>"));
++	second_page.getKey ("/Resources").replaceKey ("/Font", fonts);
++	second_page.replaceKey ("/Contents", pdf.newStream ("BT /F1 11 Tf 20 110 Td (Page two) Tj ET\n"));
++	QPDFPageDocumentHelper (pdf).addPage (second_page, false);
++	auto form = QPDFObjectHandle::newDictionary ();
++	form.replaceKey ("/Fields", QPDFObjectHandle::newArray ({ widget, signature_field }));
++	form.replaceKey ("/DR", QPDFObjectHandle::parse ("<<>>"));
++	form.getKey ("/DR").replaceKey ("/Font", fonts);
++	form.replaceKey ("/DA", QPDFObjectHandle::newString ("/F1 9 Tf 0 g"));
++	pdf.getRoot ().replaceKey ("/AcroForm", form);
++	QPDFWriter writer (pdf, filename);
++	if (encrypted)
++		writer.setR6EncryptionParameters ("test-password", "test-owner", true, true, true,
++		                                  true, true, true, qpdf_r3p_full, true);
++	writer.write ();
++}
++
++PpsInkList *
++pen_ink (int index)
++{
++	const PpsPoint rotated[] = { { 28.0, 43.0 }, { 83.0, 43.0 }, { 98.0, 58.0 } };
++	const PpsPoint straight[] = { { 30.0, 48.0 }, { 80.0, 48.0 } };
++	PpsPath *path = index == 0 ? pps_path_new_for_array (rotated, G_N_ELEMENTS (rotated))
++	                           : pps_path_new_for_array (straight, G_N_ELEMENTS (straight));
++	const PpsPath *paths[] = { path };
++	PpsInkList *ink = pps_ink_list_new_for_array (paths, G_N_ELEMENTS (paths));
++	pps_path_free (path);
++	return ink;
++}
++
++void
++draw_pen_stroke (PpsDocument *document, int index = 0)
++{
++	g_autoptr (PpsPage) page = pps_document_get_page (document, index);
++	g_autoptr (PpsAnnotation) annot = pps_annotation_ink_new (page);
++	const GdkRGBA color{ index == 0 ? 0.0f : 1.0f, 0, 1, index == 0 ? 1.0f : 0.5f };
++
++	pps_annotation_set_rgba (annot, &color);
++	pps_annotation_set_border_width (annot, index == 0 ? 4.0 : 6.0);
++	pps_annotation_ink_set_ink_list (PPS_ANNOTATION_INK (annot), pen_ink (index));
++	pps_document_annotations_add_annotation (PPS_DOCUMENT_ANNOTATIONS (document), annot);
++}
++
++PpsDocument *
++load_document (const char *uri, const char *password = nullptr)
++{
++	g_autoptr (GError) error = nullptr;
++	PpsDocument *document = pps_document_factory_get_document (uri, &error);
++	g_assert_no_error (error);
++	g_assert_nonnull (document);
++	if (password)
++		pps_document_security_set_password (PPS_DOCUMENT_SECURITY (document), password);
++	g_assert_true (pps_document_load (document, uri, &error));
++	g_assert_no_error (error);
++	return document;
++}
++
++bool
++has_pencil_strokes (PpsDocument *document)
++{
++	gboolean has_strokes = FALSE;
++	g_object_get (document, "has-pencil-strokes", &has_strokes, nullptr);
++	return has_strokes;
++}
++
++bool
++run_save_job (PpsDocument *document, const char *target, const char *original, bool keep_editable, GError **error)
++{
++	g_autoptr (PpsJob) job = pps_job_save_new (document, target, original);
++	g_object_set (job, "keep-editable-ink", keep_editable, nullptr);
++	bool finished = false;
++	g_signal_connect (job, "finished", G_CALLBACK (+[] (PpsJob *, bool *finished) {
++				  *finished = true;
++			  }),
++	                  &finished);
++	pps_job_run (job);
++	while (!finished)
++		g_main_context_iteration (nullptr, TRUE);
++	return pps_job_is_succeeded (job, error);
++}
++
++void
++save_document (PpsDocument *document, const char *target, const char *original, bool editable = false)
++{
++	g_autoptr (GError) error = nullptr;
++	g_assert_true (run_save_job (document, target, original, editable, &error));
++	g_assert_no_error (error);
++	g_assert_false (pps_document_get_modified (document));
++}
++
++cairo_surface_t *
++render_page_content (PopplerPage *page)
++{
++	double width, height;
++	poppler_page_get_size (page, &width, &height);
++	auto surface = cairo_image_surface_create (CAIRO_FORMAT_RGB24, width * 4, height * 4);
++	auto cr = cairo_create (surface);
++	cairo_scale (cr, 4, 4);
++	cairo_set_source_rgb (cr, 1, 1, 1);
++	cairo_paint (cr);
++	G_GNUC_BEGIN_IGNORE_DEPRECATIONS
++	poppler_page_render_for_printing_with_options (page, cr, POPPLER_PRINT_DOCUMENT);
++	G_GNUC_END_IGNORE_DEPRECATIONS
++	cairo_destroy (cr);
++	cairo_surface_flush (surface);
++	return surface;
++}
++
++void
++check_pixel (cairo_surface_t *surface, double x, double y, int red, int green, int blue, int tolerance = 0)
++{
++	auto data = cairo_image_surface_get_data (surface);
++	auto stride = cairo_image_surface_get_stride (surface);
++	auto row = reinterpret_cast<const guint32 *> (data + static_cast<int> (y * 4) * stride);
++	auto pixel = row[static_cast<int> (x * 4)];
++	g_assert_cmpint (ABS (static_cast<int> ((pixel >> 16) & 255) - red), <=, tolerance);
++	g_assert_cmpint (ABS (static_cast<int> ((pixel >> 8) & 255) - green), <=, tolerance);
++	g_assert_cmpint (ABS (static_cast<int> (pixel & 255) - blue), <=, tolerance);
++}
++
++void
++check_page_contents (const char *filename, bool second_stroke = true)
++{
++	QPDF pdf;
++	pdf.processFile (filename);
++	auto pages = QPDFPageDocumentHelper (pdf).getAllPages ();
++	g_assert_cmpuint (pages.size (), ==, 2);
++	auto &page = pages.front ();
++	auto annots = page.getObjectHandle ().getKey ("/Annots");
++	g_assert_cmpint (annots.getArrayNItems (), ==, 6);
++	g_assert_true (annots.getArrayItem (0).getKey ("/Subtype").isNameAndEquals ("/Link"));
++	g_assert_true (annots.getArrayItem (1).getKey ("/Subtype").isNameAndEquals ("/Widget"));
++	g_assert_true (annots.getArrayItem (2).getKey ("/FT").isNameAndEquals ("/Sig"));
++	g_assert_true (annots.getArrayItem (3).getKey ("/Subtype").isNameAndEquals ("/Ink"));
++	g_assert_cmpint (annots.getArrayItem (3).getKey ("/F").getIntValue (), ==, 0);
++	g_assert_cmpint (annots.getArrayItem (4).getKey ("/F").getIntValue (), ==, 2);
++	g_assert_true (annots.getArrayItem (5).getKey ("/AP").getKey ("/N").isStream ());
++	auto fields = pdf.getRoot ().getKey ("/AcroForm").getKey ("/Fields");
++	g_assert_true (fields.getArrayItem (0).getKey ("/V").getStringValue () == "Sample");
++	g_assert_true (fields.getArrayItem (1).getKey ("/FT").isNameAndEquals ("/Sig"));
++	g_assert_true (fields.getArrayItem (1).getKey ("/V").isNull ());
++	g_assert_cmpuint (page.getPageContents ().size (), ==, 3);
++	g_assert_cmpuint (pages.at (1).getPageContents ().size (), ==, second_stroke ? 3 : 1);
++	g_assert_true (pages.at (1).getObjectHandle ().getKey ("/Annots").isNull ());
++
++	g_autoptr (GError) error = nullptr;
++	g_autofree char *uri = g_filename_to_uri (filename, nullptr, &error);
++	g_assert_no_error (error);
++	g_autoptr (PopplerDocument) doc = poppler_document_new_from_file (uri, nullptr, &error);
++	g_assert_no_error (error);
++	g_autoptr (PopplerPage) print_page = poppler_document_get_page (doc, 0);
++	g_autofree char *text = poppler_page_get_text (print_page);
++	g_assert_nonnull (strstr (text, "Sample form"));
++	auto surface = render_page_content (print_page);
++	// Rotated, cropped page. The four-point-wide stroke crosses the text widget at (50, 175).
++	check_pixel (surface, 50, 175, 0, 0, 255);
++	check_pixel (surface, 68, 173.5, 0, 0, 255);
++	check_pixel (surface, 68, 176.5, 0, 0, 255);
++	check_pixel (surface, 68, 172.5, 255, 255, 255);
++	check_pixel (surface, 68, 177.5, 255, 255, 255);
++	check_pixel (surface, 91, 167, 0, 0, 255);
++	check_pixel (surface, 13, 19, 0, 0, 0);
++	check_pixel (surface, 58, 24, 255, 255, 255); // The unprinted red review ink.
++	cairo_surface_destroy (surface);
++
++	GList *form_fields = poppler_page_get_form_field_mapping (print_page);
++	bool found_field = false;
++	for (auto *entry = form_fields; entry; entry = entry->next) {
++		auto *mapping = static_cast<PopplerFormFieldMapping *> (entry->data);
++		if (poppler_form_field_get_field_type (mapping->field) != POPPLER_FORM_FIELD_TEXT)
++			continue;
++		poppler_form_field_text_set_text (mapping->field, "Still editable");
++		g_autofree char *value = poppler_form_field_text_get_text (mapping->field);
++		g_assert_cmpstr (value, ==, "Still editable");
++		found_field = true;
++	}
++	poppler_page_free_form_field_mapping (form_fields);
++	g_assert_true (found_field);
++
++	g_autoptr (PopplerPage) second = poppler_document_get_page (doc, 1);
++	surface = render_page_content (second);
++	if (second_stroke) {
++		// A six-point-wide stroke at 50% opacity. Double painting would turn 127 into 63.
++		check_pixel (surface, 50, 89.5, 255, 127, 255, 2);
++		check_pixel (surface, 50, 94.5, 255, 127, 255, 2);
++	} else {
++		check_pixel (surface, 50, 92, 255, 255, 255);
++	}
++	check_pixel (surface, 50, 88.5, 255, 255, 255);
++	check_pixel (surface, 50, 95.5, 255, 255, 255);
++	cairo_surface_destroy (surface);
++}
++
++void
++check_editable_copy (const char *filename, bool with_pencil, const char *password = nullptr)
++{
++	QPDF pdf;
++	pdf.processFile (filename, password);
++	g_assert_cmpint (pdf.isEncrypted (), ==, password != nullptr);
++	auto page = QPDFPageDocumentHelper (pdf).getAllPages ().front ();
++	auto annots = page.getObjectHandle ().getKey ("/Annots");
++	g_assert_cmpint (annots.getArrayNItems (), ==, with_pencil ? 7 : 6);
++	g_assert_cmpint (annots.getArrayItem (3).getKey ("/F").getIntValue (), ==, 0);
++	g_assert_cmpuint (page.getPageContents ().size (), ==, 1);
++	if (with_pencil) {
++		auto ink = annots.getArrayItem (6);
++		g_assert_true (ink.getKey ("/Subtype").isNameAndEquals ("/Ink"));
++		g_assert_cmpint (ink.getKey ("/F").getIntValue (), ==, an_print);
++		auto contents = ink.getKey ("/Contents");
++		g_assert_true (contents.isNull () || contents.getUTF8Value ().empty ());
++	}
++}
++
++void
++test_ink_save ()
++{
++	g_autoptr (GError) error = nullptr;
++	g_autofree char *directory = g_dir_make_tmp ("papers-ink-save.XXXXXX", &error);
++	g_assert_no_error (error);
++	g_autofree char *input = g_build_filename (directory, "input.pdf", nullptr);
++	g_autofree char *output = g_build_filename (directory, "output.pdf", nullptr);
++	g_autofree char *second_output = g_build_filename (directory, "second-output.pdf", nullptr);
++	g_autofree char *input_uri = g_filename_to_uri (input, nullptr, nullptr);
++	g_autofree char *output_uri = g_filename_to_uri (output, nullptr, nullptr);
++	g_autofree char *second_output_uri = g_filename_to_uri (second_output, nullptr, nullptr);
++
++	create_input (input);
++	g_autoptr (PpsDocument) document = load_document (input_uri);
++	save_document (document, output_uri, input_uri);
++	check_editable_copy (output, false);
++
++	draw_pen_stroke (document);
++	draw_pen_stroke (document, 1);
++	g_assert_true (has_pencil_strokes (document));
++	save_document (document, output_uri, input_uri);
++	check_page_contents (output);
++	// Saving again from the same editing session must keep the strokes in both copies.
++	save_document (document, second_output_uri, input_uri);
++	check_page_contents (second_output);
++
++	// An overwrite save of the reopened PDF must not append another copy of the ink.
++	g_autoptr (PpsDocument) reopened = load_document (output_uri);
++	g_assert_false (has_pencil_strokes (reopened));
++	save_document (reopened, output_uri, output_uri);
++	check_page_contents (output);
++
++	g_unlink (input);
++	g_unlink (output);
++	g_unlink (second_output);
++	g_rmdir (directory);
++}
++
++void
++test_undo_and_editable_ink ()
++{
++	g_autoptr (GError) error = nullptr;
++	g_autofree char *directory = g_dir_make_tmp ("papers-undo-ink.XXXXXX", &error);
++	g_assert_no_error (error);
++	g_autofree char *input = g_build_filename (directory, "input.pdf", nullptr);
++	g_autofree char *output = g_build_filename (directory, "output.pdf", nullptr);
++	g_autofree char *input_uri = g_filename_to_uri (input, nullptr, nullptr);
++	g_autofree char *output_uri = g_filename_to_uri (output, nullptr, nullptr);
++
++	create_input (input);
++	g_autoptr (PpsDocument) document = load_document (input_uri);
++	g_autoptr (PpsAnnotationModel) annotation_model = pps_annotation_model_new ();
++	g_autoptr (PpsDocumentModel) model = PPS_DOCUMENT_MODEL (g_object_new (
++	    PPS_TYPE_DOCUMENT_MODEL, "annotation-model", annotation_model, "document", document, nullptr));
++	g_autoptr (PpsUndoContext) undo_context = pps_undo_context_new (model);
++	g_autoptr (PpsAnnotationsContext) annotations = pps_annotations_context_new (model, undo_context);
++	const GdkRGBA blue{ 0, 0, 1, 1 };
++	PpsAnnotationInkAddData data{ pen_ink (0), nullptr, FALSE, 4 };
++	g_autoptr (PpsAnnotation) ink = pps_annotations_context_add_annotation_sync (
++	    annotations, 0, PPS_ANNOTATION_TYPE_INK, nullptr, nullptr, &blue, &data);
++	pps_ink_list_free (data.ink_list);
++	g_assert_nonnull (ink);
++	g_assert_true (has_pencil_strokes (document));
++
++	pps_undo_context_undo (undo_context);
++	g_assert_false (has_pencil_strokes (document));
++	save_document (document, output_uri, input_uri);
++	check_editable_copy (output, false);
++
++	pps_undo_context_redo (undo_context);
++	g_assert_true (has_pencil_strokes (document));
++	save_document (document, output_uri, input_uri, true);
++	check_editable_copy (output, true);
++	save_document (document, output_uri, input_uri);
++	check_page_contents (output, false);
++
++	g_unlink (input);
++	g_unlink (output);
++	g_rmdir (directory);
++}
++
++void
++test_ink_save_failure_and_retry ()
++{
++	g_autoptr (GError) error = nullptr;
++	g_autofree char *directory = g_dir_make_tmp ("papers-ink-retry.XXXXXX", &error);
++	g_assert_no_error (error);
++	g_autofree char *input = g_build_filename (directory, "input.pdf", nullptr);
++	g_autofree char *snapshot = g_build_filename (directory, "snapshot.pdf", nullptr);
++	g_autofree char *blocked = g_build_filename (directory, "blocked.pdf", nullptr);
++	g_autofree char *sentinel = g_build_filename (blocked, "existing", nullptr);
++	g_autofree char *output = g_build_filename (directory, "output.pdf", nullptr);
++	g_autofree char *input_uri = g_filename_to_uri (input, nullptr, nullptr);
++	g_autofree char *snapshot_uri = g_filename_to_uri (snapshot, nullptr, nullptr);
++	g_autofree char *blocked_uri = g_filename_to_uri (blocked, nullptr, nullptr);
++	g_autofree char *output_uri = g_filename_to_uri (output, nullptr, nullptr);
++
++	create_input (input);
++	g_assert_cmpint (g_mkdir (blocked, 0700), ==, 0);
++	g_assert_true (g_file_set_contents (sentinel, "existing data", -1, &error));
++	g_assert_no_error (error);
++	g_autoptr (PpsDocument) document = load_document (input_uri);
++	draw_pen_stroke (document);
++	g_assert_true (pps_document_get_modified (document));
++
++	guint64 revision;
++	g_assert_false (pps_document_stage_save (document, blocked_uri, FALSE, &revision, &error));
++	g_assert_error (error, G_FILE_ERROR, G_FILE_ERROR_ISDIR);
++	g_clear_error (&error);
++	g_assert_true (pps_document_get_modified (document));
++	g_assert_false (run_save_job (document, blocked_uri, input_uri, false, &error));
++	g_assert_error (error, G_IO_ERROR, G_IO_ERROR_IS_DIRECTORY);
++	g_clear_error (&error);
++	g_assert_true (pps_document_get_modified (document));
++	g_autofree char *existing = nullptr;
++	g_assert_true (g_file_get_contents (sentinel, &existing, nullptr, &error));
++	g_assert_no_error (error);
++	g_assert_cmpstr (existing, ==, "existing data");
++	check_editable_copy (input, false);
++
++	g_autoptr (PpsJob) cancelled = pps_job_save_new (document, output_uri, input_uri);
++	pps_job_cancel (cancelled);
++	pps_job_run (cancelled);
++	g_assert_false (pps_job_is_succeeded (cancelled, &error));
++	g_assert_error (error, G_IO_ERROR, G_IO_ERROR_CANCELLED);
++	g_clear_error (&error);
++	g_assert_false (g_file_test (output, G_FILE_TEST_EXISTS));
++	g_assert_true (pps_document_get_modified (document));
++
++	g_autoptr (GDir) target_dir = g_dir_open (directory, 0, &error);
++	g_assert_no_error (error);
++	while (const char *name = g_dir_read_name (target_dir))
++		g_assert_false (g_str_has_prefix (name, ".papers-"));
++	g_autofree char *tmp_name = g_strdup_printf ("%s-%u", g_get_prgname (), getpid ());
++	g_autofree char *tmp_path = g_build_filename (g_get_tmp_dir (), tmp_name, nullptr);
++	g_autoptr (GDir) tmp_dir = g_dir_open (tmp_path, 0, &error);
++	g_assert_no_error (error);
++	g_assert_null (g_dir_read_name (tmp_dir));
++
++	g_assert_true (pps_document_stage_save (document, snapshot_uri, FALSE, &revision, &error));
++	g_assert_no_error (error);
++	check_page_contents (snapshot, false);
++	draw_pen_stroke (document, 1);
++	pps_document_save_committed (document, revision);
++	g_assert_true (pps_document_get_modified (document));
++	save_document (document, output_uri, input_uri);
++	check_page_contents (output);
++
++	g_unlink (input);
++	g_unlink (snapshot);
++	g_unlink (output);
++	g_unlink (sentinel);
++	g_rmdir (blocked);
++	g_rmdir (directory);
++}
++
++void
++test_encrypted_ink_save ()
++{
++	g_autoptr (GError) error = nullptr;
++	g_autofree char *directory = g_dir_make_tmp ("papers-encrypted-ink-save.XXXXXX", &error);
++	g_assert_no_error (error);
++	g_autofree char *input = g_build_filename (directory, "input.pdf", nullptr);
++	g_autofree char *output = g_build_filename (directory, "output.pdf", nullptr);
++	g_autofree char *input_uri = g_filename_to_uri (input, nullptr, nullptr);
++	g_autofree char *output_uri = g_filename_to_uri (output, nullptr, nullptr);
++
++	create_input (input, true);
++	g_autoptr (PpsDocument) document = load_document (input_uri, "test-password");
++	draw_pen_stroke (document);
++	save_document (document, output_uri, input_uri);
++	check_editable_copy (output, true, "test-password");
++
++	g_unlink (input);
++	g_unlink (output);
++	g_rmdir (directory);
++}
++} // namespace
++
++int
++main (int argc, char **argv)
++{
++	g_test_init (&argc, &argv, nullptr);
++	g_assert_true (pps_init ());
++	g_test_add_func ("/libview-jobs/save-pen-ink", test_ink_save);
++	g_test_add_func ("/libview-jobs/undo-and-save-editable-pen-ink", test_undo_and_editable_ink);
++	g_test_add_func ("/libview-jobs/save-pen-ink-failure-and-retry", test_ink_save_failure_and_retry);
++	g_test_add_func ("/libview-jobs/save-pen-ink-encrypted", test_encrypted_ink_save);
++	return g_test_run ();
++}
+diff --git a/meson.build b/meson.build
+index f468a9a..90b0e6f 100644
+--- a/meson.build
++++ b/meson.build
+@@ -1,10 +1,11 @@
+ project(
+-  'papers', ['c'],
++  'papers', ['c', 'cpp'],
+   version: '51.1',
+   license: 'GPL-2.0-or-later',
+   meson_version: '>= 1.8.0',
+   default_options: [
+     'buildtype=debugoptimized',
++    'cpp_std=c++20',
+   ]
+ )
+ 
+diff --git a/shell/resources/pps-document-view.blp b/shell/resources/pps-document-view.blp
+index 6f27cd9..24aaf8d 100644
+--- a/shell/resources/pps-document-view.blp
++++ b/shell/resources/pps-document-view.blp
+@@ -870,6 +870,12 @@ menu document_menu {
+       label: _("_Save As…");
+       action: "doc.save-as";
+     }
++
++    item {
++      label: _("Save _Editable Copy…");
++      action: "doc.save-editable-copy";
++      hidden-when: "action-disabled";
++    }
+   }
+ 
+   section {
+diff --git a/shell/src/document_view.rs b/shell/src/document_view.rs
+index aad7da7..4a8f834 100644
+--- a/shell/src/document_view.rs
++++ b/shell/src/document_view.rs
+@@ -172,6 +172,7 @@ mod imp {
+ 
+         // Signal handlers
+         pub(super) modified_handler_id: RefCell<Option<SignalHandlerId>>,
++        pub(super) pencil_strokes_handler_id: RefCell<Option<SignalHandlerId>>,
+ 
+         // Loaders
+         pub(super) file: RefCell<Option<gio::File>>,
+@@ -250,6 +251,9 @@ mod imp {
+                     .imp()
+                     .set_action_enabled("find-previous", false);
+                 obj.as_ref().imp().set_action_enabled("copy", false);
++                obj.as_ref()
++                    .imp()
++                    .set_action_enabled("save-editable-copy", false);
+             }
+         }
+     }
+@@ -846,7 +850,7 @@ mod imp {
+                         match response {
+                             "yes" => {
+                                 obj.close_after_save.set(true);
+-                                obj.save_as();
++                                obj.save_as(false);
+                             }
+                             "no" => obj.parent_window().destroy(),
+                             "cancel" => obj.close_after_save.set(false),
+@@ -864,10 +868,6 @@ mod imp {
+         pub(super) fn close_handled(&self) -> glib::Propagation {
+             self.save_settings();
+ 
+-            if let Some(id) = self.modified_handler_id.take() {
+-                self.document().unwrap().disconnect(id);
+-            }
+-
+             if self.check_document_modified() {
+                 return glib::Propagation::Stop;
+             }
+@@ -876,6 +876,7 @@ mod imp {
+                 return glib::Propagation::Stop;
+             }
+ 
++            self.disconnect_document_signals();
+             glib::Propagation::Proceed
+         }
+     }
+diff --git a/shell/src/document_view/actions.rs b/shell/src/document_view/actions.rs
+index 5048220..831b33b 100644
+--- a/shell/src/document_view/actions.rs
++++ b/shell/src/document_view/actions.rs
+@@ -162,7 +162,16 @@ impl imp::PpsDocumentView {
+                     #[weak(rename_to = obj)]
+                     self,
+                     move |_, _, _| {
+-                        obj.cmd_save_as();
++                        obj.save_as(false);
++                    }
++                ))
++                .build(),
++            gio::ActionEntryBuilder::new("save-editable-copy")
++                .activate(glib::clone!(
++                    #[weak(rename_to = obj)]
++                    self,
++                    move |_, _, _| {
++                        obj.save_as(true);
+                     }
+                 ))
+                 .build(),
+@@ -1012,10 +1021,6 @@ impl imp::PpsDocumentView {
+         self.rotate(90);
+     }
+ 
+-    fn cmd_save_as(&self) {
+-        self.save_as();
+-    }
+-
+     fn cmd_save_image_as(&self) {
+         let Some(image) = self.image.borrow().clone() else {
+             return;
+diff --git a/shell/src/document_view/io.rs b/shell/src/document_view/io.rs
+index ebb486a..3401147 100644
+--- a/shell/src/document_view/io.rs
++++ b/shell/src/document_view/io.rs
+@@ -102,29 +102,6 @@ impl imp::PpsDocumentView {
+             );
+     }
+ 
+-    pub(super) fn document_modified(&self) {
+-        if self.modified.get() {
+-            return;
+-        }
+-
+-        self.modified.set(true);
+-
+-        let window_title = self
+-            .header_bar
+-            .title_widget()
+-            .and_downcast::<adw::WindowTitle>()
+-            .unwrap();
+-        let title = window_title.title();
+-
+-        let new_title = if self.obj().direction() == gtk::TextDirection::Rtl {
+-            format!("{title} •")
+-        } else {
+-            format!("• {title}")
+-        };
+-
+-        window_title.set_title(&new_title);
+-    }
+-
+     pub(super) fn set_document_metadata(&self) {
+         let (Some(info), Some(metadata)) =
+             (self.document().and_then(|d| d.info()), self.metadata())
+@@ -210,6 +187,35 @@ impl imp::PpsDocumentView {
+             window.set_title(Some(&gettext("Papers")));
+             title_widget.set_title(&gettext("Papers"));
+         }
++
++        if self.modified.get() {
++            self.update_title_indicator(true);
++        }
++    }
++
++    fn update_title_indicator(&self, modified: bool) {
++        let title_widget = self
++            .header_bar
++            .title_widget()
++            .and_downcast::<adw::WindowTitle>()
++            .unwrap();
++        let title = title_widget.title();
++        let ltr = self.obj().direction() == gtk::TextDirection::Ltr;
++
++        if modified {
++            let title = if ltr {
++                format!("• {title}")
++            } else {
++                format!("{title} •")
++            };
++            title_widget.set_title(&title);
++        } else if let Some(title) = if ltr {
++            title.strip_prefix("• ")
++        } else {
++            title.strip_suffix(" •")
++        } {
++            title_widget.set_title(title);
++        }
+     }
+ 
+     // This function detects the schema dynamically, since not only
+@@ -243,11 +249,31 @@ impl imp::PpsDocumentView {
+         self.lockdown_settings.replace(Some(settings));
+     }
+ 
++    pub(super) fn has_pencil_strokes(document: &Document) -> bool {
++        document.find_property("has-pencil-strokes").is_some()
++            && document.property::<bool>("has-pencil-strokes")
++    }
++
++    pub(super) fn disconnect_document_signals(&self) {
++        if let Some(document) = self.document() {
++            for id in [
++                self.modified_handler_id.take(),
++                self.pencil_strokes_handler_id.take(),
++            ]
++            .into_iter()
++            .flatten()
++            {
++                document.disconnect(id);
++            }
++        }
++    }
++
+     pub(super) fn set_document(&self, document: Option<&Document>) {
+         if self.model.document() == document.cloned() {
+             return;
+         }
+ 
++        self.disconnect_document_signals();
+         self.model.set_document(document);
+ 
+         self.set_message_area(None);
+@@ -255,6 +281,7 @@ impl imp::PpsDocumentView {
+         self.set_document_metadata();
+ 
+         let Some(document) = document else {
++            self.doc_restrictions_changed();
+             return;
+         };
+ 
+@@ -293,18 +320,33 @@ impl imp::PpsDocumentView {
+ 
+         self.set_default_actions();
+ 
+-        self.modified.set(false);
++        self.modified.set(document.is_modified());
+ 
+         let id = document.connect_modified_notify(glib::clone!(
+             #[weak(rename_to = obj)]
+             self,
+-            move |_| {
+-                obj.document_modified();
++            move |document| {
++                let modified = document.is_modified();
++                if obj.modified.replace(modified) != modified {
++                    obj.update_title_indicator(modified);
++                }
+             }
+         ));
+ 
+         self.modified_handler_id.replace(Some(id));
+ 
++        if document.find_property("has-pencil-strokes").is_some() {
++            let id = document.connect_notify_local(
++                Some("has-pencil-strokes"),
++                glib::clone!(
++                    #[weak(rename_to = obj)]
++                    self,
++                    move |_, _| obj.doc_restrictions_changed(),
++                ),
++            );
++            self.pencil_strokes_handler_id.replace(Some(id));
++        }
++
+         // This cannot be done in pps_document_view_setup_default because before
+         // having a document, we don't know which sidebars are supported
+         self.setup_sidebar();
+@@ -362,15 +404,25 @@ impl imp::PpsDocumentView {
+         self.obj().native().and_downcast::<gtk::Window>().unwrap()
+     }
+ 
+-    pub(super) fn save_as(&self) {
++    pub(super) fn save_as(&self, keep_editable_ink: bool) {
++        let Some(document) = self.document() else {
++            return;
++        };
++        let title = if keep_editable_ink {
++            gettext("Save Editable Copy…")
++        } else if Self::has_pencil_strokes(&document) {
++            gettext("Save As… (Pencil Ink May Become Permanent)")
++        } else {
++            gettext("Save As…")
++        };
+         let dialog = gtk::FileDialog::builder()
+-            .title(gettext("Save As…"))
++            .title(title)
+             .modal(true)
+             .initial_name(self.edit_name.borrow().clone())
+             .initial_folder(&gio::File::for_path(self.default_save_directory()))
+             .build();
+ 
+-        Document::factory_add_filters(&dialog, self.document().as_ref());
++        Document::factory_add_filters(&dialog, Some(&document));
+ 
+         glib::spawn_future_local(glib::clone!(
+             #[weak(rename_to = obj)]
+@@ -381,15 +433,20 @@ impl imp::PpsDocumentView {
+                 match result {
+                     Err(_) => obj.close_after_save.set(false),
+                     Ok(file) => {
++                        if obj.document().as_ref() != Some(&document) {
++                            obj.close_after_save.set(false);
++                            return;
++                        }
++
+                         obj.file_dialog_save_folder(Some(&file), UserDirectory::Documents);
+ 
+                         obj.clear_save_job();
+ 
+-                        let document = obj.document().unwrap();
+                         let uri = file.uri();
+                         let document_uri = obj.file.borrow().as_ref().unwrap().uri();
+ 
+                         let save_job = papers_view::JobSave::new(&document, &uri, &document_uri);
++                        save_job.set_property("keep-editable-ink", keep_editable_ink);
+ 
+                         let id = save_job.connect_finished(glib::clone!(
+                             #[weak]
+@@ -416,12 +473,15 @@ impl imp::PpsDocumentView {
+ 
+                                 obj.clear_save_job();
+ 
+-                                if obj.close_after_save.get() {
++                                if obj.close_after_save.replace(false) {
+                                     glib::idle_add_local_once(glib::clone!(
+                                         #[weak]
+                                         obj,
+                                         move || {
+-                                            obj.parent_window().destroy();
++                                            if obj.document().is_some_and(|doc| !doc.is_modified())
++                                            {
++                                                obj.parent_window().destroy();
++                                            }
+                                         }
+                                     ));
+                                 }
+diff --git a/shell/src/document_view/signals.rs b/shell/src/document_view/signals.rs
+index 9d0ff27..d29b450 100644
+--- a/shell/src/document_view/signals.rs
++++ b/shell/src/document_view/signals.rs
+@@ -12,6 +12,7 @@ impl imp::PpsDocumentView {
+     pub(crate) fn doc_restrictions_changed(&self) {
+         let Some(document) = self.document() else {
+             self.set_action_enabled("save-as", false);
++            self.set_action_enabled("save-editable-copy", false);
+             self.set_action_enabled("print", false);
+             return;
+         };
+@@ -44,6 +45,10 @@ impl imp::PpsDocumentView {
+         }
+ 
+         self.set_action_enabled("save-as", ok_to_copy);
++        self.set_action_enabled(
++            "save-editable-copy",
++            ok_to_copy && Self::has_pencil_strokes(&document),
++        );
+         self.set_action_enabled("print", ok_to_print);
+     }
+ 
