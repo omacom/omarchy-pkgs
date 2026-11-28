@@ -595,9 +595,13 @@ prefixes remain unchanged so existing PRs keep receiving updates. The separate
 - **A package with no upstream declaration or hook gets no upstream updates.** That
   includes the kernels (`linux-omarchy*`, `linux-aurora`): bump
   them by PR.
-- `sync-upstream.yml` reports each completed run to Basecamp when
-  `BASECAMP_CHATBOT_URL` is set, identifying the hourly or six-hourly group.
-  Individual package update and PR check
+- `sync-upstream.yml` writes a GitHub Actions summary for every run and posts
+  to Basecamp when `BASECAMP_CHATBOT_URL` is set (identifying the five-minute,
+  hourly, or six-hourly group) only when a run needs attention: workflow
+  failures, package update failures, or failing/unavailable checks on a
+  created or updated PR. Fully green runs (no updates needed, clean PR updates
+  with passing or pending checks, or unchanged open PRs) stay quiet in
+  Basecamp. Individual package update and PR check
   failures leave the completed sync green; its notification and Actions
   summary give counts and link to the affected PRs. PR update results and
   current PR check results are counted separately: checks still running (or
