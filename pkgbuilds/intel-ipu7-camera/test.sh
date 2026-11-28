@@ -163,6 +163,21 @@ assert_eq "existing features add" "--enable-features=WaylandWindowDecorations,We
 run_remove "$CONF"
 assert_eq "existing features remove" "--enable-features=WaylandWindowDecorations" "$(cat "$CONF")"
 
+# Repeated --enable-features= lines (Chromium uses the last switch)
+printf '%s\n' '--enable-features=Foo' '--enable-features=Bar' >"$CONF"
+run_add "$CONF"
+assert_eq "repeated feature lines add" $'--enable-features=Foo,WebRtcPipeWireCamera\n--enable-features=Bar,WebRtcPipeWireCamera' "$(cat "$CONF")"
+run_add "$CONF"
+assert_eq "repeated feature lines add idempotent" $'--enable-features=Foo,WebRtcPipeWireCamera\n--enable-features=Bar,WebRtcPipeWireCamera' "$(cat "$CONF")"
+run_remove "$CONF"
+assert_eq "repeated feature lines remove" $'--enable-features=Foo\n--enable-features=Bar' "$(cat "$CONF")"
+
+printf '%s\n' '--enable-features=Foo,WebRtcPipeWireCamera' '--enable-features=Bar' >"$CONF"
+run_add "$CONF"
+assert_eq "repeated lines second missing add" $'--enable-features=Foo,WebRtcPipeWireCamera\n--enable-features=Bar,WebRtcPipeWireCamera' "$(cat "$CONF")"
+run_remove "$CONF"
+assert_eq "repeated lines second missing remove" $'--enable-features=Foo\n--enable-features=Bar' "$(cat "$CONF")"
+
 printf '%s\n' '--enable-features= --ozone-platform=wayland' >"$CONF"
 run_add "$CONF"
 assert_eq "empty enable-features add" "--enable-features=WebRtcPipeWireCamera --ozone-platform=wayland" "$(cat "$CONF")"
