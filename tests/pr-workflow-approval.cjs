@@ -568,7 +568,7 @@ function runBlock(file, step) {
 // A fake gh for the merge App's steps: each PR's auto-merge state in a JSON
 // file, every call logged, gh pr merge arming the PR unless it is listed as
 // failing, and gh pr view failing for the PRs listed.
-function armFixture(prs, { failMerge = [], failView = [], failDisable = [] } = {}) {
+function armFixture(prs, { failMerge = [], failView = [], failDisable = [], failMergeTransition = {} } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'arm-'));
   const bin = join(dir, 'bin');
   mkdirSync(bin);
@@ -576,21 +576,34 @@ function armFixture(prs, { failMerge = [], failView = [], failDisable = [] } = {
   writeFileSync(state, JSON.stringify(prs));
   writeFileSync(join(bin, 'gh'), `#!/usr/bin/env node
 const fs = require('fs');
+const { execFileSync } = require('node:child_process');
 fs.appendFileSync(${JSON.stringify(join(dir, 'calls'))}, process.argv.slice(2).join(' ') + '\\n');
 const prs = JSON.parse(fs.readFileSync(${JSON.stringify(state)}, 'utf8'));
 const args = process.argv.slice(2);
-const n = args.find(a => /^[0-9]+$/.test(a));
+const n = args.find(a => /^[1-9][0-9]{0,9}$/.test(a));
 if (args[0] === 'pr' && args[1] === 'view') {
-  if (${JSON.stringify(failView)}.includes(n)) process.exit(1);
+  if (${JSON.stringify(failView)}.includes(n) || prs[n]?.failView) process.exit(1);
   const pr = prs[n];
+  const fields = args[args.indexOf('--json') + 1].split(',');
   const jq = args[args.indexOf('--jq') + 1];
-  const facts = jq.includes('headRefOid') ? [pr.state || 'OPEN', pr.isDraft || false, pr.base || 'master', pr.head || ''] : [];
-  if (jq.includes('autoMergeRequest')) facts.push(pr.armed ? 'true' : 'false');
-  console.log(facts.join(' '));
+  const all = {
+    state: pr.state || 'OPEN',
+    isDraft: Boolean(pr.isDraft),
+    baseRefName: pr.base || 'master',
+    headRefOid: pr.head || '',
+    autoMergeRequest: pr.armed ? {} : null,
+  };
+  const picked = Object.fromEntries(fields.map(k => [k, all[k]]));
+  process.stdout.write(execFileSync('jq', ['-r', jq], { input: JSON.stringify(picked), encoding: 'utf8' }));
 } else if (args[0] === 'pr' && args[1] === 'merge') {
   if (args.includes('--disable-auto')) {
     if (${JSON.stringify(failDisable)}.includes(n)) process.exit(1);
     prs[n].armed = false;
+  } else if (Object.prototype.hasOwnProperty.call(${JSON.stringify(failMergeTransition)}, n)) {
+    const { exit = 1, ...patch } = ${JSON.stringify(failMergeTransition)}[n];
+    Object.assign(prs[n], patch);
+    fs.writeFileSync(${JSON.stringify(state)}, JSON.stringify(prs));
+    process.exit(exit);
   } else if (${JSON.stringify(failMerge)}.includes(n)) process.exit(1);
   else prs[n].armed = true;
   fs.writeFileSync(${JSON.stringify(state)}, JSON.stringify(prs));
@@ -678,6 +691,32 @@ test('an empty plan arms nothing and passes', () => {
     assert.equal(result.status, 0, result.stdout + result.stderr);
     assert.deepEqual(f.outcomes(), {});
     assert.deepEqual(f.calls(), []);
+  } finally { f.cleanup(); }
+});
+
+test('the arm job accepts a peer merge or arm at the judged head/base and fails closed otherwise', () => {
+  const cases = [
+    ['101', 'a', { head: sha('a') }, { state: 'MERGED', armed: false }, 'success', ''],
+    ['102', 'b', { head: sha('b') }, { state: 'OPEN', armed: true }, 'success', ''],
+    ['103', 'c', { head: sha('c') }, { state: 'CLOSED', armed: false }, 'failure', 'gh pr merge failed'],
+    ['104', 'd', { head: sha('d') }, null, 'failure', 'gh pr merge failed'],
+    ['105', 'e', { head: sha('e') }, { failView: true }, 'failure', 'gh pr merge failed'],
+    ['106', 'f', { head: sha('f') }, { state: 'MERGED', head: sha('9'), armed: false }, 'failure', 'gh pr merge failed'],
+    ['107', '1', { head: sha('1') }, { state: 'OPEN', base: 'rc', armed: true }, 'failure', 'gh pr merge failed'],
+    ['108', '2', { head: sha('2') }, { exit: 0, state: 'MERGED', base: 'rc', armed: false }, 'failure', 'gh pr merge failed'],
+    ['109', '3', { head: sha('9'), state: 'MERGED' }, undefined, 'failure', `moved since it was judged: MERGED false master ${sha('9')}`],
+    ['110', '4', { head: sha('4') }, { exit: 0, state: 'MERGED', armed: false }, 'success', ''],
+  ];
+  const prs = Object.fromEntries(cases.map(([n, , pr]) => [n, pr]));
+  const failMergeTransition = Object.fromEntries(cases.filter(([, , , t]) => t).map(([n, , , t]) => [n, t]));
+  const f = armFixture(prs, { failMerge: ['104'], failMergeTransition });
+  try {
+    f.plan(cases.map(([n, c]) => enable(`auto/sync-upstream-${c}`, n, c)));
+    const result = f.run(runBlock('package-prs.yml', 'Arm auto-merge on each PR'), { REPORT: 'false' });
+    assert.equal(result.status, 1, result.stdout + result.stderr);
+    const expected = Object.fromEntries(cases.map(([n, c, , , outcome, reason]) =>
+      [`auto/sync-upstream-${c}`, { number: n, outcome, reason }]));
+    assert.deepEqual(f.outcomes(), expected);
   } finally { f.cleanup(); }
 });
 
@@ -1072,15 +1111,18 @@ test('author trust: bots, then write access, then VOUCHED.td, as vouch decides i
   assert.equal(await status('den', { den: 'write' }), 'collaborator', 'vouch checks access before the file');
 });
 
-test('a transient permission error is retried as vouch retries it, a 404 is not', async () => {
+test('a transient permission error is retried and returns error instead of downgrading to unknown, while 404 falls through', async () => {
   const context = { repo: { owner: 'omacom', repo: 'omarchy-pkgs' } };
-  const flaky = statuses => {
+  const flaky = (statuses, permission = 'write') => {
     const seen = [];
     return { seen, github: { rest: { repos: { getCollaboratorPermissionLevel: async () => {
-      const status = statuses[seen.length];
-      seen.push(status ?? 'ok');
-      if (status) throw Object.assign(new Error(String(status)), { status });
-      return { data: { permission: 'write' } };
+      const idx = seen.length;
+      const status = statuses[idx];
+      seen.push(idx >= statuses.length ? 'ok' : status);
+      if (idx < statuses.length) {
+        throw status === undefined ? new Error('ECONNRESET') : Object.assign(new Error(String(status)), { status });
+      }
+      return { data: { permission } };
     } } } } };
   };
   const waits = [];
@@ -1091,9 +1133,125 @@ test('a transient permission error is retried as vouch retries it, a 404 is not'
   f = flaky([404]);
   assert.equal(await authorStatus({ ...f, context, login: 'wes', vouched: 'github:wes', wait }), 'vouched');
   assert.equal(f.seen.length, 1);
-  f = flaky([500, 500, 500, 500, 500, 500, 500]);
-  assert.equal(await authorStatus({ ...f, context, login: 'wes', vouched: '', wait }), 'unknown');
-  assert.equal(f.seen.length, 6, 'five retries, then the file');
+  f = flaky([404]);
+  assert.equal(await authorStatus({ ...f, context, login: 'stranger', vouched: '', wait }), 'unknown');
+  assert.equal(f.seen.length, 1);
+  for (const status of [500, 502, 429, 401, undefined]) {
+    f = flaky(Array(6).fill(status));
+    assert.equal(await authorStatus({ ...f, context, login: 'wes', vouched: '', wait }), 'error', String(status));
+    assert.equal(f.seen.length, 6, `five retries then error (${status})`);
+  }
+  f = flaky([422]);
+  assert.equal(await authorStatus({ ...f, context, login: 'wes', vouched: '', wait }), 'error');
+  assert.equal(f.seen.length, 1, 'non-retryable 4xx fails immediately without falling through');
+  for (const badPerm of [null, 'bogus']) {
+    f = flaky([], badPerm);
+    assert.equal(await authorStatus({ ...f, context, login: 'wes', vouched: '', wait }), 'error', String(badPerm));
+    assert.equal(f.seen.length, 1, `malformed 200 permission (${badPerm}) returns error without falling through`);
+  }
+  f = flaky(Array(6).fill(503));
+  assert.equal(await authorStatus({ ...f, context, login: 'mallory', vouched: '-github:mallory spam\n', wait }), 'denounced',
+    'denounced users fail closed even on collaborator API failure');
+});
+
+test('a transient permission API failure preserves collaborator auto-merge unless content or approval revocation disqualifies', async () => {
+  const autoMerge = require('../.github/scripts/auto-merge-pr.cjs');
+  const wait = async () => {};
+  const runCase = async ({ status, permission, files, labels = [], payload = {}, timeline = [[]], failTimeline = false, failCompare = false, vouched = '' }) => {
+    const outputs = {};
+    const pr = {
+      number: 42, state: 'open', draft: false, labels, user: { login: 'wes' },
+      head: { ref: 'pkg-update', sha: sha('a'), repo: { full_name: 'omacom/omarchy-pkgs' } },
+      base: { ref: 'master', sha: sha('b'), repo: { default_branch: 'master' } },
+      changed_files: files.length,
+    };
+    const github = { rest: {
+      pulls: { get: async () => ({ data: pr }) },
+      issues: {
+        listEventsForTimeline: async ({ page = 1 }) => {
+          if (failTimeline) throw Object.assign(new Error('503'), { status: 503 });
+          return { data: timeline[page - 1] || [] };
+        },
+      },
+      repos: {
+        getCollaboratorPermissionLevel: async () => {
+          if (status) throw Object.assign(new Error(String(status)), { status });
+          return { data: { permission } };
+        },
+        compareCommitsWithBasehead: async () => {
+          if (failCompare) throw Object.assign(new Error('503'), { status: 503 });
+          return { data: { files } };
+        },
+      },
+    } };
+    const context = { repo: { owner: 'omacom', repo: 'omarchy-pkgs' }, payload };
+    const core = { info() {}, setOutput: (k, v) => { outputs[k] = v; } };
+    await autoMerge({ github, context, core, number: 42, vouched, wait });
+    return outputs;
+  };
+
+  const pkgOnly = [{ filename: 'pkgbuilds/foo/PKGBUILD', status: 'modified' }];
+  const withWorkflow = [...pkgOnly, { filename: '.github/workflows/publish.yml', status: 'modified' }];
+  const revoked = { action: 'unlabeled', label: { name: 'build-approved' } };
+
+  const kept = await runCase({ status: 503, files: pkgOnly });
+  assert.equal(kept.enable, 'false');
+  assert.equal(kept.withdraw, 'false', 'never withdraws qualifying PR on transient 5xx');
+
+  const stripped = await runCase({ status: 503, files: withWorkflow });
+  assert.equal(stripped.enable, 'false');
+  assert.equal(stripped.withdraw, 'true', 'still withdraws disqualifying PR on transient 5xx');
+
+  const revokedOnError = await runCase({ status: 503, files: pkgOnly, payload: revoked });
+  assert.equal(revokedOnError.enable, 'false');
+  assert.equal(revokedOnError.withdraw, 'true', 'fails closed when build-approved is removed during API error');
+
+  // Even when a later edited event replaced the waiting unlabeled run, the
+  // timeline still records build-approved removal (including past page 1).
+  const page1 = Array.from({ length: 100 }, () => ({ event: 'commented' }));
+  const page2 = [{ event: 'unlabeled', label: { name: 'build-approved' } }];
+  const revokedLaterRun = await runCase({ status: 503, files: pkgOnly, payload: { action: 'edited' }, timeline: [page1, page2] });
+  assert.equal(revokedLaterRun.enable, 'false');
+  assert.equal(revokedLaterRun.withdraw, 'true', 'withdraws when build-approved removal appears in PR timeline');
+
+  const timelineFailed = await runCase({ status: 503, files: pkgOnly, payload: { action: 'edited' }, failTimeline: true });
+  assert.equal(timelineFailed.enable, 'false');
+  assert.equal(timelineFailed.withdraw, 'true', 'fails closed when PR timeline lookup fails');
+
+  const stillLabelled = await runCase({ status: 503, files: pkgOnly, labels: [{ name: 'build-approved' }], failTimeline: true });
+  assert.equal(stillLabelled.enable, 'false');
+  assert.equal(stillLabelled.withdraw, 'false', 'keeps auto-merge without timeline call when build-approved is still present');
+
+  const revokedOnCollab = await runCase({ permission: 'write', files: pkgOnly, payload: revoked });
+  assert.equal(revokedOnCollab.enable, 'true');
+  assert.equal(revokedOnCollab.withdraw, 'false', 'collaborator PR stays armed if build-approved is removed');
+
+  const revokedWithCompareDown = await runCase({ status: 503, files: pkgOnly, payload: { action: 'edited' }, timeline: [page2], failCompare: true });
+  assert.equal(revokedWithCompareDown.enable, 'false');
+  assert.equal(revokedWithCompareDown.withdraw, 'true', 'withdraws revoked approval even if compareCommitsWithBasehead also fails');
+
+  const denouncedOnError = await runCase({ status: 503, files: pkgOnly, vouched: '-github:wes\n' });
+  assert.equal(denouncedOnError.enable, 'false');
+  assert.equal(denouncedOnError.withdraw, 'true', 'withdraws denounced author even if collaborator API fails');
+
+  const realUnknown = await runCase({ status: 404, files: pkgOnly });
+  assert.equal(realUnknown.enable, 'false');
+  assert.equal(realUnknown.withdraw, 'true', '404 still resolves to unknown and withdraws');
+
+  // planArms classifies an exhausted collaborator permission error as failure, not refused.
+  const humanPr = {
+    number: 77, state: 'open', draft: false, merged_at: null, labels: [], user: { login: 'wes' },
+    head: { ref: 'auto/sync-upstream-x', sha: sha('7'), repo: { full_name: 'omacom/omarchy-pkgs', owner: { login: 'omacom' } } },
+    base: { ref: 'master', sha: sha('b'), repo: { default_branch: 'master' } },
+    changed_files: 1, files: pkgOnly,
+  };
+  const { github } = fakeGitHub({ 77: humanPr });
+  github.rest.repos.getCollaboratorPermissionLevel = async () => { throw Object.assign(new Error('503'), { status: 503 }); };
+  const context = { repo: { owner: 'omacom', repo: 'omarchy-pkgs' } };
+  const plan = await planArms({ github, context, core: { info() {} }, groups: [{ branch: 'auto/sync-upstream-x' }], vouched: '', wait });
+  assert.equal(plan.length, 1);
+  assert.equal(plan[0].outcome, 'failure');
+  assert.match(plan[0].reason, /\(error\)/);
 });
 
 test('a PR number is taken only as a person types it', () => {
