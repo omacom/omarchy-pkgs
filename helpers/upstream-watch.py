@@ -108,10 +108,14 @@ class Fetcher:
             raw_hdrs = headers.read_text(errors="replace").replace("\r\n", "\n")
             blocks = [b for b in re.split(r"\n\n+", raw_hdrs.strip()) if b.strip()]
             final_hdr = blocks[-1] if blocks else ""
-            match = re.search(r"(?im)^content-range:\s*bytes\s+0-([0-9]+)/(?:[0-9]+|\*)\s*$", final_hdr)
-            if not match:
+            cr_matches = re.findall(r"(?im)^content-range:\s*bytes\s+0-([0-9]+)/([0-9]+|\*)\s*$", final_hdr)
+            if len(cr_matches) != 1:
                 return None
-            expected_len = int(match.group(1)) + 1
+            end_byte = int(cr_matches[0][0])
+            total = cr_matches[0][1]
+            if total != "*" and int(total) <= end_byte:
+                return None
+            expected_len = end_byte + 1
             data = scratch.read_bytes()
             if not data or len(data) != expected_len or len(data) > size:
                 return None
@@ -310,9 +314,12 @@ def read_deb_control(control_tar_bytes):
     # cannot be interpreted as a libarchive mtree manifest with contents=.
     with tarfile.open(fileobj=io.BytesIO(control_tar_bytes)) as archive:
         members = [m for m in archive if m.name.removeprefix("./") == "control"]
-        if len(members) != 1:
-            raise ValueError("deb control file is missing or ambiguous")
-        return archive.extractfile(members[0]).read().decode()
+        if len(members) != 1 or not members[0].isfile() or members[0].size > DEB_RANGE_BYTES:
+            raise ValueError("deb control file is missing, non-regular, oversized, or ambiguous")
+        data = archive.extractfile(members[0]).read(DEB_RANGE_BYTES + 1)
+        if len(data) > DEB_RANGE_BYTES:
+            raise ValueError("deb control file exceeds size limit")
+        return data.decode()
 
 
 def deb_control_from_prefix(prefix):
@@ -340,7 +347,12 @@ def deb_control_from_prefix(prefix):
         if data_end > len(prefix):
             break
         pos = data_end + (size % 2)
-    return read_deb_control(found[0]) if len(found) == 1 else None
+    if len(found) != 1:
+        return None
+    try:
+        return read_deb_control(found[0])
+    except (tarfile.TarError, UnicodeDecodeError, ValueError):
+        return None
 
 
 def discover(watch, fetch, min_age=0):
@@ -837,6 +849,8 @@ def sync(package, fetch, min_age=0, check=False):
             # Re-verify the discovered version against the full cached .deb so a
             # mid-rollout swap on a mutable URL cannot pair an old pkgver with new bytes.
             full_file = fetch.file(release["deb_range_url"])
+            if full_file.read_bytes()[:8] != b"!<arch>\n":
+                raise ValueError("mutable deb response is not an ar archive")
             names = run(["bsdtar", "-tf", str(full_file)], text=True).splitlines()
             controls = [name for name in names if name.startswith("control.tar")]
             if len(controls) != 1:
