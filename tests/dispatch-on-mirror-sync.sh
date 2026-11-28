@@ -37,6 +37,17 @@ exec "$REAL_TIMEOUT" "\$@"
 STUB
 chmod +x "$T/bin/timeout"
 
+# Signal when a process attempts to acquire flock, then exec real flock.
+REAL_FLOCK=$(command -v flock)
+cat >"$T/bin/flock" <<STUB
+#!/bin/bash
+if [[ -n \${STUB_FLOCK_ENTER_MARKER:-} ]]; then
+  : >"\$STUB_FLOCK_ENTER_MARKER"
+fi
+exec "$REAL_FLOCK" "\$@"
+STUB
+chmod +x "$T/bin/flock"
+
 cat >"$T/bin/curl" <<'STUB'
 #!/bin/bash
 printf '%s\n' "$@" >"$STUB_DIR/curl-args"
@@ -264,7 +275,7 @@ STUB_CURL_EXIT=0 STUB_CURL_BODY="0$T_5"$'\n' STUB_DISPATCH_EXIT=0 run_sync
 pass "leading-zero timestamps compare in base-10 without octal errors"
 
 # 9. Overlapping invocations serialize deterministically via flock so only one dispatches
-rm -f "$T/dispatch-calls" "$T/dispatch1-entered" "$T/release-dispatch1"
+rm -f "$T/dispatch-calls" "$T/dispatch1-entered" "$T/release-dispatch1" "$T/flock2-entered"
 STATE_DIRECTORY="$T/state" STUB_CURL_EXIT=0 STUB_CURL_BODY="$T_6"$'\n' STUB_DISPATCH_EXIT=0 \
   STUB_DISPATCH_ENTER_MARKER="$T/dispatch1-entered" \
   STUB_DISPATCH_RELEASE_MARKER="$T/release-dispatch1" \
@@ -276,10 +287,16 @@ for _ in $(seq 1 200); do
 done
 [[ -e $T/dispatch1-entered ]] || fail "first overlapping run never entered dispatch"
 STATE_DIRECTORY="$T/state" STUB_CURL_EXIT=0 STUB_CURL_BODY="$T_6"$'\n' STUB_DISPATCH_EXIT=0 \
+  STUB_FLOCK_ENTER_MARKER="$T/flock2-entered" \
   "$T/ci/dispatch-on-mirror-sync.sh" >"$T/stdout2" 2>"$T/stderr2" &
 pid2=$!
-sleep 0.05
-kill -0 "$pid2" 2>/dev/null || fail "second overlapping run did not block on flock"
+for _ in $(seq 1 200); do
+  [[ -e $T/flock2-entered ]] && break
+  sleep 0.01
+done
+[[ -e $T/flock2-entered ]] || fail "second overlapping run never attempted flock"
+sleep 0.02
+kill -0 "$pid2" 2>/dev/null || fail "second overlapping run did not block on held flock"
 [[ $(dispatch_count) -eq 1 ]] || fail "second overlapping run dispatched before lock release"
 : >"$T/release-dispatch1"
 wait "$pid1" "$pid2"
