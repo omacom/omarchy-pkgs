@@ -327,7 +327,7 @@ excluded from automatic AUR updates and retain manual maintenance holds.
 - `linuxqq`, `spark-hwmon-dkms`, and `yt6801-dkms`: retain their watch
   declarations while held for manual verification.
 
-**Hardware, boot, firmware, and pinned local holds without upstream watches (23):**
+**Hardware, boot, firmware, and pinned local holds without upstream watches (22):**
 - Apple Silicon / Aurora boot, kernel, audio, and graphics: `alsa-ucm-conf-aurora`,
   `aurora-audio`, `aurora-bless`, `linux-aurora`, `m1n1-aurora`, `mesa-aurora`,
   `omarchy-aurora-firmware`, `uboot-asahi`, `uboot-aurora`. (`m1n1-aurora` and
@@ -337,7 +337,7 @@ excluded from automatic AUR updates and retain manual maintenance holds.
 - Apple T2 Mac support: `apple-bcm-firmware-fetcher`, `apple-t2-audio-config`,
   `linux-t2`, `t2fanrd`.
 - Platform audio, firmware, and hardware daemons: `alsa-ucm-conf`,
-  `linux-firmware-cirrus-dx13260`, `linux-firmware-qcom`,
+  `linux-firmware-cirrus-dx13260`,
   `raspberry-pi-4-bluetooth-firmware`, `speakerguardd`.
 - Benchmarks, toolkits, and local apps: `aura`, `geekbench`, `geekbench6`,
   `omarchy-amiga-screensaver`, `openvino-genai`.
