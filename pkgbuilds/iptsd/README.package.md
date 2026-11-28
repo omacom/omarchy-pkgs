@@ -1,6 +1,6 @@
 # iptsd
 
-Userspace touch and pen processing for Microsoft Surface digitizers, built from pinned upstream `linux-surface/iptsd` v3.1.0 against Arch Linux libraries. Arch Linux ARM does not package it, and the AUR carries only an unmaintained `iptsd-git`.
+Userspace touch and pen processing for Microsoft Surface digitizers, built from pinned upstream `linux-surface/iptsd` against Arch Linux libraries. Arch Linux ARM does not package it, and the AUR carries only an unmaintained `iptsd-git`.
 
 On the Surface Pro 11 (Snapdragon X Elite), the HID-over-SPI digitizer delivers touch through the kernel, but the pen only works once iptsd processes the raw digitizer reports into its virtual stylus and touchscreen devices. It is installed by Omarchy's `install/hardware/microsoft/surface-pro-11.sh`.
 
