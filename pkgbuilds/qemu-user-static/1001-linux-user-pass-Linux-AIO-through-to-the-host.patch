@@ -1,0 +1,279 @@
+From e734729dc3e62898dc91983e4d07937bead67a26 Mon Sep 17 00:00:00 2001
+From: Allan Clempe <allan.clempe@gmail.com>
+Date: Thu, 26 Nov 2026 18:00:00 +1000
+Subject: [PATCH] linux-user: pass Linux AIO through to the host
+
+qemu-user implements none of io_setup, io_destroy, io_submit, io_cancel
+or io_getevents, so programs that use the kernel AIO interface fail
+with ENOSYS; SQL Server 2022 stops with "Unable to create a new
+asynchronous I/O context".
+
+A 64-bit guest and host of the same endianness share aio_context_t,
+struct iocb, struct io_event and struct iovec byte for byte, and with
+guest_base 0 a guest pointer inside them is the host pointer, so the
+host kernel can take them unchanged.  Pass the five calls through in
+that case; anything else keeps returning ENOSYS.
+
+Guest pointers are checked against the guest's memory first, as for
+every other syscall, so the host kernel is never handed memory that is
+QEMU's own: io_submit's iocb array, each iocb, and its buffers or
+iovec array and their buffers (writable for reads, readable for
+writes), and io_getevents' and io_cancel's event buffers.  io_submit
+submits the iocbs before the first that fails the check and returns
+EFAULT if that is the first.  For a bad buffer this differs from the
+kernel, which accepts the iocb and reports EFAULT in its completion
+event; for a bad iocb it is the same.
+
+Checking a read buffer writable also unprotects a page that QEMU
+write-protected because it holds translated code, which the host
+kernel could not otherwise write into.  The page can be protected
+again before the read runs, so a read that completes with EFAULT into
+buffers that are valid guest memory is unprotected and redone with
+preadv2() when its event is collected.
+
+io_event.res carries a host errno; give it the guest's number, for
+targets whose errnos differ from the host's (mips64el, alpha).
+
+Tested on an arm64 host with an x86-64 guest: reads, reads and
+vectored reads into a page holding translated code, an error in a
+completion event, iocbs and buffers that are not mapped, and buffers
+and event arrays in QEMU's own memory, which now fail with EFAULT;
+SQL Server 2022 starts and passes a write workload and DBCC CHECKDB.
+
+Signed-off-by: Allan Clempe <allan.clempe@gmail.com>
+---
+ linux-user/syscall.c | 211 +++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 211 insertions(+)
+
+diff --git a/linux-user/syscall.c b/linux-user/syscall.c
+index 9f454502c..c0d2ce4ef 100644
+--- a/linux-user/syscall.c
++++ b/linux-user/syscall.c
+@@ -691,6 +691,117 @@ static type safe_##name(type1 arg1, type2 arg2, type3 arg3, type4 arg4, \
+ }
+ 
+ safe_syscall3(ssize_t, read, int, fd, void *, buff, size_t, count)
++
++/*
++ * Linux AIO passthrough. Every 64-bit guest and host of the same endianness
++ * (x86-64 on arm64 among them) share aio_context_t, struct iocb, struct
++ * io_event and struct iovec byte for byte, and with guest_base 0 a guest
++ * pointer inside them is the host pointer, so the host kernel can take them
++ * as they are, once QEMU has checked them against the guest's memory.
++ * Anything else keeps the old -ENOSYS.
++ */
++#if defined(TARGET_NR_io_setup) && defined(__NR_io_setup) && \
++    TARGET_ABI_BITS == 64 && HOST_LONG_BITS == 64 && \
++    HOST_BIG_ENDIAN == TARGET_BIG_ENDIAN
++#define QEMU_LINUX_AIO_PASSTHROUGH 1
++#include <linux/aio_abi.h>
++
++safe_syscall5(int, io_getevents, unsigned long, ctx_id, long, min_nr,
++              long, nr, void *, events, struct timespec *, timeout)
++
++/*
++ * Check the buffers of one iocb against the guest's memory: writable for a
++ * read, readable for a write. Checking a buffer writable also unprotects a
++ * page that QEMU write-protected because it holds translated code, which
++ * the host kernel could not write into. Commands without a buffer pass.
++ */
++static bool aio_iocb_buffers_ok(CPUState *cpu, const struct iocb *cb)
++{
++    int type;
++
++    switch (cb->aio_lio_opcode) {
++    case IOCB_CMD_PREAD:
++    case IOCB_CMD_PREADV:
++        type = VERIFY_WRITE;
++        break;
++    case IOCB_CMD_PWRITE:
++    case IOCB_CMD_PWRITEV:
++        type = VERIFY_READ;
++        break;
++    default:
++        return true;
++    }
++
++    if (cb->aio_lio_opcode == IOCB_CMD_PREADV ||
++        cb->aio_lio_opcode == IOCB_CMD_PWRITEV) {
++        const struct iovec *iov;
++        uint64_t i;
++
++        if (cb->aio_nbytes > IOV_MAX) {
++            return true; /* the host kernel refuses it with EINVAL */
++        }
++        if (!access_ok(cpu, VERIFY_READ, cb->aio_buf,
++                       cb->aio_nbytes * sizeof(*iov))) {
++            return false;
++        }
++        iov = g2h_untagged(cb->aio_buf);
++        for (i = 0; i < cb->aio_nbytes; i++) {
++            if (iov[i].iov_len &&
++                !access_ok(cpu, type, (abi_ulong)(uintptr_t)iov[i].iov_base,
++                           iov[i].iov_len)) {
++                return false;
++            }
++        }
++        return true;
++    }
++    return !cb->aio_nbytes ||
++           access_ok(cpu, type, cb->aio_buf, cb->aio_nbytes);
++}
++
++/*
++ * Make a completion event right for the guest. A read the host kernel
++ * failed with EFAULT may have hit a page that QEMU write-protected again,
++ * for code translated on it, after io_submit unprotected it: if the guest
++ * buffers are valid, unprotect them and redo the read here. Then give the
++ * result's errno the guest's number.
++ */
++static void aio_fix_event(CPUState *cpu, struct io_event *ev)
++{
++    int tries;
++
++    for (tries = 0; ev->res == -EFAULT && tries < 3; tries++) {
++        const struct iocb *cb;
++        struct iovec one, *iov;
++        int count;
++        ssize_t r;
++
++        if (!access_ok(cpu, VERIFY_READ, ev->obj, sizeof(*cb))) {
++            break;
++        }
++        cb = g2h_untagged(ev->obj);
++        if ((cb->aio_lio_opcode != IOCB_CMD_PREAD &&
++             cb->aio_lio_opcode != IOCB_CMD_PREADV) ||
++            !aio_iocb_buffers_ok(cpu, cb)) {
++            break;
++        }
++        if (cb->aio_lio_opcode == IOCB_CMD_PREAD) {
++            one.iov_base = g2h_untagged(cb->aio_buf);
++            one.iov_len = cb->aio_nbytes;
++            iov = &one;
++            count = 1;
++        } else {
++            iov = g2h_untagged(cb->aio_buf);
++            count = cb->aio_nbytes;
++        }
++        r = preadv2(cb->aio_fildes, iov, count, cb->aio_offset,
++                    cb->aio_rw_flags);
++        ev->res = r < 0 ? -errno : r;
++    }
++    if (ev->res < 0 && ev->res >= -4095) {
++        ev->res = -host_to_target_errno(-ev->res);
++    }
++}
++#endif
+ safe_syscall3(ssize_t, write, int, fd, const void *, buff, size_t, count)
+ safe_syscall4(int, openat, int, dirfd, const char *, pathname, \
+               int, flags, mode_t, mode)
+@@ -13976,6 +14087,106 @@ static abi_long do_syscall1(CPUArchState *cpu_env, int num, abi_long arg1,
+         return get_errno(epoll_ctl(arg1, arg2, arg3, epp));
+     }
+ 
++#ifdef QEMU_LINUX_AIO_PASSTHROUGH
++    case TARGET_NR_io_setup:
++        if (guest_base) {
++            return -TARGET_ENOSYS;
++        }
++        if (!access_ok(cpu, VERIFY_WRITE, arg2, sizeof(aio_context_t))) {
++            return -TARGET_EFAULT;
++        }
++        return get_errno(syscall(__NR_io_setup, (unsigned int)arg1,
++                                 g2h_untagged(arg2)));
++    case TARGET_NR_io_destroy:
++        if (guest_base) {
++            return -TARGET_ENOSYS;
++        }
++        return get_errno(syscall(__NR_io_destroy, (unsigned long)arg1));
++    case TARGET_NR_io_submit:
++    {
++        abi_long nr = arg2, i;
++        const abi_ulong *iocbpp;
++
++        if (guest_base) {
++            return -TARGET_ENOSYS;
++        }
++        if (nr < 0) {
++            return -TARGET_EINVAL;
++        }
++        /*
++         * Submit the iocbs up to the first that is not valid guest memory,
++         * or whose buffers are not, as the kernel stops at the first it
++         * can't read. Check the pointer array one entry at a time, so a
++         * huge nr can't overflow the length.
++         */
++        iocbpp = g2h_untagged(arg3);
++        for (i = 0; i < nr; i++) {
++            if (!access_ok(cpu, VERIFY_READ, arg3 + i * sizeof(abi_ulong),
++                           sizeof(abi_ulong)) ||
++                !access_ok(cpu, VERIFY_READ, iocbpp[i], sizeof(struct iocb)) ||
++                !aio_iocb_buffers_ok(cpu, g2h_untagged(iocbpp[i]))) {
++                break;
++            }
++        }
++        if (nr > 0 && i == 0) {
++            return -TARGET_EFAULT;
++        }
++        return get_errno(syscall(__NR_io_submit, (unsigned long)arg1,
++                                 (long)i, iocbpp));
++    }
++    case TARGET_NR_io_cancel:
++    {
++        struct io_event *ev;
++
++        if (guest_base) {
++            return -TARGET_ENOSYS;
++        }
++        if (!access_ok(cpu, VERIFY_READ, arg2, sizeof(struct iocb)) ||
++            !access_ok(cpu, VERIFY_WRITE, arg3, sizeof(*ev))) {
++            return -TARGET_EFAULT;
++        }
++        ev = g2h_untagged(arg3);
++        ret = get_errno(syscall(__NR_io_cancel, (unsigned long)arg1,
++                                g2h_untagged(arg2), ev));
++        if (ret == 0) {
++            aio_fix_event(cpu, ev);
++        }
++        return ret;
++    }
++    case TARGET_NR_io_getevents:
++    {
++        struct timespec ts, *pts = NULL;
++        struct io_event *events;
++        abi_long i;
++
++        if (guest_base) {
++            return -TARGET_ENOSYS;
++        }
++        if (arg3 > 0 &&
++            ((abi_ulong)arg3 > guest_addr_max / sizeof(*events) ||
++             !access_ok(cpu, VERIFY_WRITE, arg4, arg3 * sizeof(*events)))) {
++            return -TARGET_EFAULT;
++        }
++        if (arg5) {
++            struct target_timespec *tts;
++
++            if (!lock_user_struct(VERIFY_READ, tts, arg5, 1)) {
++                return -TARGET_EFAULT;
++            }
++            __get_user(ts.tv_sec, &tts->tv_sec);
++            __get_user(ts.tv_nsec, &tts->tv_nsec);
++            unlock_user_struct(tts, arg5, 0);
++            pts = &ts;
++        }
++        events = g2h_untagged(arg4);
++        ret = get_errno(safe_io_getevents(arg1, arg2, arg3, events, pts));
++        for (i = 0; i < ret; i++) {
++            aio_fix_event(cpu, &events[i]);
++        }
++        return ret;
++    }
++#endif
++
+ #if defined(TARGET_NR_epoll_wait)
+     case TARGET_NR_epoll_wait:
+ #endif
+-- 
+2.56.0
+
