@@ -28,14 +28,23 @@ built_depends=$(cd "$package_dir" && package_asus-zenbook-a16-audio >/dev/null 2
 grep -qxF 'linux-firmware-qcom>=20261019-1.1' <<<"$built_depends" ||
   fail "the built package needs the linux-firmware-qcom that ships the topology"
 
-# The UCM profile restates the CRD profile and sets the WSA digital volumes on
-# every boot.
+# The UCM profile restates the CRD profile (except the HiFi include, which now
+# points at the A16 HiFi) and sets the WSA digital volumes on every boot.
 ucm="$pkgdir/usr/share/alsa/ucm2/conf.d/glymur/ASUSTeKCOMPUTERINC.-ZenbookA16UX3607OA-1.0-UX3607OA.conf"
 [[ -f $ucm && ! -L $ucm ]] || fail "the UCM profile is a file"
+hifi="$pkgdir/usr/share/alsa/ucm2/glymur/ZenbookA16-HiFi.conf"
+[[ -f $hifi && ! -L $hifi ]] || fail "the A16 HiFi is a file"
+grep -qF 'File "/glymur/ZenbookA16-HiFi.conf"' "$ucm" ||
+  fail "the UCM profile uses the A16 HiFi"
+grep -qF 'SectionDevice."HDMI0"' "$hifi" || fail "the A16 HiFi defines the HDMI0 device"
+grep -qF 'SectionDevice."HDMI1"' "$hifi" || fail "the A16 HiFi defines the HDMI1 device"
+grep -qF 'SectionDevice."HDMI2"' "$hifi" || fail "the A16 HiFi defines the HDMI2 device"
+grep -qF 'JackControl "DP0 Jack"' "$hifi" || fail "the HDMI0 device uses the DP0 jack"
 crd=/usr/share/alsa/ucm2/Qualcomm/glymur/GLYMUR-CRD.conf
 if [[ -f $crd ]]; then
   while IFS= read -r line; do
     [[ -z ${line//[[:space:]]/} || $line == \#* ]] && continue
+    [[ $line == *'File "/Qualcomm/glymur/HiFi.conf"' ]] && continue
     grep -qxF -- "$line" "$ucm" || fail "the UCM profile restates the CRD profile: $line"
   done <"$crd"
 fi
@@ -61,5 +70,13 @@ wp="$pkgdir/usr/share/wireplumber/wireplumber.conf.d/60-asus-zenbook-a16-soft-vo
 grep -q 'api.alsa.card.longname = "ASUSTeKCOMPUTERINC.-ZenbookA16UX3607OA-1.0-UX3607OA"' "$wp" ||
   fail "the soft-volume rule only applies to the Zenbook A16's card"
 grep -q 'api.alsa.soft-mixer = true' "$wp" || fail "the soft-volume rule switches to software volume"
+
+wp_names="$pkgdir/usr/share/wireplumber/wireplumber.conf.d/60-asus-zenbook-a16-node-names.conf"
+[[ -f $wp_names ]] || fail "the WirePlumber node-name rule is installed"
+grep -q 'node.nick = "Speaker"' "$wp_names" || fail "the node-name rule names the speaker"
+grep -q 'node.nick = "HDMI0 (USB-C)"' "$wp_names" || fail "the node-name rule names HDMI0"
+grep -q 'node.nick = "HDMI1 (USB-C)"' "$wp_names" || fail "the node-name rule names HDMI1"
+grep -q 'node.nick = "HDMI2 (onboard)"' "$wp_names" || fail "the node-name rule names HDMI2"
+grep -q 'node.nick = "Microphone"' "$wp_names" || fail "the node-name rule names the microphone"
 
 echo "ok - asus-zenbook-a16-audio"
