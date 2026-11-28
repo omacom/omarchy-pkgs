@@ -25,6 +25,7 @@ for recipe in omarchy-settings omarchy-settings-dev; do
       export CARCH=$target_arch OMARCHY_SRC=$fixture
       export srcdir=$scratch/src pkgdir=$scratch/$recipe-$target_arch
       backup=()
+      provides=()
       # shellcheck disable=SC1090 # Exercise each recipe's actual package function.
       source "$BUILD_ROOT/pkgbuilds/$recipe/PKGBUILD"
       package
@@ -32,7 +33,7 @@ for recipe in omarchy-settings omarchy-settings-dev; do
       for path in etc/mkinitcpio.conf.d/omarchy_hooks.conf \
         etc/limine-entry-tool.d/omarchy-defaults.conf \
         etc/limine-entry-tool.d/omarchy-uki.conf; do
-        printf '%s\n' "${backup[@]}" | grep -Fxq "$path"
+        printf '%s\n' "${backup[@]}" | grep -Fx "$path" >/dev/null
       done
       for path in etc/limine-entry-tool.d/omarchy-defaults.conf etc/limine-entry-tool.d/omarchy-uki.conf; do
         cmp "$fixture/$path" "$pkgdir/$path"
@@ -47,17 +48,22 @@ for recipe in omarchy-settings omarchy-settings-dev; do
       for template in default.conf limine.conf; do
         cmp "$fixture/default/limine/$template" "$pkgdir/usr/share/omarchy/default/limine/$template"
       done
-      if printf '%s\n' "${backup[@]}" | grep -Fxq etc/mkinitcpio.conf.d/00-omarchy-hooks.conf; then
+      if printf '%s\n' "${backup[@]}" | grep -Fx etc/mkinitcpio.conf.d/00-omarchy-hooks.conf >/dev/null; then
         echo 'FAIL: backup names a 00-omarchy-hooks.conf the source does not ship' >&2
         exit 1
       fi
-      if printf '%s\n' "${backup[@]}" | grep -Fxq etc/sysctl.d/90-omarchy-arp.conf; then
+      [[ ! -e $pkgdir/etc/mkinitcpio.conf.d/00-omarchy-hooks.conf ]]
+      if printf '%s\n' ${provides[@]+"${provides[@]}"} | grep -Fx omarchy-mkinitcpio-hooks-baseline >/dev/null; then
+        echo "FAIL: $recipe $CARCH provides omarchy-mkinitcpio-hooks-baseline without 00-omarchy-hooks.conf" >&2
+        exit 1
+      fi
+      if printf '%s\n' "${backup[@]}" | grep -Fx etc/sysctl.d/90-omarchy-arp.conf >/dev/null; then
         echo 'FAIL: backup names a 90-omarchy-arp.conf the source does not ship' >&2
         exit 1
       fi
       # The installer owns the machine-specific live configuration.
       [[ ! -e $pkgdir/etc/default/limine ]]
-      if printf '%s\n' "${backup[@]}" | grep -Fxq 'etc/default/limine'; then
+      if printf '%s\n' "${backup[@]}" | grep -Fx 'etc/default/limine' >/dev/null; then
         echo 'FAIL: installer-owned Limine configuration is in backup metadata' >&2
         exit 1
       fi
@@ -69,13 +75,13 @@ for recipe in omarchy-settings omarchy-settings-dev; do
       thunderbolt=etc/mkinitcpio.conf.d/thunderbolt_module.conf
       if [[ $CARCH == aarch64 ]]; then
         [[ ! -e $pkgdir/$thunderbolt ]]
-        if printf '%s\n' "${backup[@]}" | grep -Fxq "$thunderbolt"; then
+        if printf '%s\n' "${backup[@]}" | grep -Fx "$thunderbolt" >/dev/null; then
           echo 'FAIL: removed ARM Thunderbolt config remains in backup metadata' >&2
           exit 1
         fi
       else
         cmp "$fixture/$thunderbolt" "$pkgdir/$thunderbolt"
-        printf '%s\n' "${backup[@]}" | grep -Fxq "$thunderbolt"
+        printf '%s\n' "${backup[@]}" | grep -Fx "$thunderbolt" >/dev/null
       fi
       echo "PASS: $recipe $CARCH retains boot configuration and matching backup metadata"
     )
@@ -96,7 +102,7 @@ for recipe in omarchy-settings omarchy-settings-dev; do
       source "$BUILD_ROOT/pkgbuilds/$recipe/PKGBUILD"
       package
       cmp "$fixture/etc/sysctl.d/90-omarchy-arp.conf" "$pkgdir/etc/sysctl.d/90-omarchy-arp.conf"
-      printf '%s\n' "${backup[@]}" | grep -Fxq etc/sysctl.d/90-omarchy-arp.conf
+      printf '%s\n' "${backup[@]}" | grep -Fx etc/sysctl.d/90-omarchy-arp.conf >/dev/null
       echo "PASS: $recipe $CARCH ships the ARP sysctl drop-in and backs it up"
     )
   done
@@ -113,10 +119,12 @@ package_aarch64() {
     # package() builds from $srcdir/omarchy.
     export CARCH=aarch64 OMARCHY_SRC=$source_tree srcdir=${source_tree%/omarchy} pkgdir=$out
     backup=()
+    provides=()
     # shellcheck disable=SC1090 # Exercise the recipe's actual package function.
     source "$BUILD_ROOT/pkgbuilds/$recipe/PKGBUILD"
     package || exit 1
     printf '%s\n' "${backup[@]}" > "$out.backup"
+    printf '%s\n' ${provides[@]+"${provides[@]}"} > "$out.provides"
   )
 }
 
@@ -195,12 +203,89 @@ cp -a "$fixture" "$split"
 cp "$fixtures"/omarchy-13362/*.conf "$split/etc/mkinitcpio.conf.d/"
 # Its 00-omarchy-hooks.conf asks the runtime's own detector (omarchy-hw-platform
 # on PATH), so the package builds without a copy of it and ships none.
+# Contract with omarchy-mac-boot: when its staged payload omits
+# 93-omarchy-mac-plymouth.conf, package() adds a virtual dependency on the
+# HOOKS baseline. Exercise omarchy-mac-boot's real package() with and without
+# that drop-in so any rename in omarchy-mac-boot fails this test immediately.
+mac_boot_depends() {
+  local mode=$1 out=$scratch/mac-boot-$1
+  mkdir -p "$out/src/boot" "$out/pkg"
+  cat > "$out/src/boot/install" <<'EOF'
+#!/bin/sh
+mkdir -p "$1/etc/mkinitcpio.conf.d" "$1/usr/lib/omarchy/initcpio"
+EOF
+  if [[ $mode == with-plymouth ]]; then
+    printf ': > "$1/etc/mkinitcpio.conf.d/93-omarchy-mac-plymouth.conf"\n' >> "$out/src/boot/install"
+  fi
+  chmod +x "$out/src/boot/install"
+  (
+    export CARCH=aarch64 srcdir=$out/src pkgdir=$out/pkg
+    depends=() backup=()
+    # shellcheck disable=SC1091 # Exercise omarchy-mac-boot's actual package function.
+    source "$BUILD_ROOT/pkgbuilds/omarchy-mac-boot/PKGBUILD"
+    package
+    printf '%s\n' "${depends[@]}" | sort -u
+  ) > "$out.depends"
+}
+mac_boot_depends with-plymouth
+mac_boot_depends without-plymouth
+mac_boot_baseline_dep=$(comm -13 "$scratch/mac-boot-with-plymouth.depends" "$scratch/mac-boot-without-plymouth.depends")
+if [[ $mac_boot_baseline_dep != omarchy-mkinitcpio-hooks-baseline ]]; then
+  echo "FAIL: omarchy-mac-boot baseline dependency drifted: '$mac_boot_baseline_dep'" >&2
+  exit 1
+fi
+
 for recipe in omarchy-settings omarchy-settings-dev; do
   package_aarch64 "$recipe" "$split" "$scratch/split-$recipe" >/dev/null
   for conf in 00-omarchy-hooks.conf omarchy_hooks.conf; do
     cmp "$fixtures/omarchy-13362/$conf" "$scratch/split-$recipe/etc/mkinitcpio.conf.d/$conf"
   done
   grep -Fxq etc/mkinitcpio.conf.d/00-omarchy-hooks.conf "$scratch/split-$recipe.backup"
+  grep -Fxq "$mac_boot_baseline_dep" "$scratch/split-$recipe.provides" || {
+    echo "FAIL: $recipe aarch64 ships 00-omarchy-hooks.conf without providing $mac_boot_baseline_dep" >&2
+    exit 1
+  }
+  grep -Fxq omarchy-security-functions "$scratch/split-$recipe.provides" || {
+    echo "FAIL: $recipe aarch64 lost provides=omarchy-security-functions" >&2
+    exit 1
+  }
+  if [[ $recipe == omarchy-settings-dev ]]; then
+    grep -Fxq omarchy-settings "$scratch/split-$recipe.provides" || {
+      echo "FAIL: $recipe aarch64 lost top-level provides=omarchy-settings" >&2
+      exit 1
+    }
+  fi
+  # x86_64 ships 00-omarchy-hooks.conf too and must carry the same drop-ins,
+  # backup entry and provides entries.
+  (
+    export CARCH=x86_64 OMARCHY_SRC=$split srcdir=${split%/omarchy} pkgdir=$scratch/split-$recipe-x86_64
+    backup=()
+    provides=()
+    # shellcheck disable=SC1090 # Exercise each recipe's actual package function.
+    source "$BUILD_ROOT/pkgbuilds/$recipe/PKGBUILD"
+    package
+    for conf in 00-omarchy-hooks.conf omarchy_hooks.conf; do
+      cmp "$fixtures/omarchy-13362/$conf" "$pkgdir/etc/mkinitcpio.conf.d/$conf"
+    done
+    printf '%s\n' "${backup[@]}" | grep -Fxq etc/mkinitcpio.conf.d/00-omarchy-hooks.conf || {
+      echo "FAIL: $recipe x86_64 ships 00-omarchy-hooks.conf without backing it up" >&2
+      exit 1
+    }
+    printf '%s\n' ${provides[@]+"${provides[@]}"} | grep -Fxq "$mac_boot_baseline_dep" || {
+      echo "FAIL: $recipe x86_64 ships 00-omarchy-hooks.conf without providing $mac_boot_baseline_dep" >&2
+      exit 1
+    }
+    printf '%s\n' ${provides[@]+"${provides[@]}"} | grep -Fxq omarchy-security-functions || {
+      echo "FAIL: $recipe x86_64 lost provides=omarchy-security-functions" >&2
+      exit 1
+    }
+    if [[ $recipe == omarchy-settings-dev ]]; then
+      printf '%s\n' ${provides[@]+"${provides[@]}"} | grep -Fxq omarchy-settings || {
+        echo "FAIL: $recipe x86_64 lost top-level provides=omarchy-settings" >&2
+        exit 1
+      }
+    fi
+  )
   [[ ! -e $scratch/split-$recipe/usr/share/libalpm/scripts/omarchy-hw-platform ]]
 done
 layout="omacom/omarchy#13362 (00-omarchy-hooks.conf)"
@@ -221,6 +306,16 @@ done
 for hook in udev encrypt; do
   [[ $hooks != *" $hook "* ]] || { echo "FAIL: $layout: an Aurora Mac keeps $hook:$hooks" >&2; exit 1; }
 done
+# Even when omarchy-mac-boot drops its own 93-omarchy-mac-plymouth.conf
+# (omacom/omarchy-mac#544), 00-omarchy-hooks.conf keeps plymouth right after
+# systemd in an Aurora Mac's initramfs.
+aurora_no_plymouth=$(machine aurora-no-plymouth "$arch_default" "$packaged" mac-boot)
+rm -f "$aurora_no_plymouth/mkinitcpio.conf.d/93-omarchy-mac-plymouth.conf"
+hooks_no_plymouth=" $(effective_hooks "$aurora_no_plymouth" apple-silicon) "
+[[ $hooks_no_plymouth == *" systemd plymouth "* ]] || {
+  echo "FAIL: $layout: an Aurora Mac without 93-omarchy-mac-plymouth.conf loses plymouth after systemd:$hooks_no_plymouth" >&2
+  exit 1
+}
 echo "PASS: $layout: shipped unchanged and backed up; Snapdragon and the Spark get Omarchy's hooks; Macs keep theirs"
 
 # Sources the recipe cannot make safe for Macs stop the aarch64 build, each
@@ -247,6 +342,52 @@ refuse "a hooks file that sets no HOOKS" "$unsafe" omarchy_hooks.conf 'FILES+=(/
 refuse "a HOOKS line with a trailing comment" "$unguardable" omarchy_hooks.conf "HOOKS=($omarchy_hooks) # local"
 refuse "a HOOKS line split over lines" "$unguardable" omarchy_hooks.conf "HOOKS=(base udev"$'\n'"  block encrypt filesystems)"
 refuse "an indented HOOKS that ignores asahi" "$unsafe" 00-omarchy-hooks.conf "if true; then"$'\n'"  HOOKS=($omarchy_hooks)"$'\n'"fi"
+
+# Sources shipping 91-omarchy-initcpio-rebuild.hook place Omarchy's initcpio
+# hooks under /etc/initcpio/ so unchanged settings upgrades skip
+# 90-mkinitcpio-install.hook; older sources keep /usr/lib/initcpio/.
+initcpio_src=$scratch/initcpio/omarchy
+mkdir -p "$initcpio_src/default/initcpio/hooks" "$initcpio_src/default/initcpio/install" \
+  "$initcpio_src/default/libalpm/hooks"
+cp -a "$fixture/." "$initcpio_src/"
+for hook in omarchy-snapshot-overlay omarchy-restore; do
+  printf 'hook %s\n' "$hook" > "$initcpio_src/default/initcpio/hooks/$hook"
+  printf 'install %s\n' "$hook" > "$initcpio_src/default/initcpio/install/$hook"
+done
+
+for recipe in omarchy-settings omarchy-settings-dev; do
+  (
+    export CARCH=x86_64 OMARCHY_SRC=$initcpio_src srcdir=$scratch/initcpio pkgdir=$scratch/initcpio-legacy-$recipe
+    backup=()
+    # shellcheck disable=SC1090
+    source "$BUILD_ROOT/pkgbuilds/$recipe/PKGBUILD"
+    package
+    for hook in omarchy-snapshot-overlay omarchy-restore; do
+      cmp "$initcpio_src/default/initcpio/hooks/$hook" "$pkgdir/usr/lib/initcpio/hooks/$hook"
+      cmp "$initcpio_src/default/initcpio/install/$hook" "$pkgdir/usr/lib/initcpio/install/$hook"
+      [[ ! -e $pkgdir/etc/initcpio/hooks/$hook && ! -e $pkgdir/etc/initcpio/install/$hook ]]
+    done
+  )
+done
+
+printf '[Action]\nExec = /usr/bin/omarchy-boot-sync-initcpio --pacman-hook\n' \
+  > "$initcpio_src/default/libalpm/hooks/91-omarchy-initcpio-rebuild.hook"
+
+for recipe in omarchy-settings omarchy-settings-dev; do
+  (
+    export CARCH=x86_64 OMARCHY_SRC=$initcpio_src srcdir=$scratch/initcpio pkgdir=$scratch/initcpio-etc-$recipe
+    backup=()
+    # shellcheck disable=SC1090
+    source "$BUILD_ROOT/pkgbuilds/$recipe/PKGBUILD"
+    package
+    for hook in omarchy-snapshot-overlay omarchy-restore; do
+      cmp "$initcpio_src/default/initcpio/hooks/$hook" "$pkgdir/etc/initcpio/hooks/$hook"
+      cmp "$initcpio_src/default/initcpio/install/$hook" "$pkgdir/etc/initcpio/install/$hook"
+      [[ ! -e $pkgdir/usr/lib/initcpio/hooks/$hook && ! -e $pkgdir/usr/lib/initcpio/install/$hook ]]
+    done
+  )
+done
+echo "PASS: initcpio hooks move to /etc/initcpio/ when 91-omarchy-initcpio-rebuild.hook is present"
 
 # Upgrades: pacman replaces an unmodified hooks file, keeps a modified one and
 # leaves the guarded version as .pacnew, and installs it where it was absent.

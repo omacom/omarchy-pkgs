@@ -1,0 +1,189 @@
+Apple Touch ID: accept SEP interface v4 and v5, so one build works on the
+7.2 (v4) and 7.3 (v5) aurora kernels.
+
+By Ryan Murray, from aurora-silicon/aurora-sep-userspace 12f26f61
+(ae9e9323, 2026-10-31), libfprint/0005-aurora-support-v4-and-v5.patch, as
+carried by aurora-silicon/alarm-aurora libfprint-aurora. LGPL-2.1-or-later,
+like libfprint. Adapted only by name: SEP_BIO_* reads AURORA_BIO_* and
+sep_bio_* reads aurora_bio_*, for this driver's aurora-bio.h.
+
+Original description:
+
+  aurora: support SEP v4 and v5 with versioned enrolment
+
+  Keep existing v4 kernels usable while enabling v5 enrolment guards. Recheck
+  GET_INFO at open, use the legacy v4 ioctl layout only on v4, and never retry
+  a failed v5 request through the old interface. Matching uses the common ABI.
+
+  Assisted-by: LLM
+  Signed-off-by: Ryan Murray <ryan@aurorasilicon.org>
+
+diff --git a/libfprint/drivers/aurora/aurora.c b/libfprint/drivers/aurora/aurora.c
+index 5d3f74c4..ca71bf88 100644
+--- a/libfprint/drivers/aurora/aurora.c
++++ b/libfprint/drivers/aurora/aurora.c
+@@ -42,6 +42,7 @@ struct _FpiDeviceAurora
+   FpDevice  parent;
+ 
+   gint      fd;
++  guint32   iface_version;
+   guint     watch_id;
+   guint32   enroll_last_reported_stage;
+ 
+@@ -56,6 +57,14 @@ G_DEFINE_TYPE (FpiDeviceAurora, fpi_device_aurora, FP_TYPE_DEVICE)
+ /* helpers                                                             */
+ /* ------------------------------------------------------------------ */
+ 
++/* GET_INFO and matching have the same layout in both supported interfaces.
++ * Enrolment changed size in v5, so never infer support from a lower bound. */
++static gboolean
++aurora_iface_supported (guint32 version)
++{
++  return version == 4 || version == 5;
++}
++
+ static gboolean
+ aurora_ioctl (FpiDeviceAurora *self, unsigned long req, void *arg, GError **error)
+ {
+@@ -330,6 +339,7 @@ aurora_uuid_hex (const guint8 *uuid, gchar out[AURORA_BIO_UUID_LEN * 2 + 1])
+ static void
+ aurora_probe (FpDevice *device)
+ {
++  FpiDeviceAurora *self = FPI_DEVICE_AURORA (device);
+   struct aurora_bio_info info = { 0 };
+   const gchar *path;
+   g_autofree gchar *serial = NULL;
+@@ -368,13 +378,12 @@ aurora_probe (FpDevice *device)
+ 
+   close (fd);
+ 
+-  if (info.version != AURORA_BIO_IFACE_VERSION)
++  if (!aurora_iface_supported (info.version))
+     {
+       fpi_device_probe_complete (device, NULL, NULL,
+                                  fpi_device_error_new_msg (FP_DEVICE_ERROR_NOT_SUPPORTED,
+-                                                           "interface version %u, expected %u",
+-                                                           info.version,
+-                                                           AURORA_BIO_IFACE_VERSION));
++                                                           "interface version %u, expected 4 or 5",
++                                                           info.version));
+       return;
+     }
+ 
+@@ -394,6 +403,7 @@ aurora_probe (FpDevice *device)
+   if (info.enroll_stages > 0)
+     fpi_device_set_nr_enroll_stages (device, info.enroll_stages);
+ 
++  self->iface_version = info.version;
+   serial = g_strdup ("apple-sep");
+   fpi_device_probe_complete (device, serial, NULL, NULL);
+ }
+@@ -403,6 +413,8 @@ aurora_open (FpDevice *device)
+ {
+   FpiDeviceAurora *self = FPI_DEVICE_AURORA (device);
+   const gchar *path;
++  struct aurora_bio_info info = { 0 };
++  g_autoptr(GError) error = NULL;
+ 
+   if (aurora_is_removed (device))
+     {
+@@ -435,6 +447,21 @@ aurora_open (FpDevice *device)
+       return;
+     }
+ 
++  /* Recheck on the fd used for operations, rather than relying on probe. */
++  self->iface_version = 0;
++  if (!aurora_ioctl (self, AURORA_BIO_GET_INFO, &info, &error) ||
++      !aurora_iface_supported (info.version))
++    {
++      if (error == NULL)
++        error = fpi_device_error_new_msg (FP_DEVICE_ERROR_NOT_SUPPORTED,
++                                           "interface version %u, expected 4 or 5",
++                                           info.version);
++      close (self->fd);
++      self->fd = -1;
++      fpi_device_open_complete (device, g_steal_pointer (&error));
++      return;
++    }
++  self->iface_version = info.version;
+   fpi_device_open_complete (device, NULL);
+ }
+ 
+@@ -589,6 +616,44 @@ aurora_enrol_ready (gint fd, GIOCondition condition, gpointer user_data)
+     }
+ }
+ 
++/* v4's request predates account/finger binding. Keep this private legacy
++ * layout out of the current kernel UAPI header. Its size is part of the ioctl. */
++struct aurora_enrol_start_v4 {
++  guint32 flags;
++  guint32 reserved;
++  guint8 label[AURORA_BIO_LABEL_LEN];
++};
++
++#define AURORA_ENROL_START_V4 _IOW(AURORA_BIO_IOC_MAGIC, 0x03, struct aurora_enrol_start_v4)
++
++static gboolean
++aurora_start_enrol (FpiDeviceAurora *self,
++                    struct aurora_bio_enrol_start *start,
++                    GError **error)
++{
++  if (self->iface_version == 4)
++    {
++      struct aurora_enrol_start_v4 legacy = { 0 };
++
++      legacy.flags = start->flags;
++      memcpy (legacy.label, start->label, sizeof (legacy.label));
++      return aurora_ioctl (self, AURORA_ENROL_START_V4, &legacy, error);
++    }
++
++  if (self->iface_version != 5)
++    {
++      g_set_error_literal (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_NOT_SUPPORTED,
++                           "unsupported SEP enrolment interface");
++      return FALSE;
++    }
++
++  /* In particular, ENOTTY or a persistence refusal on v5 must not retry
++   * the legacy request: that would bypass the v5 admission contract. */
++  if (!aurora_ioctl (self, AURORA_BIO_PREPARE_ENROL, start, error))
++    return FALSE;
++  return aurora_ioctl (self, AURORA_BIO_ENROL_START, start, error);
++}
++
+ static void
+ aurora_enroll (FpDevice *device)
+ {
+@@ -629,7 +694,7 @@ aurora_enroll (FpDevice *device)
+     }
+   lookup = getpwnam_r (username, &account, account_buf, sizeof (account_buf), &found);
+   if (lookup != 0 || found == NULL || g_strcmp0 (found->pw_name, username) != 0 ||
+-      (guint64) found->pw_uid > G_MAXUINT32)
++      (guint64) found->pw_uid >= G_MAXUINT32)
+     {
+       fpi_device_enroll_complete (device, NULL,
+                                   fpi_device_error_new_msg (FP_DEVICE_ERROR_DATA_INVALID,
+@@ -646,13 +711,7 @@ aurora_enroll (FpDevice *device)
+       return;
+     }
+ 
+-  if (!aurora_ioctl (self, AURORA_BIO_PREPARE_ENROL, &start, &error))
+-    {
+-      fpi_device_enroll_complete (device, NULL, g_steal_pointer (&error));
+-      return;
+-    }
+-
+-  if (!aurora_ioctl (self, AURORA_BIO_ENROL_START, &start, &error))
++  if (!aurora_start_enrol (self, &start, &error))
+     {
+       fpi_device_enroll_complete (device, NULL, g_steal_pointer (&error));
+       return;
+@@ -938,7 +997,7 @@ aurora_match_start (FpDevice *device)
+         }
+ 
+       if (ioctl (self->fd, AURORA_BIO_GET_INFO, &info) == 0 &&
+-          info.version == AURORA_BIO_IFACE_VERSION &&
++          aurora_iface_supported (info.version) &&
+           (info.reserved[0] & AURORA_BIO_INFO_LIVE_COUNT_VALID) != 0 &&
+           info.reserved[1] == 0)
+         {

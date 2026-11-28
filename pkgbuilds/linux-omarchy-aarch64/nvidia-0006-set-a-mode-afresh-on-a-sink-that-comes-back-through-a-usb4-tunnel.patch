@@ -1,0 +1,178 @@
+From da1aa3fbfae145797c55f75a94ec01c67f535826 Mon Sep 17 00:00:00 2001
+From: Ryan Hughes <ryan@heyoodle.com>
+Date: Tue, 6 Oct 2026 22:52:10 -0400
+Subject: [PATCH] nvkms: set a mode afresh on a sink that comes back through a
+ USB4 tunnel
+
+When a DisplayPort sink goes away while a head drives it, the DP library
+keeps it as a zombie and revives that head in place when the sink comes
+back. Behind a USB4 dock the DisplayPort tunnel is torn down when the
+sink goes away and built anew when it returns, and the revived head then
+leaves the sink blank, although the link trains.
+
+The client only sets a mode afresh if it notices that the sink was
+unplugged. Hyprland handles one connector after another and shutting a
+head down takes it about a second, so when a dock with two monitors is
+replugged within a few seconds, the second monitor is often back before
+Hyprland looks at it: it reads as connected, its head is revived, and
+the monitor stays black until the user turns the output off and on.
+
+On a connector whose link runs through a DP tunnel, keep a sink that
+comes back to a head that still drives it reported as unplugged until
+that head is shut down, then report it as plugged, so the client always
+sees the unplug and sets a mode on the sink from scratch.
+---
+ .../src/dp/nvdp-connector-event-sink.cpp      | 45 ++++++++++++++++++-
+ .../src/dp/nvdp-connector-event-sink.hpp      |  3 ++
+ src/nvidia-modeset/src/dp/nvdp-connector.cpp  | 35 +++++++++++++++
+ 3 files changed, 81 insertions(+), 2 deletions(-)
+
+diff --git a/src/nvidia-modeset/src/dp/nvdp-connector-event-sink.cpp b/src/nvidia-modeset/src/dp/nvdp-connector-event-sink.cpp
+index 21f5252..6c5cb0a 100644
+--- a/src/nvidia-modeset/src/dp/nvdp-connector-event-sink.cpp
++++ b/src/nvidia-modeset/src/dp/nvdp-connector-event-sink.cpp
+@@ -223,6 +223,37 @@ static void nvDPAddDeviceToActiveGroup(NVDpyEvoPtr pDpyEvo)
+     }
+ }
+ 
++/*
++ * A DisplayPort tunnel through a USB4 dock is torn down when its sink goes
++ * away and built again when the sink comes back. Reviving a head that still
++ * drove the sink on the new tunnel leaves the sink blank, so if the client has
++ * not shut that head down yet, keep reporting the sink as unplugged until it
++ * has. The client then sets a mode on it from scratch.
++ */
++static NvBool HoldReplugUntilDetached(NVDpyEvoPtr pDpyEvo)
++{
++    NVDPLibConnectorPtr pDpLibConnector = pDpyEvo->pConnectorEvo->pDpLibConnector;
++    NVDPLibDevicePtr pDpLibDevice = pDpyEvo->dp.pDpLibDevice;
++    const NVDevEvoRec *pDevEvo = pDpyEvo->pDispEvo->pDevEvo;
++    NvU32 head;
++
++    if (pDpLibConnector->headInFirmware ||
++        pDpLibDevice->device->isMultistream() ||
++        !pDpLibConnector->connector->isDpInTunnelingSupported()) {
++        return FALSE;
++    }
++
++    for (head = 0; head < pDevEvo->numHeads; head++) {
++        if (nvDpyIdIsInDpyIdList(pDpyEvo->id,
++                                 pDpLibConnector->dpyIdList[head])) {
++            pDpLibDevice->replugHeld = TRUE;
++            return TRUE;
++        }
++    }
++
++    return FALSE;
++}
++
+ static bool DpyHasGsyncEDID(NVDpyEvoPtr pDpyEvo)
+ {
+     return pDpyEvo->parsedEdid.valid &&
+@@ -392,9 +423,14 @@ void ConnectorEventSink::newDevice(DisplayPort::Device *device)
+ 
+     nvAssert(device->isPlugged());
+ 
+-    pDpLibDevice->isPlugged = TRUE;
+     pDpyEvo->dp.pDpLibDevice = pDpLibDevice;
+ 
++    if (HoldReplugUntilDetached(pDpyEvo)) {
++        return;
++    }
++
++    pDpLibDevice->isPlugged = TRUE;
++
+     // If there's an active group that this pDpy is supposed to be a member of,
+     // insert it now.
+     nvDPAddDeviceToActiveGroup(pDpyEvo);
+@@ -488,7 +524,9 @@ void ConnectorEventSink::notifyZombieStateChange(DisplayPort::Device *dev,
+ 
+     NVDPLibDevicePtr pDpLibDevice = pDpyEvo->dp.pDpLibDevice;
+     if (zombied) {
+-        dev->getOwningGroup()->remove(dev);
++        if (dev->getOwningGroup()) {
++            dev->getOwningGroup()->remove(dev);
++        }
+ 
+         if (pDpLibDevice->isPlugged && !dev->isPlugged()) {
+             pDpLibDevice->isPlugged = FALSE;
+@@ -502,6 +540,9 @@ void ConnectorEventSink::notifyZombieStateChange(DisplayPort::Device *dev,
+         // plugged back in.
+     } else {
+         if (!pDpLibDevice->isPlugged && dev->isPlugged()) {
++            if (HoldReplugUntilDetached(pDpyEvo)) {
++                return;
++            }
+             pDpLibDevice->isPlugged = TRUE;
+             sendEvent = TRUE;
+         }
+diff --git a/src/nvidia-modeset/src/dp/nvdp-connector-event-sink.hpp b/src/nvidia-modeset/src/dp/nvdp-connector-event-sink.hpp
+index d05bf74..cd9b0f5 100644
+--- a/src/nvidia-modeset/src/dp/nvdp-connector-event-sink.hpp
++++ b/src/nvidia-modeset/src/dp/nvdp-connector-event-sink.hpp
+@@ -94,6 +94,9 @@ struct _nv_dplibconnector {
+ struct _nv_dplibdevice {
+     DisplayPort::Device *device;
+     NvBool isPlugged;
++    // The sink came back while a head still drove it, and is reported as
++    // unplugged until that head is shut down; see HoldReplugUntilDetached().
++    NvBool replugHeld;
+ };
+ 
+ struct __nv_dplibmodesetstate {
+diff --git a/src/nvidia-modeset/src/dp/nvdp-connector.cpp b/src/nvidia-modeset/src/dp/nvdp-connector.cpp
+index 0a9bf76..2190a67 100644
+--- a/src/nvidia-modeset/src/dp/nvdp-connector.cpp
++++ b/src/nvidia-modeset/src/dp/nvdp-connector.cpp
+@@ -32,6 +32,7 @@
+ #include "nvkms-modeset.h"
+ #include "nvkms-utils.h"
+ #include "nvkms-rmapi.h"
++#include "nvkms-private.h"
+ #include "nvkms-prealloc.h"
+ 
+ #include <dp_connector.h>
+@@ -910,6 +911,40 @@ void nvDPPostSetMode(NVDPLibConnectorPtr pDpLibConnector,
+         }
+     }
+ 
++    /*
++     * Report sinks that HoldReplugUntilDetached() kept unplugged once no head
++     * drives them anymore, so that the client sets a mode on them anew.
++     */
++    if (newHeadMask != oldHeadMask) {
++        NVDpyEvoPtr pDpyEvo;
++
++        FOR_ALL_EVO_DPYS(pDpyEvo, pDispEvo->validDisplays, pDispEvo) {
++            NVDPLibDevicePtr pDpLibDevice = pDpyEvo->dp.pDpLibDevice;
++            NvBool driven = FALSE;
++
++            if (pDpyEvo->pConnectorEvo->pDpLibConnector != pDpLibConnector ||
++                pDpLibDevice == NULL || !pDpLibDevice->replugHeld) {
++                continue;
++            }
++
++            for (NvU32 head = 0; head < pDispEvo->pDevEvo->numHeads; head++) {
++                if (nvDpyIdIsInDpyIdList(pDpyEvo->id,
++                                         pDpLibConnector->dpyIdList[head])) {
++                    driven = TRUE;
++                }
++            }
++            if (driven) {
++                continue;
++            }
++
++            pDpLibDevice->replugHeld = FALSE;
++            if (pDpLibDevice->device->isPlugged()) {
++                pDpLibDevice->isPlugged = TRUE;
++                nvSendDpyEventEvo(pDpyEvo, NVKMS_EVENT_TYPE_DPY_CHANGED);
++            }
++        }
++    }
++
+     /*
+      * Update DisplayPort link information for all displays on DpLib connector
+      */
+-- 
+2.56.0
+

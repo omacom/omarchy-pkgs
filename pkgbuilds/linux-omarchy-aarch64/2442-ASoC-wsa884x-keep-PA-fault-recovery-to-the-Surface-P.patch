@@ -1,0 +1,203 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Birk Skyum <birk.skyum@pm.me>
+Date: Wed, 11 Nov 2026 17:56:14 +0000
+Subject: [PATCH] ASoC: wsa884x: keep PA fault recovery to the Surface Pro 11
+ and stop a fault loop
+
+2154's PA fault recovery polls every amplifier every 100 ms while it
+plays and resets any whose PA_FSM_STA1 shows one of five status bits.
+It was made and tested on the Surface Pro 11, but it runs on every
+board. On the Dell XPS 13 9345 it faulted the amplifiers and the
+SoundWire bus, and playback worked with upstream's driver instead. The
+ASUS Vivobook 14 (X1407QA) reports a PA fault on its right amplifier at
+every stream start. Keep the polling and the start-of-stream checks to
+microsoft,denali, the board the 2S profile is already kept to, so other
+boards get upstream behaviour.
+
+The recovery also only gave up once a reset failed. An amplifier whose
+reset succeeds and that faults again 100 ms later is reset ten times a
+second for as long as audio plays. On a Surface Pro 11 the right
+amplifier did that about 8000 times in 14 minutes, then the SoundWire
+controller stopped responding and every speaker stream failed with
+-ENODATA until a reboot. After more than five faults within two
+seconds, leave that amplifier off until its widget powers up again,
+and stop polling it. An underrun restart unmutes without powering the
+widget down and up, so the unmute path leaves it off too.
+
+Signed-off-by: Birk Skyum <birk.skyum@pm.me>
+---
+ sound/soc/codecs/wsa884x.c | 83 +++++++++++++++++++++++++++++++-------
+ 1 file changed, 69 insertions(+), 14 deletions(-)
+
+diff --git a/sound/soc/codecs/wsa884x.c b/sound/soc/codecs/wsa884x.c
+index ad846d5c8..98c2b049f 100644
+--- a/sound/soc/codecs/wsa884x.c
++++ b/sound/soc/codecs/wsa884x.c
+@@ -736,6 +736,9 @@
+ #define WSA884X_PA_RECOVERY_RETRIES	3
+ #define WSA884X_PA_RECOVERY_FAILURES	3
+ #define WSA884X_PA_HEALTH_INTERVAL_MS	100
++/* More faults than this within the window and the amplifier stays off. */
++#define WSA884X_PA_FAULT_LIMIT		5
++#define WSA884X_PA_FAULT_WINDOW_MS	2000
+ 
+ struct wsa884x_priv {
+ 	struct regmap *regmap;
+@@ -761,6 +764,10 @@ struct wsa884x_priv {
+ 	bool pa_on;
+ 	struct delayed_work pa_health_work;
+ 	unsigned int pa_recovery_failures;
++	/* PA fault recovery runs only on the boards it was made for. */
++	bool pa_watch;
++	unsigned int pa_faults;
++	unsigned long pa_fault_start;
+ 	unsigned int supply_config;
+ };
+ 
+@@ -1742,13 +1749,26 @@ static int wsa884x_recover_pa(struct wsa884x_priv *wsa884x, bool reenable)
+ 	return ret ?: -EIO;
+ }
+ 
++/* Count a PA fault; true once there have been too many in the window. */
++static bool wsa884x_pa_fault_storm(struct wsa884x_priv *wsa884x)
++{
++	if (!wsa884x->pa_faults ||
++	    time_after(jiffies, wsa884x->pa_fault_start +
++			       msecs_to_jiffies(WSA884X_PA_FAULT_WINDOW_MS))) {
++		wsa884x->pa_fault_start = jiffies;
++		wsa884x->pa_faults = 0;
++	}
++
++	return ++wsa884x->pa_faults > WSA884X_PA_FAULT_LIMIT;
++}
++
+ static void wsa884x_pa_health_work(struct work_struct *work)
+ {
+ 	struct wsa884x_priv *wsa884x =
+ 		container_of(to_delayed_work(work), struct wsa884x_priv,
+ 			     pa_health_work);
+ 	unsigned int sta1 = 0;
+-	bool rearm;
++	bool rearm, given_up = false;
+ 	int ret;
+ 
+ 	ret = pm_runtime_resume_and_get(wsa884x->dev);
+@@ -1762,12 +1782,27 @@ static void wsa884x_pa_health_work(struct work_struct *work)
+ 	ret = regmap_read(wsa884x->regmap, WSA884X_PA_FSM_STA1, &sta1);
+ 	if (!ret && (sta1 & WSA884X_PA_ERROR_MASK) &&
+ 	    wsa884x->pa_recovery_failures < WSA884X_PA_RECOVERY_FAILURES) {
+-		ret = wsa884x_recover_pa(wsa884x, true);
+-		if (ret)
+-			wsa884x->pa_recovery_failures++;
+-		else
+-			wsa884x->pa_recovery_failures = 0;
++		if (wsa884x_pa_fault_storm(wsa884x)) {
++			/*
++			 * A reset that succeeds every time on an amplifier that
++			 * faults again at once only floods the SoundWire bus,
++			 * which can stop responding. Leave this amplifier off
++			 * until the next stream.
++			 */
++			wsa884x_recover_pa(wsa884x, false);
++			wsa884x->pa_recovery_failures = WSA884X_PA_RECOVERY_FAILURES;
++			dev_warn(wsa884x->dev,
++				 "PA faulted %u times in %u ms; amplifier left off until the next stream\n",
++				 wsa884x->pa_faults, WSA884X_PA_FAULT_WINDOW_MS);
++		} else {
++			ret = wsa884x_recover_pa(wsa884x, true);
++			if (ret)
++				wsa884x->pa_recovery_failures++;
++			else
++				wsa884x->pa_recovery_failures = 0;
++		}
+ 	}
++	given_up = wsa884x->pa_recovery_failures >= WSA884X_PA_RECOVERY_FAILURES;
+ 
+ out_unlock:
+ 	mutex_unlock(&wsa884x->sp_lock);
+@@ -1775,7 +1810,7 @@ static void wsa884x_pa_health_work(struct work_struct *work)
+ 	pm_runtime_put_autosuspend(wsa884x->dev);
+ 
+ out_rearm:
+-	rearm = READ_ONCE(wsa884x->pa_on);
++	rearm = READ_ONCE(wsa884x->pa_on) && !given_up;
+ 	if (rearm)
+ 		schedule_delayed_work(&wsa884x->pa_health_work,
+ 				      msecs_to_jiffies(WSA884X_PA_HEALTH_INTERVAL_MS));
+@@ -1951,6 +1986,7 @@ static int wsa884x_spkr_event(struct snd_soc_dapm_widget *w,
+ 		scoped_guard(mutex, &wsa884x->sp_lock) {
+ 			wsa884x->pa_on = true;
+ 			wsa884x->pa_recovery_failures = 0;
++			wsa884x->pa_faults = 0;
+ 		}
+ 
+ 		wsa884x_spkr_post_pmu(component, wsa884x);
+@@ -1959,8 +1995,9 @@ static int wsa884x_spkr_event(struct snd_soc_dapm_widget *w,
+ 					      WSA884X_PDM_WD_CTL_PDM_WD_EN_MASK,
+ 					      0x1);
+ 
+-		mod_delayed_work(system_wq, &wsa884x->pa_health_work,
+-				 msecs_to_jiffies(WSA884X_PA_HEALTH_INTERVAL_MS));
++		if (wsa884x->pa_watch)
++			mod_delayed_work(system_wq, &wsa884x->pa_health_work,
++					 msecs_to_jiffies(WSA884X_PA_HEALTH_INTERVAL_MS));
+ 		break;
+ 	case SND_SOC_DAPM_PRE_PMD:
+ 		scoped_guard(mutex, &wsa884x->sp_lock)
+@@ -2068,11 +2105,21 @@ static int wsa884x_mute_stream(struct snd_soc_dai *dai, int mute, int stream)
+ 					      0x0);
+ 
+ 	} else {
++		/*
++		 * The health check left this amplifier off for the rest of the
++		 * stream. An underrun restart unmutes without powering the
++		 * widget down and up, so don't switch it back on here.
++		 */
++		if (wsa884x->pa_watch &&
++		    wsa884x->pa_recovery_failures >= WSA884X_PA_RECOVERY_FAILURES)
++			return 0;
++
+ 		/*
+ 		 * A PA_ON_ERR can remain latched across a normal graph
+ 		 * teardown.  Clear it before trying to start the amplifier.
+ 		 */
+-		if (!regmap_read(wsa884x->regmap, WSA884X_PA_FSM_STA1, &sta1) &&
++		if (wsa884x->pa_watch &&
++		    !regmap_read(wsa884x->regmap, WSA884X_PA_FSM_STA1, &sta1) &&
+ 		    (sta1 & WSA884X_PA_ERROR_MASK))
+ 			wsa884x_recover_pa(wsa884x, false);
+ 
+@@ -2082,11 +2129,13 @@ static int wsa884x_mute_stream(struct snd_soc_dai *dai, int mute, int stream)
+ 		snd_soc_component_write_field(component, WSA884X_PA_FSM_EN,
+ 					      WSA884X_PA_FSM_EN_GLOBAL_PA_EN_MASK,
+ 					      0x1);
+-		usleep_range(1000, 1100);
++		if (wsa884x->pa_watch) {
++			usleep_range(1000, 1100);
+ 
+-		if (!regmap_read(wsa884x->regmap, WSA884X_PA_FSM_STA1, &sta1) &&
+-		    (sta1 & WSA884X_PA_ERROR_MASK))
+-			wsa884x_recover_pa(wsa884x, true);
++			if (!regmap_read(wsa884x->regmap, WSA884X_PA_FSM_STA1, &sta1) &&
++			    (sta1 & WSA884X_PA_ERROR_MASK))
++				wsa884x_recover_pa(wsa884x, true);
++		}
+ 	}
+ 
+ 	return 0;
+@@ -2328,6 +2377,12 @@ static int wsa884x_probe(struct sdw_slave *pdev,
+ 
+ 	mutex_init(&wsa884x->sp_lock);
+ 	INIT_DELAYED_WORK(&wsa884x->pa_health_work, wsa884x_pa_health_work);
++	/*
++	 * The recovery was made and tested on the Surface Pro 11. On other
++	 * boards its 100 ms polling and resets have been seen to fault the
++	 * amplifiers and the SoundWire bus, so they keep upstream behaviour.
++	 */
++	wsa884x->pa_watch = of_machine_is_compatible("microsoft,denali");
+ 
+ 	ret = devm_add_action_or_reset(dev, wsa884x_cancel_pa_health_work,
+ 				       wsa884x);
+-- 
+2.47.3
+

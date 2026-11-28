@@ -2,7 +2,7 @@
 
 Speakers and microphones for the ASUS Zenbook A16 (UX3607OA, Snapdragon X2 Elite / Glymur).
 
-Without it the `snd-x1e80100` card fails to probe:
+Before linux-firmware carried the board's topology, the `snd-x1e80100` card failed to probe:
 
 ```
 qcom-apm gprsvc:service:2:1: tplg firmware loading qcom/glymur/GLYMUR-ASUS-Zenbook-A16-UX3607OA-tplg.bin failed -2
@@ -11,9 +11,9 @@ snd-x1e80100 sound: ASoC: failed to instantiate card -2
 
 so there is no ALSA card and PipeWire only offers a dummy output.
 
-The board's device tree has the same two audio links as Qualcomm's Glymur CRD: four WSA884x speakers (woofer and tweeter, left and right) on `WSA_CODEC_DMA_RX_0`, and two DMICs on `VA_CODEC_DMA_TX_0`. Those are exactly the backends the CRD topology defines, and the CRD UCM profile drives four WSA884x speakers. This package points the board names at the CRD files:
+The board's device tree has the same two audio links as Qualcomm's Glymur CRD: four WSA884x speakers (woofer and tweeter, left and right) on `WSA_CODEC_DMA_RX_0`, and two DMICs on `VA_CODEC_DMA_TX_0`. Those are exactly the backends the CRD topology defines, and the CRD UCM profile drives four WSA884x speakers.
 
-- `/usr/lib/firmware/qcom/glymur/GLYMUR-ASUS-Zenbook-A16-UX3607OA-tplg.bin` → `GLYMUR-CRD-tplg.bin` (linux-firmware-qcom)
+- The topology, `qcom/glymur/GLYMUR-ASUS-Zenbook-A16-UX3607OA-tplg.bin`, comes from linux-firmware-qcom since `20261019-1.1` (upstream 466e500d). It is the CRD topology byte for byte, which this package linked to before `1-2`.
 - `/usr/share/alsa/ucm2/conf.d/glymur/ASUSTeKCOMPUTERINC.-ZenbookA16UX3607OA-1.0-UX3607OA.conf`: the CRD profile (`Qualcomm/glymur/GLYMUR-CRD.conf`, alsa-ucm-conf) restated, plus a `FixedBootSequence` that sets the four WSA digital volumes to `100%`, the kernel's ceiling, on every boot: 84 (0 dB) with linux-omarchy-aarch64's Zenbook A16 limit, 81 (-3 dB) on a kernel without it. The CRD profile sets them only in a `BootSequence`, which runs when the card has no saved state, so a level saved under the kernel's earlier -3 dB ceiling would otherwise stick, and with software volume nothing else moves them.
 
 The kernel requests the topology by the device tree's model, while UCM looks the profile up by the card's long name, which the kernel builds from DMI (`board_vendor-product_name-product_version-board_name`, stripped of spaces).
@@ -32,6 +32,6 @@ UCM merges the four amplifiers' `PA Volume` controls into one `Speakers Volume`,
 
 ## Retirement
 
-- Topology and UCM: drop once linux-firmware ships a Zenbook A16 topology and alsa-ucm-conf a Zenbook A16 profile; the files would conflict.
+- UCM profile: drop once alsa-ucm-conf's Zenbook A16 profile sets the WSA digital volumes on every boot.
 - udev rule: drop once the Qualcomm SoundWire driver resumes v3.1.0 controllers reliably, for example by resetting and re-enumerating instead of exiting clock stop.
 - WirePlumber rule: drop once `PA Volume` changes the output on this board, or UCM stops using it as the speakers' volume.

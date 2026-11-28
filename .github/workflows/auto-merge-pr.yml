@@ -7,14 +7,21 @@ name: Auto-merge approved package PRs
 # pass, and a red build stays an open PR. .github/scripts/auto-merge-pr.cjs
 # has the rule.
 #
-# Auto-merge is enabled with the PAT in PKGS_BOT_TOKEN: a merge made with the
-# built-in GITHUB_TOKEN does not start publish.yml.
+# The omarchy-pkgs-merge App arms and withdraws auto-merge. GitHub merges as
+# whoever armed it, and a merge made with the built-in GITHUB_TOKEN would
+# not start publish.yml.
 #
 # pull_request_target runs this default-branch code with secrets; the PR's
-# code is never checked out here.
+# code is never checked out here. It reacts to a push within seconds, so a
+# change that stops a PR qualifying withdraws auto-merge long before the
+# new head's builds can turn green. A repository Actions policy allows this
+# workflow's pull_request_target and workflow_dispatch events.
+#
+# Every base branch triggers it, and edited covers a base change: a PR moved
+# off master must lose auto-merge, and decide() arms only PRs into master.
 on:
   pull_request_target:
-    types: [opened, reopened, synchronize, ready_for_review, labeled, unlabeled]
+    types: [opened, reopened, synchronize, ready_for_review, labeled, unlabeled, edited]
   workflow_dispatch:
     inputs:
       pr:
@@ -25,84 +32,141 @@ permissions:
   contents: read
   pull-requests: read
 
+# One run per PR at a time, and a run is never cancelled: a stream of edits
+# to the title or body must not keep cancelling a withdraw. A newer event
+# waits, and replaces any run still waiting, so the last one judges the PR
+# as it is by then.
 concurrency:
   group: auto-merge-pr-${{ github.event.pull_request.number || github.event.inputs.pr }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
-  auto-merge:
+  # Decides with the read-only token whether apply needs to start. It runs
+  # only first-party actions and the default branch's scripts, and passes
+  # apply nothing but the action: apply decides again for itself.
+  decide:
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    outputs:
+      action: ${{ steps.action.outputs.action }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event.repository.default_branch }}
           persist-credentials: false
 
-      - name: Find the PR's author
-        id: pr
-        uses: actions/github-script@v7
+      - name: Decide
+        id: decide
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         env:
           NUMBER: ${{ github.event.pull_request.number || github.event.inputs.pr }}
         with:
           script: |
-            const { data: pr } = await github.rest.pulls.get({
-              ...context.repo, pull_number: Number(process.env.NUMBER),
-            });
-            core.setOutput('number', String(pr.number));
-            core.setOutput('author', pr.user.login);
+            const { readFileSync } = require('fs');
+            const autoMerge = require('./.github/scripts/auto-merge-pr.cjs');
+            await autoMerge({ github, context, core, number: process.env.NUMBER,
+              vouched: readFileSync('.github/VOUCHED.td', 'utf8') });
 
-      - id: vouch
-        uses: mitchellh/vouch/action/check-user@f23dbb5e745334f97414ec70463ce7301071a661 # v1
+      # The apply job mints a write token only when there is something to do:
+      # arm a PR that is not armed, or take auto-merge back from one that is.
+      # Any event on a PR that no longer qualifies takes auto-merge back, a
+      # push included: GitHub keeps auto-merge through later pushes. That
+      # includes auto-merge a maintainer enabled by hand on a PR outside the
+      # rule; they merge it by hand instead (auto-merge-pr.cjs, withdraw).
+      - name: Choose the action
+        id: action
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ steps.decide.outputs.number }}
+          ENABLE: ${{ steps.decide.outputs.enable }}
+          WITHDRAW: ${{ steps.decide.outputs.withdraw }}
+        run: .github/scripts/auto-merge-action.sh "$PR" "$ENABLE" "$WITHDRAW"
+
+  # Holds the merge App's key, and runs only first-party actions, the
+  # default branch's scripts and gh. It decides again from the PR as it is
+  # now, author trust included, so a push, label or base change since decide
+  # is judged before any write. It mints the write token only when the new
+  # decision needs one.
+  apply:
+    needs: decide
+    if: ${{ needs.decide.outputs.action == 'enable' || needs.decide.outputs.action == 'withdraw' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    environment:
+      name: bot-merge
+      deployment: false
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          user: ${{ steps.pr.outputs.author }}
-          allow-fail: true
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
 
-      - name: Decide
+      - name: Decide again
         id: decide
-        uses: actions/github-script@v7
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         env:
-          NUMBER: ${{ steps.pr.outputs.number }}
-          VOUCH_STATUS: ${{ steps.vouch.outputs.status }}
+          NUMBER: ${{ github.event.pull_request.number || github.event.inputs.pr }}
         with:
           script: |
+            const { readFileSync } = require('fs');
             const autoMerge = require('./.github/scripts/auto-merge-pr.cjs');
-            await autoMerge({ github, context, core,
-              number: Number(process.env.NUMBER), vouchStatus: process.env.VOUCH_STATUS });
+            await autoMerge({ github, context, core, number: process.env.NUMBER,
+              vouched: readFileSync('.github/VOUCHED.td', 'utf8') });
 
-      - name: Enable auto-merge
-        if: steps.decide.outputs.enable == 'true'
+      - name: Choose the action
+        id: action
         env:
-          GH_TOKEN: ${{ secrets.PKGS_BOT_TOKEN }}
-          PR: ${{ steps.pr.outputs.number }}
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ steps.decide.outputs.number }}
+          ENABLE: ${{ steps.decide.outputs.enable }}
+          WITHDRAW: ${{ steps.decide.outputs.withdraw }}
+        run: .github/scripts/auto-merge-action.sh "$PR" "$ENABLE" "$WITHDRAW"
+
+      - name: Get the merge App's token
+        id: app
+        if: ${{ steps.action.outputs.action != 'none' }}
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ vars.PKGS_MERGE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.PKGS_MERGE_APP_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
+
+      # --match-head-commit: never arm a merge for a commit newer than the one
+      # just judged. A failed lookup fails the step, so it never reads as
+      # "not armed". A write that fails stands only if a fresh lookup shows
+      # the state it wanted.
+      - name: Arm or withdraw auto-merge
+        if: ${{ steps.action.outputs.action != 'none' }}
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          ACTION: ${{ steps.action.outputs.action }}
+          PR: ${{ steps.decide.outputs.number }}
           HEAD_SHA: ${{ steps.decide.outputs.head_sha }}
+          BASE: ${{ steps.decide.outputs.base }}
+          METHOD: ${{ steps.decide.outputs.method }}
         run: |
-          if [[ -z "$GH_TOKEN" ]]; then
-            echo "::error::Set PKGS_BOT_TOKEN; a GITHUB_TOKEN merge would not publish."
-            exit 1
-          fi
-          # Idempotent: enabling twice errors. Bot lanes enable their own.
-          if [[ "$(gh pr view "$PR" -R "$GITHUB_REPOSITORY" --json autoMergeRequest --jq '.autoMergeRequest != null')" == true ]]; then
-            echo "auto-merge already enabled on #$PR"
-            exit 0
-          fi
-          # --match-head-commit: never arm a merge for a commit newer than
-          # the one just judged.
-          gh pr merge --auto --squash --match-head-commit "$HEAD_SHA" "$PR" -R "$GITHUB_REPOSITORY"
-
-      # Removing build-approved withdraws the approval, so withdraw the
-      # auto-merge it armed too. Only on that event: auto-merge a maintainer
-      # enabled by hand on any other PR is theirs to keep.
-      - name: Withdraw auto-merge
-        if: >-
-          steps.decide.outputs.enable == 'false' &&
-          github.event.action == 'unlabeled' && github.event.label.name == 'build-approved'
-        env:
-          GH_TOKEN: ${{ secrets.PKGS_BOT_TOKEN }}
-          PR: ${{ steps.pr.outputs.number }}
-        run: |
-          if [[ "$(gh pr view "$PR" -R "$GITHUB_REPOSITORY" --json autoMergeRequest --jq '.autoMergeRequest != null')" == true ]]; then
-            gh pr merge --disable-auto "$PR" -R "$GITHUB_REPOSITORY"
-          fi
+          armed() { gh pr view "$PR" -R "$GITHUB_REPOSITORY" --json autoMergeRequest --jq '.autoMergeRequest != null'; }
+          [[ $PR =~ ^[1-9][0-9]*$ ]] || { echo "::error::not a PR number: $PR"; exit 1; }
+          [[ $METHOD == merge ]] || METHOD=squash
+          state=$(armed)
+          case $ACTION in
+            enable)
+              if [[ $state == true ]]; then echo "auto-merge already enabled on #$PR"; exit 0; fi
+              # The PR as judged, read again right before the write: gh merges
+              # at once a PR that is already green, so nothing may have moved.
+              facts=$(gh pr view "$PR" -R "$GITHUB_REPOSITORY" --json state,isDraft,baseRefName,headRefOid \
+                --jq '"\(.state) \(.isDraft) \(.baseRefName) \(.headRefOid)"')
+              if [[ $facts != "OPEN false $BASE $HEAD_SHA" ]]; then
+                echo "#$PR is now $facts, not as judged: not armed; its next event decides again"
+                exit 0
+              fi
+              gh pr merge --auto "--$METHOD" --match-head-commit "$HEAD_SHA" "$PR" -R "$GITHUB_REPOSITORY" ||
+                [[ "$(armed)" == true ]]
+              ;;
+            withdraw)
+              if [[ $state == true ]]; then
+                gh pr merge --disable-auto "$PR" -R "$GITHUB_REPOSITORY" || [[ "$(armed)" == false ]]
+              fi
+              ;;
+          esac

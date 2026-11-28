@@ -7,11 +7,14 @@ name: Sync Rebuild Triggers
 # publishes. A rebuild that fails stays an unmerged red PR for a maintainer
 # without holding back any other package.
 #
-# The PR and auto-merge use the PAT in PKGS_BOT_TOKEN, because a merge made
-# with the built-in GITHUB_TOKEN does not start publish.yml, and its pushes
-# are held for approval instead of building.
+# The omarchy-pkgs-sync App pushes and opens the PR, because a push made
+# with the built-in GITHUB_TOKEN is held for approval instead of building.
+# The omarchy-pkgs-merge App arms auto-merge, because a merge made with
+# GITHUB_TOKEN does not start publish.yml (package-prs.yml).
 
-# Every 6 hours, dispatched by the controller box (ci/dispatch.sh) because
+# Within five minutes of each edge mirror sync (ci/dispatch-on-mirror-sync.sh),
+# so a Qt update doesn't reach edge before its rebuilds, and every hour as the
+# backstop, dispatched by the controller box (ci/dispatch.sh) because
 # GitHub's schedule ran it hours late.
 on:
   workflow_dispatch:
@@ -34,19 +37,11 @@ jobs:
       contents: read
     outputs:
       groups: ${{ steps.groups.outputs.groups }}
+      close-superseded: ${{ steps.groups.outputs.close-superseded }}
 
     steps:
-      - name: Require the bot token
-        env:
-          PKGS_BOT_TOKEN: ${{ secrets.PKGS_BOT_TOKEN }}
-        run: |
-          if [[ -z "$PKGS_BOT_TOKEN" ]]; then
-            echo "::error::Set PKGS_BOT_TOKEN to a PAT with Contents: write and Pull requests: write on this repository, owned by an account trusted to trigger builds."
-            exit 1
-          fi
-
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -76,26 +71,37 @@ jobs:
               useradd -m -u "$HOST_UID" -g "$HOST_GID" runner
               chown -R runner:runner /workspace/pkgbuilds
 
-              if [[ -n "${PACKAGES:-}" ]]; then
-                read -r -a package_args <<< "$PACKAGES"
+              read -r -a package_args <<< "${PACKAGES:-}"
+              if (( ${#package_args[@]} > 0 )); then
                 runuser -u runner -- ./bin/sync-rebuilds "${package_args[@]}"
               else
                 runuser -u runner -- ./bin/sync-rebuilds
               fi
             '
         env:
-          PACKAGES: ${{ github.event.inputs.packages }}
+          PACKAGES: ${{ inputs.packages }}
 
       - name: Group the bumps into PRs
         if: ${{ !cancelled() && steps.sync.outcome != 'skipped' }}
         id: groups
+        env:
+          PACKAGES: ${{ inputs.packages }}
         run: |
           groups=$(.github/scripts/package-pr-groups.sh auto/sync-rebuilds "$RUNNER_TEMP/pins.patch")
-          echo "groups=$groups" >> "$GITHUB_OUTPUT"
+          read -r -a package_args <<< "${PACKAGES:-}"
+          if (( ${#package_args[@]} > 0 )); then
+            close_superseded=false
+          else
+            close_superseded=true
+          fi
+          {
+            echo "groups=$groups"
+            echo "close-superseded=$close_superseded"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Hand the bumps to the PR jobs
         if: ${{ !cancelled() && steps.groups.outputs.groups != '' && steps.groups.outputs.groups != '[]' }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: package-pins
           path: ${{ runner.temp }}/pins.patch
@@ -103,14 +109,18 @@ jobs:
 
   prs:
     needs: sync
-    if: ${{ !cancelled() && needs.sync.outputs.groups != '' }}
+    if: ${{ !cancelled() && needs.sync.outputs.groups != '' && (needs.sync.outputs.groups != '[]' || needs.sync.outputs.close-superseded == 'true') }}
     permissions:
       contents: read
+      pull-requests: read
+      checks: read
+      statuses: read
     uses: ./.github/workflows/package-prs.yml
     with:
       groups: ${{ needs.sync.outputs.groups }}
       prefix: auto/sync-rebuilds
       title: Rebuild against updated dependencies
+      close-superseded: ${{ needs.sync.outputs.close-superseded == 'true' }}
       body: |
         Automated pkgrel bump for a package that links against a dependency
         which has moved in the official repositories.
@@ -124,7 +134,8 @@ jobs:
         This PR auto-merges once the build checks pass. A failing rebuild
         leaves it open for a maintainer without holding back any other package.
     secrets:
-      PKGS_BOT_TOKEN: ${{ secrets.PKGS_BOT_TOKEN }}
+      PKGS_SYNC_APP_KEY: ${{ secrets.PKGS_SYNC_APP_KEY }}
+      PKGS_MERGE_APP_KEY: ${{ secrets.PKGS_MERGE_APP_KEY }}
 
   notify:
     needs: [sync, prs]

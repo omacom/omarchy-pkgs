@@ -1,6 +1,6 @@
 # Steam launcher for Apple Silicon
 
-`omarchy-steam-fex` provides `omarchy-launch-steam` for the Asahi Linux `steam`, `muvm`, and `FEX-Emu` stack. Those runtime packages come from `asahi-alarm`; `FEX-Emu` provides `FEXBash`. The package is restricted to aarch64 and assumes that stack's `~/.local/share/fex-steam/steam-launcher/bin_steam.sh` layout.
+`omarchy-steam-fex` provides `omarchy-launch-steam` for the `steam`, `muvm`, and `FEX-Emu` stack. All three come from this repository: `steam` is the native arm64 client, `muvm` is built from AsahiLinux/muvm, and `fex-emu` provides `FEX-Emu` and `FEXBash`. The package is restricted to aarch64 and assumes that stack's `~/.local/share/fex-steam/steam-launcher/bin_steam.sh` layout.
 
 The launcher runs Steam through `muvm` and `FEXBash` with the CEF occlusion workaround. Once Steam's client files are present, it patches the Steam UI network initialization block that can leave login waiting indefinitely. Initial bootstrap uses Steam's normal checks. Subsequent launches keep update and bootstrap checks enabled but pass `-noverifyfiles`: Steam otherwise detects the modified UI file, replaces it, and loses the login fix. After a client update replaces the UI file, launch again to reapply the patch. If the FEX launcher is unavailable, it falls back to `steam`.
 

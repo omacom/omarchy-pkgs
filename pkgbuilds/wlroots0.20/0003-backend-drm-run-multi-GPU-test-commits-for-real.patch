@@ -1,0 +1,101 @@
+backend/drm: run multi-GPU test commits for real
+
+A GPU that copies buffers into its own skipped every test commit: the
+buffer under test can't be scanned out before it is copied. So no test ever
+failed there, and a compositor that looks for another configuration when a
+test fails, as sway's output configuration does, never did. A configuration
+the kernel then rejects, such as too much bandwidth for two 4K displays on
+a dock, left every output of the GPU off.
+
+A test needs a buffer of the GPU's own in the right size and format, not
+the copy in it: take the next swapchain buffer, without copying into it,
+and run the atomic test with it.
+
+diff --git a/backend/drm/drm.c b/backend/drm/drm.c
+index ff169477..827c9a23 100644
+--- a/backend/drm/drm.c
++++ b/backend/drm/drm.c
+@@ -14,6 +14,7 @@
+ #include <wlr/backend/interface.h>
+ #include <wlr/interfaces/wlr_output.h>
+ #include <wlr/render/drm_syncobj.h>
++#include <wlr/render/swapchain.h>
+ #include <wlr/render/wlr_renderer.h>
+ #include <wlr/util/box.h>
+ #include <wlr/util/log.h>
+@@ -750,7 +751,7 @@ static const pixman_region32_t *get_buffer_damage(const struct wlr_output_state
+ }
+ 
+ static bool drm_connector_state_update_primary_fb(struct wlr_drm_connector *conn,
+-		struct wlr_drm_connector_state *state) {
++		struct wlr_drm_connector_state *state, bool test_only) {
+ 	struct wlr_drm_backend *drm = conn->backend;
+ 
+ 	assert(state->base->committed & WLR_OUTPUT_STATE_BUFFER);
+@@ -785,13 +786,19 @@ static bool drm_connector_state_update_primary_fb(struct wlr_drm_connector *conn
+ 			return false;
+ 		}
+ 
+-		local_buf = drm_surface_blit(&plane->mgpu_surf, source_buf,
+-			get_buffer_damage(state->base), wait_timeline, wait_point);
++		if (test_only) {
++			// A test needs a buffer of this GPU's in the right size and format,
++			// not the copy in it
++			local_buf = wlr_swapchain_acquire(plane->mgpu_surf.swapchain);
++		} else {
++			local_buf = drm_surface_blit(&plane->mgpu_surf, source_buf,
++				get_buffer_damage(state->base), wait_timeline, wait_point);
++		}
+ 		if (local_buf == NULL) {
+ 			return false;
+ 		}
+ 
+-		if (plane->mgpu_surf.timeline != NULL) {
++		if (!test_only && plane->mgpu_surf.timeline != NULL) {
+ 			state->wait_timeline = wlr_drm_syncobj_timeline_ref(plane->mgpu_surf.timeline);
+ 			state->wait_point = plane->mgpu_surf.point;
+ 		}
+@@ -911,14 +918,8 @@ static bool drm_connector_prepare(struct wlr_drm_connector_state *conn_state, bo
+ 		return false;
+ 	}
+ 
+-	if (test_only && conn->backend->mgpu_renderer.wlr_rend) {
+-		// If we're running as a secondary GPU, we can't perform an atomic
+-		// commit without blitting a buffer.
+-		return true;
+-	}
+-
+ 	if (state->committed & WLR_OUTPUT_STATE_BUFFER) {
+-		if (!drm_connector_state_update_primary_fb(conn, conn_state)) {
++		if (!drm_connector_state_update_primary_fb(conn, conn_state, test_only)) {
+ 			return false;
+ 		}
+ 
+@@ -981,13 +982,6 @@ static bool drm_connector_commit_state(struct wlr_drm_connector *conn,
+ 		goto out;
+ 	}
+ 
+-	if (test_only && conn->backend->mgpu_renderer.wlr_rend) {
+-		// If we're running as a secondary GPU, we can't perform an atomic
+-		// commit without blitting a buffer.
+-		ok = true;
+-		goto out;
+-	}
+-
+ 	if (!pending.active && conn->crtc == NULL) {
+ 		// Disabling an already-disabled connector
+ 		ok = true;
+@@ -1995,13 +1989,6 @@ bool commit_drm_device(struct wlr_drm_backend *drm,
+ 		modeset |= output_state->base.allow_reconfiguration;
+ 	}
+ 
+-	if (test_only && drm->mgpu_renderer.wlr_rend) {
+-		// If we're running as a secondary GPU, we can't perform an atomic
+-		// commit without blitting a buffer.
+-		ok = true;
+-		goto out;
+-	}
+-
+ 	uint32_t flags = 0;
+ 	if (!test_only) {
+ 		flags |= DRM_MODE_PAGE_FLIP_EVENT;

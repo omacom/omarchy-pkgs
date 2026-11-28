@@ -25,6 +25,21 @@
 #         different on stable.
 # The rebuild_on half of the rule is metadata, enforced by
 # validate_package_metadata.
+#
+# A promotion copies an edge build into rc or stable in the same way, so
+# promote.yml runs this check too, through bin/check-promotion:
+#
+#   fast-ring-check.sh prepare-view <channel> <from> <arch> <name>...
+#   fast-ring-check.sh check-plan <results> <name>=<file>...
+#
+# `prepare-view` makes the channel look as the promotion would leave it: the
+# named packages' entries move from its [omarchy] repository to a [promoted]
+# one with <from>'s entries. `check-plan` downloads files from it and runs
+# `check`. A problem the source and edge both show is then the baseline.
+# With PROMOTION=1 a promoted package is not held to the fast ring's rule
+# on Python modules: it is a link problem only when the channel lacks the
+# Python version the module was built for, and its extension modules get
+# the ELF check like any other file.
 
 set -euo pipefail
 
@@ -78,12 +93,16 @@ rebuild_sonames() {
 }
 
 prepare() {
-  local channel=$1 arch=$2 server
+  local channel=$1 arch=$2 mode=${3:-} server
+  local base=${OMARCHY_PKGS_BASE:-https://pkgs.omarchy.org}
+  local conf=${PACMAN_CONF:-/etc/pacman.conf}
   local -a foreign=()
   server=$(channel_mirror "$channel" "$arch") || { echo "unknown channel $channel for $arch" >&2; exit 2; }
   printf 'Server = %s\n' "$server" > /etc/pacman.d/mirrorlist
-  sed -i '/^\[omarchy\]/,/^$/d' /etc/pacman.conf
-  sed -i "/^\[core\]$/i [omarchy]\nSigLevel = Required DatabaseOptional\nServer = https://pkgs.omarchy.org/$channel/$arch\n" /etc/pacman.conf
+  sed -i '/^\[omarchy\]/,/^$/d' "$conf"
+  if [[ $mode != --no-omarchy ]]; then
+    sed -i "/^\[core\]$/i [omarchy]\nSigLevel = Required DatabaseOptional\nServer = $base/$channel/$arch\n" "$conf"
+  fi
   # -yy: the image's databases are edge's and newer than the channel's, so
   # a plain -y would call them current and keep them.
   pacman -Syy --noconfirm
@@ -96,6 +115,117 @@ prepare() {
   fi
   # -uu: a channel's snapshot is older than the image's, so this downgrades.
   pacman -Suu --noconfirm
+}
+
+# split_db <channel db> <from db> <promoted db> <name>...: the channel as a
+# promotion of the named packages would leave it, in two databases. The
+# named packages' entries leave <channel db>, and <promoted db> holds their
+# entries from <from db>, so no dependency can resolve to a version the
+# promotion replaces.
+split_db() {
+  local channel=$1 from=$2 promoted=$3 t name dir
+  shift 3
+  local -A in_channel=() in_from=()
+  t=$(mktemp -d)
+  mkdir "$t/channel" "$t/from" "$t/promoted"
+  if ! bsdtar -xf "$channel" -C "$t/channel" || ! bsdtar -xf "$from" -C "$t/from"; then
+    rm -rf "$t"
+    return 1
+  fi
+  for dir in "$t/channel"/*/; do
+    [[ -d $dir ]] || continue
+    in_channel[$(sed -n '/^%NAME%$/{n;p;q}' "$dir/desc")]=$dir
+  done
+  for dir in "$t/from"/*/; do
+    [[ -d $dir ]] || continue
+    in_from[$(sed -n '/^%NAME%$/{n;p;q}' "$dir/desc")]=$dir
+  done
+  for name in "$@"; do
+    [[ -n ${in_from[$name]:-} ]] || { echo "$name is not in the source database" >&2; rm -rf "$t"; return 1; }
+    cp -R "${in_from[$name]}" "$t/promoted/" || { rm -rf "$t"; return 1; }
+    if [[ -n ${in_channel[$name]:-} ]]; then
+      rm -rf "${in_channel[$name]}" || { rm -rf "$t"; return 1; }
+    fi
+  done
+  # Entries at the top level, as repo-add writes them: no ./ prefix. An
+  # empty database is a valid one.
+  if ! (cd "$t/promoted" && bsdtar -czf "$promoted" -- *) ||
+    ! (cd "$t/channel" && shopt -s nullglob && entries=(*) && bsdtar -czf "$channel" -T /dev/null -- "${entries[@]}"); then
+    rm -rf "$t"
+    return 1
+  fi
+  rm -rf "$t"
+}
+
+# prepare_view <channel> <from> <arch> <name>...: prepare <channel>, then
+# make it look as a promotion of the named packages from <from> would
+# leave it: their entries move from its [omarchy] repository to a
+# [promoted] one served from <from>. One server per repository: libalpm
+# stops asking a host after a few failed downloads, so a fallback Server on
+# the same host is no use. A destination before its first promotion has no
+# [omarchy] database yet (HTTP 404) and gets an empty view without [omarchy].
+prepare_view() {
+  local channel=$1 from=$2 arch=$3 code rc t
+  local base=${OMARCHY_PKGS_BASE:-https://pkgs.omarchy.org}
+  local conf=${PACMAN_CONF:-/etc/pacman.conf}
+  local sync=${PACMAN_SYNC:-/var/lib/pacman/sync}
+  shift 3
+  t=$(mktemp -d)
+  # The CDN can serve a database a minute old; a query string skips it.
+  rc=0
+  code=$(curl -sSL --retry 3 -o "$t/channel.db" -w '%{http_code}' "$base/$channel/$arch/omarchy.db?$RANDOM") || rc=$?
+  if (( rc == 0 )) && [[ $code == 200 ]]; then
+    prepare "$channel" "$arch" || { rm -rf "$t"; return 1; }
+    mv "$t/channel.db" "$sync/omarchy.db"
+  elif (( rc == 0 )) && [[ $code == 404 && $channel != "$from" && $channel != edge ]]; then
+    prepare "$channel" "$arch" --no-omarchy || { rm -rf "$t"; return 1; }
+    bsdtar -czf "$sync/omarchy.db" -T /dev/null
+  else
+    rm -rf "$t"
+    echo "cannot fetch $base/$channel/$arch/omarchy.db (curl exit $rc, HTTP ${code:-000})" >&2
+    return 1
+  fi
+  if ! curl -fsSL --retry 3 -o "$t/from.db" "$base/$from/$arch/omarchy.db?$RANDOM"; then
+    rm -rf "$t"
+    return 1
+  fi
+  if ! split_db "$sync/omarchy.db" "$t/from.db" "$sync/promoted.db" "$@"; then
+    rm -rf "$t"
+    return 1
+  fi
+  rm -rf "$t"
+  rm -f "$sync/omarchy.db.sig"
+  if grep -q '^\[omarchy\]$' "$conf"; then
+    sed -i "/^\[omarchy\]$/i [promoted]\nSigLevel = Required DatabaseOptional\nServer = $base/$from/$arch\n" "$conf"
+  else
+    rm -f "$sync/omarchy.db"
+    sed -i "/^\[core\]$/i [promoted]\nSigLevel = Required DatabaseOptional\nServer = $base/$from/$arch\n" "$conf"
+  fi
+}
+
+# check_plan <results> <name>=<file>...: download the files from the
+# [promoted] repository prepare_view left and check them.
+check_plan() {
+  local results=$1 arg
+  local -a names=() files=()
+  shift
+  local served
+  for arg in "$@"; do
+    names+=("promoted/${arg%%=*}")
+    files+=("/var/cache/pacman/pkg/${arg#*=}")
+    # The source moved since the plan was made: check what was planned or
+    # nothing.
+    served=$(pacman -Sddp --print-format '%f' "promoted/${arg%%=*}" 2>/dev/null || true)
+    if [[ $served != "${arg#*=}" ]]; then
+      problem rule - "the source serves ${served:-nothing} for ${arg%%=*}, not the planned ${arg#*=}" > "$results"
+      return 0
+    fi
+  done
+  if ! pacman -Sddw --noconfirm "${names[@]}" >&2; then
+    problem rule - "the packages cannot be downloaded from the promotion's source" > "$results"
+    return 0
+  fi
+  check "$results" "${files[@]}"
 }
 
 # bundled_dir <binary> <directory>...: of the directories holding a bundled
@@ -129,7 +259,7 @@ problem() {
 inspect_files() {
   local machine path kind out needed dyn prog interp soname dir
   local -a paths=() dirs=() lines=() copies=()
-  local -A shipped=()
+  local -A shipped=() python=()
   mapfile -t paths
   machine=$(readelf -h /usr/bin/bash | sed -n 's/^ *Machine: *//p')
 
@@ -142,9 +272,16 @@ inspect_files() {
   done
 
   for path in "${paths[@]}"; do
-    if [[ $path =~ ^/usr/lib/python3\.[0-9]+/ ]]; then
-      problem rule "$path" "a Python module, which breaks when Python's minor version moves"
-      continue
+    if [[ $path =~ ^/usr/lib/python(3\.[0-9]+)/ ]]; then
+      if [[ ${PROMOTION:-} != 1 ]]; then
+        problem rule "$path" "a Python module, which breaks when Python's minor version moves"
+        continue
+      fi
+      # Once per version: a module tree has thousands of files.
+      if [[ ! -x /usr/bin/python${BASH_REMATCH[1]} && -z ${python[${BASH_REMATCH[1]}]:-} ]]; then
+        python[${BASH_REMATCH[1]}]=1
+        problem link "/usr/lib/python${BASH_REMATCH[1]}" "Python ${BASH_REMATCH[1]} modules, and this channel has no Python ${BASH_REMATCH[1]}"
+      fi
     fi
     [[ -f $path && ! -L $path && $path != /usr/lib/debug/* ]] || continue
     [[ "$(head -c4 "$path" | od -An -c | tr -d ' ')" == '177ELF' ]] || continue
@@ -253,11 +390,26 @@ check() {
     fi
     pacman -Udd --noconfirm --noscriptlet --ask 4 "$@"
   fi
+  local name version installed
   for file in "$@"; do
-    names+=("$(bsdtar -xOf "$file" .PKGINFO | sed -n 's/^pkgname = //p')")
+    name=$(bsdtar -xOf "$file" .PKGINFO | sed -n 's/^pkgname = //p')
+    version=$(bsdtar -xOf "$file" .PKGINFO | sed -n 's/^pkgver = //p')
+    # pacman can drop a target that conflicts with another one providing
+    # its name, and -Qlq would then list the provider's files.
+    installed=$(pacman -Q "$name" 2>&1 || true)
+    if [[ $installed != "$name $version" ]]; then
+      problem rule - "$name $version was not installed ($installed)" >> "$results"
+      return 0
+    fi
+    names+=("$name")
   done
+  local list
+  if ! list=$(pacman -Qlq "${names[@]}"); then
+    problem rule - "pacman could not list the installed files" >> "$results"
+    return 0
+  fi
   # A metapackage installs no files; that is a pass.
-  { pacman -Qlq "${names[@]}" | grep -v '/$' || true; } | inspect_files >> "$results"
+  { grep -v '/$' <<<"$list" || true; } | inspect_files >> "$results"
 }
 
 # channel_failures <edge results> <channel results>: the channel's problems
@@ -276,6 +428,8 @@ if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
   case "$command" in
     prepare) prepare "$@" ;;
     check) check "$@" ;;
-    *) echo "usage: $0 prepare <channel> <arch> | check <results> <package file>..." >&2; exit 2 ;;
+    prepare-view) prepare_view "$@" ;;
+    check-plan) check_plan "$@" ;;
+    *) echo "usage: $0 prepare <channel> <arch> | check <results> <package file>... | prepare-view <channel> <from> <arch> <name>... | check-plan <results> <name>=<file>..." >&2; exit 2 ;;
   esac
 fi

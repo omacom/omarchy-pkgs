@@ -1,0 +1,292 @@
+From 862701cac0623c9f5889da4313c1a419f67d561f Mon Sep 17 00:00:00 2001
+From: Naeem Malik <malik2015naeem@gmail.com>
+Date: Tue, 3 Nov 2026 23:26:28 +0530
+Subject: [PATCH] cpufreq: Cap power-saver on Apple Silicon without boost
+ frequencies
+
+The cpufreq driver's boost method assumes every apple-cpufreq machine
+has boost frequencies, as the M1 Max does. The M3 Max has none: its
+device tree marks no turbo operating points, scaling_boost_frequencies
+is empty and boost reads 0. The kernel still offers the switch but
+refuses to turn it on ("cpufreq: store_boost: Cannot enable BOOST!"),
+so writing 1 fails with EINVAL. Balanced and performance both write 1,
+so the initial profile fails to activate at startup and every switch
+to performance is refused. The daemon shows balanced, but no profile
+was ever applied.
+
+Use the boost method only when the switch has something to turn on: a
+policy lists boost frequencies, or boost is already on. Otherwise use
+the caps method, but cap power-saver only, at the same 60%, and leave
+balanced and performance uncapped. That keeps the boost method's split,
+where power-saver is the only profile that holds the CPU back, so the
+default profile does not slow these machines down. The boost switch is
+not written there, so an apple-cpufreq kernel without boost frequencies
+that offers no writable switch at all now gets these caps rather than
+the placeholder. New policies are picked up for any supported scaling
+driver now, since apple-cpufreq can be capped too.
+
+Test: meson test, 183/183. The two new tests of a machine without boost
+frequencies fail without the fix; the third checks that one listing
+boost frequencies keeps the boost method even when boost starts off.
+
+On an M3 Max (Mac15,9, kernel 7.2), the startup error is gone and
+every profile switch succeeds: balanced and performance leave the
+P-cores at 4056 MHz and the E-cores at 2568 MHz, power-saver caps them
+at 2424 and 1704 MHz, and the boost switch stays at 0.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ README.md                 | 13 +++++-
+ src/ppd-driver-cpufreq.c  | 51 +++++++++++++++++++---
+ tests/integration_test.py | 92 +++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 150 insertions(+), 6 deletions(-)
+
+diff --git a/README.md b/README.md
+index edf0ade..8816992 100644
+--- a/README.md
++++ b/README.md
+@@ -238,7 +238,9 @@ of the CPU frequency scaling subsystem.
+ 
+ It is only used if every CPU frequency policy uses a scaling driver where
+ turning boost off is known to cap the CPU at its sustainable frequency,
+-currently only `apple-cpufreq`, and the boost switch exists and can be written:
++currently only `apple-cpufreq`, the boost switch has something to turn on (a
++policy lists boost frequencies, or boost is already on), and the switch can be
++written:
+ 
+ ```sh
+ $ cat /sys/devices/system/cpu/cpufreq/policy*/scaling_driver
+@@ -258,6 +260,15 @@ it on. The scaling governor is not changed. The boost switch has no setting
+ that depends on the power source, so it follows the selected profile on
+ battery and on AC alike.
+ 
++Some Apple Silicon machines, such as the M3 Max, have no boost frequencies:
++`scaling_boost_frequencies` is empty or missing, and `boost` reads 0, where
++the kernel refuses to turn it on, or does not exist. There the driver caps
++`scaling_max_freq` like on the machines below, but only in "power-saver", at
++60% of each policy's highest frequency. "balanced" and "performance" are
++uncapped, the same split as with the boost switch. The boost switch is left
++alone, so it need not be writable, but every policy needs a
++`scaling_available_frequencies` table, as with the caps below.
++
+ On machines whose CPU frequency is managed by Arm SCMI or Qualcomm firmware,
+ such as the Qualcomm Snapdragon X series, the same driver caps each policy's
+ `scaling_max_freq` instead, at a share of the policy's highest non-boost
+diff --git a/src/ppd-driver-cpufreq.c b/src/ppd-driver-cpufreq.c
+index 5d15814..f9eb4f1 100644
+--- a/src/ppd-driver-cpufreq.c
++++ b/src/ppd-driver-cpufreq.c
+@@ -25,6 +25,11 @@
+  *   is left alone: performance, which is uncapped, allows the boost
+  *   frequencies, so whether they are used stays up to the switch.
+  *
++ * An apple-cpufreq machine whose frequency table has no boost frequencies,
++ * such as the M3 Max, has a boost switch the kernel refuses to turn on, or
++ * none, so it uses the caps method instead. Only power-saver is capped there, which
++ * keeps the boost method's split: balanced and performance run uncapped.
++ *
+  * It is only used when every cpufreq policy runs one of the scaling drivers
+  * in the table below. Any other system keeps its current driver.
+  *
+@@ -85,6 +90,7 @@ struct _PpdDriverCpufreq
+ 
+   PpdProfile activated_profile;
+   CpufreqMethod method;
++  guint balanced_percent; /* with the caps method */
+   char *boost_path;
+   GPtrArray *policies; /* of Policy, with the caps method */
+ };
+@@ -332,6 +338,30 @@ probe_boost (PpdDriverCpufreq *cpufreq)
+   return cpufreq->boost_path != NULL;
+ }
+ 
++/* Whether the boost switch has anything to turn on: a policy lists boost
++ * frequencies, or boost is already on. Without boost frequencies the kernel
++ * refuses to turn it on ("Cannot enable BOOST"). */
++static gboolean
++boost_can_be_enabled (GPtrArray *policy_dirs)
++{
++  g_autofree char *boost_path = NULL;
++  g_autofree char *boost = NULL;
++
++  for (guint i = 0; i < policy_dirs->len; i++) {
++    g_autofree guint64 *boost_freqs = NULL;
++    guint n_boost_freqs;
++
++    boost_freqs = read_freqs (g_ptr_array_index (policy_dirs, i),
++                              "scaling_boost_frequencies", &n_boost_freqs);
++    if (n_boost_freqs > 0)
++      return TRUE;
++  }
++
++  boost_path = ppd_utils_get_sysfs_path (CPUFREQ_POLICY_DIR);
++  boost = read_attr (boost_path, "boost");
++  return g_strcmp0 (boost, "1") == 0;
++}
++
+ static gboolean
+ probe_caps (PpdDriverCpufreq *cpufreq,
+             GPtrArray        *policy_dirs)
+@@ -382,9 +412,17 @@ ppd_driver_cpufreq_probe (PpdDriver *driver)
+   case CPUFREQ_METHOD_NONE:
+     return PPD_PROBE_RESULT_FAIL;
+   case CPUFREQ_METHOD_BOOST:
+-    ret = probe_boost (cpufreq);
++    if (boost_can_be_enabled (policy_dirs)) {
++      ret = probe_boost (cpufreq);
++      break;
++    }
++    g_debug ("No boost frequencies to switch, capping power-saver instead");
++    cpufreq->method = CPUFREQ_METHOD_CAPS;
++    cpufreq->balanced_percent = UNCAPPED_PERCENT;
++    ret = probe_caps (cpufreq, policy_dirs);
+     break;
+   case CPUFREQ_METHOD_CAPS:
++    cpufreq->balanced_percent = BALANCED_PERCENT;
+     ret = probe_caps (cpufreq, policy_dirs);
+     break;
+   }
+@@ -407,13 +445,14 @@ profile_to_boost (PpdProfile profile)
+ }
+ 
+ static guint
+-profile_to_percent (PpdProfile profile)
++profile_to_percent (PpdDriverCpufreq *cpufreq,
++                    PpdProfile        profile)
+ {
+   switch (profile) {
+   case PPD_PROFILE_POWER_SAVER:
+     return POWER_SAVER_PERCENT;
+   case PPD_PROFILE_BALANCED:
+-    return BALANCED_PERCENT;
++    return cpufreq->balanced_percent;
+   case PPD_PROFILE_PERFORMANCE:
+     return UNCAPPED_PERCENT;
+   }
+@@ -495,8 +534,10 @@ pick_up_new_policies (PpdDriverCpufreq *cpufreq)
+     if (has_policy (cpufreq, base))
+       continue;
+ 
++    /* Only one cpufreq driver is registered at a time, so any supported one
++     * is the one being capped, apple-cpufreq included */
+     driver = read_attr (base, "scaling_driver");
+-    if (!driver || scaling_driver_to_method (driver) != CPUFREQ_METHOD_CAPS)
++    if (!driver || scaling_driver_to_method (driver) == CPUFREQ_METHOD_NONE)
+       continue;
+ 
+     policy = probe_policy (base);
+@@ -521,7 +562,7 @@ apply_caps (PpdDriverCpufreq  *cpufreq,
+ 
+   pick_up_new_policies (cpufreq);
+ 
+-  percent = profile_to_percent (profile);
++  percent = profile_to_percent (cpufreq, profile);
+   for (guint i = 0; i < policies->len;) {
+     Policy *policy = g_ptr_array_index (policies, i);
+     guint64 cap = policy_cap (policy, percent);
+diff --git a/tests/integration_test.py b/tests/integration_test.py
+index 992e78e..f3ccdba 100644
+--- a/tests/integration_test.py
++++ b/tests/integration_test.py
+@@ -1704,6 +1704,98 @@ class Tests(dbusmock.DBusTestCase):
+             )
+         return os.path.join(policy, "scaling_max_freq")
+ 
++    M3_MAX_P_FREQS = (
++        "1092000 1356000 1596000 1884000 2172000 2424000 2616000 2808000 "
++        "2988000 3144000 3288000 3420000 3516000 3576000 3624000 3708000 "
++        "3780000 3864000 3960000 4056000"
++    )
++    M3_MAX_E_FREQS = "1020000 1320000 1704000 2088000 2484000 2568000"
++
++    def create_apple_without_boost(self):
++        """An M3 Max: no boost frequencies, and a boost switch stuck off"""
++        max0 = self.create_cpufreq_policy(
++            "policy0", "apple-cpufreq", self.M3_MAX_P_FREQS
++        )
++        max1 = self.create_cpufreq_policy(
++            "policy1", "apple-cpufreq", self.M3_MAX_E_FREQS
++        )
++        for policy in (max0, max1):
++            self.write_file_contents(
++                os.path.join(os.path.dirname(policy), "scaling_boost_frequencies"),
++                "\n",
++            )
++        boost = os.path.join(
++            self.testbed.get_root_dir(), "sys/devices/system/cpu/cpufreq/boost"
++        )
++        self.write_file_contents(boost, "0\n")
++        return max0, max1, boost
++
++    def test_cpufreq_apple_without_boost(self):
++        """Apple Silicon without boost frequencies caps only power-saver"""
++        max0, max1, boost = self.create_apple_without_boost()
++
++        self.start_daemon()
++        profiles = self.get_dbus_property("Profiles")
++        self.assertEqual(len(profiles), 3)
++        self.assertEqual(profiles[0]["CpuDriver"], "cpufreq")
++        self.assertEqual(profiles[2]["Driver"], "cpufreq")
++        self.assertEqual(self.get_dbus_property("ActiveProfile"), "balanced")
++        self.assert_file_eventually_contains(max0, "4056000")
++        self.assert_file_eventually_contains(max1, "2568000")
++
++        # 60% of 4056000 is 2433600, and of 2568000 is 1540800
++        self.set_dbus_property("ActiveProfile", GLib.Variant.new_string("power-saver"))
++        self.assertEqual(self.get_dbus_property("ActiveProfile"), "power-saver")
++        self.assert_file_eventually_contains(max0, "2424000")
++        self.assert_file_eventually_contains(max1, "1704000")
++
++        self.set_dbus_property("ActiveProfile", GLib.Variant.new_string("performance"))
++        self.assertEqual(self.get_dbus_property("ActiveProfile"), "performance")
++        self.assert_file_eventually_contains(max0, "4056000")
++        self.assert_file_eventually_contains(max1, "2568000")
++
++        self.set_dbus_property("ActiveProfile", GLib.Variant.new_string("power-saver"))
++        self.assert_file_eventually_contains(max0, "2424000")
++        self.set_dbus_property("ActiveProfile", GLib.Variant.new_string("balanced"))
++        self.assertEqual(self.get_dbus_property("ActiveProfile"), "balanced")
++        self.assert_file_eventually_contains(max0, "4056000")
++
++        # The boost switch, which the kernel would refuse, is never touched
++        self.assertEqual(self.read_file_contents(boost), b"0\n")
++        self.assertFalse(self.have_text_in_log("Failed to activate"))
++
++    def test_cpufreq_apple_without_boost_lifted_on_exit(self):
++        """Stopping in power-saver lifts the cap on Apple Silicon too"""
++        max0, max1, _ = self.create_apple_without_boost()
++
++        self.start_daemon()
++        self.set_dbus_property("ActiveProfile", GLib.Variant.new_string("power-saver"))
++        self.assert_file_eventually_contains(max0, "2424000")
++        self.stop_daemon()
++        self.assertEqual(self.read_file_contents(max0), b"4056000")
++        self.assertEqual(self.read_file_contents(max1), b"2568000")
++
++    def test_cpufreq_apple_boost_frequencies_keep_boost(self):
++        """Apple Silicon that lists boost frequencies keeps the boost switch,
++        even when the daemon starts with boost off"""
++        max0 = self.create_cpufreq_policy(
++            "policy0",
++            "apple-cpufreq",
++            "600000 2064000 3036000",
++            boost_freqs="3228000",
++        )
++        boost = os.path.join(
++            self.testbed.get_root_dir(), "sys/devices/system/cpu/cpufreq/boost"
++        )
++        self.write_file_contents(boost, "0\n")
++
++        self.start_daemon()
++        self.assertEqual(self.get_dbus_property("ActiveProfile"), "balanced")
++        self.assert_file_eventually_contains(boost, "1")
++        self.set_dbus_property("ActiveProfile", GLib.Variant.new_string("power-saver"))
++        self.assert_file_eventually_contains(boost, "0")
++        self.assertEqual(self.read_file_contents(max0), b"3036000\n")
++
+     def start_upower(self, on_battery):
+         _, upowerd, _ = self.start_dbus_template(
+             "upower", {"DaemonVersion": "0.99", "OnBattery": on_battery}
+-- 
+2.56.0
+
