@@ -42,7 +42,8 @@ for recipe in omarchy-settings omarchy-settings-dev; do
       sed -n '/^_etc_overrides_apply() {/,/^}/p' "$install_script" |
         sed -e "s#/usr/share/omarchy/etc-overrides#$root/ov#g" \
           -e "s#\([ (]\)/etc/#\1$root/etc/#g" \
-          -e "s#\([ (]\)/usr/lib/#\1$root/usr/lib/#g" >"$root/apply.sh"
+          -e "s#\([ (]\)/usr/lib/#\1$root/usr/lib/#g" \
+          -e "s#\([ (]\)/usr/share/plymouth/#\1$root/usr/share/plymouth/#g" >"$root/apply.sh"
       grep -q '^_etc_overrides_apply() {' "$root/apply.sh" || fail "$case_name: no _etc_overrides_apply"
       # Refuse to run anything that could still reach the real system.
       if grep -E '(^|[ ("])/(etc|usr)/' "$root/apply.sh"; then
