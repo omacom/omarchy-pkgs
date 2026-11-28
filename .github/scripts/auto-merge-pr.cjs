@@ -134,24 +134,30 @@ function vouchedStatus(text, login) {
 }
 
 // The vouch status of a PR's author: bot, collaborator (admin or write
-// access), or the VOUCHED.td entry. As in vouch's api, a 401, 403, 429 or
-// 5xx is retried five times, 1 s to 16 s apart, and a lookup that still
-// fails falls through to the file.
+// access), or the VOUCHED.td entry. A 401, 403, 429, 5xx or network error is
+// retried five times, 1 s to 16 s apart. Only a 200 with read/none or a 404
+// (user/collaborator not found) falls through to VOUCHED.td; any other
+// failure or malformed response returns 'error' so decide() refuses to arm
+// while withdraw() preserves existing auto-merge unless content or approval
+// revocation disqualifies the PR.
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 async function authorStatus({ github, context, login, vouched, wait = sleep }) {
   if (login.endsWith('[bot]')) return 'bot';
   for (let attempt = 0; ; attempt++) {
     try {
       const { data } = await github.rest.repos.getCollaboratorPermissionLevel({ ...context.repo, username: login });
-      if (['admin', 'write'].includes(data.permission)) return 'collaborator';
-      break;
+      if (['admin', 'write'].includes(data?.permission)) return 'collaborator';
+      if (['read', 'none'].includes(data?.permission)) return vouchedStatus(vouched, login);
+      return 'error';
     } catch (error) {
-      const status = error.status;
-      if (!(status === undefined || [401, 403, 429].includes(status) || status >= 500) || attempt >= 5) break;
+      const status = error?.status;
+      if (status === 404) return vouchedStatus(vouched, login);
+      if (!(status === undefined || [401, 403, 429].includes(status) || status >= 500) || attempt >= 5) {
+        return 'error';
+      }
       await wait(1000 * 2 ** attempt);
     }
   }
-  return vouchedStatus(vouched, login);
 }
 
 // A PR number exactly as a person types it: 1e2 or 0x10 would read as one
@@ -184,14 +190,18 @@ async function evaluate({ github, context, pr, vouched, wait }) {
   const repository = `${context.repo.owner}/${context.repo.repo}`;
   const decision = decide({ pr, files, vouchStatus, repository, owners });
   const asTrusted = decide({ pr, files, vouchStatus: 'collaborator', repository, owners });
-  return { decision, vouchStatus, withdraw: withdraw(decision, vouchStatus, asTrusted.enable) };
+  // Removing build-approved must fail closed even if the collaborator lookup
+  // errored: build-pr.yml does not re-run on unlabeled, so an already-green
+  // PR would otherwise stay armed and merge.
+  const approvalRevoked = context.payload?.action === 'unlabeled' && context.payload?.label?.name === 'build-approved';
+  return { decision, vouchStatus, withdraw: withdraw(decision, vouchStatus, asTrusted.enable && !approvalRevoked) };
 }
 
 // auto-merge-pr.yml: decide for the event's PR. vouched is the default
 // branch's .github/VOUCHED.td.
-module.exports = async function autoMerge({ github, context, core, number, vouched }) {
+module.exports = async function autoMerge({ github, context, core, number, vouched, wait }) {
   const { data: pr } = await github.rest.pulls.get({ ...context.repo, pull_number: prNumber(number) });
-  const { decision, vouchStatus, withdraw: takeBack } = await evaluate({ github, context, pr, vouched });
+  const { decision, vouchStatus, withdraw: takeBack } = await evaluate({ github, context, pr, vouched, wait });
   core.info(`#${pr.number}: ${decision.enable ? 'auto-merge' : 'leave for a maintainer'} (${vouchStatus}: ${decision.reason})`);
   core.setOutput('number', String(pr.number));
   core.setOutput('enable', String(decision.enable));
@@ -234,10 +244,10 @@ async function planArms({ github, context, core, groups, vouched, wait }) {
       } else if (pr.state !== 'open') {
         entry = { ...entry, outcome: 'closed', reason: 'PR is closed' };
       } else {
-        const { decision } = await evaluate({ github, context, pr, vouched, wait });
+        const { decision, vouchStatus } = await evaluate({ github, context, pr, vouched, wait });
         entry = decision.enable
           ? { ...entry, action: 'enable', head_sha: pr.head.sha, base: pr.base.ref, method: decision.method }
-          : { ...entry, outcome: 'refused', reason: decision.reason };
+          : { ...entry, outcome: vouchStatus === 'error' ? 'failure' : 'refused', reason: decision.reason };
       }
     } catch (error) {
       entry = { ...entry, outcome: 'failure', reason: `lookup failed: ${error.message}` };
