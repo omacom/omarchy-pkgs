@@ -1,0 +1,86 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: David Heinemeier Hansson <david@heinemeierhansson.com>
+Date: Sat, 28 Nov 2026 10:11:02 +0100
+Subject: [PATCH] phy: qcom: qmp-combo: Resume runtime PM before reconfiguring
+ the PHY
+
+Type-C orientation and mode callbacks (qmp_combo_typec_switch_set() and
+qmp_combo_typec_mux_set()) call qmp_combo_reconfigure_phy() without holding
+a runtime PM reference on the PHY device. When runtime PM is enabled for
+the PHY via power/control=auto, an idle initialized PHY runtime-suspends,
+entering autonomous mode and disabling/unpreparing its clocks including
+pipe_clk.
+
+A subsequent Type-C notification then runs qmp_combo_reconfigure_phy()
+while the device is runtime-suspended: it accesses PHY registers with
+clocks off and calls qmp_combo_com_exit(qmp, true), which disables and
+unprepares pipe_clk and the bulk clocks a second time (triggering
+clk_core_disable / clk_core_unprepare warnings on gcc_usb3_prim_phy_pipe_clk
+on the ASUS Zenbook A16 UX3607OA) and leaves the USB-C port wedged in
+suspended state.
+
+Resume the PHY device around qmp_combo_reconfigure_phy() with
+pm_runtime_resume_and_get() / pm_runtime_put(), and guard
+qmp_combo_runtime_suspend() and qmp_combo_runtime_resume() on
+com_powered_on so a failed forced re-initialization cannot unbalance the
+clocks on a later runtime PM transition either. Neither runtime PM callback
+acquires phy_mutex, so resuming under phy_mutex cannot deadlock.
+---
+ drivers/phy/qualcomm/phy-qcom-qmp-combo.c | 13 ++++++++++---
+ 1 file changed, 10 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/phy/qualcomm/phy-qcom-qmp-combo.c b/drivers/phy/qualcomm/phy-qcom-qmp-combo.c
+index 9eca19f..c23d131 100644
+--- a/drivers/phy/qualcomm/phy-qcom-qmp-combo.c
++++ b/drivers/phy/qualcomm/phy-qcom-qmp-combo.c
+@@ -4900,6 +4900,10 @@ static int qmp_combo_reconfigure_phy(struct qmp_combo *qmp, enum qmpphy_mode new
+ {
+ 	int ret;
+ 
++	ret = pm_runtime_resume_and_get(qmp->dev);
++	if (ret)
++		return ret;
++
+ 	dev_dbg(qmp->dev, "qmp_combo_reconfigure_phy: switching from qmpphy mode %d to %d\n",
+ 		qmp->qmpphy_mode, new_mode);
+ 
+@@ -4916,7 +4920,7 @@ static int qmp_combo_reconfigure_phy(struct qmp_combo *qmp, enum qmpphy_mode new
+ 	/* Now everything's powered down, power up the right PHYs */
+ 	ret = qmp_combo_com_init(qmp, true);
+ 	if (ret)
+-		return ret;
++		goto out_put;
+ 
+ 	/* First USB4 initialization is performed once by usb4_init(). */
+ 	if ((qmp->usb_init_count || qmp->usb4_init_count) &&
+@@ -4935,6 +4939,9 @@ static int qmp_combo_reconfigure_phy(struct qmp_combo *qmp, enum qmpphy_mode new
+ 	    qmp->dp_init_count)
+ 		qmp->cfg->dp_aux_init(qmp);
+ 
++out_put:
++	pm_runtime_put(qmp->dev);
++
+ 	return ret;
+ }
+ 
+@@ -5191,7 +5198,7 @@ static int __maybe_unused qmp_combo_runtime_suspend(struct device *dev)
+ 
+ 	dev_vdbg(dev, "Suspending QMP phy, mode:%d\n", qmp->phy_mode);
+ 
+-	if (!qmp->init_count) {
++	if (!qmp->init_count || !qmp->com_powered_on) {
+ 		dev_vdbg(dev, "PHY not initialized, bailing out\n");
+ 		return 0;
+ 	}
+@@ -5221,7 +5228,7 @@ static int __maybe_unused qmp_combo_runtime_resume(struct device *dev)
+ 
+ 	dev_vdbg(dev, "Resuming QMP phy, mode:%d\n", qmp->phy_mode);
+ 
+-	if (!qmp->init_count) {
++	if (!qmp->init_count || !qmp->com_powered_on) {
+ 		dev_vdbg(dev, "PHY not initialized, bailing out\n");
+ 		return 0;
+ 	}
+-- 
+2.56.1
+

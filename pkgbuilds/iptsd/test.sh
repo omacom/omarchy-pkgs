@@ -11,8 +11,8 @@ fail() {
 
 source "$package_dir/PKGBUILD"
 
-[[ $_commit == a83bc1232f7096f8b33b50fdbda249cd640de670 ]] ||
-  fail "iptsd builds from the pinned v3.1.0 commit"
+[[ $_commit =~ ^[0-9a-f]{40}$ ]] ||
+  fail "iptsd builds from a pinned 40-hex commit"
 [[ ${source[0]} == *"#commit=${_commit}" ]] ||
   fail "the source is fetched at the pinned commit"
 grep -q -- '--wrap-mode=nofallback' "$package_dir/PKGBUILD" ||

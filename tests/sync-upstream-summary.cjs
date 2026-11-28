@@ -45,7 +45,7 @@ function fixture(t, count = 1) {
   const invoke = ({ armed = true, ...overrides } = {}) => {
     results.forEach((result, i) => writeFileSync(join(resultsPath, `${i}.json`), JSON.stringify(result)));
     if (armed) {
-      const outcomes = Object.fromEntries(results.filter(r => r && r.pr === 'success' && r.number && r.review !== true)
+      const outcomes = Object.fromEntries(results.filter(r => r && (r.pr === 'success' || r.pr === 'unchanged') && r.number && r.review !== true)
         .map(r => [r.branch, { number: r.number, outcome: r.merge }]));
       writeFileSync(join(resultsPath, 'armed.outcomes'), JSON.stringify(outcomes));
     }
@@ -82,7 +82,7 @@ test('a rejected PR push counts as a package failure and finds its existing PR',
   Object.assign(f.results[6], { pr: 'failure', merge: 'skipped', number: '' });
   const result = await f.invoke();
   assert.equal(result.succeeded, true);
-  assert.deepEqual(result.updates, { passing: 6, failing: 1, unknown: 0 });
+  assert.deepEqual(result.updates, { passing: 6, unchanged: 0, failing: 1, unknown: 0 });
   assert.deepEqual(f.failures, []);
   assert.deepEqual(f.lookup, [{ owner: 'omacom', repo: 'omarchy-pkgs',
     head: 'omacom:auto/sync-upstream-package-6', state: 'open', per_page: 100 }]);
@@ -109,7 +109,7 @@ test('the workflow records failed outcomes despite successful conclusions and ke
   const keys = readFileSync(outputPath, 'utf8').trim().split('\n').map(line => line.slice('key='.length));
   assert.equal(keys[0], keys[1]);
   const record = JSON.parse(readFileSync(join(f.resultsPath, 'package-pr-results', `${keys[0]}.json`), 'utf8'));
-  assert.deepEqual(record, { ...f.groups[0], apply: 'success', token: 'skipped', hold: 'skipped', pr: 'failure', number: '' });
+  assert.deepEqual(record, { ...f.groups[0], apply: 'success', token: 'skipped', should_push: 'skipped', hold: 'skipped', pr: 'failure', pr_operation: '', number: '' });
   const result = await f.invoke({ resultsPath: join(f.resultsPath, 'package-pr-results') });
   assert.equal(result.succeeded, true);
   assert.equal(result.updates.failing, 1);
@@ -284,12 +284,70 @@ test('a missing artifact directory is a failure when updates were expected', asy
   assert.equal(result.updates.unknown, 1);
 });
 
-test('a no-update run succeeds without package artifacts or PR jobs', async t => {
-  const f = fixture(t, 0);
-  const result = await f.invoke({ resultsPath: join(f.resultsPath, 'absent'), prsResult: 'skipped' });
+test('a no-update run succeeds quietly without spamming Basecamp while writing the job summary', async t => {
+  for (const cadence of ['five-minute', 'hourly', 'six-hourly']) {
+    const f = fixture(t, 0);
+    const result = await f.invoke({ resultsPath: join(f.resultsPath, 'absent'), prsResult: 'skipped', cadence });
+    assert.equal(result.succeeded, true);
+    assert.equal(f.outputs.content, '');
+    assert.equal(result.content, '');
+    assert.match(f.summary, /No package updates needed/);
+    assert.deepEqual(f.lookup, []);
+  }
+});
+
+test('fully green PR updates (passing or pending checks) succeed quietly without spamming Basecamp', async t => {
+  const f = fixture(t, 3);
+  f.states.set(1, 'SUCCESS');
+  f.states.set(2, 'PENDING');
+  f.states.set(3, null);
+  const result = await f.invoke({ cadence: 'five-minute' });
   assert.equal(result.succeeded, true);
-  assert.match(result.content, /No package updates needed/);
-  assert.deepEqual(f.lookup, []);
+  assert.deepEqual(result.updates, { passing: 3, unchanged: 0, failing: 0, unknown: 0 });
+  assert.deepEqual(result.checks, { passing: 1, failing: 0, pending: 2, unknown: 0 });
+  assert.equal(f.outputs.content, '');
+  assert.equal(result.content, '');
+  assert.match(f.summary, /PR updates: 3 passing, 0 failing\./);
+  assert.match(f.summary, /PR checks at notification time: 1 passing, 0 failing, 2 pending\./);
+});
+
+test('a clean reviewed draft PR succeeds quietly without spamming Basecamp', async t => {
+  const f = fixture(t, 1);
+  Object.assign(f.groups[0], { review: true });
+  Object.assign(f.results[0], { review: true, merge: 'skipped' });
+  f.states.set(1, 'PENDING');
+  const result = await f.invoke({ armed: false, cadence: 'six-hourly' });
+  assert.equal(result.succeeded, true);
+  assert.equal(f.outputs.content, '');
+  assert.equal(result.content, '');
+  assert.match(f.summary, /PR updates: 1 passing, 0 failing\./);
+});
+
+test('an updated PR whose link cannot be resolved still notifies Basecamp', async t => {
+  const f = fixture(t, 1);
+  Object.assign(f.results[0], { pr_operation: 'updated', number: '' });
+  f.github.rest.pulls.list = async () => ({ data: [] });
+  const result = await f.invoke({ cadence: 'hourly' });
+  assert.equal(result.succeeded, true);
+  assert.match(f.outputs.content, /no PR link available.*PR link unavailable/);
+});
+
+test('create-pull-request none and closed operations stay quiet in Basecamp', async t => {
+  const f = fixture(t, 3);
+  Object.assign(f.results[0], { pr: 'success', pr_operation: 'none', number: '' });
+  Object.assign(f.results[1], { pr: 'success', pr_operation: 'none' });
+  Object.assign(f.results[2], { pr: 'success', pr_operation: 'closed', merge: 'closed' });
+  f.github.rest.pulls.list = async () => ({ data: [] });
+  f.states.set(2, 'FAILURE');
+  f.states.set(3, null);
+  const result = await f.invoke({ cadence: 'six-hourly' });
+  assert.equal(result.succeeded, true);
+  assert.equal(result.updates.passing, 0);
+  assert.equal(result.updates.unchanged, 3);
+  assert.equal(result.updates.failing, 0);
+  assert.equal(f.outputs.content, '');
+  assert.equal(result.content, '');
+  assert.match(f.summary, /PR updates: 0 passing, 3 unchanged, 0 failing\./);
 });
 
 test('a failed sync with no groups still produces a failure notification', async t => {
@@ -382,4 +440,60 @@ test('an hourly feed-fetch failure still reports the three successful PR updates
   assert.match(result.content, /PR updates: 3 passing, 0 failing/);
   assert.match(result.content, /Sync job: failure/);
   assert.match(result.content, /actions\/runs\/123/);
+});
+
+test('all-unchanged open PRs succeed quietly without spamming Basecamp while writing the job summary', async t => {
+  const f = fixture(t, 2);
+  f.results[0].pr = 'unchanged';
+  f.results[1].pr = 'unchanged';
+  f.states.set(1, 'FAILURE');
+  f.states.set(2, 'FAILURE');
+  const report = await f.invoke({ armed: true, cadence: 'six-hourly' });
+  assert.equal(report.succeeded, true);
+  assert.equal(report.updates.passing, 0);
+  assert.equal(report.updates.unchanged, 2);
+  assert.equal(report.updates.failing, 0);
+  assert.equal(report.checks.failing, 2);
+  assert.equal(f.outputs.content, '');
+  assert.equal(report.content, '');
+  assert.match(f.summary, /PR updates: 0 passing, 2 unchanged, 0 failing\./);
+  assert.match(f.summary, /<td>Unchanged<\/td><td>failing<\/td>/);
+});
+
+test('mixed clean passing update and unchanged failing PR stays quiet in Basecamp while recording counts in summary', async t => {
+  const f = fixture(t, 2);
+  f.results[1].pr = 'unchanged';
+  f.states.set(1, 'PENDING');
+  f.states.set(2, 'FAILURE');
+  const report = await f.invoke({ cadence: 'six-hourly' });
+  assert.equal(report.succeeded, true);
+  assert.equal(report.updates.passing, 1);
+  assert.equal(report.updates.unchanged, 1);
+  assert.equal(f.outputs.content, '');
+  assert.equal(report.content, '');
+  assert.match(f.summary, /PR updates: 1 passing, 1 unchanged, 0 failing\./);
+});
+
+test('mixed failing new PR check and unchanged PR notifies Basecamp with separate counts', async t => {
+  const { results, states, outputs, invoke } = fixture(t, 2);
+  results[1].pr = 'unchanged';
+  states.set(1, 'FAILURE');
+  states.set(2, 'FAILURE');
+  const report = await invoke({ cadence: 'six-hourly' });
+  assert.equal(report.succeeded, true);
+  assert.equal(report.updates.passing, 1);
+  assert.equal(report.updates.unchanged, 1);
+  assert.match(outputs.content, /PR updates: 1 passing, 1 unchanged, 0 failing\./);
+  assert.match(outputs.content, /pull\/1">package-0 #1<\/a>: PR checks failing/);
+  assert.doesNotMatch(outputs.content, /pull\/2">package-1 #2<\/a>/);
+});
+
+test('unchanged PR with refused auto-merge still reports failure to Basecamp', async t => {
+  const f = fixture(t, 1);
+  f.results[0].pr = 'unchanged';
+  f.results[0].merge = 'refused';
+  const report = await f.invoke({ cadence: 'six-hourly' });
+  assert.equal(report.updates.failing, 1);
+  assert.equal(report.updates.unchanged, 0);
+  assert.match(f.outputs.content, /Auto-merge refused/);
 });

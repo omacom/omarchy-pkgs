@@ -416,6 +416,11 @@ test('every bot lane opens its PRs per package through package-prs.yml', () => {
   assert.doesNotMatch(describe, /secrets\.|create-github-app-token|environment:/);
   assert.doesNotMatch(job('pr'), /sync-pr-body\.py/);
   assert.doesNotMatch(job('close-superseded'), /sync-pr-body\.py/);
+  // close-superseded paginates all open PRs (no 500-PR cap) and detects
+  // non-conflicting PRs whose edits already landed on master via merge-tree.
+  assert.doesNotMatch(job('close-superseded'), /--limit 500/);
+  assert.match(job('close-superseded'), /gh api graphql --paginate/);
+  assert.match(job('close-superseded'), /git merge-tree --write-tree HEAD FETCH_HEAD/);
   assert.match(job('pr'), /^    needs: describe\n    if: \$\{\{ !cancelled\(\) && inputs\.groups != '\[\]' \}\}\n/);
   const choose = step("Choose this PR's description");
   assert.match(choose, /printf '%s\\n' "\$FALLBACK" > "\$RUNNER_TEMP\/pr-body\.md"/);
@@ -462,9 +467,9 @@ test('every bot lane opens its PRs per package through package-prs.yml', () => {
   // A newer update to a reviewed PR re-drafts it first, and nothing is pushed if that fails.
   const hold = prs.indexOf('- name: Hold an existing reviewed PR as a draft');
   assert.ok(hold > 0 && hold < prs.indexOf('- name: Open or update the PR'), 'hold runs before the push');
-  assert.match(prs, /id: hold\n +if: \$\{\{ steps\.apply\.outcome == 'success' && matrix\.group\.review == true \}\}/);
+  assert.match(prs, /id: hold\n +if: \$\{\{ steps\.apply\.outcome == 'success' && steps\.should_push\.outputs\.push == 'true' && matrix\.group\.review == true \}\}/);
   assert.match(prs, /\.github\/scripts\/hold-reviewed-pr\.sh "\$BRANCH" "\$\{packages\[@\]\}"/);
-  assert.match(prs, /id: pr\n +if: \$\{\{ steps\.apply\.outcome == 'success' && steps\.hold\.outcome != 'failure' \}\}/);
+  assert.match(prs, /id: pr\n +if: \$\{\{ steps\.apply\.outcome == 'success' && steps\.should_push\.outputs\.push == 'true' && steps\.hold\.outcome != 'failure' \}\}/);
   assert.doesNotMatch(prs, /^ +(contents|pull-requests|actions): write$/m);
 });
 
@@ -1102,4 +1107,368 @@ test('the arm plan judges each group PR by the auto-merge rule and never a fork 
   assert.deepEqual([...new Set(calls.map(call => call.head))], looked);
   assert.ok(calls.every(call => call.base === 'master'));
   assert.deepEqual(calls.filter(call => call.head === 'omacom:auto/sync-upstream-c').map(call => call.state), ['open', 'closed']);
+});
+
+test('close-superseded closes only superseded PRs and guards against errors and concurrent pushes', () => {
+  const { execFileSync } = require('node:child_process');
+  const { mkdtempSync, mkdirSync, writeFileSync, chmodSync, readFileSync: read, rmSync } = require('node:fs');
+  const { tmpdir } = require('node:os');
+  const prs = read(join(__dirname, '../.github/workflows/package-prs.yml'), 'utf8');
+  const stepStart = prs.indexOf('- name: Close superseded PRs\n');
+  assert.ok(stepStart > 0);
+  const runMarker = '        run: |\n';
+  const runStart = prs.indexOf(runMarker, stepStart);
+  assert.ok(runStart > 0);
+  const script = prs.slice(runStart + runMarker.length)
+    .split('\n')
+    .map(l => l.startsWith('          ') ? l.slice(10) : l)
+    .join('\n');
+
+  const root = mkdtempSync(join(tmpdir(), 'close-superseded-'));
+  try {
+    const remote = join(root, 'remote.git');
+    const work = join(root, 'work');
+    const bin = join(root, 'bin');
+    const closedLog = join(root, 'closed.log');
+    mkdirSync(bin);
+    const git = (cwd, args) => execFileSync('git', args, {
+      cwd,
+      encoding: 'utf8',
+      env: { ...process.env, GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@t', GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@t' },
+    }).trim();
+
+    git(root, ['init', '--bare', '-b', 'master', remote]);
+    git(root, ['clone', remote, work]);
+    writeFileSync(join(work, 'a.txt'), 'v1\n');
+    writeFileSync(join(work, 'b.txt'), 'v1\n');
+    writeFileSync(join(work, 'c.txt'), 'v1\n');
+    git(work, ['add', '.']);
+    git(work, ['commit', '-m', 'base']);
+    git(work, ['push', 'origin', 'master']);
+
+    const makeBranch = (name, file, content) => {
+      git(work, ['checkout', '-b', name, 'origin/master']);
+      writeFileSync(join(work, file), content);
+      git(work, ['add', file]);
+      git(work, ['commit', '-m', name]);
+      const sha = git(work, ['rev-parse', 'HEAD']);
+      git(work, ['push', 'origin', name]);
+      return sha;
+    };
+
+    const shaLanded = makeBranch('auto/sync-upstream-landed', 'a.txt', 'v2\n');
+    const shaValid = makeBranch('auto/sync-upstream-valid', 'b.txt', 'v2\n');
+    const shaConflict = makeBranch('auto/sync-upstream-conflict', 'c.txt', 'branch-v2\n');
+    const shaMoved = makeBranch('auto/sync-upstream-moved', 'a.txt', 'v2\n');
+    const shaMergeErr = makeBranch('auto/sync-upstream-mergeerr', 'b.txt', 'v3\n');
+
+    git(work, ['checkout', 'master']);
+    writeFileSync(join(work, 'a.txt'), 'v2\n');
+    writeFileSync(join(work, 'c.txt'), 'master-v2\n');
+    git(work, ['add', 'a.txt', 'c.txt']);
+    git(work, ['commit', '-m', 'master moves on']);
+    git(work, ['push', 'origin', 'master']);
+
+    const sameRepo = { nameWithOwner: 'omacom/omarchy-pkgs' };
+    const nodes = [
+      { number: 10, headRefName: 'auto/sync-upstream-landed', baseRefName: 'master', headRefOid: shaLanded, mergeable: 'MERGEABLE', headRepository: sameRepo },
+      { number: 11, headRefName: 'auto/sync-upstream-valid', baseRefName: 'master', headRefOid: shaValid, mergeable: 'MERGEABLE', headRepository: sameRepo },
+      { number: 12, headRefName: 'auto/sync-upstream-conflict', baseRefName: 'master', headRefOid: shaConflict, mergeable: 'UNKNOWN', headRepository: sameRepo },
+      { number: 13, headRefName: 'auto/sync-upstream-moved', baseRefName: 'master', headRefOid: shaMoved, mergeable: 'MERGEABLE', headRepository: sameRepo },
+      { number: 14, headRefName: 'auto/sync-upstream-fetcherr', baseRefName: 'master', headRefOid: 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef', mergeable: 'MERGEABLE', headRepository: sameRepo },
+      { number: 15, headRefName: 'auto/sync-upstream-mergeerr', baseRefName: 'master', headRefOid: shaMergeErr, mergeable: 'MERGEABLE', headRepository: sameRepo },
+      { number: 16, headRefName: 'auto/sync-upstream', baseRefName: 'master', headRefOid: shaLanded, mergeable: 'CONFLICTING', headRepository: { nameWithOwner: 'fork/omarchy-pkgs' } },
+    ];
+    writeFileSync(join(root, 'nodes.json'), JSON.stringify({ data: { repository: { pullRequests: { nodes } } } }));
+
+    // Wrap git to inject a status-128 merge-tree error for shaMergeErr only.
+    const realGit = execFileSync('which', ['git'], { encoding: 'utf8' }).trim();
+    const gitStub = `#!/bin/bash
+if [[ "$1" == "merge-tree" ]]; then
+  if [[ "$("${realGit}" rev-parse FETCH_HEAD 2>/dev/null || true)" == "${shaMergeErr}" ]]; then
+    exit 128
+  fi
+fi
+exec "${realGit}" "$@"
+`;
+    writeFileSync(join(bin, 'git'), gitStub);
+    chmodSync(join(bin, 'git'), 0o755);
+
+    const ghStub = `#!/bin/bash
+set -euo pipefail
+if [[ "$1" == "api" && "$2" == "graphql" ]]; then
+  jq_expr=""
+  while [[ $# -gt 0 ]]; do
+    if [[ "$1" == "--jq" ]]; then jq_expr="$2"; shift 2; else shift; fi
+  done
+  jq -r "$jq_expr" "${join(root, 'nodes.json')}"
+elif [[ "$1" == "pr" && "$2" == "view" ]]; then
+  num="$3"
+  case "$num" in
+    10) echo "OPEN master ${shaLanded}" ;;
+    11) echo "OPEN master ${shaValid}" ;;
+    12) echo "OPEN master ${shaConflict}" ;;
+    13) echo "OPEN master 1111111111111111111111111111111111111111" ;;
+    14) echo "OPEN master deadbeefdeadbeefdeadbeefdeadbeefdeadbeef" ;;
+    15) echo "OPEN master ${shaMergeErr}" ;;
+  esac
+elif [[ "$1" == "pr" && "$2" == "close" ]]; then
+  echo "$3" >> "${closedLog}"
+fi
+`;
+    writeFileSync(join(bin, 'gh'), ghStub);
+    chmodSync(join(bin, 'gh'), 0o755);
+
+    execFileSync('bash', ['-euo', 'pipefail', '-c', script], {
+      cwd: work,
+      env: {
+        ...process.env,
+        PATH: `${bin}:${process.env.PATH}`,
+        GITHUB_REPOSITORY: 'omacom/omarchy-pkgs',
+        GROUPS_JSON: '[]',
+        PREFIX: 'auto/sync-upstream',
+        DEFAULT_BRANCH: 'master',
+      },
+    });
+
+    const closed = read(closedLog, 'utf8').trim().split('\n').filter(Boolean);
+    assert.deepEqual(closed, ['10', '12']);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('check-shadowed runs on every PR without paths filter and narrows full-tree helper triggers', () => {
+  const wf = readFileSync(join(__dirname, '../.github/workflows/check-shadowed.yml'), 'utf8');
+  const onBlock = wf.split('\njobs:\n')[0];
+  assert.doesNotMatch(onBlock, /^ +paths:/m);
+  assert.match(wf, /helpers\/message-helpers\.sh helpers\/paths\.sh helpers\/package-metadata\.sh/);
+  assert.doesNotMatch(wf, /release\/shadowed-packages\.txt helpers /);
+});
+test('publish.yml renders PR comments as Markdown tables for sources and slots', () => {
+  const { execFileSync } = require('node:child_process');
+  const wf = readFileSync(join(__dirname, '../.github/workflows/publish.yml'), 'utf8');
+  const start = wf.indexOf('      - name: Render\n');
+  assert.ok(start > 0);
+  const marker = "jq -r --arg outcome \"${{ needs.publish.result }}\" '\n";
+  const jqStart = wf.indexOf(marker, start);
+  assert.ok(jqStart > 0);
+  const jqEnd = wf.indexOf("\n          ' publish-record.json > comment.md", jqStart);
+  assert.ok(jqEnd > jqStart);
+  const filter = wf.slice(jqStart + marker.length, jqEnd).replaceAll("'\"'\"'", "'");
+
+  const render = (record, outcome = 'success') =>
+    execFileSync('jq', ['-r', '--arg', 'outcome', outcome, filter], {
+      input: JSON.stringify(record),
+      encoding: 'utf8',
+    });
+
+  // 1. All skipped: groups identical-status arches onto one row
+  const skipped = render({
+    target: 'live', commit: '86c5371abcdef', run: 'https://example.test/run/1',
+    plan: [], slots: [],
+    sources: [
+      { package: 'amp-desktop-bin', arch: 'x86_64', source: 'already-published' },
+      { package: 'amp-desktop-bin', arch: 'aarch64', source: 'already-published' },
+      { package: 'bambustudio-bin', arch: 'x86_64', source: 'already-published' },
+    ],
+  });
+  assert.match(skipped, /\| Package \| Arch \| Status \|/);
+  assert.match(skipped, /\| `amp-desktop-bin` \| `aarch64`, `x86_64` \| already published \(skipped\) \|/);
+  assert.match(skipped, /_Nothing to publish: already at master's version everywhere\._/);
+
+  // 2. Published with mixed statuses + slots table
+  const published = render({
+    target: 'live', commit: '1234567abcdef', run: 'https://example.test/run/2',
+    plan: [{ package: 'notion-desktop', arch: 'x86_64', channels: 'edge', publish_arches: 'x86_64' }],
+    sources: [
+      { package: 'notion-desktop', arch: 'x86_64', source: 'pr-artifact' },
+      { package: 'notion-desktop', arch: 'aarch64', source: 'rebuild' },
+    ],
+    slots: [
+      { mirror: 'edge', arch: 'x86_64', status: 'published', packages: ['notion-desktop-7.45.2-2-x86_64.pkg.tar.zst', 'notion-desktop-debug-7.45.2-2-x86_64.pkg.tar.zst'] },
+    ],
+  });
+  assert.match(published, /\| `notion-desktop` \| `x86_64` \| PR artifact \|/);
+  assert.match(published, /\| `notion-desktop` \| `aarch64` \| rebuilt at merge \|/);
+  assert.match(published, /\| Channel \| Status \| Packages \|/);
+  assert.match(published, /\| `edge\/x86_64` \| published \| `notion-desktop-7\.45\.2-2-x86_64\.pkg\.tar\.zst` \|/);
+  assert.doesNotMatch(published, /-debug-/);
+
+  // 3. Failure state
+  const failed = render({
+    target: 'live', commit: '9999999abcdef', run: 'https://example.test/run/3',
+    plan: [], slots: [],
+    sources: [{ package: 'foo', arch: 'x86_64', source: 'build-failed' }],
+  }, 'failure');
+  assert.match(failed, /### Publish FAILED → \*\*live\*\*/);
+  assert.match(failed, /\| `foo` \| `x86_64` \| \*\*build-failed\*\* \|/);
+  assert.match(failed, /_A build failed, so no channel was touched\._/);
+});
+
+test('should-push-pr.sh skips unchanged PRs and human WIP fixes while refreshing real updates and conflicts', () => {
+  const { execFileSync } = require('node:child_process');
+  const { mkdtempSync, mkdirSync, writeFileSync, chmodSync, rmSync } = require('node:fs');
+  const { tmpdir } = require('node:os');
+  const script = join(__dirname, '../.github/scripts/should-push-pr.sh');
+
+  // Verify package-prs.yml wires the step with the App token and gates hold/pr on push == true.
+  const prs = readFileSync(join(__dirname, '../.github/workflows/package-prs.yml'), 'utf8');
+  assert.match(prs, /- name: Check whether the PR needs an update\n +id: should_push\n/);
+  assert.match(prs, /\.github\/scripts\/should-push-pr\.sh "\$BRANCH" "\$\{packages\[@\]\}"/);
+  assert.match(prs, /steps\.should_push\.outputs\.push == 'true' && matrix\.group\.review == true/);
+  assert.match(prs, /steps\.should_push\.outputs\.push == 'true' && steps\.hold\.outcome != 'failure'/);
+
+  const root = mkdtempSync(join(tmpdir(), 'should-push-'));
+  try {
+    const remote = join(root, 'remote.git');
+    const work = join(root, 'work');
+    const bin = join(root, 'bin');
+    mkdirSync(bin);
+    const git = (cwd, args) => execFileSync('git', args, {
+      cwd,
+      encoding: 'utf8',
+      env: { ...process.env, GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@t', GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@t' },
+    }).trim();
+
+    git(root, ['init', '--bare', '-b', 'master', remote]);
+    git(root, ['clone', remote, work]);
+    mkdirSync(join(work, 'pkgbuilds/demo/.omarchy'), { recursive: true });
+    writeFileSync(join(work, 'pkgbuilds/demo/PKGBUILD'), 'pkgname=demo\npkgver=1.0\npkgrel=1\n');
+    writeFileSync(join(work, 'pkgbuilds/demo/.omarchy/package.json'), '{"source":"local"}\n');
+    git(work, ['add', '.']);
+    git(work, ['commit', '-m', 'base']);
+    git(work, ['push', 'origin', 'master']);
+
+    // Create existing bot PR branch with pkgver=2.0
+    git(work, ['checkout', '-b', 'auto/sync-upstream-demo', 'origin/master']);
+    writeFileSync(join(work, 'pkgbuilds/demo/PKGBUILD'), 'pkgname=demo\npkgver=2.0\npkgrel=1\n_build=1\n');
+    git(work, ['add', '.']);
+    git(work, ['commit', '-m', 'bot bump 2.0']);
+    const botOid = git(work, ['rev-parse', 'HEAD']);
+    git(work, ['push', 'origin', 'auto/sync-upstream-demo']);
+
+    // Create branch with human WIP fix commit on top of bot commit at pkgver=2.0
+    git(work, ['checkout', '-b', 'auto/sync-upstream-human', 'auto/sync-upstream-demo']);
+    writeFileSync(join(work, 'pkgbuilds/demo/PKGBUILD'), 'pkgname=demo\npkgver=2.0\npkgrel=1\n_build=1\n# human fix\n');
+    git(work, ['add', '.']);
+    git(work, ['commit', '-m', 'human fix']);
+    git(work, ['push', 'origin', 'auto/sync-upstream-human']);
+
+    // Return to master and apply sync output (pkgver=2.0, _build=1) to working tree
+    git(work, ['checkout', 'master']);
+    writeFileSync(join(work, 'pkgbuilds/demo/PKGBUILD'), 'pkgname=demo\npkgver=2.0\npkgrel=1\n_build=1\n');
+
+    const recentDate = new Date(Date.now() - 3600 * 1000).toISOString();
+    const staleDate = new Date(Date.now() - 8 * 86400 * 1000).toISOString();
+
+    const ghStub = `#!/bin/bash
+set -euo pipefail
+if [[ "$1" == "api" ]]; then
+  if [[ "$STUB_PR" == "" ]]; then echo ""; else echo "$STUB_PR"; fi
+elif [[ "$1" == "pr" && "$2" == "view" ]]; then
+  printf "%s|%s|%s|%s|%s|%s|%s\n" "$STUB_MERGEABLE" "$STUB_COMMITS" "$STUB_FIRST_OID" "$STUB_TIP_OID" "$STUB_AUTHOR" "$STUB_DATE" "$STUB_CHECKS"
+fi
+`;
+    writeFileSync(join(bin, 'gh'), ghStub);
+    chmodSync(join(bin, 'gh'), 0o755);
+
+    const run = (branch, env) => {
+      const out = execFileSync('bash', [script, branch, 'demo'], {
+        cwd: work,
+        encoding: 'utf8',
+        env: {
+          ...process.env,
+          PATH: `${bin}:${process.env.PATH}`,
+          GITHUB_REPOSITORY: 'omacom/omarchy-pkgs',
+          DEFAULT_BRANCH: 'master',
+          STUB_FIRST_OID: botOid,
+          STUB_TIP_OID: botOid,
+          STUB_DATE: recentDate,
+          STUB_CHECKS: 'SETTLED',
+          ...env,
+        },
+      });
+      return Object.fromEntries(out.trim().split('\n').map(l => l.split('=')));
+    };
+
+    // 1. No open PR -> push=true (new)
+    assert.deepEqual(run('auto/sync-upstream-demo', { STUB_PR: '', STUB_MERGEABLE: '', STUB_COMMITS: '0', STUB_AUTHOR: '' }),
+      { push: 'true', pr: '', reason: 'new' });
+
+    // 2. Open PR with identical package files and settled checks -> push=false (unchanged)
+    assert.deepEqual(run('auto/sync-upstream-demo', { STUB_PR: '42', STUB_MERGEABLE: 'MERGEABLE', STUB_COMMITS: '1', STUB_AUTHOR: 'omarchy-pkgs-sync' }),
+      { push: 'false', pr: '42', reason: 'unchanged' });
+
+    // 3. Transient check failure or missing checks -> push=true (transient-check)
+    assert.deepEqual(run('auto/sync-upstream-demo', { STUB_PR: '42', STUB_MERGEABLE: 'MERGEABLE', STUB_COMMITS: '1', STUB_AUTHOR: 'omarchy-pkgs-sync', STUB_CHECKS: 'TRANSIENT' }),
+      { push: 'true', pr: '42', reason: 'transient-check' });
+    assert.deepEqual(run('auto/sync-upstream-demo', { STUB_PR: '42', STUB_MERGEABLE: 'MERGEABLE', STUB_COMMITS: '1', STUB_AUTHOR: 'omarchy-pkgs-sync', STUB_CHECKS: 'NONE' }),
+      { push: 'true', pr: '42', reason: 'transient-check' });
+
+    // 4. Stale PR (>= 7 days old) -> push=true (stale-retry)
+    assert.deepEqual(run('auto/sync-upstream-demo', { STUB_PR: '42', STUB_MERGEABLE: 'MERGEABLE', STUB_COMMITS: '1', STUB_AUTHOR: 'omarchy-pkgs-sync', STUB_DATE: staleDate }),
+      { push: 'true', pr: '42', reason: 'stale-retry' });
+
+    // 4b. Empty commit author login does not shift date or check_state fields
+    assert.deepEqual(run('auto/sync-upstream-demo', { STUB_PR: '42', STUB_MERGEABLE: 'MERGEABLE', STUB_COMMITS: '1', STUB_AUTHOR: '', STUB_CHECKS: 'TRANSIENT' }),
+      { push: 'true', pr: '42', reason: 'transient-check' });
+    assert.deepEqual(run('auto/sync-upstream-demo', { STUB_PR: '42', STUB_MERGEABLE: 'MERGEABLE', STUB_COMMITS: '1', STUB_AUTHOR: '', STUB_DATE: staleDate, STUB_CHECKS: 'SETTLED' }),
+      { push: 'true', pr: '42', reason: 'stale-retry' });
+
+    // 5. Conflicting bot PR -> push=true (conflict)
+    assert.deepEqual(run('auto/sync-upstream-demo', { STUB_PR: '42', STUB_MERGEABLE: 'CONFLICTING', STUB_COMMITS: '1', STUB_AUTHOR: 'omarchy-pkgs-sync' }),
+      { push: 'true', pr: '42', reason: 'conflict' });
+
+    // 6. Human WIP fix pushed onto branch (even if conflicting) while bot's base commit matches -> push=false (human-commit)
+    assert.deepEqual(run('auto/sync-upstream-human', { STUB_PR: '43', STUB_MERGEABLE: 'CONFLICTING', STUB_COMMITS: '2', STUB_AUTHOR: 'emirb' }),
+      { push: 'false', pr: '43', reason: 'human-commit' });
+
+    // 6b. Maintainer commit with unlinked git email (empty login) or unfetchable base commit still protects the branch
+    assert.deepEqual(run('auto/sync-upstream-human', { STUB_PR: '43', STUB_MERGEABLE: 'CONFLICTING', STUB_COMMITS: '2', STUB_AUTHOR: '' }),
+      { push: 'false', pr: '43', reason: 'human-commit' });
+    assert.deepEqual(run('auto/sync-upstream-human', { STUB_PR: '43', STUB_MERGEABLE: 'CONFLICTING', STUB_COMMITS: '2', STUB_AUTHOR: 'emirb', STUB_FIRST_OID: 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef' }),
+      { push: 'false', pr: '43', reason: 'human-commit' });
+
+    // 6c. New untracked file under pkgbuilds/<pkg>/ counts as an update when absent on PR,
+    // and as unchanged when the PR branch already committed that exact file.
+    writeFileSync(join(work, 'pkgbuilds/demo/new.patch'), 'diff\n');
+    assert.deepEqual(run('auto/sync-upstream-demo', { STUB_PR: '42', STUB_MERGEABLE: 'MERGEABLE', STUB_COMMITS: '1', STUB_AUTHOR: 'omarchy-pkgs-sync' }),
+      { push: 'true', pr: '42', reason: 'updated' });
+    git(work, ['checkout', '--', 'pkgbuilds/demo/PKGBUILD']);
+    git(work, ['checkout', '-b', 'auto/sync-upstream-added', 'auto/sync-upstream-demo']);
+    git(work, ['add', 'pkgbuilds/demo/new.patch']);
+    git(work, ['commit', '-m', 'bot adds new.patch']);
+    const addedOid = git(work, ['rev-parse', 'HEAD']);
+    git(work, ['push', 'origin', 'auto/sync-upstream-added']);
+    git(work, ['checkout', 'master']);
+    writeFileSync(join(work, 'pkgbuilds/demo/PKGBUILD'), 'pkgname=demo\npkgver=2.0\npkgrel=1\n_build=1\n');
+    writeFileSync(join(work, 'pkgbuilds/demo/new.patch'), 'diff\n');
+    assert.deepEqual(run('auto/sync-upstream-added', { STUB_PR: '44', STUB_MERGEABLE: 'MERGEABLE', STUB_COMMITS: '1', STUB_FIRST_OID: addedOid, STUB_TIP_OID: addedOid, STUB_AUTHOR: 'omarchy-pkgs-sync' }),
+      { push: 'false', pr: '44', reason: 'unchanged' });
+    rmSync(join(work, 'pkgbuilds/demo/new.patch'));
+
+    // 7. Same pkgver but revision (_build) changed -> diff vs bot's first commit -> push=true (updated)
+    writeFileSync(join(work, 'pkgbuilds/demo/PKGBUILD'), 'pkgname=demo\npkgver=2.0\npkgrel=1\n_build=2\n');
+    assert.deepEqual(run('auto/sync-upstream-human', { STUB_PR: '43', STUB_MERGEABLE: 'MERGEABLE', STUB_COMMITS: '2', STUB_AUTHOR: 'emirb' }),
+      { push: 'true', pr: '43', reason: 'updated' });
+
+    // 8. Master recipe fix changes pkgbuilds/demo/PKGBUILD -> diff vs FETCH_HEAD -> push=true (updated)
+    writeFileSync(join(work, 'pkgbuilds/demo/PKGBUILD'), 'pkgname=demo\npkgver=2.0\npkgrel=1\n_build=1\ndepends=(gtk4-layer-shell)\n');
+    assert.deepEqual(run('auto/sync-upstream-demo', { STUB_PR: '42', STUB_MERGEABLE: 'MERGEABLE', STUB_COMMITS: '1', STUB_AUTHOR: 'omarchy-pkgs-sync' }),
+      { push: 'true', pr: '42', reason: 'updated' });
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('package-prs.yml and callers grant checks/statuses read permissions for should-push-pr.sh', () => {
+  const pprs = readFileSync(join(__dirname, '../.github/workflows/package-prs.yml'), 'utf8');
+  assert.match(pprs, /name: Check whether the PR needs an update[\s\S]*?GH_TOKEN: \$\{\{ github\.token \}\}/);
+  for (const file of ['package-prs.yml', 'sync-upstream.yml', 'sync-rebuilds.yml']) {
+    const wf = readFileSync(join(__dirname, '../.github/workflows', file), 'utf8');
+    assert.match(wf, /checks: read/);
+    assert.match(wf, /statuses: read/);
+    assert.match(wf, /pull-requests: read/);
+  }
 });

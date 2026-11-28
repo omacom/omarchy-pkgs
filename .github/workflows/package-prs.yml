@@ -55,6 +55,9 @@ on:
 
 permissions:
   contents: read
+  pull-requests: read
+  checks: read
+  statuses: read
 
 jobs:
   # Writes each PR's description with helpers/sync-pr-body.py. Reading a
@@ -204,11 +207,29 @@ jobs:
           permission-contents: write
           permission-pull-requests: write
 
+      # Skip force-pushing an open PR that already carries the exact same
+      # package files (or a maintainer's manual fix at the same version), so
+      # broken PRs do not re-trigger builds every six hours.
+      - name: Check whether the PR needs an update
+        id: should_push
+        if: ${{ steps.apply.outcome == 'success' }}
+        continue-on-error: ${{ inputs.report-package-failures }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BRANCH: ${{ matrix.group.branch }}
+          PACKAGES: ${{ matrix.group.packages }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          read -r -a packages <<<"$PACKAGES"
+          out=$(.github/scripts/should-push-pr.sh "$BRANCH" "${packages[@]}")
+          printf '%s\n' "$out"
+          printf '%s\n' "$out" >> "$GITHUB_OUTPUT"
+
       # A reviewed PR the owner already marked ready (and auto-merge-pr.yml
       # armed) would otherwise take a newer update and land it unreviewed.
       - name: Hold an existing reviewed PR as a draft
         id: hold
-        if: ${{ steps.apply.outcome == 'success' && matrix.group.review == true }}
+        if: ${{ steps.apply.outcome == 'success' && steps.should_push.outputs.push == 'true' && matrix.group.review == true }}
         continue-on-error: ${{ inputs.report-package-failures }}
         env:
           GH_TOKEN: ${{ steps.app.outputs.token }}
@@ -220,7 +241,7 @@ jobs:
 
       - name: Open or update the PR
         id: pr
-        if: ${{ steps.apply.outcome == 'success' && steps.hold.outcome != 'failure' }}
+        if: ${{ steps.apply.outcome == 'success' && steps.should_push.outputs.push == 'true' && steps.hold.outcome != 'failure' }}
         continue-on-error: ${{ inputs.report-package-failures }}
         uses: peter-evans/create-pull-request@3ffccacd46053766916f087ce41d627c0b8cf2d1 # v8.1.3
         with:
@@ -251,12 +272,15 @@ jobs:
           key=$(jq -r '.branch' <<< "$GROUP_JSON" | sha256sum | cut -d' ' -f1)
           echo "key=$key" >> "$GITHUB_OUTPUT"
           jq -n --argjson group "$GROUP_JSON" --argjson steps "$STEPS_JSON" '
+            ($steps.should_push.outputs.push // "") as $push |
             $group + {
               apply: ($steps.apply.outcome // "skipped"),
               token: ($steps.app.outcome // "skipped"),
+              should_push: ($steps.should_push.outcome // "skipped"),
               hold: ($steps.hold.outcome // "skipped"),
-              pr: ($steps.pr.outcome // "skipped"),
-              number: ($steps.pr.outputs["pull-request-number"] // "")
+              pr: (if $push == "false" then "unchanged" else ($steps.pr.outcome // "skipped") end),
+              pr_operation: (if $push == "false" then "none" else ($steps.pr.outputs["pull-request-operation"] // "") end),
+              number: (if $push == "false" then ($steps.should_push.outputs.pr // "") else ($steps.pr.outputs["pull-request-number"] // "") end)
             }
           ' > "$RUNNER_TEMP/package-pr-results/$key.json"
 
@@ -388,18 +412,26 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
-  # A PR on this lane's prefix that the run did not refresh, and that
-  # conflicts with master, is stale: master moved its packages on without it.
-  # Close it rather than leave a red PR behind. Not being refreshed is not
-  # enough on its own, since a feed that failed this run (one of dozens timing
-  # out is routine) leaves a still-valid PR unrefreshed too. The lane's old
-  # batch PR, on the bare prefix, is retired outright.
+  # A PR on this lane's prefix that the run did not refresh is stale if it
+  # conflicts with master or if merging it into master would be a no-op (the
+  # exact same edits already landed on master). Close it rather than leave an
+  # orphaned or red PR behind. Not being refreshed is not enough on its own,
+  # since a feed that failed this run (one of dozens timing out is routine)
+  # leaves a still-valid PR unrefreshed too. The lane's old batch PR, on the
+  # bare prefix, is retired outright.
   close-superseded:
     runs-on: ubuntu-latest
     environment:
       name: bot-sync
       deployment: false
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 0
+          persist-credentials: false
+
       - name: Get the sync App's token
         id: app
         uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
@@ -414,13 +446,51 @@ jobs:
           GH_TOKEN: ${{ steps.app.outputs.token }}
           GROUPS_JSON: ${{ inputs.groups }}
           PREFIX: ${{ inputs.prefix }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
-          gh pr list -R "$GITHUB_REPOSITORY" --state open --limit 500 --json number,headRefName,mergeable \
-            --jq '.[] | select(.headRefName == env.PREFIX or (.headRefName | startswith(env.PREFIX + "-"))) | "\(.number) \(.headRefName) \(.mergeable)"' |
-          while read -r number branch mergeable; do
+          set -o pipefail
+          owner=${GITHUB_REPOSITORY%%/*}
+          name=${GITHUB_REPOSITORY#*/}
+          master_tree=$(git rev-parse 'HEAD^{tree}')
+          # Paginate through every open PR: gh pr list truncates at 500
+          # once the repository exceeds 500 open PRs.
+          # shellcheck disable=SC2016
+          gh api graphql --paginate -f owner="$owner" -f name="$name" -f query='
+            query($owner: String!, $name: String!, $endCursor: String) {
+              repository(owner: $owner, name: $name) {
+                pullRequests(states: OPEN, first: 100, after: $endCursor) {
+                  nodes { number headRefName baseRefName headRefOid mergeable headRepository { nameWithOwner } }
+                  pageInfo { hasNextPage endCursor }
+                }
+              }
+            }' --jq '.data.repository.pullRequests.nodes[] | select(.baseRefName == env.DEFAULT_BRANCH and .headRepository.nameWithOwner == env.GITHUB_REPOSITORY and (.headRefName == env.PREFIX or (.headRefName | startswith(env.PREFIX + "-")))) | "\(.number) \(.headRefName) \(.headRefOid) \(.mergeable)"' |
+          while read -r number branch head_oid mergeable; do
             jq -e --arg branch "$branch" 'any(.[]; .branch == $branch)' <<<"$GROUPS_JSON" >/dev/null && continue
-            [[ $branch == "$PREFIX" || $mergeable == CONFLICTING ]] || continue
-            echo "closing #$number ($branch): superseded"
+            reason=""
+            if [[ $branch == "$PREFIX" ]]; then
+              reason="retired batch branch"
+            elif [[ $mergeable == CONFLICTING ]]; then
+              reason="conflicts with $DEFAULT_BRANCH"
+            elif git fetch -q --no-tags origin "$head_oid"; then
+              rc=0
+              tree=$(git merge-tree --write-tree HEAD FETCH_HEAD 2>/dev/null) || rc=$?
+              if (( rc == 0 )); then
+                [[ "${tree%%$'\n'*}" == "$master_tree" ]] || continue
+                reason="already landed on $DEFAULT_BRANCH"
+              elif (( rc == 1 )); then
+                reason="conflicts with $DEFAULT_BRANCH"
+              else
+                echo "::warning::git merge-tree failed for #$number ($branch) with exit $rc; skipping"
+                continue
+              fi
+            else
+              continue
+            fi
+            # Re-verify PR state, base, and head SHA immediately before closing
+            # so a concurrent push or retarget is never closed or deleted.
+            live=$(gh pr view "$number" -R "$GITHUB_REPOSITORY" --json state,baseRefName,headRefOid               --jq '"\(.state) \(.baseRefName) \(.headRefOid)"' 2>/dev/null) || continue
+            [[ "$live" == "OPEN $DEFAULT_BRANCH $head_oid" ]] || continue
+            echo "closing #$number ($branch): superseded ($reason)"
             gh pr close "$number" -R "$GITHUB_REPOSITORY" --delete-branch \
               --comment "Superseded: master has moved these packages on, or per-package PRs carry them now."
           done
