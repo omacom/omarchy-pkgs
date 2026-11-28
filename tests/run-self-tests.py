@@ -59,6 +59,7 @@ def build_test_list():
         ("fast-makepkg", ["runuser", "-u", "nobody", "--", "python", "tests/fast-makepkg.py"], {}),
         ("sync-upstream self-test", ["./bin/sync-upstream", "self-test"], {}),
         ("pinned-sources", ["./tests/pinned-sources.sh"], {}),
+        ("recipe-hygiene", ["python", "tests/recipe-hygiene.py"], {}),
         ("upstream-watch", ["python", "tests/upstream-watch.py"], {}),
         ("sync-pr-body", ["python", "tests/sync-pr-body.py"], {}),
         ("package-metadata", ["./tests/package-metadata.sh"], {}),
