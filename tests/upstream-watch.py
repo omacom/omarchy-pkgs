@@ -855,6 +855,67 @@ class P1WatchImprovementsTests(unittest.TestCase):
         dup = b'!<arch>\n' + ar_member('control.tar.gz', ctrl_tar) + ar_member('control.tar.xz', ctrl_tar)
         self.assertIsNone(w.deb_control_from_prefix(dup))
 
+    def test_deb_range_sync_verifies_full_download_version(self):
+        import io, tarfile, tempfile
+        def make_deb(version):
+            buf = io.BytesIO()
+            with tarfile.open(fileobj=buf, mode='w:gz') as tf:
+                ctrl = f'Package: demo\nVersion: {version}\n'.encode()
+                info = tarfile.TarInfo('./control')
+                info.size = len(ctrl)
+                tf.addfile(info, io.BytesIO(ctrl))
+            ctrl_tar = buf.getvalue()
+            def ar_member(name, payload):
+                hdr = f"{name:<16}{'0':<12}{'0':<6}{'0':<6}{'100644':<8}{len(payload):<10}`\n".encode()
+                return hdr + payload + (b'\n' if len(payload) % 2 else b'')
+            return b'!<arch>\n' + ar_member('debian-binary', b'2.0\n') + ar_member('control.tar.gz', ctrl_tar)
+
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            pkg = td / 'demo'
+            (pkg / '.omarchy').mkdir(parents=True)
+            url = 'https://example.test/demo.deb'
+            (pkg / '.omarchy/package.json').write_text(json.dumps({
+                'source': 'local',
+                'upstream': {'watch': {
+                    'archive': url,
+                    'pattern': r'(?m)^Version: (?P<version>[0-9.]+)$',
+                    'mutable_sources': ['source:0'],
+                }},
+            }))
+            original_recipe = (
+                "pkgname=demo\npkgver=4.1.13.29\npkgrel=1\narch=('x86_64')\n"
+                f"source=('demo.deb::{url}')\nsha256sums=('" + "0" * 64 + "')\n"
+            )
+            (pkg / 'PKGBUILD').write_text(original_recipe)
+
+            deb_30 = make_deb('4.1.13.30')
+            deb_31 = make_deb('4.1.13.31')
+            full_path = td / 'full.deb'
+
+            # Case 1: Range reports 4.1.13.30, full download swapped to 4.1.13.31 -> must fail and keep recipe untouched
+            full_path.write_bytes(deb_31)
+            class SwappedFetch:
+                def range_bytes(self, u, size=w.DEB_RANGE_BYTES):
+                    return deb_30
+                def file(self, u):
+                    return full_path
+            with self.assertRaisesRegex(ValueError, 'mutable deb changed version'):
+                w.sync(pkg, SwappedFetch())
+            self.assertEqual((pkg / 'PKGBUILD').read_text(), original_recipe)
+
+            # Case 2: Range reports 4.1.13.30 and full download matches 4.1.13.30 -> updates cleanly
+            full_path.write_bytes(deb_30)
+            class MatchingFetch:
+                def range_bytes(self, u, size=w.DEB_RANGE_BYTES):
+                    return deb_30
+                def file(self, u):
+                    return full_path
+            result = w.sync(pkg, MatchingFetch())
+            self.assertEqual(result['status'], 'updated')
+            self.assertIn('pkgver=4.1.13.30', (pkg / 'PKGBUILD').read_text())
+            self.assertIn(w.hash_file(full_path, 'sha256'), (pkg / 'PKGBUILD').read_text())
+
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)

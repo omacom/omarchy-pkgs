@@ -306,19 +306,13 @@ def git_branch_tip(url, branch, tag_pattern, cache, min_age=0):
 
 
 def read_deb_control(control_tar_bytes):
-    try:
-        with tarfile.open(fileobj=io.BytesIO(control_tar_bytes)) as archive:
-            members = [m for m in archive if m.name.removeprefix("./") == "control"]
-            if len(members) != 1:
-                raise ValueError("deb control file is missing or ambiguous")
-            return archive.extractfile(members[0]).read().decode()
-    except tarfile.ReadError:
-        # Handle compression formats not built into Python's tarfile (e.g. zstd on older Python).
-        names = subprocess.run(["bsdtar", "-tf", "-"], input=control_tar_bytes, capture_output=True, check=True).stdout.decode().splitlines()
-        members = [name for name in names if name.removeprefix("./") == "control"]
+    # Use Python's tarfile exclusively (never bsdtar) so untrusted bytes
+    # cannot be interpreted as a libarchive mtree manifest with contents=.
+    with tarfile.open(fileobj=io.BytesIO(control_tar_bytes)) as archive:
+        members = [m for m in archive if m.name.removeprefix("./") == "control"]
         if len(members) != 1:
             raise ValueError("deb control file is missing or ambiguous")
-        return subprocess.run(["bsdtar", "-xOf", "-", members[0]], input=control_tar_bytes, capture_output=True, check=True).stdout.decode()
+        return archive.extractfile(members[0]).read().decode()
 
 
 def deb_control_from_prefix(prefix):
