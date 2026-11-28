@@ -14,6 +14,14 @@ Automatic upstream version bumps are held (`sync: false`) because `omarchy-hyprl
 
 `hypr-startup-hold.patch` adds `misc:startup_hold_layer` (`level:namespace`; empty, the default, turns it off) and `misc:startup_hold_timeout` (ms, 5000 by default). A monitor that still shows the picture aquamarine adopted with `AQ_SPLASH_ADOPT=1`, the boot splash's last frame, presents nothing until that layer is mapped on it and opaque, or until the timeout; every other monitor renders as before. `hypr-startup-cursor.patch` adds `cursor:hide_at_startup` (false by default): from startup, no cursor shows until the client under the pointer sets one or the pointer moves, so Hyprland's own cursor doesn't appear over the held picture before the session's cover sets a blank one. `hypr-monitor-added-zoom.patch` starts a new monitor at its normal size when the `monitorAdded` animation or all animations are off, instead of drawing its first five frames magnified. The hold calls aquamarine's `IOutput::showsAdoptedPicture()` from `pkgbuilds/aquamarine`, so this recipe needs `aquamarine>=0.16.0-1.2`, and the two are promoted together. None of the three patches is upstream yet.
 
+## X11 scale
+
+`xwayland-scale.patch` adds `xwayland:scale` ([ParkerrDev/xscale](https://github.com/ParkerrDev/xscale)): one scale that every X11 client renders at, so X11 apps are sharp and the size of their Wayland selves on every monitor, instead of upscaled and blurry, or tiny under `force_zero_scaling`. Hyprland scales the X11 windows itself, so it works with Arch's `xorg-xwayland` and changes no protocol. At `0`, the default, it changes nothing. It is not upstream yet. Apply it after the other patches, rebase it with `--fuzz=0` on a version bump, and drop it once the selected release carries the setting.
+
+Reloading either `xwayland:scale` or `xwayland:force_zero_scaling` refreshes the cached X11 scale even when no monitor rule changes.
+
+Open X11 menus follow changes to their owner's `xwayland_unscaled` rule immediately, preserving their X11 pixel size and offset when the rule is enabled or disabled. Since 0.57.1 the recipe requires hyprutils 0.14.3 and Aquamarine 0.16.0: these releases use `COutputState::setMaxBpc`, which Aquamarine 0.15.1 does not provide even though Hyprland's upstream CMake minimum still permits it.
+
 ## x86_64
 
 This recipe also builds for x86_64, so PCs take this build instead of Arch's `extra/hyprland`: `[omarchy]` comes before `[extra]` in Omarchy's `pacman.conf`. That gives PCs the patches above and keeps them on the Hyprland the titlebars plugin was built against when Arch moves first. Move both architectures and the plugin to a newer Hyprland in one change, with a `pkgrel` above Arch's for the same version so a machine already on Arch's build moves to this one.
