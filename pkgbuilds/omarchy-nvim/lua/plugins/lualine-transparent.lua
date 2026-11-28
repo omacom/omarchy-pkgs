@@ -9,7 +9,7 @@ return {
 		opts.options.theme = function()
 			local theme = require("lualine.utils.loader").load_theme("auto")
 			for _, mode in pairs(theme) do
-				for _, section in ipairs({ "b", "c" }) do
+				for _, section in ipairs({ "b", "c", "x" }) do
 					if mode[section] then
 						mode[section].bg = "None"
 					end
