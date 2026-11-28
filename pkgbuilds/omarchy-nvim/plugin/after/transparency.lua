@@ -67,3 +67,11 @@ table.insert(groups, "CursorLine")
 for _, name in ipairs(groups) do
 	make_transparent(name)
 end
+
+-- Themes like Gruvbox link the focused Snacks result to CursorLine.
+-- Fall back to the theme's selection color if that highlight is transparent.
+local picker_cursorline = "SnacksPickerListCursorLine"
+local picker_hl = vim.api.nvim_get_hl(0, { name = picker_cursorline, link = false })
+if not picker_hl.bg and not picker_hl.reverse then
+  vim.api.nvim_set_hl(0, picker_cursorline, { link = "Visual" })
+end
