@@ -247,6 +247,36 @@ package_supports_arch() {
   esac
 }
 
+# Regex detecting PKGBUILDs whose arch=() or pkgbase may depend on CARCH or
+# sourced files; shared by bin/build-matrix and package_load_recipe_map.
+# shellcheck disable=SC2034
+PACKAGE_ARCH_VARIES_RE='CARCH|(^|[[:space:];&(|])(source|\.)[[:space:]]'
+
+# Internal: read "<has_any:0|1>TAB<space-separated arches>TAB<pkgbase>" for one
+# recipe under CARCH=<target>, with stdin closed and no positional args exposed
+# to the PKGBUILD. Always fails closed on source errors, early exit, or invalid
+# pkgbase/arch metadata.
+_package_recipe_probe() {
+  local pkgdir="$1" target="$2" out
+  out=$(CDPATH="" cd -- "$pkgdir" && env -u OMARCHY_SRC CARCH="$target" bash -c '
+    unset pkgbase pkgname arch
+    source ./PKGBUILD >/dev/null 2>&1 || exit 1
+    _omarchy_base=${pkgbase:-${pkgname[0]:-}}
+    [[ $_omarchy_base =~ ^[A-Za-z0-9@_+][A-Za-z0-9@._+-]*$ ]] || exit 1
+    _omarchy_has_any=0
+    _omarchy_arches=""
+    for _omarchy_a in "${arch[@]}"; do
+      [[ $_omarchy_a =~ ^[A-Za-z0-9_]+$ ]] || exit 1
+      [[ $_omarchy_a == any ]] && _omarchy_has_any=1
+      _omarchy_arches+="${_omarchy_arches:+ }$_omarchy_a"
+    done
+    [[ -n $_omarchy_arches ]] || exit 1
+    printf "%s\t%s\t%s\n" "$_omarchy_has_any" "$_omarchy_arches" "$_omarchy_base"
+  ' </dev/null) || return 1
+  [[ $out == [01]$'\t'?*$'\t'?* && $out != *$'\n'* ]] || return 1
+  printf "%s\n" "$out"
+}
+
 # The channel DB indexes only its newest version, but older published archives
 # remain immutable. The build planner must skip an existing filename even when
 # the checkout differs from the version currently indexed.
@@ -302,18 +332,17 @@ package_builds_for_mirror() {
   esac
 }
 
-# Whether bin/promote-channel may carry this package into the given channel:
-# any package not built there natively. Native builds are authoritative —
-# advancing over them could pair a published filename with different bytes,
-# which the R2 cache would never recover from.
-package_moves_to_channel() {
-  local pkgdir="$1" channel="$2"
-  # Pinned packages build natively in rc from the release pin. That the
-  # advancing environment lacks OMARCHY_RC_PINS (so *it* may not build them)
-  # does not make the edge copy movable over the pin's artifact — edge's
-  # version can be ahead of the in-flight RC.
-  [[ "$channel" == "rc" ]] && package_is_pinned "$pkgdir" && return 1
-  ! package_builds_for_mirror "$pkgdir" "$channel"
+# Whether bin/promote-channel may carry a package with the given validated
+# (pinned, release_ring) metadata into the given channel. Pinned packages build
+# natively in rc from the release pin; fast-ring packages publish to rc and
+# stable at merge.
+package_policy_moves_to_channel() {
+  local pinned="$1" ring="$2" channel="$3"
+  case "$channel" in
+    rc) [[ "$pinned" != "true" && "$ring" != "fast" ]] ;;
+    stable) [[ "$pinned" == "true" || "$ring" != "fast" ]] ;;
+    *) return 1 ;;
+  esac
 }
 
 package_dirs() {
@@ -326,6 +355,159 @@ package_dirs() {
   done
 }
 
+# Populate associative array <map_var> with recipes for one or more
+# space-separated architectures <arches>. Scans $PKGBUILDS_DIR and validates
+# metadata once; recipes that do not match PACKAGE_ARCH_VARIES_RE are probed
+# once across all requested architectures, while CARCH-varying recipes match
+# build-matrix (sharing the first CI architecture's pkgbase when it declares
+# arch=(any)). Fails closed on missing/empty root, scan or grep errors, dangling
+# symlinks, unreadable dirs, incomplete or malformed metadata (reporting the
+# offending file), unreadable PKGBUILDs, or ambiguous recipes supporting the
+# same architecture. When <prefix_mode> is "--per-arch", keys are
+# "<arch>/<pkgbase>"; otherwise keys are "<pkgbase>". Recipes that do not build
+# an architecture are stored as "" so callers can distinguish them from unknown
+# pkgbases while still checking [[ -n ${map[$k]:-} ]] for supported ones. With
+# --policy-map <var>, also store validated "<pinned:true|false>:<release_ring>"
+# policy values.
+package_load_recipe_map() {
+  local -n _map=$1
+  local _arches_str=$2 _prefix_mode=${3:-} _has_policy=0
+  if [[ ${4:-} == --policy-map ]]; then
+    local -n _policy=$5
+    _has_policy=1
+  fi
+  local _ref_arch="${CI_ARCHES:-x86_64}"
+  _ref_arch=${_ref_arch%% *}
+  local _entry _meta _ref_info _ref_rest _ref_has_any _ref_arches _ref_base
+  local _info _rest _arch_list _supported _base _arch _probe_arch _key
+  local _scan_pid _grep_pid _idx _jq_out _f _arch_varies
+  local -a _pkgdirs=() _pkgbuilds=() _meta_files=() _policies=() _arches=()
+  local -A _varies=()
+  read -r -a _arches <<<"$_arches_str"
+
+  if [[ ! -d "$PKGBUILDS_DIR" ]]; then
+    echo "Failed to scan $PKGBUILDS_DIR" >&2
+    return 1
+  fi
+  while IFS= read -r -d "" _entry; do
+    # Ignore hidden scratch entries (e.g. bin/import-aur's .import-aur.* temp dirs).
+    [[ ${_entry##*/} == .* ]] && continue
+    if [[ -L "$_entry" && ! -e "$_entry" ]]; then
+      echo "dangling symlink in $PKGBUILDS_DIR: $_entry" >&2
+      return 1
+    fi
+    [[ -d "$_entry" ]] || continue
+    if [[ ! -r "$_entry" || ! -x "$_entry" ]]; then
+      echo "unreadable recipe directory: $_entry" >&2
+      return 1
+    fi
+    _meta=$(metadata_file_for_dir "$_entry")
+    if [[ ! -f "$_entry/PKGBUILD" ]]; then
+      echo "incomplete recipe (missing PKGBUILD): $_entry" >&2
+      return 1
+    fi
+    if [[ ! -f "$_meta" || ! -r "$_meta" ]]; then
+      echo "incomplete or unreadable metadata: $_meta" >&2
+      return 1
+    fi
+    _pkgdirs+=("$_entry")
+    _pkgbuilds+=("$_entry/PKGBUILD")
+    _meta_files+=("$_meta")
+  done < <(find -H "$PKGBUILDS_DIR" -mindepth 1 -maxdepth 1 -print0 | sort -z)
+  _scan_pid=$!
+  if ! wait "$_scan_pid"; then
+    echo "Failed to scan $PKGBUILDS_DIR" >&2
+    return 1
+  fi
+  if (( ${#_pkgdirs[@]} == 0 )); then
+    echo "No recipes found under $PKGBUILDS_DIR" >&2
+    return 1
+  fi
+
+  _jq_out=$(jq -nr --argjson n "${#_meta_files[@]}" '
+    reduce inputs as $x ({count: {}, out: []};
+      (input_filename) as $f
+      | if (.count[$f] // 0) >= 1 then error("multiple JSON documents in \($f)")
+        elif ($x | type) != "object" then error("non-object JSON in \($f)")
+        elif ($x | has("pinned")) and (($x.pinned | type) != "boolean") then error("invalid pinned in \($f)")
+        elif (($x.release_ring // "") != "" and ($x.release_ring // "") != "fast") then error("invalid release_ring in \($f)")
+        else .count[$f] = 1 | .out += ["\($x.pinned // false):\($x.release_ring // "")"]
+        end
+    )
+    | if (.out | length) != $n then error("empty or missing JSON document") else .out[] end
+  ' "${_meta_files[@]}") || {
+    for _f in "${_meta_files[@]}"; do
+      jq -es 'length == 1 and (.[0] | type == "object")' "$_f" >/dev/null 2>&1 || {
+        echo "invalid or empty metadata: $_f" >&2
+        break
+      }
+    done
+    return 1
+  }
+  mapfile -t _policies <<<"$_jq_out"
+
+  while IFS= read -r -d "" _f; do
+    _varies[$_f]=1
+  done < <(grep -l --null -E "$PACKAGE_ARCH_VARIES_RE" "${_pkgbuilds[@]}" || (( $? == 1 )))
+  _grep_pid=$!
+  if ! wait "$_grep_pid"; then
+    echo "Failed to scan PKGBUILDs in $PKGBUILDS_DIR" >&2
+    return 1
+  fi
+
+  for _idx in "${!_pkgdirs[@]}"; do
+    _entry=${_pkgdirs[$_idx]}
+    _arch_varies=${_varies[$_entry/PKGBUILD]:-0}
+
+    _probe_arch=${_arches[0]}
+    (( _arch_varies )) && _probe_arch=$_ref_arch
+    _ref_info=$(_package_recipe_probe "$_entry" "$_probe_arch") || {
+      echo "Cannot read pkgbuilds/${_entry##*/}/PKGBUILD for $_probe_arch" >&2
+      return 1
+    }
+    _ref_has_any=${_ref_info%%$'\t'*}
+    _ref_rest=${_ref_info#*$'\t'}
+    _ref_arches=${_ref_rest%%$'\t'*}
+    _ref_base=${_ref_rest#*$'\t'}
+
+    for _arch in "${_arches[@]}"; do
+      if (( _ref_has_any )); then
+        _supported=1
+        _base=$_ref_base
+      elif (( ! _arch_varies )) || [[ $_arch == "$_ref_arch" ]]; then
+        _supported=0
+        [[ " $_ref_arches " == *" $_arch "* ]] && _supported=1
+        _base=$_ref_base
+      else
+        _info=$(_package_recipe_probe "$_entry" "$_arch") || {
+          echo "Cannot read pkgbuilds/${_entry##*/}/PKGBUILD for $_arch" >&2
+          return 1
+        }
+        _rest=${_info#*$'\t'}
+        _arch_list=${_rest%%$'\t'*}
+        _base=${_rest#*$'\t'}
+        _supported=0
+        [[ " $_arch_list " == *" any "* || " $_arch_list " == *" $_arch "* ]] && _supported=1
+      fi
+      _key=$_base
+      [[ $_prefix_mode == --per-arch ]] && _key="$_arch/$_base"
+      if (( _supported )); then
+        if [[ -n ${_map[$_key]:-} && ! $_entry -ef ${_map[$_key]} ]]; then
+          echo "Ambiguous recipes for $_base on $_arch: pkgbuilds/${_map[$_key]##*/} and pkgbuilds/${_entry##*/}" >&2
+          return 1
+        fi
+        if [[ -z ${_map[$_key]:-} || ! -L "$_entry" ]]; then
+          _map[$_key]=$_entry
+          if (( _has_policy )); then
+            _policy[$_key]=${_policies[$_idx]}
+          fi
+        fi
+      elif [[ -z ${_map[$_key]+set} ]]; then
+        _map[$_key]=""
+      fi
+    done
+  done
+}
 
 package_has_upstream_hook() {
   local pkgdir="$1"

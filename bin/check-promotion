@@ -22,26 +22,68 @@
 set -euo pipefail
 BUILD_ROOT=$(realpath "${BASH_SOURCE[0]%/*}/..")
 source "$BUILD_ROOT/helpers/message-helpers.sh"
-source "$BUILD_ROOT/helpers/docker-helpers.sh"
 source "$BUILD_ROOT/helpers/paths.sh"
 
+ARCH="" FROM="" TO=""
 JOBS=${CHECK_PROMOTION_JOBS:-3}
-while [[ $# -gt 0 && $1 == --* ]]; do
+while [[ $# -gt 0 && $1 == -* ]]; do
   case $1 in
-    --arch) ARCH=${2:?Missing architecture}; shift 2 ;;
-    --from) FROM=${2:?Missing channel}; shift 2 ;;
-    --to) TO=${2:?Missing channel}; shift 2 ;;
+    --arch) (( $# >= 2 )) || { print_error "Missing architecture"; exit 2; }; ARCH=$2; shift 2 ;;
+    --from) (( $# >= 2 )) || { print_error "Missing channel"; exit 2; }; FROM=$2; shift 2 ;;
+    --to) (( $# >= 2 )) || { print_error "Missing channel"; exit 2; }; TO=$2; shift 2 ;;
+    -h|--help) sed -n '2,21p' "$0"; exit 0 ;;
+    --) shift; break ;;
     *) print_error "Unknown option: $1"; exit 2 ;;
   esac
 done
-require_valid_arch "$ARCH"
-if ! validate_mirror "${FROM:-}" || ! validate_mirror "${TO:-}" || [[ $FROM == "$TO" ]]; then
-  print_error "--from and --to must name two channels"
+if [[ -z $ARCH || $ARCH == *[[:space:]]* ]] || ! validate_arch "$ARCH"; then
+  print_error "--arch must be one of: $VALID_ARCHES"
   exit 2
 fi
-[[ $JOBS =~ ^[1-9][0-9]*$ ]] || { print_error "CHECK_PROMOTION_JOBS must be a positive number"; exit 2; }
-PLAN=${1:?Usage: bin/check-promotion --arch <arch> --from <channel> --to <channel> <plan>}
-[[ -s $PLAN ]] || { print_error "The plan $PLAN is empty"; exit 2; }
+case "${FROM:-}->${TO:-}" in
+  edge-\>rc | rc-\>stable | edge-\>stable) ;;
+  *) print_error "--from and --to must be a forward promotion (edge -> rc, rc -> stable, or edge -> stable)"; exit 2 ;;
+esac
+[[ $JOBS =~ ^[1-9][0-9]{0,2}$ ]] || { print_error "CHECK_PROMOTION_JOBS must be between 1 and 999"; exit 2; }
+(( $# == 1 )) || { print_error "Usage: bin/check-promotion --arch <arch> --from <channel> --to <channel> <plan>"; exit 2; }
+PLAN=$1
+[[ $PLAN == -* ]] && PLAN="./$PLAN"
+[[ -f $PLAN && -r $PLAN ]] || { print_error "The plan $PLAN is missing or unreadable"; exit 2; }
+
+# Snapshot once so NUL validation and TSV parsing read the exact same bytes.
+plan_snap=$(mktemp)
+trap 'rm -f "$plan_snap"' EXIT
+cat -- "$PLAN" > "$plan_snap"
+[[ -s $plan_snap ]] || { print_error "The plan $PLAN is empty"; exit 2; }
+tr -d '\0' < "$plan_snap" | cmp -s - "$plan_snap" || { print_error "The plan $PLAN contains NUL bytes"; exit 2; }
+
+# One package per line: its name and file, which every later step reads.
+pkg_re='^[A-Za-z0-9@_+][A-Za-z0-9@._+-]*$'
+names=()
+declare -A file_of=()
+suffix_re="^([0-9]+:)?[^[:cntrl:][:space:]:/-]+-[0-9]+(\.[0-9]+)?-(${ARCH}|any)\.pkg\.tar\.([A-Za-z0-9]+)$"
+while IFS= read -r line || [[ -n $line ]]; do
+  # Split on literal tabs without collapsing empty fields (IFS whitespace).
+  base=${line%%$'\t'*}
+  rest=${line#*$'\t'}
+  name=${rest%%$'\t'*}
+  file=${rest#*$'\t'}
+  suffix=${file#"${name}-"}
+  if [[ $line != *$'\t'* || $rest != *$'\t'* || $file == *$'\t'* ]] ||
+    [[ ! $base =~ $pkg_re || ! $name =~ $pkg_re || -n ${file_of[$name]:-} ]] ||
+    [[ $file != "${name}-"* || $file == *.sig || ! $suffix =~ $suffix_re ]]; then
+    print_error "Bad or repeated plan line for '${name:-$base}'"
+    exit 2
+  fi
+  names+=("$name")
+  file_of[$name]=$file
+done < "$plan_snap"
+rm -f "$plan_snap"
+trap - EXIT
+(( ${#names[@]} > 0 )) || { print_error "The plan $PLAN is empty"; exit 2; }
+
+CONTAINER_ENGINE=${CONTAINER_ENGINE:-}
+source "$BUILD_ROOT/helpers/docker-helpers.sh"
 check_engine
 
 image="omarchy-pkg-builder:latest-$ARCH-edge"
@@ -54,19 +96,11 @@ tag="omarchy-promotion-check:$ARCH-$$"
 results=$(mktemp -d)
 cleanup() {
   rm -rf "$results"
-  "$CONTAINER_ENGINE" rmi "$tag-$FROM" "$tag-$TO" "$tag-edge" >/dev/null 2>&1 || true
+  local -a imgs=("$tag-$FROM" "$tag-$TO")
+  [[ $FROM == edge ]] || imgs+=("$tag-edge")
+  "$CONTAINER_ENGINE" rmi "${imgs[@]}" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
-
-# One package per line: its name and file, which every later step reads.
-names=()
-declare -A file_of=()
-while IFS=$'\t' read -r _ name file; do
-  [[ -n $name && -n $file && -z ${file_of[$name]:-} ]] || { print_error "Bad or repeated plan line for '$name'"; exit 2; }
-  names+=("$name")
-  file_of[$name]=$file
-done < "$PLAN"
-(( ${#names[@]} == $(wc -l < "$PLAN") )) || { print_error "Could not read every line of $PLAN"; exit 2; }
 
 # prepare <channel>: the image of <channel> as the promotion would leave it.
 # For an rc -> stable baseline, edge keeps its own packages so RC versions in
@@ -99,14 +133,27 @@ prepare "$FROM"
 # prepared <channel> and record what would break there. The results come
 # back on stdout: the container, which runs the package's pacman hooks as
 # root, gets no writable mount of the host.
+url_encode() {
+  local LC_ALL=C str="$1" encoded="" i ch
+  for ((i = 0; i < ${#str}; i++)); do
+    ch=${str:i:1}
+    case "$ch" in
+      [A-Za-z0-9._~-]) encoded+="$ch" ;;
+      *) printf -v ch '%%%02X' "'$ch"; encoded+="$ch" ;;
+    esac
+  done
+  printf '%s' "$encoded"
+}
+
 inspect() {
-  local out=$results/$1 channel=$2
+  local out=$results/pkg/$1 channel=$2 encoded_file
   if [[ $channel == edge && $FROM != edge ]]; then
+    encoded_file=$(url_encode "${file_of[$1]}")
     # shellcheck disable=SC2016 # $1 and $2 expand in the container's shell
     "$CONTAINER_ENGINE" run --rm --user root "$platform" -e PROMOTION=1 \
       -v "$BUILD_ROOT/helpers:/helpers:ro" "$tag-$channel" \
-      bash -c 'curl -fsSL --retry 3 -o "/tmp/$1" "$2" >&2 && /helpers/fast-ring-check.sh check /tmp/results "/tmp/$1" >&2 && cat /tmp/results' \
-      _ "${file_of[$1]}" "https://pkgs.omarchy.org/$FROM/$ARCH/${file_of[$1]}" > "$out/$channel" 2> "$out/$channel.log"
+      bash -c 'curl -fsSL --retry 3 -o "/tmp/$1" "$2" >&2 && curl -fsSL --retry 3 -o "/tmp/$1.sig" "$2.sig" >&2 && pacman-key --verify "/tmp/$1.sig" "/tmp/$1" >&2 && /helpers/fast-ring-check.sh check /tmp/results "/tmp/$1" >&2 && cat /tmp/results' \
+      _ "${file_of[$1]}" "https://pkgs.omarchy.org/$FROM/$ARCH/$encoded_file" > "$out/$channel" 2> "$out/$channel.log"
     return
   fi
   # shellcheck disable=SC2016 # $1 expands in the container's shell
@@ -120,7 +167,7 @@ inspect() {
 # when there is a link problem for them to excuse. The baseline is what
 # both of them show. "done" marks a check that ran to the end.
 check_package() {
-  local out=$results/$1
+  local out=$results/pkg/$1
   mkdir -p "$out"
   inspect "$1" "$TO" || return 0
   : > "$out/baseline"
@@ -147,16 +194,16 @@ wait
 
 failed=0
 for name in "${names[@]}"; do
-  if [[ ! -f $results/$name/done ]]; then
+  if [[ ! -f $results/pkg/$name/done ]]; then
     print_error "$name: the check itself failed on $ARCH"
-    tail -n 20 "$results/$name"/*.log 2>/dev/null >&2 || true
+    tail -n 20 "$results/pkg/$name"/*.log 2>/dev/null >&2 || true
     failed=1
-  elif [[ -s $results/$name/failures ]]; then
+  elif [[ -s $results/pkg/$name/failures ]]; then
     print_error "$name does not run on $TO ($ARCH):"
-    awk -F'\t' '{ printf "  %s: %s\n", $2, $3 }' "$results/$name/failures"
+    awk -F'\t' '{ printf "  %s: %s\n", $2, $3 }' "$results/pkg/$name/failures"
     # pacman's own words when it would not install the package.
-    if grep -q '^rule' "$results/$name/failures"; then
-      { grep -E '^(error|warning|:: )' "$results/$name/$TO.log" || true; } | tail -n 8 | sed 's/^/    | /'
+    if grep -q '^rule' "$results/pkg/$name/failures"; then
+      { grep -E '^(error|warning|:: )' "$results/pkg/$name/$TO.log" || true; } | tail -n 8 | sed 's/^/    | /'
     fi
     failed=1
   fi

@@ -89,6 +89,7 @@ def build_test_list():
         ("upstream-github-netrc", ["./tests/upstream-github-netrc.sh"], {}),
         ("omarchy-release self-test", ["./bin/omarchy-release", "self-test"], {}),
         ("fast-ring-check", ["./tests/fast-ring-check.sh"], {}),
+        ("check-promotion", ["./tests/check-promotion.sh"], {}),
         ("check-shadowed", ["./tests/check-shadowed.sh"], {}),
         ("workflow-helpers-sourced", ["python", "tests/workflow-helpers-sourced.py"], {}),
         ("owe-package-restart", ["python", "tests/owe-package-restart.py"], {}),
