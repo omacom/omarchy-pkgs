@@ -94,7 +94,7 @@ current_pkgrel=$(grep -m1 '^pkgrel=' PKGBUILD | cut -d= -f2- | tr -d "\"'")
 
 if [[ "${versions[0]}" == "$current_pkgver" ]]; then
   read -r current_x86_64 current_aarch64 < <(
-    bash -c 'source "$1" >/dev/null 2>&1 && printf "%s %s\n" "${sha256sums_x86_64[0]:-}" "${sha256sums_aarch64[0]:-}"' _ PKGBUILD
+    bash -c 'source "$1" >/dev/null 2>&1 && printf "%s %s\n" "${sha256sums_x86_64[0]:-}" "${sha256sums_aarch64[0]:-}"' _ ./PKGBUILD
   )
   declare -A current_commits=(
     [x86_64]="$current_x86_64"
