@@ -80,6 +80,7 @@ def build_test_list():
         ("ipu7-install", ["bash", "tests/ipu7-install.sh"], {}),
         ("settings-etc-overrides", ["./tests/settings-etc-overrides.sh"], {}),
         ("unpublish-plan", ["./tests/unpublish-plan.sh"], {}),
+        ("unpublish-packages", ["./tests/unpublish-packages.sh"], {}),
         ("build-matrix", ["./tests/build-matrix.sh"], {}),
         ("neovim-remote-clipboard", ["./tests/neovim-remote-clipboard.sh"], {}),
         ("passwordless-package-lifecycle", ["python", "tests/passwordless-package-lifecycle.py"], {}),
