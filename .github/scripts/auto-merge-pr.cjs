@@ -168,6 +168,25 @@ function prNumber(value) {
   return Number(text);
 }
 
+// Whether build-approved was removed from this PR, surviving pending-run
+// replacement when a later event superseded the unlabeled run. Fails closed
+// if the PR timeline cannot be read.
+async function approvalRevoked({ github, context, pr }) {
+  if (pr.labels.some(label => label.name === 'build-approved')) return false;
+  if (context.payload?.action === 'unlabeled' && context.payload?.label?.name === 'build-approved') return true;
+  try {
+    for (let page = 1; ; page++) {
+      const { data: events } = await github.rest.issues.listEventsForTimeline({
+        ...context.repo, issue_number: pr.number, per_page: 100, page,
+      });
+      if (events.some(event => event.event === 'unlabeled' && event.label?.name === 'build-approved')) return true;
+      if (events.length < 100) return false;
+    }
+  } catch {
+    return true;
+  }
+}
+
 // The decision for one PR as it is now, and whether to take back auto-merge.
 const COMPARE_LIMIT = 300;
 async function evaluate({ github, context, pr, vouched, wait }) {
@@ -191,10 +210,10 @@ async function evaluate({ github, context, pr, vouched, wait }) {
   const decision = decide({ pr, files, vouchStatus, repository, owners });
   const asTrusted = decide({ pr, files, vouchStatus: 'collaborator', repository, owners });
   // Removing build-approved must fail closed even if the collaborator lookup
-  // errored: build-pr.yml does not re-run on unlabeled, so an already-green
-  // PR would otherwise stay armed and merge.
-  const approvalRevoked = context.payload?.action === 'unlabeled' && context.payload?.label?.name === 'build-approved';
-  return { decision, vouchStatus, withdraw: withdraw(decision, vouchStatus, asTrusted.enable && !approvalRevoked) };
+  // errored and a newer event replaced the waiting unlabeled run: build-pr.yml
+  // does not re-run on unlabeled, so an already-green PR could still merge.
+  const keepArmed = asTrusted.enable && !(vouchStatus === 'error' && await approvalRevoked({ github, context, pr }));
+  return { decision, vouchStatus, withdraw: withdraw(decision, vouchStatus, keepArmed) };
 }
 
 // auto-merge-pr.yml: decide for the event's PR. vouched is the default

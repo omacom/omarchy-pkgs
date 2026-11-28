@@ -1081,16 +1081,22 @@ test('a transient permission error is retried and returns error instead of downg
 test('a transient permission API failure preserves collaborator auto-merge unless content or approval revocation disqualifies', async () => {
   const autoMerge = require('../.github/scripts/auto-merge-pr.cjs');
   const wait = async () => {};
-  const runCase = async ({ status, permission, files, payload = {} }) => {
+  const runCase = async ({ status, permission, files, labels = [], payload = {}, timeline = [[]], failTimeline = false }) => {
     const outputs = {};
     const pr = {
-      number: 42, state: 'open', draft: false, labels: [], user: { login: 'wes' },
+      number: 42, state: 'open', draft: false, labels, user: { login: 'wes' },
       head: { ref: 'pkg-update', sha: sha('a'), repo: { full_name: 'omacom/omarchy-pkgs' } },
       base: { ref: 'master', sha: sha('b'), repo: { default_branch: 'master' } },
       changed_files: files.length,
     };
     const github = { rest: {
       pulls: { get: async () => ({ data: pr }) },
+      issues: {
+        listEventsForTimeline: async ({ page = 1 }) => {
+          if (failTimeline) throw Object.assign(new Error('503'), { status: 503 });
+          return { data: timeline[page - 1] || [] };
+        },
+      },
       repos: {
         getCollaboratorPermissionLevel: async () => {
           if (status) throw Object.assign(new Error(String(status)), { status });
@@ -1120,6 +1126,22 @@ test('a transient permission API failure preserves collaborator auto-merge unles
   const revokedOnError = await runCase({ status: 503, files: pkgOnly, payload: revoked });
   assert.equal(revokedOnError.enable, 'false');
   assert.equal(revokedOnError.withdraw, 'true', 'fails closed when build-approved is removed during API error');
+
+  // Even when a later edited event replaced the waiting unlabeled run, the
+  // timeline still records build-approved removal (including past page 1).
+  const page1 = Array.from({ length: 100 }, () => ({ event: 'commented' }));
+  const page2 = [{ event: 'unlabeled', label: { name: 'build-approved' } }];
+  const revokedLaterRun = await runCase({ status: 503, files: pkgOnly, payload: { action: 'edited' }, timeline: [page1, page2] });
+  assert.equal(revokedLaterRun.enable, 'false');
+  assert.equal(revokedLaterRun.withdraw, 'true', 'withdraws when build-approved removal appears in PR timeline');
+
+  const timelineFailed = await runCase({ status: 503, files: pkgOnly, payload: { action: 'edited' }, failTimeline: true });
+  assert.equal(timelineFailed.enable, 'false');
+  assert.equal(timelineFailed.withdraw, 'true', 'fails closed when PR timeline lookup fails');
+
+  const stillLabelled = await runCase({ status: 503, files: pkgOnly, labels: [{ name: 'build-approved' }], failTimeline: true });
+  assert.equal(stillLabelled.enable, 'false');
+  assert.equal(stillLabelled.withdraw, 'false', 'keeps auto-merge without timeline call when build-approved is still present');
 
   const revokedOnCollab = await runCase({ permission: 'write', files: pkgOnly, payload: revoked });
   assert.equal(revokedOnCollab.enable, 'true');
