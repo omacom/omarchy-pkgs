@@ -1,0 +1,74 @@
+diff --git a/src/main.rs b/src/main.rs
+index 13b0afa..f471090 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -97,7 +97,10 @@ fn read_temp_file(temp_file: &mut std::fs::File, temp_buf: &mut String) -> Resul
+     temp.map(|t| (t / 1000) as u8)
+ }
+ 
+-fn find_temp_file(temps: glob::Paths, temp_buf: &mut String) -> Option<std::fs::File> {
++fn find_temp_file(
++    temps: impl Iterator<Item = glob::GlobResult>,
++    temp_buf: &mut String,
++) -> Option<std::fs::File> {
+     for temp_path_res in temps {
+         let Ok(temp_path) = temp_path_res else {
+             eprintln!("Unable to read glob path");
+@@ -122,9 +125,23 @@ fn find_cpu_temp_file(temp_buf: &mut String) -> Result<std::fs::File> {
+     find_temp_file(temps, temp_buf).ok_or(Error::NoCpu)
+ }
+ 
++fn is_amdgpu_sensor(temp_path: &std::path::Path) -> bool {
++    temp_path
++        .parent()
++        .and_then(|hwmon| std::fs::read_to_string(hwmon.join("name")).ok())
++        .is_some_and(|name| name.trim() == "amdgpu")
++}
++
+ fn find_gpu_temp_file(temp_buf: &mut String) -> Result<Option<std::fs::File>> {
+-    let temps = glob::glob("/sys/class/drm/card0/device/hwmon/hwmon*/temp1_input")?;
+-    Ok(find_temp_file(temps, temp_buf))
++    // The discrete GPU is not always card0: the number depends on probe order,
++    // and on a MacBookPro16,1 the Intel iGPU takes card1 and the AMD dGPU card2.
++    // Look at every card and prefer the amdgpu sensor over anything else.
++    let mut temps: Vec<PathBuf> =
++        glob::glob("/sys/class/drm/card*/device/hwmon/hwmon*/temp1_input")?
++            .filter_map(Result::ok)
++            .collect();
++    temps.sort_by_key(|path| !is_amdgpu_sensor(path));
++    Ok(find_temp_file(temps.into_iter().map(Ok), temp_buf))
+ }
+ 
+ fn main() -> ExitCode {
+@@ -152,16 +169,22 @@ fn start_temp_loop(
+     let mut was_long_sleep = false;
+     while !cancellation_token.load(std::sync::atomic::Ordering::Relaxed) {
+         let cpu_temp = read_temp_file(&mut cpu_temp_file, &mut temp_buffer)?;
+-        let temp = if let Some(gpu_temp_file) = &mut gpu_temp_file {
+-            let gpu_temp = read_temp_file(gpu_temp_file, &mut temp_buffer)?;
+-            if gpu_temp > cpu_temp {
+-                gpu_temp
+-            } else {
+-                cpu_temp
++        let mut temp = cpu_temp;
++        if let Some(file) = &mut gpu_temp_file {
++            // A discrete GPU can disappear from under us: a reset, a runtime
++            // suspend or a Thunderbolt re-enumeration all invalidate the open
++            // sensor. Losing the GPU reading must not take the daemon down,
++            // because it leaves the fans pinned at whatever speed it wrote
++            // last while the machine keeps heating. Fall back to the CPU
++            // sensor and stop looking at the GPU.
++            match read_temp_file(file, &mut temp_buffer) {
++                Ok(gpu_temp) => temp = temp.max(gpu_temp),
++                Err(err) => {
++                    eprintln!("GPU temperature unreadable ({err}), using the CPU sensor alone");
++                    gpu_temp_file = None;
++                }
+             }
+-        } else {
+-            cpu_temp
+-        };
++        }
+ 
+         temps.push_back(temp);
+         if was_long_sleep {

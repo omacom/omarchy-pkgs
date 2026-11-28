@@ -1,0 +1,192 @@
+diff --git i/src/main.rs w/src/main.rs
+index f471090..d0c577c 100644
+--- i/src/main.rs
++++ w/src/main.rs
+@@ -86,6 +86,9 @@ fn check_pid_file() -> Result<()> {
+ }
+ 
+ fn read_temp_file(temp_file: &mut std::fs::File, temp_buf: &mut String) -> Result<u8> {
++    // A failed read or seek returns early and can leave partial data behind;
++    // start clean so that it cannot break the next sensor's parse.
++    temp_buf.clear();
+     temp_file
+         .read_to_string(temp_buf)
+         .map_err(Error::TempRead)?;
+@@ -125,25 +128,93 @@ fn find_cpu_temp_file(temp_buf: &mut String) -> Result<std::fs::File> {
+     find_temp_file(temps, temp_buf).ok_or(Error::NoCpu)
+ }
+ 
+-fn is_amdgpu_sensor(temp_path: &std::path::Path) -> bool {
+-    temp_path
+-        .parent()
+-        .and_then(|hwmon| std::fs::read_to_string(hwmon.join("name")).ok())
+-        .is_some_and(|name| name.trim() == "amdgpu")
++/// The readable temperature inputs of one GPU. For amdgpu these are the edge
++/// and junction sensors and the hottest one counts; junction is the hot spot
++/// the GPU throttles on and runs well above edge under load.
++struct GpuSensor {
++    hwmon: PathBuf,
++    files: Vec<std::fs::File>,
+ }
+ 
+-fn find_gpu_temp_file(temp_buf: &mut String) -> Result<Option<std::fs::File>> {
++impl GpuSensor {
++    fn read(&mut self, temp_buf: &mut String) -> Result<u8> {
++        let mut max = 0;
++        for file in &mut self.files {
++            max = max.max(read_temp_file(file, temp_buf)?);
++        }
++        Ok(max)
++    }
++}
++
++fn hwmon_name(hwmon: &std::path::Path) -> Option<String> {
++    std::fs::read_to_string(hwmon.join("name"))
++        .ok()
++        .map(|name| name.trim().to_owned())
++}
++
++fn open_gpu_sensor(hwmon: PathBuf, temp_buf: &mut String) -> Option<GpuSensor> {
++    let is_amdgpu = hwmon_name(&hwmon).as_deref() == Some("amdgpu");
++    let inputs: Vec<PathBuf> = if is_amdgpu {
++        glob::glob(&format!("{}/temp*_input", hwmon.display()))
++            .ok()?
++            .filter_map(Result::ok)
++            .filter(|input| {
++                let label = input.with_file_name(
++                    input
++                        .file_name()
++                        .and_then(|n| n.to_str())
++                        .unwrap_or_default()
++                        .replace("_input", "_label"),
++                );
++                std::fs::read_to_string(label)
++                    .is_ok_and(|l| matches!(l.trim(), "edge" | "junction"))
++            })
++            .collect()
++    } else {
++        vec![hwmon.join("temp1_input")]
++    };
++
++    let mut files = Vec::new();
++    for input in inputs {
++        let Ok(mut file) = std::fs::File::open(&input) else {
++            continue;
++        };
++        if read_temp_file(&mut file, temp_buf).is_ok() {
++            files.push(file);
++        }
++    }
++
++    (!files.is_empty()).then_some(GpuSensor { hwmon, files })
++}
++
++fn find_gpu_sensor(temp_buf: &mut String) -> Option<GpuSensor> {
+     // The discrete GPU is not always card0: the number depends on probe order,
+     // and on a MacBookPro16,1 the Intel iGPU takes card1 and the AMD dGPU card2.
+     // Look at every card and prefer the amdgpu sensor over anything else.
+-    let mut temps: Vec<PathBuf> =
+-        glob::glob("/sys/class/drm/card*/device/hwmon/hwmon*/temp1_input")?
+-            .filter_map(Result::ok)
+-            .collect();
+-    temps.sort_by_key(|path| !is_amdgpu_sensor(path));
+-    Ok(find_temp_file(temps.into_iter().map(Ok), temp_buf))
++    let mut hwmons: Vec<PathBuf> = glob::glob("/sys/class/drm/card*/device/hwmon/hwmon*")
++        .ok()?
++        .filter_map(Result::ok)
++        .filter_map(|p| p.canonicalize().ok())
++        .collect();
++    hwmons.sort();
++    hwmons.dedup();
++    hwmons.sort_by_key(|hwmon| hwmon_name(hwmon).as_deref() != Some("amdgpu"));
++    hwmons
++        .into_iter()
++        .find_map(|hwmon| open_gpu_sensor(hwmon, temp_buf))
+ }
+ 
++fn log_gpu_sensor(sensor: &GpuSensor) {
++    println!(
++        "Following GPU temperature: {} ({} sensor(s))",
++        sensor.hwmon.display(),
++        sensor.files.len()
++    );
++}
++
++/// How often to look for the GPU sensor again after losing it or not finding it.
++const GPU_RESCAN: std::time::Duration = std::time::Duration::from_secs(5);
++
+ fn main() -> ExitCode {
+     match real_main() {
+         Ok(()) => ExitCode::SUCCESS,
+@@ -157,7 +228,7 @@ fn main() -> ExitCode {
+ fn start_temp_loop(
+     mut temp_buffer: String,
+     mut cpu_temp_file: std::fs::File,
+-    mut gpu_temp_file: Option<std::fs::File>,
++    mut gpu_sensor: Option<GpuSensor>,
+     fans: &NonEmptyVec<FanController>,
+ ) -> Result<()> {
+     let cancellation_token = Arc::new(AtomicBool::new(false));
+@@ -167,21 +238,31 @@ fn start_temp_loop(
+     let mut last_temp = 0;
+     let mut temps = ArrayDeque::<u8, 50, arraydeque::Wrapping>::new();
+     let mut was_long_sleep = false;
++    let mut last_gpu_scan = std::time::Instant::now();
+     while !cancellation_token.load(std::sync::atomic::Ordering::Relaxed) {
+         let cpu_temp = read_temp_file(&mut cpu_temp_file, &mut temp_buffer)?;
+         let mut temp = cpu_temp;
+-        if let Some(file) = &mut gpu_temp_file {
+-            // A discrete GPU can disappear from under us: a reset, a runtime
+-            // suspend or a Thunderbolt re-enumeration all invalidate the open
+-            // sensor. Losing the GPU reading must not take the daemon down,
+-            // because it leaves the fans pinned at whatever speed it wrote
+-            // last while the machine keeps heating. Fall back to the CPU
+-            // sensor and stop looking at the GPU.
+-            match read_temp_file(file, &mut temp_buffer) {
++
++        // A discrete GPU can disappear from under us: a reset, a runtime
++        // suspend or a Thunderbolt re-enumeration all invalidate the open
++        // sensor. Losing the GPU reading should not stop the daemon, which
++        // would hand the fans back to the firmware until systemd restarts
++        // it. Use the CPU sensor alone until the GPU sensor can be found
++        // again.
++        if gpu_sensor.is_none() && last_gpu_scan.elapsed() >= GPU_RESCAN {
++            last_gpu_scan = std::time::Instant::now();
++            gpu_sensor = find_gpu_sensor(&mut temp_buffer);
++            if let Some(sensor) = &gpu_sensor {
++                log_gpu_sensor(sensor);
++            }
++        }
++        if let Some(sensor) = &mut gpu_sensor {
++            match sensor.read(&mut temp_buffer) {
+                 Ok(gpu_temp) => temp = temp.max(gpu_temp),
+                 Err(err) => {
+-                    eprintln!("GPU temperature unreadable ({err}), using the CPU sensor alone");
+-                    gpu_temp_file = None;
++                    println!("GPU temperature unreadable ({err}), using the CPU sensor until it returns");
++                    gpu_sensor = None;
++                    last_gpu_scan = std::time::Instant::now();
+                 }
+             }
+         }
+@@ -225,14 +306,18 @@ fn real_main() -> Result<()> {
+     let fan_paths = find_fan_paths()?;
+     let fans = load_fan_configs(fan_paths)?;
+     let cpu_temp_file = find_cpu_temp_file(&mut temp_buffer)?;
+-    let gpu_temp_file = find_gpu_temp_file(&mut temp_buffer)?;
++    let gpu_sensor = find_gpu_sensor(&mut temp_buffer);
++    match &gpu_sensor {
++        Some(sensor) => log_gpu_sensor(sensor),
++        None => println!("No GPU temperature sensor yet, using the CPU sensor"),
++    }
+ 
+     println!();
+     for fan in &fans {
+         fan.set_manual(true)?;
+     }
+ 
+-    let res = start_temp_loop(temp_buffer, cpu_temp_file, gpu_temp_file, &fans);
++    let res = start_temp_loop(temp_buffer, cpu_temp_file, gpu_sensor, &fans);
+     println!("T2 Fan Daemon is shutting down...");
+     for fan in fans {
+         fan.set_manual(false)?;
