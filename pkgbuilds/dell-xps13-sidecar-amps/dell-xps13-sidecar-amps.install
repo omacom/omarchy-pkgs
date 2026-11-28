@@ -1,4 +1,92 @@
 _apply_command="/usr/bin/dell-xps13-sidecar-amps-apply"
+_systemd_runtime_dir="/run/systemd/system"
+_etc_mkinitcpio_hook="/etc/pacman.d/hooks/90-mkinitcpio-install.hook"
+_usr_mkinitcpio_hook="/usr/share/libalpm/hooks/90-mkinitcpio-install.hook"
+
+_in_chroot() {
+  if command -v systemd-detect-virt >/dev/null 2>&1 && systemd-detect-virt -r >/dev/null 2>&1; then
+    return 0
+  fi
+  if command -v ischroot >/dev/null 2>&1 && ischroot >/dev/null 2>&1; then
+    return 0
+  fi
+  return 1
+}
+
+_systemd_runtime_available() {
+  ! _in_chroot && [ -d "$_systemd_runtime_dir" ]
+}
+
+_hook_is_masked() {
+  local hook=$1
+  if [ -L "$hook" ]; then
+    case "$(readlink -f "$hook" 2>/dev/null)" in
+      /dev/null) return 0 ;;
+    esac
+  fi
+  [ -e "$hook" ] && [ ! -s "$hook" ]
+}
+
+_hook_watches_modprobe() {
+  local hook=$1 op=$2
+  [ -r "$hook" ] || return 1
+  awk -v want_op="$op" '
+    function flush_trigger() {
+      if (section == "Trigger" && type_path && op_ok && target_ok && !negated) {
+        trigger_matched = 1
+      }
+      type_path = 0; op_ok = 0; target_ok = 0; negated = 0
+    }
+    /^[[:space:]]*#/ || /^[[:space:]]*$/ { next }
+    /^[[:space:]]*\[.*\][[:space:]]*$/ {
+      flush_trigger()
+      line = $0
+      gsub(/^[[:space:]]*\[|\][[:space:]]*$/, "", line)
+      section = line
+      next
+    }
+    section == "Trigger" {
+      if ($0 ~ /^[[:space:]]*Type[[:space:]]*=[[:space:]]*Path[[:space:]]*$/) type_path = 1
+      if ($0 ~ "^[[:space:]]*Operation[[:space:]]*=[[:space:]]*" want_op "[[:space:]]*$") op_ok = 1
+      if ($0 ~ /^[[:space:]]*Target[[:space:]]*=[[:space:]]*usr\/lib\/modprobe\.d\/(\*)?[[:space:]]*$/) target_ok = 1
+      if ($0 ~ /^[[:space:]]*Target[[:space:]]*=[[:space:]]*!/) negated = 1
+    }
+    section == "Action" {
+      if ($0 ~ /^[[:space:]]*When[[:space:]]*=[[:space:]]*PostTransaction[[:space:]]*$/) post_action = 1
+      if ($0 ~ /^[[:space:]]*Exec[[:space:]]*=[[:space:]]*(\/usr\/share\/libalpm\/scripts\/(mkinitcpio[[:space:]]+install|limine-mkinitcpio-install)|(\/usr\/bin\/)?omarchy-boot-rebuild[[:space:]]+--pacman-install)[[:space:]]*$/) has_rebuilder = 1
+    }
+    END {
+      flush_trigger()
+      exit((trigger_matched && post_action && has_rebuilder) ? 0 : 1)
+    }
+  ' "$hook"
+}
+
+_should_rebuild_boot_images() {
+  local op=$1
+
+  if ! _systemd_runtime_available; then
+    printf ':: Skipping boot-image rebuild in chroot/offline environment; rebuild boot images before rebooting.\n'
+    return 1
+  fi
+
+  if [ -L "$_etc_mkinitcpio_hook" ] || [ -e "$_etc_mkinitcpio_hook" ]; then
+    if _hook_is_masked "$_etc_mkinitcpio_hook"; then
+      printf ':: Skipping boot-image rebuild because %s is masked; rebuild boot images before rebooting.\n' "$_etc_mkinitcpio_hook"
+      return 1
+    fi
+    if _hook_watches_modprobe "$_etc_mkinitcpio_hook" "$op"; then
+      return 1
+    fi
+    return 0
+  fi
+
+  if [ -f "$_usr_mkinitcpio_hook" ] && _hook_watches_modprobe "$_usr_mkinitcpio_hook" "$op"; then
+    return 1
+  fi
+
+  return 0
+}
 
 _rebuild_boot_images() {
   local output status
@@ -20,17 +108,27 @@ _rebuild_boot_images() {
   fi
 }
 
+_apply_and_notify() {
+  local op=$1 msg=$2
+  if _should_rebuild_boot_images "$op"; then
+    "$_apply_command" || return
+  else
+    "$_apply_command" --no-rebuild || return
+  fi
+  printf '%s\n' "$msg"
+}
+
 post_install() {
-  "$_apply_command" || return
-  printf ':: Reboot to enable the Dell XPS 13 sidecar speaker amplifiers.\n'
+  _apply_and_notify Install ":: Reboot to enable the Dell XPS 13 sidecar speaker amplifiers."
 }
 
 post_upgrade() {
-  "$_apply_command" || return
-  printf ':: Reboot to apply the Dell XPS 13 sidecar amplifier update.\n'
+  _apply_and_notify Upgrade ":: Reboot to apply the Dell XPS 13 sidecar amplifier update."
 }
 
 post_remove() {
-  _rebuild_boot_images || return
+  if _should_rebuild_boot_images Remove; then
+    _rebuild_boot_images || return
+  fi
   printf ':: Reboot to finish removing the Dell XPS 13 sidecar amplifier workaround.\n'
 }
