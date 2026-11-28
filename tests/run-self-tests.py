@@ -66,6 +66,7 @@ def build_test_list():
         ("package-metadata", ["./tests/package-metadata.sh"], {}),
         ("settings-boot-config", ["./tests/settings-boot-config.sh"], {}),
         ("controller", ["./tests/controller.sh"], {}),
+        ("controller-box", ["python", "tests/controller-box.py"], {}),
         ("dispatch-on-mirror-sync", ["./tests/dispatch-on-mirror-sync.sh"], {}),
         ("pkgname-unique", ["./tests/pkgname-unique.sh"], {}),
         ("limine-mkinitcpio-hook", ["./tests/limine-mkinitcpio-hook.sh"], {}),

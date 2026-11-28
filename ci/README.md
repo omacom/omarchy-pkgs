@@ -89,7 +89,7 @@ Edit `/etc/omarchy-controller.env` on the box. The next tick reads it.
 | `REGIONS` | empty | Regions to try first; empty means any |
 | `MAX_AGE_MINUTES` | 265 | Delete a droplet older than this. Must exceed the longest builder job `timeout-minutes` plus `MAX_BOOT_MINUTES` and teardown headroom; on existing controller boxes seeded with `200` in `/etc/omarchy-controller.env`, raise it to `265` first or remove the line after the controller pulls the new default |
 | `MAX_BOOT_MINUTES` | 10 | Delete a droplet still provisioning after this |
-| `DO_SSH_KEYS` | Ryan, DHH and Emir's account key IDs | Attached to every builder. Without one, DigitalOcean emails a root password per builder |
+| `DO_SSH_KEYS` | Ryan, DHH and Emir's account key IDs (overridden when `DO_SSH_KEYS` is passed to `create.sh`) | Attached to every builder. Without one, DigitalOcean emails a root password per builder |
 
 ### Change the controller
 
@@ -148,7 +148,7 @@ The controller reaps on its own. To do it manually, delete droplets tagged
 
 ```bash
 DIGITALOCEAN_TOKEN=<account that pays for builders> GITHUB_TOKEN=<fine-grained PAT> \
-  REPO=omacom/omarchy-pkgs ci/controller-box/create.sh
+  DO_SSH_KEYS='[<account ssh key id>]' REPO=omacom/omarchy-pkgs ci/controller-box/create.sh
 ```
 
 - The GitHub PAT is fine-grained and scoped to this repository: Actions read
@@ -157,6 +157,18 @@ DIGITALOCEAN_TOKEN=<account that pays for builders> GITHUB_TOKEN=<fine-grained P
 - The DigitalOcean token is written into the box's env file, so it is the
   account that pays. It needs ssh_key:read to attach `DO_SSH_KEYS`; without
   it every create is refused with 403.
+- `DO_SSH_KEYS` is required (unless it is unset and `SSH_KEYS` is set) and
+  must be a non-empty JSON array of positive integer SSH key IDs or literal
+  colon-separated MD5 fingerprints registered with the DigitalOcean account
+  (list them with `doctl compute ssh-key list`). By default it attaches to
+  both the controller droplet (granting root SSH access) and every builder
+  via `/etc/omarchy-controller.env`. To use a separate key list for the
+  controller droplet, pass `SSH_KEYS` alongside `DO_SSH_KEYS`; if
+  `DO_SSH_KEYS` is unset, `SSH_KEYS` sets only the controller droplet keys
+  and keeps the example `DO_SSH_KEYS` defaults in `/etc/omarchy-controller.env`.
+  An exported empty `DO_SSH_KEYS=` or `SSH_KEYS=` still counts as set and
+  fails validation.
 - `ADMIN_GITHUB_USERS` names whose GitHub SSH keys get root on the box and
-  the builders. Set it; the default is a fixed list in `create.sh`.
+  the builders. Set it; the default is a fixed list in `create.sh`. Every
+  listed user must have at least one GitHub SSH key.
 - The script refuses to create a second controller.
