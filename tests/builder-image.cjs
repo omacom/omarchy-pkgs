@@ -1,6 +1,6 @@
 const assert = require('node:assert/strict');
 const { spawnSync } = require('node:child_process');
-const { chmodSync, cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, utimesSync, writeFileSync } = require('node:fs');
+const { chmodSync, cpSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } = require('node:fs');
 const { tmpdir } = require('node:os');
 const { join } = require('node:path');
 const { test } = require('node:test');
@@ -142,5 +142,106 @@ test('a private image or failed push never replaces the previous compatible-imag
     const result = publish(f, extraEnv);
     assert.notEqual(result.status, 0);
     assert.equal(f.calls().some(args => args[0] === 'push' && args[1] === `ghcr.io/omacom/omarchy-pkg-builder:${key}`), false);
+  }
+});
+
+const KNOWN_SIG_TOKENS = new Set([
+  'Required', 'PackageRequired', 'Optional', 'PackageOptional', 'Never', 'PackageNever',
+  'TrustedOnly', 'PackageTrustedOnly', 'TrustAll', 'PackageTrustAll',
+  'DatabaseRequired', 'DatabaseOptional', 'DatabaseNever', 'DatabaseTrustedOnly', 'DatabaseTrustAll',
+]);
+
+function isStrictPackageSigLevel(value) {
+  let required = false;
+  let trustAll = false;
+  for (const tok of value.trim().split(/\s+/).filter(Boolean)) {
+    if (!KNOWN_SIG_TOKENS.has(tok)) return false;
+    if (tok === 'Required' || tok === 'PackageRequired') required = true;
+    else if (tok === 'Optional' || tok === 'PackageOptional' || tok === 'Never' || tok === 'PackageNever') required = false;
+    if (tok === 'TrustAll' || tok === 'PackageTrustAll') trustAll = true;
+    else if (tok === 'TrustedOnly' || tok === 'PackageTrustedOnly') trustAll = false;
+  }
+  return required && !trustAll;
+}
+
+function parsePacmanSigLevels(text) {
+  const logical = [];
+  for (const [idx, raw] of text.split('\n').entries()) {
+    if (/^\s*#/.test(raw)) continue;
+    for (const part of raw.split('\\n')) logical.push({ line: idx + 1, text: part });
+  }
+  const entries = [];
+  let section = null;
+  for (let i = 0; i < logical.length; i++) {
+    const sec = logical[i].text.match(/\[([A-Za-z0-9._-]+)\]\s*(?:#.*)?$/);
+    if (sec) { section = sec[1]; continue; }
+    const sig = logical[i].text.match(/(?<![A-Za-z0-9_])SigLevel\s*=\s*([^\n'"\\;#]+)/i);
+    if (!sig) continue;
+    const servers = [];
+    for (const dir of [-1, 1]) {
+      for (let j = i + dir; j >= 0 && j < logical.length; j += dir) {
+        const line = logical[j].text.trim();
+        if (!line) continue;
+        if (!/^[A-Za-z]+\s*=/.test(line)) break;
+        const srv = line.match(/^(?:Server|CacheServer|Include)\s*=\s*([^\s'"\\;#]+)/);
+        if (srv) servers.push(srv[1]);
+      }
+    }
+    entries.push({ line: logical[i].line, section, value: sig[1].trim(), servers });
+  }
+  return entries;
+}
+
+function findWeakSigLevels(text, { allowFileRepos = false } = {}) {
+  return parsePacmanSigLevels(text)
+    .filter(e => !isStrictPackageSigLevel(e.value))
+    .filter(e => !(allowFileRepos && e.servers.length > 0 && e.servers.every(u => u.startsWith('file://'))))
+    .map(e => `line ${e.line} ([${e.section || 'unknown'}]): SigLevel = ${e.value}`);
+}
+
+test('SigLevel policy rejects Optional, Never, TrustAll, and overrides on remote repos', () => {
+  for (const ok of ['Required DatabaseOptional', 'Required', 'PackageRequired DatabaseOptional']) {
+    assert.equal(isStrictPackageSigLevel(ok), true, ok);
+  }
+  for (const weak of [
+    'Optional', 'Never', 'TrustAll', 'Optional TrustAll', 'Required TrustAll',
+    'Required PackageOptional', 'Required PackageNever', 'Required PackageTrustAll',
+    'Required DatabaseOptional Optional', '$SIGLEVEL',
+  ]) {
+    assert.equal(isStrictPackageSigLevel(weak), false, weak);
+  }
+
+  const remoteWeak = "printf '\\n[omarchy]\\nSigLevel = Optional\\nServer = https://pkgs.omarchy.org/%s/x86_64\\n'";
+  assert.equal(findWeakSigLevels(remoteWeak).length, 1);
+  assert.equal(findWeakSigLevels(remoteWeak, { allowFileRepos: true }).length, 1);
+
+  const localUnsigned = 'sed -i "/^\\[core\\]$/i [omarchy-build]\\nSigLevel = Never\\nServer = file://$BUILD_OUTPUT_DIR\\n"';
+  assert.equal(findWeakSigLevels(localUnsigned).length, 1);
+  assert.equal(findWeakSigLevels(localUnsigned, { allowFileRepos: true }).length, 0);
+
+  const mixed = "[omarchy]\nSigLevel = Optional\nServer = file:///local\n\nServer = https://pkgs.omarchy.org/edge/x86_64\n";
+  assert.equal(findWeakSigLevels(mixed, { allowFileRepos: true }).length, 1);
+
+  const cacheRemote = "[omarchy]\nSigLevel = Never\nServer = file:///local\nCacheServer = https://pkgs.omarchy.org/edge/x86_64\n";
+  assert.equal(findWeakSigLevels(cacheRemote, { allowFileRepos: true }).length, 1);
+
+  const includeMirror = "[omarchy]\nSigLevel = Never\nServer = file:///local\nInclude = /etc/pacman.d/mirrorlist\n";
+  assert.equal(findWeakSigLevels(includeMirror, { allowFileRepos: true }).length, 1);
+});
+
+test('build/Dockerfile and build/ scripts enforce strict package SigLevel for remote repos', () => {
+  const buildDir = join(root, 'build');
+  const dockerfile = readFileSync(join(buildDir, 'Dockerfile'), 'utf8');
+  const omarchyLine = dockerfile.split('\n').find(l => l.includes('[omarchy]') && l.includes('>> /etc/pacman.conf'));
+  assert.ok(omarchyLine, 'build/Dockerfile must append [omarchy] to /etc/pacman.conf');
+  const omarchy = parsePacmanSigLevels(omarchyLine).find(e => e.section === 'omarchy');
+  assert.equal(omarchy && omarchy.value, 'Required DatabaseOptional',
+    `build/Dockerfile [omarchy] must set SigLevel = Required DatabaseOptional, got: ${omarchy && omarchy.value}`);
+
+  for (const name of readdirSync(buildDir, { recursive: true }).sort()) {
+    const fullPath = join(buildDir, name);
+    if (!statSync(fullPath).isFile()) continue;
+    const problems = findWeakSigLevels(readFileSync(fullPath, 'utf8'), { allowFileRepos: name !== 'Dockerfile' });
+    assert.deepEqual(problems, [], `build/${name} has weak SigLevel for a non-file:// repo:\n  ${problems.join('\n  ')}`);
   }
 });

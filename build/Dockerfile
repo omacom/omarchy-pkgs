@@ -131,7 +131,7 @@ RUN export GNUPGHOME="$(mktemp -d)" && \
     pacman-key --add /tmp/omarchy.gpg && \
     rm -rf "${GNUPGHOME}" /tmp/omarchy.gpg && \
     pacman-key --lsign-key "${OMARCHY_KEY}" && \
-    printf '\n[omarchy]\nSigLevel = Optional\nServer = https://pkgs.omarchy.org/%s/x86_64\n' "${MIRROR}" >> /etc/pacman.conf && \
+    printf '\n[omarchy]\nSigLevel = Required DatabaseOptional\nServer = https://pkgs.omarchy.org/%s/x86_64\n' "${MIRROR}" >> /etc/pacman.conf && \
     pacman -Sy --noconfirm && \
     pacman -S --noconfirm omarchy-keyring && \
     pacman-key --populate omarchy && \
