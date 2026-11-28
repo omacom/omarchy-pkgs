@@ -129,9 +129,15 @@ EOF
   # Compilers write their temporaries to /tmp, so it lives in memory rather
   # than on the builder's disk, and configure scripts must still be able to run
   # the test programs they build there.
+  mkdir -p "$ws/build-output/stable/$TEST_ARCH"
+  echo sentinel > "$ws/build-output/stable/$TEST_ARCH/sentinel"
   fixture "$ws" scratch ''
   cat >> "$ws/pkgbuilds/scratch/PKGBUILD" <<'EOF'
 check() {
+  # Only the active mirror/arch output dir is mounted, and shared plan files are read-only.
+  if [[ -e "/build-output/stable/$CARCH/sentinel" ]]; then return 1; fi
+  if (echo tampered >> /build-plan/packages) 2>/dev/null; then return 1; fi
+  if (echo tampered >> /build-plan/dependencies) 2>/dev/null; then return 1; fi
   # The filesystem type and superblock options of a tmpfs mounted at $1 in
   # its own right. A bind mount of a host directory that happens to sit on
   # tmpfs has that directory, not /, as its root, so it prints nothing.
@@ -174,6 +180,44 @@ EOF
     exit 1
   fi
   printf 'PASS: empty plans finish without starting a package build\n'
+
+  # A failed package build with meson-logs must persist those logs under
+  # $SRC_DIR (src/**/meson-logs/) even when /src is container-local or tmpfs,
+  # without overwriting an existing source tree or leaving staging dirs behind.
+  mkdir -p "$ws/src/meson-fail"
+  echo keep > "$ws/src/meson-fail/existing-tree-marker"
+  fixture "$ws" meson-fail ''
+  cat >> "$ws/pkgbuilds/meson-fail/PKGBUILD" <<'EOF'
+check() {
+  mkdir -p build/meson-logs
+  printf 'assertion failed: expected 1\n' > build/meson-logs/testlog.txt
+  return 1
+}
+EOF
+  local meson_status=0
+  run_build "$ws" meson-fail > "$ws/meson-fail.log" 2>&1 || meson_status=$?
+  if (( meson_status != 2 )); then
+    cat "$ws/meson-fail.log"
+    echo "FAIL: expected completed failure (2) for meson-fail, got $meson_status" >&2
+    exit 1
+  fi
+  local exported_log
+  if [[ "$CONTAINER_ENGINE" == "docker" ]] || (( $(awk '/^MemTotal:/ { print $2 }' /proc/meminfo 2>/dev/null || echo 0) >= 56 * 1024 * 1024 )); then
+    exported_log="$ws/src/test-logs/edge/$TEST_ARCH/meson-fail/src/build/meson-logs/testlog.txt"
+  else
+    exported_log=$(find "$ws/src" -type f -path '*/meson-logs/testlog.txt' | head -1)
+  fi
+  if [[ -z "$exported_log" || ! -f "$exported_log" ]] || ! grep -qx 'assertion failed: expected 1' "$exported_log"; then
+    cat "$ws/meson-fail.log"
+    echo "FAIL: meson test log was not persisted at $exported_log" >&2
+    exit 1
+  fi
+  [[ "$(cat "$ws/src/meson-fail/existing-tree-marker")" == keep ]]
+  if compgen -G "$ws/cache/build-plan.*" >/dev/null; then
+    echo "FAIL: build-plan staging directory was not cleaned up" >&2
+    exit 1
+  fi
+  printf 'PASS: failed package meson-logs persist under src/ without clobbering existing trees\n'
 }
 
 # Worker 2: release/dev pairs and Flea in one isolated build run.
