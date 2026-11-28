@@ -1,0 +1,385 @@
+#!/usr/bin/env bash
+#
+# omarchy-mount-drives - mount the extra drives declared in /etc/fstab.
+#
+# File managers only list volumes that are already mounted: an unmounted
+# disk has no entry in the sidebar and nothing to click. This tool mounts
+# the extra drives that /etc/fstab places under the current user's
+# /run/media directory, then reports what happened.
+#
+# Usage:
+#   omarchy-mount-drives                 Mount every drive, then show status
+#   omarchy-mount-drives status          Show status only
+#   omarchy-mount-drives list            List the drives this tool manages
+#   omarchy-mount-drives mount [NAME]    Mount one drive (or all)
+#   omarchy-mount-drives unmount [NAME]  Unmount one drive (or all)
+#   omarchy-mount-drives toggle [NAME]   Mount when unmounted, unmount when mounted
+#   omarchy-mount-drives open [NAME]     Open a drive in the file manager
+#   omarchy-mount-drives is-mounted NAME Exit 0 when the drive is mounted
+#
+# NAME matches the last part of the mount point (the drive name),
+# case-insensitively. Pass --no-notify to suppress desktop notifications.
+
+set -uo pipefail
+
+USER_NAME="$(id -un)"
+MOUNT_ROOT="/run/media/$USER_NAME"
+FSTAB="/etc/fstab"
+GLYPH_HDD=$'\uf0a0'
+GLYPH_PLUG=$'\uf1e6'
+GLYPH_OK=$'\uf00c'
+GLYPH_WARN=$'\uf071'
+
+NOTIFY=1
+
+usage() {
+  cat <<'EOF'
+Usage:
+  omarchy-mount-drives                 Mount every drive, then show status
+  omarchy-mount-drives status          Show status only
+  omarchy-mount-drives list            List the drives this tool manages
+  omarchy-mount-drives mount [NAME]    Mount one drive (or all)
+  omarchy-mount-drives unmount [NAME]  Unmount one drive (or all)
+  omarchy-mount-drives toggle [NAME]   Mount when unmounted, unmount when mounted
+  omarchy-mount-drives open [NAME]     Open a drive in the file manager
+  omarchy-mount-drives is-mounted NAME Exit 0 when the drive is mounted
+
+NAME matches the drive name (the last part of the mount point),
+case-insensitively. Pass --no-notify to suppress desktop notifications.
+EOF
+}
+
+# ---------------------------------------------------------------- helpers
+
+# Every volume fstab mounts under /run/media/$USER that can hold files.
+# Reading fstab keeps the list honest: a new disk is picked up automatically.
+# Any filesystem counts as an extra drive here; only swap and placeholder
+# entries are skipped.
+list_drives() {
+  awk -v root="$MOUNT_ROOT" '
+    /^[[:space:]]*#/ { next }
+    NF >= 4 {
+      type = $3
+      if (type == "" || type == "swap" || type == "none") next
+      if (index($2, root "/") != 1) next
+      print $1 "\t" $2 "\t" $3 "\t" $4
+    }
+  ' "$FSTAB" 2>/dev/null
+}
+
+drive_name() { basename "$1"; }
+
+# Turn an fstab source (UUID=..., LABEL=..., /dev/...) into a device path.
+# Resolved to the real device (e.g. /dev/nvme0n1p3) so the kernel's per-device
+# files (/proc/fs/ntfs3/nvme0n1p3) can be found through the UUID symlink.
+device_path() {
+  local path
+  case "$1" in
+  UUID=*) path="/dev/disk/by-uuid/${1#UUID=}" ;;
+  LABEL=*) path="/dev/disk/by-label/${1#LABEL=}" ;;
+  PARTUUID=*) path="/dev/disk/by-partuuid/${1#PARTUUID=}" ;;
+  /dev/*) path="$1" ;;
+  *) echo ""; return ;;
+  esac
+  if [[ -e $path ]]; then
+    readlink -f "$path" 2>/dev/null || echo "$path"
+  else
+    echo "$path"
+  fi
+}
+
+unit_for() { systemd-escape --path --suffix=mount "$1" 2>/dev/null; }
+
+# The ntfs3 kernel driver exposes the real (on-disk) and current dirty state.
+ntfs_dirty_state() {
+  local dev="${1##*/}"
+  local info="/proc/fs/ntfs3/$dev/volinfo"
+  local real=""
+  [[ -r $info ]] || return 0
+  real="$(sed -n '6p' "$info" 2>/dev/null)"
+  case "$real" in
+  dirty) echo "dirty" ;;
+  clean) echo "clean" ;;
+  *) echo "" ;;
+  esac
+}
+
+human() { numfmt --to=iec --suffix=B --format="%.1f" "$1" 2>/dev/null || echo "$1"; }
+
+# Ask for root the way the caller can answer: a terminal gets the sudo
+# password prompt, anything without a terminal gets the graphical polkit one.
+elevate() {
+  if [[ -t 0 || -t 1 ]]; then
+    sudo "$@"
+  else
+    pkexec "$@"
+  fi
+}
+
+# Prefer the Omarchy file manager in the running session, and fall back to
+# the default handler so the tool works outside Omarchy too.
+open_folder() {
+  local target="$1"
+  if command -v uwsm-app >/dev/null 2>&1 && command -v folio >/dev/null 2>&1; then
+    uwsm-app -- folio "$target" >/dev/null 2>&1 &
+    return 0
+  fi
+  if command -v xdg-open >/dev/null 2>&1; then
+    xdg-open "$target" >/dev/null 2>&1 &
+    return 0
+  fi
+  return 1
+}
+
+# ---------------------------------------------------------------- status
+
+print_status() {
+  local any=0
+  printf '%-16s %-9s %-10s %-9s %s\n' "DRIVE" "SIZE" "FREE" "STATE" "WHERE"
+  while IFS=$'\t' read -r source target fstype options; do
+    [[ -n ${source:-} ]] || continue
+    any=1
+    local name size free state where dev dirty
+    name="$(drive_name "$target")"
+    dev="$(device_path "$source")"
+    if mountpoint -q "$target" 2>/dev/null; then
+      size="$(df -B1 --output=size "$target" 2>/dev/null | tail -1 | tr -dc '0-9')"
+      free="$(df -B1 --output=avail "$target" 2>/dev/null | tail -1 | tr -dc '0-9')"
+      state="mounted"
+      where="$target"
+      dirty="$(ntfs_dirty_state "$dev")"
+      [[ -n $dirty ]] && state="mounted ($dirty)"
+    else
+      size="$(lsblk -bndo SIZE "$dev" 2>/dev/null)"
+      free=""
+      state="not mounted"
+      where="$target"
+      dirty=""
+    fi
+    printf '%-16s %-9s %-10s %-9s %s\n' \
+      "$name" \
+      "$([[ -n ${size:-} ]] && human "${size}" || echo "-")" \
+      "$([[ -n ${free:-} ]] && human "${free}" || echo "-")" \
+      "$state" \
+      "$where"
+  done < <(list_drives)
+  ((any)) || echo "No extra drives configured in $FSTAB."
+}
+
+# ---------------------------------------------------------------- actions
+
+# Start the fstab mount unit so the mount uses exactly the fstab options
+# (uid/gid/umask/force/...). Falls back to a plain mount when the unit has
+# not been generated yet.
+start_unit() {
+  local target="$1" source="$2" fstype="$3" options="$4" unit load_state
+  unit="$(unit_for "$target")"
+  load_state="$(systemctl show "$unit" -p LoadState --value 2>/dev/null)"
+
+  if [[ $load_state == "not-found" ]]; then
+    elevate systemctl daemon-reload >/dev/null 2>&1
+    load_state="$(systemctl show "$unit" -p LoadState --value 2>/dev/null)"
+  fi
+
+  if [[ $load_state == "loaded" ]]; then
+    if elevate systemctl start "$unit" 2>&1; then
+      return 0
+    fi
+    # Show why systemd could not mount it.
+    journalctl -u "$unit" -n 3 --no-pager 2>/dev/null | sed 's/^/    /'
+  fi
+
+  # Plain mount: the unit is missing or refused to start.
+  elevate mkdir -p "$target" 2>/dev/null
+  if elevate mount -t "$fstype" -o "$options" "$source" "$target" 2>&1; then
+    return 0
+  fi
+
+  # ntfs3 refuses a volume Windows left dirty; "force" mounts it anyway.
+  if [[ $fstype == "ntfs3" ]]; then
+    echo "    retrying with force (Windows left the volume dirty)..."
+    if elevate mount -t "$fstype" -o "$options,force" "$source" "$target" 2>&1; then
+      return 0
+    fi
+  fi
+
+  return 1
+}
+
+stop_unit() {
+  local target="$1" unit
+  unit="$(unit_for "$target")"
+  if [[ "$(systemctl show "$unit" -p LoadState --value 2>/dev/null)" == "loaded" ]] &&
+    systemctl is-active --quiet "$unit"; then
+    elevate systemctl stop "$unit" && return 0
+  fi
+  elevate umount "$target" 2>/dev/null
+}
+
+mount_one() {
+  local source="$1" target="$2" fstype="$3" options="$4" name dev
+  name="$(drive_name "$target")"
+  dev="$(device_path "$source")"
+
+  if mountpoint -q "$target" 2>/dev/null; then
+    echo "$GLYPH_OK $name is already mounted at $target"
+    return 0
+  fi
+
+  if [[ -n $dev && ! -e $dev ]]; then
+    echo "$GLYPH_WARN $name: no device found ($source) - is the disk connected?"
+    return 1
+  fi
+
+  echo "$GLYPH_PLUG mounting $name ($fstype) at $target..."
+  if start_unit "$target" "$source" "$fstype" "$options"; then
+    echo "$GLYPH_OK $name mounted at $target"
+    return 0
+  fi
+
+  echo "$GLYPH_WARN $name could not be mounted."
+  return 1
+}
+
+unmount_one() {
+  local source="$1" target="$2" fstype="$3" options="$4" name
+  name="$(drive_name "$target")"
+  if ! mountpoint -q "$target" 2>/dev/null; then
+    echo "$name is not mounted"
+    return 0
+  fi
+  if stop_unit "$target"; then
+    echo "$GLYPH_OK $name unmounted"
+    return 0
+  fi
+  echo "$GLYPH_WARN $name could not be unmounted (something is using it)."
+  return 1
+}
+
+open_one() {
+  local source="$1" target="$2" name
+  name="$(drive_name "$target")"
+  if ! mountpoint -q "$target" 2>/dev/null; then
+    echo "$GLYPH_WARN $name is not mounted - mounting it first."
+    mount_one "$source" "$target" "$3" "$4" || return 1
+  fi
+  if ! open_folder "$target"; then
+    echo "$GLYPH_WARN no file manager launcher found (need uwsm + folio or xdg-open)." >&2
+    return 1
+  fi
+  echo "$GLYPH_OK opened $name in the file manager"
+}
+
+# ---------------------------------------------------------------- driver
+
+select_drives() {
+  # Prints the fstab rows matching $1 (all when empty or "all").
+  local want="${1:-all}"
+  if [[ -z $want || ${want,,} == "all" ]]; then
+    list_drives
+    return
+  fi
+  local found=0 source target fstype options name
+  while IFS=$'\t' read -r source target fstype options; do
+    [[ -n ${source:-} ]] || continue
+    name="$(drive_name "$target")"
+    if [[ ${name,,} == "${want,,}" ]]; then
+      printf '%s\t%s\t%s\t%s\n' "$source" "$target" "$fstype" "$options"
+      found=1
+    fi
+  done < <(list_drives)
+  if ((found == 0)); then
+    echo "No drive named '$want'." >&2
+    echo "Known drives:" >&2
+    while IFS=$'\t' read -r source target fstype options; do
+      [[ -n ${source:-} ]] || continue
+      echo "  $(drive_name "$target")" >&2
+    done < <(list_drives)
+    exit 2
+  fi
+}
+
+notify() {
+  ((NOTIFY)) || return 0
+  command -v omarchy-notification-send >/dev/null 2>&1 || return 0
+  omarchy-notification-send --app-name "Drives" -g "$GLYPH_HDD" "$1" "$2" >/dev/null 2>&1
+}
+
+args=()
+for arg in "$@"; do
+  case "$arg" in
+  --no-notify) NOTIFY=0 ;;
+  *) args+=("$arg") ;;
+  esac
+done
+
+command="${args[0]:-mount}"
+case "$command" in
+-h | --help | help)
+  usage
+  exit 0
+  ;;
+esac
+
+case "$command" in
+status)
+  print_status
+  exit 0
+  ;;
+list)
+  while IFS=$'\t' read -r source target fstype options; do
+    [[ -n ${source:-} ]] || continue
+    printf '%-16s %-8s %s\n' "$(drive_name "$target")" "$fstype" "$target"
+  done < <(list_drives)
+  exit 0
+  ;;
+is-mounted)
+  name="${args[1]:-}"
+  while IFS=$'\t' read -r source target fstype options; do
+    [[ -n ${source:-} ]] || continue
+    drive="$(drive_name "$target")"
+    if [[ ${drive,,} == "${name,,}" || ${name,,} == "all" ]]; then
+      mountpoint -q "$target" 2>/dev/null && exit 0
+    fi
+  done < <(list_drives)
+  exit 1
+  ;;
+esac
+
+case "$command" in
+mount | unmount | open | toggle)
+  wanted="${args[1]:-all}"
+  ok=0
+  failed=0
+  names=()
+  while IFS=$'\t' read -r source target fstype options; do
+    [[ -n ${source:-} ]] || continue
+    case "$command" in
+    mount) mount_one "$source" "$target" "$fstype" "$options" && ok=1 || failed=1 ;;
+    unmount) unmount_one "$source" "$target" "$fstype" "$options" && ok=1 || failed=1 ;;
+    open) open_one "$source" "$target" "$fstype" "$options" && ok=1 || failed=1 ;;
+    toggle)
+      if mountpoint -q "$target" 2>/dev/null; then
+        unmount_one "$source" "$target" "$fstype" "$options" && ok=1 || failed=1
+      else
+        mount_one "$source" "$target" "$fstype" "$options" && ok=1 || failed=1
+      fi
+      ;;
+    esac
+    names+=("$(drive_name "$target")")
+  done < <(select_drives "$wanted")
+
+  echo
+  print_status
+
+  if ((ok)); then
+    notify "Drives ready" "${names[*]} - available in your file manager"
+  fi
+  ((failed)) && exit 1
+  exit 0
+  ;;
+*)
+  usage
+  exit 2
+  ;;
+esac
