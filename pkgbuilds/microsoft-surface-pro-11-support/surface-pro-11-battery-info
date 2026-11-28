@@ -1,0 +1,113 @@
+#!/usr/bin/env python3
+"""Write the Surface Pro 11 battery's cycle count where the desktop can read it.
+
+The Qualcomm battery manager (qcom-battmgr-bat) reports this battery, but its
+ADSP firmware sends no cycle count: the field is 0, and its per-property
+requests answer 0 for everything. The Surface EC keeps the count. Since Linux
+no longer registers the EC's own battery (BAT1) on this machine, this asks the
+EC for its battery information directly, the request surface_battery sends
+(ACPI _BIX layout), through /dev/surface/aggregator.
+
+Writes <out>/cycle-count (the number) and <out>/battery.json. Run by
+surface-pro-11-battery-info.service, at boot and hourly.
+
+  surface-pro-11-battery-info [--out DIR] [--bix FILE]
+
+--bix reads a saved reply instead of asking the EC (for tests).
+"""
+import argparse
+import ctypes
+import fcntl
+import json
+import os
+import struct
+import sys
+
+DEVICE = "/dev/surface/aggregator"
+# _IOWR(0xA5, 1, struct ssam_cdev_request): 40 bytes
+SSAM_CDEV_REQUEST = 0xC028A501
+FLAG_HAS_RESPONSE = 0x01
+# The main battery, as the kernel's ssam:01:02:01:01:00 node names it:
+# target category BAT, target 1, instance 1; command 2 is _BIX.
+TC_BAT, TID, CID_BIX, IID_MAIN = 0x02, 0x01, 0x02, 0x01
+BIX_LEN = 119
+UNKNOWN = 0xFFFFFFFF
+FIELDS = ("power_unit", "design_capacity", "last_full_capacity", "technology",
+          "design_voltage", "design_capacity_warning", "design_capacity_low",
+          "cycle_count")
+
+
+class Buf(ctypes.LittleEndianStructure):
+    _layout_ = "ms"
+    _pack_ = 1
+    _fields_ = [("data", ctypes.c_uint64), ("length", ctypes.c_uint16),
+                ("pad", ctypes.c_uint8 * 6)]
+
+
+class Request(ctypes.LittleEndianStructure):
+    _layout_ = "ms"
+    _pack_ = 1
+    _fields_ = [("target_category", ctypes.c_uint8), ("target_id", ctypes.c_uint8),
+                ("command_id", ctypes.c_uint8), ("instance_id", ctypes.c_uint8),
+                ("flags", ctypes.c_uint16), ("status", ctypes.c_int16),
+                ("payload", Buf), ("response", Buf)]
+
+
+def ask_ec():
+    resp = ctypes.create_string_buffer(BIX_LEN)
+    rq = Request(TC_BAT, TID, CID_BIX, IID_MAIN, FLAG_HAS_RESPONSE, 0)
+    rq.response.data = ctypes.addressof(resp)
+    rq.response.length = BIX_LEN
+    with open(DEVICE, "rb", buffering=0) as dev:
+        fcntl.ioctl(dev.fileno(), SSAM_CDEV_REQUEST, rq)
+    if rq.status:
+        raise OSError(f"the EC refused the battery information request (status {rq.status})")
+    return resp.raw[:rq.response.length]
+
+
+def parse(bix):
+    """The first fields of a _BIX reply: revision byte, then little-endian u32s."""
+    if len(bix) < 1 + 4 * len(FIELDS):
+        raise ValueError(f"battery information reply too short: {len(bix)} bytes")
+    values = struct.unpack_from(f"<{len(FIELDS)}I", bix, 1)
+    return dict(zip(FIELDS, values))
+
+
+def write(path, text):
+    tmp = f"{path}.tmp"
+    with open(tmp, "w") as f:
+        f.write(text)
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, path)
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    ap.add_argument("--out", default="/run/surface-pro-11-battery")
+    ap.add_argument("--bix", help="read a saved _BIX reply instead of asking the EC")
+    args = ap.parse_args()
+
+    try:
+        raw = open(args.bix, "rb").read() if args.bix else ask_ec()
+        info = parse(raw)
+    except (OSError, ValueError) as e:
+        sys.exit(f"surface-pro-11-battery-info: {e}")
+
+    os.makedirs(args.out, exist_ok=True)
+    count_file = os.path.join(args.out, "cycle-count")
+    cycles = info["cycle_count"]
+    if cycles == UNKNOWN:
+        # The EC does not know it: leave no number rather than a wrong one.
+        if os.path.exists(count_file):
+            os.remove(count_file)
+    else:
+        write(count_file, f"{cycles}\n")
+    # power_unit 0: capacities in mWh, voltage in mV (ACPI _BIX).
+    write(os.path.join(args.out, "battery.json"), json.dumps({
+        "cycle_count": None if cycles == UNKNOWN else cycles,
+        "design_capacity_mwh": info["design_capacity"] if info["power_unit"] == 0 else None,
+        "last_full_capacity_mwh": info["last_full_capacity"] if info["power_unit"] == 0 else None,
+    }) + "\n")
+
+
+main()
