@@ -378,30 +378,123 @@ const runNameExpression = upstreamWorkflow.match(/run-name: Sync upstream \(\$\{
 // match between Actions and JavaScript for the event fixtures below.
 const evaluate = (expression, github, inputs) => new Function('github', 'inputs', `return (${expression})`)(github, inputs);
 
+const packagesExpressionMatch = scopeStep.match(/PACKAGES: \$\{\{ (.+) \}\}/);
+
 for (const [name, event, inputs, expected] of [
-  ['manual hourly run', {}, { cadence: 'hourly' },
-    { cadence: 'hourly', lane: 'auto-merge', prefix: 'auto/track-branches', concurrency: 'track-branches' }],
-  ['manual five-minute run', {}, { cadence: 'five-minute' },
-    { cadence: 'five-minute', lane: 'five-minute', prefix: 'auto/track-branches', concurrency: 'track-branches-five-minute' }],
-  ['manual six-hourly run', {}, { cadence: 'six-hourly' },
-    { cadence: 'six-hourly', lane: 'reviewed', prefix: 'auto/sync-upstream', concurrency: 'sync-upstream' }],
+  ['manual hourly run', {}, { cadence: 'hourly', packages: '' },
+    { cadence: 'hourly', lane: 'auto-merge', prefix: 'auto/track-branches', concurrency: 'track-branches', closeSuperseded: 'true' }],
+  ['manual five-minute run', {}, { cadence: 'five-minute', packages: '' },
+    { cadence: 'five-minute', lane: 'five-minute', prefix: 'auto/sync-five-minute', concurrency: 'track-branches-five-minute', closeSuperseded: 'true' }],
+  ['manual six-hourly run', {}, { cadence: 'six-hourly', packages: '' },
+    { cadence: 'six-hourly', lane: 'reviewed', prefix: 'auto/sync-upstream', concurrency: 'sync-upstream', closeSuperseded: 'true' }],
   ['legacy manual run without a cadence', {}, {},
-    { cadence: 'six-hourly', lane: 'reviewed', prefix: 'auto/sync-upstream', concurrency: 'sync-upstream' }],
+    { cadence: 'six-hourly', lane: 'reviewed', prefix: 'auto/sync-upstream', concurrency: 'sync-upstream', closeSuperseded: 'true' }],
+  ['manual scoped hourly run', {}, { cadence: 'hourly', packages: 'perplexity' },
+    { cadence: 'hourly', lane: 'auto-merge', prefix: 'auto/track-branches', concurrency: 'track-branches', closeSuperseded: 'false' }],
+  ['manual scoped five-minute run with surrounding whitespace', {}, { cadence: 'five-minute', packages: '  omarchy-dev  ' },
+    { cadence: 'five-minute', lane: 'five-minute', prefix: 'auto/sync-five-minute', concurrency: 'track-branches-five-minute', closeSuperseded: 'false' }],
+  ['manual hourly run with whitespace-only packages', {}, { cadence: 'hourly', packages: '   ' },
+    { cadence: 'hourly', lane: 'auto-merge', prefix: 'auto/track-branches', concurrency: 'track-branches', closeSuperseded: 'true' }],
+  ['manual hourly run with carriage-return packages', {}, { cadence: 'hourly', packages: '\r' },
+    { cadence: 'hourly', lane: 'auto-merge', prefix: 'auto/track-branches', concurrency: 'track-branches', closeSuperseded: 'false' }],
 ]) {
   test(`${name} keeps its package selection, existing PR branches and concurrency`, t => {
     const f = fixture(t, 0);
     const github = { event };
     const cadence = evaluate(cadenceExpression, github, inputs);
+    assert.ok(packagesExpressionMatch, 'Select the package group must pass PACKAGES env');
+    const packages = evaluate(packagesExpressionMatch[1], github, inputs) || '';
     const outputPath = join(f.resultsPath, 'scope-output');
     execFileSync('bash', ['-e', '-c', scopeScript], {
-      env: { ...process.env, CADENCE: cadence, GITHUB_OUTPUT: outputPath },
+      env: { ...process.env, CADENCE: cadence, PACKAGES: packages, GITHUB_OUTPUT: outputPath },
     });
     const scope = Object.fromEntries(readFileSync(outputPath, 'utf8').trim().split('\n').map(line => line.split('=')));
-    assert.deepEqual(scope, { cadence: expected.cadence, lane: expected.lane, prefix: expected.prefix });
+    assert.deepEqual(scope, {
+      cadence: expected.cadence,
+      lane: expected.lane,
+      prefix: expected.prefix,
+      'close-superseded': expected.closeSuperseded,
+    });
     assert.equal(evaluate(concurrencyExpression, github, inputs), expected.concurrency);
     assert.equal(evaluate(runNameExpression, github, inputs), expected.cadence);
   });
 }
+
+test('every package-prs.yml concurrency group owns a disjoint prefix and gates close-superseded on scoped runs', t => {
+  const rebuildsWorkflow = readFileSync(join(__dirname, '../.github/workflows/sync-rebuilds.yml'), 'utf8');
+  const buildPrWorkflow = readFileSync(join(__dirname, '../.github/workflows/build-pr.yml'), 'utf8');
+  const cancelExpr = buildPrWorkflow.match(/^  cancel-in-progress: \$\{\{(.*)\}\}$/m)[1];
+  const cancels = (repo, ref) => new Function('github', 'startsWith', `return (${cancelExpr})`)(
+    { repository: 'omacom/omarchy-pkgs', head_ref: ref,
+      event: { pull_request: { head: { repo: { full_name: repo } } } } },
+    (text, prefix) => text.startsWith(prefix));
+
+  // Collect every (concurrency, prefix) pair across all package-prs.yml callers.
+  const lanes = [];
+  for (const cadence of ['five-minute', 'hourly', 'six-hourly']) {
+    const f = fixture(t, 0);
+    const outputPath = join(f.resultsPath, `scope-${cadence}`);
+    execFileSync('bash', ['-e', '-c', scopeScript], {
+      env: { ...process.env, CADENCE: cadence, PACKAGES: '', GITHUB_OUTPUT: outputPath },
+    });
+    const scope = Object.fromEntries(readFileSync(outputPath, 'utf8').trim().split('\n').map(line => line.split('=')));
+    lanes.push({
+      name: `sync-upstream (${cadence})`,
+      concurrency: evaluate(concurrencyExpression, { event: {} }, { cadence }),
+      prefix: scope.prefix,
+    });
+  }
+  const rebuildsPrefix = rebuildsWorkflow.match(/\n      prefix: (\S+)\n/)[1];
+  const rebuildsConcurrency = rebuildsWorkflow.match(/\n  group: (\S+)\n/)[1];
+  lanes.push({ name: 'sync-rebuilds', concurrency: rebuildsConcurrency, prefix: rebuildsPrefix });
+
+  // No two concurrency groups may share or overlap a branch prefix under
+  // close-superseded's `headRefName == PREFIX || startswith(PREFIX + "-")` rule.
+  for (let i = 0; i < lanes.length; i++) {
+    assert.equal(cancels('omacom/omarchy-pkgs', `${lanes[i].prefix}-sample`), false,
+      `${lanes[i].name} prefix ${lanes[i].prefix} must be exempt from build-pr cancellation`);
+    for (let j = i + 1; j < lanes.length; j++) {
+      const a = lanes[i];
+      const b = lanes[j];
+      assert.notEqual(a.concurrency, b.concurrency, `${a.name} and ${b.name} concurrency`);
+      assert.equal(a.prefix === b.prefix || a.prefix.startsWith(`${b.prefix}-`) || b.prefix.startsWith(`${a.prefix}-`), false,
+        `${a.name} (${a.prefix}) overlaps ${b.name} (${b.prefix})`);
+    }
+  }
+
+  // Both sync-upstream.yml and sync-rebuilds.yml wire close-superseded to package-prs.yml
+  // and skip package-prs.yml when a scoped run produces no updates.
+  for (const [file, wf] of [['sync-upstream.yml', upstreamWorkflow], ['sync-rebuilds.yml', rebuildsWorkflow]]) {
+    assert.match(wf, /\n      close-superseded: \$\{\{ needs\.sync\.outputs\.close-superseded == 'true' \}\}\n/, file);
+    const prsIf = wf.match(/\n  prs:\n    needs: sync\n    if: \$\{\{ (.+) \}\}\n/);
+    assert.ok(prsIf, `${file} must have prs job if expression`);
+    const jsExpr = prsIf[1].replace(/\.([a-z]+-[a-z-]+)/g, "['$1']");
+    const evalPrsIf = (groups, closeSuperseded) => new Function('cancelled', 'needs', `return (${jsExpr})`)(
+      () => false,
+      { sync: { outputs: { groups, 'close-superseded': closeSuperseded } } },
+    );
+    assert.equal(evalPrsIf('', 'true'), false, `${file}: empty groups must skip prs`);
+    assert.equal(evalPrsIf('[]', 'true'), true, `${file}: unscoped no-op run still runs close-superseded`);
+    assert.equal(evalPrsIf('[]', 'false'), false, `${file}: scoped no-op run skips prs entirely`);
+    assert.equal(evalPrsIf('[{"branch":"x","packages":"a"}]', 'false'), true, `${file}: scoped run with updates runs prs`);
+  }
+
+  // Verify sync-rebuilds.yml Group the bumps into PRs step outputs close-superseded accurately.
+  const rebuildsGroupStep = rebuildsWorkflow.match(/- name: Group the bumps into PRs[\s\S]*?(?=\n      - name: Hand the bumps)/)[0];
+  assert.match(rebuildsGroupStep, /PACKAGES: \$\{\{ inputs\.packages \}\}/);
+  const rebuildsGroupScript = rebuildsGroupStep.split('        run: |\n')[1].split('\n')
+    .map(line => line.replace(/^          /, '')).join('\n')
+    .replace('groups=$(.github/scripts/package-pr-groups.sh auto/sync-rebuilds "$RUNNER_TEMP/pins.patch")', 'groups="[]"');
+  for (const [pkgs, expectedClose] of [['', 'true'], ['   ', 'true'], ['\t', 'true'], ['\r', 'false'], ['walker', 'false'], [' a b ', 'false']]) {
+    const f = fixture(t, 0);
+    const out = join(f.resultsPath, 'rebuilds-out');
+    execFileSync('bash', ['-e', '-c', rebuildsGroupScript], {
+      env: { ...process.env, PACKAGES: pkgs, GITHUB_OUTPUT: out },
+    });
+    const parsed = Object.fromEntries(readFileSync(out, 'utf8').trim().split('\n').map(line => line.split('=')));
+    assert.equal(parsed['close-superseded'], expectedClose, `sync-rebuilds PACKAGES=${JSON.stringify(pkgs)}`);
+  }
+});
 
 test('invalid cadence fails before selecting packages or PR branches', t => {
   const f = fixture(t, 0);

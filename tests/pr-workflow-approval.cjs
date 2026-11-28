@@ -334,6 +334,7 @@ test('only same-repository sync branches queue behind an in-flight build', () =>
   assert.equal(cancels('omacom/omarchy-pkgs', 'auto/sync-upstream-ttfx'), false);
   assert.equal(cancels('omacom/omarchy-pkgs', 'auto/sync-rebuilds'), false);
   assert.equal(cancels('omacom/omarchy-pkgs', 'auto/track-branches-omarchy-dev-omarchy-settings-dev'), false);
+  assert.equal(cancels('omacom/omarchy-pkgs', 'auto/sync-five-minute-omarchy-dev-omarchy-settings-dev'), false);
   assert.equal(cancels('omacom/omarchy-pkgs', 'ttfx/fix'), true);
   assert.equal(cancels('someone/omarchy-pkgs', 'auto/sync-upstream'), true);
   assert.equal(cancels(undefined, ''), true); // workflow_dispatch
@@ -421,6 +422,8 @@ test('every bot lane opens its PRs per package through package-prs.yml', () => {
   assert.doesNotMatch(job('close-superseded'), /--limit 500/);
   assert.match(job('close-superseded'), /gh api graphql --paginate/);
   assert.match(job('close-superseded'), /git merge-tree --write-tree HEAD FETCH_HEAD/);
+  assert.match(prs, /\n      close-superseded:\n        description: .+?\n        type: boolean\n        default: true\n/);
+  assert.match(job('close-superseded'), /^    if: \$\{\{ !cancelled\(\) && inputs\.close-superseded \}\}\n/);
   assert.match(job('pr'), /^    needs: describe\n    if: \$\{\{ !cancelled\(\) && inputs\.groups != '\[\]' \}\}\n/);
   const choose = step("Choose this PR's description");
   assert.match(choose, /printf '%s\\n' "\$FALLBACK" > "\$RUNNER_TEMP\/pr-body\.md"/);
@@ -1233,6 +1236,133 @@ fi
 
     const closed = read(closedLog, 'utf8').trim().split('\n').filter(Boolean);
     assert.deepEqual(closed, ['10', '12']);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('close-superseded isolates five-minute and hourly prefixes so neither closes the other\x27s PRs', () => {
+  const { execFileSync } = require('node:child_process');
+  const { mkdtempSync, mkdirSync, writeFileSync, chmodSync, readFileSync: read, existsSync: exists, rmSync } = require('node:fs');
+  const { tmpdir } = require('node:os');
+  const prs = read(join(__dirname, '../.github/workflows/package-prs.yml'), 'utf8');
+  const stepStart = prs.indexOf('- name: Close superseded PRs\n');
+  assert.ok(stepStart > 0);
+  const runMarker = '        run: |\n';
+  const runStart = prs.indexOf(runMarker, stepStart);
+  assert.ok(runStart > 0);
+  const script = prs.slice(runStart + runMarker.length)
+    .split('\n')
+    .map(l => l.startsWith('          ') ? l.slice(10) : l)
+    .join('\n');
+
+  const root = mkdtempSync(join(tmpdir(), 'close-superseded-scope-'));
+  try {
+    const remote = join(root, 'remote.git');
+    const work = join(root, 'work');
+    const bin = join(root, 'bin');
+    mkdirSync(bin);
+    const git = (cwd, args) => execFileSync('git', args, {
+      cwd,
+      encoding: 'utf8',
+      env: { ...process.env, GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@t', GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@t' },
+    }).trim();
+
+    git(root, ['init', '--bare', '-b', 'master', remote]);
+    git(root, ['clone', remote, work]);
+    writeFileSync(join(work, 'dev.txt'), 'v1\n');
+    writeFileSync(join(work, 'hourly.txt'), 'v1\n');
+    git(work, ['add', '.']);
+    git(work, ['commit', '-m', 'base']);
+    git(work, ['push', 'origin', 'master']);
+
+    const makeBranch = (name, file, content) => {
+      git(work, ['checkout', '-b', name, 'origin/master']);
+      writeFileSync(join(work, file), content);
+      git(work, ['add', file]);
+      git(work, ['commit', '-m', name]);
+      const sha = git(work, ['rev-parse', 'HEAD']);
+      git(work, ['push', 'origin', name]);
+      return sha;
+    };
+
+    const shaFiveMinConflict = makeBranch('auto/sync-five-minute-omarchy-dev-omarchy-settings-dev', 'dev.txt', 'pr-v2\n');
+    const shaLegacyFiveMinLanded = makeBranch('auto/track-branches-omarchy-dev-omarchy-settings-dev', 'dev.txt', 'master-v2\n');
+    const shaLegacyFiveMinPending = makeBranch('auto/track-branches-legacy-pending', 'pending.txt', 'pending-v1\n');
+    const shaHourlyConflict = makeBranch('auto/track-branches-perplexity', 'hourly.txt', 'pr-v2\n');
+    const shaHourlyLanded = makeBranch('auto/track-branches-rawmakase-bin', 'hourly.txt', 'master-v2\n');
+    const shaSixHourlyConflict = makeBranch('auto/sync-upstream-zed', 'hourly.txt', 'pr-v2\n');
+
+    git(work, ['checkout', 'master']);
+    writeFileSync(join(work, 'dev.txt'), 'master-v2\n');
+    writeFileSync(join(work, 'hourly.txt'), 'master-v2\n');
+    git(work, ['add', '.']);
+    git(work, ['commit', '-m', 'master advances']);
+    git(work, ['push', 'origin', 'master']);
+
+    const sameRepo = { nameWithOwner: 'omacom/omarchy-pkgs' };
+    const nodes = [
+      { number: 201, headRefName: 'auto/sync-five-minute-omarchy-dev-omarchy-settings-dev', baseRefName: 'master', headRefOid: shaFiveMinConflict, mergeable: 'CONFLICTING', headRepository: sameRepo },
+      { number: 202, headRefName: 'auto/track-branches-perplexity', baseRefName: 'master', headRefOid: shaHourlyConflict, mergeable: 'CONFLICTING', headRepository: sameRepo },
+      { number: 203, headRefName: 'auto/track-branches-rawmakase-bin', baseRefName: 'master', headRefOid: shaHourlyLanded, mergeable: 'MERGEABLE', headRepository: sameRepo },
+      { number: 204, headRefName: 'auto/track-branches', baseRefName: 'master', headRefOid: shaHourlyConflict, mergeable: 'CONFLICTING', headRepository: sameRepo },
+      { number: 205, headRefName: 'auto/sync-upstream-zed', baseRefName: 'master', headRefOid: shaSixHourlyConflict, mergeable: 'CONFLICTING', headRepository: sameRepo },
+      { number: 206, headRefName: 'auto/track-branches-omarchy-dev-omarchy-settings-dev', baseRefName: 'master', headRefOid: shaLegacyFiveMinLanded, mergeable: 'MERGEABLE', headRepository: sameRepo },
+      { number: 207, headRefName: 'auto/track-branches-legacy-pending', baseRefName: 'master', headRefOid: shaLegacyFiveMinPending, mergeable: 'MERGEABLE', headRepository: sameRepo },
+    ];
+    writeFileSync(join(root, 'nodes.json'), JSON.stringify({ data: { repository: { pullRequests: { nodes } } } }));
+
+    let runIndex = 0;
+    const runWithPrefix = (prefix, groupsJson = '[]') => {
+      const closedLog = join(root, `closed-${++runIndex}.log`);
+      const ghStub = `#!/bin/bash
+set -euo pipefail
+if [[ "$1" == "api" && "$2" == "graphql" ]]; then
+  jq_expr=""
+  while [[ $# -gt 0 ]]; do
+    if [[ "$1" == "--jq" ]]; then jq_expr="$2"; shift 2; else shift; fi
+  done
+  jq -r "$jq_expr" "${join(root, 'nodes.json')}"
+elif [[ "$1" == "pr" && "$2" == "view" ]]; then
+  case "$3" in
+    201) echo "OPEN master ${shaFiveMinConflict}" ;;
+    202) echo "OPEN master ${shaHourlyConflict}" ;;
+    203) echo "OPEN master ${shaHourlyLanded}" ;;
+    204) echo "OPEN master ${shaHourlyConflict}" ;;
+    205) echo "OPEN master ${shaSixHourlyConflict}" ;;
+    206) echo "OPEN master ${shaLegacyFiveMinLanded}" ;;
+    207) echo "OPEN master ${shaLegacyFiveMinPending}" ;;
+  esac
+elif [[ "$1" == "pr" && "$2" == "close" ]]; then
+  echo "$3" >> "${closedLog}"
+fi
+`;
+      writeFileSync(join(bin, 'gh'), ghStub);
+      chmodSync(join(bin, 'gh'), 0o755);
+      execFileSync('bash', ['-euo', 'pipefail', '-c', script], {
+        cwd: work,
+        env: {
+          ...process.env,
+          PATH: `${bin}:${process.env.PATH}`,
+          GITHUB_REPOSITORY: 'omacom/omarchy-pkgs',
+          GROUPS_JSON: groupsJson,
+          PREFIX: prefix,
+          DEFAULT_BRANCH: 'master',
+        },
+      });
+      return exists(closedLog) ? read(closedLog, 'utf8').trim().split('\n').filter(Boolean) : [];
+    };
+
+    // Five-minute run with no updates closes ONLY five-minute PR #201; never hourly #202/#203/#204 or six-hourly #205.
+    assert.deepEqual(runWithPrefix('auto/sync-five-minute'), ['201']);
+    // Hourly run with no updates closes hourly PRs #202/#203/#204 plus any already-landed legacy
+    // auto/track-branches-omarchy-dev-omarchy-settings-dev PR #206, never five-minute #201 or six-hourly #205.
+    assert.deepEqual(runWithPrefix('auto/track-branches'), ['202', '203', '204', '206']);
+    // A refreshed PR in GROUPS_JSON is never closed even under its own prefix.
+    assert.deepEqual(
+      runWithPrefix('auto/sync-five-minute', JSON.stringify([{ branch: 'auto/sync-five-minute-omarchy-dev-omarchy-settings-dev', packages: 'omarchy-dev omarchy-settings-dev' }])),
+      [],
+    );
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

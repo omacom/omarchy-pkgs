@@ -578,14 +578,17 @@ on named packages.
 | Workflow | Runs | Opens one PR per package on | For |
 |---|---|---|---|
 | `sync-upstream.yml` | every 6 hours | `auto/sync-upstream-<package>` | upstream updates for packages without `"auto_merge": true` |
-| `sync-upstream.yml` | hourly | `auto/track-branches-<package>` | `"auto_merge": true` packages: the newest upstream release or branch tip |
-| `sync-upstream.yml` | every 5 minutes | `auto/track-branches-<package>` | `"sync_cadence": "five-minute"` packages: `omarchy-dev` and `omarchy-settings-dev` |
+| `sync-upstream.yml` | hourly | `auto/track-branches-<package>` | other `"auto_merge": true` packages: the newest upstream release or branch tip |
+| `sync-upstream.yml` | every 5 minutes | `auto/sync-five-minute-<package>` | `"sync_cadence": "five-minute"` packages: `omarchy-dev` and `omarchy-settings-dev` |
 | `sync-rebuilds.yml` | every hour | `auto/sync-rebuilds-<package>` | a `pkgrel` bump where a `rebuild_on` dependency moved |
 
 For a manual upstream run, choose the `five-minute`, `hourly` or `six-hourly` package group
-with the `cadence` input (default: `six-hourly`). The historical PR branch
-prefixes remain unchanged so existing PRs keep receiving updates. The separate
-`track-branches.yml` workflow has been retired.
+with the `cadence` input (default: `six-hourly`). The `hourly` and `six-hourly`
+lanes keep their historical PR branch prefixes, while `five-minute` uses its own
+`auto/sync-five-minute-*` prefix so concurrent runs never cross-close PRs from
+another cadence. Manual runs scoped with `packages` skip superseded-PR cleanup so
+they never close unrelated PRs. The separate `track-branches.yml` workflow has
+been retired.
 
 - **A red PR holds back only its own package.** Fix it on `master` or on the
   PR. The next run updates the PR if upstream moves again, and closes it once
