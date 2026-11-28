@@ -1237,3 +1237,11 @@ fi
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+test('check-shadowed runs on every PR without paths filter and narrows full-tree helper triggers', () => {
+  const wf = readFileSync(join(__dirname, '../.github/workflows/check-shadowed.yml'), 'utf8');
+  const onBlock = wf.split('\njobs:\n')[0];
+  assert.doesNotMatch(onBlock, /^ +paths:/m);
+  assert.match(wf, /helpers\/message-helpers\.sh helpers\/paths\.sh helpers\/package-metadata\.sh/);
+  assert.doesNotMatch(wf, /release\/shadowed-packages\.txt helpers /);
+});
