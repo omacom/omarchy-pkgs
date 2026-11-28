@@ -26,6 +26,7 @@ github:jacob-vincent-mink
 github:jdvmi00
 github:kwilczynski
 github:malik-na
+github:ninepointlabs
 github:ryanrhughes
 github:RyanTheTide
 github:scottjones
