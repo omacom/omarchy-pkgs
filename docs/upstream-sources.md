@@ -216,7 +216,7 @@ in `origin` and has no effect on release selection.
 | `dropbox` | redirect | [https://www.dropbox.com/download?plat=lnx.x86_64](https://www.dropbox.com/download?plat=lnx.x86_64) |
 | `dropbox-cli` | regex | [https://linux.dropbox.com/packages/](https://linux.dropbox.com/packages/) |
 | `heroic-games-launcher-bin` | github | [Heroic-Games-Launcher/HeroicGamesLauncher](https://github.com/Heroic-Games-Launcher/HeroicGamesLauncher) |
-| `lib32-nvidia-580xx-utils` | regex | [https://download.nvidia.com/XFree86/Linux-x86_64/](https://download.nvidia.com/XFree86/Linux-x86_64/) |
+| `lib32-nvidia-580xx-utils` | regex | NVIDIA GeForce Linux x64 lookup ([GeForce 10 Series](https://gfwsl.geforce.com/services_toolkit/services/com/nvidia/services/AjaxDriverService.php?func=DriverManualLookup&psid=101&pfid=816&osID=12&languageCode=1033&isWHQL=0&dch=0&sort1=0&numberOfResults=10)) |
 | `limine-mkinitcpio-hook` | git_tags | [https://gitlab.com/Zesko/limine-entry-tool.git](https://gitlab.com/Zesko/limine-entry-tool.git) |
 | `limine-snapper-sync` | git_tags | [https://gitlab.com/Zesko/limine-snapper-sync.git](https://gitlab.com/Zesko/limine-snapper-sync.git) |
 | `lmstudio-bin` | regex | [https://lmstudio.ai/download](https://lmstudio.ai/download) |
@@ -227,7 +227,7 @@ in `origin` and has no effect on release selection.
 | `minecraft-launcher` | archive | [https://launcher.mojang.com/download/Minecraft.deb](https://launcher.mojang.com/download/Minecraft.deb) |
 | `nautilus-dropbox` | github | [dropbox/nautilus-dropbox](https://github.com/dropbox/nautilus-dropbox) |
 | `nordvpn-bin` | debian | [https://repo.nordvpn.com/deb/nordvpn/debian/dists/stable/main/binary-amd64/Packages](https://repo.nordvpn.com/deb/nordvpn/debian/dists/stable/main/binary-amd64/Packages) |
-| `nvidia-580xx-utils` | regex | [https://download.nvidia.com/XFree86/Linux-x86_64/](https://download.nvidia.com/XFree86/Linux-x86_64/) |
+| `nvidia-580xx-utils` | regex | NVIDIA GeForce Linux x64 lookup ([GeForce 10 Series](https://gfwsl.geforce.com/services_toolkit/services/com/nvidia/services/AjaxDriverService.php?func=DriverManualLookup&psid=101&pfid=816&osID=12&languageCode=1033&isWHQL=0&dch=0&sort1=0&numberOfResults=10)) |
 | `nvidia-utils` (with `nvidia-open-dkms`, `lib32-nvidia-utils` and the `linux-omarchy` kernels) | hook | Arch's [nvidia-utils](https://archlinux.org/packages/extra/x86_64/nvidia-utils/) |
 | `omarchy-emacs` | git_tags | [https://github.com/scottjones/omarchy-emacs.git](https://github.com/scottjones/omarchy-emacs.git) |
 | `omazed` | git_tags | [https://github.com/aps6/omazed.git](https://github.com/aps6/omazed.git) |
