@@ -10,7 +10,7 @@
 #      only ever moves forward
 #   2. refuse if any remaining filename already exists on the remote with
 #      different bytes
-#   3. sign each package (GPG_PRIVATE_KEY / GPG_PASSPHRASE)
+#   3. sign each package (or verify and reuse an existing remote .sig)
 #   4. repo-add the packages into the pulled database (replaces the entry
 #      for that name; nothing else in the channel is touched)
 #   5. upload packages, then signatures, then the database last
@@ -90,7 +90,9 @@ fi
 if grep -qxF 'omarchy.db.tar.zst' <<<"$listing"; then
   rclone copy "$DEST" "$WORK/repo" --s3-no-head --filter '+ /omarchy.db.tar.zst' --filter '+ /omarchy.files.tar.zst' --filter '- *'
   [[ -f "$WORK/repo/omarchy.db.tar.zst" ]] || { print_error "Failed to pull omarchy.db.tar.zst from $DEST"; exit 1; }
+  [[ -f "$WORK/repo/omarchy.files.tar.zst" ]] || { print_error "Failed to pull omarchy.files.tar.zst from $DEST"; exit 1; }
   db_list=$(tar -tf "$WORK/repo/omarchy.db.tar.zst")
+  files_list=$(tar -tf "$WORK/repo/omarchy.files.tar.zst")
   db_entries=$(grep -c '/$' <<<"$db_list" || true)
   print_info "Pulled current database ($db_entries entries)"
 elif [[ $INIT == true ]]; then
@@ -141,6 +143,9 @@ for f in "${FILES[@]}"; do
   b=$(basename "$f")
   grep -qxF "$b" <<<"$listing" || continue
   remote_sum=$(rclone hashsum md5 "$DEST/$b" --s3-no-head 2>/dev/null | awk '{print $1}')
+  if [[ ! $remote_sum =~ ^[0-9a-fA-F]{32}$ ]]; then
+    remote_sum=$(rclone cat "$DEST/$b" --s3-no-head | md5sum | awk '{print $1}')
+  fi
   local_sum=$(md5sum "$f" | awk '{print $1}')
   if [[ -n "$remote_sum" && "$remote_sum" == "$local_sum" ]]; then
     print_info "Already published with identical bytes, adding to the database only: $b"
@@ -157,26 +162,83 @@ echo "$GPG_PRIVATE_KEY" | gpg --batch --quiet --import
 KEY_ID=$(gpg --list-secret-keys --with-colons | awk -F: '$1=="sec"{print $5; exit}')
 [[ -n "$KEY_ID" ]] || { print_error "No secret key imported"; exit 1; }
 for f in "${FILES[@]}"; do
-  cp "$f" "$WORK/repo/"
-  gpg --batch --yes --pinentry-mode loopback --passphrase "$GPG_PASSPHRASE" \
-    --detach-sign --no-armor --local-user "$KEY_ID" "$WORK/repo/$(basename "$f")"
-  print_step "signed $(basename "$f")"
+  b=$(basename "$f")
+  cp "$f" "$WORK/repo/$b"
+  if grep -qxF "$b.sig" <<<"$listing"; then
+    rclone copyto "$DEST/$b.sig" "$WORK/repo/$b.sig" --s3-no-head
+    gpg --batch --quiet --verify "$WORK/repo/$b.sig" "$WORK/repo/$b" || {
+      print_error "Existing remote signature $b.sig does not verify against $b"
+      exit 1
+    }
+    print_step "reused existing signature $b.sig"
+  else
+    gpg --batch --yes --pinentry-mode loopback --passphrase "$GPG_PASSPHRASE" \
+      --detach-sign --no-armor --local-user "$KEY_ID" "$WORK/repo/$b"
+    print_step "signed $b"
+  fi
 done
 
 # --- 4. repo-add (replaces the entry for each pkgname) ---------------------
-( cd "$WORK/repo" && repo-add --quiet omarchy.db.tar.zst "${FILES[@]/#*\//}" )
-ln -sf omarchy.db.tar.zst "$WORK/repo/omarchy.db"
-ln -sf omarchy.files.tar.zst "$WORK/repo/omarchy.files"
-print_info "Database now has $(tar -tf "$WORK/repo/omarchy.db.tar.zst" | grep -c '/$') entries"
+# If an earlier run uploaded omarchy.files before failing to upload omarchy.db.tar.zst,
+# strip any stale omarchy.files entry for an incoming pkgname so repo-add does not nest it.
+if [[ -f "$WORK/repo/omarchy.files.tar.zst" ]]; then
+  stale_excludes=()
+  while IFS= read -r dir; do
+    [[ -n "$dir" ]] || continue
+    grep -qxF "$dir" <<<"$db_list" && continue
+    d=${dir%/}
+    for f in "${FILES[@]}"; do
+      if [[ "${d%-*-*}" == "${PKG_NAME[$f]}" ]]; then
+        stale_excludes+=(--exclude "$d" --exclude "$d/*")
+        break
+      fi
+    done
+  done < <(grep '/$' <<<"$files_list" || true)
+  if (( ${#stale_excludes[@]} )); then
+    bsdtar --zstd -cf "$WORK/repo/omarchy.files.tar.zst.clean" "${stale_excludes[@]}" "@$WORK/repo/omarchy.files.tar.zst"
+    mv "$WORK/repo/omarchy.files.tar.zst.clean" "$WORK/repo/omarchy.files.tar.zst"
+  fi
+fi
+( cd "$WORK/repo" && repo-add --quiet --include-sigs omarchy.db.tar.zst "${FILES[@]/#*\//}" )
+db_out=$(tar -tf "$WORK/repo/omarchy.db.tar.zst")
+files_out=$(tar -tf "$WORK/repo/omarchy.files.tar.zst")
+cmp -s <( (grep '/$' <<<"$db_out" || true) | sort ) \
+       <( (grep '/$' <<<"$files_out" || true) | sort ) || {
+  print_error "Refusing upload: omarchy.db.tar.zst and omarchy.files.tar.zst entries diverge"
+  exit 1
+}
+print_info "Database now has $(grep -c '/$' <<<"$db_out" || true) entries"
 
 # --- 5. upload: packages, signatures, database last -----------------------
 rclone copy "$WORK/repo" "$DEST" --s3-no-head --ignore-existing --filter '- *.sig' --filter '+ *.pkg.tar.*' --filter '- *'
 rclone copy "$WORK/repo" "$DEST" --s3-no-head --ignore-existing --filter '+ *.pkg.tar.*.sig' --filter '- *'
-# Re-verify every referenced file is really there before the db goes up.
-listing=$(rclone lsf "$DEST/" --s3-no-head)
+# Re-verify every referenced file and its signature (size and MD5) before metadata goes up.
+: > "$WORK/expected.list"
 for f in "${FILES[@]}"; do
   b=$(basename "$f")
-  grep -qxF "$b" <<<"$listing" && grep -qxF "$b.sig" <<<"$listing" || { print_error "Upload incomplete: $b"; exit 1; }
+  printf '%s\n%s.sig\n' "$b" "$b" >> "$WORK/expected.list"
 done
-rclone copy "$WORK/repo" "$DEST" --s3-no-head --checksum --copy-links --filter '+ omarchy.db*' --filter '+ omarchy.files*' --filter '- *'
+listing=$(rclone lsf --format shp --hash md5 --files-from-raw "$WORK/expected.list" "$DEST/" --s3-no-head)
+declare -A REMOTE_SIZE=() REMOTE_MD5=()
+while IFS=';' read -r remote_size remote_md5 remote_path; do
+  [[ -n "$remote_path" ]] || continue
+  REMOTE_SIZE[$remote_path]=$remote_size
+  REMOTE_MD5[$remote_path]=$remote_md5
+done <<<"$listing"
+while IFS= read -r obj; do
+  [[ -v REMOTE_SIZE[$obj] ]] || { print_error "Upload incomplete: $obj"; exit 1; }
+  [[ "${REMOTE_SIZE[$obj]}" == "$(stat -c%s "$WORK/repo/$obj")" ]] || { print_error "Remote size mismatch for $obj"; exit 1; }
+  remote_md5=${REMOTE_MD5[$obj]}
+  local_md5=$(md5sum "$WORK/repo/$obj" | awk '{print $1}')
+  if [[ -z "$remote_md5" ]]; then
+    remote_md5=$(rclone cat "$DEST/$obj" --s3-no-head | md5sum | awk '{print $1}')
+  fi
+  [[ "$remote_md5" == "$local_md5" ]] || { print_error "Remote checksum mismatch for $obj"; exit 1; }
+done < "$WORK/expected.list"
+# Upload exact metadata keys in order, with omarchy.db.tar.zst last as the retry
+# commit point; never uploads repo-add .old backups.
+rclone copyto "$WORK/repo/omarchy.files.tar.zst" "$DEST/omarchy.files.tar.zst" --s3-no-head --checksum
+rclone copyto "$WORK/repo/omarchy.files.tar.zst" "$DEST/omarchy.files" --s3-no-head --checksum
+rclone copyto "$WORK/repo/omarchy.db.tar.zst" "$DEST/omarchy.db" --s3-no-head --checksum
+rclone copyto "$WORK/repo/omarchy.db.tar.zst" "$DEST/omarchy.db.tar.zst" --s3-no-head --checksum
 print_success "Published ${#FILES[@]} package(s) to $DEST"
