@@ -762,5 +762,99 @@ class T3CodeHookTest(unittest.TestCase):
         self.assertEqual(result.stdout, '')
 
 
+class P1WatchImprovementsTests(unittest.TestCase):
+    def test_github_paginates_monorepo_when_page_one_has_no_matches(self):
+        pages = {
+            'https://api.github.com/repos/example/mono/releases?per_page=100': [
+                {'tag_name': f'other-v{i}.0.0', 'draft': False, 'prerelease': False,
+                 'published_at': '2026-01-01T00:00:00Z', 'assets': []}
+                for i in range(100)
+            ],
+            'https://api.github.com/repos/example/mono/releases?per_page=100&page=2': [
+                {'tag_name': 'desktop-v2.3.4', 'draft': False, 'prerelease': False,
+                 'published_at': '2026-01-01T00:00:00Z', 'assets': []}
+            ],
+        }
+        seen = []
+        class FakeFetch:
+            def json(self, url):
+                seen.append(url)
+                return pages[url]
+        watch = {'github': 'example/mono', 'pattern': r'desktop-v(?P<version>[0-9]+(?:\.[0-9]+)*)'}
+        found = w.discover(watch, FakeFetch())
+        self.assertEqual([r['pkgver'] for r in found], ['2.3.4'])
+        self.assertEqual(len(seen), 2)
+
+    def test_github_stops_on_page_one_when_match_found(self):
+        pages = {
+            'https://api.github.com/repos/example/mono/releases?per_page=100': [
+                {'tag_name': 'desktop-v2.3.4', 'draft': False, 'prerelease': False,
+                 'published_at': '2026-01-01T00:00:00Z', 'assets': []}
+            ] + [
+                {'tag_name': f'other-v{i}.0.0', 'draft': False, 'prerelease': False,
+                 'published_at': '2026-01-01T00:00:00Z', 'assets': []}
+                for i in range(99)
+            ],
+        }
+        seen = []
+        class FakeFetch:
+            def json(self, url):
+                seen.append(url)
+                return pages[url]
+        watch = {'github': 'example/mono', 'pattern': r'desktop-v(?P<version>[0-9]+(?:\.[0-9]+)*)'}
+        found = w.discover(watch, FakeFetch())
+        self.assertEqual([r['pkgver'] for r in found], ['2.3.4'])
+        self.assertEqual(len(seen), 1)
+
+    def test_npm_pattern_transforms_prerelease_and_preserves_published_at(self):
+        class FakeFetch:
+            def json(self, url):
+                return {
+                    'dist-tags': {'latest': '1.0.0-rc.6'},
+                    'time': {'1.0.0-rc.6': '2026-11-20T12:00:00.000Z'},
+                }
+        watch = {
+            'npm': 'cf',
+            'pattern': r'(?P<version>[0-9]+(?:\.[0-9]+)*)(?P<sep>-?)(?P<pre>(?:[a-z]+\.[0-9]+)?)',
+            'version': '{version}{pre}',
+            'variables': {'_npmver': '{version}{sep}{pre}'},
+        }
+        found = w.discover(watch, FakeFetch())
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0]['pkgver'], '1.0.0rc.6')
+        self.assertEqual(found[0]['published_at'], '2026-11-20T12:00:00.000Z')
+        self.assertEqual(found[0]['values']['sep'], '-')
+        self.assertEqual(found[0]['values']['pre'], 'rc.6')
+
+    def test_deb_archive_uses_range_fast_path_without_full_download(self):
+        import io, tarfile
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode='w:gz') as tf:
+            ctrl = b'Package: demo\nVersion: 4.1.13.29\n'
+            info = tarfile.TarInfo('./control')
+            info.size = len(ctrl)
+            tf.addfile(info, io.BytesIO(ctrl))
+        ctrl_tar = buf.getvalue()
+        def ar_member(name, payload):
+            hdr = f"{name:<16}{'0':<12}{'0':<6}{'0':<6}{'100644':<8}{len(payload):<10}`\n".encode()
+            pad = b'\n' if len(payload) % 2 else b''
+            return hdr + payload + pad
+        prefix = b'!<arch>\n' + ar_member('debian-binary', b'2.0\n') + ar_member('control.tar.gz', ctrl_tar)
+        class FakeFetch:
+            def range_bytes(self, url, size=w.DEB_RANGE_BYTES):
+                return prefix
+            def file(self, url):
+                raise AssertionError('full file download must not run when Range prefix contains control.tar')
+        watch = {'archive': 'https://example.test/demo.deb', 'pattern': r'(?m)^Version: (?P<version>[0-9.]+)$'}
+        found = w.discover(watch, FakeFetch())
+        self.assertEqual([r['pkgver'] for r in found], ['4.1.13.29'])
+        # Negative ar member size must return None instead of looping forever.
+        bad_hdr = f"{'debian-binary':<16}{'0':<12}{'0':<6}{'0':<6}{'100644':<8}{'-60':<10}`\n".encode()
+        self.assertIsNone(w.deb_control_from_prefix(b'!<arch>\n' + bad_hdr))
+        # Duplicate control.tar members in prefix must return None (fall back to full parser).
+        dup = b'!<arch>\n' + ar_member('control.tar.gz', ctrl_tar) + ar_member('control.tar.xz', ctrl_tar)
+        self.assertIsNone(w.deb_control_from_prefix(dup))
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)
